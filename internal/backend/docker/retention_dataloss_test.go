@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -176,6 +177,7 @@ func TestFinalizeRestoredLease_KeepsFinalizerWhenReleaseAppendFails(t *testing.T
 	e := eng523RestoringRecord(orig, newLease)
 	require.NoError(t, rs.Put(e))
 
+	before := testutil.ToFloat64(restoreFinalizerPendingTotal)
 	b.finalizeRestoredLease(newLease, &e, slog.Default())
 
 	got, err := rs.Get(orig)
@@ -183,6 +185,8 @@ func TestFinalizeRestoredLease_KeepsFinalizerWhenReleaseAppendFails(t *testing.T
 	require.NotNil(t, got,
 		"ENG-523: retention record (the adopted volume's finalizer) must NOT be deleted when the release Append failed")
 	assert.Equal(t, shared.RetentionStatusRestoring, got.Status)
+	assert.Equal(t, before+1, testutil.ToFloat64(restoreFinalizerPendingTotal),
+		"a kept-pending finalizer must be counted for observability (ENG-523)")
 }
 
 // ENG-523 (reaper half): a lingering restoring record — the exact state a restore

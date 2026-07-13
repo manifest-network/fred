@@ -482,6 +482,19 @@ var (
 		Help:      "Retained-volume leak events (failed destroy / give-up / uncommitted revert) — see ENG-376",
 	})
 
+	// restoreFinalizerPendingTotal counts restore finalizations kept pending: a restore
+	// succeeded (new lease Ready) but its active-release write failed, so the retention
+	// record is LEFT restoring to keep protecting the adopted volume as its finalizer
+	// (ENG-523). Reconcile sweeps retry, so a lingering record re-increments this each
+	// sweep — a sustained rate means the release store is failing (mirrors the
+	// observable-backstop role of retentionLeakedTotal).
+	restoreFinalizerPendingTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "restore_finalizer_pending_total",
+		Help:      "Restore-finalizer kept-pending events: a successful restore whose active-release write failed, so the retention record stays restoring to keep protecting the adopted volume (ENG-523). A sustained rate means the release store is failing.",
+	})
+
 	// retentionReapingBytes is the reserved disk footprint (SKU quota) of records in
 	// the reaping (pending-destroy) state — bytes still on disk awaiting reclaim.
 	retentionReapingBytes = promauto.NewGauge(prometheus.GaugeOpts{

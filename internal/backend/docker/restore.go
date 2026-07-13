@@ -1013,7 +1013,14 @@ func (b *Backend) finalizeRestoredLease(leaseUUID string, rec *shared.RetentionE
 	}
 	if !releaseRecorded {
 		// Keep the finalizer: the adopted volume stays protected until a later
-		// reconcileRestoring/Update durably records the release and drops the record.
+		// reconcileRestoring sweep or an Update durably records the release and drops the
+		// record. Tradeoff while it lingers (only under a sustained release-store outage):
+		// the ORIGINAL lease UUID reports Retained (info.go maps restoring→retained) even
+		// though the restore is done, and a Restore-retry from the original is rejected
+		// (ClaimForRestore needs Active). Both self-heal once the store recovers and the
+		// record is dropped; restoreFinalizerPendingTotal makes the lingering state
+		// observable (a sustained rate = failing release store).
+		restoreFinalizerPendingTotal.Inc()
 		logger.Warn("restore ok but release not durably recorded; keeping retention record as the adopted volume's finalizer (ENG-523)",
 			"lease_uuid", leaseUUID, "original_lease_uuid", rec.OriginalLeaseUUID)
 		return
