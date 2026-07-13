@@ -1002,6 +1002,13 @@ func TestReconcileRestoring_DeletesOnReady(t *testing.T) {
 		}},
 	})
 	rs := attachRetentionStore(t, b)
+	// The restore succeeded (u2 Ready) and recorded its active release; only the
+	// terminal record Delete lingered. reconcileRestoring finalizes it via the durable
+	// release without re-appending a duplicate (ENG-523 finalizer gate).
+	relStore := attachReleaseStore(t, b)
+	require.NoError(t, relStore.Append("u2", shared.Release{
+		Manifest: []byte(`{"services":{}}`), Image: "stack", Status: "active", CreatedAt: time.Now(),
+	}))
 
 	e := shared.RetentionEntry{
 		OriginalLeaseUUID: "u1",
@@ -2048,6 +2055,7 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	seedActiveRetained(t, rs, "u1")
 
@@ -2406,6 +2414,7 @@ func TestRestore_NormalizesLegacyUnnamedItem_Succeeds(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	seedActiveRetained(t, rs, "u1") // retained record has ServiceName="app"
 
@@ -2953,6 +2962,7 @@ func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	seedMixedRetained(t, rs, "u1")
 

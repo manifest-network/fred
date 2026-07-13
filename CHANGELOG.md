@@ -42,6 +42,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
     past a failed terminal delete — it defers for any live non-Failed
     provision, running the orphaned-restore rollback only for an absent or
     Failed provision. (ENG-512)
+- docker-backend: a restore whose best-effort release-record write fails no longer
+  strands the restored lease. `doRestore` deleted the retention record
+  unconditionally after adopting the volumes, so if the release `Append` failed the
+  lease was left with neither record — a later boot's orphan reaper (which keys on
+  the release record) could then destroy the still-live tenant data. The retention
+  record now acts as the adopted volume's finalizer: it is dropped only once the
+  release is durably recorded, and otherwise left `restoring` so the boot reaper
+  keeps protecting the volume and `reconcileRestoring` finalizes it once the lease
+  reaches Ready. Safe now that `reconcileRestoring` never tears down a running
+  lease (ENG-512). (ENG-523)
 - scheduler: the withdraw scheduler no longer panics or wedges on a very large
   credit balance. `estimateDepletionTime` converted an unbounded balance /
   burn-rate ratio via `LegacyDec.TruncateInt64()` (panics on int64 overflow)
