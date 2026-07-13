@@ -2048,6 +2048,7 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	seedActiveRetained(t, rs, "u1")
 
@@ -2406,6 +2407,7 @@ func TestRestore_NormalizesLegacyUnnamedItem_Succeeds(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	seedActiveRetained(t, rs, "u1") // retained record has ServiceName="app"
 
@@ -2953,6 +2955,7 @@ func TestRestore_MixedStatefulStatelessLease(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	seedMixedRetained(t, rs, "u1")
 

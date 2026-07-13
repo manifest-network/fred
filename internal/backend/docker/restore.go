@@ -934,41 +934,10 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			// async re-deploy worker span, which is the ~3-4x cost ENG-357 targets.
 			restoreDurationSeconds.Observe(time.Since(restoreStart).Seconds())
 			restoresTotal.WithLabelValues("success").Inc()
-			// Persist an "active" release for the NEW lease so its manifest survives a
-			// docker-backend restart. recoverState rehydrates prov.StackManifest ONLY
-			// from releaseStore.LatestActive (recover.go), and Restart hard-fails on a
-			// nil manifest (restart_update.go), so without this a restored lease becomes
-			// un-Restartable after the next backend restart. The lease is already Ready
-			// here, so the release is written directly as active (mirrors provision.go's
-			// on-success Append, not restart's deploying+ActivateLatest two-step). The
-			// payload bytes are the marshaled retained StackManifest — the same
-			// json.Marshal(stack) round-trip ParsePayload consumes (restart_update.go).
-			//
-			// Best-effort (Warn, not abort) by necessity: unlike restart_update.go — which
-			// records the release BEFORE doing any work and so can hard-abort on a write
-			// failure — the restore has already brought the stack up and adopted the volumes,
-			// so there is nothing to abort. Nor can the retention Delete below be gated on
-			// this Append succeeding: withholding the Delete would leave a retained record
-			// pointing at volumes already renamed into the live lease, and reconcileRestoring
-			// would then re-quarantine them out from under the running lease. So a (rare)
-			// Append failure degrades to the pre-fix state — no worse than before, and
-			// self-corrected by the next Update/re-provision (both re-source the manifest
-			// from the chain). (ENG-433)
-			if b.releaseStore != nil {
-				if manifestBytes, marshalErr := json.Marshal(rec.StackManifest); marshalErr != nil {
-					logger.Warn("restore ok but failed to marshal manifest for release record", "lease_uuid", leaseUUID, "error", marshalErr)
-				} else if relErr := b.releaseStore.Append(leaseUUID, shared.Release{
-					Manifest:  manifestBytes,
-					Image:     "stack",
-					Status:    "active",
-					CreatedAt: time.Now(),
-				}); relErr != nil {
-					logger.Warn("restore ok but failed to record release history", "lease_uuid", leaseUUID, "error", relErr)
-				}
-			}
-			if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
-				logger.Warn("restore ok but failed to delete retention record", "error", delErr)
-			}
+			// Record the new lease's active release, then finalize the restore. The
+			// restoring retention record is the adopted volume's finalizer, so it is
+			// dropped only once the release is durably recorded (ENG-523).
+			b.finalizeRestoredLease(leaseUUID, rec, logger)
 			b.refreshRetentionAccounting()
 			return
 		}
@@ -981,6 +950,56 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 		OldContainerIDs: nil, ServiceContainers: nil, Operation: "restore", NoComposeRollback: true, Logger: logger,
 		OnSuccess: func(p *leasesm.ProvisionState) { p.StackManifest = rec.StackManifest },
 	})
+}
+
+// finalizeRestoredLease records the NEW lease's active release, then — and only
+// then — drops the restoring retention record. recoverState rehydrates
+// prov.StackManifest ONLY from releaseStore.LatestActive, and Restart hard-fails on
+// a nil manifest, so the release must be written for the restored lease to survive a
+// backend restart. The lease is already Ready here, so it is written directly as
+// active (mirrors provision.go's on-success Append).
+//
+// The retention record is the adopted volume's FINALIZER (Kubernetes-style): while
+// it exists (restoring), cleanupOrphanedVolumes protects the adopted canonical
+// volume (recover.go's restoring arm) and reconcileRestoring finalizes it once the
+// lease is confirmed Ready. Dropping the finalizer BEFORE the release is durably
+// recorded would leave the lease with NEITHER record, so a later boot's orphan
+// reaper — which keys on the release record (leaseHasActiveRelease) — would destroy
+// the still-live tenant data (ENG-523). So the record is deleted only once the
+// release Append succeeds; on any failure (Append error, marshal error, or no
+// release store) it is LEFT restoring, and reconcileRestoring (Ready->Delete) or the
+// next Update re-provision self-heals it.
+//
+// Leaving the record lingering is safe post-ENG-512: reconcileRestoring never tears
+// a running lease down (Ready->Delete; every other live state defers), so a stale
+// restoring record can no longer re-quarantine a healthy lease's volumes — which is
+// what previously forced the unconditional Delete here. (ENG-433 / ENG-523)
+func (b *Backend) finalizeRestoredLease(leaseUUID string, rec *shared.RetentionEntry, logger *slog.Logger) {
+	releaseRecorded := false
+	if b.releaseStore != nil {
+		if manifestBytes, marshalErr := json.Marshal(rec.StackManifest); marshalErr != nil {
+			logger.Warn("restore ok but failed to marshal manifest for release record", "lease_uuid", leaseUUID, "error", marshalErr)
+		} else if relErr := b.releaseStore.Append(leaseUUID, shared.Release{
+			Manifest:  manifestBytes,
+			Image:     "stack",
+			Status:    "active",
+			CreatedAt: time.Now(),
+		}); relErr != nil {
+			logger.Warn("restore ok but failed to record release history", "lease_uuid", leaseUUID, "error", relErr)
+		} else {
+			releaseRecorded = true
+		}
+	}
+	if !releaseRecorded {
+		// Keep the finalizer: the adopted volume stays protected until a later
+		// reconcileRestoring/Update durably records the release and drops the record.
+		logger.Warn("restore ok but release not durably recorded; keeping retention record as the adopted volume's finalizer (ENG-523)",
+			"lease_uuid", leaseUUID, "original_lease_uuid", rec.OriginalLeaseUUID)
+		return
+	}
+	if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
+		logger.Warn("restore ok but failed to delete retention record", "error", delErr)
+	}
 }
 
 // rollbackRestoreAdoption is the idempotent compensating teardown for an adopted
