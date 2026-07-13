@@ -18,6 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- docker-backend: reject tenant-supplied container labels under the reserved
+  `traefik.*` prefix during manifest validation (previously only `fred.*` was
+  blocked). With ingress enabled, Traefik's Docker provider merges router labels
+  from every container into one shared routing table, so a tenant could register
+  a `traefik.http.routers.*` rule targeting another tenant's deterministic
+  subdomain and intercept its HTTPS traffic. (ENG-497)
+
 ## [0.8.0] - 2026-07-09
 
 ### Added
