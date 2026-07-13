@@ -591,16 +591,25 @@ func (b *Backend) leaseHasActiveRelease(volumeID string) bool {
 func leaseUUIDFromVolumeName(id string) (string, bool) {
 	const prefix = "fred-"
 	rest, ok := strings.CutPrefix(id, prefix)
-	if !ok {
-		return "", false
-	}
-	// {uuid}(36) + "-" + {service} + "-" + {idx}
-	if len(rest) < 37 || rest[36] != '-' {
+	if !ok || len(rest) < 37 || rest[36] != '-' {
 		return "", false
 	}
 	candidate := rest[:36]
 	if _, err := uuid.Parse(candidate); err != nil {
 		return "", false
+	}
+	// Require the {service}-{idx} suffix so only real managed names match, not a
+	// bare fred-{uuid}- prefix. {service} may contain hyphens; {idx} is the
+	// numeric trailer after the last hyphen.
+	suffix := rest[37:]
+	dash := strings.LastIndexByte(suffix, '-')
+	if dash <= 0 || dash == len(suffix)-1 {
+		return "", false
+	}
+	for i := dash + 1; i < len(suffix); i++ {
+		if suffix[i] < '0' || suffix[i] > '9' {
+			return "", false
+		}
 	}
 	return candidate, true
 }

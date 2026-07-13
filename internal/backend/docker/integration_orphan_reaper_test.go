@@ -69,10 +69,10 @@ func TestIntegration_Docker_OrphanReaper_KeepsLiveLeaseWithRemovedContainers(t *
 		_ = docker.Close()
 	})
 
-	// A canonical UUID lease id, matching real chain-assigned (UUIDv7) leases: the
-	// reaper's active-release protection parses the UUID out of the volume name,
-	// so a non-UUID id would silently not be protected and the test would validate
-	// nothing.
+	// A canonical UUID lease id. Real chain-assigned leases are UUIDv7, but the
+	// reaper only needs the canonical 36-char format (leaseUUIDFromVolumeName
+	// parses it via uuid.Parse), which uuid.NewString()'s v4 satisfies. A non-UUID
+	// id would silently not be protected and the test would validate nothing.
 	leaseUUID := uuid.NewString()
 	// redis:7 declares VOLUME /data; fred binds the managed stateful volume there.
 	appManifest := manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}}
