@@ -616,7 +616,14 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64
 			}
 
 		case tar.TypeReg:
-			if totalBytes+hdr.Size > maxBytes {
+			// Compare against the remaining budget instead of summing first: a
+			// tenant-controlled hdr.Size near math.MaxInt64 would overflow
+			// totalBytes+hdr.Size to a negative value and slip past a "> maxBytes"
+			// gate, letting a single entry stream unbounded bytes to disk. The
+			// maxBytes-totalBytes subtraction cannot underflow because the loop
+			// maintains 0 <= totalBytes <= maxBytes. Negative sizes are rejected
+			// outright.
+			if hdr.Size < 0 || hdr.Size > maxBytes-totalBytes {
 				return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d byte limit", maxBytes)
 			}
 			if dir := filepath.Dir(name); dir != "." {

@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- test: Go native fuzz harnesses for the two tenant-facing custom parsers.
+  `FuzzSanitizeAndExtractTar` drives the tar extractor with arbitrary archive
+  bytes and byte budgets, asserting it never panics, keeps writes within
+  `maxBytes` on disk, and never creates a real path outside the destination.
+  `FuzzParsePayload` drives the manifest parser and asserts every payload it
+  accepts satisfies the validation invariants (DNS-safe service names, no
+  reserved `fred.*`/`traefik.*` label prefixes, bounded/absolute tmpfs mounts) —
+  a validation-bypass hunter, not just a crash finder. fred previously had no
+  fuzz coverage. (ENG-521)
+
 ### Changed
 
 ### Deprecated
@@ -40,6 +50,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   from every container into one shared routing table, so a tenant could register
   a `traefik.http.routers.*` rule targeting another tenant's deterministic
   subdomain and intercept its HTTPS traffic. (ENG-497)
+- docker-backend: reject tar entries whose declared size would overflow the
+  extraction byte budget. `sanitizeAndExtractTar` gated its per-extraction size
+  cap with `totalBytes + hdr.Size > maxBytes`, where `hdr.Size` is an
+  attacker-controlled `int64` from a tenant image's tar stream. Once an earlier
+  entry advanced `totalBytes` above zero, a later entry declaring a
+  near-`math.MaxInt64` size wrapped the sum negative and slipped past the gate,
+  letting a single entry stream unbounded bytes to host disk and defeat the cap
+  — a disk-exhaustion DoS affecting co-located tenants on a shared node. The
+  gate now compares against the remaining budget and rejects negative sizes.
+  (ENG-520)
 
 ## [0.8.0] - 2026-07-09
 
