@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -68,7 +69,11 @@ func TestIntegration_Docker_OrphanReaper_KeepsLiveLeaseWithRemovedContainers(t *
 		_ = docker.Close()
 	})
 
-	leaseUUID := fmt.Sprintf("orphan-reaper-%d", time.Now().UnixNano())
+	// A canonical UUID lease id, matching real chain-assigned (UUIDv7) leases: the
+	// reaper's active-release protection parses the UUID out of the volume name,
+	// so a non-UUID id would silently not be protected and the test would validate
+	// nothing.
+	leaseUUID := uuid.NewString()
 	// redis:7 declares VOLUME /data; fred binds the managed stateful volume there.
 	appManifest := manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}}
 	payload, err := json.Marshal(appManifest)

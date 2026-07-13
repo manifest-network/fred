@@ -574,7 +574,15 @@ func (b *Backend) leaseHasActiveRelease(volumeID string) bool {
 		return false
 	}
 	rel, err := b.releaseStore.LatestActive(leaseUUID)
-	return err == nil && rel != nil
+	if err != nil {
+		// Fail safe: a transient release-store read error must NOT let the reaper
+		// destroy a volume that may have an active release. Keep it; the next boot
+		// retries. This mirrors the retention-store fail-safe in cleanupOrphaned-
+		// Volumes below (a read failure skips destruction rather than risking it).
+		b.logger.Warn("cleanupOrphanedVolumes: release-store read failed; keeping volume (fail-safe)", "volume_id", volumeID, "error", err)
+		return true
+	}
+	return rel != nil
 }
 
 // leaseUUIDFromVolumeName extracts the lease UUID from a managed volume name of
