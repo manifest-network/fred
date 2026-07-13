@@ -16,6 +16,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- scheduler: the withdraw scheduler no longer panics or wedges on a very large
+  credit balance. `estimateDepletionTime` converted an unbounded balance /
+  burn-rate ratio via `LegacyDec.TruncateInt64()` (panics on int64 overflow)
+  and a `time.Duration` multiply (overflowed to a bogus past time); a tenant
+  with a large balance and a tiny per-interval burn could trip it. Because the
+  estimate ran inside a mutex held without `defer`, a recovered panic left the
+  lock held and silently wedged revenue withdrawal and credit-exhaustion
+  lease-closing. The horizon is now clamped to a finite bound, and the critical
+  section releases its lock via `defer`. (ENG-500)
 - provisioner: the reconciler no longer terminates a lease on a transient
   backend circuit-breaker trip. `ErrCircuitOpen` was bucketed with permanent
   errors, so a brief backend outage that opened the breaker permanently
