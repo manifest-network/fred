@@ -1259,9 +1259,12 @@ func (w *cappingLogWriter) Write(p []byte) (int, error) {
 		return 0, errLogCapReached
 	}
 	if len(p) > w.remaining {
-		w.buf.Write(p[:w.remaining])
+		n := w.remaining
+		w.buf.Write(p[:n])
 		w.remaining = 0
-		return len(p), errLogCapReached
+		// Report only the bytes actually accepted (io.Writer contract: n <
+		// len(p) requires a non-nil error), and stop the demux.
+		return n, errLogCapReached
 	}
 	w.buf.Write(p)
 	w.remaining -= len(p)
@@ -1283,7 +1286,7 @@ func demuxContainerLogs(reader io.Reader) (string, error) {
 	case err == nil:
 		// Whole stream fit within the cap.
 	case errors.Is(err, errLogCapReached):
-		buf.WriteString("\n[log truncated: exceeded 5 MiB limit]")
+		fmt.Fprintf(&buf, "\n[log truncated: exceeded %d MiB limit]", maxContainerLogBytes>>20)
 	default:
 		return "", fmt.Errorf("failed to read container logs: %w", err)
 	}
