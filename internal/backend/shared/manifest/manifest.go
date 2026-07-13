@@ -296,10 +296,16 @@ func (m *flatManifest) validate(inStack bool) error {
 		return err
 	}
 
-	// Validate labels don't conflict with fred.* namespace
+	// Validate labels don't use a reserved prefix. fred owns fred.* for its
+	// own bookkeeping, and traefik.* because the ingress Traefik discovers
+	// routers from every container's labels via the Docker provider — a
+	// tenant-supplied traefik.* label would register into the shared routing
+	// table and could hijack another tenant's route (ENG-497).
 	for key := range m.Labels {
-		if strings.HasPrefix(key, "fred.") {
-			return fmt.Errorf("labels cannot use reserved prefix 'fred.': %s", key)
+		for _, prefix := range reservedLabelPrefixes {
+			if strings.HasPrefix(key, prefix) {
+				return fmt.Errorf("labels cannot use reserved prefix '%s': %s", prefix, key)
+			}
 		}
 	}
 
@@ -428,6 +434,15 @@ var blockedEnvPrefixes = []string{
 	"LD_",     // dynamic linker (LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, etc.)
 	"FRED_",   // reserved for backend-internal use
 	"DOCKER_", // Docker runtime variables
+}
+
+// reservedLabelPrefixes are container-label key prefixes that tenants cannot
+// set. Any label key starting with one of these is rejected in validate().
+var reservedLabelPrefixes = []string{
+	"fred.",    // reserved for backend-internal bookkeeping
+	"traefik.", // ingress routing: Traefik's Docker provider merges routers
+	// from every container's labels into one shared table, so a tenant label
+	// here could hijack another tenant's route (ENG-497).
 }
 
 // validateEnvVars checks that environment variable names are safe.

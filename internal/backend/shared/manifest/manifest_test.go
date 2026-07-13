@@ -512,6 +512,52 @@ func TestManifest_StopGracePeriod_Boundaries(t *testing.T) {
 	})
 }
 
+// --- label validation tests ---
+
+func TestManifest_Labels_RejectsTraefikPrefix(t *testing.T) {
+	m := &Manifest{
+		Image: "nginx",
+		Labels: map[string]string{
+			"traefik.http.routers.pwn.rule": "Host(`victim.example.com`)",
+		},
+	}
+	err := m.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved prefix 'traefik.'")
+}
+
+func TestManifest_Labels_RejectsFredPrefix(t *testing.T) {
+	m := &Manifest{
+		Image:  "nginx",
+		Labels: map[string]string{"fred.lease": "spoof"},
+	}
+	err := m.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved prefix 'fred.'")
+}
+
+func TestManifest_Labels_AllowsBenignLabel(t *testing.T) {
+	m := &Manifest{
+		Image:  "nginx",
+		Labels: map[string]string{"com.example.team": "payments"},
+	}
+	assert.NoError(t, m.Validate())
+}
+
+func TestStackManifest_Labels_RejectsTraefikPrefix(t *testing.T) {
+	sm := StackManifest{
+		Services: map[string]*Manifest{
+			"web": {
+				Image:  "nginx",
+				Labels: map[string]string{"traefik.enable": "true"},
+			},
+		},
+	}
+	err := sm.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved prefix 'traefik.'")
+}
+
 // --- expose validation tests ---
 
 func TestManifest_Expose_Valid(t *testing.T) {
