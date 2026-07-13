@@ -1002,6 +1002,13 @@ func TestReconcileRestoring_DeletesOnReady(t *testing.T) {
 		}},
 	})
 	rs := attachRetentionStore(t, b)
+	// The restore succeeded (u2 Ready) and recorded its active release; only the
+	// terminal record Delete lingered. reconcileRestoring finalizes it via the durable
+	// release without re-appending a duplicate (ENG-523 finalizer gate).
+	relStore := attachReleaseStore(t, b)
+	require.NoError(t, relStore.Append("u2", shared.Release{
+		Manifest: []byte(`{"services":{}}`), Image: "stack", Status: "active", CreatedAt: time.Now(),
+	}))
 
 	e := shared.RetentionEntry{
 		OriginalLeaseUUID: "u1",

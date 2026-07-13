@@ -125,7 +125,12 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	b.provisionsMu.RUnlock()
 
 	if live && status == backend.ProvisionStatusReady {
-		_ = b.retentionStore.Delete(e.OriginalLeaseUUID) // restore finished; drop leftover record
+		// Restore finished. Finalize through the SAME gate as doRestore: (re-)record the
+		// new lease's active release, and drop the retention record ONLY once that release
+		// is durable. A bare Delete here would drop the finalizer for a restore whose
+		// release Append failed (no release + no record → reapable), re-opening ENG-523;
+		// routing through finalizeRestoredLease makes this sweep the retry path instead.
+		b.finalizeRestoredLease(e.NewLeaseUUID, &e, b.logger)
 		return
 	}
 	if live && status != backend.ProvisionStatusFailed {
@@ -967,8 +972,10 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 // reaper — which keys on the release record (leaseHasActiveRelease) — would destroy
 // the still-live tenant data (ENG-523). So the record is deleted only once the
 // release Append succeeds; on any failure (Append error, marshal error, or no
-// release store) it is LEFT restoring, and reconcileRestoring (Ready->Delete) or the
-// next Update re-provision self-heals it.
+// release store) it is LEFT restoring. reconcileRestoring re-invokes this helper on
+// its next sweep once the lease is Ready (the retry path), so a transient failure
+// self-heals; the next Update re-provision also re-records the release. It is
+// idempotent — an already-durable release is not re-appended.
 //
 // Leaving the record lingering is safe post-ENG-512: reconcileRestoring never tears
 // a running lease down (Ready->Delete; every other live state defers), so a stale
@@ -977,7 +984,12 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 func (b *Backend) finalizeRestoredLease(leaseUUID string, rec *shared.RetentionEntry, logger *slog.Logger) {
 	releaseRecorded := false
 	if b.releaseStore != nil {
-		if manifestBytes, marshalErr := json.Marshal(rec.StackManifest); marshalErr != nil {
+		// Idempotent: reconcileRestoring re-invokes this as the retry path, so skip a
+		// duplicate Append when the release is already durable (e.g. doRestore's Append
+		// succeeded but its subsequent record Delete failed).
+		if existing, lerr := b.releaseStore.LatestActive(leaseUUID); lerr == nil && existing != nil {
+			releaseRecorded = true
+		} else if manifestBytes, marshalErr := json.Marshal(rec.StackManifest); marshalErr != nil {
 			logger.Warn("restore ok but failed to marshal manifest for release record", "lease_uuid", leaseUUID, "error", marshalErr)
 		} else if relErr := b.releaseStore.Append(leaseUUID, shared.Release{
 			Manifest:  manifestBytes,

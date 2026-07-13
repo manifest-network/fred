@@ -148,6 +148,7 @@ func eng523RestoringRecord(orig, newLease string) shared.RetentionEntry {
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          1,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		StackManifest:       restoreStackManifest(), // realistic, parseable payload (not a nil "null" marshal)
 		RetainedVolumeNames: []string{"fred-retained-" + orig + "-app-0"},
 	}
 }
@@ -248,4 +249,89 @@ func TestFinalizeRestoredLease_DropsFinalizerWhenReleaseRecorded(t *testing.T) {
 	rel, err := relStore.LatestActive(newLease)
 	require.NoError(t, err)
 	require.NotNil(t, rel, "the new lease must have an active release recorded")
+}
+
+// ENG-523 (Copilot #174): reconcileRestoring is the retry path for the finalizer. When
+// the new lease is Ready but no active release is durable yet (finalizeRestoredLease
+// kept the record because Append failed) and the release store is STILL failing, it
+// must KEEP the record restoring — a bare Delete here would re-open the ENG-523 window
+// (no release + no record → reapable on the next boot).
+func TestReconcileRestoring_ReadyButReleaseUnrecordable_KeepsFinalizer(t *testing.T) {
+	orig := "0192f1a0-1111-7abc-8def-000000000008"
+	newLease := "0192f1a0-2222-7abc-8def-000000000009"
+
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		newLease: {ProvisionState: leasesm.ProvisionState{LeaseUUID: newLease, Status: backend.ProvisionStatusReady}},
+	})
+	rs := attachRetentionStore(t, b)
+
+	relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: filepath.Join(t.TempDir(), "rel.db")})
+	require.NoError(t, err)
+	require.NoError(t, relStore.Close()) // Append + LatestActive fail
+	b.releaseStore = relStore
+
+	e := eng523RestoringRecord(orig, newLease)
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	got, err := rs.Get(orig)
+	require.NoError(t, err)
+	require.NotNil(t, got,
+		"reconcileRestoring must keep the finalizer when the release can't be durably recorded (ENG-523)")
+	assert.Equal(t, shared.RetentionStatusRestoring, got.Status)
+}
+
+// Companion: when the release store works, reconcileRestoring's Ready path RECORDS the
+// missing release (self-heal) and only then drops the finalizer.
+func TestReconcileRestoring_ReadyRecordsMissingReleaseThenDropsFinalizer(t *testing.T) {
+	orig := "0192f1a0-1111-7abc-8def-00000000000a"
+	newLease := "0192f1a0-2222-7abc-8def-00000000000b"
+
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		newLease: {ProvisionState: leasesm.ProvisionState{LeaseUUID: newLease, Status: backend.ProvisionStatusReady}},
+	})
+	rs := attachRetentionStore(t, b)
+	relStore := attachReleaseStore(t, b) // working, empty: no active release yet (Append had failed)
+
+	e := eng523RestoringRecord(orig, newLease)
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	got, err := rs.Get(orig)
+	require.NoError(t, err)
+	assert.Nil(t, got, "finalizer dropped once the release is recorded")
+
+	rel, err := relStore.LatestActive(newLease)
+	require.NoError(t, err)
+	require.NotNil(t, rel, "reconcileRestoring must record the missing active release before dropping the finalizer")
+}
+
+// finalizeRestoredLease is idempotent: when an active release already exists (doRestore
+// recorded it but its record Delete failed), the retry drops the record WITHOUT
+// appending a duplicate active release.
+func TestFinalizeRestoredLease_IdempotentWhenReleaseAlreadyRecorded(t *testing.T) {
+	orig := "0192f1a0-1111-7abc-8def-00000000000c"
+	newLease := "0192f1a0-2222-7abc-8def-00000000000d"
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	relStore := attachReleaseStore(t, b)
+	require.NoError(t, relStore.Append(newLease, shared.Release{
+		Manifest: []byte(`{"services":{}}`), Image: "stack", Status: "active", CreatedAt: time.Now(),
+	}))
+
+	e := eng523RestoringRecord(orig, newLease)
+	require.NoError(t, rs.Put(e))
+
+	b.finalizeRestoredLease(newLease, &e, slog.Default())
+
+	got, err := rs.Get(orig)
+	require.NoError(t, err)
+	assert.Nil(t, got, "record dropped once the release is durable")
+
+	releases, err := relStore.List(newLease)
+	require.NoError(t, err)
+	assert.Len(t, releases, 1, "must not append a duplicate active release (idempotent)")
 }
