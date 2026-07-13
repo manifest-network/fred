@@ -1231,15 +1231,62 @@ func (d *DockerClient) ContainerLogs(ctx context.Context, containerID string, ta
 	}
 	defer func() { _ = reader.Close() }()
 
-	// Docker multiplexes stdout/stderr with 8-byte headers per frame
-	// when the container is not using a TTY. Use stdcopy.StdCopy to
-	// demux, combining both streams into one buffer.
+	return demuxContainerLogs(reader)
+}
+
+// maxContainerLogBytes bounds how many bytes of a container's (tenant-controlled)
+// combined stdout/stderr fred buffers in memory for a single log read. Docker's
+// Tail option limits lines, not bytes, so without this cap a container emitting
+// very large output could exhaust provider memory via GET /logs (ENG-499). The
+// cap is shared by the tenant /logs path (GetLogs) and the diagnostics-capture
+// path (captureContainerLogs), both of which call ContainerLogs.
+const maxContainerLogBytes = 5 << 20 // 5 MiB
+
+// errLogCapReached signals that cappingLogWriter has accepted its full byte
+// budget, so stdcopy.StdCopy can stop draining the remaining stream.
+var errLogCapReached = errors.New("container log size cap reached")
+
+// cappingLogWriter accumulates writes into buf until it has accepted its byte
+// budget, then reports errLogCapReached so the demux stops early instead of
+// buffering an unbounded amount of tenant-controlled output.
+type cappingLogWriter struct {
+	buf       *strings.Builder
+	remaining int
+}
+
+func (w *cappingLogWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, errLogCapReached
+	}
+	if len(p) > w.remaining {
+		w.buf.Write(p[:w.remaining])
+		w.remaining = 0
+		return len(p), errLogCapReached
+	}
+	w.buf.Write(p)
+	w.remaining -= len(p)
+	return len(p), nil
+}
+
+// demuxContainerLogs demultiplexes a Docker (non-TTY) log stream — stdout/stderr
+// framed with 8-byte headers — into one combined string, buffering at most
+// maxContainerLogBytes. If the stream exceeds the cap the output is truncated
+// and a marker is appended. Capping the demuxed output (rather than wrapping the
+// raw stream in io.LimitReader) avoids a mid-frame cut that stdcopy.StdCopy would
+// report as an error; per-frame memory stays bounded because the daemon splits
+// stored log messages at 16 KiB.
+func demuxContainerLogs(reader io.Reader) (string, error) {
 	var buf strings.Builder
-	_, err = stdcopy.StdCopy(&buf, &buf, reader)
-	if err != nil {
+	w := &cappingLogWriter{buf: &buf, remaining: maxContainerLogBytes}
+	_, err := stdcopy.StdCopy(w, w, reader)
+	switch {
+	case err == nil:
+		// Whole stream fit within the cap.
+	case errors.Is(err, errLogCapReached):
+		buf.WriteString("\n[log truncated: exceeded 5 MiB limit]")
+	default:
 		return "", fmt.Errorf("failed to read container logs: %w", err)
 	}
-
 	return buf.String(), nil
 }
 

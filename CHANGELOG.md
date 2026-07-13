@@ -27,6 +27,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- docker-backend: bound container log reads to 5 MiB per container. The Docker
+  `Tail` option limits lines, not bytes, and a container's stdout/stderr is
+  tenant-controlled, so `GET /v1/leases/{uuid}/logs` (and the diagnostics
+  capture path) previously buffered an unbounded amount of tenant output in
+  memory — a tenant emitting very large output could OOM the provider and take
+  down co-located tenants. The demuxed output is now capped with a truncation
+  marker. (ENG-499)
 - docker-backend: reject tenant-supplied container labels under the reserved
   `traefik.*` prefix during manifest validation (previously only `fred.*` was
   blocked). With ingress enabled, Traefik's Docker provider merges router labels
