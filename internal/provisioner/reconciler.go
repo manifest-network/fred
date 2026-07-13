@@ -776,7 +776,7 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 //   - backend.ErrAlreadyProvisioned: skip (transient race with concurrent Deprovision)
 //   - errPayloadNotAvailable: reject (PENDING) or close (ACTIVE) the lease
 //   - ErrValidation: reject (PENDING) or close (ACTIVE) the lease
-//   - ErrCircuitOpen: reject (PENDING) or close (ACTIVE) the lease
+//   - ErrCircuitOpen: transient (breaker auto-recovers) — flag for retry, never terminate
 //   - other errors: log and flag for retry next cycle
 func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseUUID string, lease billingtypes.Lease, hadError *bool) {
 	if errors.Is(err, errLeaseAlreadyInFlight) {
@@ -790,6 +790,18 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		)
 		return
 	}
+	if errors.Is(err, backend.ErrCircuitOpen) {
+		// The backend circuit breaker is open — a TRANSIENT condition that
+		// auto-recovers once the breaker half-opens (gobreaker CBTimeout). A
+		// brief backend blip must never permanently reject/close an otherwise
+		// recoverable lease on-chain; flag the cycle for retry instead (ENG-498).
+		slog.Warn("reconcile: backend circuit open, will retry next cycle",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+		)
+		*hadError = true
+		return
+	}
 
 	// Determine the termination reason for permanent errors
 	var reason string
@@ -798,8 +810,6 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		reason = "payload not available for re-provisioning"
 	case errors.Is(err, backend.ErrValidation):
 		reason = validationErrorToRejectReason(err)
-	case errors.Is(err, backend.ErrCircuitOpen):
-		reason = "backend unavailable"
 	default:
 		// Transient error — log and retry next cycle
 		slog.Error("reconcile: provisioning failed",

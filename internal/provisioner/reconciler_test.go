@@ -265,6 +265,48 @@ func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
 	assert.False(t, hadError, "ErrAlreadyProvisioned must be treated as benign")
 }
 
+// TestHandleProvisionError_CircuitOpenIsTransient verifies that a backend
+// circuit-open error is treated as transient: the reconciler must NOT close an
+// active lease on-chain (the breaker auto-recovers), and must flag the cycle
+// for retry. A transient backend outage that trips the breaker previously
+// permanently closed recoverable leases (ENG-498).
+func TestHandleProvisionError_CircuitOpenIsTransient(t *testing.T) {
+	var closed []string
+	var mu sync.Mutex
+	mockChain := &chaintest.MockClient{
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closed = append(closed, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	r, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+		mockChain, noopAck, router, nil, nil,
+	)
+	require.NoError(t, err)
+
+	lease := billingtypes.Lease{Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_ACTIVE}
+	hadError := false
+	r.handleProvisionError(
+		context.Background(),
+		fmt.Errorf("provision failed: %w", backend.ErrCircuitOpen),
+		"lease-1",
+		lease,
+		&hadError,
+	)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Empty(t, closed, "circuit-open must NOT close an active lease")
+	assert.True(t, hadError, "circuit-open must flag the cycle for retry")
+}
+
 func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 	// Setup: Pending lease on chain, not provisioned on backend
 	// Expected: Start provisioning
@@ -2412,11 +2454,12 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 	assert.Equal(t, rejectReasonInvalidSKU, rejectedReason)
 }
 
-func TestReconciler_ReconcileAll_PendingCircuitOpen_Rejects(t *testing.T) {
-	// Setup: Pending lease on chain, not provisioned, backend returns ErrCircuitOpen
-	// Expected: Reject the lease immediately (not left pending forever)
+func TestReconciler_ReconcileAll_PendingCircuitOpen_Retries(t *testing.T) {
+	// Setup: Pending lease on chain, not provisioned, backend returns ErrCircuitOpen.
+	// Expected: the lease is NOT rejected. Circuit-open is transient (the breaker
+	// auto-recovers), so it is retried next cycle rather than terminated on-chain
+	// for a brief backend outage (ENG-498).
 	var rejectedLeases []string
-	var rejectedReason string
 	var mu sync.Mutex
 
 	mockChain := &chaintest.MockClient{
@@ -2429,7 +2472,6 @@ func TestReconciler_ReconcileAll_PendingCircuitOpen_Rejects(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
-			rejectedReason = reason
 			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
 		},
 	}
@@ -2451,12 +2493,11 @@ func TestReconciler_ReconcileAll_PendingCircuitOpen_Rejects(t *testing.T) {
 	ctx := t.Context()
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
-	// Verify lease was rejected (not left pending forever)
+	// Verify the lease was NOT rejected — a transient breaker trip must not
+	// terminate a recoverable lease.
 	mu.Lock()
 	defer mu.Unlock()
-	require.Len(t, rejectedLeases, 1)
-	assert.Equal(t, "lease-1", rejectedLeases[0])
-	assert.Equal(t, "backend unavailable", rejectedReason)
+	assert.Empty(t, rejectedLeases, "circuit-open must not reject a pending lease")
 }
 
 func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *testing.T) {

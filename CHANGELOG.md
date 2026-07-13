@@ -16,6 +16,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- provisioner: the reconciler no longer terminates a lease on a transient
+  backend circuit-breaker trip. `ErrCircuitOpen` was bucketed with permanent
+  errors, so a brief backend outage that opened the breaker permanently
+  rejected pending leases and closed active ones on-chain — including
+  recoverable leases that would have succeeded on the next tick, and letting
+  one tenant's load-induced breaker trip terminate other tenants' leases in the
+  same cycle. It is now treated as transient: logged and retried next cycle.
+  (ENG-498)
+
 ### Security
 
 - docker-backend: reject tenant-supplied container labels under the reserved
