@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -427,10 +428,6 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 	}
 
 	// Fetch credit balances WITHOUT holding the lock (network I/O)
-	type creditResult struct {
-		balances sdktypes.Coins
-		err      error
-	}
 	results := make(map[string]creditResult, len(tenantLeases))
 	for tenant := range tenantLeases {
 		if ctx.Err() != nil {
@@ -440,11 +437,57 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 		results[tenant] = creditResult{balances, err}
 	}
 
-	// Apply results under lock
-	var earliestDepletion time.Time
-	var leasesToClose []string
+	// Apply results under the scheduler lock. Extracted so the lock is released
+	// via defer even if the body panics — a panic here previously leaked s.mu
+	// and wedged the scheduler (ENG-500).
+	earliestDepletion, leasesToClose := s.applyCreditResults(tenantLeases, results, now)
 
+	// Check for context cancellation before making chain call
+	if ctx.Err() != nil {
+		return defaultNextCheck
+	}
+
+	// Close depleted leases (outside the lock to avoid blocking)
+	if len(leasesToClose) > 0 {
+		closed, txHashes, err := s.client.CloseLeases(ctx, leasesToClose, "credit exhausted")
+		if err != nil {
+			slog.Error("failed to close depleted leases", "error", err)
+		} else {
+			slog.Info("closed depleted leases", "count", closed, "tx_hashes", txHashes)
+		}
+	}
+
+	// Determine next check time
+	if !earliestDepletion.IsZero() && earliestDepletion.Before(defaultNextCheck) {
+		// Schedule check before estimated depletion to catch it in time
+		nextCheck := earliestDepletion.Add(-depletionCheckBuffer)
+		if nextCheck.Before(now) {
+			// If depletion is imminent, check again after the buffer period
+			nextCheck = now.Add(depletionCheckBuffer)
+		}
+		slog.Info("tenant approaching credit depletion, scheduling early check",
+			"depletion_estimate", earliestDepletion,
+			"next_check", nextCheck,
+		)
+		return nextCheck
+	}
+
+	return defaultNextCheck
+}
+
+// creditResult holds the fetched credit balance (or error) for one tenant.
+type creditResult struct {
+	balances sdktypes.Coins
+	err      error
+}
+
+// applyCreditResults folds the fetched per-tenant credit results into burn-rate
+// state, returning the earliest estimated depletion and any leases whose credit
+// is exhausted. The scheduler lock is taken here and released via defer, so a
+// panic in the body cannot leak it and wedge the scheduler (ENG-500).
+func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string, results map[string]creditResult, now time.Time) (earliestDepletion time.Time, leasesToClose []string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	for tenant, leaseUUIDs := range tenantLeases {
 		result, checked := results[tenant]
@@ -527,41 +570,15 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 			delete(s.tenants, tenant)
 		}
 	}
-
-	s.mu.Unlock()
-
-	// Check for context cancellation before making chain call
-	if ctx.Err() != nil {
-		return defaultNextCheck
-	}
-
-	// Close depleted leases (outside the lock to avoid blocking)
-	if len(leasesToClose) > 0 {
-		closed, txHashes, err := s.client.CloseLeases(ctx, leasesToClose, "credit exhausted")
-		if err != nil {
-			slog.Error("failed to close depleted leases", "error", err)
-		} else {
-			slog.Info("closed depleted leases", "count", closed, "tx_hashes", txHashes)
-		}
-	}
-
-	// Determine next check time
-	if !earliestDepletion.IsZero() && earliestDepletion.Before(defaultNextCheck) {
-		// Schedule check before estimated depletion to catch it in time
-		nextCheck := earliestDepletion.Add(-depletionCheckBuffer)
-		if nextCheck.Before(now) {
-			// If depletion is imminent, check again after the buffer period
-			nextCheck = now.Add(depletionCheckBuffer)
-		}
-		slog.Info("tenant approaching credit depletion, scheduling early check",
-			"depletion_estimate", earliestDepletion,
-			"next_check", nextCheck,
-		)
-		return nextCheck
-	}
-
-	return defaultNextCheck
+	return
 }
+
+// maxDepletionSeconds bounds the depletion horizon so that neither
+// LegacyDec.TruncateInt64() (which panics on int64 overflow) nor the
+// time.Duration(n)*time.Second multiply (which overflows int64 nanoseconds and
+// wraps to a bogus time) can be reached from a large balance / tiny burn
+// (ENG-500). ~292 years; beyond this the exact depletion time is irrelevant.
+const maxDepletionSeconds = int64(math.MaxInt64) / int64(time.Second)
 
 // estimateDepletionTime calculates when a tenant's credit will be depleted
 // based on observed burn rate.
@@ -597,10 +614,17 @@ func (s *WithdrawScheduler) estimateDepletionTime(prevBalance, currBalance sdkty
 			continue
 		}
 
-		// Estimate time to depletion: current / burn_rate
+		// Estimate time to depletion: current / burn_rate. Clamp to a finite
+		// horizon: an enormous balance with a tiny burn makes secondsRemaining
+		// exceed int64, which would panic in TruncateInt64 and overflow the
+		// time.Duration multiply into a bogus (past) time (ENG-500).
 		secondsRemaining := currCoin.ToLegacyDec().Quo(burnRatePerSec)
 		if secondsRemaining.IsPositive() {
-			depletion := now.Add(time.Duration(secondsRemaining.TruncateInt64()) * time.Second)
+			secs := maxDepletionSeconds
+			if t := secondsRemaining.TruncateInt(); t.IsInt64() && t.Int64() < maxDepletionSeconds {
+				secs = t.Int64()
+			}
+			depletion := now.Add(time.Duration(secs) * time.Second)
 
 			if earliestDepletion.IsZero() || depletion.Before(earliestDepletion) {
 				earliestDepletion = depletion
@@ -609,7 +633,7 @@ func (s *WithdrawScheduler) estimateDepletionTime(prevBalance, currBalance sdkty
 					"denom", prevCoin.Denom,
 					"current_balance", currCoin,
 					"burn_rate_per_sec", burnRatePerSec,
-					"seconds_remaining", secondsRemaining.TruncateInt64(),
+					"seconds_remaining", secs,
 					"depletion_time", depletion,
 				)
 			}
