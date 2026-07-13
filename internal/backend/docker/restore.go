@@ -128,23 +128,19 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 		_ = b.retentionStore.Delete(e.OriginalLeaseUUID) // restore finished; drop leftover record
 		return
 	}
-	if live && (status == backend.ProvisionStatusProvisioning || status == backend.ProvisionStatusRestarting) {
-		// A live provision at Provisioning OR Restarting is a restore that is
-		// genuinely in flight — doRestore's terminal defer owns the record, so
-		// defer to it rather than racing it. Restore() reserves the new-lease
-		// provision at Provisioning (step b) and only reaches Restarting once the
-		// actor processes evRestoreRequested; the record is already `restoring`
-		// (ClaimForRestore, step d) throughout that window. A PERIODIC sweep that
-		// lands in the Provisioning sub-window must NOT treat the in-flight restore
-		// as orphaned — doing so would re-quarantine the just-adopted volumes and
-		// spuriously fail the restore.
-		//
-		// Neither status can arise at STARTUP: recoverState rebuilds provisions from
-		// live containers and only yields container-derived statuses (Ready/Failed);
-		// Provisioning/Restarting are in-memory operation states preserved solely
-		// from a pre-existing overlay entry, which a cold start does not have. So a
-		// restore that crashed mid-flight is (correctly) rolled back by the orphaned
-		// arm below.
+	if live && status != backend.ProvisionStatusFailed {
+		// A live provision in ANY non-Failed state must NOT be torn down:
+		//   - Provisioning/Restarting: a restore genuinely in flight — doRestore's
+		//     terminal defer owns the record; re-quarantining the just-adopted
+		//     volumes would spuriously fail the restore. (A PERIODIC sweep landing
+		//     in the Provisioning sub-window must not treat it as orphaned.)
+		//   - Updating/Deprovisioning: a running new lease whose restore record
+		//     merely lingered past a failed terminal Delete — tearing it down would
+		//     stop a healthy lease mid-operation and yank its volumes (ENG-512).
+		// Only an ABSENT or Failed provision signals a restore that crashed, which
+		// the orphaned arm below (correctly) rolls back. At STARTUP recoverState
+		// rebuilds provisions from live containers and yields only Ready/Failed, so
+		// a mid-flight crash still reaches the orphaned arm.
 		return
 	}
 	// Orphaned (crash/failed): tear down any orphaned project, re-quarantine the
@@ -284,11 +280,16 @@ func volumeRootUnverifiable(exists bool, statErr error) bool {
 	return statErr != nil || !exists
 }
 
-// allVolumesAbsent reports whether none of names is in the present set. An empty
-// name set is vacuously absent (covers legacy zero-volume records).
+// allVolumesAbsent reports whether none of the retained names — nor their
+// canonical (not-yet-renamed) form — is present on disk. A deprovision give-up
+// leaves the volume under its canonical fred-{lease}-* name while the record
+// lists the fred-retained-* names; checking both keeps the pruner from deleting a
+// record whose data is still on disk, which a later boot would then destroy
+// (ENG-501). An empty name set is vacuously absent (covers legacy zero-volume
+// records).
 func allVolumesAbsent(names []string, present map[string]bool) bool {
 	for _, n := range names {
-		if present[n] {
+		if present[n] || present[canonicalFromRetained(n)] {
 			return false
 		}
 	}
