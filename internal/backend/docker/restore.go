@@ -130,6 +130,15 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 		// is durable. A bare Delete here would drop the finalizer for a restore whose
 		// release Append failed (no release + no record → reapable), re-opening ENG-523;
 		// routing through finalizeRestoredLease makes this sweep the retry path instead.
+		//
+		// Re-record from the LIVE provision's CURRENT manifest, not the retention record's
+		// frozen (pre-close) one: a tenant Update may have landed after the restore (its own
+		// best-effort release write may also have failed), so recording e.StackManifest here
+		// could persist a stale release that recoverState later redeploys, silently reverting
+		// the update. p.StackManifest tracks the running deployment (restart_update.go). (M-01)
+		if p.StackManifest != nil {
+			e.StackManifest = p.StackManifest
+		}
 		b.finalizeRestoredLease(e.NewLeaseUUID, &e, b.logger)
 		return
 	}

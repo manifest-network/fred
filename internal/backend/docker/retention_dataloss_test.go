@@ -335,3 +335,38 @@ func TestFinalizeRestoredLease_IdempotentWhenReleaseAlreadyRecorded(t *testing.T
 	require.NoError(t, err)
 	assert.Len(t, releases, 1, "must not append a duplicate active release (idempotent)")
 }
+
+// M-01 (PR #174 review): reconcileRestoring's retry must re-record the LIVE provision's
+// CURRENT manifest, not the retention record's frozen (pre-Update) one. Otherwise a
+// sweep landing after a tenant Update (whose own best-effort release write also failed)
+// records a stale release and silently reverts the update on the next restart.
+func TestReconcileRestoring_ReRecordsLiveManifestNotFrozenRecord(t *testing.T) {
+	orig := "0192f1a0-1111-7abc-8def-00000000000e"
+	newLease := "0192f1a0-2222-7abc-8def-00000000000f"
+
+	// The lease was Updated after the restore: its live provision carries a NEW manifest
+	// (redis:7), distinct from the retention record's frozen restore manifest (nginx:latest).
+	updated := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+		manifest.DefaultServiceName: {Image: "redis:7"},
+	}}
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		newLease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: newLease, Status: backend.ProvisionStatusReady, StackManifest: updated,
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+	relStore := attachReleaseStore(t, b)
+
+	e := eng523RestoringRecord(orig, newLease) // e.StackManifest = restoreStackManifest() = nginx:latest (frozen)
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	rel, err := relStore.LatestActive(newLease)
+	require.NoError(t, err)
+	require.NotNil(t, rel, "reconcileRestoring must record the missing release")
+	assert.Contains(t, string(rel.Manifest), "redis:7",
+		"must record the LIVE (updated) manifest, not the frozen record manifest (M-01)")
+	assert.NotContains(t, string(rel.Manifest), "nginx",
+		"must NOT re-record the retention record's frozen pre-Update manifest (M-01)")
+}
