@@ -798,6 +798,7 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		slog.Warn("reconcile: backend circuit open, will retry next cycle",
 			"lease_uuid", leaseUUID,
 			"tenant", lease.Tenant,
+			"error", err,
 		)
 		*hadError = true
 		return
