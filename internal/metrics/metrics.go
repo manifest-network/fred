@@ -354,6 +354,26 @@ var (
 		Name:      "incomplete_cycles_total",
 		Help:      "Provider-wide withdrawal cycles that hit the iteration bound with the pagination cursor still non-empty (provider not fully drained).",
 	})
+
+	// WithdrawSkippedByGuardTotal counts scheduler wakes that skipped the paid
+	// withdrawal because the withdraw-cadence guard had not elapsed since the
+	// last full drain (ENG-524). Only increments when guard_active=1.
+	WithdrawSkippedByGuardTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "withdraw",
+		Name:      "skipped_by_guard_total",
+		Help:      "Scheduler wakes that skipped the paid withdrawal because the withdraw-interval guard had not elapsed.",
+	})
+
+	// WithdrawGuardActive is 1 when the withdraw-cadence guard is active
+	// (credit_check_interval < withdraw_interval), else 0. Disambiguates a zero
+	// skipped_by_guard_total (guard inert vs. active-but-never-skipped).
+	WithdrawGuardActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "withdraw",
+		Name:      "guard_active",
+		Help:      "1 when the withdraw-cadence guard is active (credit_check_interval < withdraw_interval), else 0.",
+	})
 )
 
 // Watermill metrics
