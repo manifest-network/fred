@@ -292,7 +292,11 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 			return nil
 		}
 
-		s.withdrawAndCheckCredits(ctx, false)
+		// Use internalCtx (not the parent ctx) so Stop() — which cancels only the
+		// internal context — aborts in-flight chain RPCs instead of waiting out the
+		// current cycle, and so this matches TriggerWithdraw (which also uses s.ctx).
+		// internalCtx is a child of the parent ctx, so a parent-cancel still cancels it.
+		s.withdrawAndCheckCredits(internalCtx, false)
 	}
 }
 
