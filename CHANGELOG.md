@@ -25,8 +25,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   reserved `fred.*`/`traefik.*` label prefixes, bounded/absolute tmpfs mounts) —
   a validation-bypass hunter, not just a crash finder. fred previously had no
   fuzz coverage. (ENG-521)
+- providerd: new `credit_check_interval` config knob that decouples the
+  credit-check cadence from the paid provider-withdrawal cadence; when set
+  shorter than `withdraw_interval`, the paid withdrawal is rate-limited to
+  `withdraw_interval` while credit checks keep running frequently. Default
+  (`0`) preserves the previous coupled behavior. Adds the
+  `fred_withdraw_skipped_by_guard_total` counter and the
+  `fred_withdraw_guard_active` gauge. (ENG-524)
 
 ### Changed
+
+- scheduler: when `credit_check_interval` is set shorter than
+  `withdraw_interval`, the provider-revenue withdrawal is rate-limited to its own
+  interval instead of running on every credit-check wake. (ENG-524)
 
 ### Deprecated
 

@@ -1599,3 +1599,40 @@ func TestConfig_Validate_BackendTLS(t *testing.T) {
 		require.ErrorContains(t, cfg.Validate(), "require an https:// url")
 	})
 }
+
+func TestConfig_Validate_CreditCheckInterval(t *testing.T) {
+	// validConfig() is the package's real valid-config helper (config_test.go:1436);
+	// it returns a Config VALUE. Each subtest's `c := base()` is an addressable local,
+	// so the pointer-receiver Validate() works via auto-address-of (as neighbouring
+	// tests do).
+	base := func() Config {
+		c := validConfig()
+		c.WithdrawInterval = 24 * time.Hour
+		return c
+	}
+	t.Run("zero is valid (coupled default)", func(t *testing.T) {
+		c := base()
+		c.CreditCheckInterval = 0
+		require.NoError(t, c.Validate())
+	})
+	t.Run("equal to withdraw_interval is valid", func(t *testing.T) {
+		c := base()
+		c.CreditCheckInterval = 24 * time.Hour
+		require.NoError(t, c.Validate())
+	})
+	t.Run("shorter than withdraw_interval is valid", func(t *testing.T) {
+		c := base()
+		c.CreditCheckInterval = 1 * time.Hour
+		require.NoError(t, c.Validate())
+	})
+	t.Run("negative is rejected", func(t *testing.T) {
+		c := base()
+		c.CreditCheckInterval = -1 * time.Second
+		require.ErrorContains(t, c.Validate(), "credit_check_interval cannot be negative")
+	})
+	t.Run("longer than withdraw_interval is rejected", func(t *testing.T) {
+		c := base()
+		c.CreditCheckInterval = 48 * time.Hour
+		require.ErrorContains(t, c.Validate(), "must not exceed withdraw_interval")
+	})
+}

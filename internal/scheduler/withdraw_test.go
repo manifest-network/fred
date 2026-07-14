@@ -76,8 +76,8 @@ func TestNewWithdrawScheduler(t *testing.T) {
 		{
 			name: "with defaults",
 			cfg: WithdrawSchedulerConfig{
-				ProviderUUID: "test-uuid",
-				Interval:     time.Minute,
+				ProviderUUID:     "test-uuid",
+				WithdrawInterval: time.Minute,
 			},
 			wantMaxIterations:  100,
 			wantErrorThreshold: 3,
@@ -87,7 +87,7 @@ func TestNewWithdrawScheduler(t *testing.T) {
 			name: "with custom values",
 			cfg: WithdrawSchedulerConfig{
 				ProviderUUID:              "test-uuid",
-				Interval:                  5 * time.Minute,
+				WithdrawInterval:          5 * time.Minute,
 				MaxWithdrawIterations:     50,
 				CreditCheckErrorThreshold: 5,
 				CreditCheckRetryInterval:  time.Minute,
@@ -100,7 +100,7 @@ func TestNewWithdrawScheduler(t *testing.T) {
 			name: "zero values get defaults",
 			cfg: WithdrawSchedulerConfig{
 				ProviderUUID:              "test-uuid",
-				Interval:                  time.Minute,
+				WithdrawInterval:          time.Minute,
 				MaxWithdrawIterations:     0,
 				CreditCheckErrorThreshold: 0,
 				CreditCheckRetryInterval:  0,
@@ -118,7 +118,7 @@ func TestNewWithdrawScheduler(t *testing.T) {
 
 			require.NotNil(t, s, "NewWithdrawScheduler() returned nil")
 			assert.Equal(t, tt.cfg.ProviderUUID, s.providerUUID)
-			assert.Equal(t, tt.cfg.Interval, s.interval)
+			assert.Equal(t, tt.cfg.WithdrawInterval, s.withdrawInterval)
 			assert.Equal(t, tt.wantMaxIterations, s.maxWithdrawIterations)
 			assert.Equal(t, tt.wantErrorThreshold, s.creditCheckErrorThreshold)
 			assert.Equal(t, tt.wantRetryInterval, s.creditCheckRetryInterval)
@@ -141,8 +141,8 @@ func TestWithdrawScheduler_Withdraw_NothingToWithdraw(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.withdraw(context.Background())
@@ -164,8 +164,8 @@ func TestWithdrawScheduler_Withdraw_Success(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.withdraw(context.Background())
@@ -187,8 +187,8 @@ func TestWithdrawScheduler_Withdraw_Error(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	// Should not panic on error
@@ -214,8 +214,8 @@ func TestWithdrawScheduler_Withdraw_RetryOnError(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -250,8 +250,8 @@ func TestWithdrawScheduler_Withdraw_PaginatesUntilCursorEmpty(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	err := s.withdraw(context.Background())
@@ -282,7 +282,7 @@ func TestWithdrawScheduler_Withdraw_StopsAtIterationBoundAndReportsIncomplete(t 
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
 		ProviderUUID:          "test-uuid",
-		Interval:              time.Minute,
+		WithdrawInterval:      time.Minute,
 		MaxWithdrawIterations: 5,
 	})
 
@@ -315,8 +315,8 @@ func TestWithdrawScheduler_Withdraw_ErrorMidPagination(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	err := s.withdraw(context.Background())
@@ -343,8 +343,8 @@ func TestWithdrawScheduler_Withdraw_ContextCanceledMidPagination(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	err := s.withdraw(ctx)
@@ -366,8 +366,8 @@ func TestWithdrawScheduler_Withdraw_NilResponseIsError(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	err := s.withdraw(context.Background())
@@ -383,8 +383,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_NoLeases(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	nextCheck := s.checkCreditsAndClose(context.Background())
@@ -423,8 +423,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_DepletedCredit(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.checkCreditsAndClose(context.Background())
@@ -455,8 +455,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_HealthyCredit(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.checkCreditsAndClose(context.Background())
@@ -466,8 +466,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_HealthyCredit(t *testing.T) {
 
 func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
 	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	now := time.Now()
@@ -627,8 +627,8 @@ func TestWithdrawScheduler_TriggerWithdraw(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	// Set context (normally done in Start)
@@ -669,8 +669,8 @@ func TestWithdrawScheduler_WithdrawOnce(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.WithdrawOnce(context.Background())
@@ -691,8 +691,8 @@ func TestWithdrawScheduler_Start_ContextCancellation(t *testing.T) {
 		}
 
 		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-			ProviderUUID: "test-uuid",
-			Interval:     100 * time.Millisecond,
+			ProviderUUID:     "test-uuid",
+			WithdrawInterval: 100 * time.Millisecond,
 		})
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -719,6 +719,249 @@ func TestWithdrawScheduler_Start_ContextCancellation(t *testing.T) {
 	})
 }
 
+// TestWithdrawScheduler_GuardThrottlesWithdraw verifies the decoupled-cadence
+// guard: with CreditCheckInterval < WithdrawInterval, the scheduler wakes
+// every creditCheckInterval to run a credit check, but only issues a paid
+// withdraw once per withdrawInterval.
+func TestWithdrawScheduler_GuardThrottlesWithdraw(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var withdrawCalls, creditChecks int32
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(ctx context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+			},
+			WithdrawByProviderFunc: func(ctx context.Context, _ string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+				atomic.AddInt32(&withdrawCalls, 1)
+				return "txhash", &billingtypes.MsgWithdrawResponse{}, nil // empty NextKey => full drain
+			},
+			GetActiveLeasesByProviderFunc: func(ctx context.Context, _ string) ([]billingtypes.Lease, error) {
+				atomic.AddInt32(&creditChecks, 1) // credit check runs on EVERY wake
+				return []billingtypes.Lease{}, nil
+			},
+		}
+		// Deterministic under synctest: the bubble clock starts at 2000-01-01 and
+		// lastWithdrawTime is the zero value, so the first wake (t0+1h) withdraws
+		// and stamps; every subsequent 1h wake sees time.Since(last) < 24h and skips.
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    24 * time.Hour,
+			CreditCheckInterval: 1 * time.Hour,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+
+		time.Sleep(24*time.Hour + time.Minute) // ~24 credit-check wakes of virtual time
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+
+		assert.Equal(t, int32(1), atomic.LoadInt32(&withdrawCalls),
+			"expected exactly one paid withdraw across 24h of 1h wakes")
+		assert.GreaterOrEqual(t, atomic.LoadInt32(&creditChecks), int32(24),
+			"credit check must run on every wake, not just when the withdraw fires")
+	})
+}
+
+// TestWithdrawScheduler_GuardInertByDefault verifies backward compatibility:
+// when CreditCheckInterval is left unset, it defaults to WithdrawInterval, so
+// the two cadences are equal and the guard is inert (guardActive == false).
+// Every wake performs a paid withdraw, matching pre-ENG-524 behavior.
+func TestWithdrawScheduler_GuardInertByDefault(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var withdrawCalls int32
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(ctx context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+			},
+			WithdrawByProviderFunc: func(ctx context.Context, _ string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+				atomic.AddInt32(&withdrawCalls, 1)
+				return "txhash", &billingtypes.MsgWithdrawResponse{}, nil
+			},
+			GetActiveLeasesByProviderFunc: func(ctx context.Context, _ string) ([]billingtypes.Lease, error) {
+				return []billingtypes.Lease{}, nil
+			},
+		}
+		// CreditCheckInterval unset => equals WithdrawInterval => guard inert.
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:     "test-uuid",
+			WithdrawInterval: 1 * time.Hour,
+		})
+		require.False(t, s.guardActive)
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+		time.Sleep(3*time.Hour + time.Minute)
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		// Every wake withdraws (today's behavior): ~3 over 3h.
+		assert.GreaterOrEqual(t, atomic.LoadInt32(&withdrawCalls), int32(3))
+	})
+}
+
+// TestWithdrawScheduler_IdleProviderThrottled pins the IsZero stamp in
+// withdraw(): even when there is nothing to withdraw, withdraw() stamps
+// lastWithdrawTime so the guard still throttles the free withdrawable-check
+// to once per withdrawInterval, instead of re-probing on every credit-check
+// wake.
+func TestWithdrawScheduler_IdleProviderThrottled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var getCalls int32
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(ctx context.Context, _ string) (sdktypes.Coins, error) {
+				atomic.AddInt32(&getCalls, 1)
+				return sdktypes.Coins{}, nil // nothing to withdraw
+			},
+			GetActiveLeasesByProviderFunc: func(ctx context.Context, _ string) ([]billingtypes.Lease, error) {
+				return []billingtypes.Lease{}, nil
+			},
+		}
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    24 * time.Hour,
+			CreditCheckInterval: 1 * time.Hour,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+		time.Sleep(24*time.Hour + time.Minute)
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		// Without the IsZero stamp this would be ~24 (a free query every tick).
+		assert.Equal(t, int32(1), atomic.LoadInt32(&getCalls),
+			"idle provider must be throttled to one withdrawable-check per withdraw_interval")
+	})
+}
+
+// TestWithdrawScheduler_GuardReArmsNextWindow proves the guard's stamp resets
+// each window rather than latching forever: a first withdraw fires and stamps
+// at t0+1h, then the guard suppresses every 1h wake until t0+25h, when
+// time.Since(lastWithdrawTime) == withdrawInterval (24h) and a second withdraw
+// fires.
+func TestWithdrawScheduler_GuardReArmsNextWindow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var withdrawCalls int32
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(ctx context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+			},
+			WithdrawByProviderFunc: func(ctx context.Context, _ string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+				atomic.AddInt32(&withdrawCalls, 1)
+				return "txhash", &billingtypes.MsgWithdrawResponse{}, nil
+			},
+			GetActiveLeasesByProviderFunc: func(ctx context.Context, _ string) ([]billingtypes.Lease, error) {
+				return []billingtypes.Lease{}, nil
+			},
+		}
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    24 * time.Hour,
+			CreditCheckInterval: 1 * time.Hour,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+		// First withdraw at t0+1h (stamp), second at t0+25h (since==24h). Sleep to t0+25h+.
+		time.Sleep(25*time.Hour + time.Minute)
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		assert.Equal(t, int32(2), atomic.LoadInt32(&withdrawCalls),
+			"guard must re-arm: a second withdraw fires one withdraw_interval after the first")
+	})
+}
+
+// TestWithdrawScheduler_TriggerWithdrawBypassesGuard verifies that the force
+// path (TriggerWithdraw) always withdraws, even when the cadence guard is
+// active and lastWithdrawTime was just stamped — the whole point of an
+// on-demand trigger is an immediate withdraw. Uses the real-time
+// WaitGroup-signalled pattern (no synctest bubble), mirroring
+// TestWithdrawScheduler_TriggerWithdraw.
+func TestWithdrawScheduler_TriggerWithdrawBypassesGuard(t *testing.T) {
+	var withdrawCalled int32
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	client := &mockChainClient{
+		GetProviderWithdrawableFunc: func(ctx context.Context, providerUUID string) (sdktypes.Coins, error) {
+			return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+		},
+		WithdrawByProviderFunc: func(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+			mu.Lock()
+			atomic.AddInt32(&withdrawCalled, 1)
+			mu.Unlock()
+			wg.Done()
+			return "txhash", &billingtypes.MsgWithdrawResponse{}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{}, nil
+		},
+	}
+
+	// Guard active: CreditCheckInterval < WithdrawInterval.
+	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+		ProviderUUID:        "test-uuid",
+		WithdrawInterval:    time.Hour,
+		CreditCheckInterval: time.Minute,
+	})
+	require.True(t, s.guardActive, "guard must be active for this test to be meaningful")
+
+	// Set context (normally done in Start)
+	s.ctx = context.Background()
+
+	// Seed a fresh stamp: under the periodic path this would suppress a
+	// withdraw for the next hour. The force path must ignore it.
+	s.mu.Lock()
+	s.lastWithdrawTime = time.Now()
+	s.mu.Unlock()
+
+	wg.Add(1)
+	s.TriggerWithdraw()
+
+	// Wait for the goroutine to complete
+	wg.Wait()
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&withdrawCalled),
+		"force path must withdraw despite a fresh lastWithdrawTime under an active guard")
+}
+
+// TestWithdrawScheduler_GuardConcurrentWriters exercises the periodic loop's
+// lastWithdrawTime writer (Start's ticks) racing against the force path's
+// writer (TriggerWithdraw) on the same field, guarded by s.mu. Run under
+// `go test -race`: the point of this test is that the race detector reports
+// nothing and the run does not deadlock, not any particular call count.
+func TestWithdrawScheduler_GuardConcurrentWriters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(ctx context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+			},
+			WithdrawByProviderFunc: func(ctx context.Context, _ string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+				return "txhash", &billingtypes.MsgWithdrawResponse{}, nil
+			},
+			GetActiveLeasesByProviderFunc: func(ctx context.Context, _ string) ([]billingtypes.Lease, error) {
+				return []billingtypes.Lease{}, nil
+			},
+		}
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    1 * time.Hour,
+			CreditCheckInterval: 10 * time.Minute,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }() // periodic loop stamps lastWithdrawTime on full drain
+		// Fire the force path repeatedly across the run so a TriggerWithdraw
+		// goroutine's stamp genuinely overlaps the periodic loop's stamps.
+		for i := 0; i < 5; i++ {
+			s.TriggerWithdraw()
+			time.Sleep(30 * time.Minute)
+		}
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		// No functional assertion: the point is that `go test -race` reports no data
+		// race on lastWithdrawTime and the run does not deadlock.
+	})
+}
+
 func TestWithdrawScheduler_ConsecutiveErrors(t *testing.T) {
 	errorCount := 0
 	tenant := generateTestAddress(t, "manifest")
@@ -737,7 +980,7 @@ func TestWithdrawScheduler_ConsecutiveErrors(t *testing.T) {
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
 		ProviderUUID:              "test-uuid",
-		Interval:                  time.Minute,
+		WithdrawInterval:          time.Minute,
 		CreditCheckErrorThreshold: 2,
 		CreditCheckRetryInterval:  10 * time.Second,
 	})
@@ -819,8 +1062,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_ContextCancellation(t *testing.T
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	// Should return early when context is cancelled
@@ -859,8 +1102,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_CloseLeasesContextCheck(t *testi
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.checkCreditsAndClose(ctx)
@@ -872,8 +1115,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_CloseLeasesContextCheck(t *testi
 func TestWithdrawScheduler_EstimateDepletionTime_HighPrecision(t *testing.T) {
 	// Test that burn rate calculation handles various time intervals correctly
 	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	now := time.Now()
@@ -960,8 +1203,8 @@ func TestTriggerWithdraw_PanicDoesNotCrashFred(t *testing.T) {
 	}
 
 	scheduler := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-provider",
-		Interval:     time.Hour, // long so only triggers fire
+		ProviderUUID:     "test-provider",
+		WithdrawInterval: time.Hour, // long so only triggers fire
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
