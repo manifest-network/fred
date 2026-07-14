@@ -895,7 +895,7 @@ backends:
 	assert.Equal(t, 20, cfg.RateLimitBurst)
 	assert.Equal(t, []string{"*"}, cfg.CORSOrigins)
 	assert.Equal(t, 1.2, cfg.GasAdjustment, "default gas_adjustment should match Cosmos CLI convention")
-	assert.Equal(t, 100, cfg.WithdrawLimit, "default withdraw_limit should be the chain's MaxBatchLeaseSize")
+	assert.Equal(t, 100, cfg.WithdrawLimit, "default withdraw_limit should be 100 (a deliberate literal, not MaxBatchLeaseSize)")
 }
 
 func TestLoad_ConfigOverrides(t *testing.T) {

@@ -508,7 +508,7 @@ func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string, ke
 	msg := &billingtypes.MsgWithdraw{
 		Sender:       c.providerAddress,
 		ProviderUuid: providerUUID,
-		Limit:        c.withdrawLimit, // leases settled per page (default 100; capped at chain MaxBatchLeaseSize)
+		Limit:        c.withdrawLimit, // leases settled per page (default 100; config.Validate enforces <= chain MaxBatchLeaseSize)
 		Key:          key,             // opaque pagination cursor; empty starts from the beginning
 	}
 
