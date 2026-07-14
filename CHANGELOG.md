@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.9.0] - 2026-07-14
+
+### Added
+
 - config: `withdraw_limit` (default `100`) sets how many active leases are settled
   per provider-wide withdrawal transaction (`MsgWithdraw.Limit`). Previously fred
   sent `Limit: 0`, so the chain applied its default of 50; the effective page size
