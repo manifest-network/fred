@@ -719,6 +719,49 @@ func TestWithdrawScheduler_Start_ContextCancellation(t *testing.T) {
 	})
 }
 
+// TestWithdrawScheduler_GuardThrottlesWithdraw verifies the decoupled-cadence
+// guard: with CreditCheckInterval < WithdrawInterval, the scheduler wakes
+// every creditCheckInterval to run a credit check, but only issues a paid
+// withdraw once per withdrawInterval.
+func TestWithdrawScheduler_GuardThrottlesWithdraw(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var withdrawCalls, creditChecks int32
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(ctx context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000))), nil
+			},
+			WithdrawByProviderFunc: func(ctx context.Context, _ string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
+				atomic.AddInt32(&withdrawCalls, 1)
+				return "txhash", &billingtypes.MsgWithdrawResponse{}, nil // empty NextKey => full drain
+			},
+			GetActiveLeasesByProviderFunc: func(ctx context.Context, _ string) ([]billingtypes.Lease, error) {
+				atomic.AddInt32(&creditChecks, 1) // credit check runs on EVERY wake
+				return []billingtypes.Lease{}, nil
+			},
+		}
+		// Deterministic under synctest: the bubble clock starts at 2000-01-01 and
+		// lastWithdrawTime is the zero value, so the first wake (t0+1h) withdraws
+		// and stamps; every subsequent 1h wake sees time.Since(last) < 24h and skips.
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    24 * time.Hour,
+			CreditCheckInterval: 1 * time.Hour,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+
+		time.Sleep(24*time.Hour + time.Minute) // ~24 credit-check wakes of virtual time
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+
+		assert.Equal(t, int32(1), atomic.LoadInt32(&withdrawCalls),
+			"expected exactly one paid withdraw across 24h of 1h wakes")
+		assert.GreaterOrEqual(t, atomic.LoadInt32(&creditChecks), int32(24),
+			"credit check must run on every wake, not just when the withdraw fires")
+	})
+}
+
 func TestWithdrawScheduler_ConsecutiveErrors(t *testing.T) {
 	errorCount := 0
 	tenant := generateTestAddress(t, "manifest")

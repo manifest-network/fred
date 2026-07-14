@@ -54,10 +54,12 @@ type WithdrawScheduler struct {
 	client       ChainClient
 	providerUUID string
 
-	creditCheckInterval time.Duration
-	withdrawInterval    time.Duration
-	guardActive         bool
-	lastWithdrawTime    time.Time // guarded by mu
+	// Cadence guard: paid withdraw is rate-limited to withdrawInterval; credit
+	// checks run every creditCheckInterval (ENG-524).
+	creditCheckInterval time.Duration // credit-check / wake cadence
+	withdrawInterval    time.Duration // paid-withdraw cadence
+	guardActive         bool          // set once at construction; safe to read without mu
+	lastWithdrawTime    time.Time     // guarded by mu
 
 	// Configurable limits
 	maxWithdrawIterations     int
@@ -163,7 +165,7 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 				metrics.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler").Inc()
 			}
 		}()
-		s.withdrawAndCheckCredits(ctx)
+		s.withdrawAndCheckCredits(ctx, true)
 	})
 }
 
@@ -197,6 +199,12 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 		"credit_check_interval", s.creditCheckInterval,
 		"guard_active", s.guardActive,
 	)
+
+	if s.guardActive {
+		metrics.WithdrawGuardActive.Set(1)
+	} else {
+		metrics.WithdrawGuardActive.Set(0)
+	}
 
 	// Replace context for use by TriggerWithdraw (protected by mutex).
 	// IMPORTANT: Create the new context BEFORE canceling the old one to avoid a race
@@ -284,16 +292,31 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 			return nil
 		}
 
-		s.withdrawAndCheckCredits(ctx)
+		s.withdrawAndCheckCredits(ctx, false)
 	}
 }
 
-// withdrawAndCheckCredits performs withdrawal, checks tenant credits,
-// and schedules the next check based on estimated depletion times.
-func (s *WithdrawScheduler) withdrawAndCheckCredits(ctx context.Context) {
-	// First, perform the withdrawal
-	if err := s.withdraw(ctx); err != nil {
-		slog.Error("withdrawal failed", "error", err)
+// withdrawAndCheckCredits checks tenant credits (always) and performs the
+// paid withdrawal (gated by the cadence guard, unless force is set), then
+// schedules the next check based on estimated depletion times.
+//
+// force bypasses the guard for on-demand triggers (TriggerWithdraw), where
+// an immediate withdraw is the whole point of the call.
+func (s *WithdrawScheduler) withdrawAndCheckCredits(ctx context.Context, force bool) {
+	s.mu.Lock()
+	last := s.lastWithdrawTime
+	s.mu.Unlock()
+
+	if force || !s.guardActive || time.Since(last) >= s.withdrawInterval {
+		if err := s.withdraw(ctx); err != nil {
+			slog.Error("withdrawal failed", "error", err)
+		}
+	} else {
+		metrics.WithdrawSkippedByGuardTotal.Inc()
+		slog.Debug("paid withdrawal skipped by cadence guard",
+			"since_last", time.Since(last),
+			"withdraw_interval", s.withdrawInterval,
+		)
 	}
 
 	// Then check credits and auto-close depleted leases
@@ -305,6 +328,14 @@ func (s *WithdrawScheduler) withdrawAndCheckCredits(ctx context.Context) {
 	s.mu.Unlock()
 
 	slog.Debug("next credit check scheduled", "at", nextCheck, "in", time.Until(nextCheck))
+}
+
+// setLastWithdraw records "provider is drained as of now" to anchor the paid
+// withdraw guard. Called at each nothing-deferred success return of withdraw().
+func (s *WithdrawScheduler) setLastWithdraw() {
+	s.mu.Lock()
+	s.lastWithdrawTime = time.Now()
+	s.mu.Unlock()
 }
 
 // withdraw drains a provider's withdrawable lease fees for one cycle.
@@ -355,6 +386,8 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) error {
 
 	if withdrawable.IsZero() {
 		slog.Info("no funds to withdraw, skipping transaction", "provider_uuid", s.providerUUID)
+		// Empty withdrawable == drained: anchor the interval so we don't re-probe every credit-check wake (bounded ≤ withdrawInterval delay for later accrual is the intended rate-limit; funds are safe on-chain).
+		s.setLastWithdraw()
 		return nil
 	}
 
@@ -386,6 +419,7 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) error {
 				"provider_uuid", s.providerUUID,
 				"pages", page,
 			)
+			s.setLastWithdraw()
 			return nil
 		}
 		key = resp.NextKey
