@@ -175,6 +175,7 @@ func run(cmd *cobra.Command, args []string) error {
 		TxPollInterval: cfg.TxPollInterval,
 		TxTimeout:      cfg.TxTimeout,
 		QueryPageLimit: cfg.QueryPageLimit,
+		WithdrawLimit:  cfg.WithdrawLimit,
 	}, signerPool)
 	if err != nil {
 		return fmt.Errorf("failed to create chain client: %w", err)

@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- config: `withdraw_limit` (default `100`) sets how many active leases are settled
+  per provider-wide withdrawal transaction (`MsgWithdraw.Limit`). Previously fred
+  sent `Limit: 0`, so the chain applied its default of 50; the effective page size
+  is now 100 (the chain's `MaxBatchLeaseSize` ceiling), halving the number of
+  settlement txs per cycle as a provider's active-lease count grows. The withdrawal
+  cycle still pages over the cursor, so this only trades tx count against per-tx gas
+  — validated to `1..MaxBatchLeaseSize`. Operators near a full page should confirm
+  `gas_limit` (the Simulate-down fallback) covers a 100-lease withdrawal. (ENG-529)
 - test: Go native fuzz harnesses for the two tenant-facing custom parsers.
   `FuzzSanitizeAndExtractTar` drives the tar extractor with arbitrary archive
   bytes and byte budgets, asserting it never panics, keeps writes within

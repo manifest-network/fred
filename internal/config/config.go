@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/spf13/viper"
 )
 
@@ -85,6 +86,11 @@ type Config struct {
 	// Query and pagination limits
 	QueryPageLimit        int `mapstructure:"query_page_limit"`
 	MaxWithdrawIterations int `mapstructure:"max_withdraw_iterations"`
+	// WithdrawLimit is the number of active leases settled per provider-wide
+	// MsgWithdraw page (sent as MsgWithdraw.Limit). The withdraw scheduler
+	// paginates across pages regardless, so this only trades settlement-tx count
+	// against per-tx gas. Must be 1..MaxBatchLeaseSize (the chain rejects more).
+	WithdrawLimit int `mapstructure:"withdraw_limit"`
 
 	// WebSocket reconnection backoff
 	WebSocketReconnectInitial time.Duration `mapstructure:"websocket_reconnect_initial"`
@@ -191,6 +197,12 @@ func Load(configPath string) (*Config, error) {
 	// Query and pagination defaults
 	v.SetDefault("query_page_limit", 100)
 	v.SetDefault("max_withdraw_iterations", 100)
+	// Explicit 100 (currently == chain MaxBatchLeaseSize, the largest page the chain
+	// accepts) minimizes settlement-tx count as leases-per-provider grows. Kept a
+	// literal, not the const, so a future chain bump of MaxBatchLeaseSize can't
+	// silently raise per-withdraw gas via a go.mod update — that stays a deliberate
+	// gas-reviewed change. The Validate ceiling below uses the const.
+	v.SetDefault("withdraw_limit", 100)
 
 	// WebSocket reconnection defaults
 	v.SetDefault("websocket_reconnect_initial", "1s")
@@ -350,6 +362,12 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxWithdrawIterations <= 0 {
 		return fmt.Errorf("max_withdraw_iterations must be positive")
+	}
+	if c.WithdrawLimit <= 0 {
+		return fmt.Errorf("withdraw_limit must be positive")
+	}
+	if c.WithdrawLimit > billingtypes.MaxBatchLeaseSize {
+		return fmt.Errorf("withdraw_limit (%d) must not exceed the chain's MaxBatchLeaseSize (%d)", c.WithdrawLimit, billingtypes.MaxBatchLeaseSize)
 	}
 
 	// WebSocket reconnection validations

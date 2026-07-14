@@ -148,6 +148,7 @@ func newMockClient(opts ...func(*Client)) *Client {
 		txPollInterval: 10 * time.Millisecond,
 		txTimeout:      500 * time.Millisecond,
 		queryPageLimit: 100,
+		withdrawLimit:  100,
 		now:            time.Now,
 	}
 	for _, opt := range opts {
@@ -1450,6 +1451,43 @@ func TestClient_WithdrawByProvider(t *testing.T) {
 		assert.Equal(t, []byte("cursor-xyz"), sentKey, "the opaque cursor must be forwarded into MsgWithdraw.Key")
 	})
 
+	t.Run("sends the configured withdraw limit as MsgWithdraw.Limit", func(t *testing.T) {
+		s := newTestSigner(t)
+		pool := newTestSignerPoolFromSigner(s)
+		addr, err := sdktypes.AccAddressFromBech32(s.address)
+		require.NoError(t, err)
+		accountAny := newTestAccountAny(t, addr, 1, 0)
+
+		aq := &mockAuthQuery{
+			AccountFn: func(context.Context, *authtypes.QueryAccountRequest, ...grpc.CallOption) (*authtypes.QueryAccountResponse, error) {
+				return &authtypes.QueryAccountResponse{Account: accountAny}, nil
+			},
+		}
+		data := withdrawTxData(t, &billingtypes.MsgWithdrawResponse{})
+		var sentLimit uint64
+		ts := &mockTxService{
+			SimulateFn: okSimulate(200000),
+			BroadcastTxFn: func(_ context.Context, req *tx.BroadcastTxRequest, _ ...grpc.CallOption) (*tx.BroadcastTxResponse, error) {
+				decoded, decErr := s.txConfig.TxDecoder()(req.TxBytes)
+				require.NoError(t, decErr)
+				msgs := decoded.GetMsgs()
+				require.Len(t, msgs, 1)
+				wd, ok := msgs[0].(*billingtypes.MsgWithdraw)
+				require.True(t, ok, "broadcast msg must be *MsgWithdraw")
+				sentLimit = wd.Limit
+				return &tx.BroadcastTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: "TXLIMIT"}}, nil
+			},
+			GetTxFn: func(_ context.Context, req *tx.GetTxRequest, _ ...grpc.CallOption) (*tx.GetTxResponse, error) {
+				return &tx.GetTxResponse{TxResponse: &sdktypes.TxResponse{Code: 0, TxHash: req.Hash, Data: data}}, nil
+			},
+		}
+		c := newMockClient(func(c *Client) { c.signerPool = pool; c.authQuery = aq; c.txService = ts; c.withdrawLimit = 77 })
+
+		_, _, err = c.WithdrawByProvider(t.Context(), "prov-1", nil)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(77), sentLimit, "WithdrawByProvider must send the client's configured withdraw limit, not a hardcoded 0")
+	})
+
 	t.Run("broadcast failure", func(t *testing.T) {
 		s := newTestSigner(t)
 		pool := newTestSignerPoolFromSigner(s)
@@ -1472,6 +1510,24 @@ func TestClient_WithdrawByProvider(t *testing.T) {
 		_, _, err := c.WithdrawByProvider(t.Context(), "prov-1", nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to withdraw")
+	})
+}
+
+func TestNewClient_WithdrawLimitDefault(t *testing.T) {
+	pool := newTestSignerPoolFromSigner(newTestSigner(t))
+
+	t.Run("defaults to 100 when unset", func(t *testing.T) {
+		c, err := NewClient(ClientConfig{Endpoint: "localhost:9090"}, pool)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		assert.Equal(t, uint64(100), c.withdrawLimit)
+	})
+
+	t.Run("uses the configured value", func(t *testing.T) {
+		c, err := NewClient(ClientConfig{Endpoint: "localhost:9090", WithdrawLimit: 50}, pool)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		assert.Equal(t, uint64(50), c.withdrawLimit)
 	})
 }
 

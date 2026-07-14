@@ -171,6 +171,7 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		TxTimeout:                 30 * time.Second,
 		QueryPageLimit:            100,
 		MaxWithdrawIterations:     100,
+		WithdrawLimit:             100,
 		WebSocketReconnectInitial: time.Second,
 		WebSocketReconnectMax:     60 * time.Second,
 		MaxRequestBodySize:        1 << 20,
@@ -208,6 +209,7 @@ func TestConfig_Validate_NoBackends(t *testing.T) {
 		TxTimeout:                 30 * time.Second,
 		QueryPageLimit:            100,
 		MaxWithdrawIterations:     100,
+		WithdrawLimit:             100,
 		WebSocketReconnectInitial: time.Second,
 		WebSocketReconnectMax:     60 * time.Second,
 		MaxRequestBodySize:        1 << 20,
@@ -246,6 +248,7 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 			TxTimeout:                 30 * time.Second,
 			QueryPageLimit:            100,
 			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
 			WebSocketReconnectInitial: time.Second,
 			WebSocketReconnectMax:     60 * time.Second,
 			MaxRequestBodySize:        1 << 20,
@@ -300,6 +303,70 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_WithdrawLimit(t *testing.T) {
+	baseConfig := func() Config {
+		return Config{
+			ProviderUUID:              "01234567-89ab-cdef-0123-456789abcdef",
+			ProviderAddress:           "manifest1abc",
+			KeyName:                   "provider",
+			KeyringDir:                "/home/provider/.manifest",
+			Bech32Prefix:              "manifest",
+			WithdrawInterval:          time.Hour,
+			RateLimitRPS:              10,
+			RateLimitBurst:            20,
+			GasLimit:                  500000,
+			GasPrice:                  25,
+			GasAdjustment:             1.2,
+			FeeDenom:                  "umfx",
+			HTTPReadTimeout:           15 * time.Second,
+			HTTPWriteTimeout:          15 * time.Second,
+			HTTPIdleTimeout:           60 * time.Second,
+			WebSocketPingInterval:     30 * time.Second,
+			TxPollInterval:            500 * time.Millisecond,
+			TxTimeout:                 30 * time.Second,
+			QueryPageLimit:            100,
+			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
+			WebSocketReconnectInitial: time.Second,
+			WebSocketReconnectMax:     60 * time.Second,
+			MaxRequestBodySize:        1 << 20,
+			CreditCheckErrorThreshold: 3,
+			CreditCheckRetryInterval:  30 * time.Second,
+			ReconciliationInterval:    5 * time.Minute,
+			ShutdownTimeout:           30 * time.Second,
+			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
+			CallbackBaseURL:           "http://localhost:8080",
+			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+		}
+	}
+
+	tests := []struct {
+		name          string
+		withdrawLimit int
+		wantErr       string
+	}{
+		{name: "zero is invalid", withdrawLimit: 0, wantErr: "withdraw_limit must be positive"},
+		{name: "negative is invalid", withdrawLimit: -1, wantErr: "withdraw_limit must be positive"},
+		{name: "above MaxBatchLeaseSize is invalid", withdrawLimit: 101, wantErr: "withdraw_limit (101) must not exceed"},
+		{name: "one is valid", withdrawLimit: 1, wantErr: ""},
+		{name: "MaxBatchLeaseSize is valid", withdrawLimit: 100, wantErr: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.WithdrawLimit = tt.withdrawLimit
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err, "Validate() = nil, want error containing %q", tt.wantErr)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestConfig_Validate_CallbackCanonicalPathPrefix(t *testing.T) {
 	baseConfig := func() Config {
 		return Config{
@@ -323,6 +390,7 @@ func TestConfig_Validate_CallbackCanonicalPathPrefix(t *testing.T) {
 			TxTimeout:                 30 * time.Second,
 			QueryPageLimit:            100,
 			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
 			WebSocketReconnectInitial: time.Second,
 			WebSocketReconnectMax:     60 * time.Second,
 			MaxRequestBodySize:        1 << 20,
@@ -411,6 +479,7 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			TxTimeout:                 30 * time.Second,
 			QueryPageLimit:            100,
 			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
 			WebSocketReconnectInitial: time.Second,
 			WebSocketReconnectMax:     60 * time.Second,
 			MaxRequestBodySize:        1 << 20,
@@ -599,6 +668,7 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 			TxTimeout:                 30 * time.Second,
 			QueryPageLimit:            100,
 			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
 			WebSocketReconnectInitial: time.Second,
 			WebSocketReconnectMax:     60 * time.Second,
 			MaxRequestBodySize:        1 << 20,
@@ -692,6 +762,7 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 			TxTimeout:                 30 * time.Second,
 			QueryPageLimit:            100,
 			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
 			WebSocketReconnectInitial: time.Second,
 			WebSocketReconnectMax:     60 * time.Second,
 			MaxRequestBodySize:        1 << 20,
@@ -824,6 +895,7 @@ backends:
 	assert.Equal(t, 20, cfg.RateLimitBurst)
 	assert.Equal(t, []string{"*"}, cfg.CORSOrigins)
 	assert.Equal(t, 1.2, cfg.GasAdjustment, "default gas_adjustment should match Cosmos CLI convention")
+	assert.Equal(t, 100, cfg.WithdrawLimit, "default withdraw_limit should be the chain's MaxBatchLeaseSize")
 }
 
 func TestLoad_ConfigOverrides(t *testing.T) {
@@ -922,6 +994,7 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			TxTimeout:                 30 * time.Second,
 			QueryPageLimit:            100,
 			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
 			WebSocketReconnectInitial: time.Second,
 			WebSocketReconnectMax:     60 * time.Second,
 			MaxRequestBodySize:        1 << 20,
@@ -1042,6 +1115,7 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			TxTimeout:                 30 * time.Second,
 			QueryPageLimit:            100,
 			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
 			WebSocketReconnectInitial: time.Second,
 			WebSocketReconnectMax:     60 * time.Second,
 			MaxRequestBodySize:        1 << 20,
@@ -1115,6 +1189,7 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			TxTimeout:                 30 * time.Second,
 			QueryPageLimit:            100,
 			MaxWithdrawIterations:     100,
+			WithdrawLimit:             100,
 			WebSocketReconnectInitial: time.Second,
 			WebSocketReconnectMax:     60 * time.Second,
 			MaxRequestBodySize:        1 << 20,
@@ -1457,6 +1532,7 @@ func validConfig() Config {
 		TxTimeout:                 30 * time.Second,
 		QueryPageLimit:            100,
 		MaxWithdrawIterations:     100,
+		WithdrawLimit:             100,
 		WebSocketReconnectInitial: time.Second,
 		WebSocketReconnectMax:     60 * time.Second,
 		MaxRequestBodySize:        1 << 20,
