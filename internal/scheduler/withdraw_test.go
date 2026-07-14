@@ -76,8 +76,8 @@ func TestNewWithdrawScheduler(t *testing.T) {
 		{
 			name: "with defaults",
 			cfg: WithdrawSchedulerConfig{
-				ProviderUUID: "test-uuid",
-				Interval:     time.Minute,
+				ProviderUUID:     "test-uuid",
+				WithdrawInterval: time.Minute,
 			},
 			wantMaxIterations:  100,
 			wantErrorThreshold: 3,
@@ -87,7 +87,7 @@ func TestNewWithdrawScheduler(t *testing.T) {
 			name: "with custom values",
 			cfg: WithdrawSchedulerConfig{
 				ProviderUUID:              "test-uuid",
-				Interval:                  5 * time.Minute,
+				WithdrawInterval:          5 * time.Minute,
 				MaxWithdrawIterations:     50,
 				CreditCheckErrorThreshold: 5,
 				CreditCheckRetryInterval:  time.Minute,
@@ -100,7 +100,7 @@ func TestNewWithdrawScheduler(t *testing.T) {
 			name: "zero values get defaults",
 			cfg: WithdrawSchedulerConfig{
 				ProviderUUID:              "test-uuid",
-				Interval:                  time.Minute,
+				WithdrawInterval:          time.Minute,
 				MaxWithdrawIterations:     0,
 				CreditCheckErrorThreshold: 0,
 				CreditCheckRetryInterval:  0,
@@ -118,7 +118,7 @@ func TestNewWithdrawScheduler(t *testing.T) {
 
 			require.NotNil(t, s, "NewWithdrawScheduler() returned nil")
 			assert.Equal(t, tt.cfg.ProviderUUID, s.providerUUID)
-			assert.Equal(t, tt.cfg.Interval, s.interval)
+			assert.Equal(t, tt.cfg.WithdrawInterval, s.withdrawInterval)
 			assert.Equal(t, tt.wantMaxIterations, s.maxWithdrawIterations)
 			assert.Equal(t, tt.wantErrorThreshold, s.creditCheckErrorThreshold)
 			assert.Equal(t, tt.wantRetryInterval, s.creditCheckRetryInterval)
@@ -141,8 +141,8 @@ func TestWithdrawScheduler_Withdraw_NothingToWithdraw(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.withdraw(context.Background())
@@ -164,8 +164,8 @@ func TestWithdrawScheduler_Withdraw_Success(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.withdraw(context.Background())
@@ -187,8 +187,8 @@ func TestWithdrawScheduler_Withdraw_Error(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	// Should not panic on error
@@ -214,8 +214,8 @@ func TestWithdrawScheduler_Withdraw_RetryOnError(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -250,8 +250,8 @@ func TestWithdrawScheduler_Withdraw_PaginatesUntilCursorEmpty(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	err := s.withdraw(context.Background())
@@ -282,7 +282,7 @@ func TestWithdrawScheduler_Withdraw_StopsAtIterationBoundAndReportsIncomplete(t 
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
 		ProviderUUID:          "test-uuid",
-		Interval:              time.Minute,
+		WithdrawInterval:      time.Minute,
 		MaxWithdrawIterations: 5,
 	})
 
@@ -315,8 +315,8 @@ func TestWithdrawScheduler_Withdraw_ErrorMidPagination(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	err := s.withdraw(context.Background())
@@ -343,8 +343,8 @@ func TestWithdrawScheduler_Withdraw_ContextCanceledMidPagination(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	err := s.withdraw(ctx)
@@ -366,8 +366,8 @@ func TestWithdrawScheduler_Withdraw_NilResponseIsError(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	err := s.withdraw(context.Background())
@@ -383,8 +383,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_NoLeases(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	nextCheck := s.checkCreditsAndClose(context.Background())
@@ -423,8 +423,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_DepletedCredit(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.checkCreditsAndClose(context.Background())
@@ -455,8 +455,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_HealthyCredit(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.checkCreditsAndClose(context.Background())
@@ -466,8 +466,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_HealthyCredit(t *testing.T) {
 
 func TestWithdrawScheduler_EstimateDepletionTime(t *testing.T) {
 	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	now := time.Now()
@@ -627,8 +627,8 @@ func TestWithdrawScheduler_TriggerWithdraw(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	// Set context (normally done in Start)
@@ -669,8 +669,8 @@ func TestWithdrawScheduler_WithdrawOnce(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.WithdrawOnce(context.Background())
@@ -691,8 +691,8 @@ func TestWithdrawScheduler_Start_ContextCancellation(t *testing.T) {
 		}
 
 		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-			ProviderUUID: "test-uuid",
-			Interval:     100 * time.Millisecond,
+			ProviderUUID:     "test-uuid",
+			WithdrawInterval: 100 * time.Millisecond,
 		})
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -737,7 +737,7 @@ func TestWithdrawScheduler_ConsecutiveErrors(t *testing.T) {
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
 		ProviderUUID:              "test-uuid",
-		Interval:                  time.Minute,
+		WithdrawInterval:          time.Minute,
 		CreditCheckErrorThreshold: 2,
 		CreditCheckRetryInterval:  10 * time.Second,
 	})
@@ -819,8 +819,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_ContextCancellation(t *testing.T
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	// Should return early when context is cancelled
@@ -859,8 +859,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_CloseLeasesContextCheck(t *testi
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	s.checkCreditsAndClose(ctx)
@@ -872,8 +872,8 @@ func TestWithdrawScheduler_CheckCreditsAndClose_CloseLeasesContextCheck(t *testi
 func TestWithdrawScheduler_EstimateDepletionTime_HighPrecision(t *testing.T) {
 	// Test that burn rate calculation handles various time intervals correctly
 	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 
 	now := time.Now()
@@ -960,8 +960,8 @@ func TestTriggerWithdraw_PanicDoesNotCrashFred(t *testing.T) {
 	}
 
 	scheduler := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-provider",
-		Interval:     time.Hour, // long so only triggers fire
+		ProviderUUID:     "test-provider",
+		WithdrawInterval: time.Hour, // long so only triggers fire
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -27,8 +27,8 @@ func TestWithdrawScheduler_StopStopsStart(t *testing.T) {
 	}
 
 	s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     50 * time.Millisecond,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: 50 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

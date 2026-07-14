@@ -53,7 +53,11 @@ type tenantState struct {
 type WithdrawScheduler struct {
 	client       ChainClient
 	providerUUID string
-	interval     time.Duration
+
+	creditCheckInterval time.Duration
+	withdrawInterval    time.Duration
+	guardActive         bool
+	lastWithdrawTime    time.Time // guarded by mu
 
 	// Configurable limits
 	maxWithdrawIterations     int
@@ -78,7 +82,8 @@ type WithdrawScheduler struct {
 // WithdrawSchedulerConfig holds configuration for the withdrawal scheduler.
 type WithdrawSchedulerConfig struct {
 	ProviderUUID              string
-	Interval                  time.Duration
+	WithdrawInterval          time.Duration // paid-withdraw cadence
+	CreditCheckInterval       time.Duration // credit-check / wake cadence; 0 => = WithdrawInterval
 	MaxWithdrawIterations     int
 	CreditCheckErrorThreshold int
 	CreditCheckRetryInterval  time.Duration
@@ -92,6 +97,9 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 	errorThreshold := cmp.Or(max(cfg.CreditCheckErrorThreshold, 0), 3)
 	retryInterval := cmp.Or(max(cfg.CreditCheckRetryInterval, 0), 30*time.Second)
 
+	withdrawInterval := cfg.WithdrawInterval
+	creditCheckInterval := cmp.Or(max(cfg.CreditCheckInterval, 0), cfg.WithdrawInterval)
+
 	// Create initial context that can be canceled on shutdown.
 	// This ensures TriggerWithdraw works correctly even before Start() is called.
 	// Start() will replace this with a context derived from the passed-in context.
@@ -100,7 +108,9 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 	return &WithdrawScheduler{
 		client:                    client,
 		providerUUID:              cfg.ProviderUUID,
-		interval:                  cfg.Interval,
+		withdrawInterval:          withdrawInterval,
+		creditCheckInterval:       creditCheckInterval,
+		guardActive:               creditCheckInterval < withdrawInterval,
 		maxWithdrawIterations:     maxIterations,
 		creditCheckErrorThreshold: errorThreshold,
 		creditCheckRetryInterval:  retryInterval,
@@ -183,7 +193,9 @@ func (s *WithdrawScheduler) Stop() {
 func (s *WithdrawScheduler) Start(ctx context.Context) error {
 	slog.Info("starting withdrawal scheduler",
 		"provider_uuid", s.providerUUID,
-		"interval", s.interval,
+		"withdraw_interval", s.withdrawInterval,
+		"credit_check_interval", s.creditCheckInterval,
+		"guard_active", s.guardActive,
 	)
 
 	// Replace context for use by TriggerWithdraw (protected by mutex).
@@ -216,7 +228,7 @@ func (s *WithdrawScheduler) Start(ctx context.Context) error {
 
 	// Set initial next check time
 	s.mu.Lock()
-	s.nextCheckTime = time.Now().Add(s.interval)
+	s.nextCheckTime = time.Now().Add(s.creditCheckInterval)
 	s.mu.Unlock()
 
 	for {
@@ -403,7 +415,7 @@ func (s *WithdrawScheduler) withdraw(ctx context.Context) error {
 // tenants with depleted credit. Returns the time for the next check.
 func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time {
 	now := time.Now()
-	defaultNextCheck := now.Add(s.interval)
+	defaultNextCheck := now.Add(s.creditCheckInterval)
 
 	// Get all active leases for this provider
 	leases, err := s.client.GetActiveLeasesByProvider(ctx, s.providerUUID)

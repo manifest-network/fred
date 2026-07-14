@@ -18,8 +18,8 @@ import (
 // horizon must clamp to a finite, far-future value instead.
 func TestWithdrawScheduler_EstimateDepletionTime_ClampsOverflow(t *testing.T) {
 	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 	now := time.Now()
 
@@ -44,8 +44,8 @@ func TestWithdrawScheduler_EstimateDepletionTime_ClampsOverflow(t *testing.T) {
 // sane future horizon (ENG-500).
 func TestWithdrawScheduler_EstimateDepletionTime_ClampsDurationOverflow(t *testing.T) {
 	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
-		ProviderUUID: "test-uuid",
-		Interval:     time.Minute,
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
 	})
 	now := time.Now()
 
