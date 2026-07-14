@@ -144,6 +144,7 @@ type Client struct {
 	txPollInterval  time.Duration
 	txTimeout       time.Duration
 	queryPageLimit  uint64
+	withdrawLimit   uint64           // leases settled per provider-wide MsgWithdraw page (MsgWithdraw.Limit)
 	simBreaker      simBreaker       // consecutive-failure circuit-breaker for Simulate
 	now             func() time.Time // injectable clock (time.Now in production; overridable in tests)
 }
@@ -157,6 +158,7 @@ type ClientConfig struct {
 	TxPollInterval time.Duration // Interval for polling tx status (default: 500ms)
 	TxTimeout      time.Duration // Timeout for waiting for tx inclusion (default: 60s)
 	QueryPageLimit int           // Page limit for paginated queries (default: 100)
+	WithdrawLimit  int           // Leases settled per provider-wide MsgWithdraw page (default: 100; the chain rejects > MaxBatchLeaseSize)
 }
 
 // NewClient creates a new chain client connected to the given gRPC endpoint.
@@ -196,6 +198,7 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 	txPollInterval := cmp.Or(cfg.TxPollInterval, 500*time.Millisecond)
 	txTimeout := cmp.Or(cfg.TxTimeout, defaultTxTimeout)
 	queryPageLimit := cmp.Or(max(cfg.QueryPageLimit, 0), 100)
+	withdrawLimit := cmp.Or(max(cfg.WithdrawLimit, 0), 100)
 
 	return &Client{
 		conn:            conn,
@@ -208,6 +211,7 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 		txPollInterval:  txPollInterval,
 		txTimeout:       txTimeout,
 		queryPageLimit:  uint64(queryPageLimit),
+		withdrawLimit:   uint64(withdrawLimit),
 		now:             time.Now,
 	}, nil
 }
@@ -498,14 +502,14 @@ func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (ui
 // it is passed back verbatim, never parsed. Callers loop until NextKey is empty
 // (see the WithdrawScheduler); the per-cycle bound lives there, not here.
 //
-// Limit is left at 0 so the chain applies its DefaultProviderWithdrawLimit,
-// matching the CLI's `manifestd tx billing withdraw --provider` behavior.
+// Limit is the configured withdrawLimit (leases settled per page); the scheduler
+// pages via the cursor, so this only trades settlement-tx count against per-tx gas.
 func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string, key []byte) (string, *billingtypes.MsgWithdrawResponse, error) {
 	msg := &billingtypes.MsgWithdraw{
 		Sender:       c.providerAddress,
 		ProviderUuid: providerUUID,
-		Limit:        0,   // Use chain's default limit
-		Key:          key, // opaque pagination cursor; empty starts from the beginning
+		Limit:        c.withdrawLimit, // leases settled per page (default 100; config.Validate enforces <= chain MaxBatchLeaseSize on the config-driven path)
+		Key:          key,             // opaque pagination cursor; empty starts from the beginning
 	}
 
 	txHash, err := c.broadcastTx(ctx, msg)
