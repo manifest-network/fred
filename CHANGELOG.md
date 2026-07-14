@@ -26,6 +26,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend: reject a lease whose total (or per-item) container quantity is
+  negative or exceeds a hard cap before reserving any state, closing a pre-admission
+  memory-exhaustion DoS. `Provision` pre-sized the per-lease container-ID slice from
+  the chain-supplied quantity (`make([]string, 0, totalQuantity)`) inside the lock —
+  before SKU validation and the resource-pool admission gate — so an honest
+  max-quantity lease (billing caps per-item quantity at 1e9) drove a ~16 GB
+  allocation, and a negative value from an overflowed `uint64→int` cast panicked the
+  `make`. Total and per-item quantity are now validated against `maxLeaseQuantity`
+  (1024) at the top of `Provision` and rejected as a validation error before any
+  allocation. (ENG-503)
 - docker-backend: closed three retention/restore data-integrity gaps that could
   destroy or tear down live tenant data:
   - the startup orphan-volume reaper no longer destroys a still-open lease's
