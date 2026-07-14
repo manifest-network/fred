@@ -60,9 +60,12 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// overflowed cast; a total above maxLeaseQuantity would drive an unbounded pre-admission
 	// allocation (~16 GB at the chain's 1e9 billing cap) or, if negative, panic the make().
 	// Rejected synchronously as a validation error, before any state is reserved. (ENG-503)
-	for _, item := range req.Items {
+	for i, item := range req.Items {
 		if item.Quantity < 0 || item.Quantity > maxLeaseQuantity {
-			return fmt.Errorf("%w: item quantity %d out of range [0, %d]", backend.ErrValidation, item.Quantity, maxLeaseQuantity)
+			// Name the offending item (index/SKU/service — all tenant-supplied, so safe to
+			// echo) so a multi-item lease rejection is actionable client-side.
+			return fmt.Errorf("%w: item %d (SKU %q, service %q) quantity %d out of range [0, %d]",
+				backend.ErrValidation, i, item.SKU, item.ServiceName, item.Quantity, maxLeaseQuantity)
 		}
 	}
 	if totalQuantity < 0 || totalQuantity > maxLeaseQuantity {
