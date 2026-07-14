@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -340,6 +341,9 @@ func TestConfig_Validate_WithdrawLimit(t *testing.T) {
 		}
 	}
 
+	// Derive the ceiling from the chain constant so these cases keep asserting the
+	// real contract (one-above-max rejected, max accepted) across dependency bumps.
+	maxLimit := int(billingtypes.MaxBatchLeaseSize)
 	tests := []struct {
 		name          string
 		withdrawLimit int
@@ -347,9 +351,9 @@ func TestConfig_Validate_WithdrawLimit(t *testing.T) {
 	}{
 		{name: "zero is invalid", withdrawLimit: 0, wantErr: "withdraw_limit must be positive"},
 		{name: "negative is invalid", withdrawLimit: -1, wantErr: "withdraw_limit must be positive"},
-		{name: "above MaxBatchLeaseSize is invalid", withdrawLimit: 101, wantErr: "withdraw_limit (101) must not exceed"},
+		{name: "above MaxBatchLeaseSize is invalid", withdrawLimit: maxLimit + 1, wantErr: "must not exceed the chain's MaxBatchLeaseSize"},
 		{name: "one is valid", withdrawLimit: 1, wantErr: ""},
-		{name: "MaxBatchLeaseSize is valid", withdrawLimit: 100, wantErr: ""},
+		{name: "MaxBatchLeaseSize is valid", withdrawLimit: maxLimit, wantErr: ""},
 	}
 
 	for _, tt := range tests {

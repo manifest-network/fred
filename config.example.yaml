@@ -586,9 +586,9 @@ max_withdraw_iterations: 100
 # Leases settled per provider-wide withdrawal transaction (MsgWithdraw.Limit).
 # The withdrawal cycle pages over the cursor regardless, so this only trades
 # settlement-tx count against per-tx gas: higher = fewer txs, more gas per tx.
-# Must be 1..100 (the chain rejects a larger page). If you raise the effective
-# per-tx lease count, confirm gas_limit (the Simulate-down fallback) still covers
-# a full page. Default 100.
+# Must be 1..the chain's max batch size (currently 100; the chain rejects a
+# larger page). If you raise the effective per-tx lease count, confirm gas_limit
+# (the Simulate-down fallback) still covers a full page. Default 100.
 withdraw_limit: 100
 
 # =============================================================================
