@@ -96,6 +96,7 @@ type Config struct {
 	// Credit check thresholds
 	CreditCheckErrorThreshold int           `mapstructure:"credit_check_error_threshold"`
 	CreditCheckRetryInterval  time.Duration `mapstructure:"credit_check_retry_interval"`
+	CreditCheckInterval       time.Duration `mapstructure:"credit_check_interval"` // 0 = coupled to withdraw_interval (resolved by the scheduler).
 
 	// Backend configuration
 	Backends                    []BackendConfig `mapstructure:"backends"`
@@ -202,6 +203,7 @@ func Load(configPath string) (*Config, error) {
 	// Credit check defaults
 	v.SetDefault("credit_check_error_threshold", 3)
 	v.SetDefault("credit_check_retry_interval", "30s")
+	v.SetDefault("credit_check_interval", "0s")
 
 	// Parallel signing defaults
 	v.SetDefault("sub_signer_count", 0)
@@ -283,6 +285,12 @@ func (c *Config) Validate() error {
 	// Numeric validations
 	if c.WithdrawInterval <= 0 {
 		return fmt.Errorf("withdraw_interval must be positive")
+	}
+	if c.CreditCheckInterval < 0 {
+		return fmt.Errorf("credit_check_interval cannot be negative")
+	}
+	if c.CreditCheckInterval > 0 && c.CreditCheckInterval > c.WithdrawInterval {
+		return fmt.Errorf("credit_check_interval (%s) must not exceed withdraw_interval (%s)", c.CreditCheckInterval, c.WithdrawInterval)
 	}
 	if c.RateLimitRPS <= 0 {
 		return fmt.Errorf("rate_limit_rps must be positive")
