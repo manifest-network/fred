@@ -809,32 +809,34 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	}.materialize()
 	b.provisionsMu.Unlock()
 
-	// (c) Gate disk capacity on the AGGREGATE promote delta, then allocate pool
-	// slots. Restore adopts existing volumes (rename, not fresh disk), so only the
-	// growth of the lease's total DiskMB above its already-committed retained
-	// footprint is new disk pressure; same-tier and demote restores add none. This
-	// is checked once for the whole lease — a per-volume gate would double-count the
-	// retained bytes still in the projection until ClaimForRestore and reject a
-	// fitting multi-volume promote (ENG-545). An unresolved SKU counts 0 (leaseDiskMB
-	// drops it), which only makes the gate more conservative.
+	// (c) Reserve pool slots for the restore atomically. Restore adopts existing
+	// volumes (rename, not fresh disk), so disk capacity is gated once on the
+	// AGGREGATE promote delta — the growth of the lease's total DiskMB above its
+	// already-committed retained footprint — while CPU/mem/tenant are gated per
+	// instance. Doing this under a single pool lock keeps the gate both EXACT (no
+	// per-volume double-count of the retained bytes still in the projection until
+	// ClaimForRestore) and ATOMIC (no concurrent provision/restore can slip disk in
+	// between the check and the reservations), so a fitting multi-volume promote is
+	// admitted and the pool cannot be over-committed (ENG-545). An unresolved SKU
+	// counts 0 in leaseDiskMB, making the delta gate more conservative.
 	newDiskMB, _ := b.leaseDiskMB(req.Items)
 	oldDiskMB, _ := b.leaseDiskMB(rec.Items)
-	if derr := b.pool.CheckAdoptDiskHeadroom(newDiskMB - oldDiskMB); derr != nil {
-		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, derr)
-	}
-	var allocatedIDs []string
+	adoptInstances := make([]shared.AdoptInstance, 0, totalQuantity(req.Items))
 	for _, item := range req.Items {
 		for i := range item.Quantity {
-			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant); aerr != nil {
-				releaseAll(b.pool, allocatedIDs)
-				updateResourceMetrics(b.pool.Stats())
-				b.removeProvision(req.LeaseUUID)
-				return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, aerr)
-			}
-			allocatedIDs = append(allocatedIDs, id)
+			adoptInstances = append(adoptInstances, shared.AdoptInstance{
+				ID:  fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i),
+				SKU: item.SKU,
+			})
 		}
+	}
+	if aerr := b.pool.TryAllocateAdoptAll(adoptInstances, rec.Tenant, newDiskMB-oldDiskMB); aerr != nil {
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, aerr)
+	}
+	allocatedIDs := make([]string, len(adoptInstances))
+	for i, in := range adoptInstances {
+		allocatedIDs[i] = in.ID
 	}
 	// Refresh the resource gauges now that the allocation succeeded, mirroring
 	// Provision/Deprovision's on-success refresh. The rollback paths re-refresh

@@ -73,54 +73,65 @@ func NewResourcePool(totalCPU float64, totalMemoryMB, totalDiskMB int64, resolve
 // TryAllocate attempts to reserve resources for a new provision (gates all of
 // CPU, memory, disk, and tenant quota).
 func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
-	return p.tryAllocate(leaseUUID, sku, tenant, true)
-}
-
-// TryAllocateAdopt reserves resources for a lease being RESTORED by adopting an
-// existing retained volume (rename, not fresh disk). It gates CPU, memory, and
-// tenant quota normally but SKIPS the global disk capacity check: the adopted
-// bytes are already committed on disk and counted in the retained projection, so
-// re-gating them per volume would double-count the lease's own footprint. The
-// disk CAPACITY of a restore is instead gated once, up front, by
-// CheckAdoptDiskHeadroom against the AGGREGATE promote delta (ENG-545). DiskMB is
-// still added to allocatedDisk for correct live accounting; the retained
-// projection drops it when the record flips to restoring.
-func (p *ResourcePool) TryAllocateAdopt(leaseUUID, sku, tenant string) error {
-	return p.tryAllocate(leaseUUID, sku, tenant, false)
-}
-
-// CheckAdoptDiskHeadroom verifies that a restore's aggregate PROMOTE DELTA fits
-// remaining global disk capacity. Restore adopts existing volumes (rename, not
-// fresh disk), and the retained lease's whole footprint is already counted in the
-// retained projection, so only growth above it — deltaMB = newTotalDiskMB minus
-// the old retained DiskMB, summed across the lease's volumes — is new disk
-// pressure. Same-tier and demote restores (deltaMB <= 0) always pass. Gating the
-// aggregate once, rather than per adopted volume, is what keeps the check exact:
-// during the per-volume adopt loop allocatedDisk grows by each new DiskMB while
-// retainedDisk still holds the old footprint until refreshRetentionAccounting
-// runs, so a per-volume gate would double-count and reject a multi-volume promote
-// whose true post-claim footprint fits (ENG-545).
-func (p *ResourcePool) CheckAdoptDiskHeadroom(deltaMB int64) error {
-	if deltaMB <= 0 {
-		return nil
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.allocatedDisk+p.retainedDisk+deltaMB > p.totalDisk {
+	return p.tryAllocateLocked(leaseUUID, sku, tenant, true)
+}
+
+// AdoptInstance identifies one container instance to reserve on the restore/adopt
+// path: its pool allocation id and the SKU of the tier it is restored onto.
+type AdoptInstance struct {
+	ID  string
+	SKU string
+}
+
+// TryAllocateAdoptAll atomically reserves every instance of a restore under a
+// single lock acquisition. Restore adopts existing volumes (rename, not fresh
+// disk), so the per-instance reservations SKIP the global disk gate — the adopted
+// bytes are already committed on disk and counted in the retained projection.
+// Disk CAPACITY is instead gated once, here, on the AGGREGATE promote delta:
+// promoteDeltaMB = newTotalDiskMB - oldRetainedDiskMB summed across the lease's
+// volumes; a same-tier or demote restore (deltaMB <= 0) adds no disk pressure.
+//
+// Gating the delta and committing all reservations under ONE lock is what makes
+// admission correct on both axes: (1) EXACT — a per-volume disk gate would
+// double-count the retained bytes still in the projection until ClaimForRestore
+// and reject a fitting multi-volume promote; and (2) ATOMIC — no concurrent
+// TryAllocate/restore can consume disk between the delta check and the
+// reservations, so the pool cannot be over-committed (ENG-545, PR #184 review).
+//
+// CPU, memory, and tenant quota are gated per instance (new containers). On any
+// failure nothing is reserved: the instances committed so far in this call are
+// rolled back before returning.
+func (p *ResourcePool) TryAllocateAdoptAll(instances []AdoptInstance, tenant string, promoteDeltaMB int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if promoteDeltaMB > 0 && p.allocatedDisk+p.retainedDisk+promoteDeltaMB > p.totalDisk {
 		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
-			deltaMB, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
+			promoteDeltaMB, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
+	}
+
+	reserved := make([]string, 0, len(instances))
+	for _, in := range instances {
+		if err := p.tryAllocateLocked(in.ID, in.SKU, tenant, false); err != nil {
+			for _, id := range reserved {
+				p.releaseLocked(id)
+			}
+			return err
+		}
+		reserved = append(reserved, in.ID)
 	}
 	return nil
 }
 
-// tryAllocate is the shared implementation for TryAllocate and TryAllocateAdopt.
-// When gateDisk is true the global disk capacity check is enforced (fresh
-// provision); when false (adopt/restore) the check is skipped because the disk was
-// already committed and its capacity is gated up front by CheckAdoptDiskHeadroom.
-func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+// tryAllocateLocked reserves one instance. The caller MUST hold p.mu. When
+// gateDisk is true the global disk capacity check is enforced (fresh provision);
+// when false (adopt) it is skipped because the disk is already committed and its
+// capacity is gated by the caller (TryAllocateAdoptAll's aggregate delta). CPU,
+// memory, and tenant quota are always gated; the full DiskMB is always added to
+// allocatedDisk for correct live accounting.
+func (p *ResourcePool) tryAllocateLocked(leaseUUID, sku, tenant string, gateDisk bool) error {
 	// Check if already allocated
 	if _, exists := p.allocations[leaseUUID]; exists {
 		return fmt.Errorf("lease %s already has allocated resources", leaseUUID)
@@ -194,7 +205,11 @@ func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool)
 func (p *ResourcePool) Release(leaseUUID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.releaseLocked(leaseUUID)
+}
 
+// releaseLocked is Release's body; the caller MUST hold p.mu.
+func (p *ResourcePool) releaseLocked(leaseUUID string) {
 	alloc, exists := p.allocations[leaseUUID]
 	if !exists {
 		return

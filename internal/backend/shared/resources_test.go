@@ -428,59 +428,165 @@ func TestTryAllocate_AvailableNeverNegativeInError(t *testing.T) {
 	assert.Contains(t, err.Error(), "have 0 MB available", "available must clamp to 0, never negative")
 }
 
-func TestTryAllocateAdopt_SkipsDiskGate(t *testing.T) {
+func TestTryAllocateAdoptAll_SkipsPerInstanceDiskGate(t *testing.T) {
 	resolver := func(string) (SKUProfile, error) {
 		return SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 200}, nil
 	}
 	p := NewResourcePool(8, 8192, 1000, resolver, nil)
-	p.SetRetainedDisk(900) // 900 retained (other leases) + a 200 adopt would be 1100 > 1000
+	p.SetRetainedDisk(900) // 900 retained (other leases) + a fresh 200 would be 1100 > 1000
 
 	// A normal provision is correctly denied (would over-commit disk).
 	require.Error(t, p.TryAllocate("fresh", "sku", "t1"))
-	// Adopting a retained volume must SUCCEED (net-zero new disk) ...
-	require.NoError(t, p.TryAllocateAdopt("restore", "sku", "t1"))
+	// A same-tier adopt (delta 0) skips the per-instance disk gate and succeeds —
+	// the bytes are already committed on disk and counted in the retained projection.
+	require.NoError(t, p.TryAllocateAdoptAll([]AdoptInstance{{ID: "restore-0", SKU: "sku"}}, "t1", 0))
 	// ... and still records the disk in live accounting.
 	assert.Equal(t, int64(200), p.Stats().AllocatedDiskMB)
 }
 
-func TestTryAllocateAdopt_StillGatesCPU(t *testing.T) {
+func TestTryAllocateAdoptAll_StillGatesCPU(t *testing.T) {
 	resolver := func(string) (SKUProfile, error) {
 		return SKUProfile{CPUCores: 10, MemoryMB: 256, DiskMB: 200}, nil // 10 cores > 8 total
 	}
 	p := NewResourcePool(8, 8192, 1000, resolver, nil)
-	require.Error(t, p.TryAllocateAdopt("restore", "sku", "t1"), "adopt must still gate CPU/memory (new containers)")
+	require.Error(t, p.TryAllocateAdoptAll([]AdoptInstance{{ID: "restore-0", SKU: "sku"}}, "t1", 0),
+		"adopt must still gate CPU/memory (new containers)")
+	assert.Equal(t, float64(0), p.Stats().AllocatedCPU, "a rejected adopt reserves nothing")
 }
 
-// TestCheckAdoptDiskHeadroom is the ENG-545 regression at the pool level: a
-// restore's disk capacity is gated once against the AGGREGATE promote delta
-// (newTotalDiskMB - oldRetainedDiskMB), never per adopted volume. Same-tier and
-// demote deltas always pass; a promote delta is rejected only when it exceeds
-// remaining capacity (allocatedDisk + retainedDisk + delta > totalDisk). The
-// check is read-only.
-func TestCheckAdoptDiskHeadroom(t *testing.T) {
+// TestTryAllocateAdoptAll_GatesAggregateDelta is the ENG-545 regression at the pool
+// level: a restore's disk capacity is gated once against the AGGREGATE promote
+// delta (newTotalDiskMB - oldRetainedDiskMB), never per adopted volume, so a
+// fitting multi-volume promote is admitted rather than double-counted and rejected.
+func TestTryAllocateAdoptAll_GatesAggregateDelta(t *testing.T) {
 	resolver := func(string) (SKUProfile, error) {
-		return SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 1024}, nil
+		return SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 2048}, nil // new tier
 	}
-	// total 4096; the lease under restore has a retained footprint of 2048 (e.g.
-	// 2×1024) still counted in the projection at gate time.
-	p := NewResourcePool(8, 8192, 4096, resolver, nil)
-	p.SetRetainedDisk(2048)
+	// total 4096; the lease under restore has a retained footprint of 2048 (2×1024
+	// old) in the projection. Promote to 2×2048 = 4096 → delta 2048 → post-claim
+	// footprint 4096 fits exactly.
+	newPool := func() *ResourcePool {
+		p := NewResourcePool(8, 8192, 4096, resolver, nil)
+		p.SetRetainedDisk(2048)
+		return p
+	}
+	two := []AdoptInstance{{ID: "r-0", SKU: "sku"}, {ID: "r-1", SKU: "sku"}}
 
-	// Same-tier / demote (delta <= 0) always pass, even with no apparent headroom.
-	require.NoError(t, p.CheckAdoptDiskHeadroom(0), "same-tier restore must pass")
-	require.NoError(t, p.CheckAdoptDiskHeadroom(-512), "demote restore must pass")
+	// Fitting multi-volume promote (delta 2048) is admitted — a per-volume gate
+	// would have double-counted the retained bytes and rejected the second instance.
+	p := newPool()
+	require.NoError(t, p.TryAllocateAdoptAll(two, "t1", 2048),
+		"a fitting multi-volume promote must be admitted")
+	assert.Equal(t, int64(4096), p.Stats().AllocatedDiskMB, "both instances reserved")
 
-	// Promote delta that fits: growing 2048 -> 4096 is a +2048 delta;
-	// allocatedDisk(0) + retainedDisk(2048) + 2048 == 4096 == total → fits exactly.
-	// This is the multi-volume case a per-volume gate wrongly rejected.
-	require.NoError(t, p.CheckAdoptDiskHeadroom(2048),
-		"a promote whose post-claim footprint fits (== capacity) must be admitted")
-
-	// One MB beyond capacity must be rejected.
-	err := p.CheckAdoptDiskHeadroom(2049)
+	// One MB beyond capacity is rejected with nothing reserved.
+	p = newPool()
+	err := p.TryAllocateAdoptAll(two, "t1", 2049)
 	require.Error(t, err, "a promote delta exceeding capacity must be gated (ENG-545)")
 	assert.Contains(t, err.Error(), "insufficient disk")
+	assert.Equal(t, int64(0), p.Stats().AllocatedDiskMB, "a rejected batch reserves nothing")
 
-	// The check is read-only: no reservation was made.
-	assert.Equal(t, int64(0), p.Stats().AllocatedDiskMB, "CheckAdoptDiskHeadroom must not allocate")
+	// Same-tier / demote (delta <= 0) always pass, even at zero apparent headroom.
+	p = newPool()
+	require.NoError(t, p.TryAllocateAdoptAll(two, "t1", 0), "same-tier restore must pass")
+	p = newPool()
+	require.NoError(t, p.TryAllocateAdoptAll(two, "t1", -512), "demote restore must pass")
+}
+
+// TestTryAllocateAdoptAll_AtomicNoOverCommit is the PR #184 review regression: the
+// aggregate disk gate and the per-instance reservations run under a single lock, so
+// an allocation that consumed headroom before the batch is seen by the batch's gate
+// — the restore is rejected rather than over-committing the pool. A separate
+// headroom-check-then-adopt design over-committed in exactly this scenario.
+func TestTryAllocateAdoptAll_AtomicNoOverCommit(t *testing.T) {
+	resolver := func(sku string) (SKUProfile, error) {
+		switch sku {
+		case "big":
+			return SKUProfile{CPUCores: 0.1, MemoryMB: 16, DiskMB: 2048}, nil
+		case "filler":
+			return SKUProfile{CPUCores: 0.1, MemoryMB: 16, DiskMB: 1024}, nil
+		}
+		return SKUProfile{}, fmt.Errorf("unknown sku %q", sku)
+	}
+	p := NewResourcePool(8, 8192, 4096, resolver, nil)
+	p.SetRetainedDisk(2048) // the lease under restore, old footprint
+
+	// A fresh provision consumes 1024 of the headroom the restore would need.
+	require.NoError(t, p.TryAllocate("intruder", "filler", "t2"))
+
+	// The restore batch (delta 2048) now sees allocatedDisk(1024) + retained(2048) +
+	// 2048 = 5120 > 4096 and is rejected with nothing reserved — no over-commit.
+	err := p.TryAllocateAdoptAll([]AdoptInstance{{ID: "r-0", SKU: "big"}, {ID: "r-1", SKU: "big"}}, "t1", 2048)
+	require.Error(t, err, "batch must re-check capacity atomically against the concurrent allocation")
+
+	s := p.Stats()
+	assert.LessOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, s.TotalDiskMB, "pool must never be over-committed")
+	assert.Equal(t, int64(1024), s.AllocatedDiskMB, "only the intruder is reserved; the rejected restore reserved nothing")
+}
+
+// TestTryAllocateAdoptAll_AllOrNothing verifies the batch is atomic on failure: if
+// a later instance cannot be reserved (here the 3rd exhausts CPU), the instances
+// already reserved in the call are rolled back, leaving the pool untouched.
+func TestTryAllocateAdoptAll_AllOrNothing(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 3, MemoryMB: 16, DiskMB: 10}, nil // 3 CPU each; 3rd needs 9 > 8
+	}
+	p := NewResourcePool(8, 8192, 4096, resolver, nil)
+	three := []AdoptInstance{{ID: "r-0", SKU: "s"}, {ID: "r-1", SKU: "s"}, {ID: "r-2", SKU: "s"}}
+	require.Error(t, p.TryAllocateAdoptAll(three, "t1", 0), "the 3rd instance must exhaust CPU")
+	s := p.Stats()
+	assert.Equal(t, float64(0), s.AllocatedCPU, "partial reservations must be rolled back")
+	assert.Equal(t, int64(0), s.AllocatedDiskMB, "partial reservations must be rolled back")
+	assert.Equal(t, 0, s.AllocationCount, "no allocation may remain after an all-or-nothing failure")
+}
+
+// TestTryAllocateAdoptAll_ConcurrentNoOverCommit stresses the atomicity guarantee:
+// many goroutines interleave fresh provisions and restore batches against a tight
+// pool, and the invariant allocatedDisk+retainedDisk <= totalDisk must never be
+// observed violated (each restore here has no retained footprint of its own, so
+// delta == reserved and no per-lease double-count is expected). Run with -race and
+// -count to exercise the interleavings.
+func TestTryAllocateAdoptAll_ConcurrentNoOverCommit(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 0.001, MemoryMB: 1, DiskMB: 256}, nil
+	}
+	p := NewResourcePool(1000, 1_000_000, 4096, resolver, nil)
+	p.SetRetainedDisk(1024) // static footprint of other (non-restoring) leases
+
+	violation := make(chan string, 1)
+	flag := func() {
+		s := p.Stats()
+		if s.AllocatedDiskMB+s.RetainedDiskMB > s.TotalDiskMB {
+			select {
+			case violation <- fmt.Sprintf("over-commit: alloc=%d retained=%d total=%d",
+				s.AllocatedDiskMB, s.RetainedDiskMB, s.TotalDiskMB):
+			default:
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if i%2 == 0 {
+				_ = p.TryAllocate(fmt.Sprintf("prov-%d", i), "s", "t")
+			} else {
+				_ = p.TryAllocateAdoptAll([]AdoptInstance{
+					{ID: fmt.Sprintf("r-%d-0", i), SKU: "s"},
+					{ID: fmt.Sprintf("r-%d-1", i), SKU: "s"},
+				}, "t", 512) // new 512 == delta (no retained footprint for these)
+			}
+			flag()
+		}(i)
+	}
+	wg.Wait()
+	flag()
+
+	select {
+	case msg := <-violation:
+		t.Fatal(msg)
+	default:
+	}
 }
