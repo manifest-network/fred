@@ -817,10 +817,20 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// per-volume double-count of the retained bytes still in the projection until
 	// ClaimForRestore) and ATOMIC (no concurrent provision/restore can slip disk in
 	// between the check and the reservations), so a fitting multi-volume promote is
-	// admitted and the pool cannot be over-committed (ENG-545). An unresolved SKU
-	// counts 0 in leaseDiskMB, making the delta gate more conservative.
-	newDiskMB, _ := b.leaseDiskMB(req.Items)
-	oldDiskMB, _ := b.leaseDiskMB(rec.Items)
+	// admitted and the pool cannot be over-committed (ENG-545).
+	//
+	// req.Items SKUs are all resolved above (the profiles loop rejects an unknown
+	// SKU with ErrValidation), so newDiskMB is fully counted here. Only the retained
+	// record can reference a SKU whose profile was later removed; leaseDiskMB counts
+	// that as 0, which undercounts oldDiskMB and makes the delta (new-old) LARGER —
+	// the gate strictly MORE conservative, never an over-admission. Warn for operator
+	// visibility, mirroring computeRetainedDiskMB.
+	newDiskMB, newUnresolved := b.leaseDiskMB(req.Items)
+	oldDiskMB, oldUnresolved := b.leaseDiskMB(rec.Items)
+	if len(oldUnresolved) > 0 || len(newUnresolved) > 0 {
+		logger.Warn("restore disk gate: unresolved SKU profile(s); disk delta over-estimated, admission is more conservative",
+			"retained_unresolved_skus", oldUnresolved, "request_unresolved_skus", newUnresolved)
+	}
 	adoptInstances := make([]shared.AdoptInstance, 0, totalQuantity(req.Items))
 	for _, item := range req.Items {
 		for i := range item.Quantity {
