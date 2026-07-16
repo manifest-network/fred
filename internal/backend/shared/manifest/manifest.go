@@ -789,7 +789,11 @@ func (h *HealthCheckConfig) Validate() error {
 			return fmt.Errorf("test requires at least one command after %s", h.Test[0])
 		}
 	case HealthCheckTestNone:
-		// Valid, disables health check
+		// NONE disables the health check and takes no arguments. Reject trailing
+		// elements so the Go validator matches the JSON schema (maxItems: 1).
+		if len(h.Test) != 1 {
+			return fmt.Errorf("NONE health check takes no arguments")
+		}
 	default:
 		return fmt.Errorf("test must start with CMD, CMD-SHELL, or NONE")
 	}
