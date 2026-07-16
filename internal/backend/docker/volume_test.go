@@ -130,6 +130,40 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
 	})
+
+	// ENG-539: a tenant can plant a symlink inside its read-write stateful volume
+	// on one deploy, then on a later deploy declare a VOLUME whose path traverses
+	// that symlink. sanitizeVolumePath only validates the *string*, so the raw
+	// os.MkdirAll/os.Chown used to follow the on-disk symlink and escape the volume
+	// root — bind-mounting / chowning arbitrary host paths into the container.
+	// buildStatefulVolumeBinds must confine every operation to the volume root and
+	// fail closed when a path component is a symlink that escapes it.
+	t.Run("symlink leaf component escaping the volume root is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		outside := t.TempDir()
+		// Sentinel proving the escape target is a pre-existing directory the
+		// attacker points at (e.g. host "/" or another tenant's volume root).
+		require.NoError(t, os.WriteFile(filepath.Join(outside, "victim"), []byte("x"), 0o600))
+		// Tenant plants `dir/data -> outside` from inside its container on deploy 1.
+		require.NoError(t, os.Symlink(outside, filepath.Join(dir, "data")))
+
+		// Deploy 2 declares VOLUME /data.
+		_, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		require.Error(t, err, "must refuse to resolve a VOLUME path through a symlink that escapes the volume root")
+	})
+
+	t.Run("symlink intermediate component escaping the volume root is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		outside := t.TempDir()
+		// Tenant plants `dir/esc -> outside`.
+		require.NoError(t, os.Symlink(outside, filepath.Join(dir, "esc")))
+
+		// Deploy 2 declares VOLUME /esc/pwned, which would traverse the symlink.
+		_, err := buildStatefulVolumeBinds(dir, []string{"/esc/pwned"}, 0, 0)
+		require.Error(t, err, "must refuse to create a VOLUME subdir through an escaping symlink")
+		// The escape target must not be written to.
+		assert.NoDirExists(t, filepath.Join(outside, "pwned"), "MkdirAll must not have followed the symlink out of the volume root")
+	})
 }
 
 func TestNoopVolumeManager(t *testing.T) {

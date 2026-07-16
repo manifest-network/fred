@@ -42,8 +42,11 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -52,6 +55,51 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
+
+// resolveMigratedBindSource returns the host bind-source path for a migrated
+// stateful volume target under hostRoot, failing closed if the target resolves
+// through a symlink that escapes hostRoot. Without this, a tenant that planted a
+// symlink inside its legacy volume (e.g. `data -> /`) would, at migration, get an
+// arbitrary host path bind-mounted into the recreated container — the same escape
+// as buildStatefulVolumeBinds (ENG-539). Legacy containers are stopped before this
+// runs, so there is no concurrent writer racing the check.
+//
+// A not-yet-existing subdir is permitted: os.Root has already proven that every
+// EXISTING path component stays within the root, so the source Docker creates at
+// mount time also stays within it. Any component that escapes the root, or a leaf
+// that is itself a symlink, is rejected; a symlink that stays within the root is
+// followed (it cannot redirect the bind source outside the volume, and legacy
+// containers are stopped so no concurrent writer can re-point it).
+func resolveMigratedBindSource(hostRoot, sanitized string) (string, error) {
+	root, err := os.OpenRoot(hostRoot)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// Volume root absent on disk: there is no directory tree that could
+			// hide a tenant-planted symlink, so the source Docker creates under the
+			// operator-owned volume path is safe. In the normal migration flow the
+			// root exists after RenameVolume; this preserves the pre-ENG-539
+			// behavior for the absent-root edge case.
+			return filepath.Join(hostRoot, sanitized), nil
+		}
+		return "", fmt.Errorf("open volume root %q: %w", hostRoot, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	info, err := root.Lstat(sanitized)
+	switch {
+	case err == nil:
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return "", fmt.Errorf("mount target %q resolves through a symlink", sanitized)
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		// Not created yet — allowed; the existing prefix was traversed by os.Root
+		// without escaping, so the eventual Docker-created source stays in-root.
+	default:
+		// "path escapes from parent" or any other error: fail closed.
+		return "", fmt.Errorf("resolve mount target %q: %w", sanitized, err)
+	}
+	return filepath.Join(hostRoot, sanitized), nil
+}
 
 // legacyMigration describes the work needed to recreate ALL legacy
 // containers of one lease as a single stack-form (1-service,
@@ -397,7 +445,11 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 				if sanitized == "" {
 					return fmt.Errorf("legacy mount target %q is unsupported under stack-form layout", r.Target)
 				}
-				binds.StatefulBinds[filepath.Join(hostRoot, sanitized)] = r.Target
+				src, err := resolveMigratedBindSource(hostRoot, sanitized)
+				if err != nil {
+					return fmt.Errorf("legacy mount target %q: %w", r.Target, err)
+				}
+				binds.StatefulBinds[src] = r.Target
 			}
 		}
 		volBinds[manifest.DefaultServiceName][inst.LegacyContainer.InstanceIndex] = binds

@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,55 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestResolveMigratedBindSource pins the ENG-539 hardening on the legacy→stack
+// migration path: a stateful volume target must never resolve through a symlink
+// that escapes the volume root, or the recreated container would bind-mount an
+// arbitrary host path. Legacy containers are stopped before this runs, so there
+// is no concurrent writer racing the check.
+func TestResolveMigratedBindSource(t *testing.T) {
+	t.Run("existing real directory resolves within the volume root", func(t *testing.T) {
+		hostRoot := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(hostRoot, "data"), 0o700))
+		src, err := resolveMigratedBindSource(hostRoot, "data")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(hostRoot, "data"), src)
+	})
+
+	t.Run("missing subdir is allowed (Docker creates it safely within the root)", func(t *testing.T) {
+		hostRoot := t.TempDir()
+		src, err := resolveMigratedBindSource(hostRoot, "data")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(hostRoot, "data"), src)
+	})
+
+	t.Run("absent volume root falls back to plain join (behavior-preserving)", func(t *testing.T) {
+		// In the normal flow the root exists after RenameVolume; when it does not
+		// (e.g. nothing was ever written), there is no tree to hide a symlink, so
+		// the pre-ENG-539 behavior is preserved rather than failing the migration.
+		hostRoot := filepath.Join(t.TempDir(), "does-not-exist")
+		src, err := resolveMigratedBindSource(hostRoot, "data")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(hostRoot, "data"), src)
+	})
+
+	t.Run("leaf symlink escaping the volume root is rejected", func(t *testing.T) {
+		hostRoot := t.TempDir()
+		outside := t.TempDir()
+		require.NoError(t, os.Symlink(outside, filepath.Join(hostRoot, "data")))
+		_, err := resolveMigratedBindSource(hostRoot, "data")
+		require.Error(t, err, "a migrated target that is a symlink out of the volume root must be refused")
+	})
+
+	t.Run("intermediate symlink escaping the volume root is rejected", func(t *testing.T) {
+		hostRoot := t.TempDir()
+		outside := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(outside, "sub"), 0o700))
+		require.NoError(t, os.Symlink(outside, filepath.Join(hostRoot, "esc")))
+		_, err := resolveMigratedBindSource(hostRoot, "esc/sub")
+		require.Error(t, err, "a migrated target traversing an escaping symlink must be refused")
+	})
+}
 
 // TestRecoverState_MigratesLegacyContainer: a managed container with
 // fred.lease_uuid but no fred.service_name is recreated as a stack-form

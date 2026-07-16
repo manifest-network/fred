@@ -24,6 +24,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- docker: harden stateful-volume bind setup against a symlink escape. A tenant
+  could plant a symlink inside its read-write stateful volume (e.g. `data -> /`)
+  and, on a later deploy declaring a matching `VOLUME`, have
+  `buildStatefulVolumeBinds` follow it — bind-mounting or `chown`-ing an arbitrary
+  host path (host `/`, another tenant's volume) into the container with
+  root-equivalent access. `sanitizeVolumePath` only validated the VOLUME *string*,
+  so the raw `os.MkdirAll`/`os.Chown` traversed the on-disk symlink. Subdirectory
+  creation is now confined to the volume root via `os.Root` (mirroring the ENG-430
+  tar-extraction hardening), so a VOLUME path that traverses a symlink escaping the
+  volume root is rejected instead of followed. The same guard is applied to the
+  legacy→stack migration bind path (`migrate.go`). (ENG-539)
+
 ## [0.9.0] - 2026-07-14
 
 ### Added
