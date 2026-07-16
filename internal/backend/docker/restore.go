@@ -191,7 +191,7 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 		// retained F + live F = 2F in steady state (ENG-360 Fix #1).
 		b.refreshRetentionAccounting()
 		// Derive and release the new lease's live allocation ids using the same
-		// {newLease}-{svc}-{idx} scheme as Restore()'s TryAllocateAdopt loop.
+		// {newLease}-{svc}-{idx} scheme Restore() builds for TryAllocateAdoptAll.
 		var liveIDs []string
 		for _, item := range e.Items {
 			for i := range item.Quantity {
