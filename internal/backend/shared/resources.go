@@ -73,28 +73,80 @@ func NewResourcePool(totalCPU float64, totalMemoryMB, totalDiskMB int64, resolve
 // TryAllocate attempts to reserve resources for a new provision (gates all of
 // CPU, memory, disk, and tenant quota).
 func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
-	return p.tryAllocate(leaseUUID, sku, tenant, true)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tryAllocateLocked(leaseUUID, sku, tenant, true)
 }
 
-// TryAllocateAdopt reserves resources for a lease being RESTORED by adopting an
-// existing retained volume (rename, not new disk). It gates CPU, memory, and
-// tenant quota normally but SKIPS the global disk capacity check: the adopted
-// bytes are already committed on disk and counted in the retained projection, so
-// re-gating them would double-count the lease's own footprint and spuriously deny
-// a restore that physically fits. DiskMB is still added to allocatedDisk for
-// correct live accounting; the retained projection drops it when the record flips
-// to restoring.
-func (p *ResourcePool) TryAllocateAdopt(leaseUUID, sku, tenant string) error {
-	return p.tryAllocate(leaseUUID, sku, tenant, false)
+// AdoptInstance identifies one container instance to reserve on the restore/adopt
+// path: its pool allocation id and the SKU of the tier it is restored onto.
+type AdoptInstance struct {
+	ID  string
+	SKU string
 }
 
-// tryAllocate is the shared implementation for TryAllocate and TryAllocateAdopt.
-// When gateDisk is true the global disk capacity check is enforced; when false
-// (adopt/restore) the check is skipped because the disk was already committed.
-func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool) error {
+// TryAllocateAdoptAll atomically reserves every instance of a restore under a
+// single lock acquisition. Restore adopts existing volumes (rename, not fresh
+// disk), so the per-instance reservations SKIP the global disk gate — the adopted
+// bytes are already committed on disk and counted in the retained projection.
+// Disk CAPACITY is gated once, here, on the AGGREGATE promote delta. The pool
+// computes the new total from its OWN resolver — the exact DiskMB the per-instance
+// reservations below will add — and subtracts oldRetainedDiskMB (the lease's
+// already-committed retained footprint, which the caller derives from the
+// retention record and which is already counted in retainedDisk). A same-tier or
+// demote restore (delta <= 0) adds no disk pressure.
+//
+// Gating the delta and committing all reservations under ONE lock is what makes
+// admission correct on three axes: (1) EXACT — a per-volume disk gate would
+// double-count the retained bytes still in the projection until ClaimForRestore
+// and reject a fitting multi-volume promote; (2) ATOMIC — no concurrent
+// TryAllocate/restore can consume disk between the delta check and the
+// reservations, so the pool cannot be over-committed; and (3) CONSISTENT — the
+// gated new total is computed from the same resolver that sizes the reservations,
+// so a caller whose SKU resolver diverges from the pool's cannot under-gate disk
+// (ENG-545, PR #184 review). Only oldRetainedDiskMB is a caller input, and it
+// enters the gate in the safe direction (undercounting it enlarges the delta).
+//
+// CPU, memory, and tenant quota are gated per instance (new containers). On any
+// failure nothing is reserved: the instances committed so far in this call are
+// rolled back before returning.
+func (p *ResourcePool) TryAllocateAdoptAll(instances []AdoptInstance, tenant string, oldRetainedDiskMB int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	var newDiskMB int64
+	for _, in := range instances {
+		profile, err := p.skuResolver(in.SKU)
+		if err != nil {
+			return err
+		}
+		newDiskMB += profile.DiskMB
+	}
+	if delta := newDiskMB - oldRetainedDiskMB; delta > 0 && p.allocatedDisk+p.retainedDisk+delta > p.totalDisk {
+		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
+			delta, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
+	}
+
+	reserved := make([]string, 0, len(instances))
+	for _, in := range instances {
+		if err := p.tryAllocateLocked(in.ID, in.SKU, tenant, false); err != nil {
+			for _, id := range reserved {
+				p.releaseLocked(id)
+			}
+			return err
+		}
+		reserved = append(reserved, in.ID)
+	}
+	return nil
+}
+
+// tryAllocateLocked reserves one instance. The caller MUST hold p.mu. When
+// gateDisk is true the global disk capacity check is enforced (fresh provision);
+// when false (adopt) it is skipped because the disk is already committed and its
+// capacity is gated by the caller (TryAllocateAdoptAll's aggregate delta). CPU,
+// memory, and tenant quota are always gated; the full DiskMB is always added to
+// allocatedDisk for correct live accounting.
+func (p *ResourcePool) tryAllocateLocked(leaseUUID, sku, tenant string, gateDisk bool) error {
 	// Check if already allocated
 	if _, exists := p.allocations[leaseUUID]; exists {
 		return fmt.Errorf("lease %s already has allocated resources", leaseUUID)
@@ -168,7 +220,11 @@ func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool)
 func (p *ResourcePool) Release(leaseUUID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.releaseLocked(leaseUUID)
+}
 
+// releaseLocked is Release's body; the caller MUST hold p.mu.
+func (p *ResourcePool) releaseLocked(leaseUUID string) {
 	alloc, exists := p.allocations[leaseUUID]
 	if !exists {
 		return

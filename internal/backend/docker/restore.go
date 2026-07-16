@@ -191,7 +191,7 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 		// retained F + live F = 2F in steady state (ENG-360 Fix #1).
 		b.refreshRetentionAccounting()
 		// Derive and release the new lease's live allocation ids using the same
-		// {newLease}-{svc}-{idx} scheme as Restore()'s TryAllocateAdopt loop.
+		// {newLease}-{svc}-{idx} scheme Restore() builds for TryAllocateAdoptAll.
 		var liveIDs []string
 		for _, item := range e.Items {
 			for i := range item.Quantity {
@@ -809,19 +809,44 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	}.materialize()
 	b.provisionsMu.Unlock()
 
-	// (c) Allocate pool slots.
-	var allocatedIDs []string
+	// (c) Reserve pool slots for the restore atomically. Restore adopts existing
+	// volumes (rename, not fresh disk), so disk capacity is gated once on the
+	// AGGREGATE promote delta — the growth of the lease's total DiskMB above its
+	// already-committed retained footprint — while CPU/mem/tenant are gated per
+	// instance. TryAllocateAdoptAll does the whole reservation under a single pool
+	// lock: the gate is EXACT (no per-volume double-count of the retained bytes
+	// still in the projection until ClaimForRestore), ATOMIC (no concurrent
+	// provision/restore can slip disk in between the check and the reservations),
+	// and CONSISTENT (the pool computes the new total from its own resolver, so it
+	// cannot under-gate against the reservation). A fitting multi-volume promote is
+	// admitted and the pool cannot be over-committed (ENG-545).
+	//
+	// We pass only the OLD retained footprint. The retained record can reference a
+	// SKU whose profile was later removed; leaseDiskMB counts that as 0, which
+	// undercounts oldDiskMB and makes the delta LARGER — strictly more conservative,
+	// never an over-admission. Warn for operator visibility, mirroring
+	// computeRetainedDiskMB.
+	oldDiskMB, oldUnresolved := b.leaseDiskMB(rec.Items)
+	if len(oldUnresolved) > 0 {
+		logger.Warn("restore disk gate: retained record references unresolved SKU profile(s); retained footprint undercounted, admission is more conservative",
+			"retained_unresolved_skus", oldUnresolved)
+	}
+	adoptInstances := make([]shared.AdoptInstance, 0, totalQuantity(req.Items))
 	for _, item := range req.Items {
 		for i := range item.Quantity {
-			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant); aerr != nil {
-				releaseAll(b.pool, allocatedIDs)
-				updateResourceMetrics(b.pool.Stats())
-				b.removeProvision(req.LeaseUUID)
-				return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, aerr)
-			}
-			allocatedIDs = append(allocatedIDs, id)
+			adoptInstances = append(adoptInstances, shared.AdoptInstance{
+				ID:  fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i),
+				SKU: item.SKU,
+			})
 		}
+	}
+	if aerr := b.pool.TryAllocateAdoptAll(adoptInstances, rec.Tenant, oldDiskMB); aerr != nil {
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, aerr)
+	}
+	allocatedIDs := make([]string, len(adoptInstances))
+	for i, in := range adoptInstances {
+		allocatedIDs[i] = in.ID
 	}
 	// Refresh the resource gauges now that the allocation succeeded, mirroring
 	// Provision/Deprovision's on-success refresh. The rollback paths re-refresh
