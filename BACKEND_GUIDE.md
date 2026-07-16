@@ -83,7 +83,7 @@ Your backend receives the full SKU and decides what to do with it. This is entir
 
 **Note:** The `mock-backend` included with Fred ignores the SKU entirely - it provisions the same fake resource regardless of SKU. This is intentional for testing purposes.
 
-**Note on `k8s-*` / k3s:** The `k8s-small`/`k8s-large` rows above are illustrative only. The bundled `k3s-backend` is an **experimental, non-functional scaffold (ENG-133)**: it serves the full HTTP contract, but its provisioner returns `status=failed, error="not implemented"` and returns `ErrNotProvisioned` for info/logs/restart/update. It is **not for production use**; real Kubernetes provisioning lands in ENG-134+.
+**Note on `k8s-*` / k3s:** The `k8s-small`/`k8s-large` rows above are illustrative only. The bundled `k3s-backend` is an **experimental, non-functional scaffold (ENG-133)**: it serves the full HTTP contract except the optional `POST /restore` retention route (retention/restore is docker-only today), but its provisioner returns `status=failed, error="not implemented"` and returns `ErrNotProvisioned` for info/logs/restart/update. It is **not for production use**; real Kubernetes provisioning lands in ENG-134+.
 
 ## Inbound Authentication
 

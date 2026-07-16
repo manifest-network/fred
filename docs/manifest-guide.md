@@ -106,7 +106,7 @@ A JSON object with a top-level `services` key containing a map of service names 
 | `env` | object | No | `{}` | Environment variables (string→string map). |
 | `command` | string[] | No | `[]` | Overrides the container entrypoint. |
 | `args` | string[] | No | `[]` | Arguments passed to the command. |
-| `labels` | object | No | `{}` | Custom container labels (string→string map). |
+| `labels` | object | No | `{}` | Custom container labels (string→string map). Keys may not start with `fred.` or `traefik.` (reserved). |
 | `health_check` | object | No | `null` | Health check configuration. See [Health Check](#health-check). |
 | `tmpfs` | string[] | No | `[]` | Additional tmpfs mount paths. See [Tmpfs Mounts](#tmpfs-mounts). |
 | `user` | string | No | `""` | Container runtime user (`"uid"`, `"uid:gid"`, `"name"`, `"name:group"`). |
@@ -203,14 +203,15 @@ Env var names are validated for security:
 
 ### Labels
 
-- Keys must **not** start with `fred.` — this prefix is reserved for backend-managed labels.
+- Keys must **not** start with `fred.` or `traefik.` — both are reserved: `fred.` for backend-managed labels, and `traefik.` for shared ingress routing (a tenant-set `traefik.*` label could otherwise hijack another tenant's router — ENG-497). Configure ingress via the manifest's `ingress`/port settings, not raw Traefik labels.
 
 ```json
 // Valid
 { "labels": { "app": "myapp", "version": "1.0" } }
 
-// Invalid
+// Invalid — reserved prefixes
 { "labels": { "fred.lease": "abc-123" } }
+{ "labels": { "traefik.http.routers.x.rule": "Host(`evil.example`)" } }
 ```
 
 ### Health Check
@@ -641,6 +642,7 @@ Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume 
 | `NONE` health check with `service_healthy` | Same as above | Use `CMD` or `CMD-SHELL` instead |
 | Setting `PATH` env var | `variable "PATH" is not allowed` | Use a different variable name or set PATH in the Dockerfile |
 | Using `fred.*` label prefix | `labels cannot use reserved prefix 'fred.'` | Choose a different prefix |
+| Using `traefik.*` label prefix | `labels cannot use reserved prefix 'traefik.'` | Remove it — configure ingress via the manifest `ingress`/port settings, not raw Traefik labels (ENG-497) |
 | More than 4 tmpfs mounts | `too many mounts (N), maximum is 4` | Consolidate mount points |
 | Tmpfs on `/tmp` or `/run` | `path "/tmp" is managed by the backend` | These are auto-mounted; use sub-paths if needed |
 | Tmpfs under `/proc`, `/sys`, `/dev` | `path ... is under sensitive path ...` | These kernel filesystems cannot be masked |

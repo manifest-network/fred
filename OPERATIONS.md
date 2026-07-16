@@ -47,17 +47,19 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 
 ## Out-of-gas tuning
 
-Lease acknowledgments are submitted as Cosmos SDK transactions with a fixed `gas_limit` (default 1,500,000) multiplied by `gas_adjustment` (default 1.2). When the chain rejects with `out of gas`, the broadcast layer retries with `1.5×` more gas, compounding up to `max_gas_limit` (default `0` = uncapped).
+Lease acknowledgments and withdrawals are submitted as Cosmos SDK transactions. Since ENG-431 the daemon **simulates gas per transaction**: the declared gas is `gas_adjustment × simulated GasUsed` (default `gas_adjustment` 1.2), and a simulated estimate exceeding `max_gas_limit` (default `0` = uncapped) is rejected before broadcast. `gas_limit` (default 1,500,000) is now only the **Simulate-failure fallback ceiling** — used when the Simulate RPC errors or the simulation circuit-breaker is open, not on the steady-state path. When the chain still rejects a broadcast with `out of gas`, the broadcast layer retries with `1.5×` more gas, compounding up to `max_gas_limit`.
 
 **Diagnosing:**
-- Spikes in `fred_chain_signer_oog_retries_total{result="retried"}`: retries are working — the gas estimate is tight but eventually succeeds. Consider raising `gas_limit` to skip the retry.
+- `fred_chain_gas_simulation_total{result}`: a rising `fallback` rate means Simulate is unavailable and the daemon is on the fixed `gas_limit` ceiling (so `gas_limit` tuning below becomes relevant); `refused` means a simulated estimate exceeded `max_gas_limit` and the tx was rejected before broadcast.
+- `fred_chain_gas_simulated`: histogram of the declared-gas magnitude per broadcast — watch it to observe steady-state gas draw and to size `max_gas_limit`.
+- Spikes in `fred_chain_signer_oog_retries_total{result="retried"}`: retries are working — the estimate was tight but eventually succeeded.
 - Spikes in `fred_chain_signer_oog_retries_total{result="exhausted"}` or `fred_provisioner_ack_batch_fee_gas_errors_total`: the cap is too low or the underlying tx genuinely needs more gas (e.g. a large authz batch).
 
 **Tuning:**
-1. Look at chain logs for the `gas_used` of failing txs.
-2. Set `gas_limit` to `1.2 × p99 gas_used`.
+1. Steady-state gas self-tunes via per-tx simulation — you normally do **not** set `gas_limit`; it only affects the Simulate-failure fallback path.
+2. If `fred_chain_gas_simulation_total{result="fallback"}` is non-trivial, set `gas_limit` to `1.2 × p99 gas_used` (from chain logs or `fred_chain_gas_simulated`) so the fallback still covers a real tx.
 3. If using authz sub-signers (`sub_signer_count > 0`), each lane has its own gas budget; the total chain cost scales with `sub_signer_count`.
-4. Set `max_gas_limit` to a safety cap (e.g. `4 × gas_limit`) so a runaway tx doesn't consume an entire fee budget on retries.
+4. Set `max_gas_limit` to a safety cap (e.g. `4 × gas_limit`) so a runaway tx doesn't consume an entire fee budget on retries; note it also bounds the pre-broadcast reject (`result="refused"`).
 
 ---
 
@@ -320,17 +322,20 @@ they are **not** counted by `restore_total`.
 
 ## Withdrawal and credit monitoring
 
-Fees are pulled into the provider account by `WithdrawScheduler` at `withdraw_interval` (default 1h). Between ticks, the credit checker estimates which tenants will deplete before the next tick and triggers an early withdrawal so we don't miss fees.
+Fees are pulled into the provider account by `WithdrawScheduler` on a paid-withdraw cadence of `withdraw_interval` (default 1h). The scheduler also wakes on a separate credit-check cadence, `credit_check_interval` (default `0s` = coupled to `withdraw_interval`); each wake estimates which tenants will deplete before the next paid withdrawal. When `credit_check_interval < withdraw_interval` a **withdraw-cadence guard** is active (`fred_withdraw_guard_active` = 1): credit checks run at the faster cadence, but the paid provider-wide withdrawal stays rate-limited to once per `withdraw_interval` since the last full drain, so faster credit polling no longer forces an extra paid withdrawal every tick (ENG-524). Closed leases settle in full regardless, so a deferred paid withdrawal is a cash-timing choice, not lost fees. `credit_check_interval` must be `≤ withdraw_interval` when set.
 
 **Symptoms of failure:**
 - `fred_chain_transactions_total{type="withdraw",outcome="error"}` rising
 - Provider balance not increasing despite active leases
+- `fred_withdraw_incomplete_cycles_total` rising → the provider was not fully drained in a cycle because the cursor hit `max_withdraw_iterations` (default 100); raise it for the active-lease count (deferred to the next cycle, not lost)
 - Cross-provider auto-close events not triggering withdrawals → check the watcher is running and seeded
 
 **Common causes:**
 - Insufficient gas (see [Out-of-gas tuning](#out-of-gas-tuning))
 - Authz authorization expired or revoked when using `sub_signer_count > 0` — the primary key keeps working but sub-signers fail
 - Sub-signer balance below `sub_signer_min_balance` and top-up failing — check `sub_signer_top_up_amount` and primary balance
+
+> **Not a fault:** paid withdrawals appearing less frequent than credit checks is expected when the cadence guard is active — `fred_withdraw_guard_active` = 1 and `fred_withdraw_skipped_by_guard_total` incrementing is by-design rate-limiting, not an error.
 
 ---
 

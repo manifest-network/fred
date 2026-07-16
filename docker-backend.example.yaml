@@ -15,6 +15,13 @@ name: docker
 # HTTP server listen address
 listen_addr: ":9001"
 
+# Maximum inbound HTTP request body size in bytes. Default: 2 MiB (2097152),
+# deliberately larger than providerd's 1 MiB cap so a manifest that cleared
+# providerd is not rejected on the backend hop after envelope wrapping. A
+# non-positive value falls back to the default. Also settable via the
+# DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE env var (ENG-448).
+# max_request_body_size: 2097152
+
 # ---------------------------------------------------------------------------
 # TLS / mTLS (ENG-103)
 # ---------------------------------------------------------------------------

@@ -23,6 +23,13 @@ name: k3s
 # docker-backend default of :9001 if both run on the same host.
 listen_addr: ":9002"
 
+# Maximum inbound HTTP request body size in bytes. Default: 2 MiB (2097152),
+# deliberately larger than providerd's cap so a manifest that cleared providerd
+# is not rejected on the backend hop after envelope wrapping. A non-positive
+# value falls back to the default. Also settable via the
+# K3S_BACKEND_MAX_REQUEST_BODY_SIZE env var (ENG-448).
+# max_request_body_size: 2097152
+
 # =============================================================================
 # KUBECONFIG
 # =============================================================================
@@ -164,8 +171,15 @@ allowed_registries:
 # Must match callback_secret configured on the Fred side.
 callback_secret: ""
 
+# Production mode: tighten startup checks. When true, the backend refuses to
+# start if any dev-only insecure toggle is set (currently
+# callback_insecure_skip_verify below). Mirrors providerd's production_mode.
+# Default: false
+# production_mode: true
+
 # Skip TLS certificate verification for callbacks (development only!).
 # WARNING: Never enable in production — vulnerable to MITM attacks.
+# Rejected at startup when production_mode is true.
 # callback_insecure_skip_verify: false
 
 # Path to bbolt database for persisting pending callbacks.
