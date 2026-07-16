@@ -475,14 +475,14 @@ Full diagnostics (exit codes, OOM status, container logs) are available via the 
 ```json
 {
   "lease_uuid": "...",
-  "status": "success" | "failed" | "deprovisioned",
+  "status": "deprovisioned",
   "error": "",
   "backend": "docker",
-  "retained": false
+  "retained": true
 }
 ```
 
-`backend` and `retained` are both `omitempty`. `retained` is only meaningful on a `deprovisioned` callback: it is `true` when the backend actually soft-deleted (retained) the lease's volumes, and is the best-effort ground truth (the queryable `/retentions` status is the durable backstop).
+`status` is one of `success`, `failed`, or `deprovisioned`. `backend` and `retained` are both `omitempty`. `retained` is only meaningful on a `deprovisioned` callback: it is `true` when the backend actually soft-deleted (retained) the lease's volumes, and is the best-effort ground truth (the queryable `/retentions` status is the durable backstop).
 
 ### Retry Strategy
 
