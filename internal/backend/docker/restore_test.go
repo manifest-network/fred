@@ -3381,7 +3381,7 @@ func TestRollback_RevertStoreError_KeepsLiveCounted(t *testing.T) {
 	rec.NewLeaseUUID = "new"
 	rec.Generation = 2
 	require.NoError(t, rs.Put(rec))
-	require.NoError(t, b.pool.TryAllocateAdopt("new-app-0", "docker-micro", "t1"))
+	require.NoError(t, b.pool.TryAllocateAdopt("new-app-0", "docker-micro", "t1", 512)) // same-tier (docker-micro DiskMB=512)
 
 	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }} // re-quarantine succeeds
 

@@ -24,6 +24,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- docker: gate the disk **promote delta** when restoring a lease onto a
+  larger-disk SKU tier. `Restore` adopts retained volumes via a pool allocation
+  that intentionally skips the global disk-capacity check (the adopted bytes are
+  already committed on disk and counted in the retained projection). On a
+  *promote* (new SKU `disk_mb` greater than the retained tier's), the extra
+  headroom was never checked against free capacity, so a tenant could soft-close
+  a small-tier lease and restore it onto a much larger tier — repeatedly — to
+  drive committed XFS quota past physical disk and cause cross-tenant `ENOSPC`.
+  The adopt path now gates only the growth above the retained footprint
+  (`max(0, new − old)` disk); same-tier and demote restores still skip the gate
+  as before. (ENG-545)
 - docker: harden stateful-volume bind setup against a symlink escape. A tenant
   could plant a symlink inside its read-write stateful volume (e.g. `data -> /`)
   and, on a later deploy declaring a matching `VOLUME`, have

@@ -73,25 +73,30 @@ func NewResourcePool(totalCPU float64, totalMemoryMB, totalDiskMB int64, resolve
 // TryAllocate attempts to reserve resources for a new provision (gates all of
 // CPU, memory, disk, and tenant quota).
 func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
-	return p.tryAllocate(leaseUUID, sku, tenant, true)
+	return p.tryAllocate(leaseUUID, sku, tenant, true, 0)
 }
 
 // TryAllocateAdopt reserves resources for a lease being RESTORED by adopting an
-// existing retained volume (rename, not new disk). It gates CPU, memory, and
-// tenant quota normally but SKIPS the global disk capacity check: the adopted
-// bytes are already committed on disk and counted in the retained projection, so
-// re-gating them would double-count the lease's own footprint and spuriously deny
-// a restore that physically fits. DiskMB is still added to allocatedDisk for
-// correct live accounting; the retained projection drops it when the record flips
-// to restoring.
-func (p *ResourcePool) TryAllocateAdopt(leaseUUID, sku, tenant string) error {
-	return p.tryAllocate(leaseUUID, sku, tenant, false)
+// existing retained volume (rename, not fresh disk). It gates CPU, memory, and
+// tenant quota normally. For the global disk gate it does NOT re-check the whole
+// footprint — the adopted bytes are already committed on disk and counted in the
+// retained projection, so re-gating would double-count and spuriously deny a
+// restore that physically fits. Instead it gates only the PROMOTE DELTA: the
+// growth of the new SKU's DiskMB above adoptOldDiskMB (the disk the retained
+// record already contributed to the retained projection). Same-tier and demote
+// (delta <= 0) skip the disk gate exactly as before; a promote into a larger
+// tier is capacity-checked so restore cannot over-commit the pool (ENG-545). The
+// full new DiskMB is still added to allocatedDisk for correct live accounting;
+// the retained projection drops adoptOldDiskMB when the record flips to restoring.
+func (p *ResourcePool) TryAllocateAdopt(leaseUUID, sku, tenant string, adoptOldDiskMB int64) error {
+	return p.tryAllocate(leaseUUID, sku, tenant, false, adoptOldDiskMB)
 }
 
 // tryAllocate is the shared implementation for TryAllocate and TryAllocateAdopt.
-// When gateDisk is true the global disk capacity check is enforced; when false
-// (adopt/restore) the check is skipped because the disk was already committed.
-func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool) error {
+// When gateDisk is true the full DiskMB is gated against global capacity (fresh
+// provision). When false (adopt/restore) only the promote delta above
+// adoptOldDiskMB is gated; adoptOldDiskMB is ignored when gateDisk is true.
+func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool, adoptOldDiskMB int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -115,9 +120,22 @@ func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool)
 		return fmt.Errorf("insufficient memory: need %d MB, have %d MB available",
 			profile.MemoryMB, p.totalMemory-p.allocatedMemory)
 	}
-	if gateDisk && p.allocatedDisk+p.retainedDisk+profile.DiskMB > p.totalDisk {
+	// Global disk gate. A fresh provision gates its full DiskMB. An adopt
+	// (restore) gates only the PROMOTE DELTA above the volume's already-committed
+	// retained footprint: those bytes are already counted in retainedDisk, so only
+	// growth (DiskMB - adoptOldDiskMB) is new disk pressure. Same-tier and demote
+	// (delta <= 0) add no pressure and skip the gate exactly as the prior
+	// unconditional adopt skip did; only a promote into a larger tier is
+	// capacity-checked, so a restore can no longer over-commit the pool (ENG-545).
+	diskPressure := profile.DiskMB
+	if !gateDisk {
+		if diskPressure = profile.DiskMB - adoptOldDiskMB; diskPressure < 0 {
+			diskPressure = 0
+		}
+	}
+	if (gateDisk || diskPressure > 0) && p.allocatedDisk+p.retainedDisk+diskPressure > p.totalDisk {
 		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
-			profile.DiskMB, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
+			diskPressure, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
 	}
 
 	// Check per-tenant quota if configured

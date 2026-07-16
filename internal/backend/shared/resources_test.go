@@ -437,8 +437,9 @@ func TestTryAllocateAdopt_SkipsDiskGate(t *testing.T) {
 
 	// A normal provision is correctly denied (would over-commit disk).
 	require.Error(t, p.TryAllocate("fresh", "sku", "t1"))
-	// Adopting a retained volume must SUCCEED (net-zero new disk) ...
-	require.NoError(t, p.TryAllocateAdopt("restore", "sku", "t1"))
+	// Adopting a retained volume at the SAME tier must SUCCEED (net-zero new
+	// disk: old DiskMB == new DiskMB == 200, so the promote delta is 0) ...
+	require.NoError(t, p.TryAllocateAdopt("restore", "sku", "t1", 200))
 	// ... and still records the disk in live accounting.
 	assert.Equal(t, int64(200), p.Stats().AllocatedDiskMB)
 }
@@ -448,5 +449,43 @@ func TestTryAllocateAdopt_StillGatesCPU(t *testing.T) {
 		return SKUProfile{CPUCores: 10, MemoryMB: 256, DiskMB: 200}, nil // 10 cores > 8 total
 	}
 	p := NewResourcePool(8, 8192, 1000, resolver, nil)
-	require.Error(t, p.TryAllocateAdopt("restore", "sku", "t1"), "adopt must still gate CPU/memory (new containers)")
+	require.Error(t, p.TryAllocateAdopt("restore", "sku", "t1", 200), "adopt must still gate CPU/memory (new containers)")
+}
+
+// TestTryAllocateAdopt_GatesPromoteDelta is the ENG-545 regression: adopting a
+// retained volume into a LARGER (promote) SKU must gate the growth above the
+// retained footprint against global capacity, so a restore cannot over-commit
+// the disk pool. Same-tier/demote adopts still skip the gate (net-zero/negative
+// new disk). Before the fix, TryAllocateAdopt skipped the disk gate entirely, so
+// the promote below was admitted and drove allocatedDisk past totalDisk.
+func TestTryAllocateAdopt_GatesPromoteDelta(t *testing.T) {
+	resolver := func(sku string) (SKUProfile, error) {
+		switch sku {
+		case "small": // the retained (old) tier
+			return SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 500}, nil
+		case "big": // promote target
+			return SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 900}, nil
+		default:
+			return SKUProfile{}, fmt.Errorf("unknown sku %q", sku)
+		}
+	}
+	// total disk 1000. Another lease holds 500; the retained (soft-deleted) volume
+	// being restored counts 500 in the retained projection → pool fully committed.
+	p := NewResourcePool(8, 8192, 1000, resolver, nil)
+	require.NoError(t, p.TryAllocate("other", "small", "t0")) // allocatedDisk = 500
+	p.SetRetainedDisk(500)                                    // old footprint of the lease under restore
+	// allocatedDisk(500) + retainedDisk(500) == totalDisk(1000): zero free.
+
+	// Same-tier adopt (small→small, delta 0) must still succeed — the adopted
+	// bytes are already counted, so it is net-zero new disk.
+	require.NoError(t, p.TryAllocateAdopt("restore-same", "small", "t1", 500),
+		"same-tier adopt must skip the disk gate (net-zero new disk)")
+	p.Release("restore-same")
+
+	// Promote adopt (small→big, delta +400) must be REJECTED: 500 + 500 + 400 > 1000.
+	err := p.TryAllocateAdopt("restore-promote", "big", "t1", 500)
+	require.Error(t, err, "promote adopt exceeding free capacity must be gated (ENG-545)")
+	assert.Contains(t, err.Error(), "insufficient disk")
+	assert.Equal(t, int64(500), p.Stats().AllocatedDiskMB,
+		"a rejected promote must not reserve disk or over-commit the pool")
 }

@@ -809,12 +809,22 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	}.materialize()
 	b.provisionsMu.Unlock()
 
-	// (c) Allocate pool slots.
+	// (c) Allocate pool slots. Disk is gated on the PROMOTE DELTA above each
+	// volume's already-committed retained footprint (same-tier/demote skip the
+	// disk gate; only growth into a larger tier is capacity-checked) — ENG-545.
+	// oldDiskMB maps service → the DiskMB the retained record contributed to the
+	// retained projection; an unresolved old SKU counted 0, so gate the full cap.
+	oldDiskMB := make(map[string]int64, len(rec.Items))
+	for _, it := range rec.Items {
+		if op, oerr := b.cfg.GetSKUProfile(it.SKU); oerr == nil {
+			oldDiskMB[it.ServiceName] = op.DiskMB
+		}
+	}
 	var allocatedIDs []string
 	for _, item := range req.Items {
 		for i := range item.Quantity {
 			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant); aerr != nil {
+			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant, oldDiskMB[item.ServiceName]); aerr != nil {
 				releaseAll(b.pool, allocatedIDs)
 				updateResourceMetrics(b.pool.Stats())
 				b.removeProvision(req.LeaseUUID)
