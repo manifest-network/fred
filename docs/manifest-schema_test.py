@@ -285,6 +285,11 @@ def main():
         "labels": {"fred.lease": "abc"}
     })
 
+    expect_invalid("label with traefik. prefix", {
+        "image": "nginx",
+        "labels": {"traefik.http.routers.x.rule": "Host(`evil.example`)"}
+    })
+
     expect_invalid("health_check empty test", {
         "image": "nginx",
         "health_check": {"test": []}

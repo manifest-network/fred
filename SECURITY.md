@@ -151,7 +151,7 @@ All requests are wrapped with `http.MaxBytesReader` enforcing a configurable max
 ### Query Parameter Bounds
 
 - `tail` parameter: validated as positive integer, bounded 1–10,000
-- Container log reads are additionally capped at 5 MiB total (`maxContainerLogBytes`, docker backend) via a demux-output capping writer — since Docker's `tail` bounds lines, not bytes. Output beyond the cap is truncated with a `[log truncated ...]` marker, preventing OOM from an adversarial container emitting oversized stdout/stderr (ENG-499).
+- Container log reads are additionally capped at 5 MiB total (`maxContainerLogBytes`, docker backend) via a demux-output capping writer — since Docker's `tail` bounds lines, not bytes. Output beyond the cap is truncated with a `[log truncated: exceeded 5 MiB limit]` marker, preventing OOM from an adversarial container emitting oversized stdout/stderr (ENG-499).
 
 ### Manifest Validation (Docker Backend)
 
