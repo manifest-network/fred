@@ -353,6 +353,18 @@ func TestStackManifest_DependsOn_HealthyWithNoneHealthCheck(t *testing.T) {
 	assert.Contains(t, err.Error(), "health_check")
 }
 
+func TestHealthCheckConfig_Validate_NoneRejectsExtraArgs(t *testing.T) {
+	// NONE disables the health check and takes no arguments. Extra elements must
+	// be rejected so the Go validator matches the JSON schema contract, which
+	// enforces maxItems: 1 for the NONE branch (docs/manifest-schema.json).
+	err := (&HealthCheckConfig{Test: []string{"NONE", "extra"}}).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "NONE")
+
+	// The canonical single-element form stays valid.
+	require.NoError(t, (&HealthCheckConfig{Test: []string{"NONE"}}).Validate())
+}
+
 func TestStackManifest_DependsOn_MultipleDependencies(t *testing.T) {
 	sm := StackManifest{
 		Services: map[string]*Manifest{

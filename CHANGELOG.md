@@ -16,6 +16,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- manifest: a `NONE` health check with trailing arguments (e.g.
+  `["NONE", "extra"]`) is now rejected instead of silently accepted. The Go
+  validator previously ignored elements after `NONE` while the JSON schema
+  (`docs/manifest-schema.json`) rejected them; both now agree that `NONE` takes
+  no arguments. The canonical `["NONE"]` form is unaffected.
+
 ### Security
 
 ## [0.9.0] - 2026-07-14
