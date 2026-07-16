@@ -422,6 +422,24 @@ func filterSubpaths(candidates, parents []string) []string {
 // VOLUME path cannot be sanitized (unsupported path format).
 func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
 	binds := make(map[string]string, len(imageVolumes))
+	if len(imageVolumes) == 0 {
+		return binds, nil
+	}
+	// Confine every subdir operation to the volume root. A tenant with a
+	// read-write stateful volume can plant a symlink inside it on one deploy
+	// (e.g. `data -> /`), then on a later deploy declare a VOLUME whose path
+	// traverses that symlink. sanitizeVolumePath validates only the *string*, so
+	// raw os.MkdirAll/os.Chown would follow the on-disk symlink and escape the
+	// volume root — bind-mounting or chowning arbitrary host paths (host "/",
+	// another tenant's volume) into the container. os.Root refuses to traverse
+	// any symlinked component that escapes the root, so creation fails closed.
+	// Mirrors the ENG-430 tar-extraction hardening. See ENG-539.
+	root, err := os.OpenRoot(hostPath)
+	if err != nil {
+		return nil, fmt.Errorf("open volume root %q: %w", hostPath, err)
+	}
+	defer func() { _ = root.Close() }()
+
 	for _, volPath := range imageVolumes {
 		sanitized := sanitizeVolumePath(volPath)
 		if sanitized == "" {
@@ -435,16 +453,17 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 		if sanitized == writablePathSubdir || strings.HasPrefix(sanitized, writablePathSubdir+"/") {
 			return nil, fmt.Errorf("image declares VOLUME %q that collides with the reserved writable-path directory %q", volPath, writablePathSubdir)
 		}
-		subdir := filepath.Join(hostPath, sanitized)
-		if err := os.MkdirAll(subdir, 0o700); err != nil {
-			return nil, fmt.Errorf("volume subdir %q: %w", subdir, err)
+		if err := root.MkdirAll(sanitized, 0o700); err != nil {
+			return nil, fmt.Errorf("volume subdir %q: %w", filepath.Join(hostPath, sanitized), err)
 		}
 		if uid != 0 || gid != 0 {
-			if err := os.Chown(subdir, uid, gid); err != nil {
-				return nil, fmt.Errorf("chown volume subdir %q: %w", subdir, err)
+			// Lchown, never Chown: the leaf is a real directory after MkdirAll, and
+			// Lchown never follows a symlink even if one were raced in (CVE-2026-32282).
+			if err := root.Lchown(sanitized, uid, gid); err != nil {
+				return nil, fmt.Errorf("chown volume subdir %q: %w", filepath.Join(hostPath, sanitized), err)
 			}
 		}
-		binds[subdir] = volPath
+		binds[filepath.Join(hostPath, sanitized)] = volPath
 	}
 	return binds, nil
 }
