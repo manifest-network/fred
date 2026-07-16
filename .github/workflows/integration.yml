@@ -18,6 +18,10 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/integration.yml"
+      # Evaluated last, so it wins: a docs-only change under the dirs above
+      # (e.g. internal/backend/docker/README.md) does not run the suite. A change
+      # touching any non-.md file still matches a positive pattern and runs.
+      - "!**/*.md"
   push:
     branches: [main]
     paths:
@@ -28,6 +32,10 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/integration.yml"
+      # Evaluated last, so it wins: a docs-only change under the dirs above
+      # (e.g. internal/backend/docker/README.md) does not run the suite. A change
+      # touching any non-.md file still matches a positive pattern and runs.
+      - "!**/*.md"
   # Nightly safety net: catches rot from changes outside the path filter
   # (dependency bumps, shared code) and from GitHub runner-image drift.
   schedule:
