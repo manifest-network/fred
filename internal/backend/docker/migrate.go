@@ -66,8 +66,10 @@ import (
 //
 // A not-yet-existing subdir is permitted: os.Root has already proven that every
 // EXISTING path component stays within the root, so the source Docker creates at
-// mount time also stays within it. An existing component that is a symlink, or any
-// path that escapes the root, is rejected.
+// mount time also stays within it. Any component that escapes the root, or a leaf
+// that is itself a symlink, is rejected; a symlink that stays within the root is
+// followed (it cannot redirect the bind source outside the volume, and legacy
+// containers are stopped so no concurrent writer can re-point it).
 func resolveMigratedBindSource(hostRoot, sanitized string) (string, error) {
 	root, err := os.OpenRoot(hostRoot)
 	if err != nil {
