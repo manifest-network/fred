@@ -16,6 +16,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+### Security
+
+## [0.10.0] - 2026-07-16
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
 - manifest: a `NONE` health check with trailing arguments (e.g.
   `["NONE", "extra"]`) is now rejected instead of silently accepted. The Go
   validator previously ignored elements after `NONE` while the JSON schema
