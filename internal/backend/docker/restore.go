@@ -813,23 +813,23 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// volumes (rename, not fresh disk), so disk capacity is gated once on the
 	// AGGREGATE promote delta — the growth of the lease's total DiskMB above its
 	// already-committed retained footprint — while CPU/mem/tenant are gated per
-	// instance. Doing this under a single pool lock keeps the gate both EXACT (no
-	// per-volume double-count of the retained bytes still in the projection until
-	// ClaimForRestore) and ATOMIC (no concurrent provision/restore can slip disk in
-	// between the check and the reservations), so a fitting multi-volume promote is
+	// instance. TryAllocateAdoptAll does the whole reservation under a single pool
+	// lock: the gate is EXACT (no per-volume double-count of the retained bytes
+	// still in the projection until ClaimForRestore), ATOMIC (no concurrent
+	// provision/restore can slip disk in between the check and the reservations),
+	// and CONSISTENT (the pool computes the new total from its own resolver, so it
+	// cannot under-gate against the reservation). A fitting multi-volume promote is
 	// admitted and the pool cannot be over-committed (ENG-545).
 	//
-	// req.Items SKUs are all resolved above (the profiles loop rejects an unknown
-	// SKU with ErrValidation), so newDiskMB is fully counted here. Only the retained
-	// record can reference a SKU whose profile was later removed; leaseDiskMB counts
-	// that as 0, which undercounts oldDiskMB and makes the delta (new-old) LARGER —
-	// the gate strictly MORE conservative, never an over-admission. Warn for operator
-	// visibility, mirroring computeRetainedDiskMB.
-	newDiskMB, newUnresolved := b.leaseDiskMB(req.Items)
+	// We pass only the OLD retained footprint. The retained record can reference a
+	// SKU whose profile was later removed; leaseDiskMB counts that as 0, which
+	// undercounts oldDiskMB and makes the delta LARGER — strictly more conservative,
+	// never an over-admission. Warn for operator visibility, mirroring
+	// computeRetainedDiskMB.
 	oldDiskMB, oldUnresolved := b.leaseDiskMB(rec.Items)
-	if len(oldUnresolved) > 0 || len(newUnresolved) > 0 {
-		logger.Warn("restore disk gate: unresolved SKU profile(s); disk delta over-estimated, admission is more conservative",
-			"retained_unresolved_skus", oldUnresolved, "request_unresolved_skus", newUnresolved)
+	if len(oldUnresolved) > 0 {
+		logger.Warn("restore disk gate: retained record references unresolved SKU profile(s); retained footprint undercounted, admission is more conservative",
+			"retained_unresolved_skus", oldUnresolved)
 	}
 	adoptInstances := make([]shared.AdoptInstance, 0, totalQuantity(req.Items))
 	for _, item := range req.Items {
@@ -840,7 +840,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			})
 		}
 	}
-	if aerr := b.pool.TryAllocateAdoptAll(adoptInstances, rec.Tenant, newDiskMB-oldDiskMB); aerr != nil {
+	if aerr := b.pool.TryAllocateAdoptAll(adoptInstances, rec.Tenant, oldDiskMB); aerr != nil {
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, aerr)
 	}

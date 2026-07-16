@@ -89,27 +89,42 @@ type AdoptInstance struct {
 // single lock acquisition. Restore adopts existing volumes (rename, not fresh
 // disk), so the per-instance reservations SKIP the global disk gate — the adopted
 // bytes are already committed on disk and counted in the retained projection.
-// Disk CAPACITY is instead gated once, here, on the AGGREGATE promote delta:
-// promoteDeltaMB = newTotalDiskMB - oldRetainedDiskMB summed across the lease's
-// volumes; a same-tier or demote restore (deltaMB <= 0) adds no disk pressure.
+// Disk CAPACITY is gated once, here, on the AGGREGATE promote delta. The pool
+// computes the new total from its OWN resolver — the exact DiskMB the per-instance
+// reservations below will add — and subtracts oldRetainedDiskMB (the lease's
+// already-committed retained footprint, which the caller derives from the
+// retention record and which is already counted in retainedDisk). A same-tier or
+// demote restore (delta <= 0) adds no disk pressure.
 //
 // Gating the delta and committing all reservations under ONE lock is what makes
-// admission correct on both axes: (1) EXACT — a per-volume disk gate would
+// admission correct on three axes: (1) EXACT — a per-volume disk gate would
 // double-count the retained bytes still in the projection until ClaimForRestore
-// and reject a fitting multi-volume promote; and (2) ATOMIC — no concurrent
+// and reject a fitting multi-volume promote; (2) ATOMIC — no concurrent
 // TryAllocate/restore can consume disk between the delta check and the
-// reservations, so the pool cannot be over-committed (ENG-545, PR #184 review).
+// reservations, so the pool cannot be over-committed; and (3) CONSISTENT — the
+// gated new total is computed from the same resolver that sizes the reservations,
+// so a caller whose SKU resolver diverges from the pool's cannot under-gate disk
+// (ENG-545, PR #184 review). Only oldRetainedDiskMB is a caller input, and it
+// enters the gate in the safe direction (undercounting it enlarges the delta).
 //
 // CPU, memory, and tenant quota are gated per instance (new containers). On any
 // failure nothing is reserved: the instances committed so far in this call are
 // rolled back before returning.
-func (p *ResourcePool) TryAllocateAdoptAll(instances []AdoptInstance, tenant string, promoteDeltaMB int64) error {
+func (p *ResourcePool) TryAllocateAdoptAll(instances []AdoptInstance, tenant string, oldRetainedDiskMB int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if promoteDeltaMB > 0 && p.allocatedDisk+p.retainedDisk+promoteDeltaMB > p.totalDisk {
+	var newDiskMB int64
+	for _, in := range instances {
+		profile, err := p.skuResolver(in.SKU)
+		if err != nil {
+			return err
+		}
+		newDiskMB += profile.DiskMB
+	}
+	if delta := newDiskMB - oldRetainedDiskMB; delta > 0 && p.allocatedDisk+p.retainedDisk+delta > p.totalDisk {
 		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
-			promoteDeltaMB, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
+			delta, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
 	}
 
 	reserved := make([]string, 0, len(instances))

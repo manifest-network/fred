@@ -437,9 +437,9 @@ func TestTryAllocateAdoptAll_SkipsPerInstanceDiskGate(t *testing.T) {
 
 	// A normal provision is correctly denied (would over-commit disk).
 	require.Error(t, p.TryAllocate("fresh", "sku", "t1"))
-	// A same-tier adopt (delta 0) skips the per-instance disk gate and succeeds —
-	// the bytes are already committed on disk and counted in the retained projection.
-	require.NoError(t, p.TryAllocateAdoptAll([]AdoptInstance{{ID: "restore-0", SKU: "sku"}}, "t1", 0))
+	// A same-tier adopt skips the disk gate and succeeds — passing the retained
+	// footprint (200) equal to the new tier makes the promote delta 0.
+	require.NoError(t, p.TryAllocateAdoptAll([]AdoptInstance{{ID: "restore-0", SKU: "sku"}}, "t1", 200))
 	// ... and still records the disk in live accounting.
 	assert.Equal(t, int64(200), p.Stats().AllocatedDiskMB)
 }
@@ -456,15 +456,15 @@ func TestTryAllocateAdoptAll_StillGatesCPU(t *testing.T) {
 
 // TestTryAllocateAdoptAll_GatesAggregateDelta is the ENG-545 regression at the pool
 // level: a restore's disk capacity is gated once against the AGGREGATE promote
-// delta (newTotalDiskMB - oldRetainedDiskMB), never per adopted volume, so a
-// fitting multi-volume promote is admitted rather than double-counted and rejected.
+// delta (the pool's own new total minus the caller's oldRetainedDiskMB), never per
+// adopted volume, so a fitting multi-volume promote is admitted rather than
+// double-counted and rejected.
 func TestTryAllocateAdoptAll_GatesAggregateDelta(t *testing.T) {
 	resolver := func(string) (SKUProfile, error) {
 		return SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 2048}, nil // new tier
 	}
 	// total 4096; the lease under restore has a retained footprint of 2048 (2×1024
-	// old) in the projection. Promote to 2×2048 = 4096 → delta 2048 → post-claim
-	// footprint 4096 fits exactly.
+	// old) in the projection. Two instances → the pool computes new = 2×2048 = 4096.
 	newPool := func() *ResourcePool {
 		p := NewResourcePool(8, 8192, 4096, resolver, nil)
 		p.SetRetainedDisk(2048)
@@ -472,25 +472,28 @@ func TestTryAllocateAdoptAll_GatesAggregateDelta(t *testing.T) {
 	}
 	two := []AdoptInstance{{ID: "r-0", SKU: "sku"}, {ID: "r-1", SKU: "sku"}}
 
-	// Fitting multi-volume promote (delta 2048) is admitted — a per-volume gate
-	// would have double-counted the retained bytes and rejected the second instance.
+	// Fitting multi-volume promote: new(4096) - oldRetained(2048) = delta 2048;
+	// 0 + retained(2048) + 2048 == 4096 == total → admitted. A per-volume gate would
+	// have double-counted the retained bytes and rejected the second instance.
 	p := newPool()
 	require.NoError(t, p.TryAllocateAdoptAll(two, "t1", 2048),
 		"a fitting multi-volume promote must be admitted")
 	assert.Equal(t, int64(4096), p.Stats().AllocatedDiskMB, "both instances reserved")
 
-	// One MB beyond capacity is rejected with nothing reserved.
+	// A smaller old footprint enlarges the delta past capacity → rejected, nothing
+	// reserved: new(4096) - oldRetained(2047) = delta 2049 > 2048 available.
 	p = newPool()
-	err := p.TryAllocateAdoptAll(two, "t1", 2049)
+	err := p.TryAllocateAdoptAll(two, "t1", 2047)
 	require.Error(t, err, "a promote delta exceeding capacity must be gated (ENG-545)")
 	assert.Contains(t, err.Error(), "insufficient disk")
 	assert.Equal(t, int64(0), p.Stats().AllocatedDiskMB, "a rejected batch reserves nothing")
 
-	// Same-tier / demote (delta <= 0) always pass, even at zero apparent headroom.
+	// Same-tier (oldRetained == new) and demote (oldRetained > new) give delta <= 0
+	// and always pass, even at zero apparent headroom.
 	p = newPool()
-	require.NoError(t, p.TryAllocateAdoptAll(two, "t1", 0), "same-tier restore must pass")
+	require.NoError(t, p.TryAllocateAdoptAll(two, "t1", 4096), "same-tier restore must pass")
 	p = newPool()
-	require.NoError(t, p.TryAllocateAdoptAll(two, "t1", -512), "demote restore must pass")
+	require.NoError(t, p.TryAllocateAdoptAll(two, "t1", 4608), "demote restore must pass")
 }
 
 // TestTryAllocateAdoptAll_AtomicNoOverCommit is the PR #184 review regression: the
@@ -576,7 +579,7 @@ func TestTryAllocateAdoptAll_ConcurrentNoOverCommit(t *testing.T) {
 				_ = p.TryAllocateAdoptAll([]AdoptInstance{
 					{ID: fmt.Sprintf("r-%d-0", i), SKU: "s"},
 					{ID: fmt.Sprintf("r-%d-1", i), SKU: "s"},
-				}, "t", 512) // new 512 == delta (no retained footprint for these)
+				}, "t", 0) // oldRetained 0; the pool computes new = 2×256 = 512 itself
 			}
 			flag()
 		}(i)
@@ -589,4 +592,27 @@ func TestTryAllocateAdoptAll_ConcurrentNoOverCommit(t *testing.T) {
 		t.Fatal(msg)
 	default:
 	}
+}
+
+// TestTryAllocateAdoptAll_GatesNewFromPoolResolver is the PR #184 review regression:
+// the pool computes the new total from its OWN resolver (the values it reserves),
+// so a caller cannot under-gate disk by reporting a smaller new footprint. Even
+// with a zero retained hint, a restore whose real (pool-resolved) footprint exceeds
+// capacity is rejected with nothing reserved — no over-commit.
+func TestTryAllocateAdoptAll_GatesNewFromPoolResolver(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 0.1, MemoryMB: 16, DiskMB: 2048}, nil
+	}
+	p := NewResourcePool(8, 8192, 4096, resolver, nil)
+	require.NoError(t, p.TryAllocate("filler", "s", "t0")) // allocatedDisk = 2048; 2048 available
+
+	// The pool resolves 2×2048 = 4096 for the batch itself, so it gates the true
+	// footprint against the 2048 available and rejects — the caller cannot make it
+	// under-gate by passing a small oldRetained hint.
+	err := p.TryAllocateAdoptAll(
+		[]AdoptInstance{{ID: "r-0", SKU: "s"}, {ID: "r-1", SKU: "s"}}, "t1", 0)
+	require.Error(t, err, "the pool must gate the new total from its own resolver, not a caller value")
+	s := p.Stats()
+	assert.LessOrEqual(t, s.AllocatedDiskMB+s.RetainedDiskMB, s.TotalDiskMB, "no over-commit")
+	assert.Equal(t, int64(2048), s.AllocatedDiskMB, "only the filler is reserved")
 }
