@@ -468,6 +468,32 @@ func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName string
 	return paths, nil
 }
 
+// writablePathExtractDir returns the extraction target directory for a sanitized
+// writable path under destDir, creating the intermediate directories confined to
+// destDir. destDir (the volume's _wp subdir) is RemoveAll'd by the caller before
+// extraction; it is created fresh here, then the per-path subdir is created via
+// os.Root so a symlink extracted for an EARLIER writable path cannot redirect this
+// MkdirAll outside destDir (os.Root refuses to traverse a symlinked component that
+// escapes the root). See ENG-543.
+func writablePathExtractDir(destDir, sanitized string) (string, error) {
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
+		return "", err
+	}
+	relDir := filepath.Dir(sanitized)
+	if relDir == "." || relDir == "" {
+		return destDir, nil
+	}
+	root, err := os.OpenRoot(destDir)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.MkdirAll(relDir, 0o700); err != nil {
+		return "", err
+	}
+	return filepath.Join(destDir, relDir), nil
+}
+
 // ExtractImageContent extracts pre-existing image content for the given paths
 // into destDir on the host filesystem. For each path, it creates a temporary
 // container from the image (never started), streams the tar archive of that
@@ -518,13 +544,13 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 		// "neo4j/conf/neo4j.conf". Extract to destDir/var/lib/ so content
 		// ends up at destDir/var/lib/neo4j/conf/neo4j.conf.
 		sanitized := sanitizeVolumePath(path)
-		extractDir := filepath.Join(destDir, filepath.Dir(sanitized))
-		if mkErr := os.MkdirAll(extractDir, 0o700); mkErr != nil {
+		extractDir, mkErr := writablePathExtractDir(destDir, sanitized)
+		if mkErr != nil {
 			_ = rc.Close()
 			if failures == nil {
 				failures = make(map[string]error)
 			}
-			failures[path] = fmt.Errorf("mkdir %s: %w", extractDir, mkErr)
+			failures[path] = fmt.Errorf("prepare extract dir for %s: %w", path, mkErr)
 			continue
 		}
 

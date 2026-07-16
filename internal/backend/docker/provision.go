@@ -4,7 +4,9 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"os"
@@ -496,6 +498,26 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 	}
 	failures := b.docker.ExtractImageContent(ctx, image, writablePaths, wpDir, maxBytes)
 
+	// The bind Source below is mounted read-write into the container and Docker
+	// resolves it host-side. Docker's CopyFromContainer does NOT follow a
+	// final-component symlink, so a symlink writable path would extract to a symlink
+	// Source that redirects the mount outside the volume (host escape). Detection
+	// only yields real-directory writable paths today, but confine the Source to
+	// wpDir here so the bind path is self-defending regardless. See ENG-543.
+	wpRoot, rootErr := os.OpenRoot(wpDir)
+	if rootErr != nil && !errors.Is(rootErr, fs.ErrNotExist) {
+		// An unexpected failure opening the _wp root (permission, I/O, not-a-dir)
+		// means the confinement checks below cannot run. Fail closed: seed nothing
+		// rather than mount an unvalidated (possibly symlinked) Source. ErrNotExist
+		// is safe — nothing was extracted, so no Source exists to be a symlink.
+		b.logger.Warn("cannot open writable-path root for confinement checks; skipping all writable-path binds",
+			"path", wpDir, "image", image, "error", rootErr)
+		return nil
+	}
+	if wpRoot != nil {
+		defer func() { _ = wpRoot.Close() }()
+	}
+
 	binds := make(map[string]string, len(writablePaths))
 	for _, wp := range writablePaths {
 		if failures != nil {
@@ -509,6 +531,23 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 		if sanitized == "" {
 			b.logger.Warn("writable path rejected by sanitization", "path", wp, "image", image)
 			continue
+		}
+		if wpRoot != nil {
+			// os.Root refuses to traverse a symlinked component that escapes wpDir
+			// (surfaced as a non-ErrNotExist error), and Lstat flags a symlinked
+			// leaf. Either way the Source is unsafe to bind: skip it (best-effort —
+			// the writable path is simply not seeded, matching the extraction-failure
+			// contract).
+			switch info, lerr := wpRoot.Lstat(sanitized); {
+			case lerr == nil && info.Mode()&fs.ModeSymlink != 0:
+				b.logger.Warn("writable-path bind source is a symlink; skipping to prevent host escape",
+					"path", wp, "image", image)
+				continue
+			case lerr != nil && !errors.Is(lerr, fs.ErrNotExist):
+				b.logger.Warn("writable-path bind source failed confinement check; skipping",
+					"path", wp, "image", image, "error", lerr)
+				continue
+			}
 		}
 		binds[filepath.Join(wpDir, sanitized)] = wp
 	}

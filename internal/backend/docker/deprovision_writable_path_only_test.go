@@ -642,6 +642,101 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	}, binds)
 }
 
+// TestSetupWritablePathBinds_RejectsSymlinkBindSource pins the ENG-543 defense.
+// The writable-path bind Source is mounted read-write into the container and Docker
+// resolves it host-side. Docker's CopyFromContainer does NOT follow a
+// final-component symlink, so if extraction ever produced a symlink at the Source
+// path (a malicious image whose writable path is a symlink), the mount would be
+// redirected outside the volume — host escape. DetectWritablePaths only yields real
+// directories today, but setupWritablePathBinds must be self-defending: it must not
+// emit a bind whose Source is a symlink.
+func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+
+	hostVol := t.TempDir()
+	wpDir := filepath.Join(hostVol, writablePathSubdir)
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "host-secret"), []byte("x"), 0o600))
+
+	// Simulate extraction planting a SYMLINK at the bind Source position
+	// (wpDir/var/lib/grafana -> outside), as would happen if a symlink writable
+	// path ever reached extraction (CopyFromContainer archives it as a symlink).
+	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _ int64) map[string]error {
+		require.Equal(t, wpDir, destDir)
+		require.NoError(t, os.MkdirAll(filepath.Join(destDir, "var", "lib"), 0o755))
+		require.NoError(t, os.Symlink(outside, filepath.Join(destDir, "var", "lib", "grafana")))
+		return nil
+	}
+
+	binds := b.setupWritablePathBinds(context.Background(), "img",
+		[]string{"/var/lib/grafana"}, hostVol, 64<<20)
+
+	assert.NotContains(t, binds, filepath.Join(wpDir, "var", "lib", "grafana"),
+		"a symlink bind source must not be mounted into the container")
+	assert.Empty(t, binds, "no bind should be emitted for a symlink source")
+}
+
+// TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable pins the ENG-543 review
+// follow-up (PR #183): if the _wp root cannot be opened for the confinement checks
+// for any reason OTHER than "does not exist", setupWritablePathBinds must fail closed
+// and emit no binds rather than mount unvalidated (possibly symlinked) Sources.
+func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+
+	hostVol := t.TempDir()
+	wpDir := filepath.Join(hostVol, writablePathSubdir)
+
+	// Extraction leaves wpDir as a regular FILE, so os.OpenRoot(wpDir) fails with a
+	// non-ErrNotExist error (ENOTDIR) and the confinement checks cannot run.
+	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _ int64) map[string]error {
+		require.Equal(t, wpDir, destDir)
+		require.NoError(t, os.WriteFile(destDir, []byte("x"), 0o600))
+		return nil
+	}
+
+	binds := b.setupWritablePathBinds(context.Background(), "img",
+		[]string{"/var/lib/grafana"}, hostVol, 64<<20)
+
+	assert.Empty(t, binds,
+		"must fail closed (emit no binds) when the _wp root cannot be opened for confinement checks")
+}
+
+// TestWritablePathExtractDir pins the ENG-543 confinement of the extraction target
+// directory. The raw os.MkdirAll it replaced would follow a symlink extracted for an
+// earlier writable path and create image content outside destDir on the host;
+// creation must instead be confined to destDir and fail closed on an escaping symlink.
+func TestWritablePathExtractDir(t *testing.T) {
+	t.Run("creates the confined extract dir for a nested path", func(t *testing.T) {
+		destDir := filepath.Join(t.TempDir(), writablePathSubdir)
+		got, err := writablePathExtractDir(destDir, "var/lib/grafana")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(destDir, "var", "lib"), got)
+		assert.DirExists(t, filepath.Join(destDir, "var", "lib"))
+	})
+
+	t.Run("single-component path extracts at destDir", func(t *testing.T) {
+		destDir := filepath.Join(t.TempDir(), writablePathSubdir)
+		got, err := writablePathExtractDir(destDir, "data")
+		require.NoError(t, err)
+		assert.Equal(t, destDir, got)
+		assert.DirExists(t, destDir)
+	})
+
+	t.Run("escaping symlink at a dir component is rejected", func(t *testing.T) {
+		destDir := filepath.Join(t.TempDir(), writablePathSubdir)
+		outside := t.TempDir()
+		require.NoError(t, os.MkdirAll(destDir, 0o700))
+		// An earlier writable path's extraction planted destDir/var -> outside.
+		require.NoError(t, os.Symlink(outside, filepath.Join(destDir, "var")))
+
+		_, err := writablePathExtractDir(destDir, "var/lib/grafana")
+		require.Error(t, err, "must refuse to create an extract dir through an escaping symlink")
+		assert.NoDirExists(t, filepath.Join(outside, "lib"), "must not have created through the symlink")
+	})
+}
+
 // TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems guards the
 // retained-disk UNDER-count regression the ENG-406 review flagged: two stateful
 // services where db renames OK on attempt 1 but cache's rename fails, forcing a

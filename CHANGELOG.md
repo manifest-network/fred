@@ -35,6 +35,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   tar-extraction hardening), so a VOLUME path that traverses a symlink escaping the
   volume root is rejected instead of followed. The same guard is applied to the
   legacy→stack migration bind path (`migrate.go`). (ENG-539)
+- docker: harden the writable-path (`_wp`) scaffolding against an image-seeded
+  symlink escape (defense-in-depth follow-up to ENG-539). The `_wp` bind Source is
+  mounted read-write into the container, and Docker's `CopyFromContainer` does not
+  follow a final-component symlink — so a symlink at the Source would redirect the
+  mount outside the volume. `DetectWritablePaths` only yields real directories, so
+  this was not exploitable, but the extraction and bind paths now defend themselves
+  regardless: `writablePathExtractDir` creates the extraction target via `os.Root`
+  (an escaping symlink planted by an earlier path can no longer redirect it), and
+  `setupWritablePathBinds` skips any bind whose Source is a symlink or escapes the
+  `_wp` root. (ENG-543)
 
 ## [0.9.0] - 2026-07-14
 
