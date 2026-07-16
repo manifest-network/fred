@@ -541,16 +541,19 @@ tx_poll_interval: "500ms"
 # If exceeded, the transaction is considered failed (may still confirm later).
 tx_timeout: "30s"
 
-# Gas limit for transactions. This is the static estimate before gas_adjustment
-# is applied at sign time; the actual gas signed for is
-# floor(gas_limit * gas_adjustment) (truncation, not ceiling). On out-of-gas
-# errors at broadcast time, Fred additionally retries with 1.5x of the previous
-# attempt's gas (compounding), bounded by max_gas_limit if set.
+# Simulate-failure fallback gas ceiling. Since ENG-431 every transaction is
+# gas-simulated per-tx: the declared gas is floor(gas_adjustment * simulated
+# GasUsed). gas_limit is used ONLY when Simulate is unavailable (Simulate RPC
+# error or the simulation circuit-breaker is open); on that fallback path the
+# signed gas is floor(gas_limit * gas_adjustment). On out-of-gas errors at
+# broadcast time, Fred additionally retries with 1.5x of the previous attempt's
+# gas (compounding), bounded by max_gas_limit if set.
 gas_limit: 1500000
 
-# Multiplier applied to gas_limit at sign time (matches the --gas-adjustment
-# CLI flag pattern from Cosmos SDK tooling). Provides headroom above the
-# static estimate and reduces out-of-gas retries in practice. Range: 1.0–3.0.
+# Multiplier applied to the simulated GasUsed at sign time (and, on the
+# Simulate-failure fallback path, to gas_limit). Matches the --gas-adjustment
+# CLI flag pattern from Cosmos SDK tooling. Provides headroom above the
+# estimate and reduces out-of-gas retries in practice. Range: 1.0–3.0.
 # Default: 1.2.
 gas_adjustment: 1.2
 
@@ -559,10 +562,10 @@ gas_adjustment: 1.2
 # max_gas_limit: 5000000
 
 # Gas price in micro-units of the fee denomination per gas unit.
-# Total fee = ceil(signed_gas * gas_price / 1_000_000) where signed_gas =
-# floor(gas_limit * gas_adjustment) (see gas_limit/gas_adjustment above). With
-# the default gas_adjustment of 1.2 the fee is ~20% above the unadjusted
-# gas_limit. Higher prices = faster inclusion.
+# Total fee = ceil(signed_gas * gas_price / 1_000_000) where signed_gas is the
+# per-tx simulated estimate scaled by gas_adjustment (or, on the Simulate-failure
+# fallback path, floor(gas_limit * gas_adjustment); see gas_limit/gas_adjustment
+# above). Higher prices = faster inclusion.
 gas_price: 25
 
 # Fee denomination for transaction fees.
@@ -595,6 +598,17 @@ withdraw_limit: 100
 # ADVANCED: CREDIT CHECK CONFIGURATION
 # =============================================================================
 # Settings for monitoring tenant credit on active leases.
+
+# How often the scheduler wakes to run the credit check (its wake cadence),
+# independent of withdraw_interval (the paid-withdraw cadence).
+# "0s" (default) couples the credit check to withdraw_interval. When set > 0 it
+# must be positive and must NOT exceed withdraw_interval; a smaller value runs
+# credit checks more frequently than paid withdrawals. This activates the
+# withdraw-cadence guard (ENG-524): credit is polled at this faster cadence, but
+# the paid provider-wide withdrawal is still rate-limited to once per
+# withdraw_interval since the last full drain (observable via
+# fred_withdraw_guard_active / fred_withdraw_skipped_by_guard_total).
+credit_check_interval: "0s"
 
 # Number of consecutive credit check errors before taking action.
 # Prevents premature lease termination due to transient RPC errors.

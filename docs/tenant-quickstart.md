@@ -58,7 +58,7 @@ This message is signed using **ADR-036** (Cosmos's standard for off-chain messag
 | Maximum future skew | 10 seconds |
 | Replay (mutating endpoints + `/connection`) | One-time use |
 
-`/connection` is included because it returns sensitive endpoint details; the other read endpoints (`/status`, `/provision`, `/logs`, `/releases`, `/events`) are idempotent and skip the replay check. See [SECURITY.md § Which endpoints check replay](../SECURITY.md#which-endpoints-check-replay) for the full table.
+`/connection` is included because it returns sensitive endpoint details; the other read endpoints (`/status`, `/provision`, `/logs`, `/releases`, `/events`) are idempotent and skip the replay check. See [SECURITY.md § Token Replay (Tenant API)](../SECURITY.md#token-replay-tenant-api) for the full table.
 
 Tokens are short-lived. Generate a fresh one for each request, or batch requests within a 30-second window.
 
@@ -113,7 +113,7 @@ What to look at:
 - **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`).
 - **`fail_count`** + **`last_error`** — present after failures; only the count and most recent message.
 
-For richer diagnostics during failures, use `GET /v1/leases/{uuid}/provision` (see [Step 5](#step-5-debug-failures)).
+For richer diagnostics during failures, use `GET /v1/leases/{uuid}/provision` (see [Step 6](#step-6-debug-failures)).
 
 ---
 

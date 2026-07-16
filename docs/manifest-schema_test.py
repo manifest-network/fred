@@ -2,7 +2,7 @@
 """Validates docs/manifest-schema.json against positive and negative test cases.
 
 Uses the JSON Schema definition to approximate the Go validation logic
-in internal/backend/docker/manifest.go, but does not cover every backend rule.
+in internal/backend/shared/manifest/manifest.go, but does not cover every backend rule.
 
 Requires the 'jsonschema' package (install with: pip install jsonschema).
 Run: python3 docs/manifest-schema_test.py
@@ -283,6 +283,11 @@ def main():
     expect_invalid("label with fred. prefix", {
         "image": "nginx",
         "labels": {"fred.lease": "abc"}
+    })
+
+    expect_invalid("label with traefik. prefix", {
+        "image": "nginx",
+        "labels": {"traefik.http.routers.x.rule": "Host(`evil.example`)"}
     })
 
     expect_invalid("health_check empty test", {

@@ -498,7 +498,7 @@ All states are configured up front with explicit `Permit`/`Ignore`/`OnEntry`/`On
 
 **The `LeaseProvisionStore` seam (single-writer substrate):**
 
-The live provision records are owned by the Docker backend, not the actor: `Backend.provisions` is a `map[string]*provision` guarded by `provisionsMu` (`backend.go:72`). The actor never touches that map directly. Instead it mutates provision state **only** through `leasesm.LeaseProvisionStore` — a `backendProvisionStore` adapter (`leasesm_adapters.go:90-119`) wired as `b.provisionStore` (`backend.go:149`, `508`) and reached via the actor's `cfg`. Every SM entry/exit action reads and writes through `cfg.ProvisionStore.Get(...)` and `cfg.ProvisionStore.UpdateFn(...)` (`lease_sm.go:303`, `362`, `425`, `500`); the closure-style `UpdateFn` runs a compound multi-field update inside one `provisionsMu.Lock`, so atomicity is preserved without one method per transition.
+The live provision records are owned by the Docker backend, not the actor: `Backend.provisions` is a `map[string]*provision` guarded by `provisionsMu` (`backend.go:72`). The actor never touches that map directly. Instead it mutates provision state **only** through `leasesm.LeaseProvisionStore` — a `backendProvisionStore` adapter (`leasesm_adapters.go:98-140`) wired as `b.provisionStore` (`backend.go:171`, `562`) and reached via the actor's `cfg`. Every SM entry/exit action reads and writes through `cfg.ProvisionStore.Get(...)` and `cfg.ProvisionStore.UpdateFn(...)` (`lease_sm.go:329`, `388`, `458`, `533`); the closure-style `UpdateFn` runs a compound multi-field update inside one `provisionsMu.Lock`, so atomicity is preserved without one method per transition.
 
 This mutex-guarded shared map plus the per-lease serialization goroutine is a **deliberate idiomatic Go hybrid** — the single-writer substrate the actor model is built on. It is **not tech debt and not an unfinished migration**: the map stays shared because recovery and enumeration are inherently cross-lease, while the per-lease ordering guarantee comes from the inbox, and the store adapter takes the same mutex as the direct accessors (`recover.go`, `deprovision.go`, startup mutators) so cross-path atomicity holds.
 
@@ -610,6 +610,16 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_chain_transactions_total` | counter | `type, outcome` | Chain transactions (`acknowledge`, `reject`, `withdraw`, `close`) |
 | `fred_chain_query_duration_seconds` | histogram | `query` | Chain query latency |
 | `fred_chain_signer_oog_retries_total` | counter | `result` | Out-of-gas retry decisions at the broadcast layer (`retried`, `exhausted`) |
+| `fred_chain_gas_simulation_total` | counter | `result` | Per-tx gas-simulation outcomes: `simulated` (Simulate succeeded), `fallback` (Simulate unavailable → used the `gas_limit` ceiling), `refused` (simulated estimate exceeded `max_gas_limit`, rejected before broadcast) (ENG-431) |
+| `fred_chain_gas_simulated` | histogram | — | Declared gas magnitude per broadcast (`gas_adjustment` × simulated `GasUsed`, or the fallback ceiling) (ENG-431) |
+
+**Withdraw:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_withdraw_incomplete_cycles_total` | counter | — | Provider-wide withdrawal cycles that hit the iteration bound (`max_withdraw_iterations`) with the pagination cursor still non-empty — the provider was not fully drained in that cycle (deferred to the next cycle, not fund loss) (ENG-475) |
+| `fred_withdraw_skipped_by_guard_total` | counter | — | Scheduler wakes that skipped the paid withdrawal because the withdraw-cadence guard had not elapsed since the last full drain; only increments when `guard_active`=1 (ENG-524) |
+| `fred_withdraw_guard_active` | gauge | — | 1 when the withdraw-cadence guard is active (`credit_check_interval < withdraw_interval`), else 0 (ENG-524) |
 
 **Payload:**
 
@@ -685,6 +695,7 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_retention_orphan_skips_total` | counter | `reason` | Orphan-reconcile skips by reason (sweep-level bailouts + per-record raced prune attempts). `reason` ∈ `list_error`, `root_unverifiable`, `raced`, `disabled`, `store_error` |
 | `fred_docker_backend_retention_writable_path_reclaimed_total` | counter | — | Total writable-path-only volumes destroyed (reclaimed) at close instead of retained |
 | `fred_docker_backend_retention_index_reindex_total` | counter | `trigger` | Count of retention in-memory index (re)builds, by trigger (`open`\|`manual`) |
+| `fred_docker_backend_restore_finalizer_pending_total` | counter | — | Restore-finalizer kept-pending events: a successful restore whose active-release write failed, so the retention record stays `restoring` to keep protecting the adopted volume; reconcile re-increments each sweep, so a sustained rate means the release store is failing (mirrors `retention_leaked_total`'s observable-backstop role, ENG-523) |
 
 **Callbacks:**
 
@@ -714,6 +725,16 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_lease_terminal_event_dropped_total` | counter | `event` | Terminal SM events `sendTerminal` refused to deliver (actor exited, mid-exit, or inbox wedged). Sustained non-zero under clean shutdown indicates a real data-loss pattern |
 | `fred_docker_backend_die_event_dropped_total` | counter | `source` | Container-death signals `routeToLease` could not deliver (`event_loop`, `reconcile`). Reconciler re-detects on next cycle, so this is not data loss but flags a wedged actor or chronic burst |
 | `fred_docker_backend_lease_worker_panics_total` | counter | `worker_type` | Panics in lease worker goroutines (provision/replace/diag) — any non-zero is a latent bug |
+
+#### k3s backend (`/metrics` on the k3s-backend HTTP server)
+
+The k3s backend is an experimental, non-functional scaffold (ENG-133), but its binary still serves `GET /metrics` (default `:9002`) and increments three counters under `fred_k3s_backend_*`, mirroring the docker-backend names.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `fred_k3s_backend_provisions_total` | counter | `outcome` | Provision requests received by the k3s backend (`outcome` ∈ `accepted`/`rejected`) |
+| `fred_k3s_backend_callback_delivery_total` | counter | `outcome` | Callback delivery outcomes, one per overall delivery after retries (`outcome` ∈ `success`/`failure`) |
+| `fred_k3s_backend_callback_store_errors_total` | counter | — | bbolt errors persisting pending callbacks in the k3s backend |
 
 ### Logging (slog)
 

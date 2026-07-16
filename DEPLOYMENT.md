@@ -64,7 +64,7 @@ Each docker-backend host typically also runs Traefik (see [Ingress](#ingress-via
 | OS | Linux. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
 | Docker | iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
-| Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads)) |
+| Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads-disk_mb--0-skus)) |
 | Network | Reachable from `providerd`; outbound reachability to image registries |
 
 ---
@@ -189,7 +189,7 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 - `callback_base_url` — URL where backends reach providerd (e.g. `https://fred.example.com:8443`)
 - `callback_secret` — shared HMAC secret (32+ chars; same value used by every backend)
 - `backends` — at least one entry with `name`, `url`, and either `skus` or `default: true`
-- `placement_store_db_path` — required only when multiple backends share `skus`
+- `placement_store_db_path` — strongly recommended when multiple backends share `skus`. It is not startup-enforced: if unset, providerd logs a warning and read operations (connection details, logs) fall back to a fan-out across matching backends that may route incorrectly
 - `production_mode: true` — strongly recommended in production (forces replay protection, blocks SSRF, blocks `grpc_tls_skip_verify`)
 - `token_tracker_db_path` — required when `production_mode: true`
 
@@ -204,6 +204,15 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 - `callback_secret` — must match `providerd`'s value
 - `sku_mapping` — maps on-chain SKU UUIDs to local profile names (provisioning fails otherwise)
 - `volume_data_path` — required when any SKU has `disk_mb > 0`
+
+**Environment variables** (docker-backend / k3s-backend) — each overrides the corresponding YAML field:
+
+- `DOCKER_BACKEND_ADDR` / `K3S_BACKEND_ADDR` — override `listen_addr`
+- `DOCKER_BACKEND_CALLBACK_SECRET` / `K3S_BACKEND_CALLBACK_SECRET` — override `callback_secret` (lets you keep the secret out of the on-disk YAML)
+- `DOCKER_BACKEND_HOST_ADDRESS` / `K3S_BACKEND_HOST_ADDRESS` — override `host_address`
+- `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE` / `K3S_BACKEND_MAX_REQUEST_BODY_SIZE` — override the 2 MiB request-body cap (a non-positive value is ignored)
+- `DOCKER_HOST` (docker-backend) — Docker daemon endpoint, per the standard Docker convention
+- `KUBECONFIG` (k3s-backend) — path to the kubeconfig
 
 ---
 
@@ -382,7 +391,7 @@ backends:
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
-Identical `skus` lists on `docker-1` and `docker-2` make them a matching pool for those SKUs. Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. `placement_store_db_path` is **required** so that read operations (connection details, logs) hit the backend that actually holds each lease.
+Identical `skus` lists on `docker-1` and `docker-2` make them a matching pool for those SKUs. Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. `placement_store_db_path` should be set so that read operations (connection details, logs) route directly to the backend holding each lease; it is not startup-enforced — without it, providerd logs a warning and reads fall back to a fan-out across matching backends.
 
 To add a host: spin up another `docker-backend` with the same `skus` list, add it to `config.yaml`, and reload `providerd`. New provisions immediately distribute across the new host. To drain: remove its entry from `skus` (so it no longer receives new provisions) and let existing leases close naturally, or migrate them by deprovisioning + reprovisioning on the chain side.
 

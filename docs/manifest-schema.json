@@ -68,10 +68,10 @@
         },
         "labels": {
           "type": "object",
-          "description": "Custom labels added to the container. Keys must not start with \"fred.\" (reserved namespace).",
+          "description": "Custom labels added to the container. Keys must not start with \"fred.\" or \"traefik.\" (reserved namespaces; traefik.* is blocked to prevent cross-tenant ingress route hijack — ENG-497).",
           "propertyNames": {
             "type": "string",
-            "not": { "pattern": "^fred\\." }
+            "not": { "pattern": "^(fred|traefik)\\." }
           },
           "additionalProperties": {
             "type": "string"

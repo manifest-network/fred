@@ -44,7 +44,7 @@ Backends authenticate callbacks to Fred using HMAC-SHA256 with a four-field cano
 
 **Signed canonical string:** `<timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>` — binding all four fields prevents timestamp substitution AND cross-endpoint replay (a captured `POST /callbacks/provision` signature cannot be replayed against any other endpoint or method).
 
-**Path-stripping reverse proxies.** Because the canonical string includes the request URI, deployments where a reverse proxy rewrites the inbound path (e.g., Traefik `stripPrefix` middleware mapping `/api/fred/*` → fred's bare `/*`) would otherwise see a verifier/signer URI mismatch: backends sign the full external URL while fred receives the stripped URL post-proxy. The static `callback_canonical_path_prefix` config field tells fred's verifier what prefix to prepend to `r.URL.RequestURI()` before computing the canonical string, so signer and verifier agree. The value is **static config**, not derived from request headers (e.g., `X-Forwarded-Prefix`) — this rules out spoofing as a failure mode and leaves "config is correct" as the only invariant to maintain. The prefix must be sourced from the same configuration variable that defines the proxy's strip rule; drift between the two breaks every callback. The TLS-posture context that makes the underlying ENG-191 URI binding load-bearing is documented in `manifest-deploy/CLAUDE.md:181` and `:195`. See [docs/security-callback-auth.md](docs/security-callback-auth.md) for the full threat-model rationale.
+**Path-stripping reverse proxies.** Because the canonical string includes the request URI, deployments where a reverse proxy rewrites the inbound path (e.g., Traefik `stripPrefix` middleware mapping `/api/fred/*` → fred's bare `/*`) would otherwise see a verifier/signer URI mismatch: backends sign the full external URL while fred receives the stripped URL post-proxy. The static `callback_canonical_path_prefix` config field tells fred's verifier what prefix to prepend to `r.URL.RequestURI()` before computing the canonical string, so signer and verifier agree. The value is **static config**, not derived from request headers (e.g., `X-Forwarded-Prefix`) — this rules out spoofing as a failure mode and leaves "config is correct" as the only invariant to maintain. The prefix must be sourced from the same configuration variable that defines the proxy's strip rule; drift between the two breaks every callback. The TLS-posture context that makes the underlying ENG-191 URI binding load-bearing is documented in the `### Security` (TLS) section of the companion `manifest-deploy` operations repository's `CLAUDE.md` (a separate repo, not part of this one). See [docs/security-callback-auth.md](docs/security-callback-auth.md) for the full threat-model rationale.
 
 | Parameter | Value |
 |-----------|-------|
@@ -151,6 +151,7 @@ All requests are wrapped with `http.MaxBytesReader` enforcing a configurable max
 ### Query Parameter Bounds
 
 - `tail` parameter: validated as positive integer, bounded 1–10,000
+- Container log reads are additionally capped at 5 MiB total (`maxContainerLogBytes`, docker backend) via a demux-output capping writer — since Docker's `tail` bounds lines, not bytes. Output beyond the cap is truncated with a `[log truncated: exceeded 5 MiB limit]` marker, preventing OOM from an adversarial container emitting oversized stdout/stderr (ENG-499).
 
 ### Manifest Validation (Docker Backend)
 
@@ -169,6 +170,15 @@ Payloads uploaded via `POST /data` are verified against the on-chain `meta_hash`
 - SHA-256 hash computed over raw payload bytes
 - Compared using `subtle.ConstantTimeCompare` (prevents timing attacks)
 - meta_hash format validated as 64 hex characters
+
+### Archive / Tar Extraction (Docker Backend)
+
+Stateful-volume seed data is extracted from tenant-controlled container images via `sanitizeAndExtractTar` (ENG-430). The extraction is confined and bounded:
+- **Structural confinement:** every write goes through an `os.Root` (`os.OpenRoot`) rooted at the destination directory, so the OS refuses any operation that would escape it.
+- **Path rejection:** absolute paths and `..` traversal are rejected with an entry-named error; `.`/`./`/empty entries are skipped so a tar cannot `mkdir`/`chown` the extraction root itself.
+- **Permission stripping:** setuid/setgid bits are cleared on every entry; ownership uses `Root.Lchown` (never `Chown`) so a symlink is never followed during the ownership change.
+- **Symlinks:** links whose targets point outside the root are still created but are harmless — `os.Root` refuses to extract any *later* entry *through* them, and they only resolve inside the bind-mounted container.
+- **Byte budget (overflow-safe):** each regular file is checked against the *remaining* budget (`maxBytes - totalBytes`) rather than a running sum, so a tenant-controlled `hdr.Size` near `math.MaxInt64` cannot overflow past the gate; negative sizes are rejected outright. This bounds zip-bomb / oversized-image extraction.
 
 ## Rate Limiting
 

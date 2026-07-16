@@ -15,7 +15,7 @@ Fred ↔ backends is a **bidirectional HMAC channel**, not a one-way webhook fan
 
 The signer's view of the URI and the verifier's view of the URI agree on the outbound leg (no rewriter sits between them) but **diverge on the inbound leg** (Traefik strips the path before fred sees it). Any signature-binding change that includes the URI in its canonical string surfaces this asymmetry. ENG-191 was such a change, and ENG-198 was the compensation.
 
-## 2. TLS posture asymmetry per `manifest-deploy/CLAUDE.md:181` / `:195`
+## 2. TLS posture asymmetry (per the companion `manifest-deploy` repo's `CLAUDE.md`, `### Security` section)
 
 In this deployment topology, the fred ↔ backend channel is **plain HTTP (no TLS)** by design — the lines cited are in the `manifest-deploy` repo's `CLAUDE.md`, not this repo's. HMAC is therefore the *only* authenticity mechanism on the wire between fred and backends. An in-zone observer can read every byte. That elevates the impact of any signature-binding weakness from theoretical to materially exploitable, which is the load-bearing reason ENG-191 had to bind method + URI into the canonical string in the first place. Do not reason about this system as if it were TLS-protected.
 
@@ -55,7 +55,7 @@ Validation rules:
 - **Read `X-Forwarded-Prefix` from a trusted proxy.** Three failure modes (header present + trusted, header present + untrusted, header missing + `production_mode` gating) vs. one (config right or wrong). Header trust requires a list of trusted-proxy CIDRs maintained alongside `trusted_proxies` and a non-trivial verification path. Static config is strictly simpler and Ansible already knows the value.
 - **Normalize URIs on both sides** (e.g., always strip a known prefix at the signer, or always work in "bare" path space). Couples backend code to the deployment-specific proxy topology and breaks direct-call deploys (loadtest, dev). The signer should sign what it actually sends; the verifier compensates for what the proxy did.
 - **Revert ENG-191 / drop URI binding.** Reopens cross-endpoint replay, which is materially exploitable per (2) and (3) above. Not on the table.
-- **Switch to TLS between fred and backends to eliminate the in-zone-observer threat.** Out of scope for this fix — would also require changes in `manifest-deploy/CLAUDE.md:181`/`:195`. The HMAC channel must remain robust regardless.
+- **Switch to TLS between fred and backends to eliminate the in-zone-observer threat.** Out of scope for this fix — would also require changes in the companion `manifest-deploy` repo (`CLAUDE.md`, `### Security` section). The HMAC channel must remain robust regardless.
 
 ## Invariants the next reader must preserve
 

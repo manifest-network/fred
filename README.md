@@ -183,14 +183,14 @@ backends:
   # Give every backend the same skus list so they all match,
   # then Fred routes each provision to the least-loaded one.
   - name: docker-1
-    url: "http://10.0.0.1:9000"
+    url: "http://10.0.0.1:9001"
     skus:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
     default: true
 
   - name: docker-2
-    url: "http://10.0.0.2:9000"
+    url: "http://10.0.0.2:9001"
     skus:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
@@ -286,6 +286,7 @@ These options have sensible defaults but can be tuned for specific environments:
 | `sub_signer_min_balance` | Minimum balance before a sub-signer is topped up. | `10000000umfx` |
 | `sub_signer_top_up_amount` | Amount transferred per top-up. | `50000000umfx` |
 | `sub_signer_fund_check_interval` | How often balances are checked. | `1h` |
+| `credit_check_interval` | How often the scheduler wakes to run the credit check, independent of `withdraw_interval`. `0s` couples it to `withdraw_interval`; when set >0 it must be ≤ `withdraw_interval`. A smaller value polls credit faster while the paid withdrawal stays rate-limited to `withdraw_interval` (the ENG-524 withdraw-cadence guard). | `0s` |
 | `credit_check_error_threshold` | Errors before disabling credit monitoring | `3` |
 | `credit_check_retry_interval` | Retry interval after credit check errors | `30s` |
 | `shutdown_timeout` | Maximum time for graceful shutdown (drain + cleanup) | `30s` |
@@ -1350,7 +1351,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for detailed benchmarks, stress test result
 
 ## Dependencies
 
-- Go 1.25+ (uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
+- Go 1.26.5+ (per the `go 1.26.5` directive in `go.mod`; also uses `sync.WaitGroup.Go()`, `testing.B.Loop()`, `range` over integers)
 - Watermill (event routing)
 - Cosmos SDK v0.50.14
 - CometBFT v0.38.x

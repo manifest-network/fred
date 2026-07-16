@@ -8,7 +8,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 
 ## Prerequisites
 
-- **Go 1.25.9** (per `go.mod`) — Fred uses `sync.WaitGroup.Go()` and `testing.B.Loop()` which require 1.25+.
+- **Go 1.26.5** (per `go.mod`) — the `go 1.26.5` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` and `testing.B.Loop()` (added in Go 1.25).
 - **Docker 24+** with iptables enabled — required for `make test-integration` and the docker-backend.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **(Optional) `golangci-lint`** — `make lint` runs `go vet` unconditionally and adds golangci checks if it's on `PATH`.
@@ -22,8 +22,8 @@ For an overview of what Fred does and how it's structured, start with [README.md
 git clone https://github.com/manifest-network/fred.git
 cd fred
 go mod download
-make all              # builds providerd, mock-backend, docker-backend into ./build/
-make test             # unit tests, ~30s
+make all              # builds providerd, mock-backend, docker-backend, k3s-backend into ./build/
+make test             # all unit tests (runs the stress suite too; see Stress tests)
 ```
 
 For an end-to-end local environment against a running chain:
@@ -86,7 +86,8 @@ Every package has a `doc.go` (or a leading package comment) that describes its p
 ### Unit tests
 
 ```bash
-make test                       # all unit tests, fast
+make test                       # all unit tests (no -short, so the stress suite runs too)
+go test -short ./...            # unit tests only, skipping the stress suite
 go test ./internal/api/         # specific package
 go test -run TestAuthToken ./...  # specific test by name
 ```
@@ -123,7 +124,7 @@ Running the suites locally is still the fastest iteration loop, and required for
 
 ### Stress tests
 
-Stress tests are gated behind `testing.Short()` so they don't slow down the regular suite. The largest ones (500K, 1M events) additionally require `STRESS_TEST_LARGE=1`:
+Stress tests self-skip under `testing.Short()`, so `go test -short ./...` and the CI `test` job skip them — but a plain `make test` (which does **not** pass `-short`) runs them. The largest ones (500K, 1M events) additionally require `STRESS_TEST_LARGE=1`:
 
 ```bash
 go test -v -run "StressTest|SustainedLoad" ./internal/provisioner/ -timeout 10m
@@ -135,7 +136,7 @@ See [PERFORMANCE.md](PERFORMANCE.md) for the methodology and reference numbers.
 ### Coverage
 
 ```bash
-make test-coverage          # opens coverage.html
+make test-coverage          # generates coverage.html (open it manually); runs with -tags integration, so it needs a Docker daemon
 sudo make test-coverage-all # includes volume tests
 ```
 
@@ -168,12 +169,12 @@ make fmt    # runs `go fmt ./...`
 make lint
 ```
 
-This runs `go vet` plus `golangci-lint` if installed. The `.golangci.yml` enables: `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `gocritic`, `misspell`, `unconvert`, `unparam`, `nilerr`, `errorlint`, `exhaustruct`. Test files and `cmd/` are excluded from some strict checks (see `.golangci.yml` for the rules). `exhaustruct` runs in directive-only mode — it checks only struct literals explicitly marked `//exhaustruct:enforce`.
+This runs `go vet` plus `golangci-lint` if installed. The `.golangci.yml` enables: `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `gocritic`, `misspell`, `unconvert`, `unparam`, `nilerr`, `errorlint`, `exhaustruct`, `gosec` (the last scoped by rule-wide excludes such as G115/G104 and per-path suppressions). Test files and `cmd/` are excluded from some strict checks (see `.golangci.yml` for the rules). `exhaustruct` runs in directive-only mode — it checks only struct literals explicitly marked `//exhaustruct:enforce`.
 
-Install golangci-lint. CI pins **v2.8.0** (`.github/workflows/ci.yml`), and the config uses the v2 schema, so match that version locally to avoid local-vs-CI drift:
+Install golangci-lint. CI pins **v2.9.0** (`.github/workflows/ci.yml`), and the config uses the v2 schema, so match that version locally to avoid local-vs-CI drift:
 
 ```bash
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.8.0
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.9.0
 ```
 
 ### Conventions used in this codebase
@@ -224,7 +225,7 @@ Backend operations involve three layers:
 
 1. **`internal/backend/client.go`** — Fred's HTTP client. Define request/response structs, add a method on `HTTPClient`. Wrap with the circuit breaker.
 2. **`cmd/docker-backend/main.go`** (and `cmd/mock-backend/main.go`) — the actual HTTP handlers. Apply the HMAC auth middleware.
-3. **`internal/backend/docker/`** — the implementation. New mutating operations should typically be a new lease-actor message type with corresponding state-machine triggers (see `lease_sm.go`).
+3. **`internal/backend/docker/`** — the implementation. New mutating operations should typically be a new lease-actor message type with corresponding state-machine triggers (see `internal/backend/shared/leasesm/lease_sm.go`, adapted into the docker backend via `leasesm_adapters.go`).
 
 Update [BACKEND_GUIDE.md](BACKEND_GUIDE.md) to document the new endpoint for third-party backend implementers.
 
