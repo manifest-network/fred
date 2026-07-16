@@ -504,9 +504,17 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 	// Source that redirects the mount outside the volume (host escape). Detection
 	// only yields real-directory writable paths today, but confine the Source to
 	// wpDir here so the bind path is self-defending regardless. See ENG-543.
-	var wpRoot *os.Root
-	if r, err := os.OpenRoot(wpDir); err == nil {
-		wpRoot = r
+	wpRoot, rootErr := os.OpenRoot(wpDir)
+	if rootErr != nil && !errors.Is(rootErr, fs.ErrNotExist) {
+		// An unexpected failure opening the _wp root (permission, I/O, not-a-dir)
+		// means the confinement checks below cannot run. Fail closed: seed nothing
+		// rather than mount an unvalidated (possibly symlinked) Source. ErrNotExist
+		// is safe — nothing was extracted, so no Source exists to be a symlink.
+		b.logger.Warn("cannot open writable-path root for confinement checks; skipping all writable-path binds",
+			"path", wpDir, "image", image, "error", rootErr)
+		return nil
+	}
+	if wpRoot != nil {
 		defer func() { _ = wpRoot.Close() }()
 	}
 

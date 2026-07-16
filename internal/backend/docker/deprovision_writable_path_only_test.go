@@ -677,6 +677,32 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 	assert.Empty(t, binds, "no bind should be emitted for a symlink source")
 }
 
+// TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable pins the ENG-543 review
+// follow-up (PR #183): if the _wp root cannot be opened for the confinement checks
+// for any reason OTHER than "does not exist", setupWritablePathBinds must fail closed
+// and emit no binds rather than mount unvalidated (possibly symlinked) Sources.
+func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
+
+	hostVol := t.TempDir()
+	wpDir := filepath.Join(hostVol, writablePathSubdir)
+
+	// Extraction leaves wpDir as a regular FILE, so os.OpenRoot(wpDir) fails with a
+	// non-ErrNotExist error (ENOTDIR) and the confinement checks cannot run.
+	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _ int64) map[string]error {
+		require.Equal(t, wpDir, destDir)
+		require.NoError(t, os.WriteFile(destDir, []byte("x"), 0o600))
+		return nil
+	}
+
+	binds := b.setupWritablePathBinds(context.Background(), "img",
+		[]string{"/var/lib/grafana"}, hostVol, 64<<20)
+
+	assert.Empty(t, binds,
+		"must fail closed (emit no binds) when the _wp root cannot be opened for confinement checks")
+}
+
 // TestWritablePathExtractDir pins the ENG-543 confinement of the extraction target
 // directory. The raw os.MkdirAll it replaced would follow a symlink extracted for an
 // earlier writable path and create image content outside destDir on the host;
