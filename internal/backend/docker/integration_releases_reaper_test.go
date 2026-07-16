@@ -116,8 +116,15 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	require.NoError(t, b2.Start(ctx)) // recoverState rehydrates StackManifest from the surviving record
 	t.Cleanup(func() { _ = b2.Stop() })
 
-	prov := getProvisionInfo(t, b2, leaseUUID)
-	require.Equal(t, backend.ProvisionStatusReady, prov.Status, "lease must recover as Ready")
+	// recoverState re-adopts the running container asynchronously, so the actor
+	// may still be settling Status when Start returns — wait for Ready rather than
+	// asserting it immediately (mirrors restore_metrics_test.go).
+	require.Eventually(t, func() bool {
+		b2.provisionsMu.RLock()
+		defer b2.provisionsMu.RUnlock()
+		p, ok := b2.provisions[leaseUUID]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 30*time.Second, 100*time.Millisecond, "lease must recover as Ready")
 
 	// THE ENG-440 ASSERTION: a real Restart must succeed. Pre-fix this returned
 	// ErrInvalidState "no stored manifest" synchronously, because the reaped record
@@ -129,8 +136,15 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	cb = waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
 	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status, "restart redeploy must succeed")
 
-	prov = getProvisionInfo(t, b2, leaseUUID)
-	assert.Equal(t, backend.ProvisionStatusReady, prov.Status, "lease must be Ready after restart")
+	// The restart callback reports Success before the actor flips Status=Ready, so
+	// wait for Ready rather than reading it immediately — this was the source of the
+	// AgeReapedReleaseStillRestartable flake.
+	require.Eventually(t, func() bool {
+		b2.provisionsMu.RLock()
+		defer b2.provisionsMu.RUnlock()
+		p, ok := b2.provisions[leaseUUID]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 30*time.Second, 100*time.Millisecond, "lease must be Ready after restart")
 
 	require.NoError(t, b2.Deprovision(ctx, leaseUUID))
 }
