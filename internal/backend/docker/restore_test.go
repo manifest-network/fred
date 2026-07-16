@@ -3363,6 +3363,96 @@ func TestRestore_AdoptInsufficientResources_RollsBack(t *testing.T) {
 	assert.Equal(t, 1, entry.Generation, "generation must be unchanged (no claim)")
 }
 
+// TestRestore_MultiVolumePromoteThatFits_Admitted is the ENG-545 / PR #184 review
+// regression: a restore that PROMOTES a multi-instance (Quantity>1) stateful
+// service into a larger tier must be admitted when the post-restore committed disk
+// fits the pool. The disk gate is on the AGGREGATE promote delta above the retained
+// footprint, not per adopted volume — a per-volume gate double-counted the retained
+// bytes (still in retainedDisk until ClaimForRestore) against the freshly-added
+// allocatedDisk and wrongly rejected a fitting restore for Quantity>1.
+func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
+			return &ImageInfo{ID: "img-1", Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+
+	// Pool: 4096 MB disk, generous CPU/mem. Retained = docker-small qty 2 (2×1024 =
+	// 2048). Promote to docker-medium qty 2 (2×2048 = 4096). Post-restore committed
+	// disk = 4096 = totalDisk → fits exactly (retainedDisk drops to 0 on claim).
+	b.pool = shared.NewResourcePool(8, 8192, 4096, b.cfg.GetSKUProfile, nil)
+
+	orig := "u1"
+	rec := shared.RetentionEntry{
+		OriginalLeaseUUID: orig,
+		Tenant:            "tenant-a",
+		ProviderUUID:      "prov-1",
+		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+		StackManifest:     restoreStackManifest(),
+		CallbackURL:       "http://localhost/callback",
+		RetainedVolumeNames: []string{
+			retainedName(canonicalVolumeName(orig, manifest.DefaultServiceName, 0)),
+			retainedName(canonicalVolumeName(orig, manifest.DefaultServiceName, 1)),
+		},
+		Status:     shared.RetentionStatusActive,
+		Generation: 1,
+		CreatedAt:  time.Now(),
+	}
+	require.NoError(t, rs.Put(rec))
+	// The retained lease's own footprint (2048) is in the projection at gate time,
+	// exactly as in production — this is what a per-volume gate double-counts.
+	b.refreshRetentionAccounting()
+	require.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB, "sanity: retained footprint counted")
+
+	var mu sync.Mutex
+	var downProjects []string
+	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	b.volumes = &mockVolumeManager{
+		defaultDir:     t.TempDir(),
+		CreateFn:       func(_ context.Context, _ string, _ int64) (string, bool, error) { return t.TempDir(), true, nil },
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	callbackReceived := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		select {
+		case <-callbackReceived:
+		default:
+			close(callbackReceived)
+		}
+	}))
+	defer server.Close()
+
+	req := restoreRequest("u2", orig, server.URL)
+	req.Items = []backend.LeaseItem{{SKU: "docker-medium", Quantity: 2, ServiceName: manifest.DefaultServiceName}}
+
+	// Admission is synchronous; before the aggregate-delta fix this returned
+	// ErrInsufficientResources (the second adopt's gate saw old+new double-counted).
+	// Admission is exactly what this regression asserts — not the async worker's
+	// outcome.
+	require.NoError(t, b.Restore(context.Background(), req),
+		"a multi-volume promote whose post-restore disk fits must be admitted")
+
+	// The async worker adopts both retained volumes and brings the stack up; it
+	// must reach Ready — proving the fix both admits the promote AND lets the
+	// multi-volume restore complete end-to-end.
+	<-callbackReceived
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		p, ok := b.provisions["u2"]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready after admission")
+}
+
 // TestRollback_RevertStoreError_KeepsLiveCounted verifies make-before-break: when
 // RevertToActive returns a STORE ERROR during rollback, the live allocation is NOT
 // released (F stays counted as live, no under-count), the leak counter increments,
@@ -3381,7 +3471,7 @@ func TestRollback_RevertStoreError_KeepsLiveCounted(t *testing.T) {
 	rec.NewLeaseUUID = "new"
 	rec.Generation = 2
 	require.NoError(t, rs.Put(rec))
-	require.NoError(t, b.pool.TryAllocateAdopt("new-app-0", "docker-micro", "t1", 512)) // same-tier (docker-micro DiskMB=512)
+	require.NoError(t, b.pool.TryAllocateAdopt("new-app-0", "docker-micro", "t1"))
 
 	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }} // re-quarantine succeeds
 

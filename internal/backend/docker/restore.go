@@ -809,22 +809,25 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	}.materialize()
 	b.provisionsMu.Unlock()
 
-	// (c) Allocate pool slots. Disk is gated on the PROMOTE DELTA above each
-	// volume's already-committed retained footprint (same-tier/demote skip the
-	// disk gate; only growth into a larger tier is capacity-checked) — ENG-545.
-	// oldDiskMB maps service → the DiskMB the retained record contributed to the
-	// retained projection; an unresolved old SKU counted 0, so gate the full cap.
-	oldDiskMB := make(map[string]int64, len(rec.Items))
-	for _, it := range rec.Items {
-		if op, oerr := b.cfg.GetSKUProfile(it.SKU); oerr == nil {
-			oldDiskMB[it.ServiceName] = op.DiskMB
-		}
+	// (c) Gate disk capacity on the AGGREGATE promote delta, then allocate pool
+	// slots. Restore adopts existing volumes (rename, not fresh disk), so only the
+	// growth of the lease's total DiskMB above its already-committed retained
+	// footprint is new disk pressure; same-tier and demote restores add none. This
+	// is checked once for the whole lease — a per-volume gate would double-count the
+	// retained bytes still in the projection until ClaimForRestore and reject a
+	// fitting multi-volume promote (ENG-545). An unresolved SKU counts 0 (leaseDiskMB
+	// drops it), which only makes the gate more conservative.
+	newDiskMB, _ := b.leaseDiskMB(req.Items)
+	oldDiskMB, _ := b.leaseDiskMB(rec.Items)
+	if derr := b.pool.CheckAdoptDiskHeadroom(newDiskMB - oldDiskMB); derr != nil {
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, derr)
 	}
 	var allocatedIDs []string
 	for _, item := range req.Items {
 		for i := range item.Quantity {
 			id := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant, oldDiskMB[item.ServiceName]); aerr != nil {
+			if aerr := b.pool.TryAllocateAdopt(id, item.SKU, rec.Tenant); aerr != nil {
 				releaseAll(b.pool, allocatedIDs)
 				updateResourceMetrics(b.pool.Stats())
 				b.removeProvision(req.LeaseUUID)

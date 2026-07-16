@@ -73,30 +73,51 @@ func NewResourcePool(totalCPU float64, totalMemoryMB, totalDiskMB int64, resolve
 // TryAllocate attempts to reserve resources for a new provision (gates all of
 // CPU, memory, disk, and tenant quota).
 func (p *ResourcePool) TryAllocate(leaseUUID, sku, tenant string) error {
-	return p.tryAllocate(leaseUUID, sku, tenant, true, 0)
+	return p.tryAllocate(leaseUUID, sku, tenant, true)
 }
 
 // TryAllocateAdopt reserves resources for a lease being RESTORED by adopting an
 // existing retained volume (rename, not fresh disk). It gates CPU, memory, and
-// tenant quota normally. For the global disk gate it does NOT re-check the whole
-// footprint — the adopted bytes are already committed on disk and counted in the
-// retained projection, so re-gating would double-count and spuriously deny a
-// restore that physically fits. Instead it gates only the PROMOTE DELTA: the
-// growth of the new SKU's DiskMB above adoptOldDiskMB (the disk the retained
-// record already contributed to the retained projection). Same-tier and demote
-// (delta <= 0) skip the disk gate exactly as before; a promote into a larger
-// tier is capacity-checked so restore cannot over-commit the pool (ENG-545). The
-// full new DiskMB is still added to allocatedDisk for correct live accounting;
-// the retained projection drops adoptOldDiskMB when the record flips to restoring.
-func (p *ResourcePool) TryAllocateAdopt(leaseUUID, sku, tenant string, adoptOldDiskMB int64) error {
-	return p.tryAllocate(leaseUUID, sku, tenant, false, adoptOldDiskMB)
+// tenant quota normally but SKIPS the global disk capacity check: the adopted
+// bytes are already committed on disk and counted in the retained projection, so
+// re-gating them per volume would double-count the lease's own footprint. The
+// disk CAPACITY of a restore is instead gated once, up front, by
+// CheckAdoptDiskHeadroom against the AGGREGATE promote delta (ENG-545). DiskMB is
+// still added to allocatedDisk for correct live accounting; the retained
+// projection drops it when the record flips to restoring.
+func (p *ResourcePool) TryAllocateAdopt(leaseUUID, sku, tenant string) error {
+	return p.tryAllocate(leaseUUID, sku, tenant, false)
+}
+
+// CheckAdoptDiskHeadroom verifies that a restore's aggregate PROMOTE DELTA fits
+// remaining global disk capacity. Restore adopts existing volumes (rename, not
+// fresh disk), and the retained lease's whole footprint is already counted in the
+// retained projection, so only growth above it — deltaMB = newTotalDiskMB minus
+// the old retained DiskMB, summed across the lease's volumes — is new disk
+// pressure. Same-tier and demote restores (deltaMB <= 0) always pass. Gating the
+// aggregate once, rather than per adopted volume, is what keeps the check exact:
+// during the per-volume adopt loop allocatedDisk grows by each new DiskMB while
+// retainedDisk still holds the old footprint until refreshRetentionAccounting
+// runs, so a per-volume gate would double-count and reject a multi-volume promote
+// whose true post-claim footprint fits (ENG-545).
+func (p *ResourcePool) CheckAdoptDiskHeadroom(deltaMB int64) error {
+	if deltaMB <= 0 {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.allocatedDisk+p.retainedDisk+deltaMB > p.totalDisk {
+		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
+			deltaMB, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
+	}
+	return nil
 }
 
 // tryAllocate is the shared implementation for TryAllocate and TryAllocateAdopt.
-// When gateDisk is true the full DiskMB is gated against global capacity (fresh
-// provision). When false (adopt/restore) only the promote delta above
-// adoptOldDiskMB is gated; adoptOldDiskMB is ignored when gateDisk is true.
-func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool, adoptOldDiskMB int64) error {
+// When gateDisk is true the global disk capacity check is enforced (fresh
+// provision); when false (adopt/restore) the check is skipped because the disk was
+// already committed and its capacity is gated up front by CheckAdoptDiskHeadroom.
+func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -120,22 +141,9 @@ func (p *ResourcePool) tryAllocate(leaseUUID, sku, tenant string, gateDisk bool,
 		return fmt.Errorf("insufficient memory: need %d MB, have %d MB available",
 			profile.MemoryMB, p.totalMemory-p.allocatedMemory)
 	}
-	// Global disk gate. A fresh provision gates its full DiskMB. An adopt
-	// (restore) gates only the PROMOTE DELTA above the volume's already-committed
-	// retained footprint: those bytes are already counted in retainedDisk, so only
-	// growth (DiskMB - adoptOldDiskMB) is new disk pressure. Same-tier and demote
-	// (delta <= 0) add no pressure and skip the gate exactly as the prior
-	// unconditional adopt skip did; only a promote into a larger tier is
-	// capacity-checked, so a restore can no longer over-commit the pool (ENG-545).
-	diskPressure := profile.DiskMB
-	if !gateDisk {
-		if diskPressure = profile.DiskMB - adoptOldDiskMB; diskPressure < 0 {
-			diskPressure = 0
-		}
-	}
-	if (gateDisk || diskPressure > 0) && p.allocatedDisk+p.retainedDisk+diskPressure > p.totalDisk {
+	if gateDisk && p.allocatedDisk+p.retainedDisk+profile.DiskMB > p.totalDisk {
 		return fmt.Errorf("insufficient disk: need %d MB, have %d MB available",
-			diskPressure, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
+			profile.DiskMB, max(int64(0), p.totalDisk-p.allocatedDisk-p.retainedDisk))
 	}
 
 	// Check per-tenant quota if configured
