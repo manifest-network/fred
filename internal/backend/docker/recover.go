@@ -382,10 +382,19 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	}
 	b.provisions = final
 
-	// Build the final allocations list, excluding leases with in-flight
-	// operations (provisioning/restarting/updating). Their old containers
-	// are being cleaned up concurrently; including stale allocations would
-	// race with TryAllocate in Provision/Restart/Update.
+	// Build the final allocations list from container-derived state, excluding
+	// leases with in-flight operations (provisioning/restarting/updating). Their
+	// container-derived allocations are stale or absent — a still-pulling
+	// Provision has no containers yet, and a Restart/Update is mid-cleanup — so
+	// counting them here would race with the authoritative reservation.
+	//
+	// Those in-flight leases keep their reservation via ResetPreserving below
+	// instead: their CPU/mem/disk was reserved synchronously by TryAllocate
+	// (Provision) / TryAllocateAdopt (Restore) and is the authoritative figure.
+	// Dropping it on this periodic rebuild would let TryAllocate momentarily see
+	// phantom free capacity and over-admit past physical capacity, leaving the
+	// pool over-committed once the lease re-registers (ENG-546).
+	inflight := make(map[string]bool)
 	var allocations []shared.ResourceAllocation
 	for uuid, allocs := range allocsByLease {
 		if prov, ok := final[uuid]; ok {
@@ -396,7 +405,36 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 		allocations = append(allocations, allocs...)
 	}
-	b.pool.Reset(allocations)
+	// Mark every in-flight lease — whether or not it produced containers — so
+	// the pool retains its existing reservation across the rebuild.
+	for uuid, prov := range final {
+		switch prov.Status {
+		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+			inflight[uuid] = true
+		}
+	}
+	// Preserve the in-flight reservations read from the live pool, keyed
+	// identically. Allocation keys are {leaseUUID}-{service}-{index}; a leaseUUID
+	// is a canonical UUID, so a "{leaseUUID}-" prefix unambiguously identifies
+	// that lease's instance keys and cannot collide with another lease's.
+	//
+	// Race-freedom invariant: this runs while provisionsMu is held (taken before
+	// the `final` merge above, released only after the stats snapshot below), and
+	// every reservation site (Provision, Restore) registers its in-flight
+	// provision entry under provisionsMu BEFORE it reserves in the pool. Together
+	// these guarantee any reservation present in the pool here already has its
+	// entry in `inflight` (so it is preserved), and a not-yet-registered Provision
+	// is blocked on provisionsMu until we release (so its TryAllocate cannot land
+	// mid-rebuild). Moving this call out of the provisionsMu hold — or reserving
+	// in the pool before registering the entry — would reopen ENG-546.
+	b.pool.ResetPreserving(allocations, func(key string) bool {
+		for uuid := range inflight {
+			if strings.HasPrefix(key, uuid+"-") {
+				return true
+			}
+		}
+		return false
+	})
 
 	// Snapshot aggregate stats from the recovered map before releasing the lock.
 	// After unlock, `final` aliases `b.provisions` and concurrent goroutines

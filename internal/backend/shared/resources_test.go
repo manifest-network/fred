@@ -412,6 +412,80 @@ func TestResetPreservesRetainedDisk(t *testing.T) {
 	assert.Equal(t, int64(1024), p.Stats().RetainedDiskMB)
 }
 
+func resetPreservingResolver() SKUResolver {
+	return func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+	}
+}
+
+func TestResetPreserving_NilKeepEqualsReset(t *testing.T) {
+	list := []ResourceAllocation{{LeaseUUID: "l1", Tenant: "t1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
+
+	a := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
+	require.NoError(t, a.TryAllocate("stale-0", "sku", "t9")) // prior state that must be cleared
+	a.Reset(list)
+
+	b := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
+	require.NoError(t, b.TryAllocate("stale-0", "sku", "t9"))
+	b.ResetPreserving(list, nil)
+
+	assert.Equal(t, a.Stats(), b.Stats(), "nil keep must behave identically to Reset")
+	assert.Nil(t, b.GetAllocation("stale-0"), "nil keep preserves nothing")
+}
+
+func TestResetPreserving_RetainsMarkedEntryAbsentFromNewList(t *testing.T) {
+	p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
+	require.NoError(t, p.TryAllocate("inflight-app-0", "sku", "t1")) // the in-flight reservation to keep
+
+	// Rebuild from a snapshot that OMITS the in-flight lease (no container yet),
+	// but mark it to keep — mirroring recoverState dropping an in-flight lease
+	// from the container-derived list.
+	p.ResetPreserving(
+		[]ResourceAllocation{{LeaseUUID: "ready-app-0", Tenant: "t2", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		func(key string) bool { return key == "inflight-app-0" },
+	)
+
+	s := p.Stats()
+	assert.Equal(t, 2, s.AllocationCount, "both the rebuilt Ready lease and the preserved in-flight lease")
+	assert.Equal(t, int64(2048), s.AllocatedDiskMB)
+	assert.Equal(t, 2.0, s.AllocatedCPU)
+	assert.Equal(t, int64(1024), s.AllocatedMemoryMB)
+	assert.NotNil(t, p.GetAllocation("inflight-app-0"), "preserved entry survives")
+	assert.Equal(t, int64(1024), p.TenantStats("t1").AllocatedDiskMB, "preserved lease's per-tenant usage is rebuilt")
+}
+
+func TestResetPreserving_PreservedWinsOverSameKeyInList_NoDoubleCount(t *testing.T) {
+	p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
+	require.NoError(t, p.TryAllocate("dup-app-0", "sku", "t1"))
+
+	// The same key appears BOTH in the rebuild list and is marked to keep. It must
+	// be counted exactly once (the preserved entry wins).
+	p.ResetPreserving(
+		[]ResourceAllocation{{LeaseUUID: "dup-app-0", Tenant: "t1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		func(key string) bool { return key == "dup-app-0" },
+	)
+
+	s := p.Stats()
+	assert.Equal(t, 1, s.AllocationCount, "same key must not double-count")
+	assert.Equal(t, int64(1024), s.AllocatedDiskMB)
+	assert.Equal(t, 1.0, s.AllocatedCPU)
+	assert.Equal(t, int64(1024), p.TenantStats("t1").AllocatedDiskMB, "per-tenant usage counted once")
+}
+
+func TestResetPreserving_DropsUnmarkedEntryAbsentFromNewList(t *testing.T) {
+	p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
+	require.NoError(t, p.TryAllocate("stale-app-0", "sku", "t1"))
+
+	// keep matches nothing and the stale entry is absent from the new list → dropped
+	// (a Failed/Ready lease whose containers are gone must not be over-preserved).
+	p.ResetPreserving(nil, func(key string) bool { return false })
+
+	s := p.Stats()
+	assert.Equal(t, 0, s.AllocationCount, "unmarked entry absent from the rebuild list is dropped")
+	assert.Equal(t, int64(0), s.AllocatedDiskMB)
+	assert.Nil(t, p.GetAllocation("stale-app-0"))
+}
+
 func TestAvailableDiskMB_ClampsToZero(t *testing.T) {
 	s := ResourceStats{TotalDiskMB: 1000, RetainedDiskMB: 2000}
 	assert.Equal(t, int64(0), s.AvailableDiskMB(), "available disk must clamp to 0, never negative (e.g. after a total_disk_mb shrink)")
