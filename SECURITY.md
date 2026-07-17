@@ -179,6 +179,7 @@ Stateful-volume seed data is extracted from tenant-controlled container images v
 - **Permission stripping:** setuid/setgid bits are cleared on every entry; ownership uses `Root.Lchown` (never `Chown`) so a symlink is never followed during the ownership change.
 - **Symlinks:** links whose targets point outside the root are still created but are harmless — `os.Root` refuses to extract any *later* entry *through* them, and they only resolve inside the bind-mounted container.
 - **Byte budget (overflow-safe):** each regular file is checked against the *remaining* budget (`maxBytes - totalBytes`) rather than a running sum, so a tenant-controlled `hdr.Size` near `math.MaxInt64` cannot overflow past the gate; negative sizes are rejected outright. This bounds zip-bomb / oversized-image extraction.
+- **Entry-count cap (`maxEntries`, ENG-548):** the number of extracted entries (dirs/files/symlinks) is capped per writable path, so a crafted image can't flood the host with zero-byte files. It is applied per path rather than shared across paths — on a filesystem without an inode quota (btrfs/zfs) the effective bound across all of a container's writable paths is therefore `maxDetectedWritablePaths × maxEntries`, not `maxEntries` alone; on XFS, the volume-wide `ihard` project quota is the true cross-path gate.
 
 ## Rate Limiting
 
@@ -283,6 +284,7 @@ Every container created by the Docker backend runs with these security measures:
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
 | No swap | `MemorySwap == Memory` | Prevents swap usage entirely |
 | Per-volume disk quota | `bhard` block limit (xfs project quota / btrfs qgroup) | Enforces the SKU `disk_mb` cap on stateful volumes; requires the daemon capability noted below |
+| Per-volume inode quota | `ihard` limit (xfs project quota) | Bounds host inode exhaustion from zero-byte file floods; same `xfs_quota` call and `CAP_SYS_ADMIN` requirement as the disk quota above (ENG-548) |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
 | Network isolation | Per-tenant bridge network | Configurable via `network_isolation` |
 

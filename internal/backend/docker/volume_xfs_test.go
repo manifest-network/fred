@@ -81,7 +81,7 @@ func TestResolveMountpoint_Root(t *testing.T) {
 // branch returns before any exec.
 func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 	dir := t.TempDir()
-	mgr, err := newVolumeManager(dir, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dir, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-does-not-exist-app-0", 100),
 		"EnsureQuota on a missing volume must be a no-op")
@@ -106,7 +106,7 @@ func TestNewVolumeManager_XFS_ResolvesMountpoint(t *testing.T) {
 	dataPath := filepath.Join(mount, "volumes") // subdir, like /data/fred/volumes
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	xm, ok := mgr.(*xfsVolumeManager)
@@ -135,7 +135,7 @@ func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 	assert.Contains(t, strings.Join(setup, " "), "project -s -p "+dir,
 		"project -s must name the subdir inside -c, not as the fs arg")
 
-	limit := xfsQuotaArgs(xfsLimitCmd(projID, "100m"), mount)
+	limit := xfsQuotaArgs(xfsLimitCmd(projID, "100m", 262144), mount)
 	assert.Equal(t, mount, limit[len(limit)-1], "limit -p: trailing fs arg must be the mount point")
 	assert.Contains(t, strings.Join(limit, " "), "limit -p bhard=100m")
 
@@ -317,4 +317,35 @@ func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	assert.True(t, stillMapped, "the volumeToID entry must survive a failed removal (retry-resolvable)")
 	assert.Equal(t, projID, mappedID)
 	assert.True(t, stillReserved, "the projID must stay reserved in activeIDs (no premature reallocation)")
+}
+
+func TestInodeHardLimit(t *testing.T) {
+	cases := []struct {
+		name   string
+		sizeMB int64
+		minAvg int64
+		want   int64
+	}{
+		{"small SKU, default ratio", 30720, 1024, 31457280},
+		{"nano SKU, default ratio", 15360, 1024, 15728640},
+		{"xlarge SKU, no overflow", 245760, 1024, 251658240},
+		{"minAvg 0 uses default 1024", 30720, 0, 31457280},
+		{"negative minAvg uses default", 30720, -5, 31457280},
+		{"minAvg 2048 halves the ceiling", 30720, 2048, 15728640},
+		{"ephemeral 64MB floored", 64, 1024, 262144}, // raw 65536 < floor
+		{"sizeMB 0 floored", 0, 1024, 262144},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, inodeHardLimit(tc.sizeMB, tc.minAvg))
+		})
+	}
+}
+
+func TestXfsLimitCmd_IncludesIhard(t *testing.T) {
+	assert.Equal(t, "limit -p bhard=30720m ihard=31457280 42", xfsLimitCmd(42, "30720m", 31457280))
+}
+
+func TestXfsLimitClearCmd_ClearsIhard(t *testing.T) {
+	assert.Equal(t, "limit -p bhard=0 bsoft=0 ihard=0 isoft=0 42", xfsLimitClearCmd(42))
 }

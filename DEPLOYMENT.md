@@ -427,7 +427,9 @@ Fred does not currently support graceful in-place upgrades. The startup sequence
 
 Schema migrations: the bbolt files carry no explicit schema version, and Fred does **not** run schema migrations on them. An entry a newer build cannot decode is dropped (not migrated) the next time that store's age-based cleanup runs. Rolling back to an older Fred after a newer version has written is likewise not guaranteed. **Take a backup before upgrading.**
 
-> **Upgrading an XFS backend from before ENG-454/ENG-459:** it may carry orphaned XFS project-quota table entries left by volumes destroyed under the older build. New leaks are prevented going forward, but pre-existing entries are not swept automatically — `xfs_quota report -p` is filesystem-global, so Fred cannot distinguish its own orphaned entries from live foreign project limits. Clear each stale project ID with a one-time manual `xfs_quota -x -c 'limit -p bhard=0 bsoft=0 <projid>' <mount>` (matching what `Destroy` does).
+> **Upgrading an XFS backend from before ENG-454/ENG-459:** it may carry orphaned XFS project-quota table entries left by volumes destroyed under the older build. New leaks are prevented going forward, but pre-existing entries are not swept automatically — `xfs_quota report -p` is filesystem-global, so Fred cannot distinguish its own orphaned entries from live foreign project limits. Clear each stale project ID with a one-time manual `xfs_quota -x -c 'limit -p bhard=0 bsoft=0 ihard=0 isoft=0 <projid>' <mount>` (matching what `Destroy` does).
+>
+> **Downgrading after ENG-548:** once a volume has been provisioned with an inode limit (`ihard`), rolling back to a pre-ENG-548 binary — whose `Destroy` clears only `bhard`/`bsoft` — leaves `ihard` in place, silently reintroducing the ENG-459 stuck-entry leak. `fred_docker_backend_volume_quota_clear_failed_total` will **not** fire in this case, since the old binary's partial clear still reports success, so the alert-driven runbook above won't catch the regression. The remedy is the same ENG-459 operator sweep, using the four-limit clear command above.
 
 ---
 

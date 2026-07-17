@@ -619,7 +619,7 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 
 	// Extraction reseeds fresh image content into the (RemoveAll'd) wpDir.
 	freshFile := filepath.Join(wpDir, "var", "lib", "grafana", "fresh-from-image.txt")
-	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _ int64) map[string]error {
+	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _, _ int64) map[string]error {
 		require.Equal(t, wpDir, destDir, "extraction target must be the volume's _wp subdir")
 		require.NoError(t, os.MkdirAll(filepath.Dir(freshFile), 0o755))
 		require.NoError(t, os.WriteFile(freshFile, []byte("FRESH"), 0o644))
@@ -627,7 +627,7 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	}
 
 	binds := b.setupWritablePathBinds(context.Background(), "grafana/grafana:11.1.0",
-		[]string{"/var/lib/grafana"}, hostVol, 64<<20)
+		[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
 
 	// Stale tenant content is wiped; fresh image content is reseeded.
 	_, statErr := os.Stat(staleFile)
@@ -662,7 +662,7 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 	// Simulate extraction planting a SYMLINK at the bind Source position
 	// (wpDir/var/lib/grafana -> outside), as would happen if a symlink writable
 	// path ever reached extraction (CopyFromContainer archives it as a symlink).
-	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _ int64) map[string]error {
+	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _, _ int64) map[string]error {
 		require.Equal(t, wpDir, destDir)
 		require.NoError(t, os.MkdirAll(filepath.Join(destDir, "var", "lib"), 0o755))
 		require.NoError(t, os.Symlink(outside, filepath.Join(destDir, "var", "lib", "grafana")))
@@ -670,7 +670,7 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 	}
 
 	binds := b.setupWritablePathBinds(context.Background(), "img",
-		[]string{"/var/lib/grafana"}, hostVol, 64<<20)
+		[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
 
 	assert.NotContains(t, binds, filepath.Join(wpDir, "var", "lib", "grafana"),
 		"a symlink bind source must not be mounted into the container")
@@ -690,14 +690,14 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 
 	// Extraction leaves wpDir as a regular FILE, so os.OpenRoot(wpDir) fails with a
 	// non-ErrNotExist error (ENOTDIR) and the confinement checks cannot run.
-	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _ int64) map[string]error {
+	mock.ExtractImageContentFn = func(_ context.Context, _ string, _ []string, destDir string, _, _ int64) map[string]error {
 		require.Equal(t, wpDir, destDir)
 		require.NoError(t, os.WriteFile(destDir, []byte("x"), 0o600))
 		return nil
 	}
 
 	binds := b.setupWritablePathBinds(context.Background(), "img",
-		[]string{"/var/lib/grafana"}, hostVol, 64<<20)
+		[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
 
 	assert.Empty(t, binds,
 		"must fail closed (emit no binds) when the _wp root cannot be opened for confinement checks")

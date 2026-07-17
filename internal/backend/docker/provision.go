@@ -484,7 +484,7 @@ const writablePathSubdir = "_wp"
 // a managed volume subdirectory and returns a bind map for container creation.
 // Extraction failures are logged but don't fail the overall operation;
 // paths that fail are simply omitted from the bind map.
-func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writablePaths []string, hostVolumePath string, maxBytes int64) map[string]string {
+func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writablePaths []string, hostVolumePath string, maxBytes, maxEntries int64) map[string]string {
 	if len(writablePaths) == 0 {
 		return nil
 	}
@@ -496,7 +496,7 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 		b.logger.Warn("failed to clean up old writable path content, extraction may contain stale files",
 			"path", wpDir, "error", err)
 	}
-	failures := b.docker.ExtractImageContent(ctx, image, writablePaths, wpDir, maxBytes)
+	failures := b.docker.ExtractImageContent(ctx, image, writablePaths, wpDir, maxBytes, maxEntries)
 
 	// The bind Source below is mounted read-write into the container and Docker
 	// resolves it host-side. Docker's CopyFromContainer does NOT follow a
@@ -605,7 +605,7 @@ func (b *Backend) setupVolBinds(
 					}
 				}
 				if needsWritableVolume {
-					binds.WritableBinds = b.setupWritablePathBinds(ctx, services[svcName].Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024)
+					binds.WritableBinds = b.setupWritablePathBinds(ctx, services[svcName].Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
 				}
 				if volBinds[svcName] == nil {
 					volBinds[svcName] = make(map[int]serviceVolBinds)

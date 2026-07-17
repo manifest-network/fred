@@ -20,12 +20,13 @@ type volumeManager interface {
 	// created (vs reused), and any error. sizeMB is the quota in megabytes.
 	Create(ctx context.Context, id string, sizeMB int64) (hostPath string, created bool, err error)
 
-	// EnsureQuota re-applies the quota (for xfs: project-tag + bhard limit) to an
-	// EXISTING volume, so a volume created before the daemon could set quotas
-	// (ENG-454) gets its disk_mb cap enforced without a re-provision or data
-	// move. Unlike Create it NEVER creates: if the volume is absent it is a no-op
-	// (returns nil), so a concurrently-deprovisioning volume cannot be
-	// resurrected. Idempotent. Used by the startup backfill (reconcileVolumeQuotas).
+	// EnsureQuota re-applies the quota (for xfs: project-tag + block (bhard)
+	// and inode (ihard) limits) to an EXISTING volume, so a volume created
+	// before the daemon could set quotas (ENG-454) gets its disk_mb cap
+	// enforced without a re-provision or data move. Unlike Create it NEVER
+	// creates: if the volume is absent it is a no-op (returns nil), so a
+	// concurrently-deprovisioning volume cannot be resurrected. Idempotent.
+	// Used by the startup backfill (reconcileVolumeQuotas).
 	EnsureQuota(ctx context.Context, id string, sizeMB int64) error
 
 	// Destroy removes the directory and quota. Idempotent.
@@ -155,7 +156,7 @@ func detectFilesystem(path string) (string, error) {
 // newVolumeManager creates a volumeManager for the given data path and filesystem.
 // If dataPath is empty, returns a noopVolumeManager.
 // If filesystem is empty, it is auto-detected from the data path.
-func newVolumeManager(dataPath, filesystem string, logger *slog.Logger) (volumeManager, error) {
+func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger *slog.Logger) (volumeManager, error) {
 	if dataPath == "" {
 		return &noopVolumeManager{}, nil
 	}
@@ -180,11 +181,12 @@ func newVolumeManager(dataPath, filesystem string, logger *slog.Logger) (volumeM
 			return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
 		}
 		return &xfsVolumeManager{
-			dataPath:   dataPath,
-			mountPoint: mountPoint,
-			logger:     logger,
-			activeIDs:  make(map[uint32]string),
-			volumeToID: make(map[string]uint32),
+			dataPath:        dataPath,
+			mountPoint:      mountPoint,
+			logger:          logger,
+			minAvgFileBytes: minAvgFileBytes,
+			activeIDs:       make(map[uint32]string),
+			volumeToID:      make(map[string]uint32),
 		}, nil
 	case "zfs":
 		return &zfsVolumeManager{dataPath: dataPath, logger: logger}, nil

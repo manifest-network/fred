@@ -3688,7 +3688,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "conf/app.conf", Typeflag: tar.TypeReg, Mode: 0o644, Uid: 1000, Gid: 1000, Content: "key=value"},
 		})
 
-		written, skipped, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		written, skipped, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		require.NoError(t, err)
 		assert.Empty(t, skipped)
 		assert.Equal(t, int64(9), written) // len("key=value")
@@ -3703,7 +3703,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		buf := createTestTar(t, []testTarEntry{
 			{Name: "/etc/passwd", Typeflag: tar.TypeReg, Mode: 0o644, Content: "evil"},
 		})
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		assert.ErrorContains(t, err, "unsafe path")
 	})
 
@@ -3712,7 +3712,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		buf := createTestTar(t, []testTarEntry{
 			{Name: "../escape", Typeflag: tar.TypeReg, Mode: 0o644, Content: "evil"},
 		})
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		assert.ErrorContains(t, err, "unsafe path")
 	})
 
@@ -3721,7 +3721,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		buf := createTestTar(t, []testTarEntry{
 			{Name: "dev/null", Typeflag: tar.TypeBlock, Mode: 0o666},
 		})
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		assert.ErrorContains(t, err, "disallowed type")
 	})
 
@@ -3730,8 +3730,22 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		buf := createTestTar(t, []testTarEntry{
 			{Name: "big.bin", Typeflag: tar.TypeReg, Mode: 0o644, Content: strings.Repeat("x", 100)},
 		})
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 50)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 50, 1<<30)
 		assert.ErrorContains(t, err, "exceeds")
+	})
+
+	t.Run("enforces entry limit", func(t *testing.T) {
+		destDir := t.TempDir()
+		buf := createTestTar(t, []testTarEntry{
+			{Name: "f0", Typeflag: tar.TypeReg, Mode: 0o600},
+			{Name: "f1", Typeflag: tar.TypeReg, Mode: 0o600},
+			{Name: "f2", Typeflag: tar.TypeReg, Mode: 0o600},
+			{Name: "f3", Typeflag: tar.TypeReg, Mode: 0o600},
+			{Name: "f4", Typeflag: tar.TypeReg, Mode: 0o600},
+		})
+		// Generous byte budget (1<<30), tight entry budget (3): the 4th entry trips it.
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1<<30, 3)
+		assert.ErrorContains(t, err, "entry limit")
 	})
 
 	t.Run("strips setuid bits", func(t *testing.T) {
@@ -3739,7 +3753,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		buf := createTestTar(t, []testTarEntry{
 			{Name: "suid-binary", Typeflag: tar.TypeReg, Mode: 0o4755, Content: "binary"},
 		})
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		require.NoError(t, err)
 
 		info, statErr := os.Stat(filepath.Join(destDir, "suid-binary"))
@@ -3755,7 +3769,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "conf/real.conf", Typeflag: tar.TypeReg, Mode: 0o644, Content: "data"},
 			{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"},
 		})
-		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"link -> /etc/passwd"}, outOfScope)
 		// Symlink is created (dangling on host, resolves inside container).
@@ -3772,7 +3786,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "a/b/file.txt", Typeflag: tar.TypeReg, Mode: 0o644, Content: "ok"},
 			{Name: "a/b/link", Typeflag: tar.TypeSymlink, Linkname: "../../../etc/passwd"},
 		})
-		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"a/b/link -> ../../../etc/passwd"}, outOfScope)
 		assert.FileExists(t, filepath.Join(destDir, "a", "b", "file.txt"))
@@ -3787,7 +3801,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "keepme.txt", Typeflag: tar.TypeReg, Mode: 0o644, Content: "kept"},
 			{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: ".."},
 		})
-		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, outOfScope, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"escape -> .."}, outOfScope)
 		assert.FileExists(t, filepath.Join(destDir, "keepme.txt"))
@@ -3803,7 +3817,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "conf/real.conf", Typeflag: tar.TypeReg, Mode: 0o644, Content: "data"},
 			{Name: "conf/link.conf", Typeflag: tar.TypeSymlink, Linkname: "real.conf"},
 		})
-		_, skipped, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, skipped, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		require.NoError(t, err)
 		assert.Empty(t, skipped)
 
@@ -3820,7 +3834,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 		buf := createTestTar(t, []testTarEntry{
 			{Name: "owned.txt", Typeflag: tar.TypeReg, Mode: 0o644, Uid: 1000, Gid: 1000, Content: "data"},
 		})
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 		require.NoError(t, err)
 
 		info, statErr := os.Stat(filepath.Join(destDir, "owned.txt"))
@@ -3845,7 +3859,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "evil/pwned", Typeflag: tar.TypeReg, Mode: 0o644, Content: "owned"},
 		})
 
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 
 		require.Error(t, err)
 		assert.NoFileExists(t, canary, "must not write through a symlinked ancestor")
@@ -3865,7 +3879,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "secret", Typeflag: tar.TypeReg, Mode: 0o644, Content: "overwritten"},
 		})
 
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 
 		require.Error(t, err)
 		content, readErr := os.ReadFile(secret)
@@ -3886,7 +3900,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "d", Typeflag: tar.TypeDir, Mode: 0o755},
 		})
 
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 
 		require.Error(t, err)
 	})
@@ -3899,7 +3913,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "..data", Typeflag: tar.TypeReg, Mode: 0o644, Content: "payload"},
 		})
 
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 
 		require.NoError(t, err)
 		content, readErr := os.ReadFile(filepath.Join(destDir, "..data"))
@@ -3922,7 +3936,7 @@ func TestSanitizeAndExtractTar(t *testing.T) {
 			{Name: "f.txt", Typeflag: tar.TypeReg, Mode: 0o644, Content: "ok"},
 		})
 
-		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024)
+		_, _, err := sanitizeAndExtractTar(buf, destDir, 1024*1024, 1<<30)
 
 		require.NoError(t, err)
 		assert.Equal(t, beforeUID, mustStatUID(t, destDir), "'.' entry must not chown destDir")
@@ -4003,7 +4017,7 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 		DetectWritablePathsFn: func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
 			return []string{"/var/lib/app"}, nil
 		},
-		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+		ExtractImageContentFn: func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
 			return nil
 		},
 		CreateContainerFn: func(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error) {

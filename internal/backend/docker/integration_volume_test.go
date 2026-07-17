@@ -921,7 +921,7 @@ func TestIntegration_Usage_XFS(t *testing.T) {
 	mountDir := setupXFSLoopback(t)
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(mountDir, "xfs", slog.Default())
+	mgr, err := newVolumeManager(mountDir, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	const volName = "fred-int-usage-xfs-app-0"
@@ -961,7 +961,7 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 
 	ctx := context.Background()
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
@@ -984,6 +984,87 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 	// (2) Enforcement: a write past the 20 MiB cap is rejected with EDQUOT/ENOSPC.
 	err = os.WriteFile(filepath.Join(hostPath, "big.bin"), make([]byte, 25*1024*1024), 0600)
 	require.Error(t, err, "writing past the disk_mb cap must be quota-enforced (ENG-449)")
+	assert.True(t,
+		errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.ENOSPC) ||
+			strings.Contains(err.Error(), "disk quota exceeded") ||
+			strings.Contains(err.Error(), "no space left"),
+		"expected a quota/space error, got: %v", err)
+}
+
+// xfsProjectInodeCount returns projID's current inode usage — the "Used"
+// column of `xfs_quota report -p -i` — for mount, or 0 if the project has no
+// dquot yet. Mirrors xfsReportListsProject's report-parsing approach, but for
+// the inode report (-i) instead of the block report.
+func xfsProjectInodeCount(t *testing.T, mount string, projID uint32) int64 {
+	t.Helper()
+	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -i -N", mount)...).CombinedOutput()
+	require.NoError(t, err, "xfs_quota report -p -i: %s", out)
+	want := strconv.FormatUint(uint64(projID), 10)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.TrimPrefix(fields[0], "#") == want {
+			used, err := strconv.ParseInt(fields[1], 10, 64)
+			require.NoError(t, err, "parse inode Used column: %q", line)
+			return used
+		}
+	}
+	return 0
+}
+
+// TestIntegration_XFS_InodeQuota_EnforcesEDQUOT is the ENG-548 kernel-enforcement
+// regression. The unit tests for inodeHardLimit/xfsLimitCmd prove the ihard
+// VALUE is derived correctly and the command string is constructed correctly,
+// but neither proves the kernel actually HONORS it. This proves that
+// `xfs_quota limit -p ihard=N` is enforced by the kernel — the (N+1)th inode
+// created under the tagged directory is rejected with EDQUOT — the inode-count
+// analogue of TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces's
+// bhard/byte enforcement proof.
+//
+// It re-applies the ihard limit DIRECTLY via xfsLimitCmd with a tiny N,
+// bypassing inodeHardFloor (262144) for test purposes — the same technique
+// TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin uses to bypass the floor for
+// its CAP_SYS_ADMIN probe — paired with a generous bhard so only the inode
+// count binds.
+func TestIntegration_XFS_InodeQuota_EnforcesEDQUOT(t *testing.T) {
+	mount := setupXFSLoopback(t)
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+
+	const volName = "fred-int-xfs-inode-quota-app-0"
+	const capMiB = int64(100) // generous block quota: only the inode count should bind
+	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
+	require.NoError(t, err)
+	require.True(t, created)
+	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+
+	projID, err := readProjectIDFile(hostPath)
+	require.NoError(t, err)
+
+	// Create() already project-tagged the volume directory itself (and its
+	// .fred-project-id marker file), so the project's inode usage is already
+	// nonzero. Read the current count so "n" below means "n MORE files", not
+	// "n total inodes ever tagged" — robust to that baseline instead of
+	// assuming it.
+	baseline := xfsProjectInodeCount(t, mount, projID)
+
+	const n = 8 // small headroom, independent of inodeHardFloor (262144)
+	limitCmd := xfsLimitCmd(projID, "100m", baseline+n)
+	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(limitCmd, mount)...).CombinedOutput()
+	require.NoError(t, err, "xfs_quota limit -p ihard=%d: %s", baseline+n, out)
+
+	// The first n new zero-byte files fit within the ihard headroom and must succeed.
+	for i := range n {
+		p := filepath.Join(hostPath, fmt.Sprintf("f%d", i))
+		require.NoError(t, os.WriteFile(p, nil, 0600), "file %d should fit within the ihard headroom", i)
+	}
+
+	// The (n+1)th file exceeds the inode hard limit and must be rejected.
+	p := filepath.Join(hostPath, fmt.Sprintf("f%d", n))
+	err = os.WriteFile(p, nil, 0600)
+	require.Error(t, err, "creating past the ihard limit must be quota-enforced (ENG-548)")
 	assert.True(t,
 		errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.ENOSPC) ||
 			strings.Contains(err.Error(), "disk quota exceeded") ||
@@ -1028,7 +1109,7 @@ func TestIntegration_XFS_Destroy_ClearsQuotaEntry(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
@@ -1097,12 +1178,12 @@ func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 
 	// As root: setting the quota SUCCEEDS — proving the filesystem itself is fine
 	// and it is purely the capability that gates the operation.
-	rootOut, rootErr := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(xfsLimitCmd(987654321, "1m"), mount)...).CombinedOutput()
+	rootOut, rootErr := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(xfsLimitCmd(987654321, "1m", 262144), mount)...).CombinedOutput()
 	require.NoError(t, rootErr, "root should be able to set the quota: %s", rootOut)
 
 	// With CAP_SYS_ADMIN dropped (euid still 0, so the mount is reachable and
 	// quotactl(Q_XSETQLIM) is actually reached), the SAME command FAILS.
-	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("xfs_quota -x -c 'limit -p bhard=1m 987654321' %s", mount))
+	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("xfs_quota -x -c '%s' %s", xfsLimitCmd(987654321, "1m", 262144), mount))
 	require.Error(t, dropErr,
 		"setting an XFS quota without CAP_SYS_ADMIN must fail: %s", dropOut)
 	if len(dropOut) > 0 {
@@ -1182,7 +1263,7 @@ func TestIntegration_XFS_Backfill_TagsUntaggedVolume(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
@@ -1231,7 +1312,7 @@ func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	const lease = "l-e2e-backfill"
@@ -1271,7 +1352,7 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	const origLease = "l-ret"
@@ -1345,7 +1426,7 @@ func TestIntegration_Btrfs_ReconcileBackfill_EndToEnd(t *testing.T) {
 func TestIntegration_Zfs_ReconcileBackfill_EndToEnd(t *testing.T) {
 	mount, _ := setupZFSPool(t) // requires root
 	ctx := context.Background()
-	mgr, err := newVolumeManager(mount, "zfs", slog.Default())
+	mgr, err := newVolumeManager(mount, "zfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate()) // resolves parentDataset
 
@@ -1395,7 +1476,7 @@ func TestIntegration_Usage_ZFS(t *testing.T) {
 	mountPath, _ := setupZFSPool(t)
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(mountPath, "zfs", slog.Default())
+	mgr, err := newVolumeManager(mountPath, "zfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
@@ -1560,7 +1641,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 	const largeMiB, mediumMiB = int64(100), int64(20)
 
-	mgr, err := newVolumeManager(mountDir, "xfs", slog.Default())
+	mgr, err := newVolumeManager(mountDir, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	b := newBackendForTest(&mockDockerClient{}, nil)
@@ -1682,7 +1763,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 
 	const largeMiB, mediumMiB = int64(100), int64(20)
 
-	mgr, err := newVolumeManager(mountPath, "zfs", slog.Default())
+	mgr, err := newVolumeManager(mountPath, "zfs", 1024, slog.Default())
 	require.NoError(t, err)
 	// Validate resolves and caches the parent dataset name required by all ZFS ops.
 	require.NoError(t, mgr.Validate())

@@ -224,13 +224,13 @@ func TestListVolumeIDs(t *testing.T) {
 }
 
 func TestNewVolumeManager_EmptyPath(t *testing.T) {
-	vm, err := newVolumeManager("", "", nil)
+	vm, err := newVolumeManager("", "", 1024, nil)
 	require.NoError(t, err)
 	assert.IsType(t, &noopVolumeManager{}, vm)
 }
 
 func TestNewVolumeManager_UnsupportedFilesystem(t *testing.T) {
-	_, err := newVolumeManager("/tmp", "ext4", nil)
+	_, err := newVolumeManager("/tmp", "ext4", 1024, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported volume_filesystem")
 }

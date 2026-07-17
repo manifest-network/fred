@@ -317,6 +317,15 @@ host_address: ""
 volume_data_path: "/var/lib/fred/volumes"
 # volume_filesystem: "btrfs"  # optional, auto-detected from volume_data_path
 
+# Smallest average file size (bytes) a workload may have before the per-volume
+# XFS inode quota (ihard) binds instead of the block quota (bhard). ihard =
+# disk_mb*1MiB / min_avg_file_bytes, floored at 262144 inodes. Smaller value =>
+# more inodes allowed. Values below 512 are rejected. On XFS this sets the ihard
+# inode quota; the same value also caps tar-extraction entry count during
+# writable-path image seeding (any backend). (ENG-548)
+# Default: 1024 (i.e. 1024 inodes per MiB of quota).
+# min_avg_file_bytes: 1024
+
 # =============================================================================
 # TIMEOUTS
 # =============================================================================

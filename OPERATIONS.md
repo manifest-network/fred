@@ -125,10 +125,10 @@ grant it and restart to heal them.
 
 `fred_docker_backend_volume_quota_clear_failed_total` increments when a volume
 `Destroy` fails to reset its XFS project block limit
-(`xfs_quota -x -c 'limit -p bhard=0 bsoft=0 <projID>'`). Each leaked entry holds no
-disk, but it lingers in the project-quota table and every `xfs_quota` scan
-(`report -p`, used by `Usage` and `Validate`) has to walk it — so a steadily rising
-counter surfaces as a slow cumulative provisioning-latency regression.
+(`xfs_quota -x -c 'limit -p bhard=0 bsoft=0 ihard=0 isoft=0 <projID>'`). Each leaked
+entry holds no disk, but it lingers in the project-quota table and every `xfs_quota`
+scan (`report -p`, used by `Usage` and `Validate`) has to walk it — so a steadily
+rising counter surfaces as a slow cumulative provisioning-latency regression.
 
 **Remediation.** There is no automatic sweep: a `report -p` is filesystem-wide and
 cannot distinguish fred's orphaned entries from live foreign limits, so cleanup is a
@@ -136,13 +136,40 @@ manual operator task.
 
 1. List quota entries: `xfs_quota -x -c 'report -p' <mountpoint>` and find project
    IDs with a non-zero hard limit but no live volume directory.
-2. Clear each orphan: `xfs_quota -x -c 'limit -p bhard=0 bsoft=0 <projID>' <mountpoint>`.
+2. Clear each orphan: `xfs_quota -x -c 'limit -p bhard=0 bsoft=0 ihard=0 isoft=0 <projID>' <mountpoint>`.
 
 Backends that ran a **pre-v0.7.0** build never cleared limits on `Destroy` and so
 accumulated one leaked entry per provision — those need this one-time manual
 cleanup. v0.7.0+ clears the limit on every successful `Destroy`; a rising counter
 there instead points at a genuine `xfs_quota` failure (check the backend logs for
-the `xfs_quota` stderr).
+the `xfs_quota` stderr). Since ENG-548, `Destroy` also clears the inode limits
+(`ihard`/`isoft`) alongside the block limits — a backend running a pre-ENG-548
+build clears only `bhard`/`bsoft` and leaves `ihard` behind on downgrade; see
+[Tenant hits its inode quota (`EDQUOT`)](#tenant-hits-its-inode-quota-edquot)
+below.
+
+---
+
+## Tenant hits its inode quota (`EDQUOT`)
+
+XFS project quotas enforce block (`bhard`) and inode (`ihard`) limits
+independently, so a workload writing many small/zero-byte files can hit its
+inode ceiling well before its disk-space cap (ENG-548). This is a per-tenant
+limit, so it does not surface on any fred metric; the host-wide analogue is
+the standard `FilesystemInodesLow` alert on the underlying filesystem's global
+inode usage.
+
+**Symptoms:**
+- Tenant reports `EDQUOT` or "no space left on device" from its container
+- `df -h` on the tenant's volume still shows free bytes
+
+**Confirm:**
+1. `df -i <volume-path>` reports **filesystem-wide** inode usage, not the per-tenant quota — for an `ihard` hit it still shows ample free inodes (`IUse%` well below 100%). That is the tell that it's the per-project inode cap, not global exhaustion (global exhaustion would instead fire `FilesystemInodesLow`).
+2. `xfs_quota -x -c 'report -p -i' <mountpoint>` filtered to the tenant's project ID confirms inode count is pinned at the hard limit.
+
+**Remediation:** there is no fred-side alert or auto-remediation for a single tenant's inode ceiling. Two levers:
+1. Raise the SKU's `disk_mb` — `ihard` scales with it (`disk_mb × 1 MiB / min_avg_file_bytes`), so a bigger disk budget raises the inode ceiling too.
+2. Lower `min_avg_file_bytes` provider-wide (denser ratio, more inodes per MB) — restart required; values below 512 are rejected at config validation.
 
 ---
 
