@@ -183,6 +183,15 @@ type Config struct {
 	// Supported values: "btrfs", "xfs", "zfs". If empty, auto-detected from VolumeDataPath.
 	VolumeFilesystem string `yaml:"volume_filesystem"`
 
+	// MinAvgFileBytes is the smallest average file size (bytes) a volume's workload
+	// may have before the per-volume XFS inode quota (ihard) — rather than the block
+	// quota (bhard) — binds. It is the mkfs "-i bytes-per-inode" idiom applied as an
+	// inode-ceiling ratio: ihard = DiskMB*MiB / MinAvgFileBytes (floored at 262144
+	// inodes). Smaller => MORE inodes allowed => looser cap. 0 uses the default
+	// (1024 => 1024 inodes/MiB).
+	// Values below 512 are rejected (they would uncap the fix). See ENG-548.
+	MinAvgFileBytes int64 `yaml:"min_avg_file_bytes"`
+
 	// CallbackMaxAge is the maximum age of a persisted callback entry.
 	// Entries older than this are removed by the callback store's background cleanup.
 	// Defaults to 24h.
@@ -321,6 +330,15 @@ func (c *Config) GetTmpfsSizeMB() int {
 		return c.ContainerTmpfsSizeMB
 	}
 	return 64
+}
+
+// GetMinAvgFileBytes returns the configured minimum average file size in bytes,
+// used to derive per-volume XFS inode limits. Defaults to 1024. See ENG-548.
+func (c *Config) GetMinAvgFileBytes() int64 {
+	if c.MinAvgFileBytes > 0 {
+		return c.MinAvgFileBytes
+	}
+	return 1024
 }
 
 // HasStatefulSKUs returns true if any SKU profile has DiskMB > 0,
@@ -586,6 +604,13 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("volume_filesystem must be btrfs, xfs, or zfs (got %q)", c.VolumeFilesystem)
 		}
+	}
+
+	// min_avg_file_bytes has inverted semantics (smaller => looser inode cap), so a
+	// too-small value silently uncaps the ENG-548 inode limit. Reject negative and
+	// nonzero values below 512 (the most generous ratio the design admits); 0 = default.
+	if c.MinAvgFileBytes < 0 || (c.MinAvgFileBytes > 0 && c.MinAvgFileBytes < 512) {
+		return fmt.Errorf("min_avg_file_bytes must be 0 (default 1024) or >= 512 (got %d)", c.MinAvgFileBytes)
 	}
 
 	if err := c.Ingress.Validate(); err != nil {

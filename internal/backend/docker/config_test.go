@@ -859,3 +859,37 @@ func TestValidate_MaxRetainedDiskMB(t *testing.T) {
 func TestDefaultConfig_MaxRetainedDiskMBUnlimited(t *testing.T) {
 	assert.Equal(t, int64(0), DefaultConfig().MaxRetainedDiskMB)
 }
+
+func TestGetMinAvgFileBytes(t *testing.T) {
+	c := &Config{}
+	assert.Equal(t, int64(1024), c.GetMinAvgFileBytes())
+	c.MinAvgFileBytes = 2048
+	assert.Equal(t, int64(2048), c.GetMinAvgFileBytes())
+}
+
+func TestConfig_Validate_MinAvgFileBytes(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     int64
+		wantErr string // "" = expect no error
+	}{
+		{"zero is default", 0, ""},
+		{"512 floor allowed", 512, ""},
+		{"1024 allowed", 1024, ""},
+		{"negative rejected", -1, "min_avg_file_bytes must be 0"},
+		{"nonzero below 512 rejected", 511, "min_avg_file_bytes must be 0"},
+		{"tiny value rejected", 1, "min_avg_file_bytes must be 0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.MinAvgFileBytes = tc.val
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
+}
