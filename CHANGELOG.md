@@ -10,6 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- docs: mark the `btrfs` and `zfs` volume backends as experimental and untested,
+  and document `xfs` as the only backend validated and used in production. The
+  docker backend implements all three `volumeManager` filesystems, but only XFS
+  is deployed and exercised in prod (all mainnet/Morpheus backends run XFS with
+  `pquota`, and per-volume disk and inode `ihard` quotas are enforced only on
+  XFS), so the docker-backend README, `docker-backend.example.yaml`, and
+  DEPLOYMENT.md now recommend `xfs` for production and flag btrfs/zfs as
+  experimental rather than presenting the three as coequal choices. Docs-only; no
+  behavior change. (ENG-564)
+
 ### Deprecated
 
 ### Removed

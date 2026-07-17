@@ -77,26 +77,11 @@ No special setup required. Containers run with read-only rootfs and tmpfs at `/t
 
 ### Stateful workloads (`disk_mb > 0` SKUs)
 
-The docker-backend places each container's data on a quota-enforced host directory. Pick one of three filesystems for `volume_data_path`:
-
-#### btrfs (recommended for ease of use)
-
-```bash
-# Create a btrfs filesystem on a dedicated disk/partition
-mkfs.btrfs /dev/nvme1n1
-mkdir -p /var/lib/fred/volumes
-mount -t btrfs /dev/nvme1n1 /var/lib/fred/volumes
-
-# Enable quotas (one-time, per filesystem)
-btrfs quota enable /var/lib/fred/volumes
-
-# Persist in /etc/fstab
-echo "/dev/nvme1n1 /var/lib/fred/volumes btrfs defaults 0 0" >> /etc/fstab
-```
-
-Each container gets a btrfs subvolume with a qgroup quota.
+The docker-backend places each container's data on a quota-enforced host directory. Three filesystems are implemented, but **`xfs` is the only backend validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. **Use `xfs` for production deployments** (see below). The `btrfs` and `zfs` backends are implemented but **untested and not used in any deployment** — treat them as experimental.
 
 #### xfs (good for large fleets)
+
+**This is the recommended, production-validated backend.**
 
 ```bash
 mkfs.xfs /dev/nvme1n1
@@ -144,7 +129,32 @@ Each container gets a directory with an xfs project quota.
 > unenforced. To heal such volumes, grant `CAP_FOWNER` and restart the backend (or
 > re-provision them).
 
-#### zfs (best for snapshots/backups)
+#### Experimental backends (untested — not for production)
+
+> **Not production-ready.** The `btrfs` and `zfs` backends are implemented but
+> have **no production coverage** — no mainnet/Morpheus backend runs them, and the
+> per-volume inode (`ihard`) exhaustion protection enforced on XFS has no tested
+> equivalent here. They are documented for completeness only; use `xfs` for any
+> production deployment.
+
+#### btrfs (experimental)
+
+```bash
+# Create a btrfs filesystem on a dedicated disk/partition
+mkfs.btrfs /dev/nvme1n1
+mkdir -p /var/lib/fred/volumes
+mount -t btrfs /dev/nvme1n1 /var/lib/fred/volumes
+
+# Enable quotas (one-time, per filesystem)
+btrfs quota enable /var/lib/fred/volumes
+
+# Persist in /etc/fstab
+echo "/dev/nvme1n1 /var/lib/fred/volumes btrfs defaults 0 0" >> /etc/fstab
+```
+
+Each container gets a btrfs subvolume with a qgroup quota.
+
+#### zfs (experimental)
 
 ```bash
 zpool create fredpool /dev/nvme1n1
@@ -161,7 +171,7 @@ In `docker-backend.yaml`:
 ```yaml
 volume_data_path: "/var/lib/fred/volumes"
 # volume_filesystem auto-detects from the mount; set explicitly to override:
-# volume_filesystem: "btrfs"
+# volume_filesystem: "xfs"   # xfs is the only production-validated backend
 ```
 
 The docker-backend refuses to start if any SKU has `disk_mb > 0` and `volume_data_path` is unset.
