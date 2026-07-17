@@ -41,9 +41,10 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 //
 // On partial failure (some containers removed, some stuck), the provision
 // is kept in the map with Status=Failed and ContainerIDs narrowed to only
-// the failed removals. Resource pool allocations are still released (the
-// lease is being abandoned). On retry, only the stuck containers are
-// attempted.
+// the failed removals. Resource pool allocations are NOT released on this
+// branch — the volumes are still on disk and the lease is retried — so the
+// reservation keeps counting until a terminal success or give-up releases it.
+// On retry, only the stuck containers are attempted.
 func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
 
