@@ -6,12 +6,12 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
-// reconcileVolumeQuotas re-applies each existing managed volume's quota (for xfs:
-// project-tag + bhard limit) at startup, so leases provisioned while the daemon
-// lacked CAP_SYS_ADMIN (ENG-454) get their disk_mb enforced without a
-// re-provision or data move. It is idempotent and best-effort per volume: a
-// single volume's failure (e.g. a concurrent deprovision) is logged and skipped,
-// never fatal.
+// reconcileVolumeQuotas re-applies each existing managed volume's quota (for
+// xfs: project-tag + block (bhard) and inode (ihard) limits) at startup, so
+// leases provisioned while the daemon lacked CAP_SYS_ADMIN (ENG-454) get
+// their disk_mb enforced without a re-provision or data move. It is
+// idempotent and best-effort per volume: a single volume's failure (e.g. a
+// concurrent deprovision) is logged and skipped, never fatal.
 //
 // It enumerates the volumes that SHOULD carry a quota — active lease instances
 // (stateful, or ephemeral-with-writable-path) and active-status retained volumes

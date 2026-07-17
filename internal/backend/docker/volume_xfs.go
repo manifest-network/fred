@@ -352,11 +352,12 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	return dirPath, true, nil
 }
 
-// EnsureQuota re-applies the project tag + bhard limit to an existing volume,
-// recovering the projID from its .fred-project-id marker. It re-tags the inode
-// (project -s) — which heals a volume left untagged by a pre-CAP_SYS_ADMIN
-// daemon (ENG-454) — then re-applies the limit. No-op if the directory is absent
-// (never creates), so a concurrent deprovision is never resurrected.
+// EnsureQuota re-applies the project tag + block (bhard) and inode (ihard)
+// limits to an existing volume, recovering the projID from its
+// .fred-project-id marker. It re-tags the inode (project -s) — which heals a
+// volume left untagged by a pre-CAP_SYS_ADMIN daemon (ENG-454) — then
+// re-applies the limit. No-op if the directory is absent (never creates), so
+// a concurrent deprovision is never resurrected.
 func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
 	dirPath := filepath.Join(x.dataPath, id)
 	if _, err := os.Stat(dirPath); err != nil {

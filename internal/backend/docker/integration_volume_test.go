@@ -991,6 +991,87 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 		"expected a quota/space error, got: %v", err)
 }
 
+// xfsProjectInodeCount returns projID's current inode usage — the "Used"
+// column of `xfs_quota report -p -i` — for mount, or 0 if the project has no
+// dquot yet. Mirrors xfsReportListsProject's report-parsing approach, but for
+// the inode report (-i) instead of the block report.
+func xfsProjectInodeCount(t *testing.T, mount string, projID uint32) int64 {
+	t.Helper()
+	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -i -N", mount)...).CombinedOutput()
+	require.NoError(t, err, "xfs_quota report -p -i: %s", out)
+	want := strconv.FormatUint(uint64(projID), 10)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.TrimPrefix(fields[0], "#") == want {
+			used, err := strconv.ParseInt(fields[1], 10, 64)
+			require.NoError(t, err, "parse inode Used column: %q", line)
+			return used
+		}
+	}
+	return 0
+}
+
+// TestIntegration_XFS_InodeQuota_EnforcesEDQUOT is the ENG-548 kernel-enforcement
+// regression. The unit tests for inodeHardLimit/xfsLimitCmd prove the ihard
+// VALUE is derived correctly and the command string is constructed correctly,
+// but neither proves the kernel actually HONORS it. This proves that
+// `xfs_quota limit -p ihard=N` is enforced by the kernel — the (N+1)th inode
+// created under the tagged directory is rejected with EDQUOT — the inode-count
+// analogue of TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces's
+// bhard/byte enforcement proof.
+//
+// It re-applies the ihard limit DIRECTLY via xfsLimitCmd with a tiny N,
+// bypassing inodeHardFloor (262144) for test purposes — the same technique
+// TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin uses to bypass the floor for
+// its CAP_SYS_ADMIN probe — paired with a generous bhard so only the inode
+// count binds.
+func TestIntegration_XFS_InodeQuota_EnforcesEDQUOT(t *testing.T) {
+	mount := setupXFSLoopback(t)
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+
+	const volName = "fred-int-xfs-inode-quota-app-0"
+	const capMiB = int64(100) // generous block quota: only the inode count should bind
+	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
+	require.NoError(t, err)
+	require.True(t, created)
+	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+
+	projID, err := readProjectIDFile(hostPath)
+	require.NoError(t, err)
+
+	// Create() already project-tagged the volume directory itself (and its
+	// .fred-project-id marker file), so the project's inode usage is already
+	// nonzero. Read the current count so "n" below means "n MORE files", not
+	// "n total inodes ever tagged" — robust to that baseline instead of
+	// assuming it.
+	baseline := xfsProjectInodeCount(t, mount, projID)
+
+	const n = 8 // small headroom, independent of inodeHardFloor (262144)
+	limitCmd := xfsLimitCmd(projID, "100m", baseline+n)
+	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(limitCmd, mount)...).CombinedOutput()
+	require.NoError(t, err, "xfs_quota limit -p ihard=%d: %s", baseline+n, out)
+
+	// The first n new zero-byte files fit within the ihard headroom and must succeed.
+	for i := range n {
+		p := filepath.Join(hostPath, fmt.Sprintf("f%d", i))
+		require.NoError(t, os.WriteFile(p, nil, 0600), "file %d should fit within the ihard headroom", i)
+	}
+
+	// The (n+1)th file exceeds the inode hard limit and must be rejected.
+	p := filepath.Join(hostPath, fmt.Sprintf("f%d", n))
+	err = os.WriteFile(p, nil, 0600)
+	require.Error(t, err, "creating past the ihard limit must be quota-enforced (ENG-548)")
+	assert.True(t,
+		errors.Is(err, syscall.EDQUOT) || errors.Is(err, syscall.ENOSPC) ||
+			strings.Contains(err.Error(), "disk quota exceeded") ||
+			strings.Contains(err.Error(), "no space left"),
+		"expected a quota/space error, got: %v", err)
+}
+
 // xfsReportListsProject reports whether projID currently appears in
 // `xfs_quota report -p` for mount — i.e. its dquot still carries a nonzero limit or
 // usage (a modern GETNEXTQUOTA kernel skips fully-uninitialized dquots). This is the
