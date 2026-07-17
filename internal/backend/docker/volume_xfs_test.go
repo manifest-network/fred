@@ -318,3 +318,26 @@ func TestDestroy_RemoveAllFailure_KeepsQuotaAndReturnsError(t *testing.T) {
 	assert.Equal(t, projID, mappedID)
 	assert.True(t, stillReserved, "the projID must stay reserved in activeIDs (no premature reallocation)")
 }
+
+func TestInodeHardLimit(t *testing.T) {
+	cases := []struct {
+		name   string
+		sizeMB int64
+		minAvg int64
+		want   int64
+	}{
+		{"small SKU, default ratio", 30720, 1024, 31457280},
+		{"nano SKU, default ratio", 15360, 1024, 15728640},
+		{"xlarge SKU, no overflow", 245760, 1024, 251658240},
+		{"minAvg 0 uses default 1024", 30720, 0, 31457280},
+		{"negative minAvg uses default", 30720, -5, 31457280},
+		{"minAvg 2048 halves the ceiling", 30720, 2048, 15728640},
+		{"ephemeral 64MB floored", 64, 1024, 262144}, // raw 65536 < floor
+		{"sizeMB 0 floored", 0, 1024, 262144},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, inodeHardLimit(tc.sizeMB, tc.minAvg))
+		})
+	}
+}

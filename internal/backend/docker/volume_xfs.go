@@ -24,6 +24,31 @@ import (
 // could silently collide with another volume).
 const projectIDFile = ".fred-project-id"
 
+// inodeHardFloor is the minimum XFS inode hard limit applied to any volume,
+// regardless of how small its block quota is. It keeps small/ephemeral volumes
+// (e.g. the 64 MB writable-path-only fallback) from a starved inode ceiling.
+// 256 Ki ≈ a shared-hosting "starter" allowance. See ENG-548.
+const inodeHardFloor = 262_144
+
+// inodeHardLimit derives a volume's XFS inode hard limit from its block quota
+// (sizeMB) and the configured minimum average file size (minAvgFileBytes). The
+// ratio is the mkfs "-i bytes-per-inode" idiom: ihard = sizeMB*MiB/minAvgFileBytes.
+// minAvgFileBytes <= 0 uses the defaultMinAvgFileBytes default (1024 inodes per
+// MiB). The result is floored at inodeHardFloor. The intermediate
+// (sizeMB*bytesPerMiB) stays far below the int64 max for any realistic SKU size
+// (e.g. 245,760 MB → 2.577e11, ~7 orders of magnitude below the int64 max). See
+// ENG-548.
+func inodeHardLimit(sizeMB, minAvgFileBytes int64) int64 {
+	if minAvgFileBytes <= 0 {
+		minAvgFileBytes = defaultMinAvgFileBytes
+	}
+	ihard := (sizeMB * bytesPerMiB) / minAvgFileBytes
+	if ihard < inodeHardFloor {
+		ihard = inodeHardFloor
+	}
+	return ihard
+}
+
 // xfsVolumeManager creates directories with XFS project quotas.
 type xfsVolumeManager struct {
 	dataPath string

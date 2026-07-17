@@ -38,6 +38,12 @@ const (
 // max_request_body_size / DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE. (ENG-448 / F42)
 const DefaultMaxRequestBodySize int64 = 2 << 20 // 2 MiB
 
+// defaultMinAvgFileBytes is the assumed minimum average file size (bytes) for a
+// volume's workload when MinAvgFileBytes is unset (<= 0). Shared by
+// [Config.GetMinAvgFileBytes] and inodeHardLimit so the two can't drift. See
+// ENG-548.
+const defaultMinAvgFileBytes = 1024
+
 // Config holds the configuration for the Docker backend.
 type Config struct {
 	// LogLevel controls the log verbosity (debug, info, warn, error).
@@ -338,7 +344,7 @@ func (c *Config) GetMinAvgFileBytes() int64 {
 	if c.MinAvgFileBytes > 0 {
 		return c.MinAvgFileBytes
 	}
-	return 1024
+	return defaultMinAvgFileBytes
 }
 
 // HasStatefulSKUs returns true if any SKU profile has DiskMB > 0,
