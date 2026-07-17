@@ -552,11 +552,27 @@ func TestRecoverState_InFlightUpdate_PreservesReservationExactlyOnce(t *testing.
 	assert.Equal(t, 1, got.AllocationCount)
 }
 
-// TestRecoverState_ReadyLease_ReservationRebuiltFromContainers guards the
-// boundary: a Ready lease is NOT in-flight, so its reservation is rebuilt purely
-// from the container-derived list and a stale pre-existing pool entry is not
-// additionally preserved — no double count, container-derived figure wins.
-func TestRecoverState_ReadyLease_ReservationRebuiltFromContainers(t *testing.T) {
+// TestRecoverState_ReadyLease_PreservesProvisionTimeReservationOverContainerConfig
+// locks the ENG-567 pool-authoritative rule for the same-key divergence case: when
+// a Ready lease has BOTH a preserved pool reservation and a container-derived
+// allocation under the SAME key, the PRESERVED (provision-time) value must win,
+// not the container-derived (current-config) recompute.
+//
+// This matters because the preserved value equals the on-disk XFS bhard quota —
+// set once at provision time and never rewritten by a config edit — while the
+// container-derived value is recomputed from the CURRENT SKU config. If the SKU
+// profile shrinks after provisioning (e.g. an ops config edit), the container-
+// derived figure would under-count the real on-disk quota and the pool would
+// over-admit new leases against headroom that doesn't actually exist. Preserving
+// the provision-time value keeps the pool's ledger equal to reality.
+//
+// Setup: pre-allocate the lease's key under docker-medium (2048MB) — standing in
+// for the provision-time reservation / on-disk bhard — then have the container
+// list report the SAME lease/service/instance labelled docker-small (1024MB),
+// standing in for a post-provision config edit. recover.go derives the pool key
+// from LeaseUUID+ServiceName+InstanceIndex and the DiskMB from the container's
+// CURRENT SKU label, so this reproduces a genuine same-key divergence.
+func TestRecoverState_ReadyLease_PreservesProvisionTimeReservationOverContainerConfig(t *testing.T) {
 	const lease = "a1b2c3d4-0000-4000-8000-000000000004"
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
@@ -566,13 +582,14 @@ func TestRecoverState_ReadyLease_ReservationRebuiltFromContainers(t *testing.T) 
 		},
 	}
 	b := newBackendForTest(mock, nil)
-	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+	// Provision-time reservation (docker-medium, 2048MB) — the value that must win.
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-medium", "t"))
 
 	require.NoError(t, b.recoverState(context.Background()))
 
 	got := b.pool.Stats()
-	assert.Equal(t, int64(1024), got.AllocatedDiskMB, "Ready lease counted once from containers")
-	assert.Equal(t, 1, got.AllocationCount)
+	assert.Equal(t, int64(2048), got.AllocatedDiskMB, "preserved provision-time reservation (docker-medium) must win over the container-derived docker-small recompute")
+	assert.Equal(t, 1, got.AllocationCount, "same-key divergence must not double-count")
 }
 
 // TestRecoverState_InFlightProvisioning_PreservesAllInstanceReservations locks
