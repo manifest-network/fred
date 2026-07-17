@@ -352,8 +352,8 @@ func (p *ResourcePool) Reset(allocations []ResourceAllocation) {
 // ResetPreserving is the recovery-safe variant of Reset. It rebuilds the pool's
 // live allocations from allocations, but first RETAINS every current allocation
 // for which keep returns true. Retained entries take precedence over any
-// same-key entry in allocations (deduped), so a lease that appears in both is
-// counted exactly once.
+// same-key entry in allocations (deduped by allocation key), so an allocation
+// present in both is counted exactly once.
 //
 // recoverState rebuilds the pool from a container-derived snapshot each tick,
 // but a lease that is mid-operation (Provisioning/Restarting/Updating) may have
