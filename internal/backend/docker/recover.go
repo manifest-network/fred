@@ -382,19 +382,17 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	}
 	b.provisions = final
 
-	// Build the final allocations list from container-derived state, excluding
-	// leases with in-flight operations (provisioning/restarting/updating). Their
-	// container-derived allocations are stale or absent — a still-pulling
-	// Provision has no containers yet, and a Restart/Update is mid-cleanup — so
-	// counting them here would race with the authoritative reservation.
-	//
-	// Those in-flight leases keep their reservation via ResetPreserving below
-	// instead: their CPU/mem/disk was reserved synchronously by TryAllocate
-	// (Provision) / TryAllocateAdoptAll (Restore) and is the authoritative figure.
-	// Dropping it on this periodic rebuild would let TryAllocate momentarily see
-	// phantom free capacity and over-admit past physical capacity, leaving the
-	// pool over-committed once the lease re-registers (ENG-546).
-	inflight := make(map[string]bool)
+	// Build the container-derived allocations list, excluding leases with an
+	// in-flight re-provision op (provisioning/restarting/updating). Their
+	// container-derived allocations are in flux (old containers being torn down /
+	// new ones materializing) or absent, so counting them would race the
+	// authoritative reservation — the original ENG-546 exclusion. Those leases'
+	// reservations are instead carried forward from the live pool by the general
+	// preserve rule below (they are in `final`), so the exclusion is behavior-
+	// preserving rather than strictly required — but keep it: it avoids counting
+	// in-flux container values and is a margin against a duplicate-container
+	// double-count should a reservation key ever be lost. Do NOT drop it without
+	// restoring that guard.
 	var allocations []shared.ResourceAllocation
 	for uuid, allocs := range allocsByLease {
 		if prov, ok := final[uuid]; ok {
@@ -405,61 +403,42 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 		allocations = append(allocations, allocs...)
 	}
-	// Mark every in-flight lease — whether or not it produced containers — so
-	// the pool retains its existing reservation across the rebuild.
+	// Pool-authoritative preservation: the ResourcePool is the source of truth for
+	// a tracked lease's reserved footprint. Preserve the reservation of EVERY lease
+	// still tracked in b.provisions (`final`). ResetPreserving can only retain a key
+	// that physically exists in the live pool, so this keeps exactly the
+	// reservations really held and drops orphan keys of untracked leases. This one
+	// rule subsumes the former per-status allowlist (Provisioning/Restarting/
+	// Updating/Deprovisioning + Failed[VolumeCleanupAttempts>0]; ENG-546/562/563)
+	// AND additionally keeps the still-held key of a Ready→crash→GC'd Failed lease,
+	// a restore-rollback re-quarantine failure, and a deprovision partial-removal
+	// failure — all Failed/VCA==0 leases whose bytes are still on disk that the
+	// allowlist dropped (ENG-567).
 	//
-	// Deprovisioning is included even though it is a teardown (not a reservation)
-	// state: doDeprovision removes containers BEFORE releasing the pool — it
-	// defers releaseLive() until after the volume-destroy / retention work so the
-	// footprint is never momentarily uncounted while bytes persist on disk. So a
-	// Deprovisioning lease can have no containers yet still hold its reservation;
-	// dropping it here would defeat that deliberate ordering and briefly
-	// over-admit (ENG-562). Unlike the three re-provision states it is NOT
-	// excluded from the container-derived list above: a container still present
-	// mid-teardown is a valid fallback, and ResetPreserving dedups the shared key
-	// so it is counted exactly once. On the retain path preserving it may briefly
-	// overlap the retained projection (2F) — the same safe, transient over-count
-	// doDeprovision itself creates at its live→retained hand-off (never an
-	// over-admit gap).
+	// INVARIANT this relies on (test-locked): every path that frees a lease's bytes
+	// also Releases its pool key, or Deletes the lease from b.provisions (which
+	// drops it from `final`). Release sites are small and greppable: deprovision.go
+	// releaseLive, provision.go failure defer + re-provision cleanup, restore.go
+	// releaseAll. A genuinely-failed provision releases its key on the doProvision
+	// failure path, so it has nothing to preserve.
 	//
-	// Failed is included ONLY in the volume-cleanup-retry sub-state
-	// (VolumeCleanupAttempts>0): doDeprovision removed the containers but a volume
-	// Destroy/rename then failed, so it kept the lease Failed for retry and
-	// deliberately did NOT release the pool (bytes still on disk) — recover must
-	// keep that reservation for the same reason as Deprovisioning. A genuinely-
-	// failed provision (VolumeCleanupAttempts==0) already released its reservation
-	// on the doProvision failure path, so it falls through and its (stale) pool
-	// entry is correctly dropped — the VolumeCleanupAttempts marker distinguishes
-	// the two (ENG-563).
-	for uuid, prov := range final {
-		switch prov.Status {
-		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting,
-			backend.ProvisionStatusUpdating, backend.ProvisionStatusDeprovisioning:
-			inflight[uuid] = true
-		case backend.ProvisionStatusFailed:
-			// Held only while a volume-cleanup retry is pending; see above.
-			if prov.VolumeCleanupAttempts > 0 {
-				inflight[uuid] = true
-			}
-		}
+	// Race-freedom (unchanged from ENG-546): this runs while provisionsMu is held;
+	// every reservation site (Provision, Restore) registers its provision entry
+	// under provisionsMu BEFORE it reserves in the pool, so any reservation present
+	// here is already in `final`, and a not-yet-registered Provision is blocked on
+	// provisionsMu until we release.
+	trackedUUIDs := make([]string, 0, len(final))
+	for uuid := range final {
+		trackedUUIDs = append(trackedUUIDs, uuid)
 	}
-	// Preserve the in-flight reservations read from the live pool, keyed
-	// identically. Allocation keys are {leaseUUID}-{service}-{index} (or legacy
-	// {leaseUUID}-{index}); a leaseUUID is a canonical UUID, so a "{leaseUUID}-"
-	// prefix matches either shape, unambiguously identifies that lease's instance
-	// keys, and cannot collide with another lease's.
-	//
-	// Race-freedom invariant: this runs while provisionsMu is held (taken before
-	// the `final` merge above, released only after the stats snapshot below), and
-	// every reservation site (Provision, Restore) registers its in-flight
-	// provision entry under provisionsMu BEFORE it reserves in the pool. Together
-	// these guarantee any reservation present in the pool here already has its
-	// entry in `inflight` (so it is preserved), and a not-yet-registered Provision
-	// is blocked on provisionsMu until we release (so its TryAllocate cannot land
-	// mid-rebuild). Moving this call out of the provisionsMu hold — or reserving
-	// in the pool before registering the entry — would reopen ENG-546.
 	b.pool.ResetPreserving(allocations, func(key string) bool {
-		for uuid := range inflight {
+		// Allocation keys are {leaseUUID}-{service}-{index}. leaseUUID is not
+		// canonicalized at ingress (IsValidUUID = uuid.Parse, config.go; accepts
+		// hyphenless / urn:uuid: / braced / uppercase forms and keeps the original
+		// string verbatim into the key, provision.go). The match is still
+		// collision-free: no distinct valid-UUID string is a proper prefix of
+		// another, and the trailing "-" delimiter guards the token boundary.
+		for _, uuid := range trackedUUIDs {
 			if strings.HasPrefix(key, uuid+"-") {
 				return true
 			}

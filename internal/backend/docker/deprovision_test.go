@@ -116,3 +116,66 @@ func TestDeprovisionGiveUp_ListFails_RecordsBothNamespaces(t *testing.T) {
 		got.RetainedVolumeNames,
 		"fallback must record BOTH the canonical and the fred-retained- name so whichever exists is destroyed before the tombstone is deleted")
 }
+
+// TestDoDeprovision_Success_ReleasesPoolReservation locks the Release-pairing
+// invariant the pool-authoritative recoverState rule depends on (ENG-567): a
+// successful (non-retain) deprovision must release the lease's pool reservation
+// and remove it from b.provisions, so recoverState never preserves a phantom key
+// for an untracked lease.
+func TestDoDeprovision_Success_ReleasesPoolReservation(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-00000000000b"
+	existing := map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "t", Status: backend.ProvisionStatusReady,
+			Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+			ContainerIDs: []string{"c1"},
+		}},
+	}
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, existing)
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
+
+	require.NoError(t, b.doDeprovision(context.Background(), lease))
+
+	got := b.pool.Stats()
+	assert.Equal(t, int64(0), got.AllocatedDiskMB, "deprovision must release the pool reservation")
+	assert.Equal(t, 0, got.AllocationCount)
+	b.provisionsMu.RLock()
+	_, stillTracked := b.provisions[lease]
+	b.provisionsMu.RUnlock()
+	assert.False(t, stillTracked, "deprovisioned lease must be removed from b.provisions")
+}
+
+// TestDoDeprovision_GiveUp_ReleasesPoolReservation locks the give-up arm of the
+// Release-pairing invariant: when volume cleanup fails maxVolumeCleanupAttempts
+// times, doDeprovision gives up — it must releaseLive() and Delete the lease,
+// so no untracked lease is left holding a pool key.
+func TestDoDeprovision_GiveUp_ReleasesPoolReservation(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-00000000000c"
+	existing := map[string]*provision{
+		lease: {
+			ProvisionState: leasesm.ProvisionState{
+				LeaseUUID: lease, Tenant: "t", Status: backend.ProvisionStatusFailed,
+				Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+			},
+			VolumeCleanupAttempts: 2, // next attempt (3) == maxVolumeCleanupAttempts → give up
+		},
+	}
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, existing)
+	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error {
+		return errors.New("volume stuck")
+	}}
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
+
+	// Give-up returns nil (provision deleted, manual cleanup logged).
+	require.NoError(t, b.doDeprovision(context.Background(), lease))
+
+	got := b.pool.Stats()
+	assert.Equal(t, int64(0), got.AllocatedDiskMB, "give-up must release the reservation before deleting the lease")
+	assert.Equal(t, 0, got.AllocationCount)
+	b.provisionsMu.RLock()
+	_, stillTracked := b.provisions[lease]
+	b.provisionsMu.RUnlock()
+	assert.False(t, stillTracked, "given-up lease must be removed from b.provisions")
+}
