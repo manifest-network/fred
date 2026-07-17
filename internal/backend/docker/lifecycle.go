@@ -647,7 +647,7 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 		// the XFS ihard quota. See ENG-548.
 		entries++
 		if entries > maxEntries {
-			return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d entry limit", maxEntries)
+			return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d-entry limit", maxEntries)
 		}
 
 		// Strip setuid/setgid bits.
@@ -671,7 +671,7 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 			// maintains 0 <= totalBytes <= maxBytes. Negative sizes are rejected
 			// outright.
 			if hdr.Size < 0 || hdr.Size > maxBytes-totalBytes {
-				return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d byte limit", maxBytes)
+				return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d-byte limit", maxBytes)
 			}
 			if dir := filepath.Dir(name); dir != "." {
 				if mkErr := root.MkdirAll(dir, 0o700); mkErr != nil {
