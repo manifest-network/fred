@@ -1,6 +1,8 @@
 package manifest
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -613,6 +615,63 @@ func TestManifest_Expose_OutOfRange(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "between 1 and 65535")
 	})
+}
+
+// --- collection size caps (ENG-547) ---
+//
+// Unbounded tenant-controlled collections let a single cheap lease exhaust
+// host resources. The port map is the load-bearing case: every entry becomes
+// a published host port + iptables DNAT rule (userland-proxy:false in prod),
+// so tens of thousands of entries exhaust the shared ephemeral-port range and
+// flood netfilter — a cross-tenant provisioning DoS. Expose/Env/Labels are
+// capped for defense-in-depth.
+
+func manifestWithNPorts(n int) *Manifest {
+	ports := make(map[string]PortConfig, n)
+	for i := 1; i <= n; i++ {
+		ports[fmt.Sprintf("%d/tcp", i)] = PortConfig{}
+	}
+	return &Manifest{Image: "nginx", Ports: ports}
+}
+
+func TestManifest_Ports_AtCapAllowed(t *testing.T) {
+	assert.NoError(t, manifestWithNPorts(MaxPorts).Validate())
+}
+
+func TestManifest_Ports_OverCapRejected(t *testing.T) {
+	err := manifestWithNPorts(MaxPorts + 1).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too many ports")
+}
+
+func TestManifest_Expose_OverCapRejected(t *testing.T) {
+	expose := make([]string, 0, MaxExposePorts+1)
+	for i := 1; i <= MaxExposePorts+1; i++ {
+		expose = append(expose, strconv.Itoa(i))
+	}
+	err := (&Manifest{Image: "nginx", Expose: expose}).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too many expose ports")
+}
+
+func TestManifest_Env_OverCapRejected(t *testing.T) {
+	env := make(map[string]string, MaxEnvVars+1)
+	for i := 0; i <= MaxEnvVars; i++ {
+		env[fmt.Sprintf("VAR_%d", i)] = "x"
+	}
+	err := (&Manifest{Image: "nginx", Env: env}).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too many env vars")
+}
+
+func TestManifest_Labels_OverCapRejected(t *testing.T) {
+	labels := make(map[string]string, MaxLabels+1)
+	for i := 0; i <= MaxLabels; i++ {
+		labels[fmt.Sprintf("com.example.k%d", i)] = "v"
+	}
+	err := (&Manifest{Image: "nginx", Labels: labels}).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too many labels")
 }
 
 // TestPortSpecValidation exercises the package-internal validatePortSpec

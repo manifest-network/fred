@@ -28,6 +28,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- manifest: bound the number of ports (and, defense-in-depth, expose entries,
+  env vars, and labels) a tenant may declare per service. `flatManifest.Ports`
+  was validated per entry but never counted, and every entry becomes a published
+  host port plus an iptables DNAT rule (`userland-proxy:false` in prod), so a
+  single cheap one-container lease could POST tens of thousands of port entries
+  via `/update` (bounded only by the ~1 MB request body) and exhaust the shared
+  host ephemeral-port range and netfilter — a host-wide, cross-tenant
+  provisioning DoS. `Manifest.validate` now rejects manifests exceeding
+  `MaxPorts` (64), `MaxExposePorts` (64), `MaxEnvVars` (256), or `MaxLabels`
+  (128) — all far above any legitimate single-container workload — before any
+  per-entry work, on both the provision and update paths (`ParsePayload`). The
+  number of services in a stack remains bounded separately by
+  `ValidateStackAgainstItems` (1:1 with paid lease items). (ENG-547)
 - docker: preserve an in-flight lease's admission reservation across the periodic
   state rebuild. `recoverState` rebuilds the resource pool from live containers
   and then replaces it wholesale, but it excludes leases mid-operation

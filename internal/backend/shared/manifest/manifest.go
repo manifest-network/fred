@@ -74,6 +74,25 @@ var serviceNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 // excessive RAM via tmpfs mounts that bypass the container's cgroup memory limit.
 const MaxTmpfsMounts = 4
 
+// Per-service caps on tenant-controlled collection sizes. Each field is
+// validated per entry elsewhere, but the *count* was previously unbounded
+// (only the ~1 MB request-body limit applied), which is a host-resource DoS.
+//
+// MaxPorts is the load-bearing one: every port map entry becomes a published
+// host port + an iptables DNAT rule (userland-proxy:false in prod), so an
+// unbounded map lets one cheap lease exhaust the shared ephemeral-port range
+// and flood netfilter — a host-wide, cross-tenant provisioning DoS (ENG-547).
+// The others are defense-in-depth: bounded per-entry work and memory. All are
+// set far above any legitimate single-container workload (ingress is already
+// limited to one port). The number of services in a stack is bounded
+// separately by ValidateStackAgainstItems (1:1 with paid lease items).
+const (
+	MaxPorts       = 64  // published/declared ports per service
+	MaxExposePorts = 64  // container-network expose entries per service
+	MaxEnvVars     = 256 // environment variables per service
+	MaxLabels      = 128 // container labels per service
+)
+
 // flatManifest represents the tenant's container specification.
 // Resource limits are determined by the SKU, not the manifest.
 type flatManifest struct {
@@ -262,6 +281,23 @@ func (m *flatManifest) validate(inStack bool) error {
 	// depends_on is stack-only.
 	if !inStack && len(m.DependsOn) > 0 {
 		return fmt.Errorf("depends_on is only allowed in stack manifests")
+	}
+
+	// Bound tenant-controlled collection sizes before any per-entry work, so an
+	// oversized map is rejected cheaply rather than iterated. Ports is the real
+	// DoS vector (host ports + iptables rules); the rest are defense-in-depth.
+	// See the Max* constants for the rationale (ENG-547).
+	if len(m.Ports) > MaxPorts {
+		return fmt.Errorf("too many ports (%d), maximum is %d", len(m.Ports), MaxPorts)
+	}
+	if len(m.Expose) > MaxExposePorts {
+		return fmt.Errorf("too many expose ports (%d), maximum is %d", len(m.Expose), MaxExposePorts)
+	}
+	if len(m.Env) > MaxEnvVars {
+		return fmt.Errorf("too many env vars (%d), maximum is %d", len(m.Env), MaxEnvVars)
+	}
+	if len(m.Labels) > MaxLabels {
+		return fmt.Errorf("too many labels (%d), maximum is %d", len(m.Labels), MaxLabels)
 	}
 
 	// Validate port specifications
