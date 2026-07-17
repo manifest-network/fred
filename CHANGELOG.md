@@ -18,6 +18,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- docker: preserve an in-flight lease's admission reservation across the periodic
+  state rebuild. `recoverState` rebuilds the resource pool from live containers
+  and then replaces it wholesale, but it excludes leases mid-operation
+  (`Provisioning`/`Restarting`/`Updating`) from that rebuild — a still-pulling
+  provision has no containers yet, and a restart/update is mid-cleanup. The
+  full-replace `Reset` therefore dropped those leases' authoritative
+  `TryAllocate` reservation for the whole window, so `TryAllocate` briefly saw
+  phantom free capacity and could admit leases past physical CPU/memory/disk (and
+  past a tenant's quota); once the slow lease re-registered, the pool was left
+  over-committed (`allocatedDisk > totalDisk`), and because each volume carries a
+  hard XFS quota the summed quotas could exceed physical disk and cause
+  cross-tenant `ENOSPC`. Recovery now carries those in-flight reservations
+  forward from the live pool — read back from the pool itself rather than
+  reconstructed from lease state, so it is correct even before the lease's
+  `Items` are populated — via a new `ResourcePool.ResetPreserving`, keyed
+  identically so the synchronous reservation survives the rebuild. (ENG-546)
+
 ## [0.10.0] - 2026-07-16
 
 ### Added

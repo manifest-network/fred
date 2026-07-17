@@ -457,6 +457,189 @@ func TestRecoverState_InFlightProvisioning_PreservedNoContainers(t *testing.T) {
 	assert.Same(t, existing["L1"], p, "in-flight entry is preserved by pointer")
 }
 
+// TestRecoverState_InFlightProvisioning_PreservesPoolReservation is the ENG-546
+// regression. A lease still Provisioning (e.g. mid image-pull) reserved its
+// CPU/mem/disk synchronously via TryAllocate but has no containers yet, so its
+// allocation is excluded from the container-derived rebuild list. Before the
+// fix, recoverState's full-replace pool.Reset therefore DROPPED that reservation
+// for the whole window, letting TryAllocate briefly see phantom free capacity
+// and over-admit past physical capacity. The reservation must survive.
+func TestRecoverState_InFlightProvisioning_PreservesPoolReservation(t *testing.T) {
+	existing := map[string]*provision{
+		"a1b2c3d4-0000-4000-8000-000000000001": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "a1b2c3d4-0000-4000-8000-000000000001",
+			Tenant:    "t",
+			Status:    backend.ProvisionStatusProvisioning,
+			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
+	}
+	mock := &mockDockerClient{
+		// Still pulling: no containers exist yet for the in-flight lease.
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	b := newBackendForTest(mock, existing)
+	// The synchronous reservation Provision made before handing off to the pull.
+	require.NoError(t, b.pool.TryAllocate("a1b2c3d4-0000-4000-8000-000000000001-app-0", "docker-small", "t"))
+	before := b.pool.Stats()
+	require.Equal(t, int64(1024), before.AllocatedDiskMB, "docker-small disk reserved up front")
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	after := b.pool.Stats()
+	assert.Equal(t, before.AllocatedDiskMB, after.AllocatedDiskMB, "in-flight disk reservation must survive recoverState (ENG-546)")
+	assert.Equal(t, before.AllocatedCPU, after.AllocatedCPU, "in-flight CPU reservation must survive recoverState")
+	assert.Equal(t, before.AllocatedMemoryMB, after.AllocatedMemoryMB, "in-flight memory reservation must survive recoverState")
+	assert.Equal(t, 1, after.AllocationCount, "reservation preserved exactly once")
+}
+
+// TestRecoverState_InFlightProvisioning_PreservesReservation_ItemsNotYetEnriched
+// covers the window in Provision between TryAllocate and enrichReserved: the
+// entry is already Provisioning with a live pool reservation, but its Items are
+// not yet populated. The reservation must still survive — which is why the fix
+// preserves it from the LIVE POOL (by lease-UUID prefix) rather than
+// reconstructing the keys from the not-yet-populated Items.
+func TestRecoverState_InFlightProvisioning_PreservesReservation_ItemsNotYetEnriched(t *testing.T) {
+	existing := map[string]*provision{
+		"a1b2c3d4-0000-4000-8000-000000000002": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "a1b2c3d4-0000-4000-8000-000000000002",
+			Tenant:    "t",
+			Status:    backend.ProvisionStatusProvisioning,
+			Items:     nil, // enrichReserved has not run yet
+		}},
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	b := newBackendForTest(mock, existing)
+	require.NoError(t, b.pool.TryAllocate("a1b2c3d4-0000-4000-8000-000000000002-app-0", "docker-small", "t"))
+	before := b.pool.Stats()
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	assert.Equal(t, before.AllocatedDiskMB, b.pool.Stats().AllocatedDiskMB,
+		"reservation must survive even before Items are enriched (preserved from the pool, not reconstructed from Items)")
+}
+
+// TestRecoverState_InFlightUpdate_PreservesReservationExactlyOnce verifies a
+// lease mid-Update (containers running, reservation reused from Provision) keeps
+// its reservation across recoverState AND is not double-counted: its
+// container-derived allocation is excluded because the op may be mid-cleanup,
+// while the live pool reservation is preserved, so the disk is counted once.
+func TestRecoverState_InFlightUpdate_PreservesReservationExactlyOnce(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-000000000003"
+	existing := map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease,
+			Tenant:    "t",
+			Status:    backend.ProvisionStatusUpdating,
+			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: lease, Tenant: "t", SKU: "docker-small", ServiceName: "app", InstanceIndex: 0, Status: "running"},
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, existing)
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	got := b.pool.Stats()
+	assert.Equal(t, int64(1024), got.AllocatedDiskMB, "reservation preserved exactly once (not dropped, not doubled)")
+	assert.Equal(t, 1, got.AllocationCount)
+}
+
+// TestRecoverState_ReadyLease_ReservationRebuiltFromContainers guards the
+// boundary: a Ready lease is NOT in-flight, so its reservation is rebuilt purely
+// from the container-derived list and a stale pre-existing pool entry is not
+// additionally preserved — no double count, container-derived figure wins.
+func TestRecoverState_ReadyLease_ReservationRebuiltFromContainers(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-000000000004"
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: lease, Tenant: "t", SKU: "docker-small", ServiceName: "app", InstanceIndex: 0, Status: "running"},
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	got := b.pool.Stats()
+	assert.Equal(t, int64(1024), got.AllocatedDiskMB, "Ready lease counted once from containers")
+	assert.Equal(t, 1, got.AllocationCount)
+}
+
+// TestRecoverState_InFlightProvisioning_PreservesAllInstanceReservations locks
+// the crux of the fix: the keep closure preserves by {leaseUUID}- PREFIX, so
+// EVERY instance key of an in-flight lease must survive — not just the first.
+// A multi-instance / multi-service in-flight lease with no containers must carry
+// all its reservations forward. Guards against a refactor to an exact-key set
+// that would preserve only one instance and silently under-count (the ENG-546
+// over-admission class).
+func TestRecoverState_InFlightProvisioning_PreservesAllInstanceReservations(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-000000000005"
+	existing := map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease,
+			Tenant:    "t",
+			Status:    backend.ProvisionStatusProvisioning,
+			Items: []backend.LeaseItem{
+				{SKU: "docker-small", Quantity: 2, ServiceName: "app"},
+				{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+			},
+		}},
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	b := newBackendForTest(mock, existing)
+	for _, key := range []string{lease + "-app-0", lease + "-app-1", lease + "-web-0"} {
+		require.NoError(t, b.pool.TryAllocate(key, "docker-small", "t"))
+	}
+	before := b.pool.Stats()
+	require.Equal(t, int64(3*1024), before.AllocatedDiskMB)
+	require.Equal(t, 3, before.AllocationCount)
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	after := b.pool.Stats()
+	assert.Equal(t, int64(3*1024), after.AllocatedDiskMB, "every instance key of the in-flight lease must survive (prefix keep)")
+	assert.Equal(t, 3, after.AllocationCount, "all three instance reservations preserved, not just the first")
+}
+
+// TestRecoverState_FailedLease_StaleReservationDropped guards the exclude
+// boundary: a crashed provision can leave a live pool reservation while the
+// lease is Failed with no containers. Failed is NOT in-flight, so recoverState
+// must DROP the phantom reservation (release the capacity) rather than preserve
+// it — a regression that added Failed to the preserved set would leak
+// reservations forever.
+func TestRecoverState_FailedLease_StaleReservationDropped(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-000000000006"
+	existing := map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "t", Status: backend.ProvisionStatusFailed, FailCount: 1,
+		}},
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	b := newBackendForTest(mock, existing)
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB)
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	got := b.pool.Stats()
+	assert.Equal(t, int64(0), got.AllocatedDiskMB, "a Failed lease's stale reservation must be dropped, not preserved")
+	assert.Equal(t, 0, got.AllocationCount)
+}
+
 func TestRecoverState_FailingNormalizedToFailed(t *testing.T) {
 	existing := map[string]*provision{
 		"L1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "L1", Status: backend.ProvisionStatusFailing, FailCount: 1, LastError: "x"}},

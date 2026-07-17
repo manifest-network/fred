@@ -346,31 +346,85 @@ func (s ResourceStats) AvailableDiskMB() int64 {
 
 // Reset clears all allocations and rebuilds from a list of allocations.
 func (p *ResourcePool) Reset(allocations []ResourceAllocation) {
+	p.ResetPreserving(allocations, nil)
+}
+
+// ResetPreserving is the recovery-safe variant of Reset. It rebuilds the pool's
+// live allocations from allocations, but first RETAINS every current allocation
+// for which keep returns true. Retained entries take precedence over any
+// same-key entry in allocations (deduped by allocation key), so an allocation
+// present in both is counted exactly once.
+//
+// recoverState rebuilds the pool from a container-derived snapshot each tick,
+// but a lease that is mid-operation (Provisioning/Restarting/Updating) may have
+// no containers yet (still pulling its image) or containers that do not yet
+// reflect its authoritative TryAllocate reservation, so such leases are excluded
+// from that snapshot. Dropping their reservation on the rebuild would let
+// TryAllocate momentarily see phantom free capacity and over-admit past physical
+// capacity, leaving the pool over-committed once the lease re-registers
+// (ENG-546). The caller marks those in-flight leases via keep so their existing
+// reservations survive the rebuild, keyed identically — read from the live pool
+// rather than reconstructed, so the reservation is preserved even in the window
+// before its Items are populated.
+//
+// keep receives each current allocation's key and is invoked while the pool lock
+// is held, so it must not call back into ResourcePool or perform expensive or
+// blocking work. A nil keep preserves nothing, making ResetPreserving identical
+// to Reset.
+func (p *ResourcePool) ResetPreserving(allocations []ResourceAllocation, keep func(key string) bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Clear existing
+	// Snapshot the entries to retain from the CURRENT allocations before
+	// clearing, keyed by allocation key so a same-key entry in allocations
+	// cannot double-count them in the rebuild below.
+	var preserved map[string]ResourceAllocation
+	if keep != nil {
+		for key, alloc := range p.allocations {
+			if keep(key) {
+				if preserved == nil {
+					preserved = make(map[string]ResourceAllocation)
+				}
+				preserved[key] = alloc
+			}
+		}
+	}
+
+	// Clear existing.
 	p.allocations = make(map[string]ResourceAllocation)
 	p.tenantUsage = make(map[string]ResourceAllocation)
 	p.allocatedCPU = 0
 	p.allocatedMemory = 0
 	p.allocatedDisk = 0
 
-	// Rebuild from provided allocations
+	// Rebuild from the provided allocations, skipping any key being preserved
+	// (the retained entry is authoritative and re-added below).
 	for _, alloc := range allocations {
-		p.allocations[alloc.LeaseUUID] = alloc
-		p.allocatedCPU += alloc.CPUCores
-		p.allocatedMemory += alloc.MemoryMB
-		p.allocatedDisk += alloc.DiskMB
-
-		// Rebuild tenant aggregates
-		if alloc.Tenant != "" {
-			usage := p.tenantUsage[alloc.Tenant]
-			usage.CPUCores += alloc.CPUCores
-			usage.MemoryMB += alloc.MemoryMB
-			usage.DiskMB += alloc.DiskMB
-			p.tenantUsage[alloc.Tenant] = usage
+		if _, isPreserved := preserved[alloc.LeaseUUID]; isPreserved {
+			continue
 		}
+		p.addLocked(alloc)
+	}
+	// Re-add the retained in-flight reservations.
+	for _, alloc := range preserved {
+		p.addLocked(alloc)
+	}
+}
+
+// addLocked folds a single allocation into the live totals and the per-lease and
+// per-tenant maps. The caller must hold p.mu.
+func (p *ResourcePool) addLocked(alloc ResourceAllocation) {
+	p.allocations[alloc.LeaseUUID] = alloc
+	p.allocatedCPU += alloc.CPUCores
+	p.allocatedMemory += alloc.MemoryMB
+	p.allocatedDisk += alloc.DiskMB
+
+	if alloc.Tenant != "" {
+		usage := p.tenantUsage[alloc.Tenant]
+		usage.CPUCores += alloc.CPUCores
+		usage.MemoryMB += alloc.MemoryMB
+		usage.DiskMB += alloc.DiskMB
+		p.tenantUsage[alloc.Tenant] = usage
 	}
 }
 
