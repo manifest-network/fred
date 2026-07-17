@@ -45,6 +45,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (an escaping symlink planted by an earlier path can no longer redirect it), and
   `setupWritablePathBinds` skips any bind whose Source is a symlink or escapes the
   `_wp` root. (ENG-543)
+- docker: XFS tenant volumes now carry a per-volume inode hard limit (`ihard`)
+  alongside the block limit, bounding host inode exhaustion from zero-byte-file
+  floods. The ceiling is `disk_mb × 1 MiB / min_avg_file_bytes` (new
+  `min_avg_file_bytes` knob, default 1024 → 1024 inodes/MiB, floored at 262144
+  inodes); a workload whose average file is smaller than `min_avg_file_bytes`
+  may now hit `EDQUOT` on inodes. A filesystem-agnostic tar entry-count cap
+  backstops crafted-image extraction. (ENG-548)
 
 ## [0.9.0] - 2026-07-14
 
