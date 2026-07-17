@@ -613,15 +613,18 @@ func TestRecoverState_InFlightProvisioning_PreservesAllInstanceReservations(t *t
 	assert.Equal(t, 3, after.AllocationCount, "all three instance reservations preserved, not just the first")
 }
 
-// TestRecoverState_FailedLease_StaleReservationDropped guards one half of the
-// Failed sub-state split: a genuinely-failed provision (VolumeCleanupAttempts==0)
-// already released its reservation on the doProvision failure path, so any pool
-// entry still keyed to it is stale and recoverState must DROP it — resurrecting
-// it would leak capacity forever. The counterpart
-// TestRecoverState_FailedCleanupRetry_PreservesPoolReservation covers the
-// VolumeCleanupAttempts>0 sub-state, whose reservation is deliberately held and
-// must survive.
-func TestRecoverState_FailedLease_StaleReservationDropped(t *testing.T) {
+// TestRecoverState_FailedCrashGCd_PreservesReservation is the ENG-567 core case
+// (the "4th sibling"). A Ready lease whose container crashed → Failed never
+// releases its pool key (releases happen only on the Deprovision and doProvision-
+// failure paths), and if the exited container is then removed out-of-band the
+// lease is Failed with VolumeCleanupAttempts==0 and no container — but its volume
+// (and XFS bhard quota) is still on disk. The pool is authoritative for tracked
+// leases, so recoverState must PRESERVE the still-held reservation. (This
+// repurposes the former TestRecoverState_FailedLease_StaleReservationDropped,
+// whose premise — a genuinely-failed provision leaving a *stale* key — is
+// unreachable: doProvision's failure defer releases the key AND destroys the
+// volume in the same defer.)
+func TestRecoverState_FailedCrashGCd_PreservesReservation(t *testing.T) {
 	const lease = "a1b2c3d4-0000-4000-8000-000000000006"
 	existing := map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
@@ -629,6 +632,7 @@ func TestRecoverState_FailedLease_StaleReservationDropped(t *testing.T) {
 		}},
 	}
 	mock := &mockDockerClient{
+		// Exited container removed out-of-band: no containers reported.
 		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForTest(mock, existing)
@@ -638,8 +642,8 @@ func TestRecoverState_FailedLease_StaleReservationDropped(t *testing.T) {
 	require.NoError(t, b.recoverState(context.Background()))
 
 	got := b.pool.Stats()
-	assert.Equal(t, int64(0), got.AllocatedDiskMB, "a Failed lease's stale reservation must be dropped, not preserved")
-	assert.Equal(t, 0, got.AllocationCount)
+	assert.Equal(t, int64(1024), got.AllocatedDiskMB, "a tracked Failed lease's still-held reservation must be preserved (ENG-567)")
+	assert.Equal(t, 1, got.AllocationCount)
 }
 
 // TestRecoverState_FailedCleanupRetry_PreservesPoolReservation is the ENG-563
@@ -649,10 +653,12 @@ func TestRecoverState_FailedLease_StaleReservationDropped(t *testing.T) {
 // deliberately does NOT call releaseLive() — the bytes are still on disk, so the
 // reservation must stay counted for the retry. recoverState must preserve that
 // reservation (dropping it would free phantom capacity while the volume's XFS
-// quota still occupies disk → over-admit). The VolumeCleanupAttempts>0 marker is
-// what distinguishes this held-reservation sub-state from a genuinely-failed
-// provision (whose reservation was already released), which is still dropped
-// by the test above.
+// quota still occupies disk → over-admit).
+//
+// Under the pool-authoritative rule (ENG-567) VolumeCleanupAttempts no longer
+// gates preservation — every tracked lease that still holds a key is preserved —
+// so this now exercises one specific instance of that rule (the cleanup-retry
+// sub-state).
 func TestRecoverState_FailedCleanupRetry_PreservesPoolReservation(t *testing.T) {
 	const lease = "a1b2c3d4-0000-4000-8000-000000000009"
 	existing := map[string]*provision{
