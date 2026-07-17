@@ -421,11 +421,26 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// overlap the retained projection (2F) — the same safe, transient over-count
 	// doDeprovision itself creates at its live→retained hand-off (never an
 	// over-admit gap).
+	//
+	// Failed is included ONLY in the volume-cleanup-retry sub-state
+	// (VolumeCleanupAttempts>0): doDeprovision removed the containers but a volume
+	// Destroy/rename then failed, so it kept the lease Failed for retry and
+	// deliberately did NOT release the pool (bytes still on disk) — recover must
+	// keep that reservation for the same reason as Deprovisioning. A genuinely-
+	// failed provision (VolumeCleanupAttempts==0) already released its reservation
+	// on the doProvision failure path, so it falls through and its (stale) pool
+	// entry is correctly dropped — the VolumeCleanupAttempts marker distinguishes
+	// the two (ENG-563).
 	for uuid, prov := range final {
 		switch prov.Status {
 		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting,
 			backend.ProvisionStatusUpdating, backend.ProvisionStatusDeprovisioning:
 			inflight[uuid] = true
+		case backend.ProvisionStatusFailed:
+			// Held only while a volume-cleanup retry is pending; see above.
+			if prov.VolumeCleanupAttempts > 0 {
+				inflight[uuid] = true
+			}
 		}
 	}
 	// Preserve the in-flight reservations read from the live pool, keyed
