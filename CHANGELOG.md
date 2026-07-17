@@ -77,6 +77,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   only in that volume-cleanup-retry sub-state (`VolumeCleanupAttempts > 0`); a
   genuinely-failed provision, whose reservation was already released, is still
   dropped. (ENG-563)
+- docker: `recoverState` now preserves the pool reservation of every tracked
+  lease by a single structural rule (the pool is authoritative for a tracked
+  lease's footprint), replacing the per-status allowlist grown across ENG-546/
+  562/563. Besides subsuming those, it closes three more admission under-counts
+  the allowlist missed — a `Ready`→crash→GC'd `Failed` lease, a restore-rollback
+  re-quarantine failure, and a deprovision partial-removal failure — all of which
+  hold a reservation for bytes still on disk that the allowlist dropped, letting
+  `TryAllocate` over-admit past physical disk. Container-derived rebuild is
+  retained only to seed the pool on cold start and re-establish a lost key from
+  running containers. (ENG-567)
 
 ## [0.10.0] - 2026-07-16
 
