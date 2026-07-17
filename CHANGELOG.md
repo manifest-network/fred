@@ -34,6 +34,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   reconstructed from lease state, so it is correct even before the lease's
   `Items` are populated — via a new `ResourcePool.ResetPreserving`, keyed
   identically so the synchronous reservation survives the rebuild. (ENG-546)
+- docker: extend that in-flight reservation preservation to leases mid-close.
+  `doDeprovision` removes a lease's containers *before* releasing its pool
+  reservation — it defers the release until after the volume-destroy / retention
+  work so the footprint is never momentarily uncounted while bytes still persist
+  on disk — so a `Deprovisioning` lease can have no containers yet still hold its
+  reservation. `recoverState` was dropping it on the periodic rebuild (the same
+  phantom-capacity over-admission as above, reached via the close path). Recovery
+  now preserves `Deprovisioning` reservations too, counted exactly once (dedup
+  against any still-present container), matching the deprovision path's
+  deliberate release-after-teardown ordering. (ENG-562)
 
 ## [0.10.0] - 2026-07-16
 
