@@ -367,9 +367,10 @@ func (p *ResourcePool) Reset(allocations []ResourceAllocation) {
 // rather than reconstructed, so the reservation is preserved even in the window
 // before its Items are populated.
 //
-// keep receives the allocation key (the per-instance {leaseUUID}-{service}-{idx}
-// string). A nil keep preserves nothing, making ResetPreserving identical to
-// Reset.
+// keep receives each current allocation's key and is invoked while the pool lock
+// is held, so it must not call back into ResourcePool or perform expensive or
+// blocking work. A nil keep preserves nothing, making ResetPreserving identical
+// to Reset.
 func (p *ResourcePool) ResetPreserving(allocations []ResourceAllocation, keep func(key string) bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

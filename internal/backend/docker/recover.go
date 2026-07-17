@@ -390,7 +390,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	//
 	// Those in-flight leases keep their reservation via ResetPreserving below
 	// instead: their CPU/mem/disk was reserved synchronously by TryAllocate
-	// (Provision) / TryAllocateAdopt (Restore) and is the authoritative figure.
+	// (Provision) / TryAllocateAdoptAll (Restore) and is the authoritative figure.
 	// Dropping it on this periodic rebuild would let TryAllocate momentarily see
 	// phantom free capacity and over-admit past physical capacity, leaving the
 	// pool over-committed once the lease re-registers (ENG-546).
@@ -414,9 +414,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}
 	// Preserve the in-flight reservations read from the live pool, keyed
-	// identically. Allocation keys are {leaseUUID}-{service}-{index}; a leaseUUID
-	// is a canonical UUID, so a "{leaseUUID}-" prefix unambiguously identifies
-	// that lease's instance keys and cannot collide with another lease's.
+	// identically. Allocation keys are {leaseUUID}-{service}-{index} (or legacy
+	// {leaseUUID}-{index}); a leaseUUID is a canonical UUID, so a "{leaseUUID}-"
+	// prefix matches either shape, unambiguously identifies that lease's instance
+	// keys, and cannot collide with another lease's.
 	//
 	// Race-freedom invariant: this runs while provisionsMu is held (taken before
 	// the `final` merge above, released only after the stats snapshot below), and
