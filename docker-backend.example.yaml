@@ -311,11 +311,17 @@ host_address: ""
 # If volume_filesystem is not set, it is auto-detected.
 #
 # Supported configurations:
-#   - btrfs: subvolumes with qgroup quotas
-#   - xfs: project quotas (requires pquota mount option)
-#   - zfs: child datasets with quota property
+#   - xfs:   project quotas (requires pquota mount option)
+#            *** the only backend validated and used in production ***
+#   - btrfs: subvolumes with qgroup quotas   (experimental, untested)
+#   - zfs:   child datasets with quota property (experimental, untested)
+#
+# Only xfs is exercised in production (all mainnet/Morpheus backends run XFS
+# with pquota, and per-volume disk + inode quotas are enforced only on XFS).
+# The btrfs and zfs backends are implemented but not tested in any deployment;
+# use xfs for production.
 volume_data_path: "/var/lib/fred/volumes"
-# volume_filesystem: "btrfs"  # optional, auto-detected from volume_data_path
+# volume_filesystem: "xfs"  # optional, auto-detected (xfs is the only production-validated backend)
 
 # Smallest average file size (bytes) a workload may have before the per-volume
 # XFS inode quota (ihard) binds instead of the block quota (bhard). ihard =
