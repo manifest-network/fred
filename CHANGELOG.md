@@ -44,6 +44,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   now preserves `Deprovisioning` reservations too, counted exactly once (dedup
   against any still-present container), matching the deprovision path's
   deliberate release-after-teardown ordering. (ENG-562)
+- docker: extend that preservation to a lease whose close is mid-retry. When
+  `doDeprovision` removes a lease's containers but a volume destroy/rename then
+  fails (under the retry limit), it keeps the lease `Failed` and — because the
+  bytes are still on disk — deliberately does not release its pool reservation.
+  `recoverState` was dropping that still-held reservation on the periodic rebuild
+  (`Failed` was excluded from preservation): the same over-admission, reached via
+  the failed-cleanup path. Recovery now preserves a `Failed` lease's reservation
+  only in that volume-cleanup-retry sub-state (`VolumeCleanupAttempts > 0`); a
+  genuinely-failed provision, whose reservation was already released, is still
+  dropped. (ENG-563)
 
 ## [0.10.0] - 2026-07-16
 
