@@ -663,6 +663,27 @@ func TestRecoverState_FailedCrashGCd_PreservesReservation(t *testing.T) {
 	assert.Equal(t, 1, got.AllocationCount)
 }
 
+// TestRecoverState_UntrackedLeaseKey_Dropped locks the other half of the
+// pool-authoritative rule: a pool key whose owning lease is NOT in b.provisions
+// (an orphan/leaked reservation — the lease was deprovisioned/deleted) and has no
+// container must be DROPPED on rebuild, so orphan keys never accumulate.
+func TestRecoverState_UntrackedLeaseKey_Dropped(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-00000000000a"
+	// No entry in b.provisions for `lease`, and no containers.
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	b := newBackendForTest(mock, nil)
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB)
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	got := b.pool.Stats()
+	assert.Equal(t, int64(0), got.AllocatedDiskMB, "an untracked lease's orphan key must be dropped")
+	assert.Equal(t, 0, got.AllocationCount)
+}
+
 // TestRecoverState_FailedCleanupRetry_PreservesPoolReservation is the ENG-563
 // regression, and the counterpart to the test above. When doDeprovision removes
 // a lease's containers but a volume Destroy/rename then FAILS (under the retry
