@@ -170,7 +170,7 @@ ingress:
 |---|---|---|---|---|
 | VolumeDataPath | `volume_data_path` | string | *(empty)* | Host directory for managed volumes. Required when any SKU has `disk_mb > 0` |
 | VolumeFilesystem | `volume_filesystem` | string | *(auto-detected)* | Filesystem type: `btrfs`, `xfs`, or `zfs`. Auto-detected from `volume_data_path` if empty |
-| MinAvgFileBytes | `min_avg_file_bytes` | int64 | 1024 | Smallest avg file size before the XFS inode quota (ihard) binds; derives ihard = disk_mb × 1 MiB / min_avg_file_bytes, floored at 262144 inodes. XFS only. |
+| MinAvgFileBytes | `min_avg_file_bytes` | int64 | 1024 | Smallest avg file size before the per-volume inode ceiling binds. On XFS, derives the `ihard` quota (disk_mb × 1 MiB / min_avg_file_bytes, floored at 262144 inodes); the same value also caps tar-extraction entry count during writable-path image seeding on any backend. |
 
 When any SKU profile has `disk_mb > 0`, the backend manages quota-enforced host directories that are bind-mounted into containers at their Dockerfile VOLUME paths.
 

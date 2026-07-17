@@ -164,7 +164,7 @@ inode usage.
 - `df -h` on the tenant's volume still shows free bytes
 
 **Confirm:**
-1. `df -i <volume-path>` — `IUse%` at 100% while `df -h` shows headroom points at the inode cap, not the block quota.
+1. `df -i <volume-path>` reports **filesystem-wide** inode usage, not the per-tenant quota — for an `ihard` hit it still shows ample free inodes (`IUse%` well below 100%). That is the tell that it's the per-project inode cap, not global exhaustion (global exhaustion would instead fire `FilesystemInodesLow`).
 2. `xfs_quota -x -c 'report -p -i' <mountpoint>` filtered to the tenant's project ID confirms inode count is pinned at the hard limit.
 
 **Remediation:** there is no fred-side alert or auto-remediation for a single tenant's inode ceiling. Two levers:
