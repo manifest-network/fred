@@ -261,23 +261,25 @@ func xfsProjectSetupCmd(dirPath string, projID uint32) string {
 	return fmt.Sprintf("project -s -p %s %d", dirPath, projID)
 }
 
-// xfsLimitCmd is the `limit -p` command that sets the block hard limit for projID.
-func xfsLimitCmd(projID uint32, quota string) string {
-	return fmt.Sprintf("limit -p bhard=%s %d", quota, projID)
+// xfsLimitCmd is the `limit -p` command that sets the block hard limit (bhard) and
+// the inode hard limit (ihard) for projID in a single quotactl. ihard is a plain
+// integer count (no unit suffix). See ENG-548.
+func xfsLimitCmd(projID uint32, quota string, ihard int64) string {
+	return fmt.Sprintf("limit -p bhard=%s ihard=%d %d", quota, ihard, projID)
 }
 
-// xfsLimitClearCmd is the `limit -p` command that resets projID's block limits to
-// 0 (0 == "no limit" in XFS), returning its dquot to the uninitialized state so the
-// project drops out of `report -p` once its usage is also 0. Create/EnsureQuota only
-// ever set bhard (xfsLimitCmd), so zeroing bhard+bsoft clears every limit fred wrote.
-// Used by Destroy to keep the project-quota table bounded to live volumes (ENG-459).
+// xfsLimitClearCmd resets projID's block AND inode limits to 0 (0 == "no limit"),
+// returning its dquot to the uninitialized state so the project drops out of
+// `report -p` once its usage is also 0. Create/EnsureQuota set bhard+ihard, so
+// zeroing all four clears every limit fred wrote. Used by Destroy (ENG-459/548).
 func xfsLimitClearCmd(projID uint32) string {
-	return fmt.Sprintf("limit -p bhard=0 bsoft=0 %d", projID)
+	return fmt.Sprintf("limit -p bhard=0 bsoft=0 ihard=0 isoft=0 %d", projID)
 }
 
 func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
 	dirPath := filepath.Join(x.dataPath, id)
 	quota := fmt.Sprintf("%dm", sizeMB)
+	ihard := inodeHardLimit(sizeMB, x.minAvgFileBytes)
 
 	// Idempotent: if directory already exists, read the marker file for the
 	// real project ID (avoids re-deriving via CRC32 which may have been probed).
@@ -293,7 +295,7 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 		x.trackProjectID(id, projID)
 		x.mu.Unlock()
 
-		cmd := xfsLimitCmd(projID, quota)
+		cmd := xfsLimitCmd(projID, quota, ihard)
 		if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(cmd, x.mountPoint)...).CombinedOutput(); err != nil {
 			return "", false, fmt.Errorf("xfs_quota limit on existing %s (id=%d, quota=%s): %w: %s", dirPath, projID, quota, err, out)
 		}
@@ -337,7 +339,7 @@ func (x *xfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	}
 
 	// Set quota limit.
-	cmd = xfsLimitCmd(projID, quota)
+	cmd = xfsLimitCmd(projID, quota, ihard)
 	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(cmd, x.mountPoint)...).CombinedOutput(); err != nil {
 		if cleanupErr := os.RemoveAll(dirPath); cleanupErr != nil {
 			x.logger.Warn("failed to cleanup directory after xfs quota limit failure", "path", dirPath, "error", cleanupErr)
@@ -376,7 +378,7 @@ func (x *xfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB in
 	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(tagCmd, x.mountPoint)...).CombinedOutput(); err != nil {
 		return fmt.Errorf("xfs_quota project re-tag for %s (id=%d): %w: %s", dirPath, projID, err, out)
 	}
-	limitCmd := xfsLimitCmd(projID, fmt.Sprintf("%dm", sizeMB))
+	limitCmd := xfsLimitCmd(projID, fmt.Sprintf("%dm", sizeMB), inodeHardLimit(sizeMB, x.minAvgFileBytes))
 	if out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(limitCmd, x.mountPoint)...).CombinedOutput(); err != nil {
 		return fmt.Errorf("xfs_quota limit for %s (id=%d): %w: %s", dirPath, projID, err, out)
 	}
@@ -404,13 +406,13 @@ func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	}
 
 	// The directory and its tagged inodes are gone, so the project's usage is now 0.
-	// Reset its block limits to 0 so the dquot returns to the uninitialized state and
-	// the kernel's GETNEXTQUOTA walk skips it — the entry then disappears from
-	// report -p. XFS does NOT implicitly free a project's limit when its files are
-	// deleted: left set, the bhard limit persists in the quota table and leaks one
-	// entry per volume, and every xfs_quota op (report -p in Usage / Validate) scans
-	// the whole table — so provisioning latency degrades cumulatively as leases
-	// churn (ENG-459).
+	// Reset its block AND inode limits to 0 so the dquot returns to the uninitialized
+	// state and the kernel's GETNEXTQUOTA walk skips it — the entry then disappears
+	// from report -p. XFS does NOT implicitly free a project's limit when its files
+	// are deleted: left set, the bhard+ihard limits persist in the quota table and
+	// leak one entry per volume, and every xfs_quota op (report -p in Usage /
+	// Validate) scans the whole table — so provisioning latency degrades
+	// cumulatively as leases churn (ENG-459).
 	if hasProjID {
 		// Detach from the caller's ctx: a deprovision that was canceled or whose
 		// deadline elapsed must not skip this cleanup (mirrors the provision-failure

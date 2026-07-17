@@ -1097,12 +1097,12 @@ func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 
 	// As root: setting the quota SUCCEEDS — proving the filesystem itself is fine
 	// and it is purely the capability that gates the operation.
-	rootOut, rootErr := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(xfsLimitCmd(987654321, "1m"), mount)...).CombinedOutput()
+	rootOut, rootErr := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(xfsLimitCmd(987654321, "1m", 262144), mount)...).CombinedOutput()
 	require.NoError(t, rootErr, "root should be able to set the quota: %s", rootOut)
 
 	// With CAP_SYS_ADMIN dropped (euid still 0, so the mount is reachable and
 	// quotactl(Q_XSETQLIM) is actually reached), the SAME command FAILS.
-	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("xfs_quota -x -c 'limit -p bhard=1m 987654321' %s", mount))
+	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("xfs_quota -x -c '%s' %s", xfsLimitCmd(987654321, "1m", 262144), mount))
 	require.Error(t, dropErr,
 		"setting an XFS quota without CAP_SYS_ADMIN must fail: %s", dropOut)
 	if len(dropOut) > 0 {

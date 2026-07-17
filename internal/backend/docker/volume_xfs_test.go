@@ -135,7 +135,7 @@ func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 	assert.Contains(t, strings.Join(setup, " "), "project -s -p "+dir,
 		"project -s must name the subdir inside -c, not as the fs arg")
 
-	limit := xfsQuotaArgs(xfsLimitCmd(projID, "100m"), mount)
+	limit := xfsQuotaArgs(xfsLimitCmd(projID, "100m", 262144), mount)
 	assert.Equal(t, mount, limit[len(limit)-1], "limit -p: trailing fs arg must be the mount point")
 	assert.Contains(t, strings.Join(limit, " "), "limit -p bhard=100m")
 
@@ -340,4 +340,12 @@ func TestInodeHardLimit(t *testing.T) {
 			assert.Equal(t, tc.want, inodeHardLimit(tc.sizeMB, tc.minAvg))
 		})
 	}
+}
+
+func TestXfsLimitCmd_IncludesIhard(t *testing.T) {
+	assert.Equal(t, "limit -p bhard=30720m ihard=31457280 42", xfsLimitCmd(42, "30720m", 31457280))
+}
+
+func TestXfsLimitClearCmd_ClearsIhard(t *testing.T) {
+	assert.Equal(t, "limit -p bhard=0 bsoft=0 ihard=0 isoft=0 42", xfsLimitClearCmd(42))
 }
