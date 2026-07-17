@@ -407,9 +407,24 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	}
 	// Mark every in-flight lease — whether or not it produced containers — so
 	// the pool retains its existing reservation across the rebuild.
+	//
+	// Deprovisioning is included even though it is a teardown (not a reservation)
+	// state: doDeprovision removes containers BEFORE releasing the pool — it
+	// defers releaseLive() until after the volume-destroy / retention work so the
+	// footprint is never momentarily uncounted while bytes persist on disk. So a
+	// Deprovisioning lease can have no containers yet still hold its reservation;
+	// dropping it here would defeat that deliberate ordering and briefly
+	// over-admit (ENG-562). Unlike the three re-provision states it is NOT
+	// excluded from the container-derived list above: a container still present
+	// mid-teardown is a valid fallback, and ResetPreserving dedups the shared key
+	// so it is counted exactly once. On the retain path preserving it may briefly
+	// overlap the retained projection (2F) — the same safe, transient over-count
+	// doDeprovision itself creates at its live→retained hand-off (never an
+	// over-admit gap).
 	for uuid, prov := range final {
 		switch prov.Status {
-		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+		case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting,
+			backend.ProvisionStatusUpdating, backend.ProvisionStatusDeprovisioning:
 			inflight[uuid] = true
 		}
 	}

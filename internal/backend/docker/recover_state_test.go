@@ -742,6 +742,74 @@ func TestRecoverState_DeprovisioningPreserved_SurvivingContainers(t *testing.T) 
 	assert.Same(t, existing["L1"], p)
 }
 
+// TestRecoverState_Deprovisioning_PreservesPoolReservation is the ENG-562
+// regression. doDeprovision removes containers BEFORE releasing the pool (it
+// defers releaseLive() until after the volume-destroy / retention work, so the
+// footprint is never momentarily uncounted while bytes persist on disk). So a
+// lease can be Status=Deprovisioning with its containers already gone but its
+// reservation still held. recoverState must keep that reservation across the
+// rebuild — dropping it would let TryAllocate see phantom free capacity and
+// over-admit before the deprovision goroutine's own Release runs.
+func TestRecoverState_Deprovisioning_PreservesPoolReservation(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-000000000007"
+	existing := map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease,
+			Tenant:    "t",
+			Status:    backend.ProvisionStatusDeprovisioning,
+			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
+	}
+	mock := &mockDockerClient{
+		// Containers already removed; the deprovision goroutine has not yet run
+		// releaseLive(), so the pool reservation is still held.
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	b := newBackendForTest(mock, existing)
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+	before := b.pool.Stats()
+	require.Equal(t, int64(1024), before.AllocatedDiskMB)
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	after := b.pool.Stats()
+	assert.Equal(t, before.AllocatedDiskMB, after.AllocatedDiskMB, "Deprovisioning reservation must survive until releaseLive() runs (ENG-562)")
+	assert.Equal(t, 1, after.AllocationCount, "reservation preserved exactly once")
+}
+
+// TestRecoverState_Deprovisioning_WithContainer_CountedOnce covers the brief
+// window between the Deprovisioning mark and compose.Down: a container is still
+// present AND the pool reservation is still held. The container-derived
+// allocation (Deprovisioning is not excluded from the rebuild list) and the
+// preserved pool reservation share a key, so it must be counted exactly once —
+// ResetPreserving dedup makes the preserved entry win.
+func TestRecoverState_Deprovisioning_WithContainer_CountedOnce(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-000000000008"
+	existing := map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease,
+			Tenant:    "t",
+			Status:    backend.ProvisionStatusDeprovisioning,
+			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c1", LeaseUUID: lease, Tenant: "t", SKU: "docker-small", ServiceName: "app", InstanceIndex: 0, Status: "running"},
+			}, nil
+		},
+	}
+	b := newBackendForTest(mock, existing)
+	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-small", "t"))
+
+	require.NoError(t, b.recoverState(context.Background()))
+
+	got := b.pool.Stats()
+	assert.Equal(t, int64(1024), got.AllocatedDiskMB, "counted exactly once (not doubled by container-derived + preserved)")
+	assert.Equal(t, 1, got.AllocationCount)
+}
+
 // TestRecoverState_ConcurrentReaderDuringMerge runs recoverState while another
 // goroutine continuously reads provision state through the store seam. The race
 // detector must stay clean: the merge holds provisionsMu across the swap and the
