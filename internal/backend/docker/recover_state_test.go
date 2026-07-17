@@ -120,7 +120,7 @@ type mockDockerClient struct {
 	ResolveImageUserFn           func(ctx context.Context, imageName string, userOverride string) (int, int, error)
 	DetectVolumeOwnerFn          func(ctx context.Context, imageName string, volumePaths []string) (int, int, error)
 	DetectWritablePathsFn        func(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
-	ExtractImageContentFn        func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error
+	ExtractImageContentFn        func(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
 	ContainerEventsFn            func(ctx context.Context) (<-chan ContainerEvent, <-chan error)
 }
 
@@ -269,9 +269,9 @@ func (m *mockDockerClient) DetectWritablePaths(ctx context.Context, imageName st
 	return nil, nil // default: no writable paths detected
 }
 
-func (m *mockDockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+func (m *mockDockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
 	if m.ExtractImageContentFn != nil {
-		return m.ExtractImageContentFn(ctx, imageName, paths, destDir, maxBytes)
+		return m.ExtractImageContentFn(ctx, imageName, paths, destDir, maxBytes, maxEntries)
 	}
 	return nil // default: extraction succeeds silently
 }

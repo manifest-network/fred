@@ -502,7 +502,7 @@ func writablePathExtractDir(destDir, sanitized string) (string, error) {
 //
 // Returns nil on full success, or a map of path → error for failures.
 // Callers should log failures but not fail the provision (graceful degradation).
-func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error {
+func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
 	if len(paths) == 0 {
 		return nil
 	}
@@ -554,7 +554,12 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 			continue
 		}
 
-		written, skippedSymlinks, extractErr := sanitizeAndExtractTar(rc, extractDir, remainingBytes)
+		// remainingBytes is a single budget shared across all writable paths; maxEntries
+		// is instead applied per-path (not decremented) because the true cross-path /
+		// volume-wide inode gate is the caller's XFS ihard quota. On a filesystem without
+		// an inode quota (btrfs/zfs) this backstop therefore bounds entries at
+		// maxDetectedWritablePaths x maxEntries, not maxEntries alone. See ENG-548.
+		written, skippedSymlinks, extractErr := sanitizeAndExtractTar(rc, extractDir, remainingBytes, maxEntries)
 		_ = rc.Close()
 		if extractErr != nil {
 			if failures == nil {
@@ -580,8 +585,12 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 // device nodes, and skips entries that refer to the destination root itself
 // (".", "./", or empty) so a tar cannot mkdir or chown destDir. Setuid/setgid
 // bits are stripped. Total bytes written are tracked and an error is returned if
-// maxBytes is exceeded. File ownership from tar headers is preserved when running
-// as root; EPERM errors from chown are silently ignored.
+// maxBytes is exceeded; the number of inode-consuming entries (dirs/files/
+// symlinks) is likewise tracked and an error is returned if maxEntries is
+// exceeded — a defense-in-depth backstop against inode-flood DoS (see ENG-548)
+// that is filesystem-agnostic, unlike the XFS ihard quota it complements. File
+// ownership from tar headers is preserved when running as root; EPERM errors
+// from chown are silently ignored.
 //
 // Symlinks whose targets point outside destDir (absolute paths, ".." traversal)
 // are still created — os.Root.Symlink does not validate the link target, and
@@ -590,7 +599,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 // extract any later entry *through* them. The returned slice contains
 // descriptions of such out-of-scope symlinks (e.g., "name -> target") for
 // caller-side debug logging. See ENG-430.
-func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64, []string, error) {
+func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries int64) (int64, []string, error) {
 	// destDir must already exist — the caller (ExtractImageContent) creates it
 	// before calling. os.OpenRoot opens it as a confinement root for every
 	// extraction op below; it returns a clear error if destDir is missing.
@@ -602,6 +611,7 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64
 
 	tr := tar.NewReader(src)
 	var totalBytes int64
+	var entries int64
 	var outOfScope []string
 
 	for {
@@ -627,6 +637,17 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes int64) (int64
 		// already created and owns; skip them so a tar cannot mkdir/chown destDir.
 		if name == "." {
 			continue
+		}
+
+		// Bound the number of inode-consuming entries (dirs/files/symlinks). Empty
+		// files pass the byte budget but each costs an inode; this backstops the
+		// XFS ihard quota and is the only inode bound on btrfs/zfs. Implicit parent
+		// dirs created via MkdirAll for a nested entry are not counted, so the cap
+		// is permissive-only — acceptable for a defense-in-depth backstop behind
+		// the XFS ihard quota. See ENG-548.
+		entries++
+		if entries > maxEntries {
+			return totalBytes, outOfScope, fmt.Errorf("tar extraction exceeds %d entry limit", maxEntries)
 		}
 
 		// Strip setuid/setgid bits.

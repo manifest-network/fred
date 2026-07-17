@@ -124,7 +124,7 @@ func TestSanitizeAndExtractTar_SizeGateOverflow(t *testing.T) {
 	raw := buildSizeOverflowTar(t)
 	dest := t.TempDir()
 
-	written, _, extractErr := sanitizeAndExtractTar(bytes.NewReader(raw), dest, maxBytes)
+	written, _, extractErr := sanitizeAndExtractTar(bytes.NewReader(raw), dest, maxBytes, 1<<30)
 
 	onDisk := sumRegularFileBytes(t, dest)
 	require.LessOrEqualf(t, onDisk, maxBytes,
@@ -157,7 +157,7 @@ func FuzzSanitizeAndExtractTar(f *testing.F) {
 		require.NoError(t, os.WriteFile(canaryPath, []byte(canaryContent), 0o600))
 
 		// Invariant 1: never panics (a panic fails the test implicitly).
-		_, _, _ = sanitizeAndExtractTar(bytes.NewReader(tarBytes), dest, maxBytes)
+		_, _, _ = sanitizeAndExtractTar(bytes.NewReader(tarBytes), dest, maxBytes, 1<<30)
 
 		// Invariant 2: byte budget holds on disk, even when extraction errored.
 		budget := maxBytes

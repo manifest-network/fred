@@ -42,7 +42,7 @@ type dockerClient interface {
 	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
 	DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (uid, gid int, err error)
 	DetectWritablePaths(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
-	ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes int64) map[string]error
+	ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
 	ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error)
 }
 
