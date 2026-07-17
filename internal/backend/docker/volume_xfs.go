@@ -58,6 +58,9 @@ type xfsVolumeManager struct {
 	// of this mount. See resolveMountpoint and ENG-449.
 	mountPoint string
 	logger     *slog.Logger
+	// minAvgFileBytes is the ratio used by inodeHardLimit to derive each volume's
+	// XFS inode hard limit from its block quota. Set from Config.GetMinAvgFileBytes().
+	minAvgFileBytes int64
 
 	mu         sync.Mutex
 	activeIDs  map[uint32]string // projectID → volumeID

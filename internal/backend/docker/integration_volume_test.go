@@ -921,7 +921,7 @@ func TestIntegration_Usage_XFS(t *testing.T) {
 	mountDir := setupXFSLoopback(t)
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(mountDir, "xfs", slog.Default())
+	mgr, err := newVolumeManager(mountDir, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	const volName = "fred-int-usage-xfs-app-0"
@@ -961,7 +961,7 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 
 	ctx := context.Background()
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
@@ -1028,7 +1028,7 @@ func TestIntegration_XFS_Destroy_ClearsQuotaEntry(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
@@ -1182,7 +1182,7 @@ func TestIntegration_XFS_Backfill_TagsUntaggedVolume(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
@@ -1231,7 +1231,7 @@ func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	const lease = "l-e2e-backfill"
@@ -1271,7 +1271,7 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	const origLease = "l-ret"
@@ -1345,7 +1345,7 @@ func TestIntegration_Btrfs_ReconcileBackfill_EndToEnd(t *testing.T) {
 func TestIntegration_Zfs_ReconcileBackfill_EndToEnd(t *testing.T) {
 	mount, _ := setupZFSPool(t) // requires root
 	ctx := context.Background()
-	mgr, err := newVolumeManager(mount, "zfs", slog.Default())
+	mgr, err := newVolumeManager(mount, "zfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate()) // resolves parentDataset
 
@@ -1395,7 +1395,7 @@ func TestIntegration_Usage_ZFS(t *testing.T) {
 	mountPath, _ := setupZFSPool(t)
 	ctx := context.Background()
 
-	mgr, err := newVolumeManager(mountPath, "zfs", slog.Default())
+	mgr, err := newVolumeManager(mountPath, "zfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
@@ -1560,7 +1560,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 	const largeMiB, mediumMiB = int64(100), int64(20)
 
-	mgr, err := newVolumeManager(mountDir, "xfs", slog.Default())
+	mgr, err := newVolumeManager(mountDir, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	b := newBackendForTest(&mockDockerClient{}, nil)
@@ -1682,7 +1682,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 
 	const largeMiB, mediumMiB = int64(100), int64(20)
 
-	mgr, err := newVolumeManager(mountPath, "zfs", slog.Default())
+	mgr, err := newVolumeManager(mountPath, "zfs", 1024, slog.Default())
 	require.NoError(t, err)
 	// Validate resolves and caches the parent dataset name required by all ZFS ops.
 	require.NoError(t, mgr.Validate())

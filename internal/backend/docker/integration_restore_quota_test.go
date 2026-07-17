@@ -165,7 +165,7 @@ func seedRetainedForRestore(t *testing.T, b *Backend, mgr volumeManager, orig, o
 // preallocation can transiently inflate "used"; assert on bhard instead).
 func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 	mount := setupXFSLoopback(t) // root-gated; skips if root/mkfs.xfs/xfs_quota/loop absent
-	mgr, err := newVolumeManager(mount, "xfs", slog.Default())
+	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	b, callbackCh, callbackURL := newRestoreQuotaBackend(t, mgr)
 

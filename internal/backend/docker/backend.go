@@ -493,7 +493,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("failed to open retention store: %w", err)
 	}
 
-	volumes, err := newVolumeManager(cfg.VolumeDataPath, cfg.VolumeFilesystem, logger)
+	volumes, err := newVolumeManager(cfg.VolumeDataPath, cfg.VolumeFilesystem, cfg.GetMinAvgFileBytes(), logger)
 	if err != nil {
 		_ = cbStore.Close()
 		_ = diagStore.Close()

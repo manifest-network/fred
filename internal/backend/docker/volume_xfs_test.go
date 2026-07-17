@@ -81,7 +81,7 @@ func TestResolveMountpoint_Root(t *testing.T) {
 // branch returns before any exec.
 func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 	dir := t.TempDir()
-	mgr, err := newVolumeManager(dir, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dir, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-does-not-exist-app-0", 100),
 		"EnsureQuota on a missing volume must be a no-op")
@@ -106,7 +106,7 @@ func TestNewVolumeManager_XFS_ResolvesMountpoint(t *testing.T) {
 	dataPath := filepath.Join(mount, "volumes") // subdir, like /data/fred/volumes
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 
-	mgr, err := newVolumeManager(dataPath, "xfs", slog.Default())
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
 	xm, ok := mgr.(*xfsVolumeManager)
