@@ -42,6 +42,8 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A `fred-retained-*`/leaked volume the sweep can't destroy — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual reclaim. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
 | `fred_docker_backend_volume_quota_clear_failed_total` rising | An XFS volume `Destroy` failed to clear its project block limit — the project-quota table is regrowing (leaked zero-byte entries slow every `xfs_quota` scan) | [Leaked XFS project-quota entries](#leaked-xfs-project-quota-entries) |
+| `fred_docker_backend_retention_partition_collapsed_total` increasing | An allowlisted (aggregator) tenant is declaring divergent / invalid / over-limit partition keys — collapses are harmless (closes are never blocked, data is never destroyed) but signal an integrator-side key bug | [Partition collapse triage](#partition-collapse-triage) |
+| `fred_docker_backend_retention_cap_check_failed_total` increasing | Retention cap checks are failing OPEN on store-read errors — quotas are silently unenforced (data-safe, but the gates are off) | Check `retention.db` health; see the `store_error` row in [Partition collapse triage](#partition-collapse-triage) |
 
 ---
 
@@ -233,8 +235,27 @@ that tenants are silently losing restore grace to the count cap. Under
 entire retained pool, after which other tenants' `RetainOnClose` closes degrade to
 refuse-to-retain (destroy, no grace window). This is an availability DoS on the
 retention feature for those tenants, not a data-theft risk — destroy only touches
-the closing lease's own volumes. True per-tenant disk fairness would require a
-per-tenant retained-disk quota (a possible follow-up).
+the closing lease's own volumes. True per-tenant disk fairness is available via
+`max_retained_disk_mb_per_tenant` (and per-tenant `retention_tenant_budgets`).
+
+**Which cap is biting (three-way triage).** With partition budgets deployed, the
+retention counters resolve to three distinct signals — do not conflate them:
+
+- `fred_docker_backend_retention_partition_evicted_total` rising is an
+  aggregator's own **L2 per-partition** sub-cap working as intended (one of its
+  end-customers hit its slice) — **NOT** a provider-capacity signal. The bare
+  `..._retention_evicted_total` keeps its deployed **L1 per-tenant** meaning.
+- `fred_docker_backend_retention_refused_by_scope_total{scope}` tells you which
+  disk cap refused a close: `scope=global` (L0 `max_retained_disk_mb` — provider
+  capacity, the real disk-pressure signal), `scope=tenant` (L1 per-tenant
+  aggregate), or `scope=partition` (L2 per-partition, an aggregator's own slice).
+  The bare `..._retention_refused_total` keeps its deployed L0-global-only meaning
+  (and the alert keyed on it), so it is the `scope=global` subset.
+
+So under disk pressure, a rising `scope=global` refusal (or the bare
+`retention_refused_total`) is the provider-capacity signal that drives this
+runbook; `partition`/`tenant`-scoped refusals and partition evictions are an
+aggregator's own budget doing its job and do not mean the backend is full.
 
 ### Reclaiming leaked / stuck-reaping orphan volumes
 
@@ -261,6 +282,78 @@ the sweep is the only automatic reclaimer.
   (boot runs the reaping reconcile). If the volume is genuinely unrecoverable, remove it
   manually (`docker volume rm <name>` or `rm -rf <volume_data_path>/<name>`) — the next sweep
   then deletes the now-dangling tombstone (its destroy is an idempotent no-op).
+
+---
+
+## Partition collapse triage
+
+`fred_docker_backend_retention_partition_collapsed_total{reason}` (counted per
+close attempt; retries re-count) — a collapse **NEVER** blocks a close and
+**NEVER** destroys data; it only files the record in the whole-tenant default
+(`""`) bucket, exactly as if partitioning were off. It is only a signal that an
+allowlisted (aggregator) tenant is emitting keys the backend can't use.
+
+| `reason` | meaning | action |
+|---|---|---|
+| `invalid` | value fails the 1–64 char `[A-Za-z0-9._-]` rule (case-significant) | integrator-side key bug; share the charset rule |
+| `divergent` | services in one manifest disagree on the value | integrator bug (mis-labeled sidecar); all services that carry the key must carry the SAME value |
+| `no_input` | manifest unavailable at close (hydration failure) | cross-reference the `soft-delete: retained data will NOT be API-restorable` WARN; the stored label is preserved on retries (the `PutActiveMerged` guard) |
+| `over_limit` | tenant already at `max_partitions` distinct labels | keys beyond the limit collapse; budgets are unaffected; raise `max_partitions` or expect default-bucket landing (a key rotation holds both generations until old records age out) |
+| `store_error` | `retention.db` read failed during the partition bound | fail-open (safe); investigate store health; `..._retention_cap_check_failed_total{check="bound"}` fires alongside |
+
+**Adoption / typo check.** Source configured and a tenant allowlisted, but
+`fred_docker_backend_retention_partition_stamped_total` flat at 0 ⇒ the
+configured key never matches what the integrator emits (a manifest typo or an
+unpopulated label/env). No collapse fires in this case — the key is simply
+absent, so verify the integrator is actually emitting the key the
+`retention_partition_source` names.
+
+---
+
+## Budget lifecycle
+
+Sizing, changing, and rolling back `retention_tenant_budgets` (the aggregator
+allowlist) and the per-tenant caps (`max_retained_leases_per_tenant`,
+`max_retained_disk_mb_per_tenant`). Every cap here is destructive at close time,
+so measure before you set.
+
+- **Measure before you budget.** Single-tenant (or provider-global) sizing: read
+  the `fred_docker_backend_retained_leases` / `..._retained_volume_bytes` gauges.
+  Per aggregator tenant: deploy a **generous** budget first, then read the
+  startup `retention budget sanity` INFO log (emitted per budgeted tenant, with
+  `active_count` / `active_mb` vs `budget_count` / `budget_mb`) and tighten from
+  the observed holdings. An over-holdings budget instead logs `retention budget
+  below tenant's current holdings` WARN with `over_count` / `over_disk` fields.
+- **De-allowlist / shrink preflight.** Compare the tenant's current holdings
+  (the sanity INFO/WARN, above) against the new budget **before** applying.
+  Removing a `retention_tenant_budgets` entry drops the tenant to the default
+  caps; if it holds more than the defaults allow, its next closes evict
+  oldest-first (count, **batch-railed** at 32/close so it converges over several
+  closes) or refuse-to-retain (disk). Neither blocks a close.
+- **Rollback ordering.** A binary rolled back **below** the budgets release
+  silently ignores the `retention_tenant_budgets` block (unknown config) and
+  falls back to `max_retained_leases_per_tenant` / `max_retained_disk_mb_per_tenant`.
+  If those are lower than a budgeted tenant's holdings, the old binary
+  mass-evicts on the next closes. Raise `max_retained_leases_per_tenant` (and the
+  per-tenant disk cap) to cover the **largest** budgeted tenant in the **same
+  deploy** as any such binary rollback.
+- **SKU additions re-trip the largest-SKU floor.** Every budget's
+  `max_retained_disk_mb` (and the global/per-tenant disk caps) must be ≥ the
+  largest stateful SKU's `disk_mb` — this is a startup `Validate` check. Adding a
+  bigger stateful SKU raises that floor, so a now-undersized budget fails startup
+  at the **next restart**; bump the budgets in the same change.
+- **`max_partitions` shrink is non-retroactive.** Lowering it does not delete
+  existing labels; new distinct keys beyond the limit collapse (`over_limit`)
+  while existing labels drain as their records age out. The
+  `fred_docker_backend_retention_partitions` gauge may legitimately exceed the
+  sum of budgeted `max_partitions` while draining — don't cry wolf.
+- **Key rotation** holds both label generations (old and new) until the old
+  records age out, transiently consuming two partition slots — expect a brief
+  `retention_partitions` bump and, if it crosses `max_partitions`, `over_limit`
+  collapses on the new key until the old drains.
+- **Restore consumes the grace slot.** Restoring a retained lease adopts its
+  volume into the new lease and clears the retention record; a later re-close
+  re-competes for the partition's disk sub-cap from scratch.
 
 ---
 
