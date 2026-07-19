@@ -262,6 +262,31 @@ releases_max_age: 2160h
 # (h/m/s) — write 2160h for 90 days, 336h for 14 days; days/weeks are NOT valid.
 # max_retained_disk_mb: 0
 
+# ── Retention partitioning (optional; all default OFF) ──────────────────────
+# Where the OPTIONAL retention-partition key is read from at lease close.
+# Lets a single on-chain tenant (an aggregator fronting many end-customers)
+# sub-divide its OWN retention budget; it never raises any cap. Formats:
+#   "manifest.label:<key>"  — e.g. "manifest.label:com.example.customer"
+#   "manifest.env:<key>"    — e.g. "manifest.env:APP_CUSTOMER_ID"
+# Default: "" (partitioning disabled). Invalid formats fail startup.
+# retention_partition_source: ""
+#
+# Default per-tenant retained-disk cap (MB); refuse-to-retain semantics like
+# max_retained_disk_mb but per tenant. 0 = unlimited (default).
+# max_retained_disk_mb_per_tenant: 0
+#
+# Aggregator allowlist: per-tenant budget overrides, keyed by on-chain tenant
+# address (verify the key carefully — a typo silently never matches; the
+# startup budget-sanity log is your check). Aggregates are REQUIRED positive.
+# Only tenants listed here with max_partitions > 0 ever get partitions.
+# retention_tenant_budgets:
+#   manifest1exampleaggregatoraddr:
+#     max_retained_leases: 200         # REQUIRED > 0 (never "unlimited")
+#     max_retained_disk_mb: 500000     # REQUIRED > 0
+#     max_partitions: 64               # 0 = elevation-only (labels collapse)
+#     per_partition_max_leases: 5      # 0 = no per-partition count sub-cap
+#     per_partition_max_disk_mb: 30720 # 0 = no per-partition disk sub-cap
+
 # =============================================================================
 # HOST CONFIGURATION
 # =============================================================================

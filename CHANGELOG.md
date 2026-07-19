@@ -12,6 +12,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   sub-tenant grouping key within one on-chain tenant) plus the pure
   extraction/validation library for it. Nothing writes a non-empty partition
   yet — behavior and stored bytes are identical to the previous release.
+- Retention partitioning: an operator-configured `retention_partition_source`
+  plus a `retention_tenant_budgets` aggregator allowlist let one on-chain
+  tenant's retention be capped and evicted per end-customer
+  (`(tenant, partition)` scope), with per-tenant aggregate caps always
+  binding (partitions only sub-divide, never raise). New knob
+  `max_retained_disk_mb_per_tenant` (default 0 = unlimited). New metrics:
+  `retention_partition_{collapsed_total,stamped_total,evicted_total}`,
+  `retention_partitions`, `retention_refused_by_scope_total`,
+  `retention_cap_check_failed_total`; existing `retention_refused_total` /
+  `retention_evicted_total` keep their exact deployed meanings. Everything
+  defaults off; with no config the release is behavior- and byte-identical.
 
 ### Changed
 
