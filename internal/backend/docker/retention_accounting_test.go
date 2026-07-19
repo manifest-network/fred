@@ -1654,3 +1654,19 @@ func TestLogRetentionBudgetSanity_InfoWhenWithinBudget(t *testing.T) {
 	require.Contains(t, out, "tenant=agg")
 	require.NotContains(t, out, "retention budget below tenant's current holdings")
 }
+
+// TestRetentionPartitionsGauge pins the retention_partitions gauge: it counts
+// distinct non-empty (tenant, partition) PAIRS over active records. The same
+// (tenant, partition) counts once; the same partition value under a different
+// tenant is a distinct pair; and the "" default bucket is never counted.
+func TestRetentionPartitionsGauge(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	now := time.Now()
+	putActivePart(t, rs, "g-1", "agg", "A", now)
+	putActivePart(t, rs, "g-2", "agg", "B", now)
+	putActivePart(t, rs, "g-3", "other", "A", now) // distinct PAIR (tenant differs)
+	putActivePart(t, rs, "g-4", "agg", "", now)    // default bucket: not counted
+
+	b.refreshRetentionAccounting()
+	require.Equal(t, float64(3), testutil.ToFloat64(retentionPartitions))
+}

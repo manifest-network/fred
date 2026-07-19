@@ -2221,6 +2221,85 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 	b.wg.Wait()
 }
 
+// TestRestore_PartitionSurvivesLineage: restore a partition-labeled retained
+// record into a NEW lease, then close the new lease — its close re-extracts the
+// SAME partition from the manifest carried through the restore. The partition is
+// not persisted across the restore (the orig record is deleted on success); it is
+// re-derived from the same source at the next close — "restore lineage for free".
+func TestRestore_PartitionSurvivesLineage(t *testing.T) {
+	const srcKey = "com.example.customer"
+	const orig = "u1"
+	newLease := "ffffffff-0000-0000-0000-000000000001"
+
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b) // prod always configures a release store (ENG-523 finalizer)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	b.cfg.RetainOnClose = true
+
+	// Seed the retained record, then overwrite its manifest with a partition-labeled
+	// one and stamp the partition (exactly the state the original close produced).
+	seedActiveRetained(t, rs, orig)
+	stack, err := manifest.ParsePayload(deployManifestWithLabel(srcKey, "cust-a"))
+	require.NoError(t, err)
+	rec, err := rs.Get(orig)
+	require.NoError(t, err)
+	rec.StackManifest = stack
+	rec.Partition = "cust-a"
+	require.NoError(t, rs.Put(*rec))
+
+	b.cfg.RetentionPartitionSource = "manifest.label:" + srcKey
+	b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
+		"tenant-a": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 500000, MaxPartitions: 64},
+	}
+	b.partitionSource, err = shared.ParsePartitionSource(b.cfg.RetentionPartitionSource)
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	var downProjects []string
+	b.compose = happyComposeMock(&mu, &downProjects, nil)
+	// Adaptation vs the success-path scaffolding (which only needs RenameVolumeFn):
+	// the close after restore must SEE the new lease's canonical volume so it has
+	// something to retain — adopt renamed retained(orig) → canonical(newLease).
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{canonicalVolumeName(newLease, manifest.DefaultServiceName, 0)}, nil
+		},
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	require.NoError(t, b.Restore(context.Background(), restoreRequest(newLease, orig, server.URL)))
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		p, ok := b.provisions[newLease]
+		return ok && p.Status == backend.ProvisionStatusReady
+	}, 5*time.Second, 20*time.Millisecond, "restored lease must reach Ready")
+
+	// The orig record is gone (deleted on successful restore); the partition is NOT
+	// carried in any record — it survives only because the manifest carries the label.
+	require.NoError(t, b.Deprovision(context.Background(), newLease))
+	require.Eventually(t, func() bool {
+		newRec, gerr := rs.Get(newLease)
+		return gerr == nil && newRec != nil && newRec.Partition == "cust-a"
+	}, 5*time.Second, 50*time.Millisecond,
+		"the restored lease's close must re-extract the same partition from the carried manifest")
+
+	b.stopCancel()
+	b.wg.Wait()
+}
+
 // TestRestore_HonorsNewSKU_Promote drives a full restore whose request targets a
 // LARGER-disk SKU (docker-medium, DiskMB 2048) than the retained record
 // (docker-small, DiskMB 1024). It proves the new SKU is honored end-to-end: the

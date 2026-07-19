@@ -198,3 +198,64 @@ func TestClose_GlobalCapStillRefusesBudgetedTenant(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond)
 	require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "other-tenant-rec"))
 }
+
+// TestClose_ScopedRefusals drives the L1 (per-tenant aggregate) and L2
+// (per-partition) disk refusals through the REAL close path, asserting the scoped
+// counter fires at the right scope while (a) the bare retentionRefusedTotal keeps
+// its deployed L0-global-only meaning and (b) a disk refusal destroys ONLY the
+// incoming lease — every already-retained record survives (disk caps never evict).
+func TestClose_ScopedRefusals(t *testing.T) {
+	const srcKey = "com.example.customer"
+
+	t.Run("tenant scope", func(t *testing.T) {
+		// docker-micro at 1024 MB each. Tenant disk cap 4096; 4 held = 4096 (full);
+		// incoming 1024 → 4096+1024 > 4096 breaches the tenant scope. CountCap 200
+		// (>5) so no eviction fires before the disk gate.
+		b, rs, leaseUUID := newCloseHarness(t, "tenant-a", nil)
+		b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
+			"tenant-a": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 4096, MaxPartitions: 0}, // elevation-only, tight disk
+		}
+		for i := 0; i < 4; i++ { // 4×1024 fills the tenant budget exactly
+			putActivePart(t, rs, fmt.Sprintf("t-%d", i), "tenant-a", "", time.Now().Add(-time.Hour))
+		}
+		bareBefore := testutil.ToFloat64(retentionRefusedTotal)
+		scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeTenant))
+		require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
+		require.Eventually(t, func() bool {
+			return testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopeTenant)) == scopedBefore+1
+		}, 5*time.Second, 50*time.Millisecond)
+		require.Equal(t, bareBefore, testutil.ToFloat64(retentionRefusedTotal),
+			"bare counter keeps its deployed L0-only meaning")
+		for i := 0; i < 4; i++ { // refusal destroys only the incoming
+			require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, fmt.Sprintf("t-%d", i)))
+		}
+	})
+
+	t.Run("partition scope", func(t *testing.T) {
+		// cust-a already holds 4×1024 = its full per-partition disk sub-cap (4096);
+		// incoming labeled cust-a → 4096+1024 > 4096 breaches L2. PerPartitionMaxLeases
+		// 10 (>4) and CountCap 200 so no eviction fires before the disk gate; L1 disk
+		// (500000) is slack, so the FIRST breach is at the partition scope.
+		b, rs, leaseUUID := newCloseHarness(t, "tenant-a", deployManifestWithLabel(srcKey, "cust-a"))
+		b.cfg.RetentionPartitionSource = "manifest.label:" + srcKey
+		b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
+			"tenant-a": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 500000,
+				MaxPartitions: 64, PerPartitionMaxLeases: 10, PerPartitionMaxDiskMB: 4096},
+		}
+		var perr error
+		b.partitionSource, perr = shared.ParsePartitionSource(b.cfg.RetentionPartitionSource)
+		require.NoError(t, perr)
+		for i := 0; i < 4; i++ { // cust-a already holds 4×1024 = its full disk sub-cap
+			putActivePart(t, rs, fmt.Sprintf("p-%d", i), "tenant-a", "cust-a", time.Now().Add(-time.Hour))
+		}
+		scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopePartition))
+		require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
+		require.Eventually(t, func() bool {
+			return testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopePartition)) == scopedBefore+1
+		}, 5*time.Second, 50*time.Millisecond)
+		for i := 0; i < 4; i++ {
+			require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, fmt.Sprintf("p-%d", i)),
+				"every already-retained record in the partition survives (disk caps never evict)")
+		}
+	})
+}
