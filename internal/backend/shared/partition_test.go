@@ -18,6 +18,7 @@ func TestParsePartitionSource(t *testing.T) {
 		{in: "", want: PartitionSource{Kind: PartitionSourceNone}},
 		{in: "manifest.label:com.example.customer", want: PartitionSource{Kind: PartitionSourceManifestLabel, Key: "com.example.customer"}},
 		{in: "manifest.env:APP_CUSTOMER_ID", want: PartitionSource{Kind: PartitionSourceManifestEnv, Key: "APP_CUSTOMER_ID"}},
+		{in: "manifest.label:com.example:tier", want: PartitionSource{Kind: PartitionSourceManifestLabel, Key: "com.example:tier"}}, // Cut on FIRST colon keeps colon-bearing keys
 		{in: "manifest.labels:x", wantErr: "unknown kind"},
 		{in: "chain.lease:partition", wantErr: "unknown kind"}, // future source, not yet
 		{in: "manifest.label:", wantErr: "want \"<kind>:<key>\""},
@@ -117,6 +118,17 @@ func TestExtractPartition(t *testing.T) {
 			in: PartitionInputs{Manifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 				"app": {Image: "img", Env: map[string]string{"APP_CUSTOMER_ID": "cust-9"}}}}},
 			wantPart: "cust-9"},
+		{name: "nil service entry is skipped not panicked", src: labelSrc,
+			in: PartitionInputs{Manifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+				"app":   {Image: "img", Labels: map[string]string{"com.example.customer": "cust-1"}},
+				"ghost": nil,
+			}}},
+			wantPart: "cust-1"},
+		{name: "divergent detail stays bounded for a huge value", src: labelSrc,
+			in: PartitionInputs{Manifest: stackWith(map[string]map[string]string{
+				"app": {"com.example.customer": "cust-1"},
+				"db":  {"com.example.customer": strings.Repeat("x", 1<<20)}})},
+			wantReason: PartitionReasonDivergent},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

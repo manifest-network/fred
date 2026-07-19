@@ -102,6 +102,8 @@ func ParsePartitionSource(s string) (PartitionSource, error) {
 // intentionally-distinct IDs would be invisible.
 func NormalizePartition(raw string) (string, bool) {
 	v := strings.TrimSpace(raw)
+	// len counts BYTES: exact for the ASCII-only charset below, and any
+	// multibyte input is rejected by that charset check regardless.
 	if v == "" || len(v) > maxPartitionValueLen {
 		return "", false
 	}
@@ -134,8 +136,9 @@ func TruncatePartitionRaw(raw string) string {
 //   - (p,   "", "")      — exactly one distinct declared value, normalized.
 //   - ("",  reason, det) — declared but unusable; the caller counts+logs and
 //     the record lands in the default bucket. det is the PRE-TRUNCATED
-//     offending value (invalid) or the first two truncated values (divergent)
-//     for the WARN line — no caller may log anything rawer.
+//     offending value (invalid) or the established value and the first
+//     divergent one (divergent) for the WARN line — no caller may log
+//     anything rawer.
 //
 // It CANNOT fail: there is no error return, which structurally enforces the
 // never-fail-a-close invariant.
