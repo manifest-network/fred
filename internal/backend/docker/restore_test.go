@@ -3557,20 +3557,30 @@ func TestEvictRetentionsToCap_OldestFirstMultiCandidate(t *testing.T) {
 }
 
 // TestEvictRetentionsToCap_EqualCreatedAtUUIDTiebreak pins the total order:
-// equal CreatedAt breaks ties by ascending OriginalLeaseUUID.
+// equal CreatedAt breaks ties by ascending OriginalLeaseUUID. Five equal-age
+// records with maxPerTenant=2 evict 5-2+1 = 4 (lowest UUIDs ...001..004), so
+// only the highest UUID ...005 survives. This guard is probabilistic against an
+// unstable-sort regression by nature (map order is random) — five candidates
+// drop a CreatedAt-only regression's escape probability to ~1/5 per run, and
+// any wrong survivor fails loudly.
 func TestEvictRetentionsToCap_EqualCreatedAtUUIDTiebreak(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	same := time.Now().Add(-time.Hour).Truncate(time.Second)
-	putActiveAt(t, rs, "bbbbbbbb-0000-0000-0000-000000000002", "tenant-a", same)
-	putActiveAt(t, rs, "bbbbbbbb-0000-0000-0000-000000000001", "tenant-a", same) // lower UUID → evicted first
+	// Insert in shuffled order so a pass cannot rely on insertion order.
+	for _, suffix := range []string{"000000000003", "000000000001", "000000000005", "000000000002", "000000000004"} {
+		putActiveAt(t, rs, "bbbbbbbb-0000-0000-0000-"+suffix, "tenant-a", same)
+	}
 
 	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", 2, ""))
 
-	low, err := rs.Get("bbbbbbbb-0000-0000-0000-000000000001")
+	for _, suffix := range []string{"000000000001", "000000000002", "000000000003", "000000000004"} {
+		uuid := "bbbbbbbb-0000-0000-0000-" + suffix
+		rec, err := rs.Get(uuid)
+		require.NoError(t, err)
+		require.Nil(t, rec, "%s should be evicted+deleted (lower UUID, equal age)", uuid)
+	}
+	high, err := rs.Get("bbbbbbbb-0000-0000-0000-000000000005")
 	require.NoError(t, err)
-	require.Nil(t, low, "lower UUID evicted+deleted")
-	high, err := rs.Get("bbbbbbbb-0000-0000-0000-000000000002")
-	require.NoError(t, err)
-	require.NotNil(t, high)
+	require.NotNil(t, high, "highest UUID must survive")
 	require.Equal(t, shared.RetentionStatusActive, high.Status)
 }
