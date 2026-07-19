@@ -269,7 +269,7 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 				part = append(part, e)
 			}
 		}
-		marked, passRan, err := b.evictOldest(ctx, part, budget.PerPartCount-1, evictLevelPartition, budget.PerPartCount)
+		marked, passRan, err := b.evictOldest(ctx, part, evictLevelPartition, budget.PerPartCount)
 		if err != nil {
 			return err
 		}
@@ -289,7 +289,7 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 		}
 	}
 	if budget.CountCap > 0 {
-		_, passRan, err := b.evictOldest(ctx, active, budget.CountCap-1, evictLevelAggregate, budget.CountCap)
+		_, passRan, err := b.evictOldest(ctx, active, evictLevelAggregate, budget.CountCap)
 		if err != nil {
 			return err
 		}
@@ -302,7 +302,7 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 }
 
 // evictOldest marks-reaping and destroys the oldest records of `ordered`
-// (already sorted oldest-first) until at most `keep` remain, bounded by the
+// (already sorted oldest-first) down to the level's cap, bounded by the
 // per-close batch rail. Per-record protocol: MarkReapingIfActive is the atomic
 // active→reaping CAS (TOCTOU-safe — a record concurrently claimed for restore
 // returns ok=false and is skipped, no compensation; under-evict is the safe
@@ -317,7 +317,8 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 // retentionPartitionEvictedTotal. capValue is the configured cap for the level,
 // carried into the WARN. Returns the marked UUIDs (so the caller can prune its
 // snapshot between passes) and whether the pass engaged at all.
-func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEntry, keep int, level string, capValue int) (map[string]struct{}, bool, error) {
+func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEntry, level string, capValue int) (map[string]struct{}, bool, error) {
+	keep := capValue - 1 // count caps make room for one more: keep = cap-1
 	toEvict := len(ordered) - keep
 	if toEvict <= 0 {
 		return nil, false, nil
