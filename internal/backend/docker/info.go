@@ -172,6 +172,7 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 				RetainedUntil: rec.CreatedAt.Add(b.cfg.RetentionMaxAge),
 				Items:         append([]backend.LeaseItem(nil), rec.Items...),
 				Tenant:        rec.Tenant,
+				Partition:     rec.Partition,
 				BackendName:   b.cfg.Name,
 			}, nil
 		}

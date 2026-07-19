@@ -48,6 +48,21 @@ func retentionEntryFixture(leaseUUID, tenant string, createdAt time.Time) shared
 	}
 }
 
+// TestGetProvision_RetainedIncludesPartition asserts the retained ProvisionInfo
+// carries the record's Partition, so it can flow to the owner-only retained API
+// responses. A non-partitioned record (Partition "") leaves the field empty.
+func TestGetProvision_RetainedIncludesPartition(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	e := retentionEntryFixture("lease-p", "tenant-a", time.Now().Add(-time.Hour))
+	e.Partition = "cust-a"
+	require.NoError(t, rs.Put(e))
+
+	info, err := b.GetProvision(context.Background(), "lease-p")
+	require.NoError(t, err)
+	require.Equal(t, backend.ProvisionStatusRetained, info.Status)
+	require.Equal(t, "cust-a", info.Partition)
+}
+
 // TestGetProvision_Retained_Active asserts that a soft-deleted lease (active
 // retention record, no in-memory provision) surfaces Status=retained with a
 // correct RetainedUntil (CreatedAt + RetentionMaxAge), Items, and Tenant.
