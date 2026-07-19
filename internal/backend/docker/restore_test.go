@@ -3514,3 +3514,63 @@ func TestStatusAudit_Cleanup_DoesNotProtectReapingCanonical(t *testing.T) {
 	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
 	assert.Contains(t, destroyed, "fred-lease-r-app-0", "reaping canonical must NOT be protected from orphan cleanup")
 }
+
+// putActiveAt writes a minimal ACTIVE retention record with a controlled
+// CreatedAt, for eviction-order tests. RetainedVolumeNames is empty, so a
+// successful eviction deletes the record outright (assert Get → nil).
+func putActiveAt(t *testing.T, rs *shared.RetentionStore, uuid, tenant string, createdAt time.Time) {
+	t.Helper()
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   uuid,
+		Tenant:              tenant,
+		ProviderUUID:        "prov-1",
+		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		StackManifest:       restoreStackManifest(),
+		RetainedVolumeNames: []string{},
+		Status:              shared.RetentionStatusActive,
+		CreatedAt:           createdAt,
+	}))
+}
+
+// TestEvictRetentionsToCap_OldestFirstMultiCandidate closes a known pinning
+// gap. Semantics of evictRetentionsToCap: "make room for one more" — with 3
+// active records and maxPerTenant=2 it evicts down to 1 remaining, i.e. the
+// TWO oldest go, only the newest survives.
+func TestEvictRetentionsToCap_OldestFirstMultiCandidate(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	now := time.Now()
+	putActiveAt(t, rs, "aaaaaaaa-0000-0000-0000-000000000001", "tenant-a", now.Add(-3*time.Hour)) // oldest
+	putActiveAt(t, rs, "aaaaaaaa-0000-0000-0000-000000000002", "tenant-a", now.Add(-2*time.Hour))
+	putActiveAt(t, rs, "aaaaaaaa-0000-0000-0000-000000000003", "tenant-a", now.Add(-1*time.Hour)) // newest
+
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", 2, ""))
+
+	for _, gone := range []string{"aaaaaaaa-0000-0000-0000-000000000001", "aaaaaaaa-0000-0000-0000-000000000002"} {
+		rec, err := rs.Get(gone)
+		require.NoError(t, err)
+		require.Nil(t, rec, "%s should be evicted+deleted (oldest-first)", gone)
+	}
+	newest, err := rs.Get("aaaaaaaa-0000-0000-0000-000000000003")
+	require.NoError(t, err)
+	require.NotNil(t, newest)
+	require.Equal(t, shared.RetentionStatusActive, newest.Status, "newest must survive")
+}
+
+// TestEvictRetentionsToCap_EqualCreatedAtUUIDTiebreak pins the total order:
+// equal CreatedAt breaks ties by ascending OriginalLeaseUUID.
+func TestEvictRetentionsToCap_EqualCreatedAtUUIDTiebreak(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	same := time.Now().Add(-time.Hour).Truncate(time.Second)
+	putActiveAt(t, rs, "bbbbbbbb-0000-0000-0000-000000000002", "tenant-a", same)
+	putActiveAt(t, rs, "bbbbbbbb-0000-0000-0000-000000000001", "tenant-a", same) // lower UUID → evicted first
+
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", 2, ""))
+
+	low, err := rs.Get("bbbbbbbb-0000-0000-0000-000000000001")
+	require.NoError(t, err)
+	require.Nil(t, low, "lower UUID evicted+deleted")
+	high, err := rs.Get("bbbbbbbb-0000-0000-0000-000000000002")
+	require.NoError(t, err)
+	require.NotNil(t, high)
+	require.Equal(t, shared.RetentionStatusActive, high.Status)
+}
