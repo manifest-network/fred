@@ -1282,3 +1282,50 @@ func TestPartition_OldBinaryRewriteDropsLabel(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "", got.Partition, "dropped key degrades to the default bucket, never errors")
 }
+
+// TestPutActiveMerged_PreservesPartitionOnNilManifestRetry: a close retry whose
+// release-store hydration failed (base.StackManifest == nil) must preserve the
+// stored Partition alongside the stored StackManifest — "" from a starved
+// extractor is degradation, never tenant intent.
+func TestPutActiveMerged_PreservesPartitionOnNilManifestRetry(t *testing.T) {
+	s := newTestRetentionStore(t)
+	first := sampleEntry("orig-guard")
+	first.Partition = "cust-a"
+	ok, err := s.PutActiveMerged(first)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	retry := sampleEntry("orig-guard")
+	retry.StackManifest = nil // hydration failed on the retry
+	retry.Partition = ""      // extractor had no input → collapsed
+	ok, err = s.PutActiveMerged(retry)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	got, err := s.Get("orig-guard")
+	require.NoError(t, err)
+	require.NotNil(t, got.StackManifest, "existing guard: stored manifest preserved")
+	require.Equal(t, "cust-a", got.Partition, "stored partition preserved with it")
+}
+
+// TestPutActiveMerged_RestampsPartitionWhenManifestPresent: a retry whose
+// extraction genuinely ran (manifest non-nil) wins — INCLUDING a legitimate ""
+// (operator disabled the source / tenant removed the label via update).
+func TestPutActiveMerged_RestampsPartitionWhenManifestPresent(t *testing.T) {
+	s := newTestRetentionStore(t)
+	first := sampleEntry("orig-restamp")
+	first.Partition = "cust-a"
+	ok, err := s.PutActiveMerged(first)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	retry := sampleEntry("orig-restamp") // sampleEntry sets a non-nil StackManifest
+	retry.Partition = ""                 // successful re-extraction yielded default
+	ok, err = s.PutActiveMerged(retry)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	got, err := s.Get("orig-restamp")
+	require.NoError(t, err)
+	require.Equal(t, "", got.Partition, "config/tenant intent wins over history")
+}

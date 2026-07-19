@@ -283,10 +283,17 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 			// release-store hydration failure, or the release reaped between
 			// attempts), and Restore rejects nil manifests — clobbering would make
 			// an otherwise-restorable lease permanently un-restorable. The manifest
-			// is the only hydrated (retry-variable) field, so it is the only one
-			// needing this guard.
+			// and the partition derived from it are the two hydrated (retry-variable)
+			// fields, so they are the two needing this guard.
 			if base.StackManifest == nil {
 				base.StackManifest = stored.StackManifest
+				// Partition is derived FROM the manifest hydration that just
+				// failed: "" here means extraction was starved of input, never
+				// tenant intent — preserve the stored label with the manifest.
+				// A retry whose hydration SUCCEEDED re-stamps from base
+				// unconditionally, including a legitimate "" (source disabled,
+				// label removed via update): current intent wins over history.
+				base.Partition = stored.Partition
 			}
 		}
 		data, err := json.Marshal(base)
