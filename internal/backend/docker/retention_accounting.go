@@ -73,9 +73,14 @@ func retentionPartitionBudgetWithoutSource(cfg Config) bool {
 // (per_partition_max_leases + 1) × largestSKUDiskMB() — so at worst-case lease
 // sizes the partition fills on disk and refuses (destroys) incoming closes while
 // old records rot. WARN, not error: the largest SKU may be unrepresentative of
-// the aggregator's actual mix. Pure, so it is unit-testable; the WARN is emitted
-// by the caller (New).
+// the aggregator's actual mix. Gated on RetainOnClose (mirroring the other two
+// partition predicates) so it stays silent when nothing is ever retained — the
+// retain-off case is already covered by retentionCapSetButDisabled. Pure, so it
+// is unit-testable; the WARN is emitted by the caller (New).
 func retentionPartitionWindowCannotRoll(cfg Config) bool {
+	if !cfg.RetainOnClose {
+		return false
+	}
 	largest := cfg.largestSKUDiskMB()
 	if largest <= 0 {
 		return false
@@ -286,10 +291,15 @@ func (b *Backend) logRetentionBudgetSanity() {
 			emb, _ := b.leaseDiskMB(e.Items)
 			mb += emb
 		}
-		if count > bud.MaxRetainedLeases || mb > bud.MaxRetainedDiskMB {
+		overCount := count > bud.MaxRetainedLeases
+		overDisk := mb > bud.MaxRetainedDiskMB
+		if overCount || overDisk {
+			// Name the breached dimension(s): a count breach evicts (batch-railed),
+			// a disk breach refuses-to-retain — different operator responses.
 			b.logger.Warn("retention budget below tenant's current holdings: next closes will evict (count, batch-railed) or be refused-to-retain (disk)",
 				"tenant", tenant, "active_count", count, "budget_count", bud.MaxRetainedLeases,
-				"active_mb", mb, "budget_mb", bud.MaxRetainedDiskMB)
+				"active_mb", mb, "budget_mb", bud.MaxRetainedDiskMB,
+				"over_count", overCount, "over_disk", overDisk)
 			continue
 		}
 		b.logger.Info("retention budget sanity", "tenant", tenant,

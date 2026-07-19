@@ -454,10 +454,10 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		logger.Warn("retention_partition_source is set but retention_tenant_budgets is empty: every declared partition collapses to the default bucket (expected only during a staged rollout)")
 	}
 	if retentionPartitionBudgetWithoutSource(cfg) {
-		logger.Warn("a retention_tenant_budgets entry enables partitions (max_partitions > 0) but retention_partition_source is unset: partition sub-caps are dead config")
+		logger.Warn("a retention_tenant_budgets entry enables partitions (max_partitions > 0) but retention_partition_source is unset: partition sub-caps are dead config; set retention_partition_source or drop max_partitions from the budget")
 	}
 	if retentionPartitionWindowCannotRoll(cfg) {
-		logger.Warn("a retention budget's per_partition_max_disk_mb is below (per_partition_max_leases+1) x the largest stateful SKU: at worst-case lease sizes the disk sub-cap binds before the count window can roll, refusing (destroying) incoming closes in a full partition")
+		logger.Warn("a retention budget's per_partition_max_disk_mb is below (per_partition_max_leases+1) x the largest stateful SKU: at worst-case lease sizes the disk sub-cap binds before the count window can roll, refusing (destroying) incoming closes in a full partition; raise per_partition_max_disk_mb or lower per_partition_max_leases")
 	}
 
 	// Create HTTP client for callbacks

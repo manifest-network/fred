@@ -1005,4 +1005,10 @@ func TestValidate_RetentionPartitioning(t *testing.T) {
 	})
 	require.NoError(t, okCfg.Validate())
 	require.False(t, retentionPartitionWindowCannotRoll(okCfg))
+	// Retain-off: gated silent even with a would-fire budget — the retain-off
+	// misconfig is surfaced by retentionCapSetButDisabled instead.
+	retainOffCfg := warnCfg
+	retainOffCfg.RetainOnClose = false
+	require.False(t, retentionPartitionWindowCannotRoll(retainOffCfg),
+		"window-roll warn must be gated on retain_on_close")
 }

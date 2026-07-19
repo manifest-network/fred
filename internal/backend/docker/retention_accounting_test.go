@@ -1631,6 +1631,9 @@ func TestLogRetentionBudgetSanity_WarnsWhenOverHoldings(t *testing.T) {
 	require.Contains(t, out, "retention budget below tenant's current holdings")
 	require.Contains(t, out, "tenant=agg")
 	require.Contains(t, out, "level=WARN")
+	// The WARN names the breached dimension(s): count is over (2 > 1), disk is not.
+	require.Contains(t, out, "over_count=true")
+	require.Contains(t, out, "over_disk=false")
 }
 
 // TestLogRetentionBudgetSanity_InfoWhenWithinBudget: a budget at or above the
