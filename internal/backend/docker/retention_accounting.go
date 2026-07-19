@@ -197,7 +197,7 @@ func (b *Backend) computeRetainedDiskMB() (mb int64, count int, partitions int, 
 // retention store: the sum of leaseDiskMB over REAPING records, plus their count.
 // These bytes are still physically on disk, so they count toward the admission
 // projection (refreshRetentionAccounting adds them to SetRetainedDisk) — but NOT
-// toward breachRetentionCap, whose true result DESTROYS data (over-counting a
+// toward breachRetentionCaps, whose true result DESTROYS data (over-counting a
 // destroy gate is the dangerous direction). (ENG-376)
 func (b *Backend) computeReapingDiskMB() (mb int64, count int, err error) {
 	if b.retentionStore == nil {
@@ -430,6 +430,7 @@ func (b *Backend) shouldRefuseRetention(leaseUUID, tenant, partition string, ite
 	if err != nil {
 		b.logger.Warn("retention store read failed in refuse-to-retain decision; not refusing (data-safe)",
 			"lease_uuid", leaseUUID, "error", err)
+		retentionCapCheckFailedTotal.WithLabelValues(capCheckRefuseGet).Inc()
 		return "", false
 	}
 	if rec != nil {

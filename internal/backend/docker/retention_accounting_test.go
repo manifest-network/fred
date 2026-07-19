@@ -401,10 +401,13 @@ func TestShouldRefuseRetention_StoreReadErrorDoesNotRefuse(t *testing.T) {
 	b.cfg.MaxRetainedDiskMB = 1000 // tight: would breach if the cap check were reached
 	b.pool.SetRetainedDisk(2048)
 	require.NoError(t, rs.Close()) // any Get now errors (closeOnce makes the t.Cleanup double-close harmless)
+	refuseGetBefore := testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckRefuseGet))
 	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "",
 		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, resolveTenantRetentionBudget(b.cfg, "t1"))
 	assert.False(t, refuse,
 		"a retention-store read error must NOT refuse (refuse destroys volumes; fail-open is data-safe)")
+	assert.Equal(t, refuseGetBefore+1, testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckRefuseGet)),
+		"the existing-record Get fail-open must be counted")
 }
 
 // TestCloseRetainOrdering_NeverUnderCounts verifies that the close-retain
@@ -1573,6 +1576,25 @@ func TestBreachRetentionCaps_Scopes(t *testing.T) {
 	scope, breached = b.breachRetentionCaps("agg", "", items, budget)
 	require.True(t, breached)
 	require.Equal(t, refuseScopeGlobal, scope)
+
+	// Scope precedence — ALL THREE caps breach at once (query p1): global
+	// 3072+1024=4096 > 4000, tenant 2048+1024=3072 > 3000, partition
+	// 1024+1024=2048 > 1500. The switch checks global→tenant→partition, so global
+	// wins.
+	b.cfg.MaxRetainedDiskMB = 4000
+	budget = retentionBudget{CountCap: 100, DiskCapMB: 3000, MaxPartitions: 4, PerPartCount: 10, PerPartDiskMB: 1500}
+	scope, breached = b.breachRetentionCaps("agg", "p1", items, budget)
+	require.True(t, breached)
+	require.Equal(t, refuseScopeGlobal, scope, "global precedes tenant and partition when all three breach")
+
+	// Scope precedence — tenant AND partition breach, global does NOT (huge L0):
+	// global 4096 <= 100000, tenant 3072 > 3000, partition 2048 > 1500. Tenant
+	// precedes partition → tenant wins.
+	b.cfg.MaxRetainedDiskMB = 100000
+	budget = retentionBudget{CountCap: 100, DiskCapMB: 3000, MaxPartitions: 4, PerPartCount: 10, PerPartDiskMB: 1500}
+	scope, breached = b.breachRetentionCaps("agg", "p1", items, budget)
+	require.True(t, breached)
+	require.Equal(t, refuseScopeTenant, scope, "tenant precedes partition when global does not breach")
 
 	b.cfg.MaxRetainedDiskMB = 0
 	_, breached = b.breachRetentionCaps("agg", "", items, retentionBudget{})

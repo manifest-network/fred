@@ -50,16 +50,21 @@ const (
 
 // Check labels for retentionCapCheckFailedTotal — the retention cap check that
 // failed open on a store error (fail-open is data-safe but must be alertable).
+// This set deliberately EXTENDS the spec §6.4 enumeration (evict|breach|bound)
+// with refuse_get so that EVERY store-read fail-open in a cap decision is counted
+// — including the existing-record Get guard in shouldRefuseRetention, which the
+// spec's three-way enumeration omitted.
 const (
-	capCheckEvict  = "evict"  // an eviction pass's snapshot/CAS store error
-	capCheckBreach = "breach" // the disk-gate List() read error (breachRetentionCaps)
-	capCheckBound  = "bound"  // the partition-bound snapshot read error (boundPartition)
+	capCheckEvict     = "evict"      // an eviction pass's snapshot/CAS store error
+	capCheckBreach    = "breach"     // the disk-gate List() read error (breachRetentionCaps)
+	capCheckBound     = "bound"      // the partition-bound snapshot read error (boundPartition)
+	capCheckRefuseGet = "refuse_get" // the existing-record Get read error (shouldRefuseRetention)
 )
 
 // refuseScopes / capChecks are the closed label sets, used to pre-initialize the
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
 var refuseScopes = []string{refuseScopeGlobal, refuseScopeTenant, refuseScopePartition}
-var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound}
+var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound, capCheckRefuseGet}
 
 var (
 	// provisionsTotal tracks the total number of provision attempts by outcome.
@@ -533,14 +538,14 @@ var (
 	}, []string{"scope"})
 
 	// retentionCapCheckFailedTotal counts retention cap checks that failed open on
-	// a store error, by check (evict|breach|bound). Fail-open is correct (never
-	// destroy on uncertainty) but must be alertable: a sustained rate means the
-	// quota gates are silently off.
+	// a store error, by check (evict|breach|bound|refuse_get). Fail-open is correct
+	// (never destroy on uncertainty) but must be alertable: a sustained rate means
+	// the quota gates are silently off.
 	retentionCapCheckFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "retention_cap_check_failed_total",
-		Help:      "Retention cap checks that failed open on a store error, by check (evict|breach|bound)",
+		Help:      "Retention cap checks that failed open on a store error, by check (evict|breach|bound|refuse_get)",
 	}, []string{"check"})
 
 	// diskPoolBytes is the admission ceiling (total_disk_mb in bytes). A
