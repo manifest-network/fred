@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -1181,4 +1182,103 @@ func TestRetentionIndex_ReIndexConcurrentWithWriter(t *testing.T) {
 	// The live index must match a fresh rebuild — no record dropped by a ReIndex that raced a
 	// concurrent Put.
 	assertIndexConsistent(t, s)
+}
+
+// putRawRecord writes raw bytes directly under a bucket key, bypassing the typed
+// mutators — the white-box idiom (see TestRetentionIndex_RebuildKeysOnBucketKey)
+// used to simulate a legacy/old-binary record on disk. The record's tenant/status
+// are left intact so the derived index stays truthful without a ReIndex.
+func putRawRecord(t *testing.T, s *RetentionStore, key string, raw []byte) {
+	t.Helper()
+	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte(key), raw)
+	}))
+}
+
+// TestPartition_EmptyOmittedFromStoredBytes pins the compat keystone: a record
+// written with Partition=="" marshals with NO "partition" key — stored bytes
+// are indistinguishable from a pre-partition binary's records.
+func TestPartition_EmptyOmittedFromStoredBytes(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("orig-1")))
+	raw, err := s.getRaw("orig-1")
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), `"partition"`)
+
+	// Same pin for the close path's actual write primitive.
+	merged := sampleEntry("orig-2")
+	ok, err := s.PutActiveMerged(merged)
+	require.NoError(t, err)
+	require.True(t, ok)
+	raw, err = s.getRaw("orig-2")
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), `"partition"`)
+}
+
+// TestPartition_LegacyRecordDecodesToDefaultBucket: a record without the key
+// decodes Partition=="" — the default whole-tenant bucket.
+func TestPartition_LegacyRecordDecodesToDefaultBucket(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("orig-legacy")))
+	got, err := s.Get("orig-legacy")
+	require.NoError(t, err)
+	require.Equal(t, "", got.Partition)
+}
+
+// TestPartition_RoundTripsThroughLifecycleMethods: every load-mutate-rewrite
+// method preserves a stored Partition.
+func TestPartition_RoundTripsThroughLifecycleMethods(t *testing.T) {
+	s := newTestRetentionStore(t)
+	e := sampleEntry("orig-rt")
+	e.Partition = "cust-a"
+	require.NoError(t, s.Put(e))
+
+	claimed, err := s.ClaimForRestore("orig-rt", "new-lease", 0)
+	require.NoError(t, err)
+	require.Equal(t, "cust-a", claimed.Partition)
+	ok, err := s.RevertToActive("orig-rt", claimed.Generation)
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err := s.Get("orig-rt")
+	require.NoError(t, err)
+	require.Equal(t, "cust-a", got.Partition)
+	_, ok, err = s.MarkReapingIfActive("orig-rt")
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err = s.Get("orig-rt")
+	require.NoError(t, err)
+	require.Equal(t, "cust-a", got.Partition)
+	// PutReaping re-leak branch preserves stored wholesale.
+	releak := sampleEntry("orig-rt")
+	releak.Partition = "" // a degraded give-up caller passes no label
+	ok, err = s.PutReaping(releak)
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err = s.Get("orig-rt")
+	require.NoError(t, err)
+	require.Equal(t, "cust-a", got.Partition)
+}
+
+// TestPartition_OldBinaryRewriteDropsLabel simulates the rollback contract: an
+// old binary's full-struct rewrite drops the "partition" key; the record then
+// decodes into the "" default bucket.
+func TestPartition_OldBinaryRewriteDropsLabel(t *testing.T) {
+	s := newTestRetentionStore(t)
+	e := sampleEntry("orig-drop")
+	e.Partition = "cust-a"
+	require.NoError(t, s.Put(e))
+
+	raw, err := s.getRaw("orig-drop")
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(raw, &m))
+	require.Contains(t, m, "partition")
+	delete(m, "partition")
+	legacy, err := json.Marshal(m)
+	require.NoError(t, err)
+	putRawRecord(t, s, "orig-drop", legacy) // raw bucket write, mirroring the :1068+ idiom
+
+	got, err := s.Get("orig-drop")
+	require.NoError(t, err)
+	require.Equal(t, "", got.Partition, "dropped key degrades to the default bucket, never errors")
 }

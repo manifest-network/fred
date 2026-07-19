@@ -37,8 +37,18 @@ var (
 
 // RetentionEntry records the data needed to restore a soft-deleted lease.
 type RetentionEntry struct {
-	OriginalLeaseUUID   string                  `json:"original_lease_uuid"`
-	Tenant              string                  `json:"tenant"`
+	OriginalLeaseUUID string `json:"original_lease_uuid"`
+	Tenant            string `json:"tenant"`
+	// Partition is an OPTIONAL cooperative sub-grouping WITHIN Tenant, declared
+	// by the tenant for its own end-customers (aggregator model). "" is the
+	// default whole-tenant bucket: legacy records, non-partitioned tenants, and
+	// any collapsed (invalid/divergent/over-limit) declaration all land here.
+	// It is grouping metadata for cap sub-division and eviction ordering ONLY —
+	// never a security boundary (isolation stays keyed on Tenant) and never
+	// load-bearing for restore/reap correctness (a record with a wrong or
+	// missing partition remains fully restorable). Stamped only at soft-delete
+	// time by the close path; see PutActiveMerged for the retry merge rule.
+	Partition           string                  `json:"partition,omitempty"`
 	ProviderUUID        string                  `json:"provider_uuid"`
 	Items               []backend.LeaseItem     `json:"items"`
 	StackManifest       *manifest.StackManifest `json:"stack_manifest"`
