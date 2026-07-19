@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -42,7 +43,7 @@ func TestComputeRetainedDiskMB(t *testing.T) {
 	restoring.Status = shared.RetentionStatusRestoring
 	require.NoError(t, rs.Put(restoring))
 
-	mb, count, err := b.computeRetainedDiskMB()
+	mb, count, _, err := b.computeRetainedDiskMB()
 	require.NoError(t, err)
 	assert.Equal(t, int64(3*1024), mb)
 	assert.Equal(t, 2, count)
@@ -104,15 +105,18 @@ func TestBreachRetentionCap(t *testing.T) {
 	// Cap unset (0) → never breaches (even with a stale-high cache).
 	b.cfg.MaxRetainedDiskMB = 0
 	b.pool.SetRetainedDisk(1_000_000)
-	assert.False(t, b.breachRetentionCap(incoming))
+	_, breached := b.breachRetentionCaps("t1", "", incoming, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.False(t, breached)
 
 	// Cap 3000: true 2000 + incoming 2000 = 4000 > 3000 → breach.
 	b.cfg.MaxRetainedDiskMB = 3000
-	assert.True(t, b.breachRetentionCap(incoming))
+	_, breached = b.breachRetentionCaps("t1", "", incoming, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.True(t, breached)
 
 	// Cap 5000: 2000 + 2000 = 4000 <= 5000 → no breach.
 	b.cfg.MaxRetainedDiskMB = 5000
-	assert.False(t, b.breachRetentionCap(incoming))
+	_, breached = b.breachRetentionCaps("t1", "", incoming, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.False(t, breached)
 }
 
 // TestBreachRetentionCap_UsesStoreNotStaleCache pins that the cap decision reads
@@ -126,7 +130,8 @@ func TestBreachRetentionCap_UsesStoreNotStaleCache(t *testing.T) {
 	b.pool.SetRetainedDisk(9_999_999)                                                       // stale-HIGH cache (e.g. a just-reaped record not yet refreshed)
 	incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}} // 2000
 	// TRUE: 2000 + 2000 = 4000 <= 5000 → must NOT breach, even though the stale cache (9.9M) would.
-	assert.False(t, b.breachRetentionCap(incoming),
+	_, breached := b.breachRetentionCaps("t1", "", incoming, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.False(t, breached,
 		"cap decision must use the authoritative store total, not the stale cached projection")
 }
 
@@ -138,7 +143,8 @@ func TestBreachRetentionCap_StoreErrorFailsOpen(t *testing.T) {
 	withMicroSKU(b, 1000)
 	b.cfg.MaxRetainedDiskMB = 100  // tight: would breach if it reached the comparison
 	require.NoError(t, rs.Close()) // computeRetainedDiskMB now errors
-	assert.False(t, b.breachRetentionCap([]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
+	_, breached := b.breachRetentionCaps("t1", "", []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.False(t, breached,
 		"a store read error must fail open (not breach → not destroy)")
 }
 
@@ -192,6 +198,9 @@ func TestRetentionCapNeedsTenantLever(t *testing.T) {
 	assert.True(t, retentionCapNeedsTenantLever(Config{RetainOnClose: true, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 0}))
 	// cap set, per-tenant count cap also set → fine.
 	assert.False(t, retentionCapNeedsTenantLever(Config{RetainOnClose: true, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 5}))
+	// cap set, per-tenant DISK lever set (count still 0) → silenced (either lever counts).
+	assert.False(t, retentionCapNeedsTenantLever(Config{RetainOnClose: true, MaxRetainedDiskMB: 4096, MaxRetainedLeasesPerTenant: 0, MaxRetainedDiskMBPerTenant: 2048}),
+		"a per-tenant disk lever must silence the warn even without a count lever")
 	// no cap → nothing to warn about.
 	assert.False(t, retentionCapNeedsTenantLever(Config{RetainOnClose: true, MaxRetainedDiskMB: 0, MaxRetainedLeasesPerTenant: 0}))
 	// retention disabled + cap set + per-tenant 0 → must NOT warn (nothing is ever retained).
@@ -224,6 +233,21 @@ func TestRetentionCapSetButDisabled(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "disabled+per-tenant disk cap set → true (new knob has no effect)",
+			cfg:  Config{RetainOnClose: false, MaxRetainedDiskMBPerTenant: 2048},
+			want: true,
+		},
+		{
+			name: "disabled+budgets set → true (allowlist has no effect)",
+			cfg:  Config{RetainOnClose: false, RetentionTenantBudgets: map[string]RetentionTenantBudget{"agg": {MaxRetainedLeases: 5, MaxRetainedDiskMB: 4096}}},
+			want: true,
+		},
+		{
+			name: "disabled+partition source set → true (source has no effect)",
+			cfg:  Config{RetainOnClose: false, RetentionPartitionSource: "manifest.label:com.example.customer"},
+			want: true,
+		},
+		{
 			name: "disabled+no caps → false (nothing misconfigured)",
 			cfg:  Config{RetainOnClose: false, MaxRetainedDiskMB: 0, MaxRetainedLeasesPerTenant: 0},
 			want: false,
@@ -246,6 +270,36 @@ func TestRetentionCapSetButDisabled(t *testing.T) {
 	}
 }
 
+// TestRetentionPartitionCrossKnobPredicates covers the source/allowlist WARN
+// predicates: a source with no budgets (staged rollout) and a partition-enabling
+// budget with no source (dead config). Both are pure and gated on RetainOnClose.
+func TestRetentionPartitionCrossKnobPredicates(t *testing.T) {
+	src := "manifest.label:com.example.customer"
+	aggBudget := map[string]RetentionTenantBudget{"agg": {MaxRetainedLeases: 5, MaxRetainedDiskMB: 4096, MaxPartitions: 4}}
+	elevBudget := map[string]RetentionTenantBudget{"agg": {MaxRetainedLeases: 5, MaxRetainedDiskMB: 4096, MaxPartitions: 0}}
+
+	// retentionPartitionSourceWithoutBudgets: source set, allowlist empty.
+	assert.True(t, retentionPartitionSourceWithoutBudgets(Config{RetainOnClose: true, RetentionPartitionSource: src}))
+	assert.False(t, retentionPartitionSourceWithoutBudgets(Config{RetainOnClose: true, RetentionPartitionSource: src, RetentionTenantBudgets: aggBudget}),
+		"budgets present → not source-without-budgets")
+	assert.False(t, retentionPartitionSourceWithoutBudgets(Config{RetainOnClose: true}), "no source → nothing to warn")
+	assert.False(t, retentionPartitionSourceWithoutBudgets(Config{RetainOnClose: false, RetentionPartitionSource: src}),
+		"retain disabled → suppressed")
+
+	// retentionPartitionBudgetWithoutSource: a partition-enabling budget, no source.
+	assert.True(t, retentionPartitionBudgetWithoutSource(Config{RetainOnClose: true, RetentionTenantBudgets: aggBudget}))
+	assert.False(t, retentionPartitionBudgetWithoutSource(Config{RetainOnClose: true, RetentionTenantBudgets: elevBudget}),
+		"elevation-only budget (max_partitions 0) must NOT fire — sub-caps are not dead config")
+	assert.False(t, retentionPartitionBudgetWithoutSource(Config{RetainOnClose: true, RetentionPartitionSource: src, RetentionTenantBudgets: aggBudget}),
+		"source present → sub-caps are live")
+	assert.False(t, retentionPartitionBudgetWithoutSource(Config{RetainOnClose: false, RetentionTenantBudgets: aggBudget}),
+		"retain disabled → suppressed")
+
+	// retentionPartitionWindowCannotRoll: no stateful SKU → cannot fire.
+	assert.False(t, retentionPartitionWindowCannotRoll(Config{RetainOnClose: true, RetentionTenantBudgets: aggBudget}),
+		"no stateful SKU (largest 0) → predicate cannot fire")
+}
+
 func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 	b, _ := newBackendWithRetention(t)
 	withMicroSKU(b, 1024)
@@ -258,11 +312,12 @@ func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 	b.volumes = fv
 
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
-	require.True(t, b.breachRetentionCap(items), "a 2048 MB lease must breach a 1000 MB cap")
+	_, breached := b.breachRetentionCaps("t1", "", items, resolveTenantRetentionBudget(b.cfg, "t1"))
+	require.True(t, breached, "a 2048 MB lease must breach a 1000 MB cap")
 
 	before := testutil.ToFloat64(retentionRefusedTotal)
 	canonical := []string{"fred-lease-z-web-0", "fred-lease-z-web-1"}
-	errs := b.destroyOnRefuseToRetain(context.Background(), canonical, "lease-z", "t1", b.logger)
+	errs := b.destroyOnRefuseToRetain(context.Background(), canonical, "lease-z", "t1", "", refuseScopeGlobal, b.logger)
 
 	assert.Empty(t, errs)
 	assert.Equal(t, before+1, testutil.ToFloat64(retentionRefusedTotal), "production code increments the counter")
@@ -275,8 +330,9 @@ func TestShouldRefuseRetention_UnlimitedSkipsStoreRead(t *testing.T) {
 	b.cfg.MaxRetainedDiskMB = 0 // unlimited
 	// Close the store so any Get would error; the unlimited path must not touch it.
 	require.NoError(t, rs.Close())
-	assert.False(t, b.shouldRefuseRetention("lease-x",
-		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
+	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.False(t, refuse,
 		"unlimited cap must return false without reading the retention store")
 }
 
@@ -288,14 +344,16 @@ func TestShouldRefuseRetention_SkipsWhenAlreadyRetained(t *testing.T) {
 
 	// No record yet → breach → refuse.
 	b.pool.SetRetainedDisk(0)
-	assert.True(t, b.shouldRefuseRetention("lease-x", items))
+	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "", items, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.True(t, refuse)
 
 	// A prior attempt already wrote an ACTIVE record for this lease (retry case);
 	// its footprint is already in retainedDisk. Re-deciding must NOT refuse
 	// (no double-count, no inconsistent destroy-some/retain-some state).
 	require.NoError(t, rs.Put(retentionEntryFixture("lease-x", "t1", time.Now()))) // active, docker-micro qty 2
 	b.pool.SetRetainedDisk(2048)                                                   // reflects the existing record
-	assert.False(t, b.shouldRefuseRetention("lease-x", items), "retry of an already-retained lease must not be refused")
+	_, refuse = b.shouldRefuseRetention("lease-x", "t1", "", items, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.False(t, refuse, "retry of an already-retained lease must not be refused")
 }
 
 func TestLeaseDiskMB_UnknownSKUSkipped(t *testing.T) {
@@ -331,8 +389,9 @@ func TestShouldRefuseRetention_SkipsWhenRestoring(t *testing.T) {
 	entry := retentionEntryFixture("lease-x", "t1", time.Now())
 	entry.Status = shared.RetentionStatusRestoring
 	require.NoError(t, rs.Put(entry))
-	assert.False(t, b.shouldRefuseRetention("lease-x",
-		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
+	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.False(t, refuse,
 		"a restore-claimed (restoring) record must not be refused — defer to PutActiveMerged ok=false")
 }
 
@@ -342,8 +401,9 @@ func TestShouldRefuseRetention_StoreReadErrorDoesNotRefuse(t *testing.T) {
 	b.cfg.MaxRetainedDiskMB = 1000 // tight: would breach if the cap check were reached
 	b.pool.SetRetainedDisk(2048)
 	require.NoError(t, rs.Close()) // any Get now errors (closeOnce makes the t.Cleanup double-close harmless)
-	assert.False(t, b.shouldRefuseRetention("lease-x",
-		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}),
+	_, refuse := b.shouldRefuseRetention("lease-x", "t1", "",
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}, resolveTenantRetentionBudget(b.cfg, "t1"))
+	assert.False(t, refuse,
 		"a retention-store read error must NOT refuse (refuse destroys volumes; fail-open is data-safe)")
 }
 
@@ -1385,7 +1445,7 @@ func TestComputeRetainedDiskMB_UnknownSKUInActiveRecord(t *testing.T) {
 	}
 	require.NoError(t, rs.Put(e))
 
-	mb, count, err := b.computeRetainedDiskMB()
+	mb, count, _, err := b.computeRetainedDiskMB()
 
 	// Must not error — unknown SKU is a warn-and-undercount, not a fatal.
 	require.NoError(t, err)
@@ -1411,7 +1471,7 @@ func TestRefreshCountsReapingInPoolNotCap(t *testing.T) {
 	require.NoError(t, rs.Put(reaping))
 
 	// Cap-breach input stays active-only (data-safe destroy direction).
-	activeMB, activeCount, err := b.computeRetainedDiskMB()
+	activeMB, activeCount, _, err := b.computeRetainedDiskMB()
 	require.NoError(t, err)
 	assert.Equal(t, int64(2048), activeMB)
 	assert.Equal(t, 1, activeCount)
@@ -1429,4 +1489,100 @@ func TestRefreshCountsReapingInPoolNotCap(t *testing.T) {
 	assert.Equal(t, float64(1), testutil.ToFloat64(retainedLeases), "count gauge active-only")
 	assert.Equal(t, float64(2048)*bytesPerMiB, testutil.ToFloat64(retentionReapingBytes))
 	assert.Equal(t, float64(1), testutil.ToFloat64(retentionReapingLeases))
+}
+
+func TestResolveTenantRetentionBudget(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxRetainedLeasesPerTenant = 5
+	cfg.MaxRetainedDiskMBPerTenant = 2048
+	cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
+		"agg": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 500000, MaxPartitions: 64, PerPartitionMaxLeases: 5, PerPartitionMaxDiskMB: 30720},
+	}
+	agg := resolveTenantRetentionBudget(cfg, "agg")
+	require.Equal(t, retentionBudget{CountCap: 200, DiskCapMB: 500000, MaxPartitions: 64, PerPartCount: 5, PerPartDiskMB: 30720}, agg)
+	def := resolveTenantRetentionBudget(cfg, "someone-else")
+	require.Equal(t, retentionBudget{CountCap: 5, DiskCapMB: 2048}, def)
+}
+
+// TestBoundPartition: reuse / new-below-bound / at-bound collapse / store-error
+// collapse / reaping-excluded / restoring-included.
+func TestBoundPartition(t *testing.T) {
+	b, _ := newBackendWithRetention(t)
+	budget := retentionBudget{CountCap: 10, DiskCapMB: 100000, MaxPartitions: 2, PerPartCount: 3}
+	logger := b.logger
+
+	mkSnap := func(parts ...string) []shared.RetentionEntry {
+		var out []shared.RetentionEntry
+		for i, p := range parts {
+			out = append(out, shared.RetentionEntry{
+				OriginalLeaseUUID: fmt.Sprintf("u-%d", i), Tenant: "agg",
+				Partition: p, Status: shared.RetentionStatusActive,
+			})
+		}
+		return out
+	}
+
+	require.Equal(t, "p1", b.boundPartition("agg", "p1", budget, mkSnap("p1", "p2"), nil, logger))
+	require.Equal(t, "p2", b.boundPartition("agg", "p2", budget, mkSnap("p1"), nil, logger))
+	require.Equal(t, "", b.boundPartition("agg", "p3", budget, mkSnap("p1", "p2"), nil, logger))
+	snap := mkSnap("p1", "p2")
+	snap[1].Status = shared.RetentionStatusReaping
+	require.Equal(t, "p3", b.boundPartition("agg", "p3", budget, snap, nil, logger))
+	snap[1].Status = shared.RetentionStatusRestoring
+	require.Equal(t, "", b.boundPartition("agg", "p3", budget, snap, nil, logger))
+	// snapshot error: collapse, never fail — and the fail-open is counted
+	boundFailBefore := testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckBound))
+	require.Equal(t, "", b.boundPartition("agg", "p1", budget, nil, errors.New("boom"), logger))
+	require.Equal(t, boundFailBefore+1, testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckBound)))
+	// defensive short-circuits
+	require.Equal(t, "", b.boundPartition("agg", "", budget, nil, nil, logger))
+	require.Equal(t, "", b.boundPartition("agg", "p1", retentionBudget{}, nil, nil, logger))
+}
+
+// TestBreachRetentionCaps_Scopes: L0/L1/L2 terms, I6 ""-exemption, fail-open.
+func TestBreachRetentionCaps_Scopes(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024) // every record + the incoming = 1024 MB
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
+	put := func(uuid, tenant, part string) {
+		e := shared.RetentionEntry{OriginalLeaseUUID: uuid, Tenant: tenant, ProviderUUID: "prov-1",
+			Items: items, StackManifest: &manifest.StackManifest{}, Status: shared.RetentionStatusActive,
+			Partition: part, CreatedAt: time.Now()}
+		require.NoError(t, rs.Put(e))
+	}
+	put("s-1", "agg", "p1")
+	put("s-2", "agg", "")
+	put("s-3", "other", "")
+
+	budget := retentionBudget{CountCap: 100, DiskCapMB: 100000, MaxPartitions: 4, PerPartCount: 10, PerPartDiskMB: 1500}
+	scope, breached := b.breachRetentionCaps("agg", "p1", items, budget)
+	require.True(t, breached)
+	require.Equal(t, refuseScopePartition, scope)
+
+	// I6: same numbers against the "" default bucket never trip L2.
+	scope, breached = b.breachRetentionCaps("agg", "", items, budget)
+	require.False(t, breached, "default bucket is never L2-capped; scope=%s", scope)
+
+	budget = retentionBudget{CountCap: 100, DiskCapMB: 2500}
+	scope, breached = b.breachRetentionCaps("agg", "", items, budget)
+	require.True(t, breached)
+	require.Equal(t, refuseScopeTenant, scope)
+
+	b.cfg.MaxRetainedDiskMB = 3500
+	budget = retentionBudget{CountCap: 100, DiskCapMB: 100000}
+	scope, breached = b.breachRetentionCaps("agg", "", items, budget)
+	require.True(t, breached)
+	require.Equal(t, refuseScopeGlobal, scope)
+
+	b.cfg.MaxRetainedDiskMB = 0
+	_, breached = b.breachRetentionCaps("agg", "", items, retentionBudget{})
+	require.False(t, breached)
+
+	// Fail-open: close the store; with a cap set, breach returns false and counts.
+	b.cfg.MaxRetainedDiskMB = 1
+	require.NoError(t, rs.Close())
+	breachFailBefore := testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach))
+	_, breached = b.breachRetentionCaps("agg", "", items, retentionBudget{})
+	require.False(t, breached, "store error must fail open (never destroy)")
+	require.Equal(t, breachFailBefore+1, testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach)))
 }

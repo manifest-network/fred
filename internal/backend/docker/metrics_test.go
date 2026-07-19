@@ -9,7 +9,7 @@ import (
 )
 
 func TestUpdateRetentionMetrics(t *testing.T) {
-	updateRetentionMetrics(2048, 3, 512, 1) // 2048 MB admission total, 3 active, 512 MB reaping (1 record)
+	updateRetentionMetrics(2048, 3, 512, 1, 0) // 2048 MB admission total, 3 active, 512 MB reaping (1 record), 0 partitions
 	assert.Equal(t, float64(2048)*bytesPerMiB, testutil.ToFloat64(retainedVolumeBytes))
 	assert.Equal(t, float64(3), testutil.ToFloat64(retainedLeases))
 	assert.Equal(t, float64(512)*bytesPerMiB, testutil.ToFloat64(retentionReapingBytes))

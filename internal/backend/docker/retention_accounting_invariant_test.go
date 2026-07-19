@@ -35,7 +35,7 @@ import (
 // consistent. A transition that mutates the store but skips the refresh breaks it.
 func assertRetentionAccountingConsistent(t *testing.T, b *Backend, msgAndArgs ...any) {
 	t.Helper()
-	activeMB, _, err := b.computeRetainedDiskMB()
+	activeMB, _, _, err := b.computeRetainedDiskMB()
 	require.NoError(t, err)
 	reapingMB, _, err := b.computeReapingDiskMB()
 	require.NoError(t, err)
@@ -59,7 +59,7 @@ func TestRetentionAccountingInvariant_TeethDetectsSkippedRefresh(t *testing.T) {
 	// Mutate the store WITHOUT refreshing. docker-micro qty 2 → 2 × 512 = 1024 MB.
 	require.NoError(t, rs.Put(retentionEntryFixture("drifted", "t1", time.Now())))
 
-	activeMB, _, err := b.computeRetainedDiskMB()
+	activeMB, _, _, err := b.computeRetainedDiskMB()
 	require.NoError(t, err)
 	reapingMB, _, err := b.computeReapingDiskMB()
 	require.NoError(t, err)

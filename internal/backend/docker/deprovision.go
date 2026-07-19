@@ -293,11 +293,17 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// the disk gate still refuses below, or the record write later defers
 			// on a restore race — is acceptable; it only evicts the tenant's
 			// oldest, which the next close would evict anyway.
+			// Resolve the tenant's effective retention budget once (the full
+			// close-path restructure — budget-first partition extraction, single
+			// tenant snapshot, evict-before-refuse — lands in the next task; this
+			// mechanical shim threads the new signatures with legacy-identical
+			// semantics: partition "" and the default budget for every legacy config).
+			budget := resolveTenantRetentionBudget(b.cfg, tenant)
 			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
 				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}
-			if b.shouldRefuseRetention(leaseUUID, durableItems) {
-				volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, logger)...)
+			if scope, refuse := b.shouldRefuseRetention(leaseUUID, tenant, "", durableItems, budget); refuse {
+				volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, "", scope, logger)...)
 				if len(volumeErrs) == 0 {
 					// Every byte is gone — the refused stateful volumes here AND any
 					// writable-path-only volumes reclaimed before the switch — so release
