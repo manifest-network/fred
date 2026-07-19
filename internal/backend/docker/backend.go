@@ -62,6 +62,12 @@ type Backend struct {
 	volumes volumeManager
 	logger  *slog.Logger
 
+	// partitionSource is the parsed cfg.RetentionPartitionSource, resolved once
+	// in New() (a malformed source is a startup failure, never a close-time
+	// surprise). Zero value (PartitionSourceNone) means retention partitions are
+	// never extracted — the legacy whole-tenant behavior.
+	partitionSource shared.PartitionSource
+
 	// customDomainDNSReady gates HTTP-01 cert issuance on the custom domain
 	// resolving to this host (ENG-266). Set in New() to a public-resolver
 	// quorum check, unless the gate is disabled in config. nil == always

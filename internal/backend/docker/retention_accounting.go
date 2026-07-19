@@ -294,12 +294,6 @@ func resolveTenantRetentionBudget(cfg Config, tenant string) retentionBudget {
 // A consequence: the total STORED distinct labels may transiently exceed the
 // bound while tombstones drain — harmless, since no index or metric carries
 // partition values.
-//
-// tenant is constant only in this mechanical-shim commit (the sole caller so far
-// is the test); the close-path restructure in the next commit threads the real
-// per-close tenant, hence the nolint.
-//
-//nolint:unparam
 func (b *Backend) boundPartition(tenant, partition string, budget retentionBudget, snapshot []shared.RetentionEntry, snapErr error, logger *slog.Logger) string {
 	if partition == "" || budget.MaxPartitions <= 0 {
 		return "" // nothing to bound / non-aggregator (budget-first extraction already skipped)
@@ -407,12 +401,6 @@ func (b *Backend) breachRetentionCaps(tenant, partition string, items []backend.
 // uncertainty the data-safe direction is to NOT refuse — an unreadable
 // active/restoring record must not be treated as "no record" and trigger
 // irreversible destruction.
-//
-// partition is "" from every caller only in this mechanical-shim commit; the
-// close-path restructure in the next commit passes the resolved partition (which
-// drives the L2 term above), hence the nolint.
-//
-//nolint:unparam
 func (b *Backend) shouldRefuseRetention(leaseUUID, tenant, partition string, items []backend.LeaseItem, budget retentionBudget) (scope string, refuse bool) {
 	l2 := budget.PerPartDiskMB
 	if partition == "" {
