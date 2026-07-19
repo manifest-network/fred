@@ -128,7 +128,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				require.NoError(t, rs.Put(retentionEntryFixture("old2", "t1", base.Add(time.Hour))))
 				require.NoError(t, rs.Put(retentionEntryFixture("newest", "t1", base.Add(2*time.Hour))))
 
-				require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", 2, ""))
+				require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 2}, "", retentionTenantSnapshot(t, rs, "t1"), ""))
 				// One active record remains → 2 × 512 = 1024 MB.
 				require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
 			},

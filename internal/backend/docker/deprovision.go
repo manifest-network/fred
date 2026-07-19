@@ -299,7 +299,12 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// mechanical shim threads the new signatures with legacy-identical
 			// semantics: partition "" and the default budget for every legacy config).
 			budget := resolveTenantRetentionBudget(b.cfg, tenant)
-			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
+			snap, snapErr := b.retentionStore.ListByTenant(tenant)
+			if snapErr != nil {
+				retentionCapCheckFailedTotal.WithLabelValues(capCheckEvict).Inc()
+				logger.Warn("retention cap eviction skipped: tenant snapshot unavailable (fail-open)", "tenant", tenant, "error", snapErr)
+			} else if err := b.evictRetentionsToCap(ctx, tenant, budget, "", snap, leaseUUID); err != nil {
+				retentionCapCheckFailedTotal.WithLabelValues(capCheckEvict).Inc()
 				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}
 			if scope, refuse := b.shouldRefuseRetention(leaseUUID, tenant, "", durableItems, budget); refuse {

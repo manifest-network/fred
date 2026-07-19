@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -596,7 +597,7 @@ func TestEvictRetentionsToCap_ExcludesClosingLease(t *testing.T) {
 	}
 
 	// cap=1: without the exclusion this lone record would be (wrongly) evicted.
-	err := b.evictRetentionsToCap(context.Background(), "tenant-a", 1, "closing")
+	err := b.evictRetentionsToCap(context.Background(), "tenant-a", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "tenant-a"), "closing")
 	require.NoError(t, err)
 
 	// The closing lease's record must still be present.
@@ -625,7 +626,7 @@ func TestEvict_DestroyFail_LeavesReapingCounted(t *testing.T) {
 
 	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") }}
 
-	err := b.evictRetentionsToCap(context.Background(), "t1", 1, "lease-new")
+	err := b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "t1"), "lease-new")
 	require.NoError(t, err)
 
 	got, err := rs.Get("lease-old")
@@ -664,7 +665,7 @@ func TestEvict_IncrementsEvictedCounterPerRecord(t *testing.T) {
 	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return nil }}
 
 	before := testutil.ToFloat64(retentionEvictedTotal)
-	require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", 1, "lease-new"))
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "t1"), "lease-new"))
 	assert.Equal(t, before+2, testutil.ToFloat64(retentionEvictedTotal),
 		"one increment per record evicted to honor the per-tenant cap")
 }
@@ -3623,7 +3624,15 @@ func TestStatusAudit_Cleanup_DoesNotProtectReapingCanonical(t *testing.T) {
 // putActiveAt writes a minimal ACTIVE retention record with a controlled
 // CreatedAt, for eviction-order tests. RetainedVolumeNames is empty, so a
 // successful eviction deletes the record outright (assert Get → nil).
+// putActiveAt seeds a default-bucket (partition "") active retained record.
+// Delegates to putActivePart so the two helpers cannot drift.
 func putActiveAt(t *testing.T, rs *shared.RetentionStore, uuid, tenant string, createdAt time.Time) {
+	t.Helper()
+	putActivePart(t, rs, uuid, tenant, "", createdAt)
+}
+
+// putActivePart seeds an active retained record carrying the given partition.
+func putActivePart(t *testing.T, rs *shared.RetentionStore, uuid, tenant, partition string, createdAt time.Time) {
 	t.Helper()
 	require.NoError(t, rs.Put(shared.RetentionEntry{
 		OriginalLeaseUUID:   uuid,
@@ -3633,8 +3642,27 @@ func putActiveAt(t *testing.T, rs *shared.RetentionStore, uuid, tenant string, c
 		StackManifest:       restoreStackManifest(),
 		RetainedVolumeNames: []string{},
 		Status:              shared.RetentionStatusActive,
+		Partition:           partition,
 		CreatedAt:           createdAt,
 	}))
+}
+
+// statusOf returns the stored status of a retention record, failing if absent.
+func statusOf(t *testing.T, rs *shared.RetentionStore, uuid string) string {
+	t.Helper()
+	rec, err := rs.Get(uuid)
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	return rec.Status
+}
+
+// retentionTenantSnapshot is the caller-supplied ListByTenant snapshot the
+// two-level evictRetentionsToCap consumes (it no longer re-reads the store).
+func retentionTenantSnapshot(t *testing.T, rs *shared.RetentionStore, tenant string) []shared.RetentionEntry {
+	t.Helper()
+	snap, err := rs.ListByTenant(tenant)
+	require.NoError(t, err)
+	return snap
 }
 
 // TestEvictRetentionsToCap_OldestFirstMultiCandidate closes a known pinning
@@ -3648,7 +3676,7 @@ func TestEvictRetentionsToCap_OldestFirstMultiCandidate(t *testing.T) {
 	putActiveAt(t, rs, "aaaaaaaa-0000-0000-0000-000000000002", "tenant-a", now.Add(-2*time.Hour))
 	putActiveAt(t, rs, "aaaaaaaa-0000-0000-0000-000000000003", "tenant-a", now.Add(-1*time.Hour)) // newest
 
-	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", 2, ""))
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", retentionBudget{CountCap: 2}, "", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
 
 	for _, gone := range []string{"aaaaaaaa-0000-0000-0000-000000000001", "aaaaaaaa-0000-0000-0000-000000000002"} {
 		rec, err := rs.Get(gone)
@@ -3676,7 +3704,7 @@ func TestEvictRetentionsToCap_EqualCreatedAtUUIDTiebreak(t *testing.T) {
 		putActiveAt(t, rs, "bbbbbbbb-0000-0000-0000-"+suffix, "tenant-a", same)
 	}
 
-	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", 2, ""))
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", retentionBudget{CountCap: 2}, "", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
 
 	for _, suffix := range []string{"000000000001", "000000000002", "000000000003", "000000000004"} {
 		uuid := "bbbbbbbb-0000-0000-0000-" + suffix
@@ -3688,4 +3716,143 @@ func TestEvictRetentionsToCap_EqualCreatedAtUUIDTiebreak(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, high, "highest UUID must survive")
 	require.Equal(t, shared.RetentionStatusActive, high.Status)
+}
+
+// TestEvictRetentionsToCap_TwoLevel exercises the L2 (per-partition) then L1
+// (per-tenant aggregate) passes and the between-pass snapshot prune.
+func TestEvictRetentionsToCap_TwoLevel(t *testing.T) {
+	requireGone := func(t *testing.T, rs *shared.RetentionStore, uuid string) {
+		t.Helper()
+		rec, err := rs.Get(uuid)
+		require.NoError(t, err)
+		require.Nil(t, rec, "%s must be evicted+deleted", uuid)
+	}
+
+	t.Run("(c) partition at sub-cap evicts inside the partition only", func(t *testing.T) {
+		b, rs := newBackendWithRetention(t)
+		now := time.Now()
+		putActivePart(t, rs, "p-old", "tenant-a", "P", now.Add(-3*time.Hour))
+		putActivePart(t, rs, "p-new", "tenant-a", "P", now.Add(-1*time.Hour))
+		putActivePart(t, rs, "q-old", "tenant-a", "Q", now.Add(-4*time.Hour)) // globally oldest
+		putActivePart(t, rs, "bystander", "tenant-b", "P", now.Add(-9*time.Hour))
+
+		budget := retentionBudget{CountCap: 200, DiskCapMB: 500000, MaxPartitions: 64, PerPartCount: 2}
+		require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "P", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
+
+		requireGone(t, rs, "p-old")
+		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "p-new"))
+		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "q-old"),
+			"other partitions untouched despite being globally oldest")
+		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "bystander"),
+			"another tenant's record — same label string — NEVER touched (I4)")
+	})
+
+	t.Run("(b) aggregate cap evicts the globally oldest across partitions", func(t *testing.T) {
+		b, rs := newBackendWithRetention(t)
+		now := time.Now()
+		putActivePart(t, rs, "x-1", "tenant-a", "P1", now.Add(-3*time.Hour))
+		putActivePart(t, rs, "x-2", "tenant-a", "P2", now.Add(-2*time.Hour))
+		putActivePart(t, rs, "x-3", "tenant-a", "P3", now.Add(-1*time.Hour))
+
+		budget := retentionBudget{CountCap: 3, DiskCapMB: 500000, MaxPartitions: 64, PerPartCount: 5}
+		require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "P4", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
+
+		requireGone(t, rs, "x-1")
+		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "x-2"))
+		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "x-3"),
+			"a new partition never mints aggregate room (I1)")
+	})
+
+	t.Run("L2-then-L1 snapshot pruning: an L2 eviction counts toward L1", func(t *testing.T) {
+		b, rs := newBackendWithRetention(t)
+		now := time.Now()
+		putActivePart(t, rs, "y-3", "tenant-a", "Q", now.Add(-4*time.Hour)) // globally oldest
+		putActivePart(t, rs, "y-4", "tenant-a", "R", now.Add(-3*time.Hour)) // the sentinel
+		putActivePart(t, rs, "y-1", "tenant-a", "P", now.Add(-2*time.Hour)) // L2's victim
+		putActivePart(t, rs, "y-2", "tenant-a", "P", now.Add(-1*time.Hour))
+
+		budget := retentionBudget{CountCap: 3, DiskCapMB: 500000, MaxPartitions: 64, PerPartCount: 2}
+		require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "P", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
+
+		requireGone(t, rs, "y-1") // L2 victim (partition P, keep 1)
+		requireGone(t, rs, "y-3") // L1 victim (globally oldest of the pruned set)
+		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "y-4"),
+			"y-4 surviving proves the between-pass prune — without it L1's toEvict would be 2 and y-4 would die")
+		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, "y-2"))
+	})
+}
+
+// TestEvictRetentionsToCap_DefaultBucketNeverL2 pins I6: the "" default bucket
+// is never L2-capped, even with a per-partition count sub-cap configured.
+func TestEvictRetentionsToCap_DefaultBucketNeverL2(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		putActivePart(t, rs, fmt.Sprintf("legacy-%02d", i), "tenant-a", "", now.Add(-time.Duration(i)*time.Hour))
+	}
+
+	budget := retentionBudget{CountCap: 200, DiskCapMB: 500000, MaxPartitions: 64, PerPartCount: 2}
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
+
+	for i := 0; i < 10; i++ {
+		require.Equal(t, shared.RetentionStatusActive, statusOf(t, rs, fmt.Sprintf("legacy-%02d", i)),
+			"I6: the default bucket is never L2-capped — nothing may be evicted")
+	}
+}
+
+// TestEvictRetentionsToCap_BatchRail verifies the per-close batch rail bounds a
+// single pass and the backlog converges across subsequent closes.
+func TestEvictRetentionsToCap_BatchRail(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	now := time.Now()
+	seeded := maxRetentionEvictionsPerClose + 10
+	for i := 0; i < seeded; i++ {
+		putActivePart(t, rs, fmt.Sprintf("rail-%03d", i), "tenant-a", "", now.Add(-time.Duration(i)*time.Minute))
+	}
+	remaining := func() int {
+		all, err := rs.List()
+		require.NoError(t, err)
+		n := 0
+		for _, e := range all {
+			if e.Status == shared.RetentionStatusActive {
+				n++
+			}
+		}
+		return n
+	}
+
+	// CountCap=1 ⇒ keep 0 ⇒ the whole seeded set is backlog. Pass 1 is bounded
+	// by the rail; a fresh snapshot on pass 2 drains the remainder.
+	budget := retentionBudget{CountCap: 1, DiskCapMB: 500000}
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
+	require.Equal(t, seeded-maxRetentionEvictionsPerClose, remaining(), "first pass bounded by the rail (backlog WARN emitted)")
+
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "tenant-a", budget, "", retentionTenantSnapshot(t, rs, "tenant-a"), ""))
+	require.Equal(t, 0, remaining(), "converges across passes")
+}
+
+// TestPartitionMetricSplit pins the two eviction counters: L2 bumps only
+// retentionPartitionEvictedTotal, L1 bumps only retentionEvictedTotal.
+func TestPartitionMetricSplit(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	now := time.Now()
+	putActivePart(t, rs, "m-1", "agg", "P", now.Add(-2*time.Hour))
+	putActivePart(t, rs, "m-2", "agg", "P", now.Add(-1*time.Hour))
+
+	bareBefore := testutil.ToFloat64(retentionEvictedTotal)
+	partBefore := testutil.ToFloat64(retentionPartitionEvictedTotal)
+
+	// L2 pass: partition P at sub-cap 2 evicts m-1.
+	budget := retentionBudget{CountCap: 200, DiskCapMB: 500000, MaxPartitions: 4, PerPartCount: 2}
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "agg", budget, "P", retentionTenantSnapshot(t, rs, "agg"), ""))
+	require.Equal(t, bareBefore, testutil.ToFloat64(retentionEvictedTotal), "L2 eviction must NOT bump the L1 counter")
+	require.Equal(t, partBefore+1, testutil.ToFloat64(retentionPartitionEvictedTotal), "L2 eviction bumps the partition counter")
+
+	// L1 pass: fresh snapshot, default bucket, CountCap=1 evicts the survivor.
+	bareBefore2 := testutil.ToFloat64(retentionEvictedTotal)
+	partBefore2 := testutil.ToFloat64(retentionPartitionEvictedTotal)
+	budget2 := retentionBudget{CountCap: 1, DiskCapMB: 500000}
+	require.NoError(t, b.evictRetentionsToCap(context.Background(), "agg", budget2, "", retentionTenantSnapshot(t, rs, "agg"), ""))
+	require.Equal(t, bareBefore2+1, testutil.ToFloat64(retentionEvictedTotal), "L1 eviction bumps the bare counter")
+	require.Equal(t, partBefore2, testutil.ToFloat64(retentionPartitionEvictedTotal), "L1 eviction must NOT bump the partition counter")
 }

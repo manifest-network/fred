@@ -204,25 +204,46 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	}
 }
 
-// evictRetentionsToCap hard-deletes the CLOSING TENANT's oldest ACTIVE records
-// until at most (maxPerTenant-1) of that tenant's remain (making room for one more).
-// Never touches another tenant's records. No-op when maxPerTenant<=0.
+// maxRetentionEvictionsPerClose is the per-pass batch rail: a cap reduction
+// (a budget edit/removal, a config rollback) can otherwise schedule hundreds of
+// SYNCHRONOUS volume destroys inside one close. Bounded eviction converges over
+// subsequent closes while the count cap temporarily overshoots — the
+// established ceilings-not-gates posture (count caps are DoS ceilings, not
+// exact allocation gates).
+const maxRetentionEvictionsPerClose = 32
+
+const (
+	evictLevelAggregate = "aggregate" // L1: per-tenant count cap
+	evictLevelPartition = "partition" // L2: per-partition sub-cap
+)
+
+// evictRetentionsToCap enforces the two count caps for a CLOSING lease against
+// the caller's tenant snapshot, oldest-first, tenant-local. L2 first: within the
+// closing lease's partition — the "" default bucket is NEVER L2-capped (I6) —
+// down to PerPartCount-1. L1 second: across ALL of the tenant's partitions, down
+// to CountCap-1; L1 always runs on the whole tenant set regardless of labels
+// (partitions sub-divide a tenant's budget, they never raise it). Count caps
+// never refuse — they evict; only the disk caps refuse (breachRetentionCaps).
 //
 // excludeLease is the closing lease's OriginalLeaseUUID: it is skipped entirely
-// (never counted, sorted, or evicted). On a soft-delete retry the closing lease
-// may already have its own ACTIVE record from a prior attempt; without this
-// exclusion the cap eviction could destroy the lease's own in-progress record =
-// data loss.
-func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPerTenant int, excludeLease string) error {
-	if b.retentionStore == nil || maxPerTenant <= 0 || tenant == "" {
+// at BOTH levels (never counted, sorted, or evicted). On a soft-delete retry the
+// closing lease may already have its own ACTIVE record from a prior attempt;
+// without this exclusion the cap eviction could destroy the lease's own
+// in-progress record = data loss.
+//
+// The snapshot is the caller's ListByTenant output (shared with boundPartition),
+// never re-read here: the close path takes exactly one tenant snapshot. Each
+// successfully-marked record is pruned from the in-memory snapshot between passes
+// so an L2 eviction also counts toward L1; the disk gate re-reads the store
+// afterwards, so it sees the post-eviction state. refreshRetentionAccounting runs
+// only when a pass engaged.
+func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budget retentionBudget,
+	partition string, snapshot []shared.RetentionEntry, excludeLease string) error {
+	if b.retentionStore == nil || tenant == "" || (budget.CountCap <= 0 && budget.PerPartCount <= 0) {
 		return nil
 	}
-	mine, err := b.retentionStore.ListByTenant(tenant)
-	if err != nil {
-		return err
-	}
 	var active []shared.RetentionEntry
-	for _, e := range mine {
+	for _, e := range snapshot {
 		if e.OriginalLeaseUUID == excludeLease {
 			continue // never evict the closing lease's own record
 		}
@@ -230,11 +251,8 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 			active = append(active, e)
 		}
 	}
-	if len(active) < maxPerTenant {
-		return nil
-	}
 	// Deterministic total order: oldest-first, equal CreatedAt broken by
-	// ascending UUID. Given the same store state, the evicted set is a pure
+	// ascending UUID. Given the same store state the evicted set is a pure
 	// function — previously equal-timestamp order was unspecified.
 	sort.SliceStable(active, func(i, j int) bool {
 		if !active[i].CreatedAt.Equal(active[j].CreatedAt) {
@@ -242,28 +260,94 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 		}
 		return active[i].OriginalLeaseUUID < active[j].OriginalLeaseUUID
 	})
-	for i := 0; i <= len(active)-maxPerTenant; i++ {
-		b.logger.Warn("evicting tenant's oldest retained lease to honor cap", "tenant", tenant, "lease_uuid", active[i].OriginalLeaseUUID)
-		// Atomic active→reaping (TOCTOU-safe: a record concurrently claimed for
-		// restore returns ok=false and is skipped). The record is the finalizer
-		// tombstone — it is removed from the active cap set immediately (making room)
-		// but stays counted in the admission pool until its volumes are confirmed gone.
-		names, ok, merr := b.retentionStore.MarkReapingIfActive(active[i].OriginalLeaseUUID)
+
+	attempted := false                              // refresh only when a pass engaged
+	if budget.PerPartCount > 0 && partition != "" { // the "" default bucket is never L2-capped (I6)
+		var part []shared.RetentionEntry
+		for _, e := range active {
+			if e.Partition == partition {
+				part = append(part, e)
+			}
+		}
+		marked, passRan, err := b.evictOldest(ctx, part, budget.PerPartCount-1, evictLevelPartition, budget.PerPartCount)
+		if err != nil {
+			return err
+		}
+		attempted = attempted || passRan
+		if len(marked) > 0 {
+			// Prune the L2-evicted records from the snapshot so they count toward
+			// L1 too (a per-partition eviction is also an aggregate eviction). This
+			// is the standard in-place filter; pruned[i] is only ever written at an
+			// index already read from active.
+			pruned := active[:0]
+			for _, e := range active {
+				if _, gone := marked[e.OriginalLeaseUUID]; !gone {
+					pruned = append(pruned, e)
+				}
+			}
+			active = pruned
+		}
+	}
+	if budget.CountCap > 0 {
+		_, passRan, err := b.evictOldest(ctx, active, budget.CountCap-1, evictLevelAggregate, budget.CountCap)
+		if err != nil {
+			return err
+		}
+		attempted = attempted || passRan
+	}
+	if attempted {
+		b.refreshRetentionAccounting()
+	}
+	return nil
+}
+
+// evictOldest marks-reaping and destroys the oldest records of `ordered`
+// (already sorted oldest-first) until at most `keep` remain, bounded by the
+// per-close batch rail. Per-record protocol: MarkReapingIfActive is the atomic
+// active→reaping CAS (TOCTOU-safe — a record concurrently claimed for restore
+// returns ok=false and is skipped, no compensation; under-evict is the safe
+// direction). The record is the finalizer tombstone: removed from the active cap
+// set immediately (making room) but still counted in the admission pool until
+// its volumes are confirmed gone. The eviction counter fires AFTER the ok-guard
+// and independent of the destroy outcome — an increment means "evicted from the
+// active set (marked reaping)", not "destroyed" — so a concurrently
+// restore-claimed record (ok=false, skipped) is never counted (ENG-407) — then
+// destroyReapingVolumes runs the finalizer (ENG-376). L1 evictions bump
+// retentionEvictedTotal (its deployed per-tenant meaning); L2 bump
+// retentionPartitionEvictedTotal. capValue is the configured cap for the level,
+// carried into the WARN. Returns the marked UUIDs (so the caller can prune its
+// snapshot between passes) and whether the pass engaged at all.
+func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEntry, keep int, level string, capValue int) (map[string]struct{}, bool, error) {
+	toEvict := len(ordered) - keep
+	if toEvict <= 0 {
+		return nil, false, nil
+	}
+	if toEvict > maxRetentionEvictionsPerClose {
+		b.logger.Warn("retention eviction batch rail engaged: capping evictions this close; remainder converges on subsequent closes",
+			"level", level, "backlog", toEvict, "batch", maxRetentionEvictionsPerClose)
+		toEvict = maxRetentionEvictionsPerClose
+	}
+	marked := make(map[string]struct{}, toEvict)
+	for i := 0; i < toEvict; i++ {
+		e := ordered[i]
+		b.logger.Warn("evicting tenant's oldest retained lease to honor cap",
+			"tenant", e.Tenant, "lease_uuid", e.OriginalLeaseUUID, "level", level, "cap", capValue, "partition", e.Partition)
+		names, ok, merr := b.retentionStore.MarkReapingIfActive(e.OriginalLeaseUUID)
 		if merr != nil {
-			return merr
+			return marked, true, merr
 		}
 		if !ok {
 			continue // concurrently claimed for restore (or already gone) — skip
 		}
-		// The record is now genuinely evicted (active→reaping): the tenant has lost
-		// restore grace to the per-tenant cap. Count it here, after the ok guard, so
-		// a concurrently restore-claimed record (ok=false, skipped above) is NOT
-		// counted, and independent of the destroy outcome below. (ENG-407)
-		retentionEvictedTotal.Inc()
-		b.destroyReapingVolumes(ctx, active[i].OriginalLeaseUUID, names)
+		if level == evictLevelAggregate {
+			retentionEvictedTotal.Inc() // deployed meaning: per-tenant aggregate (L1) evictions
+		} else {
+			retentionPartitionEvictedTotal.Inc()
+		}
+		marked[e.OriginalLeaseUUID] = struct{}{}
+		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, names)
 	}
-	b.refreshRetentionAccounting()
-	return nil
+	return marked, true, nil
 }
 
 // destroyReapingVolumes destroys every volume of a reaping record and, ONLY if all
