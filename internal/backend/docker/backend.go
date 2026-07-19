@@ -420,6 +420,17 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
+	// Resolve the retention-partition source ONCE at construction: a malformed
+	// source is a startup failure, never a close-time surprise. Validate already
+	// parsed it (so this cannot fail post-Validate), but re-parse and store the
+	// result rather than leave the field zero — an unpopulated partitionSource
+	// silently disables the feature and makes the budgets-without-source
+	// misconfig undetectable.
+	partitionSource, err := shared.ParsePartitionSource(cfg.RetentionPartitionSource)
+	if err != nil {
+		return nil, fmt.Errorf("retention_partition_source: %w", err) // unreachable post-Validate; belt-and-braces
+	}
+
 	docker, err := NewDockerClient(cfg.DockerHost, cfg.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
@@ -434,10 +445,19 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	)
 	setStaticPoolMetrics(cfg) // ENG-360: export static pool/cap denominators for dashboards
 	if retentionCapNeedsTenantLever(cfg) {
-		logger.Warn("max_retained_disk_mb is set but max_retained_leases_per_tenant is 0 (unlimited): one tenant can fill the retained pool, degrading others to refuse-to-retain; set a per-tenant count cap")
+		logger.Warn("max_retained_disk_mb is set but max_retained_leases_per_tenant is 0 (unlimited): one tenant can fill the retained pool, degrading others to refuse-to-retain; set a per-tenant count cap or max_retained_disk_mb_per_tenant")
 	}
 	if retentionCapSetButDisabled(cfg) {
-		logger.Warn("retention cap/limit configured (max_retained_disk_mb / max_retained_leases_per_tenant) but retain_on_close=false: the cap has no effect; enable retain_on_close or remove the cap")
+		logger.Warn("retention cap/limit configured (max_retained_disk_mb / max_retained_leases_per_tenant / max_retained_disk_mb_per_tenant / retention_tenant_budgets / retention_partition_source) but retain_on_close=false: the cap has no effect; enable retain_on_close or remove the cap")
+	}
+	if retentionPartitionSourceWithoutBudgets(cfg) {
+		logger.Warn("retention_partition_source is set but retention_tenant_budgets is empty: every declared partition collapses to the default bucket (expected only during a staged rollout)")
+	}
+	if retentionPartitionBudgetWithoutSource(cfg) {
+		logger.Warn("a retention_tenant_budgets entry enables partitions (max_partitions > 0) but retention_partition_source is unset: partition sub-caps are dead config")
+	}
+	if retentionPartitionWindowCannotRoll(cfg) {
+		logger.Warn("a retention budget's per_partition_max_disk_mb is below (per_partition_max_leases+1) x the largest stateful SKU: at worst-case lease sizes the disk sub-cap binds before the count window can roll, refusing (destroying) incoming closes in a full partition")
 	}
 
 	// Create HTTP client for callbacks
@@ -524,6 +544,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		pool:             pool,
 		volumes:          volumes,
 		logger:           logger.With("backend", cfg.Name),
+		partitionSource:  partitionSource,
 		provisions:       make(map[string]*provision),
 		actors:           make(map[string]*leasesm.LeaseActor),
 		callbackStore:    cbStore,
@@ -647,6 +668,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	// boot reap (now wired in Step 5) self-refreshes; this final call guarantees
 	// a correct projection before serving traffic even if either changes.
 	b.refreshRetentionAccounting()
+	b.logRetentionBudgetSanity()
 	b.startRetentionReaper()
 
 	// Replay any pending callbacks from a previous run

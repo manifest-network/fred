@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1607,4 +1608,49 @@ func TestBreachRetentionCaps_Scopes(t *testing.T) {
 	_, breached = b.breachRetentionCaps("agg", "", items, retentionBudget{})
 	require.False(t, breached, "store error must fail open (never destroy)")
 	require.Equal(t, breachFailBefore+1, testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach)))
+}
+
+// TestLogRetentionBudgetSanity_WarnsWhenOverHoldings: a budget below the tenant's
+// current holdings WARNs at boot — the mechanism that surfaces undersized budgets
+// (typos, offboarding edits) BEFORE the first destructive close.
+func TestLogRetentionBudgetSanity_WarnsWhenOverHoldings(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
+		"agg": {MaxRetainedLeases: 1, MaxRetainedDiskMB: 500000, MaxPartitions: 4},
+	}
+	now := time.Now()
+	putActivePart(t, rs, "h-1", "agg", "", now.Add(-2*time.Hour))
+	putActivePart(t, rs, "h-2", "agg", "", now.Add(-1*time.Hour)) // 2 active > budget 1
+
+	var buf bytes.Buffer
+	b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	b.logRetentionBudgetSanity()
+
+	out := buf.String()
+	require.Contains(t, out, "retention budget below tenant's current holdings")
+	require.Contains(t, out, "tenant=agg")
+	require.Contains(t, out, "level=WARN")
+}
+
+// TestLogRetentionBudgetSanity_InfoWhenWithinBudget: a budget at or above the
+// tenant's holdings logs the INFO sanity line, never the WARN — the happy path is
+// observable (an operator can confirm the budget was read) but does not alarm.
+func TestLogRetentionBudgetSanity_InfoWhenWithinBudget(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
+		"agg": {MaxRetainedLeases: 10, MaxRetainedDiskMB: 500000, MaxPartitions: 4},
+	}
+	putActivePart(t, rs, "h-1", "agg", "", time.Now().Add(-time.Hour)) // 1 active <= budget 10
+
+	var buf bytes.Buffer
+	b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	b.logRetentionBudgetSanity()
+
+	out := buf.String()
+	require.Contains(t, out, "level=INFO")
+	require.Contains(t, out, "retention budget sanity")
+	require.Contains(t, out, "tenant=agg")
+	require.NotContains(t, out, "retention budget below tenant's current holdings")
 }

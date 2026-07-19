@@ -258,6 +258,46 @@ func (b *Backend) refreshRetentionAccounting() {
 	updateRetentionMetrics(activeMB+reapingMB, activeCount, reapingMB, reapingCount, partitionCount)
 }
 
+// logRetentionBudgetSanity reports, per configured budget, the tenant's current
+// ACTIVE retained holdings vs the budget. One indexed ListByTenant per budget
+// entry — budgeted tenants are few (the aggregator allowlist), so this is a
+// negligible boot cost. This is the mechanism that catches budget typos,
+// offboarding edits, and undersized onboarding BEFORE the first destructive
+// close (evictions are additionally bounded by the per-close batch rail). The
+// disk term refuses-to-retain rather than evicting, so an over-holdings disk
+// budget is the operator's cue to raise the budget or expect closes destroyed.
+func (b *Backend) logRetentionBudgetSanity() {
+	if b.retentionStore == nil {
+		return
+	}
+	for tenant, bud := range b.cfg.RetentionTenantBudgets {
+		mine, err := b.retentionStore.ListByTenant(tenant)
+		if err != nil {
+			b.logger.Warn("retention budget sanity: list failed", "tenant", tenant, "error", err)
+			continue
+		}
+		var count int
+		var mb int64
+		for _, e := range mine {
+			if e.Status != shared.RetentionStatusActive {
+				continue
+			}
+			count++
+			emb, _ := b.leaseDiskMB(e.Items)
+			mb += emb
+		}
+		if count > bud.MaxRetainedLeases || mb > bud.MaxRetainedDiskMB {
+			b.logger.Warn("retention budget below tenant's current holdings: next closes will evict (count, batch-railed) or be refused-to-retain (disk)",
+				"tenant", tenant, "active_count", count, "budget_count", bud.MaxRetainedLeases,
+				"active_mb", mb, "budget_mb", bud.MaxRetainedDiskMB)
+			continue
+		}
+		b.logger.Info("retention budget sanity", "tenant", tenant,
+			"active_count", count, "budget_count", bud.MaxRetainedLeases,
+			"active_mb", mb, "budget_mb", bud.MaxRetainedDiskMB)
+	}
+}
+
 // retentionBudget is the EFFECTIVE cap set for one tenant. Everything is
 // provider-set; the tenant supplies only the partition key.
 type retentionBudget struct {

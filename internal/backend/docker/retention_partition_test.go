@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -35,6 +37,45 @@ func twoServiceManifest(key, v1, v2 string) []byte {
 	}}
 	data, _ := json.Marshal(m)
 	return data
+}
+
+// TestNew_PopulatesPartitionSource is the production wiring pin. The unit test
+// harnesses (newBackendForTest) build the Backend literal directly and never run
+// New, so they cannot catch a regression where New forgets to populate
+// b.partitionSource — the field would stay zero (PartitionSourceNone), silently
+// disabling partitioning in production while every test still passes because each
+// test assigns b.partitionSource by hand. This drives the REAL constructor (New
+// defers the Docker daemon connection to Start, so it runs headless) and asserts
+// the parsed source landed on the field.
+func TestNew_PopulatesPartitionSource(t *testing.T) {
+	const srcKey = "com.example.customer"
+	cfg := DefaultConfig()
+	tmp := t.TempDir()
+	cfg.CallbackDBPath = filepath.Join(tmp, "callbacks.db")
+	cfg.DiagnosticsDBPath = filepath.Join(tmp, "diagnostics.db")
+	cfg.ReleasesDBPath = filepath.Join(tmp, "releases.db")
+	cfg.RetentionDBPath = filepath.Join(tmp, "retention.db")
+	cfg.VolumeDataPath = "" // noopVolumeManager; no filesystem needed
+	// DiskMB 0 keeps VolumeDataPath="" valid (no XFS mount required) and makes
+	// largestSKUDiskMB 0 so the budget's disk floor checks are vacuously satisfied.
+	cfg.SKUProfiles = map[string]shared.SKUProfile{
+		"docker-micro": {CPUCores: 1, MemoryMB: 256, DiskMB: 0},
+	}
+	cfg.RetainOnClose = true
+	cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
+	cfg.HostAddress = "127.0.0.1"
+	cfg.RetentionPartitionSource = "manifest.label:" + srcKey
+	cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
+		"agg": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 50000, MaxPartitions: 64},
+	}
+
+	b, err := New(cfg, slog.Default())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Stop() })
+
+	require.Equal(t, shared.PartitionSourceManifestLabel, b.partitionSource.Kind,
+		"New must populate b.partitionSource — an unset field silently disables partitioning in production")
+	require.Equal(t, srcKey, b.partitionSource.Key)
 }
 
 func TestClosePartitionMatrix(t *testing.T) {
