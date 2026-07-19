@@ -287,14 +287,12 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// rolls instead of jamming into refuse-forever. In the rare
 			// both-caps-breached close this evicts the tenant's oldest (an
 			// eviction the count cap already owed on the next non-refused close)
-			// and the incoming may then fit — strictly refusal-reducing. A
-			// "wasted" eviction when refusal still fires afterwards is the same
-			// accepted tradeoff as the PutActiveMerged-defer case below.
+			// and the incoming may then fit — strictly refusal-reducing.
 			//
-			// Best-effort cap room BEFORE the write, too: dropping the standalone
-			// Get-guard means a rare wasted eviction here if PutActiveMerged then
-			// defers (a restore raced in): acceptable — it evicts the tenant's
-			// oldest, which the next attempt would evict anyway.
+			// Eviction here is best-effort cap room: a wasted eviction — whether
+			// the disk gate still refuses below, or the record write later defers
+			// on a restore race — is acceptable; it only evicts the tenant's
+			// oldest, which the next close would evict anyway.
 			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
 				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}

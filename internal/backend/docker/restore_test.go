@@ -350,6 +350,11 @@ func TestDeprovision_BothCapsBreached_EvictsThenRefuses(t *testing.T) {
 	oldest, err := rs.Get("dddddddd-0000-0000-0000-000000000001")
 	require.NoError(t, err)
 	require.Nil(t, oldest, "count-owed eviction must have run first (volume-less record deleted)")
+	// Eviction stops at cap-1: the second-oldest survives, still ACTIVE (never over-evicted).
+	survivor, err := rs.Get("dddddddd-0000-0000-0000-000000000002")
+	require.NoError(t, err)
+	require.NotNil(t, survivor, "eviction must stop at cap-1, leaving the second-oldest retained")
+	require.Equal(t, shared.RetentionStatusActive, survivor.Status, "surviving record stays ACTIVE")
 	rec, err := rs.Get(leaseUUID)
 	require.NoError(t, err)
 	require.Nil(t, rec, "no retention record for the refused incoming")
