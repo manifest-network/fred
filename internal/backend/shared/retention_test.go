@@ -1257,6 +1257,19 @@ func TestPartition_RoundTripsThroughLifecycleMethods(t *testing.T) {
 	got, err = s.Get("orig-rt")
 	require.NoError(t, err)
 	require.Equal(t, "cust-a", got.Partition)
+
+	// MarkReapingIfExpired runs on a SECOND record: orig-rt above is already
+	// reaping, and the expired-reap path only fires from active.
+	rt2 := sampleEntry("orig-rt2")
+	rt2.Partition = "cust-b"
+	rt2.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
+	require.NoError(t, s.Put(rt2))
+	_, ok, err = s.MarkReapingIfExpired("orig-rt2", time.Hour)
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err = s.Get("orig-rt2")
+	require.NoError(t, err)
+	require.Equal(t, "cust-b", got.Partition)
 }
 
 // TestPartition_OldBinaryRewriteDropsLabel simulates the rollback contract: an

@@ -293,6 +293,10 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 				// A retry whose hydration SUCCEEDED re-stamps from base
 				// unconditionally, including a legitimate "" (source disabled,
 				// label removed via update): current intent wins over history.
+				// NOTE: this coupling assumes the partition is manifest-derived
+				// (true for every v1 source); a future non-manifest source (e.g.
+				// chain.lease) must revisit this guard or a chain-sourced label
+				// could be lost on a nil-manifest retry.
 				base.Partition = stored.Partition
 			}
 		}
