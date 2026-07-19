@@ -280,30 +280,43 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			if len(volumeErrs) == 0 {
 				releaseLiveOnRetainPath = true
 			}
-		case b.shouldRefuseRetention(leaseUUID, durableItems):
-			volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, logger)...)
-			if len(volumeErrs) == 0 {
-				// Every byte is gone — the refused stateful volumes here AND any
-				// writable-path-only volumes reclaimed before the switch — so release
-				// the live allocation. Guard on the OVERALL error count (not just new
-				// errors from destroyOnRefuseToRetain): a pre-switch wp-only Destroy
-				// failure already in volumeErrs leaves bytes on disk, so keep live
-				// counted and let the retry re-attempt rather than under-count
-				// (over-admit/ENOSPC). Consistent with the other release-live arms.
-				releaseLiveOnRetainPath = true
-			}
 		default:
-			// existing retain logic — UNCHANGED, just moved under `default:`
+			// Count-cap eviction runs BEFORE the disk-refusal gate. The gate
+			// recomputes ACTIVE-only sums from the store, so eviction
+			// (ACTIVE→REAPING) shrinks what it sees: a full rolling window now
+			// rolls instead of jamming into refuse-forever. In the rare
+			// both-caps-breached close this evicts the tenant's oldest (an
+			// eviction the count cap already owed on the next non-refused close)
+			// and the incoming may then fit — strictly refusal-reducing. A
+			// "wasted" eviction when refusal still fires afterwards is the same
+			// accepted tradeoff as the PutActiveMerged-defer case below.
+			//
+			// Best-effort cap room BEFORE the write, too: dropping the standalone
+			// Get-guard means a rare wasted eviction here if PutActiveMerged then
+			// defers (a restore raced in): acceptable — it evicts the tenant's
+			// oldest, which the next attempt would evict anyway.
+			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
+				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
+			}
+			if b.shouldRefuseRetention(leaseUUID, durableItems) {
+				volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, logger)...)
+				if len(volumeErrs) == 0 {
+					// Every byte is gone — the refused stateful volumes here AND any
+					// writable-path-only volumes reclaimed before the switch — so release
+					// the live allocation. Guard on the OVERALL error count (not just new
+					// errors from destroyOnRefuseToRetain): a pre-switch wp-only Destroy
+					// failure already in volumeErrs leaves bytes on disk, so keep live
+					// counted and let the retry re-attempt rather than under-count
+					// (over-admit/ENOSPC). Consistent with the other release-live arms.
+					releaseLiveOnRetainPath = true
+				}
+				break
+			}
+			// Retain: the closing lease fits under both caps (count eviction ran
+			// above; the disk gate did not refuse).
 			retained := make([]string, 0, len(retainCanonical))
 			for _, c := range retainCanonical {
 				retained = append(retained, retainedName(c))
-			}
-			// Best-effort cap room BEFORE the write. Dropping the standalone Get-guard
-			// means a rare wasted eviction here if PutActiveMerged then defers (a
-			// restore raced in): acceptable — it evicts the tenant's oldest, which the
-			// next attempt would evict anyway.
-			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
-				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}
 			// Hydrate a nil StackManifest from the release store so the retained data
 			// stays API-restorable. A cold-start recover restores the manifest

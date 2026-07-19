@@ -255,6 +255,106 @@ func TestDeprovision_PerTenantCapEvictsOwnOldest(t *testing.T) {
 	assert.NotNil(t, other, "other-tenant-lease retention record must remain")
 }
 
+// readyProvisionForClose builds a Ready provision seeded exactly like the close-
+// path reference test (TestDeprovision_PerTenantCapEvictsOwnOldest), parameterized
+// on the four values a close-path test varies. StackManifest is what close-time
+// extraction reads (deprovision.go captures p.StackManifest).
+func readyProvisionForClose(leaseUUID, tenant string, items []backend.LeaseItem, stack *manifest.StackManifest) *provision {
+	qty := 0
+	for _, it := range items {
+		qty += it.Quantity
+	}
+	return &provision{ProvisionState: leasesm.ProvisionState{
+		LeaseUUID:     leaseUUID,
+		Tenant:        tenant,
+		Status:        backend.ProvisionStatusReady,
+		Quantity:      qty,
+		Items:         items,
+		StackManifest: stack,
+	}}
+}
+
+// newCloseHarness seeds ONE Ready provision (docker-micro item, so withMicroSKU's
+// replaced profile map resolves it — an unresolved SKU contributes 0 MB and would
+// nullify every disk-cap assertion), attaches a real retention store, and installs
+// a volume-manager mock whose ListFn returns the lease's canonical volume (without
+// it, retainCanonical is empty and the close takes the no-cap-logic first arm).
+// payload, when non-nil, is parsed into the provision's StackManifest — exactly
+// what close-time extraction reads (deprovision.go:78).
+func newCloseHarness(t *testing.T, tenant string, payload []byte) (*Backend, *shared.RetentionStore, string) {
+	t.Helper()
+	const leaseUUID = "eeeeeeee-0000-0000-0000-00000000c105"
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
+	var stack *manifest.StackManifest
+	if payload != nil {
+		var err error
+		stack, err = manifest.ParsePayload(payload)
+		require.NoError(t, err)
+	}
+	prov := readyProvisionForClose(leaseUUID, tenant, items, stack)
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{leaseUUID: prov})
+	rs := attachRetentionStore(t, b)
+	withMicroSKU(b, 1024) // every lease = 1024 MB retained footprint
+	b.cfg.RetainOnClose = true
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{canonicalVolumeName(leaseUUID, "app", 0)}, nil
+		},
+	}
+	return b, rs, leaseUUID
+}
+
+// TestDeprovision_EvictsBeforeDiskRefusal_WindowRolls: tenant at its count cap
+// with the global disk cap sized so the incoming close only fits AFTER the count
+// eviction runs. Pre-fix: refusal fires first (switch case-guard) and the
+// incoming's volumes are destroyed while the window never rolls. Post-fix: the
+// oldest record is evicted, the incoming is retained.
+func TestDeprovision_EvictsBeforeDiskRefusal_WindowRolls(t *testing.T) {
+	b, rs, leaseUUID := newCloseHarness(t, "tenant-a", nil)
+	b.cfg.MaxRetainedLeasesPerTenant = 1
+	b.cfg.MaxRetainedDiskMB = 1536 // holds ONE 1024MB lease + slack, never two
+
+	// One pre-existing retained record fills the window and most of the disk cap.
+	putActiveAt(t, rs, "cccccccc-0000-0000-0000-000000000001", "tenant-a", time.Now().Add(-time.Hour))
+
+	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
+
+	require.Eventually(t, func() bool {
+		rec, err := rs.Get(leaseUUID)
+		return err == nil && rec != nil && rec.Status == shared.RetentionStatusActive
+	}, 5*time.Second, 50*time.Millisecond, "incoming close must be RETAINED (eviction made room)")
+
+	old, err := rs.Get("cccccccc-0000-0000-0000-000000000001")
+	require.NoError(t, err)
+	require.Nil(t, old, "oldest must have been evicted (and, volume-less, deleted) to roll the window")
+}
+
+// TestDeprovision_BothCapsBreached_EvictsThenRefuses: post-eviction the incoming
+// still breaches the global disk cap → incoming destroyed AND the count-owed
+// eviction happened. Pins the legacy-delta corner explicitly.
+func TestDeprovision_BothCapsBreached_EvictsThenRefuses(t *testing.T) {
+	b, rs, leaseUUID := newCloseHarness(t, "tenant-a", nil)
+	b.cfg.MaxRetainedLeasesPerTenant = 2
+	b.cfg.MaxRetainedDiskMB = 1024 // exactly one footprint: after evicting to 1 record, 1024+1024 > 1024 still breaches
+
+	putActiveAt(t, rs, "dddddddd-0000-0000-0000-000000000001", "tenant-a", time.Now().Add(-2*time.Hour))
+	putActiveAt(t, rs, "dddddddd-0000-0000-0000-000000000002", "tenant-a", time.Now().Add(-time.Hour))
+
+	before := testutil.ToFloat64(retentionRefusedTotal)
+	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
+
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(retentionRefusedTotal) == before+1
+	}, 5*time.Second, 50*time.Millisecond, "incoming must still be refused (disk)")
+
+	oldest, err := rs.Get("dddddddd-0000-0000-0000-000000000001")
+	require.NoError(t, err)
+	require.Nil(t, oldest, "count-owed eviction must have run first (volume-less record deleted)")
+	rec, err := rs.Get(leaseUUID)
+	require.NoError(t, err)
+	require.Nil(t, rec, "no retention record for the refused incoming")
+}
+
 // TestDeprovision_Retain_MergesPriorRecordOnRetry verifies that a retry of the
 // soft-delete path (after a partial rename on attempt 1) MERGES the existing
 // record's RetainedVolumeNames with the still-canonical volumes instead of
