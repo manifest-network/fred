@@ -338,10 +338,8 @@ func (m *flatManifest) validate(inStack bool) error {
 	// tenant-supplied traefik.* label would register into the shared routing
 	// table and could hijack another tenant's route (ENG-497).
 	for key := range m.Labels {
-		for _, prefix := range reservedLabelPrefixes {
-			if strings.HasPrefix(key, prefix) {
-				return fmt.Errorf("labels cannot use reserved prefix '%s': %s", prefix, key)
-			}
+		if prefix, ok := reservedLabelPrefix(key); ok {
+			return fmt.Errorf("labels cannot use reserved prefix '%s': %s", prefix, key)
 		}
 	}
 
@@ -472,6 +470,35 @@ var blockedEnvPrefixes = []string{
 	"DOCKER_", // Docker runtime variables
 }
 
+// blockedEnvPrefix returns the blocked prefix an uppercased env name uses, if
+// any. Single implementation of the prefix scan: validateEnvVars uses the
+// returned prefix to format its error, and IsBlockedEnvKey wraps it, so the
+// two callers cannot drift.
+func blockedEnvPrefix(upper string) (string, bool) {
+	for _, prefix := range blockedEnvPrefixes {
+		if strings.HasPrefix(upper, prefix) {
+			return prefix, true
+		}
+	}
+	return "", false
+}
+
+// IsBlockedEnvKey reports whether an env var name can never appear in a tenant
+// payload (blocked names/prefixes rejected by validateEnvVars) or is
+// structurally invalid as an env key. Exported so retention_partition_source
+// config validation shares the same lists and the two checks cannot drift.
+func IsBlockedEnvKey(name string) bool {
+	if name == "" || strings.ContainsAny(name, "=\x00") {
+		return true
+	}
+	upper := strings.ToUpper(name)
+	if blockedEnvNames[upper] {
+		return true
+	}
+	_, ok := blockedEnvPrefix(upper)
+	return ok
+}
+
 // reservedLabelPrefixes are container-label key prefixes that tenants cannot
 // set. Any label key starting with one of these is rejected in validate().
 var reservedLabelPrefixes = []string{
@@ -479,6 +506,28 @@ var reservedLabelPrefixes = []string{
 	"traefik.", // ingress routing: Traefik's Docker provider merges routers
 	// from every container's labels into one shared table, so a tenant label
 	// here could hijack another tenant's route (ENG-497).
+}
+
+// reservedLabelPrefix returns the reserved prefix a label key uses, if any.
+// It is the single implementation of the reserved-prefix scan: validate() uses
+// the returned prefix to format its error, and IsReservedLabelKey wraps it as
+// a bool, so the two callers cannot drift.
+func reservedLabelPrefix(key string) (string, bool) {
+	for _, prefix := range reservedLabelPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return prefix, true
+		}
+	}
+	return "", false
+}
+
+// IsReservedLabelKey reports whether a manifest label key can never appear in a
+// tenant payload (reserved fred./traefik. prefixes, rejected by validate).
+// Exported so retention_partition_source config validation shares the same
+// list and the two checks cannot drift.
+func IsReservedLabelKey(key string) bool {
+	_, ok := reservedLabelPrefix(key)
+	return ok
 }
 
 // validateEnvVars checks that environment variable names are safe.
@@ -495,10 +544,8 @@ func validateEnvVars(env map[string]string) error {
 		if blockedEnvNames[upper] {
 			return fmt.Errorf("env: variable %q is not allowed", k)
 		}
-		for _, prefix := range blockedEnvPrefixes {
-			if strings.HasPrefix(upper, prefix) {
-				return fmt.Errorf("env: variable %q is not allowed (prefix %q is reserved)", k, prefix)
-			}
+		if prefix, ok := blockedEnvPrefix(upper); ok {
+			return fmt.Errorf("env: variable %q is not allowed (prefix %q is reserved)", k, prefix)
 		}
 	}
 	return nil

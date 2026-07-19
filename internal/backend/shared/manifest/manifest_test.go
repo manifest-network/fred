@@ -572,6 +572,33 @@ func TestStackManifest_Labels_RejectsTraefikPrefix(t *testing.T) {
 	assert.Contains(t, err.Error(), "reserved prefix 'traefik.'")
 }
 
+func TestIsReservedLabelKey(t *testing.T) {
+	for key, want := range map[string]bool{
+		"fred.retention":         true,
+		"traefik.http.routers.x": true,
+		"com.example.customer":   false,
+		"fredx.anything":         false,
+		"":                       false,
+	} {
+		require.Equal(t, want, IsReservedLabelKey(key), "key=%q", key)
+	}
+}
+
+func TestIsBlockedEnvKey(t *testing.T) {
+	for key, want := range map[string]bool{
+		"PATH":            true,
+		"path":            true, // checks are case-insensitive (validateEnvVars uppercases)
+		"LD_PRELOAD":      true,
+		"FRED_ANYTHING":   true,
+		"DOCKER_HOST":     true,
+		"APP_CUSTOMER_ID": false,
+		"A=B":             true, // structurally invalid as an env key
+		"":                true,
+	} {
+		require.Equal(t, want, IsBlockedEnvKey(key), "key=%q", key)
+	}
+}
+
 // --- expose validation tests ---
 
 func TestManifest_Expose_Valid(t *testing.T) {
