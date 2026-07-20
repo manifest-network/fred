@@ -233,7 +233,15 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, maxPe
 	if len(active) < maxPerTenant {
 		return nil
 	}
-	sort.Slice(active, func(i, j int) bool { return active[i].CreatedAt.Before(active[j].CreatedAt) })
+	// Deterministic total order: oldest-first, equal CreatedAt broken by
+	// ascending UUID. Given the same store state, the evicted set is a pure
+	// function — previously equal-timestamp order was unspecified.
+	sort.SliceStable(active, func(i, j int) bool {
+		if !active[i].CreatedAt.Equal(active[j].CreatedAt) {
+			return active[i].CreatedAt.Before(active[j].CreatedAt)
+		}
+		return active[i].OriginalLeaseUUID < active[j].OriginalLeaseUUID
+	})
 	for i := 0; i <= len(active)-maxPerTenant; i++ {
 		b.logger.Warn("evicting tenant's oldest retained lease to honor cap", "tenant", tenant, "lease_uuid", active[i].OriginalLeaseUUID)
 		// Atomic active→reaping (TOCTOU-safe: a record concurrently claimed for

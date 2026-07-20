@@ -26,6 +26,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Retention close path now runs the per-tenant count-cap eviction BEFORE the
+  retained-disk refusal gate, so a full rolling window rolls instead of
+  refusing (destroying) every subsequent close; eviction order is now a total
+  order (CreatedAt, then lease UUID). In the rare close where both caps would
+  trip, the tenant's oldest record is evicted first and the incoming close may
+  then be retained (previously the incoming was destroyed and no eviction ran).
+
 ### Security
 
 - manifest: bound the number of ports (and, defense-in-depth, expose entries,
