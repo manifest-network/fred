@@ -1610,6 +1610,67 @@ func TestBreachRetentionCaps_Scopes(t *testing.T) {
 	require.Equal(t, breachFailBefore+1, testutil.ToFloat64(retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach)))
 }
 
+// TestBreachRetentionCaps_L1Only_TenantIsolated pins that when the global (L0)
+// cap is off, a tenant's disk-cap decision depends only on ITS OWN retained
+// footprint — a large neighbor tenant must not influence it. This is the
+// property that lets the gate read the per-tenant index instead of scanning the
+// whole store when L0 is unlimited.
+func TestBreachRetentionCaps_L1Only_TenantIsolated(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedDiskMB = 0 // global L0 unlimited
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
+	put := func(uuid, tenant string) {
+		require.NoError(t, rs.Put(shared.RetentionEntry{
+			OriginalLeaseUUID: uuid, Tenant: tenant, ProviderUUID: "prov-1", Items: items,
+			StackManifest: &manifest.StackManifest{}, Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
+		}))
+	}
+	put("agg-1", "agg")     // agg holds 1024
+	put("other-1", "other") // a large neighbor: 3 * 1024 = 3072, well over agg's L1
+	put("other-2", "other")
+	put("other-3", "other")
+
+	// L1 = 2500: agg 1024 (held) + 1024 (incoming) = 2048 <= 2500 → NOT breached,
+	// regardless of the neighbor's 3072. If the neighbor leaked in, this trips.
+	budget := retentionBudget{CountCap: 100, DiskCapMB: 2500}
+	_, breached := b.breachRetentionCaps("agg", "", items, budget)
+	require.False(t, breached, "neighbor tenant footprint must not affect agg's L1 decision when L0 is off")
+
+	// agg's OWN footprint still trips L1: a second agg record → 2048 + 1024 = 3072 > 2500.
+	put("agg-2", "agg")
+	scope, breached := b.breachRetentionCaps("agg", "", items, budget)
+	require.True(t, breached)
+	require.Equal(t, refuseScopeTenant, scope)
+}
+
+// TestBreachRetentionCaps_L1Only_SkipsNeighborSKUScan pins the observable effect
+// of the L0-off fast path: the gate reads only the closing tenant's records, so a
+// NEIGHBOR tenant's unknown SKU is not surfaced here (it is reported store-wide by
+// refreshRetentionAccounting instead). This also proves the neighbor is not scanned.
+func TestBreachRetentionCaps_L1Only_SkipsNeighborSKUScan(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.MaxRetainedDiskMB = 0 // global L0 unlimited → tenant-scoped read
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID: "agg-1", Tenant: "agg", ProviderUUID: "prov-1", Items: items,
+		StackManifest: &manifest.StackManifest{}, Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
+	}))
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID: "other-1", Tenant: "other", ProviderUUID: "prov-1",
+		Items:         []backend.LeaseItem{{SKU: "ghost-sku", Quantity: 1, ServiceName: "app"}},
+		StackManifest: &manifest.StackManifest{}, Status: shared.RetentionStatusActive, CreatedAt: time.Now(),
+	}))
+
+	var buf bytes.Buffer
+	b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	_, _ = b.breachRetentionCaps("agg", "", items, retentionBudget{CountCap: 100, DiskCapMB: 2500})
+
+	require.NotContains(t, buf.String(), "ghost-sku",
+		"L0-off gate must read only the closing tenant, not scan the neighbor's records")
+}
+
 // TestLogRetentionBudgetSanity_WarnsWhenOverHoldings: a budget below the tenant's
 // current holdings WARNs at boot — the mechanism that surfaces undersized budgets
 // (typos, offboarding edits) BEFORE the first destructive close.

@@ -416,7 +416,20 @@ func (b *Backend) breachRetentionCaps(tenant, partition string, items []backend.
 		return "", false // no disk cap at any scope: zero store I/O (legacy fast path)
 	}
 	incoming, _ := b.leaseDiskMB(items)
-	entries, err := b.retentionStore.List()
+	// globalMB (the only cross-tenant sum) is consumed solely under l0 > 0; the L1
+	// and L2 sums are both accumulated inside `e.Tenant == tenant`. So when the
+	// global cap is off, only the closing tenant's records matter and the indexed
+	// per-tenant read suffices — avoiding an O(all retained records) full-store
+	// scan on this per-close path. This gate DESTROYS on breach, so the safe
+	// direction is under-counting; the index read (skips deleted, re-validates the
+	// tenant) can only ever under-count vs a racing writer, never over-count.
+	var entries []shared.RetentionEntry
+	var err error
+	if l0 > 0 {
+		entries, err = b.retentionStore.List() // L0 needs the store-wide global sum
+	} else {
+		entries, err = b.retentionStore.ListByTenant(tenant) // only L1/L2 (tenant-scoped) are live
+	}
 	if err != nil {
 		b.logger.Warn("retention cap check: store read failed; not refusing (data-safe)", "error", err)
 		retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()

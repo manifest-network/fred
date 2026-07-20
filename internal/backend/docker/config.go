@@ -782,7 +782,7 @@ func (c *Config) validateRetentionTenantBudget(tenant string, b RetentionTenantB
 		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_disk_mb (%d) must not exceed total_disk_mb (%d)", tenant, b.MaxRetainedDiskMB, c.TotalDiskMB)
 	}
 	if c.MaxRetainedDiskMB > 0 && b.MaxRetainedDiskMB > c.MaxRetainedDiskMB {
-		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_disk_mb (%d) must not exceed max_retained_disk_mb (%d)", tenant, b.MaxRetainedDiskMB, c.MaxRetainedDiskMB)
+		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_disk_mb (%d) must not exceed the global max_retained_disk_mb (%d)", tenant, b.MaxRetainedDiskMB, c.MaxRetainedDiskMB)
 	}
 	if largest > 0 && b.MaxRetainedDiskMB < largest {
 		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_disk_mb (%d) must be >= the largest stateful SKU disk_mb (%d), else a SKU-legal lease could never be retained", tenant, b.MaxRetainedDiskMB, largest)
@@ -803,7 +803,7 @@ func (c *Config) validateRetentionTenantBudget(tenant string, b RetentionTenantB
 	}
 	if b.PerPartitionMaxLeases > 0 {
 		if b.PerPartitionMaxLeases > b.MaxRetainedLeases {
-			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_leases (%d) must not exceed max_retained_leases (%d)", tenant, b.PerPartitionMaxLeases, b.MaxRetainedLeases)
+			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_leases (%d) must not exceed this budget's max_retained_leases (%d)", tenant, b.PerPartitionMaxLeases, b.MaxRetainedLeases)
 		}
 		if b.MaxPartitions <= 0 {
 			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_leases (%d) requires max_partitions > 0", tenant, b.PerPartitionMaxLeases)
@@ -823,7 +823,7 @@ func (c *Config) validateRetentionTenantBudget(tenant string, b RetentionTenantB
 			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb requires max_partitions > 0", tenant)
 		}
 		if b.PerPartitionMaxDiskMB > b.MaxRetainedDiskMB {
-			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb (%d) must not exceed max_retained_disk_mb (%d)", tenant, b.PerPartitionMaxDiskMB, b.MaxRetainedDiskMB)
+			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb (%d) must not exceed this budget's max_retained_disk_mb (%d)", tenant, b.PerPartitionMaxDiskMB, b.MaxRetainedDiskMB)
 		}
 		if largest > 0 && b.PerPartitionMaxDiskMB < largest {
 			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb (%d) must be >= the largest stateful SKU disk_mb (%d), else a SKU-legal lease could never be retained", tenant, b.PerPartitionMaxDiskMB, largest)
