@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -1181,4 +1182,163 @@ func TestRetentionIndex_ReIndexConcurrentWithWriter(t *testing.T) {
 	// The live index must match a fresh rebuild — no record dropped by a ReIndex that raced a
 	// concurrent Put.
 	assertIndexConsistent(t, s)
+}
+
+// putRawRecord writes raw bytes directly under a bucket key, bypassing the typed
+// mutators — the white-box idiom (see TestRetentionIndex_RebuildKeysOnBucketKey)
+// used to simulate a legacy/old-binary record on disk. The record's tenant/status
+// are left intact so the derived index stays truthful without a ReIndex.
+func putRawRecord(t *testing.T, s *RetentionStore, key string, raw []byte) {
+	t.Helper()
+	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte(key), raw)
+	}))
+}
+
+// TestPartition_EmptyOmittedFromStoredBytes pins the compat keystone: a record
+// written with Partition=="" marshals with NO "partition" key — stored bytes
+// are indistinguishable from a pre-partition binary's records.
+func TestPartition_EmptyOmittedFromStoredBytes(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("orig-1")))
+	raw, err := s.getRaw("orig-1")
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), `"partition"`)
+
+	// Same pin for the close path's actual write primitive.
+	merged := sampleEntry("orig-2")
+	ok, err := s.PutActiveMerged(merged)
+	require.NoError(t, err)
+	require.True(t, ok)
+	raw, err = s.getRaw("orig-2")
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), `"partition"`)
+}
+
+// TestPartition_LegacyRecordDecodesToDefaultBucket: a record without the key
+// decodes Partition=="" — the default whole-tenant bucket.
+func TestPartition_LegacyRecordDecodesToDefaultBucket(t *testing.T) {
+	s := newTestRetentionStore(t)
+	require.NoError(t, s.Put(sampleEntry("orig-legacy")))
+	got, err := s.Get("orig-legacy")
+	require.NoError(t, err)
+	require.Equal(t, "", got.Partition)
+}
+
+// TestPartition_RoundTripsThroughLifecycleMethods: every load-mutate-rewrite
+// method preserves a stored Partition.
+func TestPartition_RoundTripsThroughLifecycleMethods(t *testing.T) {
+	s := newTestRetentionStore(t)
+	e := sampleEntry("orig-rt")
+	e.Partition = "cust-a"
+	require.NoError(t, s.Put(e))
+
+	claimed, err := s.ClaimForRestore("orig-rt", "new-lease", 0)
+	require.NoError(t, err)
+	require.Equal(t, "cust-a", claimed.Partition)
+	ok, err := s.RevertToActive("orig-rt", claimed.Generation)
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err := s.Get("orig-rt")
+	require.NoError(t, err)
+	require.Equal(t, "cust-a", got.Partition)
+	_, ok, err = s.MarkReapingIfActive("orig-rt")
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err = s.Get("orig-rt")
+	require.NoError(t, err)
+	require.Equal(t, "cust-a", got.Partition)
+	// PutReaping re-leak branch preserves stored wholesale.
+	releak := sampleEntry("orig-rt")
+	releak.Partition = "" // a degraded give-up caller passes no label
+	ok, err = s.PutReaping(releak)
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err = s.Get("orig-rt")
+	require.NoError(t, err)
+	require.Equal(t, "cust-a", got.Partition)
+
+	// MarkReapingIfExpired runs on a SECOND record: orig-rt above is already
+	// reaping, and the expired-reap path only fires from active.
+	rt2 := sampleEntry("orig-rt2")
+	rt2.Partition = "cust-b"
+	rt2.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
+	require.NoError(t, s.Put(rt2))
+	_, ok, err = s.MarkReapingIfExpired("orig-rt2", time.Hour)
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err = s.Get("orig-rt2")
+	require.NoError(t, err)
+	require.Equal(t, "cust-b", got.Partition)
+}
+
+// TestPartition_OldBinaryRewriteDropsLabel simulates the rollback contract: an
+// old binary's full-struct rewrite drops the "partition" key; the record then
+// decodes into the "" default bucket.
+func TestPartition_OldBinaryRewriteDropsLabel(t *testing.T) {
+	s := newTestRetentionStore(t)
+	e := sampleEntry("orig-drop")
+	e.Partition = "cust-a"
+	require.NoError(t, s.Put(e))
+
+	raw, err := s.getRaw("orig-drop")
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(raw, &m))
+	require.Contains(t, m, "partition")
+	delete(m, "partition")
+	legacy, err := json.Marshal(m)
+	require.NoError(t, err)
+	putRawRecord(t, s, "orig-drop", legacy) // raw bucket write, mirroring the :1068+ idiom
+
+	got, err := s.Get("orig-drop")
+	require.NoError(t, err)
+	require.Equal(t, "", got.Partition, "dropped key degrades to the default bucket, never errors")
+}
+
+// TestPutActiveMerged_PreservesPartitionOnNilManifestRetry: a close retry whose
+// release-store hydration failed (base.StackManifest == nil) must preserve the
+// stored Partition alongside the stored StackManifest — "" from a starved
+// extractor is degradation, never tenant intent.
+func TestPutActiveMerged_PreservesPartitionOnNilManifestRetry(t *testing.T) {
+	s := newTestRetentionStore(t)
+	first := sampleEntry("orig-guard")
+	first.Partition = "cust-a"
+	ok, err := s.PutActiveMerged(first)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	retry := sampleEntry("orig-guard")
+	retry.StackManifest = nil // hydration failed on the retry
+	retry.Partition = ""      // extractor had no input → collapsed
+	ok, err = s.PutActiveMerged(retry)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	got, err := s.Get("orig-guard")
+	require.NoError(t, err)
+	require.NotNil(t, got.StackManifest, "existing guard: stored manifest preserved")
+	require.Equal(t, "cust-a", got.Partition, "stored partition preserved with it")
+}
+
+// TestPutActiveMerged_RestampsPartitionWhenManifestPresent: a retry whose
+// extraction genuinely ran (manifest non-nil) wins — INCLUDING a legitimate ""
+// (operator disabled the source / tenant removed the label via update).
+func TestPutActiveMerged_RestampsPartitionWhenManifestPresent(t *testing.T) {
+	s := newTestRetentionStore(t)
+	first := sampleEntry("orig-restamp")
+	first.Partition = "cust-a"
+	ok, err := s.PutActiveMerged(first)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	retry := sampleEntry("orig-restamp") // sampleEntry sets a non-nil StackManifest
+	retry.Partition = ""                 // successful re-extraction yielded default
+	ok, err = s.PutActiveMerged(retry)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	got, err := s.Get("orig-restamp")
+	require.NoError(t, err)
+	require.Equal(t, "", got.Partition, "config/tenant intent wins over history")
 }

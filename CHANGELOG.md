@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Retention records gained an optional `partition` field (a cooperative
+  sub-tenant grouping key within one on-chain tenant) plus the pure
+  extraction/validation library for it. Nothing writes a non-empty partition
+  yet — behavior and stored bytes are identical to the previous release.
+
 ### Changed
 
 - docs: mark the `btrfs` and `zfs` volume backends as experimental and untested,
