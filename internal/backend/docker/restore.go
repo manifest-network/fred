@@ -332,7 +332,8 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 	for i := 0; i < toEvict; i++ {
 		e := ordered[i]
 		b.logger.Warn("evicting tenant's oldest retained lease to honor cap",
-			"tenant", e.Tenant, "lease_uuid", e.OriginalLeaseUUID, "level", level, "cap", capValue, "partition", e.Partition)
+			"tenant", e.Tenant, "lease_uuid", e.OriginalLeaseUUID, "level", level, "cap", capValue,
+			"partition", shared.TruncatePartitionRaw(e.Partition))
 		names, ok, merr := b.retentionStore.MarkReapingIfActive(e.OriginalLeaseUUID)
 		if merr != nil {
 			return marked, true, merr

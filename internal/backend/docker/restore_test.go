@@ -3726,6 +3726,23 @@ func putActivePart(t *testing.T, rs *shared.RetentionStore, uuid, tenant, partit
 	}))
 }
 
+// putRestoringPart stores a RESTORING record — same as putActivePart but with
+// the restoring status, for pinning gauges/bounds whose scope is ACTIVE+RESTORING.
+func putRestoringPart(t *testing.T, rs *shared.RetentionStore, uuid, tenant, partition string, createdAt time.Time) {
+	t.Helper()
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   uuid,
+		Tenant:              tenant,
+		ProviderUUID:        "prov-1",
+		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		StackManifest:       restoreStackManifest(),
+		RetainedVolumeNames: []string{},
+		Status:              shared.RetentionStatusRestoring,
+		Partition:           partition,
+		CreatedAt:           createdAt,
+	}))
+}
+
 // statusOf returns the stored status of a retention record, failing if absent.
 func statusOf(t *testing.T, rs *shared.RetentionStore, uuid string) string {
 	t.Helper()

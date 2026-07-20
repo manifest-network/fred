@@ -1658,18 +1658,49 @@ func TestLogRetentionBudgetSanity_InfoWhenWithinBudget(t *testing.T) {
 	require.NotContains(t, out, "retention budget below tenant's current holdings")
 }
 
+// TestLogRetentionBudgetSanity_SurfacesUnresolvedSKUs: an active retained lease
+// that references an unknown SKU makes active_mb an UNDERCOUNT (the unknown item
+// contributes 0), so a "within budget" reading can be silently wrong. The sanity
+// line must name the unresolved SKU(s) — the one leaseDiskMB caller that used to
+// discard them.
+func TestLogRetentionBudgetSanity_SurfacesUnresolvedSKUs(t *testing.T) {
+	b, rs := newBackendWithRetention(t)
+	withMicroSKU(b, 1024)
+	b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
+		"agg": {MaxRetainedLeases: 10, MaxRetainedDiskMB: 500000, MaxPartitions: 4},
+	}
+	e := retentionEntryFixture("lease-ghost", "agg", time.Now().Add(-time.Hour))
+	e.Items = []backend.LeaseItem{
+		{SKU: "docker-micro", Quantity: 1, ServiceName: "web"},
+		{SKU: "ghost-sku", Quantity: 1, ServiceName: "db"},
+	}
+	require.NoError(t, rs.Put(e))
+
+	var buf bytes.Buffer
+	b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	b.logRetentionBudgetSanity()
+
+	out := buf.String()
+	require.Contains(t, out, "unresolved_skus", "sanity line must flag the undercount")
+	require.Contains(t, out, "ghost-sku")
+}
+
 // TestRetentionPartitionsGauge pins the retention_partitions gauge: it counts
-// distinct non-empty (tenant, partition) PAIRS over active records. The same
-// (tenant, partition) counts once; the same partition value under a different
-// tenant is a distinct pair; and the "" default bucket is never counted.
+// distinct non-empty (tenant, partition) PAIRS over active and restoring records
+// (RESTORING buckets still hold reserved space — same scope as the write-time
+// bound). The same (tenant, partition) counts once; the same partition value
+// under a different tenant is a distinct pair; and the "" default bucket is
+// never counted.
 func TestRetentionPartitionsGauge(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	now := time.Now()
 	putActivePart(t, rs, "g-1", "agg", "A", now)
 	putActivePart(t, rs, "g-2", "agg", "B", now)
-	putActivePart(t, rs, "g-3", "other", "A", now) // distinct PAIR (tenant differs)
-	putActivePart(t, rs, "g-4", "agg", "", now)    // default bucket: not counted
+	putActivePart(t, rs, "g-3", "other", "A", now)  // distinct PAIR (tenant differs)
+	putActivePart(t, rs, "g-4", "agg", "", now)     // default bucket: not counted
+	putRestoringPart(t, rs, "g-5", "agg", "C", now) // RESTORING is in scope too
+	putRestoringPart(t, rs, "g-6", "agg", "", now)  // restoring default bucket: not counted
 
 	b.refreshRetentionAccounting()
-	require.Equal(t, float64(3), testutil.ToFloat64(retentionPartitions))
+	require.Equal(t, float64(4), testutil.ToFloat64(retentionPartitions))
 }

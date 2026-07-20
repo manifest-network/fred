@@ -283,28 +283,45 @@ func (b *Backend) logRetentionBudgetSanity() {
 		}
 		var count int
 		var mb int64
+		unresolved := make(map[string]struct{})
 		for _, e := range mine {
 			if e.Status != shared.RetentionStatusActive {
 				continue
 			}
 			count++
-			emb, _ := b.leaseDiskMB(e.Items)
+			emb, eunres := b.leaseDiskMB(e.Items)
 			mb += emb
+			for _, s := range eunres {
+				unresolved[s] = struct{}{}
+			}
 		}
 		overCount := count > bud.MaxRetainedLeases
 		overDisk := mb > bud.MaxRetainedDiskMB
+		// An unresolved SKU contributes 0 to active_mb, so the disk comparison is an
+		// UNDERCOUNT: name the offending SKU(s) on the line itself so a "within
+		// budget" reading is not silently wrong. (The store-wide UNDERCOUNT warning
+		// already fired in refreshRetentionAccounting one call earlier at boot, so
+		// this is per-tenant attribution, not a duplicate global alarm.)
+		line := []any{
+			"tenant", tenant, "active_count", count, "budget_count", bud.MaxRetainedLeases,
+			"active_mb", mb, "budget_mb", bud.MaxRetainedDiskMB,
+		}
+		if len(unresolved) > 0 {
+			skus := make([]string, 0, len(unresolved))
+			for s := range unresolved {
+				skus = append(skus, s)
+			}
+			sort.Strings(skus)
+			line = append(line, "unresolved_skus", skus)
+		}
 		if overCount || overDisk {
 			// Name the breached dimension(s): a count breach evicts (batch-railed),
 			// a disk breach refuses-to-retain — different operator responses.
 			b.logger.Warn("retention budget below tenant's current holdings: next closes will evict (count, batch-railed) or be refused-to-retain (disk)",
-				"tenant", tenant, "active_count", count, "budget_count", bud.MaxRetainedLeases,
-				"active_mb", mb, "budget_mb", bud.MaxRetainedDiskMB,
-				"over_count", overCount, "over_disk", overDisk)
+				append(line, "over_count", overCount, "over_disk", overDisk)...)
 			continue
 		}
-		b.logger.Info("retention budget sanity", "tenant", tenant,
-			"active_count", count, "budget_count", bud.MaxRetainedLeases,
-			"active_mb", mb, "budget_mb", bud.MaxRetainedDiskMB)
+		b.logger.Info("retention budget sanity", line...)
 	}
 }
 
