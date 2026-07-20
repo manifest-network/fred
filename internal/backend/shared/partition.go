@@ -139,8 +139,9 @@ func TruncatePartitionRaw(raw string) string {
 
 // ExtractPartition derives the candidate partition for a closing lease from
 // the configured source. Returns (partition, collapseReason, rawDetail):
-//   - ("",  "", "")      — not declared (source none, or no service carries
-//     the key): the silent, normal state for every non-participating tenant.
+//   - ("",  "", "")      — not declared (source none, no service carries the
+//     key, or every carrier's value is empty/whitespace): the silent, normal
+//     state for every non-participating tenant.
 //   - (p,   "", "")      — exactly one distinct declared value, normalized.
 //   - ("",  reason, det) — declared but unusable; the caller counts+logs and
 //     the record lands in the default bucket. det is already truncation-bounded
@@ -186,6 +187,16 @@ func ExtractPartition(src PartitionSource, in PartitionInputs) (partition, reaso
 			continue // absence is not divergence: label only the main service
 		}
 		v = strings.TrimSpace(v)
+		if v == "" {
+			// A key present but empty/whitespace is not a declared partition:
+			// treat it exactly like an absent key. "" is the whole-tenant
+			// sentinel no valid value may represent, so a trims-to-empty value
+			// is intent-indistinguishable from "not participating". Skipping it
+			// keeps a lone empty value a silent default (never a WARN-spamming
+			// invalid with a blank detail) and stops an empty carrier from
+			// spuriously diverging against a real value on another service.
+			continue
+		}
 		if found && v != value {
 			return "", PartitionReasonDivergent,
 				TruncatePartitionRaw(value) + " vs " + TruncatePartitionRaw(v)

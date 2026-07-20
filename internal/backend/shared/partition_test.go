@@ -115,6 +115,14 @@ func TestExtractPartition(t *testing.T) {
 		{name: "invalid value collapses", src: labelSrc,
 			in:         PartitionInputs{Manifest: stackWith(map[string]map[string]string{"app": {"com.example.customer": "no spaces allowed"}})},
 			wantReason: PartitionReasonInvalid},
+		{name: "empty declared value is absence not invalid", src: labelSrc,
+			in: PartitionInputs{Manifest: stackWith(map[string]map[string]string{"app": {"com.example.customer": ""}})}},
+		{name: "whitespace-only declared value is absence", src: labelSrc,
+			in: PartitionInputs{Manifest: stackWith(map[string]map[string]string{"app": {"com.example.customer": "   "}})}},
+		{name: "empty sidecar value does not diverge from the real value", src: labelSrc,
+			in: PartitionInputs{Manifest: stackWith(map[string]map[string]string{
+				"app": {"com.example.customer": "cust-1"}, "sidecar": {"com.example.customer": ""}})},
+			wantPart: "cust-1"},
 		{name: "env source", src: envSrc,
 			in: PartitionInputs{Manifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 				"app": {Image: "img", Env: map[string]string{"APP_CUSTOMER_ID": "cust-9"}}}}},
