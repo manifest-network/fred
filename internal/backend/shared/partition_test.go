@@ -3,6 +3,7 @@ package shared
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
@@ -153,4 +154,17 @@ func TestTruncatePartitionRaw(t *testing.T) {
 	got := TruncatePartitionRaw(long)
 	require.True(t, strings.HasPrefix(got, strings.Repeat("x", 64)))
 	require.LessOrEqual(t, len(got), 64+len("…(truncated)"))
+}
+
+// A multi-byte rune straddling the byte cap must not be sliced into a lone
+// lead/continuation byte: the result would be invalid UTF-8 in operator logs.
+// Byte 63 begins "€" (U+20AC, 3 bytes), so a naive raw[:64] emits a bare 0xE2.
+func TestTruncatePartitionRaw_DoesNotSplitRune(t *testing.T) {
+	raw := strings.Repeat("x", 63) + "€" + strings.Repeat("y", 10)
+	got := TruncatePartitionRaw(raw)
+	require.True(t, utf8.ValidString(got), "truncated value must stay valid UTF-8, got %q", got)
+	require.LessOrEqual(t, len(got), maxPartitionValueLen+len("…(truncated)"))
+	require.True(t, strings.HasSuffix(got, "…(truncated)"))
+	// The "€" straddles the cap, so it must be dropped whole, not partially.
+	require.Equal(t, strings.Repeat("x", 63)+"…(truncated)", got)
 }

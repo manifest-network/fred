@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
@@ -126,7 +127,14 @@ func TruncatePartitionRaw(raw string) string {
 	if len(raw) <= maxPartitionValueLen {
 		return raw
 	}
-	return raw[:maxPartitionValueLen] + "…(truncated)"
+	// Back off to a UTF-8 rune boundary so the byte-length cut never splits a
+	// multi-byte value into a lone lead/continuation byte (invalid UTF-8 in
+	// operator logs). A rune is at most 4 bytes, so this drops at most 3.
+	end := maxPartitionValueLen
+	for end > 0 && !utf8.RuneStart(raw[end]) {
+		end--
+	}
+	return raw[:end] + "…(truncated)"
 }
 
 // ExtractPartition derives the candidate partition for a closing lease from
