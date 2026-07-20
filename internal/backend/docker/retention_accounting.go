@@ -161,6 +161,12 @@ func warnUnknownSKUs(logger *slog.Logger, unknown map[string]struct{}, context s
 		"context", context, "unknown_skus", skus)
 }
 
+// tenantPartition is the composite key identifying a distinct retention bucket
+// across tenants. A struct key (vs a separator-joined string) avoids a per-entry
+// concatenation allocation and needs no assumption about a separator byte never
+// appearing in either field.
+type tenantPartition struct{ tenant, partition string }
+
 // computeRetainedDiskMB derives the retained-disk projection from the retention
 // store: the sum of leaseDiskMB over ACTIVE records. Returns the total MB, the
 // active-record count (for the retained_leases gauge), and the number of distinct
@@ -179,10 +185,10 @@ func (b *Backend) computeRetainedDiskMB() (mb int64, count int, partitions int, 
 		return 0, 0, 0, err
 	}
 	unknown := make(map[string]struct{})
-	distinct := make(map[string]struct{})
+	distinct := make(map[tenantPartition]struct{})
 	for _, e := range entries {
 		if e.Partition != "" && (e.Status == shared.RetentionStatusActive || e.Status == shared.RetentionStatusRestoring) {
-			distinct[e.Tenant+"\x00"+e.Partition] = struct{}{}
+			distinct[tenantPartition{e.Tenant, e.Partition}] = struct{}{}
 		}
 		if e.Status != shared.RetentionStatusActive {
 			continue
