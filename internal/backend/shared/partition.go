@@ -143,10 +143,10 @@ func TruncatePartitionRaw(raw string) string {
 //     the key): the silent, normal state for every non-participating tenant.
 //   - (p,   "", "")      — exactly one distinct declared value, normalized.
 //   - ("",  reason, det) — declared but unusable; the caller counts+logs and
-//     the record lands in the default bucket. det is the PRE-TRUNCATED
-//     offending value (invalid) or the established value and the first
-//     divergent one (divergent) for the WARN line — no caller may log
-//     anything rawer.
+//     the record lands in the default bucket. det is already truncation-bounded
+//     (via TruncatePartitionRaw): the offending value (invalid) or the
+//     established value and the first divergent one (divergent) for the WARN
+//     line — it is the most-bounded form, so no caller may log anything rawer.
 //
 // It CANNOT fail: there is no error return, which structurally enforces the
 // never-fail-a-close invariant.
