@@ -253,7 +253,7 @@ retention counters resolve to three distinct signals — do not conflate them:
   (and the alert keyed on it), so it is the `scope=global` subset.
 
 So under disk pressure, a rising `scope=global` refusal (or the bare
-`retention_refused_total`) is the provider-capacity signal that drives this
+`..._retention_refused_total`) is the provider-capacity signal that drives this
 runbook; `partition`/`tenant`-scoped refusals and partition evictions are an
 aggregator's own budget doing its job and do not mean the backend is full.
 
@@ -349,7 +349,7 @@ so measure before you set.
   sum of budgeted `max_partitions` while draining — don't cry wolf.
 - **Key rotation** holds both label generations (old and new) until the old
   records age out, transiently consuming two partition slots — expect a brief
-  `retention_partitions` bump and, if it crosses `max_partitions`, `over_limit`
+  `..._retention_partitions` bump and, if it crosses `max_partitions`, `over_limit`
   collapses on the new key until the old drains.
 - **Restore consumes the grace slot.** Restoring a retained lease adopts its
   volume into the new lease and clears the retention record; a later re-close
