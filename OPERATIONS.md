@@ -297,7 +297,7 @@ allowlisted (aggregator) tenant is emitting keys the backend can't use.
 |---|---|---|
 | `invalid` | value fails the 1–64 char `[A-Za-z0-9._-]` rule (case-significant) | integrator-side key bug; share the charset rule |
 | `divergent` | services in one manifest disagree on the value | integrator bug (mis-labeled sidecar); all services that carry the key must carry the SAME value |
-| `no_input` | manifest unavailable at close (hydration failure) | cross-reference the `soft-delete: retained data will NOT be API-restorable` WARN; the stored label is preserved on retries (the `PutActiveMerged` guard) |
+| `no_input` | manifest unavailable at close (hydration failure) | cross-reference the `soft-delete: retained data will NOT be API-restorable` WARN; the stored partition is preserved on retries (the `PutActiveMerged` guard) |
 | `over_limit` | tenant already at `max_partitions` distinct labels | keys beyond the limit collapse; budgets are unaffected; raise `max_partitions` or expect default-bucket landing (a key rotation holds both generations until old records age out) |
 | `store_error` | `retention.db` read failed during the partition bound | fail-open (safe); investigate store health; `..._retention_cap_check_failed_total{check="bound"}` fires alongside |
 
@@ -333,8 +333,9 @@ so measure before you set.
 - **Rollback ordering.** A binary rolled back **below** the budgets release
   silently ignores the `retention_tenant_budgets` block (unknown config) and
   falls back to `max_retained_leases_per_tenant` / `max_retained_disk_mb_per_tenant`.
-  If those are lower than a budgeted tenant's holdings, the old binary
-  mass-evicts on the next closes. Raise `max_retained_leases_per_tenant` (and the
+  If those are lower than a budgeted tenant's holdings, the old binary's next
+  closes evict oldest-first (count cap) or refuse-to-retain the incoming close
+  (disk cap). Raise `max_retained_leases_per_tenant` (and the
   per-tenant disk cap) to cover the **largest** budgeted tenant in the **same
   deploy** as any such binary rollback.
 - **SKU additions re-trip the largest-SKU floor.** Every budget's
