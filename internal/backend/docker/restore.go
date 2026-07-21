@@ -261,7 +261,17 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 		return active[i].OriginalLeaseUUID < active[j].OriginalLeaseUUID
 	})
 
-	attempted := false                              // refresh only when a pass engaged
+	// attempted becomes true once either pass ENGAGES (commits evictions). Refresh
+	// the cached pool projection / gauges from a defer so it runs on every return
+	// path: a pass can mark records ACTIVE→REAPING and then return a store error on
+	// a later record, and those already-committed transitions must be reflected
+	// rather than lagging until the next close or the periodic sweep.
+	attempted := false
+	defer func() {
+		if attempted {
+			b.refreshRetentionAccounting()
+		}
+	}()
 	if budget.PerPartCount > 0 && partition != "" { // the "" default bucket is never L2-capped (I6)
 		var part []shared.RetentionEntry
 		for _, e := range active {
@@ -270,10 +280,10 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 			}
 		}
 		marked, passRan, err := b.evictOldest(ctx, part, evictLevelPartition, budget.PerPartCount)
+		attempted = attempted || passRan // engaged even if a later record errored
 		if err != nil {
 			return err
 		}
-		attempted = attempted || passRan
 		if len(marked) > 0 {
 			// Prune the L2-evicted records from the snapshot so they count toward
 			// L1 too (a per-partition eviction is also an aggregate eviction). This
@@ -290,13 +300,10 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 	}
 	if budget.CountCap > 0 {
 		_, passRan, err := b.evictOldest(ctx, active, evictLevelAggregate, budget.CountCap)
+		attempted = attempted || passRan // engaged even if a later record errored
 		if err != nil {
 			return err
 		}
-		attempted = attempted || passRan
-	}
-	if attempted {
-		b.refreshRetentionAccounting()
 	}
 	return nil
 }
