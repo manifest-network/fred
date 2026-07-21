@@ -35,7 +35,7 @@ import (
 // consistent. A transition that mutates the store but skips the refresh breaks it.
 func assertRetentionAccountingConsistent(t *testing.T, b *Backend, msgAndArgs ...any) {
 	t.Helper()
-	activeMB, _, err := b.computeRetainedDiskMB()
+	activeMB, _, _, err := b.computeRetainedDiskMB()
 	require.NoError(t, err)
 	reapingMB, _, err := b.computeReapingDiskMB()
 	require.NoError(t, err)
@@ -59,7 +59,7 @@ func TestRetentionAccountingInvariant_TeethDetectsSkippedRefresh(t *testing.T) {
 	// Mutate the store WITHOUT refreshing. docker-micro qty 2 → 2 × 512 = 1024 MB.
 	require.NoError(t, rs.Put(retentionEntryFixture("drifted", "t1", time.Now())))
 
-	activeMB, _, err := b.computeRetainedDiskMB()
+	activeMB, _, _, err := b.computeRetainedDiskMB()
 	require.NoError(t, err)
 	reapingMB, _, err := b.computeReapingDiskMB()
 	require.NoError(t, err)
@@ -128,7 +128,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				require.NoError(t, rs.Put(retentionEntryFixture("old2", "t1", base.Add(time.Hour))))
 				require.NoError(t, rs.Put(retentionEntryFixture("newest", "t1", base.Add(2*time.Hour))))
 
-				require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", 2, ""))
+				require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 2}, "", retentionTenantSnapshot(t, rs, "t1"), ""))
 				// One active record remains → 2 × 512 = 1024 MB.
 				require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
 			},
@@ -213,6 +213,50 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 
 				require.NoError(t, b.recoverState(context.Background()))
 				// One active record → 2 × 512 = 1024 MB rebuilt into the pool.
+				require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
+			},
+		},
+		{
+			name: "evictRetentionsToCap two-level",
+			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
+				b.volumes = newVols()
+				// One aggregator, two partitions. Partition A holds 3, B holds 1.
+				// Budget: L2 per-partition cap 2 (keeps 1 in A, evicts 2) and L1
+				// aggregate cap 10 (no-op). The closing lease is in partition A.
+				base := time.Now().Add(-4 * time.Hour)
+				putActivePart(t, rs, "a1", "agg", "A", base)
+				putActivePart(t, rs, "a2", "agg", "A", base.Add(time.Hour))
+				putActivePart(t, rs, "a3", "agg", "A", base.Add(2*time.Hour))
+				putActivePart(t, rs, "b1", "agg", "B", base.Add(3*time.Hour))
+
+				budget := retentionBudget{CountCap: 10, PerPartCount: 2, MaxPartitions: 4}
+				require.NoError(t, b.evictRetentionsToCap(context.Background(), "agg", budget, "A",
+					retentionTenantSnapshot(t, rs, "agg"), ""))
+				// A evicted to 1 (a3 survives), B untouched → 2 active × 512 = 1024 MB.
+				require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
+			},
+		},
+		{
+			name: "scoped disk refusal",
+			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
+				b.volumes = newVols()
+				// Two held records fill the tenant's disk budget (2 × 512 = 1024).
+				putActivePart(t, rs, "held-1", "agg", "", time.Now().Add(-2*time.Hour))
+				putActivePart(t, rs, "held-2", "agg", "", time.Now().Add(-time.Hour))
+				b.refreshRetentionAccounting()
+
+				// An incoming close of one more docker-micro breaches the tenant disk
+				// cap → refuse at scope=tenant. The refusal destroys only the incoming
+				// lease's (canonical) volumes; nothing RETAINED is mutated.
+				budget := retentionBudget{DiskCapMB: 1024}
+				incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
+				scope, refuse := b.shouldRefuseRetention("incoming", "agg", "", incoming, budget)
+				require.True(t, refuse)
+				require.Equal(t, refuseScopeTenant, scope)
+				errs := b.destroyOnRefuseToRetain(context.Background(), []string{"fred-incoming-app-0"},
+					"incoming", "agg", "", scope, slog.Default())
+				require.Empty(t, errs)
+				// Both held records survive; the projection is unchanged at 1024 MB.
 				require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
 			},
 		},

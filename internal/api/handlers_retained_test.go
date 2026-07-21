@@ -21,8 +21,18 @@ import (
 // retainedProvisionServer returns an httptest server whose GET
 // /provisions/{lease} responds with a retained ProvisionInfo for matchLease and
 // 404 (ErrNotProvisioned) otherwise. The Tenant field crosses the wire
-// (json:"tenant,omitempty") so the authz fallback can read it.
+// (json:"tenant,omitempty") so the authz fallback can read it. Partition is left
+// empty (omitempty absent), so every existing caller's response is byte-identical
+// to before partitioning; retainedProvisionServerWithPartition sets it.
 func retainedProvisionServer(t *testing.T, matchLease, tenant string, retainedUntil time.Time) *httptest.Server {
+	t.Helper()
+	return retainedProvisionServerWithPartition(t, matchLease, tenant, "", retainedUntil)
+}
+
+// retainedProvisionServerWithPartition is retainedProvisionServer with an
+// explicit retention partition on the retained ProvisionInfo, so tests can prove
+// the partition flows through to the owner-only retained API responses.
+func retainedProvisionServerWithPartition(t *testing.T, matchLease, tenant, partition string, retainedUntil time.Time) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/provisions/"+matchLease {
@@ -37,6 +47,7 @@ func retainedProvisionServer(t *testing.T, matchLease, tenant string, retainedUn
 			CreatedAt:     retainedUntil.Add(-90 * 24 * time.Hour),
 			RetainedUntil: retainedUntil,
 			Tenant:        tenant,
+			Partition:     partition,
 			Items: []backend.LeaseItem{
 				{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
 			},
@@ -163,6 +174,68 @@ func TestGetLeaseProvision_Retained_WithinGraceWindow(t *testing.T) {
 	assert.Equal(t, retainedUntil.Format(time.RFC3339), resp.RetainedUntil)
 	assert.NotEmpty(t, resp.RestoreHint)
 	require.Len(t, resp.Items, 1)
+}
+
+// TestRetainedResponses_Partition proves the retention partition flows to the
+// owner-only retained responses on BOTH endpoints (/status via
+// applyRetentionFields, /provision via its retained branch) when set, and is
+// omitted (omitempty) when the record has no partition — so a non-participant's
+// retained response is byte-identical to before partitioning. It also implicitly
+// re-affirms the owner-only exposure: this response is served only after the
+// caller's token authorizes them as the lease owner.
+func TestRetainedResponses_Partition(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	retainedUntil := time.Now().Add(60 * 24 * time.Hour).Truncate(time.Second)
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{Uuid: leaseUUID, Tenant: kp.Address, ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_CLOSED}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	// serve issues an owner-authenticated GET to the given endpoint against a
+	// backend whose retained ProvisionInfo carries `partition`, returning the raw
+	// response body.
+	serve := func(t *testing.T, partition, endpoint string) string {
+		t.Helper()
+		srv := retainedProvisionServerWithPartition(t, leaseUUID, kp.Address, partition, retainedUntil)
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{{Backend: httpBackend(t, "b1", srv.URL), IsDefault: true}},
+		})
+		require.NoError(t, err)
+		h := &Handlers{client: chainClient, backendRouter: router, providerUUID: providerUUID, bech32Prefix: "manifest"}
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+endpoint, nil)
+		req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+		req.SetPathValue("lease_uuid", leaseUUID)
+		rec := httptest.NewRecorder()
+		if endpoint == "/status" {
+			h.GetLeaseStatus(rec, req)
+		} else {
+			h.GetLeaseProvision(rec, req)
+		}
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		return rec.Body.String()
+	}
+
+	t.Run("present_status", func(t *testing.T) {
+		assert.Contains(t, serve(t, "cust-a", "/status"), `"partition":"cust-a"`)
+	})
+	t.Run("present_provision", func(t *testing.T) {
+		assert.Contains(t, serve(t, "cust-a", "/provision"), `"partition":"cust-a"`)
+	})
+	t.Run("absent_status", func(t *testing.T) {
+		assert.NotContains(t, serve(t, "", "/status"), `"partition"`,
+			"omitempty: a non-partitioned retained record's response must not carry the field")
+	})
+	t.Run("absent_provision", func(t *testing.T) {
+		assert.NotContains(t, serve(t, "", "/provision"), `"partition"`,
+			"omitempty: a non-partitioned retained record's response must not carry the field")
+	})
 }
 
 // TestGetLeaseStatus_ChainPruned_AuthzFallback verifies (#5) the closed-lease

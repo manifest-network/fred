@@ -893,3 +893,122 @@ func TestConfig_Validate_MinAvgFileBytes(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_RetentionPartitioning(t *testing.T) {
+	base := func() Config {
+		cfg := validConfig()                       // minimal-passing fixture (config_test.go:17)
+		cfg.SKUProfiles = defaultTestSKUProfiles() // largest stateful SKU: docker-large 4096
+		cfg.SKUMapping = map[string]string{"uuid-1": "docker-micro", "uuid-2": "docker-small", "uuid-3": "docker-medium", "uuid-4": "docker-large"}
+		cfg.VolumeDataPath = "/tmp/vols" // stateful SKUs require it
+		cfg.TotalDiskMB = 1_000_000      // must exceed every budget disk figure below
+		cfg.RetainOnClose = true
+		return cfg
+	}
+	budget := func(mut func(*RetentionTenantBudget)) map[string]RetentionTenantBudget {
+		b := RetentionTenantBudget{
+			MaxRetainedLeases: 200, MaxRetainedDiskMB: 500000,
+			MaxPartitions: 64, PerPartitionMaxLeases: 5, PerPartitionMaxDiskMB: 30720,
+		}
+		if mut != nil {
+			mut(&b)
+		}
+		return map[string]RetentionTenantBudget{"manifest1aggregator": b}
+	}
+
+	cases := []struct {
+		name    string
+		mut     func(*Config)
+		wantErr string
+	}{
+		{name: "valid full budget", mut: func(c *Config) { c.RetentionTenantBudgets = budget(nil) }},
+		{name: "valid elevation-only (max_partitions 0, no sub-caps)", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) {
+				b.MaxPartitions = 0
+				b.PerPartitionMaxLeases = 0
+				b.PerPartitionMaxDiskMB = 0
+			})
+		}},
+		{name: "per-tenant disk negative", mut: func(c *Config) { c.MaxRetainedDiskMBPerTenant = -1 }, wantErr: "max_retained_disk_mb_per_tenant"},
+		{name: "per-tenant disk > total", mut: func(c *Config) { c.MaxRetainedDiskMBPerTenant = c.TotalDiskMB + 1 }, wantErr: "total_disk_mb"},
+		{name: "per-tenant disk > global retained cap", mut: func(c *Config) { c.MaxRetainedDiskMB = 10000; c.MaxRetainedDiskMBPerTenant = 20000 }, wantErr: "max_retained_disk_mb"},
+		{name: "per-tenant disk below largest SKU", mut: func(c *Config) { c.MaxRetainedDiskMBPerTenant = 100 }, wantErr: "largest stateful SKU"},
+		{name: "budget key empty", mut: func(c *Config) {
+			c.RetentionTenantBudgets = map[string]RetentionTenantBudget{"  ": budget(nil)["manifest1aggregator"]}
+		}, wantErr: "key"},
+		{name: "budget key interior whitespace", mut: func(c *Config) {
+			c.RetentionTenantBudgets = map[string]RetentionTenantBudget{"a b": budget(nil)["manifest1aggregator"]}
+		}, wantErr: "whitespace"},
+		{name: "budget count zero (unlimited unrepresentable)", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.MaxRetainedLeases = 0 })
+		}, wantErr: "max_retained_leases"},
+		{name: "budget count over ceiling", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.MaxRetainedLeases = 65537 })
+		}, wantErr: "65536"},
+		{name: "budget disk zero", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.MaxRetainedDiskMB = 0 })
+		}, wantErr: "max_retained_disk_mb"},
+		{name: "budget disk below largest SKU", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.MaxRetainedDiskMB = 100; b.PerPartitionMaxDiskMB = 0 })
+		}, wantErr: "largest stateful SKU"},
+		{name: "max_partitions negative", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.MaxPartitions = -1 })
+		}, wantErr: "max_partitions"},
+		{name: "max_partitions over ceiling", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.MaxPartitions = 1025 })
+		}, wantErr: "1024"},
+		{name: "count sub-cap over aggregate", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.PerPartitionMaxLeases = 201 })
+		}, wantErr: "per_partition_max_leases"},
+		{name: "count sub-cap without partitions", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.MaxPartitions = 0; b.PerPartitionMaxDiskMB = 0 })
+		}, wantErr: "max_partitions"},
+		{name: "disk sub-cap without count sub-cap (jam guard)", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.PerPartitionMaxLeases = 0 })
+		}, wantErr: "per_partition_max_leases"},
+		{name: "disk sub-cap over budget disk", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.PerPartitionMaxDiskMB = 500001 })
+		}, wantErr: "per_partition_max_disk_mb"},
+		{name: "disk sub-cap below largest SKU", mut: func(c *Config) {
+			c.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) { b.PerPartitionMaxDiskMB = 100 })
+		}, wantErr: "largest stateful SKU"},
+		{name: "source malformed", mut: func(c *Config) { c.RetentionPartitionSource = "manifest.labels:x" }, wantErr: "retention_partition_source"},
+		{name: "source unsatisfiable label", mut: func(c *Config) { c.RetentionPartitionSource = "manifest.label:fred.x" }, wantErr: "reserved"},
+		{name: "source unsatisfiable env", mut: func(c *Config) { c.RetentionPartitionSource = "manifest.env:FRED_X" }, wantErr: "blocked"},
+		{name: "source valid", mut: func(c *Config) { c.RetentionPartitionSource = "manifest.label:com.example.customer" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			tc.mut(&cfg)
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
+	// Rolling-window WARN predicate (WARN, not error): disk sub-cap binds
+	// before the count window can roll when per_partition_max_disk_mb <
+	// (per_partition_max_leases + 1) × largestSKU.
+	warnCfg := base()
+	warnCfg.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) {
+		b.PerPartitionMaxLeases = 5
+		b.PerPartitionMaxDiskMB = 8192 // < (5+1)×4096 = 24576 → predicate true
+	})
+	require.NoError(t, warnCfg.Validate())
+	require.True(t, retentionPartitionWindowCannotRoll(warnCfg))
+	okCfg := base()
+	okCfg.RetentionTenantBudgets = budget(func(b *RetentionTenantBudget) {
+		b.PerPartitionMaxLeases = 5
+		b.PerPartitionMaxDiskMB = 30720 // ≥ 24576 → predicate false
+	})
+	require.NoError(t, okCfg.Validate())
+	require.False(t, retentionPartitionWindowCannotRoll(okCfg))
+	// Retain-off: gated silent even with a would-fire budget — the retain-off
+	// misconfig is surfaced by retentionCapSetButDisabled instead.
+	retainOffCfg := warnCfg
+	retainOffCfg.RetainOnClose = false
+	require.False(t, retentionPartitionWindowCannotRoll(retainOffCfg),
+		"window-roll warn must be gated on retain_on_close")
+}

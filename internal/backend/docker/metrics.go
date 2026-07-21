@@ -39,6 +39,33 @@ const (
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
 var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRootUnverifiable, orphanSkipRaced, orphanSkipDisabled, orphanSkipStoreError}
 
+// Scope labels for retentionRefusedByScopeTotal — the cap level that tripped a
+// close-time refuse-to-retain. Kept as constants so the disk gate, the pre-init,
+// and the tests cannot drift on a typo.
+const (
+	refuseScopeGlobal    = "global"    // L0 max_retained_disk_mb
+	refuseScopeTenant    = "tenant"    // L1 per-tenant aggregate disk
+	refuseScopePartition = "partition" // L2 per-partition disk sub-cap
+)
+
+// Check labels for retentionCapCheckFailedTotal — the retention cap check that
+// failed open on a store error (fail-open is data-safe but must be alertable).
+// This set deliberately EXTENDS the spec §6.4 enumeration (evict|breach|bound)
+// with refuse_get so that EVERY store-read fail-open in a cap decision is counted
+// — including the existing-record Get guard in shouldRefuseRetention, which the
+// spec's three-way enumeration omitted.
+const (
+	capCheckEvict     = "evict"      // an eviction pass's snapshot/CAS store error
+	capCheckBreach    = "breach"     // the disk-gate List() read error (breachRetentionCaps)
+	capCheckBound     = "bound"      // the partition-bound snapshot read error (boundPartition)
+	capCheckRefuseGet = "refuse_get" // the existing-record Get read error (shouldRefuseRetention)
+)
+
+// refuseScopes / capChecks are the closed label sets, used to pre-initialize the
+// CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
+var refuseScopes = []string{refuseScopeGlobal, refuseScopeTenant, refuseScopePartition}
+var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound, capCheckRefuseGet}
+
 var (
 	// provisionsTotal tracks the total number of provision attempts by outcome.
 	provisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -452,6 +479,75 @@ var (
 		Help:      "Close-time per-tenant cap evictions (max_retained_leases_per_tenant); a tenant's oldest retained lease evicted from the active set (marked reaping) to make room",
 	})
 
+	// retentionPartitionCollapsedTotal counts aggregator partition declarations
+	// collapsed to the default ("") bucket at close, by reason. Counted per close
+	// ATTEMPT (retries re-count): on a hydration-degraded retry of a labeled
+	// record, no_input fires while the PutActiveMerged guard preserves the stored
+	// label — expected, not a fault. NO tenant or partition label is EVER attached
+	// (the values are tenant-supplied and unbounded — the zero-identity-label
+	// posture is deliberate).
+	retentionPartitionCollapsedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_partition_collapsed_total",
+		Help:      "Aggregator partition declarations collapsed to the default bucket at close, by reason (per close attempt)",
+	}, []string{"reason"})
+
+	// retentionPartitionStampedTotal counts close attempts that resolved a
+	// non-empty retention partition. It is the adoption/typo detector: a source
+	// configured and a tenant allowlisted but this flat at 0 ⇒ the key never
+	// matches (a manifest typo or an unpopulated label/env).
+	retentionPartitionStampedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_partition_stamped_total",
+		Help:      "Close attempts that resolved a non-empty retention partition",
+	})
+
+	// retentionPartitions is the number of distinct non-empty (tenant, partition)
+	// buckets across active+restoring retained records. Set from
+	// refreshRetentionAccounting's existing full List() pass (zero extra store
+	// I/O). Alert headroom must allow the bounded concurrent-close overshoot.
+	retentionPartitions = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_partitions",
+		Help:      "Distinct non-empty (tenant, partition) buckets across active+restoring retained records",
+	})
+
+	// retentionPartitionEvictedTotal counts close-time per-partition sub-cap
+	// evictions — L2 ONLY. This is an aggregator's own noisy-customer containment
+	// tool, NOT a provider capacity signal. retentionEvictedTotal keeps its
+	// deployed L1-per-tenant meaning; the two are never conflated.
+	retentionPartitionEvictedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_partition_evicted_total",
+		Help:      "Close-time per-partition sub-cap evictions (an aggregator's own noisy-customer containment; NOT a provider capacity signal)",
+	})
+
+	// retentionRefusedByScopeTotal counts close-time refuse-to-retain events by
+	// the tripped cap scope (global|tenant|partition). The bare
+	// retentionRefusedTotal keeps its deployed L0-global-only meaning (the
+	// BackendRetentionRefused alert keys on it), so this is the scoped superset.
+	retentionRefusedByScopeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_refused_by_scope_total",
+		Help:      "Close-time refuse-to-retain events by tripped cap scope (global|tenant|partition)",
+	}, []string{"scope"})
+
+	// retentionCapCheckFailedTotal counts retention cap checks that failed open on
+	// a store error, by check (evict|breach|bound|refuse_get). Fail-open is correct
+	// (never destroy on uncertainty) but must be alertable: a sustained rate means
+	// the quota gates are silently off.
+	retentionCapCheckFailedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_cap_check_failed_total",
+		Help:      "Retention cap checks that failed open on a store error, by check (evict|breach|bound|refuse_get)",
+	}, []string{"check"})
+
 	// diskPoolBytes is the admission ceiling (total_disk_mb in bytes). A
 	// denominator so dashboards don't hardcode the pool size.
 	diskPoolBytes = promauto.NewGauge(prometheus.GaugeOpts{
@@ -554,18 +650,38 @@ func init() {
 	for _, oc := range quotaBackfillOutcomes {
 		volumeQuotaBackfillTotal.WithLabelValues(oc).Add(0)
 	}
+	// Pre-init the partition-collapse reasons, refuse scopes, and cap-check series
+	// to 0 so absence/ratio alert queries return 0, not no-data, before the first
+	// close.
+	for _, r := range shared.PartitionCollapseReasons {
+		retentionPartitionCollapsedTotal.WithLabelValues(r).Add(0)
+	}
+	for _, s := range refuseScopes {
+		retentionRefusedByScopeTotal.WithLabelValues(s).Add(0)
+	}
+	for _, c := range capChecks {
+		retentionCapCheckFailedTotal.WithLabelValues(c).Add(0)
+	}
+	// Pre-init the two unlabeled partition counters to 0 so a stamp/eviction-rate
+	// query reads 0, not no-data, before the first event. Their increments are
+	// wired at the close path (stamped) and the L2 eviction pass (evicted) in the
+	// close-path restructure that follows this commit.
+	retentionPartitionStampedTotal.Add(0)
+	retentionPartitionEvictedTotal.Add(0)
 }
 
 const bytesPerMiB = 1 << 20
 
 // updateRetentionMetrics sets the retained-volume gauges. retainedMB is the
 // ADMISSION total (active + reaping); count is the ACTIVE-only lease count;
-// reapingMB/reapingCount are the reaping subset.
-func updateRetentionMetrics(retainedMB int64, count int, reapingMB int64, reapingCount int) {
+// reapingMB/reapingCount are the reaping subset; partitionCount is the number of
+// distinct non-empty (tenant, partition) buckets across active+restoring records.
+func updateRetentionMetrics(retainedMB int64, count int, reapingMB int64, reapingCount int, partitionCount int) {
 	retainedVolumeBytes.Set(float64(retainedMB) * bytesPerMiB)
 	retainedLeases.Set(float64(count))
 	retentionReapingBytes.Set(float64(reapingMB) * bytesPerMiB)
 	retentionReapingLeases.Set(float64(reapingCount))
+	retentionPartitions.Set(float64(partitionCount))
 }
 
 // setStaticPoolMetrics sets the constant denominator gauges once at startup.

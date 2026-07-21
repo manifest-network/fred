@@ -281,23 +281,82 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				releaseLiveOnRetainPath = true
 			}
 		default:
-			// Count-cap eviction runs BEFORE the disk-refusal gate. The gate
-			// recomputes ACTIVE-only sums from the store, so eviction
-			// (ACTIVE→REAPING) shrinks what it sees: a full rolling window now
-			// rolls instead of jamming into refuse-forever. In the rare
-			// both-caps-breached close this evicts the tenant's oldest (an
-			// eviction the count cap already owed on the next non-refused close)
-			// and the incoming may then fit — strictly refusal-reducing.
-			//
-			// Eviction here is best-effort cap room: a wasted eviction — whether
-			// the disk gate still refuses below, or the record write later defers
-			// on a restore race — is acceptable; it only evicts the tenant's
-			// oldest, which the next close would evict anyway.
-			if err := b.evictRetentionsToCap(ctx, tenant, b.cfg.MaxRetainedLeasesPerTenant, leaseUUID); err != nil {
+			// Hydrate a nil StackManifest from the release store BEFORE anything
+			// reads it: the partition extractor and the persisted record must see
+			// the SAME manifest. A cold-start recover restores the manifest
+			// best-effort (recover.go) and leaves it nil if the active release is
+			// missing/unparseable/store-nil; Restore rejects a nil-manifest record
+			// as corrupt, so without this the volumes are retained but un-restorable.
+			// Mirror recover.go's LatestActive + ParsePayload guard exactly.
+			if stackManifest == nil && b.releaseStore != nil {
+				if rel, relErr := b.releaseStore.LatestActive(leaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
+					if stackM, payloadErr := manifest.ParsePayload(rel.Manifest); payloadErr != nil {
+						logger.Warn("soft-delete: failed to parse release manifest for retention hydration", "error", payloadErr)
+					} else {
+						stackManifest = stackM
+					}
+				}
+			}
+			if stackManifest == nil {
+				// Still nil after hydration: preserve the data (write the record) but
+				// warn loudly that it cannot be restored through the API.
+				logger.Warn("soft-delete: retained data will NOT be API-restorable (no manifest for lease); volumes preserved for manual recovery",
+					"lease_uuid", leaseUUID)
+			}
+
+			// Budget-first partition resolution: a non-aggregator (MaxPartitions==0)
+			// never extracts — no manifest walk, no WARN, no counter — so its close
+			// stays byte-identical to the legacy whole-tenant path. The tenant
+			// snapshot is read at most once here and shared by the partition bound
+			// AND the count-cap eviction below (the disk gate re-reads the store
+			// itself, AFTER eviction, so it sees the post-eviction state).
+			budget := resolveTenantRetentionBudget(b.cfg, tenant)
+			var (
+				tenantSnapshot []shared.RetentionEntry
+				snapErr        error
+			)
+			if budget.MaxPartitions > 0 || budget.CountCap > 0 || budget.PerPartCount > 0 {
+				tenantSnapshot, snapErr = b.retentionStore.ListByTenant(tenant)
+			}
+			partition := ""
+			if budget.MaxPartitions > 0 {
+				var reason, rawDetail string
+				partition, reason, rawDetail = shared.ExtractPartition(b.partitionSource, shared.PartitionInputs{Manifest: stackManifest})
+				switch {
+				case reason != "":
+					retentionPartitionCollapsedTotal.WithLabelValues(reason).Inc()
+					// rawDetail is pre-truncated by ExtractPartition (no site may log
+					// the untruncated tenant-supplied value); logger carries lease_uuid.
+					logger.Warn("retention partition collapsed to default bucket",
+						"tenant", tenant, "reason", reason, "partition_raw", rawDetail)
+				case partition != "":
+					// boundPartition is collapse-only: it can only return partition
+					// unchanged or "" (over-limit / snapshot-error), never a fault.
+					partition = b.boundPartition(tenant, partition, budget, tenantSnapshot, snapErr, logger)
+				}
+				if partition != "" {
+					retentionPartitionStampedTotal.Inc()
+				}
+			}
+
+			// Count-cap eviction runs BEFORE the disk-refusal gate (two-level: L2
+			// per-partition, then L1 per-tenant aggregate). The disk gate recomputes
+			// ACTIVE-only sums from the store, so eviction (ACTIVE→REAPING) shrinks
+			// what it sees: a full rolling window rolls instead of jamming into
+			// refuse-forever. Best-effort cap room — a wasted eviction (the disk gate
+			// still refuses below, or the record write later defers on a restore
+			// race) only evicts the tenant's oldest, which the next close would evict
+			// anyway. Fail-open on a snapshot read error: eviction never blocks a close.
+			if snapErr != nil {
+				retentionCapCheckFailedTotal.WithLabelValues(capCheckEvict).Inc()
+				logger.Warn("retention cap eviction skipped: tenant snapshot unavailable (fail-open)", "tenant", tenant, "error", snapErr)
+			} else if err := b.evictRetentionsToCap(ctx, tenant, budget, partition, tenantSnapshot, leaseUUID); err != nil {
+				retentionCapCheckFailedTotal.WithLabelValues(capCheckEvict).Inc()
 				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}
-			if b.shouldRefuseRetention(leaseUUID, durableItems) {
-				volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, logger)...)
+
+			if scope, refuse := b.shouldRefuseRetention(leaseUUID, tenant, partition, durableItems, budget); refuse {
+				volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, partition, scope, logger)...)
 				if len(volumeErrs) == 0 {
 					// Every byte is gone — the refused stateful volumes here AND any
 					// writable-path-only volumes reclaimed before the switch — so release
@@ -315,27 +374,6 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			retained := make([]string, 0, len(retainCanonical))
 			for _, c := range retainCanonical {
 				retained = append(retained, retainedName(c))
-			}
-			// Hydrate a nil StackManifest from the release store so the retained data
-			// stays API-restorable. A cold-start recover restores the manifest
-			// best-effort (recover.go) and leaves it nil if the active release is
-			// missing/unparseable/store-nil; Restore rejects a nil-manifest record as
-			// corrupt, so without this the volumes are retained but un-restorable.
-			// Mirror recover.go's LatestActive + ParsePayload guard exactly.
-			if stackManifest == nil && b.releaseStore != nil {
-				if rel, relErr := b.releaseStore.LatestActive(leaseUUID); relErr == nil && rel != nil && len(rel.Manifest) > 0 {
-					if stackM, payloadErr := manifest.ParsePayload(rel.Manifest); payloadErr != nil {
-						logger.Warn("soft-delete: failed to parse release manifest for retention hydration", "error", payloadErr)
-					} else {
-						stackManifest = stackM
-					}
-				}
-			}
-			if stackManifest == nil {
-				// Still nil after hydration: preserve the data (write the record) but
-				// warn loudly that it cannot be restored through the API.
-				logger.Warn("soft-delete: retained data will NOT be API-restorable (no manifest for lease); volumes preserved for manual recovery",
-					"lease_uuid", leaseUUID)
 			}
 
 			// RECORD-FIRST + ATOMIC: PutActiveMerged persists the active record (with
@@ -355,6 +393,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
 				Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
 				RetainedVolumeNames: retained, Status: shared.RetentionStatusActive,
+				Partition: partition,
 				CreatedAt: time.Now(), Generation: 0,
 			}
 			ok, err := b.retentionStore.PutActiveMerged(base)
@@ -556,6 +595,10 @@ func (b *Backend) purgeReleaseHistory(leaseUUID string, logger *slog.Logger) {
 // auto-retries the destroy — turning a permanent manual-only leak into a self-healing
 // one. PutReaping is idempotent and refuses to clobber an active/restoring record, so a
 // footprint an existing record already counts is left untouched. (ENG-376)
+//
+// Give-up tombstones deliberately carry Partition "" (the default bucket): they are
+// reaping-from-birth — never eviction-ordered, never restorable, never counted by any
+// L2 term — and this is the maximally-degraded path (degraded ⇒ default bucket).
 func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
 	retentionLeakedTotal.Inc()
 	if b.retentionStore == nil {

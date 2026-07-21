@@ -522,10 +522,14 @@ type LeaseStatusResponse struct {
 	// RetainedUntil is RFC3339; Items is the restore shape (service name + SKU +
 	// quantity) the tenant uses to build a matching fresh PENDING lease;
 	// RestoreHint is a short human-readable next-step. The owning Tenant from
-	// ProvisionInfo is intentionally NOT surfaced here (cross-tenant leak guard).
+	// ProvisionInfo is intentionally NOT surfaced here (cross-tenant leak guard);
+	// Partition IS surfaced — it is the owning tenant's own sub-grouping key, shown
+	// only to that tenant (this response is owner-authenticated), so no cross-tenant
+	// disclosure. Empty (omitempty absent) for non-partitioned retained records.
 	RetainedUntil string              `json:"retained_until,omitempty"`
 	Items         []backend.LeaseItem `json:"items,omitempty"`
 	RestoreHint   string              `json:"restore_hint,omitempty"`
+	Partition     string              `json:"partition,omitempty"`
 }
 
 // GetLeaseStatus handles GET /v1/leases/{lease_uuid}/status
@@ -677,6 +681,7 @@ func applyRetentionFields(resp *LeaseStatusResponse, info *backend.ProvisionInfo
 	}
 	resp.Items = info.Items
 	resp.RestoreHint = restoreHint
+	resp.Partition = info.Partition
 }
 
 // LeaseProvisionResponse represents the response for provision diagnostics.
@@ -688,10 +693,12 @@ type LeaseProvisionResponse struct {
 	FailCount    int    `json:"fail_count"`
 	LastError    string `json:"last_error,omitempty"`
 	// Retention fields (populated when status=retained, ENG-329). See
-	// LeaseStatusResponse; the owning Tenant from ProvisionInfo is NOT surfaced.
+	// LeaseStatusResponse; the owning Tenant from ProvisionInfo is NOT surfaced,
+	// but Partition IS (the owner's own sub-grouping key, shown only to the owner).
 	RetainedUntil string              `json:"retained_until,omitempty"`
 	Items         []backend.LeaseItem `json:"items,omitempty"`
 	RestoreHint   string              `json:"restore_hint,omitempty"`
+	Partition     string              `json:"partition,omitempty"`
 }
 
 // LeaseLogsResponse represents the response for container logs.
@@ -779,6 +786,7 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 		}
 		response.Items = info.Items
 		response.RestoreHint = restoreHint
+		response.Partition = info.Partition
 	}
 
 	slog.Info("lease provision info served",
@@ -1277,6 +1285,11 @@ type WorkloadLookupResponse struct {
 // WorkloadEntry describes a single lease's workload for observability.
 // LeaseUUID is intentionally absent — the map key in WorkloadLookupResponse
 // carries it.
+//
+// WorkloadEntry is served UNAUTHENTICATED (/workloads). Tenant and Partition
+// (an aggregator's customer identifiers) must NEVER be added here — this
+// endpoint is world-readable; the same invariant covers the backend's
+// unauthenticated /stats and /metrics (no partition-valued metric labels).
 type WorkloadEntry struct {
 	Status      backend.ProvisionStatus `json:"status"`
 	CreatedAt   time.Time               `json:"created_at"`

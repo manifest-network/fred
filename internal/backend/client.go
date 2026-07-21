@@ -276,6 +276,15 @@ type ProvisionInfo struct {
 	// leak one tenant's address to another.
 	Tenant string `json:"tenant,omitempty"`
 
+	// Partition is the retained record's optional sub-tenant grouping key
+	// (retention partitioning). Unlike Tenant above, it MAY be copied into
+	// tenant-facing retained responses: retained info is only ever surfaced to
+	// its owning tenant (authorizeRetained / verifyLeaseAccess), and the value
+	// is that tenant's own declaration — it discloses nothing cross-tenant.
+	// It MUST NOT be added to the unauthenticated /workloads, /stats, or
+	// /metrics surfaces (see WorkloadEntry).
+	Partition string `json:"partition,omitempty"`
+
 	// Workload metadata — populated by ListProvisions/GetProvision to describe what is running.
 	Image         string            `json:"image,omitempty"`          // Docker image (non-stack leases)
 	SKU           string            `json:"sku,omitempty"`            // SKU identifier (non-stack leases)

@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -273,6 +274,29 @@ type Config struct {
 	// consistent with total_disk_mb and the SKU disk_mb fields).
 	MaxRetainedDiskMB int64 `yaml:"max_retained_disk_mb"`
 
+	// RetentionPartitionSource selects where the OPTIONAL retention-partition
+	// key is read from at lease close. "" (default) disables partitioning —
+	// behavior is byte-identical to a build without the feature. Formats:
+	//   "manifest.label:<key>"  read from each service's labels map
+	//   "manifest.env:<key>"    read from each service's env map
+	// The extracted value only ever SUB-DIVIDES a tenant's retention budget
+	// (never raises any cap); non-allowlisted tenants' declarations collapse
+	// to the whole-tenant bucket. Invalid/unsatisfiable sources fail startup.
+	RetentionPartitionSource string `yaml:"retention_partition_source"`
+
+	// MaxRetainedDiskMBPerTenant caps one tenant's aggregate retained disk
+	// (MB). Same refuse-to-retain semantics as max_retained_disk_mb but
+	// per-tenant. 0 = unlimited (default; today's behavior). Overridden per
+	// tenant by a retention_tenant_budgets entry.
+	MaxRetainedDiskMBPerTenant int64 `yaml:"max_retained_disk_mb_per_tenant"`
+
+	// RetentionTenantBudgets is the aggregator allowlist: per-tenant retention
+	// budget overrides keyed by the on-chain tenant address (an opaque string —
+	// deliberately not bech32-validated; a typo'd key silently never matches,
+	// which the startup budget-sanity pass surfaces). Only tenants listed here
+	// with max_partitions > 0 ever persist a non-empty partition.
+	RetentionTenantBudgets map[string]RetentionTenantBudget `yaml:"retention_tenant_budgets"`
+
 	// MigrationGracePeriod is how long the renamed `-prev` legacy container
 	// lingers after a successful recover-time migration before forced
 	// removal. Preserves rollback potential if the operator interrupts fred
@@ -291,6 +315,31 @@ type Config struct {
 	// Requires network_isolation to be enabled.
 	Ingress IngressConfig `yaml:"ingress"`
 }
+
+// RetentionTenantBudget overrides the default per-tenant retention caps for one
+// allowlisted (aggregator) tenant and optionally enables partition sub-caps.
+// Aggregates are REQUIRED positive: "unlimited" is unrepresentable inside a
+// budget (load-bearing for the bounded-scan argument).
+type RetentionTenantBudget struct {
+	MaxRetainedLeases     int   `yaml:"max_retained_leases"`
+	MaxRetainedDiskMB     int64 `yaml:"max_retained_disk_mb"`
+	MaxPartitions         int   `yaml:"max_partitions"`            // 0 = elevation-only: labels still collapse
+	PerPartitionMaxLeases int   `yaml:"per_partition_max_leases"`  // 0 = no L2 count sub-cap
+	PerPartitionMaxDiskMB int64 `yaml:"per_partition_max_disk_mb"` // 0 = no L2 disk sub-cap
+}
+
+const (
+	// maxRetentionPartitionsPerTenant is the compile-time ceiling on a budget's
+	// max_partitions — an order of magnitude above any plausible per-backend
+	// sub-tenant fleet while keeping worst-case per-close scans trivial.
+	maxRetentionPartitionsPerTenant = 1024
+	// maxRetentionBudgetLeases bounds per-close decode work for a budgeted
+	// tenant's ListByTenant snapshot (~tens of MB worst-case).
+	maxRetentionBudgetLeases = 65536
+	// maxRetentionBudgetKeyLen bounds a budget map key (the opaque tenant
+	// address); a longer key is almost certainly a paste error, never matched.
+	maxRetentionBudgetKeyLen = 128
+)
 
 func ptrBool(b bool) *bool    { return &b }
 func ptrInt64(i int64) *int64 { return &i }
@@ -596,6 +645,42 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// max_retained_disk_mb_per_tenant: the L1-default per-tenant disk cap. Same
+	// refuse-to-retain (destroy) semantics as the global cap, so the below-largest
+	// SKU check is likewise a hard error (a cap under the largest stateful SKU
+	// means a SKU-legal lease is always refused ⇒ destroyed).
+	if c.MaxRetainedDiskMBPerTenant < 0 {
+		return fmt.Errorf("max_retained_disk_mb_per_tenant must be non-negative")
+	}
+	if c.MaxRetainedDiskMBPerTenant > 0 {
+		if c.MaxRetainedDiskMBPerTenant > c.TotalDiskMB {
+			return fmt.Errorf("max_retained_disk_mb_per_tenant (%d) must not exceed total_disk_mb (%d)", c.MaxRetainedDiskMBPerTenant, c.TotalDiskMB)
+		}
+		if c.MaxRetainedDiskMB > 0 && c.MaxRetainedDiskMBPerTenant > c.MaxRetainedDiskMB {
+			return fmt.Errorf("max_retained_disk_mb_per_tenant (%d) must not exceed max_retained_disk_mb (%d)", c.MaxRetainedDiskMBPerTenant, c.MaxRetainedDiskMB)
+		}
+		if largest := c.largestSKUDiskMB(); largest > 0 && c.MaxRetainedDiskMBPerTenant < largest {
+			return fmt.Errorf("max_retained_disk_mb_per_tenant (%d) must be >= the largest stateful SKU disk_mb (%d), else a SKU-legal lease could never be retained", c.MaxRetainedDiskMBPerTenant, largest)
+		}
+	}
+
+	// retention_partition_source: a malformed or unsatisfiable source is a startup
+	// failure, never a close-time surprise. ParsePartitionSource also rejects
+	// reserved label prefixes / blocked env keys via the shared manifest helpers,
+	// so an unsatisfiable key (one no tenant manifest could ever declare) is caught
+	// here rather than silently never matching.
+	if _, err := shared.ParsePartitionSource(c.RetentionPartitionSource); err != nil {
+		return fmt.Errorf("retention_partition_source: %w", err)
+	}
+
+	// retention_tenant_budgets: per-entry validation, name-prefixed errors
+	// (mirrors the sku_profiles validate loop, config.go:468-472).
+	for tenant, budget := range c.RetentionTenantBudgets {
+		if err := c.validateRetentionTenantBudget(tenant, budget); err != nil {
+			return err
+		}
+	}
+
 	// Volume management validation
 	if c.HasStatefulSKUs() && c.VolumeDataPath == "" {
 		return fmt.Errorf("volume_data_path is required when any SKU profile has disk_mb > 0")
@@ -658,6 +743,93 @@ func validateSKUProfile(name string, profile SKUProfile) error {
 	if err := profile.Validate(); err != nil {
 		return fmt.Errorf("SKU %q: %w", name, err)
 	}
+	return nil
+}
+
+// validateRetentionTenantBudget validates one aggregator-allowlist budget entry.
+// The tenant key is opaque (no bech32 parse — the backend treats tenant as an
+// opaque string everywhere). Aggregates are REQUIRED positive: "unlimited" is
+// unrepresentable inside a budget by construction (closes the 0=unlimited hole
+// and bounds every per-close tenant scan). Disk caps use the same
+// below-largest-SKU hard error as the global cap: a disk cap under the largest
+// stateful SKU means a SKU-legal lease is always refused ⇒ destroyed.
+func (c *Config) validateRetentionTenantBudget(tenant string, b RetentionTenantBudget) error {
+	if strings.TrimSpace(tenant) == "" {
+		return fmt.Errorf("retention_tenant_budgets[%q]: tenant key must not be empty", tenant)
+	}
+	if strings.IndexFunc(tenant, unicode.IsSpace) >= 0 {
+		return fmt.Errorf("retention_tenant_budgets[%q]: tenant key must not contain whitespace", tenant)
+	}
+	if len(tenant) > maxRetentionBudgetKeyLen {
+		return fmt.Errorf("retention_tenant_budgets[%q]: tenant key too long (%d > %d)", tenant, len(tenant), maxRetentionBudgetKeyLen)
+	}
+
+	// L1 aggregate count — REQUIRED > 0, bounded by the compile-time ceiling.
+	if b.MaxRetainedLeases <= 0 {
+		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_leases must be > 0 (a budget cannot express unlimited)", tenant)
+	}
+	if b.MaxRetainedLeases > maxRetentionBudgetLeases {
+		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_leases (%d) must be <= %d", tenant, b.MaxRetainedLeases, maxRetentionBudgetLeases)
+	}
+
+	// L1 aggregate disk — REQUIRED > 0, bounded by the pool / global cap, and at
+	// least the largest stateful SKU.
+	largest := c.largestSKUDiskMB()
+	if b.MaxRetainedDiskMB <= 0 {
+		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_disk_mb must be > 0 (a budget cannot express unlimited)", tenant)
+	}
+	if b.MaxRetainedDiskMB > c.TotalDiskMB {
+		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_disk_mb (%d) must not exceed total_disk_mb (%d)", tenant, b.MaxRetainedDiskMB, c.TotalDiskMB)
+	}
+	if c.MaxRetainedDiskMB > 0 && b.MaxRetainedDiskMB > c.MaxRetainedDiskMB {
+		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_disk_mb (%d) must not exceed the global max_retained_disk_mb (%d)", tenant, b.MaxRetainedDiskMB, c.MaxRetainedDiskMB)
+	}
+	if largest > 0 && b.MaxRetainedDiskMB < largest {
+		return fmt.Errorf("retention_tenant_budgets[%s].max_retained_disk_mb (%d) must be >= the largest stateful SKU disk_mb (%d), else a SKU-legal lease could never be retained", tenant, b.MaxRetainedDiskMB, largest)
+	}
+
+	// max_partitions in [0, ceiling]; 0 = elevation-only (labels still collapse).
+	if b.MaxPartitions < 0 {
+		return fmt.Errorf("retention_tenant_budgets[%s].max_partitions must be non-negative", tenant)
+	}
+	if b.MaxPartitions > maxRetentionPartitionsPerTenant {
+		return fmt.Errorf("retention_tenant_budgets[%s].max_partitions (%d) must be <= %d", tenant, b.MaxPartitions, maxRetentionPartitionsPerTenant)
+	}
+
+	// L2 count sub-cap — optional; when set, bounded by the aggregate and requires
+	// partitions to be enabled.
+	if b.PerPartitionMaxLeases < 0 {
+		return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_leases must be non-negative", tenant)
+	}
+	if b.PerPartitionMaxLeases > 0 {
+		if b.PerPartitionMaxLeases > b.MaxRetainedLeases {
+			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_leases (%d) must not exceed this budget's max_retained_leases (%d)", tenant, b.PerPartitionMaxLeases, b.MaxRetainedLeases)
+		}
+		if b.MaxPartitions <= 0 {
+			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_leases (%d) requires max_partitions > 0", tenant, b.PerPartitionMaxLeases)
+		}
+	}
+
+	// L2 disk sub-cap — optional; requires a count sub-cap (jam guard), partitions
+	// enabled, and the same pool / SKU bounds as the aggregate disk.
+	if b.PerPartitionMaxDiskMB < 0 {
+		return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb must be non-negative", tenant)
+	}
+	if b.PerPartitionMaxDiskMB > 0 {
+		if b.PerPartitionMaxLeases <= 0 {
+			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb requires per_partition_max_leases > 0: a disk-only sub-cap has no rolling mechanism — once full, every close in that partition is refused (destroyed) forever", tenant)
+		}
+		if b.MaxPartitions <= 0 {
+			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb requires max_partitions > 0", tenant)
+		}
+		if b.PerPartitionMaxDiskMB > b.MaxRetainedDiskMB {
+			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb (%d) must not exceed this budget's max_retained_disk_mb (%d)", tenant, b.PerPartitionMaxDiskMB, b.MaxRetainedDiskMB)
+		}
+		if largest > 0 && b.PerPartitionMaxDiskMB < largest {
+			return fmt.Errorf("retention_tenant_budgets[%s].per_partition_max_disk_mb (%d) must be >= the largest stateful SKU disk_mb (%d), else a SKU-legal lease could never be retained", tenant, b.PerPartitionMaxDiskMB, largest)
+		}
+	}
+
 	return nil
 }
 
