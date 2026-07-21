@@ -398,9 +398,10 @@ Rules:
   two different customers).
 - Every service that carries the key must carry the **same** value; services
   without the key are ignored, so labeling only the main service is fine.
-- Use **opaque customer IDs, never PII or secrets** — label values are visible to
-  host operators (`docker inspect`) and env values to your own workload, and
-  service **names** are visible on an unauthenticated endpoint, so customer
+- Use **opaque customer IDs, never PII or secrets** — both label and env values
+  are visible to host operators (`docker inspect`), env values additionally to
+  your own workload, and service **names** are visible on an unauthenticated
+  endpoint, so customer
   identifiers belong in the partition value only.
 - An `/update` that changes the value re-homes the lease's **future** retention
   (last-writer-wins at close); already-retained records keep their bucket.
