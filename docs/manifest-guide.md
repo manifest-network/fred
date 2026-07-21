@@ -204,6 +204,7 @@ Env var names are validated for security:
 ### Labels
 
 - Keys must **not** start with `fred.` or `traefik.` — both are reserved: `fred.` for backend-managed labels, and `traefik.` for shared ingress routing (a tenant-set `traefik.*` label could otherwise hijack another tenant's router — ENG-497). Configure ingress via the manifest's `ingress`/port settings, not raw Traefik labels.
+- If you front many of your own end-customers behind one on-chain tenant, your provider may read a per-customer retention-partition key from a label (or env var) you declare — see [Retention partitioning (aggregator platforms)](#retention-partitioning-aggregator-platforms).
 
 ```json
 // Valid
@@ -380,6 +381,34 @@ Unknown fields are **rejected** at parse time. This prevents accidental misuse s
 // Invalid — unknown field
 { "image": "nginx", "volumes": ["/data"] }
 ```
+
+## Retention partitioning (aggregator platforms)
+
+If you front many of your own end-customers behind one on-chain tenant, your
+provider may enable retention partitioning: you declare an opaque per-customer
+key in a manifest field the provider names (commonly a service label, e.g.
+`"labels": {"com.example.customer": "cust-4711"}`), and your retained
+(soft-deleted) leases are then capped and evicted per customer instead of in one
+shared bucket.
+
+Rules:
+
+- The value must be **1–64 characters** of `[A-Za-z0-9._-]`. Case is **preserved
+  and significant** — pick ONE canonical casing (`Cust-4711` and `cust-4711` are
+  two different customers).
+- Every service that carries the key must carry the **same** value; services
+  without the key are ignored, so labeling only the main service is fine.
+- Use **opaque customer IDs, never PII or secrets** — both label and env values
+  are visible to host operators (`docker inspect`), env values additionally to
+  your own workload, and service **names** are visible on an unauthenticated
+  endpoint, so customer
+  identifiers belong in the partition value only.
+- An `/update` that changes the value re-homes the lease's **future** retention
+  (last-writer-wins at close); already-retained records keep their bucket.
+- Declaring keys **never raises any cap**: partitions only sub-divide the budget
+  your provider granted, and invalid/conflicting keys harmlessly collapse to the
+  shared bucket (a WARN + counter on the provider side — closes are never
+  blocked).
 
 ## Stack-Specific Topics
 

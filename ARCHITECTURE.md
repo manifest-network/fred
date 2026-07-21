@@ -300,6 +300,10 @@ Reconciler interplay (level-triggered backstop):
 - **Restore affinity sync (ENG-333).** Each reconcile tick fans out `GET /retentions` to every backend and syncs the `lease → backend` map into the placement store, so retained leases stay routable to their source node across restarts.
 - **Placement prune grace + deprovision fail-safe (ENG-335).** The reconciler will not prune a placement set younger than a grace window (`2 × reconcile_interval`, measured from sweep start), so a lease that provisioned during a slow sweep is not mis-pruned. When a lease exhausts its re-provision attempts and is closed, the reconciler eagerly calls `backend.Deprovision` on its backend instead of waiting for the next orphan-cleanup cycle (logged at WARN, non-fatal).
 
+### Retention partitioning (aggregator sub-tenancy)
+
+Retention records carry an optional cooperative `partition` — a sub-tenant grouping key an allowlisted (aggregator) tenant declares for its own end-customers via the operator-configured `retention_partition_source`. Partitions only sub-divide the tenant's own budget: the per-tenant aggregate caps always run over the whole record set (a tenant declaring N partitions has the same total budget as N=1), the `""` default bucket is never sub-capped (so any collapsed/legacy/undeclared record behaves exactly as before partitioning existed), count caps evict oldest-first (a per-partition sub-cap within that partition, the per-tenant aggregate across all the tenant's records), disk caps refuse the incoming close only, and every uncertainty collapses toward "keep". The partition is advisory grouping metadata — never a security boundary (isolation stays keyed on the on-chain tenant) and never load-bearing for restore/reap correctness.
+
 ## Concurrency Model
 
 ### Goroutine Management
@@ -686,6 +690,12 @@ All docker-backend metrics live under `fred_docker_backend_*`.
 | `fred_docker_backend_retained_leases` | gauge | — | Number of active retained (soft-deleted) leases |
 | `fred_docker_backend_retention_refused_total` | counter | — | Close-time refuse-to-retain events due to the max_retained_disk_mb cap |
 | `fred_docker_backend_retention_evicted_total` | counter | — | Close-time per-tenant cap evictions (max_retained_leases_per_tenant); a tenant's oldest retained lease evicted from the active set (marked reaping) to make room |
+| `fred_docker_backend_retention_partition_collapsed_total` | counter | `reason` | Aggregator partition declarations collapsed to the default (whole-tenant) bucket at close, by reason (counted per close attempt — retries re-count). `reason` ∈ `no_input`, `divergent`, `invalid`, `over_limit`, `store_error`. A collapse never blocks a close and never destroys data — the record simply files in the tenant's default bucket |
+| `fred_docker_backend_retention_partition_stamped_total` | counter | — | Close attempts that resolved a non-empty retention partition; the adoption/typo detector — a source configured and a tenant allowlisted but this flat at 0 means the configured key never matches what the integrator emits |
+| `fred_docker_backend_retention_partition_evicted_total` | counter | — | Close-time per-partition (L2) sub-cap evictions — an aggregator's own noisy-customer containment, NOT a provider capacity signal. `..._retention_evicted_total` keeps its per-tenant (L1) meaning; the two are never conflated |
+| `fred_docker_backend_retention_partitions` | gauge | — | Distinct non-empty (tenant, partition) buckets across active+restoring retained records. May legitimately exceed the sum of budgeted `max_partitions` while an over-limit shrink drains (partition values age out with their records) |
+| `fred_docker_backend_retention_refused_by_scope_total` | counter | `scope` | Close-time refuse-to-retain events by the tripped cap scope. `scope` ∈ `global` (L0 `max_retained_disk_mb`), `tenant` (L1 per-tenant aggregate disk), `partition` (L2 per-partition disk sub-cap). The bare `..._retention_refused_total` keeps its deployed L0-global-only meaning, so this is the scoped superset |
+| `fred_docker_backend_retention_cap_check_failed_total` | counter | `check` | Retention cap checks that failed OPEN on a store read error (fail-open is data-safe — never destroy on uncertainty — but a sustained rate means the quota gates are silently off). `check` ∈ `evict`, `breach`, `bound`, `refuse_get` |
 | `fred_docker_backend_disk_pool_bytes` | gauge | — | Total disk admission pool (total_disk_mb) in bytes |
 | `fred_docker_backend_retained_disk_cap_bytes` | gauge | — | Per-provider retained-volume cap (max_retained_disk_mb) in bytes; 0 when unset |
 | `fred_docker_backend_retention_reaping_bytes` | gauge | — | Reserved disk footprint of reaping (pending-destroy) retained records, in bytes |
