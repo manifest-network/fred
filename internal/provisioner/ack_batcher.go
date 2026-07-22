@@ -78,7 +78,31 @@ type ackLane struct {
 	batchInterval time.Duration
 	batchSize     int
 	requests      chan ackRequest
-	done          chan struct{}
+
+	// doneMu guards done, which is closed when the current batchLoop
+	// incarnation exits and replaced (resetDone) when the supervisor respawns
+	// the lane after a panic (ENG-589). requests is stable across incarnations;
+	// only done is per-incarnation so Acknowledge can detect a stopped lane.
+	doneMu sync.Mutex
+	done   chan struct{}
+}
+
+// currentDone returns the current incarnation's done channel. Callers must
+// snapshot it once (not re-read lane.done) so a concurrent resetDone does not
+// race the read.
+func (l *ackLane) currentDone() chan struct{} {
+	l.doneMu.Lock()
+	defer l.doneMu.Unlock()
+	return l.done
+}
+
+// resetDone installs a fresh done channel for the next incarnation. Called by
+// the supervisor between a crashed batchLoop returning (which closed the old
+// done) and respawning it.
+func (l *ackLane) resetDone() {
+	l.doneMu.Lock()
+	defer l.doneMu.Unlock()
+	l.done = make(chan struct{})
 }
 
 // AckBatcher distributes lease acknowledgment requests across N independent lanes.
@@ -120,7 +144,7 @@ func (b *AckBatcher) Start(ctx context.Context) {
 	ctx, b.cancel = context.WithCancel(ctx)
 
 	for i, lane := range b.lanes {
-		b.wg.Go(func() { lane.batchLoop(ctx, i) })
+		b.wg.Go(func() { b.superviseLane(ctx, lane, i) })
 	}
 
 	slog.Info("ack batcher started",
@@ -128,6 +152,28 @@ func (b *AckBatcher) Start(ctx context.Context) {
 		"batch_interval", b.lanes[0].batchInterval,
 		"batch_size", b.lanes[0].batchSize,
 	)
+}
+
+// superviseLane runs a lane's batchLoop and respawns it if it exits because of
+// a recovered panic (ENG-589). Without this, a single cosmos-SDK marshaling
+// panic on a malformed chain RPC response permanently kills the lane; at the
+// default single-lane config that disables ALL acknowledgment, and the timeout
+// checker then wrongly rejects healthy, successfully-provisioned leases. A clean
+// (context-canceled) exit is not restarted. Restarts are naturally paced by the
+// batch interval — a respawned lane only re-panics once new work arrives (an
+// empty flush makes no RPC), so a persistently-malformed response degrades to a
+// bounded restart-per-batch loop rather than a hot spin, with each affected
+// batch surfaced to its callers for Watermill redelivery.
+func (b *AckBatcher) superviseLane(ctx context.Context, lane *ackLane, laneIdx int) {
+	for {
+		crashed := lane.batchLoop(ctx, laneIdx)
+		if !crashed || ctx.Err() != nil {
+			return
+		}
+		lane.resetDone()
+		metrics.AckBatcherLaneRestartsTotal.WithLabelValues(strconv.Itoa(laneIdx)).Inc()
+		slog.Warn("ack batcher lane restarting after recovered panic", "lane", laneIdx)
+	}
 }
 
 // Stop gracefully shuts down all lanes, flushing pending requests.
@@ -150,6 +196,11 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 
 	for attempt := range n {
 		lane := b.lanes[(startIdx+attempt)%n]
+		// Snapshot the current incarnation's done channel once: the supervisor
+		// may replace lane.done on a respawn (ENG-589), and a select must key on
+		// a stable value. A done that closes mid-request routes us to the next
+		// lane (or a retry by the caller), which the respawned lane then serves.
+		done := lane.currentDone()
 
 		select {
 		case lane.requests <- ackRequest{leaseUUID: leaseUUID, resultCh: resultCh}:
@@ -157,12 +208,12 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 			select {
 			case result := <-resultCh:
 				return result.acknowledged, result.txHash, result.err
-			case <-lane.done:
+			case <-done:
 				return false, "", context.Canceled
 			case <-ctx.Done():
 				return false, "", ctx.Err()
 			}
-		case <-lane.done:
+		case <-done:
 			// Lane stopped, try next
 			continue
 		case <-ctx.Done():
@@ -174,9 +225,16 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 	return false, "", context.Canceled
 }
 
-// batchLoop collects requests and flushes them periodically or when batch is full.
-func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
-	defer close(l.done)
+// batchLoop collects requests and flushes them periodically or when batch is
+// full. It returns crashed=true if it exited because a flush panicked (recovered
+// here); the supervisor (superviseLane) uses that to respawn the lane. A clean
+// context-canceled shutdown returns crashed=false.
+func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
+	// Close this incarnation's own done channel on exit. Snapshot it up front so
+	// a supervisor resetDone (which only runs after this returns) can't race the
+	// close onto the next incarnation's channel.
+	done := l.currentDone()
+	defer close(done)
 
 	var pending []ackRequest
 	timer := time.NewTimer(l.batchInterval)
@@ -187,10 +245,13 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) {
 	// reflection and has historically been a source of panics on
 	// malformed server responses. Recover any panic here so one bad
 	// response does NOT crash fred. We fail all pending requests with
-	// an error (so callers get unblocked) and exit the lane — other
-	// lanes continue serving via Acknowledge's round-robin fallback.
+	// an error (so callers get unblocked) and signal crashed so the
+	// supervisor respawns the lane (ENG-589) — otherwise a single bad
+	// response permanently disables the lane (and, at the default single
+	// lane, all acknowledgment).
 	defer func() {
 		if r := recover(); r != nil {
+			crashed = true
 			slog.Error("ack batcher lane panic — recovering to keep fred alive",
 				"lane", laneIdx,
 				"pending_count", len(pending),

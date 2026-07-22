@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -257,6 +259,71 @@ func TestExecuteLegacyMigration_EnsuresTenantNetwork(t *testing.T) {
 
 	require.Len(t, calls, 1, "EnsureTenantNetwork must be called exactly once during migration")
 	assert.Equal(t, "tenant-a", calls[0])
+}
+
+// TestExecuteLegacyMigration_PrevCleanupSurvivesCallerContextCancel pins
+// ENG-592: the docker-backend runs Start under a 30s context that main cancels
+// the moment Start returns. Migration's background `-prev` grace-removal
+// goroutine must therefore be scoped to the backend lifecycle context
+// (b.stopCtx), NOT the caller's short startup context — otherwise every startup
+// migration permanently leaks its `-prev` containers because the grace goroutine
+// sees ctx.Done() fire at ~0s. This test cancels the caller ctx right after the
+// migration returns and asserts the `-prev` container is still removed once the
+// grace window elapses.
+func TestExecuteLegacyMigration_PrevCleanupSurvivesCallerContextCancel(t *testing.T) {
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
+	// Grace long enough that we cancel the caller ctx well before it fires, so
+	// the test distinguishes "keyed on caller ctx" (leak) from "keyed on
+	// b.stopCtx" (cleaned up).
+	b.cfg.MigrationGracePeriod = 750 * time.Millisecond
+
+	var mu sync.Mutex
+	var removed []string
+	fakeDocker.removeContainer = func(_ context.Context, name string) error {
+		mu.Lock()
+		removed = append(removed, name)
+		mu.Unlock()
+		return nil
+	}
+
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID:   "legacy-cid",
+		Name:          "fred-lease-1-0",
+		LeaseUUID:     "lease-1",
+		Tenant:        "tenant-a",
+		SKU:           "docker-micro",
+		Image:         "nginx:1.25",
+		InstanceIndex: 0,
+	}}
+	fakeDocker.mounts["legacy-cid"] = []ContainerMount{{
+		Source: "/var/lib/fred/volumes/fred-lease-1-0/data",
+		Target: "/data",
+		Type:   "bind",
+	}}
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
+
+	// Recover (and migrate) under a caller context that we cancel immediately
+	// afterwards — exactly what cmd/docker-backend/main.go does to the 30s Start
+	// context once Start returns.
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	require.NoError(t, b.recoverState(callerCtx))
+	cancelCaller()
+
+	// The grace goroutine (spawned during migration) must still remove the
+	// `-prev` container after the grace window, despite the caller ctx being
+	// canceled.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, name := range removed {
+			if strings.HasSuffix(name, "-prev") {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 20*time.Millisecond,
+		"migration -prev cleanup must survive caller-context cancellation (got removals: leaked -prev container)")
 }
 
 // TestFilterManagedMounts_SeparatorBoundary verifies that the prefix

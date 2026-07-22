@@ -742,6 +742,55 @@ func TestAckBatcher_MultiLane_SingleLaneFallback(t *testing.T) {
 	wg.Wait()
 }
 
+// TestAckBatcher_LanePanicRecovers_SubsequentAcksSucceed pins ENG-589: a lane
+// whose flush panics (e.g. a cosmos-SDK marshaling panic on a malformed chain
+// RPC response) must NOT be permanently disabled. At the default single-lane
+// config a dead lane means EVERY subsequent Acknowledge returns context.Canceled
+// — the lease is never acked and the timeout checker then wrongly rejects a
+// healthy, provisioned lease. The batcher must respawn the lane so acking
+// resumes once the transient panic condition clears.
+func TestAckBatcher_LanePanicRecovers_SubsequentAcksSucceed(t *testing.T) {
+	var pendingCalls atomic.Int32
+	client := &mockAckChainClient{
+		getPendingLeasesFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
+			// First flush panics (malformed-response simulation); every flush
+			// afterwards succeeds and reports both leases as pending.
+			if pendingCalls.Add(1) == 1 {
+				panic("simulated cosmos marshaling panic on malformed RPC response")
+			}
+			return []billingtypes.Lease{
+				{Uuid: "lease-a", State: billingtypes.LEASE_STATE_PENDING},
+				{Uuid: "lease-b", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+
+	// Single lane (default) — the worst case the ticket describes.
+	batcher := NewAckBatcher(client, AckBatcherConfig{
+		ProviderUUID:  testProviderUUID,
+		BatchInterval: 50 * time.Millisecond,
+		BatchSize:     10,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	batcher.Start(ctx)
+	defer batcher.Stop()
+
+	// First ack triggers the flush that panics; the caller is unblocked with an
+	// error (the panic is recovered, not propagated).
+	_, _, err := batcher.Acknowledge(ctx, "lease-a")
+	assert.Error(t, err, "first ack should surface the recovered lane panic as an error")
+
+	// The lane must respawn: a later ack (no panic now) must SUCCEED rather than
+	// return context.Canceled from a permanently-dead single lane.
+	assert.Eventually(t, func() bool {
+		acked, _, err := batcher.Acknowledge(ctx, "lease-b")
+		return err == nil && acked
+	}, 3*time.Second, 20*time.Millisecond,
+		"single lane must recover after a panic and resume acking (got a permanently-dead lane)")
+}
+
 func TestNewAckBatcher_LaneCountNormalization(t *testing.T) {
 	client := &mockAckChainClient{}
 

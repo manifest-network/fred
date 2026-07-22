@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- New metric `fred_provisioner_ack_batcher_lane_restarts_total{lane}` counts
+  ack-batcher lanes respawned after a recovered panic (see Fixed). Pair with
+  `fred_goroutine_panics_total{component="ack_batcher"}` to detect a
+  crash-looping lane.
+
 ### Changed
 
 ### Deprecated
@@ -16,7 +21,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Ack-batcher lanes now respawn after a recovered panic instead of exiting
+  permanently. Previously a single cosmos-SDK marshaling panic on a malformed
+  chain RPC response killed the lane for good; at the default single-lane
+  configuration that disabled **all** acknowledgment, and the timeout checker
+  then wrongly rejected healthy, successfully-provisioned leases. Lanes are
+  supervised and restarted; restarts are naturally paced by the batch interval.
+  (ENG-589)
+- The docker-backend now runs crash recovery and legacy migration under the
+  backend lifecycle context instead of the caller's 30s startup context. The
+  startup context was canceled the instant `Start` returned, which (1) capped
+  the migration health-wait below 30s so a legacy workload that legitimately
+  took 30–90s to become healthy failed startup, and (2) fired the `-prev`
+  grace-cleanup goroutines' cancellation at ~0s, permanently leaking every
+  migration's `-prev` containers. Fast connectivity/capability checks still run
+  under the short startup context so an unreachable daemon fails fast. (ENG-592)
+
 ### Security
+
+- `GET /logs` and diagnostics log capture now bound the **aggregate** bytes
+  buffered across all of a lease's containers (32 MiB per call), not just the
+  existing 5 MiB per-container cap. A lease may have up to 1024 containers, so
+  without an aggregate budget one authenticated `/logs` request could
+  materialize gigabytes and OOM the shared docker-backend host — cross-tenant
+  denial of service. Output beyond the budget is truncated with a marker.
+  (ENG-590)
 
 ## [0.11.0] - 2026-07-22
 

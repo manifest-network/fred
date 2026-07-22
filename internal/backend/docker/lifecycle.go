@@ -1296,6 +1296,34 @@ func (d *DockerClient) ContainerLogs(ctx context.Context, containerID string, ta
 // path (captureContainerLogs), both of which call ContainerLogs.
 const maxContainerLogBytes = 5 << 20 // 5 MiB
 
+// maxTotalLogBytes bounds the AGGREGATE bytes a single GetLogs / captureContainerLogs
+// call buffers across ALL of a lease's containers. maxContainerLogBytes caps each
+// container individually, but a lease may have up to maxLeaseQuantity (1024)
+// containers, so without an aggregate cap one authenticated GET /logs could
+// materialize gigabytes and OOM the shared docker backend host — cross-tenant
+// denial of service (ENG-590). It is the same host-exhaustion concern as
+// maxContainerLogBytes, one level up (per-lease rather than per-container).
+const maxTotalLogBytes = 32 << 20 // 32 MiB
+
+// aggregateLogLimitMessage marks output cut short because a GetLogs /
+// captureContainerLogs call reached its per-call aggregate budget
+// (maxTotalLogBytes). Used both as an appended truncation marker and as the
+// standalone placeholder for containers skipped once the budget is spent.
+const aggregateLogLimitMessage = "[log truncated: aggregate log size limit reached]"
+
+// trimLogToBudget trims a single container's (already per-container-capped) log
+// output to the aggregate byte budget remaining for a GetLogs /
+// captureContainerLogs call, returning the possibly-truncated output and the
+// bytes it consumes. The precondition is remaining > 0: callers must skip the
+// container-log read entirely once the budget is exhausted, so the potentially
+// large read never happens for containers beyond the cap.
+func trimLogToBudget(logs string, remaining int) (out string, consumed int) {
+	if len(logs) <= remaining {
+		return logs, len(logs)
+	}
+	return logs[:remaining] + "\n" + aggregateLogLimitMessage, remaining
+}
+
 // errLogCapReached signals that cappingLogWriter has accepted its full byte
 // budget, so stdcopy.StdCopy can stop draining the remaining stream.
 var errLogCapReached = errors.New("container log size cap reached")

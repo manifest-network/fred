@@ -80,6 +80,10 @@ type fakeDocker struct {
 	// the call can override this with a closure.
 	ensureTenantNetwork func(ctx context.Context, tenant string) (string, error)
 
+	// RemoveContainer hook. Default (nil) is silent success. Tests that need
+	// to *capture* removals (e.g. the -prev grace-cleanup test) override this.
+	removeContainer func(ctx context.Context, name string) error
+
 	// Compose side.
 	composeUpErr           error  // returned by composeExecutor.Up if non-nil
 	lastComposeProjectName string // captured project.Name from the most recent Up call
@@ -217,7 +221,10 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 		StopContainerFn: func(_ context.Context, _ string, _ time.Duration) error {
 			return nil
 		},
-		RemoveContainerFn: func(_ context.Context, _ string) error {
+		RemoveContainerFn: func(ctx context.Context, name string) error {
+			if state.removeContainer != nil {
+				return state.removeContainer(ctx, name)
+			}
 			return nil
 		},
 		EnsureTenantNetworkFn: func(ctx context.Context, tenant string) (string, error) {
