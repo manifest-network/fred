@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.11.0] - 2026-07-22
+
+### Added
+
 - Retention records gained an optional `partition` field (a cooperative
   sub-tenant grouping key within one on-chain tenant) plus the pure
   extraction/validation library for it. Nothing writes a non-empty partition
@@ -110,6 +124,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `TryAllocate` over-admit past physical disk. Container-derived rebuild is
   retained only to seed the pool on cold start and re-establish a lost key from
   running containers. (ENG-567)
+- docker: gate the disk **promote delta** when restoring a lease onto a
+  larger-disk SKU tier. `Restore` adopts retained volumes via a pool allocation
+  that intentionally skips the global disk-capacity check (the adopted bytes are
+  already committed on disk and counted in the retained projection). On a
+  *promote* (new SKU `disk_mb` greater than the retained tier's), the extra
+  headroom was never checked against free capacity, so a tenant could soft-close
+  a small-tier lease and restore it onto a much larger tier — repeatedly — to
+  drive committed XFS quota past physical disk and cause cross-tenant `ENOSPC`.
+  The adopt path now gates only the growth above the retained footprint
+  (`max(0, new − old)` disk); same-tier and demote restores still skip the gate
+  as before. (ENG-545)
+- docker: XFS tenant volumes now carry a per-volume inode hard limit (`ihard`)
+  alongside the block limit, bounding host inode exhaustion from zero-byte-file
+  floods. The ceiling is `disk_mb × 1 MiB / min_avg_file_bytes` (new
+  `min_avg_file_bytes` knob, default 1024 → 1024 inodes/MiB, floored at 262144
+  inodes); a workload whose average file is smaller than `min_avg_file_bytes`
+  may now hit `EDQUOT` on inodes. A filesystem-agnostic tar entry-count cap
+  backstops crafted-image extraction. (ENG-548)
+- deps: bump `golang.org/x/text` to v0.40.0 (from v0.37.0) to resolve
+  GO-2026-5970, an infinite-loop-on-invalid-input DoS in `x/text` normalization
+  (fixed upstream in v0.39.0). The advisory was published after the v0.10.0 cut
+  and flagged the `x/text` version already in the tree, so the CI vuln gate is
+  the only thing that changed; this bump keeps it green. Also pulls
+  `golang.org/x/sync` to v0.22.0, required by `x/text` v0.40.0.
 
 ## [0.10.0] - 2026-07-16
 
@@ -131,17 +169,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
-- docker: gate the disk **promote delta** when restoring a lease onto a
-  larger-disk SKU tier. `Restore` adopts retained volumes via a pool allocation
-  that intentionally skips the global disk-capacity check (the adopted bytes are
-  already committed on disk and counted in the retained projection). On a
-  *promote* (new SKU `disk_mb` greater than the retained tier's), the extra
-  headroom was never checked against free capacity, so a tenant could soft-close
-  a small-tier lease and restore it onto a much larger tier — repeatedly — to
-  drive committed XFS quota past physical disk and cause cross-tenant `ENOSPC`.
-  The adopt path now gates only the growth above the retained footprint
-  (`max(0, new − old)` disk); same-tier and demote restores still skip the gate
-  as before. (ENG-545)
 - docker: harden stateful-volume bind setup against a symlink escape. A tenant
   could plant a symlink inside its read-write stateful volume (e.g. `data -> /`)
   and, on a later deploy declaring a matching `VOLUME`, have
@@ -163,13 +190,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (an escaping symlink planted by an earlier path can no longer redirect it), and
   `setupWritablePathBinds` skips any bind whose Source is a symlink or escapes the
   `_wp` root. (ENG-543)
-- docker: XFS tenant volumes now carry a per-volume inode hard limit (`ihard`)
-  alongside the block limit, bounding host inode exhaustion from zero-byte-file
-  floods. The ceiling is `disk_mb × 1 MiB / min_avg_file_bytes` (new
-  `min_avg_file_bytes` knob, default 1024 → 1024 inodes/MiB, floored at 262144
-  inodes); a workload whose average file is smaller than `min_avg_file_bytes`
-  may now hit `EDQUOT` on inodes. A filesystem-agnostic tar entry-count cap
-  backstops crafted-image extraction. (ENG-548)
 
 ## [0.9.0] - 2026-07-14
 
