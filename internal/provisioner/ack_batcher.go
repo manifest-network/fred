@@ -57,6 +57,25 @@ type AckBatcherConfig struct {
 	LaneCount int
 }
 
+// errAckLaneUnavailable is returned by Acknowledge when the selected lane has
+// stopped for an internal restart (its done channel closed) while the caller's
+// context is still alive. It is deliberately distinct from context.Canceled so
+// a transient, RETRYABLE lane restart is never misread as a terminal caller
+// cancellation — the ENG-589 failure mode where a stopped lane's context.Canceled
+// got the message poison-dropped instead of redelivered.
+var errAckLaneUnavailable = errors.New("ack lane unavailable (restarting)")
+
+// laneUnavailableErr distinguishes a lane that stopped for an internal restart
+// (retryable — the supervisor respawns it) from genuine caller/context
+// cancellation (which must still surface as the context error so shutdown
+// semantics are preserved).
+func laneUnavailableErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errAckLaneUnavailable
+}
+
 // ackRequest represents a pending acknowledgment request.
 type ackRequest struct {
 	leaseUUID string
@@ -209,7 +228,9 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 			case result := <-resultCh:
 				return result.acknowledged, result.txHash, result.err
 			case <-done:
-				return false, "", context.Canceled
+				// Lane stopped after we handed off (e.g. mid-restart). Retryable
+				// unless the caller's context is actually canceled.
+				return false, "", laneUnavailableErr(ctx)
 			case <-ctx.Done():
 				return false, "", ctx.Err()
 			}
@@ -221,8 +242,10 @@ func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, s
 		}
 	}
 
-	// All lanes stopped
-	return false, "", context.Canceled
+	// Every lane was stopped (all restarting). Retryable unless the caller's
+	// context is canceled — never a bare context.Canceled, which would risk the
+	// message being treated as terminal and dropped (ENG-589).
+	return false, "", laneUnavailableErr(ctx)
 }
 
 // batchLoop collects requests and flushes them periodically or when batch is

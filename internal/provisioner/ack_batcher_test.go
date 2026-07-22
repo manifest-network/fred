@@ -791,6 +791,41 @@ func TestAckBatcher_LanePanicRecovers_SubsequentAcksSucceed(t *testing.T) {
 		"single lane must recover after a panic and resume acking (got a permanently-dead lane)")
 }
 
+// TestAckBatcher_LaneUnavailableReturnsRetryableError pins ENG-589 hardening:
+// when a lane has stopped for an internal restart (its done channel is closed)
+// but the CALLER's context is still alive, Acknowledge must return a distinct,
+// retryable error — NOT context.Canceled. Returning context.Canceled would
+// misrepresent a transient, retryable restart as a terminal caller cancellation,
+// which downstream code (or Watermill retry-skipping) could treat as
+// non-retryable and drop the message.
+func TestAckBatcher_LaneUnavailableReturnsRetryableError(t *testing.T) {
+	batcher := NewAckBatcher(&mockAckChainClient{}, AckBatcherConfig{ProviderUUID: testProviderUUID})
+	// Simulate all lanes stopped (done closed) WITHOUT starting the batcher and
+	// WITHOUT cancelling the caller context — i.e. a restart, not a shutdown.
+	for _, lane := range batcher.lanes {
+		close(lane.done)
+	}
+
+	_, _, err := batcher.Acknowledge(context.Background(), "lease-x")
+	assert.ErrorIs(t, err, errAckLaneUnavailable, "lane restart must surface a distinct retryable error")
+	assert.NotErrorIs(t, err, context.Canceled, "lane restart must NOT be reported as caller cancellation")
+}
+
+// TestAckBatcher_GenuineCancellationStillReportsContextError ensures the
+// distinct-error change does not mask real caller/shutdown cancellation:
+// when the context IS canceled, Acknowledge still returns context.Canceled.
+func TestAckBatcher_GenuineCancellationStillReportsContextError(t *testing.T) {
+	batcher := NewAckBatcher(&mockAckChainClient{}, AckBatcherConfig{ProviderUUID: testProviderUUID})
+	for _, lane := range batcher.lanes {
+		close(lane.done)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := batcher.Acknowledge(ctx, "lease-x")
+	assert.ErrorIs(t, err, context.Canceled, "genuine cancellation must still surface as context.Canceled")
+}
+
 func TestNewAckBatcher_LaneCountNormalization(t *testing.T) {
 	client := &mockAckChainClient{}
 
