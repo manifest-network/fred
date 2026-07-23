@@ -386,7 +386,7 @@ var (
 	// increments are transient stale reads absorbed by the grace window, whereas a
 	// sustained or rising aggregate rate points at chronic chain-node lag or a
 	// mistuned grace period. Correlate with fred_chain_transactions_total{type=
-	// "close_lease"} to see how many deferrals ultimately still closed.
+	// "close"} to see how many deferrals ultimately still closed.
 	CreditCheckZeroDeferredTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "withdraw",

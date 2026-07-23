@@ -650,6 +650,10 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 			// an early re-check the next sample could be a full creditCheckInterval away
 			// (up to withdraw_interval when coupled), leaving the empty balance
 			// unconfirmed and delaying a genuine closure well past the grace deadline.
+			// checkCreditsAndClose subtracts depletionCheckBuffer when turning this into
+			// the next check time (same as the error path), so the effective re-check
+			// lands ~depletionCheckBuffer sooner than retryInterval — immaterial against
+			// the minutes-scale grace window.
 			earlyRetry := now.Add(s.creditCheckRetryInterval)
 			if earliestDepletion.IsZero() || earlyRetry.Before(earliestDepletion) {
 				earliestDepletion = earlyRetry
