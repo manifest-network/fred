@@ -737,6 +737,47 @@ func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 	assert.Equal(t, "orphan-lease", mockBackend.deprovisionCalls[0])
 }
 
+func TestReconciler_ReconcileAll_SkipsInFlightOrphan(t *testing.T) {
+	// ENG-594: a lease created on-chain after the sweep's pending/active snapshot
+	// but event-provisioned before the provisions fetch shows up in provisions yet
+	// not in chainLeases, so it looks like an orphan. While the main provision flow
+	// still owns it (tracker.IsInFlight == true) the reconciler must NOT deprovision
+	// it — that would tear down a healthy lease mid-provision. A genuinely orphaned
+	// (not in-flight) provision in the same sweep must still be deprovisioned.
+	mockChain := &chaintest.MockClient{
+		// No leases on chain — both provisions are orphan candidates.
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "inflight-orphan", Status: backend.ProvisionStatusReady, BackendName: "test"},
+			{LeaseUUID: "real-orphan", Status: backend.ProvisionStatusReady, BackendName: "test"},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	mockTracker := newMockInFlightTracker(nil)
+	mockTracker.TrackInFlight("inflight-orphan", "tenant-1", nil, "test")
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, mockTracker, nil)
+	require.NoError(t, err)
+
+	before := promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal)
+	assert.NoError(t, reconciler.ReconcileAll(t.Context()))
+	after := promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal)
+
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Equal(t, []string{"real-orphan"}, mockBackend.deprovisionCalls,
+		"in-flight lease must be skipped; only the genuine orphan is deprovisioned")
+	assert.Equal(t, 1.0, after-before, "orphan in-flight skip must increment ReconcilerInflightSkipsTotal")
+}
+
 func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 	// Test that chain errors are handled gracefully
 	mockBackend := &mockReconcilerBackend{name: "test"}
