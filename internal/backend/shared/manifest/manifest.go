@@ -512,9 +512,18 @@ var reservedLabelPrefixes = []string{
 // It is the single implementation of the reserved-prefix scan: validate() uses
 // the returned prefix to format its error, and IsReservedLabelKey wraps it as
 // a bool, so the two callers cannot drift.
+//
+// The match is case-INSENSITIVE (ENG-595): Traefik's Docker provider treats
+// container label keys case-insensitively ("Labels are case-insensitive"), so a
+// tenant label keyed `Traefik.http.routers.evil.rule` registers a working router
+// in the shared routing table exactly like the lowercase form — reopening the
+// ENG-497 cross-tenant ingress hijack a case-sensitive check would miss. Lower-case
+// the key before comparing (the reservedLabelPrefixes constants are already
+// lowercase), mirroring validateEnvVars' ToUpper normalization.
 func reservedLabelPrefix(key string) (string, bool) {
+	lower := strings.ToLower(key)
 	for _, prefix := range reservedLabelPrefixes {
-		if strings.HasPrefix(key, prefix) {
+		if strings.HasPrefix(lower, prefix) {
 			return prefix, true
 		}
 	}
