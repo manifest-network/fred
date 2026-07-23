@@ -48,6 +48,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Kubernetes' `tolerationSeconds`) before closure fires: the first empty read
   starts the window and schedules an early re-check, and any non-zero read
   clears it (hysteresis). (ENG-591)
+- Reconciliation no longer tears down a lease that is still being provisioned as
+  if it were an orphan. `ReconcileAll` snapshots chain leases before fetching
+  backend provisions, so a lease created on-chain after that snapshot but
+  event-provisioned before the provisions fetch appears in provisions yet not in
+  the chain snapshot — and `processOrphan` deprovisioned it mid-provision. It now
+  skips any lease the in-flight tracker still owns (incrementing
+  `fred_reconciler_inflight_skips_total`), matching the guard the ack-skip branch
+  and the placement pruner already applied to this same race. The window was
+  narrow and self-healed next sweep. (ENG-594)
 - Ack-batcher lanes now respawn after a recovered panic instead of exiting
   permanently. Previously a single cosmos-SDK marshaling panic on a malformed
   chain RPC response killed the lane for good; at the default single-lane

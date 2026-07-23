@@ -1078,6 +1078,23 @@ func (r *Reconciler) processOrphan(
 		return
 	}
 
+	// In-flight guard (ENG-594): ReconcileAll snapshots chain leases BEFORE
+	// fetching backend provisions. A lease created on-chain after that snapshot
+	// but event-provisioned before the provisions fetch appears in provisions yet
+	// not in chainLeases, so it looks like an orphan. Skip it while the main
+	// provision flow still owns it — deprovisioning here would tear down a healthy
+	// lease mid-provision. Mirrors the ack-skip branch and cleanupOrphanedPlacements,
+	// which guard this same race; self-heals next sweep once the chain snapshot
+	// includes the lease. TimeoutChecker is the safety net for a genuinely stuck
+	// in-flight entry.
+	if r.tracker != nil && r.tracker.IsInFlight(leaseUUID) {
+		metrics.ReconcilerInflightSkipsTotal.Inc()
+		slog.Debug("reconcile: skipping in-flight lease in orphan path, main flow owns it",
+			"lease_uuid", leaseUUID,
+		)
+		return
+	}
+
 	// Look up the backend that originally provisioned this resource.
 	// We must use the same backend for deprovisioning - falling back to a
 	// different backend would fail since it doesn't have the resource.
