@@ -904,6 +904,84 @@ func TestNormalizeAndWrap_OneServiceStackNamedApp_AgainstLegacyItem(t *testing.T
 	require.True(t, ok, "legacy item's auto-tagged ServiceName must locate the stack's only service")
 }
 
+func TestValidateNoFixedHostPorts(t *testing.T) {
+	t.Run("dynamic ports (HostPort 0) are allowed", func(t *testing.T) {
+		stack := &StackManifest{
+			Services: map[string]*Manifest{
+				"web": {Image: "nginx", Ports: map[string]PortConfig{"80/tcp": {HostPort: 0}}},
+			},
+		}
+		assert.NoError(t, ValidateNoFixedHostPorts(stack))
+	})
+
+	t.Run("no ports at all is allowed", func(t *testing.T) {
+		stack := &StackManifest{
+			Services: map[string]*Manifest{"web": {Image: "nginx"}},
+		}
+		assert.NoError(t, ValidateNoFixedHostPorts(stack))
+	})
+
+	t.Run("fixed well-known host port is rejected", func(t *testing.T) {
+		stack := &StackManifest{
+			Services: map[string]*Manifest{
+				"web": {Image: "nginx", Ports: map[string]PortConfig{"443/tcp": {HostPort: 443}}},
+			},
+		}
+		err := ValidateNoFixedHostPorts(stack)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "host_port")
+		assert.Contains(t, err.Error(), "web")
+		assert.Contains(t, err.Error(), "443/tcp")
+	})
+
+	t.Run("fixed high host port is rejected", func(t *testing.T) {
+		stack := &StackManifest{
+			Services: map[string]*Manifest{
+				"web": {Image: "nginx", Ports: map[string]PortConfig{"8080/tcp": {HostPort: 8080}}},
+			},
+		}
+		err := ValidateNoFixedHostPorts(stack)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "host_port")
+	})
+
+	t.Run("fixed port in one of many services is rejected", func(t *testing.T) {
+		stack := &StackManifest{
+			Services: map[string]*Manifest{
+				"web": {Image: "nginx", Ports: map[string]PortConfig{"80/tcp": {HostPort: 0}}},
+				"db":  {Image: "postgres", Ports: map[string]PortConfig{"5432/tcp": {HostPort: 5432}}},
+			},
+		}
+		err := ValidateNoFixedHostPorts(stack)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "db")
+	})
+
+	t.Run("reported offender is deterministic across services and ports", func(t *testing.T) {
+		// Multiple services and multiple ports within a service each pin a
+		// fixed port. The implementation sorts service names then port specs
+		// and returns the FIRST offender, so the reported one must be service
+		// "alpha" (< "beta") port "443/tcp" (< "9000/tcp") — never "beta" or
+		// "9000/tcp". This locks the determinism the sorted iteration provides;
+		// a regression to raw map iteration would make this flaky.
+		stack := &StackManifest{
+			Services: map[string]*Manifest{
+				"beta": {Image: "nginx", Ports: map[string]PortConfig{"80/tcp": {HostPort: 8080}}},
+				"alpha": {Image: "nginx", Ports: map[string]PortConfig{
+					"9000/tcp": {HostPort: 9000},
+					"443/tcp":  {HostPort: 443},
+				}},
+			},
+		}
+		err := ValidateNoFixedHostPorts(stack)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"alpha"`)
+		assert.Contains(t, err.Error(), "443/tcp")
+		assert.NotContains(t, err.Error(), "beta")
+		assert.NotContains(t, err.Error(), "9000/tcp")
+	})
+}
+
 func mapKeys[K comparable, V any](m map[K]V) []K {
 	out := make([]K, 0, len(m))
 	for k := range m {

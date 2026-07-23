@@ -595,6 +595,12 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, valErr)
 	}
+	// Reject tenant-pinned fixed host ports on update too (ENG-605); mirrors
+	// provision.go so a tenant cannot introduce a squatted port via update.
+	if hpErr := manifest.ValidateNoFixedHostPorts(stackManifest); hpErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, hpErr)
+	}
 	// Validate all images.
 	for svcName, svc := range stackManifest.Services {
 		if imgErr := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); imgErr != nil {

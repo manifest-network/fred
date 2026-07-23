@@ -200,6 +200,13 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		b.removeProvision(req.LeaseUUID)
 		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
 	}
+	// Reject tenant-pinned fixed host ports (ENG-605): forcing dynamic
+	// assignment removes host-port squatting and cross-lease collision DoS.
+	// Admission-only — never runs on recover, so stored manifests stay valid.
+	if err := manifest.ValidateNoFixedHostPorts(stackManifest); err != nil {
+		b.removeProvision(req.LeaseUUID)
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
+	}
 	for svcName, svc := range stackManifest.Services {
 		if err := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); err != nil {
 			b.removeProvision(req.LeaseUUID)

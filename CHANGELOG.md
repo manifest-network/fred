@@ -93,6 +93,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   container labels via the docker-socket-proxy). The reserved prefixes are now
   matched case-insensitively (a fold-compare of the key's prefix head), so
   mixed-case variants like `Traefik.` are rejected too. (ENG-595)
+- manifest: reject a tenant-specified fixed host port (`host_port > 0`) at
+  provision and update time; the host port is now always assigned dynamically.
+  Previously `host_port` was only bounds-checked to `[0, 65535]` — with no
+  reservation, privileged-port floor, or allowlist — and honored verbatim,
+  binding on `0.0.0.0` in prod. In the permissionless tenant model that let an
+  adversarial paying tenant squat any fixed port (including well-known / <1024)
+  on the shared host: a second lease requesting the same port fails compose-up
+  (`address already in use`), so a tenant could block co-located leases or
+  collide with host services — an intra-host, perimeter-independent provisioning
+  DoS. Tenants reach services through Traefik ingress (or discover the assigned
+  port via `GET /v1/leases/{lease_uuid}/connection`), so forcing dynamic
+  assignment removes the vector with no legitimate loss. The gate
+  (`ValidateNoFixedHostPorts`) is admission-only — it never runs on
+  recover/deprovision, so already-stored manifests stay parseable and their
+  retained data restorable. This mirrors the Kubernetes Baseline Pod Security
+  Standard, which forbids `hostPort` for tenant workloads. (ENG-605)
 - `GET /logs` and diagnostics log capture now bound the **aggregate** bytes
   buffered across all of a lease's containers (32 MiB per call), not just the
   existing 5 MiB per-container cap. A lease may have up to 1024 containers, so

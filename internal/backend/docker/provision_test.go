@@ -469,6 +469,20 @@ func TestProvision_InvalidManifest(t *testing.T) {
 	assert.ErrorIs(t, err, backend.ErrInvalidManifest)
 }
 
+func TestProvision_RejectsFixedHostPort(t *testing.T) {
+	mock := &mockDockerClient{}
+	b := newBackendForProvisionTest(t, mock, nil)
+
+	// Manifest pins a fixed host port — the ENG-605 squatting/collision vector.
+	payload := []byte(`{"image":"nginx:latest","ports":{"8080/tcp":{"host_port":8080}}}`)
+	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, payload)
+	err := b.Provision(context.Background(), req)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, backend.ErrInvalidManifest)
+	assert.Contains(t, err.Error(), "host_port")
+}
+
 func TestProvision_DisallowedImage(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)

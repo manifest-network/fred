@@ -23,7 +23,7 @@ A flat JSON object with `image` as the only required field. Used when a lease ha
 {
   "image": "nginx:1.25",
   "ports": {
-    "80/tcp": { "host_port": 8080 }
+    "80/tcp": {}
   },
   "env": {
     "NGINX_WORKERS": "4"
@@ -48,7 +48,7 @@ A JSON object with a top-level `services` key containing a map of service names 
     "web": {
       "image": "nginx:1.25",
       "ports": {
-        "80/tcp": { "host_port": 8080 }
+        "80/tcp": {}
       },
       "depends_on": {
         "api": { "condition": "service_healthy" }
@@ -125,7 +125,7 @@ A JSON object with a top-level `services` key containing a map of service names 
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `host_port` | integer | No | `0` | Fixed host port (0 = auto-assign). Range: 0–65535. |
+| `host_port` | integer | No | `0` | Must be `0` or omitted. The host port is always auto-assigned; pinning a fixed `host_port > 0` is rejected at provision/update. |
 | `ingress` | boolean | No | `false` | Mark this port as the preferred ingress route. TCP only; at most one port per manifest may set this. Overrides the default `80 > 8080 > lowest TCP` preference. |
 
 ### HealthCheckConfig Fields
@@ -175,7 +175,7 @@ Port map keys must be in `"port/protocol"` format:
 
 > **Note:** The Go runtime normalizes protocol case (e.g., `"80/TCP"` is accepted), but the canonical form is lowercase. Always use lowercase `tcp` or `udp` in manifests.
 
-Host port (`host_port`) must be 0–65535. A value of 0 (or omitted) means Docker auto-assigns. Use `GET /v1/leases/{lease_uuid}/connection` after provisioning to discover assigned host ports.
+Host port (`host_port`) must be `0` or omitted — the host port is always auto-assigned. A manifest that pins a fixed `host_port > 0` is rejected at provision and update time (fixed host ports would let a tenant squat well-known ports on the shared host or collide with another lease). Reach the service through ingress, or use `GET /v1/leases/{lease_uuid}/connection` after provisioning to discover the assigned host port.
 
 ### Environment Variables
 
