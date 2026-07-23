@@ -178,11 +178,16 @@ func (b *AckBatcher) Start(ctx context.Context) {
 // panic on a malformed chain RPC response permanently kills the lane; at the
 // default single-lane config that disables ALL acknowledgment, and the timeout
 // checker then wrongly rejects healthy, successfully-provisioned leases. A clean
-// (context-canceled) exit is not restarted. Restarts are naturally paced by the
-// batch interval — a respawned lane only re-panics once new work arrives (an
-// empty flush makes no RPC), so a persistently-malformed response degrades to a
-// bounded restart-per-batch loop rather than a hot spin, with each affected
-// batch surfaced to its callers for Watermill redelivery.
+// (context-canceled) exit is not restarted.
+//
+// A batch flushes on either the interval timer OR when it fills to batchSize, so
+// under sustained load a persistently-malformed response could otherwise
+// re-panic and restart much faster than the interval. To bound that, each
+// restart waits one batch interval (context-aware) before respawning: recovery
+// still happens within ~batchInterval (well inside Watermill's ack-retry
+// window), while a persistent panic degrades to at most one restart per interval
+// rather than a hot spin. Each affected batch is surfaced to its callers for
+// Watermill redelivery.
 func (b *AckBatcher) superviseLane(ctx context.Context, lane *ackLane, laneIdx int) {
 	for {
 		crashed := lane.batchLoop(ctx, laneIdx)
@@ -192,6 +197,13 @@ func (b *AckBatcher) superviseLane(ctx context.Context, lane *ackLane, laneIdx i
 		lane.resetDone()
 		metrics.AckBatcherLaneRestartsTotal.WithLabelValues(strconv.Itoa(laneIdx)).Inc()
 		slog.Warn("ack batcher lane restarting after recovered panic", "lane", laneIdx)
+		// Pace restarts so a persistently-panicking flush cannot hot-loop under
+		// load (a batch can fill before the interval elapses).
+		select {
+		case <-time.After(lane.batchInterval):
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

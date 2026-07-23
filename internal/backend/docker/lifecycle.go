@@ -1332,6 +1332,14 @@ func trimLogToBudget(logs string, remaining int) (out string, consumed int) {
 	for end > 0 && !utf8.RuneStart(logs[end]) {
 		end--
 	}
+	if end == 0 {
+		// The remaining budget is smaller than the first rune, so no content
+		// fits. Consume the whole remaining budget (not 0) so the caller's
+		// running total reaches <=0 and it skips the rest of the containers
+		// instead of fetching them for no gain; emit just the marker (no
+		// content-less leading newline).
+		return aggregateLogLimitMessage, remaining
+	}
 	return logs[:end] + "\n" + aggregateLogLimitMessage, end
 }
 

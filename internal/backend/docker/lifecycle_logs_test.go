@@ -31,6 +31,24 @@ func TestTrimLogToBudget_DoesNotSplitMultibyteRune(t *testing.T) {
 	assert.Equal(t, strings.Repeat("世", 2)+"\n"+aggregateLogLimitMessage, out)
 }
 
+// TestTrimLogToBudget_FirstRuneExceedsBudget pins the follow-up finding on #198:
+// when the remaining budget is smaller than the first rune, the rune-boundary
+// backoff drives end to 0. It must then CONSUME the remaining budget (so callers
+// see remaining reach <=0 and stop fetching further containers) and emit just
+// the marker — not consumed=0 (budget stuck, reads never skipped) with a
+// content-less leading "\n".
+func TestTrimLogToBudget_FirstRuneExceedsBudget(t *testing.T) {
+	logs := strings.Repeat("世", 5) // first rune is 3 bytes
+	// remaining=2 is smaller than the 3-byte first rune: not even one rune fits.
+	out, consumed := trimLogToBudget(logs, 2)
+
+	assert.Equal(t, 2, consumed,
+		"must consume the remaining budget when not even one rune fits (so callers stop fetching)")
+	assert.True(t, utf8.ValidString(out), "output must be valid UTF-8")
+	assert.Equal(t, aggregateLogLimitMessage, out,
+		"no content fit; emit just the marker, not a content-less leading newline")
+}
+
 // multiplexedLog encodes s as a Docker non-TTY stdout frame stream — the same
 // multiplexed format the daemon returns to ContainerLogs.
 func multiplexedLog(t *testing.T, s string) *bytes.Buffer {
