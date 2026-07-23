@@ -428,7 +428,7 @@ func TestWithdrawScheduler_CheckCreditsAndClose_DepletedCredit(t *testing.T) {
 	})
 
 	// ENG-591: a single zero-balance read must NOT close leases — it starts the
-	// grace window (tolerationSeconds analogue) and defers. A brief chain-node lag
+	// grace window (tolerationSeconds equivalent) and defers. A brief chain-node lag
 	// behind a tenant top-up would otherwise wrongfully soft-delete paying data.
 	s.checkCreditsAndClose(context.Background())
 	assert.False(t, closeCalled, "CloseLeases must not fire on a single unconfirmed zero read")

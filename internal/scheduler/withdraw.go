@@ -50,7 +50,7 @@ type tenantState struct {
 	// firstZeroAt is when this tenant's credit was FIRST observed empty in the
 	// current zero-streak (zero value = not currently pending closure). Closure
 	// only fires once the empty balance has persisted for creditCheckZeroGracePeriod
-	// — the credit-check analogue of Kubernetes' tolerationSeconds, so a single
+	// — the credit-check equivalent of Kubernetes' tolerationSeconds, so a single
 	// stale zero read (e.g. fred's chain node briefly lagging a tenant top-up)
 	// cannot destroy a paying tenant's leases. Any non-zero read clears it
 	// (hysteresis: recovery starts a fresh window). (ENG-591)

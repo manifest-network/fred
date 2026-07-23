@@ -44,7 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   chain node briefly lagging a tenant top-up — could wrongfully soft-delete a
   paying tenant's data (the consecutive-error dampening only guarded the RPC
   *error* path, not a successful-but-empty read). An empty balance must now
-  persist for `credit_check_zero_grace_period` (default `5m`, the analogue of
+  persist for `credit_check_zero_grace_period` (default `5m`, the equivalent of
   Kubernetes' `tolerationSeconds`) before closure fires: the first empty read
   starts the window and schedules an early re-check, and any non-zero read
   clears it (hysteresis). (ENG-591)

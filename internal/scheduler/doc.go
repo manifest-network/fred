@@ -31,7 +31,7 @@
 // wrongfully soft-delete a paying tenant's data. Instead the first empty read
 // stamps `firstZeroAt` and defers, scheduling an early re-check; closure fires
 // only once the balance has stayed empty for the whole `credit_check_zero_grace_period`
-// (default 5m — the credit-check analogue of Kubernetes' `tolerationSeconds`).
+// (default 5m — the credit-check equivalent of Kubernetes' `tolerationSeconds`).
 // Any non-zero read clears `firstZeroAt`, so a recovery starts a fresh window
 // (hysteresis). Deferrals are counted by `fred_withdraw_credit_check_zero_deferred_total`.
 //
