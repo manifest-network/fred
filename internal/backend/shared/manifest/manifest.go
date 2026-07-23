@@ -512,9 +512,21 @@ var reservedLabelPrefixes = []string{
 // It is the single implementation of the reserved-prefix scan: validate() uses
 // the returned prefix to format its error, and IsReservedLabelKey wraps it as
 // a bool, so the two callers cannot drift.
+//
+// The match is case-INSENSITIVE (ENG-595): Traefik's Docker provider treats
+// container label keys case-insensitively ("Labels are case-insensitive"), so a
+// tenant label keyed `Traefik.http.routers.evil.rule` registers a working router
+// in the shared routing table exactly like the lowercase form — reopening the
+// ENG-497 cross-tenant ingress hijack a case-sensitive check would miss.
+//
+// Fold-compare only the prefix-length head of the key with EqualFold (the
+// reservedLabelPrefixes constants are already lowercase) rather than lower-casing
+// the whole key: label keys are tenant-controlled and not length-capped here, so
+// this stays O(len(prefix)) and allocation-free instead of O(len(key)) with an
+// allocation on any mixed-case key.
 func reservedLabelPrefix(key string) (string, bool) {
 	for _, prefix := range reservedLabelPrefixes {
-		if strings.HasPrefix(key, prefix) {
+		if len(key) >= len(prefix) && strings.EqualFold(key[:len(prefix)], prefix) {
 			return prefix, true
 		}
 	}

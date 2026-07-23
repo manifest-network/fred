@@ -558,6 +558,47 @@ func TestManifest_Labels_AllowsBenignLabel(t *testing.T) {
 	assert.NoError(t, m.Validate())
 }
 
+// TestManifest_Labels_RejectsMixedCaseReservedPrefix guards ENG-595: Traefik's
+// Docker provider is case-insensitive, so a mixed-case reserved prefix would
+// register a working router / bookkeeping key just like the lowercase form. The
+// case-sensitive check missed these, bypassing the ENG-497 hijack defense.
+func TestManifest_Labels_RejectsMixedCaseReservedPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		want string // reserved prefix named in the error
+	}{
+		{"Traefik.http.routers.pwn.rule", "traefik."},
+		{"TRAEFIK.enable", "traefik."},
+		{"TrAeFiK.http.services.x.loadbalancer.server.port", "traefik."},
+		{"FRED.lease", "fred."},
+		{"Fred.retention", "fred."},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			m := &Manifest{Image: "nginx", Labels: map[string]string{tc.key: "x"}}
+			err := m.Validate()
+			require.Error(t, err, "mixed-case reserved prefix must be rejected")
+			assert.Contains(t, err.Error(), "reserved prefix '"+tc.want+"'")
+		})
+	}
+}
+
+// TestManifest_Labels_AllowsReservedLookalike ensures the case-insensitive check
+// does not over-reject: a key that merely contains — but does not start with — a
+// reserved token (the trailing dot in the prefix is load-bearing) stays allowed.
+func TestManifest_Labels_AllowsReservedLookalike(t *testing.T) {
+	for _, key := range []string{
+		"traefikish.foo",      // no dot boundary
+		"com.example.traefik", // reserved token not at the start
+		"myfred.bookkeeping",  // not a prefix
+		"FREDDIE.mercury",     // lowercases to "freddie." — not "fred."
+	} {
+		t.Run(key, func(t *testing.T) {
+			m := &Manifest{Image: "nginx", Labels: map[string]string{key: "x"}}
+			assert.NoError(t, m.Validate(), "benign lookalike must be allowed")
+		})
+	}
+}
+
 func TestStackManifest_Labels_RejectsTraefikPrefix(t *testing.T) {
 	sm := StackManifest{
 		Services: map[string]*Manifest{
@@ -576,8 +617,12 @@ func TestIsReservedLabelKey(t *testing.T) {
 	for key, want := range map[string]bool{
 		"fred.retention":         true,
 		"traefik.http.routers.x": true,
+		"Traefik.http.routers.x": true, // ENG-595: case-insensitive
+		"TRAEFIK.enable":         true,
+		"FRED.lease":             true,
 		"com.example.customer":   false,
 		"fredx.anything":         false,
+		"traefikish.x":           false,
 		"":                       false,
 	} {
 		require.Equal(t, want, IsReservedLabelKey(key), "key=%q", key)

@@ -84,6 +84,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- The reserved container-label prefix guard (`traefik.`/`fred.`) now matches
+  case-insensitively. Traefik's Docker provider treats label keys
+  case-insensitively, so a tenant label keyed `Traefik.http.routers.evil.rule`
+  slipped past the case-sensitive `strings.HasPrefix` check and registered a
+  working router in the shared routing table — reopening the ENG-497 cross-tenant
+  ingress-hijack the guard exists to prevent (deployed Traefik reads tenant
+  container labels via the docker-socket-proxy). The reserved prefixes are now
+  matched case-insensitively (a fold-compare of the key's prefix head), so
+  mixed-case variants like `Traefik.` are rejected too. (ENG-595)
 - `GET /logs` and diagnostics log capture now bound the **aggregate** bytes
   buffered across all of a lease's containers (32 MiB per call), not just the
   existing 5 MiB per-container cap. A lease may have up to 1024 containers, so
