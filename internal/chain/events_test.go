@@ -712,7 +712,6 @@ func TestEventSubscriber_Start_ReconnectsOnHalfOpenPeer(t *testing.T) {
 
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		connectCount.Add(1)
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -734,6 +733,10 @@ func TestEventSubscriber_Start_ReconnectsOnHalfOpenPeer(t *testing.T) {
 				}
 			}
 		}
+		// Count only connections that reached the silent steady state, so a
+		// reconnect for any unrelated reason cannot satisfy the assertion without
+		// actually exercising the half-open path (Copilot review).
+		connectCount.Add(1)
 		<-hold
 	}))
 	defer srv.Close()
