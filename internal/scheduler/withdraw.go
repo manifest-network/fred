@@ -505,7 +505,7 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 	// Apply results under the scheduler lock. Extracted so the lock is released
 	// via defer even if the body panics — a panic here previously leaked s.mu
 	// and wedged the scheduler (ENG-500).
-	earliestDepletion, leasesToClose := s.applyCreditResults(tenantLeases, results, now)
+	earliestDepletion, leasesToClose, tenantsToClose := s.applyCreditResults(tenantLeases, results, now)
 
 	// Check for context cancellation before making chain call
 	if ctx.Err() != nil {
@@ -516,9 +516,21 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 	if len(leasesToClose) > 0 {
 		closed, txHashes, err := s.client.CloseLeases(ctx, leasesToClose, "credit exhausted")
 		if err != nil {
+			// Leave the tenants' state (incl. firstZeroAt) intact so the next check
+			// re-attempts the close immediately rather than restarting the grace
+			// window (ENG-591 / Copilot review).
 			slog.Error("failed to close depleted leases", "error", err)
 		} else {
 			slog.Info("closed depleted leases", "count", closed, "tx_hashes", txHashes)
+			// Close committed: drop the closed tenants' burn-rate/grace state. (The
+			// next check would also drop them via the no-active-leases sweep once the
+			// chain no longer lists their leases, but delete now to avoid a redundant
+			// re-close attempt in the interim.)
+			s.mu.Lock()
+			for _, tenant := range tenantsToClose {
+				delete(s.tenants, tenant)
+			}
+			s.mu.Unlock()
 		}
 	}
 
@@ -547,10 +559,18 @@ type creditResult struct {
 }
 
 // applyCreditResults folds the fetched per-tenant credit results into burn-rate
-// state, returning the earliest estimated depletion and any leases whose credit
-// is exhausted. The scheduler lock is taken here and released via defer, so a
-// panic in the body cannot leak it and wedge the scheduler (ENG-500).
-func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string, results map[string]creditResult, now time.Time) (earliestDepletion time.Time, leasesToClose []string) {
+// state, returning the earliest estimated depletion, any leases whose credit is
+// exhausted, and the tenants those leases belong to. The scheduler lock is taken
+// here and released via defer, so a panic in the body cannot leak it and wedge the
+// scheduler (ENG-500).
+//
+// The to-close tenants' state is deliberately NOT deleted here: the CloseLeases RPC
+// runs after this returns (and outside the lock), so the caller deletes their state
+// only once the close succeeds. Deleting eagerly would drop firstZeroAt, so a failed
+// close would restart the whole credit_check_zero_grace_period before the next
+// attempt — turning a transient close error into a multi-minute closure delay
+// (ENG-591 / Copilot review).
+func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string, results map[string]creditResult, now time.Time) (earliestDepletion time.Time, leasesToClose []string, tenantsToClose []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -618,7 +638,10 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 					"grace_period", s.creditCheckZeroGracePeriod,
 				)
 				leasesToClose = append(leasesToClose, leaseUUIDs...)
-				delete(s.tenants, tenant)
+				tenantsToClose = append(tenantsToClose, tenant)
+				// State (incl. firstZeroAt) is retained until the caller confirms the
+				// close succeeded, so a failed close retries promptly instead of
+				// restarting the grace window.
 				continue
 			}
 			// Still within the grace window: defer closure and schedule an early

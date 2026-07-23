@@ -467,7 +467,7 @@ func TestWithdrawScheduler_ZeroBalance_GraceDefersThenCloses(t *testing.T) {
 	t0 := time.Now()
 
 	// First zero read: stamps firstZeroAt, defers.
-	_, toClose := s.applyCreditResults(tenantLeases, zero, t0)
+	_, toClose, _ := s.applyCreditResults(tenantLeases, zero, t0)
 	assert.Empty(t, toClose, "first zero read must defer, not close")
 	s.mu.Lock()
 	require.NotNil(t, s.tenants[tenant])
@@ -475,19 +475,23 @@ func TestWithdrawScheduler_ZeroBalance_GraceDefersThenCloses(t *testing.T) {
 	s.mu.Unlock()
 
 	// Second zero read still inside the grace window: still defers, firstZeroAt unchanged.
-	_, toClose = s.applyCreditResults(tenantLeases, zero, t0.Add(4*time.Minute))
+	_, toClose, _ = s.applyCreditResults(tenantLeases, zero, t0.Add(4*time.Minute))
 	assert.Empty(t, toClose, "zero read within grace window must keep deferring")
 	s.mu.Lock()
 	assert.True(t, s.tenants[tenant].firstZeroAt.Equal(t0), "firstZeroAt must not advance while pending")
 	s.mu.Unlock()
 
-	// Zero read at/after the grace boundary: closes both leases and clears state.
-	_, toClose = s.applyCreditResults(tenantLeases, zero, t0.Add(5*time.Minute))
+	// Zero read at/after the grace boundary: returns both leases (and their tenant)
+	// to close. State is deliberately RETAINED here — the caller deletes it only
+	// after CloseLeases succeeds, so a failed close retries without re-gracing.
+	_, toClose, tenantsToClose := s.applyCreditResults(tenantLeases, zero, t0.Add(5*time.Minute))
 	assert.ElementsMatch(t, []string{"lease-1", "lease-2"}, toClose, "sustained zero past grace must close")
+	assert.Equal(t, []string{tenant}, tenantsToClose, "the closing tenant is returned for post-success cleanup")
 	s.mu.Lock()
-	_, stillTracked := s.tenants[tenant]
+	st, stillTracked := s.tenants[tenant]
 	s.mu.Unlock()
-	assert.False(t, stillTracked, "closed tenant state must be cleared")
+	require.True(t, stillTracked, "state is retained until the caller confirms the close (ENG-591)")
+	assert.False(t, st.firstZeroAt.IsZero(), "firstZeroAt is retained so a failed close retries without restarting grace")
 }
 
 // TestWithdrawScheduler_ZeroBalance_RecoveryResetsGrace verifies hysteresis: a
@@ -521,7 +525,7 @@ func TestWithdrawScheduler_ZeroBalance_RecoveryResetsGrace(t *testing.T) {
 
 	// A later zero read starts a FRESH window — must not close even though the
 	// original observation was >grace ago.
-	_, toClose := s.applyCreditResults(tenantLeases, zero, t0.Add(6*time.Minute))
+	_, toClose, _ := s.applyCreditResults(tenantLeases, zero, t0.Add(6*time.Minute))
 	assert.Empty(t, toClose, "post-recovery zero must start a fresh grace window, not inherit the old one")
 }
 
@@ -550,7 +554,7 @@ func TestWithdrawScheduler_ZeroBalance_RecoveryResetsBurnBaseline(t *testing.T) 
 	s.applyCreditResults(tenantLeases, zero, t0.Add(time.Minute))
 	// Recover to a LOWER non-zero balance (Y<X) at t0+2m. A naive burn rate over
 	// (t0 .. t0+2m) would be diluted by the zero gap.
-	earliest, _ := s.applyCreditResults(tenantLeases, low, t0.Add(2*time.Minute))
+	earliest, _, _ := s.applyCreditResults(tenantLeases, low, t0.Add(2*time.Minute))
 
 	// No depletion estimate is scheduled from the recovery cycle (baseline reset).
 	assert.True(t, earliest.IsZero(), "recovery from a zero window must not schedule a diluted depletion estimate")
@@ -691,6 +695,78 @@ func TestWithdrawScheduler_ZeroBalance_Integration_RecoveryPreventsClose(t *test
 
 		assert.Equal(t, int32(0), atomic.LoadInt32(&closeCalls),
 			"a mid-window recovery must reset the grace window so closure never fires")
+	})
+}
+
+// TestWithdrawScheduler_ZeroBalance_Integration_FailedCloseRetriesWithoutRegracing
+// verifies that a transient CloseLeases failure does NOT restart the grace window:
+// the tenant's state (firstZeroAt) is retained until the close succeeds, so the
+// retry happens on the next check rather than a full grace period later. (ENG-591 /
+// Copilot review.)
+func TestWithdrawScheduler_ZeroBalance_Integration_FailedCloseRetriesWithoutRegracing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tenant := generateTestAddress(t, "manifest")
+		var closeAttempts int32
+		var mu sync.Mutex
+		var firstAt, secondAt time.Time
+		var closedOK atomic.Bool
+
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(_ context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.Coins{}, nil
+			},
+			GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
+				if closedOK.Load() {
+					return []billingtypes.Lease{}, nil
+				}
+				return []billingtypes.Lease{{Uuid: "lease-1", Tenant: tenant, ProviderUuid: "test-uuid"}}, nil
+			},
+			GetCreditAccountFunc: func(_ context.Context, _ string) (*billingtypes.CreditAccount, sdktypes.Coins, error) {
+				return &billingtypes.CreditAccount{}, sdktypes.Coins{}, nil
+			},
+			CloseLeasesFunc: func(_ context.Context, leaseUUIDs []string, _ string) (uint64, []string, error) {
+				n := atomic.AddInt32(&closeAttempts, 1)
+				mu.Lock()
+				switch n {
+				case 1:
+					firstAt = time.Now()
+				case 2:
+					secondAt = time.Now()
+				}
+				mu.Unlock()
+				if n == 1 {
+					return 0, nil, errors.New("chain temporarily unavailable") // first attempt fails
+				}
+				closedOK.Store(true)
+				return uint64(len(leaseUUIDs)), []string{"txhash"}, nil
+			},
+		}
+
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    time.Hour,
+			CreditCheckInterval: time.Minute,
+		})
+		require.Equal(t, 5*time.Minute, s.creditCheckZeroGracePeriod)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+
+		time.Sleep(20 * time.Minute)
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+
+		require.GreaterOrEqual(t, atomic.LoadInt32(&closeAttempts), int32(2),
+			"a failed close must be retried")
+		mu.Lock()
+		gap := secondAt.Sub(firstAt)
+		mu.Unlock()
+		// Fixed: retry lands on the next check (~credit_check_interval) because
+		// firstZeroAt is retained and already past grace. Buggy (eager delete): the
+		// retry would restart the full 5m grace window first.
+		assert.Less(t, gap, 3*time.Minute,
+			"failed close must retry promptly (next check), not after a fresh grace window")
 	})
 }
 
