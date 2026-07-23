@@ -46,6 +46,15 @@ type tenantState struct {
 	lastBalance     sdktypes.Coins
 	lastCheckTime   time.Time
 	consecutiveErrs int // Track consecutive errors fetching credit account
+
+	// firstZeroAt is when this tenant's credit was FIRST observed empty in the
+	// current zero-streak (zero value = not currently pending closure). Closure
+	// only fires once the empty balance has persisted for creditCheckZeroGracePeriod
+	// — the credit-check analogue of Kubernetes' tolerationSeconds, so a single
+	// stale zero read (e.g. fred's chain node briefly lagging a tenant top-up)
+	// cannot destroy a paying tenant's leases. Any non-zero read clears it
+	// (hysteresis: recovery starts a fresh window). (ENG-591)
+	firstZeroAt time.Time
 }
 
 // WithdrawScheduler periodically withdraws funds from active leases and
@@ -62,9 +71,10 @@ type WithdrawScheduler struct {
 	lastWithdrawTime    time.Time     // guarded by mu
 
 	// Configurable limits
-	maxWithdrawIterations     int
-	creditCheckErrorThreshold int
-	creditCheckRetryInterval  time.Duration
+	maxWithdrawIterations      int
+	creditCheckErrorThreshold  int
+	creditCheckRetryInterval   time.Duration
+	creditCheckZeroGracePeriod time.Duration // how long an empty balance must persist before closure (ENG-591)
 
 	tenants map[string]*tenantState
 	mu      sync.Mutex
@@ -89,6 +99,9 @@ type WithdrawSchedulerConfig struct {
 	MaxWithdrawIterations     int
 	CreditCheckErrorThreshold int
 	CreditCheckRetryInterval  time.Duration
+	// CreditCheckZeroGracePeriod is how long a tenant's credit must stay empty
+	// before its leases are closed. 0 => default (5m). (ENG-591)
+	CreditCheckZeroGracePeriod time.Duration
 }
 
 // NewWithdrawScheduler creates a new withdrawal scheduler.
@@ -98,6 +111,7 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 	maxIterations := cmp.Or(max(cfg.MaxWithdrawIterations, 0), 100)
 	errorThreshold := cmp.Or(max(cfg.CreditCheckErrorThreshold, 0), 3)
 	retryInterval := cmp.Or(max(cfg.CreditCheckRetryInterval, 0), 30*time.Second)
+	zeroGracePeriod := cmp.Or(max(cfg.CreditCheckZeroGracePeriod, 0), 5*time.Minute)
 
 	withdrawInterval := cfg.WithdrawInterval
 	creditCheckInterval := cmp.Or(max(cfg.CreditCheckInterval, 0), cfg.WithdrawInterval)
@@ -108,18 +122,19 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &WithdrawScheduler{
-		client:                    client,
-		providerUUID:              cfg.ProviderUUID,
-		withdrawInterval:          withdrawInterval,
-		creditCheckInterval:       creditCheckInterval,
-		guardActive:               creditCheckInterval < withdrawInterval,
-		maxWithdrawIterations:     maxIterations,
-		creditCheckErrorThreshold: errorThreshold,
-		creditCheckRetryInterval:  retryInterval,
-		tenants:                   make(map[string]*tenantState),
-		ctx:                       ctx,
-		cancel:                    cancel,
-		wg:                        &sync.WaitGroup{},
+		client:                     client,
+		providerUUID:               cfg.ProviderUUID,
+		withdrawInterval:           withdrawInterval,
+		creditCheckInterval:        creditCheckInterval,
+		guardActive:                creditCheckInterval < withdrawInterval,
+		maxWithdrawIterations:      maxIterations,
+		creditCheckErrorThreshold:  errorThreshold,
+		creditCheckRetryInterval:   retryInterval,
+		creditCheckZeroGracePeriod: zeroGracePeriod,
+		tenants:                    make(map[string]*tenantState),
+		ctx:                        ctx,
+		cancel:                     cancel,
+		wg:                         &sync.WaitGroup{},
 	}
 }
 
@@ -577,14 +592,48 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 			state.consecutiveErrs = 0
 		}
 
-		// Check if balance is zero (depleted)
+		// Check if balance is zero (depleted). ENG-591: a single zero read must
+		// not destroy leases — the gate action is DESTROY (MsgCloseLease → volume
+		// soft-delete + grace), so a transient stale read (e.g. fred's chain node
+		// briefly lagging a tenant top-up) would wrongfully close a paying tenant.
+		// Require the empty balance to PERSIST for creditCheckZeroGracePeriod before
+		// closing (the tolerationSeconds / Prometheus-`for` idiom), re-confirming
+		// via an early re-check within the window. Any non-zero read below clears
+		// firstZeroAt, so a recovery starts a fresh window (hysteresis).
 		if result.balances.IsZero() {
-			slog.Warn("credit exhausted, closing leases",
+			state, exists := s.tenants[tenant]
+			if !exists {
+				state = &tenantState{}
+				s.tenants[tenant] = state
+			}
+			if state.firstZeroAt.IsZero() {
+				state.firstZeroAt = now // enter the pending-closure window
+			}
+			if now.Sub(state.firstZeroAt) >= s.creditCheckZeroGracePeriod {
+				slog.Warn("credit exhausted, closing leases",
+					"tenant", tenant,
+					"lease_count", len(leaseUUIDs),
+					"zero_since", state.firstZeroAt,
+					"grace_period", s.creditCheckZeroGracePeriod,
+				)
+				leasesToClose = append(leasesToClose, leaseUUIDs...)
+				delete(s.tenants, tenant)
+				continue
+			}
+			// Still within the grace window: defer closure and schedule an early
+			// re-check so the empty balance is re-confirmed (or cleared) promptly
+			// rather than waiting a full credit-check interval.
+			metrics.CreditCheckZeroDeferredTotal.Inc()
+			slog.Warn("credit read empty; deferring closure pending grace-period confirmation",
 				"tenant", tenant,
 				"lease_count", len(leaseUUIDs),
+				"zero_since", state.firstZeroAt,
+				"grace_period", s.creditCheckZeroGracePeriod,
 			)
-			leasesToClose = append(leasesToClose, leaseUUIDs...)
-			delete(s.tenants, tenant)
+			earlyRetry := now.Add(s.creditCheckRetryInterval)
+			if earliestDepletion.IsZero() || earlyRetry.Before(earliestDepletion) {
+				earliestDepletion = earlyRetry
+			}
 			continue
 		}
 
@@ -598,6 +647,11 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 			}
 			continue
 		}
+
+		// Non-zero balance observed: clear any pending zero-closure window so a
+		// tenant that recovered (top-up seen / node caught up) starts fresh if it
+		// later empties again (ENG-591 hysteresis).
+		state.firstZeroAt = time.Time{}
 
 		// Calculate burn rate from balance change
 		elapsed := now.Sub(state.lastCheckTime)

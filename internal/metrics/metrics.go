@@ -379,6 +379,19 @@ var (
 		Help:      "Scheduler wakes that skipped the paid withdrawal because the withdraw-interval guard had not elapsed.",
 	})
 
+	// CreditCheckZeroDeferredTotal counts credit checks that read a tenant's
+	// balance as empty but DEFERRED lease closure because the empty balance had
+	// not yet persisted for credit_check_zero_grace_period (ENG-591). A single
+	// increment is a transient stale read absorbed by the grace window; a sustained
+	// high rate for a tenant that never closes suggests the chain node is
+	// chronically lagging or the grace period is mistuned.
+	CreditCheckZeroDeferredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "withdraw",
+		Name:      "credit_check_zero_deferred_total",
+		Help:      "Credit checks that read an empty balance but deferred lease closure pending the zero-balance grace period (ENG-591).",
+	})
+
 	// WithdrawGuardActive is 1 when the withdraw-cadence guard is active
 	// (credit_check_interval < withdraw_interval), else 0. Disambiguates a zero
 	// skipped_by_guard_total (guard inert vs. active-but-never-skipped).

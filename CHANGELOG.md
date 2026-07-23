@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   ack-batcher lanes respawned after a recovered panic (see Fixed). Pair with
   `fred_goroutine_panics_total{component="ack_batcher"}` to detect a
   crash-looping lane.
+- New `credit_check_zero_grace_period` config knob (default `5m`) — how long a
+  tenant's credit must stay empty before the scheduler auto-closes its leases
+  (see Fixed). New metric `fred_withdraw_credit_check_zero_deferred_total` counts
+  credit checks that read empty but deferred closure within that window; a
+  sustained high rate for a tenant that never closes points at a chronically
+  lagging chain node or too-short a grace period. (ENG-591)
 
 ### Changed
 
@@ -32,6 +38,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   restart. The entry is now preserved by pointer across the reconcile map swap,
   matching the existing `Deprovisioning` preserve-case. Fixes the intermittent
   `TestDeprovision_VolumeRetry_ConcurrentRecoverState` CI flake. (ENG-603)
+- The withdraw scheduler no longer closes a tenant's leases on a single
+  zero-balance credit read. Lease closure is destructive (`MsgCloseLease` →
+  volume soft-delete + 90-day grace), so a transient stale read — e.g. fred's
+  chain node briefly lagging a tenant top-up — could wrongfully soft-delete a
+  paying tenant's data (the consecutive-error dampening only guarded the RPC
+  *error* path, not a successful-but-empty read). An empty balance must now
+  persist for `credit_check_zero_grace_period` (default `5m`, the analogue of
+  Kubernetes' `tolerationSeconds`) before closure fires: the first empty read
+  starts the window and schedules an early re-check, and any non-zero read
+  clears it (hysteresis). (ENG-591)
 - Ack-batcher lanes now respawn after a recovered panic instead of exiting
   permanently. Previously a single cosmos-SDK marshaling panic on a malformed
   chain RPC response killed the lane for good; at the default single-lane

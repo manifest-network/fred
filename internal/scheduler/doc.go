@@ -23,6 +23,18 @@
 // When credit is exhausted, MsgCloseLease is submitted for each affected lease
 // and the provisioner's normal lease_closed event flow handles the cleanup.
 //
+// # Zero-balance confirmation (ENG-591)
+//
+// Lease closure is destructive (MsgCloseLease → volume soft-delete + grace), so
+// a single empty credit read never closes leases on its own: a transient stale
+// read (e.g. fred's chain node briefly lagging a tenant top-up) would otherwise
+// wrongfully soft-delete a paying tenant's data. Instead the first empty read
+// stamps `firstZeroAt` and defers, scheduling an early re-check; closure fires
+// only once the balance has stayed empty for the whole `credit_check_zero_grace_period`
+// (default 5m — the credit-check analogue of Kubernetes' `tolerationSeconds`).
+// Any non-zero read clears `firstZeroAt`, so a recovery starts a fresh window
+// (hysteresis). Deferrals are counted by `fred_withdraw_credit_check_zero_deferred_total`.
+//
 // # External triggers
 //
 // TriggerWithdraw can be called by other components (notably the watcher,
