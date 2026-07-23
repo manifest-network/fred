@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
@@ -1321,7 +1322,17 @@ func trimLogToBudget(logs string, remaining int) (out string, consumed int) {
 	if len(logs) <= remaining {
 		return logs, len(logs)
 	}
-	return logs[:remaining] + "\n" + aggregateLogLimitMessage, remaining
+	// Back off to a UTF-8 rune boundary so the byte-length cut never splits a
+	// multi-byte rune into a lone lead/continuation byte — container logs are
+	// tenant-controlled and routinely non-ASCII, and an invalid-UTF-8 tail would
+	// be silently mangled to U+FFFD by the JSON response / diagnostics store.
+	// Mirrors shared/partition.go's TruncatePartitionRaw; a rune is at most 4
+	// bytes, so this drops at most 3.
+	end := remaining
+	for end > 0 && !utf8.RuneStart(logs[end]) {
+		end--
+	}
+	return logs[:end] + "\n" + aggregateLogLimitMessage, end
 }
 
 // errLogCapReached signals that cappingLogWriter has accepted its full byte
