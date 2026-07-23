@@ -21,6 +21,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Crash recovery (`recoverState`) no longer resurrects a lease that is mid
+  volume-cleanup-retry (`Failed` with `VolumeCleanupAttempts > 0`) back to
+  `Ready` from a stale container snapshot. Such a lease has already had its
+  containers torn down, so any container a concurrent reconcile still lists for
+  it was captured before the removal; merging that stale view after the
+  deprovision set `Failed` could reset the retry counter and — once the next
+  reconcile GC'd the resulting phantom-`Ready` no-container entry — abandon the
+  volume-cleanup retry and leak the lease's pool reservation until process
+  restart. The entry is now preserved by pointer across the reconcile map swap,
+  matching the existing `Deprovisioning` preserve-case. Fixes the intermittent
+  `TestDeprovision_VolumeRetry_ConcurrentRecoverState` CI flake. (ENG-603)
 - Ack-batcher lanes now respawn after a recovered panic instead of exiting
   permanently. Previously a single cosmos-SDK marshaling panic on a malformed
   chain RPC response killed the lane for good; at the default single-lane
