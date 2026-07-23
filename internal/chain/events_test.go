@@ -695,6 +695,89 @@ func TestEventSubscriber_Start_ReconnectsOnFailure(t *testing.T) {
 	}
 }
 
+// TestEventSubscriber_Start_ReconnectsOnHalfOpenPeer verifies the read-deadline
+// keepalive (ENG-593). The server accepts the connection and answers the four
+// subscriptions, then goes SILENT — it stops reading, so gorilla never auto-pongs
+// the client's pings, and it never closes, so there is no FIN/RST. Without a read
+// deadline the client's ReadMessage would block indefinitely (liveness would fall
+// back to the OS TCP timeout, minutes) and no reconnect would occur. With the
+// deadline, a run of missing pongs forces a read error and reconnect, so the server
+// sees repeated connection attempts.
+func TestEventSubscriber_Start_ReconnectsOnHalfOpenPeer(t *testing.T) {
+	var connectCount atomic.Int32
+
+	// Released at test end so the silent handler goroutines don't leak.
+	hold := make(chan struct{})
+	defer close(hold)
+
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Answer the four subscription requests so connectAndRun reaches its steady
+		// read loop, then stop reading entirely (never auto-pong) and hold the
+		// connection open (never send FIN/RST) — a classic half-open peer.
+		for i := 0; i < 4; i++ {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var req jsonRPCRequest
+			if err := json.Unmarshal(msg, &req); err != nil {
+				t.Logf("half-open test server: unexpected unmarshal error: %v", err)
+				continue
+			}
+			if req.Method == "subscribe" {
+				if err := conn.WriteJSON(jsonRPCResponse{JSONRPC: "2.0", ID: req.ID}); err != nil {
+					return
+				}
+			}
+		}
+		// Count only connections that reached the silent steady state, so a
+		// reconnect for any unrelated reason cannot satisfy the assertion without
+		// actually exercising the half-open path (Copilot review).
+		connectCount.Add(1)
+		<-hold
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/websocket"
+
+	sub, err := NewEventSubscriber(EventSubscriberConfig{
+		URL:              wsURL,
+		ProviderUUID:     testProviderUUID,
+		PingInterval:     100 * time.Millisecond, // read deadline = 2× = 200ms
+		ReconnectInitial: 10 * time.Millisecond,
+		ReconnectMax:     50 * time.Millisecond,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- sub.Start(ctx) }()
+
+	// A single connection would hang forever without the deadline; with it, the
+	// dead peer is detected each cycle and reconnected.
+	assert.Eventually(t, func() bool {
+		return connectCount.Load() >= 2
+	}, 5*time.Second, 20*time.Millisecond,
+		"expected reconnect after half-open peer detected via read deadline, got %d connections", connectCount.Load())
+
+	cancel()
+	select {
+	case err := <-errCh:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Start() to return")
+	}
+}
+
 func TestEventSubscriber_Start_StopsOnClose(t *testing.T) {
 	var subscribeCount atomic.Int32
 

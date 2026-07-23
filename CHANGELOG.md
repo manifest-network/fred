@@ -57,6 +57,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `fred_reconciler_inflight_skips_total`), matching the guard the ack-skip branch
   and the placement pruner already applied to this same race. The window was
   narrow and self-healed next sweep. (ENG-594)
+- The chain event WebSocket now detects a silently-dropped (half-open) peer via a
+  read deadline instead of relying on the OS TCP timeout. The 30s ping ticker
+  wrote pings but the pong handler never reset a read deadline (there was none),
+  so after a NAT idle-drop / peer crash / partition (no FIN/RST) `ReadMessage`
+  blocked for minutes — dropping chain lease events (created/closed/expired/
+  auto_closed) and delaying reconnect and thus provisioning/deprovisioning. An
+  initial read deadline of `2×ping_interval` is now armed and reset on every pong,
+  so a run of missing pongs forces a read error and reconnect within
+  ~`ping_interval`..`2×ping_interval`. (ENG-593)
 - Ack-batcher lanes now respawn after a recovered panic instead of exiting
   permanently. Previously a single cosmos-SDK marshaling panic on a malformed
   chain RPC response killed the lane for good; at the default single-lane

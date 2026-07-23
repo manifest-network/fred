@@ -326,9 +326,22 @@ func (s *EventSubscriber) connectAndRun(ctx context.Context) error {
 
 	slog.Info("websocket connected", "url", s.url)
 
-	// Set up ping/pong handlers to keep connection alive
+	// Keep the connection alive AND detect a silently-dropped (half-open) peer.
+	// gorilla/websocket only surfaces a dead peer through a read deadline: with no
+	// deadline the ping ticker below still writes pings, but a missing pong is never
+	// observed, so ReadMessage blocks until the OS TCP retransmit timeout (minutes)
+	// after a NAT idle-drop / peer crash / partition (no FIN/RST). During that window
+	// chain lease events are missed and reconnect is delayed (ENG-593). Arm an initial
+	// read deadline and reset it on every pong, so a run of missed pongs forces
+	// ReadMessage to error and trigger reconnect within ~pingInterval..2*pingInterval.
+	// Healthy event traffic does not need to reset it: we ping every pingInterval and
+	// the server's pong pushes the deadline out well before it expires.
+	readWait := 2 * s.pingInterval
+	if err := conn.SetReadDeadline(time.Now().Add(readWait)); err != nil {
+		return fmt.Errorf("failed to set initial read deadline: %w", err)
+	}
 	conn.SetPongHandler(func(string) error {
-		return nil
+		return conn.SetReadDeadline(time.Now().Add(readWait))
 	})
 
 	// Subscribe to lease_created events for this provider
