@@ -75,6 +75,20 @@ var (
 		Help:      "Total ack-batch failures that fell back to individual per-lease retries",
 	}, []string{"lane"})
 
+	// AckBatcherLaneRestartsTotal counts ack-batcher lanes respawned after a
+	// panic (ENG-589). A lane whose flush panics is recovered and restarted so
+	// acknowledgment does not stall permanently (at the default single lane a
+	// dead lane would disable ALL acking and cause the timeout checker to
+	// wrongly reject healthy leases). Sustained non-zero values mean a lane is
+	// crash-looping — pair with goroutine_panics_total{component="ack_batcher"}
+	// and alert.
+	AckBatcherLaneRestartsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "ack_batcher_lane_restarts_total",
+		Help:      "Total ack-batcher lane respawns after a recovered panic",
+	}, []string{"lane"})
+
 	// ReconcilerInflightSkipsTotal counts reconciler decisions to skip
 	// acknowledging a ready lease because the main flow is already processing
 	// it (IsInFlight == true). A sudden spike can indicate stuck in-flight

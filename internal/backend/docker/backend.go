@@ -310,7 +310,19 @@ func (b *Backend) captureContainerLogs(containerIDs []string, containerKeys map[
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	logs := make(map[string]string, len(containerIDs))
+	// Aggregate byte budget across all captured containers, mirroring GetLogs
+	// (ENG-590): a persisted diagnostic entry must not grow to gigabytes for a
+	// many-container lease. Unlike GetLogs (which placeholders over-budget
+	// containers for a live tenant view), this best-effort diagnostics snapshot
+	// simply stops once the budget is spent — a lean persisted record beats
+	// padding bbolt with hundreds of placeholder entries, and with
+	// persistedLogTail-bounded output the budget is effectively never reached
+	// here in practice.
+	remaining := maxTotalLogBytes
 	for i, cid := range containerIDs {
+		if remaining <= 0 {
+			break
+		}
 		logOutput, err := b.docker.ContainerLogs(ctx, cid, persistedLogTail)
 		if err != nil {
 			b.logger.Debug("failed to fetch container logs for diagnostics persistence",
@@ -323,7 +335,9 @@ func (b *Backend) captureContainerLogs(containerIDs []string, containerKeys map[
 				key = k
 			}
 		}
-		logs[key] = logOutput
+		trimmed, consumed := trimLogToBudget(logOutput, remaining)
+		remaining -= consumed
+		logs[key] = trimmed
 	}
 	if len(logs) == 0 {
 		return nil
@@ -632,8 +646,16 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Check daemon capabilities for hardening configuration
 	b.checkDaemonCapabilities(ctx)
 
-	// Recover state from existing containers
-	if err := b.recoverState(ctx); err != nil {
+	// Recover state from existing containers. Runs under the backend lifecycle
+	// context (b.stopCtx), NOT the caller's short startup ctx: recoverState can
+	// drive legacy migration whose health-wait takes up to MigrationReadyTimeout
+	// (90s) and which spawns background `-prev` grace-cleanup goroutines that
+	// outlive Start's return. main cancels the 30s startup ctx the instant Start
+	// returns, so binding recovery/migration to it caps the ready-wait and leaks
+	// `-prev` containers (ENG-592). This matches the retention steps below, which
+	// already run under b.stopCtx. The fast connectivity/capability checks above
+	// keep the caller's ctx so a wholly-unreachable daemon still fails fast.
+	if err := b.recoverState(b.stopCtx); err != nil {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
 
@@ -650,11 +672,16 @@ func (b *Backend) Start(ctx context.Context) error {
 	// once the capability is granted, this re-applies enforcement without a
 	// re-provision. Best-effort (never fatal). Runs after reconcileRetentions so
 	// the fred-retained- namespace matches the retention records (ENG-454).
-	b.reconcileVolumeQuotas(ctx)
+	// Uses b.stopCtx like the recovery steps above: a one-time legacy migration
+	// in recoverState can push these startup steps past the caller's short ctx
+	// deadline (ENG-592).
+	b.reconcileVolumeQuotas(b.stopCtx)
 
 	// Clean up orphaned volumes (created but no matching provision).
-	// Must run after recoverState so the provision map is populated.
-	if err := b.cleanupOrphanedVolumes(ctx); err != nil {
+	// Must run after recoverState so the provision map is populated. On
+	// b.stopCtx (see reconcileVolumeQuotas above) so a slow migration doesn't
+	// leave this running under an already-expired startup ctx (ENG-592).
+	if err := b.cleanupOrphanedVolumes(b.stopCtx); err != nil {
 		return fmt.Errorf("orphaned volume cleanup failed: %w", err)
 	}
 

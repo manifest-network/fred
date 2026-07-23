@@ -270,9 +270,24 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 		b.provisionsMu.RUnlock()
 
 		result := make(map[string]string, len(containerIDs))
-		for svcName, svcContainerIDs := range serviceContainers {
+		// Aggregate byte budget across ALL of this lease's containers (ENG-590):
+		// maxContainerLogBytes caps each container, but without this cap the
+		// accumulated map (and the JSON copy the handler builds) can reach
+		// gigabytes and OOM the shared host. Once the budget is spent we skip the
+		// remaining reads entirely rather than fetch-then-discard.
+		remaining := maxTotalLogBytes
+		// Iterate services in sorted order (matching GetInfo) so that, once the
+		// aggregate budget is exhausted, which services get real logs vs the
+		// truncation placeholder is deterministic across calls rather than
+		// dependent on Go's randomized map iteration order (ENG-590).
+		for _, svcName := range slices.Sorted(maps.Keys(serviceContainers)) {
+			svcContainerIDs := serviceContainers[svcName]
 			for i, containerID := range svcContainerIDs {
 				key := fmt.Sprintf("%s/%d", svcName, i)
+				if remaining <= 0 {
+					result[key] = aggregateLogLimitMessage
+					continue
+				}
 				logs, err := b.docker.ContainerLogs(ctx, containerID, tail)
 				if err != nil {
 					b.logger.Warn("failed to retrieve container logs",
@@ -285,7 +300,9 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 					result[key] = fmt.Sprintf("<error: %s>", err)
 					continue
 				}
-				result[key] = logs
+				trimmed, consumed := trimLogToBudget(logs, remaining)
+				remaining -= consumed
+				result[key] = trimmed
 			}
 		}
 		return result, nil

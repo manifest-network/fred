@@ -494,6 +494,12 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 	if err != nil {
 		return fmt.Errorf("resolve new container IDs: %w", err)
 	}
+	// The health-wait can take up to MigrationReadyTimeout (default 90s), which
+	// exceeds the caller's context only when that caller passes an
+	// inappropriately short one. Start deliberately drives recovery under the
+	// backend lifecycle context for exactly this reason (see recoverState call
+	// in backend.go, ENG-592); request-scoped callers (RefreshState) keep their
+	// own deadline here.
 	readyCtx, cancel := context.WithTimeout(ctx, cmp.Or(b.cfg.MigrationReadyTimeout, defaultMigrationReadyTimeout))
 	defer cancel()
 	if err := b.verifyStartup(readyCtx, svc, newIDs, logger); err != nil {
@@ -501,13 +507,19 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 	}
 
 	// 6. Schedule per-instance `-prev` removal after the operator-
-	// inspection grace window. Background — must not block startup.
+	// inspection grace window. Background — must not block startup. This
+	// fire-and-forget cleanup is gated on b.stopCtx, NOT the caller's ctx:
+	// it must survive the caller returning (main cancels the short startup
+	// context the instant Start returns — keying on ctx would fire Done() at
+	// ~0s and leak every migration's `-prev` containers) while still stopping
+	// on daemon shutdown (ENG-592). Unlike the synchronous ready-wait above,
+	// there is no caller left to honor a deadline once this goroutine detaches.
 	for _, inst := range m.Instances {
 		inst := inst
 		go func() {
 			select {
 			case <-time.After(cmp.Or(b.cfg.MigrationGracePeriod, defaultMigrationGracePeriod)):
-			case <-ctx.Done():
+			case <-b.stopCtx.Done():
 				return
 			}
 			// Use a fresh context with a short timeout so a wedged

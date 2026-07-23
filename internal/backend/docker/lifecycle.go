@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
@@ -1295,6 +1296,52 @@ func (d *DockerClient) ContainerLogs(ctx context.Context, containerID string, ta
 // cap is shared by the tenant /logs path (GetLogs) and the diagnostics-capture
 // path (captureContainerLogs), both of which call ContainerLogs.
 const maxContainerLogBytes = 5 << 20 // 5 MiB
+
+// maxTotalLogBytes bounds the AGGREGATE bytes a single GetLogs / captureContainerLogs
+// call buffers across ALL of a lease's containers. maxContainerLogBytes caps each
+// container individually, but a lease may have up to maxLeaseQuantity (1024)
+// containers, so without an aggregate cap one authenticated GET /logs could
+// materialize gigabytes and OOM the shared docker backend host — cross-tenant
+// denial of service (ENG-590). It is the same host-exhaustion concern as
+// maxContainerLogBytes, one level up (per-lease rather than per-container).
+const maxTotalLogBytes = 32 << 20 // 32 MiB
+
+// aggregateLogLimitMessage marks output cut short because a GetLogs /
+// captureContainerLogs call reached its per-call aggregate budget
+// (maxTotalLogBytes). Used both as an appended truncation marker and as the
+// standalone placeholder for containers skipped once the budget is spent.
+const aggregateLogLimitMessage = "[log truncated: aggregate log size limit reached]"
+
+// trimLogToBudget trims a single container's (already per-container-capped) log
+// output to the aggregate byte budget remaining for a GetLogs /
+// captureContainerLogs call, returning the possibly-truncated output and the
+// bytes it consumes. The precondition is remaining > 0: callers must skip the
+// container-log read entirely once the budget is exhausted, so the potentially
+// large read never happens for containers beyond the cap.
+func trimLogToBudget(logs string, remaining int) (out string, consumed int) {
+	if len(logs) <= remaining {
+		return logs, len(logs)
+	}
+	// Back off to a UTF-8 rune boundary so the byte-length cut never splits a
+	// multi-byte rune into a lone lead/continuation byte — container logs are
+	// tenant-controlled and routinely non-ASCII, and an invalid-UTF-8 tail would
+	// be silently mangled to U+FFFD by the JSON response / diagnostics store.
+	// Mirrors shared/partition.go's TruncatePartitionRaw; a rune is at most 4
+	// bytes, so this drops at most 3.
+	end := remaining
+	for end > 0 && !utf8.RuneStart(logs[end]) {
+		end--
+	}
+	if end == 0 {
+		// The remaining budget is smaller than the first rune, so no content
+		// fits. Consume the whole remaining budget (not 0) so the caller's
+		// running total reaches <=0 and it skips the rest of the containers
+		// instead of fetching them for no gain; emit just the marker (no
+		// content-less leading newline).
+		return aggregateLogLimitMessage, remaining
+	}
+	return logs[:end] + "\n" + aggregateLogLimitMessage, end
+}
 
 // errLogCapReached signals that cappingLogWriter has accepted its full byte
 // budget, so stdcopy.StdCopy can stop draining the remaining stream.
