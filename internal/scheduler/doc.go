@@ -29,8 +29,11 @@
 // a single empty credit read never closes leases on its own: a transient stale
 // read (e.g. fred's chain node briefly lagging a tenant top-up) would otherwise
 // wrongfully soft-delete a paying tenant's data. Instead the first empty read
-// stamps `firstZeroAt` and defers, scheduling an early re-check; closure fires
-// only once the balance has stayed empty for the whole `credit_check_zero_grace_period`
+// stamps `firstZeroAt` and defers, scheduling an early re-check after
+// `credit_check_retry_interval` (the same follow-up cadence the error path uses,
+// so the empty balance is re-confirmed promptly rather than at the next full
+// `credit_check_interval`); closure fires only once the balance has stayed empty
+// for the whole `credit_check_zero_grace_period`
 // (default 5m — the credit-check equivalent of Kubernetes' `tolerationSeconds`).
 // Any non-zero read clears `firstZeroAt`, so a recovery starts a fresh window
 // (hysteresis). Deferrals are counted by `fred_withdraw_credit_check_zero_deferred_total`.

@@ -15,9 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - New `credit_check_zero_grace_period` config knob (default `5m`) — how long a
   tenant's credit must stay empty before the scheduler auto-closes its leases
   (see Fixed). New metric `fred_withdraw_credit_check_zero_deferred_total` counts
-  credit checks that read empty but deferred closure within that window; a
-  sustained high rate for a tenant that never closes points at a chronically
-  lagging chain node or too-short a grace period. (ENG-591)
+  credit checks that read empty but deferred closure within that window
+  (aggregate, no tenant label); a sustained or rising rate points at a
+  chronically lagging chain node or too-short a grace period. (ENG-591)
 
 ### Changed
 

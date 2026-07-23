@@ -643,6 +643,13 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 					"grace_period", s.creditCheckZeroGracePeriod,
 				)
 			}
+			// Reuse creditCheckRetryInterval as the in-window re-confirmation cadence:
+			// it is the scheduler's single "schedule an earlier follow-up credit check"
+			// delay, already applied on the consecutive-error path, and 30s (default)
+			// suits both. Documented as covering both uses (README / doc.go). Without
+			// an early re-check the next sample could be a full creditCheckInterval away
+			// (up to withdraw_interval when coupled), leaving the empty balance
+			// unconfirmed and delaying a genuine closure well past the grace deadline.
 			earlyRetry := now.Add(s.creditCheckRetryInterval)
 			if earliestDepletion.IsZero() || earlyRetry.Before(earliestDepletion) {
 				earliestDepletion = earlyRetry

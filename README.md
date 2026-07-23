@@ -288,7 +288,7 @@ These options have sensible defaults but can be tuned for specific environments:
 | `sub_signer_fund_check_interval` | How often balances are checked. | `1h` |
 | `credit_check_interval` | How often the scheduler wakes to run the credit check, independent of `withdraw_interval`. `0s` couples it to `withdraw_interval`; when set >0 it must be ≤ `withdraw_interval`. A smaller value polls credit faster while the paid withdrawal stays rate-limited to `withdraw_interval` (the ENG-524 withdraw-cadence guard). | `0s` |
 | `credit_check_error_threshold` | Errors before disabling credit monitoring | `3` |
-| `credit_check_retry_interval` | Retry interval after credit check errors | `30s` |
+| `credit_check_retry_interval` | Delay before an earlier follow-up credit check. Applies in two cases: after credit-check errors exceed `credit_check_error_threshold`, and while a zero-balance closure is being deferred inside its `credit_check_zero_grace_period` window (so the empty balance is re-confirmed promptly rather than at the next full `credit_check_interval`). | `30s` |
 | `credit_check_zero_grace_period` | How long a tenant's credit must stay empty before its leases are auto-closed. A single stale zero read (e.g. the chain node briefly lagging a top-up) is absorbed: closure only fires once the empty balance persists for this whole window, and any non-zero read clears it. Lower = faster reclaim of unpaid leases; higher = more tolerance for transient chain-node lag before soft-deleting tenant data. `0s` uses the 5m default. | `5m` |
 | `shutdown_timeout` | Maximum time for graceful shutdown (drain + cleanup) | `30s` |
 
