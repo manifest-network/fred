@@ -420,12 +420,13 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Initialize withdrawal scheduler
 	withdrawScheduler := scheduler.NewWithdrawScheduler(chainClient, scheduler.WithdrawSchedulerConfig{
-		ProviderUUID:              cfg.ProviderUUID,
-		WithdrawInterval:          cfg.WithdrawInterval,
-		CreditCheckInterval:       cfg.CreditCheckInterval,
-		MaxWithdrawIterations:     cfg.MaxWithdrawIterations,
-		CreditCheckErrorThreshold: cfg.CreditCheckErrorThreshold,
-		CreditCheckRetryInterval:  cfg.CreditCheckRetryInterval,
+		ProviderUUID:               cfg.ProviderUUID,
+		WithdrawInterval:           cfg.WithdrawInterval,
+		CreditCheckInterval:        cfg.CreditCheckInterval,
+		MaxWithdrawIterations:      cfg.MaxWithdrawIterations,
+		CreditCheckErrorThreshold:  cfg.CreditCheckErrorThreshold,
+		CreditCheckRetryInterval:   cfg.CreditCheckRetryInterval,
+		CreditCheckZeroGracePeriod: cfg.CreditCheckZeroGracePeriod,
 	})
 
 	// Create reconciler for level-triggered state reconciliation

@@ -900,6 +900,7 @@ backends:
 	assert.Equal(t, []string{"*"}, cfg.CORSOrigins)
 	assert.Equal(t, 1.2, cfg.GasAdjustment, "default gas_adjustment should match Cosmos CLI convention")
 	assert.Equal(t, 100, cfg.WithdrawLimit, "default withdraw_limit should be 100 (a deliberate literal, not MaxBatchLeaseSize)")
+	assert.Equal(t, 5*time.Minute, cfg.CreditCheckZeroGracePeriod, "default credit_check_zero_grace_period should be 5m (ENG-591)")
 }
 
 func TestLoad_ConfigOverrides(t *testing.T) {
@@ -1634,5 +1635,25 @@ func TestConfig_Validate_CreditCheckInterval(t *testing.T) {
 		c := base()
 		c.CreditCheckInterval = 48 * time.Hour
 		require.ErrorContains(t, c.Validate(), "must not exceed withdraw_interval")
+	})
+}
+
+func TestConfig_Validate_CreditCheckZeroGracePeriod(t *testing.T) {
+	// 0 is valid (scheduler resolves it to the 5m default); negative is rejected.
+	// Mirrors the credit_check_interval idiom (ENG-591).
+	t.Run("zero is valid (default resolved by scheduler)", func(t *testing.T) {
+		c := validConfig()
+		c.CreditCheckZeroGracePeriod = 0
+		require.NoError(t, c.Validate())
+	})
+	t.Run("positive is valid", func(t *testing.T) {
+		c := validConfig()
+		c.CreditCheckZeroGracePeriod = 10 * time.Minute
+		require.NoError(t, c.Validate())
+	})
+	t.Run("negative is rejected", func(t *testing.T) {
+		c := validConfig()
+		c.CreditCheckZeroGracePeriod = -1 * time.Second
+		require.ErrorContains(t, c.Validate(), "credit_check_zero_grace_period cannot be negative")
 	})
 }

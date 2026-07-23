@@ -427,10 +427,347 @@ func TestWithdrawScheduler_CheckCreditsAndClose_DepletedCredit(t *testing.T) {
 		WithdrawInterval: time.Minute,
 	})
 
+	// ENG-591: a single zero-balance read must NOT close leases — it starts the
+	// grace window (tolerationSeconds equivalent) and defers. A brief chain-node lag
+	// behind a tenant top-up would otherwise wrongfully soft-delete paying data.
 	s.checkCreditsAndClose(context.Background())
+	assert.False(t, closeCalled, "CloseLeases must not fire on a single unconfirmed zero read")
 
-	assert.True(t, closeCalled, "CloseLeases was not called for depleted credit")
+	s.mu.Lock()
+	state := s.tenants[tenant]
+	s.mu.Unlock()
+	require.NotNil(t, state, "tenant state should record the first zero observation")
+	require.False(t, state.firstZeroAt.IsZero(), "firstZeroAt must be stamped on the first zero read")
+
+	// Once the zero balance has persisted beyond the grace period, closure fires.
+	// Backdate the pending observation past the (default 5m) grace window.
+	s.mu.Lock()
+	state.firstZeroAt = time.Now().Add(-6 * time.Minute)
+	s.mu.Unlock()
+
+	s.checkCreditsAndClose(context.Background())
+	assert.True(t, closeCalled, "CloseLeases must fire once zero persists past the grace period")
 	assert.Len(t, closedLeases, 2)
+}
+
+// TestWithdrawScheduler_ZeroBalance_GraceDefersThenCloses drives applyCreditResults
+// directly with a controlled clock to prove the grace-window boundary: a zero read
+// inside the window defers (no close), a zero read at/after the window closes.
+func TestWithdrawScheduler_ZeroBalance_GraceDefersThenCloses(t *testing.T) {
+	tenant := generateTestAddress(t, "manifest")
+	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
+	})
+	require.Equal(t, 5*time.Minute, s.creditCheckZeroGracePeriod, "default grace period should be 5m")
+
+	tenantLeases := map[string][]string{tenant: {"lease-1", "lease-2"}}
+	zero := map[string]creditResult{tenant: {balances: sdktypes.Coins{}}}
+
+	t0 := time.Now()
+
+	// First zero read: stamps firstZeroAt, defers.
+	_, toClose, _ := s.applyCreditResults(tenantLeases, zero, t0)
+	assert.Empty(t, toClose, "first zero read must defer, not close")
+	s.mu.Lock()
+	require.NotNil(t, s.tenants[tenant])
+	assert.True(t, s.tenants[tenant].firstZeroAt.Equal(t0), "firstZeroAt stamped at first observation")
+	s.mu.Unlock()
+
+	// Second zero read still inside the grace window: still defers, firstZeroAt unchanged.
+	_, toClose, _ = s.applyCreditResults(tenantLeases, zero, t0.Add(4*time.Minute))
+	assert.Empty(t, toClose, "zero read within grace window must keep deferring")
+	s.mu.Lock()
+	assert.True(t, s.tenants[tenant].firstZeroAt.Equal(t0), "firstZeroAt must not advance while pending")
+	s.mu.Unlock()
+
+	// Zero read at/after the grace boundary: returns both leases (and their tenant)
+	// to close. State is deliberately RETAINED here — the caller deletes it only
+	// after CloseLeases succeeds, so a failed close retries without re-gracing.
+	_, toClose, tenantsToClose := s.applyCreditResults(tenantLeases, zero, t0.Add(5*time.Minute))
+	assert.ElementsMatch(t, []string{"lease-1", "lease-2"}, toClose, "sustained zero past grace must close")
+	assert.Equal(t, []string{tenant}, tenantsToClose, "the closing tenant is returned for post-success cleanup")
+	s.mu.Lock()
+	st, stillTracked := s.tenants[tenant]
+	s.mu.Unlock()
+	require.True(t, stillTracked, "state is retained until the caller confirms the close (ENG-591)")
+	assert.False(t, st.firstZeroAt.IsZero(), "firstZeroAt is retained so a failed close retries without restarting grace")
+}
+
+// TestWithdrawScheduler_ZeroBalance_RecoveryResetsGrace verifies hysteresis: a
+// non-zero read during the grace window clears the pending zero, so a later zero
+// starts a fresh window rather than inheriting the stale one.
+func TestWithdrawScheduler_ZeroBalance_RecoveryResetsGrace(t *testing.T) {
+	tenant := generateTestAddress(t, "manifest")
+	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
+	})
+
+	tenantLeases := map[string][]string{tenant: {"lease-1"}}
+	nonZero := map[string]creditResult{tenant: {balances: sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1000)))}}
+	zero := map[string]creditResult{tenant: {balances: sdktypes.Coins{}}}
+
+	t0 := time.Now()
+
+	// Zero read stamps the pending window.
+	s.applyCreditResults(tenantLeases, zero, t0)
+	s.mu.Lock()
+	require.False(t, s.tenants[tenant].firstZeroAt.IsZero())
+	s.mu.Unlock()
+
+	// A non-zero read (top-up observed / node caught up) must clear the pending zero.
+	s.applyCreditResults(tenantLeases, nonZero, t0.Add(1*time.Minute))
+	s.mu.Lock()
+	require.NotNil(t, s.tenants[tenant])
+	assert.True(t, s.tenants[tenant].firstZeroAt.IsZero(), "non-zero read must reset the grace window")
+	s.mu.Unlock()
+
+	// A later zero read starts a FRESH window — must not close even though the
+	// original observation was >grace ago.
+	_, toClose, _ := s.applyCreditResults(tenantLeases, zero, t0.Add(6*time.Minute))
+	assert.Empty(t, toClose, "post-recovery zero must start a fresh grace window, not inherit the old one")
+}
+
+// TestWithdrawScheduler_ZeroBalance_RecoveryResetsBurnBaseline verifies that a
+// non-zero read recovering from a pending zero window does NOT compute a burn rate
+// across the zero plateau (which would be diluted/misleading and could schedule the
+// next check too late). Recovery resets the baseline and skips estimation for that
+// cycle. (ENG-591 / Copilot review.)
+func TestWithdrawScheduler_ZeroBalance_RecoveryResetsBurnBaseline(t *testing.T) {
+	tenant := generateTestAddress(t, "manifest")
+	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
+	})
+	tenantLeases := map[string][]string{tenant: {"lease-1"}}
+	high := map[string]creditResult{tenant: {balances: sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1_000_000)))}}
+	zero := map[string]creditResult{tenant: {balances: sdktypes.Coins{}}}
+	low := map[string]creditResult{tenant: {balances: sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(10)))}}
+
+	t0 := time.Now()
+
+	// Establish a normal non-zero baseline (X, at t0).
+	s.applyCreditResults(tenantLeases, high, t0)
+	// Dip to zero at t0+1m — burn-rate baseline (lastBalance/lastCheckTime) is NOT
+	// updated by the zero path; the pending window opens.
+	s.applyCreditResults(tenantLeases, zero, t0.Add(time.Minute))
+	// Recover to a LOWER non-zero balance (Y<X) at t0+2m. A naive burn rate over
+	// (t0 .. t0+2m) would be diluted by the zero gap.
+	earliest, _, _ := s.applyCreditResults(tenantLeases, low, t0.Add(2*time.Minute))
+
+	// No depletion estimate is scheduled from the recovery cycle (baseline reset).
+	assert.True(t, earliest.IsZero(), "recovery from a zero window must not schedule a diluted depletion estimate")
+
+	s.mu.Lock()
+	state := s.tenants[tenant]
+	s.mu.Unlock()
+	require.NotNil(t, state)
+	assert.True(t, state.firstZeroAt.IsZero(), "recovery clears the pending zero window")
+	assert.True(t, state.lastCheckTime.Equal(t0.Add(2*time.Minute)), "recovery resets the burn baseline timestamp to now")
+	assert.Equal(t, low[tenant].balances, state.lastBalance, "recovery resets the burn baseline balance to the recovered value")
+}
+
+// TestWithdrawScheduler_ZeroBalance_Integration_ClosesAfterGrace drives the full
+// running scheduler (Start loop → withdrawAndCheckCredits → checkCreditsAndClose →
+// CloseLeases) under synctest virtual time. With a sustained empty balance and the
+// default 5m grace, closure must NOT fire during the grace window (the checks are
+// deferred and re-scheduled) and must fire exactly once after it elapses. (ENG-591)
+func TestWithdrawScheduler_ZeroBalance_Integration_ClosesAfterGrace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tenant := generateTestAddress(t, "manifest")
+		var closeCalls int32
+		var mu sync.Mutex
+		var closedLeases []string
+		var leasesClosed atomic.Bool // once closed, the chain no longer lists them
+
+		client := &mockChainClient{
+			// Nothing to withdraw — keep the cycle focused on the credit check.
+			GetProviderWithdrawableFunc: func(_ context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.Coins{}, nil
+			},
+			GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
+				if leasesClosed.Load() {
+					return []billingtypes.Lease{}, nil
+				}
+				return []billingtypes.Lease{
+					{Uuid: "lease-1", Tenant: tenant, ProviderUuid: "test-uuid"},
+					{Uuid: "lease-2", Tenant: tenant, ProviderUuid: "test-uuid"},
+				}, nil
+			},
+			GetCreditAccountFunc: func(_ context.Context, _ string) (*billingtypes.CreditAccount, sdktypes.Coins, error) {
+				return &billingtypes.CreditAccount{}, sdktypes.Coins{}, nil // always empty
+			},
+			CloseLeasesFunc: func(_ context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+				atomic.AddInt32(&closeCalls, 1)
+				assert.Equal(t, "credit exhausted", reason)
+				mu.Lock()
+				closedLeases = append([]string(nil), leaseUUIDs...)
+				mu.Unlock()
+				leasesClosed.Store(true)
+				return uint64(len(leaseUUIDs)), []string{"txhash"}, nil
+			},
+		}
+
+		// Credit checks every 1m; default 5m zero-grace. Many checks land inside the
+		// window, all of which must defer rather than close.
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    time.Hour,
+			CreditCheckInterval: time.Minute,
+		})
+		require.Equal(t, 5*time.Minute, s.creditCheckZeroGracePeriod)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+
+		// Within the grace window (first zero observed ~t0+1m, grace ends ~t0+6m):
+		// closure must not have fired despite repeated empty reads.
+		time.Sleep(4 * time.Minute)
+		synctest.Wait()
+		assert.Equal(t, int32(0), atomic.LoadInt32(&closeCalls),
+			"a sustained-but-recent empty balance must not close leases inside the grace window")
+
+		// Past the grace window: closure fires exactly once, for both leases.
+		time.Sleep(4 * time.Minute) // total ~8m
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+
+		assert.Equal(t, int32(1), atomic.LoadInt32(&closeCalls),
+			"closure must fire exactly once after the empty balance persists past the grace window")
+		mu.Lock()
+		assert.ElementsMatch(t, []string{"lease-1", "lease-2"}, closedLeases)
+		mu.Unlock()
+	})
+}
+
+// TestWithdrawScheduler_ZeroBalance_Integration_RecoveryPreventsClose proves the
+// hysteresis end-to-end: a tenant reads empty, then a top-up is observed mid-window
+// (the chain node caught up). Closure must never fire, even well past what would
+// have been the original grace deadline, because the non-zero read reset the window.
+func TestWithdrawScheduler_ZeroBalance_Integration_RecoveryPreventsClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tenant := generateTestAddress(t, "manifest")
+		var closeCalls int32
+		var recovered atomic.Bool
+
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(_ context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.Coins{}, nil
+			},
+			GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
+				return []billingtypes.Lease{{Uuid: "lease-1", Tenant: tenant, ProviderUuid: "test-uuid"}}, nil
+			},
+			GetCreditAccountFunc: func(_ context.Context, _ string) (*billingtypes.CreditAccount, sdktypes.Coins, error) {
+				if recovered.Load() {
+					// Node caught up / tenant topped up — healthy balance again.
+					return &billingtypes.CreditAccount{}, sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1_000_000))), nil
+				}
+				return &billingtypes.CreditAccount{}, sdktypes.Coins{}, nil
+			},
+			CloseLeasesFunc: func(_ context.Context, leaseUUIDs []string, _ string) (uint64, []string, error) {
+				atomic.AddInt32(&closeCalls, 1)
+				return uint64(len(leaseUUIDs)), []string{"txhash"}, nil
+			},
+		}
+
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    time.Hour,
+			CreditCheckInterval: time.Minute,
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+
+		// Let a couple of empty reads stamp the pending window, then recover before
+		// the grace elapses.
+		time.Sleep(3 * time.Minute)
+		synctest.Wait()
+		recovered.Store(true)
+
+		// Run well past the original grace deadline; closure must never fire.
+		time.Sleep(10 * time.Minute)
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+
+		assert.Equal(t, int32(0), atomic.LoadInt32(&closeCalls),
+			"a mid-window recovery must reset the grace window so closure never fires")
+	})
+}
+
+// TestWithdrawScheduler_ZeroBalance_Integration_FailedCloseRetriesWithoutRegracing
+// verifies that a transient CloseLeases failure does NOT restart the grace window:
+// the tenant's state (firstZeroAt) is retained until the close succeeds, so the
+// retry happens on the next check rather than a full grace period later. (ENG-591 /
+// Copilot review.)
+func TestWithdrawScheduler_ZeroBalance_Integration_FailedCloseRetriesWithoutRegracing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tenant := generateTestAddress(t, "manifest")
+		var closeAttempts int32
+		var mu sync.Mutex
+		var firstAt, secondAt time.Time
+		var closedOK atomic.Bool
+
+		client := &mockChainClient{
+			GetProviderWithdrawableFunc: func(_ context.Context, _ string) (sdktypes.Coins, error) {
+				return sdktypes.Coins{}, nil
+			},
+			GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
+				if closedOK.Load() {
+					return []billingtypes.Lease{}, nil
+				}
+				return []billingtypes.Lease{{Uuid: "lease-1", Tenant: tenant, ProviderUuid: "test-uuid"}}, nil
+			},
+			GetCreditAccountFunc: func(_ context.Context, _ string) (*billingtypes.CreditAccount, sdktypes.Coins, error) {
+				return &billingtypes.CreditAccount{}, sdktypes.Coins{}, nil
+			},
+			CloseLeasesFunc: func(_ context.Context, leaseUUIDs []string, _ string) (uint64, []string, error) {
+				n := atomic.AddInt32(&closeAttempts, 1)
+				mu.Lock()
+				switch n {
+				case 1:
+					firstAt = time.Now()
+				case 2:
+					secondAt = time.Now()
+				}
+				mu.Unlock()
+				if n == 1 {
+					return 0, nil, errors.New("chain temporarily unavailable") // first attempt fails
+				}
+				closedOK.Store(true)
+				return uint64(len(leaseUUIDs)), []string{"txhash"}, nil
+			},
+		}
+
+		s := NewWithdrawScheduler(client, WithdrawSchedulerConfig{
+			ProviderUUID:        "test-uuid",
+			WithdrawInterval:    time.Hour,
+			CreditCheckInterval: time.Minute,
+		})
+		require.Equal(t, 5*time.Minute, s.creditCheckZeroGracePeriod)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = s.Start(ctx) }()
+
+		time.Sleep(20 * time.Minute)
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+
+		require.GreaterOrEqual(t, atomic.LoadInt32(&closeAttempts), int32(2),
+			"a failed close must be retried")
+		mu.Lock()
+		gap := secondAt.Sub(firstAt)
+		mu.Unlock()
+		// Fixed: retry lands on the next check (~credit_check_interval) because
+		// firstZeroAt is retained and already past grace. Buggy (eager delete): the
+		// retry would restart the full 5m grace window first.
+		assert.Less(t, gap, 3*time.Minute,
+			"failed close must retry promptly (next check), not after a fresh grace window")
+	})
 }
 
 func TestWithdrawScheduler_CheckCreditsAndClose_HealthyCredit(t *testing.T) {

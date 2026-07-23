@@ -46,6 +46,15 @@ type tenantState struct {
 	lastBalance     sdktypes.Coins
 	lastCheckTime   time.Time
 	consecutiveErrs int // Track consecutive errors fetching credit account
+
+	// firstZeroAt is when this tenant's credit was FIRST observed empty in the
+	// current zero-streak (zero value = not currently pending closure). Closure
+	// only fires once the empty balance has persisted for creditCheckZeroGracePeriod
+	// — the credit-check equivalent of Kubernetes' tolerationSeconds, so a single
+	// stale zero read (e.g. fred's chain node briefly lagging a tenant top-up)
+	// cannot destroy a paying tenant's leases. Any non-zero read clears it
+	// (hysteresis: recovery starts a fresh window). (ENG-591)
+	firstZeroAt time.Time
 }
 
 // WithdrawScheduler periodically withdraws funds from active leases and
@@ -62,9 +71,10 @@ type WithdrawScheduler struct {
 	lastWithdrawTime    time.Time     // guarded by mu
 
 	// Configurable limits
-	maxWithdrawIterations     int
-	creditCheckErrorThreshold int
-	creditCheckRetryInterval  time.Duration
+	maxWithdrawIterations      int
+	creditCheckErrorThreshold  int
+	creditCheckRetryInterval   time.Duration
+	creditCheckZeroGracePeriod time.Duration // how long an empty balance must persist before closure (ENG-591)
 
 	tenants map[string]*tenantState
 	mu      sync.Mutex
@@ -89,6 +99,9 @@ type WithdrawSchedulerConfig struct {
 	MaxWithdrawIterations     int
 	CreditCheckErrorThreshold int
 	CreditCheckRetryInterval  time.Duration
+	// CreditCheckZeroGracePeriod is how long a tenant's credit must stay empty
+	// before its leases are closed. 0 => default (5m). (ENG-591)
+	CreditCheckZeroGracePeriod time.Duration
 }
 
 // NewWithdrawScheduler creates a new withdrawal scheduler.
@@ -98,6 +111,7 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 	maxIterations := cmp.Or(max(cfg.MaxWithdrawIterations, 0), 100)
 	errorThreshold := cmp.Or(max(cfg.CreditCheckErrorThreshold, 0), 3)
 	retryInterval := cmp.Or(max(cfg.CreditCheckRetryInterval, 0), 30*time.Second)
+	zeroGracePeriod := cmp.Or(max(cfg.CreditCheckZeroGracePeriod, 0), 5*time.Minute)
 
 	withdrawInterval := cfg.WithdrawInterval
 	creditCheckInterval := cmp.Or(max(cfg.CreditCheckInterval, 0), cfg.WithdrawInterval)
@@ -108,18 +122,19 @@ func NewWithdrawScheduler(client ChainClient, cfg WithdrawSchedulerConfig) *With
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &WithdrawScheduler{
-		client:                    client,
-		providerUUID:              cfg.ProviderUUID,
-		withdrawInterval:          withdrawInterval,
-		creditCheckInterval:       creditCheckInterval,
-		guardActive:               creditCheckInterval < withdrawInterval,
-		maxWithdrawIterations:     maxIterations,
-		creditCheckErrorThreshold: errorThreshold,
-		creditCheckRetryInterval:  retryInterval,
-		tenants:                   make(map[string]*tenantState),
-		ctx:                       ctx,
-		cancel:                    cancel,
-		wg:                        &sync.WaitGroup{},
+		client:                     client,
+		providerUUID:               cfg.ProviderUUID,
+		withdrawInterval:           withdrawInterval,
+		creditCheckInterval:        creditCheckInterval,
+		guardActive:                creditCheckInterval < withdrawInterval,
+		maxWithdrawIterations:      maxIterations,
+		creditCheckErrorThreshold:  errorThreshold,
+		creditCheckRetryInterval:   retryInterval,
+		creditCheckZeroGracePeriod: zeroGracePeriod,
+		tenants:                    make(map[string]*tenantState),
+		ctx:                        ctx,
+		cancel:                     cancel,
+		wg:                         &sync.WaitGroup{},
 	}
 }
 
@@ -490,7 +505,7 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 	// Apply results under the scheduler lock. Extracted so the lock is released
 	// via defer even if the body panics — a panic here previously leaked s.mu
 	// and wedged the scheduler (ENG-500).
-	earliestDepletion, leasesToClose := s.applyCreditResults(tenantLeases, results, now)
+	earliestDepletion, leasesToClose, tenantsToClose := s.applyCreditResults(tenantLeases, results, now)
 
 	// Check for context cancellation before making chain call
 	if ctx.Err() != nil {
@@ -501,9 +516,21 @@ func (s *WithdrawScheduler) checkCreditsAndClose(ctx context.Context) time.Time 
 	if len(leasesToClose) > 0 {
 		closed, txHashes, err := s.client.CloseLeases(ctx, leasesToClose, "credit exhausted")
 		if err != nil {
+			// Leave the tenants' state (incl. firstZeroAt) intact so the next check
+			// re-attempts the close immediately rather than restarting the grace
+			// window (ENG-591 / Copilot review).
 			slog.Error("failed to close depleted leases", "error", err)
 		} else {
 			slog.Info("closed depleted leases", "count", closed, "tx_hashes", txHashes)
+			// Close committed: drop the closed tenants' burn-rate/grace state. (The
+			// next check would also drop them via the no-active-leases sweep once the
+			// chain no longer lists their leases, but delete now to avoid a redundant
+			// re-close attempt in the interim.)
+			s.mu.Lock()
+			for _, tenant := range tenantsToClose {
+				delete(s.tenants, tenant)
+			}
+			s.mu.Unlock()
 		}
 	}
 
@@ -532,10 +559,18 @@ type creditResult struct {
 }
 
 // applyCreditResults folds the fetched per-tenant credit results into burn-rate
-// state, returning the earliest estimated depletion and any leases whose credit
-// is exhausted. The scheduler lock is taken here and released via defer, so a
-// panic in the body cannot leak it and wedge the scheduler (ENG-500).
-func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string, results map[string]creditResult, now time.Time) (earliestDepletion time.Time, leasesToClose []string) {
+// state, returning the earliest estimated depletion, any leases whose credit is
+// exhausted, and the tenants those leases belong to. The scheduler lock is taken
+// here and released via defer, so a panic in the body cannot leak it and wedge the
+// scheduler (ENG-500).
+//
+// The to-close tenants' state is deliberately NOT deleted here: the CloseLeases RPC
+// runs after this returns (and outside the lock), so the caller deletes their state
+// only once the close succeeds. Deleting eagerly would drop firstZeroAt, so a failed
+// close would restart the whole credit_check_zero_grace_period before the next
+// attempt — turning a transient close error into a multi-minute closure delay
+// (ENG-591 / Copilot review).
+func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string, results map[string]creditResult, now time.Time) (earliestDepletion time.Time, leasesToClose []string, tenantsToClose []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -577,14 +612,75 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 			state.consecutiveErrs = 0
 		}
 
-		// Check if balance is zero (depleted)
+		// Check if balance is zero (depleted). ENG-591: a single zero read must
+		// not destroy leases — the gate action is DESTROY (MsgCloseLease → volume
+		// soft-delete + grace), so a transient stale read (e.g. fred's chain node
+		// briefly lagging a tenant top-up) would wrongfully close a paying tenant.
+		// Require the empty balance to PERSIST for creditCheckZeroGracePeriod before
+		// closing (the tolerationSeconds / Prometheus-`for` idiom), re-confirming
+		// via an early re-check within the window. Any non-zero read below clears
+		// firstZeroAt, so a recovery starts a fresh window (hysteresis).
 		if result.balances.IsZero() {
-			slog.Warn("credit exhausted, closing leases",
-				"tenant", tenant,
-				"lease_count", len(leaseUUIDs),
-			)
-			leasesToClose = append(leasesToClose, leaseUUIDs...)
-			delete(s.tenants, tenant)
+			state, exists := s.tenants[tenant]
+			if !exists {
+				state = &tenantState{}
+				s.tenants[tenant] = state
+			}
+			firstObservation := state.firstZeroAt.IsZero()
+			if firstObservation {
+				state.firstZeroAt = now // enter the pending-closure window
+			}
+			if now.Sub(state.firstZeroAt) >= s.creditCheckZeroGracePeriod {
+				slog.Warn("credit exhausted, closing leases",
+					"tenant", tenant,
+					"lease_count", len(leaseUUIDs),
+					"zero_since", state.firstZeroAt,
+					"grace_period", s.creditCheckZeroGracePeriod,
+				)
+				leasesToClose = append(leasesToClose, leaseUUIDs...)
+				tenantsToClose = append(tenantsToClose, tenant)
+				// State (incl. firstZeroAt) is retained until the caller confirms the
+				// close succeeded, so a failed close retries promptly instead of
+				// restarting the grace window.
+				continue
+			}
+			// Still within the grace window: defer closure and schedule an early
+			// re-check so the empty balance is re-confirmed (or cleared) promptly
+			// rather than waiting a full credit-check interval. Deferral is EXPECTED
+			// behavior, so only the first empty observation logs at WARN (the signal
+			// worth an operator's attention); the repeated in-window re-checks log at
+			// Debug to avoid a per-tenant WARN every retryInterval.
+			metrics.CreditCheckZeroDeferredTotal.Inc()
+			if firstObservation {
+				slog.Warn("credit read empty; deferring closure pending grace-period confirmation",
+					"tenant", tenant,
+					"lease_count", len(leaseUUIDs),
+					"zero_since", state.firstZeroAt,
+					"grace_period", s.creditCheckZeroGracePeriod,
+				)
+			} else {
+				slog.Debug("credit still empty; continuing to defer closure within grace window",
+					"tenant", tenant,
+					"lease_count", len(leaseUUIDs),
+					"zero_since", state.firstZeroAt,
+					"grace_period", s.creditCheckZeroGracePeriod,
+				)
+			}
+			// Reuse creditCheckRetryInterval as the in-window re-confirmation cadence:
+			// it is the scheduler's single "schedule an earlier follow-up credit check"
+			// delay, already applied on the consecutive-error path, and 30s (default)
+			// suits both. Documented as covering both uses (README / doc.go). Without
+			// an early re-check the next sample could be a full creditCheckInterval away
+			// (up to withdraw_interval when coupled), leaving the empty balance
+			// unconfirmed and delaying a genuine closure well past the grace deadline.
+			// checkCreditsAndClose subtracts depletionCheckBuffer when turning this into
+			// the next check time (same as the error path), so the effective re-check
+			// lands ~depletionCheckBuffer sooner than retryInterval — immaterial against
+			// the minutes-scale grace window.
+			earlyRetry := now.Add(s.creditCheckRetryInterval)
+			if earliestDepletion.IsZero() || earlyRetry.Before(earliestDepletion) {
+				earliestDepletion = earlyRetry
+			}
 			continue
 		}
 
@@ -596,6 +692,20 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 				lastBalance:   result.balances,
 				lastCheckTime: now,
 			}
+			continue
+		}
+
+		// Non-zero balance observed after a pending zero-closure window: the tenant
+		// recovered (top-up seen / node caught up). Its stored lastBalance/
+		// lastCheckTime predate the zero plateau, so a burn rate computed across that
+		// gap would be diluted and misleading (and could schedule the next check too
+		// late). Treat recovery as a fresh baseline — reset state and skip estimation
+		// this cycle; the next cycle computes a clean burn rate over a normal interval.
+		// (ENG-591 hysteresis; Copilot review.)
+		if !state.firstZeroAt.IsZero() {
+			state.firstZeroAt = time.Time{}
+			state.lastBalance = result.balances
+			state.lastCheckTime = now
 			continue
 		}
 

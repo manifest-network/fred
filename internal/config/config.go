@@ -100,9 +100,10 @@ type Config struct {
 	MaxRequestBodySize int64 `mapstructure:"max_request_body_size"`
 
 	// Credit check thresholds
-	CreditCheckErrorThreshold int           `mapstructure:"credit_check_error_threshold"`
-	CreditCheckRetryInterval  time.Duration `mapstructure:"credit_check_retry_interval"`
-	CreditCheckInterval       time.Duration `mapstructure:"credit_check_interval"` // 0 = coupled to withdraw_interval (resolved by the scheduler).
+	CreditCheckErrorThreshold  int           `mapstructure:"credit_check_error_threshold"`
+	CreditCheckRetryInterval   time.Duration `mapstructure:"credit_check_retry_interval"`
+	CreditCheckInterval        time.Duration `mapstructure:"credit_check_interval"`          // 0 = coupled to withdraw_interval (resolved by the scheduler).
+	CreditCheckZeroGracePeriod time.Duration `mapstructure:"credit_check_zero_grace_period"` // how long an empty balance must persist before lease closure; 0 = default 5m (resolved by the scheduler). (ENG-591)
 
 	// Backend configuration
 	Backends                    []BackendConfig `mapstructure:"backends"`
@@ -216,6 +217,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("credit_check_error_threshold", 3)
 	v.SetDefault("credit_check_retry_interval", "30s")
 	v.SetDefault("credit_check_interval", "0s")
+	v.SetDefault("credit_check_zero_grace_period", "5m")
 
 	// Parallel signing defaults
 	v.SetDefault("sub_signer_count", 0)
@@ -303,6 +305,9 @@ func (c *Config) Validate() error {
 	}
 	if c.CreditCheckInterval > 0 && c.CreditCheckInterval > c.WithdrawInterval {
 		return fmt.Errorf("credit_check_interval (%s) must not exceed withdraw_interval (%s)", c.CreditCheckInterval, c.WithdrawInterval)
+	}
+	if c.CreditCheckZeroGracePeriod < 0 {
+		return fmt.Errorf("credit_check_zero_grace_period cannot be negative")
 	}
 	if c.RateLimitRPS <= 0 {
 		return fmt.Errorf("rate_limit_rps must be positive")

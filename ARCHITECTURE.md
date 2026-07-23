@@ -624,6 +624,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_withdraw_incomplete_cycles_total` | counter | — | Provider-wide withdrawal cycles that hit the iteration bound (`max_withdraw_iterations`) with the pagination cursor still non-empty — the provider was not fully drained in that cycle (deferred to the next cycle, not fund loss) (ENG-475) |
 | `fred_withdraw_skipped_by_guard_total` | counter | — | Scheduler wakes that skipped the paid withdrawal because the withdraw-cadence guard had not elapsed since the last full drain; only increments when `guard_active`=1 (ENG-524) |
 | `fred_withdraw_guard_active` | gauge | — | 1 when the withdraw-cadence guard is active (`credit_check_interval < withdraw_interval`), else 0 (ENG-524) |
+| `fred_withdraw_credit_check_zero_deferred_total` | counter | — | Credit checks that read an empty balance but deferred lease closure pending the `credit_check_zero_grace_period` window (aggregate, no tenant label); a sustained or rising rate suggests a chronically lagging chain node or a mistuned grace period (ENG-591) |
 
 **Payload:**
 
