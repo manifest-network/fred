@@ -331,10 +331,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// (no off-actor field mutation).
 	for uuid, existing := range b.provisions {
 		if _, hasContainers := building[uuid]; hasContainers {
-			// By-design (ENG-414): only the in-flight statuses below are preserved
-			// here. Ready and Failing/Failed deliberately fall through to the
-			// container-derived (materialized) value, so a crashed-then-running lease
-			// recovers to Ready (locked by TestRecoverState_FailCountAntiRegression).
+			// By-design (ENG-414): only the in-flight statuses below (plus a Failed
+			// lease mid volume-cleanup-retry, ENG-603) are preserved here. Ready and
+			// Failing/Failed[VCA==0] deliberately fall through to the container-derived
+			// (materialized) value, so a crashed-then-running lease recovers to Ready
+			// (locked by TestRecoverState_FailCountAntiRegression).
 			// recoverState cannot distinguish that legitimate recovery from the narrow
 			// race where the actor set Failing/Failed (via an event-loop die) AFTER our
 			// pre-merge ListManagedContainers snapshot still showed the container
@@ -355,6 +356,27 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				// The deprovision goroutine owns this lease; do not resurrect it
 				// to a container-derived status (ENG-193 explicit case).
 				final[uuid] = existing
+			case backend.ProvisionStatusFailed:
+				// ENG-603: a Failed lease mid volume-cleanup-retry
+				// (VolumeCleanupAttempts>0) reached deprovision.go's VCA-increment
+				// block ONLY after its containers were successfully torn down (the
+				// partial-container-failure branch returns without incrementing), so
+				// its ContainerIDs are already nil and any container this snapshot
+				// still lists for it is necessarily STALE — captured before the
+				// concurrent doDeprovision's compose Down removed it, then merged here
+				// after doDeprovision set Status=Failed. Resurrecting it to a
+				// container-derived Ready (the general fall-through) would drop the
+				// VolumeCleanupAttempts count and, once the next reconcile GCs the
+				// phantom-Ready no-container entry, abandon the volume-cleanup retry
+				// AND leak the still-held pool reservation (released only on a terminal
+				// success or give-up). Preserve by pointer — same rationale as the
+				// Deprovisioning case above and the ENG-546/562/563 Failed[VCA>0] pool
+				// preservation. VCA==0 Failed leases still fall through to the
+				// container-derived value so a Ready→crash→running lease recovers to
+				// Ready (TestRecoverState_FailCountAntiRegression).
+				if existing.VolumeCleanupAttempts > 0 {
+					final[uuid] = existing
+				}
 			}
 			continue
 		}
