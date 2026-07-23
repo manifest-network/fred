@@ -525,6 +525,45 @@ func TestWithdrawScheduler_ZeroBalance_RecoveryResetsGrace(t *testing.T) {
 	assert.Empty(t, toClose, "post-recovery zero must start a fresh grace window, not inherit the old one")
 }
 
+// TestWithdrawScheduler_ZeroBalance_RecoveryResetsBurnBaseline verifies that a
+// non-zero read recovering from a pending zero window does NOT compute a burn rate
+// across the zero plateau (which would be diluted/misleading and could schedule the
+// next check too late). Recovery resets the baseline and skips estimation for that
+// cycle. (ENG-591 / Copilot review.)
+func TestWithdrawScheduler_ZeroBalance_RecoveryResetsBurnBaseline(t *testing.T) {
+	tenant := generateTestAddress(t, "manifest")
+	s := NewWithdrawScheduler(&mockChainClient{}, WithdrawSchedulerConfig{
+		ProviderUUID:     "test-uuid",
+		WithdrawInterval: time.Minute,
+	})
+	tenantLeases := map[string][]string{tenant: {"lease-1"}}
+	high := map[string]creditResult{tenant: {balances: sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(1_000_000)))}}
+	zero := map[string]creditResult{tenant: {balances: sdktypes.Coins{}}}
+	low := map[string]creditResult{tenant: {balances: sdktypes.NewCoins(sdktypes.NewCoin("umfx", sdkmath.NewInt(10)))}}
+
+	t0 := time.Now()
+
+	// Establish a normal non-zero baseline (X, at t0).
+	s.applyCreditResults(tenantLeases, high, t0)
+	// Dip to zero at t0+1m — burn-rate baseline (lastBalance/lastCheckTime) is NOT
+	// updated by the zero path; the pending window opens.
+	s.applyCreditResults(tenantLeases, zero, t0.Add(time.Minute))
+	// Recover to a LOWER non-zero balance (Y<X) at t0+2m. A naive burn rate over
+	// (t0 .. t0+2m) would be diluted by the zero gap.
+	earliest, _ := s.applyCreditResults(tenantLeases, low, t0.Add(2*time.Minute))
+
+	// No depletion estimate is scheduled from the recovery cycle (baseline reset).
+	assert.True(t, earliest.IsZero(), "recovery from a zero window must not schedule a diluted depletion estimate")
+
+	s.mu.Lock()
+	state := s.tenants[tenant]
+	s.mu.Unlock()
+	require.NotNil(t, state)
+	assert.True(t, state.firstZeroAt.IsZero(), "recovery clears the pending zero window")
+	assert.True(t, state.lastCheckTime.Equal(t0.Add(2*time.Minute)), "recovery resets the burn baseline timestamp to now")
+	assert.Equal(t, low[tenant].balances, state.lastBalance, "recovery resets the burn baseline balance to the recovered value")
+}
+
 // TestWithdrawScheduler_ZeroBalance_Integration_ClosesAfterGrace drives the full
 // running scheduler (Start loop → withdrawAndCheckCredits → checkCreditsAndClose →
 // CloseLeases) under synctest virtual time. With a sustained empty balance and the

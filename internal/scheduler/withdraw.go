@@ -606,7 +606,8 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 				state = &tenantState{}
 				s.tenants[tenant] = state
 			}
-			if state.firstZeroAt.IsZero() {
+			firstObservation := state.firstZeroAt.IsZero()
+			if firstObservation {
 				state.firstZeroAt = now // enter the pending-closure window
 			}
 			if now.Sub(state.firstZeroAt) >= s.creditCheckZeroGracePeriod {
@@ -622,14 +623,26 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 			}
 			// Still within the grace window: defer closure and schedule an early
 			// re-check so the empty balance is re-confirmed (or cleared) promptly
-			// rather than waiting a full credit-check interval.
+			// rather than waiting a full credit-check interval. Deferral is EXPECTED
+			// behavior, so only the first empty observation logs at WARN (the signal
+			// worth an operator's attention); the repeated in-window re-checks log at
+			// Debug to avoid a per-tenant WARN every retryInterval.
 			metrics.CreditCheckZeroDeferredTotal.Inc()
-			slog.Warn("credit read empty; deferring closure pending grace-period confirmation",
-				"tenant", tenant,
-				"lease_count", len(leaseUUIDs),
-				"zero_since", state.firstZeroAt,
-				"grace_period", s.creditCheckZeroGracePeriod,
-			)
+			if firstObservation {
+				slog.Warn("credit read empty; deferring closure pending grace-period confirmation",
+					"tenant", tenant,
+					"lease_count", len(leaseUUIDs),
+					"zero_since", state.firstZeroAt,
+					"grace_period", s.creditCheckZeroGracePeriod,
+				)
+			} else {
+				slog.Debug("credit still empty; continuing to defer closure within grace window",
+					"tenant", tenant,
+					"lease_count", len(leaseUUIDs),
+					"zero_since", state.firstZeroAt,
+					"grace_period", s.creditCheckZeroGracePeriod,
+				)
+			}
 			earlyRetry := now.Add(s.creditCheckRetryInterval)
 			if earliestDepletion.IsZero() || earlyRetry.Before(earliestDepletion) {
 				earliestDepletion = earlyRetry
@@ -648,10 +661,19 @@ func (s *WithdrawScheduler) applyCreditResults(tenantLeases map[string][]string,
 			continue
 		}
 
-		// Non-zero balance observed: clear any pending zero-closure window so a
-		// tenant that recovered (top-up seen / node caught up) starts fresh if it
-		// later empties again (ENG-591 hysteresis).
-		state.firstZeroAt = time.Time{}
+		// Non-zero balance observed after a pending zero-closure window: the tenant
+		// recovered (top-up seen / node caught up). Its stored lastBalance/
+		// lastCheckTime predate the zero plateau, so a burn rate computed across that
+		// gap would be diluted and misleading (and could schedule the next check too
+		// late). Treat recovery as a fresh baseline — reset state and skip estimation
+		// this cycle; the next cycle computes a clean burn rate over a normal interval.
+		// (ENG-591 hysteresis; Copilot review.)
+		if !state.firstZeroAt.IsZero() {
+			state.firstZeroAt = time.Time{}
+			state.lastBalance = result.balances
+			state.lastCheckTime = now
+			continue
+		}
 
 		// Calculate burn rate from balance change
 		elapsed := now.Sub(state.lastCheckTime)
