@@ -727,7 +727,11 @@ func TestEventSubscriber_Start_ReconnectsOnHalfOpenPeer(t *testing.T) {
 				return
 			}
 			var req jsonRPCRequest
-			if json.Unmarshal(msg, &req) == nil && req.Method == "subscribe" {
+			if err := json.Unmarshal(msg, &req); err != nil {
+				t.Logf("half-open test server: unexpected unmarshal error: %v", err)
+				continue
+			}
+			if req.Method == "subscribe" {
 				if err := conn.WriteJSON(jsonRPCResponse{JSONRPC: "2.0", ID: req.ID}); err != nil {
 					return
 				}
