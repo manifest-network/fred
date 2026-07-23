@@ -29,8 +29,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -868,6 +870,41 @@ func ValidateStackAgainstItems(stack *StackManifest, items []backend.LeaseItem) 
 		}
 	}
 
+	return nil
+}
+
+// ValidateNoFixedHostPorts rejects any service port that pins a fixed host
+// port (HostPort > 0). This is an ADMISSION-ONLY gate: it runs on the
+// tenant-facing provision/update paths, never on ParsePayload/recover, so
+// already-stored manifests (which may predate this rule) stay parseable and
+// their data restorable.
+//
+// Rationale (ENG-605): the permissionless tenant model treats any paying
+// tenant as an adversary. A tenant-specified fixed host port binds verbatim on
+// GetHostBindIP() (0.0.0.0 in prod), which lets a tenant squat well-known/
+// privileged ports and collide with host services or other leases
+// ("address already in use" -> provision DoS). Only [0,65535] was bounded
+// before, with no reservation/floor. Forcing dynamic assignment (HostPort == 0,
+// Docker picks a free ephemeral port returned in the connection info) removes
+// the squatting and cross-lease collision vector entirely; tenants reach their
+// services through Traefik ingress, so there is no legitimate need to pin a
+// host port. Iteration is sorted so the rejected port is deterministic.
+func ValidateNoFixedHostPorts(stack *StackManifest) error {
+	for _, svcName := range slices.Sorted(maps.Keys(stack.Services)) {
+		svc := stack.Services[svcName]
+		if svc == nil {
+			continue
+		}
+		for _, portSpec := range slices.Sorted(maps.Keys(svc.Ports)) {
+			if svc.Ports[portSpec].HostPort > 0 {
+				return fmt.Errorf("service %q port %q: fixed host_port is not permitted; "+
+					"omit host_port so a port is assigned dynamically, then reach the service "+
+					"via ingress or discover the assigned port with "+
+					"GET /v1/leases/{lease_uuid}/connection",
+					svcName, portSpec)
+			}
+		}
+	}
 	return nil
 }
 

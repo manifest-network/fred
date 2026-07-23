@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1035,55 +1034,13 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	assert.Equal(t, 1, prov.FailCount)
 }
 
-func TestIntegration_Docker_PortConflict(t *testing.T) {
-	callbackServer, callbackCh := startCallbackServer(t)
-
-	// NetworkIsolation=true so the container lands on a real bridge and actually
-	// publishes the host port — the only mode where a host-port conflict occurs in
-	// the compose era. With isolation OFF the container is attached to Docker's
-	// "none" network and host-port publishing is silently dropped; that
-	// isolation-off port-publishing gap is a separate product bug tracked elsewhere.
-	b := testBackendWithRealDocker(t, func(cfg *Config) {
-		cfg.NetworkIsolation = ptrBool(true)
-	})
-
-	// Start a TCP listener to occupy port 19876
-	ln, err := net.Listen("tcp", "127.0.0.1:19876")
-	require.NoError(t, err)
-	defer func() { _ = ln.Close() }()
-
-	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("port-%d", time.Now().UnixNano())
-
-	appManifest := manifest.Manifest{
-		Image:   "busybox:latest",
-		Command: []string{"sleep", "3600"},
-		Ports: map[string]manifest.PortConfig{
-			"80/tcp": {HostPort: 19876},
-		},
-	}
-	payload, err := json.Marshal(appManifest)
-	require.NoError(t, err)
-
-	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
-	})
-	require.NoError(t, err)
-
-	// Wait for failure callback (port bind fails during container start)
-	select {
-	case cb := <-callbackCh:
-		assert.Equal(t, leaseUUID, cb.LeaseUUID)
-		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for failure callback")
-	}
-}
+// NOTE: The former TestIntegration_Docker_PortConflict was removed with ENG-605.
+// It provisioned a manifest pinning a fixed host_port to force an "address
+// already in use" collision, but fixed host ports are now rejected at admission
+// (ValidateNoFixedHostPorts), so that scenario is unreachable via a tenant
+// manifest — dynamic ports are assigned free ephemeral ports and never
+// deterministically collide. Admission rejection is covered by the unit/wiring
+// tests (TestProvision_RejectsFixedHostPort, TestUpdate_RejectsFixedHostPort).
 
 // TestIntegration_EnsureTenantNetwork_ConcurrentRace verifies that two
 // concurrent calls to EnsureTenantNetwork for the same tenant both succeed,

@@ -167,6 +167,26 @@ func TestUpdate_ImageNotAllowed(t *testing.T) {
 	assert.ErrorIs(t, err, backend.ErrValidation)
 }
 
+func TestUpdate_RejectsFixedHostPort(t *testing.T) {
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+			Status: backend.ProvisionStatusReady,
+			SKU:    "docker-small",
+			Items:  []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}},
+		},
+	}
+	b := newBackendForTest(&mockDockerClient{}, provisions)
+
+	// A tenant must not be able to introduce a squatted fixed host port via
+	// an update (ENG-605), just as at provision time.
+	err := b.Update(context.Background(), backend.UpdateRequest{
+		LeaseUUID: "lease-1",
+		Payload:   []byte(`{"image":"docker.io/library/nginx:latest","ports":{"8080/tcp":{"host_port":8080}}}`),
+	})
+	require.ErrorIs(t, err, backend.ErrInvalidManifest)
+	assert.Contains(t, err.Error(), "host_port")
+}
+
 // --- GetReleases tests ---
 
 func TestGetReleases_NotProvisioned(t *testing.T) {

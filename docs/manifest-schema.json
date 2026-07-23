@@ -181,9 +181,9 @@
         "host_port": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 65535,
+          "maximum": 0,
           "default": 0,
-          "description": "Fixed host port. 0 or omitted means Docker assigns a random available port."
+          "description": "Must be 0 or omitted: the host port is always assigned dynamically. Fixed host ports are not permitted (a provision/update pinning host_port > 0 is rejected). Reach the service via ingress, or discover the assigned port with GET /v1/leases/{lease_uuid}/connection."
         },
         "ingress": {
           "type": "boolean",
