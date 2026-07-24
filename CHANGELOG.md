@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.12.0] - 2026-07-24
+
+### Added
+
 - New metric `fred_provisioner_ack_batcher_lane_restarts_total{lane}` counts
   ack-batcher lanes respawned after a recovered panic (see Fixed). Pair with
   `fred_goroutine_panics_total{component="ack_batcher"}` to detect a
