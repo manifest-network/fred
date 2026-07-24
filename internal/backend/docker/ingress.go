@@ -42,14 +42,14 @@ type IngressConfig struct {
 	CustomDomainMiddlewares []string `yaml:"custom_domain_middlewares"`
 
 	// CustomDomainDNSResolvers are the DNS servers (host:port) fred queries to
-	// check whether a tenant custom domain resolves to this host before
-	// emitting its HTTP-01 router (ENG-266). Public resolvers are used so the
-	// answer matches what the ACME CA sees. Defaults to Cloudflare 1.1.1.1:53 /
+	// check whether a tenant custom domain resolves yet before emitting its
+	// HTTP-01 router (ENG-266). Public resolvers are used so the answer matches
+	// what the ACME CA sees. Defaults to Cloudflare 1.1.1.1:53 /
 	// Google 8.8.8.8:53 / Quad9 9.9.9.9:53.
 	CustomDomainDNSResolvers []string `yaml:"custom_domain_dns_resolvers"`
 
 	// CustomDomainDNSQuorum is how many of the resolvers must independently see
-	// the domain at this host before the gate opens (ENG-266). 0 (default) ==
+	// the domain resolve before the gate opens (ENG-266). 0 (default) ==
 	// a majority of CustomDomainDNSResolvers. Clamped to [1, len(resolvers)],
 	// or 1 when no resolvers are configured.
 	CustomDomainDNSQuorum int `yaml:"custom_domain_dns_quorum"`

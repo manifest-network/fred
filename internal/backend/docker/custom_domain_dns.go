@@ -2,8 +2,6 @@ package docker
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"net"
 	"sync"
 )
@@ -14,67 +12,29 @@ type ipResolver interface {
 	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
 }
 
-// customDomainResolvesToHost reports whether `domain` currently resolves to an
-// IP this backend also serves on — the necessary-and-sufficient DNS condition
-// for an HTTP-01 challenge against `domain` to reach this host's Traefik
-// (routing itself is by Host header, independent of DNS record type).
+// customDomainResolves reports whether `domain` currently resolves to at least
+// one IP address — the necessary-and-sufficient DNS precondition for firing an
+// HTTP-01 order without poisoning the CA's negative cache (ENG-266).
 //
-// hostAddress is the backend's external address (cfg.HostAddress): a literal
-// IP (used as-is) or a hostname (resolved). Returns:
-//   - (true, nil)  when the IP sets overlap,
-//   - (false, nil) when the domain doesn't resolve or shares no IP with the
-//     host (not ready yet, or proxied/CDN — both correctly "don't order"),
-//   - (false, err) only when the HOST itself can't be resolved (a config/infra
-//     problem the caller should log and treat as "skip this tick").
-func customDomainResolvesToHost(ctx context.Context, res ipResolver, domain, hostAddress string) (bool, error) {
-	hostIPs, err := resolveToIPs(ctx, res, hostAddress)
-	if err != nil {
-		return false, fmt.Errorf("resolve host_address %q: %w", hostAddress, err)
-	}
-	if len(hostIPs) == 0 {
-		return false, fmt.Errorf("host_address %q resolved to no IPs", hostAddress)
-	}
-
-	domainAddrs, derr := res.LookupIPAddr(ctx, domain)
-	if derr != nil {
-		// NXDOMAIN / SERVFAIL / timeout on the tenant domain == not ready yet.
-		// This is the expected pre-propagation state, not an error.
-		return false, nil //nolint:nilerr // domain not resolving yet is "not ready", not an error to surface
-	}
-
-	hostSet := make(map[string]struct{}, len(hostIPs))
-	for _, ip := range hostIPs {
-		hostSet[ip.String()] = struct{}{}
-	}
-	for _, a := range domainAddrs {
-		if _, ok := hostSet[a.IP.String()]; ok {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// resolveToIPs returns the IPs for addr, treating a literal IP as a 1-element
-// set without a lookup.
-func resolveToIPs(ctx context.Context, res ipResolver, addr string) ([]net.IP, error) {
-	// host_address may carry a port (Config.Validate accepts e.g.
-	// "203.0.113.8:443" / "example.com:8443" and strips it the same way);
-	// resolve the host part, not the literal "host:port".
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		addr = h
-	}
-	if ip := net.ParseIP(addr); ip != nil {
-		return []net.IP{ip}, nil
-	}
-	addrs, err := res.LookupIPAddr(ctx, addr)
-	if err != nil {
-		return nil, err
-	}
-	ips := make([]net.IP, 0, len(addrs))
-	for _, a := range addrs {
-		ips = append(ips, a.IP)
-	}
-	return ips, nil
+// It deliberately does NOT check that the domain resolves to any particular
+// host IP (ENG-618). fred's `host_address` is the backend's PRIVATE br1
+// service-plane IP (internal_ip), whereas a tenant custom domain legitimately
+// CNAMEs to the host's PUBLIC ingress IP — the same target the *.barneyN
+// wildcard uses. Comparing the two (the previous behavior) could never match on
+// the production topology, so the gate would defer forever and a custom domain
+// dropped by a container recreate (reboot/reprovision) was never re-attached.
+// This mirrors the idiomatic multi-tenant TLS pattern: authorization (fred's
+// on-chain custom_domain claim) decides *whether* to issue; DNS readiness only
+// avoids ordering while the name is still NXDOMAIN, and the ACME challenge
+// itself is the authoritative "does it actually point here" test.
+//
+// Returns:
+//   - true  when the domain resolves to one or more addresses,
+//   - false when it does not resolve yet (NXDOMAIN / SERVFAIL / timeout / empty
+//     answer) — the expected pre-propagation state, not an error to surface.
+func customDomainResolves(ctx context.Context, res ipResolver, domain string) bool {
+	addrs, err := res.LookupIPAddr(ctx, domain)
+	return err == nil && len(addrs) > 0
 }
 
 // newResolverForServer builds a *net.Resolver that sends every query to a
@@ -103,12 +63,7 @@ func newResolvers(servers []string) []ipResolver {
 func majorityQuorum(n int) int { return n/2 + 1 }
 
 // customDomainReadyByQuorum queries each resolver INDEPENDENTLY and returns
-// whether at least `quorum` of them see `domain` resolving to a host IP, plus
-// the first host-resolution error encountered (if any). Callers should log a
-// non-nil error: it means host_address itself could not be resolved (a
-// config/infra problem) which otherwise silently defers ALL issuance with no
-// operator signal. A domain that simply doesn't resolve yet is NOT an error —
-// it's a "not ready" vote.
+// whether at least `quorum` of them see `domain` resolving.
 //
 // Mirrors Let's Encrypt multi-perspective validation: one resolver's stale
 // NXDOMAIN cache can't block issuance (others still count) and one
@@ -119,58 +74,38 @@ func majorityQuorum(n int) int { return n/2 + 1 }
 // resolver can't add its full timeout to the readiness latency. All goroutines
 // are still joined (wg.Wait) before return — none outlives this call — and the
 // buffered channel guarantees no sender ever blocks. With 0 resolvers it
-// returns (false, nil) — the gate stays closed rather than silently opening.
-func customDomainReadyByQuorum(ctx context.Context, resolvers []ipResolver, domain, hostAddress string, quorum int) (bool, error) {
+// returns false — the gate stays closed rather than silently opening.
+func customDomainReadyByQuorum(ctx context.Context, resolvers []ipResolver, domain string, quorum int) bool {
 	if len(resolvers) == 0 {
-		return false, nil
+		return false
 	}
 	// Cancel outstanding lookups as soon as the result is decided.
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	type vote struct {
-		ready   bool
-		hostErr error
-	}
-	votes := make(chan vote, len(resolvers))
+	votes := make(chan bool, len(resolvers))
 	var wg sync.WaitGroup
 	for _, r := range resolvers {
 		wg.Add(1)
 		go func(rr ipResolver) {
 			defer wg.Done()
-			ok, err := customDomainResolvesToHost(cctx, rr, domain, hostAddress)
-			votes <- vote{ready: err == nil && ok, hostErr: err}
+			votes <- customDomainResolves(cctx, rr, domain)
 		}(r)
 	}
 
 	ready, notReady := 0, 0
 	maxNotReady := len(resolvers) - quorum // once notReady exceeds this, quorum is impossible
-	decided := false
-	var hostErr error
-	// Read every vote so a genuine host-resolution error is reliably captured
-	// for diagnostics, but make the readiness decision as soon as it's final and
-	// cancel the outstanding lookups — the canceled lookups then return
-	// promptly, so a slow/hung resolver can't add its full timeout to latency.
 	for range resolvers {
-		v := <-votes
-		if !decided {
-			if v.ready {
-				ready++
-			} else {
-				notReady++
-			}
-			if ready >= quorum || notReady > maxNotReady {
-				decided = true
-				cancel()
-			}
+		if <-votes {
+			ready++
+		} else {
+			notReady++
 		}
-		// Capture the first genuine host-resolution error. Skip context.Canceled
-		// — that's our own cancellation of a not-yet-finished lookup, not a host
-		// problem, and surfacing it would mislead operators.
-		if hostErr == nil && v.hostErr != nil && !errors.Is(v.hostErr, context.Canceled) {
-			hostErr = v.hostErr
+		if ready >= quorum || notReady > maxNotReady {
+			cancel() // decided — let the remaining lookups return promptly
+			break
 		}
 	}
 	wg.Wait() // reap every goroutine; no leak
-	return ready >= quorum, hostErr
+	return ready >= quorum
 }

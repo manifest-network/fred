@@ -27,6 +27,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Custom-domain routers now re-attach on their own after a container recreate
+  (host reboot / reprovision) instead of leaving the tenant's custom domain
+  stuck at 404. The ENG-266 DNS-readiness gate required the tenant domain to
+  resolve to the backend's `host_address`, but `host_address` is the private
+  br1 service-plane IP (`internal_ip`, e.g. `172.16.x`) while a tenant custom
+  domain legitimately resolves to the host's **public** ingress IP — so the
+  overlap check could never pass on the production topology and the gate
+  deferred every custom domain forever. It only appeared to work because the
+  `-custom` label was grandfathered onto long-lived containers; the first
+  container recreate (a maintenance reboot re-runs provision, which drops the
+  label) exposed it, and nothing re-applied the router — even though DNS was
+  correct and the reconciler ran every tick (the re-check deferred silently at
+  `DEBUG`). The gate now checks only that the domain **resolves at all** (not
+  that it resolves to any particular host IP): the necessary-and-sufficient
+  signal for not firing an HTTP-01 order into a negative cache, and the
+  idiomatic multi-tenant-TLS split — authorization (the on-chain `custom_domain`
+  claim) decides *whether* to issue, and the ACME challenge itself is the
+  authoritative "does it point here" test. Post-boot the existing per-tick
+  reconcile re-attaches the router within one interval, no fresh provision
+  required. (ENG-618)
 - Crash recovery (`recoverState`) no longer resurrects a lease that is mid
   volume-cleanup-retry (`Failed` with `VolumeCleanupAttempts > 0`) back to
   `Ready` from a stale container snapshot. Such a lease has already had its

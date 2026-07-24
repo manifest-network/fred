@@ -181,7 +181,7 @@ func (b *Backend) computeCustomDomainOverrides(prov *provision, items []backend.
 		// that is not already the emitted one. Never tear down an already-emitted
 		// domain on a transient DNS mismatch; clearing ("") is never gated.
 		if desired != "" && desired != emitted && !dnsReady[desired] {
-			logger.Debug("custom_domain set but DNS not yet pointing at this host; deferring cert issuance",
+			logger.Debug("custom_domain set but DNS does not resolve yet; deferring cert issuance",
 				"service_name", m.serviceName,
 				"custom_domain", desired)
 			desired = emitted
