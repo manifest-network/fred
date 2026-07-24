@@ -23,6 +23,15 @@ import (
 
 // --- Restart tests ---
 
+func TestReplaceOpReason(t *testing.T) {
+	// doReplaceContainers runs for restart, update, AND restore — each must map
+	// to its own category, and an unknown op must not be misclassified (ENG-508).
+	assert.Equal(t, backend.ReasonRestartFailed, replaceOpReason("restart"))
+	assert.Equal(t, backend.ReasonUpdateFailed, replaceOpReason("update"))
+	assert.Equal(t, backend.ReasonRestoreFailed, replaceOpReason("restore"))
+	assert.Equal(t, backend.ReasonInternal, replaceOpReason("something-else"))
+}
+
 func TestRestart_NotProvisioned(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
 

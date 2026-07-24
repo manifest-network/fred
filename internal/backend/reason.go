@@ -18,6 +18,7 @@ const (
 	ReasonInternal               Reason = "Internal"
 	ReasonRestartFailed          Reason = "RestartFailed"
 	ReasonUpdateFailed           Reason = "UpdateFailed"
+	ReasonRestoreFailed          Reason = "RestoreFailed"
 	ReasonVolumeCleanupExhausted Reason = "VolumeCleanupExhausted"
 	ReasonCleanupFailed          Reason = "CleanupFailed"
 	// ReasonUnknown is the read-boundary default for a FAILED lease with no

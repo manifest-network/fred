@@ -13,14 +13,23 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
-// restartOrUpdateReason maps a replace op ("restart"/"update") to its curated
-// failure-category Reason (ENG-508). Defaults to ReasonRestartFailed so an
-// unrecognized op still yields a valid, non-leaking category code.
-func restartOrUpdateReason(op string) backend.Reason {
-	if op == "update" {
+// replaceOpReason maps a replace op to its curated failure-category Reason
+// (ENG-508). doReplaceContainers runs for restart, update, AND restore, so each
+// is mapped explicitly; an unrecognized op defaults to ReasonInternal (never
+// misclassified as one of the named operations). The paired human message is
+// always `op + " failed"`, matching the CallbackErr base built in
+// doReplaceContainers, so the two cannot diverge.
+func replaceOpReason(op string) backend.Reason {
+	switch op {
+	case "update":
 		return backend.ReasonUpdateFailed
+	case "restore":
+		return backend.ReasonRestoreFailed
+	case "restart":
+		return backend.ReasonRestartFailed
+	default:
+		return backend.ReasonInternal
 	}
-	return backend.ReasonRestartFailed
 }
 
 // applyCustomDomainOverrides applies per-ServiceName custom_domain values to the
@@ -270,10 +279,9 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			op.Logger.Error(op.Operation+" failed (stack)", "error", err)
 
 			if b.releaseStore != nil {
-				rReason, rMsg := restartOrUpdateReason(op.Operation), backend.MsgRestartFailed
-				if op.Operation == "update" {
-					rMsg = backend.MsgUpdateFailed
-				}
+				// Message == the CallbackErr base (op + " failed") by construction,
+				// so restart/update/restore never diverge or mislabel.
+				rReason, rMsg := replaceOpReason(op.Operation), op.Operation+" failed"
 				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", rReason, rMsg); relErr != nil {
 					op.Logger.Warn("failed to update release status", "error", relErr)
 				}
@@ -313,7 +321,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				Restored:    restored,
 				Failure: leasesm.ReplaceFailureInfo{
 					Operation:   op.Operation,
-					Reason:      restartOrUpdateReason(op.Operation),
+					Reason:      replaceOpReason(op.Operation),
 					OldStopped:  true,
 					CallbackErr: callbackErr,
 					LastError:   err.Error(),

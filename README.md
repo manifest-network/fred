@@ -540,6 +540,7 @@ The set defined today:
 | `Internal` | An internal fred/backend error occurred (not attributable to the tenant's workload) |
 | `RestartFailed` | A tenant-initiated restart failed |
 | `UpdateFailed` | A tenant-initiated manifest update failed (and was rolled back) |
+| `RestoreFailed` | A tenant-initiated restore (redeploy from retained data) failed |
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retry attempts |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
 | `Unknown` | Read-boundary default: the lease is `failed` but no specific reason was recorded |
