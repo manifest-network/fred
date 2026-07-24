@@ -716,6 +716,10 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	var createdVolumeIDs []string
 	var err error
 	var callbackErr string
+	// failReason is the curated failure-category code, authored at the failure
+	// site (ENG-508). Defaults to ReasonContainerExited (the common
+	// startup-verify failure); specific sites override it (e.g. image pull).
+	failReason := backend.ReasonContainerExited
 	provisionStart := time.Now()
 	serviceContainers := make(map[string][]string)
 	projectName := composeProjectName(req.LeaseUUID)
@@ -756,11 +760,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				}
 			}
 			callbackErrRet = callbackErr
-			// All doProvision failure paths are container-startup failures
-			// (pull/setup/network/volume preflight → compose up → health
-			// verify); author ReasonContainerExited uniformly (ENG-508). The
-			// success path leaves reasonRet at its "" zero value.
-			reasonRet = backend.ReasonContainerExited
+			// Reason is authored at the failure site (failReason); ENG-508.
+			// Defaults to ReasonContainerExited (startup-verify), overridden by
+			// specific sites (e.g. image pull → ImagePullFailed) so (reason,
+			// message) stay consistent. The success path leaves reasonRet "".
+			reasonRet = failReason
 			errRet = err
 			return
 		}
@@ -812,6 +816,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			logger.Error("failed to pull image", "service", svcName, "error", err)
 			err = fmt.Errorf("image pull failed for service %s: %w", svcName, err)
 			callbackErr = "image pull failed"
+			failReason = backend.ReasonImagePullFailed
 			return
 		}
 		imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())

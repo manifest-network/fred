@@ -379,7 +379,8 @@ type ReleaseInfo struct {
 	CreatedAt time.Time `json:"created_at"`
 	// Error (verbose release-failure detail) is intentionally NOT on this
 	// tenant-serialized wire type (ENG-508); the curated (Reason, Message) pair
-	// replaces it. Operator-only verbose detail stays in the release store.
+	// replaces it. Operator-only verbose detail stays in the diagnostics store
+	// and structured logs (the release store keeps only the curated pair).
 	Reason   Reason `json:"reason,omitempty"`
 	Message  string `json:"message,omitempty"`
 	Manifest []byte `json:"manifest"`

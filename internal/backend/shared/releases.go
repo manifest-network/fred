@@ -162,6 +162,9 @@ func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status string, reason backe
 		releases[len(releases)-1].Status = status
 		releases[len(releases)-1].Reason = reason
 		releases[len(releases)-1].Message = message
+		// Clear any legacy verbose Error so a status update never leaves stale
+		// verbose text in the store (ENG-508); the curated pair supersedes it.
+		releases[len(releases)-1].Error = ""
 
 		encoded, err := json.Marshal(releases)
 		if err != nil {

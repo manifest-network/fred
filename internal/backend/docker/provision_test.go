@@ -2853,7 +2853,9 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	info, err = b.GetProvision(context.Background(), "lease-diag")
 	require.NoError(t, err)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
-	assert.Equal(t, backend.ReasonContainerExited, info.Reason)
+	// (reason, message) must be consistent: an image-pull failure reports
+	// ImagePullFailed, not the generic ContainerExited (ENG-508).
+	assert.Equal(t, backend.ReasonImagePullFailed, info.Reason)
 	assert.Equal(t, "image pull failed", info.Message)
 	assert.NotContains(t, info.Message, "registry unreachable", "curated Message must not carry the verbose cause")
 	assert.Equal(t, 1, info.FailCount)
