@@ -1422,3 +1422,57 @@ var _ SMMetrics = mockSMMetrics{}
 // future tests need it; otherwise the linter would flag the unused
 // import that newTestActor's helpers may or may not exercise.
 var _ = sync.Mutex{}
+
+// TestProvisionErrored_AuthorsReasonMessage asserts that the
+// Provisioning→Failed entry action (onEnterFailedFromProvision) authors
+// the curated (Reason, Message) pair alongside the verbose LastError
+// (ENG-508). Reason is the machine-readable category code the caller
+// supplied; Message is the on-chain-safe CallbackErr; LastError is the
+// operator-only verbose diagnostic — the three must be independent.
+func TestProvisionErrored_AuthorsReasonMessage(t *testing.T) {
+	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{})
+	FireProvisionRequestedForTest(a)
+	FireProvisionErroredForTest(a, "image pull failed", backend.ReasonImagePullFailed, "pull /data/fred/... exit 1", nil)
+
+	got, ok := a.cfg.ProvisionStore.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, got.Status)
+	assert.Equal(t, backend.ReasonImagePullFailed, got.Reason,
+		"Reason must be the authored category code, not derived from LastError")
+	assert.Equal(t, "image pull failed", got.Message,
+		"Message must equal the on-chain CallbackErr")
+	assert.Equal(t, "pull /data/fred/... exit 1", got.LastError,
+		"verbose LastError must be untouched (operator-only)")
+}
+
+// TestReplaceFailed_AuthorsReasonMessage asserts that the
+// Restarting→Failed entry action (onEnterFailedFromReplace) authors the
+// curated (Reason, Message) pair alongside the verbose LastError. Drives
+// the replace-failed path white-box: the store is seeded in Restarting so
+// readProvisionStatus initializes the SM there, then handleReplaceFailed
+// fires evReplaceFailed → Failed with a composed CallbackErr.
+func TestReplaceFailed_AuthorsReasonMessage(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusRestarting,
+	})
+	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+
+	a.handleReplaceFailed(ReplaceFailureInfo{
+		Operation:   "restart",
+		Reason:      backend.ReasonRestartFailed,
+		CallbackErr: "restart failed; rolled back to previous version",
+		LastError:   "compose up exit 1: /data/fred/... permission denied",
+	})
+
+	got, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, got.Status)
+	assert.Equal(t, backend.ReasonRestartFailed, got.Reason,
+		"Reason must be the authored category code even when CallbackErr is composed")
+	assert.Equal(t, "restart failed; rolled back to previous version", got.Message,
+		"Message must equal the composed on-chain CallbackErr")
+	assert.Equal(t, "compose up exit 1: /data/fred/... permission denied", got.LastError,
+		"verbose LastError must be untouched (operator-only)")
+}

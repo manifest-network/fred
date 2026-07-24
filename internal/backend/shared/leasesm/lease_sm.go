@@ -389,6 +389,8 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 		p.Status = backend.ProvisionStatusFailing
 		p.FailCount++
 		p.LastError = errMsgContainerExited
+		p.Reason = backend.ReasonContainerExited
+		p.Message = errMsgContainerExited
 	})
 	if !exists {
 		return nil
@@ -627,6 +629,8 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	var diagSnap shared.DiagnosticEntry
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.LastError
+		p.Reason = info.Reason
+		p.Message = info.CallbackErr
 		p.FailCount++
 		p.Status = backend.ProvisionStatusReady
 		// Restart: if we actually stopped old containers and then restored
@@ -634,6 +638,8 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		// Update: keep LastError so the UI shows why the update failed.
 		if info.OldStopped && info.Operation == "restart" {
 			p.LastError = ""
+			p.Reason = ""
+			p.Message = ""
 		}
 		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
@@ -678,6 +684,8 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	var diagSnap shared.DiagnosticEntry
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.LastError
+		p.Reason = info.Reason
+		p.Message = info.CallbackErr
 		p.FailCount++
 		p.Status = backend.ProvisionStatusFailed
 		diagSnap = DiagnosticSnapshot(p)
@@ -722,6 +730,8 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
+		p.Reason = info.reason
+		p.Message = info.callbackErr
 		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
@@ -761,6 +771,11 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	var diagKeys map[string]string
 	exists := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusFailed
+		// Reason/Message authored unconditionally, matching the fixed
+		// errMsgContainerExited callback sent below. LastError keeps its
+		// existing conditional shape (only overwritten when diag is set).
+		p.Reason = backend.ReasonContainerExited
+		p.Message = errMsgContainerExited
 		if result.diag != "" {
 			p.LastError = errMsgContainerExited + ": " + result.diag
 		}

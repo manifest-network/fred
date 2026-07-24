@@ -116,7 +116,7 @@ func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionR
 	leasesm.FireProvisionRequestedForTest(actor)
 	callbackErr, result, logs, err := b.doProvision(ctx, req, stack, profiles, logger)
 	if err != nil {
-		leasesm.FireProvisionErroredForTest(actor, callbackErr, err.Error(), logs)
+		leasesm.FireProvisionErroredForTest(actor, callbackErr, backend.ReasonInternal, err.Error(), logs)
 	} else {
 		leasesm.FireProvisionCompletedForTest(actor, result)
 	}
