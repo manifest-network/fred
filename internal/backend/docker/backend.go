@@ -602,25 +602,22 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
 	b.provisionStore = &backendProvisionStore{backend: b}
 
-	// Gate custom-domain HTTP-01 issuance on the domain resolving to this host
-	// (ENG-266). A quorum of public resolvers mirrors what the ACME CA sees.
-	// Left nil when disabled, which dnsGateAllows treats as always-ready.
+	// Gate custom-domain HTTP-01 issuance on the domain being resolvable
+	// (ENG-266): don't fire an ACME order while the name is still NXDOMAIN, or a
+	// negative-cache entry delays the eventual issuance. A quorum of public
+	// resolvers mirrors what the ACME CA sees. The gate intentionally does NOT
+	// require the domain to resolve to this backend's host_address — that is the
+	// private br1 service-plane IP, not the public ingress the tenant domain
+	// points at, so a host-match check could never pass on the production
+	// topology and would strand every custom domain after a container recreate
+	// (ENG-618). Left nil when disabled, which dnsGateAllows treats as always-ready.
 	if b.cfg.Ingress.Enabled && !b.cfg.Ingress.CustomDomainDNSCheckDisabled {
 		resolvers := newResolvers(b.cfg.Ingress.dnsResolvers())
 		quorum := b.cfg.Ingress.dnsQuorum(len(resolvers))
-		hostAddr := b.cfg.HostAddress
 		b.customDomainDNSReady = func(ctx context.Context, domain string) bool {
 			cctx, cancel := context.WithTimeout(ctx, customDomainDNSCheckTimeout)
 			defer cancel()
-			ready, hostErr := customDomainReadyByQuorum(cctx, resolvers, domain, hostAddr, quorum)
-			if !ready && hostErr != nil {
-				// host_address couldn't be resolved via the configured resolvers
-				// (misconfig, resolver outage, or network) — without this log we'd
-				// silently defer every custom domain with no operator signal.
-				b.logger.Warn("custom-domain DNS readiness: could not resolve host_address via the configured resolvers; deferring issuance (check host_address, the resolvers, and network reachability)",
-					"custom_domain", domain, "host_address", hostAddr, "error", hostErr)
-			}
-			return ready
+			return customDomainReadyByQuorum(cctx, resolvers, domain, quorum)
 		}
 	}
 

@@ -39,132 +39,98 @@ func ipAddrs(ips ...string) []net.IPAddr {
 	return out
 }
 
-func TestCustomDomainResolvesToHost_Match(t *testing.T) {
+func TestCustomDomainResolves_Resolving(t *testing.T) {
 	res := &fakeResolver{hosts: map[string][]net.IPAddr{
-		"app.example.com":         ipAddrs("203.0.113.8"),
-		"s100-u028.manifest0.net": ipAddrs("203.0.113.8"),
+		"app.example.com": ipAddrs("64.29.115.28"),
 	}}
-	ok, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "s100-u028.manifest0.net")
-	require.NoError(t, err)
-	assert.True(t, ok)
+	assert.True(t, customDomainResolves(context.Background(), res, "app.example.com"))
 }
 
-func TestCustomDomainResolvesToHost_NoMatch_Proxied(t *testing.T) {
-	// Orange-cloud: domain resolves to a CDN edge IP, not the host.
-	res := &fakeResolver{hosts: map[string][]net.IPAddr{
-		"app.example.com":         ipAddrs("104.16.0.1"),
-		"s100-u028.manifest0.net": ipAddrs("203.0.113.8"),
-	}}
-	ok, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "s100-u028.manifest0.net")
-	require.NoError(t, err)
-	assert.False(t, ok)
+func TestCustomDomainResolves_NXDOMAIN(t *testing.T) {
+	res := &fakeResolver{hosts: map[string][]net.IPAddr{}}
+	assert.False(t, customDomainResolves(context.Background(), res, "missing.example.com"),
+		"NXDOMAIN on the tenant domain is not-ready (avoid ordering into a negative cache)")
 }
 
-func TestCustomDomainResolvesToHost_HostIsLiteralIP(t *testing.T) {
-	res := &fakeResolver{hosts: map[string][]net.IPAddr{
-		"app.example.com": ipAddrs("203.0.113.8"),
-	}}
-	ok, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "203.0.113.8")
-	require.NoError(t, err)
-	assert.True(t, ok, "host given as a literal IP must not be looked up")
+func TestCustomDomainResolves_ServfailIsNotReady(t *testing.T) {
+	res := &fakeResolver{errs: map[string]error{"app.example.com": errors.New("SERVFAIL")}}
+	assert.False(t, customDomainResolves(context.Background(), res, "app.example.com"),
+		"SERVFAIL / timeout is not-ready, not ready")
 }
 
-func TestCustomDomainResolvesToHost_DomainNXDOMAIN(t *testing.T) {
-	res := &fakeResolver{hosts: map[string][]net.IPAddr{
-		"s100-u028.manifest0.net": ipAddrs("203.0.113.8"),
-	}}
-	ok, err := customDomainResolvesToHost(context.Background(), res, "missing.example.com", "s100-u028.manifest0.net")
-	require.NoError(t, err, "NXDOMAIN on the custom domain is not-ready, not an error")
-	assert.False(t, ok)
+func TestCustomDomainResolves_EmptyAnswerIsNotReady(t *testing.T) {
+	// A resolver returning success with zero addresses is not a usable answer.
+	res := &fakeResolver{hosts: map[string][]net.IPAddr{"app.example.com": {}}}
+	assert.False(t, customDomainResolves(context.Background(), res, "app.example.com"))
 }
 
-func TestCustomDomainResolvesToHost_HostUnresolvable_IsError(t *testing.T) {
-	res := &fakeResolver{
-		hosts: map[string][]net.IPAddr{"app.example.com": ipAddrs("203.0.113.8")},
-		errs:  map[string]error{"s100-u028.manifest0.net": errors.New("server misbehaving")},
-	}
-	_, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "s100-u028.manifest0.net")
-	require.Error(t, err, "host resolution failure is a config/infra error, surfaced to caller")
-}
-
-func TestCustomDomainResolvesToHost_IPv6Match(t *testing.T) {
+// TestCustomDomainResolves_IgnoresHostTopology_ENG618 is the core regression:
+// the readiness gate must NOT require the tenant domain to resolve to the
+// backend's own address. On the production topology host_address is the backend's
+// PRIVATE br1 service-plane IP (internal_ip, 172.16.x), while a tenant custom
+// domain legitimately CNAMEs to the host's PUBLIC ingress IP (64.29.x) — the same
+// target the *.barneyN wildcard uses. A host-IP-overlap gate (the pre-ENG-618
+// behavior) could therefore NEVER pass for a real custom domain, so once a
+// container was recreated (reboot/reprovision) the -custom router was dropped and
+// never re-attached (custom domain stuck 404 forever). Resolvability alone — what
+// the ACME CA sees via public resolvers — is the correct signal.
+func TestCustomDomainResolves_IgnoresHostTopology_ENG618(t *testing.T) {
 	res := &fakeResolver{hosts: map[string][]net.IPAddr{
-		"app.example.com":         ipAddrs("2001:db8::1"),
-		"s100-u028.manifest0.net": ipAddrs("203.0.113.8", "2001:db8::1"),
+		// Public ingress IP; deliberately unrelated to any private host address.
+		"dispersed-img-gen.manifest.network": ipAddrs("64.29.115.28"),
 	}}
-	ok, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "s100-u028.manifest0.net")
-	require.NoError(t, err)
-	assert.True(t, ok)
-}
-
-func TestCustomDomainResolvesToHost_HostAddressWithPort(t *testing.T) {
-	// host_address may include a port (Config.Validate allows it); the readiness
-	// check must resolve the host part, not the literal "host:port".
-	res := &fakeResolver{hosts: map[string][]net.IPAddr{
-		"app.example.com":         ipAddrs("203.0.113.8"),
-		"s100-u028.manifest0.net": ipAddrs("203.0.113.8"),
-	}}
-	t.Run("literal IP with port", func(t *testing.T) {
-		ok, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "203.0.113.8:443")
-		require.NoError(t, err)
-		assert.True(t, ok)
-	})
-	t.Run("hostname with port", func(t *testing.T) {
-		ok, err := customDomainResolvesToHost(context.Background(), res, "app.example.com", "s100-u028.manifest0.net:8443")
-		require.NoError(t, err)
-		assert.True(t, ok)
-	})
+	assert.True(t, customDomainResolves(context.Background(), res, "dispersed-img-gen.manifest.network"),
+		"a resolving custom domain must be ready even though it does not resolve to the backend's private host_address")
 }
 
 func TestCustomDomainReadyByQuorum(t *testing.T) {
-	const host, hostIP = "s100-u028.manifest0.net", "203.0.113.8"
-	// mk builds a resolver whose view of app.example.com is domainIP
-	// ("" = NXDOMAIN); the host always resolves to hostIP.
-	mk := func(domainIP string) ipResolver {
-		hosts := map[string][]net.IPAddr{host: ipAddrs(hostIP)}
-		if domainIP != "" {
-			hosts["app.example.com"] = ipAddrs(domainIP)
+	// mk builds a resolver whose view of the domain is "resolves" or "NXDOMAIN".
+	mk := func(resolves bool) ipResolver {
+		hosts := map[string][]net.IPAddr{}
+		if resolves {
+			hosts["app.example.com"] = ipAddrs("64.29.115.28")
 		}
 		return &fakeResolver{hosts: hosts}
 	}
 	cases := []struct {
-		name      string
-		domainIPs []string // per-resolver view of app.example.com
-		quorum    int
-		want      bool
+		name   string
+		votes  []bool // per-resolver: does the domain resolve from this vantage point?
+		quorum int
+		want   bool
 	}{
-		{"all three agree", []string{hostIP, hostIP, hostIP}, 2, true},
-		{"majority despite one stale NXDOMAIN", []string{"", hostIP, hostIP}, 2, true},
-		{"majority despite one proxied edge IP", []string{"104.16.0.1", hostIP, hostIP}, 2, true},
-		{"only one propagated", []string{hostIP, "", ""}, 2, false},
-		{"none resolve", []string{"", "", ""}, 2, false},
-		{"no resolvers configured (gate stays closed)", []string{}, 1, false},
+		{"all three resolve", []bool{true, true, true}, 2, true},
+		{"majority despite one stale NXDOMAIN", []bool{false, true, true}, 2, true},
+		{"only one propagated", []bool{true, false, false}, 2, false},
+		{"none resolve", []bool{false, false, false}, 2, false},
+		{"no resolvers configured (gate stays closed)", []bool{}, 1, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resolvers := make([]ipResolver, len(tc.domainIPs))
-			for i, ip := range tc.domainIPs {
-				resolvers[i] = mk(ip)
+			resolvers := make([]ipResolver, len(tc.votes))
+			for i, r := range tc.votes {
+				resolvers[i] = mk(r)
 			}
-			got, _ := customDomainReadyByQuorum(context.Background(), resolvers, "app.example.com", host, tc.quorum)
+			got := customDomainReadyByQuorum(context.Background(), resolvers, "app.example.com", tc.quorum)
 			assert.Equal(t, tc.want, got)
 		})
 	}
 }
 
-func TestCustomDomainReadyByQuorum_CapturesHostError(t *testing.T) {
-	// Even when readiness is decided early (here quorum is impossible), a genuine
-	// host-resolution error from any resolver must still be returned for the
-	// operator warning — not masked by reading only the votes seen before the
-	// decision. Reliable regardless of vote order because all votes are read.
-	const host = "s100-u028.manifest0.net"
-	r1 := &fakeResolver{errs: map[string]error{host: errors.New("SERVFAIL")}}         // host lookup errors
-	r2 := &fakeResolver{hosts: map[string][]net.IPAddr{host: ipAddrs("203.0.113.8")}} // host ok, domain NXDOMAIN
-	r3 := &fakeResolver{hosts: map[string][]net.IPAddr{host: ipAddrs("203.0.113.8")}}
-
-	ready, hostErr := customDomainReadyByQuorum(context.Background(), []ipResolver{r1, r2, r3}, "app.example.com", host, 2)
-	assert.False(t, ready, "domain resolves nowhere → not ready")
-	require.Error(t, hostErr, "a genuine host-resolution error must be surfaced even after an early decision")
+// TestCustomDomainReadyByQuorum_PublicDomainVsPrivateHost_ENG618 exercises the
+// quorum gate under the exact production topology from ENG-618: every resolver
+// sees the tenant domain resolve to the PUBLIC ingress IP, which never matches
+// the backend's PRIVATE host_address. The gate must reach quorum and report
+// READY — the pre-fix host-overlap gate returned false here on every tick.
+func TestCustomDomainReadyByQuorum_PublicDomainVsPrivateHost_ENG618(t *testing.T) {
+	const domain = "dispersed-img-gen.manifest.network"
+	mk := func() ipResolver {
+		return &fakeResolver{hosts: map[string][]net.IPAddr{
+			domain: ipAddrs("64.29.115.28"), // public ingress IP; no private host in view at all
+		}}
+	}
+	resolvers := []ipResolver{mk(), mk(), mk()}
+	assert.True(t, customDomainReadyByQuorum(context.Background(), resolvers, domain, 2),
+		"a domain resolving to the public ingress IP must be ready regardless of the backend's private host_address")
 }
 
 func TestDNSGateAllows_NilFuncIsAlwaysReady(t *testing.T) {
@@ -182,7 +148,7 @@ func TestDNSGateAllows_DelegatesToFunc(t *testing.T) {
 
 func TestDeferUnreadyCustomDomains(t *testing.T) {
 	// ENG-266 provision-path gate: zero the CustomDomain of items whose DNS
-	// isn't pointing here yet (so provision emits no -custom router / no order),
+	// isn't resolving yet (so provision emits no -custom router / no order),
 	// preserve ready ones, leave empties untouched. Mutates in place.
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	b.customDomainDNSReady = func(_ context.Context, d string) bool { return d == "ready.example.com" }

@@ -654,7 +654,7 @@ func (b *Backend) verifyStartup(ctx context.Context, m *manifest.Manifest, conta
 }
 
 // deferUnreadyCustomDomains zeroes the CustomDomain of any item whose domain
-// does not yet resolve to this host (ENG-266), so the provision emits no
+// does not yet resolve (ENG-266), so the provision emits no
 // -custom Traefik router — and Traefik fires no HTTP-01 order — before DNS is
 // live. The periodic reconcile (ReconcileCustomDomain) re-applies the domain on
 // a later tick once it resolves. It zeroes the deferred domain on BOTH the
@@ -678,7 +678,7 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 			continue
 		}
 		if !b.dnsGateAllows(ctx, d) {
-			logger.Info("custom_domain set but DNS not yet pointing at this host; deferring to reconcile",
+			logger.Info("custom_domain set but DNS does not resolve yet; deferring to reconcile",
 				"lease_uuid", leaseUUID, "custom_domain", d)
 			toDefer = append(toDefer, i)
 		}
