@@ -231,7 +231,8 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
       "status": "ready",
       "created_at": "2024-01-15T10:30:00Z",
       "fail_count": 0,
-      "last_error": "",
+      "reason": "",
+      "message": "",
       "image": "nginx:latest",
       "sku": "docker-nginx",
       "quantity": 1,
@@ -249,7 +250,8 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
 
 **Fields:**
 - `fail_count` - Number of provision failures for this lease
-- `last_error` (omitempty) - Last diagnostic error message
+- `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
+- `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
 - `image` / `sku` (omitempty) - Image and SKU for non-stack (single-service) leases
 - `quantity` - Total expected container count across all items
 - `items` (omitempty) - Per-service items for stack leases
@@ -276,7 +278,8 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "status": "failed",
   "fail_count": 3,
-  "last_error": "container exited with code 1 (OOM killed)",
+  "reason": "ContainerExited",
+  "message": "container exited unexpectedly",
   "created_at": "2024-01-15T10:30:00Z"
 }
 ```
@@ -284,7 +287,8 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 **Fields:**
 - `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`. A backend that implements soft-delete/retention (see `/restore` below) also returns `retained` for a closed lease whose data is retained, alongside `retained_until` (RFC3339) and `items` (the restore shape)
 - `fail_count` - Number of provision failures
-- `last_error` - Full diagnostic error message (exit codes, OOM, truncated logs)
+- `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
+- `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or diagnostics expired)

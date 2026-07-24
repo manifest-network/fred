@@ -921,7 +921,8 @@ Get provision diagnostics for a specific lease.
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "status": "failed",
   "fail_count": 3,
-  "last_error": "container exited with code 1 (OOM killed)",
+  "reason": "ContainerExited",
+  "message": "container exited unexpectedly",
   "created_at": "2024-01-15T10:30:00Z"
 }
 ```
