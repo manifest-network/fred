@@ -34,6 +34,14 @@ type provision struct {
 	Status       backend.ProvisionStatus
 	CallbackURL  string
 	LastError    string
+	// Reason/Message are the ENG-508 curated, tenant-safe failure signal.
+	// LastError stays operator-only (verbose). runStubProvisioner authors
+	// both at the failure source (ReasonInternal / "not implemented"); the
+	// GetProvision map path and diagnostics fallback copy them through to
+	// ProvisionInfo so both read paths agree on the wire shape. Mirrors
+	// leasesm.ProvisionState.{Reason,Message} in the docker backend.
+	Reason  backend.Reason
+	Message string
 	// FailCount mirrors leasesm.ProvisionState.FailCount in docker. The
 	// stub provisioner increments it (not sets to 1) so retry-after-failure
 	// cycles accumulate — Provision carries prevFailCount forward when

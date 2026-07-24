@@ -1,13 +1,34 @@
 package shared
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
+
+func TestDiagnosticEntry_ReasonMessage_BackCompat(t *testing.T) {
+	// Old record: no reason/message keys.
+	old := []byte(`{"lease_uuid":"l1","error":"xfs_quota /data/fred/volumes/x exit 1","fail_count":1}`)
+	var e DiagnosticEntry
+	require.NoError(t, json.Unmarshal(old, &e))
+	assert.Equal(t, backend.Reason(""), e.Reason)
+	assert.Equal(t, "", e.Message)
+
+	// New record round-trips.
+	e2 := DiagnosticEntry{LeaseUUID: "l2", Error: "verbose", Reason: backend.ReasonContainerExited, Message: "container exited unexpectedly"}
+	b, err := json.Marshal(e2)
+	require.NoError(t, err)
+	var back DiagnosticEntry
+	require.NoError(t, json.Unmarshal(b, &back))
+	assert.Equal(t, backend.ReasonContainerExited, back.Reason)
+	assert.Equal(t, "container exited unexpectedly", back.Message)
+}
 
 func TestDiagnosticsStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_diagnostics.db")

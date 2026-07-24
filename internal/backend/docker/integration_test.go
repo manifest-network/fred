@@ -2199,7 +2199,8 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	require.Len(t, releases, 2, "expected 2 releases: initial + failed update")
 	assert.Equal(t, "active", releases[0].Status, "initial release should still be active")
 	assert.Equal(t, "failed", releases[1].Status, "bad update release should be marked failed")
-	assert.NotEmpty(t, releases[1].Error, "failed release should have error message")
+	assert.Equal(t, backend.ReasonImagePullFailed, releases[1].Reason, "failed update should carry the curated image-pull reason")
+	assert.Equal(t, backend.MsgImagePullFailed, releases[1].Message, "failed update should carry the curated image-pull message")
 	assert.Equal(t, "busybox:this-tag-does-not-exist-xyz-99999", releaseServiceImage(t, releases[1], manifest.DefaultServiceName))
 
 	// No leftover containers from the failed update — only the old ones remain (exited/removed)

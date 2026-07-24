@@ -154,7 +154,8 @@ func TestGetProvision_RetentionPrecedesDiagnostics(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, backend.ProvisionStatusRetained, info.Status,
 		"retention must take precedence over the stale Failed diagnostics entry")
-	assert.Empty(t, info.LastError, "retained response must not carry the stale diagnostics error")
+	assert.Empty(t, info.Reason, "retained response must not carry the stale diagnostics reason")
+	assert.Empty(t, info.Message, "retained response must not carry the stale diagnostics message")
 }
 
 // TestGetProvision_NilRetentionStore_FallsBackToDiagnostics confirms the nil
@@ -173,7 +174,9 @@ func TestGetProvision_NilRetentionStore_FallsBackToDiagnostics(t *testing.T) {
 	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
 		LeaseUUID:    "lease-d",
 		ProviderUUID: "prov-1",
-		Error:        "image pull failed",
+		Error:        "image pull failed: registry unreachable at /data/fred/...",
+		Reason:       backend.ReasonImagePullFailed,
+		Message:      "image pull failed",
 		FailCount:    1,
 		CreatedAt:    time.Now(),
 	}))
@@ -181,7 +184,9 @@ func TestGetProvision_NilRetentionStore_FallsBackToDiagnostics(t *testing.T) {
 	info, err := b.GetProvision(context.Background(), "lease-d")
 	require.NoError(t, err)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
-	assert.Contains(t, info.LastError, "image pull failed")
+	assert.Equal(t, backend.ReasonImagePullFailed, info.Reason)
+	assert.Equal(t, "image pull failed", info.Message)
+	assert.NotContains(t, info.Message, "/data/fred", "verbose operator detail must not leak into Message")
 }
 
 // TestGetProvision_RetentionStoreError_FailsClosed verifies (FIX 2) the

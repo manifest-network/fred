@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 func TestReleaseStore(t *testing.T) {
@@ -72,7 +74,7 @@ func TestReleaseStore(t *testing.T) {
 	})
 
 	t.Run("update latest status", func(t *testing.T) {
-		err := store.UpdateLatestStatus("lease-1", "superseded", "")
+		err := store.UpdateLatestStatus("lease-1", "superseded", "", "")
 		require.NoError(t, err)
 
 		latest, err := store.Latest("lease-1")
@@ -80,7 +82,7 @@ func TestReleaseStore(t *testing.T) {
 		assert.Equal(t, "superseded", latest.Status)
 	})
 
-	t.Run("update latest status with error", func(t *testing.T) {
+	t.Run("update latest status with reason and message", func(t *testing.T) {
 		err := store.Append("lease-1", Release{
 			Manifest:  []byte(`{"image":"nginx:3.0"}`),
 			Image:     "nginx:3.0",
@@ -89,17 +91,18 @@ func TestReleaseStore(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		err = store.UpdateLatestStatus("lease-1", "failed", "image pull failed")
+		err = store.UpdateLatestStatus("lease-1", "failed", backend.ReasonImagePullFailed, "image pull failed")
 		require.NoError(t, err)
 
 		latest, err := store.Latest("lease-1")
 		require.NoError(t, err)
 		assert.Equal(t, "failed", latest.Status)
-		assert.Equal(t, "image pull failed", latest.Error)
+		assert.Equal(t, backend.ReasonImagePullFailed, latest.Reason)
+		assert.Equal(t, "image pull failed", latest.Message)
 	})
 
 	t.Run("update latest on nonexistent is no-op", func(t *testing.T) {
-		err := store.UpdateLatestStatus("nonexistent", "active", "")
+		err := store.UpdateLatestStatus("nonexistent", "active", "", "")
 		require.NoError(t, err)
 	})
 
@@ -116,6 +119,29 @@ func TestReleaseStore(t *testing.T) {
 		err := store.Delete("nonexistent")
 		require.NoError(t, err)
 	})
+}
+
+func TestUpdateLatestStatus_PersistsReasonMessage(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "reason_message.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	require.NoError(t, store.Append("l1", Release{
+		Image:     "nginx:1.0",
+		Status:    "deploying",
+		CreatedAt: time.Now(),
+	}))
+
+	require.NoError(t, store.UpdateLatestStatus("l1", "failed", backend.ReasonUpdateFailed, "update failed"))
+
+	rels, err := store.List("l1")
+	require.NoError(t, err)
+	require.NotEmpty(t, rels)
+	last := rels[len(rels)-1]
+	assert.Equal(t, "failed", last.Status)
+	assert.Equal(t, backend.ReasonUpdateFailed, last.Reason)
+	assert.Equal(t, "update failed", last.Message)
 }
 
 func TestReleaseStore_ActivateLatest(t *testing.T) {

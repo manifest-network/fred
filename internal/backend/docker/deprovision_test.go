@@ -117,6 +117,49 @@ func TestDeprovisionGiveUp_ListFails_RecordsBothNamespaces(t *testing.T) {
 		"fallback must record BOTH the canonical and the fred-retained- name so whichever exists is destroyed before the tombstone is deleted")
 }
 
+// TestDeprovision_PartialFailure_AuthorsCleanupFailed drives the partial-failure
+// branch (a stuck container that RemoveContainer cannot remove) and verifies the
+// provision is left with the curated ReasonCleanupFailed / MsgCleanupFailed pair,
+// while the verbose detail is retained operator-side in LastError (ENG-508).
+func TestDeprovision_PartialFailure_AuthorsCleanupFailed(t *testing.T) {
+	const lease = "u1"
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error {
+			return errors.New("container removal blocked: device or resource busy")
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "t1", Status: backend.ProvisionStatusReady, Quantity: 1,
+			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+			ContainerIDs: []string{"c-stuck"},
+		}},
+	})
+	// Force compose.Down to fail so teardown falls back to per-container removal,
+	// where the mocked RemoveContainer error populates errs → partial-failure branch.
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error {
+			return errors.New("compose project metadata missing")
+		},
+	}
+
+	err := b.doDeprovision(context.Background(), lease)
+	require.Error(t, err, "partial container-removal failure must surface an error")
+
+	prov, ok := b.provisions[lease]
+	require.True(t, ok, "partial failure must keep the provision visible for retry")
+	assert.Equal(t, backend.ReasonCleanupFailed, prov.Reason,
+		"partial deprovision failure must author ReasonCleanupFailed")
+	assert.Equal(t, backend.MsgCleanupFailed, prov.Message,
+		"Message must be the curated MsgCleanupFailed const (tenant-facing)")
+	assert.Contains(t, prov.LastError, "deprovision partially failed",
+		"verbose detail must be retained operator-side in LastError")
+	assert.Contains(t, prov.LastError, "container removal blocked",
+		"LastError must retain the underlying (operator-only) failure text")
+	assert.NotEqual(t, prov.Message, prov.LastError,
+		"tenant-facing Message must be the curated const, distinct from the verbose LastError")
+}
+
 // TestDoDeprovision_Success_ReleasesPoolReservation locks the Release-pairing
 // invariant the pool-authoritative recoverState rule depends on (ENG-567): a
 // successful (non-retain) deprovision must release the lease's pool reservation

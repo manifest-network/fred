@@ -2252,7 +2252,7 @@ func TestHTTPClient_ListProvisions_PerPageTooLargeErrors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ps := make([]ProvisionInfo, 0, 2000)
 		for i := 0; i < 2000; i++ {
-			ps = append(ps, ProvisionInfo{LeaseUUID: padID(i), LastError: big})
+			ps = append(ps, ProvisionInfo{LeaseUUID: padID(i), ServiceImages: map[string]string{"svc": big}})
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: ps, Continue: padID(1999)})

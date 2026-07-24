@@ -651,7 +651,7 @@ Returns container stdout/stderr. For single-container provisions, logs are keyed
 }
 ```
 
-If log retrieval fails for a specific instance, its value contains `<error: ...>` instead.
+If log retrieval fails for a specific instance, its value is the placeholder `<log unavailable>` (the underlying error is logged operator-side, never returned).
 
 ### `GET /provisions/{lease_uuid}` (authenticated)
 
@@ -666,11 +666,12 @@ Returns a single provision record. This is the primary endpoint for retrieving f
   "status": "failed",
   "created_at": "2025-01-15T10:00:00Z",
   "fail_count": 2,
-  "last_error": "container 0 exited during startup (status: exited): exit_code=1; logs:\nError: config file not found"
+  "reason": "ContainerExited",
+  "message": "container exited unexpectedly"
 }
 ```
 
-`status` is one of: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, `deprovisioning`. `failing` marks the brief window between container-death detection and the Failed callback being emitted; a concurrent Deprovision arriving in this window transitions the lease straight to `deprovisioning` without ever reaching `failed`, preventing a stale Failed callback. `last_error` is only present on failure and contains full diagnostics (exit codes, OOM status, container logs).
+`status` is one of: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, `deprovisioning`. `failing` marks the brief window between container-death detection and the Failed callback being emitted; a concurrent Deprovision arriving in this window transitions the lease straight to `deprovisioning` without ever reaching `failed`, preventing a stale Failed callback. On failure, `reason` (a stable machine code, e.g. `ContainerExited`) and `message` (a curated human summary) are present; the verbose diagnostics (exit codes, OOM status, container logs) stay operator-side in the diagnostics store and structured logs — they are never included in this response (ENG-508).
 
 ### `GET /provisions` (authenticated)
 
@@ -694,7 +695,8 @@ Returns provision records. `GET /provisions` is keyset-paginated. Query params: 
       "status": "failed",
       "created_at": "2025-01-15T10:05:00Z",
       "fail_count": 3,
-      "last_error": "container exited unexpectedly: exit_code=137, oom_killed=true; logs:\nKilled"
+      "reason": "ContainerExited",
+      "message": "container exited unexpectedly"
     }
   ],
   "continue": "def-456"

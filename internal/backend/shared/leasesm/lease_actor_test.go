@@ -500,7 +500,7 @@ func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
 	// Inject a worker that panics instead of doing real work. The
 	// recover must catch the panic, bump the metric, and fire a
 	// provisionErrored terminal so the SM transitions to Failed.
-	actor.spawnProvisionWorker(func() (string, ProvisionSuccessResult, map[string]string, error) {
+	actor.spawnProvisionWorker(func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
 		panic("synthetic provision panic")
 	})
 
@@ -660,9 +660,9 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 		var workerSpawned atomic.Bool
 		msg := ProvisionRequestedMsg{
 			Cancel: func() {},
-			Work: func() (string, ProvisionSuccessResult, map[string]string, error) {
+			Work: func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
 				workerSpawned.Store(true)
-				return "", ProvisionSuccessResult{}, nil, nil
+				return "", "", ProvisionSuccessResult{}, nil, nil
 			},
 			Ack: make(chan error, 1),
 		}
@@ -763,8 +763,8 @@ func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
 	ack := make(chan error, 1)
 	msg := ProvisionRequestedMsg{
 		Cancel: func() {},
-		Work: func() (string, ProvisionSuccessResult, map[string]string, error) {
-			return "", ProvisionSuccessResult{}, nil, nil
+		Work: func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
+			return "", "", ProvisionSuccessResult{}, nil, nil
 		},
 		Ack: ack,
 	}
@@ -1422,3 +1422,121 @@ var _ SMMetrics = mockSMMetrics{}
 // future tests need it; otherwise the linter would flag the unused
 // import that newTestActor's helpers may or may not exercise.
 var _ = sync.Mutex{}
+
+// TestProvisionErrored_AuthorsReasonMessage asserts that the
+// Provisioning→Failed entry action (onEnterFailedFromProvision) authors
+// the curated (Reason, Message) pair alongside the verbose LastError
+// (ENG-508). Reason is the machine-readable category code the caller
+// supplied; Message is the on-chain-safe CallbackErr; LastError is the
+// operator-only verbose diagnostic — the three must be independent.
+func TestProvisionErrored_AuthorsReasonMessage(t *testing.T) {
+	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{})
+	FireProvisionRequestedForTest(a)
+	FireProvisionErroredForTest(a, "image pull failed", backend.ReasonImagePullFailed, "pull /data/fred/... exit 1", nil)
+
+	got, ok := a.cfg.ProvisionStore.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, got.Status)
+	assert.Equal(t, backend.ReasonImagePullFailed, got.Reason,
+		"Reason must be the authored category code, not derived from LastError")
+	assert.Equal(t, "image pull failed", got.Message,
+		"Message must equal the on-chain CallbackErr")
+	assert.Equal(t, "pull /data/fred/... exit 1", got.LastError,
+		"verbose LastError must be untouched (operator-only)")
+}
+
+// TestReplaceFailed_AuthorsReasonMessage asserts that the
+// Restarting→Failed entry action (onEnterFailedFromReplace) authors the
+// curated (Reason, Message) pair alongside the verbose LastError. Drives
+// the replace-failed path white-box: the store is seeded in Restarting so
+// readProvisionStatus initializes the SM there, then handleReplaceFailed
+// fires evReplaceFailed → Failed with a composed CallbackErr.
+func TestReplaceFailed_AuthorsReasonMessage(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusRestarting,
+	})
+	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+
+	a.handleReplaceFailed(ReplaceFailureInfo{
+		Operation:   "restart",
+		Reason:      backend.ReasonRestartFailed,
+		CallbackErr: "restart failed; rolled back to previous version",
+		LastError:   "compose up exit 1: /data/fred/... permission denied",
+	})
+
+	got, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusFailed, got.Status)
+	assert.Equal(t, backend.ReasonRestartFailed, got.Reason,
+		"Reason must be the authored category code even when CallbackErr is composed")
+	assert.Equal(t, "restart failed; rolled back to previous version", got.Message,
+		"Message must equal the composed on-chain CallbackErr")
+	assert.Equal(t, "compose up exit 1: /data/fred/... permission denied", got.LastError,
+		"verbose LastError must be untouched (operator-only)")
+}
+
+// TestReplaceCompleted_ClearsStaleReasonMessage asserts that the
+// Restarting→Ready success entry action (onEnterReadyFromReplaceCompleted)
+// clears the curated (Reason, Message) pair when a previously-failed lease
+// recovers (ENG-508). ProvisionState persists across transitions, so a
+// lease that failed (Reason=ContainerExited) and is then restarted still
+// carries the stale failure Reason/Message into Restarting; the success
+// transition MUST wipe them so /status|/provision|/releases no longer
+// surface a stale failure reason for a now-healthy Ready lease. Drives the
+// path white-box mirroring TestReplaceFailed_AuthorsReasonMessage: the
+// store is seeded in Restarting (so readProvisionStatus initializes the SM
+// there) carrying the stale Reason/Message, then handleReplaceCompleted
+// fires evReplaceCompleted → Ready.
+func TestReplaceCompleted_ClearsStaleReasonMessage(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusRestarting,
+		Reason:    backend.ReasonContainerExited,
+		Message:   "container exited unexpectedly",
+		LastError: "compose ps: container 'app' exited with code 137",
+	})
+	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+
+	a.handleReplaceCompleted(ReplaceSuccessResult{ContainerIDs: []string{"c1"}})
+
+	got, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusReady, got.Status,
+		"a successful replace must land the lease in Ready")
+	assert.Equal(t, backend.Reason(""), got.Reason,
+		"stale failure Reason must be cleared on healthy recovery")
+	assert.Equal(t, "", got.Message,
+		"stale failure Message must be cleared on healthy recovery")
+}
+
+// TestProvisionCompleted_ClearsStaleReasonMessage is the defense-in-depth
+// companion for the successful-provision entry action
+// (onEnterReadyFromProvision): a Failed lease that is re-provisioned (retry)
+// must not carry its prior failure Reason/Message into the healthy Ready
+// record (ENG-508). Drives Provisioning→Ready via the ForTest fires.
+func TestProvisionCompleted_ClearsStaleReasonMessage(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusFailed,
+		Reason:    backend.ReasonImagePullFailed,
+		Message:   "image pull failed",
+		LastError: "pull /data/fred/... exit 1",
+	})
+	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+
+	FireProvisionRequestedForTest(a)
+	FireProvisionCompletedForTest(a, ProvisionSuccessResult{ContainerIDs: []string{"c1"}})
+
+	got, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusReady, got.Status,
+		"a successful provision must land the lease in Ready")
+	assert.Equal(t, backend.Reason(""), got.Reason,
+		"stale failure Reason must be cleared on healthy provision")
+	assert.Equal(t, "", got.Message,
+		"stale failure Message must be cleared on healthy provision")
+}

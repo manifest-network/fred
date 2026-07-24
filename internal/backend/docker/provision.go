@@ -114,6 +114,8 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			CreatedAt:    time.Now(),
 			FailCount:    prevFailCount,
 			LastError:    "",
+			Reason:       "", // fresh reservation, no failure
+			Message:      "",
 			CallbackURL:  req.CallbackURL, // MUST be set at reservation: a failure/Deprovision
 			// racing this provision in the validation window resolves CallbackURL from the map.
 			Items:             nil, // set by enrichReserved
@@ -248,7 +250,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// worker is left as a zombie and recoverState reconciles on next
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
-	work := func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
+	work := func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
 		return b.doProvision(provCtx, req, stackManifest, profiles, logger)
 	}
 	ack := make(chan error, 1)
@@ -709,11 +711,15 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 //
 // Returns the (callbackErr, result, logs, err) contract; stack-specific result
 // fields are stackManifest + serviceContainers.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, reasonRet backend.Reason, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
 	var callbackErr string
+	// failReason is the curated failure-category code, authored at the failure
+	// site (ENG-508). Defaults to ReasonContainerExited (the common
+	// startup-verify failure); specific sites override it (e.g. image pull).
+	failReason := backend.ReasonContainerExited
 	provisionStart := time.Now()
 	serviceContainers := make(map[string][]string)
 	projectName := composeProjectName(req.LeaseUUID)
@@ -754,6 +760,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				}
 			}
 			callbackErrRet = callbackErr
+			// Reason is authored at the failure site (failReason); ENG-508.
+			// Defaults to ReasonContainerExited (startup-verify), overridden by
+			// specific sites (e.g. image pull → ImagePullFailed) so (reason,
+			// message) stay consistent. The success path leaves reasonRet "".
+			reasonRet = failReason
 			errRet = err
 			return
 		}
@@ -804,7 +815,8 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		if err = b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); err != nil {
 			logger.Error("failed to pull image", "service", svcName, "error", err)
 			err = fmt.Errorf("image pull failed for service %s: %w", svcName, err)
-			callbackErr = "image pull failed"
+			callbackErr = backend.MsgImagePullFailed
+			failReason = backend.ReasonImagePullFailed
 			return
 		}
 		imagePullDurationSeconds.Observe(time.Since(pullStart).Seconds())

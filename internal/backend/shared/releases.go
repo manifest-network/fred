@@ -9,6 +9,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -16,12 +17,14 @@ var releasesBucketName = []byte("releases")
 
 // Release represents a single release (deployment) of a lease.
 type Release struct {
-	Version   int       `json:"version"`
-	Manifest  []byte    `json:"manifest"`
-	Image     string    `json:"image"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	Error     string    `json:"error,omitempty"`
+	Version   int            `json:"version"`
+	Manifest  []byte         `json:"manifest"`
+	Image     string         `json:"image"`
+	Status    string         `json:"status"`
+	CreatedAt time.Time      `json:"created_at"`
+	Error     string         `json:"error,omitempty"`
+	Reason    backend.Reason `json:"reason,omitempty"`
+	Message   string         `json:"message,omitempty"`
 }
 
 // ReleaseStore persists release history in bbolt so it survives backend restarts.
@@ -137,8 +140,10 @@ func (s *ReleaseStore) LatestActive(leaseUUID string) (*Release, error) {
 	return nil, nil
 }
 
-// UpdateLatestStatus updates the status (and optionally error) of the most recent release.
-func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status, errMsg string) error {
+// UpdateLatestStatus updates the status and curated (reason, message) of the
+// most recent release. The verbose per-failure detail is intentionally NOT
+// stored here — callers log it and surface only the curated pair to tenants.
+func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status string, reason backend.Reason, message string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(releasesBucketName)
 		data := b.Get([]byte(leaseUUID))
@@ -155,7 +160,11 @@ func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status, errMsg string) erro
 		}
 
 		releases[len(releases)-1].Status = status
-		releases[len(releases)-1].Error = errMsg
+		releases[len(releases)-1].Reason = reason
+		releases[len(releases)-1].Message = message
+		// Clear any legacy verbose Error so a status update never leaves stale
+		// verbose text in the store (ENG-508); the curated pair supersedes it.
+		releases[len(releases)-1].Error = ""
 
 		encoded, err := json.Marshal(releases)
 		if err != nil {
@@ -190,6 +199,8 @@ func (s *ReleaseStore) ActivateLatest(leaseUUID string) error {
 		}
 		releases[len(releases)-1].Status = "active"
 		releases[len(releases)-1].Error = ""
+		releases[len(releases)-1].Reason = ""
+		releases[len(releases)-1].Message = ""
 
 		encoded, err := json.Marshal(releases)
 		if err != nil {

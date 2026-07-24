@@ -900,6 +900,8 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			CreatedAt:         time.Now(),
 			FailCount:         0,
 			LastError:         "",
+			Reason:            "", // fresh reservation, no failure
+			Message:           "",
 			CallbackURL:       req.CallbackURL,
 			Items:             slices.Clone(req.Items),
 			ContainerIDs:      make([]string, 0),
@@ -1061,6 +1063,7 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 				CallbackErr: leasesm.ErrMsgInternal,
 				Failure: leasesm.ReplaceFailureInfo{
 					Operation:   "restore",
+					Reason:      backend.ReasonInternal,
 					CallbackErr: leasesm.ErrMsgInternal,
 					LastError:   msg,
 				},

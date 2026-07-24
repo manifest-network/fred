@@ -14,6 +14,19 @@ import (
 // for ENG-133. ENG-134+ replaces this with real K8s provisioning errors.
 const stubProvisionerErrMsg = "not implemented"
 
+// defaultReason fills ReasonUnknown for a FAILED provision with no authored
+// reason (legacy record / unmapped path), so the tenant-facing ProvisionInfo
+// never surfaces a failed status with an empty machine reason (ENG-508).
+// Mirrors the docker backend's read-boundary default. The k3s stub always
+// authors ReasonInternal, so in practice reason is non-empty; the default is
+// applied for consistency and legacy safety.
+func defaultReason(status backend.ProvisionStatus, r backend.Reason) backend.Reason {
+	if r == "" && status == backend.ProvisionStatusFailed {
+		return backend.ReasonUnknown
+	}
+	return r
+}
+
 // Provision validates the request, records a "provisioning" in-memory
 // entry, and spawns a goroutine that flips the entry to "failed" and
 // posts a signed callback with status=failed, error="not implemented"
@@ -138,6 +151,8 @@ func (b *Backend) runStubProvisioner(p *provision) {
 	}
 	p.Status = backend.ProvisionStatusFailed
 	p.LastError = stubProvisionerErrMsg
+	p.Reason = backend.ReasonInternal
+	p.Message = stubProvisionerErrMsg
 	// Increment FailCount (not set to 1) so retry cycles accumulate
 	// correctly across Provision -> failed -> Provision-again -> failed
 	// chains. The Provision method carries forward prevFailCount when
@@ -176,6 +191,8 @@ func (b *Backend) runStubProvisioner(p *provision) {
 		ProviderUUID: providerUUID,
 		Tenant:       tenant,
 		Error:        stubProvisionerErrMsg,
+		Reason:       backend.ReasonInternal,
+		Message:      stubProvisionerErrMsg,
 		FailCount:    currentFailCount,
 		CreatedAt:    time.Now(),
 	}); err != nil {
@@ -318,7 +335,8 @@ func (b *Backend) GetProvision(ctx context.Context, leaseUUID string) (*backend.
 			ProviderUUID: p.ProviderUUID,
 			Status:       p.Status,
 			FailCount:    p.FailCount,
-			LastError:    p.LastError,
+			Reason:       defaultReason(p.Status, p.Reason),
+			Message:      p.Message,
 			CreatedAt:    p.CreatedAt,
 		}
 		b.provisionsMu.RUnlock()
@@ -338,7 +356,8 @@ func (b *Backend) GetProvision(ctx context.Context, leaseUUID string) (*backend.
 		ProviderUUID: diag.ProviderUUID,
 		Status:       backend.ProvisionStatusFailed,
 		FailCount:    diag.FailCount,
-		LastError:    diag.Error,
+		Reason:       defaultReason(backend.ProvisionStatusFailed, diag.Reason),
+		Message:      diag.Message,
 		CreatedAt:    diag.CreatedAt,
 	}, nil
 }
@@ -357,7 +376,8 @@ func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, 
 			ProviderUUID: p.ProviderUUID,
 			Status:       p.Status,
 			FailCount:    p.FailCount,
-			LastError:    p.LastError,
+			Reason:       defaultReason(p.Status, p.Reason),
+			Message:      p.Message,
 			CreatedAt:    p.CreatedAt,
 		})
 	}
@@ -392,7 +412,8 @@ func (b *Backend) LookupProvisions(ctx context.Context, uuids []string) ([]backe
 				ProviderUUID: p.ProviderUUID,
 				Status:       p.Status,
 				FailCount:    p.FailCount,
-				LastError:    p.LastError,
+				Reason:       defaultReason(p.Status, p.Reason),
+				Message:      p.Message,
 				CreatedAt:    p.CreatedAt,
 			})
 		}

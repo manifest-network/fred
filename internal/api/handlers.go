@@ -517,7 +517,13 @@ type LeaseStatusResponse struct {
 	ProvisioningStarted bool   `json:"provisioning_started"`
 	ProvisionStatus     string `json:"provision_status,omitempty"`
 	FailCount           int    `json:"fail_count,omitempty"`
-	LastError           string `json:"last_error,omitempty"`
+	// Reason/Message are the curated, tenant-safe failure signal (ENG-508): a
+	// stable machine-readable category code and a short human message. They
+	// REPLACE the former verbose last_error field, which leaked exec output and
+	// host paths. A FAILED provision always surfaces a Reason (defaulting to
+	// "Unknown"); Message may be empty.
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
 	// Retention fields (populated when provision_status=retained, ENG-329).
 	// RetainedUntil is RFC3339; Items is the restore shape (service name + SKU +
 	// quantity) the tenant uses to build a matching fresh PENDING lease;
@@ -605,7 +611,8 @@ func (h *Handlers) GetLeaseStatus(w http.ResponseWriter, r *http.Request) {
 		if info != nil {
 			response.ProvisionStatus = string(info.Status)
 			response.FailCount = info.FailCount
-			response.LastError = info.LastError
+			response.Reason = provisionReason(info)
+			response.Message = info.Message
 			applyRetentionFields(&response, info)
 		}
 	}
@@ -645,7 +652,8 @@ func (h *Handlers) serveRetainedStatusFallback(w http.ResponseWriter, r *http.Re
 		State:           billingtypes.LEASE_STATE_UNSPECIFIED.String(),
 		ProvisionStatus: string(info.Status),
 		FailCount:       info.FailCount,
-		LastError:       info.LastError,
+		Reason:          provisionReason(info),
+		Message:         info.Message,
 	}
 	applyRetentionFields(&response, info)
 
@@ -670,6 +678,20 @@ func authorizeRetained(info *backend.ProvisionInfo, callerTenant string) bool {
 	return info.Tenant == callerTenant
 }
 
+// provisionReason returns the tenant-facing machine reason for a provision,
+// applying the ReasonUnknown read-boundary default so a FAILED provision never
+// surfaces an empty reason to the tenant (ENG-508). The docker/k3s store
+// boundaries already default, but a legacy or misbehaving HTTP backend may hand
+// back a failed status with no authored reason — this is the fail-closed
+// backstop at the API boundary. Non-failed statuses pass through unchanged
+// (retained/ready/etc. legitimately carry an empty reason).
+func provisionReason(info *backend.ProvisionInfo) string {
+	if info.Reason == "" && info.Status == backend.ProvisionStatusFailed {
+		return string(backend.ReasonUnknown)
+	}
+	return string(info.Reason)
+}
+
 // applyRetentionFields populates the retention-specific response fields when the
 // provision is retained. Tenant from ProvisionInfo is intentionally NOT copied.
 func applyRetentionFields(resp *LeaseStatusResponse, info *backend.ProvisionInfo) {
@@ -691,7 +713,10 @@ type LeaseProvisionResponse struct {
 	ProviderUUID string `json:"provider_uuid"`
 	Status       string `json:"status"`
 	FailCount    int    `json:"fail_count"`
-	LastError    string `json:"last_error,omitempty"`
+	// Reason/Message are the curated, tenant-safe failure signal (ENG-508),
+	// replacing the former verbose last_error. See LeaseStatusResponse.
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
 	// Retention fields (populated when status=retained, ENG-329). See
 	// LeaseStatusResponse; the owning Tenant from ProvisionInfo is NOT surfaced,
 	// but Partition IS (the owner's own sub-grouping key, shown only to the owner).
@@ -778,7 +803,8 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 		ProviderUUID: h.providerUUID,
 		Status:       string(info.Status),
 		FailCount:    info.FailCount,
-		LastError:    info.LastError,
+		Reason:       provisionReason(info),
+		Message:      info.Message,
 	}
 	if info.Status == backend.ProvisionStatusRetained {
 		if !info.RetainedUntil.IsZero() {
@@ -1137,6 +1163,17 @@ func (h *Handlers) GetLeaseReleases(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to get releases from backend", "error", err, "lease_uuid", leaseUUID)
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
+	}
+
+	// API-layer Unknown backstop (ENG-508), symmetric with the provision
+	// path's provisionReason backstop: a failed release with no authored
+	// Reason surfaces the machine-readable Unknown default rather than an
+	// empty code, so the read boundary never emits a failed-but-reasonless
+	// release.
+	for i := range releases {
+		if releases[i].Reason == "" && releases[i].Status == "failed" {
+			releases[i].Reason = backend.ReasonUnknown
+		}
 	}
 
 	response := LeaseReleasesResponse{

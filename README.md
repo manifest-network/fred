@@ -480,7 +480,8 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `provisioning_started` - True if provisioning is in progress
 - `provision_status` - Backend provision status (omitted if not provisioned). May be `retained` for a closed/expired lease whose data was soft-deleted and is restorable (see [retention](internal/backend/docker/README.md#soft-delete--restore))
 - `fail_count` - Number of provisioning failures (omitted if zero)
-- `last_error` - Most recent provisioning error (omitted if none)
+- `reason` - Stable, machine-readable failure category; present whenever a failure has been recorded — including a `ready` lease whose last update failed and rolled back to the previous version — and omitted (`omitempty`) when empty; see [Failure Reason Codes](#failure-reason-codes)
+- `message` - Curated, human-readable failure summary (omitted if empty); no host paths or raw command output
 - `retained_until` - RFC3339 grace-window deadline; present only when `provision_status` is `retained`
 - `items` - Restore shape (`service_name`, `sku`, `quantity`) to request when opening the fresh lease to restore into; present only when `retained`
 - `restore_hint` - Short human-readable next step for restoring; present only when `retained`
@@ -494,7 +495,7 @@ GET /v1/leases/{lease_uuid}/provision
 Authorization: Bearer <token>
 ```
 
-Returns provision diagnostics for a lease, including status, error details, and failure count. Works for both active and non-active leases (e.g., after rejection or closure), falling back to persisted diagnostics when the provision is no longer in memory.
+Returns provision diagnostics for a lease, including status, failure reason, and failure count. Works for both active and non-active leases (e.g., after rejection or closure), falling back to persisted diagnostics when the provision is no longer in memory.
 
 **Response:**
 ```json
@@ -504,14 +505,16 @@ Returns provision diagnostics for a lease, including status, error details, and 
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "status": "failed",
   "fail_count": 3,
-  "last_error": "container exited with code 1 (OOM killed)"
+  "reason": "ContainerExited",
+  "message": "container exited unexpectedly"
 }
 ```
 
 **Fields:**
 - `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`, or `unknown`. `failing` is a transient state between container-death detection and the Failed callback; `deprovisioning` covers the container-removal window; `retained` marks a closed/expired lease whose data was soft-deleted and is restorable
 - `fail_count` - Number of provision attempts that failed
-- `last_error` - Detailed error message (only present on failure)
+- `reason` - Stable, machine-readable failure category, always present when `status` is `failed` (defaults to `Unknown` if no specific cause was recorded); see [Failure Reason Codes](#failure-reason-codes)
+- `message` - Curated, human-readable failure summary; may be empty
 - `retained_until`, `items`, `restore_hint` - Present only when `status` is `retained` (grace-window deadline, restore shape, and next-step hint); see [Get Lease Status](#get-lease-status)
 
 **Response Codes:**
@@ -519,6 +522,32 @@ Returns provision diagnostics for a lease, including status, error details, and 
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Provision not found (never provisioned or diagnostics expired)
+
+#### Failure Reason Codes
+
+`reason` is an **open, add-only** enum (Kubernetes `Condition.Reason`-shaped): new values may be
+added in future releases without notice. Clients **must** treat any value they don't recognize as
+a generic failure and fall back to displaying the human-readable `message` — never match/branch on
+`reason` with an exhaustive switch that errors on the default case. Adding a new `reason` is
+considered a backward-compatible change.
+
+The set defined today:
+
+| Reason | Meaning |
+|---|---|
+| `ContainerExited` | A container exited unexpectedly (crash, non-zero exit, OOM kill) |
+| `ImagePullFailed` | The container image could not be pulled |
+| `Internal` | An internal fred/backend error occurred (not attributable to the tenant's workload) |
+| `RestartFailed` | A tenant-initiated restart failed |
+| `UpdateFailed` | A tenant-initiated manifest update failed (and was rolled back) |
+| `RestoreFailed` | A tenant-initiated restore (redeploy from retained data) failed |
+| `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retry attempts |
+| `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
+| `Unknown` | Read-boundary default: the lease is `failed` but no specific reason was recorded |
+
+`message` is a short, human-readable string for display; it contains no host filesystem paths or
+raw command/daemon output (that detail is retained operator-side, correlated by `lease_uuid`, for
+support/debugging).
 
 ### Get Container Logs
 
@@ -698,7 +727,8 @@ Returns the release (deployment) history for a lease, showing each version that 
 - `image` - Container image used in this release
 - `status` - Release status: `deploying`, `active`, `superseded`, or `failed`
 - `created_at` - When this release was created
-- `error` - Error message (only present on failed releases)
+- `reason` - Stable, machine-readable failure category (only present on failed releases); see [Failure Reason Codes](#failure-reason-codes)
+- `message` - Curated, human-readable failure summary (only present on failed releases; may be empty)
 - `manifest` - The manifest payload used for this release
 
 **Response Codes:**
@@ -892,7 +922,8 @@ Get provision diagnostics for a specific lease.
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "status": "failed",
   "fail_count": 3,
-  "last_error": "container exited with code 1 (OOM killed)",
+  "reason": "ContainerExited",
+  "message": "container exited unexpectedly",
   "created_at": "2024-01-15T10:30:00Z"
 }
 ```

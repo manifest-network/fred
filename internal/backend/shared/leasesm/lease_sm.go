@@ -389,6 +389,8 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 		p.Status = backend.ProvisionStatusFailing
 		p.FailCount++
 		p.LastError = errMsgContainerExited
+		p.Reason = backend.ReasonContainerExited
+		p.Message = errMsgContainerExited
 	})
 	if !exists {
 		return nil
@@ -534,6 +536,12 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 		p.Status = backend.ProvisionStatusReady
 		p.ContainerIDs = result.ContainerIDs
 		p.LastError = ""
+		// Clear any stale curated failure surface (ENG-508): a retried
+		// provision that lands Ready must not carry a prior failure's
+		// Reason/Message into the healthy record. Defense-in-depth so
+		// leasesm owns the reset, not the substrate.
+		p.Reason = ""
+		p.Message = ""
 		if result.StackManifest != nil {
 			p.StackManifest = result.StackManifest
 		}
@@ -581,6 +589,12 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		}
 		p.Status = backend.ProvisionStatusReady
 		p.LastError = ""
+		// Clear any stale curated failure surface (ENG-508): a lease that
+		// failed (Reason/Message authored) and then successfully restarts
+		// or updates must not keep surfacing the prior failure reason once
+		// it is healthy again. ProvisionState persists across transitions.
+		p.Reason = ""
+		p.Message = ""
 		if result.OnSuccess != nil {
 			result.OnSuccess(p)
 		}
@@ -627,6 +641,8 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 	var diagSnap shared.DiagnosticEntry
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.LastError
+		p.Reason = info.Reason
+		p.Message = info.CallbackErr
 		p.FailCount++
 		p.Status = backend.ProvisionStatusReady
 		// Restart: if we actually stopped old containers and then restored
@@ -634,6 +650,8 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		// Update: keep LastError so the UI shows why the update failed.
 		if info.OldStopped && info.Operation == "restart" {
 			p.LastError = ""
+			p.Reason = ""
+			p.Message = ""
 		}
 		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
@@ -678,6 +696,8 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	var diagSnap shared.DiagnosticEntry
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.LastError = info.LastError
+		p.Reason = info.Reason
+		p.Message = info.CallbackErr
 		p.FailCount++
 		p.Status = backend.ProvisionStatusFailed
 		diagSnap = DiagnosticSnapshot(p)
@@ -722,6 +742,8 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 		p.Status = backend.ProvisionStatusFailed
 		p.FailCount++
 		p.LastError = info.lastError
+		p.Reason = info.reason
+		p.Message = info.callbackErr
 		diagSnap = DiagnosticSnapshot(p)
 		callbackURL = p.CallbackURL
 	})
@@ -761,6 +783,11 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	var diagKeys map[string]string
 	exists := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
 		p.Status = backend.ProvisionStatusFailed
+		// Reason/Message authored unconditionally, matching the fixed
+		// errMsgContainerExited callback sent below. LastError keeps its
+		// existing conditional shape (only overwritten when diag is set).
+		p.Reason = backend.ReasonContainerExited
+		p.Message = errMsgContainerExited
 		if result.diag != "" {
 			p.LastError = errMsgContainerExited + ": " + result.diag
 		}
@@ -835,6 +862,7 @@ type ProvisionSuccessResult struct {
 // the containers are gone by the time the SM entry action runs.
 type provisionErrorInfo struct {
 	callbackErr string
+	reason      backend.Reason // ENG-508
 	lastError   string
 	logs        map[string]string
 }
@@ -867,6 +895,7 @@ type ReplaceFailureInfo struct {
 	Operation   string // "restart" or "update"
 	OldStopped  bool   // only meaningful on the recovery path (restart-with-oldStopped clears LastError)
 	CallbackErr string
+	Reason      backend.Reason // ENG-508: category code; message is CallbackErr
 	LastError   string
 	// Logs is the pre-captured container-log map from the NEW (failed)
 	// containers. Populated by doReplace*'s defer BEFORE rollback tears
@@ -1069,6 +1098,8 @@ func DiagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
 		ProviderUUID: prov.ProviderUUID,
 		Tenant:       prov.Tenant,
 		Error:        prov.LastError,
+		Reason:       prov.Reason,
+		Message:      prov.Message,
 		FailCount:    prov.FailCount,
 		CreatedAt:    time.Now(),
 	}

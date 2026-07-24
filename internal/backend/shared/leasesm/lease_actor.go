@@ -98,7 +98,7 @@ func (diagGatheredMsg) onPanic(error)           {} // no caller to unblock
 // through the actor's inbox.
 type ProvisionRequestedMsg struct {
 	Cancel context.CancelFunc
-	Work   func() (callbackErr string, result ProvisionSuccessResult, failureLogs map[string]string, err error)
+	Work   func() (callbackErr string, reason backend.Reason, result ProvisionSuccessResult, failureLogs map[string]string, err error)
 	Ack    chan error
 }
 
@@ -133,6 +133,7 @@ func (provisionCompletedMsg) onPanic(error)           {} // no caller to unblock
 // call.
 type provisionErroredMsg struct {
 	callbackErr string
+	reason      backend.Reason // ENG-508
 	lastError   string
 	logs        map[string]string
 }
@@ -563,7 +564,7 @@ func (a *LeaseActor) handle(msg LeaseMessage) {
 	case provisionCompletedMsg:
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
-		a.handleProvisionErrored(m.callbackErr, m.lastError, m.logs)
+		a.handleProvisionErrored(m.callbackErr, m.reason, m.lastError, m.logs)
 	case replaceCompletedMsg:
 		a.handleReplaceCompleted(m.result)
 	case replaceRecoveredMsg:
@@ -681,7 +682,7 @@ func (a *LeaseActor) handleProvisionRequested(msg ProvisionRequestedMsg) {
 // cleanup (see doProvision's defer) so the persisted diagnostic entry
 // contains useful debugging output even though the failed containers
 // have been removed.
-func (a *LeaseActor) spawnProvisionWorker(work func() (string, ProvisionSuccessResult, map[string]string, error)) {
+func (a *LeaseActor) spawnProvisionWorker(work func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error)) {
 	a.workers.Add()
 	a.cfg.WG.Go(func() {
 		// Exactly one sendTerminal call site (the middle defer), driven
@@ -706,6 +707,7 @@ func (a *LeaseActor) spawnProvisionWorker(work func() (string, ProvisionSuccessR
 				// SM reaches Failed rather than wedging.
 				terminalMsg = provisionErroredMsg{
 					callbackErr: errMsgInternal,
+					reason:      backend.ReasonInternal,
 					lastError:   "provision worker exited without setting terminal event",
 				}
 				event = "provision_no_result"
@@ -730,12 +732,13 @@ func (a *LeaseActor) spawnProvisionWorker(work func() (string, ProvisionSuccessR
 				// the panic means the post-set work did not complete.
 				terminalMsg = provisionErroredMsg{
 					callbackErr: errMsgInternal,
+					reason:      backend.ReasonInternal,
 					lastError:   fmt.Sprintf("worker panic: %v", r),
 				}
 				event = "provision_panic"
 			}
 		}()
-		callbackErr, result, failureLogs, err := work()
+		callbackErr, reason, result, failureLogs, err := work()
 		if err == nil {
 			// Pre-publish so a concurrent Deprovision-preempt reading
 			// prov.ContainerIDs sees the new IDs and can tear them down
@@ -748,6 +751,7 @@ func (a *LeaseActor) spawnProvisionWorker(work func() (string, ProvisionSuccessR
 		} else {
 			terminalMsg = provisionErroredMsg{
 				callbackErr: callbackErr,
+				reason:      reason, // authored by doProvision (ENG-508); "" ⇒ Unknown default at read boundary, fail-closed
 				lastError:   err.Error(),
 				logs:        failureLogs,
 			}
@@ -760,9 +764,10 @@ func (a *LeaseActor) handleProvisionCompleted(result ProvisionSuccessResult) {
 	_ = a.sm.Fire(a.cfg.StopCtx, evProvisionCompleted, result)
 }
 
-func (a *LeaseActor) handleProvisionErrored(callbackErr, lastError string, logs map[string]string) {
+func (a *LeaseActor) handleProvisionErrored(callbackErr string, reason backend.Reason, lastError string, logs map[string]string) {
 	_ = a.sm.Fire(a.cfg.StopCtx, evProvisionErrored, provisionErrorInfo{
 		callbackErr: callbackErr,
+		reason:      reason,
 		lastError:   lastError,
 		logs:        logs,
 	})
@@ -873,6 +878,7 @@ func (a *LeaseActor) spawnReplaceWorker(work func() ReplaceResult) {
 			if terminalMsg == nil {
 				terminalMsg = replaceFailedMsg{info: ReplaceFailureInfo{
 					CallbackErr: errMsgInternal,
+					Reason:      backend.ReasonInternal,
 					LastError:   "replace worker exited without setting terminal event",
 				}}
 				event = "replace_no_result"
@@ -895,6 +901,7 @@ func (a *LeaseActor) spawnReplaceWorker(work func() ReplaceResult) {
 				a.cfg.Metrics.WorkerPanic("replace")
 				terminalMsg = replaceFailedMsg{info: ReplaceFailureInfo{
 					CallbackErr: errMsgInternal,
+					Reason:      backend.ReasonInternal,
 					LastError:   fmt.Sprintf("worker panic: %v", r),
 				}}
 				event = "replace_panic"

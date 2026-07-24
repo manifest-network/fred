@@ -135,6 +135,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					CreatedAt:         c.CreatedAt,
 					FailCount:         c.FailCount,
 					LastError:         "", // populated by cold-start/transition logic below
+					Reason:            "", // populated by cold-start/transition logic below
+					Message:           "",
 					CallbackURL:       c.CallbackURL,
 					Items:             nil, // rebuilt from labels below
 					ContainerIDs:      make([]string, 0),
@@ -270,6 +272,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				rec.Status = backend.ProvisionStatusReady
 				rec.FailCount = existing.FailCount
 				rec.LastError = existing.LastError
+				rec.Reason = existing.Reason
+				rec.Message = existing.Message
 				failedLeases = append(failedLeases, uuid)
 				b.logger.Warn("container crashed after provisioning",
 					"lease_uuid", uuid,
@@ -289,6 +293,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if _, hasExisting := b.provisions[uuid]; !hasExisting {
 				rec.FailCount++
 				rec.LastError = leasesm.ErrMsgContainerExited
+				rec.Reason = backend.ReasonContainerExited
+				rec.Message = leasesm.ErrMsgContainerExited
 				coldStartFailed = append(coldStartFailed, uuid)
 				b.logger.Info("cold-start: adjusted FailCount for already-failed provision",
 					"lease_uuid", uuid,
@@ -555,6 +561,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// failure's data (ENG-193 code-review #1).
 			if p.Status == backend.ProvisionStatusFailed && p.CreatedAt.Equal(createdAt) {
 				p.LastError = enriched
+				// Reason/Message carry the CURATED (tenant-safe) signal; the
+				// enriched diag blob stays operator-only in LastError.
+				p.Reason = backend.ReasonContainerExited
+				p.Message = leasesm.ErrMsgContainerExited
 			}
 		})
 	}

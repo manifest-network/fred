@@ -13,6 +13,25 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
+// replaceOpReason maps a replace op to its curated failure-category Reason
+// (ENG-508). doReplaceContainers runs for restart, update, AND restore, so each
+// is mapped explicitly; an unrecognized op defaults to ReasonInternal (never
+// misclassified as one of the named operations). The paired human message is
+// always `op + " failed"`, matching the CallbackErr base built in
+// doReplaceContainers, so the two cannot diverge.
+func replaceOpReason(op string) backend.Reason {
+	switch op {
+	case "update":
+		return backend.ReasonUpdateFailed
+	case "restore":
+		return backend.ReasonRestoreFailed
+	case "restart":
+		return backend.ReasonRestartFailed
+	default:
+		return backend.ReasonInternal
+	}
+}
+
 // applyCustomDomainOverrides applies per-ServiceName custom_domain values to the
 // given items slice, keyed by ServiceName so it is robust to a recoverState
 // rebuild that reorders Items. No-op when overrides is empty.
@@ -186,14 +205,15 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manife
 		profile, profErr := b.cfg.GetSKUProfile(item.SKU)
 		if profErr != nil {
 			err := fmt.Errorf("SKU profile lookup failed for %s: %w", item.SKU, profErr)
-			b.recordPreflightFailure(leaseUUID, err, logger)
+			b.recordPreflightFailure(leaseUUID, backend.ReasonRestartFailed, backend.MsgRestartFailed, err, logger)
 			return leasesm.ReplaceResult{
-				CallbackErr:             "restart failed",
+				CallbackErr:             backend.MsgRestartFailed,
 				Err:                     err,
 				RecoveredIfSourceActive: true,
 				Failure: leasesm.ReplaceFailureInfo{
 					Operation:   "restart",
-					CallbackErr: "restart failed",
+					Reason:      backend.ReasonRestartFailed,
+					CallbackErr: backend.MsgRestartFailed,
 					LastError:   err.Error(),
 				},
 			}
@@ -259,7 +279,10 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			op.Logger.Error(op.Operation+" failed (stack)", "error", err)
 
 			if b.releaseStore != nil {
-				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", err.Error()); relErr != nil {
+				// Message == the CallbackErr base (op + " failed") by construction,
+				// so restart/update/restore never diverge or mislabel.
+				rReason, rMsg := replaceOpReason(op.Operation), op.Operation+" failed"
+				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", rReason, rMsg); relErr != nil {
 					op.Logger.Warn("failed to update release status", "error", relErr)
 				}
 			}
@@ -298,6 +321,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				Restored:    restored,
 				Failure: leasesm.ReplaceFailureInfo{
 					Operation:   op.Operation,
+					Reason:      replaceOpReason(op.Operation),
 					OldStopped:  true,
 					CallbackErr: callbackErr,
 					LastError:   err.Error(),
@@ -525,11 +549,11 @@ func (b *Backend) rollbackViaCompose(op replaceContainersOp) bool {
 // handled by the SM entry action that fires when the caller returns its
 // leasesm.ReplaceResult — see the preflight branches of doRestart /
 // doUpdate (post-Task-14, the unified stack-shaped versions).
-func (b *Backend) recordPreflightFailure(leaseUUID string, err error, logger *slog.Logger) {
+func (b *Backend) recordPreflightFailure(leaseUUID string, reason backend.Reason, message string, err error, logger *slog.Logger) {
 	logger.Error("preflight failed", "error", err)
 
 	if b.releaseStore != nil {
-		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", err.Error()); relErr != nil {
+		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", reason, message); relErr != nil {
 			logger.Warn("failed to update release status", "error", relErr)
 		}
 	}
@@ -685,16 +709,17 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, stack *manifes
 		logger.Info("pulling image for update", "service", svcName, "image", svc.Image)
 		if pullErr := b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); pullErr != nil {
 			err := fmt.Errorf("image pull failed for service %s: %w", svcName, pullErr)
-			b.recordPreflightFailure(leaseUUID, err, logger)
+			b.recordPreflightFailure(leaseUUID, backend.ReasonImagePullFailed, backend.MsgImagePullFailed, err, logger)
 			// Force Status=Failed unconditionally (Restored:false) since the
 			// user's desired state (the new image set) was not achieved.
 			return leasesm.ReplaceResult{
-				CallbackErr: "image pull failed",
+				CallbackErr: backend.MsgImagePullFailed,
 				Err:         err,
 				Restored:    false,
 				Failure: leasesm.ReplaceFailureInfo{
 					Operation:   "update",
-					CallbackErr: "image pull failed",
+					Reason:      backend.ReasonImagePullFailed,
+					CallbackErr: backend.MsgImagePullFailed,
 					LastError:   err.Error(),
 				},
 			}

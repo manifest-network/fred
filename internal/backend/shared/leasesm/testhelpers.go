@@ -2,6 +2,8 @@ package leasesm
 
 import (
 	"context"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // This file holds test helpers that must be reachable from substrate
@@ -59,9 +61,10 @@ func FireProvisionCompletedForTest(a *LeaseActor, result ProvisionSuccessResult)
 // Synchronously drives Provisioning→Failed and runs
 // onEnterFailedFromProvision (Status flip, FailCount++, LastError
 // update, persist diagnostics, callback emission).
-func FireProvisionErroredForTest(a *LeaseActor, callbackErr, lastError string, logs map[string]string) {
+func FireProvisionErroredForTest(a *LeaseActor, callbackErr string, reason backend.Reason, lastError string, logs map[string]string) {
 	_ = a.sm.Fire(context.Background(), evProvisionErrored, provisionErrorInfo{
 		callbackErr: callbackErr,
+		reason:      reason,
 		lastError:   lastError,
 		logs:        logs,
 	})

@@ -177,8 +177,14 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			p.Status = backend.ProvisionStatusFailed
 			p.ContainerIDs = failedIDs
 			p.LastError = fmt.Sprintf("deprovision partially failed: %s", errors.Join(errs...))
+			p.Reason = backend.ReasonCleanupFailed
+			p.Message = backend.MsgCleanupFailed
 			diagSnap = leasesm.DiagnosticSnapshot(p)
 		})
+		// Correlation log so operators can still find the verbose detail (redacted
+		// from the tenant-facing Message) by lease_uuid (ENG-508).
+		logger.Warn("provision failed (verbose detail retained operator-side)",
+			"lease_uuid", leaseUUID, "reason", backend.ReasonCleanupFailed, "detail", errors.Join(errs...))
 		// Unlike the initial-mark migration, do NOT early-return on UpdateFn==false:
 		// still persist diagnostics and surface the error. If the entry is gone,
 		// diagSnap is zero-value and persistDiagnostics no-ops on its empty guard.
@@ -503,8 +509,14 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				p.ContainerIDs = nil // containers are gone
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
 					attempts, errors.Join(volumeErrs...))
+				p.Reason = backend.ReasonVolumeCleanupExhausted
+				p.Message = backend.MsgVolumeCleanupExhausted
 				diagSnap = leasesm.DiagnosticSnapshot(p)
 			})
+			// Correlation log so operators can still find the verbose detail (redacted
+			// from the tenant-facing Message) by lease_uuid (ENG-508).
+			logger.Warn("provision failed (verbose detail retained operator-side)",
+				"lease_uuid", leaseUUID, "reason", backend.ReasonVolumeCleanupExhausted, "detail", errors.Join(volumeErrs...))
 			b.provisionStore.Delete(leaseUUID)
 
 			// Persist diagnostics before losing the provision so operators
@@ -535,8 +547,14 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			p.ContainerIDs = nil // containers are gone
 			p.Status = backend.ProvisionStatusFailed
 			p.LastError = fmt.Sprintf("volume cleanup failed: %s", errors.Join(volumeErrs...))
+			p.Reason = backend.ReasonCleanupFailed
+			p.Message = backend.MsgCleanupFailed
 			diagSnap = leasesm.DiagnosticSnapshot(p)
 		})
+		// Correlation log so operators can still find the verbose detail (redacted
+		// from the tenant-facing Message) by lease_uuid (ENG-508).
+		logger.Warn("provision failed (verbose detail retained operator-side)",
+			"lease_uuid", leaseUUID, "reason", backend.ReasonCleanupFailed, "detail", errors.Join(volumeErrs...))
 		// Persist diagnostics outside the lock so failure state survives
 		// a process restart (no containers remain to recover from).
 		b.persistDiagnostics(diagSnap, nil)

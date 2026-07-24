@@ -33,12 +33,17 @@ func (b *Backend) GetReleases(_ context.Context, leaseUUID string) ([]backend.Re
 
 	result := make([]backend.ReleaseInfo, len(releases))
 	for i, r := range releases {
+		reason := r.Reason
+		if reason == "" && r.Status == "failed" {
+			reason = backend.ReasonUnknown
+		}
 		result[i] = backend.ReleaseInfo{
 			Version:   r.Version,
 			Image:     r.Image,
 			Status:    r.Status,
 			CreatedAt: r.CreatedAt,
-			Error:     r.Error,
+			Reason:    reason,
+			Message:   r.Message,
 			Manifest:  r.Manifest,
 		}
 	}
@@ -192,7 +197,8 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 				CreatedAt:    entry.CreatedAt,
 				BackendName:  b.cfg.Name,
 				FailCount:    entry.FailCount,
-				LastError:    entry.Error,
+				Reason:       defaultReason(backend.ProvisionStatusFailed, entry.Reason),
+				Message:      entry.Message,
 			}, nil
 		}
 	}
@@ -297,7 +303,7 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 						"container_id", leasesm.ShortID(containerID),
 						"error", err,
 					)
-					result[key] = fmt.Sprintf("<error: %s>", err)
+					result[key] = "<log unavailable>"
 					continue
 				}
 				trimmed, consumed := trimLogToBudget(logs, remaining)
@@ -323,6 +329,16 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 	return nil, backend.ErrNotProvisioned
 }
 
+// defaultReason fills ReasonUnknown for a FAILED provision with no authored
+// reason (legacy record / unmapped path). K8s/gRPC: a failed status always
+// carries a machine reason. Message stays empty (no verbose leak).
+func defaultReason(status backend.ProvisionStatus, r backend.Reason) backend.Reason {
+	if r == "" && status == backend.ProvisionStatusFailed {
+		return backend.ReasonUnknown
+	}
+	return r
+}
+
 // provisionToInfo converts a provision to a backend.ProvisionInfo.
 // Items are defensively copied (each provision now carries them post-
 // Task-3 normalization) and ServiceImages are extracted from
@@ -337,7 +353,8 @@ func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo 
 		CreatedAt:    prov.CreatedAt,
 		BackendName:  backendName,
 		FailCount:    prov.FailCount,
-		LastError:    prov.LastError,
+		Reason:       defaultReason(prov.Status, prov.Reason),
+		Message:      prov.Message,
 		Quantity:     prov.Quantity,
 	}
 	// Post-Task-15 every provision carries `prov.Items` (populated at
