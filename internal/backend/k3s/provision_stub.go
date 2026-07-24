@@ -376,6 +376,8 @@ func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, 
 			ProviderUUID: p.ProviderUUID,
 			Status:       p.Status,
 			FailCount:    p.FailCount,
+			Reason:       p.Reason,
+			Message:      p.Message,
 			CreatedAt:    p.CreatedAt,
 		})
 	}

@@ -1476,3 +1476,67 @@ func TestReplaceFailed_AuthorsReasonMessage(t *testing.T) {
 	assert.Equal(t, "compose up exit 1: /data/fred/... permission denied", got.LastError,
 		"verbose LastError must be untouched (operator-only)")
 }
+
+// TestReplaceCompleted_ClearsStaleReasonMessage asserts that the
+// Restarting→Ready success entry action (onEnterReadyFromReplaceCompleted)
+// clears the curated (Reason, Message) pair when a previously-failed lease
+// recovers (ENG-508). ProvisionState persists across transitions, so a
+// lease that failed (Reason=ContainerExited) and is then restarted still
+// carries the stale failure Reason/Message into Restarting; the success
+// transition MUST wipe them so /status|/provision|/releases no longer
+// surface a stale failure reason for a now-healthy Ready lease. Drives the
+// path white-box mirroring TestReplaceFailed_AuthorsReasonMessage: the
+// store is seeded in Restarting (so readProvisionStatus initializes the SM
+// there) carrying the stale Reason/Message, then handleReplaceCompleted
+// fires evReplaceCompleted → Ready.
+func TestReplaceCompleted_ClearsStaleReasonMessage(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusRestarting,
+		Reason:    backend.ReasonContainerExited,
+		Message:   "container exited unexpectedly",
+		LastError: "compose ps: container 'app' exited with code 137",
+	})
+	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+
+	a.handleReplaceCompleted(ReplaceSuccessResult{ContainerIDs: []string{"c1"}})
+
+	got, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusReady, got.Status,
+		"a successful replace must land the lease in Ready")
+	assert.Equal(t, backend.Reason(""), got.Reason,
+		"stale failure Reason must be cleared on healthy recovery")
+	assert.Equal(t, "", got.Message,
+		"stale failure Message must be cleared on healthy recovery")
+}
+
+// TestProvisionCompleted_ClearsStaleReasonMessage is the defense-in-depth
+// companion for the successful-provision entry action
+// (onEnterReadyFromProvision): a Failed lease that is re-provisioned (retry)
+// must not carry its prior failure Reason/Message into the healthy Ready
+// record (ENG-508). Drives Provisioning→Ready via the ForTest fires.
+func TestProvisionCompleted_ClearsStaleReasonMessage(t *testing.T) {
+	store := newMockProvisionStore()
+	store.put("lease-1", &ProvisionState{
+		LeaseUUID: "lease-1",
+		Status:    backend.ProvisionStatusFailed,
+		Reason:    backend.ReasonImagePullFailed,
+		Message:   "image pull failed",
+		LastError: "pull /data/fred/... exit 1",
+	})
+	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
+
+	FireProvisionRequestedForTest(a)
+	FireProvisionCompletedForTest(a, ProvisionSuccessResult{ContainerIDs: []string{"c1"}})
+
+	got, ok := store.Get("lease-1")
+	require.True(t, ok)
+	assert.Equal(t, backend.ProvisionStatusReady, got.Status,
+		"a successful provision must land the lease in Ready")
+	assert.Equal(t, backend.Reason(""), got.Reason,
+		"stale failure Reason must be cleared on healthy provision")
+	assert.Equal(t, "", got.Message,
+		"stale failure Message must be cleared on healthy provision")
+}

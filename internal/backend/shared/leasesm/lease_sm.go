@@ -536,6 +536,12 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 		p.Status = backend.ProvisionStatusReady
 		p.ContainerIDs = result.ContainerIDs
 		p.LastError = ""
+		// Clear any stale curated failure surface (ENG-508): a retried
+		// provision that lands Ready must not carry a prior failure's
+		// Reason/Message into the healthy record. Defense-in-depth so
+		// leasesm owns the reset, not the substrate.
+		p.Reason = ""
+		p.Message = ""
 		if result.StackManifest != nil {
 			p.StackManifest = result.StackManifest
 		}
@@ -583,6 +589,12 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		}
 		p.Status = backend.ProvisionStatusReady
 		p.LastError = ""
+		// Clear any stale curated failure surface (ENG-508): a lease that
+		// failed (Reason/Message authored) and then successfully restarts
+		// or updates must not keep surfacing the prior failure reason once
+		// it is healthy again. ProvisionState persists across transitions.
+		p.Reason = ""
+		p.Message = ""
 		if result.OnSuccess != nil {
 			result.OnSuccess(p)
 		}

@@ -1165,6 +1165,17 @@ func (h *Handlers) GetLeaseReleases(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// API-layer Unknown backstop (ENG-508), symmetric with the provision
+	// path's provisionReason backstop: a failed release with no authored
+	// Reason surfaces the machine-readable Unknown default rather than an
+	// empty code, so the read boundary never emits a failed-but-reasonless
+	// release.
+	for i := range releases {
+		if releases[i].Reason == "" && releases[i].Status == "failed" {
+			releases[i].Reason = backend.ReasonUnknown
+		}
+	}
+
 	response := LeaseReleasesResponse{
 		LeaseUUID:    leaseUUID,
 		Tenant:       auth.Token.Tenant,
