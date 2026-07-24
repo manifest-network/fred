@@ -1416,7 +1416,11 @@ func TestGetProvision_Found(t *testing.T) {
 			ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    2,
-			LastError:    "exit_code=1; logs:\nSECRET=abc"},
+			// Operator-only verbose detail stays on ProvisionState.LastError;
+			// it must NOT surface on the tenant-facing ProvisionInfo (ENG-508).
+			LastError: "exit_code=1; logs:\nSECRET=abc",
+			Reason:    backend.ReasonContainerExited,
+			Message:   "container exited unexpectedly"},
 		},
 	})
 
@@ -1425,7 +1429,9 @@ func TestGetProvision_Found(t *testing.T) {
 	assert.Equal(t, "lease-1", info.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	assert.Equal(t, 2, info.FailCount)
-	assert.Contains(t, info.LastError, "exit_code=1")
+	assert.Equal(t, backend.ReasonContainerExited, info.Reason)
+	assert.Equal(t, "container exited unexpectedly", info.Message)
+	assert.NotContains(t, info.Message, "SECRET", "verbose operator detail must not leak into the tenant Message")
 }
 
 func TestGetProvision_NotFound(t *testing.T) {
@@ -1434,6 +1440,39 @@ func TestGetProvision_NotFound(t *testing.T) {
 
 	_, err := b.GetProvision(context.Background(), "nonexistent")
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
+// TestGetProvision_LegacyDiagEntry_NoVerboseLeak pins the ENG-508 security cut at
+// the docker read boundary: a legacy diagnostics entry that carries only the
+// verbose operator Error (host path) with no curated Reason/Message must surface
+// as a redacted ProvisionInfo — the verbose text never appears in the
+// tenant-facing Message, and a FAILED status with no authored reason defaults to
+// ReasonUnknown.
+func TestGetProvision_LegacyDiagEntry_NoVerboseLeak(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+	b.retentionStore = nil
+
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "diag.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = diagStore.Close() })
+	b.diagnosticsStore = diagStore
+
+	// Legacy entry: verbose operator Error only, no curated Reason/Message.
+	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
+		LeaseUUID:    "lease-legacy",
+		ProviderUUID: "prov-1",
+		Error:        "xfs_quota /data/fred/volumes/x exit 1",
+		FailCount:    1,
+		CreatedAt:    time.Now(),
+	}))
+
+	info, err := b.GetProvision(context.Background(), "lease-legacy")
+	require.NoError(t, err)
+	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
+	assert.NotContains(t, info.Message, "/data/fred/volumes", "verbose operator detail must not leak into the tenant Message")
+	assert.Equal(t, backend.ReasonUnknown, info.Reason, "failed + empty reason must default to Unknown")
 }
 
 // --- Workload field fixtures ---
@@ -2183,7 +2222,7 @@ func TestDoProvision_LastError_ClearedOnSuccess(t *testing.T) {
 	// because a re-provision creates a new provision record)
 }
 
-func TestListProvisions_IncludesLastError(t *testing.T) {
+func TestListProvisions_IncludesReasonMessage(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
@@ -2191,14 +2230,19 @@ func TestListProvisions_IncludesLastError(t *testing.T) {
 			Status:       backend.ProvisionStatusFailed,
 			CreatedAt:    time.Now(),
 			FailCount:    2,
-			LastError:    "container crashed"},
+			// Operator-only verbose detail; must not surface on the wire (ENG-508).
+			LastError: "container crashed: /data/fred/volumes/x",
+			Reason:    backend.ReasonContainerExited,
+			Message:   "container exited unexpectedly"},
 		},
 	})
 
 	result, err := b.ListProvisions(context.Background())
 	require.NoError(t, err)
 	require.Len(t, result, 1)
-	assert.Equal(t, "container crashed", result[0].LastError)
+	assert.Equal(t, backend.ReasonContainerExited, result[0].Reason)
+	assert.Equal(t, "container exited unexpectedly", result[0].Message)
+	assert.NotContains(t, result[0].Message, "/data/fred", "verbose operator detail must not leak on the wire")
 	assert.Equal(t, 2, result[0].FailCount)
 }
 
@@ -2781,11 +2825,14 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	// Wait for async provision to complete.
 	require.Eventually(t, func() bool { return callbackReceived.Load() }, 5*time.Second, 50*time.Millisecond)
 
-	// Verify diagnostics were persisted.
+	// Verify diagnostics were persisted. entry.Error carries the VERBOSE
+	// operator detail (the raw underlying error) — this is the operator-only
+	// side that never reaches the tenant (ENG-508).
 	entry, err := diagStore.Get("lease-diag")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Contains(t, entry.Error, "image pull failed")
+	assert.Contains(t, entry.Error, "registry unreachable", "operator-side entry.Error keeps the verbose cause")
 	assert.Equal(t, 1, entry.FailCount)
 	assert.Equal(t, "tenant-a", entry.Tenant)
 	assert.Equal(t, "prov-1", entry.ProviderUUID)
@@ -2800,11 +2847,15 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	delete(b.provisions, "lease-diag")
 	b.provisionsMu.Unlock()
 
-	// GetProvision should fall back to diagnostics store.
+	// GetProvision should fall back to diagnostics store. The tenant-facing
+	// ProvisionInfo carries only the curated Reason/Message — never the verbose
+	// operator detail (ENG-508).
 	info, err = b.GetProvision(context.Background(), "lease-diag")
 	require.NoError(t, err)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
-	assert.Contains(t, info.LastError, "image pull failed")
+	assert.Equal(t, backend.ReasonContainerExited, info.Reason)
+	assert.Equal(t, "image pull failed", info.Message)
+	assert.NotContains(t, info.Message, "registry unreachable", "curated Message must not carry the verbose cause")
 	assert.Equal(t, 1, info.FailCount)
 	assert.Equal(t, "prov-1", info.ProviderUUID)
 

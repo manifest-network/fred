@@ -387,9 +387,8 @@ func TestGetProvision_FromMap_AfterStubFailure(t *testing.T) {
 	require.NotNil(t, info)
 	assert.Equal(t, "lease-1", info.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
-	assert.Equal(t, "not implemented", info.LastError)
-	// ENG-508: the map path copies the curated tenant-safe failure signal
-	// (Reason/Message) through alongside the operator-only LastError.
+	// ENG-508: the map path surfaces the curated tenant-safe failure signal
+	// (Reason/Message); the verbose operator LastError is no longer on the wire.
 	assert.Equal(t, backend.ReasonInternal, info.Reason)
 	assert.Equal(t, "not implemented", info.Message)
 	// Option 2 patch: in-memory record carries FailCount=1 alongside Status.
@@ -418,9 +417,9 @@ func TestGetProvision_FromDiagnostics_AfterDeprovision(t *testing.T) {
 	// is failure-only by construction (only the runStubProvisioner failure
 	// path calls diagnosticsStore.Store).
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
-	assert.Equal(t, "not implemented", info.LastError)
 	// ENG-508: the diagnostics fallback surfaces the same curated Reason/Message
-	// as the live map path, so both read boundaries agree on the wire shape.
+	// as the live map path, so both read boundaries agree on the wire shape;
+	// the verbose operator LastError is no longer on the wire.
 	assert.Equal(t, backend.ReasonInternal, info.Reason)
 	assert.Equal(t, "not implemented", info.Message)
 	assert.Equal(t, 1, info.FailCount)

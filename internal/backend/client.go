@@ -262,10 +262,15 @@ type ProvisionInfo struct {
 	Status       ProvisionStatus `json:"status"` // see ProvisionStatus* constants
 	CreatedAt    time.Time       `json:"created_at"`
 	FailCount    int             `json:"fail_count"`
-	LastError    string          `json:"last_error,omitempty"`
-	Reason       Reason          `json:"reason,omitempty"`
-	Message      string          `json:"message,omitempty"`
-	BackendName  string          `json:"-"` // Set by the backend or reconciler; excluded from JSON serialization
+	// LastError (the verbose operator failure detail) is intentionally NOT on
+	// this wire type: it crosses to tenant-facing API responses, and verbose
+	// exec output / host paths must never leak there (ENG-508). The curated,
+	// tenant-safe (Reason, Message) pair replaces it. The operator-only verbose
+	// detail lives on leasesm.ProvisionState.LastError and the diagnostics store
+	// (DiagnosticEntry.Error), neither of which is tenant-serialized.
+	Reason      Reason `json:"reason,omitempty"`
+	Message     string `json:"message,omitempty"`
+	BackendName string `json:"-"` // Set by the backend or reconciler; excluded from JSON serialization
 
 	// RetainedUntil is the grace-window deadline (CreatedAt + RetentionMaxAge)
 	// for a soft-deleted (Status=retained) lease. Zero for live provisions.
@@ -372,10 +377,12 @@ type ReleaseInfo struct {
 	Image     string    `json:"image"`
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
-	Error     string    `json:"error,omitempty"`
-	Reason    Reason    `json:"reason,omitempty"`
-	Message   string    `json:"message,omitempty"`
-	Manifest  []byte    `json:"manifest"`
+	// Error (verbose release-failure detail) is intentionally NOT on this
+	// tenant-serialized wire type (ENG-508); the curated (Reason, Message) pair
+	// replaces it. Operator-only verbose detail stays in the release store.
+	Reason   Reason `json:"reason,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Manifest []byte `json:"manifest"`
 }
 
 // LoadStats is the backend load snapshot fred consumes for least-loaded
@@ -557,7 +564,7 @@ const (
 	DefaultMaxInfoBytes             int64 = 1 << 20  // 1 MiB — single lease info
 	DefaultMaxProvisionBytes        int64 = 1 << 20  // 1 MiB — single provision record
 	DefaultMaxProvisionsBytes       int64 = 8 << 20  // 8 MiB — list of all provisions
-	DefaultMaxLookupProvisionsBytes int64 = 8 << 20  // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because each ProvisionInfo carries an unbounded LastError and stack leases carry unbounded ServiceImages
+	DefaultMaxLookupProvisionsBytes int64 = 8 << 20  // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because stack leases carry unbounded ServiceImages
 	DefaultMaxLogsBytes             int64 = 16 << 20 // 16 MiB — container logs can be large
 	DefaultMaxReleasesBytes         int64 = 8 << 20  // 8 MiB — release history with manifests
 	DefaultMaxStatsBytes            int64 = 1 << 20  // 1 MiB — load stats snapshot (small JSON)

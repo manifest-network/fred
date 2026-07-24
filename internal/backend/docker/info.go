@@ -197,8 +197,7 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 				CreatedAt:    entry.CreatedAt,
 				BackendName:  b.cfg.Name,
 				FailCount:    entry.FailCount,
-				LastError:    entry.Error,
-				Reason:       entry.Reason,
+				Reason:       defaultReason(backend.ProvisionStatusFailed, entry.Reason),
 				Message:      entry.Message,
 			}, nil
 		}
@@ -330,6 +329,16 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 	return nil, backend.ErrNotProvisioned
 }
 
+// defaultReason fills ReasonUnknown for a FAILED provision with no authored
+// reason (legacy record / unmapped path). K8s/gRPC: a failed status always
+// carries a machine reason. Message stays empty (no verbose leak).
+func defaultReason(status backend.ProvisionStatus, r backend.Reason) backend.Reason {
+	if r == "" && status == backend.ProvisionStatusFailed {
+		return backend.ReasonUnknown
+	}
+	return r
+}
+
 // provisionToInfo converts a provision to a backend.ProvisionInfo.
 // Items are defensively copied (each provision now carries them post-
 // Task-3 normalization) and ServiceImages are extracted from
@@ -344,8 +353,7 @@ func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo 
 		CreatedAt:    prov.CreatedAt,
 		BackendName:  backendName,
 		FailCount:    prov.FailCount,
-		LastError:    prov.LastError,
-		Reason:       prov.Reason,
+		Reason:       defaultReason(prov.Status, prov.Reason),
 		Message:      prov.Message,
 		Quantity:     prov.Quantity,
 	}

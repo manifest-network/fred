@@ -2182,6 +2182,150 @@ func TestCallbackResponse_OmitEmptyMessage(t *testing.T) {
 	assert.False(t, strings.Contains(jsonStr, "message"), "JSON should not contain 'message' when empty, got %s", jsonStr)
 }
 
+// TestGetLeaseStatus_RedactsVerboseError_SurfacesReasonMessage pins the ENG-508
+// security cut: a FAILED provision surfaces the curated machine reason + human
+// message to the tenant and NEVER the verbose operator detail (host paths,
+// stack traces). The wire type no longer carries last_error, so no host path or
+// last_error key can appear in the tenant response.
+func TestGetLeaseStatus_RedactsVerboseError_SurfacesReasonMessage(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/provisions/"+leaseUUID && r.Method == "GET" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(backend.ProvisionInfo{
+				LeaseUUID:    leaseUUID,
+				ProviderUUID: providerUUID,
+				Status:       backend.ProvisionStatusFailed,
+				FailCount:    1,
+				Reason:       backend.ReasonContainerExited,
+				Message:      "container exited unexpectedly",
+			})
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	h := &Handlers{
+		client:        chainClient,
+		backendRouter: router,
+		providerUUID:  providerUUID,
+		bech32Prefix:  "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.GetLeaseStatus(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+
+	body := rec.Body.String()
+	assert.NotContains(t, body, "/data/fred/volumes", "tenant response must not leak host paths")
+	assert.NotContains(t, body, "last_error", "the verbose last_error field must be gone from the wire")
+	assert.Contains(t, body, `"reason":"ContainerExited"`)
+	assert.Contains(t, body, `"message":"container exited unexpectedly"`)
+}
+
+// TestGetLeaseStatus_FailedEmptyReason_DefaultsUnknown pins the read-boundary
+// Unknown default: a FAILED provision that reaches the API with no authored
+// reason (legacy/pre-ENG-508 backend) must still surface a machine reason to the
+// tenant, defaulting to "Unknown" rather than an empty string.
+func TestGetLeaseStatus_FailedEmptyReason_DefaultsUnknown(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_ACTIVE,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/provisions/"+leaseUUID && r.Method == "GET" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(backend.ProvisionInfo{
+				LeaseUUID:    leaseUUID,
+				ProviderUUID: providerUUID,
+				Status:       backend.ProvisionStatusFailed,
+				FailCount:    1,
+				Reason:       "",
+				Message:      "",
+			})
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	h := &Handlers{
+		client:        chainClient,
+		backendRouter: router,
+		providerUUID:  providerUUID,
+		bech32Prefix:  "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/status", nil)
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.GetLeaseStatus(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	assert.Contains(t, rec.Body.String(), `"reason":"Unknown"`)
+}
+
 // TestGetLeaseProvision tests the GetLeaseProvision endpoint.
 func TestGetLeaseProvision(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
@@ -2253,7 +2397,8 @@ func TestGetLeaseProvision(t *testing.T) {
 		assert.Equal(t, providerUUID, response.ProviderUUID)
 		assert.Equal(t, "ready", response.Status)
 		assert.Equal(t, 0, response.FailCount)
-		assert.Empty(t, response.LastError)
+		assert.Empty(t, response.Reason)
+		assert.Empty(t, response.Message)
 	})
 
 	t.Run("happy_path_failed_with_error", func(t *testing.T) {
@@ -2265,7 +2410,8 @@ func TestGetLeaseProvision(t *testing.T) {
 					ProviderUUID: providerUUID,
 					Status:       backend.ProvisionStatusFailed,
 					FailCount:    3,
-					LastError:    "container exited unexpectedly: exit_code=1",
+					Reason:       backend.ReasonContainerExited,
+					Message:      "container exited unexpectedly",
 				})
 				return
 			}
@@ -2304,7 +2450,8 @@ func TestGetLeaseProvision(t *testing.T) {
 		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 		assert.Equal(t, "failed", response.Status)
 		assert.Equal(t, 3, response.FailCount)
-		assert.Equal(t, "container exited unexpectedly: exit_code=1", response.LastError)
+		assert.Equal(t, "ContainerExited", response.Reason)
+		assert.Equal(t, "container exited unexpectedly", response.Message)
 	})
 
 	t.Run("router_missing_returns_503", func(t *testing.T) {
@@ -2489,7 +2636,8 @@ func TestGetLeaseProvision(t *testing.T) {
 				LeaseUUID: leaseUUID,
 				Status:    backend.ProvisionStatusFailed,
 				FailCount: 1,
-				LastError: "image pull failed",
+				Reason:    backend.ReasonImagePullFailed,
+				Message:   "image pull failed",
 			})
 		}))
 		defer backendServer.Close()
@@ -2524,7 +2672,8 @@ func TestGetLeaseProvision(t *testing.T) {
 		var response LeaseProvisionResponse
 		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 		assert.Equal(t, "failed", response.Status)
-		assert.Equal(t, "image pull failed", response.LastError)
+		assert.Equal(t, "ImagePullFailed", response.Reason)
+		assert.Equal(t, "image pull failed", response.Message)
 	})
 }
 
