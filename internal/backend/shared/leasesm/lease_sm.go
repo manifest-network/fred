@@ -835,6 +835,7 @@ type ProvisionSuccessResult struct {
 // the containers are gone by the time the SM entry action runs.
 type provisionErrorInfo struct {
 	callbackErr string
+	reason      backend.Reason // ENG-508
 	lastError   string
 	logs        map[string]string
 }
@@ -867,6 +868,7 @@ type ReplaceFailureInfo struct {
 	Operation   string // "restart" or "update"
 	OldStopped  bool   // only meaningful on the recovery path (restart-with-oldStopped clears LastError)
 	CallbackErr string
+	Reason      backend.Reason // ENG-508: category code; message is CallbackErr
 	LastError   string
 	// Logs is the pre-captured container-log map from the NEW (failed)
 	// containers. Populated by doReplace*'s defer BEFORE rollback tears

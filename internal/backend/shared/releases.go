@@ -9,6 +9,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -16,12 +17,14 @@ var releasesBucketName = []byte("releases")
 
 // Release represents a single release (deployment) of a lease.
 type Release struct {
-	Version   int       `json:"version"`
-	Manifest  []byte    `json:"manifest"`
-	Image     string    `json:"image"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	Error     string    `json:"error,omitempty"`
+	Version   int            `json:"version"`
+	Manifest  []byte         `json:"manifest"`
+	Image     string         `json:"image"`
+	Status    string         `json:"status"`
+	CreatedAt time.Time      `json:"created_at"`
+	Error     string         `json:"error,omitempty"`
+	Reason    backend.Reason `json:"reason,omitempty"`
+	Message   string         `json:"message,omitempty"`
 }
 
 // ReleaseStore persists release history in bbolt so it survives backend restarts.

@@ -263,6 +263,8 @@ type ProvisionInfo struct {
 	CreatedAt    time.Time       `json:"created_at"`
 	FailCount    int             `json:"fail_count"`
 	LastError    string          `json:"last_error,omitempty"`
+	Reason       Reason          `json:"reason,omitempty"`
+	Message      string          `json:"message,omitempty"`
 	BackendName  string          `json:"-"` // Set by the backend or reconciler; excluded from JSON serialization
 
 	// RetainedUntil is the grace-window deadline (CreatedAt + RetentionMaxAge)
@@ -371,6 +373,8 @@ type ReleaseInfo struct {
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 	Error     string    `json:"error,omitempty"`
+	Reason    Reason    `json:"reason,omitempty"`
+	Message   string    `json:"message,omitempty"`
 	Manifest  []byte    `json:"manifest"`
 }
 

@@ -133,6 +133,7 @@ func (provisionCompletedMsg) onPanic(error)           {} // no caller to unblock
 // call.
 type provisionErroredMsg struct {
 	callbackErr string
+	reason      backend.Reason // ENG-508
 	lastError   string
 	logs        map[string]string
 }

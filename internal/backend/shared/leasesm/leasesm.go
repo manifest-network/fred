@@ -135,6 +135,8 @@ type ProvisionState struct {
 	CreatedAt    time.Time
 	FailCount    int
 	LastError    string
+	Reason       backend.Reason // curated failure-category code (ENG-508), authored at source
+	Message      string         // curated human message (== on-chain CallbackErr)
 	CallbackURL  string
 	Items        []backend.LeaseItem
 	ContainerIDs []string

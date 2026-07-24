@@ -7,6 +7,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -14,13 +15,17 @@ var diagnosticsBucketName = []byte("failure_diagnostics")
 
 // DiagnosticEntry represents a persisted failure diagnostic record.
 type DiagnosticEntry struct {
-	LeaseUUID    string            `json:"lease_uuid"`
-	ProviderUUID string            `json:"provider_uuid"`
-	Tenant       string            `json:"tenant"`
-	Error        string            `json:"error"`
-	Logs         map[string]string `json:"logs,omitempty"`
-	FailCount    int               `json:"fail_count"`
-	CreatedAt    time.Time         `json:"created_at"`
+	LeaseUUID    string `json:"lease_uuid"`
+	ProviderUUID string `json:"provider_uuid"`
+	Tenant       string `json:"tenant"`
+	Error        string `json:"error"`
+	// Reason/Message: curated tenant-safe failure signal (ENG-508). Error stays
+	// operator-only. Reason authored at source; Message == on-chain CallbackErr.
+	Reason    backend.Reason    `json:"reason,omitempty"`
+	Message   string            `json:"message,omitempty"`
+	Logs      map[string]string `json:"logs,omitempty"`
+	FailCount int               `json:"fail_count"`
+	CreatedAt time.Time         `json:"created_at"`
 }
 
 // DiagnosticsStore persists failure diagnostics in bbolt so they survive
