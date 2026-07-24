@@ -84,6 +84,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- providerd no longer returns the verbose backend `last_error` (host filesystem paths + raw
+  command stderr) to tenants on `GET /status`, `/provision`, `/releases`, or `/logs`. **Breaking:**
+  the `last_error` response field is removed; a K8s-shaped `reason` (machine code) + `message`
+  (curated, no host detail) replace it. Verbose detail stays operator-side (diagnostics store +
+  structured logs, correlated by `lease_uuid`). The `reason` set is open/add-only — consumers must
+  tolerate unknown values and fall back to `message`. (ENG-508)
 - The reserved container-label prefix guard (`traefik.`/`fred.`) now matches
   case-insensitively. Traefik's Docker provider treats label keys
   case-insensitively, so a tenant label keyed `Traefik.http.routers.evil.rule`

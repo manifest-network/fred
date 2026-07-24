@@ -111,7 +111,9 @@ What to look at:
 - **`state`** — `PENDING` (waiting for provisioning), `ACTIVE` (running), `CLOSED`, `EXPIRED`.
 - **`requires_payload`** — if `true` and `payload_received` is `false`, you need to upload a manifest before provisioning can start.
 - **`provision_status`** — present once provisioning has started (`provisioning`, `ready`, `failing`, `failed`, `restarting`, `updating`, `deprovisioning`, `retained`).
-- **`fail_count`** + **`last_error`** — present after failures; only the count and most recent message.
+- **`fail_count`** + **`reason`** + **`message`** — present after failures; `reason` is a stable machine
+  code (e.g. `ContainerExited`), `message` a short human summary. See [Step 6](#step-6-debug-failures)
+  for the full `reason` enum and how to handle unrecognized values.
 
 For richer diagnostics during failures, use `GET /v1/leases/{uuid}/provision` (see [Step 6](#step-6-debug-failures)).
 
@@ -245,9 +247,29 @@ curl -H "Authorization: Bearer $(fresh_token)" \
   "provider_uuid": "01234567-...",
   "status": "failed",
   "fail_count": 2,
-  "last_error": "container 0 exited during startup (status: exited): exit_code=1; logs:\nError: config file not found"
+  "reason": "ContainerExited",
+  "message": "container exited unexpectedly"
 }
 ```
+
+`reason` is a stable, machine-readable failure code — a **K8s-shaped, open/add-only enum**: new
+values may appear in future releases without notice, so treat any value your client doesn't
+recognize as a generic failure and fall back to displaying `message`. The defined set today:
+
+| Reason | Meaning |
+|---|---|
+| `ContainerExited` | A container exited unexpectedly (crash, non-zero exit, OOM kill) |
+| `ImagePullFailed` | The container image could not be pulled |
+| `Internal` | An internal fred/backend error (not attributable to the tenant's workload) |
+| `RestartFailed` | A tenant-initiated restart failed |
+| `UpdateFailed` | A tenant-initiated manifest update failed (and was rolled back) |
+| `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retries |
+| `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
+| `Unknown` | The lease is `failed` but no specific reason was recorded |
+
+`message` is a short, human-readable summary and may be empty; it never contains host filesystem
+paths or raw command/daemon output — that verbose detail is retained operator-side (diagnostics
+store + structured logs, correlated by `lease_uuid`) for support requests, not exposed over the API.
 
 For full container logs:
 
@@ -256,7 +278,7 @@ curl -H "Authorization: Bearer $(fresh_token)" \
   "https://fred.example-provider.com:8080/v1/leases/$LEASE_UUID/logs?tail=500"
 ```
 
-`last_error` and `logs` are kept for 7 days after the provision is gone (configurable by the operator). On-chain rejection messages are intentionally generic (`container exited unexpectedly`) so secrets in container logs cannot leak there — the rich diagnostics only flow through the authenticated API.
+`reason`/`message` and `logs` are kept for 7 days after the provision is gone (configurable by the operator). On-chain rejection messages are intentionally generic (`container exited unexpectedly`) so secrets in container logs cannot leak there — the rich diagnostics only flow through the authenticated API.
 
 ---
 
