@@ -480,7 +480,7 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 - `provisioning_started` - True if provisioning is in progress
 - `provision_status` - Backend provision status (omitted if not provisioned). May be `retained` for a closed/expired lease whose data was soft-deleted and is restorable (see [retention](internal/backend/docker/README.md#soft-delete--restore))
 - `fail_count` - Number of provisioning failures (omitted if zero)
-- `reason` - Stable, machine-readable failure category (omitted unless the provision has failed); see [Failure Reason Codes](#failure-reason-codes)
+- `reason` - Stable, machine-readable failure category; present whenever a failure has been recorded — including a `ready` lease whose last update failed and rolled back to the previous version — and omitted (`omitempty`) when empty; see [Failure Reason Codes](#failure-reason-codes)
 - `message` - Curated, human-readable failure summary (omitted if empty); no host paths or raw command output
 - `retained_until` - RFC3339 grace-window deadline; present only when `provision_status` is `retained`
 - `items` - Restore shape (`service_name`, `sku`, `quantity`) to request when opening the fresh lease to restore into; present only when `retained`
