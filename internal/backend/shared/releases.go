@@ -140,8 +140,10 @@ func (s *ReleaseStore) LatestActive(leaseUUID string) (*Release, error) {
 	return nil, nil
 }
 
-// UpdateLatestStatus updates the status (and optionally error) of the most recent release.
-func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status, errMsg string) error {
+// UpdateLatestStatus updates the status and curated (reason, message) of the
+// most recent release. The verbose per-failure detail is intentionally NOT
+// stored here — callers log it and surface only the curated pair to tenants.
+func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status string, reason backend.Reason, message string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(releasesBucketName)
 		data := b.Get([]byte(leaseUUID))
@@ -158,7 +160,8 @@ func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status, errMsg string) erro
 		}
 
 		releases[len(releases)-1].Status = status
-		releases[len(releases)-1].Error = errMsg
+		releases[len(releases)-1].Reason = reason
+		releases[len(releases)-1].Message = message
 
 		encoded, err := json.Marshal(releases)
 		if err != nil {
@@ -193,6 +196,8 @@ func (s *ReleaseStore) ActivateLatest(leaseUUID string) error {
 		}
 		releases[len(releases)-1].Status = "active"
 		releases[len(releases)-1].Error = ""
+		releases[len(releases)-1].Reason = ""
+		releases[len(releases)-1].Message = ""
 
 		encoded, err := json.Marshal(releases)
 		if err != nil {

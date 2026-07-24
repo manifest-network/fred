@@ -33,12 +33,17 @@ func (b *Backend) GetReleases(_ context.Context, leaseUUID string) ([]backend.Re
 
 	result := make([]backend.ReleaseInfo, len(releases))
 	for i, r := range releases {
+		reason := r.Reason
+		if reason == "" && r.Status == "failed" {
+			reason = backend.ReasonUnknown
+		}
 		result[i] = backend.ReleaseInfo{
 			Version:   r.Version,
 			Image:     r.Image,
 			Status:    r.Status,
 			CreatedAt: r.CreatedAt,
-			Error:     r.Error,
+			Reason:    reason,
+			Message:   r.Message,
 			Manifest:  r.Manifest,
 		}
 	}

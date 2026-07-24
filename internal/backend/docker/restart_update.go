@@ -196,7 +196,7 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manife
 		profile, profErr := b.cfg.GetSKUProfile(item.SKU)
 		if profErr != nil {
 			err := fmt.Errorf("SKU profile lookup failed for %s: %w", item.SKU, profErr)
-			b.recordPreflightFailure(leaseUUID, err, logger)
+			b.recordPreflightFailure(leaseUUID, backend.ReasonRestartFailed, backend.MsgRestartFailed, err, logger)
 			return leasesm.ReplaceResult{
 				CallbackErr:             backend.MsgRestartFailed,
 				Err:                     err,
@@ -270,7 +270,11 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 			op.Logger.Error(op.Operation+" failed (stack)", "error", err)
 
 			if b.releaseStore != nil {
-				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", err.Error()); relErr != nil {
+				rReason, rMsg := restartOrUpdateReason(op.Operation), backend.MsgRestartFailed
+				if op.Operation == "update" {
+					rMsg = backend.MsgUpdateFailed
+				}
+				if relErr := b.releaseStore.UpdateLatestStatus(op.LeaseUUID, "failed", rReason, rMsg); relErr != nil {
 					op.Logger.Warn("failed to update release status", "error", relErr)
 				}
 			}
@@ -537,11 +541,11 @@ func (b *Backend) rollbackViaCompose(op replaceContainersOp) bool {
 // handled by the SM entry action that fires when the caller returns its
 // leasesm.ReplaceResult — see the preflight branches of doRestart /
 // doUpdate (post-Task-14, the unified stack-shaped versions).
-func (b *Backend) recordPreflightFailure(leaseUUID string, err error, logger *slog.Logger) {
+func (b *Backend) recordPreflightFailure(leaseUUID string, reason backend.Reason, message string, err error, logger *slog.Logger) {
 	logger.Error("preflight failed", "error", err)
 
 	if b.releaseStore != nil {
-		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", err.Error()); relErr != nil {
+		if relErr := b.releaseStore.UpdateLatestStatus(leaseUUID, "failed", reason, message); relErr != nil {
 			logger.Warn("failed to update release status", "error", relErr)
 		}
 	}
@@ -697,7 +701,7 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, stack *manifes
 		logger.Info("pulling image for update", "service", svcName, "image", svc.Image)
 		if pullErr := b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); pullErr != nil {
 			err := fmt.Errorf("image pull failed for service %s: %w", svcName, pullErr)
-			b.recordPreflightFailure(leaseUUID, err, logger)
+			b.recordPreflightFailure(leaseUUID, backend.ReasonImagePullFailed, backend.MsgImagePullFailed, err, logger)
 			// Force Status=Failed unconditionally (Restored:false) since the
 			// user's desired state (the new image set) was not achieved.
 			return leasesm.ReplaceResult{
