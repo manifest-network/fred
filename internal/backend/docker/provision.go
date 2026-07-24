@@ -815,7 +815,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		if err = b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); err != nil {
 			logger.Error("failed to pull image", "service", svcName, "error", err)
 			err = fmt.Errorf("image pull failed for service %s: %w", svcName, err)
-			callbackErr = "image pull failed"
+			callbackErr = backend.MsgImagePullFailed
 			failReason = backend.ReasonImagePullFailed
 			return
 		}

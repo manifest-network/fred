@@ -263,6 +263,7 @@ recognize as a generic failure and fall back to displaying `message`. The define
 | `Internal` | An internal fred/backend error (not attributable to the tenant's workload) |
 | `RestartFailed` | A tenant-initiated restart failed |
 | `UpdateFailed` | A tenant-initiated manifest update failed (and was rolled back) |
+| `RestoreFailed` | A tenant-initiated restore (redeploy from retained data) failed |
 | `VolumeCleanupExhausted` | Volume cleanup on deprovision failed after exhausting all retries |
 | `CleanupFailed` | Cleanup on deprovision failed (containers or volumes) |
 | `Unknown` | The lease is `failed` but no specific reason was recorded |

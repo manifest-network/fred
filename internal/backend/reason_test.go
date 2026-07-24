@@ -12,6 +12,7 @@ func TestReasonConstants(t *testing.T) {
 		ReasonInternal:               "Internal",
 		ReasonRestartFailed:          "RestartFailed",
 		ReasonUpdateFailed:           "UpdateFailed",
+		ReasonRestoreFailed:          "RestoreFailed",
 		ReasonVolumeCleanupExhausted: "VolumeCleanupExhausted",
 		ReasonCleanupFailed:          "CleanupFailed",
 		ReasonUnknown:                "Unknown",
