@@ -98,7 +98,7 @@ func (diagGatheredMsg) onPanic(error)           {} // no caller to unblock
 // through the actor's inbox.
 type ProvisionRequestedMsg struct {
 	Cancel context.CancelFunc
-	Work   func() (callbackErr string, result ProvisionSuccessResult, failureLogs map[string]string, err error)
+	Work   func() (callbackErr string, reason backend.Reason, result ProvisionSuccessResult, failureLogs map[string]string, err error)
 	Ack    chan error
 }
 
@@ -682,7 +682,7 @@ func (a *LeaseActor) handleProvisionRequested(msg ProvisionRequestedMsg) {
 // cleanup (see doProvision's defer) so the persisted diagnostic entry
 // contains useful debugging output even though the failed containers
 // have been removed.
-func (a *LeaseActor) spawnProvisionWorker(work func() (string, ProvisionSuccessResult, map[string]string, error)) {
+func (a *LeaseActor) spawnProvisionWorker(work func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error)) {
 	a.workers.Add()
 	a.cfg.WG.Go(func() {
 		// Exactly one sendTerminal call site (the middle defer), driven
@@ -738,7 +738,7 @@ func (a *LeaseActor) spawnProvisionWorker(work func() (string, ProvisionSuccessR
 				event = "provision_panic"
 			}
 		}()
-		callbackErr, result, failureLogs, err := work()
+		callbackErr, reason, result, failureLogs, err := work()
 		if err == nil {
 			// Pre-publish so a concurrent Deprovision-preempt reading
 			// prov.ContainerIDs sees the new IDs and can tear them down
@@ -751,9 +751,9 @@ func (a *LeaseActor) spawnProvisionWorker(work func() (string, ProvisionSuccessR
 		} else {
 			terminalMsg = provisionErroredMsg{
 				callbackErr: callbackErr,
-				// reason wired from doProvision in Task 5 (empty ⇒ Unknown default, fail-closed)
-				lastError: err.Error(),
-				logs:      failureLogs,
+				reason:      reason, // authored by doProvision (ENG-508); "" ⇒ Unknown default at read boundary, fail-closed
+				lastError:   err.Error(),
+				logs:        failureLogs,
 			}
 			event = "provision_errored"
 		}

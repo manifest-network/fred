@@ -428,8 +428,8 @@ func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
 	ack := make(chan error, 1)
 	ok := b.routeToLease("lease-1", leasesm.ProvisionRequestedMsg{
 		Cancel: func() {},
-		Work: func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
-			return "", leasesm.ProvisionSuccessResult{}, nil, nil
+		Work: func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
+			return "", "", leasesm.ProvisionSuccessResult{}, nil, nil
 		},
 		Ack: ack,
 	})
@@ -629,9 +629,9 @@ func TestLeaseActor_ProvisionRequestedSMRejection(t *testing.T) {
 	ack := make(chan error, 1)
 	ok := b.routeToLease("lease-1", leasesm.ProvisionRequestedMsg{
 		Cancel: func() {},
-		Work: func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
+		Work: func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
 			t.Fatal("work closure must not run when SM rejects the transition")
-			return "", leasesm.ProvisionSuccessResult{}, nil, nil
+			return "", "", leasesm.ProvisionSuccessResult{}, nil, nil
 		},
 		Ack: ack,
 	})

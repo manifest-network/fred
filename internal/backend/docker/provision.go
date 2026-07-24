@@ -114,6 +114,8 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			CreatedAt:    time.Now(),
 			FailCount:    prevFailCount,
 			LastError:    "",
+			Reason:       "", // fresh reservation, no failure
+			Message:      "",
 			CallbackURL:  req.CallbackURL, // MUST be set at reservation: a failure/Deprovision
 			// racing this provision in the validation window resolves CallbackURL from the map.
 			Items:             nil, // set by enrichReserved
@@ -248,7 +250,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// worker is left as a zombie and recoverState reconciles on next
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
-	work := func() (string, leasesm.ProvisionSuccessResult, map[string]string, error) {
+	work := func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
 		return b.doProvision(provCtx, req, stackManifest, profiles, logger)
 	}
 	ack := make(chan error, 1)
@@ -709,7 +711,7 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 //
 // Returns the (callbackErr, result, logs, err) contract; stack-specific result
 // fields are stackManifest + serviceContainers.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, reasonRet backend.Reason, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
@@ -754,6 +756,11 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				}
 			}
 			callbackErrRet = callbackErr
+			// All doProvision failure paths are container-startup failures
+			// (pull/setup/network/volume preflight → compose up → health
+			// verify); author ReasonContainerExited uniformly (ENG-508). The
+			// success path leaves reasonRet at its "" zero value.
+			reasonRet = backend.ReasonContainerExited
 			errRet = err
 			return
 		}

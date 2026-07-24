@@ -500,7 +500,7 @@ func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
 	// Inject a worker that panics instead of doing real work. The
 	// recover must catch the panic, bump the metric, and fire a
 	// provisionErrored terminal so the SM transitions to Failed.
-	actor.spawnProvisionWorker(func() (string, ProvisionSuccessResult, map[string]string, error) {
+	actor.spawnProvisionWorker(func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
 		panic("synthetic provision panic")
 	})
 
@@ -660,9 +660,9 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 		var workerSpawned atomic.Bool
 		msg := ProvisionRequestedMsg{
 			Cancel: func() {},
-			Work: func() (string, ProvisionSuccessResult, map[string]string, error) {
+			Work: func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
 				workerSpawned.Store(true)
-				return "", ProvisionSuccessResult{}, nil, nil
+				return "", "", ProvisionSuccessResult{}, nil, nil
 			},
 			Ack: make(chan error, 1),
 		}
@@ -763,8 +763,8 @@ func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
 	ack := make(chan error, 1)
 	msg := ProvisionRequestedMsg{
 		Cancel: func() {},
-		Work: func() (string, ProvisionSuccessResult, map[string]string, error) {
-			return "", ProvisionSuccessResult{}, nil, nil
+		Work: func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error) {
+			return "", "", ProvisionSuccessResult{}, nil, nil
 		},
 		Ack: ack,
 	}

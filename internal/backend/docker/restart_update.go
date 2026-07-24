@@ -13,6 +13,16 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
+// restartOrUpdateReason maps a replace op ("restart"/"update") to its curated
+// failure-category Reason (ENG-508). Defaults to ReasonRestartFailed so an
+// unrecognized op still yields a valid, non-leaking category code.
+func restartOrUpdateReason(op string) backend.Reason {
+	if op == "update" {
+		return backend.ReasonUpdateFailed
+	}
+	return backend.ReasonRestartFailed
+}
+
 // applyCustomDomainOverrides applies per-ServiceName custom_domain values to the
 // given items slice, keyed by ServiceName so it is robust to a recoverState
 // rebuild that reorders Items. No-op when overrides is empty.
@@ -188,12 +198,13 @@ func (b *Backend) doRestart(ctx context.Context, leaseUUID string, stack *manife
 			err := fmt.Errorf("SKU profile lookup failed for %s: %w", item.SKU, profErr)
 			b.recordPreflightFailure(leaseUUID, err, logger)
 			return leasesm.ReplaceResult{
-				CallbackErr:             "restart failed",
+				CallbackErr:             backend.MsgRestartFailed,
 				Err:                     err,
 				RecoveredIfSourceActive: true,
 				Failure: leasesm.ReplaceFailureInfo{
 					Operation:   "restart",
-					CallbackErr: "restart failed",
+					Reason:      backend.ReasonRestartFailed,
+					CallbackErr: backend.MsgRestartFailed,
 					LastError:   err.Error(),
 				},
 			}
@@ -298,6 +309,7 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 				Restored:    restored,
 				Failure: leasesm.ReplaceFailureInfo{
 					Operation:   op.Operation,
+					Reason:      restartOrUpdateReason(op.Operation),
 					OldStopped:  true,
 					CallbackErr: callbackErr,
 					LastError:   err.Error(),
@@ -689,12 +701,13 @@ func (b *Backend) doUpdate(ctx context.Context, leaseUUID string, stack *manifes
 			// Force Status=Failed unconditionally (Restored:false) since the
 			// user's desired state (the new image set) was not achieved.
 			return leasesm.ReplaceResult{
-				CallbackErr: "image pull failed",
+				CallbackErr: backend.MsgImagePullFailed,
 				Err:         err,
 				Restored:    false,
 				Failure: leasesm.ReplaceFailureInfo{
 					Operation:   "update",
-					CallbackErr: "image pull failed",
+					Reason:      backend.ReasonImagePullFailed,
+					CallbackErr: backend.MsgImagePullFailed,
 					LastError:   err.Error(),
 				},
 			}

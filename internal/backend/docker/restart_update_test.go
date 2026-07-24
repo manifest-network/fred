@@ -851,3 +851,36 @@ func TestDoRestartPreflight_SetsRecoveredIfSourceActive(t *testing.T) {
 	assert.False(t, result.Restored,
 		"doRestart preflight must NOT set a status-derived Restored — the flag governs")
 }
+
+// TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed verifies that an
+// image-pull preflight failure in doUpdate authors the SPECIFIC
+// ReasonImagePullFailed on the ReplaceFailureInfo — not the generic
+// ReasonUpdateFailed — so tenants see the precise failure category (ENG-508).
+func TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
+			return fmt.Errorf("manifest unknown: no such image %s", imageName)
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	defer b.stopCancel()
+
+	stack := &manifest.StackManifest{
+		Services: map[string]*manifest.Manifest{
+			"web": {Image: "nginx:latest"},
+		},
+	}
+	result := b.doUpdate(context.Background(), "lease-1", stack,
+		map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512}},
+		nil, nil,
+		[]backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "web"}},
+		b.logger)
+
+	require.Error(t, result.Err, "image pull failure must fail doUpdate preflight")
+	assert.Equal(t, backend.ReasonImagePullFailed, result.Failure.Reason,
+		"doUpdate image-pull preflight must author ReasonImagePullFailed (specific), not ReasonUpdateFailed (generic)")
+	assert.NotEqual(t, backend.ReasonUpdateFailed, result.Failure.Reason,
+		"must NOT fall back to the generic update-failed reason for an image-pull preflight failure")
+	assert.Equal(t, backend.MsgImagePullFailed, result.Failure.CallbackErr,
+		"CallbackErr must be the curated MsgImagePullFailed const so the (reason,message) pair cannot drift")
+}
