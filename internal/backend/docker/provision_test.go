@@ -4133,3 +4133,15 @@ func TestProvision_ConcurrentReaderDuringValidationWindow(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// TestProvisionToInfo_CopiesReasonMessage pins the ENG-508 read-boundary
+// contract: provisionToInfo must copy the curated Reason/Message pair from
+// the provision state into the ProvisionInfo, alongside the operator-only
+// LastError. Without the copy, the tenant-facing read surfaces an empty
+// Reason and drops the curated message.
+func TestProvisionToInfo_CopiesReasonMessage(t *testing.T) {
+	prov := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "l1", LastError: "verbose", Reason: backend.ReasonContainerExited, Message: "container exited unexpectedly"}}
+	info := provisionToInfo(prov, "docker-1")
+	assert.Equal(t, backend.ReasonContainerExited, info.Reason)
+	assert.Equal(t, "container exited unexpectedly", info.Message)
+}

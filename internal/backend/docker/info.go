@@ -198,6 +198,8 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 				BackendName:  b.cfg.Name,
 				FailCount:    entry.FailCount,
 				LastError:    entry.Error,
+				Reason:       entry.Reason,
+				Message:      entry.Message,
 			}, nil
 		}
 	}
@@ -343,6 +345,8 @@ func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo 
 		BackendName:  backendName,
 		FailCount:    prov.FailCount,
 		LastError:    prov.LastError,
+		Reason:       prov.Reason,
+		Message:      prov.Message,
 		Quantity:     prov.Quantity,
 	}
 	// Post-Task-15 every provision carries `prov.Items` (populated at

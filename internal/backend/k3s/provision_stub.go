@@ -138,6 +138,8 @@ func (b *Backend) runStubProvisioner(p *provision) {
 	}
 	p.Status = backend.ProvisionStatusFailed
 	p.LastError = stubProvisionerErrMsg
+	p.Reason = backend.ReasonInternal
+	p.Message = stubProvisionerErrMsg
 	// Increment FailCount (not set to 1) so retry cycles accumulate
 	// correctly across Provision -> failed -> Provision-again -> failed
 	// chains. The Provision method carries forward prevFailCount when
@@ -176,6 +178,8 @@ func (b *Backend) runStubProvisioner(p *provision) {
 		ProviderUUID: providerUUID,
 		Tenant:       tenant,
 		Error:        stubProvisionerErrMsg,
+		Reason:       backend.ReasonInternal,
+		Message:      stubProvisionerErrMsg,
 		FailCount:    currentFailCount,
 		CreatedAt:    time.Now(),
 	}); err != nil {
@@ -319,6 +323,8 @@ func (b *Backend) GetProvision(ctx context.Context, leaseUUID string) (*backend.
 			Status:       p.Status,
 			FailCount:    p.FailCount,
 			LastError:    p.LastError,
+			Reason:       p.Reason,
+			Message:      p.Message,
 			CreatedAt:    p.CreatedAt,
 		}
 		b.provisionsMu.RUnlock()
@@ -339,6 +345,8 @@ func (b *Backend) GetProvision(ctx context.Context, leaseUUID string) (*backend.
 		Status:       backend.ProvisionStatusFailed,
 		FailCount:    diag.FailCount,
 		LastError:    diag.Error,
+		Reason:       diag.Reason,
+		Message:      diag.Message,
 		CreatedAt:    diag.CreatedAt,
 	}, nil
 }
@@ -393,6 +401,8 @@ func (b *Backend) LookupProvisions(ctx context.Context, uuids []string) ([]backe
 				Status:       p.Status,
 				FailCount:    p.FailCount,
 				LastError:    p.LastError,
+				Reason:       p.Reason,
+				Message:      p.Message,
 				CreatedAt:    p.CreatedAt,
 			})
 		}

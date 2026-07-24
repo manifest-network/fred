@@ -388,6 +388,10 @@ func TestGetProvision_FromMap_AfterStubFailure(t *testing.T) {
 	assert.Equal(t, "lease-1", info.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	assert.Equal(t, "not implemented", info.LastError)
+	// ENG-508: the map path copies the curated tenant-safe failure signal
+	// (Reason/Message) through alongside the operator-only LastError.
+	assert.Equal(t, backend.ReasonInternal, info.Reason)
+	assert.Equal(t, "not implemented", info.Message)
 	// Option 2 patch: in-memory record carries FailCount=1 alongside Status.
 	// Pre-patch this would have returned 0 from the map path; the assertion
 	// guards against regression.
@@ -415,6 +419,10 @@ func TestGetProvision_FromDiagnostics_AfterDeprovision(t *testing.T) {
 	// path calls diagnosticsStore.Store).
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	assert.Equal(t, "not implemented", info.LastError)
+	// ENG-508: the diagnostics fallback surfaces the same curated Reason/Message
+	// as the live map path, so both read boundaries agree on the wire shape.
+	assert.Equal(t, backend.ReasonInternal, info.Reason)
+	assert.Equal(t, "not implemented", info.Message)
 	assert.Equal(t, 1, info.FailCount)
 }
 
