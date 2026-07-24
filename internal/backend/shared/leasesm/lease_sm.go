@@ -1071,6 +1071,8 @@ func DiagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
 		ProviderUUID: prov.ProviderUUID,
 		Tenant:       prov.Tenant,
 		Error:        prov.LastError,
+		Reason:       prov.Reason,
+		Message:      prov.Message,
 		FailCount:    prov.FailCount,
 		CreatedAt:    time.Now(),
 	}
