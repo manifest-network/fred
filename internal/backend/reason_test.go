@@ -22,7 +22,7 @@ func TestReasonConstants(t *testing.T) {
 		}
 		// Security-relevant: CamelCase, no whitespace/punctuation/host-path chars.
 		for _, c := range string(r) {
-			if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') {
 				t.Errorf("reason %q has non-CamelCase char %q", r, c)
 			}
 		}
