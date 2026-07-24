@@ -303,7 +303,7 @@ func (b *Backend) GetLogs(ctx context.Context, leaseUUID string, tail int) (map[
 						"container_id", leasesm.ShortID(containerID),
 						"error", err,
 					)
-					result[key] = fmt.Sprintf("<error: %s>", err)
+					result[key] = "<log unavailable>"
 					continue
 				}
 				trimmed, consumed := trimLogToBudget(logs, remaining)

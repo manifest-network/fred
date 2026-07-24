@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -12,6 +13,41 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
+
+// TestGetLogs_RedactsDaemonError pins ENG-508: when ContainerLogs fails, GetLogs
+// used to surface the raw Docker daemon error (e.g. a unix socket path) directly
+// in the tenant-facing logs map. b.logger.Warn already records the detail
+// operator-side, so the map value returned to the tenant must be a generic
+// placeholder, never the raw error string.
+func TestGetLogs_RedactsDaemonError(t *testing.T) {
+	const leakedPath = "/var/run/docker.sock"
+	mock := &mockDockerClient{
+		ContainerLogsFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", errors.New("Cannot connect to the Docker daemon at unix://" + leakedPath)
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:         "lease-1",
+			Status:            backend.ProvisionStatusReady,
+			ContainerIDs:      []string{"cid-0"},
+			ServiceContainers: map[string][]string{"app": {"cid-0"}},
+		}},
+	})
+
+	logs, err := b.GetLogs(context.Background(), "lease-1", 100)
+	require.NoError(t, err) // per-container fetch errors are captured in the map, not returned
+
+	found := false
+	for _, v := range logs {
+		assert.NotContains(t, v, leakedPath,
+			"GetLogs must not leak the raw daemon error (socket/host paths) to the tenant")
+		if v == "<log unavailable>" {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected a redacted placeholder value in the logs map, got %#v", logs)
+}
 
 // TestGetLogs_AggregateByteBudget_BoundsCrossTenantMemory pins ENG-590: GetLogs
 // buffers every container's logs into one map, and maxContainerLogBytes caps
