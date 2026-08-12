@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Build: `make lint` now **fails** when `golangci-lint` is missing from `PATH` or
+  is not the pinned version, instead of printing "not installed, skipping" and
+  exiting 0. A local `make lint` previously proved nothing — and a v1 binary is
+  worse than none, since it does not reject the v2 `.golangci.yml`, it ignores
+  the v2-only keys and silently runs a different linter set. Running `make lint`
+  now requires installing the pinned version (see CONTRIBUTING.md § Linting).
+  The version moved to a new `.golangci-lint-version` file, read by the make
+  target and by both CI workflows, so the three can no longer disagree.
+
 ### Deprecated
 
 ### Removed
