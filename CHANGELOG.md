@@ -35,6 +35,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Fred no longer substitutes a backend when a lease's placement record names
+  one the router does not know** (ENG-635). Previously both the write and read
+  paths logged a warning and fell through to ordinary routing. On the write path
+  that meant removing, renaming or pausing a backend holding ACTIVE stateful
+  leases caused each of those leases to be re-provisioned on the least-loaded
+  peer — creating a brand-new **empty volume** while the tenant's real data sat
+  intact on the absent machine. It fired unattended, on a timer, for every
+  affected lease at once, and reported success to its caller. Provisioning is now
+  refused and retried on the following reconcile cycle (never rejected or closed
+  on chain — a paused backend must not terminate paying leases); reads and
+  restores return **503, not 404**, because a 404 during what is usually a paused
+  or renamed backend tells a tenant their data is gone and invites them to
+  destroy and recreate it. A lease with **no** placement record still routes
+  freely — that path, which every new lease takes, is unchanged. Recovering a
+  removed backend requires restoring its config entry under the original name
+  **and restarting providerd**, which reads its backend list only at startup;
+  see OPERATIONS.md § Removing, renaming or pausing a backend.
+
 ### Security
 
 - deps: bump `google.golang.org/grpc` to v1.82.1 (from v1.79.3) to resolve

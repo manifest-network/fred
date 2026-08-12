@@ -53,7 +53,19 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	totalQuantity := TotalLeaseQuantity(lease)
 
 	// Route to appropriate backend, honoring existing placement for restored/placed leases (ENG-333)
-	backendClient := routeForProvisionHonoringPlacement(ctx, o.router, o.placementStore, lease.Uuid, sku, o.tracker.InFlightCountsByBackend())
+	backendClient, err := routeForProvisionHonoringPlacement(ctx, o.router, o.placementStore, lease.Uuid, sku, o.tracker.InFlightCountsByBackend())
+	if err != nil {
+		// A placement naming an unknown backend is refused, never re-routed
+		// (ENG-635). Logged at ERROR because it needs operator action — the
+		// recorded backend is missing from config — and because the alternative
+		// (silently provisioning elsewhere) destroys tenant data.
+		slog.Error("refusing to provision: lease is placed on a backend the router does not know",
+			"lease_uuid", lease.Uuid,
+			"sku", sku,
+			"error", err,
+		)
+		return err
+	}
 	if backendClient == nil {
 		slog.Error("no backend available for provisioning",
 			"lease_uuid", lease.Uuid,
@@ -139,29 +151,39 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 }
 
 // routeForProvisionHonoringPlacement returns the backend that already holds the
-// lease's data (from placement) when one is recorded and reachable; otherwise it
-// falls back to least-loaded selection. This keeps a restored or already-placed
-// lease pinned to the backend with its volumes (ENG-333), preventing data drift
-// on re-provision/reconcile.
+// lease's data (from placement) when one is recorded, keeping a restored or
+// already-placed lease pinned to the backend with its volumes (ENG-333).
+//
+// A lease with NO placement record routes freely by least-loaded selection —
+// unchanged behavior, and the path every new lease takes.
+//
+// A lease WHOSE RECORD DOES NOT RESOLVE returns ErrPlacementUnresolvable rather
+// than routing somewhere else (ENG-635). fred never substitutes a backend: the
+// recorded machine holds the lease's data, so provisioning on a peer creates a
+// brand-new empty volume while the real data sits untouched on the machine that
+// is merely absent from the router — which is what happens when a backend is
+// removed, renamed or paused. That failure fires on a timer, for every affected
+// lease at once, and reports success to its caller. Refusing is the safe
+// direction: the lease stops making progress until an operator restores the
+// backend, and nothing is destroyed meanwhile.
 func routeForProvisionHonoringPlacement(
 	ctx context.Context,
 	router BackendRouter,
 	placementStore PlacementStore,
 	leaseUUID, sku string,
 	inFlightByBackend map[string]int,
-) backend.Backend {
+) (backend.Backend, error) {
 	if placementStore != nil {
 		if name := placementStore.Get(leaseUUID); name != "" {
-			if b := router.GetBackendByName(name); b != nil {
-				return b
+			b := router.GetBackendByName(name)
+			if b == nil {
+				return nil, fmt.Errorf("%w: lease %s is placed on %q",
+					ErrPlacementUnresolvable, leaseUUID, name)
 			}
-			slog.Warn("placement backend not found, falling back to least-loaded routing",
-				"lease_uuid", leaseUUID,
-				"placement_backend", name,
-			)
+			return b, nil
 		}
 	}
-	return router.RouteForProvision(ctx, sku, inFlightByBackend)
+	return router.RouteForProvision(ctx, sku, inFlightByBackend), nil
 }
 
 // DeletePlacement removes the placement record for a lease. Called when a

@@ -269,17 +269,26 @@ func (h *Handlers) authenticateLease(w http.ResponseWriter, r *http.Request, che
 }
 
 // resolveBackend determines the correct backend for a lease.
-// Checks placement first (handles round-robin routing), falls back to SKU routing.
+// Checks placement first (handles round-robin routing), falls back to SKU routing
+// for a lease with no placement record.
+//
+// A record naming a backend the router does not know returns nil, which the
+// caller surfaces as 503 (ENG-635). It deliberately does NOT fall back to SKU
+// routing: that answers the tenant's read from a machine which never held their
+// lease, so a running deployment reads back as absent. Returning nil is not a
+// degradation here — it is the difference between "temporarily unavailable" and
+// a confidently wrong answer.
 func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 	if h.placementLookup != nil {
 		if name := h.placementLookup.Get(leaseUUID); name != "" {
-			if b := h.backendRouter.GetBackendByName(name); b != nil {
-				return b
+			b := h.backendRouter.GetBackendByName(name)
+			if b == nil {
+				slog.Error("placement backend not found in router; refusing to serve from another backend",
+					"lease_uuid", leaseUUID,
+					"placement_backend", name,
+				)
 			}
-			slog.Debug("stale placement record, falling back to SKU routing",
-				"lease_uuid", leaseUUID,
-				"placement_backend", name,
-			)
+			return b
 		}
 	}
 	return h.backendRouter.Route(sku)
@@ -352,7 +361,14 @@ func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, s
 // straight to the fan-out rather than guessing a single SKU-routed backend.
 func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*backend.ProvisionInfo, error) {
 	var fastErr error
-	if b := h.resolveBackendByPlacement(leaseUUID); b != nil {
+	// An unresolvable placement is deliberately ignored here rather than
+	// refused. This is a SEARCH, not a selection: the fan-out asks every
+	// candidate whether it holds this lease and non-holders answer
+	// ErrNotProvisioned, so it can never serve a wrong backend's data the way
+	// resolveBackend could. Whether a read should 503 rather than 404 when the
+	// recorded backend is absent is a separate question from ENG-635's
+	// never-substitute rule, and is left as-is here.
+	if b, _ := h.resolveBackendByPlacement(leaseUUID); b != nil {
 		info, err := b.GetProvision(ctx, leaseUUID)
 		if err == nil && info != nil {
 			// BackendName is json:"-", so HTTP backends leave it empty on the
@@ -385,19 +401,33 @@ func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*b
 }
 
 // resolveBackendByPlacement returns the backend recorded in placement for the
-// given lease, or nil when there is no placement or the named backend is gone.
-// Unlike resolveBackend it never falls back to SKU routing — for restore, a
-// missing placement means "no retained data here", which must surface as 404,
-// not a guess at an arbitrary backend (ENG-333).
-func (h *Handlers) resolveBackendByPlacement(leaseUUID string) backend.Backend {
+// given lease. Unlike resolveBackend it never falls back to SKU routing — for
+// restore, a missing placement means "no retained data here", which must
+// surface as 404, not a guess at an arbitrary backend (ENG-333).
+//
+// The two misses are different answers and callers must not conflate them:
+//
+//   - (nil, nil)                        no placement record — nothing is
+//     recorded anywhere, so "not found" is the truthful answer.
+//   - (nil, ErrPlacementUnresolvable)   a record exists but names a backend the
+//     router does not know. Something IS recorded; fred just cannot reach it.
+//     404 would tell a tenant their data is gone during what is usually a
+//     paused or renamed backend, inviting them to destroy and recreate — which
+//     turns a recoverable outage into real data loss (ENG-635).
+func (h *Handlers) resolveBackendByPlacement(leaseUUID string) (backend.Backend, error) {
 	if h.placementLookup == nil || h.backendRouter == nil {
-		return nil
+		return nil, nil
 	}
 	name := h.placementLookup.Get(leaseUUID)
 	if name == "" {
-		return nil
+		return nil, nil
 	}
-	return h.backendRouter.GetBackendByName(name)
+	b := h.backendRouter.GetBackendByName(name)
+	if b == nil {
+		return nil, fmt.Errorf("%w: lease %s is placed on %q",
+			provisioner.ErrPlacementUnresolvable, leaseUUID, name)
+	}
+	return b, nil
 }
 
 // ConnectionResponse represents the response for connection details.
@@ -982,9 +1012,26 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve the backend that holds the SOURCE lease's retained data. Restore
 	// is same-backend: the retained volumes live only where the source lease was
-	// provisioned (ENG-333). No placement for the source lease (or its backend is
-	// gone) => no retained data here => 404.
-	backendClient := h.resolveBackendByPlacement(body.FromLeaseUUID)
+	// provisioned (ENG-333).
+	//
+	// The two misses are DIFFERENT answers and must not be collapsed:
+	//   - no placement record for the source  => no retained data here => 404
+	//   - a record naming a backend the router does not know => the data exists
+	//     on a machine we cannot currently reach => 503 (ENG-635)
+	backendClient, err := h.resolveBackendByPlacement(body.FromLeaseUUID)
+	if err != nil {
+		// A record exists but names a backend the router does not know. The
+		// retained data is not gone — fred just cannot reach the machine
+		// holding it. 404 here would read as "your data no longer exists" and
+		// invite the tenant to give up on a recoverable outage (ENG-635).
+		slog.Error("restore source is placed on a backend the router does not know",
+			"lease_uuid", leaseUUID,
+			"from_lease_uuid", body.FromLeaseUUID,
+			"error", err,
+		)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return
+	}
 	if backendClient == nil {
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 		return
@@ -1010,7 +1057,7 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		tracked = true
 	}
 
-	err := backendClient.Restore(r.Context(), backend.RestoreRequest{
+	err = backendClient.Restore(r.Context(), backend.RestoreRequest{
 		LeaseUUID:     leaseUUID,
 		FromLeaseUUID: body.FromLeaseUUID,
 		Tenant:        auth.Token.Tenant,

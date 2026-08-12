@@ -427,7 +427,14 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	if r.tracker != nil {
 		inFlightByBackend = r.tracker.InFlightCountsByBackend()
 	}
-	backendClient := routeForProvisionHonoringPlacement(ctx, r.backendRouter, r.placementStore, lease.Uuid, sku, inFlightByBackend)
+	backendClient, err := routeForProvisionHonoringPlacement(ctx, r.backendRouter, r.placementStore, lease.Uuid, sku, inFlightByBackend)
+	if err != nil {
+		// ErrPlacementUnresolvable reaches handleProvisionError, whose default
+		// branch treats it as transient: flag the sweep and retry next cycle.
+		// It must never reach the reject/close branches — a paused or renamed
+		// backend would then terminate healthy leases on chain (ENG-498).
+		return err
+	}
 	if backendClient == nil {
 		return fmt.Errorf("no backend available")
 	}
@@ -490,7 +497,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		}
 	}
 
-	err := backendClient.Provision(ctx, req)
+	err = backendClient.Provision(ctx, req)
 	if err != nil {
 		if errors.Is(err, backend.ErrInsufficientResources) {
 			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
@@ -776,6 +783,7 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 //   - backend.ErrAlreadyProvisioned: skip (transient race with concurrent Deprovision)
 //   - errPayloadNotAvailable: reject (PENDING) or close (ACTIVE) the lease
 //   - backend.ErrValidation: reject (PENDING) or close (ACTIVE) the lease
+//   - ErrPlacementUnresolvable: transient (backend absent from config) — flag for retry, never terminate
 //   - backend.ErrCircuitOpen: transient (breaker auto-recovers) — flag for retry, never terminate
 //   - other errors: log and flag for retry next cycle
 func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseUUID string, lease billingtypes.Lease, hadError *bool) {
@@ -788,6 +796,23 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		slog.Debug("reconcile: backend reports already-provisioned, retry next cycle",
 			"lease_uuid", leaseUUID,
 		)
+		return
+	}
+	if errors.Is(err, ErrPlacementUnresolvable) {
+		// The lease is pinned to a backend the router does not know, so fred
+		// refuses to provision it anywhere (ENG-635). Handled explicitly rather
+		// than left to the transient default below: this is the unattended path,
+		// so it needs its own greppable log line, and stating the classification
+		// here makes "never terminate for this" a property of the code rather
+		// than an accident of ordering. A backend is typically absent because it
+		// was paused, renamed or is mid-redeploy — closing paying leases for that
+		// would turn a maintenance window into permanent data loss (ENG-498).
+		slog.Error("reconcile: refusing to provision, lease is placed on a backend the router does not know",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+			"error", err,
+		)
+		*hadError = true
 		return
 	}
 	if errors.Is(err, backend.ErrCircuitOpen) {

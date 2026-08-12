@@ -192,6 +192,66 @@ When SKU resource pools are full, provision requests get HTTP 503 with `insuffic
 
 ---
 
+## Removing, renaming or pausing a backend
+
+**Fred never moves a lease between backends.** A lease is pinned to the backend
+holding its data for its lifetime, and a backend absent from the router is
+treated as *temporarily unreachable*, never as *gone*.
+
+So when a backend disappears from `providerd.yaml` — removed, renamed, or its
+entry commented out during maintenance — leases placed on it stop making
+progress rather than migrating:
+
+| Operation | Behavior |
+|---|---|
+| Provision / re-provision | Refused, retried every reconcile cycle. See log lines below |
+| Read (connection details, logs) | `503`, not `404` |
+| Restore from that backend's retained data | `503`, not `404` |
+| Leases on *other* backends | Unaffected |
+
+Two ERROR log lines cover the two paths, and the reconciler one is the one you
+will actually see, since it fires unattended on every cycle:
+
+```
+reconcile: refusing to provision, lease is placed on a backend the router does not know   # reconciler
+refusing to provision: lease is placed on a backend the router does not know              # event path
+```
+
+Both carry `lease_uuid` and an `error` field containing the recorded backend
+name (`placement backend not found in router: lease <uuid> is placed on "<name>"`),
+so the recorded name can be recovered from the logs even if the config entry is
+already gone.
+
+This is deliberate (ENG-635). Substituting a healthy peer would provision a
+brand-new **empty volume** while the tenant's real data sits intact on the
+absent machine — unattended, on a timer, for every affected lease at once, and
+reported to the caller as success. Refusing loses availability; substituting
+loses data.
+
+`503` rather than `404` matters for the same reason: a `404` tells a tenant
+their deployment no longer exists and invites them to destroy and recreate it,
+turning a recoverable outage into real data loss.
+
+**Recovery is to put the backend back under its original `name` and then restart
+`providerd`.** The restart is required, not optional: providerd reads its config
+and constructs the backend router once at startup and handles no reload signal
+(only SIGINT/SIGTERM), so restoring the YAML entry alone leaves the running
+process still treating the backend as unknown. After the restart, the next
+reconcile cycle resumes those leases with no further action.
+
+Note that the name is the identity key: renaming a backend in config is
+equivalent to removing it, and re-adding it under a *different* name will not
+reunite it with its leases. If a backend is genuinely gone for good, its leases
+are dead — the tenant must create new ones.
+
+> **Ansible caution.** `roles/fred/templates/providerd.yaml.j2` derives backend
+> names positionally, so removing a mid-list host renumbers every host below it.
+> That produces names which *resolve* — to the wrong machines — and every check
+> here passes. Verify rendered names against `backend_index` before applying a
+> membership change.
+
+---
+
 ## Reclaiming retained volumes under disk pressure
 
 Retained (soft-deleted) volumes count against the disk admission pool until they
