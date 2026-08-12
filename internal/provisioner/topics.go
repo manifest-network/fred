@@ -16,6 +16,19 @@ var (
 	// ErrNoBackendAvailable indicates no backend is configured to handle the request.
 	ErrNoBackendAvailable = errors.New("no backend available")
 
+	// ErrPlacementUnresolvable indicates a lease has a placement record naming a
+	// backend the router does not know. fred refuses the operation rather than
+	// choosing a different backend: the lease's data lives on the recorded
+	// machine, so provisioning it elsewhere creates an empty volume while the
+	// real data sits untouched (ENG-635).
+	//
+	// It is deliberately NOT one of the terminal errors in handleProvisionError:
+	// a backend can be absent because it was paused, renamed or is mid-redeploy,
+	// and rejecting or closing a lease for that would turn a recoverable outage
+	// into permanent tenant data loss. It falls through to the transient default
+	// and is retried on the next cycle.
+	ErrPlacementUnresolvable = errors.New("placement backend not found in router")
+
 	// ErrProvisioningFailed indicates the backend failed to provision the resource.
 	ErrProvisioningFailed = errors.New("provisioning failed")
 

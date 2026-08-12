@@ -427,7 +427,14 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	if r.tracker != nil {
 		inFlightByBackend = r.tracker.InFlightCountsByBackend()
 	}
-	backendClient := routeForProvisionHonoringPlacement(ctx, r.backendRouter, r.placementStore, lease.Uuid, sku, inFlightByBackend)
+	backendClient, err := routeForProvisionHonoringPlacement(ctx, r.backendRouter, r.placementStore, lease.Uuid, sku, inFlightByBackend)
+	if err != nil {
+		// ErrPlacementUnresolvable reaches handleProvisionError, whose default
+		// branch treats it as transient: flag the sweep and retry next cycle.
+		// It must never reach the reject/close branches — a paused or renamed
+		// backend would then terminate healthy leases on chain (ENG-498).
+		return err
+	}
 	if backendClient == nil {
 		return fmt.Errorf("no backend available")
 	}
@@ -490,7 +497,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 		}
 	}
 
-	err := backendClient.Provision(ctx, req)
+	err = backendClient.Provision(ctx, req)
 	if err != nil {
 		if errors.Is(err, backend.ErrInsufficientResources) {
 			metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()

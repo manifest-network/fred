@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -4065,8 +4066,20 @@ func TestResolveBackend_PlacementRouting(t *testing.T) {
 			"should route to placement backend, not default")
 	})
 
-	t.Run("stale_placement_falls_back_to_sku", func(t *testing.T) {
+	// ENG-635: a placement record naming a backend the router does not know is
+	// refused, not re-routed. Previously this fell through to SKU routing and
+	// answered 200 with the DEFAULT backend's connection details — a confident
+	// answer from a machine that never held the lease. The tenant would then act
+	// on a host that does not serve their deployment.
+	//
+	// 503 rather than 404 is deliberate: a backend is usually absent because it
+	// was paused, renamed or is mid-redeploy. "Temporarily unavailable" is true
+	// and recoverable; "not found" invites the tenant to destroy and recreate,
+	// turning an outage into real data loss.
+	t.Run("unresolvable_placement_refuses_with_503", func(t *testing.T) {
+		var defaultQueried atomic.Int32
 		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defaultQueried.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
 				"host":     "default-host.example.com",
@@ -4111,12 +4124,11 @@ func TestResolveBackend_PlacementRouting(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.GetLeaseConnection(rec, req)
 
-		assert.Equal(t, http.StatusOK, rec.Code)
-
-		var resp ConnectionResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
-		assert.Equal(t, "default-host.example.com", resp.Connection.Host,
-			"should fall back to SKU routing when placement backend is missing")
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code,
+			"an unresolvable placement must refuse, not answer from another backend")
+		assert.Zero(t, defaultQueried.Load(),
+			"no substitute backend may be queried — asserting the status alone would "+
+				"pass even if the wrong backend had been asked and its answer discarded")
 	})
 
 	t.Run("no_placement_uses_sku_routing", func(t *testing.T) {
@@ -5454,6 +5466,80 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 	var errResp ErrorResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
 	assert.Equal(t, "no retained data found for that lease", errResp.Error)
+}
+
+// ENG-635: the sibling of the 404 case above, and the reason the two must not
+// be collapsed. A source lease with NO placement record genuinely has no
+// retained data anywhere, so 404 is truthful. A source lease WITH a record
+// naming a backend the router does not know is a different answer: the data
+// exists, on a machine fred currently cannot reach — usually one that was
+// paused, renamed or is mid-redeploy.
+//
+// Answering 404 there tells a tenant their data is gone and invites them to
+// destroy and recreate the deployment, which turns a recoverable outage into
+// real data loss. 503 is both true and actionable.
+func TestRestoreLease_UnresolvableSourcePlacement_Returns503(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid:         leaseUUID,
+					Tenant:       kp.Address,
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no backend may be called when the source placement does not resolve: %s %s", r.Method, r.URL.Path)
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: backendServer.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	// A record EXISTS, but names a backend absent from the router.
+	placement := &mockPlacementLookup{
+		getFunc: func(uuid string) string { return "removed-backend" },
+	}
+
+	h := &Handlers{
+		client:          chainClient,
+		backendRouter:   router,
+		placementLookup: placement,
+		providerUUID:    providerUUID,
+		bech32Prefix:    "manifest",
+	}
+
+	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+validToken)
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.RestoreLease(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "body: %s", rec.Body.String())
+
+	var errResp ErrorResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+	assert.NotEqual(t, "no retained data found for that lease", errResp.Error,
+		"must not tell the tenant their data is gone when it is merely unreachable")
 }
 
 // TestRestoreLease_PlacementDisabled_Returns503 verifies that when placement

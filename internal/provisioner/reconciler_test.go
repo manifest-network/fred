@@ -2325,6 +2325,80 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 	assert.Empty(t, mockBackend.provisionCalls)
 }
 
+// ENG-635 at the reconciler tier, and the safety property that matters most
+// about it: refusing to substitute must be TRANSIENT.
+//
+// The reconciler is the path that fires unattended, on a timer, for every
+// affected lease at once. An ACTIVE lease whose recorded backend is missing
+// from the router previously reached `ACTIVE && !isProvisioned` and was
+// re-provisioned onto a peer, laying an empty volume over live data. It now
+// refuses — but the refusal must reach handleProvisionError's transient default
+// and never its reject/close branches. A backend is usually absent because it
+// was paused, renamed or is mid-redeploy; closing paying leases on chain for
+// that would convert an operator's maintenance window into permanent, chain-
+// recorded tenant data loss (the ENG-498 class of bug).
+func TestReconciler_ReconcileAll_UnresolvablePlacement_RefusesWithoutTerminating(t *testing.T) {
+	var closedLeases, rejectedLeases []string
+	var mu sync.Mutex
+
+	mockChain := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			closedLeases = append(closedLeases, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rejectedLeases = append(rejectedLeases, leaseUUIDs...)
+			return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
+		},
+	}
+
+	// A healthy peer that reports no provisions: the lease looks unprovisioned,
+	// and this backend is exactly where the old code would have sent it.
+	peer := &mockReconcilerBackend{name: "peer", provisions: []backend.ProvisionInfo{}}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: peer, IsDefault: true}},
+	})
+
+	// Placement names a backend that is not configured — the state produced by
+	// removing or renaming a host.
+	ps := &mockPlacementStore{}
+	require.NoError(t, ps.Set("lease-1", "removed-backend"))
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, ps)
+	require.NoError(t, err)
+
+	// The sweep itself must not fail: one refused lease is a per-lease error,
+	// not a reason to abandon the rest of the fleet.
+	assert.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	peer.mu.Lock()
+	provisionCalls := len(peer.provisionCalls)
+	peer.mu.Unlock()
+	assert.Zero(t, provisionCalls,
+		"the lease must not be provisioned onto a peer — that is the empty-volume-over-live-data failure")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Empty(t, closedLeases, "a missing backend must never close a paying ACTIVE lease on chain")
+	assert.Empty(t, rejectedLeases, "a missing backend must never reject a lease on chain")
+
+	// The placement record is the only pointer to where the data actually
+	// lives; refusing must not discard it.
+	assert.Equal(t, "removed-backend", ps.Get("lease-1"))
+}
+
 func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 	// Setup: Active lease on chain, failed provision with FailCount < maxReprovisionAttempts
 	// Expected: Attempt re-provisioning (not close)

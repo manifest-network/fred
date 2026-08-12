@@ -648,6 +648,90 @@ func TestOrchestrator_StartProvisioning_HonorsPlacement(t *testing.T) {
 	assert.Equal(t, 0, leastCalls, "least-loaded backend must NOT receive the Provision call")
 }
 
+// ENG-635: when a lease's placement record names a backend the router does not
+// know, fred refuses rather than routing to a peer. Removing, renaming or
+// pausing a backend that holds ACTIVE stateful leases previously made those
+// leases look unplaced, and each one was re-provisioned on the least-loaded
+// peer — a brand-new EMPTY volume while the real data sat on the absent
+// machine. Unattended, on a timer, for every affected lease at once, and the
+// caller saw success.
+func TestOrchestrator_StartProvisioning_UnresolvablePlacement_ProvisionsNoBackend(t *testing.T) {
+	peer := &mockManagerBackend{name: "backend-peer"}
+
+	router := &mockBackendRouter{
+		// The recorded backend is gone from the router.
+		getBackendByNameFn: func(string) backend.Backend { return nil },
+		// A peer IS available — this is exactly the situation in which the old
+		// code silently substituted.
+		routeForProvisionFn: func(_ context.Context, _ string, _ map[string]int) backend.Backend {
+			return peer
+		},
+	}
+
+	ps := &mockPlacementStore{}
+	ps.Set("lease-1", "removed-backend")
+
+	tracker := NewInFlightTracker()
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, tracker, ps)
+
+	lease := &billingtypes.Lease{
+		Uuid:   "lease-1",
+		Tenant: "t",
+		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrPlacementUnresolvable)
+
+	// Assert on the call count, not just the error: the failure being guarded
+	// against reports success to its caller, so an error return alone would not
+	// prove the peer was left untouched.
+	peer.mu.Lock()
+	peerCalls := len(peer.provisionCalls)
+	peer.mu.Unlock()
+	assert.Zero(t, peerCalls, "no substitute backend may be provisioned")
+
+	// The lease must not be left occupying an in-flight slot, or the next
+	// attempt would be refused as a duplicate rather than retried.
+	_, inFlight := tracker.GetInFlight("lease-1")
+	assert.False(t, inFlight, "a refused provision must not leak an in-flight entry")
+}
+
+// The boundary guard. Without it, the change above could refuse everything and
+// still look correct: a lease with NO placement record must keep routing freely,
+// which is the path every new lease takes.
+func TestOrchestrator_StartProvisioning_NoPlacementRecord_RoutesFreely(t *testing.T) {
+	target := &mockManagerBackend{name: "backend-target"}
+
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(string) backend.Backend { return nil },
+		routeForProvisionFn: func(_ context.Context, _ string, _ map[string]int) backend.Backend {
+			return target
+		},
+	}
+
+	// Placement store present but holding no record for this lease.
+	ps := &mockPlacementStore{}
+
+	tracker := NewInFlightTracker()
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, tracker, ps)
+
+	lease := &billingtypes.Lease{
+		Uuid:   "lease-unplaced",
+		Tenant: "t",
+		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+
+	target.mu.Lock()
+	calls := len(target.provisionCalls)
+	target.mu.Unlock()
+	assert.Equal(t, 1, calls, "a lease with no placement record must route freely")
+}
+
 func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testing.T) {
 	mb := &mockManagerBackend{
 		name:         "test-backend",

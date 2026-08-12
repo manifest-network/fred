@@ -20,6 +20,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **Fred no longer substitutes a backend when a lease's placement record names
+  one the router does not know** (ENG-635). Previously both the write and read
+  paths logged a warning and fell through to ordinary routing. On the write path
+  that meant removing, renaming or pausing a backend holding ACTIVE stateful
+  leases caused each of those leases to be re-provisioned on the least-loaded
+  peer — creating a brand-new **empty volume** while the tenant's real data sat
+  intact on the absent machine. It fired unattended, on a timer, for every
+  affected lease at once, and reported success to its caller. Provisioning is now
+  refused and retried on the following reconcile cycle (never rejected or closed
+  on chain — a paused backend must not terminate paying leases); reads and
+  restores return **503, not 404**, because a 404 during what is usually a paused
+  or renamed backend tells a tenant their data is gone and invites them to
+  destroy and recreate it. A lease with **no** placement record still routes
+  freely — that path, which every new lease takes, is unchanged. See
+  OPERATIONS.md § Removing, renaming or pausing a backend.
+
 - Build: `make lint` now **fails** when `golangci-lint` is missing from `PATH` or
   is not the pinned version, instead of printing "not installed, skipping" and
   exiting 0. A local `make lint` previously proved nothing — and a v1 binary is
