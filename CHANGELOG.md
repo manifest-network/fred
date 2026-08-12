@@ -27,6 +27,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- deps: bump `google.golang.org/grpc` to v1.82.1 (from v1.79.3) to resolve
+  GO-2026-6061, a pair of flaws in the xDS RBAC authorization engine and the
+  HTTP/2 server transport (fixed upstream in v1.82.1), and
+  `go.opentelemetry.io/otel` to v1.44.0 (from v1.43.0) to resolve GO-2026-5158
+  (CVE-2026-41178), an uncapped raw header length in `baggage` parsing (fixed
+  upstream in v1.44.0). Neither was reachable in practice: fred links no xDS and
+  instantiates no gRPC server (`internal/chain` is a gRPC client only), and fred
+  imports no OpenTelemetry package directly — both were flagged through vendored
+  server code that fred never constructs. Both advisories were published after
+  the v0.12.0 cut and flagged versions already in the tree, so the CI vuln gate
+  is the only thing that changed; this bump keeps it green. Also pulls
+  `go.opentelemetry.io/otel/metric` and `.../trace` to v1.44.0 (they require the
+  matching core), the `google.golang.org/genproto/googleapis/{api,rpc}`
+  pseudo-versions required by grpc v1.82.1, and `gonum.org/v1/gonum` to v0.17.0
+  in `go.sum` only (a test-only transitive of grpc, in none of the binaries).
+  `go.opentelemetry.io/otel/sdk`, `.../sdk/metric`, and the otlp exporters are
+  deliberately left at v1.43.0/v1.40.0: nothing in the called set flags them,
+  and moving them cascades into the docker/compose v2 toolchain that the
+  allowlist's Category B entries already defer.
+
 ## [0.12.0] - 2026-07-24
 
 ### Added
