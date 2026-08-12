@@ -46,6 +46,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   deliberately left at v1.43.0/v1.40.0: nothing in the called set flags them,
   and moving them cascades into the docker/compose v2 toolchain that the
   allowlist's Category B entries already defer.
+- ci: drop `GO-2026-5746`, `GO-2026-5668`, and `GO-2026-5617` from the
+  govulncheck allowlist. This is a **reachability correction, not a fix** —
+  `Fixed in: N/A` still holds upstream for all three, and no dependency moved.
+  All three scope to `github.com/docker/docker/daemon` symbols
+  (`Daemon.containerExtractToDir`, `Daemon.createIfNotExists`,
+  `Daemon.openContainerFS`), which run inside `dockerd` and are not in fred's
+  import graph at any point: `go list -deps ./...` resolves 31 `docker/docker`
+  packages, all client/API-side and none under `daemon/`, and `providerd` links
+  no Docker package at all. fred is a Docker *API client* —
+  `internal/backend/docker/lifecycle.go` calls `client.CopyFromContainer`, the
+  HTTP client of `GET /containers/{id}/archive`, while the flagged symbol is the
+  *server* side of `PUT`; there is no `CopyToContainer` call anywhere, and tar
+  extraction uses stdlib `archive/tar` under `os.Root`. The original ENG-415
+  triage (#143) conflated client and daemon; a later upstream symbol-narrowing
+  made it visible by dropping them out of the called set. Gate behavior is
+  unchanged — these three were never *called*, so they suppressed nothing, and
+  the allowlist now matches the called set exactly (13 entries). Should fred
+  ever link the Docker daemon, the gate will now flag it, which is precisely the
+  architectural change that warrants review. (ENG-639)
 
 ## [0.12.0] - 2026-07-24
 
