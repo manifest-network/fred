@@ -155,7 +155,7 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 // already-placed lease pinned to the backend with its volumes (ENG-333).
 //
 // A lease with NO placement record routes freely by least-loaded selection —
-// unchanged behaviour, and the path every new lease takes.
+// unchanged behavior, and the path every new lease takes.
 //
 // A lease WHOSE RECORD DOES NOT RESOLVE returns ErrPlacementUnresolvable rather
 // than routing somewhere else (ENG-635). fred never substitutes a backend: the

@@ -202,12 +202,25 @@ So when a backend disappears from `providerd.yaml` — removed, renamed, or its
 entry commented out during maintenance — leases placed on it stop making
 progress rather than migrating:
 
-| Operation | Behaviour |
+| Operation | Behavior |
 |---|---|
-| Provision / re-provision | Refused. Logged at ERROR: `refusing to provision: lease is placed on a backend the router does not know`. Retried every reconcile cycle |
+| Provision / re-provision | Refused, retried every reconcile cycle. See log lines below |
 | Read (connection details, logs) | `503`, not `404` |
 | Restore from that backend's retained data | `503`, not `404` |
 | Leases on *other* backends | Unaffected |
+
+Two ERROR log lines cover the two paths, and the reconciler one is the one you
+will actually see, since it fires unattended on every cycle:
+
+```
+reconcile: refusing to provision, lease is placed on a backend the router does not know   # reconciler
+refusing to provision: lease is placed on a backend the router does not know              # event path
+```
+
+Both carry `lease_uuid` and an `error` field containing the recorded backend
+name (`placement backend not found in router: lease <uuid> is placed on "<name>"`),
+so the recorded name can be recovered from the logs even if the config entry is
+already gone.
 
 This is deliberate (ENG-635). Substituting a healthy peer would provision a
 brand-new **empty volume** while the tenant's real data sits intact on the
@@ -219,12 +232,17 @@ loses data.
 their deployment no longer exists and invites them to destroy and recreate it,
 turning a recoverable outage into real data loss.
 
-**Recovery is to put the backend back** under its original `name`, at which
-point the next reconcile cycle resumes those leases with no further action. Note
-that the name is the identity key: renaming a backend in config is equivalent to
-removing it, and re-adding it under a *different* name will not reunite it with
-its leases. If a backend is genuinely gone for good, its leases are dead — the
-tenant must create new ones.
+**Recovery is to put the backend back under its original `name` and then restart
+`providerd`.** The restart is required, not optional: providerd reads its config
+and constructs the backend router once at startup and handles no reload signal
+(only SIGINT/SIGTERM), so restoring the YAML entry alone leaves the running
+process still treating the backend as unknown. After the restart, the next
+reconcile cycle resumes those leases with no further action.
+
+Note that the name is the identity key: renaming a backend in config is
+equivalent to removing it, and re-adding it under a *different* name will not
+reunite it with its leases. If a backend is genuinely gone for good, its leases
+are dead — the tenant must create new ones.
 
 > **Ansible caution.** `roles/fred/templates/providerd.yaml.j2` derives backend
 > names positionally, so removing a mid-list host renumbers every host below it.

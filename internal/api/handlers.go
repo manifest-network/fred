@@ -1012,8 +1012,12 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve the backend that holds the SOURCE lease's retained data. Restore
 	// is same-backend: the retained volumes live only where the source lease was
-	// provisioned (ENG-333). No placement for the source lease (or its backend is
-	// gone) => no retained data here => 404.
+	// provisioned (ENG-333).
+	//
+	// The two misses are DIFFERENT answers and must not be collapsed:
+	//   - no placement record for the source  => no retained data here => 404
+	//   - a record naming a backend the router does not know => the data exists
+	//     on a machine we cannot currently reach => 503 (ENG-635)
 	backendClient, err := h.resolveBackendByPlacement(body.FromLeaseUUID)
 	if err != nil {
 		// A record exists but names a backend the router does not know. The
