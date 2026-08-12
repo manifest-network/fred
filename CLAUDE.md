@@ -25,7 +25,7 @@ sudo -E env "PATH=$PATH" make test-integration-volume   # btrfs-loopback subset,
 make test-integration-k3s                               # self-builds the binary, no cluster needed
 ```
 
-`sudo -E` alone does not restore `PATH` (`secure_path`) — hence the `env`. Both suites need root — without it the volume subset silently `t.Skip`s almost everything and still exits green. The full suite additionally needs Docker + btrfs-progs + xfsprogs + zfsutils, and the 15m default timeout is now too tight. It selects with `-run Integration`, so a `//go:build integration` test whose *name* lacks "Integration" never runs and never trips the SKIP guard — three in `integration_anon_volume_test.go` already don't.
+`sudo -E` alone does not restore `PATH` (`secure_path`) — hence the `env`. Both suites need root — without it the volume subset silently `t.Skip`s almost everything and still exits green. The full suite additionally needs Docker + btrfs-progs + xfsprogs + zfsutils, and the 15m default timeout is now too tight. It selects with `-run Integration`, so a `//go:build integration` test whose *name* lacks "Integration" never runs and never trips the SKIP guard — a filtered test emits neither `--- SKIP:` nor `--- PASS:`, so CI stays green. Name every new one `TestIntegration_…`.
 
 Local stack: `bash scripts/dev-init.sh` (needs a running chain) registers provider + SKUs and writes `docker-backend.yaml` + `config.docker.yaml`. `make run-docker` picks up the former; `make run` is hardwired to the placeholder `config.example.yaml`, which dev-init never updates — start the daemon with `./build/providerd --config config.docker.yaml` instead.
 
