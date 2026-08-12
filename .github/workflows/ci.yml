@@ -52,9 +52,18 @@ jobs:
           go-version-file: go.mod
 
       # Read the pin from .golangci-lint-version so CI and `make lint` cannot drift.
+      # Fail closed on a missing/empty pin: golangci-lint-action treats an empty
+      # `version` input exactly like "latest" (parseVersion("") == parseVersion("latest")
+      # == null), so passing one through would silently unpin CI's linter.
       - name: Read pinned golangci-lint version
         id: golangci
-        run: echo "version=$(cat .golangci-lint-version)" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(cat .golangci-lint-version)"
+          if [ -z "$version" ]; then
+            echo "::error::.golangci-lint-version is empty; refusing to lint with an unpinned golangci-lint."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7

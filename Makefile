@@ -143,6 +143,13 @@ test-coverage-all:
 lint:
 	@echo "Running linter..."
 	$(GOVET) ./...
+	@if [ -z "$(GOLANGCI_LINT_VERSION)" ]; then \
+		echo "ERROR: could not read a version from .golangci-lint-version (missing or empty)."; \
+		echo "  That file is the single source of truth for the linter version, shared with CI."; \
+		echo "  Without it there is nothing to check against, so linting would be unpinned."; \
+		echo "  Restore it: git checkout -- .golangci-lint-version"; \
+		exit 1; \
+	fi
 	@have=$$(golangci-lint version 2>/dev/null | sed -n 's/^golangci-lint has version v\{0,1\}\([^ ]*\) .*/\1/p'); \
 	want=$$(echo "$(GOLANGCI_LINT_VERSION)" | sed 's/^v//'); \
 	if [ "$$have" != "$$want" ]; then \
