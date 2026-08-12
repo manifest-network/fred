@@ -145,6 +145,8 @@ func main() {
 	mux.HandleFunc("POST /deprovision", server.handleDeprovision)
 	mux.HandleFunc("GET /provisions", server.handleListProvisions)
 	mux.HandleFunc("GET /provisions/{lease_uuid}", server.handleGetProvision)
+	mux.HandleFunc("GET /retentions", server.handleListRetentions)
+	mux.HandleFunc("GET /stats", server.handleStats)
 	mux.HandleFunc("GET /logs/{lease_uuid}", server.handleGetLogs)
 	mux.HandleFunc("GET /health", server.handleHealth)
 
@@ -403,6 +405,64 @@ func (s *MockBackendServer) handleGetProvision(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(info); err != nil {
 		slog.Error("failed to encode provision response", "error", err)
+	}
+}
+
+// handleListRetentions serves GET /retentions, the keyset-paginated set of
+// leases whose data this backend retains (ENG-333 restore affinity).
+//
+// Its absence was not cosmetic: fred's client errors on any non-200
+// (client.go fetchRetentionsPage), so a mock-backend fleet left
+// fetchAllRetentions' `complete` flag permanently false, which silently
+// short-circuited the reconciler's placement pruner. Any test asserting
+// "placement records survived" against this binary passed for the wrong reason.
+func (s *MockBackendServer) handleListRetentions(w http.ResponseWriter, r *http.Request) {
+	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
+	if perr != nil {
+		http.Error(w, perr.Error(), http.StatusBadRequest)
+		return
+	}
+
+	retentions, err := s.backend.ListRetentions(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	page, next := backend.PaginateRetentions(retentions, cont, limit)
+	// Serialize as [] not null even if empty, mirroring handleListProvisions.
+	if page == nil {
+		page = []backend.RetainedLease{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(backend.ListRetentionsResponse{
+		Retentions: page,
+		Continue:   next,
+	}); err != nil {
+		slog.Error("failed to encode retentions response", "error", err)
+	}
+}
+
+// handleStats serves GET /stats, the load snapshot the router uses to pick the
+// least-loaded backend. A snapshot set programmatically is returned as-is; with
+// none set MockBackend reports nil and this synthesizes a zero-valued snapshot,
+// which fred reads as "no usable signal" (LoadStats.CPUAllocatedRatio ok=false)
+// and which leaves the backend out of the load comparison. That is the honest
+// answer for a backend with no real capacity; what it is not is a 404, which
+// fred would count as a failure.
+func (s *MockBackendServer) handleStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.backend.GetLoadStats(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if stats == nil {
+		stats = &backend.LoadStats{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(stats); err != nil {
+		slog.Error("failed to encode stats response", "error", err)
 	}
 }
 

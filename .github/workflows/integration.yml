@@ -13,6 +13,12 @@ on:
     paths:
       - "internal/backend/docker/**"
       - "internal/backend/shared/**"
+      # integration_reconciler_test.go drives a real provisioner.Reconciler
+      # against a real Docker backend, so a reconciler change can break this
+      # suite while touching nothing under internal/backend/. Without this
+      # entry those tests only ran nightly — i.e. never on the PR that broke
+      # them, which is the ENG-330 rot mode this workflow exists to prevent.
+      - "internal/provisioner/**"
       - "cmd/k3s-backend/**"
       - "Makefile"
       - "go.mod"
@@ -27,6 +33,12 @@ on:
     paths:
       - "internal/backend/docker/**"
       - "internal/backend/shared/**"
+      # integration_reconciler_test.go drives a real provisioner.Reconciler
+      # against a real Docker backend, so a reconciler change can break this
+      # suite while touching nothing under internal/backend/. Without this
+      # entry those tests only ran nightly — i.e. never on the PR that broke
+      # them, which is the ENG-330 rot mode this workflow exists to prevent.
+      - "internal/provisioner/**"
       - "cmd/k3s-backend/**"
       - "Makefile"
       - "go.mod"

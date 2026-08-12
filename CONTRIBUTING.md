@@ -102,6 +102,32 @@ go test -race -short ./...
 
 **CI does not run `-race`** (it is omitted in `.github/workflows/ci.yml` due to memory pressure on GitHub-hosted runners). Locals are the only place this runs, so make a habit of `go test -race -short ./...` before pushing — especially on PRs that touch concurrency.
 
+### Multi-backend fleet tests
+
+`internal/provisioner/fleet_harness_test.go` stands up N real `httptest` backends,
+each behind a real `backend.HTTPClient` (real HMAC, real circuit breaker) in a real
+`backend.Router`, and lets a test fault any single one mid-run — connection reset,
+hang past the timeout, 5xx, malformed JSON, oversize body, mid-pagination failure,
+or slow-but-successful. Every other reconciler test drives in-process interface
+mocks, so this is the only place the fred→backend transport is exercised at the
+reconciler tier, and that transport is where "a backend failed to answer this
+sweep" is produced.
+
+```bash
+go test ./internal/provisioner/ -run TestFleet_
+```
+
+**It carries no build tag on purpose.** It needs no Docker, no root and no network
+beyond loopback, so it belongs in the ordinary `go test -short ./...` job, where the
+whole suite runs in well under a second on every PR. Behind the `integration` tag it
+would instead ride the privileged root+btrfs+Docker workflow — tens of minutes for a
+signal you want on every push, and gated on an environment none of these tests need.
+
+The scenarios in `fleet_characterization_test.go` are characterization tests: they
+pin what a sweep must **not** destroy when it cannot see the whole fleet. If you
+change reconcile behaviour and one of them goes red, the default assumption is a
+regression, not a test that needs updating.
+
 ### Integration tests
 
 Integration tests require a running Docker daemon and use the `integration` build tag.
