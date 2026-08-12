@@ -9,9 +9,9 @@ import (
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
 	cliflags "github.com/docker/cli/cli/flags"
-	composeapi "github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/compose"
-	"github.com/docker/docker/client"
+	composeapi "github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
+	mobyclient "github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 )
 
@@ -49,6 +49,19 @@ func composeProjectName(leaseUUID string) string {
 }
 
 // composeService is the real implementation wrapping the Docker Compose API.
+//
+// Compose v5 is built on github.com/moby/moby/client, so this file talks to the
+// daemon through that module (aliased mobyclient) while lifecycle.go keeps using
+// github.com/docker/docker/client. Two Docker client libraries therefore coexist
+// in this package, bound to the same `client` identifier in different files —
+// hence the alias here, so a reader can tell which module a call belongs to.
+// They interoperate safely: both tag their errors with the same
+// github.com/containerd/errdefs sentinels, and compose values never cross into
+// the docker/docker-typed dockerClient interface (PS results are converted to
+// composeContainerSummary below). Porting lifecycle.go across is held out to
+// keep this migration reviewable; whether it would clear the two remaining
+// docker/docker advisories is unmeasured, since buildx still reaches that
+// module via pkg/namesgenerator.
 type composeService struct {
 	backend composeapi.Compose
 }
@@ -71,21 +84,26 @@ func newComposeService(dockerHost string) (*composeService, error) {
 
 	if err := dockerCli.Initialize(
 		cliflags.NewClientOptions(),
-		command.WithInitializeClient(func(cli *command.DockerCli) (client.APIClient, error) {
-			opts := []client.Opt{
-				client.WithAPIVersionNegotiation(),
+		command.WithInitializeClient(func(cli *command.DockerCli) (mobyclient.APIClient, error) {
+			opts := []mobyclient.Opt{
+				mobyclient.WithAPIVersionNegotiation(),
 			}
 			if dockerHost != "" {
-				opts = append(opts, client.WithHost(dockerHost))
+				opts = append(opts, mobyclient.WithHost(dockerHost))
 			}
-			return client.NewClientWithOpts(opts...)
+			return mobyclient.NewClientWithOpts(opts...)
 		}),
 	); err != nil {
 		return nil, fmt.Errorf("initialize docker cli: %w", err)
 	}
 
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return nil, fmt.Errorf("create compose service: %w", err)
+	}
+
 	return &composeService{
-		backend: compose.NewComposeService(dockerCli),
+		backend: backend,
 	}, nil
 }
 
@@ -132,8 +150,8 @@ func (s *composeService) PS(ctx context.Context, projectName string) ([]composeC
 			ID:      c.ID,
 			Name:    c.Name,
 			Service: c.Service,
-			State:   c.State,
-			Health:  c.Health,
+			State:   string(c.State),
+			Health:  string(c.Health),
 		}
 	}
 	return result, nil

@@ -69,6 +69,75 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- deps: migrate `github.com/docker/compose` from `/v2` v2.40.3 to **`/v5`
+  v5.4.0**, cutting the govulncheck allowlist from 7 entries to 3. This clears
+  GO-2026-4610 (a Windows-only CLI-plugin search-path privilege escalation,
+  fixed upstream in `docker/compose` 5.1.0 and `docker/cli` 29.2.0),
+  GO-2026-5378 (a containerd `runAsNonRoot` evasion via user-ID handling, fixed
+  in containerd v2.2.4 — v5 pulls v2.3.3), and GO-2026-4859 + GO-2026-4858 (two
+  BuildKit file-escape flaws, fixed in v0.28.1 — v5 pulls v0.32.1). The called
+  set was measured before and after: it goes from 7 IDs to exactly 3, with **no
+  new** IDs, despite v5 adding a large number of modules v2 never pulled.
+
+  fred had been pinned to a compose release from 2025-10-30 — roughly 9.5 months
+  stale — and no tooling could have reported it. Compose moved to a new **major
+  module path**, and a different module path is a different module: `go list -m
+  -u`, `go list -m -versions`, MVS and Dependabot are all structurally blind to
+  it, so every "is there a newer compose?" check returned "v2.40.3 is newest"
+  and was correct but useless. The previous allowlist note for GO-2026-4610
+  recorded it as having *no fix anywhere*; that was true of the `compose/v2`
+  module and false of the project, for exactly this reason.
+
+  fred's own diff is six lines, because all compose access is already narrowed
+  behind the `composeExecutor` interface: the import paths, plus
+  `compose.NewComposeService` now returning `(Compose, error)`, plus explicit
+  `string(...)` conversions now that `ContainerSummary.State`/`.Health` are the
+  distinct named types `container.ContainerState`/`HealthStatus`. All 11
+  production call sites and every test are unaffected. `internal/backend/docker`
+  now imports `github.com/moby/moby/client` (compose v5's and docker/cli v29's
+  client) alongside `github.com/docker/docker/client`, which `lifecycle.go`
+  keeps; the two interoperate safely, since both tag errors with the same
+  `containerd/errdefs` sentinels and no compose value crosses into the
+  docker/docker-typed `dockerClient` interface.
+
+  Forced along by minimal version selection: `compose-go/v2` v2.9.1 → v2.14.0
+  (fred touches 26 of its types, all unchanged or additively changed, and every
+  literal is field-named), `docker/cli` v28.5.1 → v29.6.2, `k8s.io/client-go`
+  v0.32.3 → v0.36.0 (required by containerd v2.3.3 and buildx v0.36.0; the only
+  consumer is the non-functional k3s scaffold, and its three call sites —
+  `NewForConfig`, `BuildConfigFromFlags`, `Discovery().ServerVersion()` — are
+  unchanged across those four minors), `prometheus/client_golang` v1.23.0 →
+  v1.23.2, `docker/go-connections` v0.6.0 → v0.7.0, `go.etcd.io/bbolt` v1.4.3 →
+  v1.5.0 (purely additive: two new `Options` fields and one new error; no
+  on-disk format change, which matters because bbolt backs the placement,
+  releases and retention stores), `gorilla/websocket` v1.5.3 → the commit
+  pinned by client-go/containerd/buildx (it swaps `math/rand` for `crypto/rand`
+  in frame masking and drops the deprecated `Temporary()` wrapper from the read
+  path — fred branches only on `*websocket.CloseError`, so its chain-event
+  read-deadline handling is unaffected), and `sirupsen/logrus` v1.9.3 → v1.9.4.
+  The `spf13/viper` require line moves to v1.21.0 but the existing `replace`
+  keeps the build on v1.17.0, so nothing changes there. `docker/docker` stays at
+  v28.5.2+incompatible, so `lifecycle.go`'s use of its `client`, `errdefs` and
+  `pkg/stdcopy` packages is untouched.
+
+  Compose v5 also collapses its own import graph — where v2's `pkg/compose`
+  reached fifteen buildx packages (including a blank import of
+  `buildx/driver/kubernetes`) and eight BuildKit packages, v5 reaches one and
+  three. The measured effect is a smaller build, not a larger one: `go.sum`
+  halves (3052 → 1530 lines) and the **`docker-backend` binary drops 25%**
+  (132.4 MB → 99.0 MB), because the buildx Kubernetes driver, BuildKit's
+  session/auth/secrets/SSH providers and all 141 `k8s.io/client-go` packages
+  leave it. `providerd` is unchanged in size (+0.3%). `client-go` remains a
+  direct require, but its only remaining consumer is the non-functional k3s
+  scaffold (ENG-133) — deleting that scaffold would now drop the entire
+  `k8s.io` tree from `go.mod`, which was not possible while compose v2 pulled it
+  in regardless.
+
+  What does **not** clear: GO-2026-4883 and GO-2026-4887 (`docker/docker`, fixed
+  only in `moby/moby/v2`, whose 22 published tags are all betas) and
+  GO-2026-5932 (`x/crypto/openpgp`, whose OSV entry has no `fixed` event at
+  all). Three is the realistic floor, not zero.
+
 - deps: bump `google.golang.org/grpc` to v1.82.1 (from v1.79.3) to resolve
   GO-2026-6061, a pair of flaws in the xDS RBAC authorization engine and the
   HTTP/2 server transport (fixed upstream in v1.82.1), and
