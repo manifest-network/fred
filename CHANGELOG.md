@@ -65,6 +65,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the allowlist now matches the called set exactly (13 entries). Should fred
   ever link the Docker daemon, the gate will now flag it, which is precisely the
   architectural change that warrants review. (ENG-639)
+- deps: bump `github.com/containerd/containerd/v2` to v2.1.9 (from v2.1.5) to
+  resolve GO-2026-5758, GO-2026-5622, GO-2026-5475, GO-2026-5338 and
+  GO-2026-5064, and `github.com/in-toto/in-toto-golang` to v0.11.0 (from v0.9.0)
+  to resolve GO-2026-5547 (all fixed upstream in those releases). Unlike the
+  docker/docker entries above, these six were genuinely in the called set —
+  both modules are linked into `docker-backend` through the docker/compose v2
+  toolchain. Both are indirect requires, bumped explicitly so MVS selects them
+  over the versions docker/compose v2.40.3 and buildkit v0.25.1 pin. Also pulls
+  `containerd/platforms` to v1.0.0-rc.2 (required by containerd v2.1.9), adds
+  `in-toto/attestation` v1.1.2, and raises
+  `secure-systems-lab/go-securesystemslib` to v0.10.0 and `spf13/cobra` to
+  v1.10.2 (a patch bump of a direct require) — all required by in-toto v0.11.0.
+  These were previously deferred as "compose-coupled", which was only true of
+  the containerd **2.2** line: v2.1.9 pins `k8s.io/*` at exactly the v0.32.3
+  fred already selects and `prometheus/client_golang` below fred's v1.23.0, so
+  there is no cascade. `containerd/v2` v2.2.4 (GO-2026-5378) and
+  `moby/buildkit` v0.28.1 (GO-2026-4859, GO-2026-4858) remain deferred: both
+  land on the 2.2 line, which forces `k8s.io/client-go` v0.32.3 → v0.34.1 and
+  `prometheus/client_golang` v1.23.0 → v1.23.2, both direct requires. Bumping
+  buildkit would not have resolved GO-2026-5547 in any case — v0.28.1 pins
+  in-toto at v0.10.0, one release short of the fix. The govulncheck allowlist
+  drops from 13 entries to 7 and again matches the called set exactly.
+  (ENG-639)
 
 ## [0.12.0] - 2026-07-24
 
