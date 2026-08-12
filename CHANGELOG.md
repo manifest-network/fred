@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `mock-backend` now serves `GET /retentions` and `GET /stats`, the two backend
+  contract endpoints it was missing. Their absence was not cosmetic: fred's
+  client treats any non-200 from `/retentions` as a failure, so a mock-backend
+  fleet left the reconciler's retention sweep permanently incomplete, which in
+  turn silently disabled the placement pruner. Any test or dev session that
+  concluded "placement records were preserved" against this binary was
+  observing a short-circuit rather than the behaviour it meant to check. A
+  missing `/stats` similarly made every mock backend look like it had no usable
+  load signal.
+
 ### Changed
 
 - Build: `make lint` now **fails** when `golangci-lint` is missing from `PATH` or

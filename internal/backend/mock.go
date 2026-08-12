@@ -30,6 +30,14 @@ type MockBackend struct {
 
 	// retentions is returned by ListRetentions. nil/empty = no retained leases.
 	retentions []RetainedLease
+
+	// Failure injection. Each is returned verbatim by the corresponding method
+	// when non-nil, so a test can simulate a backend that answers some calls and
+	// fails others. Without these the mock cannot fail at all, which makes any
+	// "one backend did not answer" scenario unconstructible.
+	listProvisionsErr error
+	healthErr         error
+	loadStatsErr      error
 }
 
 type mockProvision struct {
@@ -80,11 +88,24 @@ func (m *MockBackend) SetLoadStats(stats *LoadStats) {
 	m.loadStats = stats
 }
 
+// SetGetLoadStatsErr makes GetLoadStats fail with err (nil clears it). Distinct
+// from SetLoadStats(nil): that models a backend with no usable load signal,
+// whereas this models one that could not be asked — the router treats them
+// differently (capacity exclusion vs round-robin fallback).
+func (m *MockBackend) SetGetLoadStatsErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.loadStatsErr = err
+}
+
 // GetLoadStats returns the configured load snapshot (a copy, so callers cannot
 // mutate mock state), or (nil, nil) when unset.
 func (m *MockBackend) GetLoadStats(_ context.Context) (*LoadStats, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.loadStatsErr != nil {
+		return nil, m.loadStatsErr
+	}
 	if m.loadStats == nil {
 		return nil, nil
 	}
@@ -228,10 +249,24 @@ func provisionInfoFrom(p *mockProvision) ProvisionInfo {
 	}
 }
 
+// SetListProvisionsErr makes ListProvisions fail with err (nil clears it).
+// Deliberately scoped to ListProvisions and NOT to LookupProvisions, so a test
+// can model a backend whose fleet-wide listing is broken while targeted lookups
+// still answer.
+func (m *MockBackend) SetListProvisionsErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listProvisionsErr = err
+}
+
 // ListProvisions returns all provisions.
 func (m *MockBackend) ListProvisions(ctx context.Context) ([]ProvisionInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if m.listProvisionsErr != nil {
+		return nil, m.listProvisionsErr
+	}
 
 	result := make([]ProvisionInfo, 0, len(m.provisions))
 	for _, p := range m.provisions {
@@ -257,9 +292,18 @@ func (m *MockBackend) LookupProvisions(ctx context.Context, uuids []string) ([]P
 	return result, nil
 }
 
-// Health always returns nil (healthy) for mock backend.
+// SetHealthErr makes Health fail with err (nil clears it).
+func (m *MockBackend) SetHealthErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.healthErr = err
+}
+
+// Health reports the injected health error, or nil (healthy) when none is set.
 func (m *MockBackend) Health(ctx context.Context) error {
-	return nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.healthErr
 }
 
 // RefreshState is a no-op for mock backend.
