@@ -24,10 +24,13 @@ jobs:
         run: go build ./...
       - name: Test
         run: go test -short ./...
+      - name: Read pinned golangci-lint version
+        id: golangci
+        run: echo "version=$(cat .golangci-lint-version)" >> "$GITHUB_OUTPUT"
       - name: Lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.9.0 # keep in sync with .github/workflows/ci.yml
+          version: ${{ steps.golangci.outputs.version }}
 
   release:
     needs: verify

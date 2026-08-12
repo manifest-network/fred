@@ -11,7 +11,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 - **Go 1.26.5** (per `go.mod`) — the `go 1.26.5` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` and `testing.B.Loop()` (added in Go 1.25).
 - **Docker 24+** with iptables enabled — required for `make test-integration` and the docker-backend.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
-- **(Optional) `golangci-lint`** — `make lint` runs `go vet` unconditionally and adds golangci checks if it's on `PATH`.
+- **`golangci-lint`**, at the version pinned in `.golangci-lint-version` — required by `make lint`, which now fails rather than skipping when it's absent or mismatched. See [Linting](#linting) for the install command.
 - **(Optional) `btrfs-progs` + root** — only for `make test-integration-volume`, which exercises filesystem quotas.
 
 ---
@@ -161,7 +161,7 @@ Benchmark files are listed in [PERFORMANCE.md](PERFORMANCE.md#benchmark-files).
 make fmt    # runs `go fmt ./...`
 ```
 
-`make fmt` only runs `go fmt`. Import ordering (with `github.com/manifest-network/fred` grouped separately from third-party dependencies) is enforced by `goimports`, which is configured as a formatter in `.golangci.yml` and runs as part of `make lint` and the CI lint job. So the local fast loop is `make fmt && make lint`; CI catches the import grouping there even if you skip it locally.
+`make fmt` only runs `go fmt`. Import ordering (with `github.com/manifest-network/fred` grouped separately from third-party dependencies) is enforced by `goimports`, which is configured as a formatter in `.golangci.yml` and runs as part of `make lint` and the CI lint job. So the local fast loop is `make fmt && make lint` — and since `make lint` no longer skips golangci-lint silently, that loop now catches import grouping before CI does.
 
 ### Linting
 
@@ -169,13 +169,15 @@ make fmt    # runs `go fmt ./...`
 make lint
 ```
 
-This runs `go vet` plus `golangci-lint` if installed. The `.golangci.yml` enables: `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `gocritic`, `misspell`, `unconvert`, `unparam`, `nilerr`, `errorlint`, `exhaustruct`, `gosec` (the last scoped by rule-wide excludes such as G115/G104 and per-path suppressions). Test files and `cmd/` are excluded from some strict checks (see `.golangci.yml` for the rules). `exhaustruct` runs in directive-only mode — it checks only struct literals explicitly marked `//exhaustruct:enforce`.
+This runs `go vet` plus `golangci-lint`. **`make lint` fails if `golangci-lint` is missing from `PATH` or is not the pinned version** — it used to skip silently and exit 0, which made a local pass meaningless. The `.golangci.yml` enables: `errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`, `gocritic`, `misspell`, `unconvert`, `unparam`, `nilerr`, `errorlint`, `exhaustruct`, `gosec` (the last scoped by rule-wide excludes such as G115/G104 and per-path suppressions). Test files and `cmd/` are excluded from some strict checks (see `.golangci.yml` for the rules). `exhaustruct` runs in directive-only mode — it checks only struct literals explicitly marked `//exhaustruct:enforce`.
 
-Install golangci-lint. CI pins **v2.9.0** (`.github/workflows/ci.yml`), and the config uses the v2 schema, so match that version locally to avoid local-vs-CI drift:
+The pinned version lives in **`.golangci-lint-version`** — the single source of truth, read by both the `lint` make target and the CI/release workflows. Install exactly that version (upstream recommends the binary installer over `go install`, which compiles against your local toolchain):
 
 ```bash
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.9.0
+curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b "$(go env GOPATH)/bin" "$(cat .golangci-lint-version)"
 ```
+
+Make sure `$(go env GOPATH)/bin` is on your `PATH`. Matching the pin matters more than it looks: `.golangci.yml` uses the v2 schema, and a **v1** binary does not reject it — it ignores the v2-only keys and quietly runs a different linter set, so you get a green local run and a red CI. To bump the linter, edit `.golangci-lint-version`; nothing else hardcodes a version.
 
 ### Conventions used in this codebase
 

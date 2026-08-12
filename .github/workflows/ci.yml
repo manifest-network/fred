@@ -51,10 +51,15 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Read the pin from .golangci-lint-version so CI and `make lint` cannot drift.
+      - name: Read pinned golangci-lint version
+        id: golangci
+        run: echo "version=$(cat .golangci-lint-version)" >> "$GITHUB_OUTPUT"
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.9.0
+          version: ${{ steps.golangci.outputs.version }}
 
   vulncheck:
     runs-on: ubuntu-latest

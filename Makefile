@@ -24,6 +24,11 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 # without changing the local default. e.g. `make test-integration INTEGRATION_TIMEOUT=30m`.
 INTEGRATION_TIMEOUT ?= 15m
 
+# Pinned golangci-lint version. Single source of truth: .github/workflows/{ci,release}.yml
+# read the same file, so local `make lint` and CI can never drift. Bumping the
+# linter is a one-line edit to .golangci-lint-version.
+GOLANGCI_LINT_VERSION := $(shell cat .golangci-lint-version 2>/dev/null)
+
 # Build flags
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
@@ -138,11 +143,23 @@ test-coverage-all:
 lint:
 	@echo "Running linter..."
 	$(GOVET) ./...
-	@if command -v golangci-lint > /dev/null; then \
-		golangci-lint run ./...; \
-	else \
-		echo "golangci-lint not installed, skipping"; \
+	@have=$$(golangci-lint version 2>/dev/null | sed -n 's/^golangci-lint has version v\{0,1\}\([^ ]*\) .*/\1/p'); \
+	want=$$(echo "$(GOLANGCI_LINT_VERSION)" | sed 's/^v//'); \
+	if [ "$$have" != "$$want" ]; then \
+		if [ -z "$$have" ]; then \
+			echo "ERROR: golangci-lint is not on PATH."; \
+		else \
+			echo "ERROR: golangci-lint $$have is on PATH, but this repo pins $$want."; \
+		fi; \
+		echo "  CI lints every PR with $(GOLANGCI_LINT_VERSION), so a local run that skips or"; \
+		echo "  version-drifts proves nothing. A v1 binary is the worst case: it ignores"; \
+		echo "  .golangci.yml's v2 keys and quietly runs a DIFFERENT linter set."; \
+		echo "  Install the pinned version:"; \
+		echo "    curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b \$$(go env GOPATH)/bin $(GOLANGCI_LINT_VERSION)"; \
+		echo "  and put \$$(go env GOPATH)/bin on your PATH. To bump it, edit .golangci-lint-version."; \
+		exit 1; \
 	fi
+	golangci-lint run ./...
 
 # Run the daemon with example config
 run: build
