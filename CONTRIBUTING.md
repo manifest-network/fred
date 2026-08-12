@@ -118,10 +118,10 @@ go test ./internal/provisioner/ -run TestFleet_
 ```
 
 **It carries no build tag on purpose.** It needs no Docker, no root and no network
-beyond loopback, so it runs in the ordinary `go test -short ./...` job on every PR.
-A tagged suite would not: the reconciler is only reachable from the integration
-workflow's path filter, so tests guarding a reconciler change would not run on the
-PR that changes the reconciler — the ENG-330 rot mode.
+beyond loopback, so it belongs in the ordinary `go test -short ./...` job, where the
+whole suite runs in well under a second on every PR. Behind the `integration` tag it
+would instead ride the privileged root+btrfs+Docker workflow — tens of minutes for a
+signal you want on every push, and gated on an environment none of these tests need.
 
 The scenarios in `fleet_characterization_test.go` are characterization tests: they
 pin what a sweep must **not** destroy when it cannot see the whole fleet. If you

@@ -88,10 +88,14 @@ func (m *MockBackend) SetLoadStats(stats *LoadStats) {
 	m.loadStats = stats
 }
 
-// SetGetLoadStatsErr makes GetLoadStats fail with err (nil clears it). Distinct
-// from SetLoadStats(nil): that models a backend with no usable load signal,
-// whereas this models one that could not be asked — the router treats them
-// differently (capacity exclusion vs round-robin fallback).
+// SetGetLoadStatsErr makes GetLoadStats fail with err (nil clears it).
+//
+// Distinct from SetLoadStats(nil) at the API boundary — "could not be asked"
+// versus "answered, with nothing usable" — but note that RouteForProvision
+// currently collapses the two: either one leaves the candidate out of the load
+// comparison, and round-robin is reached only when NO candidate has usable
+// stats (router.go RouteForProvision). Use this to exercise the error path
+// itself, not to produce a different routing outcome.
 func (m *MockBackend) SetGetLoadStatsErr(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

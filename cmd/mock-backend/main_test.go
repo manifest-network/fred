@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -120,6 +121,131 @@ func TestMockBackend_HandleListProvisions_MalformedContinueIs400(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.handleListProvisions(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// newTestServerWithRetentions wires a MockBackendServer whose backend reports
+// the given leases as retained.
+func newTestServerWithRetentions(t *testing.T, retained []string) *MockBackendServer {
+	t.Helper()
+	srv := newTestServer(t, nil)
+	r := make([]backend.RetainedLease, 0, len(retained))
+	for _, uuid := range retained {
+		r = append(r, backend.RetainedLease{LeaseUUID: uuid})
+	}
+	srv.backend.SetRetentions(r)
+	return srv
+}
+
+// The /retentions handler mirrors /provisions, and it is load-bearing in a way
+// that is easy to lose: fred treats any non-200 here as a failure, so if this
+// endpoint regresses the reconciler's retention sweep is permanently
+// incomplete and the placement pruner silently short-circuits. Nothing else
+// fails loudly when that happens, hence these tests.
+func TestMockBackend_HandleListRetentions_OK(t *testing.T) {
+	srv := newTestServerWithRetentions(t, []string{testUUID1, testUUID2})
+
+	req := httptest.NewRequest("GET", "/retentions", nil)
+	w := httptest.NewRecorder()
+	srv.handleListRetentions(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp backend.ListRetentionsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Retentions, 2)
+	assert.Empty(t, resp.Continue)
+}
+
+func TestMockBackend_HandleListRetentions_EmptySerializesAsArray(t *testing.T) {
+	srv := newTestServerWithRetentions(t, nil)
+
+	req := httptest.NewRequest("GET", "/retentions", nil)
+	w := httptest.NewRecorder()
+	srv.handleListRetentions(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	// `null` would decode into a nil slice; the contract is an empty array.
+	assert.Contains(t, w.Body.String(), `"retentions":[]`)
+}
+
+func TestMockBackend_HandleListRetentions_Paginates(t *testing.T) {
+	srv := newTestServerWithRetentions(t, []string{testUUID1, testUUID2, testUUID3})
+
+	req := httptest.NewRequest("GET", "/retentions?limit=2", nil)
+	w := httptest.NewRecorder()
+	srv.handleListRetentions(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp backend.ListRetentionsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Retentions, 2)
+	// Sorted by lease UUID: testUUID1 < testUUID3 < testUUID2.
+	assert.Equal(t, testUUID1, resp.Retentions[0].LeaseUUID)
+	assert.Equal(t, testUUID3, resp.Retentions[1].LeaseUUID)
+	assert.Equal(t, testUUID3, resp.Continue)
+}
+
+func TestMockBackend_HandleListRetentions_MalformedContinueIs400(t *testing.T) {
+	srv := newTestServerWithRetentions(t, []string{testUUID1})
+
+	req := httptest.NewRequest("GET", "/retentions?limit=2&continue=not-a-uuid", nil)
+	w := httptest.NewRecorder()
+	srv.handleListRetentions(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// With no snapshot configured the backend reports nil, and the handler must
+// still answer 200 with a zero-valued snapshot. A 404 or a `null` body would be
+// read by fred as a failed call rather than as "no usable load signal".
+func TestMockBackend_HandleStats_NilSnapshotBecomesZeroValued(t *testing.T) {
+	srv := newTestServer(t, nil)
+
+	req := httptest.NewRequest("GET", "/stats", nil)
+	w := httptest.NewRecorder()
+	srv.handleStats(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var stats backend.LoadStats
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &stats))
+	assert.Zero(t, stats.TotalCPUCores)
+
+	_, ok := stats.CPUAllocatedRatio()
+	assert.False(t, ok, "a zero-valued snapshot must read as no usable load signal")
+}
+
+func TestMockBackend_HandleStats_ReturnsConfiguredSnapshot(t *testing.T) {
+	srv := newTestServer(t, nil)
+	srv.backend.SetLoadStats(&backend.LoadStats{
+		TotalCPUCores:     8,
+		AllocatedCPUCores: 2,
+		ActiveContainers:  3,
+	})
+
+	req := httptest.NewRequest("GET", "/stats", nil)
+	w := httptest.NewRecorder()
+	srv.handleStats(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var stats backend.LoadStats
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &stats))
+	assert.Equal(t, 8.0, stats.TotalCPUCores)
+	assert.Equal(t, 2.0, stats.AllocatedCPUCores)
+	assert.Equal(t, 3, stats.ActiveContainers)
+
+	ratio, ok := stats.CPUAllocatedRatio()
+	require.True(t, ok)
+	assert.InDelta(t, 0.25, ratio, 1e-9)
+}
+
+func TestMockBackend_HandleStats_ErrorIs500(t *testing.T) {
+	srv := newTestServer(t, nil)
+	srv.backend.SetGetLoadStatsErr(errors.New("stats unavailable"))
+
+	req := httptest.NewRequest("GET", "/stats", nil)
+	w := httptest.NewRecorder()
+	srv.handleStats(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 // TestComputeSignature_VerifiesAgainstHmacauth proves the standalone

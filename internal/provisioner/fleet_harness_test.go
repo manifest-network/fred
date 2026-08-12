@@ -14,10 +14,10 @@ package provisioner
 // contract, each behind a real backend.HTTPClient inside a real backend.Router,
 // and lets a test fault any single server mid-run. It deliberately carries no
 // build tag: it needs no Docker, no root and no network beyond loopback, so it
-// runs in the ordinary `go test -short ./...` job on every PR. A tagged suite
-// would not — internal/provisioner is absent from the integration workflow's
-// path filter, so the tests guarding a reconciler change would not run on the
-// PR that changes the reconciler (the ENG-330 failure mode).
+// belongs in the ordinary `go test -short ./...` job, where the whole suite
+// runs in well under a second on every PR. Behind the `integration` tag it
+// would instead ride the privileged root+btrfs+Docker workflow — tens of
+// minutes, and gated on an environment none of these tests need.
 
 import (
 	"bytes"

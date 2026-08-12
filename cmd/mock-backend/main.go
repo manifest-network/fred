@@ -444,11 +444,12 @@ func (s *MockBackendServer) handleListRetentions(w http.ResponseWriter, r *http.
 }
 
 // handleStats serves GET /stats, the load snapshot the router uses to pick the
-// least-loaded backend. MockBackend reports no load signal unless one was set
-// programmatically, in which case this returns a zero-valued snapshot — which
-// fred reads as "no usable signal" (LoadStats.CPUAllocatedRatio ok=false) and
-// falls back to round-robin. That is the honest answer for a backend with no
-// real capacity; what it is not is a 404, which fred would count as a failure.
+// least-loaded backend. A snapshot set programmatically is returned as-is; with
+// none set MockBackend reports nil and this synthesizes a zero-valued snapshot,
+// which fred reads as "no usable signal" (LoadStats.CPUAllocatedRatio ok=false)
+// and which leaves the backend out of the load comparison. That is the honest
+// answer for a backend with no real capacity; what it is not is a 404, which
+// fred would count as a failure.
 func (s *MockBackendServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.backend.GetLoadStats(r.Context())
 	if err != nil {
