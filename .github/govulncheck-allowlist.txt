@@ -10,14 +10,14 @@
 # entries as fixes land. Tracking: ENG-415.
 #
 # ── Category A: no upstream fix available (govulncheck "Fixed in: N/A") ──────
-# github.com/docker/docker @ v28.5.2+incompatible has no patched release, and
-# the docker/cli + moby/buildkit fixes are themselves gated on docker/compose
-# v2 compatibility. Nothing we can bump resolves these today.
-GO-2026-5746   docker/docker — no patched release
-GO-2026-5668   docker/docker — no patched release
-GO-2026-5617   docker/docker — no patched release
-GO-2026-4887   docker/docker — no patched release
-GO-2026-4883   docker/docker — no patched release
+# github.com/docker/docker @ v28.5.2+incompatible has no patched release: the
+# fix ships only as moby/moby/v2 v2.0.0-beta.8, a module fred does not use.
+# Unlike the daemon-only advisories dropped in ENG-639, these two ARE in the
+# called set — though only via docker/client package init and
+# client.Client.Close, not the plugin code the advisories describe. Keep them:
+# the gate compares against the called set, so removing them would fail CI.
+GO-2026-4887   docker/docker — no patched release (fix only in moby/moby/v2)
+GO-2026-4883   docker/docker — no patched release (fix only in moby/moby/v2)
 GO-2026-4610   no fix on the binding path — reachable via docker/compose v2 (Fixed in: N/A); the separate docker/cli v29.2.0 fix does not resolve the compose-reachable instance
 #
 # golang.org/x/crypto/openpgp is unmaintained/frozen ("Fixed in: N/A"); no
