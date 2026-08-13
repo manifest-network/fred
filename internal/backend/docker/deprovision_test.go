@@ -667,3 +667,59 @@ func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T)
 	require.NotNil(t, orig)
 	assert.Equal(t, shared.RetentionStatusRestoring, orig.Status)
 }
+
+// TestDoDeprovision_ClaimedVolume_AccountingAcrossRecoveryAndSweep is a
+// CHARACTERIZATION test: it walks the three real events that follow a close which
+// left a restore-claimed volume behind, and pins what the accounting does at each —
+// including a KNOWN GAP that is deliberately not closed in this PR.
+//
+// The gap: holding the reservation (see the tests above) is only durable while the
+// lease is still tracked. The close deletes the provision, and recoverState's
+// pool-authoritative rebuild preserves a key only for a lease still in b.provisions
+// (ENG-567), so the next reconcile tick drops it — default reconcile_interval 5m,
+// against an exposure that lasts until the retention sweep re-quarantines the volume,
+// default retention_reap_interval 1h. Between those the bytes are on disk and counted
+// by nobody, and admission can over-commit against them.
+//
+// This is pinned rather than described so the window is visible in the suite and a
+// future durable fix has to update this test deliberately instead of silently
+// changing an unobserved behaviour. See the ENG-647 follow-up.
+func TestDoDeprovision_ClaimedVolume_AccountingAcrossRecoveryAndSweep(t *testing.T) {
+	b, rs, claimedVol := claimedCloseBackend(t, false)
+	b.volumes = &mockVolumeManager{
+		DestroyFn:      func(_ context.Context, _ string) error { return nil },
+		RenameVolumeFn: func(_, _ string) error { return nil },
+		ListFn:         func() ([]string, error) { return []string{claimedVol}, nil },
+	}
+
+	// (1) The close: the reservation is held, because the bytes are still on disk and
+	// a restoring record is counted by neither projection.
+	require.NoError(t, b.doDeprovision(context.Background(), "u2"))
+	assert.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "close holds the reservation")
+	assert.Zero(t, b.pool.Stats().RetainedDiskMB)
+
+	// (2) The next reconcile tick. recoverState rebuilds the pool from live containers
+	// plus the keys of still-tracked leases; this lease was deleted by the close, so
+	// its key is dropped even though its volume is still on disk. THIS IS THE KNOWN GAP.
+	b.docker = &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
+	require.NoError(t, b.recoverState(context.Background()))
+	assert.Zero(t, b.pool.Stats().AllocatedDiskMB,
+		"KNOWN GAP (ENG-647 follow-up): the rebuild is ownership-keyed, so an untracked "+
+			"lease's reservation is dropped while its volume is still on disk")
+	assert.Zero(t, b.pool.Stats().RetainedDiskMB,
+		"and the restoring record still counts nowhere — this is the over-admission window")
+
+	// (3) The retention sweep — the real end of the window. It re-quarantines the
+	// volume, reverts the record, and the bytes become retained-counted again.
+	require.NoError(t, b.runRetentionSweep(context.Background()))
+
+	reverted, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, reverted)
+	assert.Equal(t, shared.RetentionStatusActive, reverted.Status, "the sweep completed the rollback")
+	assert.Equal(t, int64(512), b.pool.Stats().RetainedDiskMB,
+		"the bytes are counted again — the window closes here, not at the reconcile tick")
+	assertRetentionAccountingConsistent(t, b, "accounting is consistent once the sweep has run")
+}
