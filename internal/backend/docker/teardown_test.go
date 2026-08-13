@@ -97,7 +97,7 @@ func TestTeardownLeaseContainers_DownFails_LeavesOtherLeasesAlone(t *testing.T) 
 			return []ContainerInfo{
 				managedContainer("c-mine", "lease-1"),
 				managedContainer("c-theirs", "lease-2"),
-				managedContainer("c-unlabelled", ""),
+				managedContainer("c-unlabeled", ""),
 			}, nil
 		},
 		RemoveContainerFn: func(_ context.Context, id string) error {

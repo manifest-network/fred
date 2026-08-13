@@ -133,7 +133,7 @@ func (b *Backend) restoringClaimedVolumes(leaseUUID string) (map[string]bool, er
 	return claimed, nil
 }
 
-// discoverLeaseContainers returns the union of the lease's live fred-labelled
+// discoverLeaseContainers returns the union of the lease's live fred-labeled
 // containers and any ids the caller already recorded, deduplicated and stably
 // ordered (recorded first, then daemon order) so a failure list reads the same way
 // twice. RemoveContainer is idempotent — a not-found is a nil — so overlap between
