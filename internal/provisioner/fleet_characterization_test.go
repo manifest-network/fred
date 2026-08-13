@@ -472,6 +472,45 @@ func TestFleet_DegradedSweep_SkipsPayloadCleanup(t *testing.T) {
 	require.False(t, has, "payload cleanup must resume once every backend answers")
 }
 
+// deferLease trusts exactly two inputs: membership in snapshot.provisions, and
+// the placement record. The tests below pin the placement half; this one pins
+// the other, at the source.
+//
+// The property is that snapshot.provisions can only ever name a backend that
+// actually answered — every entry is inserted after that backend's
+// ListProvisions succeeded, with BackendName overwritten by the answering
+// backend's own name rather than trusted from the wire. If a non-answering
+// backend could contribute even one entry, `isProvisioned` would short-circuit
+// the guard into PROCEED on evidence that does not exist.
+func TestFleet_FleetSnapshot_ExcludesNonAnsweringBackendAndStampsOwner(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	f.backendAt(1).seedProvision(t, "lease-a", f.providerUUID, backend.ProvisionStatusReady)
+	f.backendAt(2).seedProvision(t, "lease-b", f.providerUUID, backend.ProvisionStatusReady)
+	f.backendAt(3).seedProvision(t, "lease-c", f.providerUUID, backend.ProvisionStatusReady)
+
+	f.backendAt(2).setFault(faultConnReset)
+
+	snap := f.reconciler.fetchFleetSnapshot(t.Context())
+
+	require.False(t, snap.complete, "one backend did not answer")
+	require.Equal(t, map[string]bool{
+		"backend-1": true,
+		"backend-2": false,
+		"backend-3": true,
+	}, snap.answered, "answered must record every configured backend, false for the silent one")
+	require.Equal(t, []string{"backend-2"}, snap.unansweredBackends())
+
+	// The silent backend's lease must be absent — not present-with-stale-data.
+	require.NotContains(t, snap.provisions, "lease-b",
+		"a backend that did not answer must contribute nothing")
+
+	// Answering backends' leases are present and attributed to them.
+	require.Equal(t, "backend-1", snap.provisions["lease-a"].BackendName)
+	require.Equal(t, "backend-3", snap.provisions["lease-c"].BackendName)
+}
+
 // The placement sync runs BEFORE the per-lease guard and is read back by it in
 // the same sweep, so anything it writes becomes evidence immediately. A
 // retention proves a past deprovision on a backend, not present ownership —
