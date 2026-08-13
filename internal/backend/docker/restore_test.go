@@ -3952,3 +3952,393 @@ func TestPartitionMetricSplit(t *testing.T) {
 	require.Equal(t, bareBefore2+1, testutil.ToFloat64(retentionEvictedTotal), "L1 eviction bumps the bare counter")
 	require.Equal(t, partBefore2, testutil.ToFloat64(retentionPartitionEvictedTotal), "L1 eviction must NOT bump the partition counter")
 }
+
+// ---------------------------------------------------------------------------
+// ENG-647: a failed teardown must not be treated as a completed rollback.
+//
+// The orphaned arm's compose Down used to be advisory — its error was logged and
+// execution continued, so fred re-quarantined the volumes, reverted the record and
+// DROPPED the provision while the containers were possibly still running. From that
+// point nothing could reach them: processOrphan only walks ListProvisions (which
+// ranges b.provisions, the map just deleted from) and cleanupOrphanedVolumes
+// enumerates fred's bind-mount tree, never Docker's anonymous-volume store.
+// ---------------------------------------------------------------------------
+
+// restoringEntryFixture is the shape every test below reconciles: original lease u1
+// soft-deleted, its data adopted into new lease u2 by a restore that then crashed.
+func restoringEntryFixture() shared.RetentionEntry {
+	return shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		NewLeaseUUID:        "u2",
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          3,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0))},
+	}
+}
+
+// failedRestoreProvision is what a crashed restore leaves behind: Failed, and with NO
+// ContainerIDs — Restore reserves the entry empty and only the success paths fill it
+// in. That emptiness is the whole reason the teardown re-discovers by label.
+func failedRestoreProvision() map[string]*provision {
+	return map[string]*provision{
+		"u2": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u2",
+			Status:    backend.ProvisionStatusFailed,
+			Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		}},
+	}
+}
+
+// TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback: when compose Down
+// fails but the per-container fallback finishes the job, the rollback proceeds exactly
+// as if Down had worked. The containers are found by fred label, which is the only way
+// to find them at all here — the provision names none.
+func TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback(t *testing.T) {
+	var removed []string
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{managedContainer("c-restore-0", "u2")}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, id string) error {
+			removed = append(removed, id)
+			return nil
+		},
+	}
+	b := newBackendForTest(mock, failedRestoreProvision())
+	rs := attachRetentionStore(t, b)
+	b.compose = failingDown()
+
+	var renames [][2]string
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			renames = append(renames, [2]string{old, new})
+			return nil
+		},
+	}
+
+	e := restoringEntryFixture()
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	assert.Equal(t, []string{"c-restore-0"}, removed,
+		"the fallback must reap the crashed restore's containers, which the provision does not name")
+	assert.Equal(t, [][2]string{{
+		canonicalVolumeName("u2", manifest.DefaultServiceName, 0),
+		retainedName(canonicalVolumeName("u1", manifest.DefaultServiceName, 0)),
+	}}, renames, "re-quarantine proceeds once the containers are confirmed gone")
+
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status, "the rollback completed")
+	assert.Equal(t, 4, entry.Generation)
+
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, hasU2, "the provision is dropped only because teardown actually succeeded")
+}
+
+// TestReconcileRestoring_TeardownFails_LeavesRecordRestoring is the ENG-647 pin. With
+// containers still on the host, advancing ANY of the four state transitions would
+// strand them: the record revert hides the lease from this sweep, releaseAll hands
+// their capacity to someone else, and removeProvision puts them beyond every reaper.
+func TestReconcileRestoring_TeardownFails_LeavesRecordRestoring(t *testing.T) {
+	failedBefore := testutil.ToFloat64(
+		teardownFallbackTotal.WithLabelValues(teardownOpRestoreReconcile, teardownOutcomeFailed))
+
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error {
+			return errors.New("device or resource busy")
+		},
+	}
+	b := newBackendForTest(mock, failedRestoreProvision())
+	rs := attachRetentionStore(t, b)
+	b.compose = failingDown()
+
+	// The restore's live allocation, which the rollback would normally hand back.
+	require.NoError(t, b.pool.TryAllocate("u2-"+manifest.DefaultServiceName+"-0", "docker-small", "tenant-a"))
+	allocBefore := b.pool.Stats().AllocationCount
+
+	e := restoringEntryFixture()
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
+		"the record must stay restoring so a later sweep retries the rollback")
+	assert.Equal(t, 3, entry.Generation, "RevertToActive's CAS bump must NOT have fired")
+
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.True(t, hasU2,
+		"the provision must stay tracked — dropping it puts the surviving containers beyond "+
+			"processOrphan (which ranges b.provisions) and their anonymous volumes beyond every reaper (ENG-647)")
+
+	assert.Equal(t, allocBefore, b.pool.Stats().AllocationCount,
+		"capacity must not be handed back while the containers holding it may still be running")
+
+	assert.InDelta(t, failedBefore+1, testutil.ToFloat64(
+		teardownFallbackTotal.WithLabelValues(teardownOpRestoreReconcile, teardownOutcomeFailed)), 0.0001,
+		"a stuck teardown is the operator's only signal that containers are pinned on the host")
+}
+
+// TestReconcileRestoring_TeardownFails_DoesNotRequarantine is the data-integrity half,
+// asserted on its own. Bind mounts follow the INODE, so renaming a volume dir back
+// into the retained namespace under a container that still holds it leaves that
+// container writing into data the record now advertises as frozen.
+func TestReconcileRestoring_TeardownFails_DoesNotRequarantine(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error {
+			return errors.New("device or resource busy")
+		},
+	}
+	b := newBackendForTest(mock, failedRestoreProvision())
+	rs := attachRetentionStore(t, b)
+	b.compose = failingDown()
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			t.Errorf("must not re-quarantine while a container may still hold the volume: %q -> %q", old, new)
+			return nil
+		},
+	}
+
+	e := restoringEntryFixture()
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+}
+
+// TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring: an unreadable
+// daemon is not evidence of a clean host, so it must be treated exactly like a stuck
+// container. RemoveContainerFn is left nil so the mock panics if anything is removed
+// off a listing that could not be read.
+func TestReconcileRestoring_TeardownDiscoveryFails_LeavesRecordRestoring(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return nil, errors.New("daemon unreachable")
+		},
+	}
+	b := newBackendForTest(mock, failedRestoreProvision())
+	rs := attachRetentionStore(t, b)
+	b.compose = failingDown()
+
+	e := restoringEntryFixture()
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
+	assert.Equal(t, 3, entry.Generation)
+
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.True(t, hasU2, "an unprovable host state must keep the lease tracked")
+}
+
+// TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable is the
+// retryability pin: parking the data must be a DELAY, never a loss.
+//
+// Leaving the record restoring blocks ClaimForRestore (ErrNotRestorable), so the
+// tenant cannot retry until the rollback completes. This drives the real retry loop —
+// runRetentionSweep, the same body the periodic reaper runs — across a broken daemon
+// and a recovered one, and ends by proving the restore is claimable again.
+func TestReconcileRestoring_TeardownFails_ThenSucceeds_RestoreStaysClaimable(t *testing.T) {
+	removalWorks := false
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			if removalWorks {
+				return nil, nil // compose's own teardown finally took effect
+			}
+			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error {
+			if removalWorks {
+				return nil
+			}
+			return errors.New("device or resource busy")
+		},
+	}
+	b := newBackendForTest(mock, failedRestoreProvision())
+	rs := attachRetentionStore(t, b)
+	b.compose = failingDown()
+	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }}
+
+	e := restoringEntryFixture()
+	require.NoError(t, rs.Put(e))
+
+	// Sweep 1: daemon is broken. The rollback must not half-complete.
+	require.NoError(t, b.runRetentionSweep(context.Background()))
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "the record must survive — it is the only pointer to the data")
+	require.Equal(t, shared.RetentionStatusRestoring, entry.Status)
+	_, claimErr := rs.ClaimForRestore("u1", "u3", 0)
+	require.ErrorIs(t, claimErr, shared.ErrNotRestorable,
+		"while parked the restore is blocked — this is the cost the posture accepts")
+
+	// Sweep 2: daemon recovered. The retry finishes the rollback it deferred.
+	removalWorks = true
+	require.NoError(t, b.runRetentionSweep(context.Background()))
+
+	entry, err = rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	require.Equal(t, shared.RetentionStatusActive, entry.Status, "the deferred rollback completed on retry")
+	assert.Equal(t, 4, entry.Generation)
+
+	// The point of all of it: the data is restorable again.
+	claimed, err := rs.ClaimForRestore("u1", "u3", 0)
+	require.NoError(t, err, "a crashed restore must never cost the tenant the ability to restore")
+	require.NotNil(t, claimed)
+	assert.Equal(t, "u3", claimed.NewLeaseUUID)
+}
+
+// TestReconcileRestoring_TeardownFails_RecordNotReapable pins what makes the wait
+// safe: the expiry reaper cannot touch a parked record. ListExpired and
+// MarkReapingIfExpired both require Status==Active, so an aged-out restoring record
+// is skipped rather than destroyed. Asserted rather than assumed, because the whole
+// posture rests on it.
+func TestReconcileRestoring_TeardownFails_RecordNotReapable(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error { return errors.New("busy") },
+	}
+	b := newBackendForTest(mock, failedRestoreProvision())
+	rs := attachRetentionStore(t, b)
+	b.compose = failingDown()
+	b.cfg.RetentionMaxAge = time.Nanosecond // everything is expired
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Errorf("a parked restoring record's data must never be reaped, got destroy of %q", id)
+			return nil
+		},
+	}
+
+	e := restoringEntryFixture()
+	e.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
+	require.NoError(t, rs.Put(e))
+
+	b.reconcileRestoring(context.Background(), e)
+
+	n, err := b.reapExpiredRetentions(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, n, "a restoring record is not an expiry candidate")
+
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "the record — and the data it names — must survive the reaper")
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
+}
+
+// TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring is the sibling site
+// (ENG-647's "decide and document"). doRestore's terminal defer calls this with
+// dropProvision=false, AFTER doReplaceContainers ran a compose Up — so containers can
+// exist here and the same precondition applies.
+func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error { return errors.New("busy") },
+	}
+	b := newBackendForTest(mock, failedRestoreProvision())
+	rs := attachRetentionStore(t, b)
+	b.compose = failingDown()
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(old, new string) error {
+			t.Errorf("must not re-quarantine while a container may still hold the volume: %q -> %q", old, new)
+			return nil
+		},
+	}
+
+	allocID := "u2-" + manifest.DefaultServiceName + "-0"
+	require.NoError(t, b.pool.TryAllocate(allocID, "docker-small", "tenant-a"))
+
+	e := restoringEntryFixture()
+	require.NoError(t, rs.Put(e))
+
+	b.rollbackRestoreAdoption(context.Background(), "u2", []string{allocID}, &e, false, b.logger)
+
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status,
+		"the reconcile sweep must retry this rollback rather than inherit a half-done one")
+	assert.Equal(t, 3, entry.Generation)
+
+	assert.Equal(t, 1, b.pool.Stats().AllocationCount,
+		"live capacity stays counted while the containers holding it may still be running")
+
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.True(t, hasU2, "the provision stays so the actor can still author the failure callback")
+}
+
+// TestRollbackRestoreAdoption_PreludeFailure_TeardownErrorDoesNotWedge pins the
+// deliberate exemption. dropProvision=true means the worker never ran (adopt / route /
+// ack failure, all BEFORE any compose Up), so nothing can be stranded and a Down error
+// is a wedged daemon rather than a leak.
+//
+// Bailing here would leave a Provisioning provision behind a restoring record —
+// exactly the pair reconcileRestoring's in-flight guard defers on forever, a wedge
+// only a restart clears. Completing the rollback is the only way that lease becomes
+// clean again.
+func TestRollbackRestoreAdoption_PreludeFailure_TeardownErrorDoesNotWedge(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return nil, errors.New("daemon unreachable")
+		},
+	}
+	b := newBackendForTest(mock, map[string]*provision{
+		"u2": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u2",
+			Status:    backend.ProvisionStatusProvisioning, // the prelude's reservation
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+	b.compose = failingDown()
+	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }}
+
+	allocID := "u2-" + manifest.DefaultServiceName + "-0"
+	require.NoError(t, b.pool.TryAllocate(allocID, "docker-small", "tenant-a"))
+
+	e := restoringEntryFixture()
+	require.NoError(t, rs.Put(e))
+
+	b.rollbackRestoreAdoption(context.Background(), "u2", []string{allocID}, &e, true, b.logger)
+
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status,
+		"a prelude rollback must complete even when the daemon is unreachable — no compose Up ran")
+	assert.Equal(t, 4, entry.Generation)
+
+	b.provisionsMu.RLock()
+	_, hasU2 := b.provisions["u2"]
+	b.provisionsMu.RUnlock()
+	assert.False(t, hasU2,
+		"the reservation must be dropped, or reconcileRestoring's in-flight guard defers on it forever")
+	assert.Zero(t, b.pool.Stats().AllocationCount, "and its capacity returned")
+}

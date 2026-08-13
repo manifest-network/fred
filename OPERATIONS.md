@@ -45,6 +45,7 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A `fred-retained-*`/leaked volume the sweep can't destroy — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual reclaim. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
 | `fred_docker_backend_volume_quota_clear_failed_total` rising | An XFS volume `Destroy` failed to clear its project block limit — the project-quota table is regrowing (leaked zero-byte entries slow every `xfs_quota` scan) | [Leaked XFS project-quota entries](#leaked-xfs-project-quota-entries) |
+| `fred_docker_backend_teardown_fallback_total{outcome="failed"}` rising | A `compose down` failed AND the per-container fallback could not finish it, so containers — and the anonymous volumes attached to them — are pinned on this host. Not data loss: fred keeps the lease tracked and its capacity reserved rather than advancing state over live containers, and retries. `outcome="recovered"` on the same counter is the benign case (the fallback finished the job) and needs no action beyond noting a flaky daemon. A sustained `failed` rate with `operation="restore_reconcile"` also means the affected tenant cannot retry its restore until the teardown succeeds | [Stuck teardown](#stuck-teardown-docker-backend) |
 | `fred_docker_backend_retention_partition_collapsed_total` increasing | Partition declarations collapsing to the default bucket — harmless (closes are never blocked, data is never destroyed), but check the `reason` label first: `invalid` / `divergent` / `over_limit` signal an integrator-side key bug, while `no_input` / `store_error` signal a backend hydration or store-health issue | [Partition collapse triage](#partition-collapse-triage) |
 | `fred_docker_backend_retention_cap_check_failed_total` increasing | Retention cap checks are failing OPEN on store-read errors — quotas are silently unenforced (data-safe, but the gates are off) | Check `retention.db` health; see the `store_error` row in [Partition collapse triage](#partition-collapse-triage) |
 
@@ -89,6 +90,29 @@ If `lease_actor_stuck_seconds` exceeds your alert threshold, one specific lease'
 - **Genuine deadlock**: file an issue with the goroutine dump. The actor will not unblock; the reconciler will re-detect the lease on its next cycle and retry, but the wedged goroutine leaks until restart.
 
 **Last resort:** restarting the docker-backend recovers cleanly. State is rebuilt from Docker labels and bbolt stores on startup.
+
+---
+
+## Stuck teardown (docker-backend)
+
+**Symptom:** `fred_docker_backend_teardown_fallback_total{outcome="failed"}` is rising.
+
+**What it means:** `compose down` failed for a lease, and the per-container fallback could not finish the job either. Containers for that lease are still on the host, and so are the anonymous volumes Docker attached to them.
+
+`outcome="recovered"` on the same counter is the benign twin — `down` failed but the fallback removed everything — and needs no action beyond noting that the daemon is flaky.
+
+**This is not data loss, and not an over-admission.** fred deliberately refuses to advance state over containers it cannot prove are gone: the lease stays tracked, its pool reservation stays held, and the teardown is retried (the retention sweep for a restore rollback, the lease's own retry for a close). What it does cost is capacity and disk that stay reserved, plus one anonymous volume per surviving container.
+
+**Triage:**
+
+1. Find the lease and the operation from the `operation` label and the warning logs (`compose down failed, falling back to individual removal`, then `failed to remove container`).
+2. Check the daemon: `docker ps -a --filter label=fred.lease_uuid=<uuid>`. A container stuck in `Removal In Progress`, or one whose `docker rm -f` hangs, usually means a wedged storage driver or a mount the kernel still holds.
+3. Fix the substrate (see [Wedged lease actor](#wedged-lease-actor-docker-backend) for the same class of causes). fred retries on its own; no operator action is needed in fred itself once the daemon can remove containers again.
+4. Restarting the docker-backend is safe and often enough: `recoverState` rebuilds from Docker labels, and the retry paths run again at boot.
+
+**Restore-specific consequence.** With `operation="restore_reconcile"` or `restore_rollback`, the tenant's retention record stays in `restoring` until the teardown succeeds, and a restore cannot be re-requested while it does (the API reports the lease as not restorable). The data itself is safe — a `restoring` record is never reaped and its volumes are excluded from the orphan sweep — but the retention window keeps ageing, so clear the daemon fault well before `retention_max_age` expires for that lease.
+
+To confirm nothing is stranded after the fault clears, the counter should stop rising and `docker volume ls -qf dangling=true` should stop growing.
 
 ---
 

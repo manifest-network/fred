@@ -39,6 +39,27 @@ const (
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
 var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRootUnverifiable, orphanSkipRaced, orphanSkipDisabled, orphanSkipStoreError}
 
+// Operation and outcome labels for teardownFallbackTotal — which teardown path had
+// to compensate for a failed compose Down, and whether the compensation finished the
+// job (ENG-647). Kept as constants so the four call sites, the pre-init, and the
+// tests cannot drift on a typo.
+const (
+	teardownOpRestoreReconcile = "restore_reconcile" // reconcileRestoring's orphaned arm (boot + retention sweep)
+	teardownOpRestoreRollback  = "restore_rollback"  // rollbackRestoreAdoption (failed/panicked restore worker)
+	teardownOpDeprovision      = "deprovision"       // doDeprovision's close-path teardown
+	teardownOpProvisionCleanup = "provision_cleanup" // the stack-provision failure defer
+	teardownOutcomeRecovered   = "recovered"         // fallback removed every container it found
+	teardownOutcomeFailed      = "failed"            // a container may still be running (removal or discovery failed)
+)
+
+// teardownOperations / teardownOutcomes are the closed label sets, pre-initialized to
+// 0 so a "compensation is failing" alert reads 0 rather than no-data before the first
+// Down failure — which, on a healthy provider, may be never.
+var (
+	teardownOperations = []string{teardownOpRestoreReconcile, teardownOpRestoreRollback, teardownOpDeprovision, teardownOpProvisionCleanup}
+	teardownOutcomes   = []string{teardownOutcomeRecovered, teardownOutcomeFailed}
+)
+
 // Scope labels for retentionRefusedByScopeTotal — the cap level that tripped a
 // close-time refuse-to-retain. Kept as constants so the disk gate, the pre-init,
 // and the tests cannot drift on a typo.
@@ -578,6 +599,25 @@ var (
 		Help:      "Retained-volume leak events (failed destroy / give-up / uncommitted revert) — see ENG-376",
 	})
 
+	// teardownFallbackTotal counts the per-container compensation that runs when compose
+	// Down fails, by teardown path and result (ENG-647). Down is the only call that reaps
+	// a container's anonymous volumes, so a Down failure with no compensation leaks them
+	// silently and cumulatively (the ENG-372 class) — compose v5 made this likelier by
+	// running its removals on the errgroup's derived context, so the first failure cancels
+	// its siblings mid-flight.
+	//
+	// outcome="recovered" means the fallback finished the teardown; the lease is clean and
+	// only the substrate hiccup is noteworthy. outcome="failed" means at least one
+	// container may STILL be running: fred keeps the lease tracked and retries rather than
+	// advancing state over it, so a sustained rate is not data loss — it is capacity and
+	// anonymous volumes pinned on the host, and a daemon that needs a look.
+	teardownFallbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "teardown_fallback_total",
+		Help:      "Per-container teardown fallbacks after a failed compose Down, by operation and outcome (ENG-647)",
+	}, []string{"operation", "outcome"})
+
 	// restoreFinalizerPendingTotal counts restore finalizations kept pending: a restore
 	// succeeded (new lease Ready) but its active-release write failed, so the retention
 	// record is LEFT restoring to keep protecting the adopted volume as its finalizer
@@ -649,6 +689,14 @@ func init() {
 	// Pre-init the quota-backfill outcomes to 0 (ENG-454).
 	for _, oc := range quotaBackfillOutcomes {
 		volumeQuotaBackfillTotal.WithLabelValues(oc).Add(0)
+	}
+	// Pre-init every teardown-fallback series to 0 (ENG-647). A provider whose compose
+	// Down never fails would otherwise export nothing, and "no-data" is indistinguishable
+	// from "healthy" in the alert that watches outcome="failed".
+	for _, op := range teardownOperations {
+		for _, oc := range teardownOutcomes {
+			teardownFallbackTotal.WithLabelValues(op, oc).Add(0)
+		}
 	}
 	// Pre-init the partition-collapse reasons, refuse scopes, and cap-check series
 	// to 0 so absence/ratio alert queries return 0, not no-data, before the first

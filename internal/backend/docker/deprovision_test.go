@@ -127,6 +127,9 @@ func TestDeprovision_PartialFailure_AuthorsCleanupFailed(t *testing.T) {
 		RemoveContainerFn: func(_ context.Context, _ string) error {
 			return errors.New("container removal blocked: device or resource busy")
 		},
+		// The fallback re-discovers by label (ENG-647); an empty listing keeps this
+		// test's subject the RECORDED container, exactly as before.
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
@@ -197,6 +200,11 @@ func TestDoDeprovision_ComposeDownFails_RemovesEveryRecordedContainer(t *testing
 			removed = append(removed, id)
 			return nil
 		},
+		// Daemon reports nothing (labels lost / already delisted), so the recorded list
+		// is the only source left. That is the case this test exists to pin; the
+		// complementary case — an EMPTY record and a daemon that does report the
+		// containers — is TestDoDeprovision_ComposeDownFails_RemovesDiscoveredContainersWhenRecordIsEmpty.
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
@@ -283,4 +291,187 @@ func TestDoDeprovision_GiveUp_ReleasesPoolReservation(t *testing.T) {
 	_, stillTracked := b.provisions[lease]
 	b.provisionsMu.RUnlock()
 	assert.False(t, stillTracked, "given-up lease must be removed from b.provisions")
+}
+
+// TestDoDeprovision_ComposeDownFails_RemovesDiscoveredContainersWhenRecordIsEmpty is
+// the complement of TestDoDeprovision_ComposeDownFails_RemovesEveryRecordedContainer,
+// and the reason the fallback had to stop trusting the record (ENG-647).
+//
+// A lease that never reached Ready carries NO ContainerIDs — Restore reserves the
+// entry empty and only the success paths fill it in, and recoverState's status-keyed
+// merge preserves an existing Failed entry by pointer, so it is never backfilled while
+// the process runs. Walking that list removes nothing precisely when a container
+// leaked. Discovery by fred label is what closes it.
+func TestDoDeprovision_ComposeDownFails_RemovesDiscoveredContainersWhenRecordIsEmpty(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-00000000000e"
+
+	var removed []string
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{ContainerID: "c-web-0", LeaseUUID: lease, SKU: "docker-small"},
+				{ContainerID: "c-web-1", LeaseUUID: lease, SKU: "docker-small"},
+				{ContainerID: "c-other", LeaseUUID: "someone-else", SKU: "docker-small"},
+			}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, id string) error {
+			removed = append(removed, id)
+			return nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "t", Status: backend.ProvisionStatusFailed,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+			// ContainerIDs deliberately absent: the failed-restore shape.
+		}},
+	})
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error {
+			return errors.New("compose down canceled after first removal failed")
+		},
+	}
+
+	require.NoError(t, b.doDeprovision(context.Background(), lease),
+		"a failed Down whose fallback removes every container is a successful deprovision")
+
+	assert.ElementsMatch(t, []string{"c-web-0", "c-web-1"}, removed,
+		"the lease's containers must be found by label when the record names none; "+
+			"anything missed here keeps its anonymous volumes forever (ENG-372)")
+}
+
+// ---------------------------------------------------------------------------
+// ENG-647 retryability guard: a close must not eat an in-flight restore's data.
+//
+// While a record is restoring, the ORIGINAL lease's retained data lives under the NEW
+// lease's canonical names, so closing the new lease sees volumes that look like its
+// own. Destroying them, or re-retaining them under the closing lease, permanently
+// kills the original lease's restore.
+// ---------------------------------------------------------------------------
+
+// seedRestoringInto puts a restoring record whose data has been adopted into
+// newLease's namespace, and returns the canonical name that adoption produced.
+func seedRestoringInto(t *testing.T, rs *shared.RetentionStore, orig, newLease string) string {
+	t.Helper()
+	retained := retainedName(canonicalVolumeName(orig, "app", 0))
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   orig,
+		NewLeaseUUID:        newLease,
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          3,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		RetainedVolumeNames: []string{retained},
+	}))
+	return retainedToNewCanonical(retained, orig, newLease)
+}
+
+func TestDoDeprovision_RetainPath_SkipsVolumesClaimedByRestoringRecord(t *testing.T) {
+	const lease = "u2"
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 2,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+		}},
+	})
+	b.cfg.RetainOnClose = true
+	rs := attachRetentionStore(t, b)
+	claimedVol := seedRestoringInto(t, rs, "u1", lease)
+
+	var renames [][2]string
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			// app-0 is u1's data adopted into u2's namespace; app-1 is genuinely u2's.
+			return []string{claimedVol, canonicalVolumeName(lease, "app", 1)}, nil
+		},
+		RenameVolumeFn: func(old, new string) error {
+			renames = append(renames, [2]string{old, new})
+			return nil
+		},
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Errorf("retain path must not destroy %q", id)
+			return nil
+		},
+	}
+
+	require.NoError(t, b.doDeprovision(context.Background(), lease))
+
+	assert.Equal(t, [][2]string{{
+		canonicalVolumeName(lease, "app", 1),
+		retainedName(canonicalVolumeName(lease, "app", 1)),
+	}}, renames,
+		"only the closing lease's OWN volume may be retained; re-retaining the adopted one "+
+			"under u2 leaves u1's record pointing at names that no longer exist (ENG-647)")
+
+	orig, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, orig, "the original record must be untouched")
+	assert.Equal(t, shared.RetentionStatusRestoring, orig.Status)
+	assert.Equal(t, []string{retainedName(canonicalVolumeName("u1", "app", 0))}, orig.RetainedVolumeNames,
+		"and must still name the data reconcileRestoring will re-quarantine")
+}
+
+// TestDoDeprovision_NonRetainPath_DoesNotDestroyVolumesClaimedByRestoringRecord is the
+// data-loss pin: the destroy arm names volumes by convention (canonicalVolumeName),
+// so without the guard it deletes the adopted data outright and unrecoverably.
+func TestDoDeprovision_NonRetainPath_DoesNotDestroyVolumesClaimedByRestoringRecord(t *testing.T) {
+	const lease = "u2"
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 2,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+		}},
+	})
+	// RetainOnClose stays false — the pure destroy path.
+	rs := attachRetentionStore(t, b)
+	claimedVol := seedRestoringInto(t, rs, "u1", lease)
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error {
+			destroyed = append(destroyed, id)
+			return nil
+		},
+	}
+
+	require.NoError(t, b.doDeprovision(context.Background(), lease))
+
+	assert.Equal(t, []string{canonicalVolumeName(lease, "app", 1)}, destroyed,
+		"the volume claimed by u1's in-flight restore must NOT be destroyed — that is "+
+			"unrecoverable loss of the data u1's record exists to protect (ENG-647)")
+	assert.NotContains(t, destroyed, claimedVol)
+}
+
+// TestDoDeprovision_RestoringClaimLookupFails_DoesNotDestroy pins the fail-safe: if the
+// retention store cannot be read we cannot tell our volumes from an in-flight
+// restore's, so we destroy neither and let the lease retry.
+func TestDoDeprovision_RestoringClaimLookupFails_DoesNotDestroy(t *testing.T) {
+	const lease = "u2"
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Close()) // every retention read now fails
+
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Errorf("must not destroy %q when the claim lookup failed — the volume may belong to an in-flight restore", id)
+			return nil
+		},
+	}
+
+	err := b.doDeprovision(context.Background(), lease)
+	require.Error(t, err, "an unreadable retention store must keep the lease Failed for retry, not report success")
 }

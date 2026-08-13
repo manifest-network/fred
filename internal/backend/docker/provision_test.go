@@ -1321,12 +1321,17 @@ func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
 	defer server.Close()
 
 	removeShouldFail := true
-	mock := &mockDockerClient{RemoveContainerFn: func(ctx context.Context, id string) error {
-		if removeShouldFail {
-			return fmt.Errorf("container removal failed")
-		}
-		return nil
-	}}
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(ctx context.Context, id string) error {
+			if removeShouldFail {
+				return fmt.Errorf("container removal failed")
+			}
+			return nil
+		},
+		// The fallback re-discovers by label (ENG-647); an empty listing keeps the
+		// recorded ContainerIDs as this test's subject across both retry attempts.
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,

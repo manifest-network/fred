@@ -290,18 +290,57 @@ func TestBuildComposeProject_TmpfsSizeLimits(t *testing.T) {
 	}
 }
 
-func TestBuildComposeProject_NoAnonymousVolumes(t *testing.T) {
+// TestBuildComposeProject_DeclaresNoNamedVolumes guards a premise the teardown path
+// depends on (ENG-647).
+//
+// compose Down runs with Volumes:true, which reaps a project's NAMED volumes as well
+// as its containers' anonymous ones. Its fallback, RemoveContainer with
+// RemoveVolumes:true, is `docker rm -v` — ANONYMOUS volumes only. The two are
+// therefore equivalent in reap coverage only while fred's projects declare no named
+// volumes: tenant data lives in bind-mounted host directories the volumeManager owns,
+// and image VOLUME directives are covered by a tmpfs override or a stateful bind.
+//
+// Introduce a top-level `volumes:` section or a service-level Type:"volume" and that
+// stops being true silently — Down would still reap it, the fallback would not, and
+// ENG-372's leak reopens on the exact path built to prevent it. If this test fails,
+// teardownLeaseContainers needs a named-volume story before the change lands.
+func TestBuildComposeProject_DeclaresNoNamedVolumes(t *testing.T) {
+	// A stack exercising every mount-producing path at once: two services, a stateful
+	// bind, a writable-path bind, an image VOLUME (tmpfs-overridden), tenant tmpfs, and
+	// readonly rootfs (which adds /tmp + /run).
 	params := baseProjectParams()
+	params.Stack.Services["web"] = &manifest.Manifest{Image: "nginx:latest", Tmpfs: []string{"/scratch"}}
+	params.Stack.Services["db"] = &manifest.Manifest{Image: "postgres:16"}
+	params.Items = []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
+		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
+	}
+	params.ImageSetups = map[string]*imageSetup{
+		"web": {Volumes: []string{"/var/cache/nginx"}}, // no stateful bind → tmpfs override
+		"db":  {Volumes: []string{"/var/lib/postgresql/data"}},
+	}
+	params.VolBinds = map[string]map[int]serviceVolBinds{
+		"db": {0: {
+			StatefulBinds: map[string]string{"/mnt/data/lease-1/db-0/data": "/var/lib/postgresql/data"},
+			WritableBinds: map[string]string{"/mnt/data/lease-1/db-0/_wp/run": "/run/postgresql"},
+		}},
+	}
+	params.Cfg.ContainerReadonlyRootfs = ptrBool(true)
 
 	project := buildComposeProject(params)
 
-	// No Docker-managed volumes should be in the project.
-	assert.Empty(t, project.Volumes)
+	assert.Empty(t, project.Volumes,
+		"a top-level volumes: section would declare NAMED volumes, which the per-container "+
+			"teardown fallback cannot reap (ENG-647)")
 
-	// All service volumes should be bind or tmpfs (no "volume" type).
-	svc := project.Services["web"]
-	for _, v := range svc.Volumes {
-		assert.NotEqual(t, "volume", v.Type, "no Docker-managed volumes should be created")
+	require.Len(t, project.Services, 2, "both services must be present for this to prove anything")
+	for name, svc := range project.Services {
+		require.NotEmpty(t, svc.Volumes, "service %s produced no mounts; the guard would pass vacuously", name)
+		for _, v := range svc.Volumes {
+			assert.Contains(t, []string{"bind", "tmpfs"}, v.Type,
+				"service %s mount %q must be a bind or tmpfs; Type:%q is a Docker-managed volume "+
+					"that `docker rm -v` will not reap (ENG-647)", name, v.Target, v.Type)
+		}
 	}
 }
 

@@ -1016,6 +1016,9 @@ func TestDeprovision_Stack_DownFallback(t *testing.T) {
 			mu.Unlock()
 			return nil
 		},
+		// The fallback re-discovers by label (ENG-647); an empty listing keeps the
+		// recorded ContainerIDs as this test's subject.
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 
 	composeMock := &mockComposeExecutor{

@@ -1349,6 +1349,9 @@ func TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted(t *testing.T) {
 		RemoveContainerFn: func(_ context.Context, _ string) error {
 			return fmt.Errorf("container stuck: device or resource busy")
 		},
+		// The fallback re-discovers by label (ENG-647); an empty listing leaves the
+		// recorded container as the subject, preserving this test's accounting scenario.
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-pf": {ProvisionState: leasesm.ProvisionState{

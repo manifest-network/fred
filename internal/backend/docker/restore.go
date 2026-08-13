@@ -119,8 +119,16 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	b.provisionsMu.RLock()
 	p, live := b.provisions[e.NewLeaseUUID]
 	var status backend.ProvisionStatus
+	var recordedIDs []string
 	if live {
 		status = p.Status
+		// Snapshot (not alias) under the lock, mirroring doDeprovision. Usually EMPTY
+		// here — Restore reserves the provision with no ContainerIDs and only the
+		// success paths fill them in — which is precisely why the teardown below
+		// re-discovers rather than trusting this (ENG-647). It is non-empty for a
+		// provision recoverState rebuilt from live containers, so it is still worth
+		// passing.
+		recordedIDs = slices.Clone(p.ContainerIDs)
 	}
 	b.provisionsMu.RUnlock()
 
@@ -159,9 +167,30 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	}
 	// Orphaned (crash/failed): tear down any orphaned project, re-quarantine the
 	// adopted volumes back to the retained namespace, then CAS the record to active.
+	//
+	// The teardown is a PRECONDITION for everything below it, not a best-effort
+	// courtesy, so a failure ends the pass (ENG-647). Two reasons, both fatal:
+	//   - The re-quarantine renames move the volume dirs back into the retained
+	//     namespace, and a surviving container holds them by INODE, so it would go on
+	//     writing into data the record then advertises as frozen.
+	//   - Reverting the record and dropping the provision would strand the containers
+	//     where nothing can see them: processOrphan only walks ListProvisions (which
+	//     ranges b.provisions, the map we would have just deleted from), and
+	//     cleanupOrphanedVolumes enumerates fred's bind-mount tree, never Docker's
+	//     anonymous-volume store. Their anonymous volumes then accumulate forever
+	//     (ENG-372).
+	// So: no partial rollback. Leave the record restoring, keep the provision and its
+	// pool allocation, and let the next sweep/boot retry — the same shape as the
+	// re-quarantine failure below, and the same finalizer contract the Ready arm above
+	// honors via finalizeRestoredLease (ENG-523). The wait is safe: a restoring record
+	// is not reapable (ListExpired/MarkReapingIfExpired both require ACTIVE) and
+	// cleanupOrphanedVolumes protects its canonicals.
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-	if derr := b.compose.Down(ctx, composeProjectName(e.NewLeaseUUID), stopTimeout); derr != nil {
-		b.logger.Warn("reconcile: compose down failed (continuing)", "lease_uuid", e.NewLeaseUUID, "error", derr)
+	if _, derr := b.teardownLeaseContainers(ctx, e.NewLeaseUUID, recordedIDs, stopTimeout,
+		teardownOpRestoreReconcile, b.logger.With("lease_uuid", e.NewLeaseUUID)); derr != nil {
+		b.logger.Warn("reconcile: teardown failed; leaving record restoring for the next sweep",
+			"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID, "error", derr)
+		return
 	}
 	// Re-quarantine each adopted volume. A REAL rename failure (not a benign
 	// no-op) means the volume may still be canonical-named: we must NOT advance
@@ -1191,8 +1220,31 @@ func (b *Backend) finalizeRestoredLease(leaseUUID string, rec *shared.RetentionE
 func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 	allocatedIDs []string, rec *shared.RetentionEntry, dropProvision bool, logger *slog.Logger) {
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-	if derr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); derr != nil {
-		logger.Warn("restore rollback: compose down failed (continuing)", "error", derr)
+	b.provisionsMu.RLock()
+	var recordedIDs []string
+	if p, ok := b.provisions[leaseUUID]; ok {
+		recordedIDs = slices.Clone(p.ContainerIDs)
+	}
+	b.provisionsMu.RUnlock()
+	if _, derr := b.teardownLeaseContainers(ctx, leaseUUID, recordedIDs, stopTimeout,
+		teardownOpRestoreRollback, logger); derr != nil && !dropProvision {
+		// Same precondition as reconcileRestoring's orphaned arm: a surviving container
+		// holds the adopted volumes by inode, so re-quarantining them now would let it
+		// write into data the record calls frozen (ENG-647). Leave the record restoring
+		// with the live allocation counted; the reconcile sweep retries the whole
+		// rollback, and doRestore's caller still gets its errored ReplaceResult, so the
+		// actor's evReplaceFailed → Failed transition and its callback are unaffected.
+		//
+		// dropProvision==true is deliberately EXEMPT. It means the worker never ran
+		// (adopt/route/ack failure in the synchronous prelude), so no compose Up
+		// happened and there is nothing to strand — a Down error there is a wedged
+		// daemon, not a leak. Bailing would leave a Provisioning provision behind a
+		// restoring record, which reconcileRestoring's in-flight guard then defers on
+		// forever: a wedge only a restart clears. Dropping the reservation is the only
+		// way that lease ever becomes clean again.
+		logger.Warn("restore rollback: teardown failed; leaving record restoring for the reconcile sweep",
+			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID, "error", derr)
+		return
 	}
 	failed := false
 	for _, retained := range rec.RetainedVolumeNames {

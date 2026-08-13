@@ -4,7 +4,11 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"testing"
 	"time"
@@ -241,4 +245,115 @@ func TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes(t *te
 	})
 
 	assert.Empty(t, leaked, "image introspection leaked anonymous volume(s): %v", leaked)
+}
+
+// TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFails closes
+// the loop the other two tests in this file each cover half of: it drives fred's real
+// compensation path — teardownLeaseContainers — against a real daemon, with compose
+// Down forced to fail so the per-container fallback is the ONLY thing that can reap.
+//
+// The two halves it joins: ComposeDown_RemovesAnonymousVolumes pins the happy path,
+// RemoveContainer_RemovesAnonymousVolumes pins the primitive. Neither proves fred
+// FINDS the containers when Down fails — which is the ENG-647 defect, since the
+// provision record names none of them on the restore-rollback arms. Discovery here is
+// by fred label against a live daemon, so a labelling or filtering regression fails
+// this test rather than silently leaking.
+//
+// It also pins the boundary that makes the fallback a safe substitute for Down: the
+// bind-mounted tenant directory must survive. RemoveContainer passes RemoveVolumes:true
+// (`docker rm -v`), which reaps ANONYMOUS volumes only — never binds, and never named
+// volumes, which is why fred's projects must declare none
+// (TestBuildComposeProject_DeclaresNoNamedVolumes).
+func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	docker := newIntegrationDockerClient(t, ctx)
+
+	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
+
+	composeSvc, err := newComposeService("")
+	require.NoError(t, err)
+
+	// Tenant data lives in a bind mount, exactly as applyVolumeBinds produces.
+	tenantDir := t.TempDir()
+	dataFile := filepath.Join(tenantDir, "tenant.dat")
+	require.NoError(t, os.WriteFile(dataFile, []byte("tenant data"), 0o600))
+
+	params := baseProjectParams()
+	params.LeaseUUID = fmt.Sprintf("eng647-teardown-%d", time.Now().UnixNano())
+	params.NetworkName = "" // compose's default network; no pre-created tenant net
+	params.Stack.Services["web"] = &manifest.Manifest{
+		Image:   "busybox:latest",
+		Command: []string{"sleep", "3600"},
+	}
+	params.VolBinds = map[string]map[int]serviceVolBinds{
+		"web": {0: {StatefulBinds: map[string]string{tenantDir: "/data"}}},
+	}
+	project := buildComposeProject(params)
+	svc := project.Services["web"]
+	// Force the anonymous volume an uncovered image VOLUME would produce.
+	svc.Volumes = append(svc.Volumes, composetypes.ServiceVolumeConfig{
+		Type:   "volume",
+		Target: "/anon-data",
+	})
+	project.Services["web"] = svc
+
+	projectName := composeProjectName(params.LeaseUUID)
+	containerName := "fred-" + params.LeaseUUID + "-web-0"
+
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer ccancel()
+		_ = composeSvc.Down(cctx, projectName, 5*time.Second)
+	})
+
+	require.NoError(t, composeSvc.Up(ctx, project, composeUpOpts{}))
+
+	inspected, err := docker.client.ContainerInspect(ctx, containerName)
+	require.NoError(t, err)
+	var anonVol string
+	for _, m := range inspected.Mounts {
+		if string(m.Type) == "volume" && m.Destination == "/anon-data" {
+			anonVol = m.Name
+		}
+	}
+	require.NotEmpty(t, anonVol, "expected an anonymous volume mounted at /anon-data")
+	_, err = docker.client.VolumeInspect(ctx, anonVol)
+	require.NoError(t, err, "anonymous volume should exist after Up")
+
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer ccancel()
+		_ = docker.client.VolumeRemove(cctx, anonVol, true)
+	})
+
+	// A real daemon behind RemoveContainer/ListManagedContainers, with compose Down
+	// failing the way v5 does when its errgroup cancels teardown part-way.
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.docker = docker
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error {
+			return errors.New("compose down canceled after first removal failed")
+		},
+	}
+
+	// No recorded container IDs — the failed-restore shape, where discovery is the
+	// only way to find anything at all.
+	remaining, err := b.teardownLeaseContainers(ctx, params.LeaseUUID, nil, 5*time.Second,
+		teardownOpDeprovision, slog.Default())
+	require.NoError(t, err, "the fallback must finish the teardown compose Down abandoned")
+	assert.Empty(t, remaining)
+
+	_, err = docker.client.ContainerInspect(ctx, containerName)
+	assert.True(t, client.IsErrNotFound(err),
+		"container %s must be removed by the fallback; got err=%v", containerName, err)
+
+	_, err = docker.client.VolumeInspect(ctx, anonVol)
+	assert.True(t, client.IsErrNotFound(err),
+		"anonymous volume %s must be reaped by the fallback; got err=%v", anonVol, err)
+
+	// The tenant's bind-mounted data is NOT a Docker volume and must be untouched.
+	got, err := os.ReadFile(dataFile)
+	require.NoError(t, err, "teardown must never remove bind-mounted tenant data")
+	assert.Equal(t, "tenant data", string(got))
 }
