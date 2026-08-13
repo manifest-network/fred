@@ -69,9 +69,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   permanently ending its ability to be restored. Those volumes are now recognised
   and left alone.
 
-  New metric `fred_docker_backend_teardown_fallback_total{operation,outcome}`;
-  a rising `outcome="failed"` means containers and their anonymous volumes are
-  pinned on the host and the daemon needs attention (see OPERATIONS.md).
+  New metric `fred_docker_backend_teardown_fallback_total{operation,outcome}`.
+  A rising `outcome="failed"` means the fallback could not finish either, but
+  what that costs depends on the `operation`: the *blocking* paths
+  (`restore_reconcile`, `restore_rollback`, `deprovision`) hold the lease and its
+  capacity open and retry, while the *advisory* ones (`restore_prelude`,
+  `provision_cleanup`) let state advance regardless, so nothing retries — and
+  `restore_prelude` in particular is routinely just a canceled restore request
+  with nothing on the host. See OPERATIONS.md for the triage split.
 
 - **One unreachable backend no longer stops reconciliation for the whole fleet**
   (ENG-356). `fetchAllProvisions` aborted the entire sweep if any single backend

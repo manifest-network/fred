@@ -1226,8 +1226,19 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 		recordedIDs = slices.Clone(p.ContainerIDs)
 	}
 	b.provisionsMu.RUnlock()
+	// Label the two arms apart. They are the same call but not the same event: the worker
+	// arm BLOCKS on a failed teardown (below), while the prelude arm discards the error
+	// and completes the rollback, so counting both as restore_rollback would make the
+	// wedge case unqueryable and put "nothing is wrong" samples in the alerting series
+	// (ENG-647). The prelude callers are themselves entered on caller-context
+	// cancellation and then hand that same dead context to the teardown, so a failure
+	// there is routinely just a canceled request, not a leak.
+	teardownOp := teardownOpRestoreRollback
+	if dropProvision {
+		teardownOp = teardownOpRestorePrelude
+	}
 	if _, derr := b.teardownLeaseContainers(ctx, leaseUUID, recordedIDs, stopTimeout,
-		teardownOpRestoreRollback, logger); derr != nil && !dropProvision {
+		teardownOp, logger); derr != nil && !dropProvision {
 		// Same precondition as reconcileRestoring's orphaned arm: a surviving container
 		// holds the adopted volumes by inode, so re-quarantining them now would let it
 		// write into data the record calls frozen (ENG-647). Leave the record restoring

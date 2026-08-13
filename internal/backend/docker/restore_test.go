@@ -4255,6 +4255,9 @@ func TestReconcileRestoring_TeardownFails_RecordNotReapable(t *testing.T) {
 // dropProvision=false, AFTER doReplaceContainers ran a compose Up — so containers can
 // exist here and the same precondition applies.
 func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.T) {
+	rollbackBefore := testutil.ToFloat64(
+		teardownFallbackTotal.WithLabelValues(teardownOpRestoreRollback, teardownOutcomeFailed))
+
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
 			return []ContainerInfo{managedContainer("c-stuck", "u2")}, nil
@@ -4293,6 +4296,12 @@ func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.
 	_, hasU2 := b.provisions["u2"]
 	b.provisionsMu.RUnlock()
 	assert.True(t, hasU2, "the provision stays so the actor can still author the failure callback")
+
+	// The converse of the prelude test: this arm DOES hold state open for surviving
+	// containers, so it belongs in the blocking series an operator pages on.
+	assert.InDelta(t, rollbackBefore+1, testutil.ToFloat64(
+		teardownFallbackTotal.WithLabelValues(teardownOpRestoreRollback, teardownOutcomeFailed)), 0.0001,
+		"the worker arm blocks on a failed teardown, so it counts as restore_rollback")
 }
 
 // TestRollbackRestoreAdoption_PreludeFailure_TeardownErrorDoesNotWedge pins the
@@ -4305,6 +4314,11 @@ func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.
 // only a restart clears. Completing the rollback is the only way that lease becomes
 // clean again.
 func TestRollbackRestoreAdoption_PreludeFailure_TeardownErrorDoesNotWedge(t *testing.T) {
+	preludeBefore := testutil.ToFloat64(
+		teardownFallbackTotal.WithLabelValues(teardownOpRestorePrelude, teardownOutcomeFailed))
+	rollbackBefore := testutil.ToFloat64(
+		teardownFallbackTotal.WithLabelValues(teardownOpRestoreRollback, teardownOutcomeFailed))
+
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
 			return nil, errors.New("daemon unreachable")
@@ -4341,4 +4355,16 @@ func TestRollbackRestoreAdoption_PreludeFailure_TeardownErrorDoesNotWedge(t *tes
 	assert.False(t, hasU2,
 		"the reservation must be dropped, or reconcileRestoring's in-flight guard defers on it forever")
 	assert.Zero(t, b.pool.Stats().AllocationCount, "and its capacity returned")
+
+	// The state asserted above — record active, provision gone, capacity returned — is
+	// the exact opposite of what a blocking teardown failure means, so this event must
+	// NOT land in the series an operator pages on. It is counted under its own advisory
+	// operation instead (ENG-647, PR #217 review).
+	assert.InDelta(t, preludeBefore+1, testutil.ToFloat64(
+		teardownFallbackTotal.WithLabelValues(teardownOpRestorePrelude, teardownOutcomeFailed)), 0.0001,
+		"an advisory prelude teardown failure must be counted under restore_prelude")
+	assert.InDelta(t, rollbackBefore, testutil.ToFloat64(
+		teardownFallbackTotal.WithLabelValues(teardownOpRestoreRollback, teardownOutcomeFailed)), 0.0001,
+		"and must NOT smear the blocking restore_rollback series, whose meaning is "+
+			"'containers are pinned and fred is holding state open for them'")
 }

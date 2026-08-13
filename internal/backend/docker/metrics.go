@@ -41,23 +41,38 @@ var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRootUnverifiable
 
 // Operation and outcome labels for teardownFallbackTotal — which teardown path had
 // to compensate for a failed compose Down, and whether the compensation finished the
-// job (ENG-647). Kept as constants so the four call sites, the pre-init, and the
-// tests cannot drift on a typo.
+// job (ENG-647). Kept as constants so the call sites, the pre-init, and the tests
+// cannot drift on a typo.
+//
+// The operations split into two kinds, and the distinction is what an alert must key
+// on. BLOCKING operations treat a failed teardown as fatal: the lease stays tracked,
+// its capacity stays reserved, and the teardown is retried, so outcome="failed" there
+// means containers are pinned and fred is holding state open for them. ADVISORY
+// operations discard the error and let state advance anyway, so outcome="failed"
+// there means "a possible leak, or merely an unreachable daemon" — never "fred is
+// waiting". Mixing the two under one label would make the wedge case unqueryable.
 const (
+	// Blocking.
 	teardownOpRestoreReconcile = "restore_reconcile" // reconcileRestoring's orphaned arm (boot + retention sweep)
-	teardownOpRestoreRollback  = "restore_rollback"  // rollbackRestoreAdoption (failed/panicked restore worker)
+	teardownOpRestoreRollback  = "restore_rollback"  // rollbackRestoreAdoption, worker arm: teardown blocks the rollback
 	teardownOpDeprovision      = "deprovision"       // doDeprovision's close-path teardown
-	teardownOpProvisionCleanup = "provision_cleanup" // the stack-provision failure defer
-	teardownOutcomeRecovered   = "recovered"         // fallback removed every container it found
-	teardownOutcomeFailed      = "failed"            // a container may still be running (removal or discovery failed)
+	// Advisory.
+	teardownOpRestorePrelude   = "restore_prelude"   // rollbackRestoreAdoption, dropProvision arm: the rollback completes regardless
+	teardownOpProvisionCleanup = "provision_cleanup" // the stack-provision failure defer, best-effort by design
+
+	teardownOutcomeRecovered = "recovered" // fallback removed every container it found
+	teardownOutcomeFailed    = "failed"    // a container may still be running (removal or discovery failed)
 )
 
 // teardownOperations / teardownOutcomes are the closed label sets, pre-initialized to
 // 0 so a "compensation is failing" alert reads 0 rather than no-data before the first
 // Down failure — which, on a healthy provider, may be never.
 var (
-	teardownOperations = []string{teardownOpRestoreReconcile, teardownOpRestoreRollback, teardownOpDeprovision, teardownOpProvisionCleanup}
-	teardownOutcomes   = []string{teardownOutcomeRecovered, teardownOutcomeFailed}
+	teardownOperations = []string{
+		teardownOpRestoreReconcile, teardownOpRestoreRollback, teardownOpDeprovision,
+		teardownOpRestorePrelude, teardownOpProvisionCleanup,
+	}
+	teardownOutcomes = []string{teardownOutcomeRecovered, teardownOutcomeFailed}
 )
 
 // Scope labels for retentionRefusedByScopeTotal — the cap level that tripped a
@@ -606,11 +621,22 @@ var (
 	// running its removals on the errgroup's derived context, so the first failure cancels
 	// its siblings mid-flight.
 	//
-	// outcome="recovered" means the fallback finished the teardown; the lease is clean and
-	// only the substrate hiccup is noteworthy. outcome="failed" means at least one
-	// container may STILL be running: fred keeps the lease tracked and retries rather than
-	// advancing state over it, so a sustained rate is not data loss — it is capacity and
-	// anonymous volumes pinned on the host, and a daemon that needs a look.
+	// outcome="recovered" means the fallback removed everything it found. On an ADVISORY
+	// operation that can be vacuous — the prelude arm has no containers to find, so a
+	// failed Down whose discovery succeeds records "recovered" after removing nothing.
+	//
+	// outcome="failed" means at least one container may STILL be running, but what fred
+	// does about it depends on the operation, so read the two together:
+	//   - BLOCKING (restore_reconcile, restore_rollback, deprovision): fred keeps the
+	//     lease tracked and retries rather than advancing state over it. A sustained rate
+	//     is not data loss — it is capacity and anonymous volumes pinned on the host, and
+	//     a daemon that needs a look.
+	//   - ADVISORY (restore_prelude, provision_cleanup): the caller discards the error and
+	//     state advances anyway, so nothing is being held open and nothing will retry. A
+	//     rate here means a possible leak to reap by hand, or — for restore_prelude, whose
+	//     callers are entered on caller-context cancellation and then pass that same dead
+	//     context to the teardown — merely a canceled restore request with nothing on the
+	//     host at all.
 	teardownFallbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
