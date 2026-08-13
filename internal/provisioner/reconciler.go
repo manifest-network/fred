@@ -240,23 +240,37 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				placements[leaseUUID] = provision.BackendName
 			}
 		}
-		// Retained leases pin their backend too. Active provisions take precedence
-		// (if a stale retention races a fresh provision, the provision wins).
+		// Retained leases pin their backend too — but only on a COMPLETE sweep.
 		//
-		// On an INCOMPLETE sweep that precedence cannot be established: a lease
-		// live on a backend that did not answer is missing from `placements`, so
-		// a retention record elsewhere would win by default and rebind the
-		// lease's placement to the wrong backend — inverting the rule stated
-		// above rather than applying it. Fall back only for leases that have no
-		// recorded placement at all, where there is nothing to overwrite.
-		for leaseUUID, backendName := range allRetentions {
-			if _, isActive := placements[leaseUUID]; isActive {
-				continue
+		// A retention proves a past deprovision on that backend, not present
+		// ownership. This map is SetBatch'd BEFORE the per-lease loop reads it
+		// back through placementFor, so a retention-derived record would
+		// manufacture the very evidence deferLease uses to decide it is safe to
+		// proceed — and would then aim both provision
+		// (routeForProvisionHonoringPlacement) and deprovision (the
+		// orchestrator's positive resolution) at that backend. Durably, in
+		// bbolt, outliving the outage that produced it.
+		//
+		// Gating on "no existing record" instead would be backwards: creating a
+		// record is precisely the DEFER→PROCEED flip, while overwriting an
+		// existing one is the comparatively safe half.
+		//
+		// Skipping costs only a delayed backfill of a derived index. This sync
+		// is additive and runs every sweep, retentions outlive the outage, and
+		// placement already survives close by design — so the next complete
+		// sweep repaves whatever was missed.
+		if snapshot.complete {
+			// Active provisions take precedence (if a stale retention races a
+			// fresh provision, the provision wins).
+			for leaseUUID, backendName := range allRetentions {
+				if _, isActive := placements[leaseUUID]; isActive {
+					continue
+				}
+				placements[leaseUUID] = backendName
 			}
-			if !snapshot.complete && r.placementStore.Get(leaseUUID) != "" {
-				continue
-			}
-			placements[leaseUUID] = backendName
+		} else if len(allRetentions) > 0 {
+			slog.Debug("reconcile: skipping retention-derived placement backfill, fleet view is incomplete",
+				"retentions", len(allRetentions))
 		}
 		if len(placements) > 0 {
 			if err := r.placementStore.SetBatch(placements); err != nil {

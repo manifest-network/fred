@@ -3,14 +3,19 @@ package provisioner
 // Characterization tests for reconciling a multi-backend fleet over the real
 // HTTP transport.
 //
-// These pin the behavior that must survive ENG-356, which removes the
-// fleet-wide abort in fetchAllProvisions. They are written against the CURRENT
-// code and pass on it: today a sweep that cannot reach every backend aborts, so
-// the "nothing was destroyed" invariant holds trivially. After ENG-356 the same
-// assertions must still hold, but for the interesting reason — the sweep
-// proceeds and defers exactly the leases it cannot positively attribute. That
-// equivalence is the point: any change to these assertions other than the ones
-// ENG-356 explicitly inverts is a regression, not a test that needs updating.
+// These pin what a sweep must NOT destroy when it cannot see the whole fleet.
+//
+// They were written and merged BEFORE ENG-356 (#212), against the code that
+// still aborted a degraded sweep outright — where the "nothing was destroyed"
+// invariant held trivially. ENG-356 then removed that abort, and the same
+// assertions still hold, now for the interesting reason: the sweep proceeds and
+// defers exactly the leases it cannot positively attribute.
+//
+// That equivalence is the point, and it is why these tests are worth keeping in
+// this shape. Exactly one scenario changed across that transition — the one
+// written to pin the replaced behavior. If a future change turns any of the
+// others red, the default assumption is a regression, not a test that needs
+// updating.
 
 import (
 	"testing"
@@ -465,6 +470,56 @@ func TestFleet_DegradedSweep_SkipsPayloadCleanup(t *testing.T) {
 	has, err = f.payloads.Has("lease-gone")
 	require.NoError(t, err)
 	require.False(t, has, "payload cleanup must resume once every backend answers")
+}
+
+// The placement sync runs BEFORE the per-lease guard and is read back by it in
+// the same sweep, so anything it writes becomes evidence immediately. A
+// retention proves a past deprovision on a backend, not present ownership —
+// deriving a placement from one during a degraded sweep would manufacture the
+// guard's own input, flipping a lease that should DEFER into one that PROCEEDS
+// and aiming it at the wrong backend. Durably, in bbolt, outliving the outage.
+//
+// It would also aim DEPROVISION at that backend, turning what should be a loud
+// failure against the real holder into a resolved teardown on a machine that
+// holds nothing — reported as success while the containers keep running.
+func TestFleet_DegradedSweep_DoesNotManufacturePlacementFromRetention(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// backend-1 answers and reports a RETENTION for the lease.
+	f.backendAt(1).seedRetention("lease-r")
+	// backend-2 is the silent one.
+	f.backendAt(2).setFault(faultConnReset)
+	// The lease is ACTIVE on chain with no placement record — the state in which
+	// a manufactured record does the damage.
+	f.addLease("lease-r", billingtypes.LEASE_STATE_ACTIVE)
+
+	require.NoError(t, f.sweepN(2))
+
+	require.Empty(t, f.placement.Get("lease-r"),
+		"a degraded sweep must not write a placement derived from retention data")
+
+	// And the guard must still be deferring — otherwise the assertion above
+	// could pass for the wrong reason (e.g. the lease being handled some other way).
+	for _, srv := range f.servers {
+		require.Zerof(t, srv.totalProvisionCalls(),
+			"the lease must be deferred, not provisioned (%s)", srv.name)
+	}
+}
+
+// The companion that keeps the fix from being over-broad: on a COMPLETE sweep
+// the retention-derived backfill still runs, which is what keeps restore
+// affinity working for a closed lease whose placement record was lost.
+func TestFleet_CompleteSweep_StillBackfillsPlacementFromRetention(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	f.backendAt(1).seedRetention("lease-r")
+
+	require.NoError(t, f.sweep())
+
+	require.Equal(t, "backend-1", f.placement.Get("lease-r"),
+		"a complete sweep must still backfill placement from retention data")
 }
 
 // --------------------------------------------------------------------------

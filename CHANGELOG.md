@@ -68,7 +68,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   view is incomplete. They were previously suppressed by the abort itself, and
   they act on a chain snapshot assembled from two non-atomic queries, so letting
   them run on a degraded sweep would newly expose a hazard this change is not
-  meant to introduce.
+  meant to introduce. For the same reason the placement index's retention-derived
+  backfill is also suppressed while degraded: a retention proves a past
+  deprovision on a backend, not present ownership, and that sync is read back by
+  the deferral guard in the same sweep — so writing one would manufacture the
+  evidence the guard uses to decide it is safe to act. The next complete sweep
+  repaves it.
 
 - **Fred no longer substitutes a backend when a lease's placement record names
   one the router does not know** (ENG-635). Previously both the write and read
