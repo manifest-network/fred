@@ -61,13 +61,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   record, the provision, and the pool reservation in place for the next sweep to
   retry. This matters because the re-quarantine renames a directory a surviving
   container still holds open, which would leave it writing into data fred has just
-  marked frozen. The wait is bounded and safe — a restoring record is never
-  reaped, its volumes are protected from the orphan sweep, and the restore becomes
-  claimable again as soon as teardown succeeds — with one exception, also fixed
-  here: closing the *new* lease while a restore into it was still in flight would
-  destroy (or re-retain under the wrong lease) the original lease's retained data,
-  permanently ending its ability to be restored. Those volumes are now recognised
-  and left alone.
+  marked frozen. Nothing is lost while it waits — a restoring record is
+  deliberately exempt from expiry, and its volumes are protected from the orphan
+  sweep — with one exception, also fixed here: closing the *new* lease while a
+  restore into it was still in flight would destroy (or re-retain under the wrong
+  lease) the original lease's retained data, permanently ending its ability to be
+  restored. Those volumes are now recognised and left alone.
+
+  The wait is safe but **not** time-bounded. That same exemption from expiry means
+  a tenant cannot re-request the restore for as long as the substrate stays broken;
+  it becomes claimable again only once teardown succeeds. A sustained
+  `fred_docker_backend_teardown_fallback_total{outcome="failed"}` on a blocking
+  operation is the signal to go fix the daemon, not something that clears itself.
 
   New metric `fred_docker_backend_teardown_fallback_total{operation,outcome}`.
   A rising `outcome="failed"` means the fallback could not finish either, but

@@ -184,7 +184,10 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	// re-quarantine failure below, and the same finalizer contract the Ready arm above
 	// honors via finalizeRestoredLease (ENG-523). The wait is safe: a restoring record
 	// is not reapable (ListExpired/MarkReapingIfExpired both require ACTIVE) and
-	// cleanupOrphanedVolumes protects its canonicals.
+	// cleanupOrphanedVolumes protects its canonicals. It is NOT time-bounded, though —
+	// that same expiry exemption means the tenant cannot re-request the restore
+	// (ClaimForRestore refuses a restoring record) until a sweep gets a clean teardown,
+	// so a sustained failure here is an operator signal, not a self-healing state.
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 	if _, derr := b.teardownLeaseContainers(ctx, e.NewLeaseUUID, recordedIDs, stopTimeout,
 		teardownOpRestoreReconcile, b.logger.With("lease_uuid", e.NewLeaseUUID)); derr != nil {
