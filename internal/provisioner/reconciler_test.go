@@ -3348,6 +3348,77 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 	}
 }
 
+// TestReconciler_ConfirmTerminal_BoundsTheChainLookup pins the liveness half of
+// the re-check: the per-candidate lookup carries its own deadline.
+//
+// The reconcile context is the process lifetime, and neither the chain client
+// nor gRPC bounds a query on its own, so an unanswered Lease RPC would otherwise
+// stall the sweep holding it — and because ReconcileAll is CAS-guarded, every
+// later tick would no-op behind it. The whole fail-open design (count, keep,
+// retry next sweep) presumes the call returns.
+//
+// Asserting the deadline is present is deliberate: waiting out a real expiry
+// would cost chainConfirmTimeout per run, and what matters is that the bound
+// exists, not how long it is. The second half then pins that an expiry is
+// classified as chain_error rather than as evidence of anything.
+//
+// Deliberately NOT parallel: it reads a process-global Prometheus collector.
+func TestReconciler_ConfirmTerminal_BoundsTheChainLookup(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		sawDeadline bool
+		budget      time.Duration
+	)
+
+	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(ctx context.Context, _ string) (*billingtypes.Lease, error) {
+			deadline, ok := ctx.Deadline()
+			mu.Lock()
+			sawDeadline = ok
+			if ok {
+				budget = time.Until(deadline)
+			}
+			mu.Unlock()
+			// Answer as the RPC layer would once the budget is spent.
+			return nil, context.DeadlineExceeded
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name: "test",
+		provisions: []backend.ProvisionInfo{
+			{LeaseUUID: "candidate", Status: backend.ProvisionStatusReady, BackendName: "test"},
+		},
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, nil, nil)
+	require.NoError(t, err)
+
+	skips := metrics.ReconcilerCleanupSkipsTotal.
+		WithLabelValues(metrics.CleanupPassOrphan, metrics.CleanupSkipChainError)
+	before := promtestutil.ToFloat64(skips)
+
+	// t.Context() has no deadline of its own, so any deadline the lookup sees is
+	// one confirmTerminal imposed.
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.True(t, sawDeadline, "the per-candidate chain lookup must carry a deadline")
+	assert.Positive(t, budget)
+	assert.LessOrEqual(t, budget, chainConfirmTimeout, "the budget must be the one confirmTerminal set")
+
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.deprovisionCalls, "a timed-out lookup is not evidence the lease finished")
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(skips)-before, "expiry must count as chain_error")
+}
+
 // TestReconciler_CleanupOrphanedPayloads_ChainErrorKeepsPayload is the payload
 // pass's error branch. A payload deleted out from under a live lease makes the
 // NEXT sweep classify errPayloadNotAvailable as permanent and close a healthy

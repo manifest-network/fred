@@ -30,6 +30,22 @@ const (
 	DefaultReconcileWorkers = 10
 )
 
+// chainConfirmTimeout bounds ONE per-candidate lease lookup in confirmTerminal.
+//
+// The reconcile context is the process lifetime — Start passes it straight
+// through to every sweep — and neither the chain client nor gRPC imposes a
+// per-RPC deadline of its own, so without this an unanswered Lease query stalls
+// the sweep that issued it while ReconcileAll's CAS flag makes every later tick
+// a no-op. The fail-open path this guard exists to reach (count chain_error,
+// keep the state, retry next sweep) is only reachable if the call returns.
+//
+// Not a config knob: it is a liveness backstop on a single point query, not a
+// tuning parameter, and it matches the hardcoded budgets the chain client
+// already applies to Ping and gas simulation. Generous on purpose — a lease
+// lookup that takes ten seconds means the node is in trouble, and skipping a
+// cycle of cleanup is the correct response either way.
+const chainConfirmTimeout = 10 * time.Second
+
 // errLeaseAlreadyInFlight indicates the lease is already being provisioned.
 // This is not a real error - the caller should not treat it as a failure.
 var errLeaseAlreadyInFlight = errors.New("lease already in-flight")
@@ -1045,7 +1061,10 @@ func leaseState(lease *billingtypes.Lease) string {
 // guards against comes from the sweep's own non-atomic chain queries, and is
 // identical on a sweep that saw every backend.
 func (r *Reconciler) confirmTerminal(ctx context.Context, pass, leaseUUID string) bool {
-	lease, err := r.chainClient.GetLease(ctx, leaseUUID)
+	qctx, cancel := context.WithTimeout(ctx, chainConfirmTimeout)
+	defer cancel()
+
+	lease, err := r.chainClient.GetLease(qctx, leaseUUID)
 	liveness, reason := classifyLease(lease, err)
 	if liveness == leaseTerminal {
 		return true
