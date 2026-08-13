@@ -589,11 +589,14 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fred_reconciler_runs_total` | counter | `outcome` | Reconciliation runs by outcome |
+| `fred_reconciler_runs_total` | counter | `outcome` | Reconciliation runs by outcome (`success`, `partial`, `degraded`, `error`) — one per sweep, most severe wins |
 | `fred_reconciler_duration_seconds` | histogram | — | Run timing |
 | `fred_reconciler_actions_total` | counter | `action` | Actions taken (`provisioned`, `acknowledged`, `deprovisioned`, `anomaly`, `lease_error`) |
-| `fred_reconciler_last_success_timestamp_seconds` | gauge | — | Unix timestamp of last successful run |
+| `fred_reconciler_last_success_timestamp_seconds` | gauge | — | Unix timestamp of last **clean, complete** run — a degraded sweep does not advance it |
 | `fred_reconciler_conflicts_total` | counter | — | Reconciler conflicts (lease already in-flight) |
+| `fred_reconciler_backend_fetch_total` | counter | `backend`, `outcome` | Per-backend provision-list attempts (`ok`, `error`, `circuit_open`, `panic`). The signal that a single backend is unreachable, which no longer breaks the fleet-wide sweep |
+| `fred_reconciler_sweep_complete` | gauge | — | 1 if the last sweep saw every configured backend, 0 if degraded. Gates the meaning of the action counters above |
+| `fred_provisioner_reconciler_deferred_leases_total` | counter | — | Leases skipped because their owning backend did not report. Non-zero while `sweep_complete` is 1 would be a defect |
 
 **Backend:**
 

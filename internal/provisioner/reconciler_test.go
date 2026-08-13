@@ -3057,13 +3057,107 @@ func TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement(t *testing.T) {
 
 // --- Gap tests: fetchAllProvisions, payload lifecycle, RefreshState ---
 
-func TestReconciler_ReconcileAll_ListProvisionError_AbortsReconciliation(t *testing.T) {
-	// When ListProvisions fails on any backend, ReconcileAll should abort entirely.
-	// Partial data would cause the reconciler to misidentify running containers
-	// as orphans and deprovision them.
+// TestDeferLease is the exhaustive table for the one safety decision ENG-356
+// introduces. It is a pure function precisely so this can cover every
+// combination without standing up a fleet.
+//
+// The asymmetry worth remembering while reading it: deferring is never
+// destructive — it skips work — so over-deferring costs latency, while
+// under-deferring costs a tenant their data.
+func TestDeferLease(t *testing.T) {
+	t.Parallel()
+
+	snap := func(complete bool, answered map[string]bool) fleetSnapshot {
+		return fleetSnapshot{provisions: nil, answered: answered, complete: complete}
+	}
+
+	tests := []struct {
+		name          string
+		snap          fleetSnapshot
+		isProvisioned bool
+		placed        string
+		wantDefer     bool
+		why           string
+	}{
+		{
+			name: "complete sweep proceeds even with no placement",
+			snap: snap(true, map[string]bool{"a": true}),
+			why:  "a complete sweep saw every backend, so absence IS evidence",
+		},
+		{
+			name:          "complete sweep proceeds for a provisioned lease",
+			snap:          snap(true, map[string]bool{"a": true}),
+			isProvisioned: true,
+		},
+		{
+			name:          "incomplete sweep proceeds when the lease was reported",
+			snap:          snap(false, map[string]bool{"a": true, "b": false}),
+			isProvisioned: true,
+			why:           "a backend that answered reported it; that is positive evidence",
+		},
+		{
+			name:      "incomplete sweep proceeds when the owning backend answered",
+			snap:      snap(false, map[string]bool{"a": true, "b": false}),
+			placed:    "a",
+			wantDefer: false,
+			why:       "backend a answered and did not report it, so it really is absent from a",
+		},
+		{
+			name:      "incomplete sweep DEFERS when the owning backend is silent",
+			snap:      snap(false, map[string]bool{"a": true, "b": false}),
+			placed:    "b",
+			wantDefer: true,
+			why:       "the core feature: the lease may be live on b, unseen",
+		},
+		{
+			name:      "incomplete sweep DEFERS an unplaced lease",
+			snap:      snap(false, map[string]bool{"a": true, "b": false}),
+			placed:    "",
+			wantDefer: true,
+			why:       "no record means fred cannot rule out that it lives on the silent backend",
+		},
+		{
+			name:      "incomplete sweep DEFERS a lease placed on an unconfigured backend",
+			snap:      snap(false, map[string]bool{"a": true}),
+			placed:    "removed-backend",
+			wantDefer: true,
+			why:       "absent from `answered` entirely — the ENG-635 rule, reached via the same guard",
+		},
+		{
+			name:      "every backend silent DEFERS everything unevidenced",
+			snap:      snap(false, map[string]bool{"a": false, "b": false}),
+			placed:    "a",
+			wantDefer: true,
+			why:       "the degenerate end of the same axis, not a special case",
+		},
+		{
+			name:          "every backend silent still proceeds for an evidenced lease",
+			snap:          snap(false, map[string]bool{"a": false, "b": false}),
+			isProvisioned: true,
+			why:           "impossible in practice, but the rule is evidence-based, not fleet-based",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := deferLease(tc.snap, tc.isProvisioned, tc.placed)
+			assert.Equal(t, tc.wantDefer, got, tc.why)
+		})
+	}
+}
+
+func TestReconciler_ReconcileAll_ListProvisionError_DefersWithoutAborting(t *testing.T) {
+	// ENG-356 inverted this test. A backend failing ListProvisions used to abort
+	// the ENTIRE sweep; it now marks that backend unanswered and defers only the
+	// leases fred cannot positively place. With a single backend configured, the
+	// whole fleet is unanswered, so the deferral covers everything — which is
+	// exactly the old behavior's effect, reached deliberately rather than by
+	// abandoning the sweep.
+	//
+	// What must NOT change is the safety property: the lease is neither
+	// re-provisioned (it may be live on the unreachable backend) nor torn down.
 	mockChain := &chaintest.MockClient{
-		// Return an active lease so that a false orphan would be detected
-		// if we proceeded with partial data.
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
 				{Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE},
@@ -3085,11 +3179,11 @@ func TestReconciler_ReconcileAll_ListProvisionError_AbortsReconciliation(t *test
 	require.NoError(t, err)
 
 	ctx := t.Context()
-	err = reconciler.ReconcileAll(ctx)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "incomplete backend data")
+	require.NoError(t, reconciler.ReconcileAll(ctx),
+		"an unreachable backend no longer fails the sweep")
 
-	// Verify no provisioning or deprovisioning occurred
+	// The safety property, unchanged: nothing was provisioned onto a peer and
+	// nothing was deprovisioned on the strength of data fred could not see.
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
 	assert.Empty(t, mockBackend.provisionCalls)
@@ -3642,9 +3736,13 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 
 	before := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions"))
 
-	// Must not crash fred. Must return an error (aborted reconcile).
-	reconcileErr := reconciler.ReconcileAll(t.Context())
-	assert.Error(t, reconcileErr, "reconcile must abort when a backend fetch panics")
+	// Must not crash fred, and — since ENG-356 — must not fail the sweep either.
+	// A panicking backend is just one that did not answer: it is marked
+	// unanswered and its leases are deferred, exactly like a backend that
+	// returned an error or timed out. Treating a panic as a fleet-wide abort was
+	// the same coupling this change removed for every other failure mode.
+	assert.NoError(t, reconciler.ReconcileAll(t.Context()),
+		"a panicking backend must degrade the sweep, not abort it")
 
 	after := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions"))
 	assert.Equal(t, before+1, after,
@@ -3652,8 +3750,7 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 
 	// The healthy sibling backend must still have been queried despite
 	// the bad one panicking — errgroup concurrency means the panic in
-	// one task does not short-circuit the others (panicErrs is collected
-	// AFTER g.Wait returns).
+	// one task does not short-circuit the others.
 	goodBackend.mu.Lock()
 	goodListCalls := goodBackend.listProvisionsCalls
 	goodBackend.mu.Unlock()

@@ -37,7 +37,10 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_background_cleanup_panics_total > 0` | Bug in a cleanup loop | Same — keep running, file issue |
 | `fred_api_rate_limit_rejections_total{limiter="tenant"}` spike | Specific tenant exceeded their bucket | Expected if a tenant is bursting; sustained spikes indicate a misbehaving client |
 | `fred_payload_leases_awaiting > 0` for >5 min | Tenant created lease with `meta_hash` but never uploaded payload | Tenant-side issue; the lease will eventually expire |
-| `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck or panicking | Logs + `fred_reconciler_runs_total{outcome="error"}` |
+| `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck, panicking, **or running degraded** — a sweep that could not see every backend deliberately does not advance this | Check `fred_reconciler_sweep_complete` first: 0 means degraded, and `fred_reconciler_backend_fetch_total{outcome!="ok"}` names the backend. Otherwise logs + `fred_reconciler_runs_total{outcome="error"}` |
+| `fred_reconciler_backend_fetch_total{outcome!="ok"}` sustained for one backend across ≥3 sweeps (~6 min at a 2m interval) | That backend is unreachable from providerd. Its leases are deferred — not re-provisioned, not deprovisioned — while the rest of the fleet reconciles normally | [Backend unreachable during reconciliation](#backend-unreachable-during-reconciliation) |
+| `fred_reconciler_sweep_complete == 0` sustained | Same condition, viewed fleet-wide. The action counters describe only the leases fred could positively place, so do not read them as fleet totals while this is 0 | Same |
+| `fred_provisioner_reconciler_deferred_leases_total` rising while `fred_reconciler_sweep_complete == 1` | Should be impossible — nothing defers on a complete sweep | Bug; file an issue with the reconcile logs |
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A `fred-retained-*`/leaked volume the sweep can't destroy — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual reclaim. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
@@ -189,6 +192,57 @@ When SKU resource pools are full, provision requests get HTTP 503 with `insuffic
 2. **Tighten SKU profiles**: smaller CPU/memory/disk per SKU lets more leases fit.
 3. **Tenant quotas**: if one tenant is hogging resources, set `tenant_quota` in `docker-backend.yaml` to cap them.
 4. **Force reconciliation**: orphan provisions (lease closed but containers still running) consume budget. The reconciler removes them on its cycle, but you can restart the backend to force an immediate cleanup.
+
+---
+
+## Backend unreachable during reconciliation
+
+A backend that is configured but not answering `GET /provisions` — down, wedged,
+partitioned, or with its circuit breaker open — no longer stops reconciliation
+for the rest of the fleet. Fred marks it unanswered for that sweep and **defers**
+the leases it cannot positively place, then retries on the next cycle.
+
+**Symptoms**
+
+- `fred_reconciler_backend_fetch_total{backend="X",outcome!="ok"}` rising, with
+  `outcome` distinguishing `error` (contacted and failed), `circuit_open` (fred
+  short-circuited without dialing), and `panic` (a bug — file an issue)
+- `fred_reconciler_sweep_complete` at 0
+- `fred_provisioner_reconciler_deferred_leases_total` rising
+- `fred_reconciler_runs_total{outcome="degraded"}` incrementing each cycle
+- `fred_reconciler_last_success_timestamp_seconds` frozen — expected while
+  degraded, and the reason the staleness alert does not go quiet during an outage
+
+**What is happening to the leases**
+
+| Lease | Behavior |
+|---|---|
+| On a backend that answered | Reconciled normally — this is the whole point of the change |
+| On the unreachable backend | Deferred: not acknowledged, re-provisioned, or deprovisioned |
+| With no placement record | Deferred while the sweep is incomplete — fred cannot rule out that it lives on the silent backend |
+| Orphans, orphaned payloads, prunable placements | **All three cleanup passes are skipped** until every backend answers |
+
+Nothing is destroyed and nothing migrates. The cost is latency: affected leases
+stop making progress until the backend returns.
+
+**What to do**
+
+1. Identify the backend from the `backend` label and check it directly
+   (`GET /health`, `GET /stats`, its own logs).
+2. Bring it back. Recovery needs no action on fred's side — the next sweep sees a
+   complete fleet, resumes the deferred leases, and re-enables the cleanup
+   passes.
+3. If it is gone for good, that is a **removal**, not an outage — see the next
+   section. Do not leave it configured-but-absent indefinitely: PENDING leases on
+   it are on a ~30-minute chain expiry clock, and cleanup stays paused fleet-wide
+   the whole time.
+
+> **Why cleanup pauses fleet-wide.** Orphan detection, payload cleanup and
+> placement pruning all delete durable state based on a chain snapshot taken from
+> two non-atomic queries. Before per-backend deferral, a fetch failure aborted the
+> sweep before reaching them, so they never ran on a degraded cycle. Keeping them
+> gated preserves that. Skipped cleanup costs a cycle of latency; mistaken
+> cleanup costs a tenant their workload.
 
 ---
 

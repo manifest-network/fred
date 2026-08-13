@@ -23,6 +23,9 @@ func TestMetricsRegistered(t *testing.T) {
 		ReconciliationDuration,
 		ReconciliationActions,
 		ReconciliationConflictsTotal,
+		ReconcilerBackendFetchTotal,
+		ReconcilerSweepComplete,
+		ReconcilerDeferredLeasesTotal,
 		PayloadUploadsTotal,
 		PayloadStoredCount,
 		PayloadSizeBytes,
@@ -81,6 +84,8 @@ func TestMetricsRegistered(t *testing.T) {
 		"fred_payload_leases_awaiting",
 		"fred_watermill_poisoned_messages_total",
 		"fred_reconciler_last_success_timestamp_seconds",
+		"fred_reconciler_sweep_complete",
+		"fred_provisioner_reconciler_deferred_leases_total",
 		"fred_signer_pool_size",
 		"fred_signer_pool_lane_count",
 		"fred_backend_routing_fallback_total",
@@ -101,10 +106,19 @@ func TestCounterVecLabels(t *testing.T) {
 		ProvisioningDuration.WithLabelValues("docker", "restore")
 	})
 	assert.NotPanics(t, func() {
-		ReconciliationTotal.WithLabelValues("success")
+		ReconciliationTotal.WithLabelValues(OutcomeSuccess)
+		ReconciliationTotal.WithLabelValues(OutcomePartial)
+		ReconciliationTotal.WithLabelValues(OutcomeDegraded)
+		ReconciliationTotal.WithLabelValues(OutcomeError)
 	})
 	assert.NotPanics(t, func() {
 		ReconciliationActions.WithLabelValues("provisioned")
+	})
+	assert.NotPanics(t, func() {
+		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeOK)
+		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeError)
+		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeCircuitOpen)
+		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomePanic)
 	})
 	assert.NotPanics(t, func() {
 		PayloadUploadsTotal.WithLabelValues("success")
