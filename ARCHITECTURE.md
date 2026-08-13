@@ -598,7 +598,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_reconciler_backend_fetch_total` | counter | `backend`, `outcome` | Per-backend provision-list attempts (`ok`, `error`, `circuit_open`, `panic`). The signal that a single backend is unreachable, which no longer breaks the fleet-wide sweep |
 | `fred_reconciler_sweep_complete` | gauge | — | 1 if the last sweep saw every configured backend, 0 if degraded. Gates the meaning of the action counters above |
 | `fred_provisioner_reconciler_deferred_leases_total` | counter | — | Leases skipped because their owning backend did not report. Non-zero while `sweep_complete` is 1 would be a defect |
-| `fred_reconciler_cleanup_skips_total` | counter | `pass`, `reason` | Destructive cleanup withheld for lack of positive evidence. `pass`: `orphan`, `payload`, `placement`. `reason`: `chain_live`, `chain_unknown`, `chain_error`, `backend_silent`. Every value is a deliberate fail-open; `chain_unknown` is the only one that does not self-heal and wants an operator |
+| `fred_reconciler_cleanup_skips_total` | counter | `pass`, `reason` | Destructive cleanup withheld for lack of positive evidence. `pass`: `orphan`, `payload`, `placement`. `reason`: `chain_live`, `chain_unknown`, `chain_unknown_state`, `chain_error`, `backend_silent`. Every value is a deliberate fail-open; `chain_unknown` (no record — check the endpoint) and `chain_unknown_state` (fred is older than the chain — upgrade it) are the two that do not self-heal |
 
 **Backend:**
 

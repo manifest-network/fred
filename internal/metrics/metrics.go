@@ -265,6 +265,10 @@ var (
 	//     ledger never deletes a lease, this is NOT "closed" — it means a phantom
 	//     provision, a wrong/reset chain, or an RPC node behind the head. Fred
 	//     will never reap these on its own; a sustained rate needs an operator.
+	//   - chain_unknown_state: the lease exists but carries a state this build
+	//     cannot classify — the zero UNSPECIFIED, or a state added to the chain
+	//     after this binary shipped. Kept separate from chain_unknown because the
+	//     remediation is the opposite: the chain is fine, fred is behind it.
 	//   - chain_error: the per-candidate chain re-check failed. Transient.
 	//   - backend_silent: a placement record's own backend did not answer this
 	//     sweep, so its absence from the backend data proves nothing.
@@ -623,10 +627,11 @@ const (
 	CleanupPassPayload   = "payload"
 	CleanupPassPlacement = "placement"
 
-	CleanupSkipChainLive     = "chain_live"
-	CleanupSkipChainUnknown  = "chain_unknown"
-	CleanupSkipChainError    = "chain_error"
-	CleanupSkipBackendSilent = "backend_silent"
+	CleanupSkipChainLive         = "chain_live"
+	CleanupSkipChainUnknown      = "chain_unknown"
+	CleanupSkipChainUnknownState = "chain_unknown_state"
+	CleanupSkipChainError        = "chain_error"
+	CleanupSkipBackendSilent     = "backend_silent"
 )
 
 // Operation constants for the `operation` label on provisioning_total /

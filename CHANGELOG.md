@@ -97,9 +97,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   heard of it, which happens when providerd is pointed at the wrong or a reset
   chain. Both lease queries then return **empty with no error**, which previously
   made every provision on every backend an orphan candidate. A query error is
-  likewise not absence. Each of these keeps the state and increments
-  `fred_reconciler_cleanup_skips_total{pass,reason}`; `reason="chain_unknown"`
-  also logs at WARN, since unlike the others it will not self-heal.
+  likewise not absence. And terminality is an **allowlist** of the three terminal
+  states rather than "anything that is not PENDING or ACTIVE": `LeaseState` is a
+  bare `int32` decoded as a raw varint with no validation, so a state added to the
+  chain after a providerd build ships arrives as an unrecognized number, and a
+  denylist would read the whole fleet as terminal the day that happens.
+
+  Each of these keeps the state and increments
+  `fred_reconciler_cleanup_skips_total{pass,reason}`. Two reasons log at WARN
+  because they do not self-heal, and their remediations are opposites:
+  `chain_unknown` (no record — check the endpoint, or clean up a phantom by hand)
+  and `chain_unknown_state` (the chain is fine; upgrade fred).
 
 - **A backend that does not answer no longer pauses cleanup for the backends that
   did** (ENG-654). The three destructive passes were gated on a complete fleet

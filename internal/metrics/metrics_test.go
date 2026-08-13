@@ -125,7 +125,7 @@ func TestCounterVecLabels(t *testing.T) {
 		// Both label sets are closed; every combination the reconciler can emit.
 		for _, pass := range []string{CleanupPassOrphan, CleanupPassPayload, CleanupPassPlacement} {
 			for _, reason := range []string{
-				CleanupSkipChainLive, CleanupSkipChainUnknown,
+				CleanupSkipChainLive, CleanupSkipChainUnknown, CleanupSkipChainUnknownState,
 				CleanupSkipChainError, CleanupSkipBackendSilent,
 			} {
 				ReconcilerCleanupSkipsTotal.WithLabelValues(pass, reason)

@@ -997,8 +997,14 @@ const (
 //   - PENDING/ACTIVE means the sweep's chain snapshot was simply stale: the two
 //     list queries are not atomic, so a lease created between them is invisible
 //     to both while the event path may already be provisioning it.
-//   - UNSPECIFIED is the zero value and should never appear on chain; treat it
-//     as unknown rather than guessing.
+//   - Any other state — the zero UNSPECIFIED, or a value this build has never
+//     heard of — is unknown. Terminality is an ALLOWLIST, never "not one of the
+//     live ones": LeaseState is a plain int32 and the generated unmarshaller
+//     decodes it as a raw varint (`m.State |= LeaseState(b&0x7F) << shift`) with
+//     no validation, so a state added to the chain after this binary shipped
+//     arrives as an unrecognized number. Under a denylist it would read as
+//     terminal, and fred would deprovision live leases across the fleet the
+//     moment the chain gained a state it does not know.
 //
 // The asymmetry is the same one deferLease documents. Skipping costs a cycle of
 // cleanup latency; acting on a lease that is not finished costs a tenant their
@@ -1009,13 +1015,26 @@ func classifyLease(lease *billingtypes.Lease, err error) (leaseLiveness, string)
 		return leaseUnknown, metrics.CleanupSkipChainError
 	case lease == nil:
 		return leaseUnknown, metrics.CleanupSkipChainUnknown
-	case lease.State == billingtypes.LEASE_STATE_PENDING || lease.State == billingtypes.LEASE_STATE_ACTIVE:
-		return leaseLive, metrics.CleanupSkipChainLive
-	case lease.State == billingtypes.LEASE_STATE_UNSPECIFIED:
-		return leaseUnknown, metrics.CleanupSkipChainUnknown
-	default:
-		return leaseTerminal, ""
 	}
+
+	switch lease.State {
+	case billingtypes.LEASE_STATE_PENDING, billingtypes.LEASE_STATE_ACTIVE:
+		return leaseLive, metrics.CleanupSkipChainLive
+	case billingtypes.LEASE_STATE_CLOSED, billingtypes.LEASE_STATE_REJECTED, billingtypes.LEASE_STATE_EXPIRED:
+		return leaseTerminal, ""
+	default:
+		return leaseUnknown, metrics.CleanupSkipChainUnknownState
+	}
+}
+
+// leaseState renders a lease's state for a log line. LeaseState.String() falls
+// back to the raw number for a value this build has no name for, which is
+// exactly the case worth printing.
+func leaseState(lease *billingtypes.Lease) string {
+	if lease == nil {
+		return "<no lease>"
+	}
+	return lease.State.String()
 }
 
 // confirmTerminal re-reads one lease from the chain and reports whether it is
@@ -1035,13 +1054,23 @@ func (r *Reconciler) confirmTerminal(ctx context.Context, pass, leaseUUID string
 	metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(pass, reason).Inc()
 	switch reason {
 	case metrics.CleanupSkipChainUnknown:
-		// Not self-healing, unlike the other two: fred will decline this
-		// candidate on every future sweep as well, so say so once per sweep at a
-		// level an operator sees.
+		// Not self-healing, unlike chain_live and chain_error: fred will decline
+		// this candidate on every future sweep as well, so say so once per sweep
+		// at a level an operator sees.
 		slog.Warn("reconcile: chain has no record of this lease — refusing to destroy its state, MANUAL CLEANUP MAY BE REQUIRED",
 			"lease_uuid", leaseUUID,
 			"pass", pass,
 			"error", err,
+		)
+	case metrics.CleanupSkipChainUnknownState:
+		// Also not self-healing, but the remediation is the opposite one, so it
+		// must not share the message above: the chain knows this lease perfectly
+		// well and fred cannot read its state. Upgrading fred is the fix, not
+		// hunting a phantom provision or a misconfigured endpoint.
+		slog.Warn("reconcile: lease is in a state this build does not recognize — refusing to destroy its state, fred may be older than the chain",
+			"lease_uuid", leaseUUID,
+			"pass", pass,
+			"lease_state", leaseState(lease),
 		)
 	default:
 		slog.Info("reconcile: skipping cleanup, chain does not confirm the lease is finished",

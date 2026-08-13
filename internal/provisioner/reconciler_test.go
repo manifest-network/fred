@@ -3230,8 +3230,17 @@ func TestClassifyLease(t *testing.T) {
 			name:         "unspecified is unknown, not terminal",
 			lease:        lease(billingtypes.LEASE_STATE_UNSPECIFIED),
 			wantLiveness: leaseUnknown,
-			wantReason:   metrics.CleanupSkipChainUnknown,
+			wantReason:   metrics.CleanupSkipChainUnknownState,
 			why:          "the zero value should never appear on chain; do not guess",
+		},
+		{
+			name:         "a state this build has never heard of is unknown",
+			lease:        lease(billingtypes.LeaseState(99)),
+			wantLiveness: leaseUnknown,
+			wantReason:   metrics.CleanupSkipChainUnknownState,
+			why: "LeaseState is a bare int32 decoded as a raw varint with no validation, so a state " +
+				"added to the chain after this binary shipped arrives as an unrecognized number. " +
+				"Terminality must be an allowlist or fred would reap live leases the day the chain grows one",
 		},
 		{
 			name:         "closed is terminal",
@@ -3287,6 +3296,15 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 			},
 			wantReason: metrics.CleanupSkipChainUnknown,
 			why:        "absence is not evidence: a wrong or reset chain must not deprovision the fleet",
+		},
+		{
+			name: "chain reports a state this build cannot classify",
+			getLease: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+				l := chaintest.NewMockLease(uuid, "tenant-1", "provider-1", billingtypes.LeaseState(99))
+				return l, nil
+			},
+			wantReason: metrics.CleanupSkipChainUnknownState,
+			why:        "a chain newer than this fred build must not read as a fleet full of terminal leases",
 		},
 		{
 			name: "chain query fails",

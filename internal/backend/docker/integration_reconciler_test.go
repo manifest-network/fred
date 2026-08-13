@@ -884,6 +884,20 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 		},
 		GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) { return nil, nil },
 		AcknowledgeLeasesFunc:         func(_ context.Context, _ []string) (uint64, []string, error) { return 1, []string{"tx"}, nil },
+		// The auto-close this test simulates leaves the lease CLOSED on chain, not
+		// erased from it — x/billing never deletes a lease. That distinction is
+		// what authorises the orphan sweep below to soft-delete (ENG-654); a lease
+		// the chain denied all knowledge of would be kept instead.
+		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			l := makeLease(uuid, tenant, "", sku, 1, hash[:])
+			l.State = billingtypes.LEASE_STATE_CLOSED
+			if leaseVisible {
+				l.State = billingtypes.LEASE_STATE_PENDING
+			}
+			return &l, nil
+		},
 	}
 
 	env := testReconcilerSetup(t, mockChain, func(cfg *Config) {
