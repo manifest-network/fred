@@ -93,27 +93,21 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		activeProvisions.Dec()
 	}
 
-	// Remove all containers via Compose Down for atomic cleanup; fall back
-	// to individual RemoveContainer if Compose fails (e.g., compose project
-	// metadata went missing). After Tasks 4-6 every provision is stack-
-	// shaped, so the per-container fallback only fires under genuine
-	// substrate failure rather than as the steady-state legacy path.
+	// Remove all containers via Compose Down for atomic cleanup; fall back to
+	// per-container removal if Compose fails (e.g., compose project metadata went
+	// missing). After Tasks 4-6 every provision is stack-shaped, so the fallback only
+	// fires under genuine substrate failure rather than as the steady-state legacy
+	// path. The fallback RE-DISCOVERS the containers by label instead of walking
+	// containerIDs: this record is empty for any lease that never reached Ready — a
+	// failed restore's provision names none of the containers its compose Up created —
+	// so a recorded-list fallback silently removes nothing exactly when a container
+	// leaked (ENG-647). containerIDs is still passed and unioned in.
 	var errs []error
-	var failedIDs []string
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-	if downErr := b.compose.Down(ctx, composeProjectName(leaseUUID), stopTimeout); downErr != nil {
-		logger.Warn("compose down failed, falling back to individual removal", "error", downErr)
-		for _, containerID := range containerIDs {
-			if err := b.docker.RemoveContainer(ctx, containerID); err != nil {
-				logger.Error("failed to remove container", "container_id", leasesm.ShortID(containerID), "error", err)
-				errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(containerID), err))
-				failedIDs = append(failedIDs, containerID)
-			} else {
-				logger.Info("container removed", "container_id", leasesm.ShortID(containerID))
-			}
-		}
-	} else {
-		logger.Info("compose down completed", "project", composeProjectName(leaseUUID))
+	failedIDs, teardownErr := b.teardownLeaseContainers(ctx, leaseUUID, containerIDs, stopTimeout,
+		teardownOpDeprovision, logger)
+	if teardownErr != nil {
+		errs = append(errs, teardownErr)
 	}
 
 	// releaseLive releases all pool allocations for this lease and updates
@@ -150,6 +144,20 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// the live allocation keeps counting the bytes.
 	var releaseLiveOnRetainPath bool
 
+	// claimedLeftBehind is set when a volume claimed by an IN-FLIGHT RESTORE is
+	// deliberately left on disk (below). Its bytes must then stay reserved, because a
+	// restoring record is counted by NEITHER projection — computeRetainedDiskMB skips
+	// every non-active status and the admission pool is active+reaping — so the only
+	// thing counting them is this closing lease's live allocation. Releasing it would
+	// leave a real footprint counted by nobody and let admission over-commit against
+	// it. reconcileRestoring takes the reservation over: its orphaned arm
+	// re-quarantines the volume, RevertToActive makes the record active (so the
+	// retained projection counts it again), and only THEN does it releaseAll the same
+	// {lease}-{svc}-{idx} ids — re-counted before released, never a gap. pool.Release
+	// is idempotent, so the hand-off is safe even though both paths name the same ids.
+	// (ENG-647, PR #217 review.)
+	var claimedLeftBehind bool
+
 	// Retained set may have changed (this close may have added a retained
 	// record below, or a prior attempt did); refresh after the volume branch.
 	// For the retain path, also release live AFTER refresh (overlap, no gap).
@@ -165,7 +173,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			return
 		}
 		b.refreshRetentionAccounting()
-		if releaseLiveOnRetainPath {
+		if releaseLiveOnRetainPath && !claimedLeftBehind {
 			releaseLive()
 		}
 	}()
@@ -195,7 +203,21 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// Destroy managed volumes for all instances — or soft-delete them into the
 	// retained namespace when RetainOnClose is true.
 	var volumeErrs []error
-	if b.cfg.RetainOnClose && b.retentionStore != nil {
+	// Volumes an IN-FLIGHT restore has adopted into THIS lease's namespace but that
+	// still belong to another lease's retention record. They look like ours by name and
+	// they are not: destroying them, or re-retaining them under this lease, permanently
+	// kills the original lease's restore (ENG-647). Fail-safe on a store error — we
+	// cannot tell ours from theirs, so we must not destroy either.
+	claimed, claimErr := b.restoringClaimedVolumes(leaseUUID)
+	if claimErr != nil {
+		logger.Error("deprovision: cannot read retention records to identify restore-claimed volumes; skipping volume teardown this attempt",
+			"error", claimErr)
+		volumeErrs = append(volumeErrs, fmt.Errorf("identify restore-claimed volumes: %w", claimErr))
+	}
+	switch {
+	case claimErr != nil:
+		// Deliberately skip BOTH volume arms; the lease stays Failed and retries.
+	case b.cfg.RetainOnClose && b.retentionStore != nil:
 		// Enumerate the lease's ACTUAL managed volumes (ground truth — no SKU guess).
 		all, listErr := b.volumes.List()
 		if listErr != nil {
@@ -204,6 +226,15 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		var canonical []string
 		prefix := leaseVolumePrefix(leaseUUID)
 		for _, id := range all {
+			if claimed[id] {
+				// reconcileRestoring owns re-quarantining this one back to
+				// fred-retained-{original}-*; retaining it under THIS lease would leave
+				// the original record pointing at names that no longer exist.
+				claimedLeftBehind = true
+				logger.Warn("deprovision: volume is claimed by an in-flight restore record; leaving it for the restore rollback",
+					"volume_id", id)
+				continue
+			}
 			if strings.HasPrefix(id, prefix) { // excludes fred-retained-* and other leases
 				canonical = append(canonical, id)
 			}
@@ -435,23 +466,36 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				}
 			}
 		}
-	} else {
+	default:
 		for _, item := range items {
 			for i := range item.Quantity {
 				volumeID := canonicalVolumeName(leaseUUID, item.ServiceName, i)
+				if claimed[volumeID] {
+					// An in-flight restore adopted another lease's retained data under this
+					// name. Destroying it is unrecoverable data loss and kills that lease's
+					// restore; reconcileRestoring re-quarantines it once its rollback can
+					// complete (ENG-647).
+					claimedLeftBehind = true
+					logger.Warn("deprovision: volume is claimed by an in-flight restore record; not destroying it",
+						"volume_id", volumeID)
+					continue
+				}
 				if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
 					logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
 					volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
 				}
 			}
 		}
-		if len(volumeErrs) == 0 {
+		if len(volumeErrs) == 0 && !claimedLeftBehind {
 			// All volumes destroyed — bytes are gone, so release the live allocation
 			// now. Releasing only on success (not before the loop) keeps the footprint
 			// counted while a failed Destroy leaves bytes on disk and the lease is kept
 			// Failed for retry, preventing an over-admit/ENOSPC window. Symmetric with
 			// the retain arms (releaseLiveOnRetainPath set only when
 			// len(volumeErrs) == 0).
+			//
+			// A skipped claimed volume is not an error but leaves bytes on disk just the
+			// same, so it holds the reservation for the same reason (ENG-647).
 			releaseLive()
 		}
 	}
@@ -622,11 +666,33 @@ func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items
 	if b.retentionStore == nil {
 		return // no projection to correct; metric + the give-up log are the record
 	}
+	// A tombstone is a SCHEDULED DESTROY: destroyReapingVolumes RemoveAll's every name
+	// it carries. Volumes an in-flight restore adopted into this lease's namespace are
+	// named fred-{thisLease}-{svc}-{idx} — indistinguishable by prefix from our own —
+	// so recording them here would hand another lease's retained data to the reaper and
+	// kill its restore. The close's volume branches already refuse to destroy them; a
+	// give-up must not undo that on a timer (ENG-647).
+	//
+	// If the claim set is unreadable we record NOTHING rather than risk naming data that
+	// is not ours. That under-counts a real leak, but retentionLeakedTotal (incremented
+	// above) plus the give-up log are the record, and cleanup gates fail toward keeping
+	// data.
+	claimed, claimErr := b.restoringClaimedVolumes(leaseUUID)
+	if claimErr != nil {
+		logger.Error("give-up leak: cannot identify restore-claimed volumes; recording no tombstone rather than scheduling a destroy that might name another lease's data",
+			"error", claimErr)
+		return
+	}
 	var leaked []string
 	if all, err := b.volumes.List(); err == nil {
 		cprefix := leaseVolumePrefix(leaseUUID) // fred-{lease}-
 		rprefix := retainedName(cprefix)        // fred-retained-{lease}-
 		for _, id := range all {
+			if claimed[id] {
+				logger.Warn("give-up leak: volume is claimed by an in-flight restore; excluding it from the reaping tombstone",
+					"volume_id", id)
+				continue
+			}
 			if strings.HasPrefix(id, cprefix) || strings.HasPrefix(id, rprefix) {
 				leaked = append(leaked, id)
 			}
@@ -644,6 +710,11 @@ func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items
 				// name, the sweep would "succeed" against the non-existent canonical name and
 				// drop the tombstone while the fred-retained-* volume persists untracked —
 				// reintroducing the exact under-count/leak this path fixes.
+				if claimed[canonical] {
+					logger.Warn("give-up leak: derived name is claimed by an in-flight restore; excluding it from the reaping tombstone",
+						"volume_id", canonical)
+					continue
+				}
 				leaked = append(leaked, canonical, retainedName(canonical))
 			}
 		}

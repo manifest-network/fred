@@ -35,6 +35,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A failed container teardown is no longer treated as a completed one**
+  (ENG-647). When `compose down` failed, the docker backend logged the error and
+  carried on as though the containers were gone. On the restore-rollback path
+  that meant reverting the retention record, handing the lease's capacity back to
+  the pool, and dropping the provision while its containers were possibly still
+  running — after which nothing could reach them: the orphan reconciler only sees
+  leases the backend still tracks, and the volume reaper enumerates fred's own
+  data directories, never Docker's anonymous-volume store. Their anonymous
+  volumes then accumulated silently, the leak class that once taxed every
+  `compose up` on a dev backend. Compose v5 made it likelier, since it now runs
+  its per-container removals on a context the first failure cancels, so more
+  containers survive each failed teardown.
+
+  Teardown now compensates and then confirms. A failed `down` falls back to
+  removing the lease's containers individually — reaping their anonymous volumes
+  with them — and finds those containers by re-querying the daemon for fred's
+  labels rather than trusting the provision's recorded container list, which is
+  empty for exactly the leases that leak (a restore that never reached Ready
+  records no container IDs at all). Every teardown path shares this, so a close, a
+  failed provision's cleanup, and both restore-rollback arms behave the same.
+
+  If containers still survive, fred no longer advances state over them: the
+  restore rollback stops before re-quarantining the volumes, leaving the retention
+  record, the provision, and the pool reservation in place for the next sweep to
+  retry. This matters because the re-quarantine renames a directory a surviving
+  container still holds open, which would leave it writing into data fred has just
+  marked frozen. Nothing is lost while it waits — a restoring record is
+  deliberately exempt from expiry, and its volumes are protected from the orphan
+  sweep — with one exception, also fixed here: closing the *new* lease while a
+  restore into it was still in flight would destroy (or re-retain under the wrong
+  lease) the original lease's retained data, permanently ending its ability to be
+  restored. Those volumes are now recognised and left alone.
+
+  The wait is safe but **not** time-bounded. That same exemption from expiry means
+  a tenant cannot re-request the restore for as long as the substrate stays broken;
+  it becomes claimable again only once teardown succeeds. A sustained
+  `fred_docker_backend_teardown_fallback_total{outcome="failed"}` on a blocking
+  operation is the signal to go fix the daemon, not something that clears itself.
+
+  New metric `fred_docker_backend_teardown_fallback_total{operation,outcome}`.
+  A rising `outcome="failed"` means the fallback could not finish either, but
+  what that costs depends on the `operation`: the *blocking* paths
+  (`restore_reconcile`, `restore_rollback`, `deprovision`) hold the lease and its
+  capacity open and retry, while the *advisory* ones (`restore_prelude`,
+  `provision_cleanup`) let state advance regardless, so nothing retries — and
+  `restore_prelude` in particular is routinely just a canceled restore request
+  with nothing on the host. See OPERATIONS.md for the triage split.
+
 - **One unreachable backend no longer stops reconciliation for the whole fleet**
   (ENG-356). `fetchAllProvisions` aborted the entire sweep if any single backend
   failed to list its provisions, so self-healing succeeded only when every

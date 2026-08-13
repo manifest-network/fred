@@ -743,16 +743,20 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			// "web/0"-style rather than raw indices.
 			logsRet = b.captureContainerLogs(containerIDs, stackContainerLogKeys(serviceContainers))
 
-			// Clean up via Compose Down (removes all project containers).
+			// Clean up via Compose Down (removes all project containers), falling back to
+			// per-container removal on failure. The fallback re-discovers by label rather
+			// than walking containerIDs, which is still nil whenever Up itself failed —
+			// it is only assigned from compose PS AFTER a successful Up, so the recorded
+			// list is empty for exactly the failures that leave containers behind
+			// (ENG-647). Best-effort as before: the provision has already failed and its
+			// pool allocation is released above, and there is no retained data behind a
+			// fresh provision, so a leftover is a resource leak to alert on rather than a
+			// reason to hold the lease.
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
-			if downErr := b.compose.Down(cleanupCtx, projectName, 10*time.Second); downErr != nil {
-				logger.Warn("compose down failed during cleanup, falling back to individual removal", "error", downErr)
-				for _, cid := range containerIDs {
-					if rmErr := b.docker.RemoveContainer(cleanupCtx, cid); rmErr != nil {
-						logger.Warn("failed to cleanup container after error", "container_id", leasesm.ShortID(cid), "error", rmErr)
-					}
-				}
+			if _, tdErr := b.teardownLeaseContainers(cleanupCtx, req.LeaseUUID, containerIDs, 10*time.Second,
+				teardownOpProvisionCleanup, logger); tdErr != nil {
+				logger.Warn("failed to cleanup containers after provision error", "error", tdErr)
 			}
 			for _, volumeID := range createdVolumeIDs {
 				if volErr := b.volumes.Destroy(cleanupCtx, volumeID); volErr != nil {
