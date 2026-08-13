@@ -625,6 +625,10 @@ func TestDoDeprovision_NoClaimedVolume_StillReleasesAllocation(t *testing.T) {
 // (fred-{lease}-*), which matches the adopted volume exactly, so without this the
 // guard merely deferred the destruction by one sweep — and made it look accounted-for
 // on the way.
+//
+// This is the WRITE-time half. Tombstones are persisted and outlive the binary, so the
+// reader re-checks the same claim at destroy time for records written before this guard
+// existed — see TestDestroyReapingVolumes_SkipsVolumeClaimedByRestoringRecord (ENG-659).
 func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T) {
 	const lease = "u2"
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}

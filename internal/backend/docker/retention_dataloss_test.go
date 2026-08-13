@@ -374,3 +374,238 @@ func TestReconcileRestoring_ReRecordsLiveManifestNotFrozenRecord(t *testing.T) {
 	assert.NotContains(t, string(rel.Manifest), "nginx",
 		"must NOT re-record the retention record's frozen pre-Update manifest (M-01)")
 }
+
+// --- ENG-659: the reaping finalizer re-checks ownership at DESTROY time ----------------
+//
+// A reaping tombstone is a name-keyed scheduled destroy persisted in bbolt. ENG-647 (PR
+// #217) stopped recordGiveUpLeak from WRITING an in-flight restore's adopted volume into
+// one, but records written by an older binary survive the upgrade and nothing rewrites
+// them — so the reader must re-check. These pin the reader half.
+
+// seedClaimedTombstone wires the collision: a RESTORING record for orig adopted into
+// newLease, plus a REAPING tombstone keyed at newLease that names both the adopted volume
+// (which is orig's data wearing newLease's canonical name) and newLease's own leak — the
+// exact shape a pre-ENG-647 give-up produced by prefix-collecting fred-{newLease}-*.
+// Returns (adopted, ownLeak).
+func seedClaimedTombstone(t *testing.T, rs *shared.RetentionStore, orig, newLease string) (string, string) {
+	t.Helper()
+	retained := "fred-retained-" + orig + "-app-0"
+	adopted := retainedToNewCanonical(retained, orig, newLease)
+	ownLeak := canonicalVolumeName(newLease, "app", 1)
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   orig,
+		NewLeaseUUID:        newLease,
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          1,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		RetainedVolumeNames: []string{retained},
+	}))
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   newLease,
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusReaping,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+		RetainedVolumeNames: []string{adopted, ownLeak},
+	}))
+	return adopted, ownLeak
+}
+
+// The core pin: executing a legacy tombstone must not destroy the volume an in-flight
+// restore adopted, and must leave that restore's record intact and restorable.
+func TestDestroyReapingVolumes_SkipsVolumeClaimedByRestoringRecord(t *testing.T) {
+	orig := "0192f1a0-1111-7abc-8def-000000000010"
+	newLease := "0192f1a0-2222-7abc-8def-000000000011"
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	adopted, ownLeak := seedClaimedTombstone(t, rs, orig, newLease)
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
+	}
+	leakBefore := testutil.ToFloat64(retentionLeakedTotal)
+	skipBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed))
+
+	ok := b.destroyReapingVolumes(context.Background(), newLease, []string{adopted, ownLeak})
+
+	assert.False(t, ok, "a skipped name means the record was not fully reaped")
+	assert.NotContains(t, destroyed, adopted,
+		"the volume an in-flight restore adopted is another lease's retained data — "+
+			"destroying it is unrecoverable and kills that restore (ENG-659)")
+	assert.Equal(t, []string{ownLeak}, destroyed,
+		"this lease's OWN leak is still reaped; the skip is per-name, not per-record")
+
+	tomb, err := rs.Get(newLease)
+	require.NoError(t, err)
+	require.NotNil(t, tomb, "the tombstone is the retry vehicle and must survive the skip")
+	assert.Equal(t, shared.RetentionStatusReaping, tomb.Status)
+
+	restoring, err := rs.Get(orig)
+	require.NoError(t, err)
+	require.NotNil(t, restoring, "the restoring record must be untouched, so the restore is still possible")
+	assert.Equal(t, shared.RetentionStatusRestoring, restoring.Status)
+	assert.Equal(t, []string{"fred-retained-" + orig + "-app-0"}, restoring.RetainedVolumeNames)
+
+	assert.Equal(t, leakBefore, testutil.ToFloat64(retentionLeakedTotal),
+		"a deliberate skip is not a leak: counting it would arm BackendRetentionLeaked on a healthy self-heal")
+	assert.Equal(t, skipBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed)))
+}
+
+// The same collision through the BOOT arm (reconcileRetentions), which is the actual
+// upgrade path: the first sweep after the upgrade is where a legacy tombstone is executed.
+// The new lease gets a live Provisioning provision so reconcileRestoring returns at its
+// non-Failed guard — the restoring record then stays claimed for the whole pass regardless
+// of which bbolt key order the two records are visited in.
+func TestReconcileRetentions_BootReapingArm_SkipsRestoreClaimedVolume(t *testing.T) {
+	orig := "0192f1a0-1111-7abc-8def-000000000012"
+	newLease := "0192f1a0-2222-7abc-8def-000000000013"
+
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		newLease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: newLease, Tenant: "tenant-a", Status: backend.ProvisionStatusProvisioning, Quantity: 1,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+	adopted, ownLeak := seedClaimedTombstone(t, rs, orig, newLease)
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
+	}
+
+	require.NoError(t, b.reconcileRetentions(context.Background()))
+
+	assert.NotContains(t, destroyed, adopted,
+		"the boot reaping arm executes stored records verbatim — it must honor the claim too (ENG-659)")
+	assert.Contains(t, destroyed, ownLeak)
+
+	tomb, err := rs.Get(newLease)
+	require.NoError(t, err)
+	assert.NotNil(t, tomb, "tombstone kept for the next sweep")
+	restoring, err := rs.Get(orig)
+	require.NoError(t, err)
+	require.NotNil(t, restoring)
+	assert.Equal(t, shared.RetentionStatusRestoring, restoring.Status)
+}
+
+// Fail-safe error branch: an unreadable retention store means ownership cannot be proven
+// for ANY name, so nothing is destroyed — the same posture cleanupOrphanedVolumes and
+// recordGiveUpLeak take. Over-keeping is recoverable; over-destroying is not.
+func TestDestroyReapingVolumes_ClaimLookupError_DestroysNothing(t *testing.T) {
+	orig := "0192f1a0-1111-7abc-8def-000000000014"
+	newLease := "0192f1a0-2222-7abc-8def-000000000015"
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	adopted, ownLeak := seedClaimedTombstone(t, rs, orig, newLease)
+	require.NoError(t, rs.Close()) // every retention read now fails
+
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Errorf("must not destroy %q when the claim set is unreadable — it may be another lease's data", id)
+			return nil
+		},
+	}
+	leakBefore := testutil.ToFloat64(retentionLeakedTotal)
+	skipBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
+
+	ok := b.destroyReapingVolumes(context.Background(), newLease, []string{adopted, ownLeak})
+
+	assert.False(t, ok, "nothing was destroyed, so the record cannot be dropped")
+	assert.Equal(t, skipBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable)))
+	assert.Equal(t, leakBefore, testutil.ToFloat64(retentionLeakedTotal),
+		"a fail-safe bailout abandons nothing; the record still counts the footprint")
+}
+
+// No-regression control: the ordinary reap. An evicted/expired record carries only the
+// fred-retained-* names PutActiveMerged wrote, no restore is in flight, and the record is
+// destroyed and dropped exactly as before ENG-659.
+func TestDestroyReapingVolumes_NormalReapingRecordStillFullyReaped(t *testing.T) {
+	lease := "0192f1a0-3333-7abc-8def-000000000016"
+	names := []string{"fred-retained-" + lease + "-app-0", "fred-retained-" + lease + "-app-1"}
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   lease,
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusReaping,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+		RetainedVolumeNames: names,
+	}))
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
+	}
+	claimedBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed))
+	unreadableBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
+
+	assert.True(t, b.destroyReapingVolumes(context.Background(), lease, names))
+	assert.Equal(t, names, destroyed)
+
+	rec, err := rs.Get(lease)
+	require.NoError(t, err)
+	assert.Nil(t, rec, "a fully reaped record is deleted")
+	assert.Equal(t, claimedBefore, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed)))
+	assert.Equal(t, unreadableBefore, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable)))
+}
+
+// The claim set is keyed on canonical fred-{lease}-* names (retainedToNewCanonical never
+// emits a fred-retained-* name), so an all-retained name list cannot match one and the
+// store read is skipped entirely. This keeps the guard off the hot reap path — notably
+// evictOldest's up-to-32 records inside a synchronous close. Pinned by closing the store:
+// without the pre-filter this would bail at claim_unreadable and destroy nothing.
+func TestDestroyReapingVolumes_RetainedOnlyNames_SkipTheClaimLookup(t *testing.T) {
+	lease := "0192f1a0-3333-7abc-8def-000000000017"
+	names := []string{"fred-retained-" + lease + "-app-0"}
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Close())
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
+	}
+	unreadableBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
+
+	b.destroyReapingVolumes(context.Background(), lease, names)
+
+	assert.Equal(t, names, destroyed,
+		"no fred-{lease}-* name in the list ⇒ no claim can match ⇒ no store read, destroy proceeds")
+	assert.Equal(t, unreadableBefore, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable)),
+		"the pre-filter must not be reached by way of the fail-safe bailout")
+}
+
+// Convergence: the skip defers, it does not wedge. Once the restore's rollback
+// re-quarantines the volume (record back to ACTIVE, canonical name gone), the very next
+// pass reaps the tombstone and drops it. This is the test that stops a future reader from
+// "simplifying" the skip into a Delete.
+func TestDestroyReapingVolumes_ConvergesAfterRestoreRollback(t *testing.T) {
+	orig := "0192f1a0-1111-7abc-8def-000000000018"
+	newLease := "0192f1a0-2222-7abc-8def-000000000019"
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	adopted, ownLeak := seedClaimedTombstone(t, rs, orig, newLease)
+	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return nil }}
+
+	require.False(t, b.destroyReapingVolumes(context.Background(), newLease, []string{adopted, ownLeak}),
+		"precondition: the claim holds the tombstone")
+
+	// The rollback: reconcileRestoring renames fred-{newLease}-app-0 back into the
+	// retained namespace and CASes the record to active. The claim is gone with it.
+	reverted, err := rs.RevertToActive(orig, 1)
+	require.NoError(t, err)
+	require.True(t, reverted)
+
+	assert.True(t, b.destroyReapingVolumes(context.Background(), newLease, []string{adopted, ownLeak}),
+		"claim cleared ⇒ the destroy is an idempotent no-op on the now-absent name and the record drops")
+	rec, err := rs.Get(newLease)
+	require.NoError(t, err)
+	assert.Nil(t, rec)
+}
