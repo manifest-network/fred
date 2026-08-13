@@ -56,7 +56,7 @@ func dockerVolumeSet(t *testing.T, ctx context.Context, docker *DockerClient) ma
 	return set
 }
 
-// TestComposeDown_RemovesAnonymousVolumes pins the leak-prevention contract for
+// TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes pins the leak-prevention contract for
 // ENG-372: tearing a lease's compose project down must also remove the
 // anonymous Docker volumes attached to its containers.
 //
@@ -66,7 +66,7 @@ func dockerVolumeSet(t *testing.T, ctx context.Context, docker *DockerClient) ma
 // present). A Down that does not reap them leaks one anonymous volume per such
 // container on every close, which is the source of the thousands of orphaned
 // 64-hex volumes observed accumulating on dev backends.
-func TestComposeDown_RemovesAnonymousVolumes(t *testing.T) {
+func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
@@ -138,12 +138,12 @@ func TestComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 		"anonymous volume %s must be removed by Down; got err=%v", anonVol, err)
 }
 
-// TestRemoveContainer_RemovesAnonymousVolumes pins the same leak-prevention
+// TestIntegration_Docker_RemoveContainer_RemovesAnonymousVolumes pins the same leak-prevention
 // contract on the individual-container fallback path (ENG-372). fred falls back
 // to RemoveContainer when compose Down fails (deprovision.go) and uses it for
 // create-rollback, so it too must reap the container's anonymous volumes —
 // otherwise the leak survives whenever the compose path is bypassed.
-func TestRemoveContainer_RemovesAnonymousVolumes(t *testing.T) {
+func TestIntegration_Docker_RemoveContainer_RemovesAnonymousVolumes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
@@ -189,7 +189,7 @@ func TestRemoveContainer_RemovesAnonymousVolumes(t *testing.T) {
 		"anonymous volume %s must be removed by RemoveContainer; got err=%v", anonVol, err)
 }
 
-// TestImageIntrospection_DoesNotLeakAnonymousVolumes pins that the image-
+// TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes pins that the image-
 // introspection temp containers (ENG-372 (a)) do not leak anonymous volumes.
 // Each of ResolveImageUser/DetectVolumeOwner/DetectWritablePaths spins up a
 // throwaway container FROM the tenant image to read its filesystem; Docker
@@ -197,7 +197,7 @@ func TestRemoveContainer_RemovesAnonymousVolumes(t *testing.T) {
 // time (even though these containers are never started), so the teardown must
 // remove them. These run on the provision path (cache-missed image setup), so
 // a leak here accumulates per distinct image and across backend restarts.
-func TestImageIntrospection_DoesNotLeakAnonymousVolumes(t *testing.T) {
+func TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)

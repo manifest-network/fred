@@ -53,6 +53,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   **and restarting providerd**, which reads its backend list only at startup;
   see OPERATIONS.md § Removing, renaming or pausing a backend.
 
+- Tests: the three ENG-372 anonymous-volume integration tests have never
+  executed. `make test-integration` selects with `-run Integration`, and these
+  were the only `//go:build integration` tests in the package whose names lack
+  that substring, so the selector filtered them out from the day they were
+  written. CI could not notice: a filtered test emits neither a `--- SKIP:` line
+  nor a `--- PASS:` line, so the job's SKIP guard saw nothing and its
+  `PASS >= 1` floor was satisfied by the ~85 tests that do run. The one contract
+  guarding a silent, cumulative and expensive leak — `compose down` reaping the
+  anonymous volumes Docker auto-creates for image `VOLUME` directives — was
+  therefore unguarded. Renamed to `TestIntegration_Docker_*`; all three pass
+  against the current tree, so this closes a coverage gap rather than a defect.
+  The tests were renamed instead of widening the `-run` pattern, which is shared
+  by the whole 30-minute suite.
+
 ### Security
 
 - deps: bump `google.golang.org/grpc` to v1.82.1 (from v1.79.3) to resolve
