@@ -26,6 +26,7 @@ func TestMetricsRegistered(t *testing.T) {
 		ReconcilerBackendFetchTotal,
 		ReconcilerSweepComplete,
 		ReconcilerDeferredLeasesTotal,
+		ReconcilerCleanupSkipsTotal,
 		PayloadUploadsTotal,
 		PayloadStoredCount,
 		PayloadSizeBytes,
@@ -119,6 +120,17 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeError)
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeCircuitOpen)
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomePanic)
+	})
+	assert.NotPanics(t, func() {
+		// Both label sets are closed; every combination the reconciler can emit.
+		for _, pass := range []string{CleanupPassOrphan, CleanupPassPayload, CleanupPassPlacement} {
+			for _, reason := range []string{
+				CleanupSkipChainLive, CleanupSkipChainUnknown,
+				CleanupSkipChainError, CleanupSkipBackendSilent,
+			} {
+				ReconcilerCleanupSkipsTotal.WithLabelValues(pass, reason)
+			}
+		}
 	})
 	assert.NotPanics(t, func() {
 		PayloadUploadsTotal.WithLabelValues("success")

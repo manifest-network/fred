@@ -706,10 +706,12 @@ func TestReconciler_ReconcileAll_ReconcileCustomDomainErrorDoesNotAbortTick(t *t
 }
 
 func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
-	// Setup: No lease on chain, but provisioned on backend (orphan)
+	// Setup: lease closed on chain, still provisioned on backend (orphan)
 	// Expected: Deprovision the orphan
 	mockChain := &chaintest.MockClient{
-		// No leases - default funcs return empty slices
+		// Absent from the PENDING/ACTIVE lists, and the chain confirms it closed
+		// — the positive evidence ENG-654 requires before destroying state.
+		GetLeaseFunc: chaintest.ClosedLeaseFunc("provider-1"),
 	}
 	mockBackend := &mockReconcilerBackend{
 		name: "test",
@@ -745,7 +747,8 @@ func TestReconciler_ReconcileAll_SkipsInFlightOrphan(t *testing.T) {
 	// it — that would tear down a healthy lease mid-provision. A genuinely orphaned
 	// (not in-flight) provision in the same sweep must still be deprovisioned.
 	mockChain := &chaintest.MockClient{
-		// No leases on chain — both provisions are orphan candidates.
+		// Both leases are closed on chain — both are orphan candidates.
+		GetLeaseFunc: chaintest.ClosedLeaseFunc("provider-1"),
 	}
 	mockBackend := &mockReconcilerBackend{
 		name: "test",
@@ -988,7 +991,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 
 func TestReconciler_MultipleBackends(t *testing.T) {
 	// Test reconciliation with multiple backends
-	mockChain := &chaintest.MockClient{}
+	mockChain := &chaintest.MockClient{GetLeaseFunc: chaintest.ClosedLeaseFunc("provider-1")}
 
 	backend1 := &mockReconcilerBackend{
 		name: "backend1",
@@ -1190,7 +1193,8 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 	deprovisionErr := errors.New("backend unavailable")
 
 	mockChain := &chaintest.MockClient{
-		// No leases - both provisions are orphans
+		// Both leases closed on chain - both provisions are orphans
+		GetLeaseFunc: chaintest.ClosedLeaseFunc("provider-1"),
 	}
 	mockBackend := &mockReconcilerBackend{
 		name: "test",
@@ -1228,7 +1232,8 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 	// Test that reconciler does NOT deprovision orphans belonging to other providers.
 	// This is critical when multiple providers share the same backend.
 	mockChain := &chaintest.MockClient{
-		// No leases for our provider
+		// No live leases for our provider; every lease closed on chain
+		GetLeaseFunc: chaintest.ClosedLeaseFunc("provider-1"),
 	}
 	mockBackend := &mockReconcilerBackend{
 		name: "test",
@@ -1493,7 +1498,8 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 	var mu sync.Mutex
 
 	mockChain := &chaintest.MockClient{
-		// No leases - all provisions are orphans
+		// All leases closed on chain - all provisions are orphans
+		GetLeaseFunc: chaintest.ClosedLeaseFunc("provider-1"),
 	}
 
 	// Use a backend that cancels context after first deprovision
@@ -1814,7 +1820,8 @@ func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
 	)
 
 	mockChain := &chaintest.MockClient{
-		// No leases - all provisions are orphans
+		// All leases closed on chain - all provisions are orphans
+		GetLeaseFunc: chaintest.ClosedLeaseFunc("provider-1"),
 	}
 
 	// Create many orphan provisions
@@ -2203,8 +2210,8 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	// Store payloads for various leases
 	// pending-awaiting: pending lease with MetaHash but hasn't uploaded payload yet - simulates
 	// a lease that's still waiting for payload (payload won't be in store, so nothing to clean)
-	payloadStore.Store("closed-lease", []byte("closed payload"))      // Will be cleaned (lease is closed/not found)
-	payloadStore.Store("nonexistent-lease", []byte("orphan payload")) // Will be cleaned (lease doesn't exist)
+	payloadStore.Store("closed-lease", []byte("closed payload"))      // Will be cleaned (chain confirms CLOSED)
+	payloadStore.Store("nonexistent-lease", []byte("orphan payload")) // KEPT (chain has no record — ENG-654)
 	payloadStore.Store("active-lease", []byte("active payload"))      // Retained for re-provisioning
 
 	// Verify all payloads are stored
@@ -2222,6 +2229,16 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 				{Uuid: "active-lease", Tenant: "tenant-2", State: billingtypes.LEASE_STATE_ACTIVE},
 				// Note: "closed-lease" and "nonexistent-lease" are not returned (not pending or active)
 			}, nil
+		},
+		// The per-payload re-check that separates the two absent leases: one the
+		// chain positively reports CLOSED, one it has never heard of. Absence
+		// from the lists above cannot tell them apart, and only the first
+		// authorises deleting the payload (ENG-654).
+		GetLeaseFunc: func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			if leaseUUID == "closed-lease" {
+				return chaintest.NewMockLease(leaseUUID, "tenant-3", "provider-1", billingtypes.LEASE_STATE_CLOSED), nil
+			}
+			return nil, nil
 		},
 	}
 
@@ -2247,18 +2264,21 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, hasActive, "expected active-lease payload to be retained for re-provisioning")
 
-	// closed-lease: payload should be cleaned (lease doesn't exist in chain query results)
+	// closed-lease: payload should be cleaned (chain positively reports CLOSED)
 	hasClosed, err := payloadStore.Has("closed-lease")
 	require.NoError(t, err)
-	assert.False(t, hasClosed, "expected closed-lease payload to be cleaned up (lease not found)")
+	assert.False(t, hasClosed, "expected closed-lease payload to be cleaned up (chain confirms it closed)")
 
-	// nonexistent-lease: payload should be cleaned (lease doesn't exist)
+	// nonexistent-lease: payload should be KEPT. The ledger never deletes a
+	// lease, so "the chain has no record" is not evidence the lease finished —
+	// it is a phantom, a wrong chain, or a lagging node. Fred counts it and
+	// leaves it alone (ENG-654).
 	hasNonexistent, err := payloadStore.Has("nonexistent-lease")
 	require.NoError(t, err)
-	assert.False(t, hasNonexistent, "expected nonexistent-lease payload to be cleaned up (lease not found)")
+	assert.True(t, hasNonexistent, "expected nonexistent-lease payload to be kept: absence is not evidence")
 
-	// Verify count - only active-lease payload should remain
-	assert.Equal(t, 1, payloadStore.Count())
+	// Verify count - active-lease and the unknown lease's payload remain
+	assert.Equal(t, 2, payloadStore.Count())
 }
 
 // TestReconciler_ConcurrentReconcileAll tests that concurrent ReconcileAll calls
@@ -3147,6 +3167,209 @@ func TestDeferLease(t *testing.T) {
 	}
 }
 
+// TestClassifyLease is the exhaustive table for the other safety decision the
+// reconciler makes, and the reason classifyLease is pure. Read it alongside
+// TestDeferLease: that one decides whether the sweep may act on a lease at all,
+// this one decides whether the chain has positively said the lease is finished.
+//
+// Only leaseTerminal authorises destroying state. Everything else — including a
+// lease the chain has never heard of — costs a cycle of cleanup latency, which
+// is the cheap side of the trade (ENG-654).
+func TestClassifyLease(t *testing.T) {
+	t.Parallel()
+
+	lease := func(state billingtypes.LeaseState) *billingtypes.Lease {
+		return &billingtypes.Lease{Uuid: "lease-1", State: state}
+	}
+
+	tests := []struct {
+		name         string
+		lease        *billingtypes.Lease
+		err          error
+		wantLiveness leaseLiveness
+		wantReason   string
+		why          string
+	}{
+		{
+			name:         "query error is not absence",
+			lease:        nil,
+			err:          assert.AnError,
+			wantLiveness: leaseUnknown,
+			wantReason:   metrics.CleanupSkipChainError,
+			why:          "an unreachable chain says nothing about the lease",
+		},
+		{
+			name:         "error alongside a lease still classifies as error",
+			lease:        lease(billingtypes.LEASE_STATE_CLOSED),
+			err:          assert.AnError,
+			wantLiveness: leaseUnknown,
+			wantReason:   metrics.CleanupSkipChainError,
+			why:          "a partial result from a failed call is not evidence",
+		},
+		{
+			name:         "no record is NOT closed",
+			lease:        nil,
+			wantLiveness: leaseUnknown,
+			wantReason:   metrics.CleanupSkipChainUnknown,
+			why:          "x/billing never deletes a lease, so absence means the chain never knew it",
+		},
+		{
+			name:         "pending is live",
+			lease:        lease(billingtypes.LEASE_STATE_PENDING),
+			wantLiveness: leaseLive,
+			wantReason:   metrics.CleanupSkipChainLive,
+			why:          "the sweep's snapshot was stale; the main loop owns this lease",
+		},
+		{
+			name:         "active is live",
+			lease:        lease(billingtypes.LEASE_STATE_ACTIVE),
+			wantLiveness: leaseLive,
+			wantReason:   metrics.CleanupSkipChainLive,
+		},
+		{
+			name:         "unspecified is unknown, not terminal",
+			lease:        lease(billingtypes.LEASE_STATE_UNSPECIFIED),
+			wantLiveness: leaseUnknown,
+			wantReason:   metrics.CleanupSkipChainUnknown,
+			why:          "the zero value should never appear on chain; do not guess",
+		},
+		{
+			name:         "closed is terminal",
+			lease:        lease(billingtypes.LEASE_STATE_CLOSED),
+			wantLiveness: leaseTerminal,
+		},
+		{
+			name:         "rejected is terminal",
+			lease:        lease(billingtypes.LEASE_STATE_REJECTED),
+			wantLiveness: leaseTerminal,
+		},
+		{
+			name:         "expired is terminal",
+			lease:        lease(billingtypes.LEASE_STATE_EXPIRED),
+			wantLiveness: leaseTerminal,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotLiveness, gotReason := classifyLease(tc.lease, tc.err)
+			assert.Equal(t, tc.wantLiveness, gotLiveness, tc.why)
+			assert.Equal(t, tc.wantReason, gotReason)
+		})
+	}
+}
+
+// TestReconciler_ReconcileAll_OrphanRecheck covers the three ways the chain can
+// decline to confirm an orphan candidate. Each must leave the provision alone
+// and count itself; none may reach Deprovision.
+//
+// Deliberately NOT parallel: it reads process-global Prometheus collectors.
+func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
+	tests := []struct {
+		name       string
+		getLease   func(context.Context, string) (*billingtypes.Lease, error)
+		wantReason string
+		why        string
+	}{
+		{
+			name: "chain reports the lease live",
+			getLease: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+				return chaintest.NewMockLease(uuid, "tenant-1", "provider-1", billingtypes.LEASE_STATE_ACTIVE), nil
+			},
+			wantReason: metrics.CleanupSkipChainLive,
+			why:        "the sweep's two list queries are not atomic; this lease was created between them",
+		},
+		{
+			name: "chain has no record of the lease",
+			getLease: func(_ context.Context, _ string) (*billingtypes.Lease, error) {
+				return nil, nil
+			},
+			wantReason: metrics.CleanupSkipChainUnknown,
+			why:        "absence is not evidence: a wrong or reset chain must not deprovision the fleet",
+		},
+		{
+			name: "chain query fails",
+			getLease: func(_ context.Context, _ string) (*billingtypes.Lease, error) {
+				return nil, assert.AnError
+			},
+			wantReason: metrics.CleanupSkipChainError,
+			why:        "cleanup gates fail open; retry on the next sweep",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockChain := &chaintest.MockClient{GetLeaseFunc: tc.getLease}
+			mockBackend := &mockReconcilerBackend{
+				name: "test",
+				provisions: []backend.ProvisionInfo{
+					{LeaseUUID: "candidate", Status: backend.ProvisionStatusReady, BackendName: "test"},
+				},
+			}
+			router, _ := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+			})
+
+			reconciler, err := NewReconciler(ReconcilerConfig{
+				ProviderUUID:    "provider-1",
+				CallbackBaseURL: "http://localhost:8080",
+			}, mockChain, noopAck, router, nil, nil)
+			require.NoError(t, err)
+
+			skips := metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassOrphan, tc.wantReason)
+			before := promtestutil.ToFloat64(skips)
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+			after := promtestutil.ToFloat64(skips)
+
+			mockBackend.mu.Lock()
+			defer mockBackend.mu.Unlock()
+			assert.Empty(t, mockBackend.deprovisionCalls, tc.why)
+			assert.Equal(t, 1.0, after-before, "the skip must be counted under reason %q", tc.wantReason)
+		})
+	}
+}
+
+// TestReconciler_CleanupOrphanedPayloads_ChainErrorKeepsPayload is the payload
+// pass's error branch. A payload deleted out from under a live lease makes the
+// NEXT sweep classify errPayloadNotAvailable as permanent and close a healthy
+// ACTIVE lease on chain, so an unreachable chain must keep the payload.
+func TestReconciler_CleanupOrphanedPayloads_ChainErrorKeepsPayload(t *testing.T) {
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
+		DBPath: t.TempDir() + "/payloads.db",
+	})
+	require.NoError(t, err)
+	defer payloadStore.Close()
+
+	require.True(t, payloadStore.Store("absent-lease", []byte("manifest-bytes")))
+
+	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(_ context.Context, _ string) (*billingtypes.Lease, error) {
+			return nil, assert.AnError
+		},
+	}
+	mockBackend := &mockReconcilerBackend{name: "test"}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, newMockInFlightTracker(payloadStore), nil)
+	require.NoError(t, err)
+
+	skips := metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassPayload, metrics.CleanupSkipChainError)
+	before := promtestutil.ToFloat64(skips)
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+	after := promtestutil.ToFloat64(skips)
+
+	has, err := payloadStore.Has("absent-lease")
+	require.NoError(t, err)
+	assert.True(t, has, "a payload must survive a chain fred could not reach")
+	assert.Equal(t, 1.0, after-before)
+}
+
 func TestReconciler_ReconcileAll_ListProvisionError_DefersWithoutAborting(t *testing.T) {
 	// ENG-356 inverted this test. A backend failing ListProvisions used to abort
 	// the ENTIRE sweep; it now marks that backend unanswered and defers only the
@@ -3876,7 +4099,8 @@ func TestReconciler_doStartProvisioning_HonorsPlacement(t *testing.T) {
 // --- Placement pruning tests (ENG-333) ---
 
 // statsErrRetentionBackend wraps MockBackend to make ListRetentions fail,
-// exercising the "retentionsComplete=false → no prune" gate.
+// exercising the "this record's backend did not answer /retentions → no prune"
+// gate.
 type statsErrRetentionBackend struct {
 	*backend.MockBackend
 }
@@ -3915,13 +4139,55 @@ func TestCleanupOrphanedPlacements_GateD(t *testing.T) {
 	// that makes the pruner read other Reconciler fields must set them here too,
 	// or this white-box test will nil-panic.
 	r := &Reconciler{placementStore: ps, tracker: tracker, interval: time.Minute}
-	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, true, time.Now().Add(time.Hour))
+	answered := answeredSet{"backend-a": true, "backend-b": true}
+	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, answered, answered, time.Now().Add(time.Hour))
 
 	assert.Equal(t, 2, pruned)
 	assert.Equal(t, "backend-a", ps.Get("active-chain-lease"), "gate d: ACTIVE on chain must keep")
 	assert.Equal(t, "backend-b", ps.Get("pending-chain-lease"), "gate d: PENDING on chain must keep")
 	assert.Equal(t, "", ps.Get("closed-chain-lease"), "gate d: CLOSED on chain must prune")
 	assert.Equal(t, "", ps.Get("off-chain-lease"), "absent from chain must prune")
+}
+
+// TestCleanupOrphanedPlacements_PerRecordAnswered pins the ENG-654 rescoping:
+// "did the owning backend report?" is a question about ONE record's backend, not
+// about the fleet, and it is asked of both list endpoints because they fail
+// independently. One silent machine must cost only its own records.
+//
+// Deliberately NOT parallel: it reads a process-global Prometheus collector.
+func TestCleanupOrphanedPlacements_PerRecordAnswered(t *testing.T) {
+	ps := &mockPlacementStore{}
+	ps.Set("on-answering", "backend-a")      // both endpoints answered → prune
+	ps.Set("provisions-silent", "backend-b") // /provisions failed → keep
+	ps.Set("retentions-silent", "backend-c") // /retentions failed → keep
+	ps.Set("unconfigured", "backend-decomm") // not configured at all → keep (ENG-635)
+
+	// Every record is chain-terminal and on no backend: the ONLY thing that
+	// differs between them is whether their own backend reported.
+	chainLeases := map[string]billingtypes.Lease{}
+	backendLeases := map[string]struct{}{}
+	tracker := newMockInFlightTracker(nil)
+
+	provisionsAnswered := answeredSet{"backend-a": true, "backend-b": false, "backend-c": true}
+	retentionsAnswered := answeredSet{"backend-a": true, "backend-b": true, "backend-c": false}
+
+	r := &Reconciler{placementStore: ps, tracker: tracker, interval: time.Minute}
+	skips := metrics.ReconcilerCleanupSkipsTotal.
+		WithLabelValues(metrics.CleanupPassPlacement, metrics.CleanupSkipBackendSilent)
+	before := promtestutil.ToFloat64(skips)
+
+	// now far in the future so the ENG-335 grace window is not what is being tested.
+	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases,
+		provisionsAnswered, retentionsAnswered, time.Now().Add(time.Hour))
+
+	assert.Equal(t, 1, pruned)
+	assert.Equal(t, "", ps.Get("on-answering"),
+		"a record whose backend answered both endpoints must still be pruned, degraded sweep or not")
+	assert.Equal(t, "backend-b", ps.Get("provisions-silent"), "/provisions silent for this backend must keep")
+	assert.Equal(t, "backend-c", ps.Get("retentions-silent"), "/retentions silent for this backend must keep")
+	assert.Equal(t, "backend-decomm", ps.Get("unconfigured"),
+		"an unconfigured backend's record is the only pointer to its data; keep it")
+	assert.Equal(t, 3.0, promtestutil.ToFloat64(skips)-before, "every withheld prune must be counted")
 }
 
 // TestReconciler_PrunesOrphanedPlacement verifies the happy-path prune:
@@ -3977,21 +4243,25 @@ func TestCleanupOrphanedPlacements_GraceWindow(t *testing.T) {
 	backendLeases := map[string]struct{}{}
 	tracker := newMockInFlightTracker(nil)
 	r := &Reconciler{placementStore: ps, tracker: tracker, interval: interval}
+	answered := answeredSet{"backend-a": true}
 
 	// now = t0 + 1m  → within the 2m grace → KEEP.
-	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, true, t0.Add(time.Minute))
+	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, answered, answered, t0.Add(time.Minute))
 	assert.Equal(t, 0, pruned, "young placement within grace must be kept")
 	assert.Equal(t, "backend-a", ps.Get("young-lease"))
 
 	// now = t0 + 2m + 1s → past grace → PRUNE.
-	pruned = r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, true, t0.Add(2*time.Minute+time.Second))
+	pruned = r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases, answered, answered, t0.Add(2*time.Minute+time.Second))
 	assert.Equal(t, 1, pruned, "aged placement past grace must be pruned")
 	assert.Equal(t, "", ps.Get("young-lease"))
 }
 
-// TestReconciler_DoesNotPruneOnIncompleteRetentions verifies gate (a):
-// when a backend's ListRetentions fails, retentionsComplete=false and no
-// placement must be pruned (a backend outage must not wipe valid placements).
+// TestReconciler_DoesNotPruneOnIncompleteRetentions verifies the retentions half
+// of the attribution gate end-to-end: when the record's OWN backend fails
+// ListRetentions, its placement must not be pruned (a backend outage must not
+// wipe valid placements). The single configured backend here is the record's
+// owner; TestCleanupOrphanedPlacements_PerRecordAnswered covers the case where
+// the failing backend is somebody else's.
 func TestReconciler_DoesNotPruneOnIncompleteRetentions(t *testing.T) {
 	ps := &mockPlacementStore{}
 	ps.Set("gone-lease", "backend-a")
@@ -4005,8 +4275,8 @@ func TestReconciler_DoesNotPruneOnIncompleteRetentions(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Chain returns no leases → gone-lease would be chain-terminal, but
-	// retentionsComplete=false must block the prune entirely.
+	// Chain returns no leases → gone-lease would be chain-terminal, but its
+	// backend not answering /retentions must block the prune.
 	reconciler, err := NewReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
@@ -4016,7 +4286,7 @@ func TestReconciler_DoesNotPruneOnIncompleteRetentions(t *testing.T) {
 	require.NoError(t, reconciler.RunOnce(t.Context()))
 
 	assert.Equal(t, "backend-a", ps.Get("gone-lease"),
-		"placement must NOT be pruned when a backend's retentions could not be fetched (gate a)")
+		"placement must NOT be pruned when its own backend's retentions could not be fetched")
 }
 
 // TestReconciler_DoesNotPruneActiveOrInFlight verifies the in-flight gate (c)

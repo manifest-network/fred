@@ -513,8 +513,9 @@ type fleet struct {
 	rejected []string
 	closed   []string
 
-	leaseMu sync.Mutex
-	leases  map[string]billingtypes.Lease
+	leaseMu     sync.Mutex
+	leases      map[string]billingtypes.Lease
+	getLeaseErr error
 }
 
 func newFleet(t *testing.T, opts fleetOptions) *fleet {
@@ -595,6 +596,24 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 		},
 		GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
 			return f.leasesInState(billingtypes.LEASE_STATE_ACTIVE), nil
+		},
+		// Per-lease lookups see every lease the chain holds, in whatever state —
+		// including the terminal ones the two list queries filter out. That
+		// difference is the whole point of the re-check (ENG-654), so the
+		// harness must model it: closeLease keeps a lease here, removeLease
+		// makes the chain deny all knowledge of it, and getLeaseErr models an
+		// unreachable chain.
+		GetLeaseFunc: func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			f.leaseMu.Lock()
+			defer f.leaseMu.Unlock()
+			if f.getLeaseErr != nil {
+				return nil, f.getLeaseErr
+			}
+			lease, ok := f.leases[leaseUUID]
+			if !ok {
+				return nil, nil
+			}
+			return &lease, nil
 		},
 		RejectLeasesFunc: func(_ context.Context, uuids []string, _ string) (uint64, []string, error) {
 			f.chainMu.Lock()
@@ -683,12 +702,37 @@ func (f *fleet) addLease(uuid string, state billingtypes.LeaseState, skuUUIDs ..
 	f.leases[uuid] = *lease
 }
 
-// removeLease deletes a lease from the chain entirely, which is what makes a
-// surviving provision an orphan candidate.
+// closeLease moves a lease to CLOSED. It drops out of the PENDING/ACTIVE list
+// queries but a per-lease lookup still finds it, which is the normal end of a
+// lease's life and the only thing that authorises destroying its state.
+func (f *fleet) closeLease(uuid string) {
+	f.leaseMu.Lock()
+	defer f.leaseMu.Unlock()
+	lease, ok := f.leases[uuid]
+	if !ok {
+		f.t.Fatalf("closeLease: no lease %q on chain", uuid)
+	}
+	lease.State = billingtypes.LEASE_STATE_CLOSED
+	f.leases[uuid] = lease
+}
+
+// removeLease makes the chain deny all knowledge of a lease. Note this is NOT
+// how a lease ends on the real chain — x/billing never deletes one — so it
+// models a phantom provision, a wrong/reset chain, or an RPC node behind the
+// head. Fred must refuse to clean up after it; use closeLease for an ordinary
+// terminal lease.
 func (f *fleet) removeLease(uuid string) {
 	f.leaseMu.Lock()
 	defer f.leaseMu.Unlock()
 	delete(f.leases, uuid)
+}
+
+// setGetLeaseErr makes every per-lease chain lookup fail, modelling a chain fred
+// cannot reach while its cached list results are still usable.
+func (f *fleet) setGetLeaseErr(err error) {
+	f.leaseMu.Lock()
+	defer f.leaseMu.Unlock()
+	f.getLeaseErr = err
 }
 
 func (f *fleet) leasesInState(state billingtypes.LeaseState) []billingtypes.Lease {

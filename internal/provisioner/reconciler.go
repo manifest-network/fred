@@ -43,6 +43,12 @@ var errPayloadNotAvailable = errors.New("payload not available")
 
 // ReconcilerChainClient defines the chain operations needed by the reconciler.
 type ReconcilerChainClient interface {
+	// GetLease returns a lease by UUID regardless of state, or (nil, nil) when
+	// the chain has no record of it. The sweep's two list queries are filtered
+	// to PENDING/ACTIVE, so this is the only way to tell a terminal lease from
+	// one the chain never knew — the distinction every destructive pass rests
+	// on (ENG-654, see classifyLease).
+	GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
 	GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
 	AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
@@ -216,14 +222,18 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 	// Retained leases also pin a backend (restore affinity, ENG-333). Fetch them
 	// only when placement tracking is enabled: the results feed solely the
-	// placement sync and the gated pruner below, both of which no-op without a
+	// placement sync and the pruner below, both of which no-op without a
 	// placement store. Skipping avoids pointless per-backend /retentions calls and
 	// log noise on placement-disabled deployments.
 	var allRetentions map[string]string
-	var retentionsComplete bool
+	var retentionsAnswered answeredSet
 	if r.placementStore != nil {
-		allRetentions, retentionsComplete = r.fetchAllRetentions(ctx)
-		slog.Info("fetched backend retentions", "total", len(allRetentions), "complete", retentionsComplete)
+		allRetentions, retentionsAnswered = r.fetchAllRetentions(ctx)
+		slog.Info("fetched backend retentions",
+			"total", len(allRetentions),
+			"complete", retentionsAnswered.complete(),
+			"unanswered", retentionsAnswered.unanswered(),
+		)
 	}
 
 	// Sync placements from actual backend state (handles cold start and drift).
@@ -379,28 +389,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// Only deprovision orphans that belong to this provider to avoid
 	// interfering with other providers sharing the same backend.
 	//
-	// Skipped entirely on an incomplete sweep. Orphan classification is safe
-	// against partial BACKEND data — a backend that did not answer contributes
-	// no candidates — but it is not safe against a stale CHAIN snapshot, and the
-	// two chain queries above are not atomic, so a lease created between them is
-	// invisible to both while the event path may already be provisioning it.
-	// That hazard is pre-existing, but until now the fleet-wide abort suppressed
-	// this pass on exactly these sweeps; proceeding here would newly expose it.
-	// Orphan-GC latency is not a correctness property — one deferred cycle costs
-	// nothing, deprovisioning a live lease costs a tenant their workload.
+	// This runs on every sweep, degraded or not (ENG-654). Every candidate is
+	// positively attributed: it came from a backend that answered, and
+	// processOrphan re-reads the lease from the chain and acts only on a
+	// terminal state. A backend that did not answer contributes no candidates,
+	// so partial fleet data can only ever UNDER-collect — which is why the old
+	// fleet-wide gate protected nothing on the backend axis while pausing
+	// cleanup for every healthy machine.
 	var orphans atomic.Int32
 
 	og, ogctx := errgroup.WithContext(ctx)
 	og.SetLimit(r.maxWorkers)
 
-	orphanCandidates := allProvisions
-	if !snapshot.complete {
-		orphanCandidates = nil
-		slog.Info("reconcile: skipping orphan detection, fleet view is incomplete",
-			"unanswered", snapshot.unansweredBackends())
-	}
-
-	for leaseUUID, provision := range orphanCandidates {
+	for leaseUUID, provision := range allProvisions {
 		og.Go(func() error {
 			// Recover any panic inside processOrphan. Same rationale as
 			// the processLease recover above.
@@ -470,26 +471,21 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		metrics.ReconcilerLastSuccessTimestamp.SetToCurrentTime()
 	}
 
-	// 5 & 6. The remaining passes DELETE durable state, and both are gated on a
-	// complete fleet view for the same reason the orphan pass above is: until
-	// now the fleet-wide abort suppressed them whenever any backend failed, so
-	// running them on a degraded sweep would newly expose hazards this change is
-	// not meant to introduce.
+	// 5 & 6. The remaining passes DELETE durable state, and both run every sweep,
+	// scoped to what this sweep can positively account for (ENG-654).
 	//
-	// Pruning placements is the more dangerous of the two: a deferred lease's
-	// placement record is the only thing that will let a LATER sweep identify
-	// its owner, so deleting it converts a transient backend outage into a
-	// permanently unplaceable lease. The pruner keeps its existing
-	// retentionsComplete gate as well — the two completeness signals are
-	// independent, and either one being false is enough to hold off.
-	var orphanedPayloads, prunedPlacements int
-	if snapshot.complete {
-		orphanedPayloads = r.cleanupOrphanedPayloads(ctx, chainLeases)
-		prunedPlacements = r.cleanupOrphanedPlacements(ctx, chainLeases, backendLeases, retentionsComplete, startTime)
-	} else {
-		slog.Info("reconcile: skipping payload and placement cleanup, fleet view is incomplete",
-			"unanswered", snapshot.unansweredBackends())
-	}
+	// Payload cleanup has no backend input at all — it compares the payload store
+	// against the chain — so fleet completeness was never relevant to it; its one
+	// hazard is chain-snapshot staleness, which it now settles per payload.
+	//
+	// Pruning placements is the more dangerous of the two: a record is the only
+	// thing that will let a LATER sweep identify a lease's owner, so deleting one
+	// during that backend's outage converts a transient failure into a
+	// permanently unplaceable lease. That is a question about ONE backend, not
+	// the fleet, so the pruner asks it per record — of both list endpoints,
+	// which fail independently.
+	orphanedPayloads := r.cleanupOrphanedPayloads(ctx, chainLeases)
+	prunedPlacements := r.cleanupOrphanedPlacements(ctx, chainLeases, backendLeases, snapshot.answered, retentionsAnswered, startTime)
 
 	logFunc := slog.Info
 	if leaseErrorCount > 0 || !snapshot.complete {
@@ -736,21 +732,63 @@ func (r *Reconciler) cleanupTerminalLease(leaseUUID string) {
 	}
 }
 
+// answeredSet records, per configured backend name, whether it answered one
+// particular list endpoint this sweep. A backend that errored, panicked or timed
+// out is present with the value false; absent from the map means not configured
+// at all.
+//
+// It is a named type because "did this backend answer?" is now asked per item
+// rather than fleet-wide (ENG-654), and asked of two independent endpoints
+// (/provisions and /retentions) that fail independently.
+type answeredSet map[string]bool
+
+// heard reports whether this sweep has a usable report from the named backend.
+//
+// The empty name and an unconfigured backend both answer false, deliberately:
+// absence from the map is not "no objection", it is "fred cannot account for
+// this item" — the same rule deferLease applies on the read path and ENG-635
+// applies on the write path.
+func (a answeredSet) heard(name string) bool {
+	return name != "" && a[name]
+}
+
+// complete reports whether every configured backend answered.
+func (a answeredSet) complete() bool {
+	for _, ok := range a {
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// unanswered lists the backends that did not report, for logging.
+func (a answeredSet) unanswered() []string {
+	var out []string
+	for name, ok := range a {
+		if !ok {
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // fleetSnapshot is one sweep's view of the fleet: the provisions reported by
 // the backends that ANSWERED, which backends those were, and whether that is
 // all of them.
 //
-// It is a named type rather than a tuple because completeness is consumed in
-// several places with different meanings — the per-lease deferral guard, the
-// three destructive tail passes, and the sweep-outcome metric — and each needs
-// to say which question it is asking.
+// It is a named type rather than a tuple because its two views of the same fact
+// answer different questions: `complete` is the fleet-wide one, consumed by the
+// per-lease deferral guard, the retention-derived placement backfill and the
+// sweep-outcome metric, while `answered` is the per-backend one the placement
+// pruner asks of a single record (ENG-654).
 type fleetSnapshot struct {
 	// provisions is the union over answering backends, keyed by lease UUID.
 	provisions map[string]backend.ProvisionInfo
 	// answered reports, per configured backend name, whether it returned its
-	// provisions this sweep. A backend that errored, panicked, or timed out is
-	// present with the value false — absent from the map means not configured.
-	answered map[string]bool
+	// provisions this sweep.
+	answered answeredSet
 	// complete is true when every configured backend answered. It is the
 	// authority for "absence is evidence": only on a complete sweep does a
 	// lease's absence from provisions prove it is not provisioned anywhere.
@@ -787,7 +825,7 @@ func (r *Reconciler) fetchFleetSnapshot(ctx context.Context) fleetSnapshot {
 	var mu sync.Mutex
 	snap := fleetSnapshot{
 		provisions: make(map[string]backend.ProvisionInfo),
-		answered:   make(map[string]bool, len(backends)),
+		answered:   make(answeredSet, len(backends)),
 		complete:   true,
 	}
 
@@ -884,14 +922,7 @@ func (s *fleetSnapshot) markUnanswered(name string) {
 
 // unansweredBackends lists the backends that did not report, for logging.
 func (s fleetSnapshot) unansweredBackends() []string {
-	var out []string
-	for name, ok := range s.answered {
-		if !ok {
-			out = append(out, name)
-		}
-	}
-	slices.Sort(out)
-	return out
+	return s.answered.unanswered()
 }
 
 // deferLease reports whether this sweep must skip a lease because it could not
@@ -929,17 +960,115 @@ func deferLease(snap fleetSnapshot, isProvisioned bool, placedBackend string) bo
 	return true
 }
 
+// leaseLiveness is what the chain says about one lease right now, as opposed to
+// what this sweep's snapshot said about it several seconds ago.
+type leaseLiveness int
+
+const (
+	// leaseUnknown means fred could not establish the lease's state: the query
+	// failed, the chain has no record of it, or it carries the zero state.
+	leaseUnknown leaseLiveness = iota
+	// leaseLive means PENDING or ACTIVE — the lease is a going concern and the
+	// main reconcile loop owns it.
+	leaseLive
+	// leaseTerminal means CLOSED, REJECTED or EXPIRED. It is the ONLY verdict
+	// that authorizes destroying the lease's state, and it is monotone: the
+	// chain never moves a lease back out of a terminal state.
+	leaseTerminal
+)
+
+// classifyLease maps a GetLease result to the three-state rule the destructive
+// passes act on, and names the metric reason for every non-terminal verdict.
+//
+// It is a pure function for the same reason deferLease is: it is a safety
+// decision that must be exhaustively testable without standing up a fleet.
+//
+// The rule is that fred destroys state only on positive evidence that the lease
+// is finished — never on absence, and never on a failed read:
+//
+//   - An error is not absence. The chain was unreachable or slow; try again
+//     next sweep.
+//   - A nil lease is not "closed". x/billing never deletes a lease — CloseLease
+//     sets State in place — so the chain having no record means it never knew
+//     this lease: a phantom provision, a wrong or reset chain, or an RPC node
+//     behind the head. None of those are a license to delete a tenant's data,
+//     and reading them as one is how "both list queries returned empty" turns
+//     into deprovisioning the entire fleet.
+//   - PENDING/ACTIVE means the sweep's chain snapshot was simply stale: the two
+//     list queries are not atomic, so a lease created between them is invisible
+//     to both while the event path may already be provisioning it.
+//   - UNSPECIFIED is the zero value and should never appear on chain; treat it
+//     as unknown rather than guessing.
+//
+// The asymmetry is the same one deferLease documents. Skipping costs a cycle of
+// cleanup latency; acting on a lease that is not finished costs a tenant their
+// workload.
+func classifyLease(lease *billingtypes.Lease, err error) (leaseLiveness, string) {
+	switch {
+	case err != nil:
+		return leaseUnknown, metrics.CleanupSkipChainError
+	case lease == nil:
+		return leaseUnknown, metrics.CleanupSkipChainUnknown
+	case lease.State == billingtypes.LEASE_STATE_PENDING || lease.State == billingtypes.LEASE_STATE_ACTIVE:
+		return leaseLive, metrics.CleanupSkipChainLive
+	case lease.State == billingtypes.LEASE_STATE_UNSPECIFIED:
+		return leaseUnknown, metrics.CleanupSkipChainUnknown
+	default:
+		return leaseTerminal, ""
+	}
+}
+
+// confirmTerminal re-reads one lease from the chain and reports whether it is
+// positively finished. A false return has already counted itself and logged;
+// the caller just skips the lease.
+//
+// This runs on every candidate, not only on degraded sweeps: the staleness it
+// guards against comes from the sweep's own non-atomic chain queries, and is
+// identical on a sweep that saw every backend.
+func (r *Reconciler) confirmTerminal(ctx context.Context, pass, leaseUUID string) bool {
+	lease, err := r.chainClient.GetLease(ctx, leaseUUID)
+	liveness, reason := classifyLease(lease, err)
+	if liveness == leaseTerminal {
+		return true
+	}
+
+	metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(pass, reason).Inc()
+	switch reason {
+	case metrics.CleanupSkipChainUnknown:
+		// Not self-healing, unlike the other two: fred will decline this
+		// candidate on every future sweep as well, so say so once per sweep at a
+		// level an operator sees.
+		slog.Warn("reconcile: chain has no record of this lease — refusing to destroy its state, MANUAL CLEANUP MAY BE REQUIRED",
+			"lease_uuid", leaseUUID,
+			"pass", pass,
+			"error", err,
+		)
+	default:
+		slog.Info("reconcile: skipping cleanup, chain does not confirm the lease is finished",
+			"lease_uuid", leaseUUID,
+			"pass", pass,
+			"reason", reason,
+			"error", err,
+		)
+	}
+	return false
+}
+
 // fetchAllRetentions queries every backend's retained leases in parallel,
-// returning leaseUUID→backendName and whether ALL backends answered
-// successfully. The complete flag gates placement pruning (a later task): a
-// partial result must never prune (a transient backend outage would look like
-// "data gone"). For the additive placement SYNC, a partial result is fine.
-func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string, bool) {
+// returning leaseUUID→backendName and, per backend, whether it answered.
+//
+// The answered set gates placement pruning per record (ENG-654): a record whose
+// own backend did not report its retentions must not be pruned, because a
+// transient outage on that machine would otherwise look like "the data is gone".
+// A backend that DID answer accounts for its own records, so its silence about
+// one of them is real evidence. For the additive placement SYNC, partial data is
+// fine either way.
+func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string, answeredSet) {
 	backends := r.backendRouter.Backends()
 
 	var mu sync.Mutex
 	out := make(map[string]string)
-	complete := true
+	answered := make(answeredSet, len(backends))
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(len(backends))
@@ -951,7 +1080,7 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 						"backend", b.Name(), "panic", rec, "stack", string(debug.Stack()))
 					metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_retentions").Inc()
 					mu.Lock()
-					complete = false
+					answered[b.Name()] = false
 					mu.Unlock()
 					goErr = nil
 				}
@@ -963,11 +1092,12 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 				slog.Warn("failed to list retentions from backend",
 					"backend", b.Name(), "error", err)
 				mu.Lock()
-				complete = false
+				answered[b.Name()] = false
 				mu.Unlock()
 				return nil // collect from other backends; don't cancel
 			}
 			mu.Lock()
+			answered[b.Name()] = true
 			for _, ret := range retentions {
 				out[ret.LeaseUUID] = b.Name()
 			}
@@ -976,9 +1106,9 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 			return nil
 		})
 	}
-	_ = g.Wait() // closures never return non-nil; errors captured via complete
+	_ = g.Wait() // closures never return non-nil; outcomes are recorded in answered
 
-	return out, complete
+	return out, answered
 }
 
 // handleProvisionError handles errors from provisioning attempts during reconciliation.
@@ -1324,6 +1454,18 @@ func (r *Reconciler) processOrphan(
 		return
 	}
 
+	// Confirm against the chain that this lease is really finished (ENG-654).
+	//
+	// Membership of chainLeases is not enough to justify a deprovision. It is
+	// derived from two non-atomic, state-filtered list queries, so "absent" means
+	// either terminal or never-known, and the in-flight guard above only covers
+	// the window while the main flow still owns the lease — not the one after it
+	// untracks. This re-read is the positive evidence, and it runs BEFORE the
+	// backend lookup so a live lease never trips the MANUAL CLEANUP error below.
+	if !r.confirmTerminal(ctx, metrics.CleanupPassOrphan, leaseUUID) {
+		return
+	}
+
 	// Look up the backend that originally provisioned this resource.
 	// We must use the same backend for deprovisioning - falling back to a
 	// different backend would fail since it doesn't have the resource.
@@ -1395,15 +1537,27 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 		// Check if the lease exists and is still pending
 		lease, exists := chainLeases[leaseUUID]
 		if !exists {
-			// Lease doesn't exist on chain - orphaned payload
+			// Absent from the snapshot — which is two non-atomic, state-filtered
+			// list queries, so it means terminal OR never-known OR created
+			// moments ago. Re-read the lease before deleting (ENG-654): a
+			// payload deleted out from under a live lease makes the NEXT sweep
+			// see errPayloadNotAvailable, classify it permanent, and close a
+			// healthy ACTIVE lease on chain.
+			if !r.confirmTerminal(ctx, metrics.CleanupPassPayload, leaseUUID) {
+				continue
+			}
 			payloadStore.Delete(leaseUUID)
 			cleaned++
-			slog.Info("reconcile: cleaned up orphaned payload (lease not found)",
+			slog.Info("reconcile: cleaned up orphaned payload (lease terminal on chain, absent from sweep snapshot)",
 				"lease_uuid", leaseUUID,
 			)
 			continue
 		}
 
+		// Unreachable in production — chainLeases is built from the PENDING and
+		// ACTIVE queries, so anything in it is one of those two. Kept as the
+		// belt to the braces above: it acts on a state fred positively read, and
+		// costs nothing.
 		if lease.State != billingtypes.LEASE_STATE_PENDING && lease.State != billingtypes.LEASE_STATE_ACTIVE {
 			// Lease is closed/rejected — payload is no longer needed.
 			// ACTIVE leases retain their payload for re-provisioning if the
@@ -1424,12 +1578,13 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 // It deletes a placement only when ALL of these hold, so it never races a
 // concurrent StartProvisioning Set nor wipes valid placement on a backend
 // outage:
-//   - retentionsComplete: every backend answered ListRetentions this sweep.
-//     The caller separately gates this whole pass on the PROVISIONS view being
-//     complete; the two signals are independent and both must hold. (Before
-//     ENG-356 provisions-completeness was implicit, because any backend error
-//     aborted the sweep before reaching here — it is now an explicit gate at the
-//     call site.);
+//   - the record's OWN backend answered both /provisions and /retentions this
+//     sweep. Only that backend's report can turn "absent from the backend data"
+//     into evidence about this record; another backend's silence says nothing
+//     about it (ENG-654). A record naming a backend that is not configured at
+//     all also fails this test, which is the ENG-635 rule: fred does not act on
+//     a lease it cannot attribute, and the record is the only pointer to where
+//     the data lives;
 //   - the lease is absent from backendLeases (provisions ∪ retentions);
 //   - the lease is not in-flight (a just-Set placement the backends haven't
 //     reported yet — the exact race the old additive-only code avoided);
@@ -1441,10 +1596,11 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 	ctx context.Context,
 	chainLeases map[string]billingtypes.Lease,
 	backendLeases map[string]struct{},
-	retentionsComplete bool,
+	provisionsAnswered answeredSet,
+	retentionsAnswered answeredSet,
 	now time.Time,
 ) int {
-	if r.placementStore == nil || !retentionsComplete {
+	if r.placementStore == nil {
 		return 0
 	}
 
@@ -1452,6 +1608,22 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 	for _, leaseUUID := range r.placementStore.List() {
 		if ctx.Err() != nil {
 			break
+		}
+		// The record's own backend must have reported both lists this sweep;
+		// otherwise its absence from backendLeases proves nothing about this
+		// record. Get returns "" for a record deleted concurrently, which fails
+		// the same test — there is nothing left to prune anyway.
+		owner := r.placementStore.Get(leaseUUID)
+		if !provisionsAnswered.heard(owner) || !retentionsAnswered.heard(owner) {
+			metrics.ReconcilerCleanupSkipsTotal.
+				WithLabelValues(metrics.CleanupPassPlacement, metrics.CleanupSkipBackendSilent).Inc()
+			slog.Debug("reconcile: keeping placement, its backend did not report this sweep",
+				"lease_uuid", leaseUUID,
+				"backend", owner,
+				"provisions_answered", provisionsAnswered.heard(owner),
+				"retentions_answered", retentionsAnswered.heard(owner),
+			)
+			continue
 		}
 		// Data still lives on a backend (active provision or retained) → keep.
 		if _, onBackend := backendLeases[leaseUUID]; onBackend {
