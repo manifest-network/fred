@@ -433,8 +433,12 @@ the sweep is the only automatic reclaimer.
   deliberately, and the data belongs to the *restoring* lease, not the tombstoned one. **Do not
   remove it by hand:** the steps below would destroy another tenant's data, and the tombstone
   would not clear anyway (the skip is by name, not by existence). Find the restoring record
-  (`GET /retentions`) and resolve *that* — the tombstone clears on the next sweep once the
-  restore commits or rolls back. `reason="claim_unreadable"` instead means the retention store
+  (`GET /retentions`) and clear whatever is blocking its **rollback** — usually a re-quarantine
+  rename that cannot complete (both names present on disk, or a filesystem error in `dmesg`).
+  The tombstone clears on the next sweep once that rollback re-quarantines the volume. Do **not**
+  wait for the restore to commit: a lease carrying a tombstone has already lost its provision, so
+  the rollback arm is the only one `reconcileRestoring` can take. `reason="claim_unreadable"`
+  instead means the retention store
   is unreadable, which silently stops the reaper (and blocks the close path too); fix the store
   first. See ENG-659.
 - **Reclaim (only after confirming no live/restoring lease references it).** Once the blocker is

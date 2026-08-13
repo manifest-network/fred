@@ -47,8 +47,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   restore claims is skipped and logged, and an unreadable retention store means
   nothing is destroyed that pass, mirroring the orphan reaper's fail-safe. A
   skipped name leaves the record `reaping`, so its footprint stays counted and
-  the next sweep retries once the restore commits or rolls back; it is
-  deliberately **not** counted as a leak. New
+  the next sweep retries once that restore's rollback re-quarantines the volume
+  (the only resolution reachable for a tombstoned lease, which has already lost
+  its provision); it is deliberately **not** counted as a leak. New
   `fred_docker_backend_retention_reap_skips_total{reason}` counts both cases
   (`restore_claimed`, `claim_unreadable`); see the updated
   "Reclaiming leaked / stuck-reaping orphan volumes" runbook, since a
