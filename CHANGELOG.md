@@ -133,10 +133,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `k8s.io` tree from `go.mod`, which was not possible while compose v2 pulled it
   in regardless.
 
+  One behavioural delta is worth knowing about: v5 runs its per-container
+  removals on the errgroup's *derived* context where v2 discarded it, so a
+  single failed removal can now cancel its siblings part-way through — and a
+  container that is never removed never has its anonymous volumes reaped, which
+  is the ENG-372 leak. fred compensates via the per-container fallback in
+  `deprovision.go`, and that fallback's coverage of **every** recorded container
+  is now pinned by a test.
+
   What does **not** clear: GO-2026-4883 and GO-2026-4887 (`docker/docker`, fixed
   only in `moby/moby/v2`, whose 22 published tags are all betas) and
   GO-2026-5932 (`x/crypto/openpgp`, whose OSV entry has no `fixed` event at
-  all). Three is the realistic floor, not zero.
+  all). Three is the realistic floor for *this* change — though the govulncheck
+  traces show every reachable symbol behind 4883/4887 sits in `lifecycle.go`,
+  and the only non-fred importer of any `docker/docker` package in the new graph
+  is `buildx/store` reaching `pkg/namesgenerator`. Porting `lifecycle.go` to
+  `moby/moby/client` therefore looks likely to take the list to one entry; it is
+  held to a separate change because that client's API is restructured
+  (`filters.Args` is gone, the list-options types moved onto the client
+  package), making it a rewrite of fred's Docker layer rather than an import
+  swap.
 
 - deps: bump `google.golang.org/grpc` to v1.82.1 (from v1.79.3) to resolve
   GO-2026-6061, a pair of flaws in the xDS RBAC authorization engine and the
