@@ -3,24 +3,32 @@ package provisioner
 // Characterization tests for reconciling a multi-backend fleet over the real
 // HTTP transport.
 //
-// These pin the behaviour that must survive ENG-356, which removes the
-// fleet-wide abort in fetchAllProvisions. They are written against the CURRENT
-// code and pass on it: today a sweep that cannot reach every backend aborts, so
-// the "nothing was destroyed" invariant holds trivially. After ENG-356 the same
-// assertions must still hold, but for the interesting reason — the sweep
-// proceeds and defers exactly the leases it cannot positively attribute. That
-// equivalence is the point: any change to these assertions other than the ones
-// ENG-356 explicitly inverts is a regression, not a test that needs updating.
+// These pin what a sweep must NOT destroy when it cannot see the whole fleet.
+//
+// They were written and merged BEFORE ENG-356 (#212), against the code that
+// still aborted a degraded sweep outright — where the "nothing was destroyed"
+// invariant held trivially. ENG-356 then removed that abort, and the same
+// assertions still hold, now for the interesting reason: the sweep proceeds and
+// defers exactly the leases it cannot positively attribute.
+//
+// That equivalence is the point, and it is why these tests are worth keeping in
+// this shape. Exactly one scenario changed across that transition — the one
+// written to pin the replaced behavior. If a future change turns any of the
+// others red, the default assumption is a regression, not a test that needs
+// updating.
 
 import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // allFaults is every way a backend can fail to answer a sweep. Each reaches the
@@ -402,6 +410,158 @@ func TestFleet_BackendUnreachable_DoesNotPrunePlacement(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// The destructive tail is gated on a complete fleet view
+// --------------------------------------------------------------------------
+
+// Orphan classification is safe against partial BACKEND data — a silent backend
+// contributes no candidates — but not against a stale CHAIN snapshot. The two
+// chain queries are not atomic, so a lease created between them is invisible to
+// both while the event path may already be provisioning it. Until ENG-356 the
+// fleet-wide abort suppressed the orphan pass on exactly these sweeps; letting
+// it run now would newly expose that hazard.
+//
+// So the orphan pass is skipped whole while the fleet view is incomplete, even
+// for candidates on a backend that DID answer.
+func TestFleet_DegradedSweep_SkipsOrphanDeprovisionEvenOnAnsweringBackend(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// A textbook orphan on a HEALTHY backend: provisioned, no chain lease.
+	f.backendAt(1).seedProvision(t, "lease-orphan", f.providerUUID, backend.ProvisionStatusReady)
+	// An unrelated backend is unreachable.
+	f.backendAt(3).setFault(faultConnReset)
+
+	require.NoError(t, f.sweepN(2))
+
+	require.Zero(t, f.backendAt(1).deprovisionCount("lease-orphan"),
+		"orphan GC must not run while the fleet view is incomplete, even for a candidate on an answering backend")
+
+	// Control: once the fleet is whole again, the same orphan IS reaped — so the
+	// assertion above is a gate, not a permanent leak.
+	f.backendAt(3).setFault(faultNone)
+	require.NoError(t, f.sweep())
+	require.Equal(t, 1, f.backendAt(1).deprovisionCount("lease-orphan"),
+		"orphan GC must resume once every backend answers")
+}
+
+// cleanupOrphanedPayloads deletes the payloads of leases that are gone from the
+// chain. It reads the same possibly-stale chain snapshot, and it too was
+// suppressed by the abort, so it is gated the same way.
+func TestFleet_DegradedSweep_SkipsPayloadCleanup(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// A payload with no chain lease behind it — the shape the cleaner deletes.
+	require.True(t, f.payloads.Store("lease-gone", []byte("manifest-bytes")))
+	f.backendAt(2).setFault(faultConnReset)
+
+	require.NoError(t, f.sweepN(2))
+
+	has, err := f.payloads.Has("lease-gone")
+	require.NoError(t, err)
+	require.True(t, has,
+		"payload cleanup must not run while the fleet view is incomplete")
+
+	// Control: it IS cleaned once the fleet is whole, so the gate above is not
+	// hiding a permanent leak.
+	f.backendAt(2).setFault(faultNone)
+	require.NoError(t, f.sweep())
+
+	has, err = f.payloads.Has("lease-gone")
+	require.NoError(t, err)
+	require.False(t, has, "payload cleanup must resume once every backend answers")
+}
+
+// deferLease trusts exactly two inputs: membership in snapshot.provisions, and
+// the placement record. The tests below pin the placement half; this one pins
+// the other, at the source.
+//
+// The property is that snapshot.provisions can only ever name a backend that
+// actually answered — every entry is inserted after that backend's
+// ListProvisions succeeded, with BackendName overwritten by the answering
+// backend's own name rather than trusted from the wire. If a non-answering
+// backend could contribute even one entry, `isProvisioned` would short-circuit
+// the guard into PROCEED on evidence that does not exist.
+func TestFleet_FleetSnapshot_ExcludesNonAnsweringBackendAndStampsOwner(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	f.backendAt(1).seedProvision(t, "lease-a", f.providerUUID, backend.ProvisionStatusReady)
+	f.backendAt(2).seedProvision(t, "lease-b", f.providerUUID, backend.ProvisionStatusReady)
+	f.backendAt(3).seedProvision(t, "lease-c", f.providerUUID, backend.ProvisionStatusReady)
+
+	f.backendAt(2).setFault(faultConnReset)
+
+	snap := f.reconciler.fetchFleetSnapshot(t.Context())
+
+	require.False(t, snap.complete, "one backend did not answer")
+	require.Equal(t, map[string]bool{
+		"backend-1": true,
+		"backend-2": false,
+		"backend-3": true,
+	}, snap.answered, "answered must record every configured backend, false for the silent one")
+	require.Equal(t, []string{"backend-2"}, snap.unansweredBackends())
+
+	// The silent backend's lease must be absent — not present-with-stale-data.
+	require.NotContains(t, snap.provisions, "lease-b",
+		"a backend that did not answer must contribute nothing")
+
+	// Answering backends' leases are present and attributed to them.
+	require.Equal(t, "backend-1", snap.provisions["lease-a"].BackendName)
+	require.Equal(t, "backend-3", snap.provisions["lease-c"].BackendName)
+}
+
+// The placement sync runs BEFORE the per-lease guard and is read back by it in
+// the same sweep, so anything it writes becomes evidence immediately. A
+// retention proves a past deprovision on a backend, not present ownership —
+// deriving a placement from one during a degraded sweep would manufacture the
+// guard's own input, flipping a lease that should DEFER into one that PROCEEDS
+// and aiming it at the wrong backend. Durably, in bbolt, outliving the outage.
+//
+// It would also aim DEPROVISION at that backend, turning what should be a loud
+// failure against the real holder into a resolved teardown on a machine that
+// holds nothing — reported as success while the containers keep running.
+func TestFleet_DegradedSweep_DoesNotManufacturePlacementFromRetention(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// backend-1 answers and reports a RETENTION for the lease.
+	f.backendAt(1).seedRetention("lease-r")
+	// backend-2 is the silent one.
+	f.backendAt(2).setFault(faultConnReset)
+	// The lease is ACTIVE on chain with no placement record — the state in which
+	// a manufactured record does the damage.
+	f.addLease("lease-r", billingtypes.LEASE_STATE_ACTIVE)
+
+	require.NoError(t, f.sweepN(2))
+
+	require.Empty(t, f.placement.Get("lease-r"),
+		"a degraded sweep must not write a placement derived from retention data")
+
+	// And the guard must still be deferring — otherwise the assertion above
+	// could pass for the wrong reason (e.g. the lease being handled some other way).
+	for _, srv := range f.servers {
+		require.Zerof(t, srv.totalProvisionCalls(),
+			"the lease must be deferred, not provisioned (%s)", srv.name)
+	}
+}
+
+// The companion that keeps the fix from being over-broad: on a COMPLETE sweep
+// the retention-derived backfill still runs, which is what keeps restore
+// affinity working for a closed lease whose placement record was lost.
+func TestFleet_CompleteSweep_StillBackfillsPlacementFromRetention(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	f.backendAt(1).seedRetention("lease-r")
+
+	require.NoError(t, f.sweep())
+
+	require.Equal(t, "backend-1", f.placement.Get("lease-r"),
+		"a complete sweep must still backfill placement from retention data")
+}
+
+// --------------------------------------------------------------------------
 // Recovery
 // --------------------------------------------------------------------------
 
@@ -424,15 +584,18 @@ func TestFleet_FaultThenRecover_ProvisionsExactlyOnce(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// The behaviour ENG-356 replaces
+// The behavior ENG-356 introduces
 // --------------------------------------------------------------------------
 
-// This is the baseline being removed, pinned explicitly so the change is
-// visible in the diff rather than implicit. ENG-356 rewrites this test: the
-// sweep will stop returning an error, the healthy backends' leases will be
-// reconciled, and only leases attributable to the silent backend will be
-// skipped.
-func TestFleet_DegradedSweep_CurrentlyAbortsForEveryLease(t *testing.T) {
+// The headline change, and the inverse of what this test asserted before
+// ENG-356. Previously ANY backend failing aborted the whole sweep, so a lease
+// sitting ready on a perfectly healthy backend was collateral damage of an
+// unrelated backend's outage — and recovery for every lease degraded as p^n,
+// getting worse as the fleet grew.
+//
+// Now the sweep proceeds, the healthy backends' leases are reconciled, and only
+// leases attributable to the silent backend are skipped.
+func TestFleet_DegradedSweep_ReconcilesLeasesOnHealthyBackends(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
 
@@ -443,14 +606,83 @@ func TestFleet_DegradedSweep_CurrentlyAbortsForEveryLease(t *testing.T) {
 	// One unrelated backend is unreachable.
 	f.backendAt(3).setFault(faultConnReset)
 
-	err := f.sweep()
-
-	require.Error(t, err, "today any backend failure aborts the whole sweep")
-	require.Contains(t, err.Error(), "incomplete backend data")
+	require.NoError(t, f.sweep(),
+		"a single unreachable backend must no longer fail the sweep")
 
 	acked, _, _ := f.chainCalls()
-	require.NotContains(t, acked, "lease-on-healthy",
-		"today a lease on a healthy backend is collateral damage of another backend's outage")
+	require.Contains(t, acked, "lease-on-healthy",
+		"a lease on a healthy backend must be reconciled despite another backend's outage")
+}
+
+// The other half of the same rule: acting on the healthy backends must not mean
+// acting on the silent one's leases. This is the pairing that makes the change
+// safe rather than merely less conservative — and note the two leases are
+// reconciled in the SAME sweep, so the guard is per-lease, not per-sweep.
+func TestFleet_DegradedSweep_ActsOnHealthyAndDefersSilentInOneSweep(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// Ready on a healthy backend → should be acknowledged.
+	f.addLease("lease-healthy", billingtypes.LEASE_STATE_PENDING)
+	f.backendAt(1).seedProvision(t, "lease-healthy", f.providerUUID, backend.ProvisionStatusReady)
+
+	// ACTIVE on the backend that is about to go silent → must be left alone.
+	f.addLease("lease-silent", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(3).seedProvision(t, "lease-silent", f.providerUUID, backend.ProvisionStatusReady)
+
+	// Establish placement while everything is healthy.
+	require.NoError(t, f.sweep())
+	f.assertPlacementPinned("lease-silent", "backend-3")
+
+	f.backendAt(3).setFault(faultConnReset)
+
+	before := f.captureState([]string{"lease-silent"})
+	require.NoError(t, f.sweep())
+
+	acked, _, _ := f.chainCalls()
+	require.Contains(t, acked, "lease-healthy", "the healthy backend's lease is reconciled")
+
+	f.assertNothingDestroyed(before, []string{"lease-silent"})
+	f.assertPlacementPinned("lease-silent", "backend-3")
+}
+
+// A degraded sweep must be visible. Before ENG-356 a fleet-wide outage was
+// impossible to miss because reconciliation simply stopped; afterwards it
+// costs only the affected leases, so without a distinct signal the failure
+// becomes silent. outcome="degraded" is that signal, and the last-success
+// timestamp must NOT advance — otherwise the staleness alert goes quiet during
+// precisely the outage it exists to catch.
+func TestFleet_DegradedSweep_EmitsDegradedOutcomeAndWithholdsSuccess(t *testing.T) {
+	// Deliberately NOT parallel: these are process-global Prometheus collectors,
+	// and every other fleet test drives sweeps that move the same counters. Go
+	// runs sequential tests in isolation from parallel ones, which is what makes
+	// the before/after deltas below meaningful rather than flaky.
+	f := newFleet(t, fleetOptions{})
+
+	f.addLease("lease-x", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(1).seedProvision(t, "lease-x", f.providerUUID, backend.ProvisionStatusReady)
+
+	require.NoError(t, f.sweep())
+	lastSuccessAfterClean := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
+	require.NotZero(t, lastSuccessAfterClean, "a clean sweep should record success")
+
+	degradedBefore := promtestutil.ToFloat64(
+		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeDegraded))
+
+	f.backendAt(2).setFault(faultConnReset)
+	require.NoError(t, f.sweep())
+
+	degradedAfter := promtestutil.ToFloat64(
+		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeDegraded))
+	assert.Equal(t, degradedBefore+1, degradedAfter,
+		"a sweep that could not see the whole fleet must be counted as degraded exactly once")
+
+	assert.Equal(t, lastSuccessAfterClean,
+		promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp),
+		"a degraded sweep must not advance the last-success timestamp")
+
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.ReconcilerSweepComplete),
+		"sweep_complete must report 0 while the fleet view is incomplete")
 }
 
 // The circuit breaker is part of the transport, so an unreachable backend stops

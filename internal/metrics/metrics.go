@@ -100,6 +100,23 @@ var (
 		Help:      "Total ready leases the reconciler skipped because the main flow owns them",
 	})
 
+	// ReconcilerDeferredLeasesTotal counts leases the reconciler skipped because
+	// the sweep could not positively identify which backend owns them — the
+	// per-lease deferral that replaced the fleet-wide abort (ENG-356).
+	//
+	// A sustained non-zero rate while fred_reconciler_sweep_complete is 1 would
+	// be a defect, not expected behavior: on a complete sweep nothing defers.
+	//
+	// Deliberately its own counter rather than a new label value on
+	// reconciler_actions_total: adding a label value there would silently change
+	// every existing `sum by (action)` panel and alert built on that metric.
+	ReconcilerDeferredLeasesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "reconciler_deferred_leases_total",
+		Help:      "Total leases the reconciler skipped because their owning backend did not report",
+	})
+
 	// ReconcilerPanicsTotal counts panics recovered inside reconciler
 	// per-unit goroutines (per-lease, per-orphan, per-backend-fetch). The
 	// recover exists specifically to prevent one bad lease/orphan/backend
@@ -200,6 +217,38 @@ var (
 		Name:      "actions_total",
 		Help:      "Total number of actions taken during reconciliation",
 	}, []string{"action"}) // action: provisioned, acknowledged, deprovisioned, anomaly
+
+	// ReconcilerBackendFetchTotal counts per-backend provision-list attempts by
+	// outcome. This is the signal that replaces the loud symptom ENG-356
+	// removed: a backend that cannot be reached used to break reconciliation for
+	// the whole fleet, which was impossible to miss; afterwards it degrades only
+	// its own leases and would otherwise be silent.
+	//
+	// Alert on a backend sustaining a non-ok outcome across consecutive sweeps —
+	// a single blip is expected and self-heals. Label values: "ok", "error",
+	// "circuit_open", "panic". circuit_open is separated because it means fred
+	// short-circuited without dialing, which in an incident reads very
+	// differently from a backend that was actually contacted and failed.
+	ReconcilerBackendFetchTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "backend_fetch_total",
+		Help:      "Per-backend provision-list attempts during reconciliation, by outcome",
+	}, []string{"backend", "outcome"})
+
+	// ReconcilerSweepComplete reports whether the most recent sweep saw every
+	// configured backend (1) or ran degraded (0).
+	//
+	// It gates the meaning of every other reconciler metric: on a degraded sweep
+	// the action counters describe only the leases fred could positively place,
+	// so reading them as fleet-wide totals overstates what was skipped. A
+	// boolean state gauge rather than an _info metric, since the value changes.
+	ReconcilerSweepComplete = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "sweep_complete",
+		Help:      "1 if the last reconciliation saw every configured backend, 0 if it ran degraded",
+	})
 )
 
 // Payload metrics
@@ -514,6 +563,26 @@ const (
 	OutcomePartial = "partial"
 	OutcomeError   = "error"
 	OutcomeFailed  = "failed"
+
+	// OutcomeDegraded marks a reconciliation sweep that ran to completion but
+	// could not see every backend, so some leases were deferred rather than
+	// reconciled (ENG-356).
+	//
+	// It is distinct from OutcomePartial on purpose. "partial" is emitted for
+	// any single-lease error and is therefore common and unactionable at fleet
+	// scale; "degraded" means a whole backend was unreachable, which is a
+	// different operational condition and the one worth alerting on. Reusing
+	// "partial" would have buried the new signal in existing noise.
+	OutcomeDegraded = "degraded"
+)
+
+// Outcome constants for the `outcome` label on
+// fred_reconciler_backend_fetch_total.
+const (
+	FetchOutcomeOK          = "ok"
+	FetchOutcomeError       = "error"
+	FetchOutcomeCircuitOpen = "circuit_open"
+	FetchOutcomePanic       = "panic"
 )
 
 // Operation constants for the `operation` label on provisioning_total /

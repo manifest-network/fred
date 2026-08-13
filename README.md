@@ -1338,6 +1338,20 @@ Chain State (leases)     Backend State (provisions)
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |
+| *any* | Owning backend did not answer | **Defer — no action this sweep** |
+
+The last row takes precedence over every other. A sweep applies the matrix only
+to leases whose owning backend reported: one present in the backend data, or one
+whose placement record names a backend that answered. Anything else is deferred
+and retried on the next sweep, because acting on a lease fred cannot see risks
+re-provisioning it onto a healthy peer and laying an empty volume over live data.
+
+A backend failing to answer therefore degrades only its own leases; it no longer
+stops reconciliation for the rest of the fleet. Sweeps that ran degraded are
+reported by `fred_reconciler_sweep_complete` (0) and counted as
+`fred_reconciler_runs_total{outcome="degraded"}`, and the three destructive
+passes — orphan deprovision, payload cleanup, placement pruning — are skipped
+entirely while the view is incomplete.
 
 ## Security
 

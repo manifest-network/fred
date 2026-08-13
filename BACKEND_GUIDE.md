@@ -687,6 +687,26 @@ Fred periodically calls `GET /provisions` to detect:
 
 Your `ListProvisions` must return ALL resources you're managing, so Fred can reconcile correctly.
 
+**What a failed `GET /provisions` costs.** Returning a non-200 (or timing out) is
+not fatal to the provider: Fred marks your backend unanswered for that sweep and
+reconciles every other backend normally. But it is not free either — Fred cannot
+tell "this lease is gone" from "this backend did not tell me about it", so every
+lease it believes lives on your backend is **deferred**: not acknowledged, not
+re-provisioned, not deprovisioned, until you answer again. Fred will not move
+those leases elsewhere, and will not tear them down on the strength of a reply it
+did not get.
+
+Two practical consequences:
+
+- **Prefer a slow complete answer to a fast partial one.** Fred treats a
+  successful response as authoritative for your backend, so omitting a resource
+  you still hold is far worse than taking longer to list it — an omitted lease
+  looks unprovisioned and may be re-provisioned. If you cannot enumerate
+  everything, fail the request instead.
+- **Pagination is complete-or-error.** Fred walks `continue` tokens and discards
+  the whole walk if any page fails, precisely so a mid-walk failure cannot look
+  like a short list.
+
 ## Example: Minimal Backend Structure
 
 ```go

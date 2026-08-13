@@ -431,6 +431,60 @@ func TestOrchestrator_Deprovision_ViaPlacement(t *testing.T) {
 	assert.Equal(t, "test-backend", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")
 }
 
+// Deprovision trusts a resolvable placement ABSOLUTELY: it tears down on the
+// recorded backend alone and reports success, without ever asking whether that
+// backend actually holds the lease. That is deliberate and correct — a guessed
+// deprovision across the fleet is the ENG-335 phantom-success bug this positive
+// resolution replaced.
+//
+// But it is also the reason a WRONG placement record is dangerous in a second
+// way, beyond aiming re-provisioning at the wrong machine: the close is reported
+// clean while the real containers and volumes keep running somewhere else, and
+// nothing surfaces the discrepancy. This test pins that consequence so the cost
+// of manufacturing a placement record is visible in the test suite rather than
+// only in a code comment.
+//
+// It is the companion to
+// TestFleet_DegradedSweep_DoesNotManufacturePlacementFromRetention: that one
+// stops a bad record from being written, this one shows what it would buy.
+func TestOrchestrator_Deprovision_WrongPlacement_ReportsSuccessWithoutTouchingTheRealHolder(t *testing.T) {
+	recorded := &mockManagerBackend{name: "recorded-backend"}
+	realHolder := &mockManagerBackend{name: "real-holder"}
+
+	byName := map[string]backend.Backend{
+		"recorded-backend": recorded,
+		"real-holder":      realHolder,
+	}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend { return byName[name] },
+		backendsFn:         func() []backend.Backend { return []backend.Backend{recorded, realHolder} },
+	}
+
+	// The placement names a backend that does NOT hold the lease.
+	ps := &mockPlacementStore{}
+	require.NoError(t, ps.Set("lease-1", "recorded-backend"))
+
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, NewInFlightTracker(), ps)
+
+	// Reported clean...
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
+
+	// ...having torn down on the recorded backend only.
+	recorded.mu.Lock()
+	recordedCalls := append([]string(nil), recorded.deprovisionCalls...)
+	recorded.mu.Unlock()
+	assert.Equal(t, []string{"lease-1"}, recordedCalls)
+
+	// The machine actually holding the lease was never contacted. In production
+	// its containers and volumes would still be running, with the lease closed
+	// on chain and the caller told the teardown succeeded.
+	realHolder.mu.Lock()
+	holderCalls := len(realHolder.deprovisionCalls)
+	realHolder.mu.Unlock()
+	assert.Zero(t, holderCalls,
+		"the real holder is never contacted — which is exactly why placement must never be derived from incomplete data")
+}
+
 func TestOrchestrator_Deprovision_StalePlacement_FallsToAllBackends(t *testing.T) {
 	mb := &mockManagerBackend{name: "real-backend"}
 	router := &mockBackendRouter{

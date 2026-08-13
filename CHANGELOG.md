@@ -35,6 +35,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **One unreachable backend no longer stops reconciliation for the whole fleet**
+  (ENG-356). `fetchAllProvisions` aborted the entire sweep if any single backend
+  failed to list its provisions, so self-healing succeeded only when every
+  backend answered at once — reliability degraded as `pⁿ`, getting *worse* as the
+  fleet grew, and on a 9-backend provider at a 2-minute interval a single quiet
+  machine froze reconciliation for the other eight roughly 30 times an hour. The
+  abort was a correct safety choice, not a bug: the state matrix classifies from
+  the union of all backends, so partial data can make a live lease look
+  unprovisioned and get it re-provisioned onto a healthy peer — an empty volume
+  laid over live tenant data.
+
+  The sweep now proceeds on partial data and defers exactly the leases it cannot
+  positively attribute: one present in the backend data, or one whose placement
+  record names a backend that answered, is reconciled; anything else is skipped
+  and retried next cycle. Recovery latency becomes independent of fleet size.
+
+  Because a degraded sweep is otherwise silent where the old abort was
+  impossible to miss, it ships with its own signals: a distinct
+  `fred_reconciler_runs_total{outcome="degraded"}`, a
+  `fred_reconciler_sweep_complete` gauge, a per-backend
+  `fred_reconciler_backend_fetch_total{backend,outcome}` counter separating
+  `error` / `circuit_open` / `panic`, and
+  `fred_provisioner_reconciler_deferred_leases_total`. A degraded sweep
+  deliberately does **not** advance
+  `fred_reconciler_last_success_timestamp_seconds`, so the staleness alert stays
+  meaningful during an outage. See OPERATIONS.md § Backend unreachable during
+  reconciliation.
+
+  The three passes that delete durable state — orphan deprovision, orphaned
+  payload cleanup, and placement pruning — are skipped entirely while the fleet
+  view is incomplete. They were previously suppressed by the abort itself, and
+  they act on a chain snapshot assembled from two non-atomic queries, so letting
+  them run on a degraded sweep would newly expose a hazard this change is not
+  meant to introduce. For the same reason the placement index's retention-derived
+  backfill is also suppressed while degraded: a retention proves a past
+  deprovision on a backend, not present ownership, and that sync is read back by
+  the deferral guard in the same sweep — so writing one would manufacture the
+  evidence the guard uses to decide it is safe to act. The next complete sweep
+  repaves it.
+
 - **Fred no longer substitutes a backend when a lease's placement record names
   one the router does not know** (ENG-635). Previously both the write and read
   paths logged a warning and fell through to ordinary routing. On the write path
