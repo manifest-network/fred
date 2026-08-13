@@ -412,10 +412,10 @@ func (s *MockBackendServer) handleGetProvision(w http.ResponseWriter, r *http.Re
 // leases whose data this backend retains (ENG-333 restore affinity).
 //
 // Its absence was not cosmetic: fred's client errors on any non-200
-// (client.go fetchRetentionsPage), so a mock-backend fleet left
-// fetchAllRetentions' `complete` flag permanently false, which silently
-// short-circuited the reconciler's placement pruner. Any test asserting
-// "placement records survived" against this binary passed for the wrong reason.
+// (client.go fetchRetentionsPage), so a mock-backend fleet left every backend
+// permanently unanswered in fetchAllRetentions, which silently short-circuited
+// the reconciler's placement pruner. Any test asserting "placement records
+// survived" against this binary passed for the wrong reason.
 func (s *MockBackendServer) handleListRetentions(w http.ResponseWriter, r *http.Request) {
 	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
 	if perr != nil {

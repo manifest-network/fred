@@ -412,6 +412,20 @@ func TestIntegration_Reconciler_OrphanCleanup(t *testing.T) {
 		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
 			return nil, nil
 		},
+		// A per-lease lookup still finds the lease once it leaves the PENDING
+		// list — CLOSED, not absent, which is how the real chain ends a lease
+		// (x/billing never deletes one) and the positive evidence the orphan
+		// pass now requires before deprovisioning (ENG-654).
+		GetLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			lease := makeLease(uuid, tenant, "", sku, 1, hash[:])
+			lease.State = billingtypes.LEASE_STATE_CLOSED
+			if leaseVisible {
+				lease.State = billingtypes.LEASE_STATE_PENDING
+			}
+			return &lease, nil
+		},
 		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			return 1, []string{"txhash1"}, nil
 		},
@@ -870,6 +884,20 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 		},
 		GetActiveLeasesByProviderFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) { return nil, nil },
 		AcknowledgeLeasesFunc:         func(_ context.Context, _ []string) (uint64, []string, error) { return 1, []string{"tx"}, nil },
+		// The auto-close this test simulates leaves the lease CLOSED on chain, not
+		// erased from it — x/billing never deletes a lease. That distinction is
+		// what authorises the orphan sweep below to soft-delete (ENG-654); a lease
+		// the chain denied all knowledge of would be kept instead.
+		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			l := makeLease(uuid, tenant, "", sku, 1, hash[:])
+			l.State = billingtypes.LEASE_STATE_CLOSED
+			if leaseVisible {
+				l.State = billingtypes.LEASE_STATE_PENDING
+			}
+			return &l, nil
+		},
 	}
 
 	env := testReconcilerSetup(t, mockChain, func(cfg *Config) {

@@ -125,6 +125,21 @@ func NewMockLease(uuid, tenant, providerUUID string, state billingtypes.LeaseSta
 	}
 }
 
+// ClosedLeaseFunc builds a GetLeaseFunc that reports every lease as CLOSED.
+//
+// The reconciler destroys a lease's state only on a positively-read terminal
+// state (ENG-654): absence from the PENDING/ACTIVE list queries no longer
+// implies the lease is finished, because the ledger never deletes a lease, so
+// "the chain has no record" means it never knew that lease. A test exercising
+// orphan deprovision or payload cleanup therefore has to make the chain say the
+// lease closed. Leaving GetLeaseFunc unset models the opposite case — a lease
+// the chain has never heard of, which fred deliberately refuses to clean up.
+func ClosedLeaseFunc(providerUUID string) func(context.Context, string) (*billingtypes.Lease, error) {
+	return func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+		return NewMockLease(leaseUUID, "", providerUUID, billingtypes.LEASE_STATE_CLOSED), nil
+	}
+}
+
 // NewMockLeaseWithSKU creates a mock lease with SKU items for testing.
 func NewMockLeaseWithSKU(uuid, tenant, providerUUID string, state billingtypes.LeaseState, skuUUIDs ...string) *billingtypes.Lease {
 	lease := NewMockLease(uuid, tenant, providerUUID, state)

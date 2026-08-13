@@ -41,6 +41,11 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_reconciler_backend_fetch_total{outcome!="ok"}` sustained for one backend across ≥3 sweeps (~6 min at a 2m interval) | That backend is unreachable from providerd. Its leases are deferred — not re-provisioned, not deprovisioned — while the rest of the fleet reconciles normally | [Backend unreachable during reconciliation](#backend-unreachable-during-reconciliation) |
 | `fred_reconciler_sweep_complete == 0` sustained | Same condition, viewed fleet-wide. The action counters describe only the leases fred could positively place, so do not read them as fleet totals while this is 0 | Same |
 | `fred_provisioner_reconciler_deferred_leases_total` rising while `fred_reconciler_sweep_complete == 1` | Should be impossible — nothing defers on a complete sweep | Bug; file an issue with the reconcile logs |
+| `fred_reconciler_cleanup_skips_total{reason="chain_unknown"}` rising | Fred is declining to clean up state for a lease **the chain has no record of**, and will decline again every sweep — this one does not self-heal. Either providerd is pointed at the wrong or a reset chain (check the `pass` label spread: fleet-wide means config, one lease means a phantom), or a provision exists that no lease ever created | Confirm the chain endpoint and provider UUID first. If the chain is right, the resource is genuinely unowned: deprovision it by hand once you have confirmed the tenant is gone |
+| `fred_reconciler_cleanup_skips_total{reason="chain_unknown_state"}` rising | The chain reports a lease state this providerd build cannot classify — either the zero `UNSPECIFIED`, or a state added to the ledger after this binary shipped. Cleanup is withheld, which is data-safe but permanent for those leases | **Upgrade fred** to a build whose `manifest-ledger` pin knows the new state. Unlike `chain_unknown` the chain is fine and providerd is behind it, so do not go looking for a phantom provision |
+| `fred_reconciler_cleanup_skips_total{reason="chain_error"}` sustained | The per-candidate chain re-check is failing, so cleanup is paused (data-safe). Usually the same cause as any other chain-query failure, or a lookup that blew its 10s budget — that budget exists so a stalled query cannot wedge the sweep, and it reports as an error rather than as evidence | Check `fred_chain_query_duration_seconds{query="get_lease"}` and the node's health; self-heals |
+| `fred_reconciler_cleanup_skips_total{reason="chain_live"}` rising steadily | The sweep's lease snapshot is often stale by the time cleanup runs — expected at a low rate, but a high one means sweeps are slow relative to lease churn | Compare `fred_reconciler_duration_seconds` against the reconcile interval; no action if the rate is low |
+| `fred_reconciler_cleanup_skips_total{pass="placement",reason="backend_silent"}` steady on a removed backend | Expected: a decommissioned backend's placement records are never auto-pruned | [Removing, renaming or pausing a backend](#removing-renaming-or-pausing-a-backend) |
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A `fred-retained-*`/leaked volume the sweep can't destroy — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual reclaim. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
@@ -246,6 +251,9 @@ the leases it cannot positively place, then retries on the next cycle.
 - `fred_reconciler_sweep_complete` at 0
 - `fred_provisioner_reconciler_deferred_leases_total` rising
 - `fred_reconciler_runs_total{outcome="degraded"}` incrementing each cycle
+- `fred_reconciler_cleanup_skips_total{pass="placement",reason="backend_silent"}`
+  rising — that backend's placement records are being held, which is the intended
+  behavior and not an additional fault
 - `fred_reconciler_last_success_timestamp_seconds` frozen — expected while
   degraded, and the reason the staleness alert does not go quiet during an outage
 
@@ -256,7 +264,9 @@ the leases it cannot positively place, then retries on the next cycle.
 | On a backend that answered | Reconciled normally — this is the whole point of the change |
 | On the unreachable backend | Deferred: not acknowledged, re-provisioned, or deprovisioned |
 | With no placement record | Deferred while the sweep is incomplete — fred cannot rule out that it lives on the silent backend |
-| Orphans, orphaned payloads, prunable placements | **All three cleanup passes are skipped** until every backend answers |
+| Orphans on the backends that answered | Deprovisioned normally. A silent backend reports no provisions, so it contributes no orphan candidates of its own and cannot mask anyone else's |
+| Orphaned payloads | Cleaned normally — that pass compares the payload store against the chain and reads no backend state at all |
+| Placements of leases on the unreachable backend | Not pruned: only that backend's own report can turn "absent from the backend data" into evidence about its records |
 
 Nothing is destroyed and nothing migrates. The cost is latency: affected leases
 stop making progress until the backend returns.
@@ -266,19 +276,23 @@ stop making progress until the backend returns.
 1. Identify the backend from the `backend` label and check it directly
    (`GET /health`, `GET /stats`, its own logs).
 2. Bring it back. Recovery needs no action on fred's side — the next sweep sees a
-   complete fleet, resumes the deferred leases, and re-enables the cleanup
-   passes.
+   complete fleet, resumes the deferred leases, and prunes any of its placement
+   records that turn out to be stale.
 3. If it is gone for good, that is a **removal**, not an outage — see the next
    section. Do not leave it configured-but-absent indefinitely: PENDING leases on
-   it are on a ~30-minute chain expiry clock, and cleanup stays paused fleet-wide
-   the whole time.
+   it are on a ~30-minute chain expiry clock the whole time.
 
-> **Why cleanup pauses fleet-wide.** Orphan detection, payload cleanup and
-> placement pruning all delete durable state based on a chain snapshot taken from
-> two non-atomic queries. Before per-backend deferral, a fetch failure aborted the
-> sweep before reaching them, so they never ran on a degraded cycle. Keeping them
-> gated preserves that. Skipped cleanup costs a cycle of latency; mistaken
-> cleanup costs a tenant their workload.
+> **Why cleanup no longer pauses fleet-wide.** Orphan detection, payload cleanup
+> and placement pruning all delete durable state, and until ENG-654 all three were
+> gated on a complete fleet view — so one silent machine stranded admission
+> capacity on every healthy one, for as long as the outage lasted. Each pass now
+> carries the guard its own hazard calls for. Orphan deprovision and payload
+> cleanup re-read the lease from the chain per candidate and act only on a
+> positively reported terminal state, which addresses the real hazard (the sweep's
+> two lease queries are not atomic) on every sweep rather than only on degraded
+> ones. Placement pruning asks whether *that record's* backend answered, which is
+> a per-record question. Skipped cleanup still costs only a cycle of latency;
+> mistaken cleanup still costs a tenant their workload.
 
 ---
 
@@ -333,6 +347,16 @@ Note that the name is the identity key: renaming a backend in config is
 equivalent to removing it, and re-adding it under a *different* name will not
 reunite it with its leases. If a backend is genuinely gone for good, its leases
 are dead — the tenant must create new ones.
+
+Its **placement records outlive it**, deliberately. The pruner deletes a record
+only when the named backend answered this sweep, and a decommissioned backend
+never will, so its records stay in the index — each one counted under
+`fred_reconciler_cleanup_skips_total{pass="placement",reason="backend_silent"}`.
+They are a few bytes of bbolt each and they are the only surviving pointer to
+where that machine's data was, which is why they are kept rather than reaped by a
+process that cannot tell "decommissioned" from "down since Tuesday". Deleting
+them is part of the manual decommission, once the data is confirmed migrated or
+gone.
 
 > **Ansible caution.** `roles/fred/templates/providerd.yaml.j2` derives backend
 > names positionally, so removing a mid-list host renumbers every host below it.

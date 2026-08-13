@@ -249,6 +249,39 @@ var (
 		Name:      "sweep_complete",
 		Help:      "1 if the last reconciliation saw every configured backend, 0 if it ran degraded",
 	})
+
+	// ReconcilerCleanupSkipsTotal counts destructive cleanup actions the
+	// reconciler declined to take because it lacked positive evidence (ENG-654).
+	//
+	// Every reason is a deliberate fail-open: cleanup deletes durable state, so
+	// uncertainty collapses toward "keep" and is counted here rather than acted
+	// on. Sustained non-zero is not automatically a fault — read it by reason:
+	//
+	//   - chain_live: the sweep's chain snapshot was stale and this candidate is
+	//     actually a live lease. This is the hazard the pass exists to avoid;
+	//     a low rate is expected, a high one means sweeps are slow relative to
+	//     lease churn.
+	//   - chain_unknown: the chain has no record of the lease at all. Because the
+	//     ledger never deletes a lease, this is NOT "closed" — it means a phantom
+	//     provision, a wrong/reset chain, or an RPC node behind the head. Fred
+	//     will never reap these on its own; a sustained rate needs an operator.
+	//   - chain_unknown_state: the lease exists but carries a state this build
+	//     cannot classify — the zero UNSPECIFIED, or a state added to the chain
+	//     after this binary shipped. Kept separate from chain_unknown because the
+	//     remediation is the opposite: the chain is fine, fred is behind it.
+	//   - chain_error: the per-candidate chain re-check failed. Transient.
+	//   - backend_silent: a placement record's own backend did not answer this
+	//     sweep, so its absence from the backend data proves nothing.
+	//
+	// A separate metric rather than new label values on actions_total, for the
+	// same reason deferred_leases_total is separate: adding a value there would
+	// silently change every existing `sum by (action)` panel and alert.
+	ReconcilerCleanupSkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "reconciler",
+		Name:      "cleanup_skips_total",
+		Help:      "Destructive cleanup actions skipped for lack of positive evidence, by pass and reason",
+	}, []string{"pass", "reason"})
 )
 
 // Payload metrics
@@ -583,6 +616,22 @@ const (
 	FetchOutcomeError       = "error"
 	FetchOutcomeCircuitOpen = "circuit_open"
 	FetchOutcomePanic       = "panic"
+)
+
+// Pass and reason constants for the `pass` / `reason` labels on
+// fred_reconciler_cleanup_skips_total (ENG-654). Both sets are closed: a new
+// value means a new way for cleanup to be withheld, which is worth naming here
+// and documenting in OPERATIONS.md rather than inventing at the call site.
+const (
+	CleanupPassOrphan    = "orphan"
+	CleanupPassPayload   = "payload"
+	CleanupPassPlacement = "placement"
+
+	CleanupSkipChainLive         = "chain_live"
+	CleanupSkipChainUnknown      = "chain_unknown"
+	CleanupSkipChainUnknownState = "chain_unknown_state"
+	CleanupSkipChainError        = "chain_error"
+	CleanupSkipBackendSilent     = "backend_silent"
 )
 
 // Operation constants for the `operation` label on provisioning_total /

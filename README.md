@@ -1349,9 +1349,25 @@ re-provisioning it onto a healthy peer and laying an empty volume over live data
 A backend failing to answer therefore degrades only its own leases; it no longer
 stops reconciliation for the rest of the fleet. Sweeps that ran degraded are
 reported by `fred_reconciler_sweep_complete` (0) and counted as
-`fred_reconciler_runs_total{outcome="degraded"}`, and the three destructive
-passes — orphan deprovision, payload cleanup, placement pruning — are skipped
-entirely while the view is incomplete.
+`fred_reconciler_runs_total{outcome="degraded"}`.
+
+The three passes that **delete durable state** — orphan deprovision, payload
+cleanup, placement pruning — keep running on a degraded sweep, scoped to what
+that sweep can positively account for:
+
+| Pass | What must hold before it deletes |
+|---|---|
+| Orphan deprovision | The chain, re-read per candidate, reports the lease **terminal** (`CLOSED`/`REJECTED`/`EXPIRED`) |
+| Payload cleanup | The same chain confirmation, for any payload whose lease is absent from the snapshot; the pass reads no backend state at all |
+| Placement pruning | The record's **own** backend answered both `/provisions` and `/retentions`, plus the existing on-backend, in-flight, chain-terminal and grace-window gates |
+
+Absence is never evidence. The two lease-list queries are filtered to
+`PENDING`/`ACTIVE` and are not atomic, so "missing from the sweep" means terminal
+*or* never-known *or* created seconds ago; and because the ledger never deletes a
+lease, a chain with no record of one means a phantom provision, a wrong or reset
+chain, or a lagging RPC node. A failed re-read is likewise not absence. Every
+such case keeps the state and increments
+`fred_reconciler_cleanup_skips_total{pass,reason}`.
 
 ## Security
 

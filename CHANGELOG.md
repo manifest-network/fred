@@ -83,6 +83,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `restore_prelude` in particular is routinely just a canceled restore request
   with nothing on the host. See OPERATIONS.md for the triage split.
 
+- **The reconciler no longer destroys a lease's state without the chain
+  confirming the lease is finished** (ENG-654). Orphan deprovision and orphaned
+  payload cleanup both treated "absent from this sweep's lease snapshot" as
+  "gone". That snapshot is assembled from two non-atomic queries filtered to
+  `PENDING`/`ACTIVE`, so absence actually covers three different situations:
+  terminal, created seconds ago, and never known to this chain at all. Both
+  passes now re-read the lease (`GetLease`) per candidate and act only on a
+  positively reported `CLOSED`/`REJECTED`/`EXPIRED`.
+
+  The third case was the dangerous one. `x/billing` never deletes a lease — a
+  close writes `State` in place — so a chain with no record of a lease has never
+  heard of it, which happens when providerd is pointed at the wrong or a reset
+  chain. Both lease queries then return **empty with no error**, which previously
+  made every provision on every backend an orphan candidate. A query error is
+  likewise not absence. And terminality is an **allowlist** of the three terminal
+  states rather than "anything that is not PENDING or ACTIVE": `LeaseState` is a
+  bare `int32` decoded as a raw varint with no validation, so a state added to the
+  chain after a providerd build ships arrives as an unrecognized number, and a
+  denylist would read the whole fleet as terminal the day that happens.
+
+  Each of these keeps the state and increments
+  `fred_reconciler_cleanup_skips_total{pass,reason}`. Two reasons log at WARN
+  because they do not self-heal, and their remediations are opposites:
+  `chain_unknown` (no record — check the endpoint, or clean up a phantom by hand)
+  and `chain_unknown_state` (the chain is fine; upgrade fred).
+
+- **A backend that does not answer no longer pauses cleanup for the backends that
+  did** (ENG-654). The three destructive passes were gated on a complete fleet
+  view, which preserved the pre-ENG-356 abort behavior exactly but coupled every
+  healthy machine to the sickest one: through a multi-hour outage, orphans held
+  admission reservations fleet-wide precisely when there was least capacity to
+  spare. Each pass is now scoped to what it can attribute. Orphan deprovision
+  runs on every sweep — candidates come from backends that answered, so partial
+  data can only under-collect — with the chain re-check above covering the hazard
+  the gate was standing in for. Payload cleanup runs unconditionally; it compares
+  the payload store against the chain and reads no backend state at all.
+  Placement pruning keeps its backend evidence requirement but asks it **per
+  record**: a record is pruned only if its own backend answered both
+  `/provisions` and `/retentions`, so one silent machine costs only its own
+  records (counted as `{pass="placement",reason="backend_silent"}`). One
+  consequence is deliberate: a decommissioned backend's placement records are
+  never auto-pruned, because they are the only surviving pointer to where its
+  data was — see OPERATIONS.md § Removing, renaming or pausing a backend.
+
 - **One unreachable backend no longer stops reconciliation for the whole fleet**
   (ENG-356). `fetchAllProvisions` aborted the entire sweep if any single backend
   failed to list its provisions, so self-healing succeeded only when every
@@ -111,17 +155,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   meaningful during an outage. See OPERATIONS.md § Backend unreachable during
   reconciliation.
 
-  The three passes that delete durable state — orphan deprovision, orphaned
-  payload cleanup, and placement pruning — are skipped entirely while the fleet
-  view is incomplete. They were previously suppressed by the abort itself, and
-  they act on a chain snapshot assembled from two non-atomic queries, so letting
-  them run on a degraded sweep would newly expose a hazard this change is not
-  meant to introduce. For the same reason the placement index's retention-derived
-  backfill is also suppressed while degraded: a retention proves a past
-  deprovision on a backend, not present ownership, and that sync is read back by
-  the deferral guard in the same sweep — so writing one would manufacture the
-  evidence the guard uses to decide it is safe to act. The next complete sweep
-  repaves it.
+  The placement index's retention-derived backfill is suppressed while degraded:
+  a retention proves a past deprovision on a backend, not present ownership, and
+  that sync is read back by the deferral guard in the same sweep — so writing one
+  would manufacture the evidence the guard uses to decide it is safe to act. The
+  next complete sweep repaves it. The three passes that delete durable state were
+  initially suppressed the same way; see the ENG-654 entry below for how they are
+  scoped now.
 
 - **Fred no longer substitutes a backend when a lease's placement record names
   one the router does not know** (ENG-635). Previously both the write and read
