@@ -160,6 +160,68 @@ func TestDeprovision_PartialFailure_AuthorsCleanupFailed(t *testing.T) {
 		"tenant-facing Message must be the curated const, distinct from the verbose LastError")
 }
 
+// TestDoDeprovision_ComposeDownFails_RemovesEveryRecordedContainer pins the
+// compensating behaviour that keeps ENG-372 closed when compose Down does not
+// finish what it started.
+//
+// docker/compose v5 changed teardown to run its per-container removals on the
+// errgroup's DERIVED context (`eg, ctx := errgroup.WithContext(ctx)` in
+// pkg/compose/down.go) where v2 discarded it (`eg, _ :=`). Under v2, one
+// container failing to be removed left its siblings to finish; under v5 the
+// first failure cancels the group, so siblings can be aborted part-way through
+// ContainerStop/ContainerRemove — and a container that is never removed never
+// has its anonymous volumes reaped. That is exactly the leak ENG-372 exists to
+// prevent, and it is invisible: Down returns an error, teardown continues, and
+// the volume simply accumulates.
+//
+// fred's compensation is the per-container fallback below, which is only
+// sufficient if it covers EVERY container in the record rather than stopping at
+// the first one, or at the one compose happened to fail on. This test pins that
+// coverage. It is deliberately a unit test: the cancellation lives inside
+// compose, and inducing a deterministic mid-flight removal failure against a
+// real daemon would be racy. What fred owns — and what actually keeps the leak
+// closed — is the fan-out asserted here. The reaping itself (RemoveContainer
+// passing RemoveVolumes:true) is pinned live by
+// TestIntegration_Docker_RemoveContainer_RemovesAnonymousVolumes; together the
+// two cover the whole path.
+//
+// TestDeprovision_PartialFailure_AuthorsCleanupFailed covers the arm where that
+// fallback itself fails; this one covers the arm where it must succeed.
+func TestDoDeprovision_ComposeDownFails_RemovesEveryRecordedContainer(t *testing.T) {
+	const lease = "a1b2c3d4-0000-4000-8000-00000000000d"
+	recorded := []string{"c-web-0", "c-web-1", "c-sidecar-0"}
+
+	var removed []string
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, id string) error {
+			removed = append(removed, id)
+			return nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "t", Status: backend.ProvisionStatusReady,
+			Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 3, ServiceName: "app"}},
+			ContainerIDs: recorded,
+		}},
+	})
+
+	// Simulate v5 aborting teardown part-way: Down reports failure, and the
+	// containers it did not get to are still present for the fallback to reap.
+	b.compose = &mockComposeExecutor{
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error {
+			return errors.New("compose down canceled after first removal failed")
+		},
+	}
+
+	require.NoError(t, b.doDeprovision(context.Background(), lease),
+		"a failed Down whose fallback removes every container is a successful deprovision")
+
+	assert.ElementsMatch(t, recorded, removed,
+		"every recorded container must be removed individually when compose Down fails; "+
+			"a container skipped here keeps its anonymous volumes forever (ENG-372)")
+}
+
 // TestDoDeprovision_Success_ReleasesPoolReservation locks the Release-pairing
 // invariant the pool-authoritative recoverState rule depends on (ENG-567): a
 // successful (non-retain) deprovision must release the lease's pool reservation

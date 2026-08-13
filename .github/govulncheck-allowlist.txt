@@ -11,35 +11,33 @@
 #
 # ── Category A: no upstream fix available (govulncheck "Fixed in: N/A") ──────
 # github.com/docker/docker @ v28.5.2+incompatible has no patched release: the
-# fix ships only as moby/moby/v2 v2.0.0-beta.8, a module fred does not use.
-# Unlike the daemon-only advisories dropped in ENG-639, these two ARE in the
-# called set — though only via docker/client package init and
+# fix ships only as moby/moby/v2 v2.0.0-beta.8, whose 22 published tags are ALL
+# v2.0.0-beta.N. Unlike the daemon-only advisories dropped in ENG-639, these two
+# ARE in the called set — though only via docker/client package init and
 # client.Client.Close, not the plugin code the advisories describe. Keep them:
 # the gate compares against the called set, so removing them would fail CI.
-GO-2026-4887   docker/docker — no patched release (fix only in moby/moby/v2)
-GO-2026-4883   docker/docker — no patched release (fix only in moby/moby/v2)
-GO-2026-4610   no fix on the binding path — reachable via docker/compose v2 (Fixed in: N/A); the separate docker/cli v29.2.0 fix does not resolve the compose-reachable instance
 #
-# golang.org/x/crypto/openpgp is unmaintained/frozen ("Fixed in: N/A"); no
-# release removes it. fred reaches only the openpgp/armor ASCII-encoding
-# envelope via cosmos-sdk keyring ExportPrivKeyArmor/ImportPrivKey
+# Since ENG-642 (docker/compose v5) fred's only *direct* caller of
+# docker/docker/client is internal/backend/docker/lifecycle.go — compose v5 and
+# docker/cli v29 both moved to github.com/moby/moby/client. Porting lifecycle.go
+# across is therefore worth measuring as a follow-up, but it is not a foregone
+# win: buildx still reaches docker/docker via pkg/namesgenerator, and both
+# advisories are module-granularity (empty ecosystem_specific), so any linkage
+# may keep them called. Measure with govulncheck before assuming.
+GO-2026-4887   docker/docker — no patched release (fix only in moby/moby/v2 betas)
+GO-2026-4883   docker/docker — no patched release (fix only in moby/moby/v2 betas)
+#
+# golang.org/x/crypto/openpgp is unmaintained/frozen ("Fixed in: N/A"); its OSV
+# entry has `introduced: 0` with no `fixed` event at all, so no release will
+# ever clear it. fred reaches only the openpgp/armor ASCII-encoding envelope via
+# cosmos-sdk keyring ExportPrivKeyArmor/ImportPrivKey
 # (internal/chain/signer_pool.go), not openpgp message/signature crypto.
 GO-2026-5932   x/crypto/openpgp unmaintained — reached only via cosmos-sdk keyring armor
 #
-# ── Category B: fix exists upstream, but sits past a cascade boundary in the
-#    docker/compose v2 toolchain (containerd and buildkit are transitively
-#    pinned by docker/compose v2.40.3). Every remaining fix here needs
-#    containerd v2.2.x — v2.2.4 directly, or v2.2.1 via buildkit v0.28.1 —
-#    and the 2.2 line raises k8s.io v0.32.3 → v0.34.1 and
-#    prometheus/client_golang v1.23.0 → v1.23.2, both DIRECT requires.
-#    Deferred to a dedicated, separately-tested dependency-upgrade PR.
-#    Remove these once that lands.
-#
-#    The 2.1 line does NOT cascade: containerd v2.1.9 pins k8s.io at exactly
-#    the v0.32.3 fred already selects, and prometheus below it. That is why
-#    five containerd entries and one in-toto entry left this list in ENG-639;
-#    do not re-add a blanket "compose-coupled" justification without checking
-#    the requirement graph of the specific version you need.
-GO-2026-5378   containerd/v2 fixed in v2.2.4 (deferred — 2.2 line cascades k8s.io + prometheus)
-GO-2026-4859   moby/buildkit fixed in v0.28.1 (deferred — pulls containerd v2.2.1)
-GO-2026-4858   moby/buildkit fixed in v0.28.1 (deferred — pulls containerd v2.2.1)
+# ── Category B is empty. ─────────────────────────────────────────────────────
+# It previously deferred the containerd/buildkit fixes that sat behind the
+# docker/compose v2 toolchain. ENG-642 moved fred to docker/compose v5, which
+# pulls containerd v2.3.3 and buildkit v0.32.1 directly, so every entry it held
+# is fixed in the selected graph and has left the called set. Do not re-add a
+# blanket "compose-coupled" justification: check the requirement graph of the
+# specific version you need.
