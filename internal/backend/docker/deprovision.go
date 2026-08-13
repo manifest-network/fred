@@ -144,6 +144,20 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// the live allocation keeps counting the bytes.
 	var releaseLiveOnRetainPath bool
 
+	// claimedLeftBehind is set when a volume claimed by an IN-FLIGHT RESTORE is
+	// deliberately left on disk (below). Its bytes must then stay reserved, because a
+	// restoring record is counted by NEITHER projection — computeRetainedDiskMB skips
+	// every non-active status and the admission pool is active+reaping — so the only
+	// thing counting them is this closing lease's live allocation. Releasing it would
+	// leave a real footprint counted by nobody and let admission over-commit against
+	// it. reconcileRestoring takes the reservation over: its orphaned arm
+	// re-quarantines the volume, RevertToActive makes the record active (so the
+	// retained projection counts it again), and only THEN does it releaseAll the same
+	// {lease}-{svc}-{idx} ids — re-counted before released, never a gap. pool.Release
+	// is idempotent, so the hand-off is safe even though both paths name the same ids.
+	// (ENG-647, PR #217 review.)
+	var claimedLeftBehind bool
+
 	// Retained set may have changed (this close may have added a retained
 	// record below, or a prior attempt did); refresh after the volume branch.
 	// For the retain path, also release live AFTER refresh (overlap, no gap).
@@ -159,7 +173,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			return
 		}
 		b.refreshRetentionAccounting()
-		if releaseLiveOnRetainPath {
+		if releaseLiveOnRetainPath && !claimedLeftBehind {
 			releaseLive()
 		}
 	}()
@@ -216,6 +230,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				// reconcileRestoring owns re-quarantining this one back to
 				// fred-retained-{original}-*; retaining it under THIS lease would leave
 				// the original record pointing at names that no longer exist.
+				claimedLeftBehind = true
 				logger.Warn("deprovision: volume is claimed by an in-flight restore record; leaving it for the restore rollback",
 					"volume_id", id)
 				continue
@@ -460,6 +475,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 					// name. Destroying it is unrecoverable data loss and kills that lease's
 					// restore; reconcileRestoring re-quarantines it once its rollback can
 					// complete (ENG-647).
+					claimedLeftBehind = true
 					logger.Warn("deprovision: volume is claimed by an in-flight restore record; not destroying it",
 						"volume_id", volumeID)
 					continue
@@ -470,13 +486,16 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				}
 			}
 		}
-		if len(volumeErrs) == 0 {
+		if len(volumeErrs) == 0 && !claimedLeftBehind {
 			// All volumes destroyed — bytes are gone, so release the live allocation
 			// now. Releasing only on success (not before the loop) keeps the footprint
 			// counted while a failed Destroy leaves bytes on disk and the lease is kept
 			// Failed for retry, preventing an over-admit/ENOSPC window. Symmetric with
 			// the retain arms (releaseLiveOnRetainPath set only when
 			// len(volumeErrs) == 0).
+			//
+			// A skipped claimed volume is not an error but leaves bytes on disk just the
+			// same, so it holds the reservation for the same reason (ENG-647).
 			releaseLive()
 		}
 	}
