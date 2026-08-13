@@ -39,6 +39,18 @@ const (
 // CounterVec series to 0 so absence/ratio alert queries return 0, not no-data.
 var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRootUnverifiable, orphanSkipRaced, orphanSkipDisabled, orphanSkipStoreError}
 
+// Skip reasons for retentionReapSkipsTotal (ENG-659) — the reaping finalizer's
+// destroy-time ownership re-check. Kept as constants so the reap path, the pre-init,
+// and the tests cannot drift on a typo.
+const (
+	reapSkipRestoreClaimed  = "restore_claimed"  // a tombstoned name is a volume an in-flight restore adopted — deliberate, self-healing, NOT a leak
+	reapSkipClaimUnreadable = "claim_unreadable" // retentionStore.List() failed → ownership unprovable → destroy nothing this pass (fail-safe)
+)
+
+// reapSkipReasons is the closed reason set, pre-initialized to 0 so a healthy
+// provider — which should never skip — exports 0 rather than no-data.
+var reapSkipReasons = []string{reapSkipRestoreClaimed, reapSkipClaimUnreadable}
+
 // Operation and outcome labels for teardownFallbackTotal — which teardown path had
 // to compensate for a failed compose Down, and whether the compensation finished the
 // job (ENG-647). Kept as constants so the call sites, the pre-init, and the tests
@@ -614,6 +626,33 @@ var (
 		Help:      "Retained-volume leak events (failed destroy / give-up / uncommitted revert) — see ENG-376",
 	})
 
+	// retentionReapSkipsTotal counts reaping-finalizer destroy attempts that did NOT
+	// fully reap because the destroy-time ownership re-check refused (ENG-659). Counted
+	// PER REAP ATTEMPT (one increment per destroyReapingVolumes call), never per volume,
+	// so both reasons share a unit and are safely summable — the skipped names are in the
+	// WARN log, not in the label set.
+	//
+	// Deliberately NOT retentionLeakedTotal: nothing is abandoned. The record stays
+	// reaping, so retention_reaping_bytes/_leases keep the footprint in the admission
+	// pool, and the skip resolves as soon as the restore rolls back (the name is renamed
+	// away and the next sweep's destroy is an idempotent no-op that drops the record).
+	// Counting it as a leak would arm the deployed BackendRetentionLeaked alert — whose
+	// reaping_leases == 0 suppressor stops suppressing the moment the tombstone clears —
+	// on a healthy self-heal.
+	//
+	// restore_claimed is benign at a low rate (it needs a restore in flight against a
+	// lease that also carries a tombstone); sustained, it means a restore is not
+	// converging — pair it with restore_finalizer_pending_total and
+	// retention_reaping_leases. claim_unreadable is the ticketing signal, exactly as
+	// retention_orphan_skips_total{reason="store_error"} is for the orphan pruner.
+	// reason ∈ reapSkipReasons.
+	retentionReapSkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_reap_skips_total",
+		Help:      "Reaping-finalizer destroy attempts skipped by reason (per reap attempt, not per volume) — see ENG-659",
+	}, []string{"reason"})
+
 	// teardownFallbackTotal counts the per-container compensation that runs when compose
 	// Down fails, by teardown path and result (ENG-647). Down is the only call that reaps
 	// a container's anonymous volumes, so a Down failure with no compensation leaks them
@@ -715,6 +754,12 @@ func init() {
 	// Pre-init the quota-backfill outcomes to 0 (ENG-454).
 	for _, oc := range quotaBackfillOutcomes {
 		volumeQuotaBackfillTotal.WithLabelValues(oc).Add(0)
+	}
+	// Pre-init the reap-skip reasons to 0 (ENG-659). A provider that never skips would
+	// otherwise export nothing, and "no-data" is indistinguishable from "healthy" in the
+	// alert that watches the fail-safe reason.
+	for _, r := range reapSkipReasons {
+		retentionReapSkipsTotal.WithLabelValues(r).Add(0)
 	}
 	// Pre-init every teardown-fallback series to 0 (ENG-647). A provider whose compose
 	// Down never fails would otherwise export nothing, and "no-data" is indistinguishable

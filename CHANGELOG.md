@@ -35,6 +35,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **A reaping tombstone can no longer destroy an in-flight restore's data**
+  (ENG-659). The retention finalizer destroyed every volume name a `reaping`
+  record carried, with no ownership check — the only volume-destroy path in the
+  docker backend without one. ENG-647 stopped a deprovision give-up from
+  *writing* an adopted volume's name into such a record, but tombstones are
+  persisted and outlive the binary: a provider upgrading from an older build
+  still carries records written before that guard existed, and the next sweep
+  executed them, permanently destroying the data a restoring lease had adopted.
+  The finalizer now re-checks ownership at destroy time — a name an in-flight
+  restore claims is skipped and logged, and an unreadable retention store means
+  nothing is destroyed that pass, mirroring the orphan reaper's fail-safe. A
+  skipped name leaves the record `reaping`, so its footprint stays counted and
+  the next sweep retries once the restore commits or rolls back; it is
+  deliberately **not** counted as a leak. New
+  `fred_docker_backend_retention_reap_skips_total{reason}` counts both cases
+  (`restore_claimed`, `claim_unreadable`); see the updated
+  "Reclaiming leaked / stuck-reaping orphan volumes" runbook, since a
+  deliberately-held tombstone must **not** be reclaimed by hand.
+
 - **A failed container teardown is no longer treated as a completed one**
   (ENG-647). When `compose down` failed, the docker backend logged the error and
   carried on as though the containers were gone. On the restore-rollback path

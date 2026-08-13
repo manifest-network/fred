@@ -427,6 +427,16 @@ the sweep is the only automatic reclaimer.
 - **Diagnose.** Find the volume(s): `ls <volume_data_path> | grep -E 'fred-retained-|fred-'`.
   Check why destroy fails — a container still bind-mounting it (`docker ps`, then stop it), or a
   filesystem error (`dmesg`).
+- **First check whether the reaper is holding the tombstone on purpose.** If
+  `..._retention_reap_skips_total{reason="restore_claimed"}` is also incrementing, one of the
+  tombstoned names is a volume an **in-flight restore adopted** — the destroy is refused
+  deliberately, and the data belongs to the *restoring* lease, not the tombstoned one. **Do not
+  remove it by hand:** the steps below would destroy another tenant's data, and the tombstone
+  would not clear anyway (the skip is by name, not by existence). Find the restoring record
+  (`GET /retentions`) and resolve *that* — the tombstone clears on the next sweep once the
+  restore commits or rolls back. `reason="claim_unreadable"` instead means the retention store
+  is unreadable, which silently stops the reaper (and blocks the close path too); fix the store
+  first. See ENG-659.
 - **Reclaim (only after confirming no live/restoring lease references it).** Once the blocker is
   cleared the next sweep reclaims it automatically. To force it sooner, restart the backend
   (boot runs the reaping reconcile). If the volume is genuinely unrecoverable, remove it
