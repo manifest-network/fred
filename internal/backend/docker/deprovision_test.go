@@ -614,3 +614,56 @@ func TestDoDeprovision_NoClaimedVolume_StillReleasesAllocation(t *testing.T) {
 		"an ordinary close destroys its volumes and must still return their capacity")
 	assert.Zero(t, b.pool.Stats().AllocationCount)
 }
+
+// TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord closes the delayed
+// half of the data-loss hole (ENG-647, PR #217 review).
+//
+// The close's volume branches refuse to destroy a volume an in-flight restore adopted
+// into this lease's namespace — but a give-up after maxVolumeCleanupAttempts writes a
+// REAPING tombstone, and a tombstone is a scheduled destroy: destroyReapingVolumes
+// RemoveAll's every name it carries. recordGiveUpLeak collects by prefix
+// (fred-{lease}-*), which matches the adopted volume exactly, so without this the
+// guard merely deferred the destruction by one sweep — and made it look accounted-for
+// on the way.
+func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T) {
+	const lease = "u2"
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 2,
+			Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "app"}},
+		}, VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1}, // next failure → give up
+	})
+	withMicroSKU(b, 512)
+	rs := attachRetentionStore(t, b)
+	claimedVol := seedRestoringInto(t, rs, "u1", lease) // fred-u2-app-0 IS u1's adopted data
+	ownVol := canonicalVolumeName(lease, "app", 1)
+
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{claimedVol, ownVol}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			if id == ownVol {
+				return errors.New("EBUSY") // drives the retry → give-up arm
+			}
+			t.Errorf("the close must never destroy the claimed volume %q", id)
+			return nil
+		},
+	}
+
+	_ = b.doDeprovision(context.Background(), lease) // give-up returns nil by contract
+
+	tomb, err := rs.Get(lease)
+	require.NoError(t, err)
+	require.NotNil(t, tomb, "the give-up must still tombstone this lease's OWN leaked volume")
+	assert.Equal(t, shared.RetentionStatusReaping, tomb.Status)
+	assert.Equal(t, []string{ownVol}, tomb.RetainedVolumeNames,
+		"the tombstone must name only this lease's own leak; naming the adopted volume would "+
+			"schedule destroyReapingVolumes to RemoveAll another lease's retained data (ENG-647)")
+	assert.NotContains(t, tomb.RetainedVolumeNames, claimedVol)
+
+	// And the original record is untouched, so its restore is still possible.
+	orig, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, orig)
+	assert.Equal(t, shared.RetentionStatusRestoring, orig.Status)
+}

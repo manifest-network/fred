@@ -666,11 +666,33 @@ func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items
 	if b.retentionStore == nil {
 		return // no projection to correct; metric + the give-up log are the record
 	}
+	// A tombstone is a SCHEDULED DESTROY: destroyReapingVolumes RemoveAll's every name
+	// it carries. Volumes an in-flight restore adopted into this lease's namespace are
+	// named fred-{thisLease}-{svc}-{idx} — indistinguishable by prefix from our own —
+	// so recording them here would hand another lease's retained data to the reaper and
+	// kill its restore. The close's volume branches already refuse to destroy them; a
+	// give-up must not undo that on a timer (ENG-647).
+	//
+	// If the claim set is unreadable we record NOTHING rather than risk naming data that
+	// is not ours. That under-counts a real leak, but retentionLeakedTotal (incremented
+	// above) plus the give-up log are the record, and cleanup gates fail toward keeping
+	// data.
+	claimed, claimErr := b.restoringClaimedVolumes(leaseUUID)
+	if claimErr != nil {
+		logger.Error("give-up leak: cannot identify restore-claimed volumes; recording no tombstone rather than scheduling a destroy that might name another lease's data",
+			"error", claimErr)
+		return
+	}
 	var leaked []string
 	if all, err := b.volumes.List(); err == nil {
 		cprefix := leaseVolumePrefix(leaseUUID) // fred-{lease}-
 		rprefix := retainedName(cprefix)        // fred-retained-{lease}-
 		for _, id := range all {
+			if claimed[id] {
+				logger.Warn("give-up leak: volume is claimed by an in-flight restore; excluding it from the reaping tombstone",
+					"volume_id", id)
+				continue
+			}
 			if strings.HasPrefix(id, cprefix) || strings.HasPrefix(id, rprefix) {
 				leaked = append(leaked, id)
 			}
@@ -688,6 +710,11 @@ func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items
 				// name, the sweep would "succeed" against the non-existent canonical name and
 				// drop the tombstone while the fred-retained-* volume persists untracked —
 				// reintroducing the exact under-count/leak this path fixes.
+				if claimed[canonical] {
+					logger.Warn("give-up leak: derived name is claimed by an in-flight restore; excluding it from the reaping tombstone",
+						"volume_id", canonical)
+					continue
+				}
 				leaked = append(leaked, canonical, retainedName(canonical))
 			}
 		}
