@@ -582,12 +582,19 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 	// Only include PayloadHash when we have the actual payload - this ensures
 	// backends never receive a hash without the corresponding data.
 	if withPayload && r.tracker != nil {
-		var getErr error
-		req.Payload, getErr = r.tracker.PayloadStore().Get(lease.Uuid)
+		// Read the payload and its recorded hash from ONE snapshot. Two reads
+		// would let a concurrent /update commit between them and hand this
+		// attempt the old payload with the new hash — which fails verification
+		// below and deletes the update that was just persisted. Both paths are
+		// live at once for an ACTIVE lease whose provision has failed: the
+		// reconciler re-provisions it while the backend still accepts /update
+		// for it, and nothing serializes the two.
+		recordedHash, getErr := []byte(nil), error(nil)
+		req.Payload, recordedHash, getErr = r.tracker.PayloadStore().GetWithHash(lease.Uuid)
 		if getErr != nil {
-			// Database error — do NOT treat as "payload missing".
-			// Abort this provision attempt so a transient disk issue doesn't
-			// cause us to close an active lease.
+			// Database error, or a recorded hash that is not a SHA-256 — do NOT
+			// treat either as "payload missing". Abort this provision attempt so
+			// a transient disk issue doesn't cause us to close an active lease.
 			r.tracker.UntrackInFlight(lease.Uuid)
 			return fmt.Errorf("failed to read payload for lease %s: %w", lease.Uuid, getErr)
 		}
@@ -615,15 +622,7 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 			// it. ENG-643 makes the on-chain hash updatable and restores it as
 			// the authoritative check, at which point the recorded hash becomes
 			// a legacy fallback.
-			expectedHash, hashErr := r.tracker.PayloadStore().GetHash(lease.Uuid)
-			if hashErr != nil {
-				// A failed read is not a mismatch. Deleting the payload here
-				// would destroy a good manifest — and close a live lease — over
-				// a transient disk error, so abort and retry next cycle.
-				r.tracker.UntrackInFlight(lease.Uuid)
-				return fmt.Errorf("failed to read payload hash for lease %s: %w", lease.Uuid, hashErr)
-			}
-
+			expectedHash := recordedHash
 			verifiedAgainst := "recorded_hash"
 			if len(expectedHash) == 0 {
 				expectedHash = lease.MetaHash

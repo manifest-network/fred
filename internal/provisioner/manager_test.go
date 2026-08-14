@@ -2756,7 +2756,7 @@ func TestManager_OverwritePayload_ReplacesStoredPayload(t *testing.T) {
 	// The recorded hash moves with the payload, which is what lets the
 	// reprovision path accept an updated manifest that no longer matches the
 	// lease's create-time MetaHash.
-	gotHash, err := payloadStore.GetHash("lease-1")
+	_, gotHash, err := payloadStore.GetWithHash("lease-1")
 	require.NoError(t, err)
 	want := sha256.Sum256(updated)
 	assert.Equal(t, want[:], gotHash)

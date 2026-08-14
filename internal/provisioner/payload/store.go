@@ -292,49 +292,58 @@ func (s *Store) Put(leaseUUID string, payload []byte) error {
 	}
 }
 
-// GetHash returns the SHA-256 recorded alongside a lease's payload.
+// GetWithHash returns a lease's payload together with the SHA-256 recorded
+// alongside it, read from a SINGLE bbolt snapshot.
 //
-// Returns (nil, nil) when no hash is recorded — either the lease has no payload,
-// or the payload was written by a build that predates the hash bucket. Callers
-// must treat that as "fall back to the on-chain MetaHash", never as a mismatch:
-// reading absence as corruption would delete a legitimate payload and, on an
-// ACTIVE lease, close it on-chain.
+// The pairing is the entire point, and it is why there is no exported
+// hash-only reader. Reading the payload and its hash in two transactions lets an
+// /update's Put commit between them, handing the caller the OLD payload and the
+// NEW hash. That pair does not verify, and the caller's response to a
+// verification failure is to delete the payload as corrupt — destroying the
+// update that had just been persisted, and then closing the ACTIVE lease
+// on-chain on the following sweep. A bbolt read transaction pins the meta page
+// at Begin, so every bucket it reads comes from one committed state and the
+// payload/hash pair is always self-consistent.
 //
-// Returns a non-nil error only when the database read itself fails, which
-// callers must distinguish from absence for the same reason Get does.
-func (s *Store) GetHash(leaseUUID string) ([]byte, error) {
+// Returns:
+//   - (nil, nil, nil) when the lease has no stored payload.
+//   - (payload, nil, nil) when a payload exists but no hash was recorded — a
+//     payload written before the hash bucket existed. Callers fall back to the
+//     on-chain MetaHash for these, and must never read the absent hash as a
+//     mismatch: that would delete a legitimate payload and close a live lease.
+//   - a non-nil error when the read fails OR the recorded hash is present but is
+//     not a SHA-256. A corrupt checksum is a failed read, not an absence —
+//     reporting it as absence would route the caller into the MetaHash fallback,
+//     which an updated payload legitimately fails.
+func (s *Store) GetWithHash(leaseUUID string) ([]byte, []byte, error) {
 	key := []byte(leaseUUID)
-	var hash []byte
+	var payload, hash []byte
 
 	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(payloadHashBucketName)
-		data := b.Get(key)
+		if data := tx.Bucket(payloadBucketName).Get(key); data != nil {
+			// Make a copy since bbolt data is only valid within the transaction
+			payload = make([]byte, len(data))
+			copy(payload, data)
+		}
+
+		data := tx.Bucket(payloadHashBucketName).Get(key)
 		if data == nil {
-			// Key absent: no hash was ever recorded for this lease, which is the
-			// legitimate pre-ENG-619 case. Leave hash nil so the caller falls
-			// back to the on-chain MetaHash.
+			// No hash recorded: the legitimate pre-ENG-619 case.
 			return nil
 		}
 		if len(data) != HashSize {
-			// Present but not a SHA-256. Reporting this as "absent" would send
-			// the caller down that same MetaHash fallback — and for a payload an
-			// update legitimately changed, MetaHash no longer matches, so the
-			// caller would delete a good manifest and then close a live lease.
-			// A corrupt checksum is a failed read, not an absence: fail the read
-			// and let the provision attempt retry.
 			return fmt.Errorf("recorded hash is %d bytes, want %d", len(data), HashSize)
 		}
-		// Make a copy since bbolt data is only valid within the transaction
 		hash = make([]byte, len(data))
 		copy(hash, data)
 		return nil
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to get payload hash for %s: %w", leaseUUID, err)
+		return nil, nil, fmt.Errorf("failed to get payload and hash for %s: %w", leaseUUID, err)
 	}
 
-	return hash, nil
+	return payload, hash, nil
 }
 
 // Get retrieves a payload for a lease without removing it.

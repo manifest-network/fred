@@ -3,6 +3,7 @@ package payload
 import (
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -785,18 +786,18 @@ func TestStore_Store_RecordsPayloadHash(t *testing.T) {
 
 	require.True(t, store.Store(testutil.ValidUUID1, data))
 
-	got, err := store.GetHash(testutil.ValidUUID1)
+	_, got, err := store.GetWithHash(testutil.ValidUUID1)
 	require.NoError(t, err)
 	want := sha256.Sum256(data)
 	assert.Equal(t, want[:], got, "Store() must record the payload's own hash")
 }
 
-func TestStore_GetHash_AbsentReturnsNilWithoutError(t *testing.T) {
+func TestStore_GetWithHash_AbsentReturnsNilWithoutError(t *testing.T) {
 	store := newTestStore(t)
 
 	// Absence must be distinguishable from a read failure: callers fall back to
 	// the on-chain MetaHash on nil, but abort the provision on an error.
-	got, err := store.GetHash("no-such-lease")
+	_, got, err := store.GetWithHash("no-such-lease")
 	require.NoError(t, err)
 	assert.Nil(t, got)
 }
@@ -813,7 +814,7 @@ func TestStore_Put_OverwritesPayloadAndHash(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, updated, got, "Put() must replace the stored payload")
 
-	gotHash, err := store.GetHash(testutil.ValidUUID1)
+	_, gotHash, err := store.GetWithHash(testutil.ValidUUID1)
 	require.NoError(t, err)
 	want := sha256.Sum256(updated)
 	assert.Equal(t, want[:], gotHash, "Put() must replace the recorded hash too")
@@ -854,7 +855,7 @@ func TestStore_Delete_ClearsRecordedHash(t *testing.T) {
 
 	// A leaked hash would make a later payload reused under the same key verify
 	// against a stale reference.
-	got, err := store.GetHash(testutil.ValidUUID1)
+	_, got, err := store.GetWithHash(testutil.ValidUUID1)
 	require.NoError(t, err)
 	assert.Nil(t, got, "Delete() must clear the recorded hash")
 }
@@ -866,7 +867,7 @@ func TestStore_Pop_ClearsRecordedHash(t *testing.T) {
 
 	assert.Equal(t, data, store.Pop(testutil.ValidUUID1))
 
-	got, err := store.GetHash(testutil.ValidUUID1)
+	_, got, err := store.GetWithHash(testutil.ValidUUID1)
 	require.NoError(t, err)
 	assert.Nil(t, got, "Pop() must clear the recorded hash")
 }
@@ -892,7 +893,7 @@ func TestStore_RecordedHashSurvivesReopen(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, updated, got)
 
-	gotHash, err := store2.GetHash(leaseUUID)
+	_, gotHash, err := store2.GetWithHash(leaseUUID)
 	require.NoError(t, err)
 	want := sha256.Sum256(updated)
 	assert.Equal(t, want[:], gotHash)
@@ -918,7 +919,7 @@ func TestStore_OpeningPreENG619DatabaseAddsHashBucket(t *testing.T) {
 	// The bucket is recreated (Healthy passes) but the legacy payload has no
 	// recorded hash, so readers fall back to the on-chain MetaHash.
 	require.NoError(t, store2.Healthy())
-	gotHash, err := store2.GetHash(leaseUUID)
+	_, gotHash, err := store2.GetWithHash(leaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, gotHash, "a pre-ENG-619 payload must have no recorded hash")
 
@@ -951,7 +952,7 @@ func writeRawHash(dbPath, leaseUUID string, value []byte) error {
 	})
 }
 
-func TestStore_GetHash_MalformedEntryIsAnError(t *testing.T) {
+func TestStore_GetWithHash_MalformedEntryIsAnError(t *testing.T) {
 	// A recorded hash that is present but not a SHA-256 must NOT read as
 	// "absent". Absence sends the caller to the on-chain MetaHash, and for a
 	// payload an update legitimately changed that means deleting a good
@@ -978,7 +979,7 @@ func TestStore_GetHash_MalformedEntryIsAnError(t *testing.T) {
 			require.NoError(t, err)
 			defer store2.Close()
 
-			got, err := store2.GetHash(testutil.ValidUUID1)
+			_, got, err := store2.GetWithHash(testutil.ValidUUID1)
 			require.Error(t, err, "a malformed recorded hash must be an error, not (nil, nil)")
 			assert.Nil(t, got)
 			assert.Contains(t, err.Error(), "want 32")
@@ -986,16 +987,100 @@ func TestStore_GetHash_MalformedEntryIsAnError(t *testing.T) {
 	}
 }
 
-func TestStore_GetHash_ExactSizeIsAccepted(t *testing.T) {
+func TestStore_GetWithHash_ExactSizeIsAccepted(t *testing.T) {
 	// The boundary the malformed check keys on: a real 32-byte hash still reads
 	// back cleanly.
 	store := newTestStore(t)
 	data := []byte("payload")
 	require.True(t, store.Store(testutil.ValidUUID1, data))
 
-	got, err := store.GetHash(testutil.ValidUUID1)
+	_, got, err := store.GetWithHash(testutil.ValidUUID1)
 	require.NoError(t, err)
 	require.Len(t, got, HashSize)
 	want := sha256.Sum256(data)
 	assert.Equal(t, want[:], got)
+}
+
+func TestStore_GetWithHash_ConcurrentPutIsRaceFree(t *testing.T) {
+	// Exercises GetWithHash against a concurrent writer under -race, which is
+	// what it is for: catching a data race in the copy-out of the two buckets.
+	//
+	// It deliberately does NOT claim to prove the single-snapshot property. The
+	// torn-read window is a few microseconds wide and the writer here manages
+	// only ~20 Puts/sec (each blocks on the 50ms batch flush), so this test was
+	// measured NOT to fail when GetWithHash is mutated back into two separate
+	// transactions. The structural guarantee is enforced deterministically by
+	// TestStore_GetWithHash_UsesExactlyOneReadTransaction instead — that one
+	// does fail under the mutation. Consistency is still asserted below as a
+	// cheap sanity check, not as the guard.
+	store := newTestStore(t)
+	const leaseUUID = "race-lease"
+	require.True(t, store.Store(leaseUUID, []byte("payload-v0")))
+
+	const readsPerReader = 500
+	const readers = 4
+
+	// Two WaitGroups on purpose: the writer runs until the readers are finished,
+	// so waiting on one combined group before closing stop would deadlock.
+	var readersWg, writerWg sync.WaitGroup
+	stop := make(chan struct{})
+
+	writerWg.Go(func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Each write is a distinct payload, so a torn pair cannot coincide.
+			_ = store.Put(leaseUUID, fmt.Appendf(nil, "payload-v%d", i))
+		}
+	})
+
+	for range readers {
+		readersWg.Go(func() {
+			for range readsPerReader {
+				payload, hash, err := store.GetWithHash(leaseUUID)
+				if err != nil {
+					t.Errorf("GetWithHash returned an error: %v", err)
+					return
+				}
+				if payload == nil || len(hash) == 0 {
+					continue // never written yet — not a tear
+				}
+				if err := VerifyHash(payload, hash); err != nil {
+					t.Errorf("torn pair: payload and recorded hash came from different commits: %v", err)
+					return
+				}
+			}
+		})
+	}
+
+	readersWg.Wait()
+	close(stop)
+	writerWg.Wait()
+}
+
+func TestStore_GetWithHash_UsesExactlyOneReadTransaction(t *testing.T) {
+	// The guard that actually has teeth. The torn-read defect is a ~microsecond
+	// window, so a probabilistic concurrency test does not reliably catch it —
+	// this asserts the structural property instead: the payload and its hash
+	// must come from ONE bbolt snapshot. bbolt counts started read transactions
+	// in DB.Stats().TxN, so a second View here shows up as a second txn.
+	//
+	// Reading them in two transactions lets an /update Put commit between them,
+	// producing (old payload, new hash); the reconciler reads that as corruption
+	// and deletes the freshly persisted update, closing the lease a sweep later.
+	store := newTestStore(t)
+	require.True(t, store.Store(testutil.ValidUUID1, []byte("payload")))
+
+	before := store.db.Stats().TxN
+	payload, hash, err := store.GetWithHash(testutil.ValidUUID1)
+	after := store.db.Stats().TxN
+
+	require.NoError(t, err)
+	require.NotNil(t, payload)
+	require.Len(t, hash, HashSize)
+	assert.Equal(t, 1, after-before,
+		"GetWithHash must read payload and hash from a single snapshot; %d transactions means the pair can tear", after-before)
 }
