@@ -642,6 +642,10 @@ Content-Type: application/json
 
 Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are stopped, new ones are created from the updated manifest, and old containers are cleaned up after verification. On failure, the operation rolls back to the previous containers. Volumes are preserved.
 
+A successful update is also **persisted** to the payload store, replacing the manifest the lease was created with. This is what makes an update survive a reprovision: the reconciler replays whatever is stored, so an update applied only to the running containers would be silently undone by the next reboot, crash-restart or host failure (ENG-619). The payload is written *after* the backend accepts it, so a rejected update never enters the store; if that write fails the endpoint answers `500` rather than `202`, because a `202` would promise a durability fred does not have. Retrying re-applies and re-persists.
+
+Because the on-chain `meta_hash` is set once at lease creation and cannot currently be updated, an updated payload no longer matches it. Fred records each stored payload's own SHA-256 and verifies against that on reprovision; `meta_hash` is still used for payloads stored before this behavior existed. See ENG-643 for the on-chain update handshake that restores `meta_hash` as the authoritative reference.
+
 **Response:** `202 Accepted`
 ```json
 {
@@ -650,12 +654,13 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 ```
 
 **Response Codes:**
-- `202 Accepted` - Update initiated
+- `202 Accepted` - Update initiated and persisted
 - `400 Bad Request` - Invalid payload or manifest validation error
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Lease is in a state that cannot be updated (e.g., currently restarting)
+- `500 Internal Server Error` - Applied to the backend but could not be persisted, or no payload store is configured
 
 ### Restore Lease
 

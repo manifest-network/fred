@@ -599,19 +599,51 @@ func (r *Reconciler) doStartProvisioning(ctx context.Context, lease billingtypes
 			return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, lease.Uuid)
 		}
 		if req.Payload != nil && len(lease.MetaHash) > 0 {
-			// Re-verify payload hash before provisioning to catch any corruption.
-			// The payload was validated on upload, but disk corruption could occur.
-			if err := payload.VerifyHash(req.Payload, lease.MetaHash); err != nil {
+			// Re-verify the payload before provisioning to catch corruption.
+			//
+			// Verify against the hash recorded when the payload was written, not
+			// against the lease's on-chain MetaHash. MetaHash is set once at
+			// lease creation and is immutable, so it names the manifest the
+			// lease was CREATED with — while a tenant /update legitimately
+			// replaces the stored manifest without changing it (ENG-619).
+			// Checking an updated payload against MetaHash would read a
+			// successful update as corruption, delete the payload, and then
+			// close the ACTIVE lease on-chain via errPayloadNotAvailable.
+			//
+			// A payload with no recorded hash was written by a build that
+			// predates the hash bucket; MetaHash remains the right reference for
+			// it. ENG-643 makes the on-chain hash updatable and restores it as
+			// the authoritative check, at which point the recorded hash becomes
+			// a legacy fallback.
+			expectedHash, hashErr := r.tracker.PayloadStore().GetHash(lease.Uuid)
+			if hashErr != nil {
+				// A failed read is not a mismatch. Deleting the payload here
+				// would destroy a good manifest — and close a live lease — over
+				// a transient disk error, so abort and retry next cycle.
+				r.tracker.UntrackInFlight(lease.Uuid)
+				return fmt.Errorf("failed to read payload hash for lease %s: %w", lease.Uuid, hashErr)
+			}
+
+			verifiedAgainst := "recorded_hash"
+			if len(expectedHash) == 0 {
+				expectedHash = lease.MetaHash
+				verifiedAgainst = "meta_hash"
+			}
+
+			if err := payload.VerifyHash(req.Payload, expectedHash); err != nil {
 				// Payload is corrupted - delete it and fail
 				r.tracker.PayloadStore().Delete(lease.Uuid)
 				r.tracker.UntrackInFlight(lease.Uuid)
 				slog.Error("reconcile: payload hash mismatch - possible corruption",
 					"lease_uuid", lease.Uuid,
+					"verified_against", verifiedAgainst,
 					"error", err,
 				)
 				return err
 			}
-			req.PayloadHash = hex.EncodeToString(lease.MetaHash)
+			// The hash sent to the backend describes the payload actually being
+			// sent, which after an update is no longer MetaHash.
+			req.PayloadHash = hex.EncodeToString(expectedHash)
 		}
 	}
 

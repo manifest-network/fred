@@ -8,6 +8,20 @@ import (
 	"fmt"
 )
 
+// ComputeHash returns the SHA-256 of payload.
+//
+// This is the hash the store records alongside a payload so a later read can be
+// verified against what was actually written, rather than against the lease's
+// create-time on-chain MetaHash — which a tenant /update legitimately diverges
+// from (ENG-619). It is an integrity reference, not a tamper-evidence one: it
+// lives beside the data it describes, so anyone who can rewrite the payload can
+// rewrite the hash. The on-chain MetaHash remains the cross-trust-boundary
+// commitment, and ENG-643 restores it as the authoritative check for updates.
+func ComputeHash(payload []byte) []byte {
+	sum := sha256.Sum256(payload)
+	return sum[:]
+}
+
 // VerifyHash computes the SHA-256 hash of payload and compares it against expectedHash
 // using constant-time comparison to prevent timing attacks.
 // Returns nil if the hash matches, otherwise returns an error with the mismatched hashes.

@@ -386,6 +386,25 @@ func (m *Manager) StorePayload(leaseUUID string, payload []byte) bool {
 	return m.payloadStore.Store(leaseUUID, payload)
 }
 
+// OverwritePayload replaces the stored payload for a lease, recording the new
+// payload's own hash alongside it (ENG-619).
+//
+// This is the durable half of a tenant /update: without it the update reaches
+// the backend but not the store the reconciler replays from, so the next
+// reprovision — a reboot, a crash-restart, a host failure — silently reverts the
+// tenant to the manifest they created the lease with.
+//
+// Returns ErrPayloadStoreUnavailable when no payload store is configured. That
+// is not a no-op worth swallowing: the caller has already applied the update to
+// the backend, and reporting success would repeat the exact lie this ticket
+// exists to remove.
+func (m *Manager) OverwritePayload(leaseUUID string, payload []byte) error {
+	if m.payloadStore == nil {
+		return ErrPayloadStoreUnavailable
+	}
+	return m.payloadStore.Put(leaseUUID, payload)
+}
+
 // HasPayload checks if a payload exists for a lease.
 // Returns false if the payload store is not configured.
 func (m *Manager) HasPayload(leaseUUID string) (bool, error) {

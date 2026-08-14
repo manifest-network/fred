@@ -38,6 +38,18 @@ var (
 
 	// payloadMetaBucketName is the bbolt bucket for storing payload metadata (timestamps).
 	payloadMetaBucketName = []byte("payload_meta")
+
+	// payloadHashBucketName is the bbolt bucket for storing each payload's own
+	// SHA-256 (ENG-619). It is deliberately a separate bucket rather than a
+	// field inside the payload record: a checksum stored outside the data it
+	// describes is what makes it useful on a single-node store, and it keeps
+	// the payload bucket byte-identical to what pre-ENG-619 builds wrote.
+	//
+	// Entries are written by Store and Put and removed by Pop and Delete, all
+	// inside the same bbolt transaction as the payload itself, so a payload can
+	// never outlive its hash or vice versa. A payload written by an older build
+	// simply has no entry here; readers fall back to the on-chain MetaHash.
+	payloadHashBucketName = []byte("payload_hashes")
 )
 
 // writeOpType represents the type of write operation.
@@ -47,6 +59,10 @@ const (
 	opStore writeOpType = iota
 	opDelete
 	opPop
+	// opPut overwrites unconditionally, where opStore conflicts on an existing
+	// key. It exists for the tenant /update path (ENG-619), which by definition
+	// replaces a payload that is already there.
+	opPut
 )
 
 // writeOp represents a write operation to be batched.
@@ -54,6 +70,7 @@ type writeOp struct {
 	opType   writeOpType
 	key      string
 	payload  []byte
+	hash     []byte    // For store/put operations: SHA-256 of payload, computed off the writer goroutine
 	time     time.Time // For store operations
 	resultCh chan writeResult
 }
@@ -62,7 +79,7 @@ type writeOp struct {
 type writeResult struct {
 	stored  bool   // For Store: whether the payload was stored (false if already existed)
 	payload []byte // For Pop: the retrieved payload
-	existed bool   // For Delete: whether the key existed
+	existed bool   // For Delete/Put: whether the key existed beforehand
 	err     error
 }
 
@@ -119,6 +136,12 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 			return err
 		}
 		if _, err := tx.CreateBucketIfNotExists(payloadMetaBucketName); err != nil {
+			return err
+		}
+		// Created here rather than migrated: a database written by a pre-ENG-619
+		// build simply gains an empty bucket on first open, and its existing
+		// payloads keep verifying against the on-chain MetaHash.
+		if _, err := tx.CreateBucketIfNotExists(payloadHashBucketName); err != nil {
 			return err
 		}
 		return nil
@@ -189,6 +212,7 @@ func (s *Store) Store(leaseUUID string, payload []byte) bool {
 		opType:   opStore,
 		key:      leaseUUID,
 		payload:  payload,
+		hash:     ComputeHash(payload),
 		time:     time.Now(),
 		resultCh: resultCh,
 	}
@@ -214,6 +238,90 @@ func (s *Store) Store(leaseUUID string, payload []byte) bool {
 		slog.Warn("payload store closed during store", "lease_uuid", leaseUUID)
 		return false
 	}
+}
+
+// Put stores a payload for a lease, overwriting any payload already there, and
+// records the payload's own SHA-256 in the same transaction.
+//
+// This is the tenant-update path (ENG-619). Store refuses to overwrite because
+// the create path must not clobber a payload it did not write; an update is the
+// opposite — replacing the stored manifest is the entire point, and failing to
+// replace it is what made reprovisions silently revert tenants to their
+// as-created deployment.
+//
+// Unlike Store, which reports a conflict through its bool, Put returns an error:
+// its caller has already applied the update to the backend, so a failure here is
+// a durability failure worth surfacing rather than a benign "someone got there
+// first".
+//
+// Note: This method blocks until the write completes. If the internal write queue
+// is full (>1000 pending operations), it will block until space is available.
+// This provides backpressure under extreme load. Callers should not hold locks
+// when calling this method.
+func (s *Store) Put(leaseUUID string, payload []byte) error {
+	resultCh := make(chan writeResult, 1)
+
+	op := writeOp{
+		opType:   opPut,
+		key:      leaseUUID,
+		payload:  payload,
+		hash:     ComputeHash(payload),
+		time:     time.Now(),
+		resultCh: resultCh,
+	}
+
+	select {
+	case s.writeCh <- op:
+	case <-s.ctx.Done():
+		return fmt.Errorf("payload store closed, cannot put payload for %s: %w", leaseUUID, s.ctx.Err())
+	}
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			return fmt.Errorf("failed to put payload for %s: %w", leaseUUID, result.err)
+		}
+		// Only a genuinely new key changes the stored count; an overwrite
+		// replaces one payload with another.
+		if !result.existed {
+			metrics.PayloadStoredCount.Inc()
+		}
+		return nil
+	case <-s.ctx.Done():
+		return fmt.Errorf("payload store closed during put for %s: %w", leaseUUID, s.ctx.Err())
+	}
+}
+
+// GetHash returns the SHA-256 recorded alongside a lease's payload.
+//
+// Returns (nil, nil) when no hash is recorded — either the lease has no payload,
+// or the payload was written by a build that predates the hash bucket. Callers
+// must treat that as "fall back to the on-chain MetaHash", never as a mismatch:
+// reading absence as corruption would delete a legitimate payload and, on an
+// ACTIVE lease, close it on-chain.
+//
+// Returns a non-nil error only when the database read itself fails, which
+// callers must distinguish from absence for the same reason Get does.
+func (s *Store) GetHash(leaseUUID string) ([]byte, error) {
+	key := []byte(leaseUUID)
+	var hash []byte
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(payloadHashBucketName)
+		data := b.Get(key)
+		if data != nil {
+			// Make a copy since bbolt data is only valid within the transaction
+			hash = make([]byte, len(data))
+			copy(hash, data)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get payload hash for %s: %w", leaseUUID, err)
+	}
+
+	return hash, nil
 }
 
 // Get retrieves a payload for a lease without removing it.
@@ -387,6 +495,9 @@ func (s *Store) Healthy() error {
 		if tx.Bucket(payloadMetaBucketName) == nil {
 			return errors.New("payload metadata bucket missing")
 		}
+		if tx.Bucket(payloadHashBucketName) == nil {
+			return errors.New("payload hash bucket missing")
+		}
 		return nil
 	})
 }
@@ -432,6 +543,7 @@ func (s *Store) writerLoop(ctx context.Context) {
 		err := s.db.Update(func(tx *bolt.Tx) error {
 			payloadBucket := tx.Bucket(payloadBucketName)
 			metaBucket := tx.Bucket(payloadMetaBucketName)
+			hashBucket := tx.Bucket(payloadHashBucketName)
 
 			for i := range batch {
 				op := &batch[i]
@@ -444,7 +556,7 @@ func (s *Store) writerLoop(ctx context.Context) {
 						results[i] = writeResult{stored: false}
 						continue
 					}
-					// Store payload and metadata
+					// Store payload, metadata and the payload's own hash
 					if err := payloadBucket.Put(key, op.payload); err != nil {
 						results[i] = writeResult{err: err}
 						continue
@@ -453,7 +565,30 @@ func (s *Store) writerLoop(ctx context.Context) {
 						results[i] = writeResult{err: err}
 						continue
 					}
+					if err := hashBucket.Put(key, op.hash); err != nil {
+						results[i] = writeResult{err: err}
+						continue
+					}
 					results[i] = writeResult{stored: true}
+
+				case opPut:
+					// Unconditional overwrite. Payload, metadata and hash move
+					// together in this one transaction, so a reader can never
+					// see a new payload against an old hash.
+					existed := payloadBucket.Get(key) != nil
+					if err := payloadBucket.Put(key, op.payload); err != nil {
+						results[i] = writeResult{err: err}
+						continue
+					}
+					if err := metaBucket.Put(key, util.TimeToBytes(op.time)); err != nil {
+						results[i] = writeResult{err: err}
+						continue
+					}
+					if err := hashBucket.Put(key, op.hash); err != nil {
+						results[i] = writeResult{err: err}
+						continue
+					}
+					results[i] = writeResult{stored: true, existed: existed}
 
 				case opPop:
 					data := payloadBucket.Get(key)
@@ -464,12 +599,16 @@ func (s *Store) writerLoop(ctx context.Context) {
 					// Make a copy before deleting
 					payload := make([]byte, len(data))
 					copy(payload, data)
-					// Delete from both buckets
+					// Delete from all three buckets
 					if err := payloadBucket.Delete(key); err != nil {
 						results[i] = writeResult{err: err}
 						continue
 					}
 					if err := metaBucket.Delete(key); err != nil {
+						results[i] = writeResult{err: err}
+						continue
+					}
+					if err := hashBucket.Delete(key); err != nil {
 						results[i] = writeResult{err: err}
 						continue
 					}
@@ -482,6 +621,10 @@ func (s *Store) writerLoop(ctx context.Context) {
 						continue
 					}
 					if err := metaBucket.Delete(key); err != nil {
+						results[i] = writeResult{err: err}
+						continue
+					}
+					if err := hashBucket.Delete(key); err != nil {
 						results[i] = writeResult{err: err}
 						continue
 					}

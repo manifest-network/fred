@@ -95,6 +95,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   a running tenant's data). The alert's triage annotation in the deployment repo
   should gain this third case.
 
+- **Tenant deployment updates are no longer silently reverted by the next
+  reprovision** (ENG-619). `POST /v1/leases/{uuid}/update` applied the new
+  payload to the backend but never wrote it to `payloads.db`, which is the store
+  the reconciler replays from. Every reprovision — a maintenance reboot, a host
+  failure, a crash-restart — therefore brought the lease back on its *as-created*
+  manifest, with no error and no signal anywhere; the backend then recorded the
+  reverted manifest as the lease's active release, so the revert stuck. Observed
+  on mainnet, where a reboot rolled a production admin UI back two minor
+  versions after three weeks of running the updated image.
+
+  The fix is not simply "persist it". The reprovision path re-verified the stored
+  payload against the lease's on-chain `meta_hash`, which is set once at lease
+  creation and immutable, so an updated payload would have failed that check,
+  been deleted as corrupt, and then had its ACTIVE lease **closed on-chain** —
+  worse than the revert. The payload store is now self-describing: it records
+  each payload's own SHA-256 in a separate `payload_hashes` bucket, written in
+  the same transaction as the payload, and the reprovision path verifies against
+  that. `meta_hash` remains the reference for payloads written before this
+  change, and ENG-643 restores it as the authoritative check once the chain can
+  carry a per-update commitment.
+
+  Operator-visible consequences: `/update` now answers `500` (instead of a
+  misleading `202`) when the payload cannot be persisted, and counts it in the
+  new `fred_payload_persist_failures_total{operation}` counter — each increment
+  is a lease whose running deployment fred has no durable record of. Providers
+  with `payload_store_db_path` unset now have `/update` rejected outright rather
+  than silently applied and lost.
+
+- `/update` requests to backends now carry `payload_hash`, the field both
+  `README.md` and `BACKEND_GUIDE.md` have always documented for that endpoint
+  but which fred never populated, leaving third-party backends unable to verify
+  a payload the contract said was verifiable.
+
 - **A reaping tombstone can no longer destroy an in-flight restore's data**
   (ENG-659). The retention finalizer destroyed every volume name a `reaping`
   record carried, with no ownership check — the only volume-destroy path in the

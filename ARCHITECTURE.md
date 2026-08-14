@@ -639,6 +639,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_payload_stored_count` | gauge | — | Payloads currently stored |
 | `fred_payload_size_bytes` | histogram | — | Upload size distribution |
 | `fred_payload_leases_awaiting` | gauge | — | Leases waiting for payload upload |
+| `fred_payload_persist_failures_total` | counter | `operation` | Payloads applied to a backend but not persisted — each one is a lease whose running deployment has no durable record (ENG-619) |
 
 **Signer pool:**
 

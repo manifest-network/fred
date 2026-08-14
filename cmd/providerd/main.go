@@ -408,6 +408,7 @@ func run(cmd *cobra.Command, args []string) error {
 		BackendRouter:     backendRouter,
 		CallbackPublisher: provisionMgr,
 		PayloadPublisher:  provisionMgr,
+		PayloadPersister:  provisionMgr,
 		StatusChecker:     provisionMgr,
 		PlacementLookup:   placementStore,
 		RestoreRecorder:   provisionMgr,
