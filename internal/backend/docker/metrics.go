@@ -59,6 +59,18 @@ const (
 // provider — which should never skip — exports 0 rather than no-data.
 var reapSkipReasons = []string{reapSkipRestoreClaimed, reapSkipClaimUnreadable, reapSkipOwnerClaimed}
 
+// Outcomes for retentionSweepTotal (ENG-680). Exactly one of these is recorded per
+// periodic sweep pass, which is what makes the sum across them a liveness heartbeat.
+const (
+	sweepOutcomeSuccess = "success" // every stage completed
+	sweepOutcomeError   = "error"   // at least one stage failed; the joined error names which
+)
+
+// sweepOutcomes is the closed outcome set. Pre-initializing BOTH matters more here than
+// elsewhere: the liveness query reads the sum, and an absent series is indistinguishable
+// from a stalled sweep.
+var sweepOutcomes = []string{sweepOutcomeSuccess, sweepOutcomeError}
+
 // Site labels for volumeDestroyRefusedTotal — which destroy path the ownership
 // choke point turned away (ENG-658). One constant per caller of volumeOp.destroy.
 // The set is closed by convention, not by the compiler (destroy takes a string), but
@@ -673,6 +685,51 @@ var (
 		Help:      "Retained-volume leak events (failed destroy / give-up / uncommitted revert) — see ENG-376",
 	})
 
+	// retentionSweepTotal counts periodic retention-sweep passes by outcome, exactly ONCE
+	// per pass. That once-per-pass property is the whole point and must survive future
+	// edits: the sum across outcomes advances every tick regardless of result, so
+	// `sum without (outcome) (increase(...[N])) == 0` is a true liveness heartbeat for the
+	// sweep goroutine, and {outcome="error"} is the degraded-store signal. Adding a
+	// per-stage label would break the heartbeat (a pass would contribute 0..N increments);
+	// per-stage attribution lives in the joined error's log line and in the stage-local
+	// counters (retention_orphan_skips_total, retention_reap_skips_total). (ENG-680)
+	//
+	// Deliberately NOT paired with a *_last_success_timestamp_seconds gauge. The docker
+	// reconciler has one and the deployed rules refuse to alert on it, in writing: a
+	// last-success gauge only advances on a fully clean pass, so benign sustained errors
+	// freeze it and it pages while the loop iterates fine (manifest-deploy
+	// roles/monitoring/files/rules/service_down.yml). A metric no rule may key on is
+	// vestigial, so this counter is the whole signal.
+	//
+	// Before ENG-680 there was no signal at all: runRetentionSweep bare-returned on the
+	// first store read error, StartCleanupLoop only slog.Error'd it, and a persistently
+	// unreadable retention.db therefore produced one log line per tick (hourly at the
+	// default cadence) and moved no counter anywhere — while the reaper reclaimed nothing,
+	// the orphan pruner never ran, and every lease close skipped volume teardown.
+	retentionSweepTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_sweep_total",
+		Help:      "Periodic retention-sweep passes by outcome (exactly one increment per pass; sum across outcomes is a liveness heartbeat)",
+	}, []string{"outcome"})
+
+	// retentionAccountingRefreshFailedTotal counts refreshRetentionAccounting calls that
+	// could not recompute the projection from the store and therefore KEPT THE LAST VALUE.
+	// That fallback is correct — a stale-but-valid projection beats a zeroed one, which
+	// would over-admit instantly — but it is silent, so all five retention gauges hold
+	// plausible numbers indefinitely while the store is broken and nothing looks wrong.
+	// This counter is the "the gauges you are reading are stale" signal.
+	//
+	// Kept separate from retentionSweepTotal rather than folded in as a stage: the refresh
+	// runs from ~10 sites (every retaining close, restore, recoverState, boot), not only
+	// the hourly sweep, so its rate and its meaning are both different. (ENG-680)
+	retentionAccountingRefreshFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "retention_accounting_refresh_failed_total",
+		Help:      "Retention accounting refreshes that failed on a store read and kept the last gauge values (the gauges are stale)",
+	})
+
 	// retentionReapSkipsTotal counts reaping-finalizer destroy attempts that did NOT
 	// fully reap because the destroy-time ownership re-check refused (ENG-659). Counted
 	// PER REAP ATTEMPT (one increment per destroyReapingVolumes call), never per volume,
@@ -836,6 +893,16 @@ func init() {
 	for _, r := range reapSkipReasons {
 		retentionReapSkipsTotal.WithLabelValues(r).Add(0)
 	}
+	// Pre-init both sweep outcomes to 0 (ENG-680). The liveness alert reads the SUM across
+	// outcomes, so a provider between process start and its first sweep tick (up to
+	// retention_reap_interval, an hour by default) would otherwise export no series at all
+	// — and increase() over an absent series is no-data, not zero.
+	for _, oc := range sweepOutcomes {
+		retentionSweepTotal.WithLabelValues(oc).Add(0)
+	}
+	// Pre-init the accounting-refresh failure counter (ENG-680) so "never failed" reads as
+	// 0 rather than no-data — the same reason the reap-skip reasons above are pre-inited.
+	retentionAccountingRefreshFailedTotal.Add(0)
 	// Pre-init every destroy-refusal series to 0 (ENG-658). A refusal is rare by
 	// design, so without this the alert that watches the fail-safe reason cannot tell
 	// "never refused" from "not reporting".

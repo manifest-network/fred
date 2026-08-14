@@ -50,6 +50,9 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A `fred-retained-*`/leaked volume the sweep can't destroy — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual reclaim. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
+| `sum without (outcome) (increase(fred_docker_backend_retention_sweep_total[3h])) == 0` (with retention enabled) | The periodic retention sweep has stopped iterating entirely — the loop goroutine is gone, the ticker is starved, or the process is wedged. The sum advances on **every** pass regardless of outcome, so a flat sum is absence, not failure. Nothing is being reaped, no interrupted restore is being reconciled, and no orphan record is being pruned | Check the docker-backend process and its logs for `retention cleanup panic`; `fred_background_cleanup_panics_total{component="retention"}` distinguishes a panicking sweep from a dead one |
+| `increase(fred_docker_backend_retention_sweep_total{outcome="error"}[6h]) > 0` | At least one sweep stage failed — in practice this means `retention.db` cannot be enumerated. While it persists the reaper reclaims nothing, the orphan pruner reclaims nothing, and **every lease close skips volume teardown entirely**, leaving closes `Failed` and retrying. The provider degrades toward refusing new work, and before ENG-680 the only trace was one log line per sweep tick | Fix `retention.db` health first — the parked work resumes on its own. The sweep's log line names every failing stage; read with the `claims_unreadable` row below, which shares the root cause |
+| `fred_docker_backend_retention_accounting_refresh_failed_total` rising | The retained-disk projection could not be recomputed, so the five retention gauges **and** the admission pool's retained input are frozen at their last values. That is the data-safe direction (a zeroed projection would over-admit), but it means those gauges are stale — do not read them as current while this is rising | Same root cause as the row above: fix the retention store. Until then, treat `retained_volume_bytes` / `retention_reaping_bytes` as last-known-good, not live |
 | `fred_docker_backend_volume_quota_clear_failed_total` rising | An XFS volume `Destroy` failed to clear its project block limit — the project-quota table is regrowing (leaked zero-byte entries slow every `xfs_quota` scan) | [Leaked XFS project-quota entries](#leaked-xfs-project-quota-entries) |
 | `fred_docker_backend_volume_destroy_refused_total{reason="claims_unreadable"}` > 0 | The retention store could not be read, so no path could establish who owns a volume and **nothing was destroyed** — data-safe, but every close, orphan sweep and reap is now parked, and closing leases stay `Failed` and retry. Same root cause as the `claim_unreadable` and `store_error` skips | Fix `retention.db` health first; the parked work resumes on its own. See the `store_error` row in [Partition collapse triage](#partition-collapse-triage) |
 | `fred_docker_backend_volume_destroy_refused_total{reason="claimed"}` sustained | A destroy path keeps meeting a volume another lease owns — normally an in-flight restore that is not converging, since a healthy restore clears its own claim on commit or rollback. Never data loss: the refusal is the guard working | Read with `restore_finalizer_pending_total` and `retention_reaping_leases`; the WARN log names the volume and its owning lease. [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
@@ -468,6 +471,24 @@ the sweep is the only automatic reclaimer.
   instead means the retention store
   is unreadable, which silently stops the reaper (and blocks the close path too); fix the store
   first. See ENG-659.
+- **A reaping record does not name the volumes it will destroy.** It records the abandoned
+  footprint's *size* (its `Items`, which is what the admission projection sums); the finalizer
+  re-derives the actual volume set on every sweep from the lease's namespace on disk
+  (`fred-{lease}-*` and `fred-retained-{lease}-*`) intersected with the ownership table. So
+  `GET /retentions` showing a reaping record with an empty volume list is **normal**, not a
+  corrupt record — and the reclaim is driven by what is on disk now, not by a list captured
+  when the record was written. A record whose lease has no volumes left on disk is dropped on
+  the next sweep — but only when the volume root was readable: an absent or unreadable
+  `volume_data_path` (an unmounted disk, most likely) is treated as uncertainty, so every
+  reaping record is **kept** and `reap_skips_total{reason="claim_unreadable"}` rises. Remount
+  the volume root and the next sweep proceeds. (ENG-676)
+- **A give-up under a degraded store still records the footprint.** It used to compute the
+  record's volume list through the same ownership table it could not read, and on failure wrote
+  no record at all — so the abandoned bytes were counted by nothing (no pool reservation, no
+  retained record, no reaping record) and admission over-committed against real disk until an
+  operator noticed. The record no longer carries a destroy plan, so there is nothing left for a
+  degraded store to prevent it computing. The one residual: if the store cannot be **written**
+  either, `retention_leaked_total` plus the `MANUAL CLEANUP REQUIRED` log are the only record.
 - **`reason="owner_claimed"` is a different hold, and there is nothing to unblock.** A
   tombstoned name belongs to a **live provision** (or another lease's retained record): the
   give-up deleted the provision while the lease was still ACTIVE on chain, the reconciler

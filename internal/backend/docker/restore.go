@@ -109,7 +109,7 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 		case shared.RetentionStatusReaping:
 			// Finalizer retry at boot: re-attempt destroy of any record stranded
 			// reaping by a prior crash/destroy-failure; delete it when confirmed gone.
-			b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, e.RetainedVolumeNames)
+			b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID)
 		}
 	}
 	return nil
@@ -375,7 +375,11 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 		b.logger.Warn("evicting tenant's oldest retained lease to honor cap",
 			"tenant", e.Tenant, "lease_uuid", e.OriginalLeaseUUID, "level", level, "cap", capValue,
 			"partition", shared.TruncatePartitionRaw(e.Partition))
-		names, ok, merr := b.retentionStore.MarkReapingIfActive(e.OriginalLeaseUUID)
+		// The names this returns are the record's stored list; the finalizer derives its
+		// own from disk (destroyReapingVolumes), so they are deliberately discarded. The
+		// CAS itself is what matters here — active→reaping must be atomic so the record is
+		// never deleted before its volumes are confirmed gone.
+		_, ok, merr := b.retentionStore.MarkReapingIfActive(e.OriginalLeaseUUID)
 		if merr != nil {
 			return marked, true, merr
 		}
@@ -388,50 +392,90 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 			retentionPartitionEvictedTotal.Inc()
 		}
 		marked[e.OriginalLeaseUUID] = struct{}{}
-		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, names)
+		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID)
 	}
 	return marked, true, nil
 }
 
-// destroyReapingVolumes destroys every volume of a reaping record and, ONLY if all
-// destroys succeed and none had to be skipped, Delete()s the record. Returns true iff
+// destroyReapingVolumes destroys the on-disk footprint of a reaping record and, ONLY if
+// all destroys succeed and none had to be skipped, Delete()s the record. Returns true iff
 // the record was fully reaped (deleted). On any destroy failure it LEAVES the record
 // reaping (the finalizer retry) and bumps retentionLeakedTotal — the footprint stays
-// counted and the next sweep retries. Idempotent: already-gone volume names no-op, and a
+// counted and the next sweep retries. Idempotent: an already-gone volume no-ops, and a
 // Delete failure leaves the record reaping for a later retry (no under-count). (ENG-376)
 //
-// OWNERSHIP RE-CHECK (ENG-659, ENG-658). A tombstone is a NAME-KEYED scheduled destroy: it
-// carries strings, not proof of ownership, and Destroy is an irreversible RemoveAll. While
-// a restore of lease A into lease B is in flight, A's retained data lives under B's
-// canonical names (fred-{B}-{svc}-{i}) — indistinguishable from B's own volumes by prefix
-// — so a tombstone keyed at B can name A's data. recordGiveUpLeak already refuses to
-// WRITE such a name (deprovision.go, ENG-647), but that is a write-time guard on one
-// producer in one binary: tombstones are persisted in bbolt and outlive the process, so a
-// provider upgrading from a pre-ENG-647 build carries records written before that guard
-// existed and nothing rewrites them. Re-checking at destroy time is what makes the
-// invariant hold for records this binary never wrote.
+// THE DESTROY SET IS DERIVED, NOT STORED (ENG-676). A reaping record states one fact —
+// this lease's footprint is abandoned, and Items says how big it is, which is what
+// computeReapingDiskMB sums into the admission projection. It does NOT carry the authority
+// to destroy anything. The set of volumes to remove is re-derived here on every pass, from
+// the two sources that actually know: the lease's namespace on disk
+// (fred-{lease}-* and fred-retained-{lease}-*) intersected with the ownership table, which
+// is the same "destroy only what nothing claims" question cleanupOrphanedVolumes asks
+// globally — this is that question scoped to one lease.
 //
-// The check itself is not local any more — every managed-volume destroy in this backend
-// goes through volumeOp.destroy (volume_destroy.go), which resolves ownership from the
-// live provision map plus the retention store. This function's job is to translate that
+// Deriving rather than replaying a stored list is what makes the accounting survive a
+// degraded store. When the writer could not resolve ownership it used to record NOTHING,
+// and since the record was both the destroy plan and the accounting unit, refusing to
+// write the plan silently discarded the accounting too: bytes on disk, no pool key, no
+// record, admission over-committing against real disk permanently (ENG-676). Now the
+// writer records the fact unconditionally and never computes a plan, so there is no
+// failure mode in which the fact is lost. It is also what this repo already does
+// everywhere else — level-triggered reconciliation, deriving the work from current state
+// rather than replaying a list captured when the state was last legible.
+//
+// It subsumes the ENG-659 hazard instead of mitigating it. A tombstone is persisted in
+// bbolt and outlives the process, so a provider upgrading from a pre-ENG-647 build carries
+// records written before the write-time guard existed — records that can name another
+// lease's adopted data (while a restore of A into B is in flight, A's data wears B's
+// canonical names). Those stored names are now never consulted at all, by any producer or
+// any vintage, so there is nothing left to re-check.
+//
+// Every destroy still goes through volumeOp.destroy (volume_destroy.go), which resolves
+// ownership from the live provision map plus the retention store and re-checks the live
+// claim under the volume's stripe (ENG-681). This function's job is to translate that
 // primitive's per-name verdicts into the record's lifecycle, which is the part only the
 // finalizer knows: refused means keep the record, failed means keep it and count a leak,
 // all-gone means Delete.
 //
-// Fail-safe on an unprovable claim set: destroy NOTHING this pass, mirroring
-// cleanupOrphanedVolumes' "skip orphan destruction this run" (recover.go) and
-// recordGiveUpLeak's "record no tombstone". We cannot tell this record's own leak from
-// another lease's adopted data, and only one of those two mistakes is reversible. Unlike
-// cleanupOrphanedVolumes, waiting costs nothing: the record IS the retry vehicle, so the
-// next sweep re-attempts without a reboot.
-func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string, names []string) bool {
-	// owner "" — a tombstone is a scheduled destroy, not an assertion of ownership, so
-	// it is entitled to exactly the names NOTHING claims. That is stricter than the
-	// per-record check it replaces in one useful way: it also refuses a name a LIVE
-	// provision holds, which is reachable when a tombstoned lease is later
-	// re-provisioned (chain-ACTIVE, no provision → the reconciler re-provisions it, and
-	// the next sweep would otherwise reap the fresh volume out from under it).
-	rep := b.volumeOp("", b.logger.With("lease_uuid", orig)).destroy(ctx, destroySiteReaping, names...)
+// Fail-safe on an unprovable claim set OR an unreadable volume root: destroy NOTHING this
+// pass and KEEP the record, mirroring cleanupOrphanedVolumes' "skip orphan destruction
+// this run" (recover.go). We cannot tell this record's own leak from another lease's
+// adopted data, and only one of those two mistakes is reversible. Waiting costs nothing:
+// the record IS the retry vehicle, so the next sweep re-attempts without a reboot. The
+// record is dropped only on the positive fact that the footprint is gone.
+func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string) bool {
+	logger := b.logger.With("lease_uuid", orig)
+	// owner "" — a tombstone is a scheduled destroy, not an assertion of ownership, so it
+	// is entitled to exactly the volumes NOTHING claims. That also refuses a name a LIVE
+	// provision holds, which is reachable when a tombstoned lease is later re-provisioned
+	// (chain-ACTIVE, no provision → the reconciler re-provisions it, and the sweep would
+	// otherwise reap the fresh volume out from under it).
+	op := b.volumeOp("", logger)
+
+	names, derr := b.reapingFootprint(orig)
+	if derr != nil {
+		// Cannot enumerate the volume root, so "no volumes" and "cannot see the volumes"
+		// are indistinguishable — and one of those two readings deletes the record that is
+		// both the retry vehicle and the accounting for bytes still on disk. Same reason
+		// and same reason-label as an unreadable claim table below.
+		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		logger.Error("reaping: cannot enumerate volumes; destroyed nothing this pass (record stays reaping for retry)",
+			"error", derr)
+		return false
+	}
+	if len(names) == 0 {
+		// Positive fact: the volume root is readable and the lease's namespace is empty, so
+		// the footprint really is gone and the record has nothing left to account for. This
+		// is also the terminal state of a legacy stateless record, which never named a
+		// volume in the first place.
+		if delErr := b.retentionStore.Delete(orig); delErr != nil {
+			logger.Warn("reaping: footprint already gone but record delete failed; next sweep retries", "error", delErr)
+			return false
+		}
+		return true
+	}
+
+	rep := op.destroy(ctx, destroySiteReaping, names...)
 
 	if len(rep.Unproven) > 0 {
 		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
@@ -503,6 +547,56 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string, names 
 		return false
 	}
 	return true
+}
+
+// reapingFootprint enumerates the volumes currently on disk in a reaping lease's
+// namespace — both the canonical fred-{lease}-* names and the quarantined
+// fred-retained-{lease}-* ones. It is the ground truth a reaping record deliberately does
+// NOT carry (see destroyReapingVolumes): the record says a footprint is abandoned, this
+// says what that footprint actually is right now.
+//
+// Both namespaces are enumerated because a give-up can strand a lease part-way through the
+// retain path's renames, leaving some volumes canonical and some already quarantined. The
+// stored-list design could not know which, so recordGiveUpLeak used to write BOTH spellings
+// of every name and rely on the destroy being an idempotent no-op for whichever did not
+// exist — a workaround for not being able to look. Looking is simpler and exact.
+//
+// An error means the volume root could not be enumerated, which the caller must treat as
+// uncertainty and never as "no volumes": the caller's response to an empty set is to DELETE
+// the record. Ownership is deliberately not consulted here — that is volumeOp.destroy's
+// job, and asking it twice would be the "two definitions that must agree" this file has
+// spent several tickets collapsing into one.
+//
+// The volume root is probed BEFORE listing, with the same fail-safe the orphan reconcile
+// uses (G2, volumeRootUnverifiable). listVolumeIDs maps a MISSING directory to (nil, nil),
+// so without this probe an unmounted or not-yet-created volume root would read as "this
+// lease has no volumes left" and delete every reaping record on the node — dropping both
+// the retry vehicle and the accounting for bytes that reappear when the mount does. Absent
+// and unreadable are both uncertainty here (the kubelet #72257 hazard), never emptiness.
+//
+// Cost is one os.ReadDir per record per pass. That is a single getdents loop with no
+// per-entry stat, and the close path already pays one; it replaces the stored name list,
+// which cost nothing to read but could not be computed exactly when it mattered most.
+func (b *Backend) reapingFootprint(orig string) ([]string, error) {
+	if b.cfg.VolumeDataPath != "" {
+		exists, statErr := pathExists(b.cfg.VolumeDataPath)
+		if volumeRootUnverifiable(exists, statErr) {
+			return nil, fmt.Errorf("volume data root %q absent or unreadable: %w", b.cfg.VolumeDataPath, statErr)
+		}
+	}
+	all, err := b.volumes.List()
+	if err != nil {
+		return nil, fmt.Errorf("list volumes: %w", err)
+	}
+	cprefix := leaseVolumePrefix(orig) // fred-{lease}-
+	rprefix := retainedName(cprefix)   // fred-retained-{lease}-
+	names := make([]string, 0, len(all))
+	for _, id := range all {
+		if strings.HasPrefix(id, cprefix) || strings.HasPrefix(id, rprefix) {
+			names = append(names, id)
+		}
+	}
+	return names, nil
 }
 
 // volumeRootUnverifiable reports whether a volume-root probe means the orphan
@@ -663,7 +757,9 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 	for _, e := range candidates {
 		// Atomic active→reaping (the record is NEVER deleted before its volumes are
 		// confirmed gone, so a destroy failure cannot drop a still-on-disk footprint).
-		names, ok, merr := b.retentionStore.MarkReapingIfExpired(e.OriginalLeaseUUID, b.cfg.RetentionMaxAge)
+		// Stored names discarded — the finalizer derives the footprint from disk. Only the
+		// atomic transition matters here (see MarkReapingIfActive above).
+		_, ok, merr := b.retentionStore.MarkReapingIfExpired(e.OriginalLeaseUUID, b.cfg.RetentionMaxAge)
 		if merr != nil {
 			b.logger.Error("reap: store error", "lease_uuid", e.OriginalLeaseUUID, "error", merr)
 			continue
@@ -671,7 +767,7 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 		if !ok {
 			continue // concurrently claimed/changed since the snapshot — skip
 		}
-		if b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, names) {
+		if b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID) {
 			n++
 		}
 	}
@@ -695,7 +791,7 @@ func (b *Backend) retryReapingRecords(ctx context.Context) error {
 		return err
 	}
 	for _, e := range recs {
-		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID, e.RetainedVolumeNames)
+		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID)
 	}
 	return nil
 }
@@ -708,31 +804,67 @@ func (b *Backend) retryReapingRecords(ctx context.Context) error {
 // (before cleanup) handles restoring and reaping records and an eager
 // reapExpiredRetentions (after cleanup) handles expired ones, so they aren't
 // double-reconciled.
+//
+// EVERY STAGE RUNS, AND THE ERRORS ARE JOINED (ENG-680). This function used to
+// bare-return on the first error, which made a persistently unreadable retention.db
+// invisible: List/ListExpired/ListReaping/ListRestoring are one filter() over one bucket
+// (shared/retention.go), so they share failure modes exactly — a corrupt page or an EIO
+// fails the FIRST enumerator and the sweep was over. reconcileOrphanedRetentions never
+// ran, which made its retention_orphan_skips_total{reason="store_error"} arm dead code
+// under precisely the condition it was written to report, and the accounting refresh
+// never ran either. The one trace was a slog.Error per tick, hourly at the default
+// cadence, behind no metric at all.
+//
+// Running the later stages after an earlier failure is safe because every stage is a
+// read-then-act pass that already fails safe on its own read: reapExpiredRetentions and
+// retryReapingRecords enumerate nothing and so destroy nothing, and
+// reconcileOrphanedRetentions re-reads both the volume list and the store itself, resets
+// its confirmation streaks and bails on either error. A stage cannot be handed a partial
+// view by a sibling — none of them share derived state — so "run anyway" strictly adds
+// information and can never add a destroy. That is the same direction the rest of this
+// file takes: destroy only on a positive fact, never on an error or an empty list.
 func (b *Backend) runRetentionSweep(ctx context.Context) error {
+	var errs []error
 	if _, err := b.reapExpiredRetentions(ctx); err != nil {
-		return err
+		errs = append(errs, fmt.Errorf("reap expired: %w", err))
 	}
-	if b.retentionStore == nil {
-		return nil
+	// A nil store means no record can exist, so the remaining stages have nothing to read.
+	// Not an early RETURN any more: the accounting refresh and the outcome record below
+	// are unconditional. (Unreachable in practice — retentionSweepInterval gates the
+	// reaper off entirely when the store is nil — but the guard is what makes that a
+	// belt-and-braces fact rather than a dependency.)
+	if b.retentionStore != nil {
+		if err := b.retryReapingRecords(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("retry reaping: %w", err))
+		}
+		if recs, err := b.retentionStore.ListRestoring(); err != nil {
+			errs = append(errs, fmt.Errorf("list restoring: %w", err))
+		} else {
+			for _, e := range recs {
+				b.reconcileRestoring(ctx, e)
+			}
+		}
+		// ENG-370: prune orphaned records BEFORE ENG-360's accounting refresh so the
+		// retained-disk projection reflects this sweep's prunes. The refresh runs even
+		// when the prune returns a fail-safe error (the prune mutated nothing in that
+		// case, but the reaper above may have, and refresh is keep-last-value on a store
+		// read error).
+		if _, err := b.reconcileOrphanedRetentions(); err != nil {
+			errs = append(errs, fmt.Errorf("reconcile orphans: %w", err))
+		}
 	}
-	if err := b.retryReapingRecords(ctx); err != nil {
-		return err
-	}
-	recs, err := b.retentionStore.ListRestoring()
-	if err != nil {
-		return err
-	}
-	for _, e := range recs {
-		b.reconcileRestoring(ctx, e)
-	}
-	// ENG-370: prune orphaned records BEFORE ENG-360's accounting refresh so the
-	// retained-disk projection reflects this sweep's prunes. The refresh runs even
-	// when the prune returns a fail-safe error (the prune mutated nothing in that
-	// case, but the reaper above may have, and refresh is keep-last-value on a store
-	// read error).
-	_, orphanErr := b.reconcileOrphanedRetentions()
 	b.refreshRetentionAccounting()
-	return orphanErr
+
+	// Exactly one outcome per pass — see retentionSweepTotal's doc for why that property
+	// is load-bearing. The error still goes back to StartCleanupLoop, which logs it with
+	// every failing stage named; the counter is what an alert can actually key on.
+	err := errors.Join(errs...)
+	if err != nil {
+		retentionSweepTotal.WithLabelValues(sweepOutcomeError).Inc()
+		return err
+	}
+	retentionSweepTotal.WithLabelValues(sweepOutcomeSuccess).Inc()
+	return nil
 }
 
 // retentionSweepInterval is the pure gating decision for the periodic sweep.

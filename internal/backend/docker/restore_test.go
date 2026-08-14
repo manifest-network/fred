@@ -209,8 +209,16 @@ func TestDeprovision_PerTenantCapEvictsOwnOldest(t *testing.T) {
 	destroyed := make(map[string]bool)
 
 	b.volumes = &mockVolumeManager{
+		// Everything actually on disk: the closing lease's canonical volume plus both
+		// pre-seeded retained ones. The evicted record's footprint is derived from here, so
+		// tenant-b's volume being present is what makes "must NOT be evicted" meaningful
+		// rather than vacuous.
 		ListFn: func() ([]string, error) {
-			return []string{"fred-new-lease-app-0"}, nil
+			return []string{
+				"fred-new-lease-app-0",
+				"fred-retained-old-lease-app-0",
+				"fred-retained-other-tenant-lease-app-0",
+			}, nil
 		},
 		RenameVolumeFn: func(old, new string) error { return nil },
 		DestroyFn: func(_ context.Context, id string) error {
@@ -624,7 +632,12 @@ func TestEvict_DestroyFail_LeavesReapingCounted(t *testing.T) {
 	newer.RetainedVolumeNames = []string{"fred-retained-lease-new-app-0"} // UUID-derived; avoid the fixture's fixed default colliding with lease-old
 	require.NoError(t, rs.Put(newer))
 
-	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") }}
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			return []string{"fred-retained-lease-old-app-0", "fred-retained-lease-new-app-0"}, nil
+		},
+		DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") },
+	}
 
 	err := b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 1}, "", retentionTenantSnapshot(t, rs, "t1"), "lease-new")
 	require.NoError(t, err)
@@ -1528,12 +1541,21 @@ func TestReapExpiredRetentions(t *testing.T) {
 	rs := attachRetentionStore(t, b)
 	b.cfg.RetentionMaxAge = 90 * 24 * time.Hour // 90 days
 
+	// Volume names are built from the lease UUID via the same helpers production uses.
+	// That correspondence is load-bearing now that the finalizer DERIVES a record's
+	// footprint from the lease's namespace on disk rather than replaying stored names
+	// (ENG-676) — a fixture naming a volume that its own lease UUID could not produce
+	// describes a state the backend cannot reach.
+	oldActiveVol := retainedName(canonicalVolumeName("old-active", "app", 0))
+	freshActiveVol := retainedName(canonicalVolumeName("fresh-active", "app", 0))
+	oldRestoringVol := retainedName(canonicalVolumeName("old-restoring", "app", 0))
+
 	// (a) expired ACTIVE entry — should be reaped.
 	expiredActive := shared.RetentionEntry{
 		OriginalLeaseUUID:   "old-active",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-old-app-0"},
+		RetainedVolumeNames: []string{oldActiveVol},
 		CreatedAt:           time.Now().Add(-100 * 24 * time.Hour),
 	}
 	require.NoError(t, rs.Put(expiredActive))
@@ -1543,7 +1565,7 @@ func TestReapExpiredRetentions(t *testing.T) {
 		OriginalLeaseUUID:   "fresh-active",
 		Tenant:              "tenant-a",
 		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-fresh-app-0"},
+		RetainedVolumeNames: []string{freshActiveVol},
 		CreatedAt:           time.Now(),
 	}
 	require.NoError(t, rs.Put(freshActive))
@@ -1554,7 +1576,7 @@ func TestReapExpiredRetentions(t *testing.T) {
 		Tenant:              "tenant-a",
 		NewLeaseUUID:        "u2",
 		Status:              shared.RetentionStatusRestoring,
-		RetainedVolumeNames: []string{"fred-retained-old-restoring-app-0"},
+		RetainedVolumeNames: []string{oldRestoringVol},
 		CreatedAt:           time.Now().Add(-100 * 24 * time.Hour),
 	}
 	require.NoError(t, rs.Put(expiredRestoring))
@@ -1562,6 +1584,12 @@ func TestReapExpiredRetentions(t *testing.T) {
 	var mu sync.Mutex
 	var destroyed []string
 	b.volumes = &mockVolumeManager{
+		// All three volumes are on disk; the finalizer derives which of them belong to the
+		// record it is reaping, so what gets destroyed is decided here plus the owner table,
+		// not by the record's stored name list.
+		ListFn: func() ([]string, error) {
+			return []string{oldActiveVol, freshActiveVol, oldRestoringVol}, nil
+		},
 		DestroyFn: func(_ context.Context, id string) error {
 			mu.Lock()
 			destroyed = append(destroyed, id)
@@ -1579,9 +1607,9 @@ func TestReapExpiredRetentions(t *testing.T) {
 	mu.Unlock()
 
 	// Only the expired active volume is destroyed.
-	assert.Contains(t, gotDestroyed, "fred-retained-old-app-0", "expired active volume must be destroyed")
-	assert.NotContains(t, gotDestroyed, "fred-retained-fresh-app-0", "fresh active volume must NOT be destroyed")
-	assert.NotContains(t, gotDestroyed, "fred-retained-old-restoring-app-0", "restoring volume must NOT be destroyed")
+	assert.Contains(t, gotDestroyed, oldActiveVol, "expired active volume must be destroyed")
+	assert.NotContains(t, gotDestroyed, freshActiveVol, "fresh active volume must NOT be destroyed")
+	assert.NotContains(t, gotDestroyed, oldRestoringVol, "restoring volume must NOT be destroyed")
 
 	// The expired active record must be gone from the store.
 	entry, err := rs.Get("old-active")
@@ -1647,6 +1675,7 @@ func TestReap_DestroyFail_LeavesReapingCounted(t *testing.T) {
 	require.NoError(t, rs.Put(exp))
 
 	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return []string{"fred-retained-lease-exp-app-0"}, nil },
 		DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") },
 	}
 
@@ -1677,7 +1706,12 @@ func TestReap_DestroySuccess_DeletesRecord(t *testing.T) {
 	exp.RetainedVolumeNames = []string{"fred-retained-lease-exp-app-0"}
 	require.NoError(t, rs.Put(exp))
 
-	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error { return nil }}
+	// The volume IS on disk, so the record is deleted because the destroy succeeded — not
+	// because the footprint looked empty. Without this the test would pass vacuously.
+	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return []string{"fred-retained-lease-exp-app-0"}, nil },
+		DestroyFn: func(_ context.Context, _ string) error { return nil },
+	}
 
 	n, err := b.reapExpiredRetentions(context.Background())
 	require.NoError(t, err)
@@ -1704,6 +1738,9 @@ func TestRetryReapingRecords_ReclaimsWhenDestroyRecovers(t *testing.T) {
 	var fail atomic.Bool
 	fail.Store(true)
 	b.volumes = &mockVolumeManager{
+		// Still on disk in BOTH sweeps: the second one deletes the record because the
+		// destroy finally succeeded, not because the footprint had vanished.
+		ListFn: func() ([]string, error) { return []string{"fred-retained-lease-r-app-0"}, nil },
 		DestroyFn: func(_ context.Context, _ string) error {
 			if fail.Load() {
 				return errors.New("EBUSY")
