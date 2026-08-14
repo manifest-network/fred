@@ -2723,3 +2723,58 @@ func TestForwardToEventSink_MalformedMessage(t *testing.T) {
 	defer sink.mu.Unlock()
 	assert.Empty(t, sink.events, "no events should reach the sink")
 }
+
+// --- ENG-619: Manager.OverwritePayload ---
+
+func TestManager_OverwritePayload_ReplacesStoredPayload(t *testing.T) {
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: &mockManagerBackend{name: "test"}, IsDefault: true}},
+	})
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
+		DBPath: t.TempDir() + "/payloads.db",
+	})
+	require.NoError(t, err)
+	defer payloadStore.Close()
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		PayloadStore:    payloadStore,
+	}, router, &chaintest.MockClient{})
+	require.NoError(t, err)
+
+	original := []byte("original manifest")
+	updated := []byte("updated manifest")
+	require.True(t, manager.StorePayload("lease-1", original))
+
+	require.NoError(t, manager.OverwritePayload("lease-1", updated))
+
+	got, err := payloadStore.Get("lease-1")
+	require.NoError(t, err)
+	assert.Equal(t, updated, got)
+
+	// The recorded hash moves with the payload, which is what lets the
+	// reprovision path accept an updated manifest that no longer matches the
+	// lease's create-time MetaHash.
+	_, gotHash, err := payloadStore.GetWithHash("lease-1")
+	require.NoError(t, err)
+	want := sha256.Sum256(updated)
+	assert.Equal(t, want[:], gotHash)
+}
+
+func TestManager_OverwritePayload_NoStoreReturnsSentinel(t *testing.T) {
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: &mockManagerBackend{name: "test"}, IsDefault: true}},
+	})
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+		// PayloadStore deliberately omitted
+	}, router, &chaintest.MockClient{})
+	require.NoError(t, err)
+
+	// Must be an error, not a silent no-op: the caller has already applied the
+	// update to a backend, and reporting success would recreate ENG-619.
+	err = manager.OverwritePayload("lease-1", []byte("updated manifest"))
+	require.ErrorIs(t, err, ErrPayloadStoreUnavailable)
+}

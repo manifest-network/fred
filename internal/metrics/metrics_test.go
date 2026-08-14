@@ -28,6 +28,7 @@ func TestMetricsRegistered(t *testing.T) {
 		ReconcilerDeferredLeasesTotal,
 		ReconcilerCleanupSkipsTotal,
 		PayloadUploadsTotal,
+		PayloadPersistFailuresTotal,
 		PayloadStoredCount,
 		PayloadSizeBytes,
 		LeasesAwaitingPayload,
@@ -170,6 +171,9 @@ func TestCounterVecLabels(t *testing.T) {
 	})
 	assert.NotPanics(t, func() {
 		RateLimitRejectionsTotal.WithLabelValues("global")
+	})
+	assert.NotPanics(t, func() {
+		PayloadPersistFailuresTotal.WithLabelValues("update")
 	})
 	assert.NotPanics(t, func() {
 		BackendInsufficientResourcesTotal.WithLabelValues("docker")

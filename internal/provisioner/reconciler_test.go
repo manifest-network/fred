@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
@@ -3648,14 +3650,48 @@ func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.
 	assert.Empty(t, rejectedLeases, "should not reject — lease is just waiting for payload")
 }
 
-func TestReconciler_ReconcileAll_PayloadHashMismatch_DeletesCorruptPayload(t *testing.T) {
-	// Payload is in the store but its hash doesn't match the lease's MetaHash.
-	// This simulates disk corruption. The reconciler should:
+// mustHasPayload calls Has() and fails the test on a read error.
+func mustHasPayload(t *testing.T, store *payload.Store, leaseUUID string) bool {
+	t.Helper()
+	has, err := store.Has(leaseUUID)
+	require.NoError(t, err)
+	return has
+}
+
+// mutatePayloadDB applies fn to a CLOSED payload store's bbolt file.
+//
+// It exists to build on-disk states the store's own API deliberately cannot
+// produce: bit-rot in the payload bucket, and a database written before the
+// payload_hashes bucket existed (ENG-619). The bucket names below are the
+// store's on-disk format, not part of its Go API. bbolt is single-writer per
+// file, so the store must be closed before calling this.
+func mutatePayloadDB(t *testing.T, dbPath string, fn func(tx *bolt.Tx) error) {
+	t.Helper()
+	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 5 * time.Second})
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, db.Update(fn))
+}
+
+// newReconcilerPayloadStore opens a payload store under a stable path so a test
+// can close it, mutate the file, and reopen it.
+func newReconcilerPayloadStore(t *testing.T, dbPath string) *payload.Store {
+	t.Helper()
+	store, err := payload.NewStore(payload.StoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	return store
+}
+
+func TestReconciler_ReconcileAll_PayloadCorruption_DeletesCorruptPayload(t *testing.T) {
+	// Real bit-rot: the stored payload bytes change while the hash recorded
+	// beside them does not. That is what the separate payload_hashes bucket
+	// exists to catch — a checksum living inside the record it describes would
+	// rot along with it. The reconciler should:
 	// 1. Delete the corrupt payload from the store
 	// 2. NOT call Provision (hash check happens before)
 	// 3. Treat it as an error (transient — payload needs re-upload)
 	payloadData := []byte("original manifest payload")
-	wrongHash := sha256.Sum256([]byte("different payload entirely"))
+	payloadHash := sha256.Sum256(payloadData)
 
 	mockChain := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
@@ -3664,7 +3700,7 @@ func TestReconciler_ReconcileAll_PayloadHashMismatch_DeletesCorruptPayload(t *te
 					Uuid:     "lease-1",
 					Tenant:   "tenant-1",
 					State:    billingtypes.LEASE_STATE_PENDING,
-					MetaHash: wrongHash[:], // Doesn't match payloadData
+					MetaHash: payloadHash[:],
 					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
 				},
 			}, nil
@@ -3678,18 +3714,19 @@ func TestReconciler_ReconcileAll_PayloadHashMismatch_DeletesCorruptPayload(t *te
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	tmpDir := t.TempDir()
-	payloadStore, err := payload.NewStore(payload.StoreConfig{
-		DBPath: tmpDir + "/payloads.db",
-	})
-	require.NoError(t, err)
-	defer payloadStore.Close()
+	dbPath := t.TempDir() + "/payloads.db"
+	store := newReconcilerPayloadStore(t, dbPath)
+	require.True(t, store.Store("lease-1", payloadData))
+	require.NoError(t, store.Close())
 
-	// Store payload that will fail hash verification
-	payloadStore.Store("lease-1", payloadData)
-	has, err := payloadStore.Has("lease-1")
-	require.NoError(t, err)
-	require.True(t, has)
+	// Rot the payload, leave its recorded hash alone.
+	mutatePayloadDB(t, dbPath, func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("payloads")).Put([]byte("lease-1"), []byte("corrupted on disk"))
+	})
+
+	payloadStore := newReconcilerPayloadStore(t, dbPath)
+	defer payloadStore.Close()
+	require.True(t, mustHasPayload(t, payloadStore, "lease-1"))
 
 	tracker := newMockInFlightTracker(payloadStore)
 
@@ -3704,11 +3741,177 @@ func TestReconciler_ReconcileAll_PayloadHashMismatch_DeletesCorruptPayload(t *te
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	// Verify corrupt payload was deleted from store
-	has, err = payloadStore.Has("lease-1")
-	require.NoError(t, err)
-	assert.False(t, has, "corrupt payload should be deleted from store")
+	assert.False(t, mustHasPayload(t, payloadStore, "lease-1"), "corrupt payload should be deleted from store")
 
 	// Verify no provisioning was attempted (hash check happens before Provision)
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls)
+}
+
+func TestReconciler_ReconcileAll_UpdatedPayload_ProvisionsAndKeepsIt(t *testing.T) {
+	// ENG-619, the whole point: a tenant /update replaces the stored manifest
+	// but CANNOT change the lease's on-chain MetaHash, which is set once at
+	// creation. Verifying an updated payload against MetaHash would read a
+	// successful update as corruption, delete the payload, and then close the
+	// ACTIVE lease on-chain — strictly worse than the silent revert it replaced.
+	originalPayload := []byte("original manifest payload")
+	updatedPayload := []byte("updated manifest payload with a new image")
+	metaHash := sha256.Sum256(originalPayload)
+	updatedHash := sha256.Sum256(updatedPayload)
+
+	mockChain := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_ACTIVE,
+					MetaHash: metaHash[:], // still names the CREATE-time manifest
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{
+		name:       "test",
+		provisions: []backend.ProvisionInfo{}, // ACTIVE + unprovisioned ⇒ reprovision
+	}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	payloadStore := newReconcilerPayloadStore(t, t.TempDir()+"/payloads.db")
+	defer payloadStore.Close()
+	require.True(t, payloadStore.Store("lease-1", originalPayload))
+	require.NoError(t, payloadStore.Put("lease-1", updatedPayload)) // the /update
+
+	tracker := newMockInFlightTracker(payloadStore)
+
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, tracker, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	// The updated payload survives — no delete, no lease closure.
+	assert.True(t, mustHasPayload(t, payloadStore, "lease-1"), "an updated payload must not be treated as corruption")
+
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	require.Len(t, mockBackend.provisionCalls, 1, "the lease should be reprovisioned")
+	req := mockBackend.provisionCalls[0]
+	assert.Equal(t, updatedPayload, req.Payload, "reprovision must replay the UPDATED manifest, not the create-time one")
+	assert.Equal(t, hex.EncodeToString(updatedHash[:]), req.PayloadHash,
+		"payload_hash must describe the payload actually sent")
+}
+
+func TestReconciler_ReconcileAll_LegacyPayloadWithoutRecordedHash_UsesMetaHash(t *testing.T) {
+	// A payload written before the payload_hashes bucket existed has no recorded
+	// hash. It must fall back to the on-chain MetaHash rather than be read as a
+	// mismatch — treating absence as corruption would delete every pre-upgrade
+	// payload on the first sweep after a deploy.
+	payloadData := []byte("legacy manifest payload")
+	payloadHash := sha256.Sum256(payloadData)
+
+	mockChain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_PENDING,
+					MetaHash: payloadHash[:],
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{name: "test", provisions: []backend.ProvisionInfo{}}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	dbPath := t.TempDir() + "/payloads.db"
+	store := newReconcilerPayloadStore(t, dbPath)
+	require.True(t, store.Store("lease-1", payloadData))
+	require.NoError(t, store.Close())
+
+	// Drop the recorded hash, keeping the payload: a pre-ENG-619 database.
+	mutatePayloadDB(t, dbPath, func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("payload_hashes")).Delete([]byte("lease-1"))
+	})
+
+	payloadStore := newReconcilerPayloadStore(t, dbPath)
+	defer payloadStore.Close()
+
+	tracker := newMockInFlightTracker(payloadStore)
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, tracker, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	assert.True(t, mustHasPayload(t, payloadStore, "lease-1"), "a legacy payload matching MetaHash must be kept")
+
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	require.Len(t, mockBackend.provisionCalls, 1)
+	assert.Equal(t, hex.EncodeToString(payloadHash[:]), mockBackend.provisionCalls[0].PayloadHash,
+		"with no recorded hash the on-chain MetaHash is still the reference")
+}
+
+func TestReconciler_ReconcileAll_LegacyPayloadMismatchingMetaHash_IsDeleted(t *testing.T) {
+	// The error branch of the fallback: a legacy payload that does NOT match
+	// MetaHash is still corruption and must still be deleted.
+	payloadData := []byte("legacy manifest payload")
+	wrongHash := sha256.Sum256([]byte("different payload entirely"))
+
+	mockChain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_PENDING,
+					MetaHash: wrongHash[:],
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{name: "test", provisions: []backend.ProvisionInfo{}}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	dbPath := t.TempDir() + "/payloads.db"
+	store := newReconcilerPayloadStore(t, dbPath)
+	require.True(t, store.Store("lease-1", payloadData))
+	require.NoError(t, store.Close())
+
+	mutatePayloadDB(t, dbPath, func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("payload_hashes")).Delete([]byte("lease-1"))
+	})
+
+	payloadStore := newReconcilerPayloadStore(t, dbPath)
+	defer payloadStore.Close()
+
+	tracker := newMockInFlightTracker(payloadStore)
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, tracker, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	assert.False(t, mustHasPayload(t, payloadStore, "lease-1"), "a legacy payload that fails MetaHash is still corrupt")
+
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
 	assert.Empty(t, mockBackend.provisionCalls)
@@ -4611,4 +4814,69 @@ func TestReconciler_ReconcileAll_OmittedProvisionNotDeprovisioned(t *testing.T) 
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
 	assert.Empty(t, mockBackend.deprovisionCalls, "an omitted-from-list provision must never be deprovisioned")
+}
+
+func TestReconciler_ReconcileAll_MalformedRecordedHash_KeepsPayload(t *testing.T) {
+	// A corrupt recorded hash must abort the provision attempt, not fall back to
+	// MetaHash. The fallback is only correct for a payload that never HAD a
+	// recorded hash; applying it to a corrupt one would compare an updated
+	// payload against the create-time commitment it legitimately diverges from,
+	// delete a good manifest, and close a live lease on the next sweep.
+	originalPayload := []byte("original manifest payload")
+	updatedPayload := []byte("updated manifest payload")
+	metaHash := sha256.Sum256(originalPayload)
+
+	mockChain := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{
+					Uuid:     "lease-1",
+					Tenant:   "tenant-1",
+					State:    billingtypes.LEASE_STATE_ACTIVE,
+					MetaHash: metaHash[:],
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "docker-micro", Quantity: 1}},
+				},
+			}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			t.Errorf("leases %v closed on-chain (%q) — a corrupt hash must not be terminal", leaseUUIDs, reason)
+			return 0, nil, nil
+		},
+	}
+	mockBackend := &mockReconcilerBackend{name: "test", provisions: []backend.ProvisionInfo{}}
+	router, _ := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+
+	dbPath := t.TempDir() + "/payloads.db"
+	store := newReconcilerPayloadStore(t, dbPath)
+	require.True(t, store.Store("lease-1", originalPayload))
+	require.NoError(t, store.Put("lease-1", updatedPayload))
+	require.NoError(t, store.Close())
+
+	// Corrupt the recorded hash, leaving the payload intact.
+	mutatePayloadDB(t, dbPath, func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("payload_hashes")).Put([]byte("lease-1"), []byte{0x00})
+	})
+
+	payloadStore := newReconcilerPayloadStore(t, dbPath)
+	defer payloadStore.Close()
+
+	tracker := newMockInFlightTracker(payloadStore)
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID:    "provider-1",
+		CallbackBaseURL: "http://localhost:8080",
+	}, mockChain, noopAck, router, tracker, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	// The payload survives so a later sweep can still provision it once the
+	// underlying read problem is resolved.
+	assert.True(t, mustHasPayload(t, payloadStore, "lease-1"),
+		"a corrupt recorded hash must not delete the payload")
+
+	mockBackend.mu.Lock()
+	defer mockBackend.mu.Unlock()
+	assert.Empty(t, mockBackend.provisionCalls, "must not provision against an unverifiable payload")
 }

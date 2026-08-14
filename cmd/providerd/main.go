@@ -382,6 +382,18 @@ func run(cmd *cobra.Command, args []string) error {
 	leaseWatcher := watcher.New(chainClient, eventSub, cfg.ProviderUUID)
 
 	// Initialize API server
+	// Wire the /update persister only when there is somewhere to persist to.
+	// UpdateLease refuses before calling the backend when this is nil, so an
+	// unset store has to arrive as a TRUE nil interface: handing it a Manager
+	// that will merely fail later moves the refusal to *after* the backend has
+	// already applied the update, leaving the lease running a manifest fred has
+	// no durable record of — the ENG-619 outcome the guard exists to prevent.
+	// Same typed-nil gotcha as placementStore above.
+	var payloadPersister api.PayloadPersister
+	if payloadStore != nil {
+		payloadPersister = provisionMgr
+	}
+
 	apiServer, err := api.NewServer(api.ServerConfig{
 		Addr:                        cfg.APIListenAddr,
 		ProviderUUID:                cfg.ProviderUUID,
@@ -408,6 +420,7 @@ func run(cmd *cobra.Command, args []string) error {
 		BackendRouter:     backendRouter,
 		CallbackPublisher: provisionMgr,
 		PayloadPublisher:  provisionMgr,
+		PayloadPersister:  payloadPersister,
 		StatusChecker:     provisionMgr,
 		PlacementLookup:   placementStore,
 		RestoreRecorder:   provisionMgr,

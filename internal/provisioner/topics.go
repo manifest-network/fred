@@ -37,6 +37,15 @@ var (
 
 	// ErrAcknowledgeFailed indicates the lease acknowledgment on chain failed.
 	ErrAcknowledgeFailed = errors.New("lease acknowledgment failed")
+
+	// ErrPayloadStoreUnavailable indicates an operation needed the payload store
+	// but none is configured (payload_store_db_path unset).
+	//
+	// It exists so the /update path can tell "persisted" from "there was nowhere
+	// to persist to" and answer the tenant honestly. Silently succeeding is what
+	// ENG-619 was: the update reaches the backend, nothing durable records it,
+	// and the next reprovision reverts the tenant with no signal anywhere.
+	ErrPayloadStoreUnavailable = errors.New("payload store not configured")
 )
 
 // Watermill topic names for internal event routing.

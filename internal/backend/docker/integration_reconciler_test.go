@@ -5,6 +5,7 @@ package docker
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -1069,4 +1070,154 @@ func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "mgr-event-sentinel")
 	// Retained volume + bbolt DB live under the loopback mount / t.TempDir → torn down automatically.
+}
+
+// TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage is the
+// mainnet scenario from ENG-619, end to end against real Docker: a tenant
+// updates a running deployment, the host later loses the container, and the
+// reconciler brings the lease back.
+//
+// Before the fix the lease came back on its as-created image, because /update
+// wrote only to the backend and the reconciler replays from the payload store.
+// The naive fix was worse: the updated payload no longer matches the lease's
+// immutable on-chain MetaHash, so the reprovision path deleted it as corrupt
+// and then closed the ACTIVE lease on-chain. This test pins both — the lease
+// must come back on the UPDATED image, and the payload must survive.
+func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testing.T) {
+	const (
+		originalImage = "busybox:latest"
+		updatedImage  = "alpine:latest"
+	)
+	leaseUUID := fmt.Sprintf("recon-update-%d", time.Now().UnixNano())
+	tenant := "test-tenant"
+	sku := "docker-micro"
+
+	payloadV1, err := json.Marshal(manifest.Manifest{
+		Image:   originalImage,
+		Command: []string{"sleep", "3600"},
+	})
+	require.NoError(t, err)
+	payloadV2, err := json.Marshal(manifest.Manifest{
+		Image:   updatedImage,
+		Command: []string{"sleep", "3600"},
+	})
+	require.NoError(t, err)
+
+	// MetaHash names the CREATE-time manifest and never changes: the chain has
+	// no message to update it (that is ENG-643).
+	metaHash := sha256.Sum256(payloadV1)
+
+	var mu sync.Mutex
+	leaseState := billingtypes.LEASE_STATE_PENDING
+
+	mockChain := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if leaseState == billingtypes.LEASE_STATE_PENDING {
+				lease := makeLease(leaseUUID, tenant, providerUUID, sku, 1, metaHash[:])
+				lease.State = billingtypes.LEASE_STATE_PENDING
+				return []billingtypes.Lease{lease}, nil
+			}
+			return nil, nil
+		},
+		GetActiveLeasesByProviderFunc: func(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if leaseState == billingtypes.LEASE_STATE_ACTIVE {
+				lease := makeLease(leaseUUID, tenant, providerUUID, sku, 1, metaHash[:])
+				lease.State = billingtypes.LEASE_STATE_ACTIVE
+				return []billingtypes.Lease{lease}, nil
+			}
+			return nil, nil
+		},
+		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
+			return 1, []string{"txhash1"}, nil
+		},
+		CloseLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
+			t.Errorf("leases %v were closed on-chain (%q) — an updated payload must never be read as corruption", leaseUUIDs, reason)
+			return 0, nil, nil
+		},
+	}
+
+	env := testReconcilerSetup(t, mockChain)
+	ctx := context.Background()
+
+	// --- create path: store the original payload and provision ---
+	require.True(t, env.tracker.store.Store(leaseUUID, payloadV1))
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+
+	select {
+	case cb := <-env.callbackCh:
+		require.Equal(t, leaseUUID, cb.LeaseUUID)
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for provision success callback")
+	}
+	env.tracker.UntrackInFlight(leaseUUID)
+
+	containers := inspectProvisionContainers(t, leaseUUID)
+	require.NotEmpty(t, containers)
+	require.Equal(t, originalImage, containers[0].Image, "should start on the as-created image")
+
+	mu.Lock()
+	leaseState = billingtypes.LEASE_STATE_ACTIVE
+	mu.Unlock()
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+
+	// --- tenant /update: exactly what the API handler does, in the same order ---
+	require.NoError(t, env.backend.Update(ctx, backend.UpdateRequest{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: env.callbackURL,
+		Payload:     payloadV2,
+		PayloadHash: hex.EncodeToString(payload.ComputeHash(payloadV2)),
+	}))
+	// Persist AFTER the backend accepts — the durable half that ENG-619 added.
+	require.NoError(t, env.tracker.store.Put(leaseUUID, payloadV2))
+
+	select {
+	case cb := <-env.callbackCh:
+		require.Equal(t, leaseUUID, cb.LeaseUUID)
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status, "update should succeed")
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for update success callback")
+	}
+
+	waitForProvisionStatus(t, env.backend, leaseUUID, backend.ProvisionStatusReady, 60*time.Second)
+	containers = inspectProvisionContainers(t, leaseUUID)
+	require.NotEmpty(t, containers)
+	require.Equal(t, updatedImage, containers[0].Image, "update should have replaced the running image")
+
+	// --- the reboot: lose the container, let the reconciler bring it back ---
+	killContainer(t, containers[0].ID)
+	waitForProvisionStatus(t, env.backend, leaseUUID, backend.ProvisionStatusFailed, 30*time.Second)
+
+	select {
+	case cb := <-env.callbackCh:
+		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	case <-time.After(10 * time.Second):
+		// recoverState may have already fired it; continue
+	}
+
+	require.NoError(t, env.reconciler.RunOnce(ctx))
+
+	select {
+	case cb := <-env.callbackCh:
+		require.Equal(t, leaseUUID, cb.LeaseUUID)
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timeout waiting for re-provision success callback")
+	}
+
+	// The assertion this whole ticket exists for.
+	containers = inspectProvisionContainers(t, leaseUUID)
+	require.NotEmpty(t, containers)
+	assert.Equal(t, updatedImage, containers[0].Image,
+		"reprovision must replay the UPDATED manifest — reverting to %s is ENG-619", originalImage)
+
+	// And the payload must still be there: deleting it as "corrupt" is what
+	// would close the lease on the following sweep.
+	has, err := env.tracker.store.Has(leaseUUID)
+	require.NoError(t, err)
+	assert.True(t, has, "the updated payload must survive hash verification")
 }

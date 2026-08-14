@@ -2,7 +2,10 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -3317,6 +3320,53 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 
 // TestUpdateLease_BackendIntegration tests the backend integration path
 // in UpdateLease using httptest.Server and a real backend.Router.
+// mockPersistCall records one OverwritePayload invocation.
+type mockPersistCall struct {
+	leaseUUID string
+	payload   []byte
+}
+
+// mockPayloadPersister is the api-side fake for the ENG-619 persistence seam.
+type mockPayloadPersister struct {
+	calls []mockPersistCall
+	err   error // when set, OverwritePayload fails
+}
+
+func (m *mockPayloadPersister) OverwritePayload(leaseUUID string, payload []byte) error {
+	m.calls = append(m.calls, mockPersistCall{leaseUUID: leaseUUID, payload: append([]byte(nil), payload...)})
+	return m.err
+}
+
+// updateTestBackend returns a router whose single backend answers /update with
+// the given status, plus a pointer to the number of /update requests it saw.
+func updateTestBackend(t *testing.T, status int, body string) (*backend.Router, *int) {
+	t.Helper()
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/update" && r.Method == "POST" {
+			calls++
+			w.WriteHeader(status)
+			if body != "" {
+				_, _ = w.Write([]byte(body))
+			}
+			return
+		}
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(server.Close)
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "test-backend",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	return router, &calls
+}
+
 func TestUpdateLease_BackendIntegration(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
 	leaseUUID := testutil.ValidUUID1
@@ -3338,10 +3388,11 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 
 	t.Run("router_missing_returns_503", func(t *testing.T) {
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: nil,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:           chainClient,
+			backendRouter:    nil,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3380,10 +3431,11 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3422,10 +3474,11 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3467,10 +3520,11 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3513,10 +3567,11 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3561,10 +3616,11 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3603,10 +3659,11 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3649,10 +3706,11 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3669,6 +3727,160 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		var response map[string]string
 		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 		assert.Equal(t, "updating", response["status"])
+	})
+
+	// --- ENG-619: an update that reaches the backend must also reach the store ---
+
+	t.Run("persists_updated_payload_after_backend_accepts", func(t *testing.T) {
+		router, _ := updateTestBackend(t, http.StatusAccepted, "")
+		persister := &mockPayloadPersister{}
+
+		h := &Handlers{
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: persister,
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		body := `{"payload":"dGVzdA=="}` // "test"
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		require.Equal(t, http.StatusAccepted, rec.Code)
+		require.Len(t, persister.calls, 1, "a successful update must persist the new payload")
+		assert.Equal(t, leaseUUID, persister.calls[0].leaseUUID)
+		assert.Equal(t, []byte("test"), persister.calls[0].payload,
+			"the persisted payload must be the one sent to the backend")
+	})
+
+	t.Run("backend_rejection_does_not_persist", func(t *testing.T) {
+		// Persist-after-success: a payload the backend refused must never reach
+		// the store, or the next reprovision would replay a manifest that was
+		// never deployed.
+		router, _ := updateTestBackend(t, http.StatusBadRequest, `{"error":"invalid manifest"}`)
+		persister := &mockPayloadPersister{}
+
+		h := &Handlers{
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: persister,
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Empty(t, persister.calls, "a rejected update must not be persisted")
+	})
+
+	t.Run("persist_failure_returns_500", func(t *testing.T) {
+		// The error branch: the backend is now running the new manifest but
+		// nothing durable records it. Answering 202 here is the silent-revert
+		// bug, so the tenant is told the update did not fully land.
+		router, updateCalls := updateTestBackend(t, http.StatusAccepted, "")
+		persister := &mockPayloadPersister{err: errors.New("disk full")}
+
+		h := &Handlers{
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: persister,
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+		assert.Equal(t, 1, *updateCalls, "the backend was still called — the tenant retries to re-apply and re-persist")
+		require.Len(t, persister.calls, 1)
+
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, "internal server error", errResp.Error)
+	})
+
+	t.Run("missing_persister_returns_500_without_calling_backend", func(t *testing.T) {
+		// Fail before touching the backend: a lease left running a manifest fred
+		// has no durable record of is worse than an update that never happened.
+		router, updateCalls := updateTestBackend(t, http.StatusAccepted, "")
+
+		h := &Handlers{
+			client:        chainClient,
+			backendRouter: router,
+			providerUUID:  providerUUID,
+			bech32Prefix:  "manifest",
+			// payloadPersister deliberately nil
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+		assert.Zero(t, *updateCalls, "the update must not be half-applied")
+	})
+
+	t.Run("sends_payload_hash_matching_the_payload", func(t *testing.T) {
+		// payload_hash is part of the documented /update request; it was never
+		// populated before ENG-619.
+		var got backend.UpdateRequest
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		defer server.Close()
+
+		client := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name: "test-backend", BaseURL: server.URL, Timeout: 5 * time.Second,
+		})
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
+		})
+		require.NoError(t, err)
+
+		h := &Handlers{
+			client:           chainClient,
+			backendRouter:    router,
+			providerUUID:     providerUUID,
+			bech32Prefix:     "manifest",
+			payloadPersister: &mockPayloadPersister{},
+		}
+
+		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.UpdateLease(rec, req)
+
+		require.Equal(t, http.StatusAccepted, rec.Code)
+		want := sha256.Sum256([]byte("test"))
+		assert.Equal(t, hex.EncodeToString(want[:]), got.PayloadHash)
+		assert.Equal(t, []byte("test"), got.Payload)
 	})
 }
 

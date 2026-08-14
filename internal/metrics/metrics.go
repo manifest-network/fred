@@ -302,6 +302,20 @@ var (
 		Help:      "Number of payloads currently stored awaiting provisioning",
 	})
 
+	// PayloadPersistFailuresTotal counts payloads that were applied to a backend
+	// but could not be written to the payload store (ENG-619).
+	//
+	// Worth alerting on rather than merely graphing: every increment is a lease
+	// whose running deployment fred has no durable record of, which the next
+	// reprovision will silently revert to its as-created manifest. The tenant
+	// receives a 500 and can retry, but nothing in fred retries on their behalf.
+	PayloadPersistFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "payload",
+		Name:      "persist_failures_total",
+		Help:      "Payloads applied to a backend but not persisted to the payload store, by operation",
+	}, []string{"operation"}) // operation: update
+
 	// PayloadSizeBytes tracks the size of uploaded payloads.
 	PayloadSizeBytes = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace,

@@ -22,7 +22,9 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // ChainClient defines the chain operations needed by handlers.
@@ -44,6 +46,23 @@ type TokenTrackerInterface interface {
 type PlacementLookup interface {
 	Get(leaseUUID string) string
 	Healthy() error
+}
+
+// PayloadPersister persists a tenant's updated deployment payload to the store
+// the reconciler replays from on reprovision.
+//
+// This is REQUIRED, not optional, and deliberately unlike the optional
+// collaborators below: an /update that reaches the backend but not the payload
+// store looks completely successful and then silently reverts the tenant to
+// their as-created manifest on the next reboot or crash-restart (ENG-619). A nil
+// persister would reintroduce exactly that, so UpdateLease refuses the update
+// rather than half-applying it.
+type PayloadPersister interface {
+	// OverwritePayload replaces the stored payload for a lease. It returns an
+	// error — rather than a "was it already there" bool like the create path —
+	// because its caller has already applied the update to the backend, so a
+	// failure here is a durability failure the tenant must be told about.
+	OverwritePayload(leaseUUID string, payload []byte) error
 }
 
 // RestorePlacementRecorder records the NEW lease's placement after a successful
@@ -78,6 +97,7 @@ type Handlers struct {
 	placementLookup   PlacementLookup
 	restoreRecorder   RestorePlacementRecorder
 	restoreTracker    RestoreInFlightTracker
+	payloadPersister  PayloadPersister
 	eventBroker       *EventBroker
 	wsUpgrader        websocket.Upgrader
 	wsMaxMessageSize  int64         // max bytes the server will read from a client message on /events
@@ -89,30 +109,32 @@ type Handlers struct {
 
 // HandlersConfig configures a Handlers instance.
 type HandlersConfig struct {
-	Client          ChainClient
-	BackendRouter   *backend.Router
-	TokenTracker    TokenTrackerInterface    // optional but recommended for replay attack protection
-	StatusChecker   StatusChecker            // optional but required for the /status endpoint
-	PlacementLookup PlacementLookup          // optional — used for routing reads to the correct backend
-	RestoreRecorder RestorePlacementRecorder // optional — restore placement bookkeeping (ENG-333)
-	RestoreTracker  RestoreInFlightTracker   // optional — inline-ack restore in-flight tracking (ENG-358)
-	EventBroker     *EventBroker             // optional — if nil, the events endpoint will return 501
-	ProviderUUID    string
-	Bech32Prefix    string
-	CallbackBaseURL string // used for restart/update callbacks to the backend
+	Client           ChainClient
+	BackendRouter    *backend.Router
+	TokenTracker     TokenTrackerInterface    // optional but recommended for replay attack protection
+	StatusChecker    StatusChecker            // optional but required for the /status endpoint
+	PlacementLookup  PlacementLookup          // optional — used for routing reads to the correct backend
+	RestoreRecorder  RestorePlacementRecorder // optional — restore placement bookkeeping (ENG-333)
+	RestoreTracker   RestoreInFlightTracker   // optional — inline-ack restore in-flight tracking (ENG-358)
+	PayloadPersister PayloadPersister         // REQUIRED for /update — without it an update cannot be made durable (ENG-619)
+	EventBroker      *EventBroker             // optional — if nil, the events endpoint will return 501
+	ProviderUUID     string
+	Bech32Prefix     string
+	CallbackBaseURL  string // used for restart/update callbacks to the backend
 }
 
 // NewHandlers creates a new Handlers instance.
 func NewHandlers(cfg HandlersConfig) *Handlers {
 	return &Handlers{
-		client:          cfg.Client,
-		backendRouter:   cfg.BackendRouter,
-		tokenTracker:    cfg.TokenTracker,
-		statusChecker:   cfg.StatusChecker,
-		placementLookup: cfg.PlacementLookup,
-		restoreRecorder: cfg.RestoreRecorder,
-		restoreTracker:  cfg.RestoreTracker,
-		eventBroker:     cfg.EventBroker,
+		client:           cfg.Client,
+		backendRouter:    cfg.BackendRouter,
+		tokenTracker:     cfg.TokenTracker,
+		statusChecker:    cfg.StatusChecker,
+		placementLookup:  cfg.PlacementLookup,
+		restoreRecorder:  cfg.RestoreRecorder,
+		restoreTracker:   cfg.RestoreTracker,
+		payloadPersister: cfg.PayloadPersister,
+		eventBroker:      cfg.EventBroker,
 		wsUpgrader: websocket.Upgrader{
 			// Allow all origins: this API is not browser-facing. Clients are
 			// CLI tools and services that authenticate with cryptographically
@@ -1148,10 +1170,28 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Refuse before touching the backend rather than after. An update we cannot
+	// persist is one the next reprovision silently undoes (ENG-619), so a lease
+	// left running a manifest fred has no durable record of is strictly worse
+	// than an update that never happened — the tenant can retry the latter.
+	if h.payloadPersister == nil {
+		slog.Error("update rejected: no payload persister configured — /update cannot be made durable",
+			"lease_uuid", leaseUUID,
+		)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	// payload_hash has always been part of the documented /update request
+	// (README, BACKEND_GUIDE) but was never populated, so a third-party backend
+	// implementing the contract received a payload it could not check. Send the
+	// hash of the payload actually being sent — the same value the store records
+	// and the reprovision path later verifies against.
 	err := backendClient.Update(r.Context(), backend.UpdateRequest{
 		LeaseUUID:   leaseUUID,
 		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
 		Payload:     updateReq.Payload,
+		PayloadHash: hex.EncodeToString(payload.ComputeHash(updateReq.Payload)),
 	})
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
@@ -1167,6 +1207,34 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("failed to update lease", "error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return
+	}
+
+	// Persist the new payload now that the backend has accepted it.
+	//
+	// After, not before: a payload the backend synchronously rejected must never
+	// reach the store, or the next reprovision would replay a manifest that was
+	// never deployed. The cost of that ordering is a crash window between the
+	// two — which reverts to the pre-ENG-619 behavior for that one lease and is
+	// repaired by the tenant retrying, rather than by fred serving a manifest
+	// nothing ever validated.
+	//
+	// The reconciler verifies a stored payload against the hash recorded here,
+	// not against the lease's create-time on-chain MetaHash, which an update
+	// legitimately diverges from. Until ENG-643 lands the on-chain commitment
+	// still names the create-time manifest; see doStartProvisioning.
+	if err := h.payloadPersister.OverwritePayload(leaseUUID, updateReq.Payload); err != nil {
+		// The backend is now running the new manifest but nothing durable
+		// records it. Answering 202 here is precisely the silent-revert bug, so
+		// report the failure: a retry re-applies and re-persists.
+		slog.Error("lease updated on backend but payload persistence failed — reprovision would revert this lease",
+			"error", err,
+			"lease_uuid", leaseUUID,
+			"tenant", auth.Token.Tenant,
+			"backend", backendClient.Name(),
+		)
+		metrics.PayloadPersistFailuresTotal.WithLabelValues("update").Inc()
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}

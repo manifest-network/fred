@@ -101,6 +101,7 @@ type ServerDeps struct {
 	BackendRouter     *backend.Router
 	CallbackPublisher CallbackPublisher
 	PayloadPublisher  PayloadPublisher
+	PayloadPersister  PayloadPersister // Required — /update returns 500 without it (ENG-619).
 	StatusChecker     StatusChecker
 	PlacementLookup   PlacementLookup          // Optional — if nil, placement routing is disabled.
 	RestoreRecorder   RestorePlacementRecorder // Optional — restore placement bookkeeping (ENG-333).
@@ -141,17 +142,18 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		tracker = tokenTracker
 	}
 	handlers := NewHandlers(HandlersConfig{
-		Client:          client,
-		BackendRouter:   backendRouter,
-		TokenTracker:    tracker,
-		StatusChecker:   statusChecker,
-		PlacementLookup: placementLookup,
-		RestoreRecorder: deps.RestoreRecorder,
-		RestoreTracker:  deps.RestoreTracker,
-		EventBroker:     eventBroker,
-		ProviderUUID:    cfg.ProviderUUID,
-		Bech32Prefix:    cfg.Bech32Prefix,
-		CallbackBaseURL: cfg.CallbackBaseURL,
+		Client:           client,
+		BackendRouter:    backendRouter,
+		TokenTracker:     tracker,
+		StatusChecker:    statusChecker,
+		PlacementLookup:  placementLookup,
+		RestoreRecorder:  deps.RestoreRecorder,
+		RestoreTracker:   deps.RestoreTracker,
+		PayloadPersister: deps.PayloadPersister,
+		EventBroker:      eventBroker,
+		ProviderUUID:     cfg.ProviderUUID,
+		Bech32Prefix:     cfg.Bech32Prefix,
+		CallbackBaseURL:  cfg.CallbackBaseURL,
 	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
