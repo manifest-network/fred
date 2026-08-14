@@ -270,19 +270,18 @@ type volumeRootWatch struct {
 
 // list enumerates dataPath and refuses to report emptiness it cannot vouch for.
 func (w *volumeRootWatch) list(dataPath string) ([]string, error) {
-	ids, err := listVolumeIDs(dataPath)
+	// The lock spans the OBSERVATION as well as the update, not just the update. Two
+	// concurrent readings can otherwise be applied out of order — the older one landing last
+	// and installing a baseline that was already superseded — which is the same
+	// stale-snapshot-wins hazard the destroy path had to fix, arriving by a different door.
+	// List runs once per sweep or close, so serializing it costs nothing worth measuring.
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	ids, dev, err := listVolumeIDsWithDevice(dataPath)
 	if err != nil {
 		return nil, err
 	}
-	dev, devErr := rootDevice(dataPath)
-	if devErr != nil {
-		// The directory enumerated a moment ago but will not stat now. Whatever that is,
-		// it is not proof of emptiness.
-		return nil, fmt.Errorf("identify volume data root %s: %w", dataPath, devErr)
-	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	if len(ids) > 0 {
 		// Ground truth, and the only place the baseline is set. Re-learning it on every
 		// populated read also means a deliberate remount onto a different device converges
@@ -295,21 +294,6 @@ func (w *volumeRootWatch) list(dataPath string) ([]string, error) {
 			"(device %d, was %d) — refusing to report it as empty; is it unmounted?", dataPath, dev, w.dev)
 	}
 	return ids, nil
-}
-
-// rootDevice returns the id of the device backing path. It is what changes under a plain
-// unmount — the path survives, but it is served by the parent filesystem afterwards — which
-// is exactly the transition an ENOENT check cannot see.
-func rootDevice(path string) (uint64, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, fmt.Errorf("stat %s: no syscall.Stat_t available on this platform", path)
-	}
-	return st.Dev, nil
 }
 
 // listVolumeIDs returns the names of all managed volume subdirectories in dataPath.
@@ -334,9 +318,44 @@ func rootDevice(path string) (uint64, error) {
 // resolves its mount point, so construction fails before Start if it is missing — which
 // makes ENOENT here unambiguously "it disappeared underneath us".
 func listVolumeIDs(dataPath string) ([]string, error) {
-	entries, err := os.ReadDir(dataPath)
+	ids, _, err := listVolumeIDsWithDevice(dataPath)
+	return ids, err
+}
+
+// listVolumeIDsWithDevice is listVolumeIDs plus the identity of the filesystem the listing
+// actually came from, taken from THE SAME open directory handle.
+//
+// One handle, not two calls against the path, and that is the whole point. A stat of the path
+// is a SECOND observation: an unmount landing between the enumeration and the stat pairs
+// volumes read from the old mount with the parent filesystem's device, which is worse than no
+// check at all — the populated branch treats that pairing as ground truth and adopts the
+// parent device as the baseline, after which every later empty reading matches and is
+// accepted. The guard would silently invert into a rubber stamp.
+//
+// An fd does not have that problem. It refers to the opened inode on the opened filesystem for
+// as long as it is held, whatever happens to the path underneath it, so fstat and getdents on
+// the same descriptor cannot disagree about which filesystem they read. That is the same rule
+// this file already applies elsewhere — keep the question inside the single operation that can
+// answer it — applied one level deeper than it was.
+func listVolumeIDsWithDevice(dataPath string) ([]string, uint64, error) {
+	f, err := os.Open(dataPath) //nolint:gosec // G304: dataPath is the operator-configured volume_data_path, validated at construction — never tenant-reachable (volume names are appended by callers, not by this open)
 	if err != nil {
-		return nil, fmt.Errorf("read volume data directory %s: %w", dataPath, err)
+		return nil, 0, fmt.Errorf("open volume data directory %s: %w", dataPath, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat volume data directory %s: %w", dataPath, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, 0, fmt.Errorf("stat %s: no syscall.Stat_t available on this platform", dataPath)
+	}
+
+	entries, err := f.ReadDir(-1)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read volume data directory %s: %w", dataPath, err)
 	}
 	var ids []string
 	for _, e := range entries {
@@ -344,7 +363,7 @@ func listVolumeIDs(dataPath string) ([]string, error) {
 			ids = append(ids, e.Name())
 		}
 	}
-	return ids, nil
+	return ids, st.Dev, nil
 }
 
 // atomicRenameVolumeDir renames oldPath → newPath via os.Rename with

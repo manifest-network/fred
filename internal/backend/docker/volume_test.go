@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -780,4 +781,52 @@ func TestVolumeManager_HostPath(t *testing.T) {
 		mgr := &noopVolumeManager{}
 		assert.Equal(t, "", mgr.HostPath("fred-anything"))
 	})
+}
+
+// TestListVolumeIDsWithDevice_IdentityMatchesTheListedDirectory pins that the identity and the
+// enumeration come from ONE handle rather than two lookups of the path.
+//
+// A stat of the path is a second observation, and an unmount landing between the two pairs
+// volumes read from the old mount with the parent filesystem's device. That pairing is worse
+// than no check: volumeRootWatch's populated branch adopts it as the baseline, after which
+// every later empty reading matches and is accepted — the guard inverts into a rubber stamp.
+// An fd cannot disagree with itself about which filesystem it read.
+func TestListVolumeIDsWithDevice_IdentityMatchesTheListedDirectory(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "fred-u1-app-0"), 0o755))
+
+	ids, dev, err := listVolumeIDsWithDevice(root)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"fred-u1-app-0"}, ids)
+	assert.Equal(t, devOf(t, root), dev,
+		"the reported device must be the one backing the directory that was enumerated")
+	assert.NotZero(t, dev)
+}
+
+// TestVolumeRootWatch_ConcurrentListsDoNotInstallAStaleBaseline pins the serialization half.
+// Two readings applied out of order would let the older one install a baseline that was
+// already superseded — the same stale-snapshot-wins hazard the destroy path had to fix,
+// arriving through a different door. Run with -race.
+func TestVolumeRootWatch_ConcurrentListsDoNotInstallAStaleBaseline(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "fred-u1-app-0"), 0o755))
+	want := devOf(t, root)
+
+	var w volumeRootWatch
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids, err := w.list(root)
+			assert.NoError(t, err)
+			assert.Len(t, ids, 1)
+		}()
+	}
+	wg.Wait()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	assert.True(t, w.seen)
+	assert.Equal(t, want, w.dev, "every reading saw the same root, so the baseline must be it")
 }
