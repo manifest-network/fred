@@ -482,6 +482,15 @@ the sweep is the only automatic reclaimer.
   `volume_data_path` (an unmounted disk, most likely) is treated as uncertainty, so every
   reaping record is **kept** and `reap_skips_total{reason="claim_unreadable"}` rises. Remount
   the volume root and the next sweep proceeds. (ENG-676)
+- **If the volume root is unmounted, fred refuses to act on the emptiness rather than
+  believing it** (ENG-687). An unmount leaves the directory behind, so it enumerates as an
+  empty node and nothing errors — which previously made every retention record look orphaned
+  and led, over the following boots, to their data being destroyed as unclaimed. Now the
+  daemon **fails to start** if `volume_data_path` is not on the filesystem `volume_filesystem`
+  names (`is the volume mounted?` in the startup error), and a running daemon reports
+  `volume data root ... is empty but now lives on a different filesystem` instead of reaping.
+  Both mean the same thing: **check the mount first**, e.g. `findmnt /data`. Nothing is
+  reclaimed and nothing is pruned until it is back.
 - **A give-up under a degraded store still records the footprint.** It used to compute the
   record's volume list through the same ownership table it could not read, and on failure wrote
   no record at all — so the abandoned bytes were counted by nothing (no pool reservation, no

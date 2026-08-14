@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -769,4 +770,69 @@ func TestDestroyReapingVolumes_ReclaimsTheWholeNamespace_NotJustTheRecordedNames
 	got, err := rs.Get(lease)
 	require.NoError(t, err)
 	assert.Nil(t, got, "record dropped once the footprint is confirmed gone")
+}
+
+// TestOrphanReconcile_UnmountedRootDoesNotPruneLiveRecords is ENG-687 end to end, and the
+// reason that ticket was filed at High rather than treated as an accounting nit.
+//
+// A plain `umount` does not remove the mountpoint directory — it stays on the parent
+// filesystem — so `ReadDir` succeeds and hands back the empty stub with no error. The
+// orphan reconcile reads absence of a volume as evidence its retention record is orphaned,
+// so an empty enumeration makes allVolumesAbsent vacuously true for EVERY active record.
+// After the confirmation streak it prunes them; mount the filesystem again and those
+// volumes have no record naming them, so the next boot's cleanupOrphanedVolumes destroys
+// retained tenant data.
+//
+// This drives a REAL volume manager rather than the mock the rest of this suite uses,
+// because the guard lives in the enumeration primitive — which is the whole point: every
+// consumer inherits it without having to remember, and a mock would prove nothing.
+func TestOrphanReconcile_UnmountedRootDoesNotPruneLiveRecords(t *testing.T) {
+	root := t.TempDir()
+	vol := "fred-u1-app-0"
+	require.NoError(t, os.MkdirAll(filepath.Join(root, vol), 0o755))
+
+	// btrfs is used only because its List is the plain enumeration with no external tooling;
+	// the guard under test is shared by all three managers.
+	mgr := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.cfg.VolumeDataPath = root // exists → the G2 gate passes, exactly as it would post-unmount
+	b.cfg.RetentionOrphanConfirmations = 1
+	b.orphanStreaks = make(map[string]int)
+	b.volumes = mgr
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   "u1",
+		Tenant:              "t1",
+		Status:              shared.RetentionStatusActive,
+		RetainedVolumeNames: []string{retainedName(vol)},
+		CreatedAt:           time.Now(),
+	}))
+
+	// A healthy pass first: the volume is present, so nothing is orphaned and the manager
+	// learns which filesystem this root lives on.
+	pruned, err := b.reconcileOrphanedRetentions()
+	require.NoError(t, err)
+	require.Zero(t, pruned)
+
+	// The unmount. The directory survives and is empty, and it is now served by a different
+	// device than the one the manager recorded.
+	require.NoError(t, os.RemoveAll(filepath.Join(root, vol)))
+	mgr.rootWatch.mu.Lock()
+	mgr.rootWatch.dev++
+	mgr.rootWatch.mu.Unlock()
+
+	skipBefore := testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipListError))
+	prunedBefore := testutil.ToFloat64(retentionOrphansPrunedTotal)
+
+	_, err = b.reconcileOrphanedRetentions()
+
+	require.Error(t, err, "an unvouchable emptiness must abort the pass, not be read as 'all orphaned'")
+	got, gerr := rs.Get("u1")
+	require.NoError(t, gerr)
+	assert.NotNil(t, got, "ENG-687: the live retention record must survive an unmounted volume root")
+	assert.Equal(t, shared.RetentionStatusActive, got.Status)
+	assert.Equal(t, prunedBefore, testutil.ToFloat64(retentionOrphansPrunedTotal), "nothing may be pruned")
+	assert.Equal(t, skipBefore+1, testutil.ToFloat64(retentionOrphanSkipsTotal.WithLabelValues(orphanSkipListError)))
+	assert.Empty(t, b.orphanStreaks, "streaks reset, so a remount starts the confirmation count over")
 }

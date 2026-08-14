@@ -80,9 +80,17 @@ func TestResolveMountpoint_Root(t *testing.T) {
 // concurrent deprovision just removed). Runs unprivileged — the missing-path
 // branch returns before any exec.
 func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
-	dir := t.TempDir()
-	mgr, err := newVolumeManager(dir, "xfs", 1024, slog.Default())
-	require.NoError(t, err)
+	// Built directly rather than through newVolumeManager, exactly as the btrfs sibling
+	// below already is: the constructor now verifies that volume_data_path really is on the
+	// filesystem it claims (ENG-687), and a t.TempDir() is tmpfs. This test is about
+	// EnsureQuota's missing-path branch, not about construction.
+	mgr := &xfsVolumeManager{
+		dataPath:   t.TempDir(),
+		mountPoint: "/",
+		logger:     slog.Default(),
+		activeIDs:  make(map[uint32]string),
+		volumeToID: make(map[string]uint32),
+	}
 	require.NoError(t, mgr.EnsureQuota(context.Background(), "fred-does-not-exist-app-0", 100),
 		"EnsureQuota on a missing volume must be a no-op")
 }
@@ -106,11 +114,13 @@ func TestNewVolumeManager_XFS_ResolvesMountpoint(t *testing.T) {
 	dataPath := filepath.Join(mount, "volumes") // subdir, like /data/fred/volumes
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 
-	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
+	// newVolumeManager now verifies the path is really on the filesystem it is configured
+	// as (ENG-687), and a t.TempDir() is tmpfs — so the manager is assembled here the same
+	// way the constructor does. What this test pins is the ENG-449 field split, which lives
+	// in resolveMountpoint and the struct, not in the probe.
+	mount, err := resolveMountpoint(dataPath)
 	require.NoError(t, err)
-
-	xm, ok := mgr.(*xfsVolumeManager)
-	require.True(t, ok)
+	xm := &xfsVolumeManager{dataPath: dataPath, mountPoint: mount, logger: slog.Default()}
 
 	assert.Equal(t, dataPath, xm.dataPath, "dataPath must stay the configured subdir (volumes live here)")
 

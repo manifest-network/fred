@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -166,13 +167,33 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 		return &noopVolumeManager{}, nil
 	}
 
-	if filesystem == "" {
-		detected, err := detectFilesystem(dataPath)
-		if err != nil {
-			return nil, fmt.Errorf("auto-detect filesystem for volume_data_path: %w", err)
-		}
+	// Reject a nonsense volume_filesystem before touching the disk, so a typo reports itself
+	// as a typo rather than as whatever the probe below happens to find.
+	switch filesystem {
+	case "", "btrfs", "xfs", "zfs":
+	default:
+		return nil, fmt.Errorf("unsupported volume_filesystem: %s", filesystem)
+	}
+
+	// The data path is probed EVEN WHEN the filesystem is configured explicitly. It used to
+	// be probed only on the auto-detect branch, which meant a provider that pinned
+	// volume_filesystem started happily on a volume root that was not the filesystem it
+	// named — including the case that matters, an unmounted mountpoint, where the directory
+	// survives and is served by the parent filesystem. Booting there enumerates zero volumes
+	// and looks exactly like a fresh node, which is how the orphan pruner comes to prune
+	// live retention records (ENG-687). Failing startup is the right response: it is a
+	// misconfiguration or a missing mount, and both need an operator, not a sweep.
+	detected, err := detectFilesystem(dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("probe filesystem at volume_data_path %q (is the volume mounted?): %w", dataPath, err)
+	}
+	switch {
+	case filesystem == "":
 		filesystem = detected
 		logger.Info("auto-detected volume filesystem", "path", dataPath, "filesystem", filesystem)
+	case filesystem != detected:
+		return nil, fmt.Errorf("volume_data_path %q is on %s, but volume_filesystem is configured as %s "+
+			"(is the volume mounted?)", dataPath, detected, filesystem)
 	}
 
 	switch filesystem {
@@ -202,6 +223,79 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 
 // volumePrefix is the naming prefix for all managed volume directories.
 const volumePrefix = "fred-"
+
+// volumeRootWatch makes "this root holds no managed volumes" a claim the enumeration has
+// to earn, rather than one it can arrive at by accident.
+//
+// listVolumeIDs distinguishes a MISSING root from an empty one, which covers a data path
+// that disappears. It cannot cover the other way a root stops being itself: when
+// volume_data_path is a MOUNTPOINT, a plain `umount` leaves the directory in place on the
+// parent filesystem, so ReadDir succeeds and returns the empty stub with no error at all.
+// Every consumer then reads a confident "no volumes here" — and acts on it.
+//
+// The consequence is not confined to accounting. reconcileOrphanedRetentions treats an
+// absent volume as evidence a retention record is orphaned, so an empty enumeration makes
+// allVolumesAbsent vacuously true for EVERY active record; after the confirmation streak it
+// prunes them, and once the filesystem is mounted again those volumes have no record naming
+// them — so the next boot's orphan sweep destroys retained tenant data. (ENG-687)
+//
+// The baseline is learned rather than configured: the first enumeration that actually finds
+// volumes records the device backing the root, and from then on an EMPTY result must come
+// from that same device or it is treated as uncertainty. That ordering is what makes it
+// safe — a root we have never seen hold anything has nothing to lose, and the transition
+// this guards is precisely "held volumes, then suddenly none".
+//
+// Only the empty result is checked. A non-empty enumeration is self-evidently reading a
+// populated fred root, and paying a stat on it would tax every close.
+type volumeRootWatch struct {
+	mu   sync.Mutex
+	dev  uint64
+	seen bool
+}
+
+// list enumerates dataPath and refuses to report emptiness it cannot vouch for.
+func (w *volumeRootWatch) list(dataPath string) ([]string, error) {
+	ids, err := listVolumeIDs(dataPath)
+	if err != nil {
+		return nil, err
+	}
+	dev, devErr := rootDevice(dataPath)
+	if devErr != nil {
+		// The directory enumerated a moment ago but will not stat now. Whatever that is,
+		// it is not proof of emptiness.
+		return nil, fmt.Errorf("identify volume data root %s: %w", dataPath, devErr)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(ids) > 0 {
+		// Ground truth, and the only place the baseline is set. Re-learning it on every
+		// populated read also means a deliberate remount onto a different device converges
+		// on the next sweep instead of wedging until restart.
+		w.dev, w.seen = dev, true
+		return ids, nil
+	}
+	if w.seen && dev != w.dev {
+		return nil, fmt.Errorf("volume data root %s is empty but now lives on a different filesystem "+
+			"(device %d, was %d) — refusing to report it as empty; is it unmounted?", dataPath, dev, w.dev)
+	}
+	return ids, nil
+}
+
+// rootDevice returns the id of the device backing path. It is what changes under a plain
+// unmount — the path survives, but it is served by the parent filesystem afterwards — which
+// is exactly the transition an ENOENT check cannot see.
+func rootDevice(path string) (uint64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("stat %s: no syscall.Stat_t available on this platform", path)
+	}
+	return st.Dev, nil
+}
 
 // listVolumeIDs returns the names of all managed volume subdirectories in dataPath.
 // Only directories with the "fred-" prefix are returned — other directories

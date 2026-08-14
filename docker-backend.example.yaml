@@ -335,6 +335,14 @@ host_address: ""
 # The filesystem of the volume_data_path must be btrfs, xfs, or zfs.
 # If volume_filesystem is not set, it is auto-detected.
 #
+# Setting it explicitly SELECTS the backend but does not override the check: the daemon
+# probes volume_data_path at startup either way and refuses to start if the path is not
+# actually on the filesystem named. This is deliberate — the usual reason for a mismatch
+# is that the volume is not mounted, and an unmounted root looks exactly like a node with
+# no volumes, which is how retention records were once pruned and their data later
+# destroyed as unclaimed (ENG-687). If startup fails here, check the mount before the
+# config: `findmnt <volume_data_path>`.
+#
 # Supported configurations:
 #   - xfs:   project quotas (requires pquota mount option)
 #            *** the only backend validated and used in production ***

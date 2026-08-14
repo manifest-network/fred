@@ -62,6 +62,9 @@ type xfsVolumeManager struct {
 	// XFS inode hard limit from its block quota. Set from Config.GetMinAvgFileBytes().
 	minAvgFileBytes int64
 
+	// rootWatch refuses to report an emptiness it cannot vouch for (ENG-687).
+	rootWatch volumeRootWatch
+
 	mu         sync.Mutex
 	activeIDs  map[uint32]string // projectID → volumeID
 	volumeToID map[string]uint32 // volumeID → projectID (reverse index)
@@ -446,7 +449,7 @@ func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 }
 
 func (x *xfsVolumeManager) List() ([]string, error) {
-	return listVolumeIDs(x.dataPath)
+	return x.rootWatch.list(x.dataPath)
 }
 
 // RenameVolume renames the volume directory and updates the in-memory
