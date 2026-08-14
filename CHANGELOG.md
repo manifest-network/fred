@@ -20,6 +20,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Build: the Go toolchain floor moves to **1.26.6** (`go.mod` directive and the
+  release image's builder stage). This clears six standard-library advisories
+  published on 2026-08-13 that the CI vuln gate treats as called —
+  GO-2026-5026, GO-2026-5972, GO-2026-6089, GO-2026-6090, GO-2026-6091 and
+  GO-2026-6218, spanning `net/http`, `crypto/tls`, `html/template`,
+  `encoding/asn1` and `net/url`, all fixed in Go 1.26.6. No allowlist entry is
+  needed and none was added: a stdlib fix that exists is not an accepted
+  exception.
+
 - Build: `make lint` now **fails** when `golangci-lint` is missing from `PATH` or
   is not the pinned version, instead of printing "not installed, skipping" and
   exiting 0. A local `make lint` previously proved nothing — and a v1 binary is
