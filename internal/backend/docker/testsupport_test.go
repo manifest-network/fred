@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -327,4 +329,64 @@ func volDestroyer(tb testing.TB, vm volumeManager) volumeDestroyer {
 	d, ok := vm.(volumeDestroyer)
 	require.True(tb, ok, "volume manager %T cannot destroy; fixture teardown needs it", vm)
 	return d
+}
+
+// volumeSet is a mutable stand-in for the volumes on disk: List reports what is present and
+// Destroy removes it, so a test that destroys and then re-enumerates sees what a real
+// filesystem would.
+//
+// Static ListFn closures were fine while nothing re-read the root mid-operation. The reaping
+// finalizer now CONFIRMS a lease's footprint is gone before dropping its record (ENG-687) —
+// a destroy is an os.RemoveAll that treats an already-absent path as done, so "every destroy
+// succeeded" is also what a vanished mount looks like — and a fixture whose List ignores its
+// own destroys makes that confirmation unsatisfiable.
+type volumeSet struct {
+	mu        sync.Mutex
+	present   map[string]bool
+	destroyed []string
+	destroyFn func(id string) error // optional: fail or observe before removal
+}
+
+func newVolumeSet(names ...string) *volumeSet {
+	vs := &volumeSet{present: make(map[string]bool, len(names))}
+	for _, n := range names {
+		vs.present[n] = true
+	}
+	return vs
+}
+
+func (v *volumeSet) list() ([]string, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	out := make([]string, 0, len(v.present))
+	for n := range v.present {
+		out = append(out, n)
+	}
+	sort.Strings(out) // stable, so failure output reads the same twice
+	return out, nil
+}
+
+func (v *volumeSet) destroy(_ context.Context, id string) error {
+	if v.destroyFn != nil {
+		if err := v.destroyFn(id); err != nil {
+			return err // still on disk: leave it present
+		}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	delete(v.present, id)
+	v.destroyed = append(v.destroyed, id)
+	return nil
+}
+
+// names returns the volumes destroyed so far, in call order.
+func (v *volumeSet) names() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]string(nil), v.destroyed...)
+}
+
+// manager wires the set into a mockVolumeManager.
+func (v *volumeSet) manager() *mockVolumeManager {
+	return &mockVolumeManager{ListFn: v.list, DestroyFn: v.destroy}
 }
