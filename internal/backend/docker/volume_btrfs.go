@@ -18,6 +18,9 @@ import (
 type btrfsVolumeManager struct {
 	dataPath string
 	logger   *slog.Logger
+	// rootWatch refuses to report an emptiness it cannot vouch for (ENG-687).
+	// Zero value is ready to use: it has simply not seen this root hold volumes yet.
+	rootWatch volumeRootWatch
 }
 
 func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
@@ -101,7 +104,7 @@ func (b *btrfsVolumeManager) Destroy(ctx context.Context, id string) error {
 }
 
 func (b *btrfsVolumeManager) List() ([]string, error) {
-	return listVolumeIDs(b.dataPath)
+	return b.rootWatch.list(b.dataPath)
 }
 
 // RenameVolume renames a btrfs subvolume root via plain os.Rename. The

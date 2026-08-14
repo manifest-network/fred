@@ -207,25 +207,24 @@ func TestDeprovision_PerTenantCapEvictsOwnOldest(t *testing.T) {
 
 	var mu sync.Mutex
 	destroyed := make(map[string]bool)
+	onDisk := newVolumeSet(
+		"fred-new-lease-app-0",
+		"fred-retained-old-lease-app-0",
+		"fred-retained-other-tenant-lease-app-0",
+	)
 
 	b.volumes = &mockVolumeManager{
 		// Everything actually on disk: the closing lease's canonical volume plus both
 		// pre-seeded retained ones. The evicted record's footprint is derived from here, so
 		// tenant-b's volume being present is what makes "must NOT be evicted" meaningful
 		// rather than vacuous.
-		ListFn: func() ([]string, error) {
-			return []string{
-				"fred-new-lease-app-0",
-				"fred-retained-old-lease-app-0",
-				"fred-retained-other-tenant-lease-app-0",
-			}, nil
-		},
+		ListFn:         onDisk.list,
 		RenameVolumeFn: func(old, new string) error { return nil },
-		DestroyFn: func(_ context.Context, id string) error {
+		DestroyFn: func(ctx context.Context, id string) error {
 			mu.Lock()
 			destroyed[id] = true
 			mu.Unlock()
-			return nil
+			return onDisk.destroy(ctx, id) // removes it, so the confirming re-read agrees
 		},
 	}
 
@@ -1581,30 +1580,18 @@ func TestReapExpiredRetentions(t *testing.T) {
 	}
 	require.NoError(t, rs.Put(expiredRestoring))
 
-	var mu sync.Mutex
-	var destroyed []string
-	b.volumes = &mockVolumeManager{
-		// All three volumes are on disk; the finalizer derives which of them belong to the
-		// record it is reaping, so what gets destroyed is decided here plus the owner table,
-		// not by the record's stored name list.
-		ListFn: func() ([]string, error) {
-			return []string{oldActiveVol, freshActiveVol, oldRestoringVol}, nil
-		},
-		DestroyFn: func(_ context.Context, id string) error {
-			mu.Lock()
-			destroyed = append(destroyed, id)
-			mu.Unlock()
-			return nil
-		},
-	}
+	// All three volumes are on disk; the finalizer derives which of them belong to the
+	// record it is reaping, so what gets destroyed is decided here plus the owner table, not
+	// by the record's stored name list. A destroy removes it from the set, so the finalizer's
+	// confirming re-read sees what a real filesystem would.
+	vs := newVolumeSet(oldActiveVol, freshActiveVol, oldRestoringVol)
+	b.volumes = vs.manager()
 
 	n, err := b.reapExpiredRetentions(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, 1, n, "exactly one expired active entry must be reaped")
 
-	mu.Lock()
-	gotDestroyed := append([]string(nil), destroyed...)
-	mu.Unlock()
+	gotDestroyed := vs.names()
 
 	// Only the expired active volume is destroyed.
 	assert.Contains(t, gotDestroyed, oldActiveVol, "expired active volume must be destroyed")
@@ -1708,10 +1695,7 @@ func TestReap_DestroySuccess_DeletesRecord(t *testing.T) {
 
 	// The volume IS on disk, so the record is deleted because the destroy succeeded — not
 	// because the footprint looked empty. Without this the test would pass vacuously.
-	b.volumes = &mockVolumeManager{
-		ListFn:    func() ([]string, error) { return []string{"fred-retained-lease-exp-app-0"}, nil },
-		DestroyFn: func(_ context.Context, _ string) error { return nil },
-	}
+	b.volumes = newVolumeSet("fred-retained-lease-exp-app-0").manager()
 
 	n, err := b.reapExpiredRetentions(context.Background())
 	require.NoError(t, err)
@@ -1737,17 +1721,16 @@ func TestRetryReapingRecords_ReclaimsWhenDestroyRecovers(t *testing.T) {
 
 	var fail atomic.Bool
 	fail.Store(true)
-	b.volumes = &mockVolumeManager{
-		// Still on disk in BOTH sweeps: the second one deletes the record because the
-		// destroy finally succeeded, not because the footprint had vanished.
-		ListFn: func() ([]string, error) { return []string{"fred-retained-lease-r-app-0"}, nil },
-		DestroyFn: func(_ context.Context, _ string) error {
-			if fail.Load() {
-				return errors.New("EBUSY")
-			}
-			return nil
-		},
+	// On disk for the first sweep and destroyed by the second, so the record is deleted
+	// because the destroy finally succeeded — not because the footprint had vanished.
+	vs := newVolumeSet("fred-retained-lease-r-app-0")
+	vs.destroyFn = func(string) error {
+		if fail.Load() {
+			return errors.New("EBUSY")
+		}
+		return nil
 	}
+	b.volumes = vs.manager()
 
 	// First sweep: destroy fails → record stays reaping.
 	require.NoError(t, b.retryReapingRecords(context.Background()))

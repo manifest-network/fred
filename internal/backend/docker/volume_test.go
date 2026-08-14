@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -246,6 +247,91 @@ func TestNewVolumeManager_UnsupportedFilesystem(t *testing.T) {
 	_, err := newVolumeManager("/tmp", "ext4", 1024, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported volume_filesystem")
+}
+
+// TestNewVolumeManager_ConfiguredFilesystemMustMatchReality is the startup half of
+// ENG-687, and the deployed fleet sits exactly on the branch it fixes: the docker-backend
+// template pins `volume_filesystem: "xfs"`, which used to skip the probe entirely.
+//
+// That matters because `volume_data_path` is a SUBDIRECTORY of the XFS mount
+// (/data/fred/volumes under /data), and the provisioning role creates that directory — so
+// if the mount is not up when it runs, the same path exists, empty, on the root
+// filesystem. Booting there enumerates zero volumes and is indistinguishable from a fresh
+// node, which is how reconcileOrphanedRetentions comes to prune live retention records and
+// the next boot's orphan sweep destroys the data behind them. Refusing to start is the
+// right answer: a missing mount needs an operator, not a sweep.
+func TestNewVolumeManager_ConfiguredFilesystemMustMatchReality(t *testing.T) {
+	// The configured value is chosen to disagree with whatever the temp dir REALLY is, rather
+	// than assuming it is tmpfs: on a host whose /tmp is XFS, hardcoding "xfs" would describe
+	// the truth instead of the lie and the constructor would rightly succeed.
+	dir := t.TempDir()
+	configured := "xfs"
+	if detected, derr := detectFilesystem(dir); derr == nil && detected == configured {
+		configured = "btrfs" // any supported type the temp dir is not
+	}
+
+	_, err := newVolumeManager(dir, configured, 1024, slog.Default())
+	require.Error(t, err, "a configured filesystem that does not match the disk must fail startup")
+	assert.Contains(t, err.Error(), "is the volume mounted?",
+		"the error must name the likely cause; this fires on hosts where the mount unit failed")
+}
+
+// TestVolumeRootWatch_EmptyAfterSeenVolumes_OnADifferentDeviceIsAnError is the runtime
+// half of ENG-687: the root does not disappear on a plain unmount, it is simply served by
+// the parent filesystem afterwards, so ReadDir succeeds and returns the empty stub. ENOENT
+// never fires and every consumer reads "no volumes here".
+//
+// The baseline is learned from a populated read, so the guard covers the transition that
+// matters — held volumes, then suddenly none — without needing to be configured.
+func TestVolumeRootWatch_EmptyAfterSeenVolumes_OnADifferentDeviceIsAnError(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "fred-u1-app-0"), 0o755))
+
+	var w volumeRootWatch
+	ids, err := w.list(root)
+	require.NoError(t, err)
+	require.Len(t, ids, 1, "precondition: the baseline is learned from a populated read")
+	require.True(t, w.seen)
+
+	// Now the unmount. Rather than hunting for a second filesystem — which a CI box may not
+	// have, and a skipped test guards nothing — the recorded baseline is moved out from under
+	// the path directly. That is the same state an unmount produces (the path is now served
+	// by a different device than the one we learned) and it is deterministic everywhere.
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "fred-u1-app-0")))
+	w.dev++
+
+	_, err = w.list(root)
+	require.Error(t, err, "an empty root on a different device is uncertainty, not emptiness")
+	assert.Contains(t, err.Error(), "is it unmounted?")
+}
+
+// TestVolumeRootWatch_EmptyBeforeAnyVolumeIsFine keeps the guard from making a genuinely
+// fresh provider unusable: a root that has never held a volume has no baseline and nothing
+// to lose, so emptiness there is simply the truth.
+func TestVolumeRootWatch_EmptyBeforeAnyVolumeIsFine(t *testing.T) {
+	var w volumeRootWatch
+	ids, err := w.list(t.TempDir())
+	require.NoError(t, err)
+	assert.Empty(t, ids)
+}
+
+// TestVolumeRootWatch_EmptyOnTheSameDeviceIsStillEmpty is the other non-regression: once
+// the volumes really are reclaimed, the root reports empty and the reaper must be able to
+// act on it. Without this the guard would wedge every finalizer permanently.
+func TestVolumeRootWatch_EmptyOnTheSameDeviceIsStillEmpty(t *testing.T) {
+	root := t.TempDir()
+	vol := filepath.Join(root, "fred-u1-app-0")
+	require.NoError(t, os.MkdirAll(vol, 0o755))
+
+	var w volumeRootWatch
+	ids, err := w.list(root)
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+
+	require.NoError(t, os.RemoveAll(vol)) // the reaper did its job
+	ids, err = w.list(root)
+	require.NoError(t, err, "same device, genuinely empty — the reaper must be able to finish")
+	assert.Empty(t, ids)
 }
 
 func TestCleanupOrphanedVolumes_ListFailure(t *testing.T) {
@@ -695,4 +781,52 @@ func TestVolumeManager_HostPath(t *testing.T) {
 		mgr := &noopVolumeManager{}
 		assert.Equal(t, "", mgr.HostPath("fred-anything"))
 	})
+}
+
+// TestListVolumeIDsWithDevice_IdentityMatchesTheListedDirectory pins that the identity and the
+// enumeration come from ONE handle rather than two lookups of the path.
+//
+// A stat of the path is a second observation, and an unmount landing between the two pairs
+// volumes read from the old mount with the parent filesystem's device. That pairing is worse
+// than no check: volumeRootWatch's populated branch adopts it as the baseline, after which
+// every later empty reading matches and is accepted — the guard inverts into a rubber stamp.
+// An fd cannot disagree with itself about which filesystem it read.
+func TestListVolumeIDsWithDevice_IdentityMatchesTheListedDirectory(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "fred-u1-app-0"), 0o755))
+
+	ids, dev, err := listVolumeIDsWithDevice(root)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"fred-u1-app-0"}, ids)
+	assert.Equal(t, devOf(t, root), dev,
+		"the reported device must be the one backing the directory that was enumerated")
+	assert.NotZero(t, dev)
+}
+
+// TestVolumeRootWatch_ConcurrentListsDoNotInstallAStaleBaseline pins the serialization half.
+// Two readings applied out of order would let the older one install a baseline that was
+// already superseded — the same stale-snapshot-wins hazard the destroy path had to fix,
+// arriving through a different door. Run with -race.
+func TestVolumeRootWatch_ConcurrentListsDoNotInstallAStaleBaseline(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "fred-u1-app-0"), 0o755))
+	want := devOf(t, root)
+
+	var w volumeRootWatch
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids, err := w.list(root)
+			assert.NoError(t, err)
+			assert.Len(t, ids, 1)
+		}()
+	}
+	wg.Wait()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	assert.True(t, w.seen)
+	assert.Equal(t, want, w.dev, "every reading saw the same root, so the baseline must be it")
 }

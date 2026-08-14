@@ -561,8 +561,35 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeI
 		b.logger.Warn(msg, "lease_uuid", orig, "skipped", skipped, "names", len(names))
 		return false
 	}
+	// CONFIRM BEFORE DROPPING THE RECORD. Every destroy above reported success, but a
+	// destroy is an os.RemoveAll that deliberately treats an already-absent path as done —
+	// so "all succeeded" is also what a vanished mount looks like. If the root went away
+	// after the enumeration, each name was removed from a filesystem that is no longer
+	// there, and deleting the record here would drop the only accounting for volumes that
+	// come back with the mount (ENG-687).
+	//
+	// A fresh index is the confirmation: it re-reads the root, which re-applies the
+	// absent-root and identity guards, and re-derives this lease's footprint. Empty and
+	// error-free is the positive fact this record's deletion has always needed; anything
+	// else keeps it for the next sweep, which costs one retry and no data. Deliberately not
+	// the op's cached index — reusing the snapshot we are trying to check would confirm
+	// nothing.
+	confirm := b.newManagedVolumeIndex()
+	switch remaining, verr := confirm.footprint(orig); {
+	case verr != nil:
+		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		logger.Error("reaping: destroys reported success but the footprint could not be re-confirmed; "+
+			"keeping the record (is the volume root still mounted?)", "error", verr)
+		return false
+	case len(remaining) > 0:
+		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		logger.Error("reaping: destroys reported success but volumes are still present; keeping the record",
+			"remaining", len(remaining))
+		return false
+	}
+
 	if derr := b.retentionStore.Delete(orig); derr != nil {
-		b.logger.Warn("reaping: destroy ok but record delete failed; next sweep retries", "lease_uuid", orig, "error", derr)
+		logger.Warn("reaping: destroy ok but record delete failed; next sweep retries", "error", derr)
 		return false
 	}
 	return true

@@ -47,6 +47,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **An unmounted volume root can no longer be mistaken for a node with no volumes**
+  (ENG-687). A plain `umount` leaves the mountpoint directory in place on the parent
+  filesystem, so enumerating it succeeds and returns an empty result with no error — and
+  every consumer reads that as "nothing here". The consequence was not cosmetic: the orphan
+  reconcile treats an absent volume as evidence its retention record is orphaned, so an
+  empty enumeration made *every* active record look orphaned, pruned them after the
+  confirmation streak, and left their volumes with no record naming them — so the next
+  boot's orphan sweep destroyed retained tenant data.
+
+  Two guards, both in the enumeration primitive so every caller inherits them. At startup
+  the configured `volume_filesystem` is now verified against the filesystem actually at
+  `volume_data_path`; previously the probe ran only when the value was left blank, so a
+  provider that pinned it — as the reference deployment does — started happily on a root
+  that was not the filesystem it named. At runtime, the first enumeration that finds volumes
+  records the device backing the root, and a later *empty* result must come from that same
+  device or it is reported as uncertainty rather than emptiness. A root that has never held
+  a volume is unaffected, and a genuine reclaim still reports empty, so the reaper converges
+  normally.
+
 - **A deprovision give-up no longer loses the abandoned footprint when the retention
   store is degraded** (ENG-676). A close that cannot establish volume ownership —
   because the retention store cannot be enumerated — correctly destroys nothing and

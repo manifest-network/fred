@@ -19,6 +19,8 @@ type zfsVolumeManager struct {
 	dataPath      string
 	parentDataset string // cached during Validate()
 	logger        *slog.Logger
+	// rootWatch refuses to report an emptiness it cannot vouch for (ENG-687).
+	rootWatch volumeRootWatch
 }
 
 // resolveParentDataset looks up the ZFS dataset name for the data path.
@@ -138,7 +140,7 @@ func (z *zfsVolumeManager) Destroy(ctx context.Context, id string) error {
 }
 
 func (z *zfsVolumeManager) List() ([]string, error) {
-	return listVolumeIDs(z.dataPath)
+	return z.rootWatch.list(z.dataPath)
 }
 
 // datasetExists reports whether the named child dataset exists under the
