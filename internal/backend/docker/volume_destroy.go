@@ -245,7 +245,7 @@ func (r destroyReport) err() error {
 // the destroy and the claim-establishing write to share a lock, which is a larger change
 // than this file. Note the direction of travel: before the choke point that path had no
 // live-provision check at all, so the same interleaving was a certainty rather than a
-// race. Tracked separately.
+// race. Tracked as ENG-681.
 type volumeOp struct {
 	b        *Backend
 	owner    string
