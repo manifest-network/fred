@@ -936,3 +936,66 @@ func TestStore_Put_AfterCloseReturnsError(t *testing.T) {
 	err := store.Put(testutil.ValidUUID1, []byte("payload"))
 	require.Error(t, err)
 }
+
+// writeRawHash writes an arbitrary value into the payload_hashes bucket of a
+// CLOSED store's database, producing a malformed entry the store's own API
+// cannot create. bbolt is single-writer per file, so the store must be closed.
+func writeRawHash(dbPath, leaseUUID string, value []byte) error {
+	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(payloadHashBucketName).Put([]byte(leaseUUID), value)
+	})
+}
+
+func TestStore_GetHash_MalformedEntryIsAnError(t *testing.T) {
+	// A recorded hash that is present but not a SHA-256 must NOT read as
+	// "absent". Absence sends the caller to the on-chain MetaHash, and for a
+	// payload an update legitimately changed that means deleting a good
+	// manifest and closing a live lease. Corruption of the checksum is a failed
+	// read, so the caller retries instead.
+	for _, tc := range []struct {
+		name  string
+		value []byte
+	}{
+		{"empty", []byte{}},
+		{"too short", []byte{0x01, 0x02, 0x03}},
+		{"too long", make([]byte, HashSize+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "test_payloads.db")
+			store, err := NewStore(StoreConfig{DBPath: dbPath})
+			require.NoError(t, err)
+			require.True(t, store.Store(testutil.ValidUUID1, []byte("payload")))
+			require.NoError(t, store.Close())
+
+			require.NoError(t, writeRawHash(dbPath, testutil.ValidUUID1, tc.value))
+
+			store2, err := NewStore(StoreConfig{DBPath: dbPath})
+			require.NoError(t, err)
+			defer store2.Close()
+
+			got, err := store2.GetHash(testutil.ValidUUID1)
+			require.Error(t, err, "a malformed recorded hash must be an error, not (nil, nil)")
+			assert.Nil(t, got)
+			assert.Contains(t, err.Error(), "want 32")
+		})
+	}
+}
+
+func TestStore_GetHash_ExactSizeIsAccepted(t *testing.T) {
+	// The boundary the malformed check keys on: a real 32-byte hash still reads
+	// back cleanly.
+	store := newTestStore(t)
+	data := []byte("payload")
+	require.True(t, store.Store(testutil.ValidUUID1, data))
+
+	got, err := store.GetHash(testutil.ValidUUID1)
+	require.NoError(t, err)
+	require.Len(t, got, HashSize)
+	want := sha256.Sum256(data)
+	assert.Equal(t, want[:], got)
+}

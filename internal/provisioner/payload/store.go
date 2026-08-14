@@ -309,11 +309,24 @@ func (s *Store) GetHash(leaseUUID string) ([]byte, error) {
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(payloadHashBucketName)
 		data := b.Get(key)
-		if data != nil {
-			// Make a copy since bbolt data is only valid within the transaction
-			hash = make([]byte, len(data))
-			copy(hash, data)
+		if data == nil {
+			// Key absent: no hash was ever recorded for this lease, which is the
+			// legitimate pre-ENG-619 case. Leave hash nil so the caller falls
+			// back to the on-chain MetaHash.
+			return nil
 		}
+		if len(data) != HashSize {
+			// Present but not a SHA-256. Reporting this as "absent" would send
+			// the caller down that same MetaHash fallback — and for a payload an
+			// update legitimately changed, MetaHash no longer matches, so the
+			// caller would delete a good manifest and then close a live lease.
+			// A corrupt checksum is a failed read, not an absence: fail the read
+			// and let the provision attempt retry.
+			return fmt.Errorf("recorded hash is %d bytes, want %d", len(data), HashSize)
+		}
+		// Make a copy since bbolt data is only valid within the transaction
+		hash = make([]byte, len(data))
+		copy(hash, data)
 		return nil
 	})
 

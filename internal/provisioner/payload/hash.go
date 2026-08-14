@@ -8,6 +8,10 @@ import (
 	"fmt"
 )
 
+// HashSize is the length in bytes of a hash produced by ComputeHash. A recorded
+// hash of any other length is corruption, not a shorter hash.
+const HashSize = sha256.Size
+
 // ComputeHash returns the SHA-256 of payload.
 //
 // This is the hash the store records alongside a payload so a later read can be
