@@ -18,7 +18,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   missing `/stats` similarly made every mock backend look like it had no usable
   load signal.
 
+- `fred_docker_backend_volume_destroy_refused_total{site,reason}` counts managed
+  volumes the ownership check declined to destroy, per volume, whichever path asked
+  (ENG-658). A refusal is the guard succeeding, not a fault: `reason="claimed"` means
+  an in-flight restore owns those bytes and the close correctly left them alone, which
+  clears when that restore commits or rolls back — expected at a low rate wherever
+  tenants restore and close concurrently, and worth investigating only if sustained
+  (read it with `restore_finalizer_pending_total`). `reason="claims_unreadable"` is
+  the ticketing signal: the retention store could not be read, so ownership was
+  unprovable and nothing was destroyed. Distinct from
+  `retention_reap_skips_total`, which counts per reap *attempt* — the two are
+  deliberately not summable.
+
 ### Changed
+
+- **Every managed-volume destroy in the docker backend now goes through a single
+  ownership-checked primitive** (ENG-658). Six call sites each derived their own set
+  of volumes to destroy — three from a name prefix, which does not prove ownership:
+  while a restore is in flight, the original lease's data physically wears the new
+  lease's canonical name, so a close, a cap-refusal, an orphan sweep or a reaping
+  tombstone could all reach data belonging to another lease. Each site carried (or
+  forgot) its own guard, and the recurring result was a data-loss ticket per site
+  (ENG-505, ENG-501, ENG-523, ENG-647, ENG-659). Ownership is now resolved once, from
+  the live provision map plus the retention store, and a volume is destroyed only when
+  the lease asking owns the bytes; the orphan sweep is the same rule asked with no
+  lease ("destroy only what nothing claims"). The two hand-written derivations of
+  "which volumes a restore has claimed" are gone, and `Destroy` has been removed from
+  the internal volume-manager interface so reaching it any other way does not compile.
+  No configuration or API change; a refusal is visible as
+  `fred_docker_backend_volume_destroy_refused_total` (above).
 
 - Build: the Go toolchain floor moves to **1.26.6** (`go.mod` directive and the
   release image's builder stage). This clears six standard-library advisories
@@ -43,6 +71,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Removed
 
 ### Fixed
+
+- **A reaping tombstone can no longer destroy a re-provisioned lease's live data**
+  (ENG-658). ENG-659 stopped the retention finalizer from executing a tombstone that
+  named a volume an in-flight *restore* had adopted, but it asked a question scoped to
+  restores only. A second collision was left open: a deprovision give-up writes a
+  tombstone naming `fred-{lease}-*` and deletes the provision, while the lease is still
+  ACTIVE on chain — so the reconciler re-provisions it, a fresh volume appears under
+  exactly the name the tombstone carries, and the next sweep reaped the running lease's
+  data. The finalizer now asks the shared owner table, which knows about live
+  provisions as well as retention records, and refuses; the record is kept so the
+  genuinely abandoned names stay counted and retryable. This is the ENG-505 class
+  reached through the finalizer rather than the orphan reaper.
+
+  **Operators:** this hold is counted as a new
+  `fred_docker_backend_retention_reap_skips_total{reason="owner_claimed"}`, kept
+  distinct from `restore_claimed` because the two resolve differently — a
+  restore-held name clears when that restore rolls back, whereas this one clears only
+  when the owning lease is next closed cleanly, so the record can legitimately sit
+  `reaping` for as long as that lease lives. On a provider carrying such a tombstone
+  from an older build, expect `BackendRetentionVolumeStuckReaping` to start firing
+  after the upgrade; check the reason label before reclaiming anything (the volume is
+  a running tenant's data). The alert's triage annotation in the deployment repo
+  should gain this third case.
 
 - **A reaping tombstone can no longer destroy an in-flight restore's data**
   (ENG-659). The retention finalizer destroyed every volume name a `reaping`

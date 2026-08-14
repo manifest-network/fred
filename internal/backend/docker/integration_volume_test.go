@@ -900,7 +900,7 @@ func TestIntegration_Usage_Btrfs(t *testing.T) {
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
 	require.NoError(t, err)
 	require.True(t, created)
-	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
 
 	const writeMiB = 10
 	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
@@ -930,7 +930,7 @@ func TestIntegration_Usage_XFS(t *testing.T) {
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
 	require.NoError(t, err)
 	require.True(t, created)
-	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
 
 	const writeMiB = 10
 	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
@@ -970,7 +970,7 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
 	require.NoError(t, err)
 	require.True(t, created)
-	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
 
 	// (1) Measurement: a 10 MiB write is accounted, proving the inode is
 	// project-tagged and `report -p` runs against the mount, not the subdir.
@@ -1038,7 +1038,7 @@ func TestIntegration_XFS_InodeQuota_EnforcesEDQUOT(t *testing.T) {
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
 	require.NoError(t, err)
 	require.True(t, created)
-	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
 
 	projID, err := readProjectIDFile(hostPath)
 	require.NoError(t, err)
@@ -1132,7 +1132,7 @@ func TestIntegration_XFS_Destroy_ClearsQuotaEntry(t *testing.T) {
 	}
 
 	for _, name := range names {
-		require.NoError(t, mgr.Destroy(ctx, name))
+		require.NoError(t, volDestroyer(t, mgr).Destroy(ctx, name))
 	}
 
 	// The fix: Destroy zeroes each project's limit after removing its dir, so every
@@ -1460,7 +1460,7 @@ func TestIntegration_Btrfs_SubdirDataPath_Measures(t *testing.T) {
 	hostPath, created, err := mgr.Create(ctx, volName, 100)
 	require.NoError(t, err)
 	require.True(t, created)
-	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
 
 	const writeMiB = 10
 	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
@@ -1486,7 +1486,7 @@ func TestIntegration_Usage_ZFS(t *testing.T) {
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
 	require.NoError(t, err)
 	require.True(t, created)
-	t.Cleanup(func() { _ = mgr.Destroy(ctx, volName) })
+	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
 
 	const writeMiB = 10
 	writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), writeMiB)
@@ -1538,7 +1538,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
 
 		require.NoError(t, mgr.RenameVolume(canon, retained))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
 			OriginalLeaseUUID:   origLease,
@@ -1554,7 +1554,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		const newLease = "int-btrfs-fits-new"
 		newCanon := canonicalVolumeName(newLease, "app", 0)
 		require.NoError(t, mgr.RenameVolume(retained, newCanon))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, newCanon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap lowers the btrfs qgroup limit to 20 MiB.
 		newHostPath, _, err := mgr.Create(ctx, newCanon, mediumMiB)
@@ -1575,7 +1575,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 
 		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
 
 		// 25 MiB — exceeds 20 MiB medium cap; write must succeed under 100 MiB large cap.
 		out, werr := exec.Command("dd", "if=/dev/zero",
@@ -1583,7 +1583,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		require.NoError(t, werr, "writing 25 MiB to 100 MiB-quota volume must succeed; dd output: %s", out)
 
 		require.NoError(t, mgr.RenameVolume(canon, retained))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
 			OriginalLeaseUUID:   origLease,
@@ -1606,7 +1606,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		// Start at medium cap (20 MiB).
 		hostPath, _, err := mgr.Create(ctx, canon, mediumMiB)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
 
 		// Write 5 MiB so the subvolume has some data.
 		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
@@ -1662,7 +1662,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
 
 		require.NoError(t, mgr.RenameVolume(canon, retained))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
 			OriginalLeaseUUID:   origLease,
@@ -1677,7 +1677,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 		const newLease = "int-xfs-fits-new"
 		newCanon := canonicalVolumeName(newLease, "app", 0)
 		require.NoError(t, mgr.RenameVolume(retained, newCanon))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, newCanon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap updates the XFS project bhard limit to 20 MiB.
 		newHostPath, _, err := mgr.Create(ctx, newCanon, mediumMiB)
@@ -1697,14 +1697,14 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
 
 		out, werr := exec.Command("dd", "if=/dev/zero",
 			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
 		require.NoError(t, werr, "25 MiB must fit 100 MiB XFS quota; dd output: %s", out)
 
 		require.NoError(t, mgr.RenameVolume(canon, retained))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
 			OriginalLeaseUUID:   origLease,
@@ -1727,7 +1727,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 		// Start at medium cap (20 MiB).
 		hostPath, _, err := mgr.Create(ctx, canon, mediumMiB)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
 
 		// Write 5 MiB so the project has some data.
 		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
@@ -1788,7 +1788,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 5)
 
 		require.NoError(t, mgr.RenameVolume(canon, retained))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
 			OriginalLeaseUUID:   origLease,
@@ -1803,7 +1803,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		const newLease = "int-zfs-fits-new"
 		newCanon := canonicalVolumeName(newLease, "app", 0)
 		require.NoError(t, mgr.RenameVolume(retained, newCanon))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, newCanon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap issues `zfs set refquota=20M <dataset>`.
 		// Since referenced (~5 MiB) < refquota (20 MiB) the set must NOT fail with
@@ -1836,7 +1836,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		// Create at medium cap — hits the fresh-create path (no legacy quota).
 		_, _, err := mgr.Create(ctx, canon, mediumMiB)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
 
 		// Resolve the ZFS dataset name so we can inspect and set properties directly.
 		dsOut, dsErr := exec.Command("zfs", "list", "-H", "-o", "name", filepath.Join(mountPath, canon)).CombinedOutput()
@@ -1873,14 +1873,14 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 
 		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, canon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
 
 		// 25 MiB of incompressible data so `referenced` actually reflects it
 		// (ZFS compression=on default would elide zero-filled data as holes).
 		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 25)
 
 		require.NoError(t, mgr.RenameVolume(canon, retained))
-		t.Cleanup(func() { _ = mgr.Destroy(ctx, retained) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
 			OriginalLeaseUUID:   origLease,

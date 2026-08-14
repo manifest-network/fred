@@ -253,11 +253,42 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				scope, refuse := b.shouldRefuseRetention("incoming", "agg", "", incoming, budget)
 				require.True(t, refuse)
 				require.Equal(t, refuseScopeTenant, scope)
-				errs := b.destroyOnRefuseToRetain(context.Background(), []string{"fred-incoming-app-0"},
-					"incoming", "agg", "", scope, slog.Default())
-				require.Empty(t, errs)
+				rep := b.destroyOnRefuseToRetain(context.Background(), b.volumeOp("incoming", slog.Default()),
+					[]string{"fred-incoming-app-0"}, "incoming", "agg", "", scope, slog.Default())
+				require.NoError(t, rep.err())
+				require.False(t, rep.leftOnDisk())
 				// Both held records survive; the projection is unchanged at 1024 MB.
 				require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
+			},
+		},
+		{
+			// The refusal branch of the destroy choke point, registered here because
+			// this table's contract is that every destroy/release site appears in it
+			// (ENG-658). It is otherwise unreachable from the close path — the names
+			// destroyOnRefuseToRetain receives came from op.partition against the same
+			// cached table — so without this case the branch is live code no test drives.
+			name: "scoped disk refusal handed a foreign volume",
+			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
+				b.volumes = newVols()
+				putActivePart(t, rs, "held-2", "agg", "", time.Now().Add(-time.Hour))
+				// A restore of held-1 is in flight into the incoming lease, so
+				// fred-incoming-app-0 is held-1's data wearing the incoming lease's name.
+				require.NoError(t, rs.Put(shared.RetentionEntry{
+					OriginalLeaseUUID:   "held-1",
+					Tenant:              "agg",
+					NewLeaseUUID:        "incoming",
+					Status:              shared.RetentionStatusRestoring,
+					Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+					RetainedVolumeNames: []string{retainedName(canonicalVolumeName("held-1", "app", 0))},
+					CreatedAt:           time.Now().Add(-2 * time.Hour),
+				}))
+				b.refreshRetentionAccounting()
+
+				rep := b.destroyOnRefuseToRetain(context.Background(), b.volumeOp("incoming", slog.Default()),
+					[]string{"fred-incoming-app-0"}, "incoming", "agg", "", refuseScopeTenant, slog.Default())
+				require.NoError(t, rep.err(), "a refusal is not an error — another lease owns those bytes")
+				require.Equal(t, []string{"fred-incoming-app-0"}, rep.Claimed)
+				require.True(t, rep.leftOnDisk(), "so the caller must keep the footprint counted")
 			},
 		},
 	}

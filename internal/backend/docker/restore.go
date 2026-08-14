@@ -25,7 +25,9 @@ import (
 const retainedVolumePrefix = "fred-retained-"
 
 // canonicalVolumeName is the live volume name a provision/restore mounts.
-// MUST match setupVolBinds / deprovision / cleanupOrphanedVolumes exactly.
+// Every managed volume name in the backend is built here — setupVolBinds, the close
+// path, the legacy migration, and the owner table (volume_destroy.go) all call it rather
+// than repeating the format string, which is how the orphan reaper's copy came to drift.
 func canonicalVolumeName(leaseUUID, serviceName string, idx int) string {
 	return fmt.Sprintf("fred-%s-%s-%d", leaseUUID, serviceName, idx)
 }
@@ -398,72 +400,80 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 // counted and the next sweep retries. Idempotent: already-gone volume names no-op, and a
 // Delete failure leaves the record reaping for a later retry (no under-count). (ENG-376)
 //
-// OWNERSHIP RE-CHECK (ENG-659). A tombstone is a NAME-KEYED scheduled destroy: it carries
-// strings, not proof of ownership, and Destroy is an irreversible RemoveAll. While a
-// restore of lease A into lease B is in flight, A's retained data lives under B's
+// OWNERSHIP RE-CHECK (ENG-659, ENG-658). A tombstone is a NAME-KEYED scheduled destroy: it
+// carries strings, not proof of ownership, and Destroy is an irreversible RemoveAll. While
+// a restore of lease A into lease B is in flight, A's retained data lives under B's
 // canonical names (fred-{B}-{svc}-{i}) — indistinguishable from B's own volumes by prefix
 // — so a tombstone keyed at B can name A's data. recordGiveUpLeak already refuses to
 // WRITE such a name (deprovision.go, ENG-647), but that is a write-time guard on one
 // producer in one binary: tombstones are persisted in bbolt and outlive the process, so a
 // provider upgrading from a pre-ENG-647 build carries records written before that guard
-// existed and nothing rewrites them. Re-checking here is what makes the invariant hold
-// for records this binary never wrote, and it is the single choke point all four callers
-// pass through (reconcileRetentions' boot arm, evictOldest, reapExpiredRetentions,
-// retryReapingRecords), so no future caller can route around it.
+// existed and nothing rewrites them. Re-checking at destroy time is what makes the
+// invariant hold for records this binary never wrote.
 //
-// Fail-safe on an unreadable claim set: destroy NOTHING this pass, mirroring
+// The check itself is not local any more — every managed-volume destroy in this backend
+// goes through volumeOp.destroy (volume_destroy.go), which resolves ownership from the
+// live provision map plus the retention store. This function's job is to translate that
+// primitive's per-name verdicts into the record's lifecycle, which is the part only the
+// finalizer knows: refused means keep the record, failed means keep it and count a leak,
+// all-gone means Delete.
+//
+// Fail-safe on an unprovable claim set: destroy NOTHING this pass, mirroring
 // cleanupOrphanedVolumes' "skip orphan destruction this run" (recover.go) and
 // recordGiveUpLeak's "record no tombstone". We cannot tell this record's own leak from
 // another lease's adopted data, and only one of those two mistakes is reversible. Unlike
 // cleanupOrphanedVolumes, waiting costs nothing: the record IS the retry vehicle, so the
 // next sweep re-attempts without a reboot.
 func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string, names []string) bool {
-	// A claim key is always retainedToNewCanonical's output, fred-{orig}-{svc}-{i}, so a
-	// list carrying no fred-{orig}-* name cannot match one and the store read is pure
-	// cost. That is the ordinary case — an evicted/expired record carries only the
-	// fred-retained-{orig}-* names PutActiveMerged wrote — which keeps the guard off the
-	// hot reap path entirely, including evictOldest's up-to-32 records inside a close.
-	// Only give-up tombstones (which alone derive canonical names) pay the List().
-	canonicalPrefix := leaseVolumePrefix(orig)
-	var claimed map[string]bool
-	if slices.ContainsFunc(names, func(n string) bool { return strings.HasPrefix(n, canonicalPrefix) }) {
-		var claimErr error
-		if claimed, claimErr = b.restoringClaimedVolumes(orig); claimErr != nil {
-			retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
-			b.logger.Error("reaping: cannot read retention records to identify restore-claimed volumes; destroying nothing this pass (record stays reaping for retry)",
-				"lease_uuid", orig, "error", claimErr)
-			return false
-		}
-	}
+	// owner "" — a tombstone is a scheduled destroy, not an assertion of ownership, so
+	// it is entitled to exactly the names NOTHING claims. That is stricter than the
+	// per-record check it replaces in one useful way: it also refuses a name a LIVE
+	// provision holds, which is reachable when a tombstoned lease is later
+	// re-provisioned (chain-ACTIVE, no provision → the reconciler re-provisions it, and
+	// the next sweep would otherwise reap the fresh volume out from under it).
+	rep := b.volumeOp("", b.logger.With("lease_uuid", orig)).destroy(ctx, destroySiteReaping, names...)
 
-	destroyFailed := false
-	skipped := 0
-	for _, name := range names {
-		if claimed[name] {
+	if len(rep.Unproven) > 0 {
+		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		b.logger.Error("reaping: ownership unprovable; destroyed nothing this pass (record stays reaping for retry)",
+			"lease_uuid", orig, "error", rep.err())
+		return false
+	}
+	// Count the refusal by HOW it resolves, not merely that it happened — the deployed
+	// stuck-reaping alert triages on this label, and the two paths need different
+	// operator action. Still one increment per reason per attempt (never per volume), so
+	// the series stays summable with the rest of reapSkipReasons.
+	var restoreHeld, ownerHeld bool
+	for _, name := range rep.Claimed {
+		switch rep.ClaimedBy[name].kind {
+		case claimAdopted, claimRestoreSrc:
 			// An in-flight restore adopted another lease's retained data under this name.
 			// Destroying it is unrecoverable loss and kills that lease's restore.
 			// reconcileRestoring re-quarantines it back to fred-retained-* once its
-			// rollback can complete, after which this name is absent and the destroy
-			// below is the idempotent no-op that finally drops the record.
-			skipped++
-			b.logger.Warn("reaping: volume is claimed by an in-flight restore record; not destroying it",
-				"lease_uuid", orig, "volume", name)
-			continue
-		}
-		if derr := b.volumes.Destroy(ctx, name); derr != nil {
-			b.logger.Error("reaping: destroy volume", "volume", name, "error", derr)
-			destroyFailed = true
+			// rollback can complete, after which the name is absent and the destroy is
+			// the idempotent no-op that finally drops the record.
+			restoreHeld = true
+		default:
+			// A live provision (or another lease's retained record) holds it: the
+			// tombstone outlived its lease and the reconciler re-provisioned it. Nothing
+			// to unblock — this clears when that lease is next closed cleanly, and the
+			// record is correctly kept in the meantime.
+			ownerHeld = true
 		}
 	}
-	if skipped > 0 {
+	if restoreHeld {
 		retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed).Inc()
 	}
-	if destroyFailed {
+	if ownerHeld {
+		retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed).Inc()
+	}
+	skipped := len(rep.Claimed)
+	if len(rep.Errs) > 0 {
 		// Checked before the skip arm so a pass that both skipped and failed counts once,
 		// as the leak — the more actionable of the two.
 		retentionLeakedTotal.Inc()
 		b.logger.Warn("reaping: volume(s) still on disk; record left reaping for retry (footprint stays counted)",
-			"lease_uuid", orig)
+			"lease_uuid", orig, "error", rep.err())
 		return false
 	}
 	if skipped > 0 {

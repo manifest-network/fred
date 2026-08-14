@@ -136,7 +136,7 @@ func seedRetainedForRestore(t *testing.T, b *Backend, mgr volumeManager, orig, o
 	require.NoError(t, err)
 	writeNonSparse(t, filepath.Join(hostPath, "data.bin"), dataMiB)
 	require.NoError(t, mgr.RenameVolume(canon, retainedName(canon)))
-	t.Cleanup(func() { _ = mgr.Destroy(ctx, retainedName(canon)) })
+	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retainedName(canon)) })
 	require.NoError(t, b.retentionStore.Put(shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		Tenant:              "tenant-a",
@@ -176,7 +176,7 @@ func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 		const orig, newLease = "int-rq-demote", "int-rq-demote-new"
 		seedRetainedForRestore(t, b, mgr, orig, "test-large", 100, 5)
 		newCanon := canonicalVolumeName(newLease, manifest.DefaultServiceName, 0)
-		t.Cleanup(func() { _ = mgr.Destroy(context.Background(), newCanon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(context.Background(), newCanon) })
 
 		req := restoreRequest(newLease, orig, callbackURL)
 		req.Items = []backend.LeaseItem{{SKU: "test-medium", ServiceName: manifest.DefaultServiceName, Quantity: 1}}
@@ -217,7 +217,7 @@ func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 		require.NoError(t, os.Remove(filepath.Join(retainedDir, "big.bin"))) // free blocks back to ~5 MiB
 
 		newCanon := canonicalVolumeName(newLease, manifest.DefaultServiceName, 0)
-		t.Cleanup(func() { _ = mgr.Destroy(context.Background(), newCanon) })
+		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(context.Background(), newCanon) })
 
 		req := restoreRequest(newLease, orig, callbackURL)
 		req.Items = []backend.LeaseItem{{SKU: "test-large", ServiceName: manifest.DefaultServiceName, Quantity: 1}}

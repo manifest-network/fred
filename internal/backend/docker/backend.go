@@ -541,6 +541,17 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		_ = retentionStore.Close()
 		return nil, fmt.Errorf("failed to create volume manager: %w", err)
 	}
+	// Destroy is not on the volumeManager interface (see its doc), so volumeOp obtains
+	// it by assertion. Check it HERE, once, so a manager that cannot destroy fails the
+	// daemon at startup in every environment rather than surfacing as a refused reap
+	// months later, on the one teardown that needed to work.
+	if err := assertVolumeDestroyer(volumes); err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		return nil, err
+	}
 
 	composeSvc, err := newComposeService(cfg.DockerHost)
 	if err != nil {

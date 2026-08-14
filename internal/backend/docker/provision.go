@@ -589,7 +589,7 @@ func (b *Backend) setupVolBinds(
 			needsWritableVolume := len(imgSetup.WritablePaths) > 0
 
 			if needsStatefulVolume || needsWritableVolume {
-				volumeID := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, svcName, i)
+				volumeID := canonicalVolumeName(leaseUUID, svcName, i)
 				sizeMB := profile.DiskMB
 				if sizeMB <= 0 {
 					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
@@ -758,10 +758,16 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 				teardownOpProvisionCleanup, logger); tdErr != nil {
 				logger.Warn("failed to cleanup containers after provision error", "error", tdErr)
 			}
-			for _, volumeID := range createdVolumeIDs {
-				if volErr := b.volumes.Destroy(cleanupCtx, volumeID); volErr != nil {
-					logger.Warn("failed to cleanup volume after error", "volume_id", volumeID, "error", volErr)
-				}
+			// createdVolumeIDs holds only the volumes THIS call brought into existence
+			// (Create reports created=false for a pre-existing directory), so it cannot
+			// name an adopted one — but the ownership check is not optional here either,
+			// because "cannot name" is a property of a caller, and this site had no
+			// check of its own at all (ENG-658). Best-effort as before: the provision has
+			// already failed and its pool allocation is released above, so a refusal or a
+			// failure is a leak to alert on, which cleanupOrphanedVolumes then collects.
+			if rep := b.volumeOp(req.LeaseUUID, logger).destroy(cleanupCtx, destroySiteProvisionCleanup, createdVolumeIDs...); rep.leftOnDisk() {
+				logger.Warn("failed to cleanup volume(s) after error",
+					"destroyed", len(rep.Destroyed), "refused", rep.refused(), "error", rep.err())
 			}
 			callbackErrRet = callbackErr
 			// Reason is authored at the failure site (failReason); ENG-508.

@@ -703,62 +703,58 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 		return nil
 	}
 
-	// Build set of expected volume IDs from recovered provisions. Volume
-	// IDs are always service-aware now (fred-{lease}-{service}-{idx});
-	// Task 9's recover-time migration renames any pre-existing legacy
-	// fred-{lease}-{idx} volumes onto this convention before the main
-	// loop sees them.
-	expected := make(map[string]bool)
-	b.provisionsMu.RLock()
-	for leaseUUID, prov := range b.provisions {
-		for _, item := range prov.Items {
-			for i := range item.Quantity {
-				expected[fmt.Sprintf("fred-%s-%s-%d", leaseUUID, item.ServiceName, i)] = true
+	// An orphan is a volume NOTHING claims — that is the whole definition, and the
+	// owner table (volume_destroy.go) is what answers it. This function used to build
+	// its own parallel version of that table: live-provision canonicals plus, for every
+	// retention record, the canonicals its renames may have left behind. Both halves
+	// are now in one place, which matters because the second half was written months
+	// after the close path's copy and the two had to agree forever (ENG-658).
+	//
+	// The protection it encoded is unchanged and still load-bearing: reconcileRetentions
+	// runs immediately before this in Start and re-quarantines crash-stranded canonical
+	// volumes back into the fred-retained- namespace, but a rename that FAILED (a real
+	// error, not a benign no-op) leaves the volume canonical-named and in no live
+	// provision — so an unclaimed-means-destroy loop would reap it. The table claims it,
+	// via the record, exactly as the expected set did.
+	//
+	// Resolve up front rather than per volume: a store read error must skip the whole
+	// run (we cannot tell a leak from a retained canonical we failed to protect), and
+	// this way the run costs one read no matter how many volumes are on disk.
+	op := b.volumeOp("", b.logger)
+	table, err := op.claims()
+	if err != nil {
+		// Count it, and at the same per-volume granularity every other site uses: this
+		// is the documented ticketing signal, and the sweep bails before reaching
+		// op.destroy, so nothing else would report it. The count is the volumes whose
+		// fate this run could not decide — every non-retained name on disk.
+		undecided := 0
+		for _, id := range volumeIDs {
+			if !isRetainedVolume(id) {
+				undecided++
 			}
 		}
-	}
-	b.provisionsMu.RUnlock()
-
-	// Protect retention-record canonicals from the reaper. reconcileRetentions
-	// runs immediately before this in Start and re-quarantines crash-stranded
-	// canonical volumes back to the fred-retained- namespace — but if any of
-	// those renames FAILED (real Docker error, not a benign no-op), the volume
-	// is still canonical-named, not fred-retained-, and not in any live
-	// provision's expected set, so the loop below would destroy it = permanent
-	// data loss. Add those canonicals (active arm: the not-yet-renamed canonical;
-	// restoring arm: the adopted/in-flight new-lease canonical) to the expected
-	// set so an incomplete rename can never be reaped.
-	if b.retentionStore != nil {
-		if recs, rerr := b.retentionStore.List(); rerr != nil {
-			// FAIL SAFE: we cannot read the retention store, so we cannot build the
-			// protected-canonical set. Proceeding to the destroy loop could reap a
-			// retained canonical we couldn't protect = permanent data loss. Skip
-			// orphan destruction entirely this run; the next boot retries.
-			b.logger.Error("cleanupOrphanedVolumes: retention read failed; skipping orphan destruction this run (fail-safe)", "error", rerr)
-			return nil
-		} else {
-			for _, e := range recs {
-				switch e.Status {
-				case shared.RetentionStatusActive:
-					for _, retained := range e.RetainedVolumeNames {
-						expected[canonicalFromRetained(retained)] = true // protect a not-yet-renamed canonical
-					}
-				case shared.RetentionStatusRestoring:
-					for _, retained := range e.RetainedVolumeNames {
-						expected[retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)] = true // adopted/in-flight new-lease canonical
-						expected[canonicalFromRetained(retained)] = true                                       // original-lease canonical (un-retained volume from a partial soft-delete)
-					}
-				}
-			}
-		}
+		volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable).Add(float64(undecided))
+		b.logger.Error("cleanupOrphanedVolumes: ownership unresolvable; skipping orphan destruction this run (fail-safe)",
+			"undecided_volumes", undecided, "error", err)
+		return nil
 	}
 
-	var orphanCount, failCount int
+	candidates := make([]string, 0, len(volumeIDs))
 	for _, id := range volumeIDs {
 		if isRetainedVolume(id) {
+			// A name property, not a claim: the retained namespace is where a closed
+			// lease's data deliberately lives, and the retention sweep owns reaping it.
 			continue
 		}
-		if expected[id] {
+		if _, unclaimed := table.mayDestroy(id, ""); !unclaimed {
+			// Claimed by a live provision or a retention record — i.e. every healthy
+			// lease's volume, on every boot. Filtered QUIETLY and before the release
+			// probe: this is the ordinary case, not a refusal, and neither a log line,
+			// a counter, nor a release-store read per live volume is warranted. That is
+			// why this site emits no reason="claimed" series; the docs say so rather
+			// than implying otherwise. The destroy below re-checks against the same
+			// table regardless, so the guard does not depend on this filter being
+			// right — only the noise does.
 			continue
 		}
 		if b.leaseHasActiveRelease(id) {
@@ -768,19 +764,24 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 			// (e.g. an operator `docker prune`). Reaping it would silently destroy
 			// retained tenant data (ENG-505). Over-keeping a stale volume is the safe
 			// direction here; a genuine leak has no release.
+			//
+			// Deliberately NOT folded into the owner table: this is a per-name RELEASE
+			// -store read, not a claim, and a record's absence there is meaningful. Fold
+			// it in and a give-up tombstone whose purgeReleaseHistory failed would become
+			// permanently unreapable instead of self-healing.
 			b.logger.Warn("cleanupOrphanedVolumes: lease still has an active release; not reaping its volume", "volume_id", id)
 			continue
 		}
-		b.logger.Info("destroying orphaned volume", "volume_id", id)
-		if err := b.volumes.Destroy(ctx, id); err != nil {
-			b.logger.Error("failed to destroy orphaned volume", "volume_id", id, "error", err)
-			failCount++
-		} else {
-			orphanCount++
-		}
+		candidates = append(candidates, id)
 	}
-	if orphanCount > 0 || failCount > 0 {
-		b.logger.Info("orphaned volume cleanup complete", "destroyed", orphanCount, "failed", failCount)
+
+	rep := op.destroy(ctx, destroySiteOrphanGC, candidates...)
+	for _, id := range rep.Destroyed {
+		b.logger.Info("destroyed orphaned volume", "volume_id", id)
+	}
+	if len(rep.Destroyed) > 0 || len(rep.Errs) > 0 || rep.refused() > 0 {
+		b.logger.Info("orphaned volume cleanup complete",
+			"destroyed", len(rep.Destroyed), "failed", len(rep.Errs), "claimed", len(rep.Claimed))
 	}
 	return nil
 }

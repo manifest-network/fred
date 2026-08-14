@@ -313,3 +313,18 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 
 	return b, state, fakeVol, fakeRel
 }
+
+// volDestroyer reaches the destroy capability that volumeManager deliberately withholds,
+// which production code obtains only inside volumeOp (volume_destroy.go, ENG-658).
+//
+// Integration tests drive a real filesystem manager directly to build and tear down
+// fixtures — precisely the case the choke point does not serve, since there is no lease
+// asserting ownership and no retention record to resolve one from. Narrowing here rather
+// than widening volumeManager keeps the production seam intact: b.volumes still cannot
+// reach Destroy in any non-test file.
+func volDestroyer(tb testing.TB, vm volumeManager) volumeDestroyer {
+	tb.Helper()
+	d, ok := vm.(volumeDestroyer)
+	require.True(tb, ok, "volume manager %T cannot destroy; fixture teardown needs it", vm)
+	return d
+}
