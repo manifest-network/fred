@@ -246,6 +246,12 @@ func (b *Backend) computeReapingDiskMB() (mb int64, count int, err error) {
 // (ENOSPC risk). On a store error the lock is still held across the return so
 // the last valid value stands without a concurrent stale Set overwriting it.
 //
+// Keeping the last value is the right call — a stale-but-valid projection beats a
+// zeroed one, which would over-admit instantly — but on its own it is invisible: all
+// five gauges go on exporting plausible numbers for as long as the store is broken.
+// Hence retentionAccountingRefreshFailedTotal on both error arms, which is the only
+// signal that says "the gauges you are reading are stale" (ENG-680).
+//
 // NOTE: breachRetentionCaps reads the store directly (a read for an admission
 // decision) and must NOT take this mutex — only the writer does.
 func (b *Backend) refreshRetentionAccounting() {
@@ -253,11 +259,13 @@ func (b *Backend) refreshRetentionAccounting() {
 	defer b.retentionAccountingMu.Unlock()
 	activeMB, activeCount, partitionCount, err := b.computeRetainedDiskMB()
 	if err != nil {
+		retentionAccountingRefreshFailedTotal.Inc()
 		b.logger.Warn("failed to recompute retained disk accounting; keeping last value", "error", err)
 		return
 	}
 	reapingMB, reapingCount, err := b.computeReapingDiskMB()
 	if err != nil {
+		retentionAccountingRefreshFailedTotal.Inc()
 		b.logger.Warn("failed to recompute reaping disk accounting; keeping last value", "error", err)
 		return
 	}

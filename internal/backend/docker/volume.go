@@ -206,12 +206,27 @@ const volumePrefix = "fred-"
 // listVolumeIDs returns the names of all managed volume subdirectories in dataPath.
 // Only directories with the "fred-" prefix are returned — other directories
 // (e.g., lost+found, .snapshots) are ignored to avoid accidental deletion.
+//
+// AN ABSENT ROOT IS AN ERROR, NOT AN EMPTY NODE. This used to map ENOENT to
+// (nil, nil), which collapsed two states a caller must distinguish — "the volume root
+// holds no volumes" and "the volume root is gone" — into one indistinguishable value.
+// Every consumer of that value then had to reconstruct the difference with a separate
+// stat, and a separate stat is a separate point in time: the root could vanish between
+// the probe and the read, and the caller would see a confident, empty, error-free answer.
+// The reaping finalizer acts on exactly that answer by DELETING the record that accounts
+// for the bytes, so the ambiguity was one unmount away from silent data-accounting loss.
+//
+// Returning the error keeps the whole question inside the single syscall that can answer
+// it, which is what makes the race impossible rather than merely unlikely — there is no
+// second observation to disagree with the first. Callers that must tolerate an
+// unconfigured root already do: volume_data_path == "" yields the noopVolumeManager,
+// whose List is a different implementation entirely. A CONFIGURED root cannot legitimately
+// be absent at runtime — newVolumeManager statfs's it (detectFilesystem) and, for xfs,
+// resolves its mount point, so construction fails before Start if it is missing — which
+// makes ENOENT here unambiguously "it disappeared underneath us".
 func listVolumeIDs(dataPath string) ([]string, error) {
 	entries, err := os.ReadDir(dataPath)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
 		return nil, fmt.Errorf("read volume data directory %s: %w", dataPath, err)
 	}
 	var ids []string

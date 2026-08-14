@@ -209,9 +209,22 @@ func TestListVolumeIDs(t *testing.T) {
 		assert.ElementsMatch(t, []string{"fred-abc-0", "fred-abc-1"}, ids)
 	})
 
-	t.Run("nonexistent path returns nil", func(t *testing.T) {
+	// Previously "nonexistent path returns nil": ENOENT was mapped to (nil, nil).
+	//
+	// That collapsed two states a caller must tell apart — "this root holds no volumes" and
+	// "this root is gone" — into one value, so anyone needing the difference had to stat
+	// separately, and a separate stat is a separate point in time. The reaping finalizer
+	// DELETES a record when it sees an empty footprint, so an unmount landing between the
+	// probe and the read would have dropped the record accounting for bytes that come back
+	// with the mount. Keeping the question inside the one syscall that can answer it makes
+	// that race impossible rather than merely unlikely (ENG-676).
+	//
+	// A configured root cannot legitimately be absent at runtime: newVolumeManager statfs's
+	// it at construction (and resolves the xfs mount point), so startup fails first. An
+	// unconfigured root yields the noopVolumeManager, whose List never reaches here.
+	t.Run("nonexistent path is an error, not an empty node", func(t *testing.T) {
 		ids, err := listVolumeIDs("/nonexistent/path")
-		require.NoError(t, err)
+		require.Error(t, err)
 		assert.Nil(t, ids)
 	})
 

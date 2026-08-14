@@ -545,8 +545,12 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// The leaked volumes require manual cleanup by the operator.
 			//
 			// Persist the abandoned footprint as a reaping tombstone BEFORE releasing
-			// live, so the bytes hand off live→reaping with no uncounted gap. (ENG-376)
-			b.recordGiveUpLeak(op, leaseUUID, tenant, providerUUID, items, logger)
+			// live, so the bytes hand off live→reaping with no uncounted gap (ENG-376).
+			// The write is unconditional now: the record states the footprint's SIZE and
+			// authorizes no destroy, so it no longer depends on an ownership table that a
+			// degraded store cannot resolve — which is what used to make this hand-off
+			// silently drop the accounting altogether (ENG-676).
+			b.recordGiveUpLeak(leaseUUID, tenant, providerUUID, items, logger)
 			// Release live UNCONDITIONALLY here: the provision is about to be
 			// deleted and `return nil`, so no retry can ever run to free it.
 			// On the retain path the flag is still false, so without this the
@@ -659,92 +663,66 @@ func (b *Backend) purgeReleaseHistory(leaseUUID string, logger *slog.Logger) {
 	}
 }
 
-// recordGiveUpLeak handles a deprovision give-up's abandoned on-disk footprint. It
-// always increments retentionLeakedTotal (the observable backstop). When a retention
-// store is configured it also writes a reaping tombstone for the lease's still-on-disk
-// volumes (ground-truthed from disk; canonical names derived from items on List error)
-// so the footprint keeps counting in the admission projection and the retention sweep
-// auto-retries the destroy — turning a permanent manual-only leak into a self-healing
-// one. PutReaping is idempotent and refuses to clobber an active/restoring record, so a
+// recordGiveUpLeak handles a deprovision give-up's abandoned on-disk footprint. When a
+// retention store is configured it writes a reaping tombstone recording the SIZE of that
+// footprint, so it keeps counting in the admission projection and the retention sweep
+// auto-retries the destroy — turning a permanent manual-only leak into a self-healing one.
+// PutReaping is idempotent and refuses to clobber an active/restoring record, so a
 // footprint an existing record already counts is left untouched. (ENG-376)
+//
+// It records a FACT, never a plan (ENG-676). The give-up releases the lease's pool
+// allocation and deletes its provision, so this record is the only thing left counting the
+// abandoned bytes — and it must therefore be writable whether or not ownership can be
+// resolved right now. The volumes to destroy are re-derived by the finalizer from disk on
+// every sweep, so nothing here has to be computed and nothing can fail to be computed.
 //
 // Give-up tombstones deliberately carry Partition "" (the default bucket): they are
 // reaping-from-birth — never eviction-ordered, never restorable, never counted by any
 // L2 term — and this is the maximally-degraded path (degraded ⇒ default bucket).
-func (b *Backend) recordGiveUpLeak(op *volumeOp, leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
+func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
 	retentionLeakedTotal.Inc()
 	if b.retentionStore == nil {
 		return // no projection to correct; metric + the give-up log are the record
 	}
-	// A tombstone is a SCHEDULED DESTROY: destroyReapingVolumes RemoveAll's every name
-	// it carries. Volumes an in-flight restore adopted into this lease's namespace are
-	// named fred-{thisLease}-{svc}-{idx} — indistinguishable by prefix from our own —
-	// so recording them here would hand another lease's retained data to the reaper and
-	// kill its restore. The close's volume branches already refuse to destroy them; a
-	// give-up must not undo that on a timer (ENG-647).
+	// Items is the whole point of this record and the only field the projection reads:
+	// computeReapingDiskMB sums leaseDiskMB(e.Items) over reaping records and
+	// refreshRetentionAccounting folds that into SetRetainedDisk. It is the FULL lease item
+	// set, not a subset — the give-up abandons the whole footprint.
 	//
-	// Asked through the same op the close used, so the write-time filter and the
-	// destroy-time re-check (destroyReapingVolumes, ENG-659) share one definition of
-	// ownership instead of two that must agree.
+	// Note what this does and does not buy while the store is DEGRADED. The projection is
+	// recomputed by scanning the store, so a store that cannot be enumerated cannot absorb
+	// this record either: the refresh below keeps its last value, the caller releases the
+	// live reservation, and the bytes are counted by neither pool term until the store is
+	// repaired. What the durable record changes is that the repair is sufficient — the next
+	// readable refresh picks it up with no operator action — where before there was nothing
+	// to recount from and the loss was permanent. (Releasing live across a failed refresh is
+	// a property of every live→retained hand-off, including the ordinary retain-path close,
+	// not something this path invents; tracked separately.)
 	//
-	// If ownership is unprovable we record NOTHING rather than risk naming data that is
-	// not ours. That under-counts a real leak, but retentionLeakedTotal (incremented
-	// above) plus the give-up log are the record, and cleanup gates fail toward keeping
-	// data. (The footprint that goes uncounted here is ENG-676, tracked separately.)
-	var leaked []string
-	if all, err := b.volumes.List(); err == nil {
-		cprefix := leaseVolumePrefix(leaseUUID) // fred-{lease}-
-		rprefix := retainedName(cprefix)        // fred-retained-{lease}-
-		candidates := make([]string, 0, len(all))
-		for _, id := range all {
-			if strings.HasPrefix(id, cprefix) || strings.HasPrefix(id, rprefix) {
-				candidates = append(candidates, id)
-			}
-		}
-		mine, _, claimErr := op.partition(candidates)
-		if claimErr != nil {
-			logger.Error("give-up leak: cannot establish volume ownership; recording no tombstone rather than scheduling a destroy that might name another lease's data",
-				"error", claimErr)
-			return
-		}
-		leaked = mine
-	} else {
-		logger.Warn("give-up leak: volume list failed; deriving canonical + retained names from items", "error", err)
-		derived := make([]string, 0, len(items))
-		for _, item := range items {
-			for i := range item.Quantity {
-				derived = append(derived, canonicalVolumeName(leaseUUID, item.ServiceName, i))
-			}
-		}
-		mine, _, claimErr := op.partition(derived)
-		if claimErr != nil {
-			logger.Error("give-up leak: cannot establish volume ownership; recording no tombstone rather than scheduling a destroy that might name another lease's data",
-				"error", claimErr)
-			return
-		}
-		// Record BOTH namespaces. A retain-path give-up may have already renamed some
-		// volumes into fred-retained-* before failing, so the on-disk name is unknown
-		// when List() is unavailable. destroyReapingVolumes treats a missing volume as an
-		// idempotent no-op, so recording both guarantees whichever exists is destroyed
-		// before the tombstone is deleted. Without the retained name, the sweep would
-		// "succeed" against the non-existent canonical name and drop the tombstone while
-		// the fred-retained-* volume persists untracked — reintroducing the exact
-		// under-count/leak this path fixes.
-		for _, canonical := range mine {
-			leaked = append(leaked, canonical, retainedName(canonical))
-		}
-	}
-	if len(leaked) == 0 {
-		return // nothing on disk to account for
-	}
+	// RetainedVolumeNames is deliberately EMPTY, and that is the fix (ENG-676). This used
+	// to enumerate the lease's volumes and partition them through the ownership table so
+	// the record could double as a destroy list, which meant that when the table could not
+	// be read — a corrupt page, an EIO, the very condition a give-up is most likely to be
+	// reached under — it recorded NOTHING at all and returned. The accounting died with the
+	// plan: bytes on disk, pool key released, provision deleted, no record, admission
+	// over-committing against real disk permanently. Separating the two removes the failure
+	// mode rather than handling it. The finalizer re-derives the footprint from disk on
+	// every pass (destroyReapingVolumes), so there is nothing to compute here and nothing
+	// that can fail to be computed.
+	//
+	// PutReaping is idempotent and refuses to clobber an active/restoring record, so a
+	// footprint an existing record already counts is left untouched. (ENG-376)
+	//
+	// If PutReaping itself fails, the store is unwritable and there is no durable place to
+	// put the fact — retentionLeakedTotal above plus the MANUAL CLEANUP log are then the
+	// only record, which is the one residual this design accepts.
 	rec := shared.RetentionEntry{
-		OriginalLeaseUUID:   leaseUUID,
-		Tenant:              tenant,
-		ProviderUUID:        providerUUID,
-		Items:               items,
-		RetainedVolumeNames: leaked,
-		Status:              shared.RetentionStatusReaping,
-		CreatedAt:           time.Now(),
+		OriginalLeaseUUID: leaseUUID,
+		Tenant:            tenant,
+		ProviderUUID:      providerUUID,
+		Items:             items,
+		Status:            shared.RetentionStatusReaping,
+		CreatedAt:         time.Now(),
 	}
 	if ok, err := b.retentionStore.PutReaping(rec); err != nil {
 		logger.Error("give-up leak: failed to record reaping tombstone; footprint UNTRACKED until manual cleanup", "lease_uuid", leaseUUID, "error", err)

@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fred_docker_backend_retention_sweep_total{outcome}` and
+  `fred_docker_backend_retention_accounting_refresh_failed_total` make a degraded
+  retention store visible for the first time (ENG-680). Until now the only trace of
+  an unreadable `retention.db` was a single log line per sweep tick — hourly at the
+  default cadence — behind no metric at all, while the reaper reclaimed nothing, the
+  orphan pruner reclaimed nothing, every lease close skipped volume teardown, and all
+  five retention gauges silently held their last values. The sweep counter increments
+  exactly once per pass, so `sum without (outcome) (increase(...))` is a liveness
+  heartbeat and `{outcome="error"}` is the degradation signal; the accounting counter
+  is the separate "the gauges you are reading are stale" signal, since the refresh runs
+  from every retention transition rather than only from the sweep. Both are
+  pre-initialised to 0 so "never failed" is distinguishable from "not reporting".
+  Deliberately no last-success gauge: one only advances on a fully clean pass, which is
+  why the deployed rules already refuse to alert on the equivalent reconciler gauge.
+
 - `mock-backend` now serves `GET /retentions` and `GET /stats`, the two backend
   contract endpoints it was missing. Their absence was not cosmetic: fred's
   client treats any non-200 from `/retentions` as a failure, so a mock-backend
@@ -30,7 +45,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `retention_reap_skips_total`, which counts per reap *attempt* — the two are
   deliberately not summable.
 
+### Fixed
+
+- **A deprovision give-up no longer loses the abandoned footprint when the retention
+  store is degraded** (ENG-676). A close that cannot establish volume ownership —
+  because the retention store cannot be enumerated — correctly destroys nothing and
+  retries, but after the attempt limit it gives up: it releases the lease's pool
+  reservation and deletes its provision, which is right, since nothing can retry after
+  that. The reaping record it writes is then the only thing still counting the bytes on
+  disk. That record used to double as a destroy plan, and computing the plan needed the
+  same ownership table the store could not serve — so the write was skipped entirely
+  and the footprint ended up counted by **nothing**: no pool reservation, no active
+  record, no reaping record. Fred over-admitted against real disk, permanently, until an
+  operator intervened.
+
+  The record now states one fact — how large the abandoned footprint is — and authorises
+  no destruction, so there is nothing left for a degraded store to prevent it computing.
+  Precisely: the footprint is uncounted **for as long as the store stays broken** (the
+  projection is recomputed by scanning the store, and the store is what is broken), but the
+  record is durable, so the projection self-corrects on the first readable refresh instead
+  of there being nothing to recount from. The change is "uncounted permanently" →
+  "uncounted until the store is repaired"; both halves are pinned by tests.
+  The finalizer re-derives the volumes to reclaim on every sweep from the lease's
+  namespace on disk intersected with the ownership table, which is the same
+  "destroy only what nothing claims" rule the startup orphan sweep already applies,
+  scoped to one lease. A reaping record with an empty volume list is therefore normal
+  and not corruption. This also removes the last way a tombstone written by an older
+  build could name another lease's adopted data: those stored names are no longer read
+  by anything.
+
 ### Changed
+
+- **The retention sweep now runs every stage instead of aborting at the first store
+  error** (ENG-680). `List`, `ListExpired`, `ListReaping` and `ListRestoring` are one
+  traversal over one bucket, so they fail on identical inputs — which meant the sweep
+  always died at the first of them and never reached the orphan reconcile. Its
+  `retention_orphan_skips_total{reason="store_error"}` arm was therefore unreachable
+  under precisely the condition it was written to report. The stages are independent by
+  construction (each re-reads the store for itself, and each already fails safe on its
+  own read), so running them all can add information but never a destroy. Stage errors
+  are joined, so the sweep's log line now names every failing step rather than only the
+  first casualty.
 
 - **Every managed-volume destroy in the docker backend now goes through a single
   ownership-checked primitive** (ENG-658). Six call sites each derived their own set

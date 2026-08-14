@@ -92,7 +92,10 @@ func TestDestroyReapingVolumes_RefusesANameClaimedAfterTheSnapshot(t *testing.T)
 	}))
 
 	bar := newDestroyBarrier()
-	b.volumes = &mockVolumeManager{DestroyFn: bar.destroyFn}
+	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return []string{first, second}, nil },
+		DestroyFn: bar.destroyFn,
+	}
 
 	ownerBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed))
 	refusedBefore := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping, destroyRefusedClaimed))
@@ -104,7 +107,7 @@ func TestDestroyReapingVolumes_RefusesANameClaimedAfterTheSnapshot(t *testing.T)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		reaped = b.destroyReapingVolumes(ctx, lease, []string{first, second})
+		reaped = b.destroyReapingVolumes(ctx, b.newManagedVolumeIndex(), lease)
 	}()
 
 	<-bar.reached
@@ -144,13 +147,17 @@ func TestDestroyReapingVolumes_UnreadableClaims_IgnoresALateClaim(t *testing.T) 
 	rs := attachRetentionStore(t, b)
 	require.NoError(t, rs.Close())
 
-	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, id string) error {
-		t.Errorf("must not destroy %q when ownership could not be established", id)
-		return nil
-	}}
+	b.volumes = &mockVolumeManager{
+		// Enumerable on disk; only the ownership table is unreadable.
+		ListFn: func() ([]string, error) { return []string{name}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Errorf("must not destroy %q when ownership could not be established", id)
+			return nil
+		},
+	}
 	unreadableBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
 
-	assert.False(t, b.destroyReapingVolumes(context.Background(), lease, []string{name}))
+	assert.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease))
 	assert.Equal(t, unreadableBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable)))
 }
 
@@ -350,11 +357,11 @@ func TestDestroyReapingVolumes_KeptRecordLogNamesTheRightHold(t *testing.T) {
 			OriginalLeaseUUID: lease, Tenant: "tenant-a", Status: shared.RetentionStatusReaping,
 			RetainedVolumeNames: []string{live},
 		}))
-		b.volumes = &mockVolumeManager{}
+		b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return []string{live}, nil }}
 
 		var buf bytes.Buffer
 		b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		require.False(t, b.destroyReapingVolumes(context.Background(), lease, []string{live}))
+		require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease))
 
 		out := buf.String()
 		assert.Contains(t, out, "do NOT reclaim by hand")
@@ -369,11 +376,11 @@ func TestDestroyReapingVolumes_KeptRecordLogNamesTheRightHold(t *testing.T) {
 		b := newBackendForTest(&mockDockerClient{}, nil)
 		rs := attachRetentionStore(t, b)
 		adopted, ownLeak := seedClaimedTombstone(t, rs, orig, newLease)
-		b.volumes = &mockVolumeManager{}
+		b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return []string{adopted, ownLeak}, nil }}
 
 		var buf bytes.Buffer
 		b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		require.False(t, b.destroyReapingVolumes(context.Background(), newLease, []string{adopted, ownLeak}))
+		require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), newLease))
 
 		assert.Contains(t, buf.String(), "the restore's rollback resolves it",
 			"this hold really does clear on rollback, and the operator must be told to wait")

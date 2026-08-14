@@ -3,12 +3,14 @@ package docker
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -35,9 +37,14 @@ func TestDoDeprovision_ContainerlessLease_PurgesStrandedReleaseHistory(t *testin
 }
 
 // TestDeprovisionGiveUp_WritesReapingTombstone verifies a give-up (max volume
-// cleanup attempts) writes a reaping tombstone for the leaked canonical volumes so
-// the footprint keeps counting + the sweep auto-retries, instead of a silent
-// uncounted leak. ENG-376 site 3.
+// cleanup attempts) writes a reaping tombstone so the footprint keeps counting + the
+// sweep auto-retries, instead of a silent uncounted leak. ENG-376 site 3.
+//
+// The assertion is on Items, not on volume names: the record's job is to say how big the
+// abandoned footprint is (computeReapingDiskMB sums leaseDiskMB(Items) into the admission
+// projection), not which volumes to destroy — the finalizer derives that from disk on
+// every pass (ENG-676). Asserting the projection rather than the name list is also
+// strictly closer to the property ENG-376 exists to protect.
 func TestDeprovisionGiveUp_WritesReapingTombstone(t *testing.T) {
 	leakBefore := testutil.ToFloat64(retentionLeakedTotal)
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
@@ -72,17 +79,66 @@ func TestDeprovisionGiveUp_WritesReapingTombstone(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond, "reaping tombstone for u1 must be written at give-up")
 
 	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
-	assert.ElementsMatch(t, []string{"fred-u1-app-0"}, got.RetainedVolumeNames)
+	assert.Equal(t,
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}, got.Items,
+		"Items is the accounting fact the admission projection reads; it must be the FULL lease set")
+	mb, count, err := b.computeReapingDiskMB()
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	assert.Equal(t, int64(1024), mb,
+		"the abandoned footprint must still be counted against admission after the give-up")
 	assert.Greater(t, testutil.ToFloat64(retentionLeakedTotal), leakBefore)
 }
 
-// TestDeprovisionGiveUp_ListFails_RecordsBothNamespaces verifies the recordGiveUpLeak
-// fallback (volumes.List error): the tombstone records BOTH the canonical name and the
-// fred-retained-* name per item. A retain-path partial rename may have moved a volume
-// into the retained namespace before failing, so recording only the canonical name would
-// let the sweep "succeed" against the (idempotent) non-existent canonical name, drop the
-// tombstone, and leave the fred-retained-* volume on disk and untracked. ENG-376.
-func TestDeprovisionGiveUp_ListFails_RecordsBothNamespaces(t *testing.T) {
+// seedUnenumerableRecord makes every retention ENUMERATION fail while single-key reads and
+// writes keep working — the shape a partially-degraded store actually has, and the one the
+// give-up path must survive.
+//
+// It exploits a real asymmetry in the store rather than inventing one. RetentionStore.filter
+// (which backs List/ListExpired/ListReaping/ListRestoring, and therefore the ownership
+// table) unmarshals the FULL RetentionEntry for every record, so one bad record fails all
+// four. scanIndex — the fail-closed integrity check NewRetentionStore runs at open —
+// unmarshals only three string fields, so a record with a well-formed uuid/tenant/status and
+// a type-mismatched Items passes open and breaks every enumeration afterwards.
+//
+// Written through a direct bolt handle before the store is constructed, mirroring
+// backdateReleaseRecords (integration_releases_reaper_test.go); the store must not be open
+// at the same time (file lock).
+func seedUnenumerableRecord(t *testing.T, dbPath string) {
+	t.Helper()
+	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		bkt, berr := tx.CreateBucketIfNotExists([]byte("retention"))
+		if berr != nil {
+			return berr
+		}
+		// "items" must be an array; a string parses under scanIndex's narrow struct (which
+		// never looks at it) and fails under filter's full one.
+		return bkt.Put([]byte("corrupt-lease"),
+			[]byte(`{"original_lease_uuid":"corrupt-lease","tenant":"t1","status":"active","items":"not-an-array"}`))
+	}))
+	require.NoError(t, db.Close())
+}
+
+// TestDeprovisionGiveUp_UnenumerableStore_StillRecordsTheFootprint is ENG-676.
+//
+// When the retention store cannot be enumerated the ownership table cannot be resolved, so
+// the close destroys nothing and retries until it gives up. The give-up then releases the
+// lease's pool allocation and deletes its provision — correct, since nothing can retry
+// after that — which leaves the reaping record as the ONLY thing still counting the bytes
+// on disk. It used to compute that record's volume names through the same unreadable table
+// and, failing, write no record at all: the footprint ended up counted by nothing (no pool
+// key, no active record, no reaping record) and admission over-committed against real disk
+// permanently.
+//
+// The record no longer carries a destroy plan, so there is nothing left for a degraded
+// store to prevent it computing. This fails on any change that reintroduces a precondition
+// between the give-up and the record.
+func TestDeprovisionGiveUp_UnenumerableStore_StillRecordsTheFootprint(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "retention.db")
+	seedUnenumerableRecord(t, dbPath)
+
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"u1": {ProvisionState: leasesm.ProvisionState{
@@ -91,30 +147,217 @@ func TestDeprovisionGiveUp_ListFails_RecordsBothNamespaces(t *testing.T) {
 		}, VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1}, // next failure → give up
 	})
 	withMicroSKU(b, 1024)
-	rs := attachRetentionStore(t, b)
 
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: dbPath})
+	require.NoError(t, err, "the store still OPENS — that is what makes this silent in production")
+	t.Cleanup(func() { _ = rs.Close() })
+	b.retentionStore = rs
+	_, listErr := rs.List()
+	require.Error(t, listErr, "precondition: enumeration fails, so ownership is unprovable")
+
+	// The volumes are on disk and enumerable; only the store is degraded.
 	b.volumes = &mockVolumeManager{
-		ListFn:    func() ([]string, error) { return nil, errors.New("statfs EIO") }, // force the fallback
-		DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") },
+		ListFn: func() ([]string, error) { return []string{"fred-u1-app-0"}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Errorf("must not destroy %q while ownership is unprovable", id)
+			return nil
+		},
 	}
+	require.NoError(t, b.pool.TryAllocate("u1-app-0", "docker-micro", "t1"))
 
-	_ = b.Deprovision(context.Background(), "u1")
+	require.NoError(t, b.doDeprovision(context.Background(), "u1"))
 
-	var got *shared.RetentionEntry
-	require.Eventually(t, func() bool {
-		g, e := rs.Get("u1")
-		if e != nil || g == nil {
-			return false
-		}
-		got = g
-		return true
-	}, 5*time.Second, 20*time.Millisecond, "reaping tombstone for u1 must be written at give-up")
-
+	got, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, got, "ENG-676: the give-up must record the abandoned footprint even when ownership is unprovable")
 	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
-	assert.ElementsMatch(t,
-		[]string{"fred-u1-app-0", "fred-retained-u1-app-0"},
-		got.RetainedVolumeNames,
-		"fallback must record BOTH the canonical and the fred-retained- name so whichever exists is destroyed before the tombstone is deleted")
+	assert.Equal(t,
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}, got.Items,
+		"Items is what keeps the bytes counted; without it the footprint is counted by nobody")
+	assert.Empty(t, got.RetainedVolumeNames,
+		"the record must NOT carry a destroy plan derived from an ownership table it could not read")
+
+	// CHARACTERIZATION of the residual, pinned deliberately rather than left to prose.
+	//
+	// The record is durable, but the projection cannot absorb it yet: every refresh scans
+	// the store, and the store is exactly what is broken. So the give-up releases the live
+	// reservation while retained is still frozen at its pre-write value, and for the
+	// duration of the degradation the abandoned bytes are counted by neither pool term.
+	//
+	// This is NOT specific to the give-up — every live→retained hand-off releases the live
+	// reservation without checking that the refresh succeeded, including the ordinary
+	// retain-path close, which predates ENG-676. It is tracked separately; what ENG-676
+	// changes is that the FACT survives, so the projection self-corrects the moment the
+	// store is readable (asserted below) instead of there being nothing to recount from.
+	assert.Equal(t, int64(0), b.pool.Stats().AllocatedDiskMB,
+		"the give-up is terminal: the live reservation is released and the provision deleted")
+	assert.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB,
+		"KNOWN WINDOW: the projection cannot see the new record while the store is unenumerable")
+}
+
+// TestDeprovisionGiveUp_UnenumerableStore_AccountingRecoversOnRepair is the other half of
+// the invariant, and the one that says why writing the record is worth anything at all: the
+// footprint is uncounted only for as long as the store is broken. Repair it and the very
+// next refresh picks the record up, with no operator action and nothing to reconstruct.
+//
+// Before ENG-676 there was no record to recover FROM, so the same repair changed nothing
+// and the bytes stayed uncounted until someone noticed by hand. This test fails if the
+// give-up ever stops writing the record.
+func TestDeprovisionGiveUp_UnenumerableStore_AccountingRecoversOnRepair(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "retention.db")
+	seedUnenumerableRecord(t, dbPath)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"u1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u1", Tenant: "t1", Status: backend.ProvisionStatusReady, Quantity: 1,
+			Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		}, VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1},
+	})
+	withMicroSKU(b, 1024)
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	b.retentionStore = rs
+	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return []string{"fred-u1-app-0"}, nil },
+		DestroyFn: func(_ context.Context, _ string) error { return nil },
+	}
+	require.NoError(t, b.pool.TryAllocate("u1-app-0", "docker-micro", "t1"))
+	require.NoError(t, b.doDeprovision(context.Background(), "u1"))
+	require.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB, "precondition: uncounted during the window")
+
+	// Repair: drop the unenumerable record and reopen. This is the operator fixing the
+	// store, not fred doing anything clever.
+	require.NoError(t, rs.Close())
+	db, derr := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	require.NoError(t, derr)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("retention")).Delete([]byte("corrupt-lease"))
+	}))
+	require.NoError(t, db.Close())
+
+	repaired, rerr := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: dbPath})
+	require.NoError(t, rerr)
+	t.Cleanup(func() { _ = repaired.Close() })
+	b.retentionStore = repaired
+
+	b.refreshRetentionAccounting()
+
+	assert.Positive(t, b.pool.Stats().RetainedDiskMB,
+		"the durable record is what lets the projection self-correct once the store is readable")
+}
+
+// TestReapingFootprint_CoversBothNamespaces preserves the hazard the old
+// "record BOTH namespaces" fallback existed for, at the layer that now owns it.
+//
+// A retain-path give-up can strand a lease part-way through its renames, leaving some
+// volumes canonical and some already quarantined under fred-retained-*. The tombstone used
+// to record both spellings of every name because a stored plan could not know which one
+// was really on disk — and getting that wrong meant the sweep "succeeded" against a
+// non-existent canonical name, dropped the tombstone, and left the fred-retained-* volume
+// on disk and untracked (ENG-376).
+//
+// Derivation replaces the guesswork with a look, so the property to pin is that the look
+// covers both namespaces — and, unlike the old fallback, that it reports volumes belonging
+// to OTHER leases nowhere in the result.
+func TestReapingFootprint_CoversBothNamespaces(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) {
+		return []string{
+			"fred-u1-app-0",          // still canonical: the rename never happened
+			"fred-retained-u1-app-1", // already quarantined by a prior attempt
+			"fred-u2-app-0",          // another lease entirely
+			"fred-retained-u2-app-0", // another lease's retained data
+		}, nil
+	}}
+
+	got, err := b.newManagedVolumeIndex().footprint("u1")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"fred-u1-app-0", "fred-retained-u1-app-1"}, got,
+		"both namespaces of THIS lease, and nothing belonging to another")
+}
+
+// TestReapingFootprint_ListError_IsNotAnEmptyFootprint is the error branch, and it is
+// load-bearing: the caller DELETES the record when the footprint is empty, so conflating
+// "looked and found nothing" with "could not look" would drop the record that is both the
+// retry vehicle and the accounting for bytes still on disk.
+func TestReapingFootprint_ListError_IsNotAnEmptyFootprint(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return nil, errors.New("statfs EIO") }}
+
+	got, err := b.newManagedVolumeIndex().footprint("u1")
+	require.Error(t, err)
+	assert.Nil(t, got)
+}
+
+// TestListVolumeIDs_AbsentRootIsAnError is where the absent-vs-empty distinction is now
+// GUARANTEED rather than reconstructed, and it is the reason the reaping finalizer needs no
+// root probe at all.
+//
+// listVolumeIDs used to map a missing directory to (nil, nil), collapsing "this node holds
+// no volumes" and "the volume root is gone" into one value. Any caller wanting the
+// difference back had to stat separately — and a separate stat is a separate point in time,
+// so an unmount landing between the probe and the read produced a confident, empty,
+// error-free answer. The reaping finalizer acts on that answer by DELETING the record that
+// accounts for the bytes, so the ambiguity was one unmount away from silent
+// data-accounting loss. Keeping the question inside the single syscall that can answer it
+// is what makes that race impossible rather than merely unlikely: there is no second
+// observation to disagree with the first.
+//
+// A configured root cannot legitimately be absent at runtime — newVolumeManager statfs's it
+// at construction — so ENOENT here always means "it disappeared underneath us".
+func TestListVolumeIDs_AbsentRootIsAnError(t *testing.T) {
+	ids, err := listVolumeIDs(filepath.Join(t.TempDir(), "not-mounted"))
+	require.Error(t, err, "an absent volume root is uncertainty, never an empty node")
+	assert.Nil(t, ids)
+
+	// ...and a present-but-empty root still reports emptiness, so the guarantee is a real
+	// distinction rather than a blanket refusal.
+	empty, err := listVolumeIDs(t.TempDir())
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+}
+
+// TestReapingFootprint_AbsentVolumeRoot_IsNotAnEmptyFootprint pins that the finalizer's
+// derivation inherits that guarantee rather than re-deriving it.
+func TestReapingFootprint_AbsentVolumeRoot_IsNotAnEmptyFootprint(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	b.cfg.VolumeDataPath = filepath.Join(t.TempDir(), "not-mounted")
+	b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return listVolumeIDs(b.cfg.VolumeDataPath) }}
+
+	got, err := b.newManagedVolumeIndex().footprint("u1")
+	require.Error(t, err, "an absent volume root must be uncertainty, not an empty footprint")
+	assert.Nil(t, got)
+}
+
+// TestDestroyReapingVolumes_AbsentVolumeRoot_KeepsTheRecord is the consequence of the
+// above at the layer that acts on it: the record survives, and nothing is destroyed.
+func TestDestroyReapingVolumes_AbsentVolumeRoot_KeepsTheRecord(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.VolumeDataPath = filepath.Join(t.TempDir(), "not-mounted")
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return listVolumeIDs(b.cfg.VolumeDataPath) },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Errorf("must not destroy %q while the volume root is unverifiable", id)
+			return nil
+		},
+	}
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID: "u1", Tenant: "t1", Status: shared.RetentionStatusReaping,
+		Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		CreatedAt: time.Now(),
+	}))
+	skipBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
+
+	assert.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), "u1"),
+		"an unverifiable root means the record cannot be dropped")
+
+	got, err := rs.Get("u1")
+	require.NoError(t, err)
+	assert.NotNil(t, got, "the record — and the footprint it accounts for — must survive")
+	assert.Equal(t, skipBefore+1,
+		testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable)))
 }
 
 // TestDeprovision_PartialFailure_AuthorsCleanupFailed drives the partial-failure
@@ -626,9 +869,13 @@ func TestDoDeprovision_NoClaimedVolume_StillReleasesAllocation(t *testing.T) {
 // guard merely deferred the destruction by one sweep — and made it look accounted-for
 // on the way.
 //
-// This is the WRITE-time half. Tombstones are persisted and outlive the binary, so the
-// reader re-checks the same claim at destroy time for records written before this guard
-// existed — see TestDestroyReapingVolumes_SkipsVolumeClaimedByRestoringRecord (ENG-659).
+// The guard is no longer at write time. The tombstone records the footprint's SIZE and
+// names no volumes at all (ENG-676), so there is no name list left to leak an adopted
+// volume into; the finalizer derives its destroy set and refuses the adopted name against
+// the owner table. That makes this an END-TO-END assertion rather than an assertion about
+// an intermediate list: give up, then run the finalizer, and check what is actually
+// destroyed. It is the stronger form of the same property — the old version could have
+// passed while the volume still died at the next sweep.
 func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T) {
 	const lease = "u2"
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
@@ -643,13 +890,19 @@ func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T)
 	claimedVol := seedRestoringInto(t, rs, "u1", lease) // fred-u2-app-0 IS u1's adopted data
 	ownVol := canonicalVolumeName(lease, "app", 1)
 
+	destroyFails := true // EBUSY drives the retry → give-up arm; relaxed for the sweep below
+	var destroyed []string
 	b.volumes = &mockVolumeManager{
 		ListFn: func() ([]string, error) { return []string{claimedVol, ownVol}, nil },
 		DestroyFn: func(_ context.Context, id string) error {
-			if id == ownVol {
-				return errors.New("EBUSY") // drives the retry → give-up arm
+			if id == claimedVol {
+				t.Errorf("must never destroy the claimed volume %q — it is another lease's retained data", id)
+				return nil
 			}
-			t.Errorf("the close must never destroy the claimed volume %q", id)
+			if destroyFails {
+				return errors.New("EBUSY")
+			}
+			destroyed = append(destroyed, id)
 			return nil
 		},
 	}
@@ -658,12 +911,18 @@ func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T)
 
 	tomb, err := rs.Get(lease)
 	require.NoError(t, err)
-	require.NotNil(t, tomb, "the give-up must still tombstone this lease's OWN leaked volume")
+	require.NotNil(t, tomb, "the give-up must still record this lease's abandoned footprint")
 	assert.Equal(t, shared.RetentionStatusReaping, tomb.Status)
-	assert.Equal(t, []string{ownVol}, tomb.RetainedVolumeNames,
-		"the tombstone must name only this lease's own leak; naming the adopted volume would "+
-			"schedule destroyReapingVolumes to RemoveAll another lease's retained data (ENG-647)")
-	assert.NotContains(t, tomb.RetainedVolumeNames, claimedVol)
+	assert.Empty(t, tomb.RetainedVolumeNames, "the record carries no destroy plan (ENG-676)")
+
+	// Now run the finalizer, which is where the guard actually lives. The adopted volume is
+	// in this lease's namespace and would be swept up by the prefix scan, so only the owner
+	// table stands between it and a RemoveAll.
+	destroyFails = false
+	require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease),
+		"a refused name means the record is kept for retry")
+	assert.Equal(t, []string{ownVol}, destroyed,
+		"this lease's own leak is reclaimed; the volume an in-flight restore adopted is not (ENG-647)")
 
 	// And the original record is untouched, so its restore is still possible.
 	orig, err := rs.Get("u1")
