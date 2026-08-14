@@ -98,6 +98,25 @@ type Backend struct {
 	// Lock ordering: stripe mutex -> provisionsMu (RLock).
 	tenantNetworkStripes [tenantNetworkStripeCount]sync.Mutex
 
+	// volumeNameStripes serializes the two operations that can act on the
+	// same managed volume name at the same time: the create-or-reuse in
+	// setupVolBinds and the destroy in volumeOp.destroy. Without it the
+	// ownership check and the RemoveAll it authorizes are two steps, so a
+	// destroy could be decided against a claim that no longer holds and then
+	// delete a directory a re-provision had already adopted (ENG-681).
+	// volumeOp.destroy re-reads the live claim under this lock, which is what
+	// makes the decision and the delete one atomic step per name.
+	//
+	// Striped for the same reason tenantNetworkStripes is: volume names embed
+	// lease UUIDs, and a map[name]*Mutex would grow with every lease the node
+	// has ever seen. Two unrelated volumes sharing a stripe just serialize a
+	// create against a destroy, which are both infrequent per volume.
+	//
+	// Lock ordering: volume-name stripe -> provisionsMu (RLock), matching the
+	// tenant-network rule above. Neither holder takes provisionsMu on entry,
+	// and a volume stripe is never held across a tenant-network acquisition.
+	volumeNameStripes [volumeNameStripeCount]sync.Mutex
+
 	// recoverMu serializes recoverState calls. The reconcile loop and
 	// external RefreshState (called by Fred's reconciler) both invoke
 	// recoverState. Without serialization, concurrent calls can detect

@@ -29,9 +29,15 @@ linters:
       # closes that half: destruction is reachable only from the one file that asks who
       # owns the bytes first (ENG-658). Excluded there, and in tests, which drive real
       # filesystem managers directly for fixture teardown via volDestroyer.
+      #
+      # Create is the other half of the same story: it ADOPTS a pre-existing directory,
+      # so a call that skips the volume-name stripe can adopt one an in-flight destroy is
+      # midway through removing. Pinned to the one file that takes the lock (ENG-681).
       forbid:
         - pattern: '\.Destroy$'
           msg: "managed-volume destruction must go through volumeOp.destroy (internal/backend/docker/volume_destroy.go): it is the only site that establishes ownership before an irreversible delete (ENG-658)"
+        - pattern: 'volumes\.Create$'
+          msg: "managed-volume creation must go through Backend.createManagedVolume (internal/backend/docker/volume_lock.go): it holds the volume-name stripe that serializes create-or-reuse against an in-flight destroy (ENG-681)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -61,6 +67,11 @@ linters:
       # The one file allowed to reach the destroy capability (ENG-658). Everything else
       # in the repo, production or not, must route through volumeOp.destroy.
       - path: ^internal/backend/docker/volume_destroy\.go$
+        linters:
+          - forbidigo
+      # The one file allowed to create a managed volume (ENG-681): it is where the
+      # volume-name stripe is taken.
+      - path: ^internal/backend/docker/volume_lock\.go$
         linters:
           - forbidigo
       # Exclude test files from strict linters

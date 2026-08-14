@@ -74,6 +74,20 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		return fmt.Errorf("%w: total quantity %d out of range [0, %d]", backend.ErrValidation, totalQuantity, maxLeaseQuantity)
 	}
 
+	// Boundary normalization: auto-tag a single unnamed item with the default
+	// service name so every downstream component (and the parser below) sees a
+	// uniformly stack-shaped request. Rejects malformed mixed/multi-unnamed
+	// inputs that were structurally invalid under the legacy contract too.
+	//
+	// Runs BEFORE the reservation because the reservation publishes this lease's
+	// ownership claim, and a claim is a set of canonical volume names built from
+	// item.ServiceName (canonicalVolumeName, restore.go). Reserving with
+	// un-normalized items would claim fred-{lease}--0 while the provision goes on
+	// to create fred-{lease}-app-0 — a claim that protects nothing (ENG-681).
+	if err := backend.NormalizeProvisionRequest(&req); err != nil {
+		return err
+	}
+
 	logger := b.logger.With(
 		"lease_uuid", req.LeaseUUID,
 		"tenant", req.Tenant,
@@ -86,6 +100,15 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// crashed and reconciler is retrying). Deprovisioning, Provisioning,
 	// Restarting, Updating, and Ready are all in-flight or live states that
 	// must not be re-provisioned until they reach Failed or are removed.
+	//
+	// The reservation is also this lease's OWNERSHIP CLAIM on its canonical volume
+	// names — snapshotVolumeClaims (volume_destroy.go) derives them from
+	// prov.Items, so an entry whose Items are unset claims nothing. It therefore
+	// carries Items from the start, exactly as Restore's reservation does. Setting
+	// them later would make the re-provision arm below RETRACT a live claim: it
+	// deletes the previous, claim-bearing entry, and the volumes it deliberately
+	// keeps (see "keep volumes" below) would be collectable by any concurrent
+	// destroy until the claim was re-established (ENG-681).
 	var prevFailCount int
 	var oldContainerIDs []string
 	var oldQuantity int
@@ -118,7 +141,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			Message:      "",
 			CallbackURL:  req.CallbackURL, // MUST be set at reservation: a failure/Deprovision
 			// racing this provision in the validation window resolves CallbackURL from the map.
-			Items:             nil, // set by enrichReserved
+			Items:             slices.Clone(req.Items), // the ownership claim; see above
 			ContainerIDs:      make([]string, 0, totalQuantity),
 			StackManifest:     nil, // set by enrichReserved
 			ServiceContainers: nil,
@@ -173,16 +196,6 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		profiles[item.SKU] = profile
 	}
 
-	// Boundary normalization: auto-tag a single unnamed item with the
-	// default service name so every downstream component (and the parser
-	// below) sees a uniformly stack-shaped request. Rejects malformed
-	// mixed/multi-unnamed inputs that were structurally invalid under the
-	// legacy contract too.
-	if err := backend.NormalizeProvisionRequest(&req); err != nil {
-		b.removeProvision(req.LeaseUUID)
-		return err
-	}
-
 	// Parse payload. ParsePayload always returns a *StackManifest;
 	// legacy flat payloads are auto-wrapped under DefaultServiceName.
 	stackManifest, err := manifest.ParsePayload(req.Payload)
@@ -235,10 +248,12 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		}
 	}
 
-	// Update the reservation with full details now that validation passed.
+	// Update the reservation with full details now that validation passed. Items
+	// are NOT set here — the reservation already published them as this lease's
+	// ownership claim (ENG-681).
 	b.provisionsMu.Lock()
 	if prov, ok := b.provisions[req.LeaseUUID]; ok {
-		prov.enrichReserved(req.RoutingSKU(), req.Items, stackManifest)
+		prov.enrichReserved(req.RoutingSKU(), stackManifest)
 	}
 	b.provisionsMu.Unlock()
 
@@ -594,7 +609,7 @@ func (b *Backend) setupVolBinds(
 				if sizeMB <= 0 {
 					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
 				}
-				hostPath, volCreated, volErr := b.volumes.Create(ctx, volumeID, sizeMB)
+				hostPath, volCreated, volErr := b.createManagedVolume(ctx, volumeID, sizeMB)
 				if volErr != nil {
 					if needsStatefulVolume {
 						return nil, createdVolumeIDs, fmt.Errorf("volume creation failed (service %s, instance %d): %w", svcName, i, volErr)
