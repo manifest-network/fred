@@ -318,9 +318,10 @@ func TestRefuseToRetain_DestroysAndCounts(t *testing.T) {
 
 	before := testutil.ToFloat64(retentionRefusedTotal)
 	canonical := []string{"fred-lease-z-web-0", "fred-lease-z-web-1"}
-	errs := b.destroyOnRefuseToRetain(context.Background(), canonical, "lease-z", "t1", "", refuseScopeGlobal, b.logger)
+	rep := b.destroyOnRefuseToRetain(context.Background(), b.volumeOp("lease-z", b.logger),
+		canonical, "lease-z", "t1", "", refuseScopeGlobal, b.logger)
 
-	assert.Empty(t, errs)
+	assert.NoError(t, rep.err())
 	assert.Equal(t, before+1, testutil.ToFloat64(retentionRefusedTotal), "production code increments the counter")
 	assert.Equal(t, canonical, fv.destroyed, "both canonical volumes must be destroyed on refuse-to-retain")
 }

@@ -51,6 +51,45 @@ const (
 // provider — which should never skip — exports 0 rather than no-data.
 var reapSkipReasons = []string{reapSkipRestoreClaimed, reapSkipClaimUnreadable}
 
+// Site labels for volumeDestroyRefusedTotal — which destroy path the ownership
+// choke point turned away (ENG-658). One constant per caller of volumeOp.destroy.
+// The set is closed by convention, not by the compiler (destroy takes a string), but
+// destroySites below is what pre-initializes the series: a new site that skips these
+// constants exports no zero series, so its absence reads as no-data rather than as
+// "never refused" — which is the failure mode the pre-init exists to prevent.
+const (
+	destroySiteDeprovisionDestroy = "deprovision_destroy" // doDeprovision's non-retain arm
+	destroySiteDeprovisionReclaim = "deprovision_reclaim" // doDeprovision's writable-path-only reclaim (ENG-406)
+	destroySiteRetentionRefused   = "retention_refused"   // destroyOnRefuseToRetain, a breached retained-disk cap
+	destroySiteProvisionCleanup   = "provision_cleanup"   // doProvision's failure defer
+	destroySiteOrphanGC           = "orphan_gc"           // cleanupOrphanedVolumes, the startup sweep
+	destroySiteReaping            = "reaping"             // destroyReapingVolumes, the retention finalizer
+)
+
+// Reasons a destroy was refused. Both mean "the bytes are still on disk", but they
+// differ in who is expected to clear them: claimed is another lease's live claim and
+// resolves itself when that lease's restore commits or rolls back, whereas
+// claims_unreadable is the fail-safe — ownership could not be established at all, so
+// nothing was destroyed. no_destroyer cannot happen with any volumeManager in this
+// repo (all four implement Destroy, and New fails fast if the configured one
+// does not); it exists because the capability is obtained by assertion, so a future
+// decorator around b.volumes would silently drop it, and a refusal is the safe reading.
+const (
+	destroyRefusedClaimed     = "claimed"
+	destroyRefusedUnreadable  = "claims_unreadable"
+	destroyRefusedNoDestroyer = "no_destroyer"
+)
+
+// The closed label sets, pre-initialized to 0 so a provider that never refuses a
+// destroy — which is every healthy provider — exports 0 rather than no-data.
+var (
+	destroySites = []string{
+		destroySiteDeprovisionDestroy, destroySiteDeprovisionReclaim, destroySiteRetentionRefused,
+		destroySiteProvisionCleanup, destroySiteOrphanGC, destroySiteReaping,
+	}
+	destroyRefusedReasons = []string{destroyRefusedClaimed, destroyRefusedUnreadable, destroyRefusedNoDestroyer}
+)
+
 // Operation and outcome labels for teardownFallbackTotal — which teardown path had
 // to compensate for a failed compose Down, and whether the compensation finished the
 // job (ENG-647). Kept as constants so the call sites, the pre-init, and the tests
@@ -653,6 +692,34 @@ var (
 		Help:      "Reaping-finalizer destroy attempts skipped by reason (per reap attempt, not per volume) — see ENG-659",
 	}, []string{"reason"})
 
+	// volumeDestroyRefusedTotal counts volumes the ownership choke point declined to
+	// destroy, PER VOLUME (unlike retentionReapSkipsTotal, which is per reap attempt —
+	// the two are deliberately not summable). Every managed-volume destroy in this
+	// backend routes through volumeOp.destroy, so this counter is the single place a
+	// "we nearly destroyed someone else's data" event becomes visible, whichever path
+	// reached it (ENG-658).
+	//
+	// A refusal is a SUCCESS of the guard, not a fault: reason="claimed" means an
+	// in-flight restore owns those bytes and the close correctly left them alone, which
+	// resolves when that restore commits or rolls back. It is expected at a low rate on
+	// a provider whose tenants restore and close concurrently. Sustained, it means a
+	// restore is not converging — read it with restore_finalizer_pending_total and
+	// retention_reaping_leases.
+	//
+	// reason="claims_unreadable" is the ticketing signal, the same fail-safe posture as
+	// retention_reap_skips_total{claim_unreadable} and
+	// retention_orphan_skips_total{store_error}: the retention store could not be read,
+	// so ownership was unprovable and nothing was destroyed. Bytes stay on disk and
+	// stay counted; the caller keeps the lease Failed and retries.
+	//
+	// site ∈ destroySites, reason ∈ destroyRefusedReasons.
+	volumeDestroyRefusedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_destroy_refused_total",
+		Help:      "Managed-volume destroys refused by the ownership check, by call site and reason (per volume) — see ENG-658",
+	}, []string{"site", "reason"})
+
 	// teardownFallbackTotal counts the per-container compensation that runs when compose
 	// Down fails, by teardown path and result (ENG-647). Down is the only call that reaps
 	// a container's anonymous volumes, so a Down failure with no compensation leaks them
@@ -760,6 +827,14 @@ func init() {
 	// alert that watches the fail-safe reason.
 	for _, r := range reapSkipReasons {
 		retentionReapSkipsTotal.WithLabelValues(r).Add(0)
+	}
+	// Pre-init every destroy-refusal series to 0 (ENG-658). A refusal is rare by
+	// design, so without this the alert that watches the fail-safe reason cannot tell
+	// "never refused" from "not reporting".
+	for _, s := range destroySites {
+		for _, r := range destroyRefusedReasons {
+			volumeDestroyRefusedTotal.WithLabelValues(s, r).Add(0)
+		}
 	}
 	// Pre-init every teardown-fallback series to 0 (ENG-647). A provider whose compose
 	// Down never fails would otherwise export nothing, and "no-data" is indistinguishable

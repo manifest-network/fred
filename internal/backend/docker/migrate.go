@@ -252,7 +252,7 @@ func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID str
 
 		newName := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, manifest.DefaultServiceName, c.InstanceIndex)
 		oldVol := fmt.Sprintf("fred-%s-%d", leaseUUID, c.InstanceIndex)
-		newVol := fmt.Sprintf("fred-%s-%s-%d", leaseUUID, manifest.DefaultServiceName, c.InstanceIndex)
+		newVol := canonicalVolumeName(leaseUUID, manifest.DefaultServiceName, c.InstanceIndex)
 
 		renames := make([]volRename, 0, len(managed))
 		for _, m := range managed {

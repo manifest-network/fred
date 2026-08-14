@@ -448,7 +448,9 @@ On startup, at each `ReconcileInterval`, and on every reconciler cycle (via `Ref
 6. **Reset resource pool** -- `pool.Reset()` clears all allocations and rebuilds them from the recovered containers' SKU profiles.
 7. **Orphaned network cleanup** -- if `NetworkIsolation` is enabled, removes any managed networks whose tenant has no active provisions and no connected containers.
 
-After state recovery, the backend also runs **orphaned volume cleanup**: lists all `fred-` prefixed directories in `volume_data_path`, compares against expected volumes from recovered provisions, and destroys any that have no matching provision. This catches volumes leaked by crashes between volume creation and container creation, or between container removal and volume destruction.
+After state recovery, the backend also runs **orphaned volume cleanup**: lists all `fred-` prefixed directories in `volume_data_path` and destroys the ones **nothing claims**. This catches volumes leaked by crashes between volume creation and container creation, or between container removal and volume destruction.
+
+> **One ownership check, not six (ENG-658).** "Nothing claims it" is not a set this sweep computes for itself — it asks the same owner table every other destroy in this backend asks (`volume_destroy.go`), assembled from the live provision map plus the retention store. That matters because a volume's *name* does not establish ownership: while a restore is in flight the original lease's data wears the new lease's canonical name, so any path that derives a destroy set from a prefix or from `canonicalVolumeName` is, for that window, naming another lease's data. `Destroy` is deliberately absent from the internal `volumeManager` interface so no other call site can reach it, and a store read that fails means the sweep destroys nothing that run rather than guessing. A refused destroy is counted on `fred_docker_backend_volume_destroy_refused_total{site,reason}` and logged with the owning lease.
 
 ## Callback Protocol
 

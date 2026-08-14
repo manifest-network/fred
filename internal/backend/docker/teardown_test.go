@@ -10,9 +10,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // errComposeDown is the canonical "compose gave up part-way" failure. Under compose
@@ -233,41 +230,4 @@ func TestTeardownLeaseContainers_CountsOutcome(t *testing.T) {
 		testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision, teardownOutcomeRecovered)), 0.0001)
 	assert.InDelta(t, failedBefore+1,
 		testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision, teardownOutcomeFailed)), 0.0001)
-}
-
-// TestRestoringClaimedVolumes_ClaimsOnlyMatchingRestoringRecords pins the guard that
-// keeps a close from eating an in-flight restore's data. While a record is restoring,
-// the ORIGINAL lease's retained data sits under the NEW lease's canonical names, so a
-// close of the new lease sees volumes that look like its own (ENG-647).
-func TestRestoringClaimedVolumes_ClaimsOnlyMatchingRestoringRecords(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	rs := attachRetentionStore(t, b)
-
-	// The record we must protect: orig=u1 being restored into u2.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "u1",
-		NewLeaseUUID:        "u2",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusRestoring,
-		Generation:          3,
-		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "web"}},
-		RetainedVolumeNames: []string{"fred-retained-u1-web-0"},
-	}))
-	// An ACTIVE record for another lease: not in flight, claims nothing.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   "u3",
-		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusActive,
-		RetainedVolumeNames: []string{"fred-retained-u3-web-0"},
-	}))
-
-	claimed, err := b.restoringClaimedVolumes("u2")
-	require.NoError(t, err)
-	assert.Equal(t, map[string]bool{"fred-u2-web-0": true}, claimed,
-		"the adopted canonical name under the NEW lease is what a close of u2 would otherwise destroy")
-
-	// A lease with no in-flight restore pointed at it claims nothing.
-	other, err := b.restoringClaimedVolumes("u3")
-	require.NoError(t, err)
-	assert.Empty(t, other)
 }

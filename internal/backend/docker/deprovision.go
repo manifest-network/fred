@@ -203,42 +203,43 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// Destroy managed volumes for all instances — or soft-delete them into the
 	// retained namespace when RetainOnClose is true.
 	var volumeErrs []error
-	// Volumes an IN-FLIGHT restore has adopted into THIS lease's namespace but that
-	// still belong to another lease's retention record. They look like ours by name and
-	// they are not: destroying them, or re-retaining them under this lease, permanently
-	// kills the original lease's restore (ENG-647). Fail-safe on a store error — we
-	// cannot tell ours from theirs, so we must not destroy either.
-	claimed, claimErr := b.restoringClaimedVolumes(leaseUUID)
-	if claimErr != nil {
-		logger.Error("deprovision: cannot read retention records to identify restore-claimed volumes; skipping volume teardown this attempt",
-			"error", claimErr)
-		volumeErrs = append(volumeErrs, fmt.Errorf("identify restore-claimed volumes: %w", claimErr))
-	}
+	// Ownership for this whole close, resolved once (volume_destroy.go). A volume an
+	// IN-FLIGHT restore has adopted into THIS lease's namespace looks like ours by name
+	// and is not: destroying it — or re-retaining it under this lease, which leaves the
+	// original record naming paths that no longer exist — permanently kills that lease's
+	// restore (ENG-647). Both volume arms below ask the same table, so neither can be
+	// fixed without the other, which is how this used to go wrong.
+	op := b.volumeOp(leaseUUID, logger)
 	switch {
-	case claimErr != nil:
-		// Deliberately skip BOTH volume arms; the lease stays Failed and retries.
 	case b.cfg.RetainOnClose && b.retentionStore != nil:
 		// Enumerate the lease's ACTUAL managed volumes (ground truth — no SKU guess).
 		all, listErr := b.volumes.List()
 		if listErr != nil {
 			volumeErrs = append(volumeErrs, fmt.Errorf("list volumes for retention: %w", listErr))
 		}
-		var canonical []string
+		prefixed := make([]string, 0, len(all))
 		prefix := leaseVolumePrefix(leaseUUID)
 		for _, id := range all {
-			if claimed[id] {
-				// reconcileRestoring owns re-quarantining this one back to
-				// fred-retained-{original}-*; retaining it under THIS lease would leave
-				// the original record pointing at names that no longer exist.
-				claimedLeftBehind = true
-				logger.Warn("deprovision: volume is claimed by an in-flight restore record; leaving it for the restore rollback",
-					"volume_id", id)
-				continue
-			}
 			if strings.HasPrefix(id, prefix) { // excludes fred-retained-* and other leases
-				canonical = append(canonical, id)
+				prefixed = append(prefixed, id)
 			}
 		}
+		// Asked as a QUERY, not a guarded action, because the destructive verb on this
+		// arm is RenameVolume: retaining a foreign volume under
+		// fred-retained-{this lease}-* strands the original record just as permanently as
+		// destroying it would. Fail-safe on an unresolvable table — we cannot tell ours
+		// from theirs, so we touch neither and the lease stays Failed for retry.
+		canonical, foreign, claimErr := op.partition(prefixed)
+		if claimErr != nil {
+			logger.Error("deprovision: cannot establish volume ownership; skipping volume teardown this attempt",
+				"error", claimErr)
+			volumeErrs = append(volumeErrs, fmt.Errorf("identify restore-claimed volumes: %w", claimErr))
+			break
+		}
+		// reconcileRestoring owns re-quarantining a foreign volume back to
+		// fred-retained-{original}-*; it is not an error here, but the bytes are still on
+		// disk, so this lease keeps holding their reservation.
+		claimedLeftBehind = len(foreign) > 0
 		// RETRY-SAFE MERGE: on a retry after a partial rename, b.volumes.List no
 		// longer returns the volumes already renamed to fred-retained-{lease}-… on
 		// the prior attempt, so `canonical` only covers the STILL-canonical ones.
@@ -261,13 +262,20 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		retainCanonical := make([]string, 0, len(canonical))
 		for _, c := range canonical {
 			if b.isWritablePathOnly(c) {
-				if err := b.volumes.Destroy(ctx, c); err != nil {
-					// Destroy failed → the volume is still canonical on disk. Record
-					// the error so the lease stays Failed and retries (re-detecting
-					// and re-destroying it); do NOT add it to retainCanonical — it
-					// must never be retained.
-					logger.Error("failed to reclaim writable-path-only volume", "volume", c, "error", err)
-					volumeErrs = append(volumeErrs, fmt.Errorf("reclaim writable-path-only volume %s: %w", c, err))
+				// Routed through the choke point like every other destroy. `c` came from
+				// partition against the same cached table, so the re-check is free and
+				// cannot refuse — but going around it is exactly how this site's guard
+				// stayed transitive, holding only because it iterated an
+				// already-filtered slice (ENG-658).
+				if rep := op.destroy(ctx, destroySiteDeprovisionReclaim, c); rep.leftOnDisk() {
+					// The volume is still canonical on disk. Record the error so the
+					// lease stays Failed and retries (re-detecting and re-destroying it);
+					// do NOT add it to retainCanonical — it must never be retained.
+					if err := rep.err(); err != nil {
+						volumeErrs = append(volumeErrs, fmt.Errorf("reclaim writable-path-only volume %s: %w", c, err))
+					} else {
+						claimedLeftBehind = true
+					}
 				} else {
 					retentionWritablePathReclaimedTotal.Inc()
 					logger.Info("reclaimed writable-path-only volume on close", "volume", c)
@@ -393,8 +401,12 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			}
 
 			if scope, refuse := b.shouldRefuseRetention(leaseUUID, tenant, partition, durableItems, budget); refuse {
-				volumeErrs = append(volumeErrs, b.destroyOnRefuseToRetain(ctx, retainCanonical, leaseUUID, tenant, partition, scope, logger)...)
-				if len(volumeErrs) == 0 {
+				rep := b.destroyOnRefuseToRetain(ctx, op, retainCanonical, leaseUUID, tenant, partition, scope, logger)
+				if err := rep.err(); err != nil {
+					volumeErrs = append(volumeErrs, err)
+				}
+				claimedLeftBehind = claimedLeftBehind || len(rep.Claimed) > 0
+				if len(volumeErrs) == 0 && !claimedLeftBehind {
 					// Every byte is gone — the refused stateful volumes here AND any
 					// writable-path-only volumes reclaimed before the switch — so release
 					// the live allocation. Guard on the OVERALL error count (not just new
@@ -402,6 +414,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 					// failure already in volumeErrs leaves bytes on disk, so keep live
 					// counted and let the retry re-attempt rather than under-count
 					// (over-admit/ENOSPC). Consistent with the other release-live arms.
+					// A refused volume is not an error but leaves bytes on disk just the
+					// same, so it holds the reservation for the same reason (ENG-647).
 					releaseLiveOnRetainPath = true
 				}
 				break
@@ -467,25 +481,21 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			}
 		}
 	default:
+		names := make([]string, 0, len(items))
 		for _, item := range items {
 			for i := range item.Quantity {
-				volumeID := canonicalVolumeName(leaseUUID, item.ServiceName, i)
-				if claimed[volumeID] {
-					// An in-flight restore adopted another lease's retained data under this
-					// name. Destroying it is unrecoverable data loss and kills that lease's
-					// restore; reconcileRestoring re-quarantines it once its rollback can
-					// complete (ENG-647).
-					claimedLeftBehind = true
-					logger.Warn("deprovision: volume is claimed by an in-flight restore record; not destroying it",
-						"volume_id", volumeID)
-					continue
-				}
-				if volErr := b.volumes.Destroy(ctx, volumeID); volErr != nil {
-					logger.Error("failed to destroy volume", "volume_id", volumeID, "error", volErr)
-					volumeErrs = append(volumeErrs, fmt.Errorf("volume %s: %w", volumeID, volErr))
-				}
+				names = append(names, canonicalVolumeName(leaseUUID, item.ServiceName, i))
 			}
 		}
+		// One call, one ownership resolution. A refused name is another lease's data
+		// adopted under ours by an in-flight restore: reconcileRestoring re-quarantines
+		// it once its rollback can complete, so we leave it (ENG-647). An unprovable
+		// table surfaces through rep.err() and keeps the lease Failed for retry.
+		rep := op.destroy(ctx, destroySiteDeprovisionDestroy, names...)
+		if err := rep.err(); err != nil {
+			volumeErrs = append(volumeErrs, err)
+		}
+		claimedLeftBehind = claimedLeftBehind || len(rep.Claimed) > 0
 		if len(volumeErrs) == 0 && !claimedLeftBehind {
 			// All volumes destroyed — bytes are gone, so release the live allocation
 			// now. Releasing only on success (not before the loop) keeps the footprint
@@ -536,7 +546,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			//
 			// Persist the abandoned footprint as a reaping tombstone BEFORE releasing
 			// live, so the bytes hand off live→reaping with no uncounted gap. (ENG-376)
-			b.recordGiveUpLeak(leaseUUID, tenant, providerUUID, items, logger)
+			b.recordGiveUpLeak(op, leaseUUID, tenant, providerUUID, items, logger)
 			// Release live UNCONDITIONALLY here: the provision is about to be
 			// deleted and `return nil`, so no retry can ever run to free it.
 			// On the retain path the flag is still false, so without this the
@@ -661,7 +671,7 @@ func (b *Backend) purgeReleaseHistory(leaseUUID string, logger *slog.Logger) {
 // Give-up tombstones deliberately carry Partition "" (the default bucket): they are
 // reaping-from-birth — never eviction-ordered, never restorable, never counted by any
 // L2 term — and this is the maximally-degraded path (degraded ⇒ default bucket).
-func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
+func (b *Backend) recordGiveUpLeak(op *volumeOp, leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
 	retentionLeakedTotal.Inc()
 	if b.retentionStore == nil {
 		return // no projection to correct; metric + the give-up log are the record
@@ -673,50 +683,55 @@ func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items
 	// kill its restore. The close's volume branches already refuse to destroy them; a
 	// give-up must not undo that on a timer (ENG-647).
 	//
-	// If the claim set is unreadable we record NOTHING rather than risk naming data that
-	// is not ours. That under-counts a real leak, but retentionLeakedTotal (incremented
+	// Asked through the same op the close used, so the write-time filter and the
+	// destroy-time re-check (destroyReapingVolumes, ENG-659) share one definition of
+	// ownership instead of two that must agree.
+	//
+	// If ownership is unprovable we record NOTHING rather than risk naming data that is
+	// not ours. That under-counts a real leak, but retentionLeakedTotal (incremented
 	// above) plus the give-up log are the record, and cleanup gates fail toward keeping
-	// data.
-	claimed, claimErr := b.restoringClaimedVolumes(leaseUUID)
-	if claimErr != nil {
-		logger.Error("give-up leak: cannot identify restore-claimed volumes; recording no tombstone rather than scheduling a destroy that might name another lease's data",
-			"error", claimErr)
-		return
-	}
+	// data. (The footprint that goes uncounted here is ENG-676, tracked separately.)
 	var leaked []string
 	if all, err := b.volumes.List(); err == nil {
 		cprefix := leaseVolumePrefix(leaseUUID) // fred-{lease}-
 		rprefix := retainedName(cprefix)        // fred-retained-{lease}-
+		candidates := make([]string, 0, len(all))
 		for _, id := range all {
-			if claimed[id] {
-				logger.Warn("give-up leak: volume is claimed by an in-flight restore; excluding it from the reaping tombstone",
-					"volume_id", id)
-				continue
-			}
 			if strings.HasPrefix(id, cprefix) || strings.HasPrefix(id, rprefix) {
-				leaked = append(leaked, id)
+				candidates = append(candidates, id)
 			}
 		}
+		mine, _, claimErr := op.partition(candidates)
+		if claimErr != nil {
+			logger.Error("give-up leak: cannot establish volume ownership; recording no tombstone rather than scheduling a destroy that might name another lease's data",
+				"error", claimErr)
+			return
+		}
+		leaked = mine
 	} else {
 		logger.Warn("give-up leak: volume list failed; deriving canonical + retained names from items", "error", err)
+		derived := make([]string, 0, len(items))
 		for _, item := range items {
 			for i := range item.Quantity {
-				canonical := canonicalVolumeName(leaseUUID, item.ServiceName, i)
-				// Record BOTH namespaces. A retain-path give-up may have already renamed
-				// some volumes into fred-retained-* before failing, so the on-disk name is
-				// unknown when List() is unavailable. destroyReapingVolumes treats a missing
-				// volume as an idempotent no-op, so recording both guarantees whichever
-				// exists is destroyed before the tombstone is deleted. Without the retained
-				// name, the sweep would "succeed" against the non-existent canonical name and
-				// drop the tombstone while the fred-retained-* volume persists untracked —
-				// reintroducing the exact under-count/leak this path fixes.
-				if claimed[canonical] {
-					logger.Warn("give-up leak: derived name is claimed by an in-flight restore; excluding it from the reaping tombstone",
-						"volume_id", canonical)
-					continue
-				}
-				leaked = append(leaked, canonical, retainedName(canonical))
+				derived = append(derived, canonicalVolumeName(leaseUUID, item.ServiceName, i))
 			}
+		}
+		mine, _, claimErr := op.partition(derived)
+		if claimErr != nil {
+			logger.Error("give-up leak: cannot establish volume ownership; recording no tombstone rather than scheduling a destroy that might name another lease's data",
+				"error", claimErr)
+			return
+		}
+		// Record BOTH namespaces. A retain-path give-up may have already renamed some
+		// volumes into fred-retained-* before failing, so the on-disk name is unknown
+		// when List() is unavailable. destroyReapingVolumes treats a missing volume as an
+		// idempotent no-op, so recording both guarantees whichever exists is destroyed
+		// before the tombstone is deleted. Without the retained name, the sweep would
+		// "succeed" against the non-existent canonical name and drop the tombstone while
+		// the fred-retained-* volume persists untracked — reintroducing the exact
+		// under-count/leak this path fixes.
+		for _, canonical := range mine {
+			leaked = append(leaked, canonical, retainedName(canonical))
 		}
 	}
 	if len(leaked) == 0 {

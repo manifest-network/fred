@@ -13,6 +13,14 @@ import (
 )
 
 // volumeManager manages quota-enforced host directories for container volumes.
+//
+// It deliberately does NOT include Destroy. Every concrete manager implements it, but
+// exposing it here would put an irreversible RemoveAll on tenant data one method call
+// away from any code holding b.volumes — which is how six call sites came to derive
+// their own destroy sets, three of them from a name that does not prove ownership.
+// Destruction is reached only through volumeOp.destroy (volume_destroy.go), which asks
+// who owns the bytes first; leaving the method off this interface is what turns
+// forgetting to ask into a compile error rather than a review comment. (ENG-658)
 type volumeManager interface {
 	// Create creates a quota-enforced directory for a container.
 	// Idempotent: if the volume already exists, updates the quota and returns
@@ -28,9 +36,6 @@ type volumeManager interface {
 	// concurrently-deprovisioning volume cannot be resurrected. Idempotent.
 	// Used by the startup backfill (reconcileVolumeQuotas).
 	EnsureQuota(ctx context.Context, id string, sizeMB int64) error
-
-	// Destroy removes the directory and quota. Idempotent.
-	Destroy(ctx context.Context, id string) error
 
 	// List returns the IDs of all managed volumes in the data directory.
 	// Used for orphan detection at startup.

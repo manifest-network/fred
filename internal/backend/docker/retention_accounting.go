@@ -2,7 +2,6 @@ package docker
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sort"
 	"syscall"
@@ -518,10 +517,16 @@ func (b *Backend) shouldRefuseRetention(leaseUUID, tenant, partition string, ite
 // shouldRefuseRetention. Logs (with scope + truncated partition + the tripped cap
 // value) and increments the scoped refusal counter; the bare retentionRefusedTotal
 // is bumped ONLY for the L0-global scope so its deployed meaning (and the alert
-// keyed on it) is preserved. Returns any destroy errors to merge into the caller's
-// volumeErrs. Only the closing lease's own volumes are touched — disk caps at any
-// level never evict another tenant's (or partition's) in-grace data.
-func (b *Backend) destroyOnRefuseToRetain(ctx context.Context, canonical []string, leaseUUID, tenant, partition, scope string, logger *slog.Logger) []error {
+// keyed on it) is preserved. Only the closing lease's own volumes are touched — disk
+// caps at any level never evict another tenant's (or partition's) in-grace data.
+//
+// Takes the caller's volumeOp rather than a bare name list. This function used to have
+// no ownership check of its own at all: its safety was entirely inherited from the fact
+// that doDeprovision happened to hand it an already-filtered slice, so a second caller
+// passing an unfiltered one would have silently defeated it (ENG-658). The op makes the
+// check travel with the names. Returns the destroy report so the caller can tell
+// "bytes gone" from "bytes still there", which is what gates releasing the reservation.
+func (b *Backend) destroyOnRefuseToRetain(ctx context.Context, op *volumeOp, canonical []string, leaseUUID, tenant, partition, scope string, logger *slog.Logger) destroyReport {
 	var capMB int64
 	switch scope {
 	case refuseScopeGlobal:
@@ -538,12 +543,5 @@ func (b *Backend) destroyOnRefuseToRetain(ctx context.Context, canonical []strin
 		retentionRefusedTotal.Inc() // deployed L0-global-only meaning preserved
 	}
 	retentionRefusedByScopeTotal.WithLabelValues(scope).Inc()
-	var errs []error
-	for _, c := range canonical {
-		if derr := b.volumes.Destroy(ctx, c); derr != nil {
-			logger.Error("retention-refused destroy failed", "volume", c, "error", derr)
-			errs = append(errs, fmt.Errorf("retention-refused destroy %s: %w", c, derr))
-		}
-	}
-	return errs
+	return op.destroy(ctx, destroySiteRetentionRefused, canonical...)
 }

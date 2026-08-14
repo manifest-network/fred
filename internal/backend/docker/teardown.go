@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
@@ -91,46 +90,6 @@ func (b *Backend) teardownLeaseContainers(ctx context.Context, leaseUUID string,
 	}
 	teardownFallbackTotal.WithLabelValues(operation, teardownOutcomeRecovered).Inc()
 	return nil, nil
-}
-
-// restoringClaimedVolumes returns the canonical volume names that an IN-FLIGHT
-// restore has adopted into leaseUUID's namespace but that still belong to ANOTHER
-// lease's retention record.
-//
-// While a record is restoring, the retained data lives under the NEW lease's
-// canonical names (fred-{new}-{svc}-{i}), so a close of the new lease sees volumes
-// that look like its own. They are not: the original record still names them, and
-// destroying them — or re-retaining them under the closing lease, which leaves the
-// original record pointing at fred-retained-{original}-* names that no longer exist —
-// permanently kills that lease's restore. reconcileRestoring re-quarantines them once
-// its rollback can complete, so the right move here is to leave them alone (ENG-647).
-//
-// This is deliberately the same set cleanupOrphanedVolumes already protects from the
-// orphan reaper (recover.go); this is that protection for the close path. Returns an
-// error rather than an empty set when the store cannot be read: callers must skip
-// destruction entirely instead of guessing, mirroring cleanupOrphanedVolumes'
-// fail-safe. A nil retentionStore means no record can exist, so no claim can either.
-func (b *Backend) restoringClaimedVolumes(leaseUUID string) (map[string]bool, error) {
-	if b.retentionStore == nil {
-		return nil, nil
-	}
-	recs, err := b.retentionStore.List()
-	if err != nil {
-		return nil, fmt.Errorf("list retention records: %w", err)
-	}
-	var claimed map[string]bool
-	for _, e := range recs {
-		if e.Status != shared.RetentionStatusRestoring || e.NewLeaseUUID != leaseUUID {
-			continue
-		}
-		for _, retained := range e.RetainedVolumeNames {
-			if claimed == nil {
-				claimed = make(map[string]bool, len(e.RetainedVolumeNames))
-			}
-			claimed[retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)] = true
-		}
-	}
-	return claimed, nil
 }
 
 // discoverLeaseContainers returns the union of the lease's live fred-labeled

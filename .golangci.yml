@@ -19,7 +19,19 @@ linters:
     - errorlint
     - exhaustruct
     - gosec
+    - forbidigo
   settings:
+    forbidigo:
+      # Destroy is an irreversible RemoveAll on tenant data. It is already off the
+      # volumeManager interface (volume.go), so `b.volumes.Destroy(...)` does not
+      # compile — but Go has no file-level visibility, so any file in package docker
+      # could re-obtain the capability by asserting to volumeDestroyer. This rule
+      # closes that half: destruction is reachable only from the one file that asks who
+      # owns the bytes first (ENG-658). Excluded there, and in tests, which drive real
+      # filesystem managers directly for fixture teardown via volDestroyer.
+      forbid:
+        - pattern: '\.Destroy$'
+          msg: "managed-volume destruction must go through volumeOp.destroy (internal/backend/docker/volume_destroy.go): it is the only site that establishes ownership before an irreversible delete (ENG-658)"
     errcheck:
       check-type-assertions: false  # Too noisy for type assertions
     exhaustruct:
@@ -46,9 +58,15 @@ linters:
         - G104
   exclusions:
     rules:
+      # The one file allowed to reach the destroy capability (ENG-658). Everything else
+      # in the repo, production or not, must route through volumeOp.destroy.
+      - path: ^internal/backend/docker/volume_destroy\.go$
+        linters:
+          - forbidigo
       # Exclude test files from strict linters
       - path: _test\.go
         linters:
+          - forbidigo
           - errcheck
           - unparam
           - unused

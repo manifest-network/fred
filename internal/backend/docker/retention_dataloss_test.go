@@ -609,3 +609,85 @@ func TestDestroyReapingVolumes_ConvergesAfterRestoreRollback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, rec)
 }
+
+// TestDestroyReapingVolumes_RefusesAVolumeALiveProvisionHolds covers a second way a
+// tombstone can name data it does not own, which the per-record claim check could not see
+// (ENG-658). A give-up leaves a tombstone naming fred-{lease}-* and deletes the provision;
+// the lease is still ACTIVE on chain, so the reconciler re-provisions it and a fresh
+// volume appears under the very name the tombstone carries. The finalizer now asks the
+// owner table — which knows about live provisions, not just restores — and refuses.
+//
+// This is the ENG-505 class reached through the finalizer instead of the orphan reaper.
+func TestDestroyReapingVolumes_RefusesAVolumeALiveProvisionHolds(t *testing.T) {
+	lease := "0192f1a0-3333-7abc-8def-000000000012"
+	live := canonicalVolumeName(lease, "app", 0)
+	staleLeak := canonicalVolumeName(lease, "app", 1)
+
+	// The lease is tracked again: the give-up deleted the provision, but the chain still
+	// says ACTIVE, so the reconciler re-provisioned it.
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
+	})
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   lease,
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusReaping,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+		RetainedVolumeNames: []string{live, staleLeak},
+	}))
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
+	}
+
+	ok := b.destroyReapingVolumes(context.Background(), lease, []string{live, staleLeak})
+
+	assert.False(t, ok, "a refused name means the record is not fully reaped and must be kept")
+	assert.NotContains(t, destroyed, live,
+		"the re-provisioned lease is running on this volume; a stale tombstone must not reap it (ENG-505 class)")
+	assert.Equal(t, []string{staleLeak}, destroyed,
+		"the genuinely abandoned name is still reaped — the refusal is per name")
+
+	tomb, err := rs.Get(lease)
+	require.NoError(t, err)
+	require.NotNil(t, tomb, "the tombstone survives so the remaining leak stays counted and retryable")
+	assert.Equal(t, shared.RetentionStatusReaping, tomb.Status)
+}
+
+// TestCleanupOrphanedVolumes_LiveProvisionProtectedWithoutAReleaseStore pins that a
+// tracked lease's volume is protected by the OWNER TABLE alone, with no release record to
+// fall back on. The two gates are independent by design and only one of them is a claim:
+// leaseHasActiveRelease is a per-name release-store probe kept out of the table
+// deliberately (folding it in would make a give-up tombstone whose purgeReleaseHistory
+// failed permanently unreapable). This is also what keeps the release probe off the hot
+// path — a healthy node's volumes are all claimed, so none of them reach it (ENG-658).
+func TestCleanupOrphanedVolumes_LiveProvisionProtectedWithoutAReleaseStore(t *testing.T) {
+	lease := "0192f1a0-4444-7abc-8def-000000000013"
+	live := canonicalVolumeName(lease, "app", 0)
+
+	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
+		lease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		}},
+	})
+	require.Nil(t, b.releaseStore, "precondition: no release store, so leaseHasActiveRelease cannot protect anything")
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return []string{live, "fred-genuine-orphan-0"}, nil },
+		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
+	}
+
+	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+
+	assert.NotContains(t, destroyed, live,
+		"a tracked lease's volume is claimed, and a claimed volume is not an orphan")
+	assert.Equal(t, []string{"fred-genuine-orphan-0"}, destroyed,
+		"the unclaimed volume is still reaped — over-keeping everything would make the sweep useless")
+}
