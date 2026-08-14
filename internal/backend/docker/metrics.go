@@ -45,11 +45,19 @@ var orphanSkipReasons = []string{orphanSkipListError, orphanSkipRootUnverifiable
 const (
 	reapSkipRestoreClaimed  = "restore_claimed"  // a tombstoned name is a volume an in-flight restore adopted — deliberate, self-healing, NOT a leak
 	reapSkipClaimUnreadable = "claim_unreadable" // retentionStore.List() failed → ownership unprovable → destroy nothing this pass (fail-safe)
+	// reapSkipOwnerClaimed: a tombstoned name belongs to a LIVE provision or another
+	// lease's retention record (ENG-658). Kept distinct from restore_claimed because the
+	// two resolve differently and an operator acts on that difference: a restore-held
+	// name clears when that restore's rollback re-quarantines it, whereas this one clears
+	// only when the owning lease is next closed cleanly — there is no restore to unblock,
+	// and the deployed BackendRetentionVolumeStuckReaping annotation triages on the
+	// reason label.
+	reapSkipOwnerClaimed = "owner_claimed"
 )
 
 // reapSkipReasons is the closed reason set, pre-initialized to 0 so a healthy
 // provider — which should never skip — exports 0 rather than no-data.
-var reapSkipReasons = []string{reapSkipRestoreClaimed, reapSkipClaimUnreadable}
+var reapSkipReasons = []string{reapSkipRestoreClaimed, reapSkipClaimUnreadable, reapSkipOwnerClaimed}
 
 // Site labels for volumeDestroyRefusedTotal — which destroy path the ownership
 // choke point turned away (ENG-658). One constant per caller of volumeOp.destroy.

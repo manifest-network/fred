@@ -188,9 +188,15 @@ type destroyReport struct {
 	// Destroyed: the bytes are gone. Includes the idempotent no-op for a name that was
 	// already absent, which every Destroy implementation reports as success.
 	Destroyed []string
-	// Claimed: another lease owns these bytes. Not an error — the deliberate,
-	// self-healing skip. They are still on disk, so their footprint must stay counted.
+	// Claimed: another lease owns these bytes. Not an error — the deliberate skip.
+	// They are still on disk, so their footprint must stay counted.
 	Claimed []string
+	// ClaimedBy records WHO owns each refused name. Callers need it because the claim
+	// kind decides how the refusal resolves, and therefore what an operator should do:
+	// a restore-held name clears itself when that restore rolls back, whereas a name a
+	// LIVE provision holds clears only when that lease is next closed. Reporting both as
+	// one reason sends the runbook's triage after a restore that does not exist.
+	ClaimedBy map[string]volumeClaim
 	// Unproven: ownership could not be established (the retention store could not be
 	// read, or the manager cannot destroy at all). Nothing was attempted.
 	Unproven []string
@@ -332,6 +338,10 @@ func (o *volumeOp) destroy(ctx context.Context, site string, names ...string) de
 	for _, name := range names {
 		if claim, permitted := table.mayDestroy(name, o.owner); !permitted {
 			rep.Claimed = append(rep.Claimed, name)
+			if rep.ClaimedBy == nil {
+				rep.ClaimedBy = make(map[string]volumeClaim, 1)
+			}
+			rep.ClaimedBy[name] = claim
 			volumeDestroyRefusedTotal.WithLabelValues(site, destroyRefusedClaimed).Inc()
 			o.logger.Warn("refusing to destroy a volume another lease owns",
 				"site", site, "volume_id", name, "asking_lease_uuid", o.owner,

@@ -439,13 +439,33 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string, names 
 			"lease_uuid", orig, "error", rep.err())
 		return false
 	}
-	if len(rep.Claimed) > 0 {
-		// An in-flight restore adopted another lease's retained data under one of these
-		// names. Destroying it is unrecoverable loss and kills that lease's restore.
-		// reconcileRestoring re-quarantines it back to fred-retained-* once its rollback
-		// can complete, after which the name is absent and the destroy is the idempotent
-		// no-op that finally drops the record.
+	// Count the refusal by HOW it resolves, not merely that it happened — the deployed
+	// stuck-reaping alert triages on this label, and the two paths need different
+	// operator action. Still one increment per reason per attempt (never per volume), so
+	// the series stays summable with the rest of reapSkipReasons.
+	var restoreHeld, ownerHeld bool
+	for _, name := range rep.Claimed {
+		switch rep.ClaimedBy[name].kind {
+		case claimAdopted, claimRestoreSrc:
+			// An in-flight restore adopted another lease's retained data under this name.
+			// Destroying it is unrecoverable loss and kills that lease's restore.
+			// reconcileRestoring re-quarantines it back to fred-retained-* once its
+			// rollback can complete, after which the name is absent and the destroy is
+			// the idempotent no-op that finally drops the record.
+			restoreHeld = true
+		default:
+			// A live provision (or another lease's retained record) holds it: the
+			// tombstone outlived its lease and the reconciler re-provisioned it. Nothing
+			// to unblock — this clears when that lease is next closed cleanly, and the
+			// record is correctly kept in the meantime.
+			ownerHeld = true
+		}
+	}
+	if restoreHeld {
 		retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed).Inc()
+	}
+	if ownerHeld {
+		retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed).Inc()
 	}
 	skipped := len(rep.Claimed)
 	if len(rep.Errs) > 0 {

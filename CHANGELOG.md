@@ -84,6 +84,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   genuinely abandoned names stay counted and retryable. This is the ENG-505 class
   reached through the finalizer rather than the orphan reaper.
 
+  **Operators:** this hold is counted as a new
+  `fred_docker_backend_retention_reap_skips_total{reason="owner_claimed"}`, kept
+  distinct from `restore_claimed` because the two resolve differently — a
+  restore-held name clears when that restore rolls back, whereas this one clears only
+  when the owning lease is next closed cleanly, so the record can legitimately sit
+  `reaping` for as long as that lease lives. On a provider carrying such a tombstone
+  from an older build, expect `BackendRetentionVolumeStuckReaping` to start firing
+  after the upgrade; check the reason label before reclaiming anything (the volume is
+  a running tenant's data). The alert's triage annotation in the deployment repo
+  should gain this third case.
+
 - **A reaping tombstone can no longer destroy an in-flight restore's data**
   (ENG-659). The retention finalizer destroyed every volume name a `reaping`
   record carried, with no ownership check — the only volume-destroy path in the

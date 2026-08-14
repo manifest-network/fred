@@ -644,10 +644,16 @@ func TestDestroyReapingVolumes_RefusesAVolumeALiveProvisionHolds(t *testing.T) {
 	b.volumes = &mockVolumeManager{
 		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
 	}
+	ownerBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed))
+	restoreBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed))
 
 	ok := b.destroyReapingVolumes(context.Background(), lease, []string{live, staleLeak})
 
 	assert.False(t, ok, "a refused name means the record is not fully reaped and must be kept")
+	assert.Equal(t, ownerBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed)))
+	assert.Equal(t, restoreBefore, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed)),
+		"there is no restore here, and the deployed stuck-reaping runbook triages on this label — "+
+			"reporting restore_claimed would send an operator hunting for a rollback that does not exist")
 	assert.NotContains(t, destroyed, live,
 		"the re-provisioned lease is running on this volume; a stale tombstone must not reap it (ENG-505 class)")
 	assert.Equal(t, []string{staleLeak}, destroyed,

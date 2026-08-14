@@ -467,6 +467,15 @@ the sweep is the only automatic reclaimer.
   instead means the retention store
   is unreadable, which silently stops the reaper (and blocks the close path too); fix the store
   first. See ENG-659.
+- **`reason="owner_claimed"` is a different hold, and there is nothing to unblock.** A
+  tombstoned name belongs to a **live provision** (or another lease's retained record): the
+  give-up deleted the provision while the lease was still ACTIVE on chain, the reconciler
+  re-provisioned it, and a fresh volume now sits under the name the tombstone carries. The
+  refusal is correct — that volume is a running tenant's data. Do **not** reclaim it, and do
+  not go looking for a restore. The tombstone's other names still reap; the held one clears
+  when that lease is next closed cleanly, so the record can legitimately sit `reaping` for as
+  long as the lease lives. Expect `BackendRetentionVolumeStuckReaping` to fire on it; confirm
+  the reason label before actioning. See ENG-658.
 - **Second signal, and the one that names the volume:**
   `..._volume_destroy_refused_total{site="reaping",reason="claimed"}` counts the same refusals
   **per volume** rather than per sweep, and the accompanying WARN log carries `volume_id` plus
