@@ -3,7 +3,6 @@ package docker
 import (
 	"slices"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
@@ -67,12 +66,17 @@ func recoveredFromProvision(p *provision) recoveredProvision {
 
 // enrichReserved sets the post-validation workload metadata on a reserved
 // provision (the slot is a Provisioning marker). It is the ONLY place SKU /
-// Items / StackManifest are written outside the actor; the caller holds
-// b.provisionsMu. Items is deep-copied so the published provision does not
-// alias the caller's request slice (NormalizeProvisionRequest mutates it in
+// StackManifest are written outside the actor; the caller holds b.provisionsMu.
+//
+// Items are deliberately NOT written here. They are the lease's ownership claim
+// on its canonical volume names (snapshotVolumeClaims, volume_destroy.go), so
+// the reservation publishes them atomically with the entry itself — deferring
+// them to this call left every provision's volumes unclaimed for the whole
+// validation window, and made the re-provision arm retract a live claim
+// (ENG-681). Both publish sites deep-copy, so the published provision never
+// aliases the caller's request slice (NormalizeProvisionRequest mutates it in
 // place).
-func (p *provision) enrichReserved(sku string, items []backend.LeaseItem, sm *manifest.StackManifest) {
+func (p *provision) enrichReserved(sku string, sm *manifest.StackManifest) {
 	p.SKU = sku
-	p.Items = slices.Clone(items)
 	p.StackManifest = sm
 }

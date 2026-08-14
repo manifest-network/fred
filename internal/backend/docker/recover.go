@@ -720,6 +720,15 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	// Resolve up front rather than per volume: a store read error must skip the whole
 	// run (we cannot tell a leak from a retained canonical we failed to protect), and
 	// this way the run costs one read no matter how many volumes are on disk.
+	//
+	// Unlike the retention sweep, this sweep is NOT exposed to a concurrent claim
+	// (checked for ENG-681): cmd/docker-backend builds and binds the HTTP server that
+	// serves /provision only after Start returns, and Start runs this before it launches
+	// the retention reaper, the reconcile loop and the event loop — so no goroutine that
+	// could publish a provision is running yet. It is covered by the choke point's
+	// destroy-time re-check anyway, at the cost of an uncontended mutex per orphan;
+	// depending on that ordering rather than on the lock would be depending on it
+	// forever.
 	op := b.volumeOp("", b.logger)
 	table, err := op.claims()
 	if err != nil {

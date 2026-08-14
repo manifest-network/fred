@@ -4145,18 +4145,9 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 // leasesm test fixtures (newTestActor + mock DoDeprovisionFn) than
 // via Backend integration.
 
-func TestProvision_EnrichReserved_DeepCopiesItems(t *testing.T) {
-	// enrichReserved must not retain the caller's Items slice: NormalizeProvisionRequest
-	// mutates req.Items[0] in place (client.go), so a stored alias would change
-	// the published provision after the fact.
-	p := &provision{ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", Status: backend.ProvisionStatusProvisioning}}
-	callerItems := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
-	p.enrichReserved("docker-small", callerItems, nil)
-	// Mutate the caller's slice after enrichment.
-	callerItems[0].ServiceName = "mutated"
-	require.Len(t, p.Items, 1)
-	assert.Equal(t, "app", p.Items[0].ServiceName, "stored Items must be a copy, not the caller's slice")
-}
+// The deep-copy invariant this used to pin on enrichReserved now lives at the
+// reservation, and is covered end-to-end alongside the claim it publishes by
+// TestProvision_ReservationPublishesTheOwnershipClaim (volume_destroy_race_test.go).
 
 func TestProvision_ConcurrentReaderDuringValidationWindow(t *testing.T) {
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
@@ -4184,7 +4175,7 @@ func TestProvision_ConcurrentReaderDuringValidationWindow(t *testing.T) {
 	for range 50 {
 		b.provisionsMu.Lock()
 		if p, ok := b.provisions["L1"]; ok {
-			p.enrichReserved("docker-small", []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}, nil)
+			p.enrichReserved("docker-small", nil)
 		}
 		b.provisionsMu.Unlock()
 	}

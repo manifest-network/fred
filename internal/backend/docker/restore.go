@@ -484,8 +484,18 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string, names 
 		// invariant. Nor is the list narrowed to the skipped names: Destroy no-ops on an
 		// already-gone name, so re-attempting the whole list next sweep is free and avoids
 		// a CAS-less rewrite of a tombstone another path may be racing.
-		b.logger.Warn("reaping: record kept (restore-claimed volume(s) left on disk); the restore's rollback resolves it",
-			"lease_uuid", orig, "skipped", skipped, "names", len(names))
+		//
+		// The message follows the same split as the counters above, for the same reason:
+		// the two holds resolve differently, and telling an operator to wait for a
+		// rollback that does not exist is how a live lease's data gets reclaimed by hand.
+		msg := "reaping: record kept (restore-claimed volume(s) left on disk); the restore's rollback resolves it"
+		switch {
+		case restoreHeld && ownerHeld:
+			msg = "reaping: record kept (volume(s) held by both an in-flight restore and a live provision); nothing to reclaim"
+		case ownerHeld:
+			msg = "reaping: record kept (volume(s) held by a live provision); this clears when that lease is next closed cleanly — do NOT reclaim by hand"
+		}
+		b.logger.Warn(msg, "lease_uuid", orig, "skipped", skipped, "names", len(names))
 		return false
 	}
 	if derr := b.retentionStore.Delete(orig); derr != nil {

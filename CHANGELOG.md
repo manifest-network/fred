@@ -72,6 +72,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **The ownership check that authorizes a volume destroy can no longer be stale by the
+  time the delete runs** (ENG-681). ENG-658 made every managed-volume destroy ask who owns
+  the bytes, but it asked once per operation and cached the answer, and nothing serialized
+  that answer against the writes that establish a claim. The retention sweep could
+  therefore read a give-up tombstone's canonical name as unclaimed, and only then have the
+  lease re-provisioned underneath it and the directory reused — after which the sweep's
+  loop deleted a running tenant's data. The claim is now re-established under a per-volume
+  lock that the create-or-reuse in the provision path also takes, so the decision and the
+  `RemoveAll` it authorizes are one step, and a provision that has adopted the directory is
+  seen rather than deleted out from under.
+
+  ENG-658 also left a second, wider gap unaddressed, closed here: a lease's claim is the
+  set of canonical volume names derived from its items, and the provision reservation
+  published no items at all — they were filled in only after SKU validation, manifest
+  parsing and pool allocation. For that whole window a provision claimed nothing, and on a
+  re-provision it was worse than a gap: the previous, claim-bearing entry is deleted and
+  replaced in the same critical section, so a live claim was *retracted* over volumes that
+  a re-provision deliberately keeps. The reservation now carries its items from the start,
+  as the restore path's already did.
+
+  No configuration, API or metric change: a refusal from the re-check is counted as the
+  same `fred_docker_backend_volume_destroy_refused_total{reason="claimed"}` as any other,
+  and reaches the finalizer's existing `retention_reap_skips_total{reason="owner_claimed"}`.
+  The WARN a kept reaping record emits now names *which* hold it is — a restore's, which
+  clears on that restore's rollback, or a live provision's, which does not and must not be
+  reclaimed by hand. It previously told operators to wait for a rollback in both cases.
+
 - **A reaping tombstone can no longer destroy a re-provisioned lease's live data**
   (ENG-658). ENG-659 stopped the retention finalizer from executing a tombstone that
   named a volume an in-flight *restore* had adopted, but it asked a question scoped to
