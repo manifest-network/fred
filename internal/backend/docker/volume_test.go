@@ -260,8 +260,16 @@ func TestNewVolumeManager_UnsupportedFilesystem(t *testing.T) {
 // the next boot's orphan sweep destroys the data behind them. Refusing to start is the
 // right answer: a missing mount needs an operator, not a sweep.
 func TestNewVolumeManager_ConfiguredFilesystemMustMatchReality(t *testing.T) {
-	// t.TempDir() is tmpfs, so "xfs" here is precisely the lie an unmounted root tells.
-	_, err := newVolumeManager(t.TempDir(), "xfs", 1024, slog.Default())
+	// The configured value is chosen to disagree with whatever the temp dir REALLY is, rather
+	// than assuming it is tmpfs: on a host whose /tmp is XFS, hardcoding "xfs" would describe
+	// the truth instead of the lie and the constructor would rightly succeed.
+	dir := t.TempDir()
+	configured := "xfs"
+	if detected, derr := detectFilesystem(dir); derr == nil && detected == configured {
+		configured = "btrfs" // any supported type the temp dir is not
+	}
+
+	_, err := newVolumeManager(dir, configured, 1024, slog.Default())
 	require.Error(t, err, "a configured filesystem that does not match the disk must fail startup")
 	assert.Contains(t, err.Error(), "is the volume mounted?",
 		"the error must name the likely cause; this fires on hosts where the mount unit failed")

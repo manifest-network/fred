@@ -245,8 +245,23 @@ const volumePrefix = "fred-"
 // safe — a root we have never seen hold anything has nothing to lose, and the transition
 // this guards is precisely "held volumes, then suddenly none".
 //
-// Only the empty result is checked. A non-empty enumeration is self-evidently reading a
-// populated fred root, and paying a stat on it would tax every close.
+// Every enumeration pays one stat, not just the empty ones: a populated read is where the
+// baseline is LEARNED, so skipping it there would leave nothing to compare against later.
+// Only the empty result is REJECTED on a mismatch — a populated one re-learns instead,
+// which is also what lets a deliberate remount converge rather than wedge.
+//
+// KNOWN LIMIT, deliberately not papered over: the baseline is process-local, so a daemon that
+// STARTS while the mount is already down has never seen this root hold anything and its first
+// empty enumeration is accepted. The startup filesystem probe covers that only when the parent
+// filesystem differs from the configured one — on a host whose root and data volume are both
+// XFS, both guards pass.
+//
+// Closing it needs a mount identity that survives a restart, which is a different mechanism
+// (a marker file in the root, or persisted identity, plus an upgrade story for roots that
+// predate it) and is tracked separately. The obvious shortcut — refusing to believe an empty
+// root while retention records still name volumes — was tried and rejected: it cannot tell an
+// unmount from a genuine reclaim of every volume, so it disables the orphan pruner on exactly
+// the nodes it was built for (pinned by TestRunRetentionSweep_PrunesOrphans).
 type volumeRootWatch struct {
 	mu   sync.Mutex
 	dev  uint64
