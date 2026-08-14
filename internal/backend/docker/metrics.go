@@ -691,7 +691,10 @@ var (
 	})
 
 	// retentionSweepTotal counts periodic retention-sweep passes by outcome, exactly ONCE
-	// per pass. That once-per-pass property is the whole point and must survive future
+	// per pass that returns. (A pass that PANICS records no outcome — StartCleanupLoop
+	// recovers it and the tick is simply missing, which the liveness query reads as a stall
+	// and cleanup_panics_total{component="retention"} names precisely.)
+	// That once-per-pass property is the whole point and must survive future
 	// edits: the sum across outcomes advances every tick regardless of result, so
 	// `sum without (outcome) (increase(...[N])) == 0` is a true liveness heartbeat for the
 	// sweep goroutine, and {outcome="error"} is the sweep-stage failure signal — usually a

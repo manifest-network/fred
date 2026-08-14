@@ -91,8 +91,19 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// One enumeration for the whole boot walk; the reaping arm below is its only user,
-	// and it is resolved lazily so a store with no reaping records pays nothing.
+	// One enumeration for the whole boot walk; the reaping arm below is its only user, and
+	// it is resolved lazily so a store with no reaping records pays nothing.
+	//
+	// This walk is longer-lived than a sweep — the restoring arm runs compose teardowns and
+	// re-quarantine RENAMES — so it is worth stating why a snapshot survives it. The
+	// dangerous shape would be a rename that moves a volume INTO a reaping lease's namespace
+	// after the snapshot: the derived set would miss it, every listed name would already be
+	// gone, and the record would be dropped while bytes remained. It cannot happen here,
+	// because a re-quarantine renames back to the ORIGINAL lease's retained namespace, and a
+	// lease cannot be both original-of-a-restore and reaping at once — the store is keyed by
+	// OriginalLeaseUUID, so it holds exactly one record per lease. Every other staleness is
+	// self-correcting: a volume that appeared is simply not destroyed this pass, and one that
+	// vanished makes its destroy an idempotent no-op.
 	idx := b.newManagedVolumeIndex()
 	for _, e := range all {
 		switch e.Status {

@@ -722,3 +722,51 @@ func TestCleanupOrphanedVolumes_LiveProvisionProtectedWithoutAReleaseStore(t *te
 	assert.Equal(t, []string{"fred-genuine-orphan-0"}, destroyed,
 		"the unclaimed volume is still reaped — over-keeping everything would make the sweep useless")
 }
+
+// TestDestroyReapingVolumes_ReclaimsTheWholeNamespace_NotJustTheRecordedNames pins the
+// behavioural WIDENING that deriving the destroy set introduces, which is the most
+// consequential change in ENG-676 and was previously asserted only in prose.
+//
+// A tombstone used to destroy exactly the names it carried. Derived, it destroys everything
+// in the lease's namespace that nothing claims — so a volume the record never named, such as
+// a writable-path-only volume whose reclaim failed before the record was written, is now
+// reclaimed instead of surviving as an orphan until some later boot sweep decides it is
+// unowned. That is the same "destroy only what nothing claims" rule cleanupOrphanedVolumes
+// applies globally, scoped to one lease, and it is why the record can afford to carry no
+// names at all.
+//
+// The widening is bounded by the lease's own prefixes and by the ownership table; the
+// sibling tests in this file cover a claimed name being refused.
+func TestDestroyReapingVolumes_ReclaimsTheWholeNamespace_NotJustTheRecordedNames(t *testing.T) {
+	lease := "0192f1a0-5555-7abc-8def-000000000201"
+	recorded := retainedName(canonicalVolumeName(lease, "app", 0))
+	unrecorded := canonicalVolumeName(lease, "app", 1) // never named by the record
+	otherLease := canonicalVolumeName("0192f1a0-6666-7abc-8def-000000000202", "app", 0)
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Put(shared.RetentionEntry{
+		OriginalLeaseUUID:   lease,
+		Tenant:              "tenant-a",
+		Status:              shared.RetentionStatusReaping,
+		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+		RetainedVolumeNames: []string{recorded}, // deliberately narrower than what is on disk
+	}))
+
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return []string{recorded, unrecorded, otherLease}, nil },
+		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
+	}
+
+	assert.True(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease),
+		"the whole namespace is gone, so the record has nothing left to account for")
+	assert.ElementsMatch(t, []string{recorded, unrecorded}, destroyed,
+		"both namespaces of THIS lease are reclaimed, including the volume the record never named")
+	assert.NotContains(t, destroyed, otherLease,
+		"the widening is bounded by the lease's own prefixes — another lease is never in scope")
+
+	got, err := rs.Get(lease)
+	require.NoError(t, err)
+	assert.Nil(t, got, "record dropped once the footprint is confirmed gone")
+}
