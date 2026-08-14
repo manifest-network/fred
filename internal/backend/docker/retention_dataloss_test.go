@@ -432,7 +432,7 @@ func TestDestroyReapingVolumes_SkipsVolumeClaimedByRestoringRecord(t *testing.T)
 	leakBefore := testutil.ToFloat64(retentionLeakedTotal)
 	skipBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed))
 
-	ok := b.destroyReapingVolumes(context.Background(), newLease)
+	ok := b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), newLease)
 
 	assert.False(t, ok, "a skipped name means the record was not fully reaped")
 	assert.NotContains(t, destroyed, adopted,
@@ -521,7 +521,7 @@ func TestDestroyReapingVolumes_ClaimLookupError_DestroysNothing(t *testing.T) {
 	leakBefore := testutil.ToFloat64(retentionLeakedTotal)
 	skipBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
 
-	ok := b.destroyReapingVolumes(context.Background(), newLease)
+	ok := b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), newLease)
 
 	assert.False(t, ok, "nothing was destroyed, so the record cannot be dropped")
 	assert.Equal(t, skipBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable)))
@@ -554,7 +554,7 @@ func TestDestroyReapingVolumes_NormalReapingRecordStillFullyReaped(t *testing.T)
 	claimedBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed))
 	unreadableBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
 
-	assert.True(t, b.destroyReapingVolumes(context.Background(), lease))
+	assert.True(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease))
 	assert.Equal(t, names, destroyed)
 
 	rec, err := rs.Get(lease)
@@ -584,7 +584,7 @@ func TestDestroyReapingVolumes_RetainedOnlyNames_SkipTheClaimLookup(t *testing.T
 	}
 	unreadableBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
 
-	b.destroyReapingVolumes(context.Background(), lease)
+	b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease)
 
 	assert.Equal(t, names, destroyed,
 		"no fred-{lease}-* name in the list ⇒ no claim can match ⇒ no store read, destroy proceeds")
@@ -613,7 +613,7 @@ func TestDestroyReapingVolumes_ConvergesAfterRestoreRollback(t *testing.T) {
 		DestroyFn: func(_ context.Context, _ string) error { return nil },
 	}
 
-	require.False(t, b.destroyReapingVolumes(context.Background(), newLease),
+	require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), newLease),
 		"precondition: the claim holds the tombstone")
 
 	// The rollback: reconcileRestoring renames fred-{newLease}-app-0 back into the
@@ -624,7 +624,7 @@ func TestDestroyReapingVolumes_ConvergesAfterRestoreRollback(t *testing.T) {
 	require.True(t, reverted)
 	onDisk = []string{ownLeak}
 
-	assert.True(t, b.destroyReapingVolumes(context.Background(), newLease),
+	assert.True(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), newLease),
 		"claim cleared and the adopted name renamed away ⇒ only this lease's own leak remains, it is destroyed, and the record drops")
 	rec, err := rs.Get(newLease)
 	require.NoError(t, err)
@@ -672,7 +672,7 @@ func TestDestroyReapingVolumes_RefusesAVolumeALiveProvisionHolds(t *testing.T) {
 	ownerBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed))
 	restoreBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed))
 
-	ok := b.destroyReapingVolumes(context.Background(), lease)
+	ok := b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease)
 
 	assert.False(t, ok, "a refused name means the record is not fully reaped and must be kept")
 	assert.Equal(t, ownerBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed)))

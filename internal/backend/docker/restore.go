@@ -91,6 +91,9 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// One enumeration for the whole boot walk; the reaping arm below is its only user,
+	// and it is resolved lazily so a store with no reaping records pays nothing.
+	idx := b.newManagedVolumeIndex()
 	for _, e := range all {
 		switch e.Status {
 		case shared.RetentionStatusActive:
@@ -109,7 +112,7 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 		case shared.RetentionStatusReaping:
 			// Finalizer retry at boot: re-attempt destroy of any record stranded
 			// reaping by a prior crash/destroy-failure; delete it when confirmed gone.
-			b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID)
+			b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID)
 		}
 	}
 	return nil
@@ -370,6 +373,11 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 		toEvict = maxRetentionEvictionsPerClose
 	}
 	marked := make(map[string]struct{}, toEvict)
+	// ONE enumeration for the whole batch. This loop runs synchronously inside a lease
+	// close and evicts up to maxRetentionEvictionsPerClose records, so a per-record
+	// os.ReadDir of the volume root would put O(batch x volumes) directory work on a
+	// tenant-facing path.
+	idx := b.newManagedVolumeIndex()
 	for i := 0; i < toEvict; i++ {
 		e := ordered[i]
 		b.logger.Warn("evicting tenant's oldest retained lease to honor cap",
@@ -392,7 +400,7 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 			retentionPartitionEvictedTotal.Inc()
 		}
 		marked[e.OriginalLeaseUUID] = struct{}{}
-		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID)
+		b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID)
 	}
 	return marked, true, nil
 }
@@ -443,7 +451,7 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 // adopted data, and only one of those two mistakes is reversible. Waiting costs nothing:
 // the record IS the retry vehicle, so the next sweep re-attempts without a reboot. The
 // record is dropped only on the positive fact that the footprint is gone.
-func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string) bool {
+func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeIndex, orig string) bool {
 	logger := b.logger.With("lease_uuid", orig)
 	// owner "" — a tombstone is a scheduled destroy, not an assertion of ownership, so it
 	// is entitled to exactly the volumes NOTHING claims. That also refuses a name a LIVE
@@ -452,7 +460,7 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string) bool {
 	// otherwise reap the fresh volume out from under it).
 	op := b.volumeOp("", logger)
 
-	names, derr := b.reapingFootprint(orig)
+	names, derr := idx.footprint(orig)
 	if derr != nil {
 		// Cannot enumerate the volume root, so "no volumes" and "cannot see the volumes"
 		// are indistinguishable — and one of those two readings deletes the record that is
@@ -563,35 +571,55 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, orig string) bool {
 //
 // An error means the volume root could not be enumerated, which the caller must treat as
 // uncertainty and never as "no volumes": the caller's response to an empty set is to DELETE
-// the record. Ownership is deliberately not consulted here — that is volumeOp.destroy's
-// job, and asking it twice would be the "two definitions that must agree" this file has
-// spent several tickets collapsing into one.
+// the record. That distinction is guaranteed at the syscall (listVolumeIDs returns ENOENT
+// rather than an empty slice), so it needs no separate stat here — and therefore has no
+// window between a probe and a read for the root to vanish in. Ownership is deliberately
+// not consulted either: that is volumeOp.destroy's job, and asking it twice would be the
+// "two definitions that must agree" this file has spent several tickets collapsing.
 //
-// The volume root is probed BEFORE listing, with the same fail-safe the orphan reconcile
-// uses (G2, volumeRootUnverifiable). listVolumeIDs maps a MISSING directory to (nil, nil),
-// so without this probe an unmounted or not-yet-created volume root would read as "this
-// lease has no volumes left" and delete every reaping record on the node — dropping both
-// the retry vehicle and the accounting for bytes that reappear when the mount does. Absent
-// and unreadable are both uncertainty here (the kubelet #72257 hazard), never emptiness.
+// The enumeration is resolved at most ONCE per index, and every caller that loops over
+// records shares one — a full os.ReadDir of the volume root per record would be O(R×V) per
+// pass, which is worst exactly where it hurts most: evictOldest runs up to 32 records
+// synchronously inside a lease close. Same lazy-once shape as volumeOp.claims, for the
+// same reason.
+type managedVolumeIndex struct {
+	b        *Backend
+	resolved bool
+	all      []string
+	err      error
+}
+
+// newManagedVolumeIndex starts one pass's view of the node's managed volumes. Scope it to a
+// single sweep/close and let it go: like the ownership table, it is a point-in-time answer,
+// and the failure mode this family guards against is a collector acting on a stale one.
+// Staleness within a pass is safe in both directions — a volume that appears after the
+// snapshot is simply not destroyed, and one that disappears makes its destroy an idempotent
+// no-op — and the per-name ownership check still runs at destroy time under the volume's
+// stripe regardless (ENG-681).
+func (b *Backend) newManagedVolumeIndex() *managedVolumeIndex {
+	return &managedVolumeIndex{b: b}
+}
+
+// footprint returns the volumes currently on disk in a reaping lease's namespace — both the
+// canonical fred-{lease}-* names and the quarantined fred-retained-{lease}-* ones.
 //
-// Cost is one os.ReadDir per record per pass. That is a single getdents loop with no
-// per-entry stat, and the close path already pays one; it replaces the stored name list,
-// which cost nothing to read but could not be computed exactly when it mattered most.
-func (b *Backend) reapingFootprint(orig string) ([]string, error) {
-	if b.cfg.VolumeDataPath != "" {
-		exists, statErr := pathExists(b.cfg.VolumeDataPath)
-		if volumeRootUnverifiable(exists, statErr) {
-			return nil, fmt.Errorf("volume data root %q absent or unreadable: %w", b.cfg.VolumeDataPath, statErr)
-		}
+// Both namespaces are enumerated because a give-up can strand a lease part-way through the
+// retain path's renames, leaving some volumes canonical and some already quarantined. The
+// stored-list design could not know which, so recordGiveUpLeak used to write BOTH spellings
+// of every name and rely on the destroy being an idempotent no-op for whichever did not
+// exist — a workaround for not being able to look. Looking is simpler and exact.
+func (i *managedVolumeIndex) footprint(orig string) ([]string, error) {
+	if !i.resolved {
+		i.all, i.err = i.b.volumes.List()
+		i.resolved = true
 	}
-	all, err := b.volumes.List()
-	if err != nil {
-		return nil, fmt.Errorf("list volumes: %w", err)
+	if i.err != nil {
+		return nil, fmt.Errorf("list volumes: %w", i.err)
 	}
 	cprefix := leaseVolumePrefix(orig) // fred-{lease}-
 	rprefix := retainedName(cprefix)   // fred-retained-{lease}-
-	names := make([]string, 0, len(all))
-	for _, id := range all {
+	names := make([]string, 0, len(i.all))
+	for _, id := range i.all {
 		if strings.HasPrefix(id, cprefix) || strings.HasPrefix(id, rprefix) {
 			names = append(names, id)
 		}
@@ -754,6 +782,7 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	var n int
+	idx := b.newManagedVolumeIndex() // one enumeration for the whole reap pass
 	for _, e := range candidates {
 		// Atomic active→reaping (the record is NEVER deleted before its volumes are
 		// confirmed gone, so a destroy failure cannot drop a still-on-disk footprint).
@@ -767,7 +796,7 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 		if !ok {
 			continue // concurrently claimed/changed since the snapshot — skip
 		}
-		if b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID) {
+		if b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID) {
 			n++
 		}
 	}
@@ -790,8 +819,9 @@ func (b *Backend) retryReapingRecords(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	idx := b.newManagedVolumeIndex() // one enumeration for the whole retry pass
 	for _, e := range recs {
-		b.destroyReapingVolumes(ctx, e.OriginalLeaseUUID)
+		b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID)
 	}
 	return nil
 }

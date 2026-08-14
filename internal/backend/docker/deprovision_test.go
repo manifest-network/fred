@@ -202,7 +202,7 @@ func TestReapingFootprint_CoversBothNamespaces(t *testing.T) {
 		}, nil
 	}}
 
-	got, err := b.reapingFootprint("u1")
+	got, err := b.newManagedVolumeIndex().footprint("u1")
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"fred-u1-app-0", "fred-retained-u1-app-1"}, got,
 		"both namespaces of THIS lease, and nothing belonging to another")
@@ -216,30 +216,47 @@ func TestReapingFootprint_ListError_IsNotAnEmptyFootprint(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return nil, errors.New("statfs EIO") }}
 
-	got, err := b.reapingFootprint("u1")
+	got, err := b.newManagedVolumeIndex().footprint("u1")
 	require.Error(t, err)
 	assert.Nil(t, got)
 }
 
-// TestReapingFootprint_AbsentVolumeRoot_IsNotAnEmptyFootprint is the sharper half of the
-// same hazard, and it is not hypothetical: listVolumeIDs maps a MISSING directory to
-// (nil, nil), so an unmounted or not-yet-created volume root enumerates as "no volumes"
-// with no error at all. Without the root probe every reaping record on the node would be
-// deleted on the next sweep — losing both the retry vehicle and the accounting for bytes
-// that reappear the moment the mount does. Absent and unreadable are uncertainty, never
-// emptiness (the fail-safe the orphan reconcile's G2 gate already applies).
+// TestListVolumeIDs_AbsentRootIsAnError is where the absent-vs-empty distinction is now
+// GUARANTEED rather than reconstructed, and it is the reason the reaping finalizer needs no
+// root probe at all.
+//
+// listVolumeIDs used to map a missing directory to (nil, nil), collapsing "this node holds
+// no volumes" and "the volume root is gone" into one value. Any caller wanting the
+// difference back had to stat separately — and a separate stat is a separate point in time,
+// so an unmount landing between the probe and the read produced a confident, empty,
+// error-free answer. The reaping finalizer acts on that answer by DELETING the record that
+// accounts for the bytes, so the ambiguity was one unmount away from silent
+// data-accounting loss. Keeping the question inside the single syscall that can answer it
+// is what makes that race impossible rather than merely unlikely: there is no second
+// observation to disagree with the first.
+//
+// A configured root cannot legitimately be absent at runtime — newVolumeManager statfs's it
+// at construction — so ENOENT here always means "it disappeared underneath us".
+func TestListVolumeIDs_AbsentRootIsAnError(t *testing.T) {
+	ids, err := listVolumeIDs(filepath.Join(t.TempDir(), "not-mounted"))
+	require.Error(t, err, "an absent volume root is uncertainty, never an empty node")
+	assert.Nil(t, ids)
+
+	// ...and a present-but-empty root still reports emptiness, so the guarantee is a real
+	// distinction rather than a blanket refusal.
+	empty, err := listVolumeIDs(t.TempDir())
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+}
+
+// TestReapingFootprint_AbsentVolumeRoot_IsNotAnEmptyFootprint pins that the finalizer's
+// derivation inherits that guarantee rather than re-deriving it.
 func TestReapingFootprint_AbsentVolumeRoot_IsNotAnEmptyFootprint(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	b.cfg.VolumeDataPath = filepath.Join(t.TempDir(), "not-mounted")
-	// A real manager over an absent root: List itself reports (nil, nil), not an error.
 	b.volumes = &mockVolumeManager{ListFn: func() ([]string, error) { return listVolumeIDs(b.cfg.VolumeDataPath) }}
-	require.NotPanics(t, func() {
-		ids, lerr := b.volumes.List()
-		require.NoError(t, lerr, "precondition: an absent root is NOT an error at the manager layer")
-		require.Empty(t, ids, "precondition: ...it looks exactly like an empty node")
-	})
 
-	got, err := b.reapingFootprint("u1")
+	got, err := b.newManagedVolumeIndex().footprint("u1")
 	require.Error(t, err, "an absent volume root must be uncertainty, not an empty footprint")
 	assert.Nil(t, got)
 }
@@ -264,7 +281,7 @@ func TestDestroyReapingVolumes_AbsentVolumeRoot_KeepsTheRecord(t *testing.T) {
 	}))
 	skipBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
 
-	assert.False(t, b.destroyReapingVolumes(context.Background(), "u1"),
+	assert.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), "u1"),
 		"an unverifiable root means the record cannot be dropped")
 
 	got, err := rs.Get("u1")
@@ -833,7 +850,7 @@ func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T)
 	// in this lease's namespace and would be swept up by the prefix scan, so only the owner
 	// table stands between it and a RemoveAll.
 	destroyFails = false
-	require.False(t, b.destroyReapingVolumes(context.Background(), lease),
+	require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease),
 		"a refused name means the record is kept for retry")
 	assert.Equal(t, []string{ownVol}, destroyed,
 		"this lease's own leak is reclaimed; the volume an in-flight restore adopted is not (ENG-647)")

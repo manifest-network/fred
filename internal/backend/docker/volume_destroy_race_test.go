@@ -107,7 +107,7 @@ func TestDestroyReapingVolumes_RefusesANameClaimedAfterTheSnapshot(t *testing.T)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		reaped = b.destroyReapingVolumes(ctx, lease)
+		reaped = b.destroyReapingVolumes(ctx, b.newManagedVolumeIndex(), lease)
 	}()
 
 	<-bar.reached
@@ -157,7 +157,7 @@ func TestDestroyReapingVolumes_UnreadableClaims_IgnoresALateClaim(t *testing.T) 
 	}
 	unreadableBefore := testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable))
 
-	assert.False(t, b.destroyReapingVolumes(context.Background(), lease))
+	assert.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease))
 	assert.Equal(t, unreadableBefore+1, testutil.ToFloat64(retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable)))
 }
 
@@ -361,7 +361,7 @@ func TestDestroyReapingVolumes_KeptRecordLogNamesTheRightHold(t *testing.T) {
 
 		var buf bytes.Buffer
 		b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		require.False(t, b.destroyReapingVolumes(context.Background(), lease))
+		require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease))
 
 		out := buf.String()
 		assert.Contains(t, out, "do NOT reclaim by hand")
@@ -380,7 +380,7 @@ func TestDestroyReapingVolumes_KeptRecordLogNamesTheRightHold(t *testing.T) {
 
 		var buf bytes.Buffer
 		b.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		require.False(t, b.destroyReapingVolumes(context.Background(), newLease))
+		require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), newLease))
 
 		assert.Contains(t, buf.String(), "the restore's rollback resolves it",
 			"this hold really does clear on rollback, and the operator must be told to wait")

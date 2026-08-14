@@ -664,12 +664,11 @@ func (b *Backend) purgeReleaseHistory(leaseUUID string, logger *slog.Logger) {
 }
 
 // recordGiveUpLeak handles a deprovision give-up's abandoned on-disk footprint. When a
-// retention store is configured it writes a reaping tombstone for the lease's
-// still-on-disk volumes (ground-truthed from disk; canonical names derived from items on
-// List error) so the footprint keeps counting in the admission projection and the
-// retention sweep auto-retries the destroy — turning a permanent manual-only leak into a
-// self-healing one. PutReaping is idempotent and refuses to clobber an active/restoring
-// record, so a footprint an existing record already counts is left untouched. (ENG-376)
+// retention store is configured it writes a reaping tombstone recording the SIZE of that
+// footprint, so it keeps counting in the admission projection and the retention sweep
+// auto-retries the destroy — turning a permanent manual-only leak into a self-healing one.
+// PutReaping is idempotent and refuses to clobber an active/restoring record, so a
+// footprint an existing record already counts is left untouched. (ENG-376)
 //
 // It records a FACT, never a plan (ENG-676). The give-up releases the lease's pool
 // allocation and deletes its provision, so this record is the only thing left counting the

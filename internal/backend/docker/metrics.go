@@ -63,7 +63,12 @@ var reapSkipReasons = []string{reapSkipRestoreClaimed, reapSkipClaimUnreadable, 
 // periodic sweep pass, which is what makes the sum across them a liveness heartbeat.
 const (
 	sweepOutcomeSuccess = "success" // every stage completed
-	sweepOutcomeError   = "error"   // at least one stage failed; the joined error names which
+	// sweepOutcomeError: at least one stage failed. Deliberately NOT described as "the
+	// retention store is degraded" — that is the common cause, not the only one. The orphan
+	// reconcile also returns a failed VOLUME-ROOT enumeration (its G1 gate), so this fires
+	// with a perfectly healthy retention.db when the volume root is unreadable. The joined
+	// error is the authoritative discriminator: it prefixes each failure with its stage.
+	sweepOutcomeError = "error"
 )
 
 // sweepOutcomes is the closed outcome set. Pre-initializing BOTH matters more here than
@@ -689,8 +694,11 @@ var (
 	// per pass. That once-per-pass property is the whole point and must survive future
 	// edits: the sum across outcomes advances every tick regardless of result, so
 	// `sum without (outcome) (increase(...[N])) == 0` is a true liveness heartbeat for the
-	// sweep goroutine, and {outcome="error"} is the degraded-store signal. Adding a
-	// per-stage label would break the heartbeat (a pass would contribute 0..N increments);
+	// sweep goroutine, and {outcome="error"} is the sweep-stage failure signal — usually a
+	// degraded retention store, but a failed volume-root enumeration in the orphan stage
+	// lands here too, so triage reads the joined stage error rather than assuming the
+	// store. Adding a per-stage label would break the heartbeat (a pass would contribute
+	// 0..N increments);
 	// per-stage attribution lives in the joined error's log line and in the stage-local
 	// counters (retention_orphan_skips_total, retention_reap_skips_total). (ENG-680)
 	//
