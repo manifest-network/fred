@@ -487,8 +487,14 @@ the sweep is the only automatic reclaimer.
   no record at all — so the abandoned bytes were counted by nothing (no pool reservation, no
   retained record, no reaping record) and admission over-committed against real disk until an
   operator noticed. The record no longer carries a destroy plan, so there is nothing left for a
-  degraded store to prevent it computing. The one residual: if the store cannot be **written**
-  either, `retention_leaked_total` plus the `MANUAL CLEANUP REQUIRED` log are the only record.
+  degraded store to prevent it computing. **The bytes are still uncounted while the store
+  stays broken** — the projection is recomputed by scanning the store — but the record is
+  durable, so capacity accounting corrects itself on the first readable sweep with no
+  operator action. Two residuals: if the store cannot be **written** either,
+  `retention_leaked_total` plus the `MANUAL CLEANUP REQUIRED` log are the only record; and
+  releasing the live reservation during that window is a general property of every
+  live→retained hand-off, not of the give-up alone (an ordinary retaining close behaves the
+  same way), tracked separately.
 - **`reason="owner_claimed"` is a different hold, and there is nothing to unblock.** A
   tombstoned name belongs to a **live provision** (or another lease's retained record): the
   give-up deleted the provision while the lease was still ACTIVE on chain, the reconciler

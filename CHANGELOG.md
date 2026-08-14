@@ -61,6 +61,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   The record now states one fact — how large the abandoned footprint is — and authorises
   no destruction, so there is nothing left for a degraded store to prevent it computing.
+  Precisely: the footprint is uncounted **for as long as the store stays broken** (the
+  projection is recomputed by scanning the store, and the store is what is broken), but the
+  record is durable, so the projection self-corrects on the first readable refresh instead
+  of there being nothing to recount from. The change is "uncounted permanently" →
+  "uncounted until the store is repaired"; both halves are pinned by tests.
   The finalizer re-derives the volumes to reclaim on every sweep from the lease's
   namespace on disk intersected with the ownership table, which is the same
   "destroy only what nothing claims" rule the startup orphan sweep already applies,

@@ -686,9 +686,18 @@ func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items
 	}
 	// Items is the whole point of this record and the only field the projection reads:
 	// computeReapingDiskMB sums leaseDiskMB(e.Items) over reaping records and
-	// refreshRetentionAccounting folds that into SetRetainedDisk, so writing this keeps the
-	// abandoned bytes counted against admission until they are actually reclaimed. It is
-	// the FULL lease item set, not a subset — the give-up abandons the whole footprint.
+	// refreshRetentionAccounting folds that into SetRetainedDisk. It is the FULL lease item
+	// set, not a subset — the give-up abandons the whole footprint.
+	//
+	// Note what this does and does not buy while the store is DEGRADED. The projection is
+	// recomputed by scanning the store, so a store that cannot be enumerated cannot absorb
+	// this record either: the refresh below keeps its last value, the caller releases the
+	// live reservation, and the bytes are counted by neither pool term until the store is
+	// repaired. What the durable record changes is that the repair is sufficient — the next
+	// readable refresh picks it up with no operator action — where before there was nothing
+	// to recount from and the loss was permanent. (Releasing live across a failed refresh is
+	// a property of every live→retained hand-off, including the ordinary retain-path close,
+	// not something this path invents; tracked separately.)
 	//
 	// RetainedVolumeNames is deliberately EMPTY, and that is the fix (ENG-676). This used
 	// to enumerate the lease's volumes and partition them through the ownership table so

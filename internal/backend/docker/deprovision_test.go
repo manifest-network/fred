@@ -176,6 +176,75 @@ func TestDeprovisionGiveUp_UnenumerableStore_StillRecordsTheFootprint(t *testing
 		"Items is what keeps the bytes counted; without it the footprint is counted by nobody")
 	assert.Empty(t, got.RetainedVolumeNames,
 		"the record must NOT carry a destroy plan derived from an ownership table it could not read")
+
+	// CHARACTERIZATION of the residual, pinned deliberately rather than left to prose.
+	//
+	// The record is durable, but the projection cannot absorb it yet: every refresh scans
+	// the store, and the store is exactly what is broken. So the give-up releases the live
+	// reservation while retained is still frozen at its pre-write value, and for the
+	// duration of the degradation the abandoned bytes are counted by neither pool term.
+	//
+	// This is NOT specific to the give-up — every live→retained hand-off releases the live
+	// reservation without checking that the refresh succeeded, including the ordinary
+	// retain-path close, which predates ENG-676. It is tracked separately; what ENG-676
+	// changes is that the FACT survives, so the projection self-corrects the moment the
+	// store is readable (asserted below) instead of there being nothing to recount from.
+	assert.Equal(t, int64(0), b.pool.Stats().AllocatedDiskMB,
+		"the give-up is terminal: the live reservation is released and the provision deleted")
+	assert.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB,
+		"KNOWN WINDOW: the projection cannot see the new record while the store is unenumerable")
+}
+
+// TestDeprovisionGiveUp_UnenumerableStore_AccountingRecoversOnRepair is the other half of
+// the invariant, and the one that says why writing the record is worth anything at all: the
+// footprint is uncounted only for as long as the store is broken. Repair it and the very
+// next refresh picks the record up, with no operator action and nothing to reconstruct.
+//
+// Before ENG-676 there was no record to recover FROM, so the same repair changed nothing
+// and the bytes stayed uncounted until someone noticed by hand. This test fails if the
+// give-up ever stops writing the record.
+func TestDeprovisionGiveUp_UnenumerableStore_AccountingRecoversOnRepair(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "retention.db")
+	seedUnenumerableRecord(t, dbPath)
+
+	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		"u1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: "u1", Tenant: "t1", Status: backend.ProvisionStatusReady, Quantity: 1,
+			Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		}, VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1},
+	})
+	withMicroSKU(b, 1024)
+	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	b.retentionStore = rs
+	b.volumes = &mockVolumeManager{
+		ListFn:    func() ([]string, error) { return []string{"fred-u1-app-0"}, nil },
+		DestroyFn: func(_ context.Context, _ string) error { return nil },
+	}
+	require.NoError(t, b.pool.TryAllocate("u1-app-0", "docker-micro", "t1"))
+	require.NoError(t, b.doDeprovision(context.Background(), "u1"))
+	require.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB, "precondition: uncounted during the window")
+
+	// Repair: drop the unenumerable record and reopen. This is the operator fixing the
+	// store, not fred doing anything clever.
+	require.NoError(t, rs.Close())
+	db, derr := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	require.NoError(t, derr)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("retention")).Delete([]byte("corrupt-lease"))
+	}))
+	require.NoError(t, db.Close())
+
+	repaired, rerr := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: dbPath})
+	require.NoError(t, rerr)
+	t.Cleanup(func() { _ = repaired.Close() })
+	b.retentionStore = repaired
+
+	b.refreshRetentionAccounting()
+
+	assert.Positive(t, b.pool.Stats().RetainedDiskMB,
+		"the durable record is what lets the projection self-correct once the store is readable")
 }
 
 // TestReapingFootprint_CoversBothNamespaces preserves the hazard the old
