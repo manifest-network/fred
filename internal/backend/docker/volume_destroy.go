@@ -235,6 +235,17 @@ func (r destroyReport) err() error {
 // Scope an op to a single operation and let it go. It is deliberately not cached on the
 // Backend: the table is a point-in-time answer, and the failure mode this whole file
 // guards against is a collector acting on a stale one.
+//
+// KNOWN WINDOW, not closed here. The table is a snapshot, and nothing serializes it
+// against the writes that establish a claim. The reachable interleaving is the periodic
+// retention sweep: it can snapshot a tombstoned canonical name as unclaimed, and only
+// then does a re-provision of that lease register in b.provisions (provision.go) and
+// reuse the volume — after which this op's loop destroys it. The window is one destroy
+// loop wide, and re-resolving per name would narrow but not close it; closing it needs
+// the destroy and the claim-establishing write to share a lock, which is a larger change
+// than this file. Note the direction of travel: before the choke point that path had no
+// live-provision check at all, so the same interleaving was a certainty rather than a
+// race. Tracked separately.
 type volumeOp struct {
 	b        *Backend
 	owner    string

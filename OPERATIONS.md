@@ -480,7 +480,7 @@ the sweep is the only automatic reclaimer.
   `..._volume_destroy_refused_total{site="reaping",reason="claimed"}` counts the same refusals
   **per volume** rather than per sweep, and the accompanying WARN log carries `volume_id` plus
   the `owner_lease_uuid` that holds it — start there rather than diffing `/retentions` by hand.
-  The same counter with `site="orphan_gc"` or `site="deprovision_destroy"` means a different path
+  The same counter with `site="deprovision_destroy"` means a different path
   hit the same collision; the volume is safe in every case, and the owner named in the log is who
   must resolve it. A refusal whose owner is a **live provision** (rather than a restoring record)
   means a tombstone outlived its lease and the reconciler has since re-provisioned it — the

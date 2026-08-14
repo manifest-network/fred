@@ -596,3 +596,33 @@ func TestDestroyChokePoint_InFlightRestoreDataIsUnreachableByAnyPath(t *testing.
 		})
 	}
 }
+
+// TestCleanupOrphanedVolumes_UnreadableClaims_CountsTheUndecided pins the ticketing
+// signal for the startup sweep. The sweep bails before reaching op.destroy, so without
+// an explicit count here the documented claims_unreadable series would never appear for
+// site="orphan_gc" — an alert that reads 0 whether the store is healthy or unreadable.
+func TestCleanupOrphanedVolumes_UnreadableClaims_CountsTheUndecided(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Close())
+
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			// Two undecidable, plus a retained name the sweep never considers.
+			return []string{"fred-a-app-0", "fred-b-app-0", "fred-retained-c-app-0"}, nil
+		},
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Errorf("must not destroy %q when ownership could not be established", id)
+			return nil
+		},
+	}
+
+	before := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable))
+	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()),
+		"an unreadable store skips the run; it does not fail startup")
+
+	assert.InDelta(t, before+2,
+		testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable)), 0.0001,
+		"counted per volume whose fate the run could not decide — retained names are not among them, "+
+			"since the sweep never considers them at all")
+}

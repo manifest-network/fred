@@ -723,7 +723,19 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	op := b.volumeOp("", b.logger)
 	table, err := op.claims()
 	if err != nil {
-		b.logger.Error("cleanupOrphanedVolumes: ownership unresolvable; skipping orphan destruction this run (fail-safe)", "error", err)
+		// Count it, and at the same per-volume granularity every other site uses: this
+		// is the documented ticketing signal, and the sweep bails before reaching
+		// op.destroy, so nothing else would report it. The count is the volumes whose
+		// fate this run could not decide — every non-retained name on disk.
+		undecided := 0
+		for _, id := range volumeIDs {
+			if !isRetainedVolume(id) {
+				undecided++
+			}
+		}
+		volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable).Add(float64(undecided))
+		b.logger.Error("cleanupOrphanedVolumes: ownership unresolvable; skipping orphan destruction this run (fail-safe)",
+			"undecided_volumes", undecided, "error", err)
 		return nil
 	}
 
@@ -737,10 +749,12 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 		if _, unclaimed := table.mayDestroy(id, ""); !unclaimed {
 			// Claimed by a live provision or a retention record — i.e. every healthy
 			// lease's volume, on every boot. Filtered QUIETLY and before the release
-			// probe: this is the ordinary case, not a refusal, and neither a log line
-			// nor a release-store read per live volume is warranted. The destroy below
-			// re-checks against the same table regardless, so the guard does not depend
-			// on this filter being right — only the noise does.
+			// probe: this is the ordinary case, not a refusal, and neither a log line,
+			// a counter, nor a release-store read per live volume is warranted. That is
+			// why this site emits no reason="claimed" series; the docs say so rather
+			// than implying otherwise. The destroy below re-checks against the same
+			// table regardless, so the guard does not depend on this filter being
+			// right — only the noise does.
 			continue
 		}
 		if b.leaseHasActiveRelease(id) {
