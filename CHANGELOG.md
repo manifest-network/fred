@@ -90,8 +90,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   imported `internal/metrics` for a single panic counter, and each backend consequently
   published 21 `providerd`-only collectors — 27 metric names once the histograms expand
   into `_bucket`/`_sum`/`_count` — describing a signer pool, withdraw loop, chain client,
-  payload store, provisioner and backend router that the process does not have. 81 stray
-  series per environment, 243 on a nine-backend fleet.
+  payload store, provisioner and backend router that the process does not have. Those 27
+  names are ~59 *series* per backend once each histogram's buckets are counted, so roughly
+  177 stray series in a three-backend environment and 531 on a nine-backend fleet.
 
   For counters this was noise, since `rate()` over a flat 0 is 0. For gauges it was a
   trap, because a 0 satisfies ordinary comparisons: `fred_signer_pool_lane_count < 3`
