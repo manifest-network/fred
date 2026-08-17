@@ -396,6 +396,18 @@ var (
 		Name:      "routing_fallback_total",
 		Help:      "Provision-routing decisions that fell back to round-robin (no usable backend load stats)",
 	})
+
+	// BackendHealthProbePanicsTotal counts panics recovered inside a per-backend
+	// health-probe goroutine. Non-zero is always a bug: the probe is an HTTP call
+	// that should return errors, not panic. The recover exists because these
+	// probes moved onto their own goroutines, where net/http's per-connection
+	// panic recovery no longer covers them.
+	BackendHealthProbePanicsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "health_probe_panics_total",
+		Help:      "Panics recovered inside a per-backend health probe goroutine (always a bug)",
+	})
 )
 
 // Rate limit metrics
@@ -427,6 +439,27 @@ var (
 		Name:      "requests_total",
 		Help:      "Total number of API requests",
 	}, []string{"method", "path", "status"})
+)
+
+// Health-check metrics
+var (
+	// HealthCheckHealthy tracks the result of each non-backend dependency probe
+	// run by the health handler (1 = healthy, 0 = unhealthy). Labels: check —
+	// one of chain, token_tracker, placement_store, payload_store.
+	//
+	// Backends are deliberately absent: they already have BackendHealthy, which
+	// carries a per-backend label this gauge cannot express.
+	//
+	// Same caveat as BackendHealthy: this is written from inside the health
+	// handler, so it is only as fresh as whatever polls /health or /readyz. With
+	// nothing polling, the series latches at its last value rather than going
+	// absent. Deployments health-check /health every 30s, which is the clock.
+	HealthCheckHealthy = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "health",
+		Name:      "check_healthy",
+		Help:      "Health of an individual providerd dependency as observed by the health handler (1 = healthy, 0 = unhealthy). Backends are covered by fred_backend_healthy instead. Only as fresh as the last /health or /readyz request; latches rather than going absent if nothing polls.",
+	}, []string{"check"})
 )
 
 // Chain metrics

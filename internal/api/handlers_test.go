@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,12 +17,14 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
@@ -71,6 +74,14 @@ func TestHealthCheck(t *testing.T) {
 }
 
 // TestHealthCheck_ChainUnavailable tests health check when chain ping fails.
+//
+// This test used to assert 503. It asserts 200 now, deliberately: that 503 is
+// the mainnet-morpheus ENG-522 incident in miniature. A single failed chain Ping
+// flipped /health to 503, the load balancer dropped providerd's only server, and
+// a backend's provision-success callback — which needs no chain at all — got
+// "no available server" three times and was dropped, orphaning the workload.
+// The chain being unreachable is a degradation of a shared remote dependency,
+// never a reason to take providerd out of rotation.
 func TestHealthCheck_ChainUnavailable(t *testing.T) {
 	chainClient := &mockChainClient{
 		pingFunc: func(ctx context.Context) error {
@@ -89,13 +100,13 @@ func TestHealthCheck_ChainUnavailable(t *testing.T) {
 
 	h.HealthCheck(rec, req)
 
-	// Should return 503 Service Unavailable
-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Equal(t, http.StatusOK, rec.Code,
+		"an unreachable chain must not de-register providerd from its load balancer (ENG-522)")
 
 	var response HealthResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	assert.Equal(t, "unhealthy", response.Status)
+	assert.Equal(t, "degraded", response.Status)
 
 	// Check that chain check shows unhealthy with sanitized message
 	// (raw error details are logged server-side, not exposed to clients)
@@ -174,13 +185,18 @@ func TestHealthCheck_BackendUnhealthy(t *testing.T) {
 
 	h.HealthCheck(rec, req)
 
-	// Should return 503 due to unhealthy backend
-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	// Was 503. Now 200 — and note this router has exactly ONE backend, so this
+	// is the "every backend is down" case, not merely "one of N". A fleet-wide
+	// backend outage is precisely when de-registering helps least (there is
+	// nowhere to route) and hurts most (the callback route dies with the tenant
+	// API, so a backend that recovers cannot report what it finished).
+	assert.Equal(t, http.StatusOK, rec.Code,
+		"an unreachable backend must not de-register providerd from its load balancer (ENG-522)")
 
 	var response HealthResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
-	assert.Equal(t, "unhealthy", response.Status)
+	assert.Equal(t, "degraded", response.Status)
 
 	// Check backend health status
 	backendCheck, ok := response.Checks["backend:test-backend"]
@@ -237,6 +253,569 @@ func TestHealthCheck_AllHealthy(t *testing.T) {
 	// Both checks should be healthy
 	assert.Equal(t, "healthy", response.Checks["chain"].Status)
 	assert.Equal(t, "healthy", response.Checks["backend:healthy-backend"].Status)
+}
+
+// mockPayloadStoreHealth implements PayloadStoreHealth for testing.
+type mockPayloadStoreHealth struct {
+	healthyFunc func() error
+}
+
+func (m *mockPayloadStoreHealth) Healthy() error {
+	if m.healthyFunc != nil {
+		return m.healthyFunc()
+	}
+	return nil
+}
+
+// unhealthyStore is the error a broken bbolt store reports.
+func unhealthyStore() error { return errors.New("bbolt: database not open") }
+
+// localStoreCases enumerates the three process-owned bbolt stores, each wired to
+// fail. They share a verdict ("unhealthy") that the two remote dependencies do
+// not, so every test that cares about the local/remote split runs over this set.
+func localStoreCases() []struct {
+	name      string
+	checkKey  string
+	message   string
+	configure func(h *Handlers)
+} {
+	return []struct {
+		name      string
+		checkKey  string
+		message   string
+		configure func(h *Handlers)
+	}{
+		{
+			name:      "token tracker",
+			checkKey:  "token_tracker",
+			message:   "token tracker unavailable",
+			configure: func(h *Handlers) { h.tokenTracker = &mockTokenTracker{healthyFunc: unhealthyStore} },
+		},
+		{
+			name:      "placement store",
+			checkKey:  "placement_store",
+			message:   "placement store unavailable",
+			configure: func(h *Handlers) { h.placementLookup = &mockPlacementLookup{healthyFunc: unhealthyStore} },
+		},
+		{
+			name:      "payload store",
+			checkKey:  "payload_store",
+			message:   "payload store unavailable",
+			configure: func(h *Handlers) { h.payloadStoreHealth = &mockPayloadStoreHealth{healthyFunc: unhealthyStore} },
+		},
+	}
+}
+
+// TestHealthCheck_LocalStoreUnhealthyStillServes pins the third verdict tier.
+//
+// A broken bbolt store is a genuinely local fault — the class a load balancer is
+// normally sanctioned to act on — so it reports "unhealthy" rather than
+// "degraded". /health still answers 200 anyway, and that is not a contradiction:
+// accepting a backend callback writes to no store at all (server.go registers
+// POST /callbacks/provision with only a timeout wrapper), so de-registering
+// providerd's single server would sever a working path to fix a broken one. A
+// supervisor can restart this process; a load balancer cannot. /readyz is where
+// the tier reaches the wire.
+func TestHealthCheck_LocalStoreUnhealthyStillServes(t *testing.T) {
+	for _, tt := range localStoreCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &Handlers{
+				providerUUID: testutil.ValidUUID1,
+				bech32Prefix: "manifest",
+			}
+			tt.configure(h)
+
+			req := httptest.NewRequest("GET", "/health", nil)
+			rec := httptest.NewRecorder()
+
+			h.HealthCheck(rec, req)
+
+			assert.Equal(t, http.StatusOK, rec.Code,
+				"/health is a liveness contract and must never 503 on a dependency probe")
+
+			var response HealthResponse
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+			assert.Equal(t, "unhealthy", response.Status,
+				"a process-owned store is not merely degraded")
+
+			check, ok := response.Checks[tt.checkKey]
+			require.True(t, ok, "missing %s check, got: %v", tt.checkKey, response.Checks)
+			assert.Equal(t, "unhealthy", check.Status)
+			assert.Equal(t, tt.message, check.Message,
+				"raw store errors must stay server-side")
+		})
+	}
+}
+
+// TestHealthCheck_LocalFailureOutranksRemote guards the precedence in the
+// verdict switch. With both a remote and a local fault present the answer must
+// be the more severe one — a naive if/else chain that checked remote first would
+// report "degraded" and hide the restart-worthy fault.
+func TestHealthCheck_LocalFailureOutranksRemote(t *testing.T) {
+	h := &Handlers{
+		client: &mockChainClient{
+			pingFunc: func(ctx context.Context) error { return errors.New("connection refused") },
+		},
+		tokenTracker: &mockTokenTracker{healthyFunc: unhealthyStore},
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	assert.Equal(t, "unhealthy", response.Status,
+		"local failure must outrank remote degradation")
+	assert.Equal(t, "unhealthy", response.Checks["chain"].Status)
+	assert.Equal(t, "unhealthy", response.Checks["token_tracker"].Status)
+}
+
+// TestHealthCheck_UnconfiguredChecksAreAbsent pins that an absent key means "not
+// configured", never "passed". A dev-mode providerd runs without the bbolt
+// stores, and folding those into the verdict would make it permanently
+// unhealthy.
+func TestHealthCheck_UnconfiguredChecksAreAbsent(t *testing.T) {
+	h := &Handlers{
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	assert.Equal(t, "healthy", response.Status)
+	for _, key := range []string{"chain", "token_tracker", "placement_store", "payload_store"} {
+		assert.NotContains(t, response.Checks, key,
+			"%s is not configured and must be omitted, not reported as passing", key)
+	}
+}
+
+// TestHealthCheck_PayloadStoreProbed covers the store that had a Healthy method
+// nothing ever called: a lost or truncated payloads.db was invisible everywhere while
+// /update returned 500 and reprovisions reverted tenants to their as-created
+// manifest (ENG-619).
+func TestHealthCheck_PayloadStoreProbed(t *testing.T) {
+	called := false
+	h := &Handlers{
+		payloadStoreHealth: &mockPayloadStoreHealth{
+			healthyFunc: func() error {
+				called = true
+				return nil
+			},
+		},
+		providerUUID: testutil.ValidUUID1,
+		bech32Prefix: "manifest",
+	}
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	rec := httptest.NewRecorder()
+
+	h.HealthCheck(rec, req)
+
+	assert.True(t, called, "the payload store's Healthy() must actually be invoked")
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	require.Contains(t, response.Checks, "payload_store")
+	assert.Equal(t, "healthy", response.Checks["payload_store"].Status)
+}
+
+// TestHealthCheck_RecordsCheckGauges pins the observability half of the fix.
+// Removing dependency state from the status code is only safe because it lands
+// in a metric instead: before this, chain, token_tracker and placement_store had
+// no HEALTH metric at all — the chain has latency and transaction counters, but
+// nothing answering "is it reachable now" — and the status code was their sole
+// reachability signal.
+//
+// Asserts both polarities in one test so the ordering of other tests touching
+// these global collectors cannot make it pass vacuously.
+func TestHealthCheck_RecordsCheckGauges(t *testing.T) {
+	checkNames := []string{"chain", "token_tracker", "placement_store", "payload_store"}
+
+	probe := func(t *testing.T, healthy bool) {
+		t.Helper()
+
+		// Seed every series to the OPPOSITE value first. Without this the
+		// "unhealthy sets 0" half is vacuous: WithLabelValues auto-creates a
+		// gauge at 0, so an implementation that never writes at all reads as 0
+		// and passes. Seeding makes a missing write observable in both
+		// directions.
+		seed := 1.0
+		if healthy {
+			seed = 0.0
+		}
+		for _, check := range checkNames {
+			metrics.HealthCheckHealthy.WithLabelValues(check).Set(seed)
+		}
+
+		result := func() error {
+			if healthy {
+				return nil
+			}
+			return unhealthyStore()
+		}
+
+		h := &Handlers{
+			client: &mockChainClient{
+				pingFunc: func(ctx context.Context) error { return result() },
+			},
+			tokenTracker:       &mockTokenTracker{healthyFunc: result},
+			placementLookup:    &mockPlacementLookup{healthyFunc: result},
+			payloadStoreHealth: &mockPayloadStoreHealth{healthyFunc: result},
+			providerUUID:       testutil.ValidUUID1,
+			bech32Prefix:       "manifest",
+		}
+
+		rec := httptest.NewRecorder()
+		h.HealthCheck(rec, httptest.NewRequest("GET", "/health", nil))
+
+		want := 0.0
+		if healthy {
+			want = 1.0
+		}
+		for _, check := range checkNames {
+			assert.Equal(t, want,
+				promtestutil.ToFloat64(metrics.HealthCheckHealthy.WithLabelValues(check)),
+				"fred_health_check_healthy{check=%q} should be %v (seeded to %v, so a missing write fails here)", check, want, seed)
+		}
+	}
+
+	t.Run("unhealthy sets 0", func(t *testing.T) { probe(t, false) })
+	t.Run("healthy sets 1", func(t *testing.T) { probe(t, true) })
+}
+
+// TestHealthCheck_KeepsProbingBackends is a regression guard on a subtle
+// coupling. Router.HealthCheck is the ONLY writer of fred_backend_healthy, and
+// this handler is its only non-test caller, so the deployment's 30s poll of
+// /health is the clock driving that gauge, the BackendUnhealthy alert and two
+// dashboards. A future "backends no longer affect the status code, so stop
+// probing them" simplification would freeze all four at a plausible wrong value
+// rather than making them go absent.
+func TestHealthCheck_KeepsProbingBackends(t *testing.T) {
+	probed := make(chan struct{}, 1)
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			select {
+			case probed <- struct{}{}:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{
+			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name:    "gauge-backend",
+				BaseURL: backendServer.URL,
+				Timeout: 5 * time.Second,
+			}),
+			IsDefault: true,
+		}},
+		BackendHealthy: metrics.BackendHealthy,
+	})
+	require.NoError(t, err)
+
+	h := &Handlers{
+		backendRouter: router,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	rec := httptest.NewRecorder()
+	h.HealthCheck(rec, httptest.NewRequest("GET", "/health", nil))
+
+	assert.Len(t, probed, 1, "/health must still probe every backend")
+	assert.Equal(t, 1.0,
+		promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("gauge-backend")),
+		"fred_backend_healthy has no other writer; /health must keep driving it")
+}
+
+// TestHealthProbeBudget_FitsInsideEveryDeadline pins the inequality the whole
+// liveness contract rests on. Three independent deadlines can each recreate the
+// ENG-522 cascade if the budget outgrows them, and the binding one is NOT
+// fred's — it belongs to the prober.
+func TestHealthProbeBudget_FitsInsideEveryDeadline(t *testing.T) {
+	// Traefik's loadBalancer healthCheck timeout. Documented default 5s, and
+	// the reference deployment's stanza sets only `path` and `interval`
+	// (manifest-deploy roles/traefik/templates/dynamic.yml.j2). This is the
+	// SMALLEST of the three and therefore the one that actually binds: a probe
+	// slower than this marks the only server DOWN regardless of what the
+	// handler would eventually have answered.
+	const traefikProbeTimeout = 5 * time.Second
+	// config.go: v.SetDefault("http_write_timeout", "15s") — the server severs
+	// the response write at this point.
+	const defaultWriteTimeout = 15 * time.Second
+
+	assert.Less(t, healthProbeBudget, traefikProbeTimeout,
+		"healthProbeBudget must stay under Traefik's 5s healthCheck timeout — the prober gives up first, so a longer budget marks the only server DOWN no matter what we answer")
+	assert.Less(t, healthProbeBudget, defaultWriteTimeout,
+		"healthProbeBudget must stay under the default http_write_timeout or the connection is severed mid-probe")
+	assert.Less(t, healthProbeBudget, defaultRequestTimeout,
+		"healthProbeBudget must stay under the request timeout or http.TimeoutHandler answers 503")
+}
+
+// TestServer_HealthNeverReturns503ThroughTheStack is the test whose absence let
+// the http.TimeoutHandler gap through review: every other health test calls
+// Handlers.HealthCheck directly, which bypasses requestTimeoutMiddleware — the
+// one component that can turn this endpoint into a 503 without any verdict
+// saying so.
+//
+// Exercised through the real mux and the real middleware chain, against a
+// backend that accepts the connection and never answers.
+func TestServer_HealthNeverReturns503ThroughTheStack(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer hung.Close()
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{
+			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name: "hung-backend",
+				// Deliberately LONGER than healthProbeBudget: the budget, not
+				// the client timeout, must be what bounds this.
+				BaseURL: hung.URL,
+				Timeout: 30 * time.Second,
+			}),
+			IsDefault: true,
+		}},
+	})
+	require.NoError(t, err)
+
+	addr := freePort(t)
+	srv, err := NewServer(ServerConfig{
+		Addr:           addr,
+		ProviderUUID:   testutil.ValidUUID1,
+		Bech32Prefix:   "manifest",
+		RateLimitRPS:   100,
+		RateLimitBurst: 200,
+		ReadTimeout:    5 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    30 * time.Second,
+		// Left at the default so the assertion below is about the real
+		// production relationship, not a test-tuned one.
+	}, ServerDeps{BackendRouter: router})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Start(ctx) }()
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+
+	// Wait on the LISTENER, not on /health. startAndWaitForServer polls /health
+	// with a 2s client timeout, which this test deliberately makes slow — using
+	// it here would time out on the very condition under test.
+	require.Eventually(t, func() bool {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "server never started listening")
+
+	client := &http.Client{Timeout: defaultRequestTimeout}
+
+	for _, path := range []string{"/health", "/readyz"} {
+		t.Run(path, func(t *testing.T) {
+			start := time.Now()
+			resp, err := client.Get(fmt.Sprintf("http://%s%s", addr, path))
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			elapsed := time.Since(start)
+
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			assert.Equal(t, http.StatusOK, resp.StatusCode,
+				"a hung backend must not produce a non-200 through the real middleware; got body %q", string(body))
+			assert.NotContains(t, string(body), "request timeout",
+				"http.TimeoutHandler must never win the race against healthProbeBudget")
+			assert.Less(t, elapsed, defaultRequestTimeout,
+				"the probe must finish inside the request budget")
+
+			var response HealthResponse
+			require.NoError(t, json.Unmarshal(body, &response))
+			assert.Equal(t, "degraded", response.Status)
+		})
+	}
+}
+
+// TestHealthCheck_HungBackendStillServes covers the case that a *stopped*
+// backend does not: one that accepts the TCP connection and then never answers.
+// Connection-refused fails in milliseconds, which is why both real incidents
+// stayed inside any budget; a hung backend instead burns its full client
+// timeout, and serially that used to blow the request budget and turn /health
+// into a 503 by way of http.TimeoutHandler.
+//
+// The backend client timeout is set short here purely to keep the test fast —
+// the property under test is that a non-answering backend yields 200 + degraded
+// rather than a timeout, which the request-scoped budget and the router's
+// concurrent probing together guarantee.
+func TestHealthCheck_HungBackendStillServes(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer backendServer.Close()
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{
+			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name:    "hung-backend",
+				BaseURL: backendServer.URL,
+				Timeout: 200 * time.Millisecond,
+			}),
+			IsDefault: true,
+		}},
+	})
+	require.NoError(t, err)
+
+	h := &Handlers{
+		backendRouter: router,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	h.HealthCheck(rec, httptest.NewRequest("GET", "/health", nil))
+	elapsed := time.Since(start)
+
+	assert.Equal(t, http.StatusOK, rec.Code,
+		"a hung backend must not turn /health into a 503")
+	assert.Less(t, elapsed, defaultRequestTimeout,
+		"the probe must finish inside the request budget so http.TimeoutHandler never fires")
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+	assert.Equal(t, "degraded", response.Status)
+	assert.Equal(t, "unhealthy", response.Checks["backend:hung-backend"].Status)
+}
+
+// TestReadyz_RemoteDegradationStays200 is what makes a second, 503-capable
+// endpoint safe to add at all. Neither real incident — the mainnet chain blip
+// nor the 2026-08-17 dev backend stop — would take /readyz down either, so
+// pointing a load balancer at it by mistake could not reproduce them.
+func TestReadyz_RemoteDegradationStays200(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer backendServer.Close()
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{
+			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name:    "down-backend",
+				BaseURL: backendServer.URL,
+				Timeout: 5 * time.Second,
+			}),
+			IsDefault: true,
+		}},
+	})
+	require.NoError(t, err)
+
+	h := &Handlers{
+		client: &mockChainClient{
+			pingFunc: func(ctx context.Context) error { return errors.New("connection refused") },
+		},
+		backendRouter: router,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	rec := httptest.NewRecorder()
+	h.Readyz(rec, httptest.NewRequest("GET", "/readyz", nil))
+
+	assert.Equal(t, http.StatusOK, rec.Code,
+		"degraded means providerd is still ready to serve")
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+	assert.Equal(t, "degraded", response.Status)
+}
+
+// TestReadyz_LocalStoreUnhealthyReturns503 is the one place the third tier
+// reaches the wire.
+func TestReadyz_LocalStoreUnhealthyReturns503(t *testing.T) {
+	for _, tt := range localStoreCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &Handlers{
+				providerUUID: testutil.ValidUUID1,
+				bech32Prefix: "manifest",
+			}
+			tt.configure(h)
+
+			rec := httptest.NewRecorder()
+			h.Readyz(rec, httptest.NewRequest("GET", "/readyz", nil))
+
+			assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+
+			var response HealthResponse
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+			assert.Equal(t, "unhealthy", response.Status)
+			assert.Equal(t, "unhealthy", response.Checks[tt.checkKey].Status)
+		})
+	}
+}
+
+// TestReadyz_AllHealthy covers the ordinary case and pins that /readyz serves
+// the same body shape as /health rather than a reduced one.
+func TestReadyz_AllHealthy(t *testing.T) {
+	h := &Handlers{
+		client: &mockChainClient{
+			pingFunc: func(ctx context.Context) error { return nil },
+		},
+		tokenTracker:  &mockTokenTracker{},
+		statusChecker: &mockStatusChecker{inFlightCount: 7},
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	rec := httptest.NewRecorder()
+	h.Readyz(rec, httptest.NewRequest("GET", "/readyz", nil))
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+
+	assert.Equal(t, "healthy", response.Status)
+	assert.Equal(t, testutil.ValidUUID1, response.ProviderUUID)
+	assert.Equal(t, "healthy", response.Checks["chain"].Status)
+	assert.Equal(t, "healthy", response.Checks["token_tracker"].Status)
+	require.NotNil(t, response.Stats)
+	assert.Equal(t, 7, response.Stats.InFlightProvisions)
 }
 
 func TestWriteError(t *testing.T) {
@@ -1958,7 +2537,8 @@ func TestGetLeaseStatus(t *testing.T) {
 
 // mockTokenTracker implements a mock TokenTracker for testing.
 type mockTokenTracker struct {
-	tryUseFunc func(signature string) error
+	tryUseFunc  func(signature string) error
+	healthyFunc func() error
 }
 
 func (m *mockTokenTracker) TryUse(signature string) error {
@@ -1969,6 +2549,9 @@ func (m *mockTokenTracker) TryUse(signature string) error {
 }
 
 func (m *mockTokenTracker) Healthy() error {
+	if m.healthyFunc != nil {
+		return m.healthyFunc()
+	}
 	return nil
 }
 
@@ -4950,12 +5533,12 @@ func TestStripImageTag(t *testing.T) {
 }
 
 func TestGetWorkloads_ContextCancelled(t *testing.T) {
-	// Simulate a slow backend that blocks until context is cancelled,
+	// Simulate a slow backend that blocks until context is canceled,
 	// then verify that GetWorkloads short-circuits with no body when the
-	// request context is cancelled mid-fan-out.
+	// request context is canceled mid-fan-out.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
-		// Server side: context cancelled, just return.
+		// Server side: context canceled, just return.
 	}))
 	defer srv.Close()
 
@@ -4982,7 +5565,7 @@ func TestGetWorkloads_ContextCancelled(t *testing.T) {
 	// the body must NOT be a populated WorkloadLookupResponse.
 	body := rec.Body.String()
 	assert.NotContains(t, body, `"workloads":`,
-		"handler should not write a body when request context is cancelled")
+		"handler should not write a body when request context is canceled")
 }
 
 // fromLeaseUUID is a distinct UUID used as the "original retained lease" in

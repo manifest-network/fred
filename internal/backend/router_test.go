@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -503,7 +504,7 @@ func TestRouter_HealthCheck_ContextCancellation(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Use already-cancelled context
+	// Use already-canceled context
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -552,7 +553,7 @@ func TestRouter_HealthCheck_SkipsGaugeOnContextCancellation(t *testing.T) {
 	// Set the gauge to 1 (healthy) first.
 	metrics.BackendHealthy.WithLabelValues("ctx-be").Set(1)
 
-	// Call HealthCheck with a cancelled context; the backend returns ctx.Err().
+	// Call HealthCheck with a canceled context; the backend returns ctx.Err().
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -565,6 +566,181 @@ func TestRouter_HealthCheck_SkipsGaugeOnContextCancellation(t *testing.T) {
 	// Gauge must remain at 1 — context cancellation should not flip it to 0.
 	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("ctx-be")),
 		"gauge should not change on context cancellation")
+}
+
+// TestRouter_HealthCheck_ProbesConcurrently is the regression guard for the
+// ENG-522 follow-up Copilot caught on PR #226.
+//
+// Serial probing made the worst case the SUM of every backend's client timeout
+// (30s each by default), so one backend that accepts a connection and never
+// answers pushed the /health handler past the API server's own request timeout
+// — whose response body is a 503, the exact status code that endpoint exists
+// never to send. Concurrency makes the worst case the MAX instead, which is
+// what lets healthProbeBudget bound the sweep without starving the backends
+// probed last.
+//
+// Asserted as a hard inequality against the serial floor, not a tight timing
+// window, so it cannot flake on a loaded CI box: 5 backends × 200ms is 1s
+// serially and ~200ms concurrently.
+func TestRouter_HealthCheck_ProbesConcurrently(t *testing.T) {
+	const (
+		backendCount = 5
+		probeDelay   = 200 * time.Millisecond
+	)
+
+	var entries []BackendEntry
+	for i := range backendCount {
+		be := &slowBackend{
+			MockBackend: NewMockBackend(MockBackendConfig{Name: fmt.Sprintf("slow-%d", i)}),
+			delay:       probeDelay,
+		}
+		entries = append(entries, BackendEntry{Backend: be, IsDefault: i == 0})
+	}
+
+	router, err := NewRouter(RouterConfig{Backends: entries})
+	require.NoError(t, err)
+
+	start := time.Now()
+	results, allHealthy := router.HealthCheck(context.Background())
+	elapsed := time.Since(start)
+
+	assert.True(t, allHealthy)
+	require.Len(t, results, backendCount)
+
+	serialFloor := probeDelay * backendCount
+	assert.Less(t, elapsed, serialFloor,
+		"probes must run concurrently: %d backends × %s took %s, which is at or above the %s serial floor",
+		backendCount, probeDelay, elapsed, serialFloor)
+}
+
+// TestRouter_HealthCheck_PreservesOrderUnderConcurrency pins that concurrent
+// probing did not make the response order depend on completion order. Callers
+// diffing successive /health bodies would otherwise see spurious churn.
+func TestRouter_HealthCheck_PreservesOrderUnderConcurrency(t *testing.T) {
+	// Declared fastest-last so completion order is the reverse of config order.
+	delays := []time.Duration{150 * time.Millisecond, 100 * time.Millisecond, 10 * time.Millisecond}
+
+	var entries []BackendEntry
+	for i, d := range delays {
+		be := &slowBackend{
+			MockBackend: NewMockBackend(MockBackendConfig{Name: fmt.Sprintf("ordered-%d", i)}),
+			delay:       d,
+		}
+		entries = append(entries, BackendEntry{Backend: be, IsDefault: i == 0})
+	}
+
+	router, err := NewRouter(RouterConfig{Backends: entries})
+	require.NoError(t, err)
+
+	results, _ := router.HealthCheck(context.Background())
+
+	require.Len(t, results, len(delays))
+	for i := range delays {
+		assert.Equal(t, fmt.Sprintf("ordered-%d", i), results[i].Name,
+			"results must stay in Backends() order, not completion order")
+	}
+}
+
+// TestRouter_HealthCheck_RecordsGaugeOnDeadlineExceeded pins the other half of
+// the cancellation rule. A probe that blows its DEADLINE is genuine evidence of
+// an unhealthy backend — it accepted the connection and never answered — and
+// must reach the gauge, because the gauge is now the only signal carrying this
+// (the status code no longer does). Only a CANCELED probe is excluded, which
+// TestRouter_HealthCheck_SkipsGaugeOnContextCancellation covers.
+func TestRouter_HealthCheck_RecordsGaugeOnDeadlineExceeded(t *testing.T) {
+	be := &contextAwareBackend{MockBackend: NewMockBackend(MockBackendConfig{Name: "deadline-be"})}
+
+	router, err := NewRouter(RouterConfig{
+		Backends:       []BackendEntry{{Backend: be, IsDefault: true}},
+		BackendHealthy: metrics.BackendHealthy,
+	})
+	require.NoError(t, err)
+
+	// Start from healthy so a missing write is distinguishable from a write of 0.
+	metrics.BackendHealthy.WithLabelValues("deadline-be").Set(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-ctx.Done()
+	require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+
+	results, allHealthy := router.HealthCheck(ctx)
+
+	assert.False(t, allHealthy)
+	require.Len(t, results, 1)
+	assert.False(t, results[0].Healthy)
+
+	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("deadline-be")),
+		"a probe that exceeded its deadline is genuine unhealth and must reach the gauge")
+}
+
+// TestRouter_HealthCheck_RecoversPanickingProbe covers the hazard introduced by
+// moving probes onto their own goroutines: net/http recovers a panic raised on
+// its own request goroutine, but not one raised on a goroutine the handler
+// spawned, so an unrecovered panic here would take the whole daemon down
+// instead of failing one probe.
+func TestRouter_HealthCheck_RecoversPanickingProbe(t *testing.T) {
+	panics := prometheus.NewCounter(prometheus.CounterOpts{Name: "test_health_probe_panics_total", Help: "test"})
+
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{
+			{Backend: &panickingBackend{MockBackend: NewMockBackend(MockBackendConfig{Name: "boom-be"})}, IsDefault: true},
+			{Backend: NewMockBackend(MockBackendConfig{Name: "fine-be"})},
+		},
+		HealthProbePanics: panics,
+	})
+	require.NoError(t, err)
+
+	var results []BackendHealth
+	var allHealthy bool
+	require.NotPanics(t, func() {
+		results, allHealthy = router.HealthCheck(context.Background())
+	}, "a panicking backend probe must not escape its goroutine")
+
+	assert.False(t, allHealthy)
+	require.Len(t, results, 2)
+
+	assert.Equal(t, "boom-be", results[0].Name)
+	assert.False(t, results[0].Healthy, "a panicking probe counts as unhealthy, never as a silent pass")
+	assert.Equal(t, "health probe panicked", results[0].Error)
+
+	assert.Equal(t, "fine-be", results[1].Name)
+	assert.True(t, results[1].Healthy, "one panicking probe must not contaminate its peers")
+
+	assert.Equal(t, 1.0, promtestutil.ToFloat64(panics))
+}
+
+// slowBackend wraps MockBackend and blocks in Health() for a fixed delay,
+// standing in for a backend that accepts the connection but is slow to answer.
+type slowBackend struct {
+	*MockBackend
+	delay time.Duration
+}
+
+func (s *slowBackend) Health(ctx context.Context) error {
+	select {
+	case <-time.After(s.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *slowBackend) Name() string {
+	return s.name
+}
+
+// panickingBackend wraps MockBackend and panics in Health().
+type panickingBackend struct {
+	*MockBackend
+}
+
+func (p *panickingBackend) Health(ctx context.Context) error {
+	panic("health probe exploded")
+}
+
+func (p *panickingBackend) Name() string {
+	return p.name
 }
 
 // unhealthyBackend wraps MockBackend but returns an error from Health().

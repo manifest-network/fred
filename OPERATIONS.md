@@ -8,14 +8,36 @@ For deployment and initial setup see [DEPLOYMENT.md](DEPLOYMENT.md). For metric 
 
 ## Health checks
 
-Both `providerd` and `docker-backend` expose `GET /health` that returns 200 when the process can do useful work. Use these for load-balancer health checks and uptime monitoring.
+Both `providerd` and `docker-backend` expose `GET /health`. **`providerd /health` is a liveness contract: no dependency verdict makes it 503, and no dependency can make it slow enough for a prober to give up either.** Point load-balancer health checks at it. `providerd` additionally exposes `GET /readyz` — the same body, but the verdict reaches the status code. **Do not point a load balancer at `/readyz`.**
 
-| Endpoint | Checks |
-|---|---|
-| `providerd /health` | Chain gRPC reachable, all backends reachable, plus token-tracker and placement-store DB writability *if those stores are configured* (`token_tracker_db_path` and `placement_store_db_path`) |
-| `docker-backend /health` | Docker daemon reachable, plus the callback, diagnostics, release, and retention bbolt stores are writable (503 if any is unhealthy) |
+| Endpoint | Probes | 503 when |
+|---|---|---|
+| `providerd /health` | Chain gRPC, every backend, plus token-tracker, placement-store and payload-store DB readability *for whichever of those stores are configured*. The whole sweep is bounded (3s) and backends are probed concurrently, so no dependency can make this endpoint slow enough for a prober to give up on it | Never |
+| `providerd /readyz` | Same probes, same budget | A configured bbolt store is unreadable (verdict `unhealthy`) |
+| `docker-backend /health` | Docker daemon reachable, plus the callback, diagnostics, release, and retention bbolt stores open and carry their expected buckets | Any of them is unhealthy |
 
-A 503 from `providerd /health` includes a JSON body with per-check status; the failing component is identified there. The `token_tracker` and `placement_store` keys only appear when the corresponding DB is configured — a dev-mode instance without them simply omits those checks rather than failing.
+All bbolt probes are read-only opens: they prove the database is present and structurally intact, **not** that a write would succeed. A full or read-only filesystem passes them.
+
+Both `providerd` endpoints return the same JSON body, whose `status` is one of three verdicts:
+
+| `status` | Meaning | `/health` | `/readyz` |
+|---|---|---|---|
+| `healthy` | Every configured probe passed | 200 | 200 |
+| `degraded` | A **remote, shared** dependency is impaired — the chain, or one or more backends. What survives depends which: a backend down leaves the other backends' leases serving and reconciling; the chain down halts reconciliation entirely and fails every lease-resolving tenant call. Either way providerd still accepts backend callbacks, which is why it must stay in rotation | 200 | 200 |
+| `unhealthy` | A **local, process-owned** bbolt store is unreadable. Restart-worthy | 200 | 503 |
+
+A check absent from `checks` means that dependency is **not configured**, not that it passed — a dev-mode instance without the bbolt stores simply omits them.
+
+### Why `/health` never 503s
+
+It used to, on any failing probe, and that is the direct cause of two outages. `providerd` sits behind a single-server load-balancer pool with no fail-open floor, so an unhealthy verdict sheds no load onto a peer — there is no peer — it removes the provider entirely. And the backends' completion callbacks arrive on that same listener and the same vhost as the tenant API, so a backend-triggered 503 severs the channel a *recovering* backend needs to report what it finished.
+
+- **mainnet-morpheus, 2026-07-13** (ENG-522): a ~1-minute upstream chain-RPC blip failed a single `Ping`. `/health` flipped 200→503 for one 30s probe interval, the load balancer dropped the only server, and a backend's provision-success callback got `no available server` three times in 6s and was dropped. The workload ran; providerd never learned; the lease was rejected 10 minutes later with `reason="callback timeout"`.
+- **dev, 2026-08-17**: one docker backend of three was stopped. The tenant API returned 503 for 15 minutes (38 × 503 vs 9 × 200), four tenant provisions failed, and one workload was orphaned — while providerd itself was serving fine when reached directly.
+
+The dependency signal did not disappear, it moved: the per-check map is still in the body, and every probe now has a metric (`fred_health_check_healthy` and `fred_backend_healthy`). **Alert on those, not on the status code.** A broken bbolt store is fixed by restarting the process, which a supervisor can do and a load balancer cannot — that is why even `unhealthy` keeps `/health` at 200.
+
+**Slowness is bounded too, and that is a separate guarantee from the verdict.** A backend that *refuses* connections fails in milliseconds; one that accepts the connection and never answers would otherwise burn its full client timeout (30s by default), and three independent deadlines each turn that into the same outage: Traefik gives up at 5s and marks the server DOWN, `http_write_timeout` severs the response at 15s, and the request-timeout middleware answers 503 at 30s from `http.TimeoutHandler` — with no verdict involved at all. So the whole sweep is capped at 3s, under the smallest of the three, and backends are probed concurrently rather than serially so that cap does not starve the backends probed last. If you shorten Traefik's `healthCheck.timeout` below 3s, shorten the budget with it.
 
 ---
 
@@ -24,7 +46,11 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | Signal | Likely cause | First step |
 |---|---|---|
 | `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
-| `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above |
+| `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
+| `fred_health_check_healthy{check="chain"} == 0` | providerd cannot reach the chain gRPC endpoint (or it answered slower than the health probe's budget). Every tenant endpoint that resolves a lease fails, **and reconciliation stops entirely** — a sweep returns as soon as the pending- or active-lease query errors, because everything downstream treats "absent from chain" as ground truth. Backend callbacks are still accepted: they touch neither the chain nor any store | Check the node and `grpc_endpoint`. This is the ENG-522 trigger, and it is now a metric rather than a 503 — providerd deliberately stays in rotation, because dropping out would sever the callback path too without restoring anything |
+| `fred_health_check_healthy{check=~"token_tracker\|placement_store\|payload_store"} == 0` | That bbolt store could not be opened, or is missing the buckets it should have. `/readyz` is 503 and `/health` reports `unhealthy` while still answering 200 | Check the store's `*_db_path` — that it exists, is the intended file, and is readable — then **restart providerd**; a load balancer cannot fix this and deliberately is not asked to. Note the probe is a read-only check, so a full or read-only filesystem passes it and still breaks writes: check disk space too even when this gauge reads 1 |
+| `fred_backend_health_probe_panics_total > 0` | Bug — a backend health probe panicked. The probe is an HTTP call that should return an error, not panic. It is recovered (the probe runs on its own goroutine, where net/http's recovery does not reach it) and counts as unhealthy, so nothing crashes | Check logs for `backend health probe panicked` and the stack trace, then file an issue |
+| `fred_health_check_healthy` series absent, or frozen while nothing changes | Nothing is polling `/health`. Both this gauge and `fred_backend_healthy` are written **only** from inside the health handler, so with no prober they latch at their last value instead of going absent | Confirm the load balancer's health check on `/health` still exists and its interval (30s in the reference deployment). A latched 1 masks a real outage |
 | `fred_backend_insufficient_resources_total` rising on a backend | Backend at capacity | Reduce SKU sizes, add backend hosts, or check `docker-backend /stats` |
 | `fred_provisioner_callback_timeouts_total` rising | Backend accepted provision but never called back | Backend logs; verify `callback_base_url` is reachable from backend; check HMAC secret match |
 | `fred_provisioner_ack_batch_fee_gas_errors_total` rising | Out-of-gas on lease acknowledgment txs | See [Out-of-gas tuning](#out-of-gas-tuning) |

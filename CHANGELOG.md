@@ -8,6 +8,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **`GET /readyz`** on `providerd` serves the same body as `/health` with the verdict
+  carried into the status code: `503` when a local bbolt store is unreadable, `200`
+  otherwise — including when the chain or every backend is unreachable, because
+  `degraded` means `providerd` is still ready to serve. Nothing routes on it,
+  deliberately: it exists so uptime monitoring and blackbox probes can see the
+  `unhealthy` tier, and so an operator can `curl` one path for the deep verdict. **Do
+  not point a load balancer at it** — the fault it reports is one a process supervisor
+  fixes by restarting and a load balancer cannot fix at all.
+
+- **`fred_health_check_healthy{check}`** exports each non-backend dependency probe
+  (`chain`, `token_tracker`, `placement_store`, `payload_store`; 1 = healthy). Three of
+  those four had **no health metric at all** — the chain has latency and transaction
+  counters, but nothing that answers "can providerd reach it right now", and the two
+  bbolt stores had nothing whatsoever. The `/health` status code was their only
+  signal, and this release removes it, so the gauge is not a nicety but the replacement
+  signal. Alert on it rather than on the status code. Backends are deliberately absent:
+  `fred_backend_healthy` already carries a per-backend label this gauge's single `check`
+  label could not express.
+
+  Both gauges are written only from inside the health handlers, so each is exactly as
+  fresh as whatever polls `/health` or `/readyz`; with no prober they latch at their
+  last value instead of going absent. That is why `/health` still probes every backend
+  even though backends no longer move its status code — `Router.HealthCheck` is the sole
+  writer of `fred_backend_healthy`, and this handler is its only non-test caller.
+
+- **The payload store is now health-checked.** `payload.Store.Healthy` has existed all
+  along with nothing calling it, so a `payloads.db` that had been lost, truncated or
+  opened against the wrong path was invisible to the health endpoint and to metrics
+  alike — while `/update` returned `500` and every reprovision of a lease that needs a
+  manifest failed outright. It now reports as `payload_store`, and is omitted rather
+  than failed when `payload_store_db_path` is unset.
+
+  Note what the probe does and does not prove: it is a read-only bbolt `View` that
+  opens the database and checks its buckets exist. A full or read-only filesystem
+  passes it and still fails every write, so it is not a substitute for disk alerting.
+
 - `fred_docker_backend_retention_sweep_total{outcome}` and
   `fred_docker_backend_retention_accounting_refresh_failed_total` make a degraded
   retention store visible for the first time (ENG-680). Until now the only trace of
@@ -46,6 +82,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   deliberately not summable.
 
 ### Fixed
+
+- **One impaired dependency no longer takes the whole provider offline** (ENG-522,
+  ENG-608). `providerd`'s `GET /health` computed a single boolean over every probe —
+  chain gRPC, every backend, and the token-tracker and placement-store bbolt DBs (the
+  payload store was never probed at all) — and answered `503` if any one of
+  them failed. Deployments health-check that exact path from a load balancer whose
+  pool holds `providerd` as its **only** server, so a single failing probe removed the
+  provider outright and every `/api/fred/*` request became `no available server`. It
+  also severed the backends' completion-callback route, which shares that listener and
+  vhost, so a backend that had finished its work could not say so and the lease was
+  rejected minutes later with `reason="callback timeout"` while the tenant's workload
+  kept running, unbilled and unmanaged.
+
+  This was never a hypothetical. On mainnet-morpheus a ~1-minute upstream chain-RPC
+  blip failed one `Ping`, dropped the only server for a single 30s probe interval, and
+  cost a provision that had already succeeded. On dev, stopping one docker backend of
+  three held the tenant API down for 15 minutes (38 × `503` against 9 × `200`), failed
+  four tenant provisions and orphaned a workload — while `providerd` answered
+  correctly the entire time when reached directly.
+
+  `/health` is now a liveness contract: **it returns 200 whenever the process can
+  answer, and never 503s because a dependency is impaired.** No probe here justifies
+  de-registration — there is no peer to shed load onto, and accepting a callback
+  touches neither the chain, nor a backend, nor any store, so a 503 severs a working
+  path in order to report a broken one. The reconciler's behaviour is unchanged; it
+  was already correct throughout both incidents.
+
+  Two things had to change for "never 503" to be literally true rather than merely
+  true of the verdict. Both endpoints are wrapped in `requestTimeoutMiddleware`, which
+  is `http.TimeoutHandler`, and **its timeout response body is a 503** — so a slow
+  enough probe made the endpoint emit the very status code it exists to avoid, and the
+  server's `http_write_timeout` (15s by default) severed the connection even earlier.
+  The whole dependency sweep is therefore bounded by `healthProbeBudget` (10s, under
+  both defaults), and `Router.HealthCheck` now probes backends **concurrently** rather
+  than serially. Serial probing made the worst case the *sum* of every backend's client
+  timeout — 30s each by default — so one backend that accepted a connection and never
+  answered was enough to blow the request budget by itself. Concurrency makes it the
+  *max*, which is what lets the budget hold without starving the backends probed last.
+  A backend that merely *refuses* connections fails in milliseconds, which is why both
+  real incidents stayed well inside any budget; a *hung* one was the gap.
+
+  Because those probes now run on their own goroutines, they are also recovered:
+  net/http recovers a panic raised on its own request goroutine but not one raised on a
+  goroutine the handler spawned, so an unrecovered panic in a backend client would have
+  gone from failing one request to taking the daemon down. A panicking probe counts as
+  unhealthy and increments `fred_backend_health_probe_panics_total`, which is always a
+  bug when non-zero.
+
+- **A degraded dependency is now distinguishable from a broken one.** The health body's
+  `status` gains a third verdict alongside `healthy` and `unhealthy`, reusing the
+  vocabulary the reconciler already established: `degraded` means a **remote, shared**
+  dependency is impaired (the chain, or one or more backends) and `providerd` is still
+  serving; `unhealthy` means a **local, process-owned** bbolt store is unreadable and
+  the process wants restarting. The distinction is the whole point — the old boolean
+  gave a stopped backend and a corrupt database the same answer, and that answer was
+  the one that caused an outage. Per-check results are unchanged, and a check absent
+  from `checks` still means "not configured", never "passed".
 
 - **An unmounted volume root can no longer be mistaken for a node with no volumes**
   (ENG-687). A plain `umount` leaves the mountpoint directory in place on the parent
