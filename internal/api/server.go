@@ -97,16 +97,17 @@ type ServerConfig struct {
 // ServerDeps holds the runtime dependencies for the API server.
 // These are the collaborators injected into the server at startup.
 type ServerDeps struct {
-	ChainClient       ChainClient
-	BackendRouter     *backend.Router
-	CallbackPublisher CallbackPublisher
-	PayloadPublisher  PayloadPublisher
-	PayloadPersister  PayloadPersister // Required — /update returns 500 without it (ENG-619).
-	StatusChecker     StatusChecker
-	PlacementLookup   PlacementLookup          // Optional — if nil, placement routing is disabled.
-	RestoreRecorder   RestorePlacementRecorder // Optional — restore placement bookkeeping (ENG-333).
-	RestoreTracker    RestoreInFlightTracker   // Optional — inline-ack restore in-flight tracking (ENG-358).
-	EventBroker       *EventBroker             // Optional — if nil, the events endpoint returns 501.
+	ChainClient        ChainClient
+	BackendRouter      *backend.Router
+	CallbackPublisher  CallbackPublisher
+	PayloadPublisher   PayloadPublisher
+	PayloadPersister   PayloadPersister   // Required — /update returns 500 without it (ENG-619).
+	PayloadStoreHealth PayloadStoreHealth // Optional — health probe for the payload store's bbolt DB.
+	StatusChecker      StatusChecker
+	PlacementLookup    PlacementLookup          // Optional — if nil, placement routing is disabled.
+	RestoreRecorder    RestorePlacementRecorder // Optional — restore placement bookkeeping (ENG-333).
+	RestoreTracker     RestoreInFlightTracker   // Optional — inline-ack restore in-flight tracking (ENG-358).
+	EventBroker        *EventBroker             // Optional — if nil, the events endpoint returns 501.
 }
 
 // NewServer creates a new API server.
@@ -142,18 +143,19 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		tracker = tokenTracker
 	}
 	handlers := NewHandlers(HandlersConfig{
-		Client:           client,
-		BackendRouter:    backendRouter,
-		TokenTracker:     tracker,
-		StatusChecker:    statusChecker,
-		PlacementLookup:  placementLookup,
-		RestoreRecorder:  deps.RestoreRecorder,
-		RestoreTracker:   deps.RestoreTracker,
-		PayloadPersister: deps.PayloadPersister,
-		EventBroker:      eventBroker,
-		ProviderUUID:     cfg.ProviderUUID,
-		Bech32Prefix:     cfg.Bech32Prefix,
-		CallbackBaseURL:  cfg.CallbackBaseURL,
+		Client:             client,
+		BackendRouter:      backendRouter,
+		TokenTracker:       tracker,
+		StatusChecker:      statusChecker,
+		PlacementLookup:    placementLookup,
+		RestoreRecorder:    deps.RestoreRecorder,
+		RestoreTracker:     deps.RestoreTracker,
+		PayloadPersister:   deps.PayloadPersister,
+		PayloadStoreHealth: deps.PayloadStoreHealth,
+		EventBroker:        eventBroker,
+		ProviderUUID:       cfg.ProviderUUID,
+		Bech32Prefix:       cfg.Bech32Prefix,
+		CallbackBaseURL:    cfg.CallbackBaseURL,
 	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
@@ -222,6 +224,9 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 
 	// Unauthenticated routes
 	mux.Handle("GET /health", withTimeout(http.HandlerFunc(handlers.HealthCheck)))
+	// Deep readiness. Deliberately NOT what a load balancer should poll — see
+	// the Readyz doc comment. /health is the liveness contract.
+	mux.Handle("GET /readyz", withTimeout(http.HandlerFunc(handlers.Readyz)))
 	mux.Handle("GET /metrics", withTimeout(promhttp.Handler()))
 	mux.Handle("GET /workloads", withTimeout(http.HandlerFunc(handlers.GetWorkloads)))
 	mux.Handle("POST /callbacks/provision", withTimeout(http.HandlerFunc(s.handleProvisionCallback)))

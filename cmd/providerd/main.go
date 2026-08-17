@@ -394,6 +394,16 @@ func run(cmd *cobra.Command, args []string) error {
 		payloadPersister = provisionMgr
 	}
 
+	// The health probe goes straight to the store rather than through the
+	// Manager: it asks whether payloads.db is readable, which is a property of
+	// the store alone. Same typed-nil gotcha as placementStore — a nil
+	// *payload.Store assigned to an interface is not a nil interface, and the
+	// health handler would call Healthy() on it.
+	var payloadStoreHealth api.PayloadStoreHealth
+	if payloadStore != nil {
+		payloadStoreHealth = payloadStore
+	}
+
 	apiServer, err := api.NewServer(api.ServerConfig{
 		Addr:                        cfg.APIListenAddr,
 		ProviderUUID:                cfg.ProviderUUID,
@@ -416,16 +426,17 @@ func run(cmd *cobra.Command, args []string) error {
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
 	}, api.ServerDeps{
-		ChainClient:       chainClient,
-		BackendRouter:     backendRouter,
-		CallbackPublisher: provisionMgr,
-		PayloadPublisher:  provisionMgr,
-		PayloadPersister:  payloadPersister,
-		StatusChecker:     provisionMgr,
-		PlacementLookup:   placementStore,
-		RestoreRecorder:   provisionMgr,
-		RestoreTracker:    provisionMgr,
-		EventBroker:       eventBroker,
+		ChainClient:        chainClient,
+		BackendRouter:      backendRouter,
+		CallbackPublisher:  provisionMgr,
+		PayloadPublisher:   provisionMgr,
+		PayloadPersister:   payloadPersister,
+		PayloadStoreHealth: payloadStoreHealth,
+		StatusChecker:      provisionMgr,
+		PlacementLookup:    placementStore,
+		RestoreRecorder:    provisionMgr,
+		RestoreTracker:     provisionMgr,
+		EventBroker:        eventBroker,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)

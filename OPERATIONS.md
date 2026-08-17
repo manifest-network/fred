@@ -8,14 +8,32 @@ For deployment and initial setup see [DEPLOYMENT.md](DEPLOYMENT.md). For metric 
 
 ## Health checks
 
-Both `providerd` and `docker-backend` expose `GET /health` that returns 200 when the process can do useful work. Use these for load-balancer health checks and uptime monitoring.
+Both `providerd` and `docker-backend` expose `GET /health`. **`providerd /health` is a liveness contract: it returns 200 whenever the process can answer, and never 503s because a dependency is impaired.** Point load-balancer health checks at it. `providerd` additionally exposes `GET /readyz` — the same body, but the verdict reaches the status code. **Do not point a load balancer at `/readyz`.**
 
-| Endpoint | Checks |
-|---|---|
-| `providerd /health` | Chain gRPC reachable, all backends reachable, plus token-tracker and placement-store DB writability *if those stores are configured* (`token_tracker_db_path` and `placement_store_db_path`) |
-| `docker-backend /health` | Docker daemon reachable, plus the callback, diagnostics, release, and retention bbolt stores are writable (503 if any is unhealthy) |
+| Endpoint | Probes | 503 when |
+|---|---|---|
+| `providerd /health` | Chain gRPC, every backend, plus token-tracker, placement-store and payload-store DB readability *for whichever of those stores are configured* | Never |
+| `providerd /readyz` | Same probes | A configured bbolt store is unreadable (verdict `unhealthy`) |
+| `docker-backend /health` | Docker daemon reachable, plus the callback, diagnostics, release, and retention bbolt stores are writable | Any of them is unhealthy |
 
-A 503 from `providerd /health` includes a JSON body with per-check status; the failing component is identified there. The `token_tracker` and `placement_store` keys only appear when the corresponding DB is configured — a dev-mode instance without them simply omits those checks rather than failing.
+Both `providerd` endpoints return the same JSON body, whose `status` is one of three verdicts:
+
+| `status` | Meaning | `/health` | `/readyz` |
+|---|---|---|---|
+| `healthy` | Every configured probe passed | 200 | 200 |
+| `degraded` | A **remote, shared** dependency is impaired — the chain, or one or more backends. providerd itself is fine: it still accepts backend callbacks, serves leases on the backends that are up, and reconciles | 200 | 200 |
+| `unhealthy` | A **local, process-owned** bbolt store is unreadable. Restart-worthy | 200 | 503 |
+
+A check absent from `checks` means that dependency is **not configured**, not that it passed — a dev-mode instance without the bbolt stores simply omits them.
+
+### Why `/health` never 503s
+
+It used to, on any failing probe, and that is the direct cause of two outages. `providerd` sits behind a single-server load-balancer pool with no fail-open floor, so an unhealthy verdict sheds no load onto a peer — there is no peer — it removes the provider entirely. And the backends' completion callbacks arrive on that same listener and the same vhost as the tenant API, so a backend-triggered 503 severs the channel a *recovering* backend needs to report what it finished.
+
+- **mainnet-morpheus, 2026-07-13** (ENG-522): a ~1-minute upstream chain-RPC blip failed a single `Ping`. `/health` flipped 200→503 for one 30s probe interval, the load balancer dropped the only server, and a backend's provision-success callback got `no available server` three times in 6s and was dropped. The workload ran; providerd never learned; the lease was rejected 10 minutes later with `reason="callback timeout"`.
+- **dev, 2026-08-17**: one docker backend of three was stopped. The tenant API returned 503 for 15 minutes (38 × 503 vs 9 × 200), four tenant provisions failed, and one workload was orphaned — while providerd itself was serving fine when reached directly.
+
+The dependency signal did not disappear, it moved: the per-check map is still in the body, and every probe now has a metric (`fred_health_check_healthy` and `fred_backend_healthy`). **Alert on those, not on the status code.** A broken bbolt store is fixed by restarting the process, which a supervisor can do and a load balancer cannot — that is why even `unhealthy` keeps `/health` at 200.
 
 ---
 
@@ -24,7 +42,10 @@ A 503 from `providerd /health` includes a JSON body with per-check status; the f
 | Signal | Likely cause | First step |
 |---|---|---|
 | `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
-| `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above |
+| `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
+| `fred_health_check_healthy{check="chain"} == 0` | providerd cannot reach the chain gRPC endpoint. Every tenant endpoint that resolves a lease fails, but backend callbacks and reconciliation-side recovery are unaffected | Check the node and `grpc_endpoint`. This is the ENG-522 trigger, and it is now a metric rather than a 503 — providerd deliberately stays in rotation |
+| `fred_health_check_healthy{check="token_tracker"\|"placement_store"\|"payload_store"} == 0` | That bbolt store is unreadable. `/readyz` is 503 and `/health` reports `unhealthy` while still answering 200 | Check disk space and permissions on the store's `*_db_path`, then **restart providerd** — a load balancer cannot fix this and deliberately is not asked to. A dead `payloads.db` also means `/update` returns 500 and reprovisions revert tenants to their as-created manifest (ENG-619) |
+| `fred_health_check_healthy` series absent, or frozen while nothing changes | Nothing is polling `/health`. Both this gauge and `fred_backend_healthy` are written **only** from inside the health handler, so with no prober they latch at their last value instead of going absent | Confirm the load balancer's health check on `/health` still exists and its interval (30s in the reference deployment). A latched 1 masks a real outage |
 | `fred_backend_insufficient_resources_total` rising on a backend | Backend at capacity | Reduce SKU sizes, add backend hosts, or check `docker-backend /stats` |
 | `fred_provisioner_callback_timeouts_total` rising | Backend accepted provision but never called back | Backend logs; verify `callback_base_url` is reachable from backend; check HMAC secret match |
 | `fred_provisioner_ack_batch_fee_gas_errors_total` rising | Out-of-gas on lease acknowledgment txs | See [Out-of-gas tuning](#out-of-gas-tuning) |

@@ -36,6 +36,7 @@ func TestMetricsRegistered(t *testing.T) {
 		BackendRequestsTotal,
 		BackendInsufficientResourcesTotal,
 		BackendHealthy,
+		HealthCheckHealthy,
 		BackendCircuitBreakerState,
 		BackendAllocatedCPURatio,
 		RoutingFallbackTotal,
@@ -180,6 +181,9 @@ func TestCounterVecLabels(t *testing.T) {
 	})
 	assert.NotPanics(t, func() {
 		BackendHealthy.WithLabelValues("docker")
+	})
+	assert.NotPanics(t, func() {
+		HealthCheckHealthy.WithLabelValues("chain")
 	})
 	assert.NotPanics(t, func() {
 		NonInFlightCallbacksTotal.WithLabelValues("docker", "success")

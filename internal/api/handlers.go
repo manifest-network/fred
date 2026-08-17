@@ -48,6 +48,18 @@ type PlacementLookup interface {
 	Healthy() error
 }
 
+// PayloadStoreHealth reports whether the payload store's bbolt database is
+// usable. The store has always had a Healthy method; nothing called it, so an
+// unwritable payloads.db was invisible to both the health endpoint and the
+// metrics — while /update returned 500 and reprovisions silently reverted
+// tenants to their as-created manifest (ENG-619).
+//
+// Optional: a providerd without payload_store_db_path has no store to probe and
+// omits the check entirely.
+type PayloadStoreHealth interface {
+	Healthy() error
+}
+
 // PayloadPersister persists a tenant's updated deployment payload to the store
 // the reconciler replays from on reprovision.
 //
@@ -90,51 +102,54 @@ type RestoreInFlightTracker interface {
 
 // Handlers contains HTTP request handlers.
 type Handlers struct {
-	client            ChainClient
-	backendRouter     *backend.Router
-	tokenTracker      TokenTrackerInterface
-	statusChecker     StatusChecker
-	placementLookup   PlacementLookup
-	restoreRecorder   RestorePlacementRecorder
-	restoreTracker    RestoreInFlightTracker
-	payloadPersister  PayloadPersister
-	eventBroker       *EventBroker
-	wsUpgrader        websocket.Upgrader
-	wsMaxMessageSize  int64         // max bytes the server will read from a client message on /events
-	wsMaxConnLifetime time.Duration // max lifetime of an /events subscription before forced reconnect
-	providerUUID      string
-	bech32Prefix      string
-	callbackBaseURL   string
+	client             ChainClient
+	backendRouter      *backend.Router
+	tokenTracker       TokenTrackerInterface
+	statusChecker      StatusChecker
+	placementLookup    PlacementLookup
+	restoreRecorder    RestorePlacementRecorder
+	restoreTracker     RestoreInFlightTracker
+	payloadPersister   PayloadPersister
+	payloadStoreHealth PayloadStoreHealth
+	eventBroker        *EventBroker
+	wsUpgrader         websocket.Upgrader
+	wsMaxMessageSize   int64         // max bytes the server will read from a client message on /events
+	wsMaxConnLifetime  time.Duration // max lifetime of an /events subscription before forced reconnect
+	providerUUID       string
+	bech32Prefix       string
+	callbackBaseURL    string
 }
 
 // HandlersConfig configures a Handlers instance.
 type HandlersConfig struct {
-	Client           ChainClient
-	BackendRouter    *backend.Router
-	TokenTracker     TokenTrackerInterface    // optional but recommended for replay attack protection
-	StatusChecker    StatusChecker            // optional but required for the /status endpoint
-	PlacementLookup  PlacementLookup          // optional — used for routing reads to the correct backend
-	RestoreRecorder  RestorePlacementRecorder // optional — restore placement bookkeeping (ENG-333)
-	RestoreTracker   RestoreInFlightTracker   // optional — inline-ack restore in-flight tracking (ENG-358)
-	PayloadPersister PayloadPersister         // REQUIRED for /update — without it an update cannot be made durable (ENG-619)
-	EventBroker      *EventBroker             // optional — if nil, the events endpoint will return 501
-	ProviderUUID     string
-	Bech32Prefix     string
-	CallbackBaseURL  string // used for restart/update callbacks to the backend
+	Client             ChainClient
+	BackendRouter      *backend.Router
+	TokenTracker       TokenTrackerInterface    // optional but recommended for replay attack protection
+	StatusChecker      StatusChecker            // optional but required for the /status endpoint
+	PlacementLookup    PlacementLookup          // optional — used for routing reads to the correct backend
+	RestoreRecorder    RestorePlacementRecorder // optional — restore placement bookkeeping (ENG-333)
+	RestoreTracker     RestoreInFlightTracker   // optional — inline-ack restore in-flight tracking (ENG-358)
+	PayloadPersister   PayloadPersister         // REQUIRED for /update — without it an update cannot be made durable (ENG-619)
+	PayloadStoreHealth PayloadStoreHealth       // optional — health probe for the payload store's bbolt DB
+	EventBroker        *EventBroker             // optional — if nil, the events endpoint will return 501
+	ProviderUUID       string
+	Bech32Prefix       string
+	CallbackBaseURL    string // used for restart/update callbacks to the backend
 }
 
 // NewHandlers creates a new Handlers instance.
 func NewHandlers(cfg HandlersConfig) *Handlers {
 	return &Handlers{
-		client:           cfg.Client,
-		backendRouter:    cfg.BackendRouter,
-		tokenTracker:     cfg.TokenTracker,
-		statusChecker:    cfg.StatusChecker,
-		placementLookup:  cfg.PlacementLookup,
-		restoreRecorder:  cfg.RestoreRecorder,
-		restoreTracker:   cfg.RestoreTracker,
-		payloadPersister: cfg.PayloadPersister,
-		eventBroker:      cfg.EventBroker,
+		client:             cfg.Client,
+		backendRouter:      cfg.BackendRouter,
+		tokenTracker:       cfg.TokenTracker,
+		statusChecker:      cfg.StatusChecker,
+		placementLookup:    cfg.PlacementLookup,
+		restoreRecorder:    cfg.RestoreRecorder,
+		restoreTracker:     cfg.RestoreTracker,
+		payloadPersister:   cfg.PayloadPersister,
+		payloadStoreHealth: cfg.PayloadStoreHealth,
+		eventBroker:        cfg.EventBroker,
 		wsUpgrader: websocket.Upgrader{
 			// Allow all origins: this API is not browser-facing. Clients are
 			// CLI tools and services that authenticate with cryptographically
@@ -1308,6 +1323,35 @@ func (h *Handlers) GetLeaseReleases(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response, http.StatusOK)
 }
 
+// Aggregate health verdicts, in increasing order of severity.
+//
+// Three tiers, not two. The old boolean folded every dependency fault into one
+// answer, and that answer was a 503 — which removed providerd from its load
+// balancer, taking down the tenant API *and* the backend callback route with it
+// (ENG-522). The tiers below draw the line the load balancer actually cares
+// about: whether the impaired thing is remote and shared, or local to this
+// process.
+const (
+	// healthStatusHealthy — every configured check passed.
+	healthStatusHealthy = "healthy"
+	// healthStatusDegraded — a remote, shared dependency (the chain, one or
+	// more backends) is impaired. providerd itself is fine and must stay in
+	// rotation: it can still accept backend callbacks, serve leases on the
+	// backends that are up, and reconcile.
+	healthStatusDegraded = "degraded"
+	// healthStatusUnhealthy — a local, process-owned resource (one of the bbolt
+	// stores) is unusable. Restart-worthy, and the operator's problem rather
+	// than the load balancer's — see the Readyz doc comment.
+	healthStatusUnhealthy = "unhealthy"
+)
+
+// Per-check verdicts. Unlike the aggregate these stay binary: a single probe
+// either answered or it did not.
+const (
+	checkStatusHealthy   = "healthy"
+	checkStatusUnhealthy = "unhealthy"
+)
+
 // HealthStats contains operational statistics for the health response.
 type HealthStats struct {
 	InFlightProvisions int `json:"in_flight_provisions"`
@@ -1327,86 +1371,112 @@ type CheckResult struct {
 	Message string `json:"message,omitempty"`
 }
 
-// HealthCheck handles GET /health
-func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
+// evaluateHealth runs every configured dependency probe and folds the results
+// into one aggregate verdict. Shared by GET /health and GET /readyz, which
+// differ only in how they map that verdict onto an HTTP status code.
+//
+// A check absent from the response means the dependency is not configured, not
+// that it passed — a dev-mode instance with no bbolt stores simply omits them.
+func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 	checks := make(map[string]*CheckResult)
-	overallHealthy := true
+
+	// Tracked separately because they map to different verdicts. Collapsing
+	// them back into one boolean reinstates ENG-522.
+	remoteImpaired := false // the chain or a backend — shared, off-box
+	localImpaired := false  // a bbolt store — this process's own disk
+
+	// record folds one probe into the response: gauge, sanitized client-facing
+	// result, and the matching impairment tier. Raw errors are logged but never
+	// returned — they can name internal hosts and paths.
+	//
+	// logMsg is passed through verbatim rather than unified into one structured
+	// line: "health check: chain unhealthy" is quoted in ENG-522's incident
+	// timeline and is what operators grep for.
+	record := func(name string, local bool, logMsg, clientMsg string, err error) {
+		if err != nil {
+			slog.Warn(logMsg, "error", err)
+			metrics.HealthCheckHealthy.WithLabelValues(name).Set(0)
+			checks[name] = &CheckResult{
+				Status:  checkStatusUnhealthy,
+				Message: clientMsg,
+			}
+			if local {
+				localImpaired = true
+			} else {
+				remoteImpaired = true
+			}
+			return
+		}
+		metrics.HealthCheckHealthy.WithLabelValues(name).Set(1)
+		checks[name] = &CheckResult{Status: checkStatusHealthy}
+	}
 
 	// Check chain connectivity
 	if h.client != nil {
-		if err := h.client.Ping(r.Context()); err != nil {
-			slog.Warn("health check: chain unhealthy", "error", err)
-			checks["chain"] = &CheckResult{
-				Status:  "unhealthy",
-				Message: "chain connectivity failed",
-			}
-			overallHealthy = false
-		} else {
-			checks["chain"] = &CheckResult{
-				Status: "healthy",
-			}
-		}
+		record("chain", false,
+			"health check: chain unhealthy", "chain connectivity failed",
+			h.client.Ping(ctx))
 	}
 
-	// Check all backends
+	// Check all backends.
+	//
+	// This probe must stay here even though it no longer moves the status code:
+	// Router.HealthCheck is the ONLY writer of fred_backend_healthy, and this is
+	// its only non-test caller, so the deployment's 30s poll of /health is the
+	// clock driving that gauge and its three consumers (the BackendUnhealthy
+	// alert and two dashboards). Stop calling it and the series latches at a
+	// plausible wrong value instead of going absent.
+	//
+	// Backends get no HealthCheckHealthy series: they already have a per-backend
+	// gauge, which this one's single "check" label could not express.
 	if h.backendRouter != nil {
-		backendResults, backendsHealthy := h.backendRouter.HealthCheck(r.Context())
+		backendResults, backendsHealthy := h.backendRouter.HealthCheck(ctx)
 		for _, result := range backendResults {
 			checkKey := "backend:" + result.Name
 			if result.Healthy {
 				checks[checkKey] = &CheckResult{
-					Status: "healthy",
+					Status: checkStatusHealthy,
 				}
 			} else {
 				slog.Warn("health check: backend unhealthy", "backend", result.Name, "error", result.Error)
 				checks[checkKey] = &CheckResult{
-					Status:  "unhealthy",
+					Status:  checkStatusUnhealthy,
 					Message: "backend health check failed",
 				}
 			}
 		}
 		if !backendsHealthy {
-			overallHealthy = false
+			remoteImpaired = true
 		}
 	}
 
 	// Check token tracker (bbolt database)
 	if h.tokenTracker != nil {
-		if err := h.tokenTracker.Healthy(); err != nil {
-			slog.Warn("health check: token tracker unhealthy", "error", err)
-			checks["token_tracker"] = &CheckResult{
-				Status:  "unhealthy",
-				Message: "token tracker unavailable",
-			}
-			overallHealthy = false
-		} else {
-			checks["token_tracker"] = &CheckResult{
-				Status: "healthy",
-			}
-		}
+		record("token_tracker", true,
+			"health check: token tracker unhealthy", "token tracker unavailable",
+			h.tokenTracker.Healthy())
 	}
 
 	// Check placement store (bbolt database)
 	if h.placementLookup != nil {
-		if err := h.placementLookup.Healthy(); err != nil {
-			slog.Warn("health check: placement store unhealthy", "error", err)
-			checks["placement_store"] = &CheckResult{
-				Status:  "unhealthy",
-				Message: "placement store unavailable",
-			}
-			overallHealthy = false
-		} else {
-			checks["placement_store"] = &CheckResult{
-				Status: "healthy",
-			}
-		}
+		record("placement_store", true,
+			"health check: placement store unhealthy", "placement store unavailable",
+			h.placementLookup.Healthy())
 	}
 
-	status := "healthy"
-	httpStatus := http.StatusOK
-	if !overallHealthy {
-		status = "unhealthy"
-		httpStatus = http.StatusServiceUnavailable
+	// Check payload store (bbolt database)
+	if h.payloadStoreHealth != nil {
+		record("payload_store", true,
+			"health check: payload store unhealthy", "payload store unavailable",
+			h.payloadStoreHealth.Healthy())
+	}
+
+	status := healthStatusHealthy
+	switch {
+	case localImpaired:
+		status = healthStatusUnhealthy
+	case remoteImpaired:
+		status = healthStatusDegraded
 	}
 
 	response := HealthResponse{
@@ -1419,6 +1489,54 @@ func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		response.Stats = &HealthStats{
 			InFlightProvisions: h.statusChecker.InFlightCount(),
 		}
+	}
+
+	return response
+}
+
+// HealthCheck handles GET /health.
+//
+// Always 200 while the process can answer at all. This is a liveness contract,
+// deliberately: the endpoint is what load balancers poll, and no dependency
+// probed here justifies pulling providerd out of rotation.
+//
+// The reason is topology, not taste. providerd sits behind a single-server
+// load-balancer pool with no fail-open floor, so an unhealthy verdict does not
+// shed load onto a peer — there is no peer. It takes the whole provider down.
+// And the backends' completion callbacks arrive on this same listener, so a
+// backend-triggered 503 severs the exact channel a *recovering* backend needs
+// to report that it finished. That is not a hypothetical: it is both ENG-522
+// (a one-minute chain blip on mainnet) and the 2026-08-17 dev outage (one
+// backend of three stopped, 15 minutes of tenant-wide 503s, one orphaned
+// workload). Accepting a callback touches neither the chain, nor a backend, nor
+// any bbolt store, so there is no probe here whose failure means "cannot serve".
+//
+// The dependency detail is not lost, it moves: the per-check map is still in the
+// body, every non-backend check now exports fred_health_check_healthy, and
+// backends keep fred_backend_healthy. Alert on those, not on this status code.
+func (h *Handlers) HealthCheck(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, h.evaluateHealth(r.Context()), http.StatusOK)
+}
+
+// Readyz handles GET /readyz.
+//
+// Same body as /health, but the aggregate verdict reaches the status code: 503
+// when a local, process-owned resource is unusable. Remote impairment (chain,
+// backends) stays 200 here too — "degraded" means providerd is still ready to
+// serve, which is exactly what it is.
+//
+// Nothing routes on this endpoint, by design. It exists so the "unhealthy" tier
+// has a wire expression for uptime monitoring and blackbox probes, and so a
+// human can curl one path for the deep verdict. Do NOT point a load balancer at
+// it: the failure it reports is one a process supervisor can fix by restarting
+// and a load balancer cannot fix at all, and pulling the single server would
+// again take the callback route down with it.
+func (h *Handlers) Readyz(w http.ResponseWriter, r *http.Request) {
+	response := h.evaluateHealth(r.Context())
+
+	httpStatus := http.StatusOK
+	if response.Status == healthStatusUnhealthy {
+		httpStatus = http.StatusServiceUnavailable
 	}
 
 	writeJSON(w, response, httpStatus)

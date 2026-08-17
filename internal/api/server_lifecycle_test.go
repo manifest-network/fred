@@ -127,6 +127,7 @@ func TestServer_RoutesRegistered(t *testing.T) {
 		path   string
 	}{
 		{"GET", "/health"},
+		{"GET", "/readyz"},
 		{"GET", "/metrics"},
 		{"POST", "/callbacks/provision"},
 		{"GET", "/v1/leases/01234567-89ab-cdef-0123-456789abcdef/status"},

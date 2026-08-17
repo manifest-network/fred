@@ -346,7 +346,8 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
-| `GET` | `/health` | None | Chain connectivity, backend health, DB health |
+| `GET` | `/health` | None | Liveness. Probes chain, backends and DBs, but **always 200** — poll this from a load balancer |
+| `GET` | `/readyz` | None | Deep readiness. Same body; 503 when a local bbolt store is unreadable. **Not** for load balancers |
 | `GET` | `/metrics` | None | Prometheus metrics |
 | `GET` | `/workloads?lease_uuid=<u1>&lease_uuid=<u2>...` | None | Bulk workload metadata lookup by lease UUID (1..MaxLookupUUIDs). Used by the manifest-admin SPA. |
 | `POST` | `/callbacks/provision` | HMAC-SHA256 | Backend → Fred callback (5-min replay window) |
@@ -356,23 +357,42 @@ See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
 ### Health Check
 
 ```
-GET /health
+GET /health     # liveness — always 200
+GET /readyz     # deep readiness — 503 when a local store is unreadable
 ```
 
-Returns server health status. Checks chain connectivity, all registered backends,
-token tracker (bbolt), and placement store (bbolt). Returns `200 OK` when all
-checks pass or `503 Service Unavailable` when any check fails.
+Both probe the same things — chain connectivity, every registered backend, and
+the token-tracker, placement-store and payload-store bbolt DBs — and return the
+same body. They differ only in how the verdict maps onto the status code:
+
+| `status` | Meaning | `/health` | `/readyz` |
+|---|---|---|---|
+| `healthy` | Every configured probe passed | 200 | 200 |
+| `degraded` | A remote, shared dependency is impaired (chain, one or more backends). providerd still serves | 200 | 200 |
+| `unhealthy` | A local, process-owned bbolt store is unreadable. Restart-worthy | 200 | 503 |
+
+`/health` is a **liveness** contract: it never 503s on a dependency probe, because
+providerd runs as the single server of its load-balancer pool and the backends'
+completion callbacks arrive on the same listener — so removing it from rotation
+takes down the tenant API *and* the callback path that lets a recovering backend
+report what it finished (ENG-522). Point load balancers here. Alert on
+`fred_health_check_healthy` and `fred_backend_healthy`, not on the status code.
+
+A check absent from `checks` means that dependency is not configured, not that it
+passed.
 
 **Response:**
 ```json
 {
-  "status": "healthy",
+  "status": "degraded",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "checks": {
     "chain": {"status": "healthy"},
     "backend:docker-1": {"status": "healthy"},
+    "backend:docker-2": {"status": "unhealthy", "message": "backend health check failed"},
     "token_tracker": {"status": "healthy"},
-    "placement_store": {"status": "healthy"}
+    "placement_store": {"status": "healthy"},
+    "payload_store": {"status": "healthy"}
   }
 }
 ```

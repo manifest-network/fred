@@ -429,6 +429,27 @@ var (
 	}, []string{"method", "path", "status"})
 )
 
+// Health-check metrics
+var (
+	// HealthCheckHealthy tracks the result of each non-backend dependency probe
+	// run by the health handler (1 = healthy, 0 = unhealthy). Labels: check —
+	// one of chain, token_tracker, placement_store, payload_store.
+	//
+	// Backends are deliberately absent: they already have BackendHealthy, which
+	// carries a per-backend label this gauge cannot express.
+	//
+	// Same caveat as BackendHealthy: this is written from inside the health
+	// handler, so it is only as fresh as whatever polls /health or /readyz. With
+	// nothing polling, the series latches at its last value rather than going
+	// absent. Deployments health-check /health every 30s, which is the clock.
+	HealthCheckHealthy = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "health",
+		Name:      "check_healthy",
+		Help:      "Health of an individual providerd dependency as observed by the health handler (1 = healthy, 0 = unhealthy). Backends are covered by fred_backend_healthy instead. Only as fresh as the last /health or /readyz request; latches rather than going absent if nothing polls.",
+	}, []string{"check"})
+)
+
 // Chain metrics
 var (
 	// ChainTxTotal tracks chain transactions by type and outcome.
