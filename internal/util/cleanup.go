@@ -32,7 +32,7 @@ type PanicHandler func(recovered any)
 //
 //	wg.Go(func() {
 //	    util.StartCleanupLoop(ctx, interval, cleanupFn, "token",
-//	        func(any) { metrics.CleanupPanicsTotal.WithLabelValues("token").Inc() })
+//	        func(any) { background.CleanupPanicsTotal.WithLabelValues("token").Inc() })
 //	})
 func StartCleanupLoop(ctx context.Context, interval time.Duration, cleanup CleanupFunc, component string, onPanic PanicHandler) {
 	ticker := time.NewTicker(interval)

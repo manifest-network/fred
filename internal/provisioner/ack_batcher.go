@@ -14,6 +14,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // Acknowledger defines the interface for acknowledging leases on chain.
@@ -293,7 +294,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 				"panic", r,
 				"stack", string(debug.Stack()),
 			)
-			metrics.GoroutinePanicsTotal.WithLabelValues("ack_batcher").Inc()
+			background.GoroutinePanicsTotal.WithLabelValues("ack_batcher").Inc()
 			// Unblock any pending callers with an error; otherwise they'd
 			// hang forever waiting on their resultCh.
 			panicErr := fmt.Errorf("ack batcher lane %d panicked: %v", laneIdx, r)

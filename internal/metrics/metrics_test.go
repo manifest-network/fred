@@ -53,8 +53,6 @@ var labelledMetricNames = []string{
 	"fred_api_rate_limit_rejections_total",
 	"fred_api_request_duration_seconds",
 	"fred_api_requests_total",
-	"fred_background_cleanup_panics_total",
-	"fred_background_goroutine_panics_total",
 	"fred_backend_allocated_cpu_ratio",
 	"fred_backend_circuit_breaker_state",
 	"fred_backend_healthy",
@@ -100,8 +98,6 @@ func allCollectors() []prometheus.Collector {
 		ReconcilerInflightSkipsTotal,
 		ReconcilerDeferredLeasesTotal,
 		ReconcilerPanicsTotal,
-		CleanupPanicsTotal,
-		GoroutinePanicsTotal,
 		SignerOOGRetriesTotal,
 		GasSimulationTotal,
 		GasSimulated,
@@ -256,10 +252,6 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerPanicsTotal.WithLabelValues("process_orphan")
 		ReconcilerPanicsTotal.WithLabelValues("fetch_provisions")
 		ReconcilerPanicsTotal.WithLabelValues("fetch_retentions")
-	})
-	assert.NotPanics(t, func() {
-		CleanupPanicsTotal.WithLabelValues("token")
-		GoroutinePanicsTotal.WithLabelValues("ack_batcher")
 	})
 	assert.NotPanics(t, func() {
 		SignerOOGRetriesTotal.WithLabelValues("retried")

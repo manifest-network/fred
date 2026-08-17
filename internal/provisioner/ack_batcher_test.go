@@ -15,6 +15,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // mockAckChainClient implements ChainClient for ack batcher tests
@@ -1032,7 +1033,7 @@ func TestAckBatcher_PanicInFlushDoesNotCrashFred(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	before := promtestutil.ToFloat64(metrics.GoroutinePanicsTotal.WithLabelValues("ack_batcher"))
+	before := promtestutil.ToFloat64(background.GoroutinePanicsTotal.WithLabelValues("ack_batcher"))
 
 	batcher.Start(ctx)
 	defer batcher.Stop()
@@ -1055,7 +1056,7 @@ func TestAckBatcher_PanicInFlushDoesNotCrashFred(t *testing.T) {
 	assert.Error(t, ackErr,
 		"caller must receive an error from the panicked flush, not success")
 
-	after := promtestutil.ToFloat64(metrics.GoroutinePanicsTotal.WithLabelValues("ack_batcher"))
+	after := promtestutil.ToFloat64(background.GoroutinePanicsTotal.WithLabelValues("ack_batcher"))
 	assert.Equal(t, before+1, after,
 		"GoroutinePanicsTotal{ack_batcher} must increment by 1")
 }

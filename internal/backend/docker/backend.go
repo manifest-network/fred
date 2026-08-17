@@ -17,7 +17,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
-	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // dockerClient abstracts the Docker API surface used by Backend,
@@ -511,7 +511,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
 		DBPath:         cfg.CallbackDBPath,
 		MaxAge:         cfg.CallbackMaxAge,
-		OnCleanupPanic: func(any) { metrics.CleanupPanicsTotal.WithLabelValues("callback").Inc() },
+		OnCleanupPanic: func(any) { background.CleanupPanicsTotal.WithLabelValues("callback").Inc() },
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open callback store: %w", err)
@@ -520,7 +520,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
 		DBPath:         cfg.DiagnosticsDBPath,
 		MaxAge:         cfg.DiagnosticsMaxAge,
-		OnCleanupPanic: func(any) { metrics.CleanupPanicsTotal.WithLabelValues("diagnostics").Inc() },
+		OnCleanupPanic: func(any) { background.CleanupPanicsTotal.WithLabelValues("diagnostics").Inc() },
 	})
 	if err != nil {
 		_ = cbStore.Close()
@@ -530,7 +530,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
 		DBPath:         cfg.ReleasesDBPath,
 		MaxAge:         cfg.ReleasesMaxAge,
-		OnCleanupPanic: func(any) { metrics.CleanupPanicsTotal.WithLabelValues("releases").Inc() },
+		OnCleanupPanic: func(any) { background.CleanupPanicsTotal.WithLabelValues("releases").Inc() },
 	})
 	if err != nil {
 		_ = cbStore.Close()
