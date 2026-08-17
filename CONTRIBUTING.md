@@ -234,7 +234,7 @@ Look at `internal/scheduler/doc.go` or `internal/backend/docker/doc.go` for the 
 
    - only providerd writes it → `internal/metrics/metrics.go`;
    - only one backend writes it → that backend's `metrics.go` (`internal/backend/docker/`, `internal/backend/k3s/`);
-   - every binary writes it → `internal/metrics/background`, and it **must** carry labels: a `*Vec` registers just as eagerly but exports no series until its first `WithLabelValues`, which is what makes it free for a binary that never writes it;
+   - more than one binary writes it, **or** it belongs to the `fred_background_*` panic family → `internal/metrics/background`, where it **must** carry labels: a `*Vec` registers just as eagerly but exports no series until its first `WithLabelValues`, which is what makes it free for a binary that never writes it. Label-bearing is the membership rule, not "written by everyone" — `GoroutinePanicsTotal` is providerd-only and lives there deliberately, keeping the family whole so the next backend that needs a panic counter does not re-import `internal/metrics`;
    - shared code that must reference no collector at all → take one by injection, as `backend.RouterConfig.RoutingFallback` and `backend.HTTPClientConfig.RequestsTotal` do, and wire it in `cmd/providerd/main.go`.
 
    A `depguard` rule blocks `internal/metrics` from `internal/backend/**` and the backend `cmd` packages, and each backend `cmd` package has a test asserting its `/metrics` carries only its own prefix. If either fires, the fix is one of the four options above, never an exclusion.

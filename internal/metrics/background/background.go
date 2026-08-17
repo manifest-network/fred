@@ -1,8 +1,11 @@
 // Package background holds the Prometheus collectors for background-goroutine
-// health — the `fred_background_*` family — which every fred binary emits.
-// providerd counts panics in its token-tracker cleanup loop and its payload,
-// ack-batcher and withdraw goroutines; the docker and k3s backends count panics
-// in their callback, diagnostics, releases and retention cleanup loops.
+// health — the whole `fred_background_*` family. CleanupPanicsTotal is written
+// by every fred binary: providerd for its token-tracker cleanup loop, the docker
+// backend for its callback, diagnostics, releases and retention loops, the k3s
+// backend for callback, diagnostics and releases (it has no retention store —
+// retention is docker-only, ENG-325). GoroutinePanicsTotal is written only by
+// providerd, for its payload-writer, ack-batcher and withdraw goroutines; it
+// lives here anyway, see the rule below.
 //
 // It exists as a package of its own because its parent, internal/metrics, is
 // providerd's. Those collectors are registered on the default registerer at
@@ -15,16 +18,25 @@
 // written on both sides of the fred↔backend boundary were the whole reason the
 // backends linked that package.
 //
-// The rule for anything added here: it must be written by every binary that
-// links this package, and it must carry labels. A *Vec registers eagerly like
-// everything else but exports no child series until its first WithLabelValues,
-// so a binary that never writes it pays nothing. An unlabelled Counter, Gauge or
-// Histogram in this package would reintroduce ENG-712 across all of them.
+// The rule for anything added here is that it must carry labels. That is the
+// enforceable invariant, and the one this package's test asserts: a *Vec
+// registers eagerly like everything else but exports no child series until its
+// first WithLabelValues, so a binary that never writes it pays nothing. An
+// unlabelled Counter, Gauge or Histogram here would export a permanent 0 on all
+// three binaries at once — ENG-712 with a wider blast radius than the original.
 //
-// Collectors only providerd writes belong in internal/metrics; collectors only
-// one backend writes belong in that backend's package-local metrics file. A
-// third option, for shared code that must not reference a collector at all, is
-// the injection seam used by backend.RouterConfig and backend.HTTPClientConfig.
+// Being written by more than one binary is the reason to put a collector here,
+// not a requirement of membership. GoroutinePanicsTotal is providerd-only and
+// still belongs: it is the other half of the fred_background_* family and of one
+// ARCHITECTURE.md table, and being label-bearing it costs the backends nothing.
+// Splitting the family would only invite the ENG-712 import edge back the next
+// time a backend needs a goroutine-panic counter.
+//
+// What does NOT belong here: a providerd-only collector unrelated to this family
+// (internal/metrics), and one only a single backend writes (that backend's
+// package-local metrics file). For shared code that must reference no collector
+// at all there is a third option — the injection seam used by
+// backend.RouterConfig and backend.HTTPClientConfig.
 package background
 
 import (

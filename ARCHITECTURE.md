@@ -663,7 +663,14 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_events_dropped_total` | counter | `event_type` | Events dropped due to full subscriber channels |
 | `fred_messages_malformed_total` | counter | `topic` | Unparseable messages |
 
-**Background goroutine health** — the one family emitted by *every* fred binary, not just providerd. `component` says which loop panicked and, with the scrape's `job`, which process: providerd emits `token`, `payload_writer`, `ack_batcher` and `withdraw_scheduler`; the docker and k3s backends emit `callback`, `diagnostics`, `releases` and `retention`. Declared in `internal/metrics/background` for that reason.
+**Background goroutine health** — `fred_background_cleanup_panics_total` is the one metric emitted by *every* fred binary, not just providerd, which is why both live in `internal/metrics/background`. Both are `CounterVec`s, so **a healthy process exports no series at all**: absence is the normal state, and a series appearing at all is the event. `component` names the loop that panicked and, with the scrape's `job`, the process:
+
+| Metric | Emitted by | `component` values |
+|---|---|---|
+| `fred_background_cleanup_panics_total` | providerd | `token` |
+| | docker-backend | `callback`, `diagnostics`, `releases`, `retention` |
+| | k3s-backend | `callback`, `diagnostics`, `releases` (no retention store — retention is docker-only, ENG-325) |
+| `fred_background_goroutine_panics_total` | providerd only | `payload_writer`, `ack_batcher`, `withdraw_scheduler` |
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
