@@ -230,7 +230,14 @@ Look at `internal/scheduler/doc.go` or `internal/backend/docker/doc.go` for the 
 
 ## Adding a new metric
 
-1. Define the metric in `internal/metrics/metrics.go` (or `internal/backend/docker/metrics.go` for docker-backend metrics).
+1. Define the metric in the package owned by the binary that writes it. **Which package is not a filing decision — it decides which binaries export the metric.** Collectors are created with `promauto`, which registers on the default registerer at *package init*, so every binary linking that package exports the metric whether or not it has a call site. An unlabelled one then sits at a permanent 0 on processes that can never write it, and a 0 satisfies ordinary gauge comparisons — that is ENG-712, where `fred_signer_pool_lane_count < 3` matched every docker-backend and missed the only host with a signer pool.
+
+   - only providerd writes it → `internal/metrics/metrics.go`;
+   - only one backend writes it → that backend's `metrics.go` (`internal/backend/docker/`, `internal/backend/k3s/`);
+   - every binary writes it → `internal/metrics/background`, and it **must** carry labels: a `*Vec` registers just as eagerly but exports no series until its first `WithLabelValues`, which is what makes it free for a binary that never writes it;
+   - shared code that must reference no collector at all → take one by injection, as `backend.RouterConfig.RoutingFallback` and `backend.HTTPClientConfig.RequestsTotal` do, and wire it in `cmd/providerd/main.go`.
+
+   A `depguard` rule blocks `internal/metrics` from `internal/backend/**` and the backend `cmd` packages, and each backend `cmd` package has a test asserting its `/metrics` carries only its own prefix. If either fires, the fix is one of the four options above, never an exclusion.
 2. Use the `fred_` namespace and an appropriate subsystem.
 3. Document the metric in [ARCHITECTURE.md § Metrics](ARCHITECTURE.md#metrics-prometheus). Include the labels and a one-sentence description that says when the value is interesting (e.g. "any non-zero is a bug" or "spikes correlate with X").
 4. If the metric is intended to drive an alert, mention it in [OPERATIONS.md § Common alerts](OPERATIONS.md#common-alerts-and-what-they-mean).

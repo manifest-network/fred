@@ -83,6 +83,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`docker-backend` and `k3s-backend` no longer export `providerd`'s metrics at a
+  permanent 0** (ENG-712). Collectors are created with `promauto`, which registers on
+  Prometheus's default registerer at *package init*, so a binary exports everything its
+  dependency closure declares whether or not it has a call site. `internal/backend/docker`
+  imported `internal/metrics` for a single panic counter, and each backend consequently
+  published 21 `providerd`-only collectors — 27 metric names once the histograms expand
+  into `_bucket`/`_sum`/`_count` — describing a signer pool, withdraw loop, chain client,
+  payload store, provisioner and backend router that the process does not have. 81 stray
+  series per environment, 243 on a nine-backend fleet.
+
+  For counters this was noise, since `rate()` over a flat 0 is 0. For gauges it was a
+  trap, because a 0 satisfies ordinary comparisons: `fred_signer_pool_lane_count < 3`
+  returned exactly the three docker-backends, which have no signer pool, and *not*
+  `providerd`, which does — wrong in both directions at once, and silent.
+
+  **No metric is renamed and no alert rule needs changing.** The affected series simply
+  stop appearing under the backend jobs, where they never meant anything; every existing
+  rule that queries one without a `job` matcher is in the `>` direction over series that
+  were flat 0, so firing behaviour is unchanged. The `fred_background_cleanup_panics_total`
+  and `fred_background_goroutine_panics_total` counters — the one family every binary
+  emits — keep their names and keep being emitted by all three, from the new
+  `internal/metrics/background` package. Expect the removed series to disappear from the
+  backend jobs at the deploy that picks up this release.
+
+  Each backend `cmd` package now asserts its `/metrics` surface carries only its own
+  prefix, and a `depguard` rule blocks the import that caused it.
+
 - **One impaired dependency no longer takes the whole provider offline** (ENG-522,
   ENG-608). `providerd`'s `GET /health` computed a single boolean over every probe —
   chain gRPC, every backend, and the token-tracker and placement-store bbolt DBs (the
