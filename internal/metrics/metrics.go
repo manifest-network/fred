@@ -396,6 +396,18 @@ var (
 		Name:      "routing_fallback_total",
 		Help:      "Provision-routing decisions that fell back to round-robin (no usable backend load stats)",
 	})
+
+	// BackendHealthProbePanicsTotal counts panics recovered inside a per-backend
+	// health-probe goroutine. Non-zero is always a bug: the probe is an HTTP call
+	// that should return errors, not panic. The recover exists because these
+	// probes moved onto their own goroutines, where net/http's per-connection
+	// panic recovery no longer covers them.
+	BackendHealthProbePanicsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "health_probe_panics_total",
+		Help:      "Panics recovered inside a per-backend health probe goroutine (always a bug)",
+	})
 )
 
 // Rate limit metrics

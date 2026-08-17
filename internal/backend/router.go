@@ -2,7 +2,9 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"slices"
 	"sync"
@@ -25,6 +27,9 @@ type Router struct {
 	// Optional Prometheus handles for least-loaded routing (nil = skip recording).
 	allocatedCPURatio *prometheus.GaugeVec // labels: backend
 	routingFallback   prometheus.Counter
+
+	// Optional Prometheus counter for panics inside a concurrent health probe.
+	healthProbePanics prometheus.Counter
 }
 
 type backendEntry struct {
@@ -53,6 +58,10 @@ type RouterConfig struct {
 	// RoutingFallback, when non-nil, counts provision-routing decisions that
 	// fell back to round-robin because no candidate exposed usable load stats.
 	RoutingFallback prometheus.Counter
+
+	// HealthProbePanics, when non-nil, counts panics recovered inside a
+	// per-backend health probe goroutine. Non-zero is always a bug.
+	HealthProbePanics prometheus.Counter
 }
 
 // BackendEntry pairs a backend with its matching criteria.
@@ -73,6 +82,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		backendHealthy:    cfg.BackendHealthy,
 		allocatedCPURatio: cfg.AllocatedCPURatio,
 		routingFallback:   cfg.RoutingFallback,
+		healthProbePanics: cfg.HealthProbePanics,
 	}
 
 	for i, entry := range cfg.Backends {
@@ -318,29 +328,82 @@ type BackendHealth struct {
 
 // HealthCheck checks the health of all configured backends.
 // Returns a slice of health statuses and an overall healthy flag.
+//
+// Probes run CONCURRENTLY, and the caller is expected to pass a
+// deadline-bounded context. This sits on the /health and /readyz request path,
+// where probing serially made the worst case the SUM of every backend's client
+// timeout (30s each by default) rather than the MAX. One backend that accepts
+// a connection and never answers was therefore enough to push the handler past
+// the API server's own request timeout — whose response body is a 503, the
+// exact status code /health exists never to send (ENG-522). Concurrency is what
+// lets a bounded budget hold without starving the backends probed last.
+//
+// Results stay in Backends() order regardless of completion order: each probe
+// writes its own slot, so a caller diffing successive responses sees a stable
+// sequence.
 func (r *Router) HealthCheck(ctx context.Context) ([]BackendHealth, bool) {
 	backends := r.Backends()
-	results := make([]BackendHealth, 0, len(backends))
+	results := make([]BackendHealth, len(backends))
+
+	var wg sync.WaitGroup
+	for i, b := range backends {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = r.probeBackend(ctx, b)
+		}()
+	}
+	wg.Wait()
+
 	allHealthy := true
-
-	for _, b := range backends {
-		health := BackendHealth{Name: b.Name(), Healthy: true}
-
-		if err := b.Health(ctx); err != nil {
-			health.Healthy = false
-			health.Error = err.Error()
+	for _, health := range results {
+		if !health.Healthy {
 			allHealthy = false
-			// Only update the metric for genuine backend failures.
-			// Context cancellation reflects the request lifecycle, not backend health.
-			if r.backendHealthy != nil && ctx.Err() == nil {
-				r.backendHealthy.WithLabelValues(b.Name()).Set(0)
-			}
-		} else if r.backendHealthy != nil {
-			r.backendHealthy.WithLabelValues(b.Name()).Set(1)
 		}
-
-		results = append(results, health)
 	}
 
 	return results, allHealthy
+}
+
+// probeBackend runs one backend health probe and records its gauge.
+//
+// It recovers because this now runs on its own goroutine, where net/http's
+// per-connection panic recovery no longer applies: an unrecovered panic inside
+// a backend client used to fail one request and would now take the whole daemon
+// down. A panicking probe counts as unhealthy rather than as a silent pass.
+func (r *Router) probeBackend(ctx context.Context, b Backend) (health BackendHealth) {
+	health = BackendHealth{Name: b.Name(), Healthy: true}
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.Error("backend health probe panicked", "backend", b.Name(), "panic", rec)
+			if r.healthProbePanics != nil {
+				r.healthProbePanics.Inc()
+			}
+			health = BackendHealth{Name: b.Name(), Healthy: false, Error: "health probe panicked"}
+		}
+	}()
+
+	err := b.Health(ctx)
+	if err == nil {
+		if r.backendHealthy != nil {
+			r.backendHealthy.WithLabelValues(b.Name()).Set(1)
+		}
+		return health
+	}
+
+	health.Healthy = false
+	health.Error = err.Error()
+
+	// Record the gauge for genuine backend failures, and a probe that blew its
+	// DEADLINE is one: a backend that accepts the connection and never answers
+	// is unhealthy, and that is precisely the case this endpoint most needs to
+	// surface now that it no longer reaches the status code. Only a CANCELED
+	// probe is excluded — cancellation reflects the caller's lifecycle (client
+	// disconnect, server shutdown), not the backend's health.
+	if r.backendHealthy != nil && !errors.Is(ctx.Err(), context.Canceled) {
+		r.backendHealthy.WithLabelValues(b.Name()).Set(0)
+	}
+
+	return health
 }

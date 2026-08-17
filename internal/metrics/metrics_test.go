@@ -36,6 +36,7 @@ func TestMetricsRegistered(t *testing.T) {
 		BackendRequestsTotal,
 		BackendInsufficientResourcesTotal,
 		BackendHealthy,
+		BackendHealthProbePanicsTotal,
 		HealthCheckHealthy,
 		BackendCircuitBreakerState,
 		BackendAllocatedCPURatio,

@@ -49,10 +49,14 @@ type PlacementLookup interface {
 }
 
 // PayloadStoreHealth reports whether the payload store's bbolt database is
-// usable. The store has always had a Healthy method; nothing called it, so an
-// unwritable payloads.db was invisible to both the health endpoint and the
-// metrics — while /update returned 500 and reprovisions silently reverted
-// tenants to their as-created manifest (ENG-619).
+// readable and carries the buckets the store expects. The store has always had
+// a Healthy method; nothing called it, so a payloads.db that had been lost,
+// truncated or opened against the wrong path was invisible to both the health
+// endpoint and the metrics.
+//
+// Note the probe is a read-only bbolt View: it proves the database opens and
+// its buckets exist, not that a write would succeed. A full or read-only
+// filesystem passes it and still fails /update.
 //
 // Optional: a providerd without payload_store_db_path has no store to probe and
 // omits the check entirely.
@@ -1335,9 +1339,20 @@ const (
 	// healthStatusHealthy — every configured check passed.
 	healthStatusHealthy = "healthy"
 	// healthStatusDegraded — a remote, shared dependency (the chain, one or
-	// more backends) is impaired. providerd itself is fine and must stay in
-	// rotation: it can still accept backend callbacks, serve leases on the
-	// backends that are up, and reconcile.
+	// more backends) is impaired. What survives depends on which:
+	//
+	//   - A backend down: leases on the healthy backends still serve and still
+	//     reconcile; only that backend's leases are deferred.
+	//   - The chain down: considerably less. Every tenant endpoint that resolves
+	//     a lease fails, and reconciliation halts outright — RunOnce returns as
+	//     soon as GetPendingLeases or GetActiveLeasesByProvider errors, because
+	//     the whole sweep treats "absent from chain" as ground truth.
+	//
+	// What holds in BOTH cases, and is the reason this is not "unhealthy": the
+	// process can still accept backend callbacks, which touch neither the chain
+	// nor a backend nor any store. Staying in rotation is what preserves that
+	// path, and dropping out would sever it for no gain — there is no peer to
+	// shed load onto.
 	healthStatusDegraded = "degraded"
 	// healthStatusUnhealthy — a local, process-owned resource (one of the bbolt
 	// stores) is unusable. Restart-worthy, and the operator's problem rather
@@ -1351,6 +1366,33 @@ const (
 	checkStatusHealthy   = "healthy"
 	checkStatusUnhealthy = "unhealthy"
 )
+
+// healthProbeBudget caps how long the whole dependency sweep may take.
+//
+// Without it the liveness contract is a lie. A backend that REFUSES connections
+// fails in milliseconds, which is why both real incidents stayed inside any
+// budget; a backend that ACCEPTS the connection and never answers instead burns
+// its full client timeout, 30s by default. Unbounded, that has three separate
+// ways to recreate the very outage this endpoint exists to prevent:
+//
+//   - The prober gives up first. This is the binding constraint: Traefik's
+//     healthCheck timeout defaults to 5s and the reference deployment sets only
+//     path and interval, so a probe slower than 5s marks the only server DOWN
+//     no matter what this handler would eventually have answered.
+//   - The server severs the response. http_write_timeout defaults to 15s.
+//   - The handler answers 503 itself. /health and /readyz are wrapped in
+//     requestTimeoutMiddleware, i.e. http.TimeoutHandler, whose timeout response
+//     body is a 503 — the exact status code this endpoint exists never to send.
+//
+// So the budget is set under the SMALLEST of those, not merely under fred's own
+// timeouts. It holds only because Router.HealthCheck probes concurrently:
+// serially, N hung backends would still need N × 30s.
+//
+// Note this is shorter than the chain client's own 5s Ping cap, which it
+// therefore dominates — a chain round-trip slower than this budget reports
+// unhealthy. That is the intended reading: a chain that cannot answer inside a
+// health probe's window is not healthy, and it still yields degraded + 200.
+const healthProbeBudget = 3 * time.Second
 
 // HealthStats contains operational statistics for the health response.
 type HealthStats struct {
@@ -1378,6 +1420,14 @@ type CheckResult struct {
 // A check absent from the response means the dependency is not configured, not
 // that it passed — a dev-mode instance with no bbolt stores simply omits them.
 func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
+	// Bound the whole sweep so a slow dependency can never reach the status
+	// code — see healthProbeBudget. Derived from the request context, so a
+	// client that disconnects still cancels the work: Router.HealthCheck
+	// distinguishes that cancellation from a genuine deadline and declines to
+	// record health for it.
+	ctx, cancel := context.WithTimeout(ctx, healthProbeBudget)
+	defer cancel()
+
 	checks := make(map[string]*CheckResult)
 
 	// Tracked separately because they map to different verdicts. Collapsing
@@ -1395,7 +1445,16 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 	record := func(name string, local bool, logMsg, clientMsg string, err error) {
 		if err != nil {
 			slog.Warn(logMsg, "error", err)
-			metrics.HealthCheckHealthy.WithLabelValues(name).Set(0)
+			// Same rule as the per-backend gauge in Router.HealthCheck: a probe
+			// that failed because the CALLER went away is not evidence about the
+			// dependency. Without this an unauthenticated client could drive
+			// these series to 0 — and their alerts with them — simply by opening
+			// /health and aborting mid-probe, since the endpoint needs no auth.
+			// A blown DEADLINE is excluded from the exclusion: that one is
+			// genuine, and is the case the budget above deliberately produces.
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				metrics.HealthCheckHealthy.WithLabelValues(name).Set(0)
+			}
 			checks[name] = &CheckResult{
 				Status:  checkStatusUnhealthy,
 				Message: clientMsg,

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -405,7 +406,7 @@ func TestHealthCheck_UnconfiguredChecksAreAbsent(t *testing.T) {
 }
 
 // TestHealthCheck_PayloadStoreProbed covers the store that had a Healthy method
-// nothing ever called: an unwritable payloads.db was invisible everywhere while
+// nothing ever called: a lost or truncated payloads.db was invisible everywhere while
 // /update returned 500 and reprovisions reverted tenants to their as-created
 // manifest (ENG-619).
 func TestHealthCheck_PayloadStoreProbed(t *testing.T) {
@@ -438,13 +439,30 @@ func TestHealthCheck_PayloadStoreProbed(t *testing.T) {
 // TestHealthCheck_RecordsCheckGauges pins the observability half of the fix.
 // Removing dependency state from the status code is only safe because it lands
 // in a metric instead: before this, chain, token_tracker and placement_store had
-// no metric at all and the status code was their sole signal.
+// no HEALTH metric at all — the chain has latency and transaction counters, but
+// nothing answering "is it reachable now" — and the status code was their sole
+// reachability signal.
 //
 // Asserts both polarities in one test so the ordering of other tests touching
 // these global collectors cannot make it pass vacuously.
 func TestHealthCheck_RecordsCheckGauges(t *testing.T) {
+	checkNames := []string{"chain", "token_tracker", "placement_store", "payload_store"}
+
 	probe := func(t *testing.T, healthy bool) {
 		t.Helper()
+
+		// Seed every series to the OPPOSITE value first. Without this the
+		// "unhealthy sets 0" half is vacuous: WithLabelValues auto-creates a
+		// gauge at 0, so an implementation that never writes at all reads as 0
+		// and passes. Seeding makes a missing write observable in both
+		// directions.
+		seed := 1.0
+		if healthy {
+			seed = 0.0
+		}
+		for _, check := range checkNames {
+			metrics.HealthCheckHealthy.WithLabelValues(check).Set(seed)
+		}
 
 		result := func() error {
 			if healthy {
@@ -471,10 +489,10 @@ func TestHealthCheck_RecordsCheckGauges(t *testing.T) {
 		if healthy {
 			want = 1.0
 		}
-		for _, check := range []string{"chain", "token_tracker", "placement_store", "payload_store"} {
+		for _, check := range checkNames {
 			assert.Equal(t, want,
 				promtestutil.ToFloat64(metrics.HealthCheckHealthy.WithLabelValues(check)),
-				"fred_health_check_healthy{check=%q} should be %v", check, want)
+				"fred_health_check_healthy{check=%q} should be %v (seeded to %v, so a missing write fails here)", check, want, seed)
 		}
 	}
 
@@ -528,6 +546,181 @@ func TestHealthCheck_KeepsProbingBackends(t *testing.T) {
 	assert.Equal(t, 1.0,
 		promtestutil.ToFloat64(metrics.BackendHealthy.WithLabelValues("gauge-backend")),
 		"fred_backend_healthy has no other writer; /health must keep driving it")
+}
+
+// TestHealthProbeBudget_FitsInsideEveryDeadline pins the inequality the whole
+// liveness contract rests on. Three independent deadlines can each recreate the
+// ENG-522 cascade if the budget outgrows them, and the binding one is NOT
+// fred's — it belongs to the prober.
+func TestHealthProbeBudget_FitsInsideEveryDeadline(t *testing.T) {
+	// Traefik's loadBalancer healthCheck timeout. Documented default 5s, and
+	// the reference deployment's stanza sets only `path` and `interval`
+	// (manifest-deploy roles/traefik/templates/dynamic.yml.j2). This is the
+	// SMALLEST of the three and therefore the one that actually binds: a probe
+	// slower than this marks the only server DOWN regardless of what the
+	// handler would eventually have answered.
+	const traefikProbeTimeout = 5 * time.Second
+	// config.go: v.SetDefault("http_write_timeout", "15s") — the server severs
+	// the response write at this point.
+	const defaultWriteTimeout = 15 * time.Second
+
+	assert.Less(t, healthProbeBudget, traefikProbeTimeout,
+		"healthProbeBudget must stay under Traefik's 5s healthCheck timeout — the prober gives up first, so a longer budget marks the only server DOWN no matter what we answer")
+	assert.Less(t, healthProbeBudget, defaultWriteTimeout,
+		"healthProbeBudget must stay under the default http_write_timeout or the connection is severed mid-probe")
+	assert.Less(t, healthProbeBudget, defaultRequestTimeout,
+		"healthProbeBudget must stay under the request timeout or http.TimeoutHandler answers 503")
+}
+
+// TestServer_HealthNeverReturns503ThroughTheStack is the test whose absence let
+// the http.TimeoutHandler gap through review: every other health test calls
+// Handlers.HealthCheck directly, which bypasses requestTimeoutMiddleware — the
+// one component that can turn this endpoint into a 503 without any verdict
+// saying so.
+//
+// Exercised through the real mux and the real middleware chain, against a
+// backend that accepts the connection and never answers.
+func TestServer_HealthNeverReturns503ThroughTheStack(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer hung.Close()
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{
+			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name: "hung-backend",
+				// Deliberately LONGER than healthProbeBudget: the budget, not
+				// the client timeout, must be what bounds this.
+				BaseURL: hung.URL,
+				Timeout: 30 * time.Second,
+			}),
+			IsDefault: true,
+		}},
+	})
+	require.NoError(t, err)
+
+	addr := freePort(t)
+	srv, err := NewServer(ServerConfig{
+		Addr:           addr,
+		ProviderUUID:   testutil.ValidUUID1,
+		Bech32Prefix:   "manifest",
+		RateLimitRPS:   100,
+		RateLimitBurst: 200,
+		ReadTimeout:    5 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    30 * time.Second,
+		// Left at the default so the assertion below is about the real
+		// production relationship, not a test-tuned one.
+	}, ServerDeps{BackendRouter: router})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Start(ctx) }()
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+
+	// Wait on the LISTENER, not on /health. startAndWaitForServer polls /health
+	// with a 2s client timeout, which this test deliberately makes slow — using
+	// it here would time out on the very condition under test.
+	require.Eventually(t, func() bool {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "server never started listening")
+
+	client := &http.Client{Timeout: defaultRequestTimeout}
+
+	for _, path := range []string{"/health", "/readyz"} {
+		t.Run(path, func(t *testing.T) {
+			start := time.Now()
+			resp, err := client.Get(fmt.Sprintf("http://%s%s", addr, path))
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			elapsed := time.Since(start)
+
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			assert.Equal(t, http.StatusOK, resp.StatusCode,
+				"a hung backend must not produce a non-200 through the real middleware; got body %q", string(body))
+			assert.NotContains(t, string(body), "request timeout",
+				"http.TimeoutHandler must never win the race against healthProbeBudget")
+			assert.Less(t, elapsed, defaultRequestTimeout,
+				"the probe must finish inside the request budget")
+
+			var response HealthResponse
+			require.NoError(t, json.Unmarshal(body, &response))
+			assert.Equal(t, "degraded", response.Status)
+		})
+	}
+}
+
+// TestHealthCheck_HungBackendStillServes covers the case that a *stopped*
+// backend does not: one that accepts the TCP connection and then never answers.
+// Connection-refused fails in milliseconds, which is why both real incidents
+// stayed inside any budget; a hung backend instead burns its full client
+// timeout, and serially that used to blow the request budget and turn /health
+// into a 503 by way of http.TimeoutHandler.
+//
+// The backend client timeout is set short here purely to keep the test fast —
+// the property under test is that a non-answering backend yields 200 + degraded
+// rather than a timeout, which the request-scoped budget and the router's
+// concurrent probing together guarantee.
+func TestHealthCheck_HungBackendStillServes(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer backendServer.Close()
+
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{
+			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name:    "hung-backend",
+				BaseURL: backendServer.URL,
+				Timeout: 200 * time.Millisecond,
+			}),
+			IsDefault: true,
+		}},
+	})
+	require.NoError(t, err)
+
+	h := &Handlers{
+		backendRouter: router,
+		providerUUID:  testutil.ValidUUID1,
+		bech32Prefix:  "manifest",
+	}
+
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	h.HealthCheck(rec, httptest.NewRequest("GET", "/health", nil))
+	elapsed := time.Since(start)
+
+	assert.Equal(t, http.StatusOK, rec.Code,
+		"a hung backend must not turn /health into a 503")
+	assert.Less(t, elapsed, defaultRequestTimeout,
+		"the probe must finish inside the request budget so http.TimeoutHandler never fires")
+
+	var response HealthResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+	assert.Equal(t, "degraded", response.Status)
+	assert.Equal(t, "unhealthy", response.Checks["backend:hung-backend"].Status)
 }
 
 // TestReadyz_RemoteDegradationStays200 is what makes a second, 503-capable
@@ -5340,12 +5533,12 @@ func TestStripImageTag(t *testing.T) {
 }
 
 func TestGetWorkloads_ContextCancelled(t *testing.T) {
-	// Simulate a slow backend that blocks until context is cancelled,
+	// Simulate a slow backend that blocks until context is canceled,
 	// then verify that GetWorkloads short-circuits with no body when the
-	// request context is cancelled mid-fan-out.
+	// request context is canceled mid-fan-out.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
-		// Server side: context cancelled, just return.
+		// Server side: context canceled, just return.
 	}))
 	defer srv.Close()
 
@@ -5372,7 +5565,7 @@ func TestGetWorkloads_ContextCancelled(t *testing.T) {
 	// the body must NOT be a populated WorkloadLookupResponse.
 	body := rec.Body.String()
 	assert.NotContains(t, body, `"workloads":`,
-		"handler should not write a body when request context is cancelled")
+		"handler should not write a body when request context is canceled")
 }
 
 // fromLeaseUUID is a distinct UUID used as the "original retained lease" in

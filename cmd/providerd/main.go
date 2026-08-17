@@ -300,6 +300,7 @@ func run(cmd *cobra.Command, args []string) error {
 		BackendHealthy:    metrics.BackendHealthy,
 		AllocatedCPURatio: metrics.BackendAllocatedCPURatio,
 		RoutingFallback:   metrics.RoutingFallbackTotal,
+		HealthProbePanics: metrics.BackendHealthProbePanicsTotal,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create backend router: %w", err)

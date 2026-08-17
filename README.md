@@ -346,7 +346,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
-| `GET` | `/health` | None | Liveness. Probes chain, backends and DBs, but **always 200** — poll this from a load balancer |
+| `GET` | `/health` | None | Liveness. Probes chain, backends and DBs, but **no verdict ever makes it 503** — poll this from a load balancer |
 | `GET` | `/readyz` | None | Deep readiness. Same body; 503 when a local bbolt store is unreadable. **Not** for load balancers |
 | `GET` | `/metrics` | None | Prometheus metrics |
 | `GET` | `/workloads?lease_uuid=<u1>&lease_uuid=<u2>...` | None | Bulk workload metadata lookup by lease UUID (1..MaxLookupUUIDs). Used by the manifest-admin SPA. |
@@ -357,7 +357,7 @@ See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
 ### Health Check
 
 ```
-GET /health     # liveness — always 200
+GET /health     # liveness — no verdict returns 503
 GET /readyz     # deep readiness — 503 when a local store is unreadable
 ```
 
@@ -368,15 +368,24 @@ same body. They differ only in how the verdict maps onto the status code:
 | `status` | Meaning | `/health` | `/readyz` |
 |---|---|---|---|
 | `healthy` | Every configured probe passed | 200 | 200 |
-| `degraded` | A remote, shared dependency is impaired (chain, one or more backends). providerd still serves | 200 | 200 |
+| `degraded` | A remote, shared dependency is impaired (chain, or one or more backends). Backend down: the rest keep serving and reconciling. Chain down: reconciliation halts and lease-resolving calls fail. Both still accept backend callbacks | 200 | 200 |
 | `unhealthy` | A local, process-owned bbolt store is unreadable. Restart-worthy | 200 | 503 |
 
-`/health` is a **liveness** contract: it never 503s on a dependency probe, because
+`/health` is a **liveness** contract: no dependency verdict makes it 503, because
 providerd runs as the single server of its load-balancer pool and the backends'
 completion callbacks arrive on the same listener — so removing it from rotation
 takes down the tenant API *and* the callback path that lets a recovering backend
 report what it finished (ENG-522). Point load balancers here. Alert on
 `fred_health_check_healthy` and `fred_backend_healthy`, not on the status code.
+
+Slowness cannot get around that: the whole dependency sweep is bounded (3s) and
+backends are probed concurrently, so a backend that accepts a connection and never
+answers cannot outlast the prober's own timeout, the server's write timeout, or the
+request timeout — the last of which would otherwise answer 503 from
+`http.TimeoutHandler` with no verdict involved.
+
+Being unauthenticated, both endpoints do still sit behind the global IP rate limiter
+and can return `429`; the default budget is far above any sane probe interval.
 
 A check absent from `checks` means that dependency is not configured, not that it
 passed.
