@@ -562,6 +562,8 @@ Used tokens are tracked in bbolt to prevent replay attacks:
 
 All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-backend exposes its own set under `fred_docker_backend_*` at the docker-backend's own `/metrics` endpoint.
 
+**Each binary exports its own section below and nothing else** — the tables here are a contract, not a catalogue. Collectors are created with `promauto`, which registers on the default registerer at *package init*, so a binary exports everything its dependency closure declares whether or not it has a call site. That is how every docker-backend came to export 21 providerd-only collectors at a permanent 0 (ENG-712), and why `internal/metrics` is providerd's alone: the backend `cmd` packages assert their surface in a test, and a `depguard` rule keeps the import from coming back. The `fred_background_*` panic counters below are the one family every binary emits; they live in `internal/metrics/background`, and being label-carrying they cost a binary that never writes them nothing.
+
 #### Fred (`/metrics` on the providerd HTTP server)
 
 **API:**
@@ -661,16 +663,23 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_events_dropped_total` | counter | `event_type` | Events dropped due to full subscriber channels |
 | `fred_messages_malformed_total` | counter | `topic` | Unparseable messages |
 
-**Background goroutine health:**
+**Background goroutine health** — `fred_background_cleanup_panics_total` is the one metric emitted by *every* fred binary, not just providerd, which is why both live in `internal/metrics/background`. Both are `CounterVec`s, so **a healthy process exports no series at all**: absence is the normal state, and a series appearing at all is the event. `component` names the loop that panicked and, with the scrape's `job`, the process:
+
+| Metric | Emitted by | `component` values |
+|---|---|---|
+| `fred_background_cleanup_panics_total` | providerd | `token` |
+| | docker-backend | `callback`, `diagnostics`, `releases`, `retention` |
+| | k3s-backend | `callback`, `diagnostics`, `releases` (no retention store — retention is docker-only, ENG-325) |
+| `fred_background_goroutine_panics_total` | providerd only | `payload_writer`, `ack_batcher`, `withdraw_scheduler` |
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `fred_background_cleanup_panics_total` | counter | `component` | Panics in cleanup loops (token tracker, callback store, etc.) — any non-zero is a bug |
+| `fred_background_cleanup_panics_total` | counter | `component` | Panics in cleanup loops (token tracker, callback store, retention sweep, etc.) — any non-zero is a bug |
 | `fred_background_goroutine_panics_total` | counter | `component` | Panics in long-lived background goroutines |
 
 #### Docker backend (`/metrics` on the docker-backend HTTP server)
 
-All docker-backend metrics live under `fred_docker_backend_*`.
+All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint carries nothing else beyond the shared `fred_background_*` counters above — `cmd/docker-backend/metrics_surface_test.go` asserts it.
 
 **Provisioning & resources:**
 

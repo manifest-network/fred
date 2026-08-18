@@ -14,6 +14,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 const (
@@ -177,7 +178,7 @@ func (s *WithdrawScheduler) TriggerWithdraw() {
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				metrics.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler").Inc()
+				background.GoroutinePanicsTotal.WithLabelValues("withdraw_scheduler").Inc()
 			}
 		}()
 		s.withdrawAndCheckCredits(ctx, true)

@@ -20,7 +20,37 @@ linters:
     - exhaustruct
     - gosec
     - forbidigo
+    - depguard
   settings:
+    depguard:
+      rules:
+        # internal/metrics is providerd's. Its collectors are created with
+        # promauto, which registers on the default registerer at package init —
+        # so linking the package is enough to export every one of them, call
+        # site or not, and the unlabelled ones then sit at a permanent 0 on a
+        # binary that can never write them. A 0 is not neutral: it satisfies
+        # ordinary gauge comparisons, so `fred_signer_pool_lane_count < 3`
+        # matched every docker-backend and missed the one host with a signer
+        # pool (ENG-712).
+        #
+        # Scoped to the backend side of the fred<->backend boundary, which is
+        # where the edge actually appeared: one import, for one panic counter,
+        # in internal/backend/docker and internal/backend/k3s. Tests are exempt
+        # — internal/backend/router_test.go legitimately asserts on the injected
+        # collectors, and a test binary ships nowhere.
+        backend-metrics-ownership:
+          files:
+            - "!$test"
+            - "**/internal/backend/**"
+            - "**/cmd/docker-backend/**"
+            - "**/cmd/k3s-backend/**"
+            - "**/cmd/mock-backend/**"
+          deny:
+            # The $ anchor is load-bearing: pkg is a prefix/regex match, so
+            # without it this also denies internal/metrics/background, the
+            # subpackage the backends are supposed to import.
+            - pkg: github.com/manifest-network/fred/internal/metrics$
+              desc: "providerd-owned; a backend binary that links it exports providerd's whole metric set at 0 (ENG-712). Use internal/metrics/background for collectors every binary writes, declare backend-local ones in that backend's metrics.go, or take the collector by injection like backend.RouterConfig.RoutingFallback."
     forbidigo:
       # Destroy is an irreversible RemoveAll on tenant data. It is already off the
       # volumeManager interface (volume.go), so `b.volumes.Destroy(...)` does not

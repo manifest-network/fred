@@ -13,6 +13,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -175,7 +176,7 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				metrics.GoroutinePanicsTotal.WithLabelValues("payload_writer").Inc()
+				background.GoroutinePanicsTotal.WithLabelValues("payload_writer").Inc()
 				// Cancel the store's ctx; subsequent Store/Pop/Delete
 				// calls observe ctx.Done() and return errors rather
 				// than blocking on the now-defunct writeCh.

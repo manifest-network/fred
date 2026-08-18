@@ -1,13 +1,32 @@
 // Package metrics provides Prometheus metrics for fred observability.
 //
-// All metrics use the `fred` namespace and are registered via promauto,
-// which uses Prometheus's default registerer. Importing this package is
-// enough to make the metrics available at any /metrics endpoint that
-// serves the default gatherer (e.g. promhttp.Handler), which is how
+// These collectors are providerd's. All use the `fred` namespace and are
+// registered via promauto on Prometheus's default registerer at package init,
+// so importing this package is enough to make them available at any /metrics
+// endpoint serving the default gatherer (e.g. promhttp.Handler), which is how
 // providerd wires its endpoint.
 //
-// The docker backend defines its own set of metrics under
-// `fred_docker_backend_*` in its package-local metrics file.
+// That same eagerness is why nothing a backend binary links may import this
+// package. Registration happens on import, not on first write, so a linking
+// binary exports the whole set whether or not it can ever produce a value — and
+// for the unlabelled collectors that means a real series at a permanent 0. A 0
+// is not neutral: it satisfies ordinary gauge comparisons, so a docker-backend
+// exporting fred_signer_pool_lane_count = 0 made the natural
+// `fred_signer_pool_lane_count < 3` match every host that has no signer pool and
+// miss the one that does (ENG-712). A *Vec is the exception that proves it —
+// registered just as eagerly, but silent until its first WithLabelValues.
+//
+// Metrics for other binaries live elsewhere:
+//
+//   - the docker and k3s backends define their own `fred_docker_backend_*` /
+//     `fred_k3s_backend_*` sets in their package-local metrics files;
+//   - the `fred_background_*` panic counters, which every binary writes, live in
+//     the background subpackage;
+//   - shared code that must reference no collector at all takes one by
+//     injection, as backend.RouterConfig and backend.HTTPClientConfig do.
+//
+// A depguard rule enforces the boundary, and each backend cmd package has a test
+// asserting its /metrics surface carries only its own prefix.
 //
 // For a categorized reference of every metric and its labels, see
 // ARCHITECTURE.md.
@@ -130,26 +149,10 @@ var (
 		Help:      "Panics recovered in reconciler per-unit goroutines, by stage",
 	}, []string{"stage"})
 
-	// CleanupPanicsTotal counts panics recovered inside background
-	// cleanup loops (token tracker, callback store, diagnostics store,
-	// etc.) driven by util.StartCleanupLoop. Any non-zero value is a
-	// latent bug in the cleanup function. Labeled by component.
-	CleanupPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: "background",
-		Name:      "cleanup_panics_total",
-		Help:      "Panics recovered in background cleanup loops, by component",
-	}, []string{"component"})
-
-	// GoroutinePanicsTotal is the catch-all for long-lived background
-	// goroutines that add their own recover() (payload store writer,
-	// ack batcher lanes, etc.). Labeled by component for correlation.
-	GoroutinePanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: "background",
-		Name:      "goroutine_panics_total",
-		Help:      "Panics recovered in long-lived background goroutines, by component",
-	}, []string{"component"})
+	// The fred_background_* panic counters live in the `background`
+	// subpackage: they are the only collectors written by more than one fred
+	// binary, and importing this package to reach them is what made every
+	// docker-backend export providerd's metric set at 0 (ENG-712).
 
 	// SignerOOGRetriesTotal counts out-of-gas retry decisions at the
 	// transaction broadcast layer. Label values: "retried" = gas was

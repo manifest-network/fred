@@ -9,54 +9,160 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMetricsRegistered(t *testing.T) {
-	// Register all collectors in a fresh registry and Gather() to verify
-	// names without relying on debug string formats.
-	reg := prometheus.NewPedanticRegistry()
+// unlabelledMetricNames is every metric this package exports the moment a binary
+// links it: the collectors declared WITHOUT labels, which promauto registers on
+// the default registerer at package init and which therefore materialise — at a
+// permanent 0 — on any binary that imports this package whether it writes them
+// or not. That set is the blast radius of importing `internal/metrics`, which is
+// why it is spelled out here rather than derived (ENG-712).
+//
+// These are Gather() family names; the three histograms each expand into
+// _bucket/_sum/_count in the text exposition, so 21 collectors here are 27
+// metric names on the wire.
+var unlabelledMetricNames = []string{
+	"fred_backend_health_probe_panics_total",
+	"fred_backend_routing_fallback_total",
+	"fred_chain_gas_simulated",
+	"fred_payload_leases_awaiting",
+	"fred_payload_size_bytes",
+	"fred_payload_stored_count",
+	"fred_provisioner_callback_timeouts_total",
+	"fred_provisioner_in_flight_provisions",
+	"fred_provisioner_reconciler_deferred_leases_total",
+	"fred_provisioner_reconciler_inflight_skips_total",
+	"fred_reconciler_conflicts_total",
+	"fred_reconciler_duration_seconds",
+	"fred_reconciler_last_success_timestamp_seconds",
+	"fred_reconciler_sweep_complete",
+	"fred_signer_pool_lane_count",
+	"fred_signer_pool_size",
+	"fred_watermill_poisoned_messages_total",
+	"fred_withdraw_credit_check_zero_deferred_total",
+	"fred_withdraw_guard_active",
+	"fred_withdraw_incomplete_cycles_total",
+	"fred_withdraw_skipped_by_guard_total",
+}
 
-	collectors := []prometheus.Collector{
+// labelledMetricNames is every *Vec in the package. A Vec registers eagerly too,
+// but exports no child series until its first WithLabelValues, so it costs a
+// binary that never writes it nothing. Listed so TestMetricSurface can tell a
+// legitimately-written Vec family apart from a collector that was renamed, or
+// added without being declared here.
+var labelledMetricNames = []string{
+	"fred_api_non_in_flight_callbacks_total",
+	"fred_api_rate_limit_rejections_total",
+	"fred_api_request_duration_seconds",
+	"fred_api_requests_total",
+	"fred_backend_allocated_cpu_ratio",
+	"fred_backend_circuit_breaker_state",
+	"fred_backend_healthy",
+	"fred_backend_insufficient_resources_total",
+	"fred_backend_request_duration_seconds",
+	"fred_backend_requests_total",
+	"fred_chain_gas_simulation_total",
+	"fred_chain_query_duration_seconds",
+	"fred_chain_signer_oog_retries_total",
+	"fred_chain_transactions_total",
+	"fred_events_dropped_total",
+	"fred_health_check_healthy",
+	"fred_messages_malformed_total",
+	"fred_payload_persist_failures_total",
+	"fred_payload_uploads_total",
+	"fred_provisioner_ack_batch_fee_gas_errors_total",
+	"fred_provisioner_ack_batch_individual_fallbacks_total",
+	"fred_provisioner_ack_batcher_lane_restarts_total",
+	"fred_provisioner_provisioning_duration_seconds",
+	"fred_provisioner_provisioning_total",
+	"fred_provisioner_reconciler_panics_total",
+	"fred_reconciler_actions_total",
+	"fred_reconciler_backend_fetch_total",
+	"fred_reconciler_cleanup_skips_total",
+	"fred_reconciler_runs_total",
+	"fred_signer_balance_query_failures_total",
+	"fred_watermill_messages_total",
+}
+
+// allCollectors is every collector this package declares, exhaustively. The
+// count assertion in TestMetricsRegistered ties it to the two name lists above,
+// so a new collector cannot be added to the package without landing in all
+// three.
+func allCollectors() []prometheus.Collector {
+	return []prometheus.Collector{
+		// Provisioning
 		InFlightProvisions,
 		ProvisioningTotal,
 		ProvisioningDuration,
-		CallbackTimeoutsTotal,
+		AckBatchFeeGasErrorsTotal,
+		AckBatchIndividualFallbacksTotal,
+		AckBatcherLaneRestartsTotal,
+		ReconcilerInflightSkipsTotal,
+		ReconcilerDeferredLeasesTotal,
+		ReconcilerPanicsTotal,
+		SignerOOGRetriesTotal,
+		GasSimulationTotal,
+		GasSimulated,
+		// Reconciliation
 		ReconciliationTotal,
 		ReconciliationDuration,
+		ReconcilerLastSuccessTimestamp,
 		ReconciliationActions,
-		ReconciliationConflictsTotal,
 		ReconcilerBackendFetchTotal,
 		ReconcilerSweepComplete,
-		ReconcilerDeferredLeasesTotal,
 		ReconcilerCleanupSkipsTotal,
+		// Payload
 		PayloadUploadsTotal,
-		PayloadPersistFailuresTotal,
 		PayloadStoredCount,
+		PayloadPersistFailuresTotal,
 		PayloadSizeBytes,
 		LeasesAwaitingPayload,
+		// Backend
 		BackendRequestDuration,
 		BackendRequestsTotal,
 		BackendInsufficientResourcesTotal,
 		BackendHealthy,
-		BackendHealthProbePanicsTotal,
-		HealthCheckHealthy,
 		BackendCircuitBreakerState,
 		BackendAllocatedCPURatio,
 		RoutingFallbackTotal,
+		BackendHealthProbePanicsTotal,
+		// Rate limit / API / health
 		RateLimitRejectionsTotal,
-		ReconcilerLastSuccessTimestamp,
 		APIRequestDuration,
 		APIRequestsTotal,
-		NonInFlightCallbacksTotal,
+		HealthCheckHealthy,
+		// Chain
 		ChainTxTotal,
 		ChainQueryDuration,
+		// Withdraw
 		WithdrawIncompleteCyclesTotal,
+		WithdrawSkippedByGuardTotal,
+		CreditCheckZeroDeferredTotal,
+		WithdrawGuardActive,
+		// Watermill / events / messages
 		WatermillMessagesTotal,
 		PoisonedMessagesTotal,
 		EventsDroppedTotal,
 		MalformedMessagesTotal,
+		ReconciliationConflictsTotal,
+		// Callback
+		CallbackTimeoutsTotal,
+		NonInFlightCallbacksTotal,
+		// Signer pool
 		SignerPoolSize,
 		SignerPoolLaneCount,
 		SignerBalanceQueryFailures,
 	}
+}
+
+func TestMetricsRegistered(t *testing.T) {
+	// A pedantic registry re-registers every collector from scratch, which
+	// validates each Desc and catches two collectors that disagree on help text
+	// or label names for the same metric name.
+	reg := prometheus.NewPedanticRegistry()
+
+	collectors := allCollectors()
+	require.Len(t, collectors, len(unlabelledMetricNames)+len(labelledMetricNames),
+		"allCollectors() is out of sync with unlabelledMetricNames + labelledMetricNames — "+
+			"a new collector must be added to all three")
 
 	for _, c := range collectors {
 		require.NoError(t, reg.Register(c))
@@ -65,38 +171,65 @@ func TestMetricsRegistered(t *testing.T) {
 	families, err := reg.Gather()
 	require.NoError(t, err)
 
-	names := make(map[string]bool, len(families))
+	known := knownMetricNames()
 	for _, f := range families {
-		names[f.GetName()] = true
-	}
-
-	// Every gathered metric name must start with "fred_".
-	for name := range names {
+		name := f.GetName()
 		assert.True(t, strings.HasPrefix(name, "fred_"), "metric %q should start with fred_", name)
+		assert.True(t, known[name], "metric %q is not declared in unlabelledMetricNames or labelledMetricNames", name)
+	}
+}
+
+// TestMetricSurface pins the exact set of metric names this package adds to the
+// default registry of every binary that links it. Because the package registers
+// via promauto at init, this test's own process is that surface: gathering the
+// default gatherer here shows precisely what a providerd — or, before ENG-712,
+// a docker-backend — exports on account of importing `internal/metrics`.
+//
+// Two directions, both load-bearing:
+//
+//   - every unlabelled name must still be exported, so a rename is caught;
+//   - every exported fred_ name must be declared, so a newly added unlabelled
+//     collector cannot slip in undeclared. That is the ENG-712 hazard: an
+//     unlabelled collector is exported at 0 by every binary that links this
+//     package, and a 0 satisfies ordinary gauge comparisons.
+//
+// The second direction tolerates Vec families, which appear only once another
+// test in this package has written one; that is why labelledMetricNames exists
+// and why this test does not assert an exact set.
+func TestMetricSurface(t *testing.T) {
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	known := knownMetricNames()
+	gathered := make(map[string]bool, len(families))
+	for _, f := range families {
+		name := f.GetName()
+		if !strings.HasPrefix(name, "fred_") {
+			continue // go_* / process_* collectors registered by client_golang itself
+		}
+		gathered[name] = true
+		assert.True(t, known[name],
+			"metric %q is exported by internal/metrics but declared in neither unlabelledMetricNames "+
+				"nor labelledMetricNames; every fred_ series this package adds to a binary must be listed (ENG-712)",
+			name)
 	}
 
-	// Non-vec metrics (Gauge, Counter, Histogram) appear immediately in Gather;
-	// Vec metrics only appear after WithLabelValues, so we check those separately
-	// in TestCounterVecLabels. Here we verify the non-vec subset.
-	for _, expected := range []string{
-		"fred_provisioner_in_flight_provisions",
-		"fred_provisioner_callback_timeouts_total",
-		"fred_reconciler_duration_seconds",
-		"fred_reconciler_conflicts_total",
-		"fred_payload_stored_count",
-		"fred_payload_size_bytes",
-		"fred_payload_leases_awaiting",
-		"fred_watermill_poisoned_messages_total",
-		"fred_reconciler_last_success_timestamp_seconds",
-		"fred_reconciler_sweep_complete",
-		"fred_provisioner_reconciler_deferred_leases_total",
-		"fred_signer_pool_size",
-		"fred_signer_pool_lane_count",
-		"fred_backend_routing_fallback_total",
-		"fred_withdraw_incomplete_cycles_total",
-	} {
-		assert.True(t, names[expected], "metric %q should be gathered", expected)
+	for _, name := range unlabelledMetricNames {
+		assert.True(t, gathered[name],
+			"metric %q is declared unlabelled but was not exported — was it renamed or moved out of this package?",
+			name)
 	}
+}
+
+func knownMetricNames() map[string]bool {
+	known := make(map[string]bool, len(unlabelledMetricNames)+len(labelledMetricNames))
+	for _, n := range unlabelledMetricNames {
+		known[n] = true
+	}
+	for _, n := range labelledMetricNames {
+		known[n] = true
+	}
+	return known
 }
 
 func TestCounterVecLabels(t *testing.T) {
@@ -108,6 +241,26 @@ func TestCounterVecLabels(t *testing.T) {
 	assert.NotPanics(t, func() {
 		ProvisioningDuration.WithLabelValues("docker", "provision")
 		ProvisioningDuration.WithLabelValues("docker", "restore")
+	})
+	assert.NotPanics(t, func() {
+		AckBatchFeeGasErrorsTotal.WithLabelValues("0")
+		AckBatchIndividualFallbacksTotal.WithLabelValues("0")
+		AckBatcherLaneRestartsTotal.WithLabelValues("0")
+	})
+	assert.NotPanics(t, func() {
+		ReconcilerPanicsTotal.WithLabelValues("process_lease")
+		ReconcilerPanicsTotal.WithLabelValues("process_orphan")
+		ReconcilerPanicsTotal.WithLabelValues("fetch_provisions")
+		ReconcilerPanicsTotal.WithLabelValues("fetch_retentions")
+	})
+	assert.NotPanics(t, func() {
+		SignerOOGRetriesTotal.WithLabelValues("retried")
+		SignerOOGRetriesTotal.WithLabelValues("exhausted")
+	})
+	assert.NotPanics(t, func() {
+		GasSimulationTotal.WithLabelValues("simulated")
+		GasSimulationTotal.WithLabelValues("fallback")
+		GasSimulationTotal.WithLabelValues("refused")
 	})
 	assert.NotPanics(t, func() {
 		ReconciliationTotal.WithLabelValues(OutcomeSuccess)
@@ -157,6 +310,11 @@ func TestCounterVecLabels(t *testing.T) {
 		APIRequestsTotal.WithLabelValues("GET", "/health", "200")
 	})
 	assert.NotPanics(t, func() {
+		for _, check := range []string{"chain", "token_tracker", "placement_store", "payload_store"} {
+			HealthCheckHealthy.WithLabelValues(check)
+		}
+	})
+	assert.NotPanics(t, func() {
 		ChainTxTotal.WithLabelValues("acknowledge", "success")
 	})
 	assert.NotPanics(t, func() {
@@ -182,9 +340,6 @@ func TestCounterVecLabels(t *testing.T) {
 	})
 	assert.NotPanics(t, func() {
 		BackendHealthy.WithLabelValues("docker")
-	})
-	assert.NotPanics(t, func() {
-		HealthCheckHealthy.WithLabelValues("chain")
 	})
 	assert.NotPanics(t, func() {
 		NonInFlightCallbacksTotal.WithLabelValues("docker", "success")
