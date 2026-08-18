@@ -81,7 +81,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `retention_reap_skips_total`, which counts per reap *attempt* — the two are
   deliberately not summable.
 
+- `fred_signer_grant_check_total{outcome}` counts sub-signer authz grant sweeps,
+  incremented exactly once per pass of the sub-signer maintenance loop, so
+  `sum without (outcome) (increase(...))` is a loop-liveness heartbeat and
+  `{outcome="error"}` is the failure signal. It exists because a `providerd` that
+  cannot verify its grants no longer sheds its sub-signers (ENG-688), which means
+  `fred_signer_pool_lane_count` correctly stays put and nothing else would move —
+  this counter is the only signal that the verification is still failing.
+  Deliberately not paired with a `*_last_success_timestamp` gauge.
+
 ### Fixed
+
+- **A transient chain-RPC error at startup no longer permanently demotes the signer
+  pool** (ENG-688). `providerd` verified its authz grants once at boot and, on *any*
+  error, discarded every sub-signer for the rest of the process lifetime — a decision
+  nothing could undo. On dev that fired on a plain startup race: the daemon came up six
+  seconds after the chain node restarted, `grpc.NewClient` dials lazily so the failure
+  surfaced at the first RPC, and one `Grants` query timed out. All nine grants were on
+  chain the whole time; only the *read* failed. Dev then signed on one lane for three
+  weeks. Every environment was exposed on every restart, i.e. every fred pin bump.
+
+  A failed query is not a fact about the grants. They are created with no expiration, so
+  once created they stay, and the chain re-checks the authorization inside every
+  `MsgExec` regardless — the startup query is observability, not a gate. `EnsureGrants`
+  now reports a query failure as `chain.ErrGrantsUnverified`, and `providerd` falls back
+  to single-signer **only** on the opposite verdict: the queries succeeded, said the
+  grants are missing, and creating them failed. That one is a positive fact worth acting
+  on, because signing with an ungranted sub-signer burns a failed on-chain tx per batch.
+  Startup additionally retries the whole setup three times (1s, doubling, capped at 10s)
+  inside its existing 60-second budget. That is a narrowing, not the fix: in the dev
+  incident the chain was still unreachable three seconds later — the initial withdrawal's
+  own three-attempt ladder failed across the same window — so the retry would not have
+  saved that boot. What saves it is not demoting on the failed read, and the sweep below.
+
+  The degraded state was expensive and quiet: ack throughput drops from ~150 to ~50 per
+  block, every ack/reject/close serialises on the provider account's sequence so the
+  provider burns the fees the sub-signers exist to absorb, and the
+  `fred_signer_balance{role="sub_signer"}` series disappear with the pool — which blinds
+  `SubSignerLowBalance` and `SubSignerTopUpStalled`, since a bare `< threshold`
+  comparison matches nothing over an absent series.
+
+- **Sub-signer authz grants are now re-checked on every maintenance sweep, not only at
+  boot** (ENG-688). The periodic `sub-signer funding` loop is renamed `sub-signer
+  maintenance` and runs `EnsureGrants` before `EnsureFunding` on the same
+  `sub_signer_fund_check_interval` tick, each half under its own 60-second budget so a
+  sluggish grant sweep cannot starve the top-ups. Both halves are level-triggered, so a
+  boot that could not verify converges on its own instead of staying degraded until an
+  operator restarts the daemon — this is the half that actually retires "permanent for
+  the process lifetime" as a property. Note the
+  consequence: a grant revoked out-of-band is re-created on the next tick — the daemon
+  converges its own desired state, which it already did on every boot.
+
+- **`providerd` no longer logs `chain client connected` before anything has dialed**
+  (ENG-688). `grpc.NewClient` is lazy and connects on the first RPC, so the line said
+  "connected" about a chain that was still starting up while the first real query timed
+  out — it is what made the incident above take three weeks to attribute. It now reads
+  `chain client configured`.
 
 - **`docker-backend` and `k3s-backend` no longer export `providerd`'s metrics at a
   permanent 0** (ENG-712). Collectors are created with `promauto`, which registers on

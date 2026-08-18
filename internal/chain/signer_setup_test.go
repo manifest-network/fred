@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"cosmossdk.io/math"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -252,6 +253,102 @@ func TestEnsureGrants_QueryError(t *testing.T) {
 	err := EnsureGrants(t.Context(), authzQ, broadcaster, pool)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to query grant")
+	assert.ErrorIs(t, err, ErrGrantsUnverified,
+		"a failed grant QUERY must report ErrGrantsUnverified: it says nothing about whether the grants exist (ENG-688)")
+}
+
+// TestEnsureGrants_CreateFailure_IsNotUnverified is the other half of the
+// ENG-688 discriminator. Asserting only that a query error carries the sentinel
+// would still pass if EnsureGrants wrapped *every* error with it, which would
+// disable the caller's fallback entirely.
+func TestEnsureGrants_CreateFailure_IsNotUnverified(t *testing.T) {
+	pool := newTestSignerPool(t, 1)
+
+	// Queries succeed and report every grant missing — a positive fact.
+	authzQ := &mockAuthzQuerier{}
+	broadcaster := &mockTxBroadcaster{
+		broadcastMultiMsgFn: func(ctx context.Context, msgs []sdk.Msg) (string, error) {
+			return "", errors.New("batch broadcast failed")
+		},
+		broadcastTxFn: func(ctx context.Context, msg sdk.Msg) (string, error) {
+			return "", errors.New("individual broadcast failed")
+		},
+	}
+
+	err := EnsureGrants(t.Context(), authzQ, broadcaster, pool)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrGrantsUnverified,
+		"grants known-missing and uncreatable is a positive fact, not an unverified read")
+}
+
+func TestEnsureGrantsWithRetry_RecoversAfterTransientQueryError(t *testing.T) {
+	pool := newTestSignerPool(t, 1)
+	var queryCalls atomic.Int32
+
+	authzQ := &mockAuthzQuerier{
+		grantsFn: func(ctx context.Context, in *authz.QueryGrantsRequest, opts ...grpc.CallOption) (*authz.QueryGrantsResponse, error) {
+			if queryCalls.Add(1) == 1 {
+				return nil, errors.New("rpc error: code = Unavailable desc = i/o timeout")
+			}
+			return &authz.QueryGrantsResponse{Grants: []*authz.Grant{{}}}, nil
+		},
+	}
+	broadcaster := &mockTxBroadcaster{
+		broadcastMultiMsgFn: func(ctx context.Context, msgs []sdk.Msg) (string, error) {
+			t.Error("no grant should be broadcast: the second attempt found them all present")
+			return "", nil
+		},
+	}
+
+	err := EnsureGrantsWithRetry(t.Context(), authzQ, broadcaster, pool)
+	require.NoError(t, err, "a transient query failure must not be fatal")
+	// Attempt 1 aborts on its first query; attempt 2 runs all len(grantedMsgTypes) queries.
+	assert.Equal(t, int32(1+len(grantedMsgTypes)), queryCalls.Load(),
+		"expected one aborted attempt followed by one complete attempt")
+}
+
+func TestEnsureGrantsWithRetry_ExhaustsAttempts_PreservesSentinel(t *testing.T) {
+	pool := newTestSignerPool(t, 1)
+	var queryCalls atomic.Int32
+
+	authzQ := &mockAuthzQuerier{
+		grantsFn: func(ctx context.Context, in *authz.QueryGrantsRequest, opts ...grpc.CallOption) (*authz.QueryGrantsResponse, error) {
+			queryCalls.Add(1)
+			return nil, errors.New("rpc error: code = Unavailable desc = i/o timeout")
+		},
+	}
+
+	err := EnsureGrantsWithRetry(t.Context(), authzQ, &mockTxBroadcaster{}, pool)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrGrantsUnverified,
+		"the retry wrapper must not swallow the sentinel; losing it here silently restores the demote-on-failed-read bug")
+	// Each attempt aborts on its first query.
+	assert.Equal(t, int32(grantMaxRetries), queryCalls.Load())
+}
+
+func TestEnsureGrantsWithRetry_HonoursContextBudget(t *testing.T) {
+	pool := newTestSignerPool(t, 1)
+
+	// Far shorter than grantInitialBackoff, so the loop must abandon inside the
+	// backoff sleep rather than serving out the whole ladder.
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	authzQ := &mockAuthzQuerier{
+		grantsFn: func(ctx context.Context, in *authz.QueryGrantsRequest, opts ...grpc.CallOption) (*authz.QueryGrantsResponse, error) {
+			return nil, errors.New("rpc error: code = Unavailable desc = i/o timeout")
+		},
+	}
+
+	start := time.Now()
+	err := EnsureGrantsWithRetry(ctx, authzQ, &mockTxBroadcaster{}, pool)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Less(t, elapsed, grantInitialBackoff,
+		"must abandon on the caller's deadline instead of sleeping out the backoff ladder")
+	assert.ErrorIs(t, err, ErrGrantsUnverified,
+		"an expired budget must still report WHY the grants are unverified, or the caller demotes on a timeout")
 }
 
 func TestEnsureFunding_BatchFails_FallbackToIndividual(t *testing.T) {

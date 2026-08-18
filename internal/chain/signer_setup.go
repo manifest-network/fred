@@ -2,6 +2,7 @@ package chain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -23,6 +24,28 @@ var grantedMsgTypes = []string{
 	sdk.MsgTypeURL(&billingtypes.MsgCloseLease{}),
 }
 
+// ErrGrantsUnverified reports that the grant *queries* failed, so nothing is
+// known about the grants. It is deliberately distinct from a failure to create
+// a grant we positively determined was missing.
+//
+// The distinction is load-bearing (ENG-688). Grants are created with
+// expiration=nil below, so they are permanent: an unreadable chain says nothing
+// about whether they exist. Treating a failed read as "absent" and demoting the
+// signer pool on it cost dev three weeks of single-signer operation after a
+// single startup-race RPC timeout — the nine grants were on chain the whole
+// time. Callers must keep the sub-signers on this error and let the periodic
+// sub-signer maintenance sweep converge; only a positive "the grants are
+// missing and could not be created" answer justifies falling back.
+var ErrGrantsUnverified = errors.New("authz grants could not be verified")
+
+// Retry configuration for EnsureGrantsWithRetry, mirroring the withdrawal
+// scheduler's transient-failure ladder (internal/scheduler/withdraw.go).
+const (
+	grantMaxRetries     = 3
+	grantInitialBackoff = 1 * time.Second
+	grantMaxBackoff     = 10 * time.Second
+)
+
 // authzQuerier queries existing authz grants.
 type authzQuerier interface {
 	Grants(ctx context.Context, in *authz.QueryGrantsRequest, opts ...grpc.CallOption) (*authz.QueryGrantsResponse, error)
@@ -39,8 +62,68 @@ type txBroadcaster interface {
 	broadcastMultiMsgTx(ctx context.Context, msgs []sdk.Msg) (string, error)
 }
 
+// EnsureGrantsWithRetry runs EnsureGrants, retrying transient failures with
+// exponential backoff. ctx is the TOTAL budget: every attempt inherits whatever
+// is left of it, and the loop abandons early once it is done.
+//
+// Retries are unconditional — there is deliberately no transient/permanent
+// classification, matching the withdrawal scheduler's retry loop. Classifying
+// by gRPC status code cannot work here: the authz module registers
+// ErrNoAuthorizationFound with cosmossdk.io/errors.Register (x/authz/errors.go
+// — note that is NOT this file's stdlib "errors" import), and that form defaults
+// the gRPC code to codes.Unknown rather than codes.NotFound, while
+// Client.isRetryableGRPCCode counts Unknown as retryable. So a "grant missing"
+// answer and an RPC blip are indistinguishable by code.
+// grantExists already folds a genuine not-found into (false, nil) before the
+// loop can see it, so every error reaching here is either transient or a
+// deterministic configuration error that costs three cheap attempts.
+//
+// EnsureGrants re-queries existence on every run, so a retry is always safe:
+// grants created by an attempt whose response was lost are simply skipped.
+func EnsureGrantsWithRetry(ctx context.Context, authzQ authzQuerier, broadcaster txBroadcaster, pool *SignerPool) error {
+	var err error
+	backoff := grantInitialBackoff
+
+	for attempt := 1; attempt <= grantMaxRetries; attempt++ {
+		err = EnsureGrants(ctx, authzQ, broadcaster, pool)
+		if err == nil {
+			return nil
+		}
+
+		if attempt == grantMaxRetries {
+			return fmt.Errorf("ensure authz grants after %d attempts: %w", attempt, err)
+		}
+
+		slog.Warn("authz grant setup failed, retrying",
+			"error", err,
+			"attempt", attempt,
+			"backoff", backoff,
+		)
+
+		select {
+		case <-ctx.Done():
+			// Preserve the grant error rather than the context error: the
+			// caller branches on ErrGrantsUnverified, and a bare ctx error
+			// would lose that verdict and fall through to the demotion path.
+			return fmt.Errorf("ensure authz grants after %d attempts (%w): %w", attempt, ctx.Err(), err)
+		case <-time.After(backoff):
+		}
+
+		backoff *= 2
+		if backoff > grantMaxBackoff {
+			backoff = grantMaxBackoff
+		}
+	}
+
+	return err
+}
+
 // EnsureGrants creates any missing authz grants from the provider (granter)
 // to each sub-signer (grantee) for the billing message types.
+//
+// A failure to QUERY a grant is reported as ErrGrantsUnverified; every other
+// error is reached only after the queries succeeded and so carries the positive
+// fact that a grant is genuinely missing. Callers branch on that distinction.
 func EnsureGrants(ctx context.Context, authzQ authzQuerier, broadcaster txBroadcaster, pool *SignerPool) error {
 	providerAddr := pool.ProviderAddress()
 	subAddrs := pool.SubSignerAddresses()
@@ -53,7 +136,8 @@ func EnsureGrants(ctx context.Context, authzQ authzQuerier, broadcaster txBroadc
 		for _, msgType := range grantedMsgTypes {
 			exists, err := grantExists(ctx, authzQ, providerAddr, granteeAddr, msgType)
 			if err != nil {
-				return fmt.Errorf("failed to query grant for %s → %s (%s): %w", providerAddr, granteeAddr, msgType, err)
+				return fmt.Errorf("%w: failed to query grant for %s → %s (%s): %w",
+					ErrGrantsUnverified, providerAddr, granteeAddr, msgType, err)
 			}
 			if exists {
 				continue

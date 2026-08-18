@@ -79,6 +79,7 @@ var labelledMetricNames = []string{
 	"fred_reconciler_cleanup_skips_total",
 	"fred_reconciler_runs_total",
 	"fred_signer_balance_query_failures_total",
+	"fred_signer_grant_check_total",
 	"fred_watermill_messages_total",
 }
 
@@ -150,6 +151,7 @@ func allCollectors() []prometheus.Collector {
 		SignerPoolSize,
 		SignerPoolLaneCount,
 		SignerBalanceQueryFailures,
+		SignerGrantCheckTotal,
 	}
 }
 
