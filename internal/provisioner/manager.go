@@ -38,6 +38,19 @@ type Manager struct {
 	placementStore  PlacementStore
 	ackBatcher      *AckBatcher
 
+	// stopCtx bounds work that outlives the call which started it — today the
+	// ack batcher's lanes. It is created in NewManager and rooted at
+	// context.Background(), deliberately NOT derived from the ctx passed to
+	// Start. Rooting it at Background preserves the lanes' pre-ENG-723 lifetime
+	// exactly (NewManager used to start them on a bare context.Background()):
+	// the only thing that ends them is Close(). Deriving from Start's ctx would
+	// instead couple lane teardown to a context main cancels partway through
+	// its shutdown sequence, several steps before it calls Close(). stopCancel
+	// fires it (ENG-723; same ownership shape as ENG-592). Mirrors
+	// internal/backend/docker.Backend.stopCtx.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+
 	// Track in-flight provisions (ephemeral - recovered via reconciliation)
 	tracker InFlightTracker
 
@@ -137,9 +150,12 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		BatchSize:     cfg.AckBatchSize,
 		LaneCount:     cfg.AckLaneCount,
 	})
-	// Start ack batcher immediately so handlers can use it without waiting for Start()
-	// This uses a background context; Stop() will still properly shut it down.
-	ackBatcher.Start(context.Background())
+	// The batcher is deliberately NOT started here: a long-lived goroutine set
+	// must be owned by a lifecycle, not by a constructor. Start() launches it
+	// (see the ordering note there). Nothing can reach the Acknowledger before
+	// then — the only two callers are the Watermill backend-callback handler,
+	// which does not exist until wmRouter.Run subscribes it, and the reconciler,
+	// whose first ack is gated behind <-Running() in cmd/providerd/main.go.
 
 	tracker := NewInFlightTracker()
 	orchestrator := NewProvisionOrchestrator(cfg.ProviderUUID, cfg.CallbackBaseURL, router, tracker, cfg.PlacementStore)
@@ -177,6 +193,8 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		timeoutCheckInterval: timeoutCheckInterval,
 		leaseEventSink:       cfg.LeaseEventSink,
 	}
+
+	m.stopCtx, m.stopCancel = context.WithCancel(context.Background())
 
 	// Register handlers
 	wmRouter.AddNoPublisherHandler(
@@ -264,7 +282,17 @@ func (m *Manager) Start(ctx context.Context) error {
 		"timeout_check_interval", m.timeoutCheckInterval,
 	)
 
-	// Note: ack batcher is started in NewManager() so handlers can use it immediately
+	// Start the ack batcher before wmRouter.Run below, which is what subscribes
+	// the handlers that call Acknowledge(). Watermill's Running() gate is not
+	// what protects this: Router.Run calls RunHandlers(ctx) — which subscribes
+	// each handler and spawns its goroutine — and only then closes the running
+	// channel, so a message can already be in a handler before any waiter
+	// observes Running().
+	//
+	// It runs on m.stopCtx, not on ctx: ctx is canceled partway through main's
+	// shutdown sequence, several steps before Close(), and the batcher's
+	// lifetime belongs to Close(). Start is once-only; a second call is a no-op.
+	m.ackBatcher.Start(m.stopCtx)
 
 	// Start callback timeout checker in background.
 	// This goroutine exits when ctx is canceled, which happens before Close() in production.
@@ -297,17 +325,33 @@ func (m *Manager) Close() error {
 	}
 
 	// Close Watermill router FIRST to drain in-progress handlers.
-	// Handlers may call AckBatcher.Acknowledge() which sends to b.requests.
-	// If we stopped the batcher first, its batchLoop would close b.requests,
-	// and any handler still running would panic on send-to-closed-channel.
-	if err := m.wmRouter.Close(); err != nil {
-		return err
-	}
+	// Handlers may still be inside AckBatcher.Acknowledge(); stopping the
+	// batcher first would fail those acks (and any Watermill retry of them)
+	// against lanes that are already winding down.
+	//
+	// Every step below runs even when this one fails. Returning early here
+	// would skip the batcher shutdown and the lifecycle-context cancellation,
+	// leaking exactly the goroutines this method exists to reclaim.
+	routerErr := m.wmRouter.Close()
 
 	// Stop ack batcher AFTER all handlers have finished.
-	// This flushes any pending ack requests that were queued by handlers.
+	// Stop() cancels the lanes' context, so each batchLoop takes its shutdown
+	// path: one last flush, then it fails everything still queued so no caller
+	// is left blocked on a result. That final flush is best-effort only — it
+	// issues its GetPendingLeases/AcknowledgeLeases on the context Stop() just
+	// canceled, so against the real gRPC chain client those calls fail. That is
+	// pre-existing behavior; nothing here depends on the flush landing.
+	// Safe when Start() was never called: Stop() nil-guards the cancel and
+	// waits on an empty WaitGroup.
 	if m.ackBatcher != nil {
 		m.ackBatcher.Stop()
+	}
+
+	// Release the lifecycle context. Stop() above already canceled the batcher's
+	// own derived context and waited for its lanes; this cancels the parent so
+	// anything else later rooted at m.stopCtx is bounded by Close() too.
+	if m.stopCancel != nil {
+		m.stopCancel()
 	}
 
 	// Note: The timeout checker goroutine exits when its context is canceled.
@@ -316,14 +360,14 @@ func (m *Manager) Close() error {
 	// We don't wait here because tests may call Close() without canceling the context.
 
 	// Close payload store if configured
+	var payloadErr error
 	if m.payloadStore != nil {
-		if err := m.payloadStore.Close(); err != nil {
-			slog.Error("failed to close payload store", "error", err)
-			return err
+		if payloadErr = m.payloadStore.Close(); payloadErr != nil {
+			slog.Error("failed to close payload store", "error", payloadErr)
 		}
 	}
 
-	return nil
+	return errors.Join(routerErr, payloadErr)
 }
 
 // PublishLeaseEvent publishes a chain event to the appropriate Watermill topic.
