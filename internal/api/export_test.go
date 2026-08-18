@@ -6,8 +6,6 @@ package api
 // only caller is a test (ENG-354).
 
 import (
-	"errors"
-	"fmt"
 	"time"
 
 	"github.com/manifest-network/fred/internal/hmacauth"
@@ -20,27 +18,6 @@ func (b *EventBroker) subscriberCount(leaseUUID string) int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.clients[leaseUUID])
-}
-
-// NewCallbackAuthenticatorWithMaxAge builds a CallbackAuthenticator with
-// a caller-supplied replay window so replay-protection tests can drive a
-// short or an out-of-range max age. Production always uses
-// NewCallbackAuthenticator, which pins DefaultCallbackMaxAge.
-func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) (*CallbackAuthenticator, error) {
-	if err := validateCallbackSecret(secret); err != nil {
-		return nil, err
-	}
-	if maxAge <= 0 {
-		return nil, errors.New("callback max age must be positive")
-	}
-	if maxAge > MaxCallbackMaxAge {
-		return nil, fmt.Errorf("callback max age %v exceeds maximum allowed %v", maxAge, MaxCallbackMaxAge)
-	}
-	return &CallbackAuthenticator{
-		secret:  secret,
-		maxAge:  maxAge,
-		nowFunc: time.Now,
-	}, nil
 }
 
 // ComputeSignatureWithTime is ComputeSignature with an explicit

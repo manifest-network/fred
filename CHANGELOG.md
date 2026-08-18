@@ -284,6 +284,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `TrackInFlightWithStartTime`, `Manager.Tracker` and `Manager.TimeoutChecker` — were
   present in the shipped `providerd` and are not any more.
 
+  Moving the scaffolding out surfaced one declaration that should not exist at all:
+  `api.MaxCallbackMaxAge` bounded a callback replay window that only a test-only
+  constructor ever set, so it documented a limit no production path could reach —
+  `NewCallbackAuthenticator` pins `DefaultCallbackMaxAge` and is the only way
+  production builds an authenticator. Both the constant and that constructor are
+  removed rather than relocated. Replay-window tests now narrow `maxAge` directly,
+  which the in-package test file can do without production carrying a second
+  constructor; secret validation still runs through the production one.
+
 - **The retention sweep now runs every stage instead of aborting at the first store
   error** (ENG-680). `List`, `ListExpired`, `ListReaping` and `ListRestoring` are one
   traversal over one bucket, so they fail on identical inputs — which meant the sweep

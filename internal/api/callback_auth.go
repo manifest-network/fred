@@ -18,10 +18,6 @@ const (
 	// Callbacks older than this are rejected to prevent replay attacks.
 	DefaultCallbackMaxAge = 5 * time.Minute
 
-	// MaxCallbackMaxAge is the maximum allowed value for callback max age.
-	// Values larger than this would undermine replay protection.
-	MaxCallbackMaxAge = 1 * time.Hour
-
 	// MinCallbackSecretLength is the minimum required length for callback secrets.
 	// For full 256-bit security with HMAC-SHA256, use at least 32 bytes.
 	MinCallbackSecretLength = 32
