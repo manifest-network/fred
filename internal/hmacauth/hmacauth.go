@@ -202,11 +202,6 @@ func SignRequest(secret string, req *http.Request, body []byte) string {
 	return Sign(secret, req.Method, req.URL.RequestURI(), body)
 }
 
-// SignRequestWithTime is SignRequest with an explicit timestamp.
-func SignRequestWithTime(secret string, req *http.Request, body []byte, t time.Time) string {
-	return SignWithTime(secret, req.Method, req.URL.RequestURI(), body, t)
-}
-
 // VerifyRequest verifies a signature against the given request shape.
 // The caller must read r.Body first and pass it; this wrapper does not
 // touch r.Body. Equivalent to

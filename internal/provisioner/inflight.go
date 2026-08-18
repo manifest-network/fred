@@ -70,24 +70,6 @@ func (m *Manager) GetTimedOutProvisions(timeout time.Duration) []InFlightProvisi
 	return m.tracker.GetTimedOutProvisions(timeout)
 }
 
-// Tracker returns the internal tracker for testing purposes.
-// This should only be used in tests.
-func (m *Manager) Tracker() InFlightTracker {
-	return m.tracker
-}
-
-// TimeoutChecker returns the internal timeout checker for testing purposes.
-// This should only be used in tests.
-func (m *Manager) TimeoutChecker() *TimeoutChecker {
-	return m.timeoutChecker
-}
-
-// checkCallbackTimeouts delegates to the timeout checker for testing.
-// This is called by tests that directly invoke timeout checking.
-func (m *Manager) checkCallbackTimeouts(ctx context.Context) {
-	m.timeoutChecker.CheckOnce(ctx)
-}
-
 // RecordRestorePlacement delegates to the orchestrator (ENG-333).
 func (m *Manager) RecordRestorePlacement(newLeaseUUID, backendName string) {
 	m.orchestrator.RecordRestorePlacement(newLeaseUUID, backendName)

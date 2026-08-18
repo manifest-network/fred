@@ -87,16 +87,92 @@ func rebuildCallbackSender(b *Backend) {
 	})
 }
 
-// doProvisionAndFire is a permanent test-shape adapter for
-// synchronously exercising doProvision. Production paths route through
-// the actor inbox (Backend.Provision → actor → doProvision); tests need
-// a synchronous entry point to exercise specific doProvision branches
-// without the full validate-and-allocate preamble and without
-// inbox-scheduling timing.
+// provisionFlowTimeout bounds each wait in doProvisionAndFire. Every hop
+// it covers is in-process, so blowing this budget means something is
+// wedged rather than slow.
+const provisionFlowTimeout = 30 * time.Second
+
+// callbackObserver decorates an http.RoundTripper and signals seen once
+// each round trip has completed.
 //
-// SM events fire synchronously here (bypassing the actor inbox) via the
-// leasesm.FireXxxForTest helpers — see leasesm/testhelpers.go for the
-// architect's bounded-set rationale.
+// This is doProvisionAndFire's synchronization barrier, and it is
+// load-bearing. Provisioning runs on the actor's worker goroutine, so
+// the test goroutine needs a happens-before edge with the SM entry
+// action that writes ProvisionState. cfg.SendCallbackFn is the LAST
+// statement of both onEnterReadyFromProvision and
+// onEnterFailedFromProvision (leasesm/lease_sm.go carries the matching
+// ordering contract), so an observed callback round trip proves every
+// store write of that entry action is already committed. The signal is
+// sent by the goroutine that performed the round trip — the actor
+// goroutine — so the test inherits that edge, and with it the edge the
+// completed POST already established with the httptest handler.
+//
+// Do NOT swap this for a LeaseActor.State() poll: the SM flips Status
+// before the entry action's callback POST returns, so a poll returns
+// while the httptest handler is still decoding into the test's
+// callbackPayload. Measured: that variant trips the race detector while
+// `go test -short` stays green.
+type callbackObserver struct {
+	base http.RoundTripper
+	seen chan struct{}
+}
+
+func (o *callbackObserver) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := o.base.RoundTrip(req)
+	select {
+	case o.seen <- struct{}{}:
+	default:
+	}
+	return resp, err
+}
+
+// observeCallbacks installs a callbackObserver on b's callback HTTP
+// client and returns the channel it signals. b.httpClient is used by
+// nothing but callbackSender (backend.go), so every round trip it makes
+// is a callback delivery.
+//
+// Must run before the lease actor is created: it rebuilds
+// b.callbackSender, and newLeaseActor captures the sender.
+func observeCallbacks(b *Backend) <-chan struct{} {
+	seen := make(chan struct{}, 1)
+	base := b.httpClient.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	b.httpClient.Transport = &callbackObserver{base: base, seen: seen}
+	rebuildCallbackSender(b)
+	return seen
+}
+
+// doProvisionAndFire is a permanent test-shape adapter for exercising
+// specific doProvision branches without Backend.Provision's
+// validate-and-allocate preamble.
+//
+// It drives the flow through the SAME seam production uses: a
+// leasesm.ProvisionRequestedMsg routed to the lease actor's inbox, which
+// fires evProvisionRequested, acks, spawns the worker that runs
+// doProvision, and lands the terminal evProvisionCompleted /
+// evProvisionErrored transition. Nothing here reaches into leasesm's
+// unexported state, so leasesm ships no test-only scaffolding (ENG-354).
+//
+// The call is therefore ASYNCHRONOUS internally and only looks
+// synchronous to the caller because it blocks on the terminal callback
+// (see callbackObserver). Every caller MUST have a callback URL on the
+// lease's provision record pointing at an httptest server; without one
+// leasesm's SendCallbackFn returns without a POST and this helper times
+// out. Any new assertion on state the httptest handler writes is safe
+// only because of that barrier — do not assert after a bare return.
+//
+// That barrier also constrains the handler: it is the round trip
+// RETURNING that releases this helper, so a handler that parks — an
+// unbuffered channel send with no receiver waiting yet, say — parks the
+// POST with it. Nothing deadlocks, which is why this is worth writing
+// down: trySendCallback bounds the attempt at shared.CallbackTimeout,
+// so the handler costs a 10s stall and then DeliverCallback re-POSTs
+// (shared.CallbackMaxAttempts attempts, zeroBackoff here) and the
+// handler runs again. Signal completion the way the handlers below do —
+// close() under a select/default, or a buffered send — never a send
+// that can block.
 //
 // The signature accepts a single-service *manifest.Manifest because
 // every legitimate caller passes a 1-service stack worth of input;
@@ -105,20 +181,41 @@ func rebuildCallbackSender(b *Backend) {
 // the unified stack-shaped doProvision. This keeps the boilerplate at
 // each call site minimal while preserving the stack-shape contract on
 // the production side.
-func (b *Backend) doProvisionAndFire(ctx context.Context, req backend.ProvisionRequest, m *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+func (b *Backend) doProvisionAndFire(t *testing.T, ctx context.Context, req backend.ProvisionRequest, m *manifest.Manifest, profiles map[string]SKUProfile, logger *slog.Logger) {
+	t.Helper()
 	stack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{manifest.DefaultServiceName: m}}
 	for i := range req.Items {
 		if req.Items[i].ServiceName == "" {
 			req.Items[i].ServiceName = manifest.DefaultServiceName
 		}
 	}
-	actor := b.actorFor(req.LeaseUUID)
-	leasesm.FireProvisionRequestedForTest(actor)
-	callbackErr, reason, result, logs, err := b.doProvision(ctx, req, stack, profiles, logger)
-	if err != nil {
-		leasesm.FireProvisionErroredForTest(actor, callbackErr, reason, err.Error(), logs)
-	} else {
-		leasesm.FireProvisionCompletedForTest(actor, result)
+
+	seen := observeCallbacks(b)
+
+	workCtx, workCancel := context.WithCancel(ctx)
+	t.Cleanup(workCancel)
+	ack := make(chan error, 1)
+	work := func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
+		return b.doProvision(workCtx, req, stack, profiles, logger)
+	}
+	require.True(t, b.routeToLease(req.LeaseUUID, leasesm.ProvisionRequestedMsg{
+		Cancel: workCancel,
+		Work:   work,
+		Ack:    ack,
+	}), "lease actor refused the provision message")
+
+	select {
+	case err := <-ack:
+		require.NoError(t, err, "lease actor rejected the provision SM transition")
+	case <-time.After(provisionFlowTimeout):
+		t.Fatal("timed out waiting for the lease actor to ack the provision request")
+	}
+
+	select {
+	case <-seen:
+	case <-time.After(provisionFlowTimeout):
+		t.Fatal("timed out waiting for the terminal provision callback — " +
+			"is CallbackURL set on this lease's provision record?")
 	}
 }
 
@@ -570,7 +667,7 @@ func TestDoProvision_ContextCanceled(t *testing.T) {
 	cancel() // Cancel before starting
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(ctx, req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, ctx, req, manifest, profiles, b.logger)
 
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
@@ -622,7 +719,7 @@ func TestDoProvision_NetworkIsolation(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
 	assert.True(t, networkCreated)
 
@@ -679,7 +776,7 @@ func TestDoProvision_VolumeCreateFailure(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
 	// Provision should be marked failed
 	b.provisionsMu.RLock()
@@ -746,7 +843,7 @@ func TestDoProvision_StatefulSKUNoImageVolumes(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
 	// volumes.Create should NOT be called when image has no VOLUME paths
 	assert.False(t, createCalled, "volumes.Create should not be called when image has no VOLUME paths")
@@ -2162,7 +2259,7 @@ func TestDoProvision_LastError_ContextCanceled(t *testing.T) {
 	cancel()
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(ctx, req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, ctx, req, manifest, profiles, b.logger)
 
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
@@ -2215,7 +2312,7 @@ func TestDoProvision_LastError_ClearedOnSuccess(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 	<-callbackReceived
 
 	b.provisionsMu.RLock()
@@ -2755,7 +2852,7 @@ func TestDoProvision_CallbackSanitized_PullFailure(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
 	// Callback should have hardcoded message — no registry auth details.
 	assert.Equal(t, "image pull failed", callbackPayload.Error)
@@ -3151,7 +3248,7 @@ func TestDoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-chown", "tenant-a", "docker-small", 1, manifestPayload)
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
 	// Verify volume subdir is owned by UID/GID 999.
 	subdir := filepath.Join(volDir, "data")
@@ -3218,7 +3315,7 @@ func TestDoProvision_StatefulSKURootUserNoChown(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}}
 
 	req := newProvisionRequest("lease-root", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
 	// Verify provision succeeded — ownership stays as created by MkdirAll
 	// (no chown call since UID/GID are 0).
@@ -4126,7 +4223,7 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 	profiles := map[string]SKUProfile{"docker-small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0}} // ephemeral
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	b.doProvisionAndFire(context.Background(), req, manifest, profiles, b.logger)
+	b.doProvisionAndFire(t, context.Background(), req, manifest, profiles, b.logger)
 
 	assert.True(t, volumeCreated, "volume should be created for ephemeral SKU with writable paths")
 	assert.Equal(t, int64(b.cfg.GetTmpfsSizeMB()), createdSizeMB, "ephemeral writable volume should use TmpfsSizeMB")

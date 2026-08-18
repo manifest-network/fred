@@ -9,10 +9,13 @@
 // against its DockerClient + provision-record map; future substrates
 // (K3s, etc.) implement them against their own primitives.
 //
-// Cross-package test access goes through the bounded set of ForTest
-// helpers in testhelpers.go (the ONLY exported scaffolding for tests);
-// substrate-side tests that need to drive the SM synchronously compose
-// these helpers around their own substrate calls.
+// This package exports NO test scaffolding. Substrate tests that need to
+// drive a lease through the SM route a message through the actor's inbox
+// exactly as production does — ProvisionRequestedMsg and friends are
+// exported for that purpose (see LeaseActor.TryEnqueue) — and synchronize
+// on the flow's terminal observable, which for the provision flow is the
+// callback emitted by the entry action. Helpers private to leasesm itself
+// live in this package's *_test.go files.
 package leasesm
 
 import (

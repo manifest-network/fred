@@ -320,18 +320,3 @@ func (t *DefaultInFlightTracker) GetTimedOutProvisions(timeout time.Duration) []
 	}
 	return timedOut
 }
-
-// TrackInFlightWithStartTime is a testing helper that allows setting a custom start time.
-// This should only be used in tests to simulate old provisions for timeout testing.
-func (t *DefaultInFlightTracker) TrackInFlightWithStartTime(leaseUUID, tenant string, items []backend.LeaseItem, backendName string, startTime time.Time) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID: leaseUUID,
-		Tenant:    tenant,
-		Items:     items,
-		Backend:   backendName,
-		StartTime: startTime,
-	}
-	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
-}

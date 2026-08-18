@@ -1,7 +1,6 @@
 package api
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -86,37 +85,12 @@ func (a *CallbackAuthenticator) WithCanonicalPathPrefix(prefix string) *Callback
 	return a
 }
 
-// NewCallbackAuthenticatorWithMaxAge creates a callback authenticator with a custom max age.
-// Returns an error if the secret is shorter than MinCallbackSecretLength bytes,
-// maxAge is not positive, or maxAge exceeds MaxCallbackMaxAge.
-func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) (*CallbackAuthenticator, error) {
-	if err := validateCallbackSecret(secret); err != nil {
-		return nil, err
-	}
-	if maxAge <= 0 {
-		return nil, errors.New("callback max age must be positive")
-	}
-	if maxAge > MaxCallbackMaxAge {
-		return nil, fmt.Errorf("callback max age %v exceeds maximum allowed %v", maxAge, MaxCallbackMaxAge)
-	}
-	return &CallbackAuthenticator{
-		secret:  secret,
-		maxAge:  maxAge,
-		nowFunc: time.Now,
-	}, nil
-}
-
 // ComputeSignature computes the HMAC-SHA256 signature for a request shape with
 // the current timestamp. method and uri must match what the verifier will see
 // on the wire (typically req.Method and req.URL.RequestURI()).
 // Returns the signature in the format "t=<timestamp>,sha256=<hex>".
 func (a *CallbackAuthenticator) ComputeSignature(method, uri string, payload []byte) string {
 	return hmacauth.SignWithTime(a.secret, method, uri, payload, a.now())
-}
-
-// ComputeSignatureWithTime computes the signature with a specific timestamp (for testing).
-func (a *CallbackAuthenticator) ComputeSignatureWithTime(method, uri string, payload []byte, t time.Time) string {
-	return hmacauth.SignWithTime(a.secret, method, uri, payload, t)
 }
 
 // now returns the current time, using the injected time function if set.
@@ -136,7 +110,10 @@ func (a *CallbackAuthenticator) VerifySignature(method, uri string, payload []by
 	return a.VerifySignatureWithTime(method, uri, payload, signature, a.now())
 }
 
-// VerifySignatureWithTime verifies the signature against a reference time (for testing).
+// VerifySignatureWithTime verifies the signature against an explicit
+// reference time. VerifySignature is the production entry point and
+// delegates here with a.now(); tests call it directly to pin the clock
+// and drive the replay window deterministically.
 func (a *CallbackAuthenticator) VerifySignatureWithTime(method, uri string, payload []byte, signature string, now time.Time) bool {
 	return a.verifySignatureWithError(method, uri, payload, signature, now) == nil
 }

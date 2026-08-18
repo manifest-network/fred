@@ -34,31 +34,3 @@ func unmarshalMessagePayload[T any](msg *message.Message, topic string) (T, bool
 	}
 	return v, true
 }
-
-// The following methods delegate to the HandlerSet for backwards compatibility
-// with existing tests and code that calls handlers via the Manager.
-
-// handleLeaseCreated delegates to the handler set.
-func (m *Manager) handleLeaseCreated(msg *message.Message) error {
-	return m.handlers.HandleLeaseCreated(msg)
-}
-
-// handleLeaseClosed delegates to the handler set.
-func (m *Manager) handleLeaseClosed(msg *message.Message) error {
-	return m.handlers.HandleLeaseClosed(msg)
-}
-
-// handleLeaseExpired delegates to the handler set.
-func (m *Manager) handleLeaseExpired(msg *message.Message) error {
-	return m.handlers.HandleLeaseExpired(msg)
-}
-
-// handleBackendCallback delegates to the handler set.
-func (m *Manager) handleBackendCallback(msg *message.Message) error {
-	return m.handlers.HandleBackendCallback(msg)
-}
-
-// handlePayloadReceived delegates to the handler set.
-func (m *Manager) handlePayloadReceived(msg *message.Message) error {
-	return m.handlers.HandlePayloadReceived(msg)
-}

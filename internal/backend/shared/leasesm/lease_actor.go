@@ -952,32 +952,6 @@ func (a *LeaseActor) handleReplaceFailed(info ReplaceFailureInfo) {
 	_ = a.sm.Fire(a.cfg.StopCtx, evReplaceFailed, info)
 }
 
-// send enqueues a message on the actor's inbox. Blocks when the inbox
-// is full (backpressure). Returns false if the backend is shutting down
-// OR the actor has exited. Production callers use the substrate's
-// routing layer (e.g. b.routeToLease in the Docker backend) which
-// delivers messages atomically with the registry resolve — that path
-// uses TryEnqueue (exported) instead. This send helper is retained for
-// leasesm-internal tests that need to drive synthetic direct-send
-// scenarios without going through routing; intra-package only.
-//
-// For TERMINAL events delivered by in-flight work goroutines — whose
-// physical work has already happened on the host and MUST be recorded
-// by the SM even during shutdown — use sendTerminal instead.
-func (a *LeaseActor) send(msg LeaseMessage) bool {
-	if a.cfg.StopCtx.Err() != nil || a.hasExited() {
-		return false
-	}
-	select {
-	case <-a.cfg.StopCtx.Done():
-		return false
-	case <-a.done:
-		return false
-	case a.inbox <- msg:
-		return true
-	}
-}
-
 // hasExited reports whether the actor's run loop has returned (a.done
 // closed). Used by SendTerminal to make the "actor-already-exited" case
 // a definitive refusal rather than a select-randomized 50/50 between
@@ -994,7 +968,7 @@ func (a *LeaseActor) hasExited() bool {
 }
 
 // sendTerminal enqueues a terminal SM event from an in-flight work
-// goroutine. Bypasses the stopCtx refusal that send() applies because the
+// goroutine. Deliberately does NOT refuse on a canceled stopCtx: the
 // goroutine has already done its physical work (containers created,
 // swapped, removed) — the SM must record the outcome even during
 // shutdown to keep releaseStore / in-memory state / the callback record
@@ -1135,10 +1109,10 @@ func (a *LeaseActor) Terminated() bool {
 // holds the registry mutex across this call so a successful enqueue
 // implies the actor is still registered and consuming its inbox.
 //
-// Unlike Send, TryEnqueue does NOT consult the actor's stopCtx or
-// exit signals — the caller (routing) checks shutdown state once at
-// the registry-mutex boundary, and a wedged actor's inbox returns
-// false here so the caller can count the refusal via its own metric.
+// Unlike sendTerminal, TryEnqueue does NOT consult the actor's exit
+// signals — the caller (routing) checks shutdown state once at the
+// registry-mutex boundary, and a wedged actor's inbox returns false
+// here so the caller can count the refusal via its own metric.
 func (a *LeaseActor) TryEnqueue(msg LeaseMessage) bool {
 	select {
 	case a.inbox <- msg:
