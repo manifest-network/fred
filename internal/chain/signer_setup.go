@@ -69,9 +69,11 @@ type txBroadcaster interface {
 // Retries are unconditional — there is deliberately no transient/permanent
 // classification, matching the withdrawal scheduler's retry loop. Classifying
 // by gRPC status code cannot work here: the authz module registers
-// ErrNoAuthorizationFound with a plain errors.Register, which defaults its gRPC
-// code to Unknown, and Client.isRetryableGRPCCode counts Unknown as retryable —
-// so a "grant missing" answer and an RPC blip are indistinguishable by code.
+// ErrNoAuthorizationFound with cosmossdk.io/errors.Register (x/authz/errors.go
+// — note that is NOT this file's stdlib "errors" import), and that form defaults
+// the gRPC code to codes.Unknown rather than codes.NotFound, while
+// Client.isRetryableGRPCCode counts Unknown as retryable. So a "grant missing"
+// answer and an RPC blip are indistinguishable by code.
 // grantExists already folds a genuine not-found into (false, nil) before the
 // loop can see it, so every error reaching here is either transient or a
 // deterministic configuration error that costs three cheap attempts.
