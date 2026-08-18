@@ -49,6 +49,20 @@ func safeGo(wg *sync.WaitGroup, errChan chan<- error, component string, fn func(
 	})
 }
 
+// demoteOnGrantSetupError reports whether a failed startup grant setup justifies
+// falling back to single-signer for the rest of the process.
+//
+// Only a positive fact does. chain.ErrGrantsUnverified means the grant *queries*
+// failed, which says nothing about whether the grants exist — they are created
+// with no expiration, so once created they stay. Demoting on that verdict is
+// ENG-688: one 20-second RPC timeout during a startup race left dev signing on a
+// single lane for three weeks while all nine grants sat on chain untouched. Any
+// other error was reached only after the queries succeeded, so it carries the
+// positive fact that a grant is genuinely missing and could not be created.
+func demoteOnGrantSetupError(err error) bool {
+	return err != nil && !errors.Is(err, chain.ErrGrantsUnverified)
+}
+
 var version = "dev"
 
 var (
@@ -181,7 +195,11 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create chain client: %w", err)
 	}
 	defer chainClient.Close()
-	slog.Info("chain client connected", "endpoint", cfg.GRPCEndpoint, "tls", cfg.GRPCTLSEnabled)
+	// "configured", not "connected": grpc.NewClient is lazy and dials on the
+	// first RPC, so nothing has reached the endpoint at this point. Saying
+	// "connected" here is what made a chain that was still starting up look
+	// healthy in the logs while the first real query timed out (ENG-688).
+	slog.Info("chain client configured", "endpoint", cfg.GRPCEndpoint, "tls", cfg.GRPCTLSEnabled)
 
 	// Parse funding coin amounts and setup sub-signers (if any)
 	var subSignerMinBalance, subSignerTopUpAmount sdk.Coin
@@ -196,14 +214,30 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	authzQ := authz.NewQueryClient(chainClient.Conn())
+
 	if signerPool.HasSubSigners() {
 		setupCtx, setupCancel := context.WithTimeout(ctx, 60*time.Second)
-		authzQ := authz.NewQueryClient(chainClient.Conn())
-		if err := chain.EnsureGrants(setupCtx, authzQ, chainClient, signerPool); err != nil {
-			slog.Warn("grant setup failed, falling back to single signer", "error", err)
-			signerPool.DemoteToSingleSigner()
-			metrics.SignerPoolSize.Set(float64(signerPool.Size()))
-			metrics.SignerPoolLaneCount.Set(float64(signerPool.LaneCount()))
+		if err := chain.EnsureGrantsWithRetry(setupCtx, authzQ, chainClient, signerPool); err != nil {
+			if demoteOnGrantSetupError(err) {
+				// The queries succeeded and told us grants are missing, and we
+				// could not create them. That is a positive fact: the
+				// sub-signers cannot sign, so using them would burn a failed
+				// on-chain tx per batch.
+				slog.Error("authz grants are missing and could not be created, falling back to single signer",
+					"error", err)
+				signerPool.DemoteToSingleSigner()
+				metrics.SignerPoolSize.Set(float64(signerPool.Size()))
+				metrics.SignerPoolLaneCount.Set(float64(signerPool.LaneCount()))
+			} else {
+				// Warn, not Error: transient and self-healing. If it keeps
+				// failing, fred_signer_grant_check_total{outcome="error"} from
+				// the maintenance sweep is the alertable signal.
+				slog.Warn("could not verify authz grants at startup; keeping sub-signers and re-checking on the maintenance loop",
+					"error", err,
+					"recheck_interval", cfg.SubSignerFundCheckInterval,
+				)
+			}
 		}
 		setupCancel()
 	}
@@ -549,10 +583,15 @@ func run(cmd *cobra.Command, args []string) error {
 		return reconciler.Start(ctx)
 	})
 
-	// Start periodic sub-signer funding check (if multi-signer)
+	// Start periodic sub-signer maintenance (if multi-signer). Both halves are
+	// level-triggered: EnsureGrants and EnsureFunding each compare the desired
+	// state against the chain and converge, so neither depends on the startup
+	// pass having succeeded. That is what makes a boot whose grant queries timed
+	// out recover on its own instead of staying degraded until someone restarts
+	// providerd (ENG-688).
 	if signerPool.HasSubSigners() {
 		bankQ := banktypes.NewQueryClient(chainClient.Conn())
-		safeGo(&wg, errChan, "sub-signer funding", func() error {
+		safeGo(&wg, errChan, "sub-signer maintenance", func() error {
 			ticker := time.NewTicker(cfg.SubSignerFundCheckInterval)
 			defer ticker.Stop()
 			for {
@@ -560,6 +599,19 @@ func run(cmd *cobra.Command, args []string) error {
 				case <-ctx.Done():
 					return nil
 				case <-ticker.C:
+					// Each half gets its own budget: a slow grant sweep must not
+					// eat the funding sweep's, or a chain that is merely sluggish
+					// would starve the top-ups.
+					grantCtx, grantCancel := context.WithTimeout(ctx, 60*time.Second)
+					// Plain EnsureGrants, not the retry wrapper: the loop is the retry.
+					outcome := metrics.OutcomeSuccess
+					if err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool); err != nil {
+						slog.Warn("sub-signer grant check failed", "error", err)
+						outcome = metrics.OutcomeError
+					}
+					metrics.SignerGrantCheckTotal.WithLabelValues(outcome).Inc()
+					grantCancel()
+
 					fundCtx, fundCancel := context.WithTimeout(ctx, 60*time.Second)
 					if err := chain.EnsureFunding(fundCtx, bankQ, chainClient, signerPool, subSignerMinBalance, subSignerTopUpAmount); err != nil {
 						slog.Warn("sub-signer funding check failed", "error", err)

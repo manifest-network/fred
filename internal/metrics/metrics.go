@@ -638,6 +638,23 @@ var (
 		Name:      "balance_query_failures_total",
 		Help:      "Total per-address signer balance query failures during /metrics scrapes",
 	}, []string{"role", "address", "denom"})
+
+	// SignerGrantCheckTotal counts sub-signer authz grant sweeps, incremented
+	// exactly once per pass of the sub-signer maintenance loop. That makes
+	// `sum without (outcome) (increase(...))` a true loop-liveness heartbeat and
+	// {outcome="error"} the failure signal.
+	//
+	// This is the only signal for a providerd that could not verify its grants
+	// at startup: since ENG-688 that no longer demotes the pool, so
+	// fred_signer_pool_lane_count stays put and nothing else moves. Deliberately
+	// NOT paired with a *_last_success_timestamp gauge — see the rationale on
+	// retentionSweepTotal in internal/backend/docker/metrics.go.
+	SignerGrantCheckTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "signer",
+		Name:      "grant_check_total",
+		Help:      "Total sub-signer authz grant sweeps by outcome",
+	}, []string{"outcome"})
 )
 
 // Outcome constants for consistent labeling

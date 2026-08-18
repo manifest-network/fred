@@ -732,6 +732,17 @@ When a tenant's credit reads empty, the scheduler does **not** close its leases 
 
 > **Not a fault:** paid withdrawals appearing less frequent than credit checks is expected when the cadence guard is active — `fred_withdraw_guard_active` = 1 and `fred_withdraw_skipped_by_guard_total` incrementing is by-design rate-limiting, not an error.
 
+### Signer pool demoted to single signer
+
+`ProviderSignerPoolDemoted` fires on `fred_signer_pool_lane_count < sub_signer_count`. Since ENG-688 that has exactly two causes, and they need different responses:
+
+1. **Sub-signer keys were missing from the keyring at boot.** Grep the journal for `sub-signer key not found` and `fewer sub-signer keys than requested`. This does **not** self-heal: restore the keyring entries (see the sub-signer runbook in `manifest-deploy`) and restart `providerd`.
+2. **The authz grants were positively determined missing and could not be created.** Look for `authz grants are missing and could not be created, falling back to single signer`. This does **not** self-heal either: demotion empties the pool, and the sub-signer maintenance loop is gated on the pool having sub-signers, so it never starts. Fix the underlying cause — usually the provider account being too low on fees to broadcast `MsgGrant` — then restart `providerd`, which re-creates the grants on the next boot.
+
+A *third* state is not this alert. If the grant **queries** failed, `providerd` deliberately keeps its sub-signers — a failed read says nothing about grants that are created without expiration, and the chain re-checks the authorization on every `MsgExec` anyway. Lane count stays put and this alert never fires; the signal is `fred_signer_grant_check_total{outcome="error"}` climbing, with `could not verify authz grants at startup` in the journal. That state is self-healing on the next `sub_signer_fund_check_interval` tick and needs no restart. Investigate only if the error outcome persists across several sweeps, which points at the chain endpoint rather than at fred.
+
+While the pool is demoted, `fred_signer_balance{role="sub_signer"}` series stop existing, so `SubSignerLowBalance` and `SubSignerTopUpStalled` are blind — they compare `< threshold` over series that are absent. Do not read their silence as health while this alert is firing.
+
 ---
 
 ## Graceful shutdown

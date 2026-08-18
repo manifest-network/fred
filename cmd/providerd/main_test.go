@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/chain"
 )
 
 func TestSafeGo_PropagatesError(t *testing.T) {
@@ -123,5 +125,44 @@ func TestSafeGo_WaitGroupTracking(t *testing.T) {
 		// wg.Wait completed after the goroutine returned
 	case <-time.After(2 * time.Second):
 		t.Fatal("wg.Wait() did not complete in time")
+	}
+}
+
+// TestDemoteOnGrantSetupError guards the reachable half of the ENG-688 fix. The
+// sentinel itself is covered in internal/chain, but this is the branch that
+// actually decides whether providerd sheds its sub-signers, and an inverted
+// condition here would silently reinstate the bug.
+func TestDemoteOnGrantSetupError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "success does not demote",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "unverified grants do not demote",
+			err:  chain.ErrGrantsUnverified,
+			want: false,
+		},
+		{
+			name: "wrapped unverified grants do not demote",
+			err:  fmt.Errorf("ensure authz grants after 3 attempts: %w: i/o timeout", chain.ErrGrantsUnverified),
+			want: false,
+		},
+		{
+			name: "grants known missing and uncreatable demotes",
+			err:  errors.New("failed to create grant: insufficient fee"),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, demoteOnGrantSetupError(tt.err))
+		})
 	}
 }
