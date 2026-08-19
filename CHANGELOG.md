@@ -137,6 +137,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   "connected" about a chain that was still starting up while the first real query timed
   out — it is what made the incident above take three weeks to attribute. It now reads
   `chain client configured`.
+- **The lease acknowledgment batcher is now owned by the provision manager's lifecycle
+  rather than by its constructor** (ENG-723). `NewManager` started the batcher's lane
+  goroutines on a fresh `context.Background()`, so merely constructing a manager
+  launched work that no context the manager held could stop — the shape of ENG-592,
+  where work that captured the wrong context silently leaked every migration's `-prev`
+  containers. Today's blast radius in `providerd` is bounded: its one manager is
+  closed on the graceful-shutdown path, which stops the batcher explicitly, and every
+  other exit from `run` returns an error `main` turns straight into `os.Exit(1)`.
+  The defect is the ownership, and the one path that made it bite was
+  `Close()` itself — it returned early when the Watermill router failed to close,
+  skipping the batcher shutdown entirely.
+
+  The manager now creates a lifecycle context in `NewManager` and starts the batcher
+  from `Start`, before `wmRouter.Run` subscribes the handlers that call `Acknowledge`.
+  The lanes' lifetime is unchanged: that context is rooted at `context.Background()`
+  and is ended by `Close()`, exactly as the constructor's `context.Background()` was.
+  It is deliberately not derived from the ctx passed to `Start`, which `main` cancels
+  partway through its shutdown sequence, several steps before it calls `Close()` —
+  deriving from it would couple lane teardown to a context that dies mid-shutdown.
+  `Close()` now runs every shutdown step even when an earlier one fails and joins their
+  errors, `AckBatcher.Start` is once-only, and an `Acknowledge` that somehow arrives
+  before `Start` fails with the existing retryable lane-unavailable error — so Watermill
+  redelivers it — instead of blocking its handler goroutine indefinitely.
 
 - **`docker-backend` and `k3s-backend` no longer export `providerd`'s metrics at a
   permanent 0** (ENG-712). Collectors are created with `promauto`, which registers on

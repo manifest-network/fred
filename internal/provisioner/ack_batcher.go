@@ -129,10 +129,29 @@ func (l *ackLane) resetDone() {
 // Each lane runs its own sequential batchLoop, enabling parallel broadcasting
 // when backed by multiple signers via authz.
 type AckBatcher struct {
-	lanes  []*ackLane
-	next   atomic.Uint64
-	cancel context.CancelFunc
-	wg     *sync.WaitGroup
+	lanes []*ackLane
+	next  atomic.Uint64
+
+	// startOnce makes Start once-only. A second Start would overwrite cancel
+	// (orphaning the first lane set) and spawn a second batchLoop per lane
+	// holding the SAME done channel, so both would close it — a
+	// close-of-closed-channel panic. Once the batcher's start moved out of
+	// NewManager and into Manager.Start (ENG-723) that stopped being
+	// unreachable-by-construction, so it is guarded rather than assumed.
+	// Stop enters the Once as well; see the note there.
+	startOnce sync.Once
+	cancel    context.CancelFunc
+	wg        *sync.WaitGroup
+
+	// started is raised by Start before the lanes spawn. Until then nothing
+	// drains lane.requests, so an Acknowledge would land in the buffered
+	// channel and then block on a resultCh no one will ever write — an
+	// unbounded hang on the caller's goroutine, which for the backend-callback
+	// path is a Watermill handler. Manager.Start launches the batcher before
+	// those handlers exist, so this is a guard for the day that ordering
+	// breaks: fail the same retryable way a restarting lane does and let
+	// Watermill redeliver, rather than wedge a handler forever.
+	started atomic.Bool
 }
 
 // NewAckBatcher creates a new acknowledgment batcher with N lanes.
@@ -160,18 +179,39 @@ func NewAckBatcher(chainClient ChainClient, cfg AckBatcherConfig) *AckBatcher {
 }
 
 // Start begins the batching loop for all lanes.
+//
+// ctx must be the owner's LIFECYCLE context, not a caller's request or startup
+// context: every lane goroutine outlives this call and is bounded only by ctx
+// or by Stop(). Canceling ctx is a complete shutdown path on its own — each
+// lane flushes, fails anything still queued, and exits, and the supervisor does
+// not respawn it. Stop() is that same cancellation plus a wait for the lanes.
+//
+// Start is once-only. A repeat call does not start a second lane set; it is a
+// programming error, so it is logged rather than silently swallowed.
 func (b *AckBatcher) Start(ctx context.Context) {
-	ctx, b.cancel = context.WithCancel(ctx)
+	launched := false
 
-	for i, lane := range b.lanes {
-		b.wg.Go(func() { b.superviseLane(ctx, lane, i) })
+	b.startOnce.Do(func() {
+		launched = true
+		ctx, b.cancel = context.WithCancel(ctx)
+		b.started.Store(true)
+
+		for i, lane := range b.lanes {
+			b.wg.Go(func() { b.superviseLane(ctx, lane, i) })
+		}
+
+		slog.Info("ack batcher started",
+			"lanes", len(b.lanes),
+			"batch_interval", b.lanes[0].batchInterval,
+			"batch_size", b.lanes[0].batchSize,
+		)
+	})
+
+	if !launched {
+		slog.Warn("ignoring AckBatcher.Start on a batcher that was already started or stopped",
+			"lanes", len(b.lanes),
+		)
 	}
-
-	slog.Info("ack batcher started",
-		"lanes", len(b.lanes),
-		"batch_interval", b.lanes[0].batchInterval,
-		"batch_size", b.lanes[0].batchSize,
-	)
 }
 
 // superviseLane runs a lane's batchLoop and respawns it if it exits because of
@@ -208,8 +248,21 @@ func (b *AckBatcher) superviseLane(ctx context.Context, lane *ackLane, laneIdx i
 	}
 }
 
-// Stop gracefully shuts down all lanes, flushing pending requests.
+// Stop shuts down all lanes and waits for them to exit. It cancels the lanes'
+// context, which puts each batchLoop on its shutdown path: a final flush, then
+// it fails everything still queued so no caller is left blocked on a result.
+// That flush is best-effort — it makes its chain calls on the context Stop just
+// canceled — so Stop is a reclamation path, not a delivery guarantee.
 func (b *AckBatcher) Stop() {
+	// Take the Once before reading b.cancel. Start writes b.cancel inside its
+	// Do, and sync.Once only orders a Do against other Do calls — a plain read
+	// here would race a concurrent first Start. Entering the Once instead blocks
+	// until an in-progress Start has returned and gives this goroutine the
+	// happens-before edge for that write. It also makes the reverse order safe:
+	// a Stop that wins consumes the Once, so a later Start is a no-op and
+	// cannot leave behind a lane set that nothing is left to cancel.
+	b.startOnce.Do(func() {})
+
 	if b.cancel != nil {
 		b.cancel()
 	}
@@ -220,6 +273,10 @@ func (b *AckBatcher) Stop() {
 // Acknowledge queues a lease for acknowledgment and waits for the result.
 // Requests are distributed across lanes via round-robin.
 func (b *AckBatcher) Acknowledge(ctx context.Context, leaseUUID string) (bool, string, error) {
+	if !b.started.Load() {
+		return false, "", laneUnavailableErr(ctx)
+	}
+
 	resultCh := make(chan ackResult, 1)
 
 	// Round-robin lane selection with fallback for stopped lanes

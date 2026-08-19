@@ -565,6 +565,9 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
 	require.NoError(t, err)
+	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
+	// the handler directly, so it starts them itself. t.Context() stops them.
+	startAckBatcherForTest(t, manager)
 
 	// Track the lease first
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -632,6 +635,9 @@ func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
 	require.NoError(t, err)
+	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
+	// the handler directly, so it starts them itself. t.Context() stops them.
+	startAckBatcherForTest(t, manager)
 
 	// Don't track the lease - simulating unknown callback
 	callback := backend.CallbackPayload{
@@ -670,6 +676,9 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
 	require.NoError(t, err)
+	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
+	// the handler directly, so it starts them itself. t.Context() stops them.
+	startAckBatcherForTest(t, manager)
 
 	// Track the lease
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -719,6 +728,9 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
 	require.NoError(t, err)
+	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
+	// the handler directly, so it starts them itself. t.Context() stops them.
+	startAckBatcherForTest(t, manager)
 
 	// Track the lease
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
@@ -2181,6 +2193,9 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 		PayloadStore:    payloadStore,
 	}, router, mockChain)
 	require.NoError(t, err)
+	// The batcher's lanes belong to Manager.Start (ENG-723); this test drives
+	// the handler directly, so it starts them itself. t.Context() stops them.
+	startAckBatcherForTest(t, manager)
 
 	// Store payload (simulating upload)
 	require.True(t, payloadStore.Store("lease-1", testPayload), "failed to store payload")

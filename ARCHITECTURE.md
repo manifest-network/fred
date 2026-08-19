@@ -338,6 +338,7 @@ The startup order is critical to avoid race conditions:
 1. Start API server (wait for it to be listening)
    └─ Must be ready before reconciliation triggers callbacks
 2. Start provision manager (wait for Watermill handlers to be subscribed)
+   ├─ Ack batcher lanes start FIRST, before the handlers that call Acknowledge()
    └─ Must be ready before callbacks arrive from backends
 3. Perform initial withdrawal
 4. Perform startup reconciliation
@@ -351,6 +352,8 @@ The startup order is critical to avoid race conditions:
 ```
 
 **Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to Fred's API. If the API server isn't listening yet, callbacks fail with "connection refused". If the provision manager's Watermill handlers aren't subscribed yet, callbacks fail with "No subscribers to send message".
+
+**Ack batcher ordering:** the batcher's lanes are launched by `Manager.Start`, before `wmRouter.Run` subscribes the backend-callback handler, which is one of only two callers of `Acknowledge()`. The other is the reconciler, whose first ack happens in step 4, well after the `Running()` gate in step 2. Watermill's `Running()` is not the protecting edge here: `Router.Run` calls `RunHandlers`, which subscribes each handler and spawns its goroutine, and only then closes the running channel. The batcher runs on the manager's own lifecycle context (`m.stopCtx`, rooted at `context.Background()`), *not* on the ctx passed to `Start`. That keeps the lanes' lifetime exactly what it was before ENG-723, when `NewManager` started them on a bare `context.Background()`: `Close()` is what ends them. Deriving the context from `Start`'s ctx would instead couple lane teardown to a context `main` cancels partway through its shutdown sequence, several steps before it calls `Close()`. Constructing a `Manager` starts no goroutines.
 
 ### State Protection
 
