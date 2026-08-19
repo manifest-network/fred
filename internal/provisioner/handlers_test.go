@@ -88,7 +88,7 @@ func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
 		Tenant:    "tenant-1",
 	})
 
-	err = manager.handlers.HandleLeaseCreated(msg)
+	err = handlersOf(manager).HandleLeaseCreated(msg)
 	assert.NoError(t, err, "handleLeaseCreated()")
 
 	// Should NOT have called provision (awaiting payload)
@@ -121,7 +121,7 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 	})
 
 	// Should return nil (no retry)
-	err = manager.handlers.HandleLeaseCreated(msg)
+	err = handlersOf(manager).HandleLeaseCreated(msg)
 	assert.NoError(t, err, "handleLeaseCreated() for lease not found")
 }
 
@@ -150,7 +150,7 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 	})
 
 	// Should return error (retry)
-	err = manager.handlers.HandleLeaseCreated(msg)
+	err = handlersOf(manager).HandleLeaseCreated(msg)
 	assert.Error(t, err, "handleLeaseCreated() should return error for chain error")
 }
 
@@ -185,7 +185,7 @@ func TestHandleLeaseClosed_NoPlacement_SweepsAllBackends(t *testing.T) {
 		LeaseUUID: "lease-1",
 	})
 
-	err = manager.handlers.HandleLeaseClosed(msg)
+	err = handlersOf(manager).HandleLeaseClosed(msg)
 	assert.NoError(t, err, "handleLeaseClosed()")
 
 	// Both backends must be swept (idempotent); the SKU no longer narrows it.
@@ -226,7 +226,7 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 		LeaseUUID: "lease-1",
 	})
 
-	err = manager.handlers.HandleLeaseClosed(msg)
+	err = handlersOf(manager).HandleLeaseClosed(msg)
 	assert.NoError(t, err, "handleLeaseClosed()")
 
 	// Both backends should have received deprovision calls
@@ -268,7 +268,7 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 		LeaseUUID: "lease-1",
 	})
 
-	err = manager.handlers.HandleLeaseClosed(msg)
+	err = handlersOf(manager).HandleLeaseClosed(msg)
 	require.Error(t, err, "handleLeaseClosed() should return error when all backends fail")
 	assert.ErrorIs(t, err, ErrDeprovisionFailed, "handleLeaseClosed() error")
 }
@@ -303,7 +303,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 		LeaseUUID: "lease-1",
 	})
 
-	err = manager.handlers.HandleLeaseClosed(msg)
+	err = handlersOf(manager).HandleLeaseClosed(msg)
 	assert.NoError(t, err, "handleLeaseClosed()")
 
 	// Payload should be cleaned up
@@ -361,7 +361,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 		MetaHashHex: strings.Repeat("0", 64),
 	})
 
-	err = manager.handlers.HandlePayloadReceived(msg)
+	err = handlersOf(manager).HandlePayloadReceived(msg)
 	assert.NoError(t, err, "should return nil after rejecting the lease")
 	assert.True(t, rejected, "lease should be rejected on-chain")
 
