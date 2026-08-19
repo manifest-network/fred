@@ -7317,3 +7317,79 @@ func TestRestoreLease_422KeepsLoadtestContract(t *testing.T) {
 		})
 	}
 }
+
+// TestUpdateLease_MalformedBackendErrorBodyIsNotForwarded is the UpdateLease
+// twin of TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded. Both
+// handlers are named by ENG-620 and they classify independently — restore uses
+// a switch, update a chain of ifs — so covering only one lets the other
+// regress silently.
+//
+// It also pins a property restore has no equivalent of: a rejected update must
+// not reach the payload store. UpdateLease persists AFTER the backend accepts,
+// precisely so a manifest the backend refused is never replayed by the next
+// reprovision (ENG-619). A malformed rejection is still a rejection.
+func TestUpdateLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
+	const hostPathSentinel = `btrfs qgroup show /var/lib/fred/volumes/fred-abc-app-0: exit status 1`
+
+	for name, body := range map[string]string{
+		"text/plain 400":     hostPathSentinel,
+		"html 400":           "<html>400 " + hostPathSentinel + "</html>",
+		"truncated json 400": `{"error":"` + hostPathSentinel,
+		"foreign json 400":   `{"message":"` + hostPathSentinel + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			kp := testutil.NewTestKeyPair("test-tenant")
+			leaseUUID := testutil.ValidUUID1
+			providerUUID := testutil.ValidUUID2
+
+			chainClient := &mockChainClient{
+				getActiveLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+					if uuid == leaseUUID {
+						return &billingtypes.Lease{
+							Uuid: leaseUUID, Tenant: kp.Address,
+							ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_ACTIVE,
+						}, nil
+					}
+					return nil, nil
+				},
+			}
+
+			router, calls := updateTestBackend(t, http.StatusBadRequest, body)
+			persister := &mockPayloadPersister{}
+
+			h := &Handlers{
+				client:           chainClient,
+				backendRouter:    router,
+				providerUUID:     providerUUID,
+				bech32Prefix:     "manifest",
+				payloadPersister: persister,
+			}
+
+			validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update",
+				strings.NewReader(`{"payload":"dGVzdA=="}`))
+			req.Header.Set("Authorization", "Bearer "+validToken)
+			req.SetPathValue("lease_uuid", leaseUUID)
+
+			rec := httptest.NewRecorder()
+			h.UpdateLease(rec, req)
+
+			respBody := rec.Body.String()
+			assert.Equal(t, 1, *calls, "the backend must have been called")
+			assert.NotContains(t, respBody, hostPathSentinel,
+				"the raw backend body must never reach the tenant response")
+			assert.NotContains(t, respBody, "qgroup", "no fragment of the raw body may reach the tenant")
+			assert.NotContains(t, respBody, "/var/lib/fred", "no host path may reach the tenant")
+			assert.Equal(t, http.StatusBadGateway, rec.Code,
+				"an off-contract backend body is an upstream fault, not a tenant one: %s", respBody)
+
+			var errResp ErrorResponse
+			require.NoError(t, json.Unmarshal([]byte(respBody), &errResp))
+			assert.Equal(t, errMsgBackendUnusableError, errResp.Error,
+				"the tenant must get fred's authored message")
+
+			assert.Empty(t, persister.calls,
+				"a payload the backend rejected must never be persisted, however it was rejected (ENG-619)")
+		})
+	}
+}

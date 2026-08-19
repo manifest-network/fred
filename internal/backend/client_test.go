@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -213,6 +215,96 @@ func TestHTTPClient_MalformedErrorBody_IsNeverForwarded(t *testing.T) {
 	}
 }
 
+// TestHTTPClient_ForeignJSONErrorBodyIsMalformed pins the hole Copilot found on
+// PR #236: a body can parse cleanly as JSON and still not be the envelope.
+//
+// `null`, `{}` and a proxy's own shape like {"message":"..."} all unmarshal
+// into the anonymous struct without error and leave Error empty. Accepting
+// that as "a terse backend" put them back on ErrValidation — permanent, which
+// rejects a PENDING lease and closes an ACTIVE one on-chain. Parsing is not
+// the test; carrying the required "error" field is.
+func TestHTTPClient_ForeignJSONErrorBodyIsMalformed(t *testing.T) {
+	for name, body := range map[string]string{
+		"json null":            `null`,
+		"empty object":         `{}`,
+		"foreign key":          `{"message":"proxy error: /var/lib/fred/volumes"}`,
+		"explicitly empty":     `{"error":""}`,
+		"error wrong type":     `{"error":{"nested":"x"}}`,
+		"validation code only": `{"validation_code":"invalid_manifest"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name: "foreign-json", BaseURL: server.URL, Timeout: 5 * time.Second,
+			})
+			err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrMalformedErrorBody)
+			assert.NotErrorIs(t, err, ErrValidation,
+				"a body without the required \"error\" field must not be filed as a permanent "+
+					"tenant-side failure — that is what closes an ACTIVE lease on-chain")
+			assert.NotContains(t, err.Error(), "/var/lib/fred", "raw body must not survive")
+		})
+	}
+}
+
+// TestHTTPClientRestore_UnreadableBodyIsNotBareStatus pins the second hole from
+// PR #236. parseErrorCode swallowed every unmarshal failure into "no code",
+// which is indistinguishable from the documented BARE 422 — so an
+// intermediary's HTML error page became ErrNotRetained, and the tenant was told
+// "no retained data found for that lease": a confident, wrong answer, with no
+// metric, no breaker signal and no 502.
+//
+// "Bare" means no body. An unreadable body is a different thing.
+func TestHTTPClientRestore_UnreadableBodyIsNotBareStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		body     string
+		wantErr  error
+		wantSame bool // true = the documented bare-status mapping must be preserved
+	}{
+		{"empty 422 stays ErrNotRetained", http.StatusUnprocessableEntity, "", ErrNotRetained, true},
+		{"whitespace 422 stays ErrNotRetained", http.StatusUnprocessableEntity, "  \n", ErrNotRetained, true},
+		{"valid envelope, no code, stays ErrNotRetained", http.StatusUnprocessableEntity, `{"error":"nope"}`, ErrNotRetained, true},
+		{"html 422 is malformed", http.StatusUnprocessableEntity, "<html>422 /var/lib/fred/x</html>", ErrMalformedErrorBody, false},
+		{"truncated json 422 is malformed", http.StatusUnprocessableEntity, `{"error":"/var/lib/fred/x`, ErrMalformedErrorBody, false},
+		{"empty 409 stays ErrInvalidState", http.StatusConflict, "", ErrInvalidState, true},
+		{"html 409 is malformed", http.StatusConflict, "<html>409 /var/lib/fred/x</html>", ErrMalformedErrorBody, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				if tt.body != "" {
+					_, _ = w.Write([]byte(tt.body))
+				}
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name: "unreadable-body", BaseURL: server.URL, Timeout: 5 * time.Second,
+			})
+			err := client.Restore(context.Background(), RestoreRequest{
+				LeaseUUID: "new-1", FromLeaseUUID: "old-1", Tenant: "t", CallbackURL: "http://fred/cb",
+			})
+			assert.ErrorIs(t, err, tt.wantErr)
+			if !tt.wantSame {
+				assert.NotErrorIs(t, err, ErrNotRetained,
+					"an unreadable body must not masquerade as the documented bare status")
+				assert.NotContains(t, err.Error(), "/var/lib/fred", "raw body must not survive")
+			}
+		})
+	}
+}
+
 // TestHTTPClient_MalformedErrorBody_CountedAndLogged verifies the operator half
 // of the CWE-209 split: the detail withheld from the tenant is relocated to a
 // metric and the log, not deleted.
@@ -240,11 +332,70 @@ func TestHTTPClient_MalformedErrorBody_CountedAndLogged(t *testing.T) {
 	counter.WithLabelValues("be-1", "provision").Add(7)
 	require.InDelta(t, 7.0, promtestutil.ToFloat64(counter.WithLabelValues("be-1", "provision")), 0.001)
 
+	// Capture the log too. OPERATIONS.md tells the operator to find the raw body
+	// in this exact line, so the log is part of the contract, not incidental —
+	// asserting only the counter would let the slog.Warn be deleted silently.
+	var rec logRecorder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(&rec))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
 	err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
 	require.ErrorIs(t, err, ErrMalformedErrorBody)
 
 	assert.InDelta(t, 8.0, promtestutil.ToFloat64(counter.WithLabelValues("be-1", "provision")), 0.001,
 		"a malformed error body must be counted for the backend that sent it")
+
+	entry, found := rec.find("backend returned a malformed error body")
+	require.True(t, found, "the malformed body must be logged for operators (OPERATIONS.md runbook)")
+	assert.Equal(t, slog.LevelWarn, entry.Level)
+	assert.Equal(t, "be-1", entry.attr("backend"), "log must name the offending backend")
+	assert.Equal(t, "provision", entry.attr("operation"), "log must name the operation")
+	assert.Equal(t, "not json", entry.attr("body"),
+		"the raw body must survive INTO THE LOG — it is withheld from the tenant, not discarded")
+}
+
+// logRecorder is a minimal slog.Handler that keeps records for assertion.
+type logRecorder struct {
+	mu      sync.Mutex
+	records []loggedRecord
+}
+
+type loggedRecord struct {
+	Level slog.Level
+	Msg   string
+	Attrs map[string]string
+}
+
+func (r *loggedRecord) attr(k string) string { return r.Attrs[k] }
+
+func (r *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (r *logRecorder) Handle(_ context.Context, rec slog.Record) error {
+	entry := loggedRecord{Level: rec.Level, Msg: rec.Message, Attrs: map[string]string{}}
+	rec.Attrs(func(a slog.Attr) bool {
+		entry.Attrs[a.Key] = a.Value.String()
+		return true
+	})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.records = append(r.records, entry)
+	return nil
+}
+
+func (r *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return r }
+func (r *logRecorder) WithGroup(string) slog.Handler      { return r }
+
+// find returns the first record whose message contains sub.
+func (r *logRecorder) find(sub string) (loggedRecord, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rec := range r.records {
+		if strings.Contains(rec.Msg, sub) {
+			return rec, true
+		}
+	}
+	return loggedRecord{}, false
 }
 
 // TestHTTPClient_Provision_ValidationError_DoesNotTripCircuitBreaker verifies that

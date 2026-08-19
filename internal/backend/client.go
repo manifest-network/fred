@@ -873,10 +873,18 @@ func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
 		// WAF rule) is exactly the case that must not be filed as permanent.
 		return c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
 	}
+	if resp.Error == "" {
+		// Parsing is NOT the test — carrying the required field is.
+		// `null`, `{}` and a foreign shape like {"message":"proxy error"} all
+		// unmarshal cleanly into this struct and leave Error empty, and a proxy
+		// emitting JSON under a different key is an ordinary thing to meet. Any
+		// of them would otherwise land on ErrValidation, which is permanent and
+		// terminates the lease on-chain — precisely the hole this change exists
+		// to close. BACKEND_GUIDE.md declares "error" REQUIRED on every non-2xx,
+		// so its absence is a contract violation, not a terse backend.
+		return c.noteMalformedErrorBody(body, operation, `envelope is missing the required "error" field`)
+	}
 
-	// A well-formed envelope with an empty "error" is terse, not untrustworthy:
-	// it came from the backend and the 400 verdict stands. Keep the permanent
-	// classification and simply carry no detail — never the raw body.
 	if sentinel, ok := validationCodeErrors[resp.ValidationCode]; ok {
 		return detailOr(sentinel, resp.Error)
 	}
@@ -888,26 +896,35 @@ func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
 // 409, shared by ErrInvalidState (no code) and ErrAlreadyProvisioned
 // (code="already_provisioned").
 //
-// Best-effort by contract: an absent, empty or unparseable body means "no
-// code", which selects the documented bare-status sentinel — BACKEND_GUIDE.md
-// specifies a bare 422 as "no retained data" precisely so a backend WITHOUT
-// retention support can answer with nothing at all. So this must never
-// escalate an empty body to ErrMalformedErrorBody; the status code alone
-// already carries the verdict.
+// Three outcomes, and the distinction between the last two matters:
 //
-// What it does drop is the old raw-bytes fallback: msg is returned only when
-// it came out of the envelope's declared "error" field, and is "" otherwise.
-// A caller that gets an empty msg surfaces the bare sentinel, whose own text
-// fred authored.
-func parseErrorCode(body []byte) (code, msg string) {
+//   - EMPTY body → no code, no error. This is a documented contract case, not a
+//     violation: BACKEND_GUIDE.md specifies a bare 422 as "no retained data"
+//     precisely so a backend WITHOUT retention support can answer with nothing
+//     at all. The status code alone carries the verdict, so the caller maps it
+//     to the bare-status sentinel.
+//   - Parses as JSON but carries no discriminator → same bare-status sentinel.
+//     An absent optional field in a valid envelope is not an error.
+//   - NON-EMPTY and unparseable → ErrMalformedErrorBody. Collapsing this into
+//     "no code" is how an intermediary's HTML 422 used to become ErrNotRetained,
+//     telling the tenant "no retained data found for that lease" — a confident,
+//     wrong, tenant-facing answer — while bypassing the metric, the breaker and
+//     the 502. "Bare" means no body, not "any body fred could not read".
+//
+// msg is returned only when it came out of the envelope's declared "error"
+// field, and is "" otherwise; the raw bytes never leave this function.
+func (c *HTTPClient) parseErrorCode(body []byte, operation string) (code, msg string, err error) {
 	var resp struct {
 		Error string `json:"error"`
 		Code  string `json:"code"`
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", ""
+	if jsonErr := json.Unmarshal(body, &resp); jsonErr != nil {
+		if len(bytes.TrimSpace(body)) == 0 {
+			return "", "", nil // bare status: the documented no-body case
+		}
+		return "", "", c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
 	}
-	return resp.Code, resp.Error
+	return resp.Code, resp.Error, nil
 }
 
 // detailOr returns sentinel decorated with detail, or the bare sentinel when
@@ -1349,7 +1366,10 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 		case http.StatusUnprocessableEntity:
 			// 422 is overloaded: bare 422 = ErrNotRetained; 422 with
 			// code="demote_exceeds_tier" = ErrDemoteDataExceedsTier.
-			code, msg := parseErrorCode(readErrorBodyBytes(resp))
+			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
+			if perr != nil {
+				return nil, perr
+			}
 			if code == CodeDemoteExceedsTier {
 				return nil, detailOr(ErrDemoteDataExceedsTier, msg)
 			}
@@ -1360,7 +1380,10 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			// reconstruct ErrAlreadyProvisioned (otherwise a duplicate restore would
 			// surface the wrong ErrInvalidState message). A bare 409 (no code) is
 			// ErrInvalidState (wrong lease state for restore).
-			code, msg := parseErrorCode(readErrorBodyBytes(resp))
+			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
+			if perr != nil {
+				return nil, perr
+			}
 			if code == "already_provisioned" {
 				return nil, detailOr(ErrAlreadyProvisioned, msg)
 			}

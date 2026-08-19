@@ -635,7 +635,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   closes its synchronous twin on `POST /restore` and `POST /update`. The backend HTTP client
   substituted the raw response body — up to 4 KiB, verbatim — into the error it returned
   whenever a client-error body was not the declared `{"error": ...}` envelope, and
-  `internal/api` wrote that straight into its own 4xx body. Fred now authors that message
+  `internal/api` wrote that straight into its own 4xx body. A body that is valid JSON but
+  omits the required `error` field — `{}`, `null`, or a proxy's own `{"message": ...}` — counts
+  as off-contract too, and a `4xx` carrying an unparseable body is no longer mistaken for the
+  one documented bodiless form (a bare `422` meaning "no retained data"). Fred now authors that message
   itself, records the raw body and a new `fred_backend_malformed_error_body_total{backend,
   operation}` counter operator-side, and answers `502` — the fault is upstream. The
   tenant-visible detail a backend *did* author inside a validated envelope still crosses
