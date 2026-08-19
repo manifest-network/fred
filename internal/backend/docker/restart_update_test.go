@@ -415,8 +415,7 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.compose = composeMock
 	b.releaseStore = releaseStore
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))

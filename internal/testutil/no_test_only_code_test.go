@@ -83,7 +83,13 @@ var testOnlyDocPhrases = []string{
 	"testing helper that",
 	"(for testing)",
 	"only for cross-package tests",
-	"exposed for testing",
+	// Deliberately the shorter stem: it subsumes "exposed for testing" and
+	// also catches the wordings that slipped past it, which is how
+	// docker.Backend.httpClient survived ENG-354 documented "exposed for
+	// test replacement" (ENG-765). Note the reason string reports the
+	// MATCHED phrase, and matching is first-match-wins over this slice, so
+	// shortening an entry changes what a hit prints.
+	"exposed for test",
 	// ENG-765. Catches the nil-in-prod injection point CLAUDE.md forbids,
 	// whose doc habitually reads "Nil in production; set in tests ...".
 	// Deliberately keyed on the PURPOSE half of that sentence, not the
@@ -277,7 +283,20 @@ type Backend struct {
 // testing.
 var Clock = 0
 `,
-			want: []string{"Clock -- doc comment says it exists for tests: exposed for testing"},
+			want: []string{"Clock -- doc comment says it exists for tests: exposed for test"},
+		},
+		{
+			// The wording that slipped past the longer "exposed for
+			// testing" and left docker.Backend.httpClient uncaught
+			// through all of ENG-354 (ENG-765).
+			name: "exposed-for-test variant wording, field",
+			src: `package p
+type Backend struct {
+	// httpClient is used by callbackSender; exposed for test replacement.
+	httpClient *http.Client
+}
+`,
+			want: []string{"Backend.httpClient -- doc comment says it exists for tests: exposed for test"},
 		},
 		{
 			name: "nested anonymous struct field",

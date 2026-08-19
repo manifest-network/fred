@@ -534,9 +534,8 @@ func TestDeprovision_RetainHandoff_LiveMovesToRetained(t *testing.T) {
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	// Pre-allocate the lease's footprint in the pool (simulates a live provision).
 	require.NoError(t, b.pool.TryAllocate("lease-z-web-0", "docker-micro", "tenant-a"))
@@ -618,9 +617,8 @@ func TestDeprovision_BranchSelection_OverCap(t *testing.T) {
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 500 // tight: 1024 MB lease breaches immediately
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-oc-web-0", "docker-micro", "tenant-a"))
 	require.NoError(t, b.pool.TryAllocate("lease-oc-web-1", "docker-micro", "tenant-a"))
@@ -714,9 +712,8 @@ func TestDeprovision_BranchSelection_UnderCap(t *testing.T) {
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 0 // unlimited: never refuse
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-uc-web-0", "docker-micro", "tenant-a"))
 	require.NoError(t, b.pool.TryAllocate("lease-uc-web-1", "docker-micro", "tenant-a"))
@@ -804,9 +801,8 @@ func TestDeprovision_RetainFailure_KeepsLiveCounted(t *testing.T) {
 	withMicroSKU(b, 512) // F = 1 × 512 = 512 MB
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-w-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
@@ -872,9 +868,8 @@ func TestDeprovision_RetainGiveUp_ReleasesLive(t *testing.T) {
 	withMicroSKU(b, 512) // F = 1 × 512 = 512 MB
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-g-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
@@ -937,9 +932,8 @@ func TestDeprovision_RetainListError_KeepsLiveCounted(t *testing.T) {
 	withMicroSKU(b, 512) // F = 512 MB
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-le-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
@@ -1163,9 +1157,8 @@ func TestDeprovision_RefuseToRetain_DestroyFailure_KeepsLiveCounted(t *testing.T
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 500 // tight: 1024 MB lease breaches immediately
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-rf-web-0", "docker-micro", "tenant-a"))
 	require.NoError(t, b.pool.TryAllocate("lease-rf-web-1", "docker-micro", "tenant-a"))
@@ -1231,9 +1224,8 @@ func TestDeprovision_NonRetain_DestroyFailure_KeepsLiveCounted(t *testing.T) {
 
 	withMicroSKU(b, 512) // F = 1 × 512 = 512 MB
 	// RetainOnClose stays false (default) — non-retain close.
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-nd-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
@@ -1297,9 +1289,8 @@ func TestDeprovision_NonRetain_Success_ReleasesLive(t *testing.T) {
 	})
 
 	withMicroSKU(b, 512) // F = 512 MB
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-ns-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
@@ -1372,9 +1363,8 @@ func TestDeprovision_NonRetainPartialFailure_KeepsLiveCounted(t *testing.T) {
 
 	withMicroSKU(b, 512) // F = 512 MB
 	// RetainOnClose stays false (default) — pure non-retain close.
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-pf-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")

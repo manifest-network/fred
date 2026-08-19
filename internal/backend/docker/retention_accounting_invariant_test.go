@@ -350,9 +350,8 @@ func TestRetentionAccountingInvariant_AfterDeprovisionRetainClose(t *testing.T) 
 	withMicroSKU(b, 512) // align the pool resolver (defaultTestSKUProfiles: 512) and computeRetainedDiskMB
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-close-web-0", "docker-micro", "tenant-a"))
 	require.NoError(t, b.pool.TryAllocate("lease-close-web-1", "docker-micro", "tenant-a"))

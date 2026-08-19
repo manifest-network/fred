@@ -148,6 +148,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   package, so until now a change confined to it ran that suite only nightly — the same
   rot mode (ENG-330) the filter's reconciler entry already guards against.
 
+- **The docker backend no longer carries a callback HTTP client field that only tests
+  read** (ENG-765). `Backend.httpClient` was assigned once in `New` and never read
+  again: the callback sender receives the *local* variable, so the field was a slot
+  tests wrote and a test helper read back, documented "exposed for test replacement" —
+  one word away from the phrase ENG-354's guard already looked for, which is why it
+  survived that sweep. It is gone, and the test helper takes the client as a parameter
+  instead.
+
+  Extracting `newCallbackHTTPClient` in the field's place gives
+  `callback_insecure_skip_verify` its first coverage of the transport it wires up,
+  rather than only of the config rule that rejects it in production mode.
+
+  The guard's phrase list now keys on `exposed for test` instead of the longer
+  `exposed for testing`, so the variant wordings that hid this field are caught too.
+
+- **`providerd` no longer ships a `Manager` field that only tests read** (ENG-765).
+  `Manager.handlers` was assigned in `NewManager` and never read again — the five
+  Watermill registrations use the local — so the field existed solely so tests could
+  invoke a handler without publishing a message. Unlike the other fields this ticket
+  removed, this one was in `providerd`'s dependency graph and shipped. Tests now
+  rebuild the handler set through the production constructor `NewHandlerSet`, which
+  also means a new `HandlerDeps` field cannot be wired in production and silently
+  missed in tests.
+
+  This is the last of five instances of one shape: a production struct field written
+  in production and read only from `_test.go`. Three were found by enumerating every
+  unexported production struct field rather than by the guard, which cannot see this
+  shape at all — there is nothing in a name or doc comment to match. That limit is now
+  written down in the guard's header.
+
 - **The retention sweep now runs every stage instead of aborting at the first store
   error** (ENG-680). `List`, `ListExpired`, `ListReaping` and `ListRestoring` are one
   traversal over one bucket, so they fail on identical inputs — which meant the sweep
