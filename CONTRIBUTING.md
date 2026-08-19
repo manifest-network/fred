@@ -212,7 +212,7 @@ Make sure `$(go env GOPATH)/bin` is on your `PATH`. Matching the pin matters mor
 - **`cmp.Or` for runtime defaults** — used in several places (e.g. `internal/backend/client.go`, `cmd/mock-backend/main.go`) to fold in zero-value defaults at use sites. Not enforced project-wide; explicit zero checks are also fine.
 - **Structured logging** — `slog` with consistent field names (`lease_uuid`, `tenant`, `backend`, `error`). Don't `fmt.Sprintf` into log messages; use key-value fields so logs are queryable.
 - **Errors at boundaries, panics never** — return errors from public APIs. `recover()` is for actor handlers and long-lived goroutines only, where a single panic must not take out the process.
-- **No tests in production code paths** — `internal/backend/chain.MockClient` lives outside the production build (issue context: PR #81). Test mocks go in `chaintest/` or alongside the test files using build tags.
+- **No test-only declarations in production files** — no nil-in-prod hook fields, no `testMode` flags, no accessors whose only callers are tests. Enforced by `internal/testutil/no_test_only_code_test.go`, which walks every non-`_test.go` file under `internal/` and `cmd/` and fails CI on a declaration whose name or doc comment advertises it as scaffolding (struct fields included). A build tag is **not** an escape hatch: the guard parses with `go/parser` and never evaluates `//go:build`. The remedies, in order of preference: move it to an in-package `export_test.go`; inject through a dependency interface production already uses; or split the function so a white-box test can drive the pieces in a controlled order. Chain mocks live in `internal/chain/chaintest/`, shared fixtures in `internal/testutil/fixtures.go`.
 
 ---
 

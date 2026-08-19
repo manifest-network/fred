@@ -62,13 +62,14 @@ func newBackendForTest(t *testing.T, fredURL string) *Backend {
 
 // rebuildCallbackSender swaps b.callbackSender for one configured with
 // zeroBackoff and a short-timeout HTTP client. Same-package access lets
-// us replace unexported fields without touching production code.
-// Mirrors docker/provision_test.go:78.
+// us replace a production field without production carrying a seam for
+// it; the client is a local here, because a *Backend field only tests
+// read would be test scaffolding in a production struct (ENG-765).
 func rebuildCallbackSender(b *Backend) {
-	b.httpClient = &http.Client{Timeout: 5 * time.Second}
+	httpClient := &http.Client{Timeout: 5 * time.Second}
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:      b.callbackStore,
-		HTTPClient: b.httpClient,
+		HTTPClient: httpClient,
 		Secret:     string(b.cfg.CallbackSecret),
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
@@ -177,6 +178,36 @@ func TestBackend_New_Success_FieldsPopulated(t *testing.T) {
 	assert.NotNil(t, b.pool)
 	require.NotNil(t, b.provisions)
 	assert.Empty(t, b.provisions)
+}
+
+// TestNewCallbackHTTPClient covers the callback client's construction,
+// including the CallbackInsecureSkipVerify branch — which had no test at
+// all: k3s/config_test.go covers the *validation* rule that rejects the
+// flag in production mode, never the transport it wires up.
+//
+// The client is a local inside New (ENG-765 removed the Backend field
+// that used to shadow it), so this function is the seam.
+func TestNewCallbackHTTPClient(t *testing.T) {
+	t.Run("verification on by default", func(t *testing.T) {
+		c := newCallbackHTTPClient(validConfig(), slog.Default())
+		require.NotNil(t, c)
+		assert.Equal(t, 30*time.Second, c.Timeout)
+		assert.Nil(t, c.Transport,
+			"default client must use the stdlib transport, which verifies TLS")
+	})
+
+	t.Run("insecure skip verify wires an unverifying transport", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.CallbackInsecureSkipVerify = true
+
+		c := newCallbackHTTPClient(cfg, slog.Default())
+		require.NotNil(t, c)
+		assert.Equal(t, 30*time.Second, c.Timeout)
+		tr, ok := c.Transport.(*http.Transport)
+		require.True(t, ok, "transport must be an *http.Transport")
+		require.NotNil(t, tr.TLSClientConfig)
+		assert.True(t, tr.TLSClientConfig.InsecureSkipVerify)
+	})
 }
 
 func TestBackend_Start_Succeeds(t *testing.T) {
@@ -605,6 +636,17 @@ func TestRunStubProvisioner_SuppressesCallbackAfterDeprovision(t *testing.T) {
 	// see the missing map entry and exit silently.
 	b.runStubProvisioner(p)
 
+	// The ownership check, specifically. Both side-effect assertions below
+	// are also satisfied by the two ctx.Err() checkpoints — Deprovision
+	// cancels before it deletes, so a worker that skipped the ownership
+	// check would still be stopped one phase later, and this test passed
+	// with that check deleted. The status flip is the one observable the
+	// checkpoints do NOT guard: it happens under provisionsMu, before
+	// either of them. Measured on origin/main before ENG-765: deleting the
+	// ownership check left this test green without this assertion.
+	assert.Equal(t, backend.ProvisionStatusProvisioning, p.Status,
+		"a worker that no longer owns the record must not flip its status")
+
 	// Assert no callback was sent.
 	select {
 	case got := <-callbacks:
@@ -626,10 +668,12 @@ func TestRunStubProvisioner_SuppressesCallbackAfterDeprovision(t *testing.T) {
 // check must observe the cancellation and abort before persisting
 // the diagnostic OR sending the callback.
 //
-// Determinism: the beforeDiagnosticStore hook uses reached/release
-// channels to pause the worker goroutine at exactly that interleaving
-// point, so the test goroutine can run Deprovision and then release
-// the worker — no scheduler-timing dependencies, no time.Sleep.
+// Determinism: runStubProvisioner's phases are driven in order on this
+// goroutine, with the real Deprovision run at exactly the interleaving
+// point under test. No worker goroutine, no pause channels, and no
+// test-only hook field on Backend (ENG-765) — the interleaving is
+// expressed by WHERE Deprovision is called, which is what the hook
+// fields used to simulate.
 func TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic(t *testing.T) {
 	fred, callbacks := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
@@ -638,26 +682,22 @@ func TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic(t *testin
 	b.provisionsMu.Lock()
 	b.provisions[p.LeaseUUID] = p
 	b.provisionsMu.Unlock()
-	b.wg.Add(1)
 
-	reached := make(chan struct{})
-	release := make(chan struct{})
-	b.beforeDiagnosticStore = func() {
-		close(reached)
-		<-release
-	}
+	// Phase 1 runs to completion: the worker owns the record and has
+	// released provisionsMu.
+	f, ok := b.claimStubFailure(p)
+	require.True(t, ok, "worker must claim a record it still owns")
 
-	done := make(chan struct{})
-	go func() {
-		b.runStubProvisioner(p)
-		close(done)
-	}()
-
-	// Worker is now blocked at checkpoint 1 with provisionsMu released.
-	<-reached
+	// Deprovision wins the lock here — after the unlock, before the
+	// diagnostic write. It cancels the lease ctx captured in f.
 	require.NoError(t, b.Deprovision(context.Background(), p.LeaseUUID))
-	close(release)
-	<-done
+	require.Error(t, f.leaseCtx.Err(), "Deprovision must cancel the lease ctx")
+
+	// Checkpoint 1 must observe the cancellation and skip the write; the
+	// callback phase re-checks and must skip too.
+	require.True(t, b.persistStubDiagnostic(f),
+		"checkpoint 1 must report the lease as canceled")
+	b.sendStubFailureCallback(f)
 
 	// Neither side effect should have occurred.
 	diag, err := b.diagnosticsStore.Get(p.LeaseUUID)
@@ -683,6 +723,10 @@ func TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic(t *testin
 // The diagnostic IS allowed to persist — it was written before the
 // cancel arrived. Asserting that explicitly proves the suppression
 // is at checkpoint 2, not at the earlier checkpoint 1.
+//
+// Like its sibling above, this drives runStubProvisioner's phases in
+// order and places the real Deprovision at the interleaving point under
+// test, so no test-only hook field is needed (ENG-765).
 func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *testing.T) {
 	fred, callbacks := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
@@ -691,27 +735,22 @@ func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *test
 	b.provisionsMu.Lock()
 	b.provisions[p.LeaseUUID] = p
 	b.provisionsMu.Unlock()
-	b.wg.Add(1)
 
-	reached := make(chan struct{})
-	release := make(chan struct{})
-	b.beforeCallbackSend = func() {
-		close(reached)
-		<-release
-	}
+	f, ok := b.claimStubFailure(p)
+	require.True(t, ok, "worker must claim a record it still owns")
 
-	done := make(chan struct{})
-	go func() {
-		b.runStubProvisioner(p)
-		close(done)
-	}()
+	// The diagnostic write happens BEFORE the cancel arrives.
+	require.False(t, b.persistStubDiagnostic(f),
+		"checkpoint 1 must not report cancellation before Deprovision runs")
 
-	<-reached
+	// Deprovision wins the lock here — after the diagnostic write,
+	// before the callback send.
 	require.NoError(t, b.Deprovision(context.Background(), p.LeaseUUID))
-	close(release)
-	<-done
+	require.Error(t, f.leaseCtx.Err(), "Deprovision must cancel the lease ctx")
 
-	// The diagnostic was written before the hook fired, so it survives.
+	b.sendStubFailureCallback(f)
+
+	// The diagnostic was written before the cancel arrived, so it survives.
 	// This proves the suppression is at checkpoint 2 (callback), not at
 	// checkpoint 1 (diagnostic).
 	diag, err := b.diagnosticsStore.Get(p.LeaseUUID)
@@ -719,7 +758,7 @@ func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *test
 	require.NotNil(t, diag, "diagnostic written before ctx cancel must survive")
 	assert.Equal(t, stubProvisionerErrMsg, diag.Error)
 
-	// The callback was guarded by ctx.Err() after the hook fired, so
+	// The callback was guarded by ctx.Err() at checkpoint 2, so
 	// SendCallback must have been skipped — no bbolt persist, no HTTP POST.
 	select {
 	case got := <-callbacks:
@@ -730,6 +769,62 @@ func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *test
 	require.NoError(t, err)
 	assert.Empty(t, pending,
 		"callbackStore must not contain a persisted entry for the canceled lease")
+}
+
+// TestRunStubProvisioner_PersistsDiagnosticBeforeCallback pins the ORDER
+// of runStubProvisioner's two post-lock phases: the diagnostic write
+// completes before the callback is sent.
+//
+// Why this needs its own test. The two ENG-189 tests above drive the
+// phases in an order the TEST chooses, so they prove each checkpoint
+// guards what it claims but say nothing about how the production
+// composition sequences them. Nothing else covers it either:
+// TestProvision_HappyPath asserts only the callback payload, and
+// TestGetProvision_FromDiagnostics_AfterDeprovision races its own
+// Deprovision against the worker, so it passes either way.
+//
+// Why the order is load-bearing. The callback is what makes Fred
+// deprovision. If the send came first, the resulting Deprovision would
+// cancel the lease ctx before the diagnostic write, checkpoint 1 would
+// suppress it, and GetProvision's diagnostics fallback — a documented
+// tenant-facing contract (BACKEND_GUIDE.md, README.md) — would have
+// nothing to surface for a failed lease.
+//
+// The assertion runs INSIDE the handler, synchronously with the POST.
+// Checking after awaitCallback returns would be the same coin flip: the
+// worker could have written the diagnostic by then under either order.
+// httptest.NewUnstartedServer lets the Backend be assigned before the
+// server goroutine exists, which orders that write ahead of any handler
+// read without a mutex.
+func TestRunStubProvisioner_PersistsDiagnosticBeforeCallback(t *testing.T) {
+	const leaseUUID = "lease-order"
+
+	var b *Backend
+	diagSeen := make(chan bool, 1)
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		diag, err := b.diagnosticsStore.Get(leaseUUID)
+		select {
+		case diagSeen <- err == nil && diag != nil:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	b = newBackendForTest(t, "")
+	srv.Start()
+
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest(leaseUUID, srv.URL)))
+
+	select {
+	case ok := <-diagSeen:
+		assert.True(t, ok,
+			"the failure diagnostic must already be persisted when the callback is delivered; "+
+				"if this fails, the diagnostic write and the callback send have been reordered")
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for callback delivery")
+	}
 }
 
 func TestReconcileCustomDomain_NoOpForUnhandledLease(t *testing.T) {

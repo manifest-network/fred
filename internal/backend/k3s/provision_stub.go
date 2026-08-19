@@ -131,6 +131,37 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 func (b *Backend) runStubProvisioner(p *provision) {
 	defer b.wg.Done()
 
+	f, ok := b.claimStubFailure(p)
+	if !ok {
+		return
+	}
+	if b.persistStubDiagnostic(f) {
+		return
+	}
+	b.sendStubFailureCallback(f)
+}
+
+// stubFailure is the set of facts runStubProvisioner's post-lock phases
+// need, captured under provisionsMu by claimStubFailure.
+//
+// It carries VALUES, never the *provision: once the lock is released the
+// record is shared with Provision and Deprovision, so a phase that read
+// through a pointer would be an unsynchronized read. leaseCtx is the one
+// reference here, and reading its cancellation state is safe by design —
+// that is the whole point of the checkpoints below.
+type stubFailure struct {
+	leaseUUID    string
+	tenant       string
+	providerUUID string
+	callbackURL  string
+	failCount    int
+	leaseCtx     context.Context
+}
+
+// claimStubFailure takes provisionsMu, marks the lease failed, and returns
+// the facts the later phases need. ok is false when this worker no longer
+// owns the record, in which case the caller must do nothing at all.
+func (b *Backend) claimStubFailure(p *provision) (f stubFailure, ok bool) {
 	b.provisionsMu.Lock()
 	// Suppress stale Failed callbacks when a concurrent Deprovision has
 	// already removed (or replaced) the lease entry. Without this check,
@@ -147,7 +178,7 @@ func (b *Backend) runStubProvisioner(p *provision) {
 	current, exists := b.provisions[p.LeaseUUID]
 	if !exists || current != p {
 		b.provisionsMu.Unlock()
-		return
+		return stubFailure{}, false
 	}
 	p.Status = backend.ProvisionStatusFailed
 	p.LastError = stubProvisionerErrMsg
@@ -160,66 +191,94 @@ func (b *Backend) runStubProvisioner(p *provision) {
 	// Docker parity: docker's in-memory provision wraps
 	// leasesm.ProvisionState which carries FailCount through retries.
 	p.FailCount++
-	currentFailCount := p.FailCount
-	callbackURL := p.CallbackURL
-	leaseUUID := p.LeaseUUID
-	tenant := p.Tenant
-	providerUUID := p.ProviderUUID
-	// Capture the lease ctx while still under provisionsMu: Deprovision
-	// will call cancel() inside the same lock before deleting the map
-	// entry, so this read is race-free and the worker sees the latest
-	// cancellation state on its next ctx.Err() check.
-	leaseCtx := p.ctx
-	b.provisionsMu.Unlock()
-
-	// Checkpoint 1: pre-diagnostic-write. ENG-189 case (b) — a
-	// Deprovision that wins the lock between unlock and Store would
-	// otherwise persist a failure diagnostic for a torn-down lease.
-	if hook := b.beforeDiagnosticStore; hook != nil {
-		hook()
+	f = stubFailure{
+		leaseUUID:    p.LeaseUUID,
+		tenant:       p.Tenant,
+		providerUUID: p.ProviderUUID,
+		callbackURL:  p.CallbackURL,
+		failCount:    p.FailCount,
+		// Capture the lease ctx while still under provisionsMu:
+		// Deprovision will call cancel() inside the same lock before
+		// deleting the map entry, so this read is race-free and the
+		// later phases see the latest cancellation state.
+		leaseCtx: p.ctx,
 	}
-	if err := leaseCtx.Err(); err != nil {
+	b.provisionsMu.Unlock()
+	return f, true
+}
+
+// persistStubDiagnostic is checkpoint 1 and the diagnostic write. It
+// reports whether the lease was CANCELED, not whether the write failed —
+// the two are deliberately different outcomes:
+//
+//   - canceled (ENG-189 case (b)): a Deprovision won provisionsMu between
+//     claimStubFailure's unlock and here, so persisting a failure
+//     diagnostic for a torn-down lease is wrong and the callback must be
+//     skipped too. Reports true; the caller stops.
+//   - Store error: the diagnostic is lost, but the provision really did
+//     fail and Fred still has to be told. Logged and reported as NOT
+//     canceled so the callback still goes out. Do not fold this into the
+//     return value — filing it as "stop" turns a bbolt hiccup into a lease
+//     Fred never learns about, and no test in this package would fail.
+//
+// The guard lives here rather than at the call site so that a test driving
+// the phases directly still exercises it.
+func (b *Backend) persistStubDiagnostic(f stubFailure) (canceled bool) {
+	if err := f.leaseCtx.Err(); err != nil {
 		b.logger.Debug("suppressing diagnostic persist for canceled provision",
-			"lease_uuid", leaseUUID,
+			"lease_uuid", f.leaseUUID,
 			"err", err,
 		)
-		return
+		return true
 	}
 
 	if err := b.diagnosticsStore.Store(shared.DiagnosticEntry{
-		LeaseUUID:    leaseUUID,
-		ProviderUUID: providerUUID,
-		Tenant:       tenant,
+		LeaseUUID:    f.leaseUUID,
+		ProviderUUID: f.providerUUID,
+		Tenant:       f.tenant,
 		Error:        stubProvisionerErrMsg,
 		Reason:       backend.ReasonInternal,
 		Message:      stubProvisionerErrMsg,
-		FailCount:    currentFailCount,
+		FailCount:    f.failCount,
 		CreatedAt:    time.Now(),
 	}); err != nil {
+		// Deliberate fall-through: see the contract above.
 		b.logger.Error("failed to persist failure diagnostic",
-			"lease_uuid", leaseUUID,
+			"lease_uuid", f.leaseUUID,
 			"error", err,
 		)
 	}
+	return false
+}
 
-	// Checkpoint 2: pre-callback-send. ENG-189 case (c) —
-	// shared.CallbackSender.SendCallback persists to bbolt BEFORE
-	// delivery, so without this guard a torn-down lease can still
-	// have a stale status=failed callback queued for replay.
-	if hook := b.beforeCallbackSend; hook != nil {
-		hook()
-	}
-	if err := leaseCtx.Err(); err != nil {
+// sendStubFailureCallback is checkpoint 2 and the callback send. ENG-189
+// case (c): shared.CallbackSender.SendCallback persists to bbolt BEFORE
+// delivery, so without this guard a torn-down lease can still have a stale
+// status=failed callback queued for replay.
+//
+// It re-checks cancellation rather than trusting the caller, so a
+// composition that drops persistStubDiagnostic's early return still
+// suppresses the callback.
+//
+// This runs strictly AFTER persistStubDiagnostic, and that order is a
+// tenant-facing contract, not an implementation detail: the callback is
+// what makes Fred deprovision, and a deprovision arriving before the
+// diagnostic write cancels leaseCtx — after which checkpoint 1 drops the
+// diagnostic and GetProvision's diagnostics fallback (documented in
+// BACKEND_GUIDE.md) has nothing to surface. TestRunStubProvisioner_
+// PersistsDiagnosticBeforeCallback pins the order.
+func (b *Backend) sendStubFailureCallback(f stubFailure) {
+	if err := f.leaseCtx.Err(); err != nil {
 		b.logger.Debug("suppressing callback send for canceled provision",
-			"lease_uuid", leaseUUID,
+			"lease_uuid", f.leaseUUID,
 			"err", err,
 		)
 		return
 	}
 
 	b.callbackSender.SendCallback(
-		leaseUUID,
-		callbackURL,
+		f.leaseUUID,
+		f.callbackURL,
 		b.cfg.Name,
 		backend.CallbackStatusFailed,
 		stubProvisionerErrMsg,
