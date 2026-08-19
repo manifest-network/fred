@@ -45,7 +45,10 @@ type CallbackAuthenticator struct {
 	// matches what the signer used. Empty means no prepend — byte-identical
 	// to the pre-prefix behavior.
 	canonicalPathPrefix string
-	nowFunc             func() time.Time // For testing; defaults to time.Now
+	// nowFunc is the authenticator's clock. NewCallbackAuthenticator is
+	// the only constructor and always sets it to time.Now, so it is never
+	// nil; now() calls it unconditionally.
+	nowFunc func() time.Time
 }
 
 // validateCallbackSecret checks that the secret meets minimum length requirements.
@@ -89,12 +92,9 @@ func (a *CallbackAuthenticator) ComputeSignature(method, uri string, payload []b
 	return hmacauth.SignWithTime(a.secret, method, uri, payload, a.now())
 }
 
-// now returns the current time, using the injected time function if set.
+// now returns the current time through the authenticator's clock.
 func (a *CallbackAuthenticator) now() time.Time {
-	if a.nowFunc != nil {
-		return a.nowFunc()
-	}
-	return time.Now()
+	return a.nowFunc()
 }
 
 // VerifySignature verifies that the provided signature matches the request shape.

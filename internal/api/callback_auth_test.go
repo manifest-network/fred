@@ -555,8 +555,8 @@ func TestCallbackAuthenticator_VerifySignature_Standalone(t *testing.T) {
 	})
 
 	t.Run("accepts_valid_current_signature", func(t *testing.T) {
-		// Reset to real time
-		auth.nowFunc = nil
+		// Reset to the production clock
+		auth.nowFunc = time.Now
 
 		// Create a fresh signature
 		signature := auth.ComputeSignature(testCallbackMethod, testCallbackURI, payload)
