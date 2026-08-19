@@ -71,8 +71,7 @@ func TestCrossLeaseParallelism(t *testing.T) {
 		}
 	}
 	b := newBackendForTest(mock, provisions)
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	defer b.stopCancel()
 
 	// Fire all container-death events as fast as possible from a single

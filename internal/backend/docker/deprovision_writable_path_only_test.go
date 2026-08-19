@@ -92,9 +92,8 @@ func TestDeprovision_WritablePathOnly_DestroyedNotRetained(t *testing.T) {
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	// Pre-allocate the live footprint (simulates a running provision).
 	require.NoError(t, b.pool.TryAllocate("lease-wp-web-0", "docker-micro", "tenant-a"))
@@ -188,9 +187,8 @@ func TestDeprovision_StatefulVolume_RetainedNotDestroyed(t *testing.T) {
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-sf-web-0", "docker-micro", "tenant-a"))
 
@@ -278,9 +276,8 @@ func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testi
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-mx-db-0", "docker-micro", "tenant-a"))
 	require.NoError(t, b.pool.TryAllocate("lease-mx-dash-0", "docker-micro", "tenant-a"))
@@ -382,9 +379,8 @@ func TestDeprovision_WritablePathOnly_WithXFSMarker_StillReclaimed(t *testing.T)
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-xfs-web-0", "docker-micro", "tenant-a"))
 
@@ -458,9 +454,8 @@ func TestDeprovision_AmbiguousVolume_RetainedConservatively(t *testing.T) {
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-amb-web-0", "docker-micro", "tenant-a"))
 
@@ -555,9 +550,8 @@ func TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained(t *testing.T) {
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-mk-web-0", "docker-micro", "tenant-a"))
 
@@ -780,9 +774,8 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-rt-db-0", "docker-micro", "tenant-a"))
 	require.NoError(t, b.pool.TryAllocate("lease-rt-cache-0", "docker-micro", "tenant-a"))
@@ -899,9 +892,8 @@ func TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted(t *testing.T)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 300 // < 512 → durableItems=[db]=512 breaches → refuse-to-retain
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-rf-db-0", "docker-micro", "tenant-a"))
 	require.NoError(t, b.pool.TryAllocate("lease-rf-dash-0", "docker-micro", "tenant-a"))
@@ -969,9 +961,8 @@ func TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively(t *testing.
 	withMicroSKU(b, 512)
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-wpf-web-0", "docker-micro", "tenant-a"))
 
@@ -1051,9 +1042,8 @@ func TestDeprovision_PartialInstanceRetain_CapCheckCountsOnlyRetained(t *testing
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 600 // accurate 512 retains; over-counted 1024 would refuse+destroy
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.pool.TryAllocate("lease-pi-svc-0", "docker-micro", "tenant-a"))
 	require.NoError(t, b.pool.TryAllocate("lease-pi-svc-1", "docker-micro", "tenant-a"))

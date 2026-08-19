@@ -462,8 +462,7 @@ func TestStackRestart_Success(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	err := b.Restart(context.Background(), backend.RestartRequest{
@@ -573,8 +572,7 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	err := b.Restart(context.Background(), backend.RestartRequest{
@@ -671,8 +669,7 @@ func TestStackUpdate_Success(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	newPayload := validStackManifestJSON(map[string]string{
@@ -968,8 +965,7 @@ func TestStackProvision_ComposeUpFailure(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.compose = composeMock
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 
 	req := newStackProvisionRequest("lease-1", "tenant-a", items, payload)
 	req.CallbackURL = callbackServer.URL
@@ -1290,8 +1286,7 @@ func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
@@ -1387,8 +1382,7 @@ func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{
@@ -1493,8 +1487,7 @@ func TestStackRestart_RollbackClearsLastError(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{

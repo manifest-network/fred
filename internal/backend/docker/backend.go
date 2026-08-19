@@ -157,9 +157,6 @@ type Backend struct {
 	// callbackSender handles callback delivery with retry and HMAC
 	callbackSender *shared.CallbackSender
 
-	// httpClient is used by callbackSender for delivery; exposed for test replacement.
-	httpClient *http.Client
-
 	// volumeOwnerCache caches detected volume UID/GID per image ID
 	// (content-addressable sha256 digest). Zero-value ready; no init needed.
 	volumeOwnerCache sync.Map // image ID → volumeOwnerEntry
@@ -447,6 +444,29 @@ func (b *Backend) dnsGateAllows(ctx context.Context, domain string) bool {
 	return b.customDomainDNSReady(ctx, domain)
 }
 
+// newCallbackHTTPClient builds the HTTP client the CallbackSender uses for
+// outbound callback delivery.
+//
+// Extracted from New so the CallbackInsecureSkipVerify branch is reachable
+// from a test: the client is a local that New hands straight to
+// NewCallbackSender, and the Backend deliberately keeps no field pointing
+// at it (ENG-765 — a field only tests read is test scaffolding in a
+// production struct).
+func newCallbackHTTPClient(cfg Config, logger *slog.Logger) *http.Client {
+	c := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	if cfg.CallbackInsecureSkipVerify {
+		logger.Error("INSECURE: callback TLS verification disabled — do NOT use in production")
+		c.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // Intentional for development
+			},
+		}
+	}
+	return c
+}
+
 // New creates a new Docker backend.
 func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	if err := cfg.Validate(); err != nil {
@@ -493,20 +513,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		logger.Warn("a retention budget's per_partition_max_disk_mb is below (per_partition_max_leases+1) x the largest stateful SKU: at worst-case lease sizes the disk sub-cap binds before the count window can roll, refusing (destroying) incoming closes in a full partition; raise per_partition_max_disk_mb or lower per_partition_max_leases")
 	}
 
-	// Create HTTP client for callbacks
-	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	// Configure TLS if needed
-	if cfg.CallbackInsecureSkipVerify {
-		logger.Error("INSECURE: callback TLS verification disabled — do NOT use in production")
-		httpClient.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // Intentional for development
-			},
-		}
-	}
+	httpClient := newCallbackHTTPClient(cfg, logger)
 
 	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
 		DBPath:         cfg.CallbackDBPath,
@@ -596,7 +603,6 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		releaseStore:     releaseStore,
 		retentionStore:   retentionStore,
 		orphanStreaks:    make(map[string]int),
-		httpClient:       httpClient,
 		// tenantNetworkStripes is a fixed-size array embedded in Backend;
 		// the zero value is ready to use (N unlocked sync.Mutexes).
 	}

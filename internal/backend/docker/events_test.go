@@ -53,8 +53,7 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 			CallbackURL:  callbackServer.URL},
 		},
 	})
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	defer b.stopCancel()
 
 	// Start the event loop in a goroutine.

@@ -52,34 +52,47 @@ func newProvisionRequest(leaseUUID, tenant, sku string, qty int, payload []byte)
 	}
 }
 
-// newBackendForProvisionTest creates a Backend with httpClient set and zero backoff.
+// newBackendForProvisionTest creates a Backend with a zero-backoff callback
+// sender pointed at testCallbackClient.
 func newBackendForProvisionTest(t *testing.T, mock *mockDockerClient, provisions map[string]*provision) *Backend {
 	t.Helper()
 	b := newBackendForTest(mock, provisions)
-	b.httpClient = &http.Client{Timeout: 5 * time.Second}
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, testCallbackClient)
 	return b
 }
 
 // zeroBackoff eliminates retry delays in tests.
 var zeroBackoff = [shared.CallbackMaxAttempts]time.Duration{}
 
-// rebuildCallbackSender is a test-only workaround that re-creates the
-// callbackSender from the Backend's current httpClient, callbackStore, and cfg
-// fields with zero backoff for fast tests.
+// testCallbackClient is the default callback client for tests that rebuild
+// the sender for some reason OTHER than pointing it at a server — a swapped
+// callbackStore or CallbackSecret, say. Its 5s timeout is what
+// newBackendForProvisionTest has always used.
 //
-// Why this exists: CallbackSender captures its dependencies (HTTP client,
-// secret, store, etc.) at construction time. Many tests swap these fields on
-// the Backend after newBackendForProvisionTest returns (e.g. b.httpClient =
-// server.Client()), but those mutations have no effect on the already-built
-// sender. This helper rebuilds the sender so it picks up the new values.
+// Sharing one *http.Client across tests is safe: it is concurrency-safe by
+// contract, and nothing here mutates it. Tests that need the observer
+// transport build their own (see observeCallbacks); tests talking to an
+// httptest server pass that server's client.
+var testCallbackClient = &http.Client{Timeout: 5 * time.Second}
+
+// rebuildCallbackSender re-creates b.callbackSender from hc, b.callbackStore
+// and b.cfg, with zero backoff for fast tests.
 //
-// The alternative would be a more complex test builder that accepts every
-// possible override before constructing the Backend.
-func rebuildCallbackSender(b *Backend) {
+// CallbackSender captures its dependencies at construction, so a test that
+// changes any of them afterwards must rebuild for the change to take effect.
+// The HTTP client is a PARAMETER rather than a Backend field because
+// production has no such field to read (ENG-765): New keeps its callback
+// client as a local and hands it straight to NewCallbackSender.
+//
+// Call this AFTER every dependency the sender captures is in place. It reads
+// b.callbackStore and b.cfg.CallbackSecret at call time, so a rebuild hoisted
+// above an assignment to either silently builds a sender against the old
+// value — and the tests here would not fail, since their callback handlers do
+// not verify the signature.
+func rebuildCallbackSender(b *Backend, hc *http.Client) {
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:      b.callbackStore,
-		HTTPClient: b.httpClient,
+		HTTPClient: hc,
 		Secret:     string(b.cfg.CallbackSecret),
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
@@ -126,21 +139,26 @@ func (o *callbackObserver) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, err
 }
 
-// observeCallbacks installs a callbackObserver on b's callback HTTP
-// client and returns the channel it signals. b.httpClient is used by
-// nothing but callbackSender (backend.go), so every round trip it makes
-// is a callback delivery.
+// observeCallbacks points b's callback sender at a client whose transport
+// is wrapped in a callbackObserver, and returns the channel it signals.
+// That client is used by nothing but callbackSender, so every round trip it
+// makes is a callback delivery.
 //
-// Must run before the lease actor is created: it rebuilds
-// b.callbackSender, and newLeaseActor captures the sender.
+// Must run before the lease actor is created, and that is now load-bearing
+// rather than belt-and-braces: this installs a NEW client rather than
+// mutating one the sender already holds, so an actor that captured an
+// earlier sender would never be observed. newLeaseActor captures the sender.
+//
+// The 5s timeout matches testCallbackClient deliberately. Without it the
+// per-attempt bound would rise to shared.CallbackTimeout (10s), and three
+// zero-backoff attempts against a parked handler would consume the whole
+// provisionFlowTimeout budget below.
 func observeCallbacks(b *Backend) <-chan struct{} {
 	seen := make(chan struct{}, 1)
-	base := b.httpClient.Transport
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	b.httpClient.Transport = &callbackObserver{base: base, seen: seen}
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &callbackObserver{base: http.DefaultTransport, seen: seen},
+	})
 	return seen
 }
 
@@ -997,9 +1015,8 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 			CallbackURL:  server.URL},
 		},
 	})
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
 
@@ -1059,9 +1076,8 @@ func TestDeprovision_RetainSuccessSendsRetainedCallback(t *testing.T) {
 	}
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
 
@@ -1125,9 +1141,8 @@ func TestDeprovision_RetainPartialFailureEmitsNoCallbackKeepsFailed(t *testing.T
 	}
 	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	// Rename failure surfaces as a volume-cleanup error (under the limit → lease
 	// kept Failed for retry, no terminal callback emitted on this attempt).
@@ -1184,9 +1199,8 @@ func TestDeprovision_VolumeExhaustionSendsFailedCallback(t *testing.T) {
 	b.volumes = &mockVolumeManager{DestroyFn: func(ctx context.Context, id string) error {
 		return fmt.Errorf("permission denied")
 	}}
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	before := testutil.ToFloat64(deprovisionsTotal)
 	require.NoError(t, b.Deprovision(context.Background(), "lease-1")) // give-up returns nil, not error
@@ -1359,9 +1373,8 @@ func TestDeprovision_VolumeRetry_GiveUp_ConcurrentRecoverState(t *testing.T) {
 			Items:       []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}},
 			VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1}, // next failure → give-up
 	})
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 	b.volumes = &mockVolumeManager{DestroyFn: func(_ context.Context, _ string) error {
 		return fmt.Errorf("device busy")
 	}}
@@ -1439,9 +1452,8 @@ func TestDeprovision_RetryAfterPartialFailureFiresOneCallback(t *testing.T) {
 	b.compose = &mockComposeExecutor{DownFn: func(ctx context.Context, project string, t time.Duration) error {
 		return fmt.Errorf("compose down failed")
 	}}
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	// Call 1: partial container failure → error, NO callback, provision stays Failed.
 	require.Error(t, b.Deprovision(context.Background(), "lease-1"))
@@ -1826,9 +1838,8 @@ func TestSendCallback_Success(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
-	b.httpClient = server.Client()
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	b.sendCallback("lease-1", backend.CallbackStatusSuccess, "")
 
@@ -1850,8 +1861,7 @@ func TestSendCallback_FailurePayload(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
-	b.httpClient = server.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	b.sendCallback("lease-1", backend.CallbackStatusFailed, "image pull failed")
 
@@ -1878,8 +1888,7 @@ func TestSendCallback_TruncatesLongError(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
-	b.httpClient = server.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	// Send an error message that exceeds the on-chain rejection reason limit.
 	longError := strings.Repeat("x", callbackMaxErrorLen+100)
@@ -1907,8 +1916,7 @@ func TestSendCallback_Retry(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
-	b.httpClient = server.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	b.sendCallback("lease-1", backend.CallbackStatusSuccess, "")
 
@@ -1927,12 +1935,13 @@ func TestSendCallback_ShutdownAbortsRetry(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
-	b.httpClient = server.Client()
-	// Use long backoff so shutdown cancellation is observable.
+	// Use long backoff so shutdown cancellation is observable. Built inline
+	// rather than via rebuildCallbackSender because that helper pins
+	// zeroBackoff, which is the one thing this test cannot use.
 	longBackoff := [shared.CallbackMaxAttempts]time.Duration{0, 5 * time.Second, 5 * time.Second}
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:      b.callbackStore,
-		HTTPClient: b.httpClient,
+		HTTPClient: server.Client(),
 		Secret:     string(b.cfg.CallbackSecret),
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
@@ -1961,8 +1970,7 @@ func TestDeliverCallback_Success(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
-	b.httpClient = server.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	ok := b.callbackSender.DeliverCallback("lease-1", server.URL, []byte(`{"test":true}`))
 	assert.True(t, ok)
@@ -1977,8 +1985,7 @@ func TestDeliverCallback_ServerError(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
-	b.httpClient = server.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	ok := b.callbackSender.DeliverCallback("lease-1", server.URL, []byte(`{}`))
 	assert.False(t, ok)
@@ -2368,9 +2375,8 @@ func TestSendCallback_PersistsBeforeDelivery(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
-	b.httpClient = server.Client()
 	b.callbackStore = cbStore
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	b.sendCallback("lease-1", backend.CallbackStatusSuccess, "")
 
@@ -2397,9 +2403,8 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1", CallbackURL: server.URL}},
 	})
-	b.httpClient = server.Client()
 	b.callbackStore = cbStore
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	b.sendCallback("lease-1", backend.CallbackStatusFailed, "container crashed")
 
@@ -2446,9 +2451,8 @@ func TestReplayPendingCallbacks_Success(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
-	b.httpClient = server.Client()
 	b.callbackStore = cbStore
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	b.callbackSender.ReplayPendingCallbacks()
 
@@ -2497,9 +2501,8 @@ func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
-	b.httpClient = server.Client()
 	b.callbackStore = cbStore
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	b.callbackSender.ReplayPendingCallbacks()
 
@@ -2516,7 +2519,7 @@ func TestReplayPendingCallbacks_NilStore(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.callbackStore = nil
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, testCallbackClient)
 
 	// Should not panic
 	b.callbackSender.ReplayPendingCallbacks()
@@ -2561,9 +2564,8 @@ func TestReplayPendingCallbacks_ExpiresOldEntries(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
-	b.httpClient = server.Client()
 	b.callbackStore = cbStore
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 
 	b.callbackSender.ReplayPendingCallbacks()
 
@@ -2588,7 +2590,7 @@ func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.callbackStore = cbStore
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, testCallbackClient)
 
 	// Should not panic or make HTTP calls
 	b.callbackSender.ReplayPendingCallbacks()
@@ -2624,9 +2626,8 @@ func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
 
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
-	b.httpClient = server.Client()
 	b.callbackStore = cbStore
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, server.Client())
 	b.cfg.CallbackMaxAge = 0 // Zero means "don't expire"
 
 	b.callbackSender.ReplayPendingCallbacks()
@@ -2909,8 +2910,7 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.diagnosticsStore = diagStore
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 
 	req := backend.ProvisionRequest{
 		LeaseUUID:    "lease-diag",
@@ -3040,8 +3040,7 @@ func TestProvision_FailurePersistsContainerLogs(t *testing.T) {
 	b.compose = composeMock
 	b.diagnosticsStore = diagStore
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 
 	req := backend.ProvisionRequest{
 		LeaseUUID:    "lease-logs",
@@ -3175,8 +3174,7 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 	b.diagnosticsStore = diagStore
 	_ = b.pool.TryAllocate("lease-reprov-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 
 	req := newProvisionRequest("lease-reprov", "tenant-a", "docker-small", 1, validManifestJSON("docker.io/nginx:latest"))
 	req.CallbackURL = callbackServer.URL
