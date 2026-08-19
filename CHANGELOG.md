@@ -637,8 +637,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   whenever a client-error body was not the declared `{"error": ...}` envelope, and
   `internal/api` wrote that straight into its own 4xx body. A body that is valid JSON but
   omits the required `error` field — `{}`, `null`, or a proxy's own `{"message": ...}` — counts
-  as off-contract too, and a `4xx` carrying an unparseable body is no longer mistaken for the
-  one documented bodiless form (a bare `422` meaning "no retained data"). Fred now authors that message
+  as off-contract too, on every 4xx fred parses. Only a genuinely **empty** body still means the
+  one documented bodiless form (a bare `422` meaning "no retained data"); an unparseable or
+  wrong-shaped body is no longer mistaken for it, which previously let an intermediary's error
+  page reach the tenant as a confident `404 no retained data found for that lease`. Fred now authors that message
   itself, records the raw body and a new `fred_backend_malformed_error_body_total{backend,
   operation}` counter operator-side, and answers `502` — the fault is upstream. The
   tenant-visible detail a backend *did* author inside a validated envelope still crosses

@@ -898,31 +898,46 @@ func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
 //
 // Three outcomes, and the distinction between the last two matters:
 //
-//   - EMPTY body → no code, no error. This is a documented contract case, not a
-//     violation: BACKEND_GUIDE.md specifies a bare 422 as "no retained data"
-//     precisely so a backend WITHOUT retention support can answer with nothing
-//     at all. The status code alone carries the verdict, so the caller maps it
-//     to the bare-status sentinel.
-//   - Parses as JSON but carries no discriminator → same bare-status sentinel.
-//     An absent optional field in a valid envelope is not an error.
-//   - NON-EMPTY and unparseable → ErrMalformedErrorBody. Collapsing this into
-//     "no code" is how an intermediary's HTML 422 used to become ErrNotRetained,
-//     telling the tenant "no retained data found for that lease" — a confident,
-//     wrong, tenant-facing answer — while bypassing the metric, the breaker and
-//     the 502. "Bare" means no body, not "any body fred could not read".
+// Exactly one body is exempt from the envelope, and it is the EMPTY one.
+// BACKEND_GUIDE.md specifies a bare 422 as "no retained data" precisely so a
+// backend WITHOUT retention support can answer with nothing at all, so the
+// status code alone carries that verdict. Everything else must be the
+// envelope, held to the SAME standard as parseValidationError — syntax and
+// the required "error" field:
+//
+//   - unparseable (HTML, truncated JSON) → ErrMalformedErrorBody
+//   - parses but omits "error" (`null`, `{}`, a proxy's `{"message": ...}`,
+//     even `{"code": "..."}`) → ErrMalformedErrorBody
+//
+// Both used to collapse into "no code", which is how an intermediary's 422
+// became ErrNotRetained and told the tenant "no retained data found for that
+// lease" — fred stating a lease-state fact it had no basis for, while
+// bypassing the metric, the breaker and the 502. A JSON error page is at least
+// as common as an HTML one, so checking syntax alone left the larger half of
+// that hole open. "Bare" means no body, not "any body fred could not read".
+//
+// A valid envelope with no "code" is a different thing and stays legal: code
+// is omitempty by contract, so its absence selects the bare-status sentinel.
+// The trade is deliberate — a body carrying a good discriminator but no
+// "error" is refused rather than salvaged, because one rule for the whole
+// envelope is worth more than rescuing that field, and two nearly-identical
+// parsers holding it to different standards is what produced this bug class.
 //
 // msg is returned only when it came out of the envelope's declared "error"
-// field, and is "" otherwise; the raw bytes never leave this function.
+// field; the raw bytes never leave this function.
 func (c *HTTPClient) parseErrorCode(body []byte, operation string) (code, msg string, err error) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "", "", nil // bare status: the one documented no-body case
+	}
 	var resp struct {
 		Error string `json:"error"`
 		Code  string `json:"code"`
 	}
 	if jsonErr := json.Unmarshal(body, &resp); jsonErr != nil {
-		if len(bytes.TrimSpace(body)) == 0 {
-			return "", "", nil // bare status: the documented no-body case
-		}
 		return "", "", c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
+	}
+	if resp.Error == "" {
+		return "", "", c.noteMalformedErrorBody(body, operation, `envelope is missing the required "error" field`)
 	}
 	return resp.Code, resp.Error, nil
 }

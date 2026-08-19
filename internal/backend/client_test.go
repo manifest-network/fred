@@ -273,10 +273,23 @@ func TestHTTPClientRestore_UnreadableBodyIsNotBareStatus(t *testing.T) {
 		{"empty 422 stays ErrNotRetained", http.StatusUnprocessableEntity, "", ErrNotRetained, true},
 		{"whitespace 422 stays ErrNotRetained", http.StatusUnprocessableEntity, "  \n", ErrNotRetained, true},
 		{"valid envelope, no code, stays ErrNotRetained", http.StatusUnprocessableEntity, `{"error":"nope"}`, ErrNotRetained, true},
+		{"valid coded envelope still classifies", http.StatusUnprocessableEntity, `{"error":"too big","code":"demote_exceeds_tier"}`, ErrDemoteDataExceedsTier, true},
+		{"valid coded 409 still classifies", http.StatusConflict, `{"error":"dup","code":"already_provisioned"}`, ErrAlreadyProvisioned, true},
 		{"html 422 is malformed", http.StatusUnprocessableEntity, "<html>422 /var/lib/fred/x</html>", ErrMalformedErrorBody, false},
 		{"truncated json 422 is malformed", http.StatusUnprocessableEntity, `{"error":"/var/lib/fred/x`, ErrMalformedErrorBody, false},
+		// The shape half. A proxy emitting a JSON error page is at least as
+		// common as one emitting HTML, and these parse cleanly — so checking
+		// syntax alone left the larger half of the hole open.
+		{"json null 422 is malformed", http.StatusUnprocessableEntity, `null`, ErrMalformedErrorBody, false},
+		{"empty object 422 is malformed", http.StatusUnprocessableEntity, `{}`, ErrMalformedErrorBody, false},
+		{"foreign json 422 is malformed", http.StatusUnprocessableEntity, `{"message":"proxy error: /var/lib/fred/x"}`, ErrMalformedErrorBody, false},
+		// Deliberate: a good discriminator does not rescue a body that omits the
+		// required "error". One rule for the whole envelope.
+		{"code without error 422 is malformed", http.StatusUnprocessableEntity, `{"code":"demote_exceeds_tier"}`, ErrMalformedErrorBody, false},
 		{"empty 409 stays ErrInvalidState", http.StatusConflict, "", ErrInvalidState, true},
 		{"html 409 is malformed", http.StatusConflict, "<html>409 /var/lib/fred/x</html>", ErrMalformedErrorBody, false},
+		{"foreign json 409 is malformed", http.StatusConflict, `{"message":"proxy error: /var/lib/fred/x"}`, ErrMalformedErrorBody, false},
+		{"code without error 409 is malformed", http.StatusConflict, `{"code":"already_provisioned"}`, ErrMalformedErrorBody, false},
 	}
 
 	for _, tt := range tests {
