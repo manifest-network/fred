@@ -392,7 +392,7 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Handle the message
-	err = manager.handleLeaseCreated(msg)
+	err = manager.handlers.HandleLeaseCreated(msg)
 	assert.NoError(t, err)
 
 	// Verify provisioning was called
@@ -441,7 +441,7 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Handle should return error for retry
-	err = manager.handleLeaseCreated(msg)
+	err = manager.handlers.HandleLeaseCreated(msg)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrProvisioningFailed)
 
@@ -466,7 +466,7 @@ func TestManager_HandleLeaseCreated_MalformedMessage(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), []byte("invalid json"))
 
 	// Handle should return nil (don't retry malformed messages)
-	err = manager.handleLeaseCreated(msg)
+	err = manager.handlers.HandleLeaseCreated(msg)
 	assert.NoError(t, err, "should return nil for malformed message")
 
 	// Verify no provisioning was attempted
@@ -498,7 +498,7 @@ func TestManager_HandleLeaseClosed(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handleLeaseClosed(msg)
+	err = manager.handlers.HandleLeaseClosed(msg)
 	assert.NoError(t, err)
 
 	// Verify deprovision was called
@@ -532,7 +532,7 @@ func TestManager_HandleLeaseClosed_DeprovisionError(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handleLeaseClosed(msg)
+	err = manager.handlers.HandleLeaseClosed(msg)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrDeprovisionFailed)
 }
@@ -576,7 +576,7 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handleBackendCallback(msg)
+	err = manager.handlers.HandleBackendCallback(msg)
 	assert.NoError(t, err)
 
 	// Verify acknowledge was called
@@ -613,7 +613,7 @@ func TestManager_HandleBackendCallback_Failed(t *testing.T) {
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handleBackendCallback(msg)
+	err = manager.handlers.HandleBackendCallback(msg)
 	assert.NoError(t, err)
 
 	// Verify removed from in-flight (failed is terminal)
@@ -642,7 +642,7 @@ func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return nil (ignore unknown callbacks)
-	err = manager.handleBackendCallback(msg)
+	err = manager.handlers.HandleBackendCallback(msg)
 	assert.NoError(t, err, "should return nil for unknown lease")
 }
 
@@ -681,7 +681,7 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handleBackendCallback(msg)
+	err = manager.handlers.HandleBackendCallback(msg)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrAcknowledgeFailed)
 
@@ -731,7 +731,7 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return nil (terminal error treated as success)
-	err = manager.handleBackendCallback(msg)
+	err = manager.handlers.HandleBackendCallback(msg)
 	assert.NoError(t, err, "should return nil for terminal acknowledge error")
 
 	// Verify removed from in-flight (not stuck for retry)
@@ -808,7 +808,7 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return nil (unknown status is logged, not retried)
-	err = manager.handleBackendCallback(msg)
+	err = manager.handlers.HandleBackendCallback(msg)
 	assert.NoError(t, err, "should return nil for unknown status")
 
 	// Lease should be removed from in-flight (unknown status is treated as terminal
@@ -905,7 +905,7 @@ func TestManager_HandleLeaseExpired(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handleLeaseExpired(msg)
+	err = manager.handlers.HandleLeaseExpired(msg)
 	assert.NoError(t, err)
 
 	// Verify deprovision was called (same behavior as handleLeaseClosed)
@@ -993,7 +993,7 @@ func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should succeed by falling back to default backend
-	err = manager.handleLeaseClosed(msg)
+	err = manager.handlers.HandleLeaseClosed(msg)
 	assert.NoError(t, err, "should fallback to default backend")
 
 	// Verify deprovision was called on the default backend
@@ -1043,7 +1043,7 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Handle the message
-	err = manager.handleLeaseCreated(msg)
+	err = manager.handlers.HandleLeaseCreated(msg)
 	assert.NoError(t, err)
 
 	// Verify GPU backend received the provision call
@@ -1107,7 +1107,7 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handleBackendCallback(msg)
+	err = manager.handlers.HandleBackendCallback(msg)
 	assert.NoError(t, err)
 
 	// Verify lease was rejected
@@ -1157,7 +1157,7 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handleBackendCallback(msg)
+	err = manager.handlers.HandleBackendCallback(msg)
 	assert.NoError(t, err)
 
 	// Verify default reason was used
@@ -1476,7 +1476,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Handle the message
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	assert.NoError(t, err)
 
 	// Verify provisioning was called with payload
@@ -1521,7 +1521,7 @@ func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return nil (no retry) when payload store is not configured
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	assert.NoError(t, err, "should return nil for missing payload store")
 
 	// Verify no provisioning was attempted
@@ -1554,7 +1554,7 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), []byte("invalid json"))
 
 	// Handle should return nil (don't retry malformed messages)
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	assert.NoError(t, err, "should return nil for malformed message")
 
 	// Verify no provisioning was attempted
@@ -1599,7 +1599,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return nil (lease not found, clean up payload)
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	assert.NoError(t, err, "should return nil for lease not found")
 
 	// Verify payload was cleaned up
@@ -1654,7 +1654,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return nil (lease not pending, skip provisioning)
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	assert.NoError(t, err, "should return nil for non-pending lease")
 
 	// Verify payload was cleaned up
@@ -1702,7 +1702,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return error for retry
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	require.Error(t, err, "should return error for chain error")
 }
 
@@ -1750,7 +1750,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return error for retry
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrProvisioningFailed)
 
@@ -1804,7 +1804,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should return nil (skip already in-flight lease)
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	assert.NoError(t, err, "should return nil for already in-flight lease")
 
 	// Verify no provisioning was attempted (already being processed)
@@ -1853,7 +1853,7 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
 	// Should succeed (proceeds without payload with warning)
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	assert.NoError(t, err, "should return nil when payload missing from store")
 
 	// Verify provisioning was called (with nil payload and no hash)
@@ -1914,7 +1914,7 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	assert.NoError(t, err)
 
 	// Verify GPU backend received the call
@@ -1973,11 +1973,11 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		mu.Unlock()
 
 		// Track a lease with an artificial old start time
-		tracker := manager.Tracker().(*DefaultInFlightTracker)
+		tracker := manager.tracker.(*DefaultInFlightTracker)
 		tracker.TrackInFlightWithStartTime("timeout-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
 
 		// Run timeout check
-		manager.checkCallbackTimeouts(context.Background())
+		manager.timeoutChecker.CheckOnce(context.Background())
 
 		// Verify lease was rejected
 		mu.Lock()
@@ -1999,7 +1999,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		manager.TrackInFlight("fresh-lease", "tenant-1", testItems("test-sku"), "test")
 
 		// Run timeout check
-		manager.checkCallbackTimeouts(context.Background())
+		manager.timeoutChecker.CheckOnce(context.Background())
 
 		// Verify lease was NOT rejected
 		mu.Lock()
@@ -2021,7 +2021,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		mu.Unlock()
 
 		// Track multiple old leases
-		tracker := manager.Tracker().(*DefaultInFlightTracker)
+		tracker := manager.tracker.(*DefaultInFlightTracker)
 		for i := range 5 {
 			leaseID := "cancel-lease-" + string(rune('a'+i))
 			tracker.TrackInFlightWithStartTime(leaseID, "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
@@ -2032,7 +2032,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		cancel()
 
 		// Run timeout check with cancelled context
-		manager.checkCallbackTimeouts(ctx)
+		manager.timeoutChecker.CheckOnce(ctx)
 
 		// May have processed 0 or 1 lease before noticing cancellation
 		mu.Lock()
@@ -2065,11 +2065,11 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		require.NoError(t, err)
 
 		// Track an old lease
-		tracker := failManager.Tracker().(*DefaultInFlightTracker)
+		tracker := failManager.tracker.(*DefaultInFlightTracker)
 		tracker.TrackInFlightWithStartTime("fail-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
 
 		// Run timeout check - should not panic
-		failManager.checkCallbackTimeouts(context.Background())
+		failManager.timeoutChecker.CheckOnce(context.Background())
 
 		// Lease should REMAIN in-flight when chain reject fails
 		// This prevents the reconciler from seeing a PENDING lease not in-flight
@@ -2112,10 +2112,10 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go manager.TimeoutChecker().Start(ctx)
+	go manager.timeoutChecker.Start(ctx)
 
 	// Track a lease that will timeout
-	tracker := manager.Tracker().(*DefaultInFlightTracker)
+	tracker := manager.tracker.(*DefaultInFlightTracker)
 	tracker.TrackInFlightWithStartTime("auto-timeout-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Second))
 
 	// Wait for timeout checker to run
@@ -2194,7 +2194,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	eventPayload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), eventPayload)
 
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	require.NoError(t, err)
 
 	// Step 2: REGRESSION CHECK - Payload must still exist after Provision() returns
@@ -2219,7 +2219,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	callbackPayload, _ := json.Marshal(callback)
 	callbackMsg := message.NewMessage(watermill.NewUUID(), callbackPayload)
 
-	err = manager.handleBackendCallback(callbackMsg)
+	err = manager.handlers.HandleBackendCallback(callbackMsg)
 	require.NoError(t, err)
 
 	// Payload should persist after successful callback — it's retained for
@@ -2283,7 +2283,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	eventPayload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), eventPayload)
 
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	require.NoError(t, err)
 
 	// Payload should still exist
@@ -2300,7 +2300,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	callbackPayload, _ := json.Marshal(callback)
 	callbackMsg := message.NewMessage(watermill.NewUUID(), callbackPayload)
 
-	err = manager.handleBackendCallback(callbackMsg)
+	err = manager.handlers.HandleBackendCallback(callbackMsg)
 	require.NoError(t, err)
 
 	// Payload should be deleted after failed callback (no point keeping it)
@@ -2358,7 +2358,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	eventPayload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), eventPayload)
 
-	err = manager.handlePayloadReceived(msg)
+	err = manager.handlers.HandlePayloadReceived(msg)
 	require.NoError(t, err)
 
 	// Verify provisioning was called

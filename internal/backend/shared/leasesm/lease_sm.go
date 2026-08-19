@@ -555,6 +555,22 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 		cfg.Metrics.ActiveProvisionsInc()
 	}
 
+	// ORDERING CONTRACT: SendCallbackFn MUST remain the last statement of
+	// this entry action. The docker provision tests synchronize on the
+	// callback round trip as their "entry action finished" barrier
+	// (docker.doProvisionAndFire / observeCallbacks), so a store write
+	// added below this line can land after the barrier has already
+	// released the asserting goroutine.
+	//
+	// This comment is the entire enforcement. Nothing automated catches
+	// the benign shape: on the docker substrate every store write goes
+	// through backendProvisionStore, which holds provisionsMu, and those
+	// tests read under the same mutex — so a late write is properly
+	// synchronized and the race detector has nothing to report no matter
+	// how late it is. A late write of a DIFFERENT value than the test
+	// expects fails an assertion; a late write of the SAME value is
+	// invisible to the suite, with or without -race. Do not add a write
+	// here on the assumption that -race would have caught it.
 	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
 	return nil
 }
@@ -756,6 +772,22 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
 	}
 
+	// ORDERING CONTRACT: SendCallbackFn MUST remain the last statement of
+	// this entry action. The docker provision tests synchronize on the
+	// callback round trip as their "entry action finished" barrier
+	// (docker.doProvisionAndFire / observeCallbacks), so a store write
+	// added below this line can land after the barrier has already
+	// released the asserting goroutine.
+	//
+	// This comment is the entire enforcement. Nothing automated catches
+	// the benign shape: on the docker substrate every store write goes
+	// through backendProvisionStore, which holds provisionsMu, and those
+	// tests read under the same mutex — so a late write is properly
+	// synchronized and the race detector has nothing to report no matter
+	// how late it is. A late write of a DIFFERENT value than the test
+	// expects fails an assertion; a late write of the SAME value is
+	// invisible to the suite, with or without -race. Do not add a write
+	// here on the assumption that -race would have caught it.
 	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
 	return nil
 }

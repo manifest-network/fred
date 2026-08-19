@@ -15,7 +15,7 @@ import (
 
 // Tests in this file exercise the LeaseActor's internal semantics
 // (SM transitions, worker spawning, terminal-event drain, panic recovery,
-// send/sendTerminal mechanics). They live in `package leasesm` (internal
+// sendTerminal mechanics). They live in `package leasesm` (internal
 // tests) per Deviation #1 — they use unexported types/fields/methods
 // directly because constructing test scenarios at this layer is much
 // cleaner with same-package access than going through the docker
@@ -24,24 +24,6 @@ import (
 // Backend-routing integration tests (b.routeToLease, b.routeToLeaseBlocking,
 // b.Deprovision, etc.) stay in docker/lease_actor_test.go where they
 // exercise the substrate's actor registry + HTTP callback machinery.
-
-// TestLeaseActor_SendRefusesAfterActorExit pins the post-exit refusal
-// contract on send(): once the actor's run loop has returned (a.done
-// closed), send must return false rather than queue into an inbox no
-// one will drain. Before the defer-reorder fix, post-exit send() could
-// silently rot a message because the hasExited check didn't exist on
-// this path.
-func TestLeaseActor_SendRefusesAfterActorExit(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	actor := newTestActor(t, "lease-gone", testActorOpts{StopCtx: ctx})
-
-	// Force the actor to exit by cancelling the test ctx (= StopCtx).
-	cancel()
-	<-actor.Done()
-
-	ok := actor.send(ContainerDiedMsg{ContainerID: "c1"})
-	assert.False(t, ok, "send must refuse once the actor has exited")
-}
 
 // TestLeaseActor_SendTerminalRefusesAfterActorExit guards the
 // sendTerminal contract: once the actor has fully exited (a.done
@@ -1431,8 +1413,12 @@ var _ = sync.Mutex{}
 // operator-only verbose diagnostic — the three must be independent.
 func TestProvisionErrored_AuthorsReasonMessage(t *testing.T) {
 	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{})
-	FireProvisionRequestedForTest(a)
-	FireProvisionErroredForTest(a, "image pull failed", backend.ReasonImagePullFailed, "pull /data/fred/... exit 1", nil)
+	require.NoError(t, a.sm.Fire(context.Background(), evProvisionRequested))
+	require.NoError(t, a.sm.Fire(context.Background(), evProvisionErrored, provisionErrorInfo{
+		callbackErr: "image pull failed",
+		reason:      backend.ReasonImagePullFailed,
+		lastError:   "pull /data/fred/... exit 1",
+	}))
 
 	got, ok := a.cfg.ProvisionStore.Get("lease-1")
 	require.True(t, ok)
@@ -1516,7 +1502,7 @@ func TestReplaceCompleted_ClearsStaleReasonMessage(t *testing.T) {
 // companion for the successful-provision entry action
 // (onEnterReadyFromProvision): a Failed lease that is re-provisioned (retry)
 // must not carry its prior failure Reason/Message into the healthy Ready
-// record (ENG-508). Drives Provisioning→Ready via the ForTest fires.
+// record (ENG-508). Drives Provisioning→Ready by firing the SM directly (in-package).
 func TestProvisionCompleted_ClearsStaleReasonMessage(t *testing.T) {
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
@@ -1528,8 +1514,9 @@ func TestProvisionCompleted_ClearsStaleReasonMessage(t *testing.T) {
 	})
 	a := newTestActorNoSpawn(t, "lease-1", testActorOpts{ProvisionStore: store})
 
-	FireProvisionRequestedForTest(a)
-	FireProvisionCompletedForTest(a, ProvisionSuccessResult{ContainerIDs: []string{"c1"}})
+	require.NoError(t, a.sm.Fire(context.Background(), evProvisionRequested))
+	require.NoError(t, a.sm.Fire(context.Background(), evProvisionCompleted,
+		ProvisionSuccessResult{ContainerIDs: []string{"c1"}}))
 
 	got, ok := store.Get("lease-1")
 	require.True(t, ok)

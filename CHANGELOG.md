@@ -271,6 +271,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **Test-only scaffolding no longer compiles into fred's production packages**
+  (ENG-354). Declarations whose only callers were tests — `leasesm`'s
+  `FireProvisionXxxForTest` helpers, `Manager.Tracker` / `Manager.TimeoutChecker`,
+  `EventBroker.subscriberCount`, `CallbackAuthenticator.ComputeSignatureWithTime`
+  and `hmacauth.SignRequestWithTime` among them — sat in ordinary `.go` files, so
+  nothing stopped a production call site from being added to one. They now live in
+  in-package `export_test.go` files, or were deleted once their callers moved to the
+  production seam underneath, and `internal/testutil` carries a guard test that fails
+  on a new one. The linker had already been dropping most of them (`go tool nm` on the
+  previous `docker-backend` finds zero `FireProvision` symbols) but not all: three —
+  `TrackInFlightWithStartTime`, `Manager.Tracker` and `Manager.TimeoutChecker` — were
+  present in the shipped `providerd` and are not any more.
+
+  Moving the scaffolding out surfaced one declaration that should not exist at all:
+  `api.MaxCallbackMaxAge` bounded a callback replay window that only a test-only
+  constructor ever set, so it documented a limit no production path could reach —
+  `NewCallbackAuthenticator` pins `DefaultCallbackMaxAge` and is the only way
+  production builds an authenticator. Both the constant and that constructor are
+  removed rather than relocated. Replay-window tests now narrow `maxAge` directly,
+  which the in-package test file can do without production carrying a second
+  constructor; secret validation still runs through the production one.
+
 - **The retention sweep now runs every stage instead of aborting at the first store
   error** (ENG-680). `List`, `ListExpired`, `ListReaping` and `ListRestoring` are one
   traversal over one bucket, so they fail on identical inputs — which meant the sweep

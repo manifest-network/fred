@@ -37,6 +37,19 @@ func newTestCallbackAuthenticator(t *testing.T, secret string) *CallbackAuthenti
 	return auth
 }
 
+// newTestCallbackAuthenticatorWithMaxAge narrows the replay window on an
+// authenticator built by the production constructor, so replay tests can
+// use a window shorter than DefaultCallbackMaxAge without production
+// carrying a second constructor. Secret validation still runs through
+// NewCallbackAuthenticator; only maxAge is overridden, which this test
+// package can do directly because it is in-package.
+func newTestCallbackAuthenticatorWithMaxAge(t *testing.T, secret string, maxAge time.Duration) *CallbackAuthenticator {
+	t.Helper()
+	auth := newTestCallbackAuthenticator(t, secret)
+	auth.maxAge = maxAge
+	return auth
+}
+
 func TestNewCallbackAuthenticator_SecretValidation(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -343,43 +356,9 @@ func TestCallbackAuthenticator_ReplayProtection(t *testing.T) {
 	assert.False(t, auth.VerifySignatureWithTime(testCallbackMethod, testCallbackURI, payload, signature, signedAt.Add(time.Hour)))
 }
 
-func TestNewCallbackAuthenticatorWithMaxAge_Validation(t *testing.T) {
-	tests := []struct {
-		name    string
-		secret  string
-		maxAge  time.Duration
-		wantErr bool
-	}{
-		{"valid", testCallbackSecret, time.Minute, false},
-		{"valid - 1 second", testCallbackSecret, time.Second, false},
-		{"valid - 30 minutes", testCallbackSecret, 30 * time.Minute, false},
-		{"valid - exactly 1 hour", testCallbackSecret, time.Hour, false},
-		{"invalid - zero maxAge", testCallbackSecret, 0, true},
-		{"invalid - negative maxAge", testCallbackSecret, -time.Minute, true},
-		{"invalid - exceeds max maxAge", testCallbackSecret, 2 * time.Hour, true},
-		{"invalid - short secret", "short", time.Minute, true},
-		{"invalid - empty secret", "", time.Minute, true},
-		{"invalid - 31 byte secret", "1234567890123456789012345678901", time.Minute, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			auth, err := NewCallbackAuthenticatorWithMaxAge(tt.secret, tt.maxAge)
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Nil(t, auth)
-			} else {
-				assert.NoError(t, err)
-				assert.NotNil(t, auth)
-			}
-		})
-	}
-}
-
 func TestCallbackAuthenticator_CustomMaxAge(t *testing.T) {
 	// Create authenticator with 1 minute max age
-	auth, err := NewCallbackAuthenticatorWithMaxAge("test-secret-that-is-at-least-32-chars", time.Minute)
-	require.NoError(t, err)
+	auth := newTestCallbackAuthenticatorWithMaxAge(t, "test-secret-that-is-at-least-32-chars", time.Minute)
 
 	payload := []byte(`{"test":"data"}`)
 	signedAt := time.Now()
@@ -458,8 +437,7 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 
 	// Use injectable time for deterministic testing (no time.Sleep needed)
 	currentTime := time.Now()
-	auth, err := NewCallbackAuthenticatorWithMaxAge(secret, time.Minute)
-	require.NoError(t, err)
+	auth := newTestCallbackAuthenticatorWithMaxAge(t, secret, time.Minute)
 	auth.nowFunc = func() time.Time { return currentTime }
 
 	publishedCallback := &mockCallbackPublisher{}
@@ -577,8 +555,8 @@ func TestCallbackAuthenticator_VerifySignature_Standalone(t *testing.T) {
 	})
 
 	t.Run("accepts_valid_current_signature", func(t *testing.T) {
-		// Reset to real time
-		auth.nowFunc = nil
+		// Reset to the production clock
+		auth.nowFunc = time.Now
 
 		// Create a fresh signature
 		signature := auth.ComputeSignature(testCallbackMethod, testCallbackURI, payload)

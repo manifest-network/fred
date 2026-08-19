@@ -1,7 +1,6 @@
 package api
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,10 +17,6 @@ const (
 	// DefaultCallbackMaxAge is the default maximum age for callback timestamps.
 	// Callbacks older than this are rejected to prevent replay attacks.
 	DefaultCallbackMaxAge = 5 * time.Minute
-
-	// MaxCallbackMaxAge is the maximum allowed value for callback max age.
-	// Values larger than this would undermine replay protection.
-	MaxCallbackMaxAge = 1 * time.Hour
 
 	// MinCallbackSecretLength is the minimum required length for callback secrets.
 	// For full 256-bit security with HMAC-SHA256, use at least 32 bytes.
@@ -50,7 +45,10 @@ type CallbackAuthenticator struct {
 	// matches what the signer used. Empty means no prepend — byte-identical
 	// to the pre-prefix behavior.
 	canonicalPathPrefix string
-	nowFunc             func() time.Time // For testing; defaults to time.Now
+	// nowFunc is the authenticator's clock. NewCallbackAuthenticator is
+	// the only constructor and always sets it to time.Now, so it is never
+	// nil; now() calls it unconditionally.
+	nowFunc func() time.Time
 }
 
 // validateCallbackSecret checks that the secret meets minimum length requirements.
@@ -86,26 +84,6 @@ func (a *CallbackAuthenticator) WithCanonicalPathPrefix(prefix string) *Callback
 	return a
 }
 
-// NewCallbackAuthenticatorWithMaxAge creates a callback authenticator with a custom max age.
-// Returns an error if the secret is shorter than MinCallbackSecretLength bytes,
-// maxAge is not positive, or maxAge exceeds MaxCallbackMaxAge.
-func NewCallbackAuthenticatorWithMaxAge(secret string, maxAge time.Duration) (*CallbackAuthenticator, error) {
-	if err := validateCallbackSecret(secret); err != nil {
-		return nil, err
-	}
-	if maxAge <= 0 {
-		return nil, errors.New("callback max age must be positive")
-	}
-	if maxAge > MaxCallbackMaxAge {
-		return nil, fmt.Errorf("callback max age %v exceeds maximum allowed %v", maxAge, MaxCallbackMaxAge)
-	}
-	return &CallbackAuthenticator{
-		secret:  secret,
-		maxAge:  maxAge,
-		nowFunc: time.Now,
-	}, nil
-}
-
 // ComputeSignature computes the HMAC-SHA256 signature for a request shape with
 // the current timestamp. method and uri must match what the verifier will see
 // on the wire (typically req.Method and req.URL.RequestURI()).
@@ -114,17 +92,9 @@ func (a *CallbackAuthenticator) ComputeSignature(method, uri string, payload []b
 	return hmacauth.SignWithTime(a.secret, method, uri, payload, a.now())
 }
 
-// ComputeSignatureWithTime computes the signature with a specific timestamp (for testing).
-func (a *CallbackAuthenticator) ComputeSignatureWithTime(method, uri string, payload []byte, t time.Time) string {
-	return hmacauth.SignWithTime(a.secret, method, uri, payload, t)
-}
-
-// now returns the current time, using the injected time function if set.
+// now returns the current time through the authenticator's clock.
 func (a *CallbackAuthenticator) now() time.Time {
-	if a.nowFunc != nil {
-		return a.nowFunc()
-	}
-	return time.Now()
+	return a.nowFunc()
 }
 
 // VerifySignature verifies that the provided signature matches the request shape.
@@ -136,7 +106,10 @@ func (a *CallbackAuthenticator) VerifySignature(method, uri string, payload []by
 	return a.VerifySignatureWithTime(method, uri, payload, signature, a.now())
 }
 
-// VerifySignatureWithTime verifies the signature against a reference time (for testing).
+// VerifySignatureWithTime verifies the signature against an explicit
+// reference time. VerifySignature is the production entry point and
+// delegates here with a.now(); tests call it directly to pin the clock
+// and drive the replay window deterministically.
 func (a *CallbackAuthenticator) VerifySignatureWithTime(method, uri string, payload []byte, signature string, now time.Time) bool {
 	return a.verifySignatureWithError(method, uri, payload, signature, now) == nil
 }

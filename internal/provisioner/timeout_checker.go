@@ -51,7 +51,10 @@ func (c *TimeoutChecker) Start(ctx context.Context) {
 	}
 }
 
-// CheckOnce performs a single timeout check. This is exposed for testing.
+// CheckOnce performs one sweep of the in-flight tracker: every provision
+// older than the callback timeout is rejected on-chain, and untracked
+// only once that rejection has either succeeded or become impossible.
+// This is the body of Start's ticker loop, run on every tick.
 func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 	timedOut := c.tracker.GetTimedOutProvisions(c.timeout)
 
