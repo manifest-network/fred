@@ -136,12 +136,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   is already durable at the moment the callback arrives, checked inside the callback
   handler so it cannot pass on timing.
 
-  Two production fields whose only readers were tests are gone as well:
-  `k3s.Backend.httpClient`, which `New` assigned and then never read (the callback
-  sender receives the local), and — as a side effect of removing it —
-  `newCallbackHTTPClient` is now a named function with tests, so
-  `callback_insecure_skip_verify` finally has coverage of the transport it wires up
-  rather than only of the config rule that rejects it in production mode.
+  A third field goes with them, for a different reason: `k3s.Backend.httpClient`,
+  which `New` assigned and then never read, since the callback sender receives the
+  local. Removing it left the client's construction without a seam, so that moved into
+  `newCallbackHTTPClient` — which means `callback_insecure_skip_verify` finally has
+  coverage of the transport it wires up, rather than only of the config rule that
+  rejects it in production mode.
 
   `internal/backend/k3s/**` also joins `.github/workflows/integration.yml`'s path
   filters. `cmd/k3s-backend`'s integration test execs the binary built from that

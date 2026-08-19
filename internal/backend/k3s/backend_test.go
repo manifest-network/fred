@@ -778,10 +778,17 @@ func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *test
 // Why this needs its own test. The two ENG-189 tests above drive the
 // phases in an order the TEST chooses, so they prove each checkpoint
 // guards what it claims but say nothing about how the production
-// composition sequences them. Nothing else covers it either:
-// TestProvision_HappyPath asserts only the callback payload, and
-// TestGetProvision_FromDiagnostics_AfterDeprovision races its own
-// Deprovision against the worker, so it passes either way.
+// composition sequences them. TestProvision_HappyPath asserts only the
+// callback payload, so a reorder leaves it green.
+//
+// The rest of the incumbent coverage is timing-dependent rather than
+// absent, which is a weaker claim than "nothing covers it" and the
+// accurate one. Measured against a swapped composition:
+// TestGetProvision_FromDiagnostics_AfterDeprovision fails 30/30 and
+// TestGetProvision_MapAndDiagnostics_AgreeOnWire 29/30. Both race their
+// own Deprovision against the worker — they catch a reorder by winning
+// that race, not by construction, and the second already loses it once
+// in thirty. This test makes the same check deterministic.
 //
 // Why the order is load-bearing. The callback is what makes Fred
 // deprovision. If the send came first, the resulting Deprovision would
@@ -791,8 +798,9 @@ func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *test
 // nothing to surface for a failed lease.
 //
 // The assertion runs INSIDE the handler, synchronously with the POST.
-// Checking after awaitCallback returns would be the same coin flip: the
-// worker could have written the diagnostic by then under either order.
+// Checking after awaitCallback returns is exactly what makes the tests
+// above timing-dependent: the worker may have written the diagnostic by
+// then under either order.
 // httptest.NewUnstartedServer lets the Backend be assigned before the
 // server goroutine exists, which orders that write ahead of any handler
 // read without a mutex.
