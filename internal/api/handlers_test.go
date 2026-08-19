@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -7029,4 +7030,290 @@ func TestRestoreLease_DemoteExceedsTier422(t *testing.T) {
 	h.RestoreLease(rec, req)
 
 	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code, "body: %s", rec.Body.String())
+
+	// ENG-620: the 422 message must carry the backend's detail EXACTLY ONCE.
+	// It used to be doubled — fred re-prefixed a message that already opened
+	// with the same sentinel text — so tenants read "retained data exceeds the
+	// requested smaller tier: retained data exceeds the requested smaller
+	// tier: …".
+	assert.Equal(t, 1, strings.Count(rec.Body.String(), "retained data exceeds the requested smaller tier"),
+		"the demote 422 detail must appear exactly once, not doubled: %s", rec.Body.String())
+}
+
+// TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded is the ENG-620
+// regression at the tenant boundary: whatever a backend puts in a 4xx body it
+// did not author to contract, none of it reaches the tenant.
+//
+// The client-layer twin (TestHTTPClient_MalformedErrorBody_IsNeverForwarded)
+// proves the error value is clean; this proves the HTTP response is, which is
+// what an attacker actually reads.
+func TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
+	const hostPathSentinel = `btrfs qgroup show /var/lib/fred/volumes/fred-abc-app-0: exit status 1`
+
+	cases := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{"text/plain 400", http.StatusBadRequest, "text/plain", hostPathSentinel},
+		{"html 400", http.StatusBadRequest, "text/html", "<html>400 " + hostPathSentinel + "</html>"},
+		{"truncated json 400", http.StatusBadRequest, "application/json", `{"error":"` + hostPathSentinel},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kp := testutil.NewTestKeyPair("test-tenant")
+			leaseUUID := testutil.ValidUUID1
+			providerUUID := testutil.ValidUUID2
+
+			chainClient := &mockChainClient{
+				getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+					if uuid == leaseUUID {
+						return &billingtypes.Lease{
+							Uuid:         leaseUUID,
+							Tenant:       kp.Address,
+							ProviderUuid: providerUUID,
+							State:        billingtypes.LEASE_STATE_PENDING,
+						}, nil
+					}
+					return nil, nil
+				},
+			}
+
+			backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer backendServer.Close()
+
+			backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name:    "test-backend-malformed",
+				BaseURL: backendServer.URL,
+				Timeout: 5 * time.Second,
+			})
+			router, err := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+			})
+			require.NoError(t, err)
+
+			placement := &mockPlacementLookup{
+				getFunc: func(uuid string) string {
+					if uuid == fromLeaseUUID {
+						return "test-backend-malformed"
+					}
+					return ""
+				},
+			}
+
+			h := &Handlers{
+				client:          chainClient,
+				backendRouter:   router,
+				placementLookup: placement,
+				providerUUID:    providerUUID,
+				bech32Prefix:    "manifest",
+			}
+
+			validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
+			reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
+			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
+			req.Header.Set("Authorization", "Bearer "+validToken)
+			req.SetPathValue("lease_uuid", leaseUUID)
+
+			rec := httptest.NewRecorder()
+			h.RestoreLease(rec, req)
+
+			body := rec.Body.String()
+			assert.NotContains(t, body, hostPathSentinel,
+				"the raw backend body must never reach the tenant response")
+			assert.NotContains(t, body, "qgroup", "no fragment of the raw body may reach the tenant")
+			assert.NotContains(t, body, "/var/lib/fred", "no host path may reach the tenant")
+			assert.Equal(t, http.StatusBadGateway, rec.Code,
+				"an off-contract backend body is an upstream fault, not a tenant one: %s", body)
+		})
+	}
+}
+
+// detailErrorFromBackend builds the error a real backend 400 produces, by
+// driving the production client against an httptest backend whose response
+// body carries the given detail. Deliberately not a constructor exported from
+// internal/backend: that would be a test-only hook in production code, and it
+// would also let this test pass against a detail shape the wire cannot
+// actually produce.
+func detailErrorFromBackend(t *testing.T, detail string) error {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]string{"error": detail})
+	require.NoError(t, err)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+
+	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name:    "detail-src",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+	err = client.Update(context.Background(), backend.UpdateRequest{LeaseUUID: testutil.ValidUUID1})
+	require.ErrorIs(t, err, backend.ErrValidation)
+	return err
+}
+
+// TestTenantDetail covers the helper that decides what a backend-originated
+// 4xx says to a tenant. Its three jobs are all security-relevant: relay only
+// the detail authored inside a validated envelope, never the wrapped chain;
+// strip control characters, which are the log-forging and terminal-escape
+// vector in relayed text; and bound the length.
+func TestTenantDetail(t *testing.T) {
+	const fallback = "the request was rejected as invalid"
+
+	t.Run("bare sentinel falls back to fred's own message", func(t *testing.T) {
+		// A sentinel carries no backend detail, so its own text must NOT be
+		// relayed as though a backend had authored it for the tenant.
+		got := tenantDetail(backend.ErrValidation, fallback)
+		assert.Equal(t, fallback, got)
+	})
+
+	t.Run("wrapped non-detail error falls back", func(t *testing.T) {
+		// fmt.Errorf-wrapped chains are exactly what used to reach tenants.
+		err := fmt.Errorf("adopt retained volumes: %w", backend.ErrValidation)
+		got := tenantDetail(err, fallback)
+		assert.Equal(t, fallback, got)
+		assert.NotContains(t, got, "adopt retained volumes")
+	})
+
+	t.Run("strips control characters", func(t *testing.T) {
+		// \r and ESC forge extra lines / terminal sequences in anything that
+		// renders the body; \n and \t collapse to a space so words stay apart.
+		err := detailErrorFromBackend(t, "bad\rmanifest\x1b[31m: field\nx\ty")
+		got := tenantDetail(err, fallback)
+		assert.NotContains(t, got, "\r")
+		assert.NotContains(t, got, "\x1b")
+		assert.NotContains(t, got, "\n")
+		assert.Equal(t, "badmanifest[31m: field x y", got)
+	})
+
+	t.Run("bounds an overlong detail on a rune boundary", func(t *testing.T) {
+		// Multi-byte runes so a naive byte slice would split one. 1000 runes =
+		// 2000 bytes: comfortably over maxTenantDetailBytes but under the
+		// client's 4 KiB body read cap, which is the OTHER bound and kicks in
+		// first — a body large enough to hit it is truncated mid-JSON and
+		// becomes ErrMalformedErrorBody instead of arriving here.
+		err := detailErrorFromBackend(t, strings.Repeat("é", 1000))
+		got := tenantDetail(err, fallback)
+		assert.LessOrEqual(t, len(got), maxTenantDetailBytes+len("…"))
+		assert.True(t, utf8.ValidString(got), "must not split a multi-byte rune: %q", got)
+		assert.True(t, strings.HasSuffix(got, "…"))
+	})
+
+	t.Run("relays a real detail unchanged", func(t *testing.T) {
+		const detail = `service "web": depends_on references unknown service "db"`
+		err := detailErrorFromBackend(t, detail)
+		assert.Equal(t, detail, tenantDetail(err, fallback))
+	})
+
+	t.Run("detail of only control characters falls back", func(t *testing.T) {
+		err := detailErrorFromBackend(t, "\x00\x01\x02")
+		assert.Equal(t, fallback, tenantDetail(err, fallback))
+	})
+}
+
+// TestRestoreLease_422KeepsLoadtestContract pins the substrings an EXTERNAL
+// consumer greps out of the 422 body. manifest-loadtest scenario
+// 17-restore-cross-tier.js hard-checks `body.toLowerCase().includes('tier')`
+// (:212) and separates the two refusal arms with /bytes used exceeds disk_mb=/
+// and /unable to verify|unmeasur/ (:165, :185). ENG-620 changed how this
+// message is composed, so the contract is asserted here rather than discovered
+// by a red loadtest run.
+//
+// The two bodies below are what checkDemoteFit actually produces
+// (internal/backend/docker/restore.go), wrapped in the docker-backend envelope.
+func TestRestoreLease_422KeepsLoadtestContract(t *testing.T) {
+	arms := map[string]string{
+		"measured_exceeds": `retained data exceeds the requested smaller tier: service "app": 2097152 bytes used exceeds disk_mb=1 cap (1048576 bytes)`,
+		"unmeasurable":     `retained data exceeds the requested smaller tier: service "app": unable to verify retained data fits the requested tier`,
+	}
+
+	for arm, backendMsg := range arms {
+		t.Run(arm, func(t *testing.T) {
+			kp := testutil.NewTestKeyPair("test-tenant")
+			leaseUUID := testutil.ValidUUID1
+			providerUUID := testutil.ValidUUID2
+
+			chainClient := &mockChainClient{
+				getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+					if uuid == leaseUUID {
+						return &billingtypes.Lease{
+							Uuid: leaseUUID, Tenant: kp.Address,
+							ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_PENDING,
+						}, nil
+					}
+					return nil, nil
+				},
+			}
+
+			body, err := json.Marshal(map[string]string{
+				"error": backendMsg,
+				"code":  backend.CodeDemoteExceedsTier,
+			})
+			require.NoError(t, err)
+
+			backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = w.Write(body)
+			}))
+			defer backendServer.Close()
+
+			backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+				Name: "loadtest-contract", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
+			})
+			router, rerr := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+			})
+			require.NoError(t, rerr)
+
+			h := &Handlers{
+				client:        chainClient,
+				backendRouter: router,
+				placementLookup: &mockPlacementLookup{getFunc: func(uuid string) string {
+					if uuid == fromLeaseUUID {
+						return "loadtest-contract"
+					}
+					return ""
+				}},
+				providerUUID: providerUUID,
+				bech32Prefix: "manifest",
+			}
+
+			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore",
+				strings.NewReader(`{"from_lease_uuid":"`+fromLeaseUUID+`"}`))
+			req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+			req.SetPathValue("lease_uuid", leaseUUID)
+
+			rec := httptest.NewRecorder()
+			h.RestoreLease(rec, req)
+
+			got := rec.Body.String()
+			require.Equal(t, http.StatusUnprocessableEntity, rec.Code, "body: %s", got)
+			assert.Contains(t, strings.ToLower(got), "tier",
+				"manifest-loadtest 17-restore-cross-tier.js:212 hard-checks for 'tier'")
+			assert.Equal(t, 1, strings.Count(got, "retained data exceeds the requested smaller tier"),
+				"the sentinel text must appear exactly once, not doubled: %s", got)
+
+			switch arm {
+			case "measured_exceeds":
+				assert.Contains(t, got, "bytes used exceeds disk_mb=",
+					"loadtest :185 distinguishes the measured arm by this substring")
+			case "unmeasurable":
+				assert.Contains(t, got, "unable to verify",
+					"loadtest :165/:185 distinguishes the unmeasurable arm by this substring")
+			}
+		})
+	}
 }

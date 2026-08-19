@@ -302,14 +302,15 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 
 		client := backend.NewHTTPClient(backend.HTTPClientConfig{
-			Name:                bcfg.Name,
-			BaseURL:             bcfg.URL,
-			Timeout:             bcfg.Timeout,
-			Secret:              string(cfg.CallbackSecret),
-			TLSClientConfig:     tlsClientConfig,
-			RequestDuration:     metrics.BackendRequestDuration,
-			RequestsTotal:       metrics.BackendRequestsTotal,
-			CircuitBreakerState: metrics.BackendCircuitBreakerState,
+			Name:                    bcfg.Name,
+			BaseURL:                 bcfg.URL,
+			Timeout:                 bcfg.Timeout,
+			Secret:                  string(cfg.CallbackSecret),
+			TLSClientConfig:         tlsClientConfig,
+			RequestDuration:         metrics.BackendRequestDuration,
+			RequestsTotal:           metrics.BackendRequestsTotal,
+			CircuitBreakerState:     metrics.BackendCircuitBreakerState,
+			MalformedErrorBodyTotal: metrics.BackendMalformedErrorBodyTotal,
 		})
 
 		backendEntries = append(backendEntries, backend.BackendEntry{

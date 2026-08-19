@@ -267,6 +267,72 @@ func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
 	assert.False(t, hadError, "ErrAlreadyProvisioned must be treated as benign")
 }
 
+// TestHandleProvisionError_MalformedErrorBodyIsTransient is the reconciler half
+// of ENG-620/ENG-739: a backend 4xx whose body fred could not parse must not
+// reject a PENDING lease or close an ACTIVE one on-chain.
+//
+// Before the fix, parseValidationError wrapped ANY 400 — including one an
+// intermediary produced — in backend.ErrValidation, which lands in the
+// permanent switch below and terminates the lease.
+//
+// Two independent things now prevent that, and this test passes on either:
+// the sentinel does not wrap ErrValidation (pinned at the client by
+// TestHTTPClient_MalformedErrorBody_IsNeverForwarded, which asserts
+// NotErrorIs(err, ErrValidation)), and handleProvisionError has an explicit
+// branch for it. What this test pins is the OUTCOME — no on-chain
+// reject/close — which is the property that must hold however it is achieved.
+func TestHandleProvisionError_MalformedErrorBodyIsTransient(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state billingtypes.LeaseState
+	}{
+		{"active lease is not closed", billingtypes.LEASE_STATE_ACTIVE},
+		{"pending lease is not rejected", billingtypes.LEASE_STATE_PENDING},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var closed, rejected []string
+			mockChain := &chaintest.MockClient{
+				CloseLeasesFunc: func(_ context.Context, uuids []string, _ string) (uint64, []string, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					closed = append(closed, uuids...)
+					return uint64(len(uuids)), []string{"tx-hash"}, nil
+				},
+				RejectLeasesFunc: func(_ context.Context, uuids []string, _ string) (uint64, []string, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					rejected = append(rejected, uuids...)
+					return uint64(len(uuids)), []string{"tx-hash"}, nil
+				},
+			}
+			mockBackend := &mockReconcilerBackend{name: "test"}
+			router, _ := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+			})
+			r, err := NewReconciler(
+				ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+				mockChain, noopAck, router, nil, nil,
+			)
+			require.NoError(t, err)
+
+			lease := billingtypes.Lease{Uuid: "lease-1", Tenant: "tenant-a", State: tc.state}
+			hadError := false
+			r.handleProvisionError(
+				context.Background(),
+				fmt.Errorf("provision failed: %w", backend.ErrMalformedErrorBody),
+				"lease-1", lease, &hadError,
+			)
+
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Empty(t, closed, "an unparseable backend body must NOT close an active lease")
+			assert.Empty(t, rejected, "an unparseable backend body must NOT reject a pending lease")
+			assert.True(t, hadError, "must flag the cycle for retry")
+		})
+	}
+}
+
 // TestHandleProvisionError_CircuitOpenIsTransient verifies that a backend
 // circuit-open error is treated as transient: the reconciler must NOT close an
 // active lease on-chain (the breaker auto-recovers), and must flag the cycle

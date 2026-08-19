@@ -57,6 +57,7 @@ var labelledMetricNames = []string{
 	"fred_backend_circuit_breaker_state",
 	"fred_backend_healthy",
 	"fred_backend_insufficient_resources_total",
+	"fred_backend_malformed_error_body_total",
 	"fred_backend_request_duration_seconds",
 	"fred_backend_requests_total",
 	"fred_chain_gas_simulation_total",
@@ -120,6 +121,7 @@ func allCollectors() []prometheus.Collector {
 		BackendRequestDuration,
 		BackendRequestsTotal,
 		BackendInsufficientResourcesTotal,
+		BackendMalformedErrorBodyTotal,
 		BackendHealthy,
 		BackendCircuitBreakerState,
 		BackendAllocatedCPURatio,
@@ -339,6 +341,7 @@ func TestCounterVecLabels(t *testing.T) {
 	})
 	assert.NotPanics(t, func() {
 		BackendInsufficientResourcesTotal.WithLabelValues("docker")
+		BackendMalformedErrorBodyTotal.WithLabelValues("docker", "restore")
 	})
 	assert.NotPanics(t, func() {
 		BackendHealthy.WithLabelValues("docker")

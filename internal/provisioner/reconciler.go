@@ -1196,6 +1196,7 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 //   - backend.ErrAlreadyProvisioned: skip (transient race with concurrent Deprovision)
 //   - errPayloadNotAvailable: reject (PENDING) or close (ACTIVE) the lease
 //   - backend.ErrValidation: reject (PENDING) or close (ACTIVE) the lease
+//   - backend.ErrMalformedErrorBody: transient (backend answered off-contract) — flag for retry, never terminate
 //   - ErrPlacementUnresolvable: transient (backend absent from config) — flag for retry, never terminate
 //   - backend.ErrCircuitOpen: transient (breaker auto-recovers) — flag for retry, never terminate
 //   - other errors: log and flag for retry next cycle
@@ -1221,6 +1222,30 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		// was paused, renamed or is mid-redeploy — closing paying leases for that
 		// would turn a maintenance window into permanent data loss (ENG-498).
 		slog.Error("reconcile: refusing to provision, lease is placed on a backend the router does not know",
+			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+			"error", err,
+		)
+		*hadError = true
+		return
+	}
+	if errors.Is(err, backend.ErrMalformedErrorBody) {
+		// The backend rejected the request with a body fred could not parse, so
+		// fred does not know WHY — and cannot know the backend even authored it
+		// (an intermediary emitting its own 4xx looks identical). Stated as its
+		// own branch rather than left to the transient default below so that
+		// "never terminate on an unparseable answer" is a property of the code:
+		// the pre-ENG-620 client wrapped every 400 in ErrValidation, which lands
+		// in the permanent switch and CLOSES an ACTIVE lease on-chain.
+		//
+		// Operator-introduced, not tenant-reachable (ENG-739): docker-backend
+		// routes every 4xx through its ErrorResponse writer, and the ENG-356
+		// snapshot gate already defers a backend whose GET /provisions did not
+		// answer, so the reachable variant is a selective intermediary failure.
+		// Self-limiting from the other side too: the client counts this toward
+		// the circuit breaker, so a persistently off-contract backend degrades
+		// into the ErrCircuitOpen arm below rather than looping here forever.
+		slog.Error("reconcile: backend returned an unusable error body, will retry next cycle",
 			"lease_uuid", leaseUUID,
 			"tenant", lease.Tenant,
 			"error", err,

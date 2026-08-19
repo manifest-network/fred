@@ -136,12 +136,6 @@ func TestHTTPClient_Provision_ValidationErrorCodes(t *testing.T) {
 			ErrValidation,
 			"something new",
 		},
-		{
-			"non-JSON body (backwards compat)",
-			`plain text error`,
-			ErrValidation,
-			"plain text error",
-		},
 	}
 
 	for _, tt := range tests {
@@ -165,6 +159,92 @@ func TestHTTPClient_Provision_ValidationErrorCodes(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantMessage)
 		})
 	}
+}
+
+// TestHTTPClient_MalformedErrorBody_IsNeverForwarded is the ENG-620 regression:
+// a client-error body that is not the declared JSON error envelope must never
+// reach the caller as text, and must not be filed as a permanent validation
+// failure.
+//
+// Both properties matter and they are separate. The first is the information
+// disclosure the ticket is about. The second is the ENG-498 failure class: the
+// old code wrapped ANY 400 in ErrValidation, which the reconciler treats as
+// permanent — it rejects a PENDING lease and closes an ACTIVE one on-chain. A
+// body fred could not parse may not even have come from the backend.
+func TestHTTPClient_MalformedErrorBody_IsNeverForwarded(t *testing.T) {
+	// A host path plus raw command output, the exact shape ENG-508 removed from
+	// the async path. If any substring of this reaches the caller, the tenant
+	// sees it too — internal/api writes err.Error() into the 4xx body.
+	const hostPathSentinel = `btrfs qgroup show /var/lib/fred/volumes/fred-abc-app-0: exit status 1`
+
+	bodies := map[string]string{
+		"text/plain body":    hostPathSentinel,
+		"html error page":    "<html><body>400 " + hostPathSentinel + "</body></html>",
+		"truncated json":     `{"error":"` + hostPathSentinel,
+		"json array not obj": `["` + hostPathSentinel + `"]`,
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name:    "test-malformed-400",
+				BaseURL: server.URL,
+				Timeout: 5 * time.Second,
+			})
+
+			err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+			require.Error(t, err)
+
+			assert.NotContains(t, err.Error(), hostPathSentinel,
+				"the raw backend body must never survive into the error a tenant can read")
+			assert.NotContains(t, err.Error(), "qgroup",
+				"no fragment of the raw body may survive either")
+			assert.ErrorIs(t, err, ErrMalformedErrorBody)
+			assert.NotErrorIs(t, err, ErrValidation,
+				"an unparseable body must NOT be classified permanent: ErrValidation makes the "+
+					"reconciler reject a PENDING lease and close an ACTIVE one on-chain (ENG-498)")
+		})
+	}
+}
+
+// TestHTTPClient_MalformedErrorBody_CountedAndLogged verifies the operator half
+// of the CWE-209 split: the detail withheld from the tenant is relocated to a
+// metric and the log, not deleted.
+func TestHTTPClient_MalformedErrorBody_CountedAndLogged(t *testing.T) {
+	counter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "test_malformed_error_body_total"},
+		[]string{"backend", "operation"},
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:                    "be-1",
+		BaseURL:                 server.URL,
+		Timeout:                 5 * time.Second,
+		MalformedErrorBodyTotal: counter,
+	})
+
+	// Seed the OPPOSITE expectation first: WithLabelValues auto-creates a series
+	// at 0, so asserting ==0 on a never-written counter passes vacuously.
+	counter.WithLabelValues("be-1", "provision").Add(7)
+	require.InDelta(t, 7.0, promtestutil.ToFloat64(counter.WithLabelValues("be-1", "provision")), 0.001)
+
+	err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+	require.ErrorIs(t, err, ErrMalformedErrorBody)
+
+	assert.InDelta(t, 8.0, promtestutil.ToFloat64(counter.WithLabelValues("be-1", "provision")), 0.001,
+		"a malformed error body must be counted for the backend that sent it")
 }
 
 // TestHTTPClient_Provision_ValidationError_DoesNotTripCircuitBreaker verifies that
@@ -1850,9 +1930,22 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 			wantErr:    ErrInsufficientResources,
 		},
 		{
-			name:       "400 Bad Request returns ErrValidation",
+			// On-contract 400: the envelope is present, so the verdict stands
+			// and stays PERMANENT (reject/close on-chain).
+			name:       "400 Bad Request with the error envelope returns ErrValidation",
 			statusCode: http.StatusBadRequest,
+			body:       `{"error":"validation error: invalid manifest: bad shape"}`,
 			wantErr:    ErrValidation,
+		},
+		{
+			// ENG-620: a bodiless 400 is off-contract and indistinguishable
+			// from one an intermediary produced, so it must NOT be filed as a
+			// permanent tenant-side failure. Previously this row asserted
+			// ErrValidation, which is the classification that lets a stray 400
+			// close an ACTIVE lease on-chain (ENG-498 class).
+			name:       "400 Bad Request with no body returns ErrMalformedErrorBody",
+			statusCode: http.StatusBadRequest,
+			wantErr:    ErrMalformedErrorBody,
 		},
 	}
 

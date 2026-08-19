@@ -630,6 +630,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- **providerd no longer relays an unparseable backend error body to tenants, and no longer
+  treats one as the tenant's fault.** ENG-508 closed the stored/async `last_error` leak; this
+  closes its synchronous twin on `POST /restore` and `POST /update`. The backend HTTP client
+  substituted the raw response body — up to 4 KiB, verbatim — into the error it returned
+  whenever a client-error body was not the declared `{"error": ...}` envelope, and
+  `internal/api` wrote that straight into its own 4xx body. Fred now authors that message
+  itself, records the raw body and a new `fred_backend_malformed_error_body_total{backend,
+  operation}` counter operator-side, and answers `502` — the fault is upstream. The
+  tenant-visible detail a backend *did* author inside a validated envelope still crosses
+  (manifest validation messages, the registry allowlist, demote byte counts): those are the
+  tenant's own input and the provider's published policy, and suppressing them would only make
+  a 4xx unactionable. It is now bounded and stripped of control characters.
+
+  The classification changes with it (ENG-739). An unparseable `400` was wrapped in
+  `ErrValidation`, which the reconciler treats as **permanent** — it rejects a PENDING lease
+  and **closes an ACTIVE one on-chain** — even though nothing established the backend had
+  authored that body. This is an *operator-introduced intermediary being misread as a
+  permanent tenant-side failure*, not something a tenant can trigger: `docker-backend` routes
+  every 4xx through its error-envelope writer, and the ENG-356 snapshot gate already defers
+  every lease of a backend whose `GET /provisions` did not answer, so the reachable variant
+  needs a selective failure (a `400` on `POST /provision` while `GET /provisions` still
+  answers — a body-inspecting WAF rule). It is now transient, and self-limiting from the
+  other side: the client counts it toward the circuit breaker, so a persistently off-contract
+  backend degrades into the already-transient circuit-open path instead of retrying forever.
+
+  In practice the shipped `docker-backend` already curates its 4xx bodies — the ENG-438 demote
+  gate deliberately withholds the volume-usage error because it can embed host paths — so this
+  is hardening rather than a live leak; the in-repo binary that exercised the fallback was
+  `mock-backend`, which emitted `text/plain` errors and now emits the envelope.
+  `BACKEND_GUIDE.md` gains the matching normative clause: the `error` field is tenant-visible
+  and must carry no host paths or raw command output, and `validation_code` is documented for
+  the first time. Tenants may now see `502` where an off-contract backend previously produced
+  `400`. (ENG-620, ENG-739)
+- **A tenant-facing `422` from `/restore` no longer repeats itself.** Fred re-prefixed the
+  demote-exceeds-tier message with a sentinel the backend had already baked into it, so the
+  body read `retained data exceeds the requested smaller tier: retained data exceeds the
+  requested smaller tier: service "app": ...`. The sentinel now travels through the error
+  chain for `errors.Is` rather than through string concatenation. (ENG-620)
 - providerd no longer returns the verbose backend `last_error` (host filesystem paths + raw
   command stderr) to tenants on `GET /status`, `/provision`, `/releases`, or `/logs`. **Breaking:**
   the `last_error` response field is removed; a K8s-shaped `reason` (machine code) + `message`
