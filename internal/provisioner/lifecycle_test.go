@@ -2,14 +2,18 @@ package provisioner
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ThreeDotsLabs/watermill"
+	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // Lifecycle tests for the ack batcher's ownership (ENG-723).
@@ -25,6 +29,13 @@ import (
 // short ack batch interval so a real ack round-trip completes quickly.
 func newLifecycleTestManager(t *testing.T) *Manager {
 	t.Helper()
+	return newLifecycleTestManagerWithPayloadStore(t, nil)
+}
+
+// newLifecycleTestManagerWithPayloadStore is newLifecycleTestManager with a
+// payload store attached, for the tests that assert Close() shuts it down.
+func newLifecycleTestManagerWithPayloadStore(t *testing.T, payloadStore *payload.Store) *Manager {
+	t.Helper()
 
 	router, err := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: &mockManagerBackend{name: "test"}, IsDefault: true}},
@@ -34,6 +45,7 @@ func newLifecycleTestManager(t *testing.T) *Manager {
 	m, err := NewManager(ManagerConfig{
 		ProviderUUID:     "provider-1",
 		CallbackBaseURL:  "http://localhost:8080",
+		PayloadStore:     payloadStore,
 		AckBatchInterval: 20 * time.Millisecond,
 		AckBatchSize:     10,
 	}, router, &mockAckChainClient{pendingLeases: []string{"lease-1"}})
@@ -114,6 +126,126 @@ func TestManager_CloseCancelsLifecycleContext(t *testing.T) {
 	select {
 	case <-errCh:
 	case <-time.After(2 * time.Second):
+		t.Error("Manager.Start() did not return after Close() + cancel")
+	}
+}
+
+// stuckSubscriber is a message.Subscriber whose subscription channel is never
+// closed. Watermill's handler body is `for msg := range h.messagesCh`
+// (watermill v1.5.1 message/router.go), so the handler goroutine never returns
+// and Router.handlersWg never drains. That is the one and only condition under
+// which Router.Close() returns an error: it reports "router close timeout" when
+// waitForHandlers exceeds RouterConfig.CloseTimeout. (Closing an already-closed
+// router cannot error — Close() returns nil early on r.closed — so a double
+// close is not a usable failure injection here.)
+type stuckSubscriber struct {
+	ch chan *message.Message
+}
+
+func (s *stuckSubscriber) Subscribe(context.Context, string) (<-chan *message.Message, error) {
+	return s.ch, nil
+}
+
+func (s *stuckSubscriber) Close() error { return nil }
+
+// TestManager_CloseFinishesShutdownWhenRouterCloseFails is the regression test
+// for the early return Close() used to take (ENG-723):
+//
+//	if err := m.wmRouter.Close(); err != nil { return err }
+//
+// which skipped the ack batcher stop, the lifecycle-context cancellation and
+// the payload store close — every reclaim step Close() exists to perform. The
+// step it skipped last is the costliest: Manager.Close() is the only closer of
+// the payload store in production (cmd/providerd/main.go builds it with no
+// defer of its own), and payload.Store.Close() is what cancels the store's
+// context and waits for writerLoop's final drain-and-flush, so an early return
+// loses whatever that last flush would have committed. Callers are not
+// stranded either way — writerLoop's flush ticker releases each result channel
+// while the loop lives, and once the store's context is done a caller returns
+// immediately — so the cost is durability, not a blocked goroutine.
+//
+// Reintroducing that early return keeps assertion (a) passing — it returns the
+// router error too — and fails (b), (c) and (d). Verified by mutation, not
+// assumed.
+func TestManager_CloseFinishesShutdownWhenRouterCloseFails(t *testing.T) {
+	payloadStore, err := payload.NewStore(payload.StoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "payloads.db"),
+	})
+	require.NoError(t, err)
+	// Close() is idempotent; this only covers an early t.Fatal below.
+	t.Cleanup(func() { _ = payloadStore.Close() })
+
+	m := newLifecycleTestManagerWithPayloadStore(t, payloadStore)
+
+	// Swap in a router that cannot close cleanly. NewManager hardcodes
+	// message.RouterConfig{}, whose CloseTimeout defaults to 30s, and exposes no
+	// knob for it — so the substitution is also what keeps this test at ~0.3s
+	// rather than ~30s. Assigning an unexported field from an in-package test
+	// adds nothing to production code (cf. manager_test.go's
+	// &Manager{leaseEventSink: sink}).
+	stuck := &stuckSubscriber{ch: make(chan *message.Message)}
+	// Reclaim the wedged handler goroutine when the test ends: closing the
+	// channel ends its range loop. watchAllHandlersStopped then observes
+	// IsClosed() == true and returns instead of closing the router again.
+	t.Cleanup(func() { close(stuck.ch) })
+
+	wedged, err := message.NewRouter(
+		message.RouterConfig{CloseTimeout: 300 * time.Millisecond},
+		watermill.NopLogger{},
+	)
+	require.NoError(t, err)
+	wedged.AddNoPublisherHandler("wedged", "wedged-topic", stuck, func(*message.Message) error { return nil })
+	m.wmRouter = wedged
+
+	startCtx, cancelStart := context.WithCancel(context.Background())
+	defer cancelStart()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.Start(startCtx) }()
+
+	select {
+	case <-m.Running():
+	case <-time.After(5 * time.Second):
+		t.Fatal("manager did not start")
+	}
+
+	// Positive controls. Without them every post-Close assertion below passes
+	// vacuously against a batcher that never ran and a store that was never open.
+	acked, _, ackErr := m.AckBatcher().Acknowledge(startCtx, "lease-1")
+	require.NoError(t, ackErr, "ack lanes must be live before Close()")
+	require.True(t, acked, "ack lanes must be live before Close()")
+	require.NoError(t, m.stopCtx.Err(), "lifecycle context must be live before Close()")
+	require.NoError(t, m.payloadStore.Healthy(), "payload store must be open before Close()")
+
+	closeErr := m.Close()
+
+	// (a) The router error reaches the caller, joined with the payload store's.
+	// Watermill builds it with errors.New at the call site, so a substring is
+	// the only handle; go.mod pins v1.5.1, where it is Router.Close()'s only
+	// error, so a bump that reworded it would fail here loudly.
+	assert.ErrorContains(t, closeErr, "router close timeout",
+		"Close() must report the router failure")
+
+	// (b) The lifecycle context is canceled anyway.
+	assert.Error(t, m.stopCtx.Err(),
+		"a failing router close must not skip the lifecycle-context cancellation (ENG-723)")
+
+	// (c) The ack batcher lanes are stopped anyway — and gone, not merely quiescent.
+	assert.True(t, waitGroupSettled(m.ackBatcher.wg, 5*time.Second),
+		"a failing router close must not skip the ack batcher shutdown (ENG-723)")
+	_, _, ackErr = m.AckBatcher().Acknowledge(context.Background(), "lease-1")
+	assert.ErrorIs(t, ackErr, errAckLaneUnavailable,
+		"the ack lanes must be gone after Close(), not merely idle")
+
+	// (d) The payload store is closed anyway. bbolt reports "database not open"
+	// for a View against a closed DB.
+	assert.Error(t, m.payloadStore.Healthy(),
+		"a failing router close must not skip the payload store close (ENG-723)")
+
+	cancelStart()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
 		t.Error("Manager.Start() did not return after Close() + cancel")
 	}
 }
