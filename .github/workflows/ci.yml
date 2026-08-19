@@ -13,10 +13,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
@@ -26,10 +26,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
@@ -44,10 +44,10 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
@@ -66,17 +66,38 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
         with:
           version: ${{ steps.golangci.outputs.version }}
+
+  # Guards the ENG-509 supply-chain fix: the release job holds `id-token: write`
+  # + `packages: write`, and GitHub scopes permissions per job, so any action it
+  # runs inherits the signing and publish identity. A floating tag (`@v4`) is
+  # attacker-mutable; a 40-char commit SHA is not. Fail closed so a new workflow
+  # step cannot quietly reintroduce one.
+  actions-pinned:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Every `uses:` must be pinned to a 40-char commit SHA
+        run: |
+          unpinned="$(grep -rnE '^[[:space:]]*(- )?uses:' .github/workflows/ \
+            | grep -vE 'uses: [^@]+@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)"
+          if [ -n "$unpinned" ]; then
+            echo "::error::unpinned GitHub Action(s) — pin to a 40-char commit SHA with a '# vX.Y.Z' comment:"
+            echo "$unpinned"
+            exit 1
+          fi
+          echo "all $(grep -rcE '^[[:space:]]*(- )?uses:' .github/workflows/ | awk -F: '{n+=$2} END{print n}') action references are SHA-pinned"
 
   vulncheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 

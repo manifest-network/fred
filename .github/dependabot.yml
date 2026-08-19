@@ -1,0 +1,28 @@
+# Dependabot version updates.
+#
+# Scope is deliberately limited to `github-actions`. Every `uses:` in
+# .github/workflows/ is pinned to a 40-char commit SHA (ENG-509) so that a
+# hijacked upstream tag cannot reach the release job's `id-token: write` +
+# `packages: write` identity; that pinning is only safe if something keeps the
+# pins current, which is what this config does.
+#
+# `gomod` is NOT enabled on purpose. Go dependency bumps here are driven by the
+# govulncheck gate and its triaged allowlist (.github/govulncheck-allowlist.txt),
+# which requires per-advisory reachability analysis that an automated bump PR
+# cannot do — see CONTRIBUTING.md and the release notes for the allowlist
+# convention.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR per week for routine pin refreshes; security-relevant majors
+      # still surface individually via Dependabot alerts.
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci
