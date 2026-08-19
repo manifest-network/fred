@@ -90,6 +90,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   this counter is the only signal that the verification is still failing.
   Deliberately not paired with a `*_last_success_timestamp` gauge.
 
+### Changed
+
+- **Test-only scaffolding no longer compiles into fred's production packages**
+  (ENG-354). Declarations whose only callers were tests — `leasesm`'s
+  `FireProvisionXxxForTest` helpers, `Manager.Tracker` / `Manager.TimeoutChecker`,
+  `EventBroker.subscriberCount`, `CallbackAuthenticator.ComputeSignatureWithTime`
+  and `hmacauth.SignRequestWithTime` among them — sat in ordinary `.go` files, so
+  nothing stopped a production call site from being added to one. They now live in
+  in-package `export_test.go` files, or were deleted once their callers moved to the
+  production seam underneath, and `internal/testutil` carries a guard test that fails
+  on a new one. The linker had already been dropping most of them (`go tool nm` on the
+  previous `docker-backend` finds zero `FireProvision` symbols) but not all: three —
+  `TrackInFlightWithStartTime`, `Manager.Tracker` and `Manager.TimeoutChecker` — were
+  present in the shipped `providerd` and are not any more.
+
+  Moving the scaffolding out surfaced one declaration that should not exist at all:
+  `api.MaxCallbackMaxAge` bounded a callback replay window that only a test-only
+  constructor ever set, so it documented a limit no production path could reach —
+  `NewCallbackAuthenticator` pins `DefaultCallbackMaxAge` and is the only way
+  production builds an authenticator. Both the constant and that constructor are
+  removed rather than relocated. Replay-window tests now narrow `maxAge` directly,
+  which the in-package test file can do without production carrying a second
+  constructor; secret validation still runs through the production one.
+
+- **The retention sweep now runs every stage instead of aborting at the first store
+  error** (ENG-680). `List`, `ListExpired`, `ListReaping` and `ListRestoring` are one
+  traversal over one bucket, so they fail on identical inputs — which meant the sweep
+  always died at the first of them and never reached the orphan reconcile. Its
+  `retention_orphan_skips_total{reason="store_error"}` arm was therefore unreachable
+  under precisely the condition it was written to report. The stages are independent by
+  construction (each re-reads the store for itself, and each already fails safe on its
+  own read), so running them all can add information but never a destroy. Stage errors
+  are joined, so the sweep's log line now names every failing step rather than only the
+  first casualty.
+
+- **Every managed-volume destroy in the docker backend now goes through a single
+  ownership-checked primitive** (ENG-658). Six call sites each derived their own set
+  of volumes to destroy — three from a name prefix, which does not prove ownership:
+  while a restore is in flight, the original lease's data physically wears the new
+  lease's canonical name, so a close, a cap-refusal, an orphan sweep or a reaping
+  tombstone could all reach data belonging to another lease. Each site carried (or
+  forgot) its own guard, and the recurring result was a data-loss ticket per site
+  (ENG-505, ENG-501, ENG-523, ENG-647, ENG-659). Ownership is now resolved once, from
+  the live provision map plus the retention store, and a volume is destroyed only when
+  the lease asking owns the bytes; the orphan sweep is the same rule asked with no
+  lease ("destroy only what nothing claims"). The two hand-written derivations of
+  "which volumes a restore has claimed" are gone, and `Destroy` has been removed from
+  the internal volume-manager interface so reaching it any other way does not compile.
+  No configuration or API change; a refusal is visible as
+  `fred_docker_backend_volume_destroy_refused_total` (above).
+
+- Build: the Go toolchain floor moves to **1.26.6** (`go.mod` directive and the
+  release image's builder stage). This clears six standard-library advisories
+  published on 2026-08-13 that the CI vuln gate treats as called —
+  GO-2026-5026, GO-2026-5972, GO-2026-6089, GO-2026-6090, GO-2026-6091 and
+  GO-2026-6218, spanning `net/http`, `crypto/tls`, `html/template`,
+  `encoding/asn1` and `net/url`, all fixed in Go 1.26.6. No allowlist entry is
+  needed and none was added: a stdlib fix that exists is not an accepted
+  exception.
+
+- Build: `make lint` now **fails** when `golangci-lint` is missing from `PATH` or
+  is not the pinned version, instead of printing "not installed, skipping" and
+  exiting 0. A local `make lint` previously proved nothing — and a v1 binary is
+  worse than none, since it does not reject the v2 `.golangci.yml`, it ignores
+  the v2-only keys and silently runs a different linter set. Running `make lint`
+  now requires installing the pinned version (see CONTRIBUTING.md § Linting).
+  The version moved to a new `.golangci-lint-version` file, read by the make
+  target and by both CI workflows, so the three can no longer disagree.
+
+### Deprecated
+
+### Removed
+
 ### Fixed
 
 - **A transient chain-RPC error at startup no longer permanently demotes the signer
@@ -291,81 +364,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   and not corruption. This also removes the last way a tombstone written by an older
   build could name another lease's adopted data: those stored names are no longer read
   by anything.
-
-### Changed
-
-- **Test-only scaffolding no longer compiles into fred's production packages**
-  (ENG-354). Declarations whose only callers were tests — `leasesm`'s
-  `FireProvisionXxxForTest` helpers, `Manager.Tracker` / `Manager.TimeoutChecker`,
-  `EventBroker.subscriberCount`, `CallbackAuthenticator.ComputeSignatureWithTime`
-  and `hmacauth.SignRequestWithTime` among them — sat in ordinary `.go` files, so
-  nothing stopped a production call site from being added to one. They now live in
-  in-package `export_test.go` files, or were deleted once their callers moved to the
-  production seam underneath, and `internal/testutil` carries a guard test that fails
-  on a new one. The linker had already been dropping most of them (`go tool nm` on the
-  previous `docker-backend` finds zero `FireProvision` symbols) but not all: three —
-  `TrackInFlightWithStartTime`, `Manager.Tracker` and `Manager.TimeoutChecker` — were
-  present in the shipped `providerd` and are not any more.
-
-  Moving the scaffolding out surfaced one declaration that should not exist at all:
-  `api.MaxCallbackMaxAge` bounded a callback replay window that only a test-only
-  constructor ever set, so it documented a limit no production path could reach —
-  `NewCallbackAuthenticator` pins `DefaultCallbackMaxAge` and is the only way
-  production builds an authenticator. Both the constant and that constructor are
-  removed rather than relocated. Replay-window tests now narrow `maxAge` directly,
-  which the in-package test file can do without production carrying a second
-  constructor; secret validation still runs through the production one.
-
-- **The retention sweep now runs every stage instead of aborting at the first store
-  error** (ENG-680). `List`, `ListExpired`, `ListReaping` and `ListRestoring` are one
-  traversal over one bucket, so they fail on identical inputs — which meant the sweep
-  always died at the first of them and never reached the orphan reconcile. Its
-  `retention_orphan_skips_total{reason="store_error"}` arm was therefore unreachable
-  under precisely the condition it was written to report. The stages are independent by
-  construction (each re-reads the store for itself, and each already fails safe on its
-  own read), so running them all can add information but never a destroy. Stage errors
-  are joined, so the sweep's log line now names every failing step rather than only the
-  first casualty.
-
-- **Every managed-volume destroy in the docker backend now goes through a single
-  ownership-checked primitive** (ENG-658). Six call sites each derived their own set
-  of volumes to destroy — three from a name prefix, which does not prove ownership:
-  while a restore is in flight, the original lease's data physically wears the new
-  lease's canonical name, so a close, a cap-refusal, an orphan sweep or a reaping
-  tombstone could all reach data belonging to another lease. Each site carried (or
-  forgot) its own guard, and the recurring result was a data-loss ticket per site
-  (ENG-505, ENG-501, ENG-523, ENG-647, ENG-659). Ownership is now resolved once, from
-  the live provision map plus the retention store, and a volume is destroyed only when
-  the lease asking owns the bytes; the orphan sweep is the same rule asked with no
-  lease ("destroy only what nothing claims"). The two hand-written derivations of
-  "which volumes a restore has claimed" are gone, and `Destroy` has been removed from
-  the internal volume-manager interface so reaching it any other way does not compile.
-  No configuration or API change; a refusal is visible as
-  `fred_docker_backend_volume_destroy_refused_total` (above).
-
-- Build: the Go toolchain floor moves to **1.26.6** (`go.mod` directive and the
-  release image's builder stage). This clears six standard-library advisories
-  published on 2026-08-13 that the CI vuln gate treats as called —
-  GO-2026-5026, GO-2026-5972, GO-2026-6089, GO-2026-6090, GO-2026-6091 and
-  GO-2026-6218, spanning `net/http`, `crypto/tls`, `html/template`,
-  `encoding/asn1` and `net/url`, all fixed in Go 1.26.6. No allowlist entry is
-  needed and none was added: a stdlib fix that exists is not an accepted
-  exception.
-
-- Build: `make lint` now **fails** when `golangci-lint` is missing from `PATH` or
-  is not the pinned version, instead of printing "not installed, skipping" and
-  exiting 0. A local `make lint` previously proved nothing — and a v1 binary is
-  worse than none, since it does not reject the v2 `.golangci.yml`, it ignores
-  the v2-only keys and silently runs a different linter set. Running `make lint`
-  now requires installing the pinned version (see CONTRIBUTING.md § Linting).
-  The version moved to a new `.golangci-lint-version` file, read by the make
-  target and by both CI workflows, so the three can no longer disagree.
-
-### Deprecated
-
-### Removed
-
-### Fixed
 
 - **The ownership check that authorizes a volume destroy can no longer be stale by the
   time the delete runs** (ENG-681). ENG-658 made every managed-volume destroy ask who owns
@@ -632,6 +630,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- providerd no longer returns the verbose backend `last_error` (host filesystem paths + raw
+  command stderr) to tenants on `GET /status`, `/provision`, `/releases`, or `/logs`. **Breaking:**
+  the `last_error` response field is removed; a K8s-shaped `reason` (machine code) + `message`
+  (curated, no host detail) replace it. Verbose detail stays operator-side (diagnostics store +
+  structured logs, correlated by `lease_uuid`). The `reason` set is open/add-only — consumers must
+  tolerate unknown values and fall back to `message`. (ENG-508)
+- **Every third-party GitHub Action is now pinned to a full 40-char commit SHA**
+  instead of a floating major tag (`@v3`, `@v4`, ...), across all four workflows.
+  The `release` job holds `id-token: write` (Fulcio OIDC), `packages: write`
+  (ghcr) and `contents: write`, and GitHub scopes permissions per job, so every
+  action it runs executes with the ambient signing and publish identity. A
+  hijacked upstream tag — the tj-actions/changed-files 2025 incident is the
+  template — could therefore cosign-sign an attacker-built image on the next
+  `v*` tag push, and because the certificate identity genuinely reads
+  `release.yml@refs/tags/vX`, that image would **pass** `cosign verify`: the
+  signature is authentic, only the artifact is not. A new `actions-pinned` CI
+  job fails closed on any `uses:` that is not a 40-char SHA, so a later edit
+  cannot quietly reintroduce one, and a `github-actions` Dependabot config
+  keeps the pins moving under review. `gomod` is deliberately left disabled:
+  Go dependency bumps here are driven by the govulncheck gate and its triaged
+  allowlist, which needs per-advisory reachability analysis an automated bump
+  PR cannot do. (ENG-509)
+
 - deps: migrate `github.com/docker/compose` from `/v2` v2.40.3 to **`/v5`
   v5.4.0**, cutting the govulncheck allowlist from 7 entries to 3. This clears
   GO-2026-4610 (a Windows-only CLI-plugin search-path privilege escalation,
@@ -879,12 +900,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
-- providerd no longer returns the verbose backend `last_error` (host filesystem paths + raw
-  command stderr) to tenants on `GET /status`, `/provision`, `/releases`, or `/logs`. **Breaking:**
-  the `last_error` response field is removed; a K8s-shaped `reason` (machine code) + `message`
-  (curated, no host detail) replace it. Verbose detail stays operator-side (diagnostics store +
-  structured logs, correlated by `lease_uuid`). The `reason` set is open/add-only — consumers must
-  tolerate unknown values and fall back to `message`. (ENG-508)
 - The reserved container-label prefix guard (`traefik.`/`fred.`) now matches
   case-insensitively. Traefik's Docker provider treats label keys
   case-insensitively, so a tenant label keyed `Traefik.http.routers.evil.rule`
