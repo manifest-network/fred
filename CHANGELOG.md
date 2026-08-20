@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.13.0] - 2026-08-20
+
+### Added
+
 - **`GET /readyz`** on `providerd` serves the same body as `/health` with the verdict
   carried into the status code: `503` when a local bbolt store is unreadable, `200`
   otherwise — including when the chain or every backend is unreachable, because
