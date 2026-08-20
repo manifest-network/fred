@@ -105,6 +105,32 @@ Read the body, then verify before dispatching to the handler. Backends inside th
 
 Your backend must implement these HTTP endpoints:
 
+### Error responses (applies to every endpoint)
+
+Every non-2xx response **MUST** be JSON in this envelope:
+
+```json
+{
+  "error": "human-readable description of what went wrong",
+  "validation_code": "unknown_sku | invalid_manifest | image_not_allowed",
+  "code": "already_provisioned | demote_exceeds_tier"
+}
+```
+
+- `error` **(required)** — a human-readable description. See the curation rule below.
+- `validation_code` (omitempty) — on a `400`, the sub-category of the validation failure. Fred parses it to reconstruct a precise sentinel error, which is what gives the on-chain rejection reason its precision; omit it and fred falls back to a generic validation failure.
+- `code` (omitempty) — a discriminator for the status codes fred overloads. Today: `already_provisioned` on `/restore`'s `409`, and `demote_exceeds_tier` on `/restore`'s `422`. See those endpoints.
+
+The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
+
+The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess: it relays your `error` message to the tenant at the status you sent and states no verdict of its own. That is not treated as a malformed body and does not count against the circuit breaker, so a new discriminator degrades safely against an older `providerd`. The practical consequence for backend authors: the precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) only appears once `providerd` learns the code, so ship the fred side first if the mapping matters.
+
+**The `error` field is TENANT-VISIBLE.** For `/restore` and `/update`, fred relays it to the tenant in its own 4xx response body. So it **MUST NOT** contain host paths, raw command output, or storage internals — those stay in your backend's own logs. This is the same obligation the `message` field carries on `/provisions`, and it exists because the tenant is untrusted: your `error` string is the one place a filesystem path can walk out of the provider. Author it for the tenant and keep the diagnosis in your logs.
+
+Do include what lets a tenant *fix* the request — the offending manifest field, the rejected image reference, the registry allowlist, the byte counts of a tier that does not fit. Those are the tenant's own input and your published policy, and suppressing them only makes the error unactionable.
+
+**A non-envelope body is a contract violation.** If a 4xx body does not parse as the JSON above — including a body that is valid JSON but omits the required `error` field, such as `{}` or a proxy's own `{"message": "..."}` — fred does **not** forward it: it answers the tenant with a generic message, records the raw body in its own logs, and counts it in `fred_backend_malformed_error_body_total{backend,operation}`. It also declines to treat that response as a permanent tenant-side failure — an unparseable `400` could have come from an intermediary rather than from your backend, and fred will not reject or close a lease on-chain on that basis. Emit the envelope and you keep both the tenant's diagnostic and the permanent classification.
+
 ### POST /provision
 
 Start provisioning a resource asynchronously.

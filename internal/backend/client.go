@@ -455,11 +455,57 @@ const (
 // (e.g., unknown SKU, invalid manifest, disallowed image registry).
 var ErrValidation = errors.New("validation error")
 
+// ErrMalformedErrorBody is returned when a backend answers with a client-error
+// status whose body is NOT the declared JSON error envelope. fred cannot know
+// why the request failed — or even whether the backend, rather than something
+// between them, produced the response — so it authors its own message and
+// forwards none of the body.
+//
+// A well-formed envelope carrying an EMPTY "error" is a different case and is
+// not this error: it came from the backend and its verdict stands, so the
+// status-code sentinel is returned with no detail.
+//
+// Deliberately NOT wrapping ErrValidation. ErrValidation is the reconciler's
+// PERMANENT branch — it rejects a PENDING lease and CLOSES an ACTIVE one
+// on-chain (handleProvisionError) — and a body fred could not parse is no
+// evidence that the tenant is at fault.
+//
+// Scope, stated precisely (ENG-739): this is an operator-introduced
+// intermediary being misread as a permanent tenant-side validation failure,
+// NOT something a tenant can trigger. No tenant-reachable input produces a
+// non-envelope 400 — docker-backend routes every 4xx through its ErrorResponse
+// writer. The generic "a proxy 400s the whole hop" scenario is already
+// contained by the ENG-356 snapshot gate, which defers every lease of a
+// backend whose GET /provisions did not answer; the reachable variant needs a
+// SELECTIVE failure (400 on POST /provision while GET /provisions still
+// returns valid JSON — a body-inspecting WAF rule).
+//
+// The Kubernetes apiserver makes the same call for the same shape: an
+// admission-webhook response it cannot decode becomes a fixed
+// ServiceUnavailable it authored, with the real error kept on the operator
+// channel (ErrCallingWebhook.Reason), never returned to the caller.
+var ErrMalformedErrorBody = errors.New("backend returned an unrecognized error response")
+
 // ErrDemoteDataExceedsTier is returned when a restore requests a smaller
 // disk tier (demote) than the retained volume's measured data footprint, so
 // the data would not fit the new cap. A dedicated sentinel (NOT wrapping
 // ErrValidation) so the API can map it to 422 distinctly. (ENG-438)
 var ErrDemoteDataExceedsTier = errors.New("retained data exceeds the requested smaller tier")
+
+// ErrRestoreRefused is returned when a /restore 4xx body IS the declared
+// envelope but carries a "code" discriminator fred does not recognize for that
+// status. fred relays the backend's authored message at the status the backend
+// chose and states no lease-state fact of its own — an unrecognized code is
+// evidence AGAINST "no retained data", not for it.
+//
+// Deliberately NOT ErrMalformedErrorBody. The envelope was well-formed, so this
+// is a business verdict fred could not classify, not an off-contract backend.
+// "code" is an OPEN, add-only set (the same policy backend.Reason states), so a
+// backend shipping a new discriminator before providerd learns it must not trip
+// the circuit breaker for every other tenant on that backend, and must not land
+// in fred_backend_malformed_error_body_total — whose runbook remedy ("fix the
+// envelope, suspect an intermediary") would send the operator somewhere wrong.
+var ErrRestoreRefused = errors.New("backend refused the restore")
 
 // CodeDemoteExceedsTier is the machine-readable error code the docker-backend
 // emits (HTTP 422) and the HTTPClient parses to reconstruct
@@ -468,6 +514,14 @@ var ErrDemoteDataExceedsTier = errors.New("retained data exceeds the requested s
 // on this exact string; defining it once here makes drift a compile error
 // rather than a silent misclassification. (ENG-438)
 const CodeDemoteExceedsTier = "demote_exceeds_tier"
+
+// CodeAlreadyProvisioned is the machine-readable code the docker-backend emits
+// on /restore's 409 to distinguish "already provisioned" from the bare 409
+// meaning "invalid state". Defined here for the same reason as
+// CodeDemoteExceedsTier: producer and consumer must agree on the exact string,
+// and a shared constant makes drift a compile error rather than a silent
+// misclassification.
+const CodeAlreadyProvisioned = "already_provisioned"
 
 // Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
 // still works, while allowing callers to classify the failure without string matching.
@@ -549,8 +603,9 @@ type HTTPClient struct {
 	retentionsPageLimit      int
 
 	// Optional Prometheus metrics (nil = skip recording)
-	requestDuration *prometheus.HistogramVec
-	requestsTotal   *prometheus.CounterVec
+	requestDuration         *prometheus.HistogramVec
+	requestsTotal           *prometheus.CounterVec
+	malformedErrorBodyTotal *prometheus.CounterVec
 }
 
 // MaxLookupUUIDs caps the number of lease UUIDs accepted by a single
@@ -627,6 +682,11 @@ type HTTPClientConfig struct {
 	RequestDuration     *prometheus.HistogramVec // labels: backend, operation, status
 	RequestsTotal       *prometheus.CounterVec   // labels: backend, operation, status
 	CircuitBreakerState *prometheus.GaugeVec     // labels: backend
+	// MalformedErrorBodyTotal counts client-error responses whose body was not
+	// the declared JSON error envelope. A backend contributing to this is
+	// off-contract (BACKEND_GUIDE.md) and its tenants are getting a generic
+	// message in place of a real diagnostic.
+	MalformedErrorBodyTotal *prometheus.CounterVec // labels: backend, operation
 }
 
 // positiveOr returns v if v > 0, otherwise returns fallback.
@@ -685,6 +745,19 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
 			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
 			//   - ErrDemoteDataExceedsTier: 422 (code=demote_exceeds_tier) from Restore — data exceeds the tier cap, a permanent client error, not a backend failure
+			//   - ErrRestoreRefused: a well-formed Restore refusal whose code fred does not know.
+			//     Belongs here with the other authored refusals: the envelope was valid, so this is
+			//     a business outcome, and "code" is an open add-only set — a backend that ships a
+			//     new discriminator before providerd learns it must not open the breaker.
+			// ErrMalformedErrorBody is deliberately ABSENT from this list, unlike every
+			// other 4xx above: a body fred cannot parse is not an expected business
+			// outcome, it is a backend that is off-contract. Counting it makes the
+			// failure self-limiting — five consecutive ones trip the breaker and the
+			// backend degrades into the ErrCircuitOpen arm, which is already transient
+			// everywhere — instead of retrying an unparseable answer forever. No tenant
+			// input can reach this against a compliant backend (docker-backend routes
+			// every 4xx through its ErrorResponse writer), so it is not a lever a tenant
+			// can pull to open the breaker on other tenants. (ENG-739)
 			return err == nil ||
 				errors.Is(err, ErrNotProvisioned) ||
 				errors.Is(err, ErrValidation) ||
@@ -692,7 +765,8 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
 				errors.Is(err, ErrNotRetained) ||
-				errors.Is(err, ErrDemoteDataExceedsTier)
+				errors.Is(err, ErrDemoteDataExceedsTier) ||
+				errors.Is(err, ErrRestoreRefused)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -739,6 +813,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		retentionsPageLimit:      retentionsPageLimit,
 		requestDuration:          cfg.RequestDuration,
 		requestsTotal:            cfg.RequestsTotal,
+		malformedErrorBodyTotal:  cfg.MalformedErrorBodyTotal,
 	}
 }
 
@@ -808,42 +883,133 @@ func decodeJSONLimited(r io.ReadCloser, limit int64, dst any) error {
 // validation_code field, the corresponding sub-category sentinel is used
 // (ErrUnknownSKU, ErrInvalidManifest, ErrImageNotAllowed). Otherwise
 // falls back to the generic ErrValidation.
-func parseValidationError(body []byte) error {
+//
+// A body that is not the declared envelope yields ErrMalformedErrorBody —
+// never the raw bytes. fred is the trust boundary in front of untrusted
+// tenants, so it authors what crosses; text a backend put in a declared field
+// crosses only because BACKEND_GUIDE.md places a curation duty on whoever
+// wrote it, and bytes fred could not parse carry no such duty. The unparsed
+// body is recorded on the operator channel by noteMalformedErrorBody.
+func (c *HTTPClient) parseValidationError(body []byte, operation string) error {
 	var resp struct {
 		Error          string         `json:"error"`
 		ValidationCode ValidationCode `json:"validation_code"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return fmt.Errorf("%w: %s", ErrValidation, string(body))
+		// Unparseable: fred cannot even tell whether the BACKEND produced this
+		// 400. An intermediary emitting its own (oversized header, h2 quirk,
+		// WAF rule) is exactly the case that must not be filed as permanent.
+		return c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
 	}
-
-	msg := resp.Error
-	if msg == "" {
-		msg = string(body)
+	if resp.Error == "" {
+		// Parsing is NOT the test — carrying the required field is.
+		// `null`, `{}` and a foreign shape like {"message":"proxy error"} all
+		// unmarshal cleanly into this struct and leave Error empty, and a proxy
+		// emitting JSON under a different key is an ordinary thing to meet. Any
+		// of them would otherwise land on ErrValidation, which is permanent and
+		// terminates the lease on-chain — precisely the hole this change exists
+		// to close. BACKEND_GUIDE.md declares "error" REQUIRED on every non-2xx,
+		// so its absence is a contract violation, not a terse backend.
+		return c.noteMalformedErrorBody(body, operation, `envelope is missing the required "error" field`)
 	}
 
 	if sentinel, ok := validationCodeErrors[resp.ValidationCode]; ok {
-		return fmt.Errorf("%w: %s", sentinel, msg)
+		return detailOr(sentinel, resp.Error)
 	}
-	return fmt.Errorf("%w: %s", ErrValidation, msg)
+	return detailOr(ErrValidation, resp.Error)
 }
 
 // parseErrorCode extracts the omitempty "code" discriminator from an error
-// response body (best-effort; returns "" when absent or unparseable). Used to
-// disambiguate overloaded status codes — e.g. Restore's 409, shared by
-// ErrInvalidState (no code) and ErrAlreadyProvisioned (code="already_provisioned").
-func parseErrorCode(body []byte) (code, msg string) {
+// response body. Used to disambiguate overloaded status codes — e.g. Restore's
+// 409, shared by ErrInvalidState (no code) and ErrAlreadyProvisioned
+// (code="already_provisioned").
+//
+// Three outcomes, and the distinction between the last two matters:
+//
+// Exactly one body is exempt from the envelope, and it is the EMPTY one.
+// BACKEND_GUIDE.md specifies a bare 422 as "no retained data" precisely so a
+// backend WITHOUT retention support can answer with nothing at all, so the
+// status code alone carries that verdict. Everything else must be the
+// envelope, held to the SAME standard as parseValidationError — syntax and
+// the required "error" field:
+//
+//   - unparseable (HTML, truncated JSON) → ErrMalformedErrorBody
+//   - parses but omits "error" (`null`, `{}`, a proxy's `{"message": ...}`,
+//     even `{"code": "..."}`) → ErrMalformedErrorBody
+//
+// Both used to collapse into "no code", which is how an intermediary's 422
+// became ErrNotRetained and told the tenant "no retained data found for that
+// lease" — fred stating a lease-state fact it had no basis for, while
+// bypassing the metric, the breaker and the 502. A JSON error page is at least
+// as common as an HTML one, so checking syntax alone left the larger half of
+// that hole open. "Bare" means no body, not "any body fred could not read".
+//
+// A valid envelope with no "code" is a different thing and stays legal: code
+// is omitempty by contract, so its absence selects the bare-status sentinel.
+// The trade is deliberate — a body carrying a good discriminator but no
+// "error" is refused rather than salvaged, because one rule for the whole
+// envelope is worth more than rescuing that field, and two nearly-identical
+// parsers holding it to different standards is what produced this bug class.
+//
+// msg is returned only when it came out of the envelope's declared "error"
+// field; the raw bytes never leave this function.
+func (c *HTTPClient) parseErrorCode(body []byte, operation string) (code, msg string, err error) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "", "", nil // bare status: the one documented no-body case
+	}
 	var resp struct {
 		Error string `json:"error"`
 		Code  string `json:"code"`
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", string(body)
+	if jsonErr := json.Unmarshal(body, &resp); jsonErr != nil {
+		return "", "", c.noteMalformedErrorBody(body, operation, "body is not the JSON error envelope")
 	}
 	if resp.Error == "" {
-		resp.Error = string(body)
+		return "", "", c.noteMalformedErrorBody(body, operation, `envelope is missing the required "error" field`)
 	}
-	return resp.Code, resp.Error
+	return resp.Code, resp.Error, nil
+}
+
+// detailOr returns sentinel decorated with detail, or the bare sentinel when
+// the backend supplied no detail. Keeps an empty detail from rendering as an
+// empty tenant-facing message.
+func detailOr(sentinel error, detail string) error {
+	if detail == "" {
+		return sentinel
+	}
+	return withDetail(sentinel, detail)
+}
+
+// noteUnrecognizedErrorCode records an envelope carrying a "code" fred does not
+// know for that status. Operator channel only, and deliberately NOT counted in
+// fred_backend_malformed_error_body_total: that counter means "the body was not
+// the declared envelope" and its runbook entry sends the operator to fix the
+// envelope or hunt an intermediary. Neither is the remedy here, which is to
+// upgrade providerd or fix a producer emitting a code valid for another status.
+func (c *HTTPClient) noteUnrecognizedErrorCode(operation string, status int, code string) {
+	slog.Warn("backend error envelope carried an unrecognized code for this status",
+		"backend", c.name,
+		"operation", operation,
+		"status", status,
+		"code", code,
+	)
+}
+
+// noteMalformedErrorBody records an off-contract error body on the OPERATOR
+// channel — log plus counter — and returns the sentinel fred surfaces instead.
+// This is the CWE-209 split the ENG-508 fix established for the async path:
+// the detail is relocated to where operators can read it, not deleted.
+func (c *HTTPClient) noteMalformedErrorBody(body []byte, operation, why string) error {
+	if c.malformedErrorBodyTotal != nil {
+		c.malformedErrorBodyTotal.WithLabelValues(c.name, operation).Inc()
+	}
+	slog.Warn("backend returned a malformed error body; withholding it from the tenant",
+		"backend", c.name,
+		"operation", operation,
+		"why", why,
+		"body", string(body),
+	)
+	return ErrMalformedErrorBody
 }
 
 // signRequest adds an HMAC-SHA256 signature header to the request.
@@ -932,7 +1098,7 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 			switch resp.StatusCode {
 			case http.StatusBadRequest:
 				// 400: validation error — permanent, won't succeed on retry.
-				return nil, parseValidationError(readErrorBodyBytes(resp))
+				return nil, c.parseValidationError(readErrorBodyBytes(resp), "provision")
 			case http.StatusConflict:
 				// 409: lease already provisioned — idempotent duplicate.
 				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
@@ -1212,7 +1378,7 @@ func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) (err error) 
 		case http.StatusAccepted:
 			return nil, nil
 		case http.StatusBadRequest:
-			return nil, parseValidationError(readErrorBodyBytes(resp))
+			return nil, c.parseValidationError(readErrorBodyBytes(resp), "update")
 		case http.StatusNotFound:
 			return nil, ErrNotProvisioned
 		case http.StatusConflict:
@@ -1258,22 +1424,52 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 		case http.StatusUnprocessableEntity:
 			// 422 is overloaded: bare 422 = ErrNotRetained; 422 with
 			// code="demote_exceeds_tier" = ErrDemoteDataExceedsTier.
-			code, msg := parseErrorCode(readErrorBodyBytes(resp))
-			if code == CodeDemoteExceedsTier {
-				return nil, fmt.Errorf("%w: %s", ErrDemoteDataExceedsTier, msg)
+			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
+			if perr != nil {
+				return nil, perr
 			}
-			return nil, ErrNotRetained
+			switch code {
+			case "":
+				// No discriminator: the documented bare 422.
+				return nil, ErrNotRetained
+			case CodeDemoteExceedsTier:
+				return nil, detailOr(ErrDemoteDataExceedsTier, msg)
+			default:
+				// A code fred does not know is evidence AGAINST "no retained
+				// data", not for it — yet this used to fall through to
+				// ErrNotRetained, which internal/api REMAPS to 404 "no retained
+				// data found for that lease". That discarded the message the
+				// backend was obliged to curate and replaced it with a positive
+				// claim about the tenant's data that its own body contradicted.
+				// Relay the backend's words at the status it chose instead.
+				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
+				return nil, detailOr(ErrRestoreRefused, msg)
+			}
 		case http.StatusConflict:
 			// Restore overloads 409 for two sentinels: the backend tags the
 			// already-provisioned case with code="already_provisioned" so we can
 			// reconstruct ErrAlreadyProvisioned (otherwise a duplicate restore would
 			// surface the wrong ErrInvalidState message). A bare 409 (no code) is
 			// ErrInvalidState (wrong lease state for restore).
-			code, msg := parseErrorCode(readErrorBodyBytes(resp))
-			if code == "already_provisioned" {
-				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, msg)
+			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
+			if perr != nil {
+				return nil, perr
 			}
-			return nil, ErrInvalidState
+			if code == CodeAlreadyProvisioned {
+				return nil, detailOr(ErrAlreadyProvisioned, msg)
+			}
+			// An unrecognized code is left on ErrInvalidState deliberately,
+			// unlike the 422 above. The asymmetry is the 404 remap: for 422 fred
+			// CHANGES the status class and asserts that no retained data exists,
+			// which an unknown code contradicts. Here the tenant gets 409 — the
+			// status the backend itself chose, and RFC 9110's 409 already means
+			// "conflict with the current state of the resource", so fred is
+			// restating the backend's verdict rather than inventing one. The
+			// message is carried for operators either way.
+			if code != "" {
+				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
+			}
+			return nil, detailOr(ErrInvalidState, msg)
 		case http.StatusServiceUnavailable:
 			// 503: backend at capacity — not a health failure (matches Provision).
 			return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))
@@ -1283,7 +1479,7 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			// prelude returns ErrUnknownSKU/ErrInvalidManifest/ErrImageNotAllowed
 			// via GetSKUProfile/ValidateImage; the returned error still wraps
 			// ErrValidation so the breaker allowlist and 400 mapping hold.
-			return nil, parseValidationError(readErrorBodyBytes(resp))
+			return nil, c.parseValidationError(readErrorBodyBytes(resp), "restore")
 		default:
 			return nil, fmt.Errorf("restore failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}

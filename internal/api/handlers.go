@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
@@ -537,7 +539,56 @@ const (
 	errMsgServiceUnavailable   = "service temporarily unavailable"
 	errMsgInvalidLeaseUUID     = "invalid lease UUID format"
 	errMsgLeaseNotFound        = "lease not found"
+	// errMsgBackendUnusableError is returned when the backend rejected the
+	// request but its error body was off-contract, so fred has no diagnostic
+	// to relay. Paired with 502: the fault is upstream of the tenant.
+	errMsgBackendUnusableError = "the provider backend returned an unusable error; the request was not applied"
 )
+
+// maxTenantDetailBytes bounds the backend-authored detail fred relays in a 4xx
+// body. The client already caps a backend error body at 4 KiB, which is far
+// more than a tenant needs to fix a manifest and more than belongs in one
+// error line.
+const maxTenantDetailBytes = 512
+
+// tenantDetail renders the tenant-facing message for a backend-originated 4xx.
+//
+// It returns ONLY the detail the backend authored inside a validated error
+// envelope — never err.Error() of the whole wrapped chain, which is how a
+// stray verbose string reaches a tenant (ENG-508's rule, applied to the
+// synchronous path). An error carrying no such detail falls back to fred's own
+// curated message rather than to the chain's text.
+//
+// The detail is bounded and stripped of control characters: it is relayed
+// text, and a 4xx body is a place where a newline or an ANSI escape has been
+// used to forge log lines and terminal output elsewhere (CVE-2021-25743).
+func tenantDetail(err error, fallback string) string {
+	detail, ok := backend.Detail(err)
+	if !ok || detail == "" {
+		return fallback
+	}
+	detail = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return ' '
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, detail)
+	if len(detail) > maxTenantDetailBytes {
+		// Trim back to a rune boundary so a multi-byte sequence is not split.
+		limit := maxTenantDetailBytes
+		for limit > 0 && !utf8.RuneStart(detail[limit]) {
+			limit--
+		}
+		detail = detail[:limit] + "…"
+	}
+	if detail == "" {
+		return fallback
+	}
+	return detail
+}
 
 // GetLeaseConnection handles GET /v1/leases/{lease_uuid}/connection
 func (h *Handlers) GetLeaseConnection(w http.ResponseWriter, r *http.Request) {
@@ -1126,9 +1177,24 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 			// tenants: the provider is full, not a permanent client error.
 			writeError(w, "insufficient resources to restore", http.StatusServiceUnavailable)
 		case errors.Is(err, backend.ErrDemoteDataExceedsTier):
-			writeError(w, err.Error(), http.StatusUnprocessableEntity)
+			writeError(w, tenantDetail(err, "retained data exceeds the requested smaller tier"),
+				http.StatusUnprocessableEntity)
 		case errors.Is(err, backend.ErrValidation):
-			writeError(w, err.Error(), http.StatusBadRequest)
+			writeError(w, tenantDetail(err, "the restore request was rejected as invalid"),
+				http.StatusBadRequest)
+		case errors.Is(err, backend.ErrRestoreRefused):
+			// The backend refused with a well-formed envelope whose code fred
+			// does not know. Relay its message at the status it chose; fred has
+			// no lease-state verdict of its own to add, and guessing one is what
+			// this branch exists to stop.
+			writeError(w, tenantDetail(err, "the provider backend refused the restore"),
+				http.StatusUnprocessableEntity)
+		case errors.Is(err, backend.ErrMalformedErrorBody):
+			// The backend answered off-contract, so fred has no diagnostic to
+			// pass on. 502: the fault is upstream, not the tenant's request.
+			slog.Warn("restore rejected with an unusable backend error body",
+				"error", err, "lease_uuid", leaseUUID, "from_lease", body.FromLeaseUUID)
+			writeError(w, errMsgBackendUnusableError, http.StatusBadGateway)
 		default:
 			slog.Error("failed to restore lease", "error", err, "lease_uuid", leaseUUID, "from_lease", body.FromLeaseUUID)
 			writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
@@ -1222,7 +1288,14 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, backend.ErrValidation) {
-			writeError(w, err.Error(), http.StatusBadRequest)
+			writeError(w, tenantDetail(err, "the update request was rejected as invalid"),
+				http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, backend.ErrMalformedErrorBody) {
+			slog.Warn("update rejected with an unusable backend error body",
+				"error", err, "lease_uuid", leaseUUID)
+			writeError(w, errMsgBackendUnusableError, http.StatusBadGateway)
 			return
 		}
 		slog.Error("failed to update lease", "error", err, "lease_uuid", leaseUUID)

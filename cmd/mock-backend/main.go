@@ -202,24 +202,51 @@ type MockBackendServer struct {
 	callbackURLsMu sync.Mutex
 }
 
+// errorBody is the declared error envelope every backend must emit for a
+// non-2xx response (BACKEND_GUIDE.md). Mirrors docker-backend's ErrorResponse,
+// minus the discriminators mock-backend has no cause to set.
+type errorBody struct {
+	Error string `json:"error"`
+}
+
+// errorResponse writes the declared JSON error envelope
+// ({"error": "..."}) that BACKEND_GUIDE.md specifies for every non-2xx
+// response.
+//
+// mock-backend used http.Error here, which emits text/plain. fred's client
+// could not parse that, so every mock-backend rejection took the raw-body
+// fallback — the exact path ENG-620 removed. Keeping mock-backend on-contract
+// means dev and E2E exercise the shipped envelope rather than a fallback that
+// no longer exists.
+func errorResponse(w http.ResponseWriter, status int, message string) {
+	encoded, err := json.Marshal(errorBody{Error: message})
+	if err != nil {
+		http.Error(w, `{"error":"internal encoding error"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(encoded)
+}
+
 func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Request) {
 	var req backend.ProvisionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", err))
 		return
 	}
 
 	// Validate required fields
 	if req.LeaseUUID == "" {
-		http.Error(w, "lease_uuid is required", http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
 		return
 	}
 	if req.CallbackURL == "" {
-		http.Error(w, "callback_url is required", http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, "callback_url is required")
 		return
 	}
 	if len(req.Items) == 0 {
-		http.Error(w, "items is required", http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, "items is required")
 		return
 	}
 
@@ -246,7 +273,7 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 	// Validate callback URL format and store for this lease (thread-safe)
 	parsedURL, err := url.Parse(req.CallbackURL)
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-		http.Error(w, "invalid callback_url: must be a valid http/https URL", http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, "invalid callback_url: must be a valid http/https URL")
 		return
 	}
 	s.callbackURLsMu.Lock()
@@ -260,10 +287,10 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		s.callbackURLsMu.Unlock()
 
 		if errors.Is(err, backend.ErrAlreadyProvisioned) {
-			http.Error(w, err.Error(), http.StatusConflict)
+			errorResponse(w, http.StatusConflict, err.Error())
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -279,17 +306,17 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 func (s *MockBackendServer) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	leaseUUID := r.PathValue("lease_uuid")
 	if leaseUUID == "" {
-		http.Error(w, "lease_uuid is required", http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
 		return
 	}
 
 	info, err := s.backend.GetInfo(r.Context(), leaseUUID)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
-			http.Error(w, "not provisioned", http.StatusNotFound)
+			errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -304,14 +331,14 @@ func (s *MockBackendServer) handleDeprovision(w http.ResponseWriter, r *http.Req
 		LeaseUUID string `json:"lease_uuid"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", err))
 		return
 	}
 
 	slog.Info("deprovision request", "lease_uuid", req.LeaseUUID)
 
 	if err := s.backend.Deprovision(r.Context(), req.LeaseUUID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -330,19 +357,19 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 	// Same wire shape as the unfiltered path; always returns 200 (possibly empty).
 	if uuids, ok := r.URL.Query()["lease_uuid"]; ok {
 		if len(uuids) == 0 || len(uuids) > backend.MaxLookupUUIDs {
-			http.Error(w, fmt.Sprintf("lease_uuid count must be between 1 and %d", backend.MaxLookupUUIDs), http.StatusBadRequest)
+			errorResponse(w, http.StatusBadRequest, fmt.Sprintf("lease_uuid count must be between 1 and %d", backend.MaxLookupUUIDs))
 			return
 		}
 		for _, u := range uuids {
 			if !config.IsValidUUID(u) {
-				http.Error(w, "invalid lease_uuid", http.StatusBadRequest)
+				errorResponse(w, http.StatusBadRequest, "invalid lease_uuid")
 				return
 			}
 		}
 
 		provisions, err := s.backend.LookupProvisions(r.Context(), uuids)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		if provisions == nil {
@@ -360,13 +387,13 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 
 	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
 	if perr != nil {
-		http.Error(w, perr.Error(), http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, perr.Error())
 		return
 	}
 
 	provisions, err := s.backend.ListProvisions(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	page, next := backend.PaginateProvisions(provisions, cont, limit)
@@ -388,17 +415,17 @@ func (s *MockBackendServer) handleListProvisions(w http.ResponseWriter, r *http.
 func (s *MockBackendServer) handleGetProvision(w http.ResponseWriter, r *http.Request) {
 	leaseUUID := r.PathValue("lease_uuid")
 	if leaseUUID == "" {
-		http.Error(w, "lease_uuid is required", http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
 		return
 	}
 
 	info, err := s.backend.GetProvision(r.Context(), leaseUUID)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
-			http.Error(w, "not provisioned", http.StatusNotFound)
+			errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -419,13 +446,13 @@ func (s *MockBackendServer) handleGetProvision(w http.ResponseWriter, r *http.Re
 func (s *MockBackendServer) handleListRetentions(w http.ResponseWriter, r *http.Request) {
 	limit, cont, perr := backend.ParsePageParams(r.URL.Query())
 	if perr != nil {
-		http.Error(w, perr.Error(), http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, perr.Error())
 		return
 	}
 
 	retentions, err := s.backend.ListRetentions(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	page, next := backend.PaginateRetentions(retentions, cont, limit)
@@ -453,7 +480,7 @@ func (s *MockBackendServer) handleListRetentions(w http.ResponseWriter, r *http.
 func (s *MockBackendServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.backend.GetLoadStats(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if stats == nil {
@@ -469,7 +496,7 @@ func (s *MockBackendServer) handleStats(w http.ResponseWriter, r *http.Request) 
 func (s *MockBackendServer) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	leaseUUID := r.PathValue("lease_uuid")
 	if leaseUUID == "" {
-		http.Error(w, "lease_uuid is required", http.StatusBadRequest)
+		errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
 		return
 	}
 
@@ -483,10 +510,10 @@ func (s *MockBackendServer) handleGetLogs(w http.ResponseWriter, r *http.Request
 	logs, err := s.backend.GetLogs(r.Context(), leaseUUID, tail)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
-			http.Error(w, "not provisioned", http.StatusNotFound)
+			errorResponse(w, http.StatusNotFound, "not provisioned")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 

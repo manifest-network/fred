@@ -364,6 +364,17 @@ var (
 		Help:      "Total number of provisions rejected due to insufficient backend resources",
 	}, []string{"backend"})
 
+	// BackendMalformedErrorBodyTotal counts client-error responses whose body was
+	// not the declared JSON error envelope, so fred answered the tenant with a
+	// generic message instead of the backend's diagnostic. A non-zero rate means
+	// a backend is off-contract (BACKEND_GUIDE.md) — ENG-620.
+	BackendMalformedErrorBodyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "backend",
+		Name:      "malformed_error_body_total",
+		Help:      "Total number of backend client-error responses whose body was not the declared JSON error envelope",
+	}, []string{"backend", "operation"})
+
 	// BackendHealthy tracks backend health status (1 = healthy, 0 = unhealthy).
 	BackendHealthy = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,

@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -136,12 +138,6 @@ func TestHTTPClient_Provision_ValidationErrorCodes(t *testing.T) {
 			ErrValidation,
 			"something new",
 		},
-		{
-			"non-JSON body (backwards compat)",
-			`plain text error`,
-			ErrValidation,
-			"plain text error",
-		},
 	}
 
 	for _, tt := range tests {
@@ -165,6 +161,264 @@ func TestHTTPClient_Provision_ValidationErrorCodes(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantMessage)
 		})
 	}
+}
+
+// TestHTTPClient_MalformedErrorBody_IsNeverForwarded is the ENG-620 regression:
+// a client-error body that is not the declared JSON error envelope must never
+// reach the caller as text, and must not be filed as a permanent validation
+// failure.
+//
+// Both properties matter and they are separate. The first is the information
+// disclosure the ticket is about. The second is the ENG-498 failure class: the
+// old code wrapped ANY 400 in ErrValidation, which the reconciler treats as
+// permanent — it rejects a PENDING lease and closes an ACTIVE one on-chain. A
+// body fred could not parse may not even have come from the backend.
+func TestHTTPClient_MalformedErrorBody_IsNeverForwarded(t *testing.T) {
+	// A host path plus raw command output, the exact shape ENG-508 removed from
+	// the async path. If any substring of this reaches the caller, the tenant
+	// sees it too — internal/api writes err.Error() into the 4xx body.
+	const hostPathSentinel = `btrfs qgroup show /var/lib/fred/volumes/fred-abc-app-0: exit status 1`
+
+	bodies := map[string]string{
+		"text/plain body":    hostPathSentinel,
+		"html error page":    "<html><body>400 " + hostPathSentinel + "</body></html>",
+		"truncated json":     `{"error":"` + hostPathSentinel,
+		"json array not obj": `["` + hostPathSentinel + `"]`,
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name:    "test-malformed-400",
+				BaseURL: server.URL,
+				Timeout: 5 * time.Second,
+			})
+
+			err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+			require.Error(t, err)
+
+			assert.NotContains(t, err.Error(), hostPathSentinel,
+				"the raw backend body must never survive into the error a tenant can read")
+			assert.NotContains(t, err.Error(), "qgroup",
+				"no fragment of the raw body may survive either")
+			assert.ErrorIs(t, err, ErrMalformedErrorBody)
+			assert.NotErrorIs(t, err, ErrValidation,
+				"an unparseable body must NOT be classified permanent: ErrValidation makes the "+
+					"reconciler reject a PENDING lease and close an ACTIVE one on-chain (ENG-498)")
+		})
+	}
+}
+
+// TestHTTPClient_ForeignJSONErrorBodyIsMalformed pins the hole Copilot found on
+// PR #236: a body can parse cleanly as JSON and still not be the envelope.
+//
+// `null`, `{}` and a proxy's own shape like {"message":"..."} all unmarshal
+// into the anonymous struct without error and leave Error empty. Accepting
+// that as "a terse backend" put them back on ErrValidation — permanent, which
+// rejects a PENDING lease and closes an ACTIVE one on-chain. Parsing is not
+// the test; carrying the required "error" field is.
+func TestHTTPClient_ForeignJSONErrorBodyIsMalformed(t *testing.T) {
+	for name, body := range map[string]string{
+		"json null":            `null`,
+		"empty object":         `{}`,
+		"foreign key":          `{"message":"proxy error: /var/lib/fred/volumes"}`,
+		"explicitly empty":     `{"error":""}`,
+		"error wrong type":     `{"error":{"nested":"x"}}`,
+		"validation code only": `{"validation_code":"invalid_manifest"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name: "foreign-json", BaseURL: server.URL, Timeout: 5 * time.Second,
+			})
+			err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrMalformedErrorBody)
+			assert.NotErrorIs(t, err, ErrValidation,
+				"a body without the required \"error\" field must not be filed as a permanent "+
+					"tenant-side failure — that is what closes an ACTIVE lease on-chain")
+			assert.NotContains(t, err.Error(), "/var/lib/fred", "raw body must not survive")
+		})
+	}
+}
+
+// TestHTTPClientRestore_UnreadableBodyIsNotBareStatus pins the second hole from
+// PR #236. parseErrorCode swallowed every unmarshal failure into "no code",
+// which is indistinguishable from the documented BARE 422 — so an
+// intermediary's HTML error page became ErrNotRetained, and the tenant was told
+// "no retained data found for that lease": a confident, wrong answer, with no
+// metric, no breaker signal and no 502.
+//
+// "Bare" means no body. An unreadable body is a different thing.
+func TestHTTPClientRestore_UnreadableBodyIsNotBareStatus(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		body     string
+		wantErr  error
+		wantSame bool // true = the documented bare-status mapping must be preserved
+	}{
+		{"empty 422 stays ErrNotRetained", http.StatusUnprocessableEntity, "", ErrNotRetained, true},
+		{"whitespace 422 stays ErrNotRetained", http.StatusUnprocessableEntity, "  \n", ErrNotRetained, true},
+		{"valid envelope, no code, stays ErrNotRetained", http.StatusUnprocessableEntity, `{"error":"nope"}`, ErrNotRetained, true},
+		{"valid coded envelope still classifies", http.StatusUnprocessableEntity, `{"error":"too big","code":"demote_exceeds_tier"}`, ErrDemoteDataExceedsTier, true},
+		{"valid coded 409 still classifies", http.StatusConflict, `{"error":"dup","code":"already_provisioned"}`, ErrAlreadyProvisioned, true},
+		{"html 422 is malformed", http.StatusUnprocessableEntity, "<html>422 /var/lib/fred/x</html>", ErrMalformedErrorBody, false},
+		{"truncated json 422 is malformed", http.StatusUnprocessableEntity, `{"error":"/var/lib/fred/x`, ErrMalformedErrorBody, false},
+		// The shape half. A proxy emitting a JSON error page is at least as
+		// common as one emitting HTML, and these parse cleanly — so checking
+		// syntax alone left the larger half of the hole open.
+		{"json null 422 is malformed", http.StatusUnprocessableEntity, `null`, ErrMalformedErrorBody, false},
+		{"empty object 422 is malformed", http.StatusUnprocessableEntity, `{}`, ErrMalformedErrorBody, false},
+		{"foreign json 422 is malformed", http.StatusUnprocessableEntity, `{"message":"proxy error: /var/lib/fred/x"}`, ErrMalformedErrorBody, false},
+		// Deliberate: a good discriminator does not rescue a body that omits the
+		// required "error". One rule for the whole envelope.
+		{"code without error 422 is malformed", http.StatusUnprocessableEntity, `{"code":"demote_exceeds_tier"}`, ErrMalformedErrorBody, false},
+		{"empty 409 stays ErrInvalidState", http.StatusConflict, "", ErrInvalidState, true},
+		{"html 409 is malformed", http.StatusConflict, "<html>409 /var/lib/fred/x</html>", ErrMalformedErrorBody, false},
+		{"foreign json 409 is malformed", http.StatusConflict, `{"message":"proxy error: /var/lib/fred/x"}`, ErrMalformedErrorBody, false},
+		{"code without error 409 is malformed", http.StatusConflict, `{"code":"already_provisioned"}`, ErrMalformedErrorBody, false},
+		// An unrecognized code is evidence AGAINST "no retained data". On 422
+		// the old fallthrough also REMAPPED the status to 404, so fred both
+		// changed the status class and asserted a fact the body contradicted.
+		{"unknown code 422 is refused, not not-retained", http.StatusUnprocessableEntity, `{"error":"retention subsystem is draining","code":"draining"}`, ErrRestoreRefused, false},
+		{"cross-status code on 422 is refused", http.StatusUnprocessableEntity, `{"error":"lease already provisioned","code":"already_provisioned"}`, ErrRestoreRefused, false},
+		// 409 keeps its sentinel deliberately: fred returns the status the
+		// backend chose, and RFC 9110's 409 already means "conflict with the
+		// current state", so there is no invented fact to remove.
+		{"unknown code 409 keeps 409 semantics", http.StatusConflict, `{"error":"lease is migrating","code":"draining"}`, ErrInvalidState, true},
+		{"cross-status code on 409 keeps 409 semantics", http.StatusConflict, `{"error":"too big","code":"demote_exceeds_tier"}`, ErrInvalidState, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				if tt.body != "" {
+					_, _ = w.Write([]byte(tt.body))
+				}
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name: "unreadable-body", BaseURL: server.URL, Timeout: 5 * time.Second,
+			})
+			err := client.Restore(context.Background(), RestoreRequest{
+				LeaseUUID: "new-1", FromLeaseUUID: "old-1", Tenant: "t", CallbackURL: "http://fred/cb",
+			})
+			assert.ErrorIs(t, err, tt.wantErr)
+			if !tt.wantSame {
+				assert.NotErrorIs(t, err, ErrNotRetained,
+					"an unreadable body must not masquerade as the documented bare status")
+				assert.NotContains(t, err.Error(), "/var/lib/fred", "raw body must not survive")
+			}
+		})
+	}
+}
+
+// TestHTTPClient_MalformedErrorBody_CountedAndLogged verifies the operator half
+// of the CWE-209 split: the detail withheld from the tenant is relocated to a
+// metric and the log, not deleted.
+func TestHTTPClient_MalformedErrorBody_CountedAndLogged(t *testing.T) {
+	counter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "test_malformed_error_body_total"},
+		[]string{"backend", "operation"},
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name:                    "be-1",
+		BaseURL:                 server.URL,
+		Timeout:                 5 * time.Second,
+		MalformedErrorBodyTotal: counter,
+	})
+
+	// Seed the OPPOSITE expectation first: WithLabelValues auto-creates a series
+	// at 0, so asserting ==0 on a never-written counter passes vacuously.
+	counter.WithLabelValues("be-1", "provision").Add(7)
+	require.InDelta(t, 7.0, promtestutil.ToFloat64(counter.WithLabelValues("be-1", "provision")), 0.001)
+
+	// Capture the log too. OPERATIONS.md tells the operator to find the raw body
+	// in this exact line, so the log is part of the contract, not incidental —
+	// asserting only the counter would let the slog.Warn be deleted silently.
+	var rec logRecorder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(&rec))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
+	require.ErrorIs(t, err, ErrMalformedErrorBody)
+
+	assert.InDelta(t, 8.0, promtestutil.ToFloat64(counter.WithLabelValues("be-1", "provision")), 0.001,
+		"a malformed error body must be counted for the backend that sent it")
+
+	entry, found := rec.find("backend returned a malformed error body")
+	require.True(t, found, "the malformed body must be logged for operators (OPERATIONS.md runbook)")
+	assert.Equal(t, slog.LevelWarn, entry.Level)
+	assert.Equal(t, "be-1", entry.attr("backend"), "log must name the offending backend")
+	assert.Equal(t, "provision", entry.attr("operation"), "log must name the operation")
+	assert.Equal(t, "not json", entry.attr("body"),
+		"the raw body must survive INTO THE LOG — it is withheld from the tenant, not discarded")
+}
+
+// logRecorder is a minimal slog.Handler that keeps records for assertion.
+type logRecorder struct {
+	mu      sync.Mutex
+	records []loggedRecord
+}
+
+type loggedRecord struct {
+	Level slog.Level
+	Msg   string
+	Attrs map[string]string
+}
+
+func (r *loggedRecord) attr(k string) string { return r.Attrs[k] }
+
+func (r *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (r *logRecorder) Handle(_ context.Context, rec slog.Record) error {
+	entry := loggedRecord{Level: rec.Level, Msg: rec.Message, Attrs: map[string]string{}}
+	rec.Attrs(func(a slog.Attr) bool {
+		entry.Attrs[a.Key] = a.Value.String()
+		return true
+	})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.records = append(r.records, entry)
+	return nil
+}
+
+func (r *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return r }
+func (r *logRecorder) WithGroup(string) slog.Handler      { return r }
+
+// find returns the first record whose message contains sub.
+func (r *logRecorder) find(sub string) (loggedRecord, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rec := range r.records {
+		if strings.Contains(rec.Msg, sub) {
+			return rec, true
+		}
+	}
+	return loggedRecord{}, false
 }
 
 // TestHTTPClient_Provision_ValidationError_DoesNotTripCircuitBreaker verifies that
@@ -1850,9 +2104,22 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 			wantErr:    ErrInsufficientResources,
 		},
 		{
-			name:       "400 Bad Request returns ErrValidation",
+			// On-contract 400: the envelope is present, so the verdict stands
+			// and stays PERMANENT (reject/close on-chain).
+			name:       "400 Bad Request with the error envelope returns ErrValidation",
 			statusCode: http.StatusBadRequest,
+			body:       `{"error":"validation error: invalid manifest: bad shape"}`,
 			wantErr:    ErrValidation,
+		},
+		{
+			// ENG-620: a bodiless 400 is off-contract and indistinguishable
+			// from one an intermediary produced, so it must NOT be filed as a
+			// permanent tenant-side failure. Previously this row asserted
+			// ErrValidation, which is the classification that lets a stray 400
+			// close an ACTIVE lease on-chain (ENG-498 class).
+			name:       "400 Bad Request with no body returns ErrMalformedErrorBody",
+			statusCode: http.StatusBadRequest,
+			wantErr:    ErrMalformedErrorBody,
 		},
 	}
 
@@ -2362,4 +2629,123 @@ func TestHTTPClient_ListProvisions_ToleratesMidFetchDeletion(t *testing.T) {
 	}
 	assert.NotContains(t, seen, provUUID(20), "deleted-mid-fetch item is simply absent")
 	assert.Len(t, got, 24)
+}
+
+// TestHTTPClientRestore_UnrecognizedCodeRelaysBackendMessage covers the half the
+// status table does not: the table pins WHICH sentinel comes back, this pins
+// that the backend's authored message survives instead of being discarded.
+//
+// That message is the thing BACKEND_GUIDE obliges the backend to curate for the
+// tenant. Dropping it and substituting fred's own "no retained data found for
+// that lease" was the actual harm — the sentinel was just how it happened.
+func TestHTTPClientRestore_UnrecognizedCodeRelaysBackendMessage(t *testing.T) {
+	const authored = "retention subsystem is draining; retry in a few minutes"
+
+	for name, tc := range map[string]struct {
+		status     int
+		substitute string
+	}{
+		"422": {http.StatusUnprocessableEntity, "no retained data"},
+		"409": {http.StatusConflict, "invalid state"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"error":"` + authored + `","code":"draining"}`))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name: "relay", BaseURL: server.URL, Timeout: 5 * time.Second,
+			})
+			err := client.Restore(context.Background(), RestoreRequest{
+				LeaseUUID: "n", FromLeaseUUID: "o", Tenant: "t", CallbackURL: "http://f/cb",
+			})
+			require.Error(t, err)
+
+			detail, ok := Detail(err)
+			require.True(t, ok, "the backend's authored message must be carried, not discarded")
+			assert.Equal(t, authored, detail)
+			assert.NotContains(t, err.Error(), tc.substitute,
+				"fred must not substitute its own verdict for the backend's message")
+		})
+	}
+}
+
+// TestHTTPClientRestore_UnrecognizedCodeIsNotAMalformedBody pins the reason this
+// path does NOT reuse the malformed machinery. The envelope was well-formed, so
+// counting it in fred_backend_malformed_error_body_total would corrupt that
+// metric's stated meaning and send the operator to the wrong remedy ("fix the
+// envelope, suspect an intermediary" — neither applies to a version skew).
+func TestHTTPClientRestore_UnrecognizedCodeIsNotAMalformedBody(t *testing.T) {
+	counter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "test_unrecognized_code_not_malformed_total"},
+		[]string{"backend", "operation"},
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"x","code":"draining"}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name: "be-1", BaseURL: server.URL, Timeout: 5 * time.Second,
+		MalformedErrorBodyTotal: counter,
+	})
+
+	// Seed a non-zero value first: WithLabelValues auto-creates at 0, so an
+	// == assertion on a never-written counter would pass vacuously.
+	counter.WithLabelValues("be-1", "restore").Add(7)
+
+	var rec logRecorder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(&rec))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	err := client.Restore(context.Background(), RestoreRequest{
+		LeaseUUID: "n", FromLeaseUUID: "o", Tenant: "t", CallbackURL: "http://f/cb",
+	})
+	require.ErrorIs(t, err, ErrRestoreRefused)
+
+	assert.InDelta(t, 7.0, promtestutil.ToFloat64(counter.WithLabelValues("be-1", "restore")), 0.001,
+		"a well-formed envelope with an unknown code is NOT a malformed body")
+
+	entry, found := rec.find("unrecognized code for this status")
+	require.True(t, found, "the unknown code must still reach operators")
+	assert.Equal(t, slog.LevelWarn, entry.Level)
+	assert.Equal(t, "draining", entry.attr("code"))
+	assert.Equal(t, "422", entry.attr("status"))
+}
+
+// TestHTTPClientRestore_UnrecognizedCodeDoesNotTripBreaker is the guard on the
+// forward-compatibility premise. `code` is an open, add-only set, so a backend
+// that ships a new discriminator before providerd learns it must degrade to a
+// plain refusal — not open the breaker for every other tenant on that backend.
+func TestHTTPClientRestore_UnrecognizedCodeDoesNotTripBreaker(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"draining","code":"draining"}`))
+	}))
+	defer server.Close()
+
+	const threshold = 3
+	client := NewHTTPClient(HTTPClientConfig{
+		Name: "skew", BaseURL: server.URL, Timeout: 5 * time.Second, CBFailureThresh: threshold,
+	})
+
+	const n = threshold * 4
+	for i := range n {
+		err := client.Restore(context.Background(), RestoreRequest{
+			LeaseUUID: "n", FromLeaseUUID: "o", Tenant: "t", CallbackURL: "http://f/cb",
+		})
+		require.ErrorIs(t, err, ErrRestoreRefused, "call %d", i+1)
+		require.NotErrorIs(t, err, ErrCircuitOpen,
+			"a version skew must not open the breaker (call %d)", i+1)
+	}
+	assert.Equal(t, n, requestCount, "every request must have reached the backend")
 }
