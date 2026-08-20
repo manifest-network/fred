@@ -57,9 +57,6 @@ type Manager struct {
 	// Orchestrator for provisioning coordination
 	orchestrator *ProvisionOrchestrator
 
-	// Handler set for Watermill message handlers
-	handlers *HandlerSet
-
 	// Timeout checker for callback timeouts
 	timeoutChecker *TimeoutChecker
 
@@ -187,7 +184,6 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		ackBatcher:           ackBatcher,
 		tracker:              tracker,
 		orchestrator:         orchestrator,
-		handlers:             handlers,
 		timeoutChecker:       timeoutChecker,
 		callbackTimeout:      callbackTimeout,
 		timeoutCheckInterval: timeoutCheckInterval,

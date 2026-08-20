@@ -49,8 +49,7 @@ func TestLeaseActor_DirectDispatch(t *testing.T) {
 			CallbackURL:  callbackServer.URL},
 		},
 	})
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	defer b.stopCancel()
 
 	require.True(t, b.actorFor("lease-1").TryEnqueue(leasesm.ContainerDiedMsg{ContainerID: "c1"}))
@@ -125,8 +124,7 @@ func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T)
 			CallbackURL:  callbackServer.URL},
 		},
 	})
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	defer b.stopCancel()
 
 	g1Done := make(chan struct{})
@@ -355,8 +353,7 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.compose = composeMock
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	defer b.stopCancel()
 
 	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
@@ -910,9 +907,8 @@ func TestConcurrentProvisionDeprovision_Stress(t *testing.T) {
 	defer callbackSrv.Close()
 
 	b := newBackendForProvisionTest(t, mock, nil)
-	b.httpClient = callbackSrv.Client()
 	b.cfg.StartupVerifyDuration = 1 * time.Millisecond // fast
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackSrv.Client())
 
 	uuids := make([]string, numUUIDs)
 	for i := range uuids {

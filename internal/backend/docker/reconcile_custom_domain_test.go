@@ -569,8 +569,7 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
 	b.releaseStore = releaseStore
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
 
@@ -693,8 +692,7 @@ func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
 	b.releaseStore = releaseStore
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
 	// recordingDNS so we can assert the candidate filter holds under concurrency:
@@ -900,8 +898,7 @@ func TestReconcileCustomDomain_AsyncRedeployFailure_DoesNotCommit(t *testing.T) 
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	b.httpClient = callbackServer.Client()
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(b, callbackServer.Client())
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	b.cfg.Ingress = IngressConfig{Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure"}
 	b.customDomainDNSReady = func(_ context.Context, _ string) bool { return true }

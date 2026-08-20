@@ -114,6 +114,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   which the in-package test file can do without production carrying a second
   constructor; secret validation still runs through the production one.
 
+- **The k3s backend no longer carries test-only hook fields, and the guard can now
+  catch that shape** (ENG-765). ENG-354's sweep moved test-only *declarations* out of
+  production packages, but its guard only walked top-level declarations; widening it to
+  struct fields surfaced two the phrase list still could not name —
+  `beforeDiagnosticStore` and `beforeCallbackSend`, both documented "Nil in production;
+  set in tests", each a `func()` the stub provisioner called mid-flight so a test could
+  freeze a worker goroutine at an exact interleaving. `runStubProvisioner` is now split
+  into the three phases it always had — claim under the lock, persist the diagnostic,
+  send the callback — and the two ENG-189 teardown-race tests drive those phases in
+  order with a real `Deprovision` between them, so the interleaving is expressed by
+  where the call sits rather than by a hook in production code. Each cancellation check
+  lives inside the phase it guards, so a test driving one phase still exercises it.
+
+  Removing the hooks cost one guarantee that had to be replaced rather than dropped: the
+  hooks were the only thing pinning that the failure diagnostic is written *before* the
+  callback is sent. That order is a tenant-facing contract — the callback is what makes
+  Fred deprovision, and a deprovision arriving first cancels the lease context, after
+  which the diagnostic is suppressed and `GetProvision`'s documented diagnostics
+  fallback has nothing to surface for a failed lease. A new test asserts the diagnostic
+  is already durable at the moment the callback arrives, checked inside the callback
+  handler so it cannot pass on timing.
+
+  A third field goes with them, for a different reason: `k3s.Backend.httpClient`,
+  which `New` assigned and then never read, since the callback sender receives the
+  local. Removing it left the client's construction without a seam, so that moved into
+  `newCallbackHTTPClient` — which means `callback_insecure_skip_verify` finally has
+  coverage of the transport it wires up, rather than only of the config rule that
+  rejects it in production mode.
+
+  `internal/backend/k3s/**` also joins `.github/workflows/integration.yml`'s path
+  filters. `cmd/k3s-backend`'s integration test execs the binary built from that
+  package, so until now a change confined to it ran that suite only nightly — the same
+  rot mode (ENG-330) the filter's reconciler entry already guards against.
+
+- **The docker backend no longer carries a callback HTTP client field that only tests
+  read** (ENG-765). `Backend.httpClient` was assigned once in `New` and never read
+  again: the callback sender receives the *local* variable, so the field was a slot
+  tests wrote and a test helper read back, documented "exposed for test replacement" —
+  one word away from the phrase ENG-354's guard already looked for, which is why it
+  survived that sweep. It is gone, and the test helper takes the client as a parameter
+  instead.
+
+  Extracting `newCallbackHTTPClient` in the field's place gives
+  `callback_insecure_skip_verify` its first coverage of the transport it wires up,
+  rather than only of the config rule that rejects it in production mode.
+
+  The guard's phrase list now keys on `exposed for test` instead of the longer
+  `exposed for testing`, so the variant wordings that hid this field are caught too.
+
+- **`providerd` no longer ships a `Manager` field that only tests read** (ENG-765).
+  `Manager.handlers` was assigned in `NewManager` and never read again — the five
+  Watermill registrations use the local — so the field existed solely so tests could
+  invoke a handler without publishing a message. Unlike the other fields this ticket
+  removed, this one was in `providerd`'s dependency graph and shipped. Tests now
+  rebuild the handler set through the production constructor `NewHandlerSet`, which
+  also means a new `HandlerDeps` field cannot be wired in production and silently
+  missed in tests.
+
+  This is the last of five instances of one shape: a production struct field written
+  in production and read only from `_test.go`. Three were found by enumerating every
+  unexported production struct field rather than by the guard, which cannot see this
+  shape at all — there is nothing in a name or doc comment to match. That limit is now
+  written down in the guard's header.
+
 - **The retention sweep now runs every stage instead of aborting at the first store
   error** (ENG-680). `List`, `ListExpired`, `ListReaping` and `ListRestoring` are one
   traversal over one bucket, so they fail on identical inputs — which meant the sweep

@@ -112,7 +112,7 @@ func newRestoreQuotaBackend(t *testing.T, mgr volumeManager) (*Backend, <-chan b
 	var mu sync.Mutex
 	var down []string
 	b.compose = happyComposeMock(&mu, &down, nil)
-	rebuildCallbackSender(b) // pick up testCallbackSecret so callback HMAC verifies
+	rebuildCallbackSender(b, testCallbackClient) // pick up testCallbackSecret so callback HMAC verifies
 	attachRetentionStore(t, b)
 	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 100}
 	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 20}

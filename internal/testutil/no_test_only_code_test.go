@@ -13,7 +13,9 @@ package testutil
 //
 // The guard is a tripwire, not an oracle. It catches the two shapes the
 // class has actually taken in this repo — a ForTest/TestOnly name, and a
-// doc comment that says the declaration is for tests — and applies them to
+// doc comment that says the declaration is for tests (including the
+// nil-in-prod injection point CLAUDE.md forbids, whose doc says so
+// outright) — and applies them to
 // top-level funcs, types, consts and vars, and to struct fields (reported
 // as Type.Field). A field's doc comment and its trailing comment both feed
 // the match, because Go documents fields either way.
@@ -30,14 +32,23 @@ package testutil
 //     list widened well past the one below. If one appears, extend
 //     structFields to *ast.InterfaceType rather than widening phrases.
 //   - A hook whose comment hedges ("For testing; defaults to …") instead of
-//     using one of the phrases below. Widening the phrase list to reach
-//     those was measured and rejected: the smallest widening that catches
-//     them also flags internal/chain/client.go's TLSSkipVerify, which is
-//     shipped production config (wired at cmd/providerd/main.go from
-//     cfg.GRPCTLSSkipVerify, documented as grpc_tls_skip_verify in
-//     config.example.yaml) whose "(for testing only)" comment is an
-//     operator security warning. A guard that flags production config is a
-//     guard the next person disables.
+//     using one of the phrases below. A widening keyed on "for testing" was
+//     measured and rejected: the smallest one that catches those also flags
+//     internal/chain/client.go's TLSSkipVerify, which is shipped production
+//     config (wired at cmd/providerd/main.go from cfg.GRPCTLSSkipVerify,
+//     documented as grpc_tls_skip_verify in config.example.yaml) whose
+//     "(for testing only)" comment is an operator security warning. A guard
+//     that flags production config is a guard the next person disables.
+//     ENG-765 added "set in tests", which reaches the nil-in-prod shape
+//     without paying that cost — see the note on the phrase itself for why
+//     it is keyed on purpose rather than on state.
+//   - A field written in production but read only by tests, whose name and
+//     doc are both ordinary production prose. No phrase can reach that:
+//     there is nothing in the text to match. ENG-765 found three
+//     (docker.Backend.httpClient, k3s.Backend.httpClient,
+//     provisioner.Manager.handlers) by enumerating every unexported
+//     production struct field and comparing prod reads against test reads.
+//     Catching it needs write-vs-read selector analysis, not a phrase.
 //
 // TestTestOnlyRules pins the matching rules themselves, including the
 // deliberate misses above. Extend it alongside any change to the patterns.
@@ -72,7 +83,28 @@ var testOnlyDocPhrases = []string{
 	"testing helper that",
 	"(for testing)",
 	"only for cross-package tests",
-	"exposed for testing",
+	// Deliberately the shorter stem: it subsumes "exposed for testing" and
+	// also catches the wordings that slipped past it, which is how
+	// docker.Backend.httpClient survived ENG-354 documented "exposed for
+	// test replacement" (ENG-765). Note the reason string reports the
+	// MATCHED phrase, and matching is first-match-wins over this slice, so
+	// shortening an entry changes what a hit prints.
+	"exposed for test",
+	// ENG-765. Catches the nil-in-prod injection point CLAUDE.md forbids,
+	// whose doc habitually reads "Nil in production; set in tests ...".
+	// Deliberately keyed on the PURPOSE half of that sentence, not the
+	// state half: "nil in production" would be a state phrase, and this
+	// repo documents legitimate optional dependencies exactly that way
+	// ("nil = disabled" in provisioner/manager.go, "Store may be nil to
+	// disable callback persistence" in shared/callback_sender.go, "Left
+	// nil when no TLS fields are set" in cmd/providerd/main.go). Reword
+	// any of those slightly and a state phrase flags shipped config —
+	// the failure mode this list's third blind spot below exists to
+	// avoid. chain/client.go's clock seam already normalizes to
+	// "time.now in production". Measured across all production files
+	// under internal/ and cmd/: this phrase matched only the two k3s
+	// hooks ENG-765 removed.
+	"set in tests",
 }
 
 // testSupportPackages are directories whose entire purpose is to support
@@ -251,7 +283,20 @@ type Backend struct {
 // testing.
 var Clock = 0
 `,
-			want: []string{"Clock -- doc comment says it exists for tests: exposed for testing"},
+			want: []string{"Clock -- doc comment says it exists for tests: exposed for test"},
+		},
+		{
+			// The wording that slipped past the longer "exposed for
+			// testing" and left docker.Backend.httpClient uncaught
+			// through all of ENG-354 (ENG-765).
+			name: "exposed-for-test variant wording, field",
+			src: `package p
+type Backend struct {
+	// httpClient is used by callbackSender; exposed for test replacement.
+	httpClient *http.Client
+}
+`,
+			want: []string{"Backend.httpClient -- doc comment says it exists for tests: exposed for test"},
 		},
 		{
 			name: "nested anonymous struct field",
@@ -287,6 +332,46 @@ type StubForTest struct {
 			src: `package p
 type Store interface {
 	ResetForTest()
+}
+`,
+			want: nil,
+		},
+		{
+			// ENG-765's shape. The trailing-comment position, and the
+			// phrase on one line.
+			name: "nil-in-prod hook field, trailing comment",
+			src: `package p
+type Backend struct {
+	beforeSend func() // nil in production; set in tests to force an interleaving
+}
+`,
+			want: []string{"Backend.beforeSend -- doc comment says it exists for tests: set in tests"},
+		},
+		{
+			// The same shape in the doc position, with the phrase
+			// straddling a line break — which is how gofmt left the real
+			// k3s hooks, and the reason an unnormalized Contains would
+			// have missed one of the two.
+			name: "nil-in-prod hook field, phrase wrapped across doc lines",
+			src: `package p
+type Backend struct {
+	// beforeSend fires at checkpoint 2. Nil in production; set in
+	// tests to interleave a teardown race.
+	beforeSend func()
+}
+`,
+			want: []string{"Backend.beforeSend -- doc comment says it exists for tests: set in tests"},
+		},
+		{
+			// The optional-dependency idiom this repo uses everywhere.
+			// It is the reason the phrase above is keyed on purpose
+			// ("set in tests") rather than state ("nil in production").
+			name: "documented limit: an optional production dependency is not flagged",
+			src: `package p
+type Manager struct {
+	// placementStore is optional and is nil in production when the
+	// operator has not configured a placement database.
+	placementStore *Store
 }
 `,
 			want: nil,

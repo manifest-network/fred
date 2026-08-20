@@ -19,6 +19,13 @@ on:
       # entry those tests only ran nightly — i.e. never on the PR that broke
       # them, which is the ENG-330 rot mode this workflow exists to prevent.
       - "internal/provisioner/**"
+      # cmd/k3s-backend/integration_test.go execs the real k3s-backend
+      # binary, which is built from internal/backend/k3s — so a change
+      # confined to that package can break this suite while matching no
+      # other entry here. Same ENG-330 rot mode as the reconciler note
+      # above (found while removing that package's test-only hooks,
+      # ENG-765).
+      - "internal/backend/k3s/**"
       - "cmd/k3s-backend/**"
       - "Makefile"
       - "go.mod"
@@ -39,6 +46,13 @@ on:
       # entry those tests only ran nightly — i.e. never on the PR that broke
       # them, which is the ENG-330 rot mode this workflow exists to prevent.
       - "internal/provisioner/**"
+      # cmd/k3s-backend/integration_test.go execs the real k3s-backend
+      # binary, which is built from internal/backend/k3s — so a change
+      # confined to that package can break this suite while matching no
+      # other entry here. Same ENG-330 rot mode as the reconciler note
+      # above (found while removing that package's test-only hooks,
+      # ENG-765).
+      - "internal/backend/k3s/**"
       - "cmd/k3s-backend/**"
       - "Makefile"
       - "go.mod"

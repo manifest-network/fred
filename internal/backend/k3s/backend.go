@@ -90,9 +90,6 @@ type Backend struct {
 
 	callbackSender *shared.CallbackSender
 
-	// httpClient is used by callbackSender for outbound callback delivery.
-	httpClient *http.Client
-
 	// stopCtx is canceled on shutdown; stopCancel triggers it. Canceling
 	// aborts in-flight callback retries (see shared.CallbackSender).
 	stopCtx    context.Context
@@ -117,19 +114,29 @@ type Backend struct {
 	// kubeBuildErr captures the build outcome under kubeBuildOnce so
 	// subsequent Health() calls return the same wrapped error.
 	kubeBuildErr error
+}
 
-	// beforeDiagnosticStore fires inside runStubProvisioner at checkpoint 1
-	// — after the worker has released provisionsMu and before the
-	// ctx.Err() check that guards diagnosticsStore.Store. Nil in
-	// production; set in tests (same-package access) to deterministically
-	// interleave a Deprovision-races-worker race for ENG-189 case (b).
-	beforeDiagnosticStore func()
-
-	// beforeCallbackSend fires inside runStubProvisioner at checkpoint 2
-	// — after the diagnostic write and before the ctx.Err() check that
-	// guards callbackSender.SendCallback. Nil in production; set in
-	// tests to interleave ENG-189 case (c).
-	beforeCallbackSend func()
+// newCallbackHTTPClient builds the HTTP client the CallbackSender uses for
+// outbound callback delivery.
+//
+// Extracted from New so the CallbackInsecureSkipVerify branch is reachable
+// from a test: the client is a local that New hands straight to
+// NewCallbackSender, and the Backend deliberately keeps no field pointing
+// at it (ENG-765 — a field only tests read is test scaffolding in a
+// production struct).
+func newCallbackHTTPClient(cfg Config, logger *slog.Logger) *http.Client {
+	c := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	if cfg.CallbackInsecureSkipVerify {
+		logger.Error("INSECURE: callback TLS verification disabled — do NOT use in production")
+		c.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, //nolint:gosec // Intentional for development
+			},
+		}
+	}
+	return c
 }
 
 // New creates a new K3s backend.
@@ -155,17 +162,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		cfg.TenantQuota,
 	)
 
-	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-	if cfg.CallbackInsecureSkipVerify {
-		logger.Error("INSECURE: callback TLS verification disabled — do NOT use in production")
-		httpClient.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, //nolint:gosec // Intentional for development
-			},
-		}
-	}
+	httpClient := newCallbackHTTPClient(cfg, logger)
 
 	cbStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
 		DBPath: cfg.CallbackDBPath,
@@ -211,7 +208,6 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		callbackStore:    cbStore,
 		diagnosticsStore: diagStore,
 		releaseStore:     releaseStore,
-		httpClient:       httpClient,
 	}
 
 	b.stopCtx, b.stopCancel = context.WithCancel(context.Background())

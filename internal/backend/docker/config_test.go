@@ -1,6 +1,8 @@
 package docker
 
 import (
+	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +86,35 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 		cfg := validConfig()
 		cfg.ProductionMode = true
 		require.NoError(t, cfg.Validate())
+	})
+}
+
+// TestNewCallbackHTTPClient covers what the tests above do not: the
+// TRANSPORT callback_insecure_skip_verify wires up, as opposed to the
+// Validate rule that rejects the flag in production mode. Nothing exercised
+// it before — the only handle on that client was a Backend field that no
+// production code read, which ENG-765 deleted; this function is the seam
+// that replaces it.
+func TestNewCallbackHTTPClient(t *testing.T) {
+	t.Run("verification on by default", func(t *testing.T) {
+		c := newCallbackHTTPClient(validConfig(), slog.Default())
+		require.NotNil(t, c)
+		assert.Equal(t, 30*time.Second, c.Timeout)
+		assert.Nil(t, c.Transport,
+			"default client must use the stdlib transport, which verifies TLS")
+	})
+
+	t.Run("insecure skip verify wires an unverifying transport", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.CallbackInsecureSkipVerify = true
+
+		c := newCallbackHTTPClient(cfg, slog.Default())
+		require.NotNil(t, c)
+		assert.Equal(t, 30*time.Second, c.Timeout)
+		tr, ok := c.Transport.(*http.Transport)
+		require.True(t, ok, "transport must be an *http.Transport")
+		require.NotNil(t, tr.TLSClientConfig)
+		assert.True(t, tr.TLSClientConfig.InsecureSkipVerify)
 	})
 }
 
