@@ -492,6 +492,21 @@ var ErrMalformedErrorBody = errors.New("backend returned an unrecognized error r
 // ErrValidation) so the API can map it to 422 distinctly. (ENG-438)
 var ErrDemoteDataExceedsTier = errors.New("retained data exceeds the requested smaller tier")
 
+// ErrRestoreRefused is returned when a /restore 4xx body IS the declared
+// envelope but carries a "code" discriminator fred does not recognize for that
+// status. fred relays the backend's authored message at the status the backend
+// chose and states no lease-state fact of its own — an unrecognized code is
+// evidence AGAINST "no retained data", not for it.
+//
+// Deliberately NOT ErrMalformedErrorBody. The envelope was well-formed, so this
+// is a business verdict fred could not classify, not an off-contract backend.
+// "code" is an OPEN, add-only set (the same policy backend.Reason states), so a
+// backend shipping a new discriminator before providerd learns it must not trip
+// the circuit breaker for every other tenant on that backend, and must not land
+// in fred_backend_malformed_error_body_total — whose runbook remedy ("fix the
+// envelope, suspect an intermediary") would send the operator somewhere wrong.
+var ErrRestoreRefused = errors.New("backend refused the restore")
+
 // CodeDemoteExceedsTier is the machine-readable error code the docker-backend
 // emits (HTTP 422) and the HTTPClient parses to reconstruct
 // ErrDemoteDataExceedsTier across the HTTP boundary. 422 is overloaded (a bare
@@ -499,6 +514,14 @@ var ErrDemoteDataExceedsTier = errors.New("retained data exceeds the requested s
 // on this exact string; defining it once here makes drift a compile error
 // rather than a silent misclassification. (ENG-438)
 const CodeDemoteExceedsTier = "demote_exceeds_tier"
+
+// CodeAlreadyProvisioned is the machine-readable code the docker-backend emits
+// on /restore's 409 to distinguish "already provisioned" from the bare 409
+// meaning "invalid state". Defined here for the same reason as
+// CodeDemoteExceedsTier: producer and consumer must agree on the exact string,
+// and a shared constant makes drift a compile error rather than a silent
+// misclassification.
+const CodeAlreadyProvisioned = "already_provisioned"
 
 // Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
 // still works, while allowing callers to classify the failure without string matching.
@@ -722,6 +745,10 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
 			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
 			//   - ErrDemoteDataExceedsTier: 422 (code=demote_exceeds_tier) from Restore — data exceeds the tier cap, a permanent client error, not a backend failure
+			//   - ErrRestoreRefused: a well-formed Restore refusal whose code fred does not know.
+			//     Belongs here with the other authored refusals: the envelope was valid, so this is
+			//     a business outcome, and "code" is an open add-only set — a backend that ships a
+			//     new discriminator before providerd learns it must not open the breaker.
 			// ErrMalformedErrorBody is deliberately ABSENT from this list, unlike every
 			// other 4xx above: a body fred cannot parse is not an expected business
 			// outcome, it is a backend that is off-contract. Counting it makes the
@@ -738,7 +765,8 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 				errors.Is(err, ErrAlreadyProvisioned) ||
 				errors.Is(err, ErrInvalidState) ||
 				errors.Is(err, ErrNotRetained) ||
-				errors.Is(err, ErrDemoteDataExceedsTier)
+				errors.Is(err, ErrDemoteDataExceedsTier) ||
+				errors.Is(err, ErrRestoreRefused)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -950,6 +978,21 @@ func detailOr(sentinel error, detail string) error {
 		return sentinel
 	}
 	return withDetail(sentinel, detail)
+}
+
+// noteUnrecognizedErrorCode records an envelope carrying a "code" fred does not
+// know for that status. Operator channel only, and deliberately NOT counted in
+// fred_backend_malformed_error_body_total: that counter means "the body was not
+// the declared envelope" and its runbook entry sends the operator to fix the
+// envelope or hunt an intermediary. Neither is the remedy here, which is to
+// upgrade providerd or fix a producer emitting a code valid for another status.
+func (c *HTTPClient) noteUnrecognizedErrorCode(operation string, status int, code string) {
+	slog.Warn("backend error envelope carried an unrecognized code for this status",
+		"backend", c.name,
+		"operation", operation,
+		"status", status,
+		"code", code,
+	)
 }
 
 // noteMalformedErrorBody records an off-contract error body on the OPERATOR
@@ -1385,10 +1428,23 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			if perr != nil {
 				return nil, perr
 			}
-			if code == CodeDemoteExceedsTier {
+			switch code {
+			case "":
+				// No discriminator: the documented bare 422.
+				return nil, ErrNotRetained
+			case CodeDemoteExceedsTier:
 				return nil, detailOr(ErrDemoteDataExceedsTier, msg)
+			default:
+				// A code fred does not know is evidence AGAINST "no retained
+				// data", not for it — yet this used to fall through to
+				// ErrNotRetained, which internal/api REMAPS to 404 "no retained
+				// data found for that lease". That discarded the message the
+				// backend was obliged to curate and replaced it with a positive
+				// claim about the tenant's data that its own body contradicted.
+				// Relay the backend's words at the status it chose instead.
+				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
+				return nil, detailOr(ErrRestoreRefused, msg)
 			}
-			return nil, ErrNotRetained
 		case http.StatusConflict:
 			// Restore overloads 409 for two sentinels: the backend tags the
 			// already-provisioned case with code="already_provisioned" so we can
@@ -1399,10 +1455,21 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			if perr != nil {
 				return nil, perr
 			}
-			if code == "already_provisioned" {
+			if code == CodeAlreadyProvisioned {
 				return nil, detailOr(ErrAlreadyProvisioned, msg)
 			}
-			return nil, ErrInvalidState
+			// An unrecognized code is left on ErrInvalidState deliberately,
+			// unlike the 422 above. The asymmetry is the 404 remap: for 422 fred
+			// CHANGES the status class and asserts that no retained data exists,
+			// which an unknown code contradicts. Here the tenant gets 409 — the
+			// status the backend itself chose, and RFC 9110's 409 already means
+			// "conflict with the current state of the resource", so fred is
+			// restating the backend's verdict rather than inventing one. The
+			// message is carried for operators either way.
+			if code != "" {
+				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
+			}
+			return nil, detailOr(ErrInvalidState, msg)
 		case http.StatusServiceUnavailable:
 			// 503: backend at capacity — not a health failure (matches Provision).
 			return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))

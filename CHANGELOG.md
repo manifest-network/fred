@@ -668,6 +668,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   and must carry no host paths or raw command output, and `validation_code` is documented for
   the first time. Tenants may now see `502` where an off-contract backend previously produced
   `400`. (ENG-620, ENG-739)
+- **A `/restore` rejection carrying an unrecognized `code` no longer becomes a confident wrong
+  answer.** `409` and `422` are the two statuses fred overloads on `/restore`, and the client
+  compared the body's `code` against a single expected value per status — anything else, whether a
+  discriminator a newer backend added or one valid for the *other* status, fell through to the
+  no-code branch. On `422` that meant `ErrNotRetained`, which fred **remaps to `404` "no retained
+  data found for that lease"**: it changed the status class the backend chose and asserted a
+  positive fact about the tenant's data that the backend's own body contradicted, while discarding
+  the message `BACKEND_GUIDE.md` obliges the backend to curate. Fred now relays the backend's
+  message at the status it sent. Deliberately **not** treated as a malformed body: the envelope was
+  well-formed, so it is excluded from `fred_backend_malformed_error_body_total` (whose runbook
+  remedy — fix the envelope, suspect an intermediary — would be wrong here) and from the circuit
+  breaker, so a backend shipping a new discriminator before `providerd` learns it degrades to a
+  plain refusal instead of tripping the breaker for every other tenant on that backend. It is
+  logged for operators instead. `already_provisioned` also becomes a shared exported constant like
+  `demote_exceeds_tier`, so producer/consumer drift is a compile error. The `409` path keeps
+  `ErrInvalidState` deliberately — there fred returns the status the backend chose and invents
+  nothing. (ENG-620)
 - **A tenant-facing `422` from `/restore` no longer repeats itself.** Fred re-prefixed the
   demote-exceeds-tier message with a sentinel the backend had already baked into it, so the
   body read `retained data exceeds the requested smaller tier: retained data exceeds the

@@ -290,6 +290,16 @@ func TestHTTPClientRestore_UnreadableBodyIsNotBareStatus(t *testing.T) {
 		{"html 409 is malformed", http.StatusConflict, "<html>409 /var/lib/fred/x</html>", ErrMalformedErrorBody, false},
 		{"foreign json 409 is malformed", http.StatusConflict, `{"message":"proxy error: /var/lib/fred/x"}`, ErrMalformedErrorBody, false},
 		{"code without error 409 is malformed", http.StatusConflict, `{"code":"already_provisioned"}`, ErrMalformedErrorBody, false},
+		// An unrecognized code is evidence AGAINST "no retained data". On 422
+		// the old fallthrough also REMAPPED the status to 404, so fred both
+		// changed the status class and asserted a fact the body contradicted.
+		{"unknown code 422 is refused, not not-retained", http.StatusUnprocessableEntity, `{"error":"retention subsystem is draining","code":"draining"}`, ErrRestoreRefused, false},
+		{"cross-status code on 422 is refused", http.StatusUnprocessableEntity, `{"error":"lease already provisioned","code":"already_provisioned"}`, ErrRestoreRefused, false},
+		// 409 keeps its sentinel deliberately: fred returns the status the
+		// backend chose, and RFC 9110's 409 already means "conflict with the
+		// current state", so there is no invented fact to remove.
+		{"unknown code 409 keeps 409 semantics", http.StatusConflict, `{"error":"lease is migrating","code":"draining"}`, ErrInvalidState, true},
+		{"cross-status code on 409 keeps 409 semantics", http.StatusConflict, `{"error":"too big","code":"demote_exceeds_tier"}`, ErrInvalidState, true},
 	}
 
 	for _, tt := range tests {
@@ -2619,4 +2629,123 @@ func TestHTTPClient_ListProvisions_ToleratesMidFetchDeletion(t *testing.T) {
 	}
 	assert.NotContains(t, seen, provUUID(20), "deleted-mid-fetch item is simply absent")
 	assert.Len(t, got, 24)
+}
+
+// TestHTTPClientRestore_UnrecognizedCodeRelaysBackendMessage covers the half the
+// status table does not: the table pins WHICH sentinel comes back, this pins
+// that the backend's authored message survives instead of being discarded.
+//
+// That message is the thing BACKEND_GUIDE obliges the backend to curate for the
+// tenant. Dropping it and substituting fred's own "no retained data found for
+// that lease" was the actual harm — the sentinel was just how it happened.
+func TestHTTPClientRestore_UnrecognizedCodeRelaysBackendMessage(t *testing.T) {
+	const authored = "retention subsystem is draining; retry in a few minutes"
+
+	for name, tc := range map[string]struct {
+		status     int
+		substitute string
+	}{
+		"422": {http.StatusUnprocessableEntity, "no retained data"},
+		"409": {http.StatusConflict, "invalid state"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"error":"` + authored + `","code":"draining"}`))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(HTTPClientConfig{
+				Name: "relay", BaseURL: server.URL, Timeout: 5 * time.Second,
+			})
+			err := client.Restore(context.Background(), RestoreRequest{
+				LeaseUUID: "n", FromLeaseUUID: "o", Tenant: "t", CallbackURL: "http://f/cb",
+			})
+			require.Error(t, err)
+
+			detail, ok := Detail(err)
+			require.True(t, ok, "the backend's authored message must be carried, not discarded")
+			assert.Equal(t, authored, detail)
+			assert.NotContains(t, err.Error(), tc.substitute,
+				"fred must not substitute its own verdict for the backend's message")
+		})
+	}
+}
+
+// TestHTTPClientRestore_UnrecognizedCodeIsNotAMalformedBody pins the reason this
+// path does NOT reuse the malformed machinery. The envelope was well-formed, so
+// counting it in fred_backend_malformed_error_body_total would corrupt that
+// metric's stated meaning and send the operator to the wrong remedy ("fix the
+// envelope, suspect an intermediary" — neither applies to a version skew).
+func TestHTTPClientRestore_UnrecognizedCodeIsNotAMalformedBody(t *testing.T) {
+	counter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "test_unrecognized_code_not_malformed_total"},
+		[]string{"backend", "operation"},
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"x","code":"draining"}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientConfig{
+		Name: "be-1", BaseURL: server.URL, Timeout: 5 * time.Second,
+		MalformedErrorBodyTotal: counter,
+	})
+
+	// Seed a non-zero value first: WithLabelValues auto-creates at 0, so an
+	// == assertion on a never-written counter would pass vacuously.
+	counter.WithLabelValues("be-1", "restore").Add(7)
+
+	var rec logRecorder
+	prev := slog.Default()
+	slog.SetDefault(slog.New(&rec))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	err := client.Restore(context.Background(), RestoreRequest{
+		LeaseUUID: "n", FromLeaseUUID: "o", Tenant: "t", CallbackURL: "http://f/cb",
+	})
+	require.ErrorIs(t, err, ErrRestoreRefused)
+
+	assert.InDelta(t, 7.0, promtestutil.ToFloat64(counter.WithLabelValues("be-1", "restore")), 0.001,
+		"a well-formed envelope with an unknown code is NOT a malformed body")
+
+	entry, found := rec.find("unrecognized code for this status")
+	require.True(t, found, "the unknown code must still reach operators")
+	assert.Equal(t, slog.LevelWarn, entry.Level)
+	assert.Equal(t, "draining", entry.attr("code"))
+	assert.Equal(t, "422", entry.attr("status"))
+}
+
+// TestHTTPClientRestore_UnrecognizedCodeDoesNotTripBreaker is the guard on the
+// forward-compatibility premise. `code` is an open, add-only set, so a backend
+// that ships a new discriminator before providerd learns it must degrade to a
+// plain refusal — not open the breaker for every other tenant on that backend.
+func TestHTTPClientRestore_UnrecognizedCodeDoesNotTripBreaker(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"draining","code":"draining"}`))
+	}))
+	defer server.Close()
+
+	const threshold = 3
+	client := NewHTTPClient(HTTPClientConfig{
+		Name: "skew", BaseURL: server.URL, Timeout: 5 * time.Second, CBFailureThresh: threshold,
+	})
+
+	const n = threshold * 4
+	for i := range n {
+		err := client.Restore(context.Background(), RestoreRequest{
+			LeaseUUID: "n", FromLeaseUUID: "o", Tenant: "t", CallbackURL: "http://f/cb",
+		})
+		require.ErrorIs(t, err, ErrRestoreRefused, "call %d", i+1)
+		require.NotErrorIs(t, err, ErrCircuitOpen,
+			"a version skew must not open the breaker (call %d)", i+1)
+	}
+	assert.Equal(t, n, requestCount, "every request must have reached the backend")
 }

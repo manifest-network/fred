@@ -7393,3 +7393,74 @@ func TestUpdateLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 		})
 	}
 }
+
+// TestRestoreLease_UnrecognizedBackendCodeRelays422 is the tenant-visible half
+// of the fix: a 422 carrying a code fred does not know must NOT be remapped to
+// 404 "no retained data found for that lease".
+//
+// That remap was the sharpest fabrication left in this path — fred changing the
+// status class the backend chose AND asserting a positive fact about the
+// tenant's data that the backend's own body contradicted, while discarding the
+// message BACKEND_GUIDE obliged the backend to curate.
+func TestRestoreLease_UnrecognizedBackendCodeRelays422(t *testing.T) {
+	const authored = "retention subsystem is draining; retry in a few minutes"
+
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid == leaseUUID {
+				return &billingtypes.Lease{
+					Uuid: leaseUUID, Tenant: kp.Address,
+					ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"` + authored + `","code":"draining"}`))
+	}))
+	defer backendServer.Close()
+
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "unknown-code", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	h := &Handlers{
+		client:        chainClient,
+		backendRouter: router,
+		placementLookup: &mockPlacementLookup{getFunc: func(uuid string) string {
+			if uuid == fromLeaseUUID {
+				return "unknown-code"
+			}
+			return ""
+		}},
+		providerUUID: providerUUID,
+		bech32Prefix: "manifest",
+	}
+
+	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore",
+		strings.NewReader(`{"from_lease_uuid":"`+fromLeaseUUID+`"}`))
+	req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+	req.SetPathValue("lease_uuid", leaseUUID)
+
+	rec := httptest.NewRecorder()
+	h.RestoreLease(rec, req)
+
+	body := rec.Body.String()
+	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code,
+		"the backend chose 422; fred must not remap it to 404: %s", body)
+	assert.Contains(t, body, authored, "the backend's authored message must reach the tenant")
+	assert.NotContains(t, body, "no retained data",
+		"fred must not assert that no retained data exists when the code says otherwise")
+}

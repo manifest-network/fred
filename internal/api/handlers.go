@@ -1182,6 +1182,13 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, backend.ErrValidation):
 			writeError(w, tenantDetail(err, "the restore request was rejected as invalid"),
 				http.StatusBadRequest)
+		case errors.Is(err, backend.ErrRestoreRefused):
+			// The backend refused with a well-formed envelope whose code fred
+			// does not know. Relay its message at the status it chose; fred has
+			// no lease-state verdict of its own to add, and guessing one is what
+			// this branch exists to stop.
+			writeError(w, tenantDetail(err, "the provider backend refused the restore"),
+				http.StatusUnprocessableEntity)
 		case errors.Is(err, backend.ErrMalformedErrorBody):
 			// The backend answered off-contract, so fred has no diagnostic to
 			// pass on. 502: the fault is upstream, not the tenant's request.

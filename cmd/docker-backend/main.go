@@ -522,7 +522,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, backend.ErrAlreadyProvisioned) {
 			// 409 with code="already_provisioned" → client reconstructs
 			// ErrAlreadyProvisioned (Restore overloads 409 for two sentinels).
-			s.errorResponseWithCode(w, http.StatusConflict, "lease already provisioned", "already_provisioned")
+			s.errorResponseWithCode(w, http.StatusConflict, "lease already provisioned", backend.CodeAlreadyProvisioned)
 			return
 		}
 		if errors.Is(err, backend.ErrValidation) {
