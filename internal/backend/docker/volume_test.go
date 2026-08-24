@@ -73,6 +73,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		expected := filepath.Join(dir, "data")
 		assert.Equal(t, "/data", binds[expected])
 		assert.DirExists(t, expected)
+		assertNoSymlinkBindSources(t, binds)
 	})
 
 	t.Run("multiple volume paths", func(t *testing.T) {
@@ -84,6 +85,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		assert.Equal(t, "/var/lib/postgresql/data", binds[filepath.Join(dir, "var/lib/postgresql/data")])
 		assert.DirExists(t, filepath.Join(dir, "data"))
 		assert.DirExists(t, filepath.Join(dir, "var/lib/postgresql/data"))
+		assertNoSymlinkBindSources(t, binds)
 	})
 
 	t.Run("unsupported volume path returns error", func(t *testing.T) {
@@ -108,6 +110,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, err)
 		assert.Len(t, binds, 1)
 		// Just verify it succeeds without chown — no permission error
+		assertNoSymlinkBindSources(t, binds)
 	})
 
 	t.Run("mkdir on read-only parent fails", func(t *testing.T) {
@@ -165,6 +168,60 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		// The escape target must not be written to.
 		assert.NoDirExists(t, filepath.Join(outside, "pwned"), "MkdirAll must not have followed the symlink out of the volume root")
 	})
+
+	// ENG-795: the half of ENG-539 the two subtests above do NOT cover. Both of them
+	// point the planted symlink at a separate t.TempDir(), whose absolute path does not
+	// exist *relative to the volume root* — so os.Root's Stat returns ErrNotExist,
+	// MkdirAll keeps its EEXIST and errors. They pin the ESCAPING case, which os.Root
+	// genuinely handles.
+	//
+	// os.Root is escape-safe, not symlink-free: rootMkdirAll SUCCEEDS on a leaf symlink
+	// that resolves, inside the root, to a directory (os/root_openat.go, "succeed if the
+	// link resolves to a directory"), and the leaf stays a symlink on disk. The bind
+	// Source is the raw joined string and Docker resolves it host-side — runc trusts the
+	// mount source and lets the kernel follow it — so the mount lands on whatever the
+	// link names. `..` from a first-level subdir names the lease's own volume root, where
+	// the .fred-project-id quota marker lives (volume_xfs.go) and whose unwritability
+	// isWritablePathOnly's classification depends on.
+	t.Run("in-root symlink leaf is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "data"), 0o700))
+		// Sentinel at the volume ROOT: what the redirected mount would expose.
+		require.NoError(t, os.WriteFile(filepath.Join(dir, projectIDFile), []byte("42"), 0o600))
+		// Deploy 1, from inside the tenant's read-write /data mount: `ln -s .. /data/x`.
+		require.NoError(t, os.Symlink("..", filepath.Join(dir, "data", "x")))
+
+		// Deploy 2 declares VOLUME /data/x. Nothing upstream stops it: sanitizeVolumePath
+		// sees no ".." in the *string*, and update preflight never inspects the image's
+		// VOLUME set or on-disk state.
+		binds, err := buildStatefulVolumeBinds(dir, []string{"/data/x"}, 0, 0)
+		require.Error(t, err, "a leaf symlink that stays INSIDE the volume root must be rejected")
+		assert.Empty(t, binds, "no bind may be emitted once the leaf is refused")
+	})
+
+	t.Run("in-root symlink leaf pointing at a sibling is rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "data", "y"), 0o700))
+		require.NoError(t, os.Symlink("y", filepath.Join(dir, "data", "x")))
+
+		binds, err := buildStatefulVolumeBinds(dir, []string{"/data/x"}, 0, 0)
+		require.Error(t, err, "a leaf symlink is unsafe as a bind Source wherever it points")
+		assert.Empty(t, binds, "no bind may be emitted once the leaf is refused")
+	})
+}
+
+// assertNoSymlinkBindSources pins the invariant the ENG-539/ENG-795 subtests exist to
+// protect, which require.Error alone does not: whatever buildStatefulVolumeBinds
+// returns, no emitted bind Source may be a symlink. Docker resolves the Source
+// host-side, so a guard that returned a symlinked Source without erroring would satisfy
+// every "must reject" assertion above and still hand the tenant a redirected mount.
+func assertNoSymlinkBindSources(t *testing.T, binds map[string]string) {
+	t.Helper()
+	for source := range binds {
+		info, err := os.Lstat(source)
+		require.NoError(t, err, "emitted bind source %q must exist on disk", source)
+		assert.Zero(t, info.Mode()&os.ModeSymlink, "emitted bind source %q must not be a symlink", source)
+	}
 }
 
 func TestNoopVolumeManager(t *testing.T) {

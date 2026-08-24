@@ -20,6 +20,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -254,6 +255,182 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 
 	_, statErr := os.Stat(subvolPath)
 	assert.True(t, errors.Is(statErr, fs.ErrNotExist), "volume directory should be gone after deprovision")
+}
+
+// bindMountSource returns the HOST-side Source of the bind mounted at dest, or "" if
+// there is none. Distinct from containerHasBindMount, which discards m.Source — and the
+// Source is the whole of ENG-795: Docker resolves it host-side (runc trusts the mount
+// source and lets the kernel follow it), so a symlinked Source silently redirects the
+// mount while every destination-only assertion still passes.
+func bindMountSource(t *testing.T, containerID, dest string) string {
+	t.Helper()
+	docker, err := NewDockerClient("", "")
+	require.NoError(t, err)
+	defer func() { _ = docker.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	inspect, err := docker.client.ContainerInspect(ctx, containerID)
+	require.NoError(t, err)
+
+	for _, m := range inspect.Mounts {
+		if m.Destination == dest && m.Type == "bind" {
+			return m.Source
+		}
+	}
+	return ""
+}
+
+// containersForLease counts the managed containers of a lease. getContainerID cannot be
+// used to assert ABSENCE — it require.Len(…, 1)s and fails the test outright.
+func containersForLease(t *testing.T, leaseUUID string) int {
+	t.Helper()
+	docker, err := NewDockerClient("", "")
+	require.NoError(t, err)
+	defer func() { _ = docker.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	containers, err := docker.client.ContainerList(ctx, container.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("label", LabelManaged+"=true"),
+			filters.Arg("label", LabelLeaseUUID+"="+leaseUUID),
+		),
+	})
+	require.NoError(t, err)
+	return len(containers)
+}
+
+// TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected pins the ENG-795 guard through
+// the real provision path, over a real managed btrfs volume, with a real Docker daemon.
+//
+// buildStatefulVolumeBinds confines subdir creation with os.Root, which is escape-safe but
+// NOT symlink-free: os.Root's MkdirAll deliberately succeeds when the leaf is a symlink
+// resolving, inside the root, to a directory, and leaves it a symlink. The emitted bind
+// Source is the raw joined string, so Docker follows it and mounts whatever it names —
+// for a `..` link, the lease's own volume ROOT, where the .fred-project-id quota marker
+// lives (volume_xfs.go reads it back unvalidated) and whose unwritability
+// isWritablePathOnly's close-time classification assumes.
+//
+// The tenant-plantable route is a nested declared VOLUME (deploy 1 declares /data and the
+// tenant runs `ln -s .. /data/x`; deploy 2 declares VOLUME /data/x) — that path is pinned
+// by the unit test, which needs no second image. Here the symlink is planted host-side
+// between two provisions of the same lease so the assertion stays on redis:7 rather than
+// pulling a second image only for its VOLUME list. What this test proves is the half the
+// unit test cannot: that fred refuses BEFORE Docker is asked to resolve the Source, and
+// that no container is created with a redirected mount.
+func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	b := testBackendWithRealDocker(t, func(cfg *Config) {
+		cfg.NetworkIsolation = ptrBool(false)
+		cfg.VolumeDataPath = mountPath
+		cfg.VolumeFilesystem = "btrfs"
+		// testBackendWithRealDocker parks the reconciler at 1h; step 3 needs it to
+		// observe the killed container and move the lease to Failed.
+		cfg.ReconcileInterval = 2 * time.Second
+	})
+
+	ctx := context.Background()
+	leaseUUID := fmt.Sprintf("vol-symlink-leaf-%d", time.Now().UnixNano())
+
+	appManifest := manifest.Manifest{
+		Image:   "redis:7", // declares VOLUME /data
+		Command: []string{"redis-server", "--save", "1", "1"},
+	}
+	payload, err := json.Marshal(appManifest)
+	require.NoError(t, err)
+
+	provisionReq := backend.ProvisionRequest{
+		LeaseUUID:    leaseUUID,
+		Tenant:       "test-tenant",
+		ProviderUUID: "test-provider",
+		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:  callbackServer.URL,
+		Payload:      payload,
+	}
+
+	// 1. Provision normally.
+	require.NoError(t, b.Provision(ctx, provisionReq))
+	select {
+	case cb := <-callbackCh:
+		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
+	case <-time.After(3 * time.Minute):
+		t.Fatal("timeout waiting for provision callback")
+	}
+
+	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
+	subvolPath := filepath.Join(mountPath, volumeID)
+	dataDir := filepath.Join(subvolPath, "data")
+
+	// 2. POSITIVE CONTROL. Without this the refusal below could pass vacuously — a guard
+	//    that rejected everything would look identical. Assert the healthy Source is the
+	//    real in-volume directory, and that it is not a symlink.
+	containerID := getContainerID(t, leaseUUID)
+	require.Equal(t, dataDir, bindMountSource(t, containerID, "/data"),
+		"the healthy bind Source must be the declared VOLUME's subdir inside the managed volume")
+	info, err := os.Lstat(dataDir)
+	require.NoError(t, err)
+	require.Zero(t, info.Mode()&fs.ModeSymlink, "the healthy leaf must be a real directory")
+
+	// Write real tenant data, so step 7's "the guard did not touch it" assertion has
+	// something to be about.
+	execInContainer(t, containerID, []string{"redis-cli", "SET", "eng795_key", "eng795_value"})
+	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
+	require.FileExists(t, filepath.Join(dataDir, "dump.rdb"))
+
+	// 3. Take the lease down so the volume is quiescent, then plant the symlink. A live
+	//    tenant does this from inside the container at a NESTED path; planting it here
+	//    directly puts the volume in the identical on-disk state without a second image.
+	killContainer(t, containerID)
+	waitForContainerExited(t, containerID)
+	waitForProvisionStatus(t, b, leaseUUID, backend.ProvisionStatusFailed, 30*time.Second)
+	drainCallbacks(callbackCh)
+
+	require.NoError(t, os.Rename(dataDir, filepath.Join(subvolPath, "realdata")))
+	// Relative and in-root: os.Root permits it, which is exactly the gap. An ABSOLUTE
+	// target or one escaping the root is refused by os.Root itself (ENG-539) and would
+	// make this test pass for the wrong reason.
+	require.NoError(t, os.Symlink("realdata", dataDir))
+
+	before := testutil.ToFloat64(volumeBindSymlinkRejectedTotal)
+
+	// 4. Re-provision the same lease onto the poisoned volume.
+	require.NoError(t, b.Provision(ctx, provisionReq))
+
+	failTimeout := time.After(3 * time.Minute)
+	var failure backend.CallbackPayload
+	for failure.Status != backend.CallbackStatusFailed {
+		select {
+		case cb := <-callbackCh:
+			failure = cb
+		case <-failTimeout:
+			t.Fatal("timeout waiting for the re-provision to fail closed on the symlinked volume leaf")
+		}
+	}
+
+	// 5. The refusal must be attributable, and must have happened at the guard.
+	assert.Equal(t, float64(1), testutil.ToFloat64(volumeBindSymlinkRejectedTotal)-before,
+		"exactly one bind-source rejection must be counted")
+
+	// 6. No container may exist for this lease: the guard runs before compose.Up, so
+	//    Docker was never asked to resolve the symlinked Source.
+	assert.Zero(t, containersForLease(t, leaseUUID),
+		"no container may be created once the bind Source is refused")
+
+	// 7. The guard must not have touched tenant data — it rejects, it does not repair.
+	assert.FileExists(t, filepath.Join(subvolPath, "realdata", "dump.rdb"),
+		"the tenant's data under the link target must be left untouched")
+	linkInfo, err := os.Lstat(dataDir)
+	require.NoError(t, err)
+	assert.NotZero(t, linkInfo.Mode()&fs.ModeSymlink,
+		"the planted symlink must still be there: the guard rejects, it never unlinks")
+
+	require.NoError(t, b.Deprovision(ctx, leaseUUID))
 }
 
 func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {

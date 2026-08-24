@@ -18,6 +18,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- **docker: a stateful-volume bind source whose leaf is a symlink is now rejected — the
+  half of ENG-539 that was never fixed.** ENG-539 confined subdirectory creation to the
+  volume root with `os.Root`, and that guard holds: a link that escapes the root, or an
+  absolute one, still fails closed. But `os.Root` is *escape*-safe, not *symlink*-free.
+  Its `MkdirAll` mirrors `os.MkdirAll` and returns success when the leaf is a symlink that
+  resolves — **inside** the root — to a directory, leaving the leaf a symlink on disk. The
+  bind `Source` fred emits is the raw joined path, which Docker resolves host-side; runc
+  deliberately trusts the mount source and lets the kernel follow it, so nothing downstream
+  of fred catches this. `buildStatefulVolumeBinds` now `Lstat`s the leaf and fails the
+  operation if it is a symlink, matching the check the migration path (`migrate.go`) and
+  the writable-path path (ENG-543) already had. New counter
+  `fred_docker_backend_volume_bind_symlink_rejected_total`.
+
+  Reachable in two deploys by a tenant whose image runs as **root** (the volume root is
+  `0700 root:root`, and containers are not user-namespace-remapped in production, so
+  container UID 0 is host UID 0 — owner bits alone grant write; a non-root image gets
+  `EACCES` and cannot exploit this). Deploy an image declaring `VOLUME /data`, run
+  `ln -s .. /data/x` inside the container, then `POST /update` to an image declaring
+  `VOLUME /data/x`: update preflight validates service names, fixed host ports, the
+  registry allowlist and SKU profiles, never the image's `VOLUME` set or on-disk state.
+
+  **The reach is the lease's own volume root — not a sibling tenant's volume and not the
+  host filesystem**; `../..` and absolute targets are still refused by `os.Root`, and
+  `sanitizeVolumePath` still rejects anything that lexically Cleans above the root. What
+  the root holds is the problem. The `.fred-project-id` marker becomes tenant-writable, and
+  it is read back unvalidated: `resolveProjectID` prefers the on-disk file over the
+  in-memory map, `EnsureQuota` re-tags the directory into whatever project ID the file
+  names and re-applies that project's limit, and `Destroy` clears it — so a tenant-authored
+  value redirects XFS quota operations onto **another lease's** project. It also falsifies
+  the premise `isWritablePathOnly` documents and depends on ("the container can't write the
+  volume root"), which decides at close whether a volume is retained or reclaimed.
+
+  Fred **rejects and does not repair**, matching kubelet's handling of the equivalent
+  subPath flaw: the planted link is left in place, and the tenant's data under it is
+  untouched. A volume already in this state therefore fails every provision, update and
+  restore until an operator removes the link — the new counter is how that population
+  becomes visible. (ENG-795)
+
 ## [0.13.0] - 2026-08-20
 
 ### Added
