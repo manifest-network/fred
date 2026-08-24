@@ -460,6 +460,11 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 	// another tenant's volume) into the container. os.Root refuses to traverse
 	// any symlinked component that escapes the root, so creation fails closed.
 	// Mirrors the ENG-430 tar-extraction hardening. See ENG-539.
+	//
+	// That covers ESCAPING symlinks only. os.Root is escape-safe, not
+	// symlink-free: it permits — and MkdirAll deliberately succeeds on — a leaf
+	// symlink that resolves INSIDE the root, so the leaf-symlink check below is
+	// a second, separate guard, not a restatement of this one. See ENG-795.
 	root, err := os.OpenRoot(hostPath)
 	if err != nil {
 		return nil, fmt.Errorf("open volume root %q: %w", hostPath, err)
@@ -482,9 +487,45 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 		if err := root.MkdirAll(sanitized, 0o700); err != nil {
 			return nil, fmt.Errorf("volume subdir %q: %w", filepath.Join(hostPath, sanitized), err)
 		}
+		// MkdirAll succeeding does NOT mean the leaf is a directory. os.Root's
+		// MkdirAll mirrors os.MkdirAll and returns nil when the leaf is a symlink
+		// that resolves — within the root — to a directory, leaving the leaf a
+		// symlink on disk. The bind Source emitted below is the raw joined string,
+		// which Docker resolves host-side (runc trusts the mount source and lets the
+		// kernel follow it), so a symlinked leaf silently redirects the mount to
+		// whatever the link names. A tenant that planted `{root}/data/x -> ".."` on
+		// an earlier deploy and then declares VOLUME /data/x gets its own volume
+		// ROOT mounted read-write: that is where the .fred-project-id quota marker
+		// lives (volume_xfs.go reads it back unvalidated on Destroy/EnsureQuota) and
+		// whose unwritability isWritablePathOnly's close-time classification assumes.
+		//
+		// Fail closed, mirroring resolveMigratedBindSource (migrate.go). Unlike the
+		// writable-path equivalent in setupWritablePathBinds — which SKIPS, because a
+		// _wp path may legitimately go unseeded — a stateful VOLUME has no safe
+		// fallback: omitting the bind would run the workload on the container's
+		// ephemeral layer and lose its data at the next replace. ErrNotExist is an
+		// error here too; MkdirAll just created this path. (ENG-795)
+		//
+		// Scope, so the next reader does not over-trust this: on PROVISION it is a hard
+		// boundary — no tenant container exists yet, so nothing can race it. On
+		// update/restart it is only a race narrowing, because doReplaceContainers calls
+		// setupVolBinds while the tenant's OLD container is still running and lets the
+		// later compose.Up stop it, so the leaf can be exchanged between this Lstat and
+		// dockerd resolving the Source. Closing that needs the writer gone before the
+		// check (what migrate.go relies on) — mounting by fd, the way kubelet does it,
+		// is not available to us because dockerd performs the mount. See ENG-797.
+		info, lerr := root.Lstat(sanitized)
+		if lerr != nil {
+			return nil, fmt.Errorf("resolve volume subdir %q: %w", filepath.Join(hostPath, sanitized), lerr)
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			volumeBindSymlinkRejectedTotal.Inc()
+			return nil, fmt.Errorf("volume subdir %q resolves through a symlink", filepath.Join(hostPath, sanitized))
+		}
 		if uid != 0 || gid != 0 {
-			// Lchown, never Chown: the leaf is a real directory after MkdirAll, and
-			// Lchown never follows a symlink even if one were raced in (CVE-2026-32282).
+			// Lchown, never Chown: the guard above has established the leaf is a real
+			// directory, and Lchown never follows a symlink even if one were raced in
+			// (CVE-2026-32282).
 			if err := root.Lchown(sanitized, uid, gid); err != nil {
 				return nil, fmt.Errorf("chown volume subdir %q: %w", filepath.Join(hostPath, sanitized), err)
 			}

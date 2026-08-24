@@ -347,6 +347,25 @@ var (
 		Help:      "XFS project-quota clear failures on volume destroy (leaked table entry needs operator cleanup) — see ENG-459",
 	})
 
+	// volumeBindSymlinkRejectedTotal counts stateful-volume bind sources refused
+	// because the declared VOLUME's leaf was a symlink (ENG-795). Only a tenant that
+	// planted the link inside its own read-write volume can produce one, so an
+	// increment is an attempt, not a fred fault.
+	//
+	// It counts ATTEMPTS, not wedged volumes, and the distinction is load-bearing for
+	// anyone alerting on it: the guard inspects only the leaves the CURRENT image
+	// declares, so the same volume provisions normally under an image that does not
+	// declare the poisoned path — and that container can then remove the link, since
+	// its parent is mounted read-write. A failed update also rolls back to the previous
+	// image, which is such a container. So a repeated count is a tenant retrying, not a
+	// lease stuck waiting on operator cleanup.
+	volumeBindSymlinkRejectedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "volume_bind_symlink_rejected_total",
+		Help:      "Stateful-volume bind-source rejection ATTEMPTS because the declared VOLUME leaf is a symlink (tenant-planted; the volume is not wedged and needs no operator cleanup) — see ENG-795",
+	})
+
 	// restoreDemoteRefusedTotal counts restores refused by the demote
 	// fit-gate (checkDemoteFit) because the retained data does not fit the
 	// requested smaller tier, by backend and reason. Fixed-cardinality
