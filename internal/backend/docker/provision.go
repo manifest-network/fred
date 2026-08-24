@@ -505,6 +505,15 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 		// fallback: omitting the bind would run the workload on the container's
 		// ephemeral layer and lose its data at the next replace. ErrNotExist is an
 		// error here too; MkdirAll just created this path. (ENG-795)
+		//
+		// Scope, so the next reader does not over-trust this: on PROVISION it is a hard
+		// boundary — no tenant container exists yet, so nothing can race it. On
+		// update/restart it is only a race narrowing, because doReplaceContainers calls
+		// setupVolBinds while the tenant's OLD container is still running and lets the
+		// later compose.Up stop it, so the leaf can be exchanged between this Lstat and
+		// dockerd resolving the Source. Closing that needs the writer gone before the
+		// check (what migrate.go relies on) — mounting by fd, the way kubelet does it,
+		// is not available to us because dockerd performs the mount. See ENG-797.
 		info, lerr := root.Lstat(sanitized)
 		if lerr != nil {
 			return nil, fmt.Errorf("resolve volume subdir %q: %w", filepath.Join(hostPath, sanitized), lerr)

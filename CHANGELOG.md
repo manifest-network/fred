@@ -52,9 +52,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   Fred **rejects and does not repair**, matching kubelet's handling of the equivalent
   subPath flaw: the planted link is left in place, and the tenant's data under it is
-  untouched. A volume already in this state therefore fails every provision, update and
-  restore until an operator removes the link — the new counter is how that population
-  becomes visible. (ENG-795)
+  untouched. The refusal is scoped to the VOLUME paths the deployed image declares, so it
+  blocks exactly the deploy that would redirect a mount and leaves the volume otherwise
+  usable — a manifest that does not declare the poisoned path deploys normally, a failed
+  update still rolls back to the previous image, and the tenant can delete the link from
+  any container that mounts its parent. Nothing is stranded and no operator action is
+  required; the new counter records attempts. (ENG-795)
 
 ## [0.13.0] - 2026-08-20
 

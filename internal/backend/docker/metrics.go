@@ -349,12 +349,16 @@ var (
 
 	// volumeBindSymlinkRejectedTotal counts stateful-volume bind sources refused
 	// because the declared VOLUME's leaf was a symlink (ENG-795). Only a tenant that
-	// planted the link inside its own read-write volume can produce one, so any
-	// increment is either an escape attempt or a volume left wedged by one: the
-	// refusal is permanent and input-independent, so the same lease fails every
-	// provision, update and RESTORE until an operator removes the link — and a
-	// retained volume in that state is hard-deleted once it passes RetentionMaxAge.
-	// A rising count is therefore an operator action item, not just an attack signal.
+	// planted the link inside its own read-write volume can produce one, so an
+	// increment is an attempt, not a fred fault.
+	//
+	// It counts ATTEMPTS, not wedged volumes, and the distinction is load-bearing for
+	// anyone alerting on it: the guard inspects only the leaves the CURRENT image
+	// declares, so the same volume provisions normally under an image that does not
+	// declare the poisoned path — and that container can then remove the link, since
+	// its parent is mounted read-write. A failed update also rolls back to the previous
+	// image, which is such a container. So a repeated count is a tenant retrying, not a
+	// lease stuck waiting on operator cleanup.
 	volumeBindSymlinkRejectedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
