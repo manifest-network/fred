@@ -363,7 +363,7 @@ var (
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_bind_symlink_rejected_total",
-		Help:      "Stateful-volume bind sources rejected because the VOLUME leaf is a symlink (tenant-planted; needs operator cleanup) — see ENG-795",
+		Help:      "Stateful-volume bind-source rejection ATTEMPTS because the declared VOLUME leaf is a symlink (tenant-planted; the volume is not wedged and needs no operator cleanup) — see ENG-795",
 	})
 
 	// restoreDemoteRefusedTotal counts restores refused by the demote

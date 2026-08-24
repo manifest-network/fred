@@ -208,6 +208,37 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.Error(t, err, "a leaf symlink is unsafe as a bind Source wherever it points")
 		assert.Empty(t, binds, "no bind may be emitted once the leaf is refused")
 	})
+
+	// The refusal is SCOPED to the leaves the current image declares, and that scoping is
+	// the operational contract: volume_bind_symlink_rejected_total's Help and the
+	// CHANGELOG both promise a planted link does not wedge the volume and needs no
+	// operator cleanup. A review draft of this change claimed the refusal was
+	// "input-independent" — it is not, and nothing pinned the difference. Without this
+	// subtest, a later "harden it" change that scanned the whole volume root instead of
+	// the declared leaf would pass every other test here while making a poisoned volume
+	// permanently un-deployable and un-restorable, silently inverting that contract.
+	t.Run("a planted leaf does not block an image that does not declare it", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "data"), 0o700))
+		require.NoError(t, os.Symlink("..", filepath.Join(dir, "data", "x")))
+
+		// The image that declares the poisoned leaf is refused...
+		_, err := buildStatefulVolumeBinds(dir, []string{"/data/x"}, 0, 0)
+		require.Error(t, err)
+
+		// ...but the same volume still serves an image declaring only /data. That is the
+		// tenant's own way out: /data comes back mounted read-write, so its container can
+		// delete the link without an operator.
+		binds, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		require.NoError(t, err, "a planted leaf must not wedge the rest of the volume")
+		assert.Equal(t, "/data", binds[filepath.Join(dir, "data")])
+		assertNoSymlinkBindSources(t, binds)
+
+		// And the guard rejected without repairing — the link is still the tenant's to remove.
+		info, lerr := os.Lstat(filepath.Join(dir, "data", "x"))
+		require.NoError(t, lerr)
+		assert.NotZero(t, info.Mode()&os.ModeSymlink, "the guard rejects; it never unlinks")
+	})
 }
 
 // assertNoSymlinkBindSources pins the invariant the ENG-539/ENG-795 subtests exist to

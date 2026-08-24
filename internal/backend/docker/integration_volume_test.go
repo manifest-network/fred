@@ -399,14 +399,23 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 
 	before := testutil.ToFloat64(volumeBindSymlinkRejectedTotal)
 
-	// 4. Re-provision the same lease onto the poisoned volume.
-	require.NoError(t, b.Provision(ctx, provisionReq))
+	// 4. Re-provision the same lease onto the poisoned volume, against a SECOND callback
+	//    server. Step 3's kill produces its own `failed` callback on the first channel,
+	//    and drainCallbacks is a non-blocking drain (`default: return`) — so a callback
+	//    still in flight when it runs survives, and a loop reading the first `failed`
+	//    off the shared channel could accept the KILL's verdict as the re-provision's
+	//    and assert before the worker has even run. A fresh channel correlates the
+	//    payload to this attempt by construction rather than by timing.
+	replayServer, replayCh := startCallbackServer(t)
+	replayReq := provisionReq
+	replayReq.CallbackURL = replayServer.URL
+	require.NoError(t, b.Provision(ctx, replayReq))
 
 	failTimeout := time.After(3 * time.Minute)
 	var failure backend.CallbackPayload
 	for failure.Status != backend.CallbackStatusFailed {
 		select {
-		case cb := <-callbackCh:
+		case cb := <-replayCh:
 			failure = cb
 		case <-failTimeout:
 			t.Fatal("timeout waiting for the re-provision to fail closed on the symlinked volume leaf")
@@ -417,10 +426,14 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	assert.Equal(t, float64(1), testutil.ToFloat64(volumeBindSymlinkRejectedTotal)-before,
 		"exactly one bind-source rejection must be counted")
 
-	// 6. No container may exist for this lease: the guard runs before compose.Up, so
-	//    Docker was never asked to resolve the symlinked Source.
+	// 6. Nothing is left running or resolvable for this lease. Note what this does and
+	//    does not prove: the failure defer runs compose.Down on the whole PROJECT, so a
+	//    zero count would also hold had compose.Up run and been cleaned up. It is the
+	//    counter above that establishes the guard fired — and since it returns an error
+	//    out of setupVolBinds, compose.Up is never reached. This assertion is the
+	//    host-side backstop: no container survives to hold the redirected mount.
 	assert.Zero(t, containersForLease(t, leaseUUID),
-		"no container may be created once the bind Source is refused")
+		"no container may be left for a lease whose bind Source was refused")
 
 	// 7. The guard must not have touched tenant data — it rejects, it does not repair.
 	assert.FileExists(t, filepath.Join(subvolPath, "realdata", "dump.rdb"),
