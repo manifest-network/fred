@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -84,7 +85,9 @@ func TestOrchestrator_StartProvisioning_Success(t *testing.T) {
 	assert.Equal(t, "lease-1", req.LeaseUUID)
 	assert.Equal(t, "tenant-a", req.Tenant)
 	assert.Equal(t, "prov-1", req.ProviderUUID)
-	assert.Equal(t, "http://localhost:8080/callbacks/provision", req.CallbackURL)
+	tracked, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, BuildCallbackURLForGeneration("http://localhost:8080", tracked.Generation), req.CallbackURL)
 	assert.Nil(t, req.Payload)
 	assert.Empty(t, req.PayloadHash)
 
@@ -279,8 +282,9 @@ func TestOrchestrator_Deprovision_AllBackendsFail(t *testing.T) {
 	assert.ErrorIs(t, err, ErrDeprovisionFailed)
 }
 
-func TestOrchestrator_Deprovision_PartialBackendSuccess(t *testing.T) {
-	mb1 := &mockManagerBackend{name: "b1", deprovisionErr: errors.New("fail")}
+func TestOrchestrator_Deprovision_PartialBackendSuccessStillFails(t *testing.T) {
+	backendErr := errors.New("fail")
+	mb1 := &mockManagerBackend{name: "b1", deprovisionErr: backendErr}
 	mb2 := &mockManagerBackend{name: "b2"}
 	router := &mockBackendRouter{
 		backendsFn: func() []backend.Backend { return []backend.Backend{mb1, mb2} },
@@ -288,9 +292,126 @@ func TestOrchestrator_Deprovision_PartialBackendSuccess(t *testing.T) {
 	tracker := NewInFlightTracker()
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
-	// At least one succeeds -> no error
 	err := orch.Deprovision(context.Background(), "lease-1")
-	assert.NoError(t, err)
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	assert.ErrorIs(t, err, backendErr)
+}
+
+func TestOrchestrator_Deprovision_UnresolvedPlacement_PartialSweepFails(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		ps   *mockPlacementStore
+	}{
+		{name: "absent", ps: &mockPlacementStore{}},
+		{
+			name: "unusable",
+			// A timestamp without Backend or Attempt is structurally present but
+			// unusable, matching placement.Placement.State semantics.
+			ps: &mockPlacementStore{setAt: map[string]time.Time{"lease-1": time.Now()}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			possibleHolderErr := errors.New("possible holder unavailable")
+			possibleHolder := &mockManagerBackend{name: "backend-a", deprovisionErr: possibleHolderErr}
+			noopPeer := &mockManagerBackend{name: "backend-b"}
+			router := &mockBackendRouter{
+				backendsFn: func() []backend.Backend { return []backend.Backend{possibleHolder, noopPeer} },
+			}
+			orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, NewInFlightTracker(), tt.ps)
+
+			err := orch.Deprovision(context.Background(), "lease-1")
+			require.ErrorIs(t, err, ErrDeprovisionFailed)
+			assert.ErrorIs(t, err, possibleHolderErr,
+				"a peer's no-op success must not mask failure on the possible holder")
+		})
+	}
+}
+
+func TestOrchestrator_Deprovision_UnusablePlacement_AllSuccessfulSweepFailsClosed(t *testing.T) {
+	backendA := &mockManagerBackend{name: "backend-a"}
+	backendB := &mockManagerBackend{name: "backend-b"}
+	router := &mockBackendRouter{
+		backendsFn: func() []backend.Backend { return []backend.Backend{backendA, backendB} },
+	}
+	// This models a conflict record written by a pre-candidate build: durable
+	// evidence exists, but it does not identify the complete historical owner set.
+	placements := &mockPlacementStore{
+		conflicts: map[string]bool{"lease-1": true},
+		setAt:     map[string]time.Time{"lease-1": time.Now()},
+	}
+	orch := NewProvisionOrchestrator(
+		"prov-1", "http://localhost:8080", router, NewInFlightTracker(), placements,
+	)
+
+	err := orch.Deprovision(context.Background(), "lease-1")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	require.ErrorIs(t, err, ErrPlacementUnresolvable,
+		"successful no-ops on today's router cannot account for an unknown former owner")
+
+	backendA.mu.Lock()
+	assert.Equal(t, []string{"lease-1"}, backendA.deprovisionCalls)
+	backendA.mu.Unlock()
+	backendB.mu.Lock()
+	assert.Equal(t, []string{"lease-1"}, backendB.deprovisionCalls)
+	backendB.mu.Unlock()
+}
+
+func TestOrchestrator_Deprovision_KnownConflictRequiresEveryNamedBackend(t *testing.T) {
+	configured := &mockManagerBackend{name: "backend-b"}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == configured.name {
+				return configured
+			}
+			return nil
+		},
+		backendsFn: func() []backend.Backend { return []backend.Backend{configured} },
+	}
+	placements := &mockPlacementStore{}
+	require.NoError(t, placements.SetConflictsIfNotNewer(map[string][]string{
+		"lease-1": {"backend-a", "backend-b"},
+	}, placements.SnapshotRevision()))
+	orch := NewProvisionOrchestrator(
+		"prov-1", "http://localhost:8080", router, NewInFlightTracker(), placements,
+	)
+
+	err := orch.Deprovision(context.Background(), "lease-1")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	require.ErrorIs(t, err, ErrPlacementUnresolvable,
+		"backend-a remains a positive candidate after it is removed from the router")
+
+	configured.mu.Lock()
+	assert.Equal(t, []string{"lease-1"}, configured.deprovisionCalls,
+		"configured candidates are still swept best-effort")
+	configured.mu.Unlock()
+}
+
+func TestOrchestrator_Deprovision_KnownConflictSucceedsAfterEveryCandidate(t *testing.T) {
+	backendA := &mockManagerBackend{name: "backend-a"}
+	backendB := &mockManagerBackend{name: "backend-b"}
+	byName := map[string]backend.Backend{
+		backendA.name: backendA,
+		backendB.name: backendB,
+	}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend { return byName[name] },
+		backendsFn:         func() []backend.Backend { return []backend.Backend{backendA, backendB} },
+	}
+	placements := &mockPlacementStore{}
+	require.NoError(t, placements.SetConflictsIfNotNewer(map[string][]string{
+		"lease-1": {"backend-a", "backend-b"},
+	}, placements.SnapshotRevision()))
+	orch := NewProvisionOrchestrator(
+		"prov-1", "http://localhost:8080", router, NewInFlightTracker(), placements,
+	)
+
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
+	backendA.mu.Lock()
+	assert.Equal(t, []string{"lease-1"}, backendA.deprovisionCalls)
+	backendA.mu.Unlock()
+	backendB.mu.Lock()
+	assert.Equal(t, []string{"lease-1"}, backendB.deprovisionCalls)
+	backendB.mu.Unlock()
 }
 
 // TestOrchestrator_Deprovision_PlacementMissing_SweepsAllBackends is the ENG-335
@@ -319,7 +440,7 @@ func TestOrchestrator_Deprovision_PlacementMissing_SweepsAllBackends(t *testing.
 	}
 }
 
-func TestOrchestrator_Deprovision_InFlightBackendNotFound_FallsToAllBackends(t *testing.T) {
+func TestOrchestrator_Deprovision_InFlightBackendNotFound_SweepsButReportsUnreachedOwner(t *testing.T) {
 	mb := &mockManagerBackend{name: "real-backend"}
 	router := &mockBackendRouter{
 		getBackendByNameFn: func(name string) backend.Backend { return nil }, // in-flight backend gone
@@ -330,7 +451,9 @@ func TestOrchestrator_Deprovision_InFlightBackendNotFound_FallsToAllBackends(t *
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
-	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
+	err := orch.Deprovision(context.Background(), "lease-1")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	require.ErrorIs(t, err, ErrPlacementUnresolvable)
 
 	mb.mu.Lock()
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
@@ -360,8 +483,8 @@ func TestOrchestrator_StartProvisioning_RecordsPlacement(t *testing.T) {
 	assert.Equal(t, "test-backend", ps.Get("lease-1"), "placement should be recorded after successful provisioning")
 }
 
-func TestOrchestrator_StartProvisioning_PlacementErrorNonFatal(t *testing.T) {
-	// Even if the placement store fails, StartProvisioning should succeed.
+func TestOrchestrator_StartProvisioning_PlacementAttemptErrorFailsClosed(t *testing.T) {
+	// If the write-ahead placement fails, no backend may be contacted.
 	mb := &mockManagerBackend{name: "test-backend"}
 	router := &mockBackendRouter{
 		routeFn: func(sku string) backend.Backend { return mb },
@@ -379,8 +502,13 @@ func TestOrchestrator_StartProvisioning_PlacementErrorNonFatal(t *testing.T) {
 	}
 
 	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
-	assert.NoError(t, err, "placement Set error should not fail provisioning")
-	assert.True(t, tracker.IsInFlight("lease-1"))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrProvisioningFailed)
+	assert.ErrorContains(t, err, "disk full")
+	assert.False(t, tracker.IsInFlight("lease-1"))
+	mb.mu.Lock()
+	assert.Empty(t, mb.provisionCalls, "backend must not be called before durable intent exists")
+	mb.mu.Unlock()
 }
 
 func TestOrchestrator_StartProvisioning_BackendFails_NoPlacement(t *testing.T) {
@@ -402,6 +530,170 @@ func TestOrchestrator_StartProvisioning_BackendFails_NoPlacement(t *testing.T) {
 	require.Error(t, err)
 
 	assert.Empty(t, ps.Get("lease-1"), "placement should not be recorded when backend fails")
+	p := ps.Lookup("lease-1")
+	assert.Equal(t, placement.StateAttempting, p.State(), "ambiguous failure must retain its target")
+	assert.Equal(t, "test-backend", p.Attempt)
+}
+
+func TestClassifyProvisionOutcome(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want provisionOutcome
+	}{
+		{name: "accepted", want: provisionOutcomeAccepted},
+		{name: "already exists", err: fmt.Errorf("wrapped: %w", backend.ErrAlreadyProvisioned), want: provisionOutcomeAlreadyExists},
+		{name: "validation refusal", err: fmt.Errorf("wrapped: %w", backend.ErrValidation), want: provisionOutcomeDefinitiveFailure},
+		{name: "capacity refusal", err: fmt.Errorf("wrapped: %w", backend.ErrInsufficientResources), want: provisionOutcomeDefinitiveFailure},
+		{name: "open circuit", err: fmt.Errorf("wrapped: %w", backend.ErrCircuitOpen), want: provisionOutcomeDefinitiveFailure},
+		{name: "malformed response is ambiguous", err: backend.ErrMalformedErrorBody, want: provisionOutcomeAmbiguous},
+		{name: "transport is ambiguous", err: errors.New("connection reset"), want: provisionOutcomeAmbiguous},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, classifyProvisionOutcome(tt.err))
+		})
+	}
+}
+
+func TestOrchestrator_StartProvisioning_AmbiguousAttemptSuppressesSecondBackendCall(t *testing.T) {
+	first := &mockManagerBackend{name: "backend-a", provisionErr: errors.New("connection reset")}
+	second := &mockManagerBackend{name: "backend-b"}
+	routeCalls := 0
+	router := &mockBackendRouter{
+		routeForProvisionFn: func(context.Context, string, map[string]int) backend.Backend {
+			routeCalls++
+			if routeCalls == 1 {
+				return first
+			}
+			return second
+		},
+	}
+	tracker := NewInFlightTracker()
+	ps := &mockPlacementStore{}
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, tracker, ps)
+	lease := &billingtypes.Lease{
+		Uuid: "lease-ambiguous", Tenant: "tenant-a",
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	require.Error(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+	assert.False(t, tracker.IsInFlight(lease.Uuid), "ambiguous call releases ephemeral in-flight state")
+	p := ps.Lookup(lease.Uuid)
+	require.Equal(t, placement.StateAttempting, p.State())
+	assert.Equal(t, "backend-a", p.Attempt)
+
+	// This mirrors Watermill's immediate retry. Routing is free to select B,
+	// but the durable unresolved attempt makes the retry a benign no-op.
+	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+	first.mu.Lock()
+	firstCalls := len(first.provisionCalls)
+	first.mu.Unlock()
+	second.mu.Lock()
+	secondCalls := len(second.provisionCalls)
+	second.mu.Unlock()
+	assert.Equal(t, 1, firstCalls)
+	assert.Zero(t, secondCalls, "unresolved backend A outcome must block a call to B")
+	assert.False(t, tracker.IsInFlight(lease.Uuid), "benign durable-attempt skip must release its new tracker slot")
+}
+
+func TestOrchestrator_StartProvisioning_InsufficientResourcesClearsAndReroutes(t *testing.T) {
+	first := &mockManagerBackend{name: "backend-a", provisionErr: backend.ErrInsufficientResources}
+	second := &mockManagerBackend{name: "backend-b"}
+	routeCalls := 0
+	router := &mockBackendRouter{
+		routeForProvisionFn: func(context.Context, string, map[string]int) backend.Backend {
+			routeCalls++
+			if routeCalls == 1 {
+				return first
+			}
+			return second
+		},
+	}
+	tracker := NewInFlightTracker()
+	ps := &mockPlacementStore{}
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, tracker, ps)
+	lease := &billingtypes.Lease{
+		Uuid: "lease-capacity-reroute", Tenant: "tenant-a",
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	require.ErrorIs(t, err, backend.ErrInsufficientResources)
+	assert.Equal(t, placement.StateAbsent, ps.Lookup(lease.Uuid).State())
+
+	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+	p := ps.Lookup(lease.Uuid)
+	assert.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, "backend-b", p.Backend)
+	second.mu.Lock()
+	assert.Len(t, second.provisionCalls, 1)
+	second.mu.Unlock()
+}
+
+func TestOrchestrator_StartProvisioning_DefinitiveFailurePreservesConfirmedPin(t *testing.T) {
+	pinned := &mockManagerBackend{name: "backend-a", provisionErr: backend.ErrCircuitOpen}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == pinned.name {
+				return pinned
+			}
+			return nil
+		},
+	}
+	ps := &mockPlacementStore{}
+	require.NoError(t, ps.Set("lease-active", pinned.name))
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, NewInFlightTracker(), ps)
+	lease := &billingtypes.Lease{
+		Uuid: "lease-active", Tenant: "tenant-a",
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	require.ErrorIs(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}), backend.ErrCircuitOpen)
+	p := ps.Lookup(lease.Uuid)
+	assert.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, pinned.name, p.Backend)
+	assert.Empty(t, p.Attempt, "failure clears only the retry attempt")
+}
+
+func TestRouteForProvisionHonoringPlacement_AttemptDoesNotPin(t *testing.T) {
+	attempted := &mockManagerBackend{name: "backend-a"}
+	freelyRouted := &mockManagerBackend{name: "backend-b"}
+	ps := &mockPlacementStore{}
+	require.NoError(t, ps.SetAttempting("lease-1", attempted.name))
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == attempted.name {
+				return attempted
+			}
+			return nil
+		},
+		routeForProvisionFn: func(context.Context, string, map[string]int) backend.Backend {
+			return freelyRouted
+		},
+	}
+
+	got, err := routeForProvisionHonoringPlacement(context.Background(), router, ps, "lease-1", "sku-1", nil)
+	require.NoError(t, err)
+	assert.Same(t, freelyRouted, got)
+}
+
+func TestOrchestrator_StartProvisioning_AlreadyProvisionedConfirmsAndStops(t *testing.T) {
+	mb := &mockManagerBackend{name: "backend-a", provisionErr: backend.ErrAlreadyProvisioned}
+	router := &mockBackendRouter{routeFn: func(string) backend.Backend { return mb }}
+	tracker := NewInFlightTracker()
+	ps := &mockPlacementStore{}
+	orch := NewProvisionOrchestrator("provider-1", "http://cb", router, tracker, ps)
+	lease := &billingtypes.Lease{
+		Uuid: "lease-duplicate", Tenant: "tenant-a",
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+	p := ps.Lookup(lease.Uuid)
+	assert.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, mb.name, p.Backend)
+	assert.False(t, tracker.IsInFlight(lease.Uuid), "duplicate may not emit another callback")
 }
 
 func TestOrchestrator_Deprovision_ViaPlacement(t *testing.T) {
@@ -429,6 +721,28 @@ func TestOrchestrator_Deprovision_ViaPlacement(t *testing.T) {
 
 	// ENG-333: placement must survive deprovision; the reconciler is the sole pruner.
 	assert.Equal(t, "test-backend", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")
+}
+
+func TestOrchestrator_Deprovision_ViaAttemptOnlyPlacement(t *testing.T) {
+	mb := &mockManagerBackend{name: "attempt-backend"}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == mb.name {
+				return mb
+			}
+			return nil
+		},
+	}
+	ps := &mockPlacementStore{}
+	require.NoError(t, ps.SetAttempting("lease-attempt", mb.name))
+	orch := NewProvisionOrchestrator("prov-1", "http://cb", router, NewInFlightTracker(), ps)
+
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-attempt"))
+	mb.mu.Lock()
+	assert.Equal(t, []string{"lease-attempt"}, mb.deprovisionCalls)
+	mb.mu.Unlock()
+	assert.Equal(t, placement.StateAttempting, ps.Lookup("lease-attempt").State(),
+		"deprovision preserves affinity until retention-aware pruning")
 }
 
 // Deprovision trusts a resolvable placement ABSOLUTELY: it tears down on the
@@ -485,7 +799,7 @@ func TestOrchestrator_Deprovision_WrongPlacement_ReportsSuccessWithoutTouchingTh
 		"the real holder is never contacted — which is exactly why placement must never be derived from incomplete data")
 }
 
-func TestOrchestrator_Deprovision_StalePlacement_FallsToAllBackends(t *testing.T) {
+func TestOrchestrator_Deprovision_StalePlacement_SweepsButReportsUnreachedOwner(t *testing.T) {
 	mb := &mockManagerBackend{name: "real-backend"}
 	router := &mockBackendRouter{
 		getBackendByNameFn: func(name string) backend.Backend {
@@ -502,7 +816,10 @@ func TestOrchestrator_Deprovision_StalePlacement_FallsToAllBackends(t *testing.T
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
 
-	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
+	err := orch.Deprovision(context.Background(), "lease-1")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	require.ErrorIs(t, err, ErrPlacementUnresolvable,
+		"a best-effort sweep cannot report terminal success while a positively named owner was never contacted")
 
 	mb.mu.Lock()
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
@@ -512,7 +829,7 @@ func TestOrchestrator_Deprovision_StalePlacement_FallsToAllBackends(t *testing.T
 	assert.Equal(t, "removed-backend", ps.Get("lease-1"), "stale placement must survive deprovision (ENG-333)")
 }
 
-func TestOrchestrator_Deprovision_PlacementTakesPriorityOverInFlight(t *testing.T) {
+func TestOrchestrator_Deprovision_UnionsPlacementAndInFlight(t *testing.T) {
 	mbPlacement := &mockManagerBackend{name: "placement-backend"}
 	mbInFlight := &mockManagerBackend{name: "inflight-backend"}
 	router := &mockBackendRouter{
@@ -537,14 +854,47 @@ func TestOrchestrator_Deprovision_PlacementTakesPriorityOverInFlight(t *testing.
 	err := orch.Deprovision(context.Background(), "lease-1")
 	require.NoError(t, err)
 
-	// Placement backend should have been used, not in-flight backend
+	// Both are positive evidence of a possible holder and must be contacted.
 	mbPlacement.mu.Lock()
 	assert.Equal(t, []string{"lease-1"}, mbPlacement.deprovisionCalls)
 	mbPlacement.mu.Unlock()
 
 	mbInFlight.mu.Lock()
-	assert.Empty(t, mbInFlight.deprovisionCalls)
+	assert.Equal(t, []string{"lease-1"}, mbInFlight.deprovisionCalls)
 	mbInFlight.mu.Unlock()
+}
+
+func TestOrchestrator_Deprovision_MixedKnownAndUnknownCandidate_KnownFailureIsNotMasked(t *testing.T) {
+	knownErr := errors.New("known holder unavailable")
+	known := &mockManagerBackend{name: "known-backend", deprovisionErr: knownErr}
+	peer := &mockManagerBackend{name: "unrelated-peer"}
+	router := &mockBackendRouter{
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == known.name {
+				return known
+			}
+			return nil // the in-flight backend is no longer configured
+		},
+		backendsFn: func() []backend.Backend { return []backend.Backend{known, peer} },
+	}
+
+	ps := &mockPlacementStore{}
+	require.NoError(t, ps.Set("lease-1", known.name))
+	tracker := NewInFlightTracker()
+	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "removed-backend")
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
+
+	err := orch.Deprovision(context.Background(), "lease-1")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	assert.ErrorIs(t, err, knownErr)
+
+	known.mu.Lock()
+	assert.Equal(t, []string{"lease-1"}, known.deprovisionCalls)
+	known.mu.Unlock()
+	peer.mu.Lock()
+	assert.Equal(t, []string{"lease-1"}, peer.deprovisionCalls,
+		"unknown candidate still requires the full fleet sweep")
+	peer.mu.Unlock()
 }
 
 func TestOrchestrator_Deprovision_FallbackAllBackends_KeepsPlacement(t *testing.T) {
@@ -559,7 +909,8 @@ func TestOrchestrator_Deprovision_FallbackAllBackends_KeepsPlacement(t *testing.
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
 
 	err := orch.Deprovision(context.Background(), "lease-1")
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	require.ErrorIs(t, err, ErrPlacementUnresolvable)
 
 	// ENG-333: placement survives even on the fallback path; the reconciler is the sole pruner.
 	assert.Equal(t, "stale-backend", ps.Get("lease-1"), "placement must survive fallback deprovision (ENG-333)")
@@ -643,18 +994,64 @@ type errorPlacementStore struct {
 	setErr error
 }
 
-func (e *errorPlacementStore) Set(leaseUUID, backendName string) error {
+func (e *errorPlacementStore) SetAttempting(leaseUUID, backendName string) error {
 	if e.setErr != nil {
 		return e.setErr
 	}
-	return e.mockPlacementStore.Set(leaseUUID, backendName)
+	return e.mockPlacementStore.SetAttempting(leaseUUID, backendName)
+}
+
+func (e *errorPlacementStore) Confirm(leaseUUID, backendName string) error {
+	if e.setErr != nil {
+		return e.setErr
+	}
+	return e.mockPlacementStore.Confirm(leaseUUID, backendName)
+}
+
+func (e *errorPlacementStore) ConfirmAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error) {
+	if e.setErr != nil {
+		return false, e.setErr
+	}
+	return e.mockPlacementStore.ConfirmAttemptIfRevision(leaseUUID, backendName, revision)
+}
+
+func (e *errorPlacementStore) ClearAttempt(leaseUUID, backendName string) error {
+	if e.setErr != nil {
+		return e.setErr
+	}
+	return e.mockPlacementStore.ClearAttempt(leaseUUID, backendName)
+}
+
+func (e *errorPlacementStore) ClearAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error) {
+	if e.setErr != nil {
+		return false, e.setErr
+	}
+	return e.mockPlacementStore.ClearAttemptIfRevision(leaseUUID, backendName, revision)
 }
 
 func (e *errorPlacementStore) SetBatch(placements map[string]string) error {
+	return e.SetBatchIfNotNewer(placements, ^uint64(0))
+}
+
+func (e *errorPlacementStore) SetBatchIfNotNewer(placements map[string]string, maxRevision uint64) error {
 	if e.setErr != nil {
 		return e.setErr
 	}
-	return e.mockPlacementStore.SetBatch(placements)
+	return e.mockPlacementStore.SetBatchIfNotNewer(placements, maxRevision)
+}
+
+func (e *errorPlacementStore) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) error {
+	if e.setErr != nil {
+		return e.setErr
+	}
+	return e.mockPlacementStore.SetConflictsIfNotNewer(conflicts, maxRevision)
+}
+
+func (e *errorPlacementStore) ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision uint64) error {
+	if e.setErr != nil {
+		return e.setErr
+	}
+	return e.mockPlacementStore.ClearConflictsIfNotNewer(leases, maxRevision)
 }
 
 func TestOrchestrator_StartProvisioning_HonorsPlacement(t *testing.T) {
@@ -813,15 +1210,20 @@ func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testi
 	assert.Equal(t, 1.0, after-before, "BackendInsufficientResourcesTotal should increment by 1")
 }
 
-// --- RecordRestorePlacement tests ---
+// --- Restore placement lifecycle tests ---
 
-func TestOrchestrator_RecordRestorePlacement(t *testing.T) {
+func TestOrchestrator_RestorePlacementLifecycle(t *testing.T) {
 	placements := &mockPlacementStore{}
 	_ = placements.Set("source-lease", "backend-a") // preserved across close
 
 	o := NewProvisionOrchestrator("prov-1", "http://cb", &mockBackendRouter{}, NewInFlightTracker(), placements)
 
-	o.RecordRestorePlacement("new-lease", "backend-a")
+	revision, err := o.SetPlacementAttempting("new-lease", "backend-a")
+	require.NoError(t, err)
+	assert.Equal(t, placement.StateAttempting, placements.Lookup("new-lease").State())
+	confirmed, err := o.ConfirmPlacementIfRevision("new-lease", "backend-a", revision)
+	require.NoError(t, err)
+	require.True(t, confirmed)
 
 	assert.Equal(t, "backend-a", placements.Get("new-lease"), "new lease adopts the restore backend")
 	// Source placement is NOT touched here — the reconciler prunes it once the
@@ -829,8 +1231,11 @@ func TestOrchestrator_RecordRestorePlacement(t *testing.T) {
 	assert.Equal(t, "backend-a", placements.Get("source-lease"), "source placement left for the reconciler to prune")
 }
 
-func TestOrchestrator_RecordRestorePlacement_NilStore(t *testing.T) {
+func TestOrchestrator_RestorePlacementLifecycle_NilStore(t *testing.T) {
 	o := NewProvisionOrchestrator("prov-1", "http://cb", &mockBackendRouter{}, NewInFlightTracker(), nil)
-	// Must not panic with a nil placement store.
-	o.RecordRestorePlacement("new-lease", "backend-a")
+	// Restore must fail closed before a backend call with a nil placement store.
+	_, err := o.SetPlacementAttempting("new-lease", "backend-a")
+	require.ErrorIs(t, err, ErrPlacementStoreUnavailable)
+	require.NoError(t, o.ConfirmPlacement("new-lease", "backend-a"))
+	require.NoError(t, o.ClearPlacementAttempt("new-lease", "backend-a"))
 }

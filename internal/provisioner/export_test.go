@@ -49,12 +49,14 @@ func handlersOf(m *Manager) *HandlerSet {
 func (t *DefaultInFlightTracker) TrackInFlightWithStartTime(leaseUUID, tenant string, items []backend.LeaseItem, backendName string, startTime time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	generation := t.allocateGenerationLocked()
 	t.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID: leaseUUID,
-		Tenant:    tenant,
-		Items:     items,
-		Backend:   backendName,
-		StartTime: startTime,
+		LeaseUUID:  leaseUUID,
+		Tenant:     tenant,
+		Items:      items,
+		Backend:    backendName,
+		Generation: generation,
+		StartTime:  startTime,
 	}
 	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 }

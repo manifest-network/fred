@@ -206,6 +206,11 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			)
 		}
 		metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
+		// Without an in-flight entry, the callback cannot be tied to the operation
+		// that created the current placement Attempt. This is true even when the
+		// backend name matches: a delayed restart/update callback may predate a
+		// newer provision attempt. Treat all non-in-flight callbacks as status-event
+		// notifications only; authoritative inventory repairs placement.
 
 		switch callback.Status {
 		case backend.CallbackStatusSuccess:
@@ -236,6 +241,53 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		)
 		return nil
 	}
+	// The tracker is the local operation identity. A callback naming a different
+	// backend belongs to an older or otherwise unrelated operation for this lease;
+	// applying it to the currently tracked backend could acknowledge/reject the
+	// wrong incarnation and erase its durable placement transition. Empty is
+	// accepted for backwards compatibility with backends that predate the field.
+	if callback.Backend != "" && callback.Backend != provision.Backend {
+		slog.Warn("ignoring callback whose backend does not match the in-flight operation",
+			"lease_uuid", callback.LeaseUUID,
+			"callback_backend", callback.Backend,
+			"in_flight_backend", provision.Backend,
+			"generation", provision.Generation,
+		)
+		return nil
+	}
+	if callback.OperationGeneration != provision.Generation &&
+		(provision.GenerationRequired || callback.OperationGeneration != 0) {
+		slog.Warn("ignoring callback whose operation token does not match the in-flight operation",
+			"lease_uuid", callback.LeaseUUID,
+			"callback_generation", callback.OperationGeneration,
+			"in_flight_generation", provision.Generation,
+			"token_required", provision.GenerationRequired,
+		)
+		return nil
+	}
+	claimed, claimedOK := h.deps.Tracker.TryClaimInFlight(callback.LeaseUUID, provision.Generation)
+	for !claimedOK {
+		// A timeout or duplicate delivery may hold this generation's settlement
+		// claim across a slow chain call. Waiting here keeps the authenticated
+		// callback live; relying on Watermill's finite short retries could poison
+		// the only success callback before a transient timeout rejection releases
+		// its claim.
+		current, stillExists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
+		if !stillExists || current.Generation != provision.Generation {
+			// The claimant completed this generation. In particular, never fall
+			// through to the non-in-flight restart/update path or touch a replacement.
+			return nil
+		}
+		select {
+		case <-msg.Context().Done():
+			return fmt.Errorf("wait to settle callback for lease %s: %w",
+				callback.LeaseUUID, msg.Context().Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+		claimed, claimedOK = h.deps.Tracker.TryClaimInFlight(callback.LeaseUUID, provision.Generation)
+	}
+	provision = claimed
+	defer h.deps.Tracker.ReleaseInFlightClaim(callback.LeaseUUID, provision.Generation)
 
 	slog.Info("processing backend callback",
 		"lease_uuid", callback.LeaseUUID,
@@ -256,6 +308,18 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 
 	switch callback.Status {
 	case backend.CallbackStatusSuccess:
+		// Repair any Attempt left behind by a failed synchronous Confirm before
+		// moving the lease on chain. On error, keep the in-flight entry and let
+		// Watermill retry this durable callback.
+		if err := h.deps.Orchestrator.ConfirmPlacement(callback.LeaseUUID, provision.Backend); err != nil {
+			slog.Error("failed to confirm placement from success callback, keeping in-flight",
+				"lease_uuid", callback.LeaseUUID,
+				"backend", provision.Backend,
+				"error", err,
+			)
+			return fmt.Errorf("confirm placement for lease %s: %w", callback.LeaseUUID, err)
+		}
+
 		// Acknowledge the lease on chain via batcher to avoid sequence mismatch errors
 		acknowledged, txHash, err := h.deps.Acknowledger.Acknowledge(msg.Context(), callback.LeaseUUID)
 		if err != nil {
@@ -264,7 +328,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 				// Lease is already in a non-PENDING state (likely already ACTIVE).
 				// This can happen if we received a duplicate callback or the reconciler
 				// already acknowledged it. Treat as success - the lease is active.
-				h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+				h.deps.Tracker.FinishClaimedInFlight(callback.LeaseUUID, provision.Generation)
 				recordDuration()
 				metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend, operation).Inc()
 				h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
@@ -285,7 +349,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		}
 
 		// Only remove from in-flight after successful acknowledgment
-		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+		h.deps.Tracker.FinishClaimedInFlight(callback.LeaseUUID, provision.Generation)
 		recordDuration()
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend, operation).Inc()
 
@@ -324,9 +388,19 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			return fmt.Errorf("failed to fetch lease %s: %w", callback.LeaseUUID, err)
 		}
 		if lease != nil && lease.State == billingtypes.LEASE_STATE_ACTIVE {
+			// A definitive async failure settles only this operation's Attempt.
+			// Any established Backend pin belongs to the ACTIVE lease and survives.
+			if err := h.deps.Orchestrator.ClearPlacementAttempt(callback.LeaseUUID, provision.Backend); err != nil {
+				slog.Error("failed to clear placement attempt after active reprovision failure, keeping in-flight",
+					"lease_uuid", callback.LeaseUUID,
+					"backend", provision.Backend,
+					"error", err,
+				)
+				return fmt.Errorf("clear placement attempt for lease %s: %w", callback.LeaseUUID, err)
+			}
 			// Lease is ACTIVE — this was a re-provision attempt. Untrack and
 			// let the reconciler detect the still-failed backend state.
-			h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+			h.deps.Tracker.FinishClaimedInFlight(callback.LeaseUUID, provision.Generation)
 			recordDuration()
 			metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend, operation).Inc()
 
@@ -356,19 +430,25 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			return fmt.Errorf("failed to reject lease %s: %w", callback.LeaseUUID, err)
 		}
 
-		// Only untrack AFTER successful rejection
-		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
-		recordDuration()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend, operation).Inc()
-
-		// Clean up payload and placement after successful rejection.
-		// Placement was recorded when the backend accepted the provision
-		// request, but rejected leases don't emit a close event, so
-		// Deprovision (which normally cleans up placement) is never called.
+		// Clean up payload and placement after successful rejection, while the
+		// in-flight entry still excludes a concurrent provision. Placement
+		// deletion is revision-checked and backend-scoped so a stale callback can
+		// never erase newer ownership.
 		if h.deps.PayloadStore != nil {
 			h.deps.PayloadStore.Delete(callback.LeaseUUID)
 		}
-		h.deps.Orchestrator.DeletePlacement(callback.LeaseUUID)
+		if err := h.deps.Orchestrator.DeletePlacementIfOwned(callback.LeaseUUID, provision.Backend); err != nil {
+			slog.Warn("failed to conditionally clean up rejected lease placement",
+				"lease_uuid", callback.LeaseUUID,
+				"backend", provision.Backend,
+				"error", err,
+			)
+		}
+
+		// Only untrack AFTER successful rejection and conditional cleanup.
+		h.deps.Tracker.FinishClaimedInFlight(callback.LeaseUUID, provision.Generation)
+		recordDuration()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend, operation).Inc()
 
 		h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, reason)
 
@@ -384,7 +464,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		// Unknown status is treated as terminal to prevent leases from being stuck
 		// in the in-flight map indefinitely. The reconciler will pick up the lease
 		// and handle it based on its actual chain/backend state.
-		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
+		h.deps.Tracker.FinishClaimedInFlight(callback.LeaseUUID, provision.Generation)
 		recordDuration()
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, provision.Backend, operation).Inc()
 

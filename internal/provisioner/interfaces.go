@@ -2,7 +2,6 @@ package provisioner
 
 import (
 	"context"
-	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -33,15 +32,19 @@ var _ BackendRouter = (*backend.Router)(nil)
 // PlacementStore records which backend is serving each lease so that
 // read operations reach the correct backend after provision routing.
 type PlacementStore interface {
-	Get(leaseUUID string) string
-	SetAt(leaseUUID string) (time.Time, bool)
-	Set(leaseUUID, backendName string) error
-	Delete(leaseUUID string)
-	SetBatch(placements map[string]string) error
-	Count() int
-	List() []string
-	Healthy() error
-	Close() error
+	Lookup(leaseUUID string) placement.Placement
+	List() map[string]placement.Placement
+	SnapshotRevision() uint64
+	SetAttempting(leaseUUID, backendName string) error
+	Confirm(leaseUUID, backendName string) error
+	ConfirmAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
+	ClearAttempt(leaseUUID, backendName string) error
+	ClearAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
+	Delete(leaseUUID string) error
+	DeleteIfRevision(leaseUUID string, revision uint64) (bool, error)
+	SetBatchIfNotNewer(placements map[string]string, maxRevision uint64) error
+	SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) error
+	ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision uint64) error
 }
 
 // Compile-time check that placement.Store implements PlacementStore.

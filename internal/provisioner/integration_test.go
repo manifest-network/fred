@@ -120,8 +120,9 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 
 	// Step 3: Publish success callback.
 	err = manager.PublishCallback(backend.CallbackPayload{
-		LeaseUUID: leaseUUID,
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:           leaseUUID,
+		Status:              backend.CallbackStatusSuccess,
+		OperationGeneration: mustInFlightGeneration(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 
@@ -187,9 +188,10 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 
 	// Publish failure callback.
 	err = manager.PublishCallback(backend.CallbackPayload{
-		LeaseUUID: leaseUUID,
-		Status:    backend.CallbackStatusFailed,
-		Error:     "container crashed",
+		LeaseUUID:           leaseUUID,
+		Status:              backend.CallbackStatusFailed,
+		Error:               "container crashed",
+		OperationGeneration: mustInFlightGeneration(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 
@@ -262,8 +264,9 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond)
 
 	err = manager.PublishCallback(backend.CallbackPayload{
-		LeaseUUID: leaseUUID,
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:           leaseUUID,
+		Status:              backend.CallbackStatusSuccess,
+		OperationGeneration: mustInFlightGeneration(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 

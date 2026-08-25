@@ -49,6 +49,7 @@ The dependency signal did not disappear, it moved: the per-check map is still in
 | `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
 | `fred_health_check_healthy{check="chain"} == 0` | providerd cannot reach the chain gRPC endpoint (or it answered slower than the health probe's budget). Every tenant endpoint that resolves a lease fails, **and reconciliation stops entirely** — a sweep returns as soon as the pending- or active-lease query errors, because everything downstream treats "absent from chain" as ground truth. Backend callbacks are still accepted: they touch neither the chain nor any store | Check the node and `grpc_endpoint`. This is the ENG-522 trigger, and it is now a metric rather than a 503 — providerd deliberately stays in rotation, because dropping out would sever the callback path too without restoring anything |
 | `fred_health_check_healthy{check=~"token_tracker\|placement_store\|payload_store"} == 0` | That bbolt store could not be opened, or is missing the buckets it should have. `/readyz` is 503 and `/health` reports `unhealthy` while still answering 200 | Check the store's `*_db_path` — that it exists, is the intended file, and is readable — then **restart providerd**; a load balancer cannot fix this and deliberately is not asked to. Note the probe is a read-only check, so a full or read-only filesystem passes it and still breaks writes: check disk space too even when this gauge reads 1 |
+| `increase(fred_placement_write_failures_total[5m]) > 0` | providerd could not durably record a placement transition. A write-ahead failure blocks a new provision or restore before the backend is contacted; a later confirm/cleanup failure leaves an explicit unresolved attempt for reconciliation rather than silently claiming no backend was contacted | Check the `failed to ... placement` log for the lease and transition, then check free space, filesystem permissions and I/O errors at `placement_store_db_path`. The health gauge is only a read probe and can remain 1 on a full or read-only filesystem. Restore write access; the next reconciliation retries safe work. Page on every increase — do not alert on the raw counter being non-zero, because counters remain non-zero after recovery |
 | `fred_backend_health_probe_panics_total > 0` | Bug — a backend health probe panicked. The probe is an HTTP call that should return an error, not panic. It is recovered (the probe runs on its own goroutine, where net/http's recovery does not reach it) and counts as unhealthy, so nothing crashes | Check logs for `backend health probe panicked` and the stack trace, then file an issue |
 | `fred_health_check_healthy` series absent, or frozen while nothing changes | Nothing is polling `/health`. Both this gauge and `fred_backend_healthy` are written **only** from inside the health handler, so with no prober they latch at their last value instead of going absent | Confirm the load balancer's health check on `/health` still exists and its interval (30s in the reference deployment). A latched 1 masks a real outage |
 | `fred_backend_insufficient_resources_total` rising on a backend | Backend at capacity | Reduce SKU sizes, add backend hosts, or check `docker-backend /stats` |
@@ -296,7 +297,8 @@ the leases it cannot positively place, then retries on the next cycle.
 |---|---|
 | On a backend that answered | Reconciled normally — this is the whole point of the change |
 | On the unreachable backend | Deferred: not acknowledged, re-provisioned, or deprovisioned |
-| With no placement record | Deferred while the sweep is incomplete — fred cannot rule out that it lives on the silent backend |
+| With no placement record | Deferred until this providerd process has completed one full backend inventory and durably synchronized its placements. After that startup proof, absence means no provision attempt was recorded, so a PENDING lease can be routed to a healthy backend even while another backend is silent |
+| With an unresolved placement attempt | Treated as possibly live on the attempted backend. If that backend is silent the lease is deferred; an attempt is never treated as proof that the backend rejected the request |
 | Orphans on the backends that answered | Deprovisioned normally. A silent backend reports no provisions, so it contributes no orphan candidates of its own and cannot mask anyone else's |
 | Orphaned payloads | Cleaned normally — that pass compares the payload store against the chain and reads no backend state at all |
 | Placements of leases on the unreachable backend | Not pruned: only that backend's own report can turn "absent from the backend data" into evidence about its records |
@@ -344,6 +346,7 @@ progress rather than migrating:
 | Provision / re-provision | Refused, retried every reconcile cycle. See log lines below |
 | Read (connection details, logs) | `503`, not `404` |
 | Restore from that backend's retained data | `503`, not `404` |
+| Close / deprovision | Every durably known owner, attempt, and conflict candidate is targeted. Reachable peers are still swept, but the close fails rather than acknowledging success if any recorded name is no longer configured or cannot be contacted |
 | Leases on *other* backends | Unaffected |
 
 Two ERROR log lines cover the two paths, and the reconciler one is the one you
@@ -389,7 +392,11 @@ They are a few bytes of bbolt each and they are the only surviving pointer to
 where that machine's data was, which is why they are kept rather than reaped by a
 process that cannot tell "decommissioned" from "down since Tuesday". Deleting
 them is part of the manual decommission, once the data is confirmed migrated or
-gone.
+gone. A lease ever reported by multiple backends retains the sorted set of all
+those candidates in the same record. Removing one candidate from configuration
+does not let the remaining backend become authoritative: put every candidate
+back under its original name and obtain a complete `/provisions` plus
+`/retentions` sweep before expecting the quarantine to clear.
 
 > **Ansible caution.** `roles/fred/templates/providerd.yaml.j2` derives backend
 > names positionally, so removing a mid-list host renumbers every host below it.
@@ -657,7 +664,7 @@ Fred uses bbolt (an embedded key-value store) for several persistent structures:
 |---|---|---|
 | `token_tracker_db_path` | Replay protection for tenant tokens | Brief replay window after restart; tokens are 30s anyway |
 | `payload_store_db_path` | Tenant deployment payloads awaiting provisioning | Tenants must re-upload pending payloads |
-| `placement_store_db_path` | lease→backend mapping for multi-backend read routing | Read-path misroutes until reconciler rebuilds (next cycle) |
+| `placement_store_db_path` | Durable confirmed and attempted lease→backend ownership used by routing and degraded-sweep safety | Existing leases and unresolved attempts are unknown. On restart fred defers recordless leases until one complete backend inventory has durably rebuilt placements; it does not trust an incomplete first sweep |
 | `<docker>/callbacks.db` | Pending callbacks (delivery retry) | Some callbacks may not be redelivered after restart |
 | `<docker>/diagnostics.db` | Failure diagnostics (last_error, logs) | Older `failed` leases lose diagnostics; new failures still recorded |
 | `<docker>/releases.db` | Per-lease deployment history | Release history lost; provisioning still works |
@@ -667,7 +674,7 @@ Fred uses bbolt (an embedded key-value store) for several persistent structures:
 1. **Stop the service**.
 2. **Move the file aside** rather than deleting (`mv X.db X.db.broken`) so you can inspect it later if needed.
 3. **Restart the service**. It will recreate an empty database.
-4. **Run a manual reconciliation** (it runs automatically on startup) — the placement store rebuilds from backend `ListProvisions`, the payload store stays empty (tenants re-upload), the token tracker is empty (acceptable, see above), and the docker callback store starts fresh.
+4. **Run a manual reconciliation** (it runs automatically on startup) while every configured backend is reachable. Only a complete backend inventory can rebuild the placement store and make record absence trustworthy; during an outage fred deliberately keeps recordless leases deferred. The payload store stays empty (tenants re-upload), the token tracker is empty (acceptable, see above), and the docker callback store starts fresh.
 
 Never run two `providerd` or `docker-backend` instances against the same bbolt files — bbolt enforces single-writer with a file lock and the second process will fail to start. If it doesn't fail, you have data corruption coming.
 

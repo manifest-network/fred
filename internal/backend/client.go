@@ -332,6 +332,10 @@ type CallbackPayload struct {
 	Status    CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
 	Error     string         `json:"error,omitempty"`
 	Backend   string         `json:"backend,omitempty"` // Backend name; empty from pre-upgrade senders.
+	// OperationGeneration is injected by fred's callback HTTP endpoint from the
+	// HMAC-authenticated callback URL. Backends need only POST to the URL they
+	// received; they do not interpret or echo the token in their JSON body.
+	OperationGeneration uint64 `json:"operation_generation,omitempty"`
 	// Retained is set true on a deprovisioned callback when the backend actually
 	// soft-deleted (retained) the lease's volumes. Best-effort ground truth for
 	// the optimistic push; the queryable retention status is the durable backstop.

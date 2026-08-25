@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,15 +75,128 @@ func TestCheckOnce_SingleTimeout_RejectsAndUntracks(t *testing.T) {
 	assert.False(t, tracker.IsInFlight("lease-old"), "lease should be untracked after rejection")
 }
 
+func TestCheckOnce_ClaimPreventsReplacementDuringReject(t *testing.T) {
+	tracker := NewInFlightTracker()
+	tracker.TrackInFlightWithStartTime("lease-old", "tenant-1",
+		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-a",
+		time.Now().Add(-20*time.Minute))
+	old, exists := tracker.GetInFlight("lease-old")
+	require.True(t, exists)
+
+	rejecter := &mockRejecter{rejectFn: func(_ context.Context, _ []string, _ string) (uint64, []string, error) {
+		assert.False(t, tracker.UntrackInFlightIfGeneration("lease-old", old.Generation),
+			"callback cleanup must not remove a generation while timeout settlement owns it")
+		_, popped := tracker.PopInFlight("lease-old")
+		assert.False(t, popped, "legacy pop must not bypass a settlement claim")
+		_, claimed := tracker.TryClaimInFlight("lease-old", old.Generation)
+		assert.False(t, claimed, "a second settlement actor must not claim the same generation")
+		_, tracked := tracker.TryTrackInFlightWithGeneration(
+			"lease-old", "tenant-1", []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-b",
+		)
+		assert.False(t, tracked, "a replacement must not start while the old generation is claimed")
+		return 1, []string{"tx"}, nil
+	}}
+
+	newTimeoutCheckerForTest(tracker, rejecter, 10*time.Minute).CheckOnce(context.Background())
+	assert.False(t, tracker.IsInFlight("lease-old"), "successful settlement must finish the claimed generation")
+
+	replacementGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-old", "tenant-1", []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-b",
+	)
+	require.True(t, tracked)
+	current, exists := tracker.GetInFlight("lease-old")
+	require.True(t, exists)
+	assert.Equal(t, replacementGeneration, current.Generation)
+	assert.Equal(t, "backend-b", current.Backend)
+}
+
+func TestCheckOnce_AlreadyClaimedGenerationIsSkipped(t *testing.T) {
+	tracker := NewInFlightTracker()
+	tracker.TrackInFlightWithStartTime("lease-old", "tenant-1",
+		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-a",
+		time.Now().Add(-20*time.Minute))
+	p, exists := tracker.GetInFlight("lease-old")
+	require.True(t, exists)
+	_, claimed := tracker.TryClaimInFlight(p.LeaseUUID, p.Generation)
+	require.True(t, claimed)
+
+	rejectCalls := 0
+	rejecter := &mockRejecter{rejectFn: func(_ context.Context, _ []string, _ string) (uint64, []string, error) {
+		rejectCalls++
+		return 1, []string{"tx"}, nil
+	}}
+	checker := newTimeoutCheckerForTest(tracker, rejecter, 10*time.Minute)
+
+	checker.CheckOnce(context.Background())
+	assert.Equal(t, 0, rejectCalls, "the actor holding the claim owns settlement")
+	assert.True(t, tracker.IsInFlight("lease-old"))
+
+	require.True(t, tracker.ReleaseInFlightClaim(p.LeaseUUID, p.Generation))
+	checker.CheckOnce(context.Background())
+	assert.Equal(t, 1, rejectCalls)
+	assert.False(t, tracker.IsInFlight("lease-old"))
+}
+
+func TestCheckOnce_ConcurrentSweepsRejectGenerationOnce(t *testing.T) {
+	tracker := NewInFlightTracker()
+	tracker.TrackInFlightWithStartTime("lease-old", "tenant-1",
+		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-a",
+		time.Now().Add(-20*time.Minute))
+
+	var rejectCalls atomic.Int32
+	rejectStarted := make(chan struct{})
+	allowReject := make(chan struct{})
+	rejecter := &mockRejecter{rejectFn: func(_ context.Context, _ []string, _ string) (uint64, []string, error) {
+		if rejectCalls.Add(1) == 1 {
+			close(rejectStarted)
+		}
+		<-allowReject
+		return 1, []string{"tx"}, nil
+	}}
+	checker := newTimeoutCheckerForTest(tracker, rejecter, 10*time.Minute)
+
+	firstDone := make(chan struct{})
+	go func() {
+		checker.CheckOnce(context.Background())
+		close(firstDone)
+	}()
+	<-rejectStarted
+
+	secondDone := make(chan struct{})
+	go func() {
+		checker.CheckOnce(context.Background())
+		close(secondDone)
+	}()
+	select {
+	case <-secondDone:
+		// The second sweep saw the claim and skipped this generation.
+	case <-time.After(time.Second):
+		close(allowReject)
+		<-firstDone
+		<-secondDone
+		t.Fatal("second timeout sweep did not skip the claimed generation")
+	}
+
+	close(allowReject)
+	<-firstDone
+	assert.Equal(t, int32(1), rejectCalls.Load())
+	assert.False(t, tracker.IsInFlight("lease-old"))
+}
+
 func TestCheckOnce_RejectFailure_KeepsInFlight(t *testing.T) {
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlightWithStartTime("lease-stuck", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
 		time.Now().Add(-20*time.Minute))
 
+	rejectCalls := 0
 	rejecter := &mockRejecter{
 		rejectFn: func(_ context.Context, _ []string, _ string) (uint64, []string, error) {
-			return 0, nil, fmt.Errorf("chain unavailable")
+			rejectCalls++
+			if rejectCalls == 1 {
+				return 0, nil, fmt.Errorf("chain unavailable")
+			}
+			return 1, []string{"tx"}, nil
 		},
 	}
 
@@ -91,6 +205,10 @@ func TestCheckOnce_RejectFailure_KeepsInFlight(t *testing.T) {
 
 	assert.True(t, tracker.IsInFlight("lease-stuck"),
 		"lease should remain in-flight when rejection fails")
+
+	checker.CheckOnce(context.Background())
+	assert.Equal(t, 2, rejectCalls, "a retryable failure must release the claim for the next sweep")
+	assert.False(t, tracker.IsInFlight("lease-stuck"))
 }
 
 // TestCheckOnce_ActiveReprovisionNotPending_UntracksAndHandsBack covers ENG-337.

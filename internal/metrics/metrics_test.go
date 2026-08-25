@@ -17,7 +17,7 @@ import (
 // why it is spelled out here rather than derived (ENG-712).
 //
 // These are Gather() family names; the three histograms each expand into
-// _bucket/_sum/_count in the text exposition, so 21 collectors here are 27
+// _bucket/_sum/_count in the text exposition, so 22 collectors here are 28
 // metric names on the wire.
 var unlabelledMetricNames = []string{
 	"fred_backend_health_probe_panics_total",
@@ -26,6 +26,7 @@ var unlabelledMetricNames = []string{
 	"fred_payload_leases_awaiting",
 	"fred_payload_size_bytes",
 	"fred_payload_stored_count",
+	"fred_placement_write_failures_total",
 	"fred_provisioner_callback_timeouts_total",
 	"fred_provisioner_in_flight_provisions",
 	"fred_provisioner_reconciler_deferred_leases_total",
@@ -91,6 +92,7 @@ var labelledMetricNames = []string{
 func allCollectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		// Provisioning
+		PlacementWriteFailuresTotal,
 		InFlightProvisions,
 		ProvisioningTotal,
 		ProvisioningDuration,

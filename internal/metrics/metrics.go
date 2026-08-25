@@ -43,6 +43,22 @@ const (
 
 // Provisioning metrics
 var (
+	// PlacementWriteFailuresTotal counts failed writes to the durable placement
+	// store. Placement transitions are write-ahead safety records: when one
+	// cannot be persisted, provisioning is either refused before contacting a
+	// backend or left with an unresolved attempt for a later sweep to resolve.
+	// Any increase therefore needs operator attention (ENG-632).
+	//
+	// Deliberately unlabelled. Backend and lease identifiers belong in the
+	// accompanying log; putting either on a counter would create an unbounded
+	// Prometheus series set.
+	PlacementWriteFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "write_failures_total",
+		Help:      "Total failed writes to the durable placement store",
+	})
+
 	// InFlightProvisions tracks the number of provisions currently in progress.
 	InFlightProvisions = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,

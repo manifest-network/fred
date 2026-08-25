@@ -358,6 +358,7 @@ func run(cmd *cobra.Command, args []string) error {
 	// Use the interface type so that an unset store remains a true nil interface
 	// (a typed nil *placement.Store would pass != nil checks and panic).
 	var placementStore provisioner.PlacementStore
+	var placementLookup api.PlacementLookup
 	if cfg.PlacementStoreDBPath != "" {
 		ps, err := placement.NewStore(cfg.PlacementStoreDBPath)
 		if err != nil {
@@ -365,6 +366,7 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 		defer ps.Close()
 		placementStore = ps
+		placementLookup = ps
 		slog.Info("placement store enabled", "db_path", cfg.PlacementStoreDBPath)
 	} else {
 		slog.Warn("placement store disabled (no placement_store_db_path configured)")
@@ -440,6 +442,16 @@ func run(cmd *cobra.Command, args []string) error {
 		payloadStoreHealth = payloadStore
 	}
 
+	// Restore is also a write path: expose its recorder only when the placement
+	// store exists. Passing Manager unconditionally would make a placement-disabled
+	// deployment look durable because its bridge methods intentionally no-op when
+	// no store is configured, allowing Restore to contact a backend without a
+	// write-ahead attempt.
+	var restoreRecorder api.RestorePlacementRecorder
+	if placementStore != nil {
+		restoreRecorder = provisionMgr
+	}
+
 	apiServer, err := api.NewServer(api.ServerConfig{
 		Addr:                        cfg.APIListenAddr,
 		ProviderUUID:                cfg.ProviderUUID,
@@ -469,8 +481,8 @@ func run(cmd *cobra.Command, args []string) error {
 		PayloadPersister:   payloadPersister,
 		PayloadStoreHealth: payloadStoreHealth,
 		StatusChecker:      provisionMgr,
-		PlacementLookup:    placementStore,
-		RestoreRecorder:    provisionMgr,
+		PlacementLookup:    placementLookup,
+		RestoreRecorder:    restoreRecorder,
 		RestoreTracker:     provisionMgr,
 		EventBroker:        eventBroker,
 	})

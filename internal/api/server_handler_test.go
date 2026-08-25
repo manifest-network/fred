@@ -57,6 +57,24 @@ func TestHandleProvisionCallback_Success(t *testing.T) {
 	assert.Equal(t, backend.CallbackStatusSuccess, pub.callback.Status)
 }
 
+func TestHandleProvisionCallback_PropagatesAuthenticatedOperationGeneration(t *testing.T) {
+	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+	pub := &capturingCallbackPublisher{}
+	srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
+	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success"}`
+	req := httptest.NewRequest(http.MethodPost,
+		"/callbacks/provision?operation_generation=42", strings.NewReader(body))
+	req.Header.Set(CallbackSignatureHeader,
+		auth.ComputeSignature(req.Method, req.URL.RequestURI(), []byte(body)))
+
+	rr := httptest.NewRecorder()
+	srv.handleProvisionCallback(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	require.True(t, pub.called)
+	assert.Equal(t, uint64(42), pub.callback.OperationGeneration)
+}
+
 func TestHandleProvisionCallback_SuccessFailedStatus(t *testing.T) {
 	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 	pub := &capturingCallbackPublisher{}

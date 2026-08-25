@@ -31,6 +31,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // allFaults is every way a backend can fail to answer a sweep. Each reaches the
@@ -189,6 +190,30 @@ func TestFleet_UnplacedLeaseOnFaultedBackend_IsNotProvisionedOnAPeer(t *testing.
 		require.Zerof(t, srv.totalProvisionCalls(),
 			"no lease may be provisioned anywhere while the fleet is incomplete (%s)", srv.name)
 	}
+}
+
+// Once this process has completed and durably synced a healthy fleet sweep,
+// an absent placement is no longer legacy ambiguity: every accepted provision
+// since startup is write-ahead, and the complete sweep backfilled everything
+// older. That keeps the dropped-event reconciliation backstop live when an
+// unrelated backend later goes down.
+func TestFleet_CompletePlacementSweepArmsAbsentRecordTrust(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// Empty is intentional: a successful no-op SetBatch must still arm the
+	// process-local migration latch.
+	require.NoError(t, f.sweep())
+	require.True(t, f.reconciler.placementSweepSeen.Load())
+
+	f.backendAt(3).setFault(faultConnReset)
+	f.addLease("lease-after-trust", billingtypes.LEASE_STATE_PENDING)
+	require.NoError(t, f.sweep())
+
+	f.assertProvisionedExactlyOnce("lease-after-trust")
+	record := f.placement.Lookup("lease-after-trust")
+	require.Equal(t, placement.StateConfirmed, record.State())
+	require.NotEmpty(t, record.Backend)
 }
 
 // A backend that dies partway through a paginated listing is the subtlest

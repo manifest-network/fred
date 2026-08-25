@@ -69,68 +69,91 @@ func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 
 	now := time.Now()
 
-	// Process each timed-out provision
-	for _, p := range timedOut {
+	// Process each timed-out provision.
+	for _, candidate := range timedOut {
 		// Check context before each operation
 		if ctx.Err() != nil {
 			return
 		}
 
-		// Reject the lease on chain FIRST, before untracking.
-		// This prevents a race where the reconciler sees a PENDING lease that's
-		// not in-flight and tries to provision it again.
-		rejected, txHashes, err := c.rejecter.RejectLeases(ctx, []string{p.LeaseUUID}, truncateRejectReason("callback timeout"))
-		if err != nil {
-			if isTerminalAcknowledgeError(err) {
-				// The lease is no longer PENDING (ErrLeaseNotPending) or no longer
-				// exists (ErrLeaseNotFound), so RejectLeases can NEVER succeed for
-				// it. This can be a reconciler-registered ACTIVE-lease re-provision
-				// (reconciler.go) whose callback was lost, or an originally-PENDING
-				// entry whose state changed concurrently in the unlocked window
-				// between GetTimedOutProvisions and this reject (e.g. a racing
-				// success-ack that already flipped it ACTIVE). Either way, retrying
-				// forever would wedge the lease in-flight permanently and inflate
-				// InFlightProvisions (which also skews capacity/routing signals).
-				// Untrack it and hand it back to the reconciler, which owns the
-				// re-provision / FailCount / close path. (ENG-337)
-				c.tracker.UntrackInFlight(p.LeaseUUID)
-				metrics.CallbackTimeoutsTotal.Inc()
-				slog.Warn("timed-out provision is not a pending lease; untracked and handed back to reconciler",
-					"lease_uuid", p.LeaseUUID,
-					"tenant", p.Tenant,
-					"backend", p.Backend,
-					"age", now.Sub(p.StartTime),
-					"error", err,
-				)
-				continue
-			}
-			slog.Error("failed to reject timed-out lease, keeping in-flight to prevent re-provision",
-				"lease_uuid", p.LeaseUUID,
-				"error", err,
-			)
-			// Keep in-flight so reconciler doesn't try to re-provision.
-			// Next timeout check will retry the rejection.
+		// The timeout snapshot can race a callback or another timeout sweep. Claim
+		// this exact generation before making the on-chain rejection so only one
+		// actor can settle it, and so no replacement can be installed underneath
+		// the eventual cleanup.
+		p, claimed := c.tracker.TryClaimInFlight(candidate.LeaseUUID, candidate.Generation)
+		if !claimed {
 			continue
 		}
 
-		// Only untrack AFTER successful rejection
-		operation := p.Kind.operationLabel()
-		c.tracker.UntrackInFlight(p.LeaseUUID)
-		metrics.CallbackTimeoutsTotal.Inc()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend, operation).Inc()
-
-		// Record duration (from start until timeout)
-		duration := now.Sub(p.StartTime).Seconds()
-		metrics.ProvisioningDuration.WithLabelValues(p.Backend, operation).Observe(duration)
-
-		slog.Warn("rejected timed-out provision",
-			"lease_uuid", p.LeaseUUID,
-			"tenant", p.Tenant,
-			"backend", p.Backend,
-			"operation", operation,
-			"age", now.Sub(p.StartTime),
-			"rejected", rejected,
-			"tx_hashes", txHashes,
-		)
+		c.settleTimedOutProvision(ctx, p, now)
 	}
+}
+
+func (c *TimeoutChecker) settleTimedOutProvision(ctx context.Context, p InFlightProvision, now time.Time) {
+	claimFinished := false
+	defer func() {
+		// A retryable chain failure must leave the provision available to the
+		// next timeout sweep. This also releases the claim if a future early exit
+		// or panic is added before terminal settlement completes.
+		if !claimFinished {
+			c.tracker.ReleaseInFlightClaim(p.LeaseUUID, p.Generation)
+		}
+	}()
+
+	// Reject the lease on chain FIRST, before untracking.
+	// This prevents a race where the reconciler sees a PENDING lease that's
+	// not in-flight and tries to provision it again.
+	rejected, txHashes, err := c.rejecter.RejectLeases(ctx, []string{p.LeaseUUID}, truncateRejectReason("callback timeout"))
+	if err != nil {
+		if isTerminalAcknowledgeError(err) {
+			// The lease is no longer PENDING (ErrLeaseNotPending) or no longer
+			// exists (ErrLeaseNotFound), so RejectLeases can NEVER succeed for
+			// it. This can be a reconciler-registered ACTIVE-lease re-provision
+			// (reconciler.go) whose callback was lost, or an originally-PENDING
+			// entry whose state changed concurrently in the unlocked window
+			// between GetTimedOutProvisions and this reject (e.g. a racing
+			// success-ack that already flipped it ACTIVE). Either way, retrying
+			// forever would wedge the lease in-flight permanently and inflate
+			// InFlightProvisions (which also skews capacity/routing signals).
+			// Untrack it and hand it back to the reconciler, which owns the
+			// re-provision / FailCount / close path. (ENG-337)
+			claimFinished = c.tracker.FinishClaimedInFlight(p.LeaseUUID, p.Generation)
+			metrics.CallbackTimeoutsTotal.Inc()
+			slog.Warn("timed-out provision is not a pending lease; untracked and handed back to reconciler",
+				"lease_uuid", p.LeaseUUID,
+				"tenant", p.Tenant,
+				"backend", p.Backend,
+				"age", now.Sub(p.StartTime),
+				"error", err,
+			)
+			return
+		}
+		slog.Error("failed to reject timed-out lease, keeping in-flight to prevent re-provision",
+			"lease_uuid", p.LeaseUUID,
+			"error", err,
+		)
+		// Keep in-flight so reconciler doesn't try to re-provision.
+		// Next timeout check will retry the rejection.
+		return
+	}
+
+	// Only untrack AFTER successful rejection
+	operation := p.Kind.operationLabel()
+	claimFinished = c.tracker.FinishClaimedInFlight(p.LeaseUUID, p.Generation)
+	metrics.CallbackTimeoutsTotal.Inc()
+	metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend, operation).Inc()
+
+	// Record duration (from start until timeout)
+	duration := now.Sub(p.StartTime).Seconds()
+	metrics.ProvisioningDuration.WithLabelValues(p.Backend, operation).Observe(duration)
+
+	slog.Warn("rejected timed-out provision",
+		"lease_uuid", p.LeaseUUID,
+		"tenant", p.Tenant,
+		"backend", p.Backend,
+		"operation", operation,
+		"age", now.Sub(p.StartTime),
+		"rejected", rejected,
+		"tx_hashes", txHashes,
+	)
 }

@@ -2,6 +2,8 @@ package provisioner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"log/slog"
 	"maps"
 	"slices"
@@ -39,12 +41,18 @@ func (k ProvisionKind) operationLabel() string {
 
 // InFlightProvision represents a lease that is currently being provisioned.
 type InFlightProvision struct {
-	LeaseUUID string
-	Tenant    string
-	Items     []backend.LeaseItem // All items being provisioned
-	Backend   string
-	StartTime time.Time     // For duration metrics
-	Kind      ProvisionKind // Provision vs restore — labels callback metrics (ENG-358)
+	LeaseUUID  string
+	Tenant     string
+	Items      []backend.LeaseItem // All items being provisioned
+	Backend    string
+	Generation uint64 // Operation identity for conditional cleanup (ENG-632)
+	// GenerationRequired is set by token-aware production entry points. Their
+	// callbacks must echo Generation through the HMAC-authenticated callback URL;
+	// legacy/test registrations leave it false for rolling compatibility.
+	GenerationRequired bool
+	StartTime          time.Time     // For duration metrics
+	Kind               ProvisionKind // Provision vs restore — labels callback metrics (ENG-358)
+	settlementClaimed  bool          // serializes callback/timeout terminal work
 }
 
 // RoutingSKU returns the first SKU for backend routing decisions.
@@ -68,17 +76,30 @@ type InFlightTracker interface {
 	// Returns true if the lease was successfully tracked (was not already in-flight),
 	// false if the lease was already being provisioned.
 	TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
+	// TryTrackInFlightWithGeneration is TryTrackInFlight plus an operation token.
+	// The token lets the initiating call clean up only its own tracker entry when
+	// a fast callback has already allowed a replacement operation to start.
+	TryTrackInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool)
 
 	// TryTrackRestoreInFlight is TryTrackInFlight for a restore: the entry is
 	// marked KindRestore so the restore's provision callback is acknowledged
 	// inline rather than by the reconciler, and its metrics carry operation=restore (ENG-358).
 	TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
+	TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool)
 
 	// TrackInFlight registers a lease as being provisioned.
 	TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string)
 
 	// UntrackInFlight removes a lease from the in-flight tracking.
 	UntrackInFlight(leaseUUID string)
+	// UntrackInFlightIfGeneration removes the entry only when it still belongs to
+	// the named operation.
+	UntrackInFlightIfGeneration(leaseUUID string, generation uint64) bool
+	// Terminal settlement can contain slow chain and storage calls. A claim
+	// prevents timeout/callback actors from replacing the generation mid-flight.
+	TryClaimInFlight(leaseUUID string, generation uint64) (InFlightProvision, bool)
+	ReleaseInFlightClaim(leaseUUID string, generation uint64) bool
+	FinishClaimedInFlight(leaseUUID string, generation uint64) bool
 
 	// PopInFlight atomically removes and returns an in-flight provision.
 	// Returns the provision info and true if found, or zero value and false if not found.
@@ -127,15 +148,30 @@ type ReconcilerTracker interface {
 // DefaultInFlightTracker is the default implementation of InFlightTracker.
 // It uses a sync.RWMutex for thread-safe tracking of in-flight provisions.
 type DefaultInFlightTracker struct {
-	inFlight map[string]InFlightProvision
-	mu       sync.RWMutex
+	inFlight       map[string]InFlightProvision
+	nextGeneration uint64
+	mu             sync.RWMutex
 }
 
 // NewInFlightTracker creates a new DefaultInFlightTracker.
 func NewInFlightTracker() *DefaultInFlightTracker {
 	return &DefaultInFlightTracker{
-		inFlight: make(map[string]InFlightProvision),
+		inFlight:       make(map[string]InFlightProvision),
+		nextGeneration: randomGenerationSeed(),
 	}
+}
+
+func randomGenerationSeed() uint64 {
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err == nil {
+		if seed := binary.BigEndian.Uint64(raw[:]); seed != 0 {
+			return seed
+		}
+	}
+	// crypto/rand failure is exceptionally unlikely. The wall clock still keeps
+	// generation reuse across process restarts far less likely than restarting at
+	// one, while allocateGenerationLocked preserves the non-zero invariant.
+	return uint64(time.Now().UnixNano())
 }
 
 // Compile-time check that DefaultInFlightTracker implements InFlightTracker.
@@ -145,12 +181,17 @@ var _ InFlightTracker = (*DefaultInFlightTracker)(nil)
 func (t *DefaultInFlightTracker) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if p, exists := t.inFlight[leaseUUID]; exists && p.settlementClaimed {
+		return
+	}
+	generation := t.allocateGenerationLocked()
 	t.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID: leaseUUID,
-		Tenant:    tenant,
-		Items:     items,
-		Backend:   backendName,
-		StartTime: time.Now(),
+		LeaseUUID:  leaseUUID,
+		Tenant:     tenant,
+		Items:      items,
+		Backend:    backendName,
+		Generation: generation,
+		StartTime:  time.Now(),
 	}
 	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 }
@@ -159,7 +200,14 @@ func (t *DefaultInFlightTracker) TrackInFlight(leaseUUID, tenant string, items [
 // Returns true if the lease was successfully tracked (was not already in-flight),
 // false if the lease was already being provisioned.
 func (t *DefaultInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	return t.tryTrack(leaseUUID, tenant, items, backendName, KindProvision)
+	_, ok := t.tryTrack(leaseUUID, tenant, items, backendName, KindProvision, false)
+	return ok
+}
+
+// TryTrackInFlightWithGeneration atomically tracks a provision and returns its
+// operation generation.
+func (t *DefaultInFlightTracker) TryTrackInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool) {
+	return t.tryTrack(leaseUUID, tenant, items, backendName, KindProvision, true)
 }
 
 // TryTrackRestoreInFlight is TryTrackInFlight for a restore: it marks the entry
@@ -168,36 +216,107 @@ func (t *DefaultInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, item
 // returns false (leaving any existing entry untouched) when the lease is already
 // in-flight, so a duplicate restore or a racing reconciler is a no-op for the caller.
 func (t *DefaultInFlightTracker) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	return t.tryTrack(leaseUUID, tenant, items, backendName, KindRestore)
+	_, ok := t.tryTrack(leaseUUID, tenant, items, backendName, KindRestore, false)
+	return ok
+}
+
+// TryTrackRestoreInFlightWithGeneration atomically tracks a restore and returns
+// its operation generation.
+func (t *DefaultInFlightTracker) TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool) {
+	return t.tryTrack(leaseUUID, tenant, items, backendName, KindRestore, true)
 }
 
 // tryTrack is the shared atomic track-if-absent implementation.
-func (t *DefaultInFlightTracker) tryTrack(leaseUUID, tenant string, items []backend.LeaseItem, backendName string, kind ProvisionKind) bool {
+func (t *DefaultInFlightTracker) tryTrack(leaseUUID, tenant string, items []backend.LeaseItem, backendName string, kind ProvisionKind, generationRequired bool) (uint64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, exists := t.inFlight[leaseUUID]; exists {
-		return false
+		return 0, false
 	}
+	generation := t.allocateGenerationLocked()
 	t.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID: leaseUUID,
-		Tenant:    tenant,
-		Items:     items,
-		Backend:   backendName,
-		StartTime: time.Now(),
-		Kind:      kind,
+		LeaseUUID:          leaseUUID,
+		Tenant:             tenant,
+		Items:              items,
+		Backend:            backendName,
+		Generation:         generation,
+		GenerationRequired: generationRequired,
+		StartTime:          time.Now(),
+		Kind:               kind,
 	}
 	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
-	return true
+	return generation, true
+}
+
+func (t *DefaultInFlightTracker) allocateGenerationLocked() uint64 {
+	t.nextGeneration++
+	if t.nextGeneration == 0 {
+		t.nextGeneration++
+	}
+	return t.nextGeneration
 }
 
 // UntrackInFlight removes a lease from the in-flight tracking.
 func (t *DefaultInFlightTracker) UntrackInFlight(leaseUUID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, exists := t.inFlight[leaseUUID]; exists {
+	if p, exists := t.inFlight[leaseUUID]; exists && !p.settlementClaimed {
 		delete(t.inFlight, leaseUUID)
 		metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 	}
+}
+
+// UntrackInFlightIfGeneration conditionally removes one operation without
+// disturbing a newer replacement for the same lease.
+func (t *DefaultInFlightTracker) UntrackInFlightIfGeneration(leaseUUID string, generation uint64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, exists := t.inFlight[leaseUUID]
+	if !exists || p.Generation != generation || p.settlementClaimed {
+		return false
+	}
+	delete(t.inFlight, leaseUUID)
+	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
+	return true
+}
+
+// TryClaimInFlight atomically claims one generation for terminal settlement.
+func (t *DefaultInFlightTracker) TryClaimInFlight(leaseUUID string, generation uint64) (InFlightProvision, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, exists := t.inFlight[leaseUUID]
+	if !exists || p.Generation != generation || p.settlementClaimed {
+		return InFlightProvision{}, false
+	}
+	p.settlementClaimed = true
+	t.inFlight[leaseUUID] = p
+	return p, true
+}
+
+// ReleaseInFlightClaim returns a generation to retryable in-flight state.
+func (t *DefaultInFlightTracker) ReleaseInFlightClaim(leaseUUID string, generation uint64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, exists := t.inFlight[leaseUUID]
+	if !exists || p.Generation != generation || !p.settlementClaimed {
+		return false
+	}
+	p.settlementClaimed = false
+	t.inFlight[leaseUUID] = p
+	return true
+}
+
+// FinishClaimedInFlight removes a generation only for its settlement owner.
+func (t *DefaultInFlightTracker) FinishClaimedInFlight(leaseUUID string, generation uint64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, exists := t.inFlight[leaseUUID]
+	if !exists || p.Generation != generation || !p.settlementClaimed {
+		return false
+	}
+	delete(t.inFlight, leaseUUID)
+	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
+	return true
 }
 
 // IsInFlight checks if a lease is currently being provisioned.
@@ -213,6 +332,9 @@ func (t *DefaultInFlightTracker) PopInFlight(leaseUUID string) (InFlightProvisio
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	provision, exists := t.inFlight[leaseUUID]
+	if exists && provision.settlementClaimed {
+		return InFlightProvision{}, false
+	}
 	if exists {
 		delete(t.inFlight, leaseUUID)
 		metrics.InFlightProvisions.Set(float64(len(t.inFlight)))

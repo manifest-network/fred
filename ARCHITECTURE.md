@@ -228,8 +228,11 @@ The full transition matrix lives in [internal/backend/docker/README.md](internal
 5. HandleLeaseCreated:
    a. Check if lease already in-flight (idempotency)
    b. Route to backend by SKU (least-loaded matching backend if several match)
-   c. Call backend POST /provision with callback URL
-   d. Track as in-flight, record placement (lease→backend)
+   c. Track as in-flight
+   d. Durably record an unresolved placement attempt for that backend
+   e. Call backend POST /provision with callback URL
+   f. Confirm the placement on acceptance, clear only the attempt on a typed
+      refusal, or retain the attempt when the outcome is ambiguous
 6. Backend provisions resource asynchronously
 7. Backend calls POST /callbacks/provision (API server):
    a. Verify HMAC signature (CallbackAuthenticator)
@@ -271,7 +274,7 @@ The full transition matrix lives in [internal/backend/docker/README.md](internal
       `retained: true` on its deprovisioned callback.
 ```
 
-The lease's **placement record survives close** (only the payload is cleaned up). This is deliberate: it keeps the closed lease's backend resolvable so a later restore can be routed to the node that holds its retained data (restore affinity, ENG-333). A `PENDING` lease that is *rejected* (never provisioned) deletes its placement eagerly, since there is no retention to protect.
+The lease's **confirmed placement survives close** (only the payload is cleaned up). This is deliberate: it keeps the closed lease's backend resolvable so a later restore can be routed to the node that holds its retained data (restore affinity, ENG-333). A rejected `PENDING` operation clears only its matching attempt; any conservative residue is removed by the revision-gated reconciler pruner.
 
 ### Lease Restore
 
@@ -284,8 +287,9 @@ Restore adopts a soft-deleted lease's retained data into a new lease (see the [d
    a. Resolve the backend that holds the SOURCE lease's retained data, via the
       source lease's surviving placement (restore is same-backend, ENG-333)
    b. Track the new lease in-flight as a restore BEFORE calling the backend
-   c. Call backend POST /restore; optimistically record the new lease's
-      placement on the source backend
+   c. Durably record the new lease's unresolved attempt on the source backend
+   d. Call backend POST /restore, then confirm or retain/clear that attempt by
+      the same outcome rules as fresh provisioning
 4. Backend adopts the retained volumes and re-deploys the retained manifest async
 5. Backend POSTs the success callback:
    a. Because the lease was tracked in-flight (step 3b), the callback is
@@ -296,8 +300,9 @@ The new lease **may target a different SKU tier** than the source (promote/demot
 
 Reconciler interplay (level-triggered backstop):
 
-- **Inline ack, reconciler backstop.** Inline acknowledgement (ENG-358) is the fast path; if no restore tracker is wired, the restore still converges because the reconciler acks a `PENDING` + `ready` lease. The reconciler *skips* acking a lease the in-flight tracker already owns (counted by `reconciler_inflight_skips_total`), avoiding a double-ack.
+- **Inline ack, reconciler backstop.** Inline acknowledgement (ENG-358) is the fast path. Restore requires both the durable placement recorder and generation-scoped tracker; a deployment missing either returns 503 before contacting a backend. Once accepted, the reconciler remains the level-triggered backstop for a lost callback and acks a `PENDING` + `ready` lease. It *skips* a lease the in-flight tracker still owns (counted by `reconciler_inflight_skips_total`), avoiding a double-ack.
 - **Restore affinity sync (ENG-333).** Each reconcile tick fans out `GET /retentions` to every backend and syncs the `lease → backend` map into the placement store, so retained leases stay routable to their source node across restarts.
+- **Write-ahead placement (ENG-632).** Placement stores two independent facts: `Backend` is confirmed ownership and `Attempt` is an unresolved outbound call. Every provision and restore persists `Attempt` before contacting a backend. A failed prewrite makes zero backend calls; a transport/5xx ambiguity retains the attempt and blocks substitution until that backend later answers authoritative `/provisions` and `/retentions` inventories. Confirmed ownership is never erased by a failed re-provision. If multiple backends report the same lease, the store durably quarantines the lease with the sorted set of every known owner; reconciliation cannot resolve the conflict until each recorded candidate answers both inventories, and deprovision fails closed if any candidate is no longer configured or cannot be reached. Record absence is trusted during a degraded sweep only after this process has completed and durably synced one unambiguous full-fleet inventory. Callback URLs carry an HMAC-covered operation generation, and callback/timeout settlement claims serialize terminal work so an older response cannot settle a replacement operation.
 - **Placement prune grace + deprovision fail-safe (ENG-335).** The reconciler will not prune a placement set younger than a grace window (`2 × reconcile_interval`, measured from sweep start), so a lease that provisioned during a slow sweep is not mis-pruned. When a lease exhausts its re-provision attempts and is closed, the reconciler eagerly calls `backend.Deprovision` on its backend instead of waiting for the next orphan-cleanup cycle (logged at WARN, non-fatal).
 - **Destroy only on a positive fact (ENG-654).** The passes that delete durable state never infer "finished" from absence. A lease missing from the sweep's `chainLeases` proves nothing on its own: that map is built from two non-atomic queries filtered to `PENDING`/`ACTIVE`, so absence covers terminal, never-known, and just-created alike. Orphan deprovision and orphaned-payload cleanup therefore re-read the lease (`GetLease`) per candidate and act only on a positively reported `CLOSED`/`REJECTED`/`EXPIRED`; a query error, an `UNSPECIFIED` state, or a chain with no record of the lease all keep the state and bump `fred_reconciler_cleanup_skips_total`. The last of those is not a corner case — `x/billing` never deletes a lease, so "no record" means a phantom provision, a wrong or reset chain, or a lagging RPC node, and treating it as terminal would let one bad endpoint deprovision the fleet. Placement pruning asks a different question, per record rather than per sweep: it prunes only what the record's **own** backend accounted for on both `/provisions` and `/retentions`. Between them these replace the fleet-wide completeness gate ENG-356 left on all three passes, under which one silent machine paused cleanup — and stranded admission capacity — for every healthy one.
 
@@ -401,7 +406,7 @@ func (r *Router) RouteRoundRobin(sku string) Backend       // round-robin across
 - `Route` — returns the first matching backend (used for deprovision fallback and read-path when no placement exists)
 - `RouteForProvision` — routes a new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats
 - `RouteRoundRobin` — distributes across all matching backends via an atomic counter (the tie-break and no-stats fallback for `RouteForProvision`)
-- **Placement lookup** — maps `lease_uuid → backend_name` for read-path routing (connection, logs, diagnostics)
+- **Placement lookup** — stores a confirmed backend plus an optional unresolved attempt, or a durable quarantine containing every known conflicting owner. Only a confirmed backend pins read/provision routing; attempts and conflicts gate destructive reconciliation and positively target deprovision.
 
 When a single backend matches a SKU, all strategies behave identically.
 
@@ -540,7 +545,7 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
 - Written when provisioning starts (after `RouteForProvision` picks a backend)
 - Read on every tenant API call (connection, logs, diagnostics) to route to the correct backend
 - Deleted only by the reconciler (`cleanupOrphanedPlacements`, ENG-333); survives lease close so a later restore can route to the source node. Deleted eagerly only when a never-provisioned `PENDING` lease is rejected (no retention to protect)
-- Rebuilt on startup: the reconciler calls `SetBatch` with placements from all backends' `ListProvisions`
+- Rebuilt on startup from every backend's `/provisions` and `/retentions` inventories; only a complete snapshot may resolve an attempt or conflict
 - Optional — only needed when multiple backends share the same SKU list
 
 ### Payload Store
@@ -590,6 +595,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_provisioner_ack_batch_individual_fallbacks_total` | counter | `lane` | Ack-batch failures that fell back to per-lease retries |
 | `fred_provisioner_reconciler_inflight_skips_total` | counter | — | Ready leases the reconciler skipped because the main flow owns them |
 | `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`, `fetch_retentions`) — any non-zero is a latent bug |
+| `fred_placement_write_failures_total` | counter | — | Failed durable placement mutations. Any increase is actionable: prewrite failures block the backend call, while later failures retain conservative state for reconciliation |
 
 **Reconciler:**
 

@@ -38,6 +38,14 @@ func testItems(sku string) []backend.LeaseItem {
 	return []backend.LeaseItem{{SKU: sku, Quantity: 1}}
 }
 
+func mustInFlightGeneration(t *testing.T, manager *Manager, leaseUUID string) uint64 {
+	t.Helper()
+	p, exists := manager.GetInFlight(leaseUUID)
+	require.True(t, exists, "lease %s must be in-flight", leaseUUID)
+	require.NotZero(t, p.Generation)
+	return p.Generation
+}
+
 // mockManagerBackend implements backend.Backend for manager tests.
 type mockManagerBackend struct {
 	mu               sync.Mutex
@@ -355,6 +363,9 @@ func TestManager_PopInFlight(t *testing.T) {
 func TestBuildCallbackURL(t *testing.T) {
 	expected := "http://localhost:8080/callbacks/provision"
 	assert.Equal(t, expected, BuildCallbackURL("http://localhost:8080"))
+	assert.Equal(t, expected+"?operation_generation=42",
+		BuildCallbackURLForGeneration("http://localhost:8080", 42))
+	assert.Equal(t, expected, BuildCallbackURLForGeneration("http://localhost:8080", 0))
 }
 
 func TestManager_HandleLeaseCreated(t *testing.T) {
@@ -402,7 +413,10 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 	assert.Equal(t, "lease-1", mockBackend.provisionCalls[0].LeaseUUID)
 	assert.Equal(t, "tenant-1", mockBackend.provisionCalls[0].Tenant)
 	assert.Equal(t, "provider-1", mockBackend.provisionCalls[0].ProviderUUID)
-	assert.Equal(t, "http://localhost:8080/callbacks/provision", mockBackend.provisionCalls[0].CallbackURL)
+	inFlight, exists := manager.GetInFlight("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, BuildCallbackURLForGeneration("http://localhost:8080", inFlight.Generation),
+		mockBackend.provisionCalls[0].CallbackURL)
 
 	// Verify in-flight tracking
 	assert.True(t, manager.IsInFlight("lease-1"), "lease should be in-flight after handleLeaseCreated")
@@ -573,8 +587,9 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:           "lease-1",
+		Status:              backend.CallbackStatusSuccess,
+		OperationGeneration: mustInFlightGeneration(t, manager, "lease-1"),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -981,7 +996,8 @@ func TestManager_StartAndClose(t *testing.T) {
 }
 
 func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
-	// Test the warning log when backend lookup by name fails
+	// A best-effort fleet sweep still runs, but the close delivery must not be
+	// acknowledged as successful while its positively named backend was absent.
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -1004,9 +1020,9 @@ func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	// Should succeed by falling back to default backend
 	err = handlersOf(manager).HandleLeaseClosed(msg)
-	assert.NoError(t, err, "should fallback to default backend")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	require.ErrorIs(t, err, ErrPlacementUnresolvable)
 
 	// Verify deprovision was called on the default backend
 	mockBackend.mu.Lock()
@@ -2230,8 +2246,9 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 
 	// Step 3: Simulate successful callback - payload should be deleted now
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:           "lease-1",
+		Status:              backend.CallbackStatusSuccess,
+		OperationGeneration: mustInFlightGeneration(t, manager, "lease-1"),
 	}
 	callbackPayload, _ := json.Marshal(callback)
 	callbackMsg := message.NewMessage(watermill.NewUUID(), callbackPayload)
@@ -2312,9 +2329,10 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 
 	// Simulate failed callback
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "unknown SKU",
+		LeaseUUID:           "lease-1",
+		Status:              backend.CallbackStatusFailed,
+		Error:               "unknown SKU",
+		OperationGeneration: mustInFlightGeneration(t, manager, "lease-1"),
 	}
 	callbackPayload, _ := json.Marshal(callback)
 	callbackMsg := message.NewMessage(watermill.NewUUID(), callbackPayload)

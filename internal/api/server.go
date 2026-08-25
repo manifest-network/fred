@@ -21,6 +21,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner"
 )
 
 const (
@@ -105,7 +106,7 @@ type ServerDeps struct {
 	PayloadStoreHealth PayloadStoreHealth // Optional — health probe for the payload store's bbolt DB.
 	StatusChecker      StatusChecker
 	PlacementLookup    PlacementLookup          // Optional — if nil, placement routing is disabled.
-	RestoreRecorder    RestorePlacementRecorder // Optional — restore placement bookkeeping (ENG-333).
+	RestoreRecorder    RestorePlacementRecorder // Optional globally; Restore returns 503 when absent (ENG-632).
 	RestoreTracker     RestoreInFlightTracker   // Optional — inline-ack restore in-flight tracking (ENG-358).
 	EventBroker        *EventBroker             // Optional — if nil, the events endpoint returns 501.
 }
@@ -344,6 +345,19 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 	if !config.IsValidUUID(callback.LeaseUUID) {
 		writeError(w, "lease_uuid must be a valid UUID", http.StatusBadRequest)
 		return
+	}
+
+	// The backend posts to the callback URL fred supplied. RequestURI is part of
+	// the verified HMAC, so this token is authenticated even though legacy
+	// backends need not understand or copy it into their JSON payload.
+	callback.OperationGeneration = 0
+	if raw := r.URL.Query().Get(provisioner.CallbackOperationGenerationParam); raw != "" {
+		generation, parseErr := strconv.ParseUint(raw, 10, 64)
+		if parseErr != nil || generation == 0 {
+			writeError(w, "operation_generation must be a non-zero uint64", http.StatusBadRequest)
+			return
+		}
+		callback.OperationGeneration = generation
 	}
 
 	switch callback.Status {

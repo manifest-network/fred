@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 )
@@ -61,9 +62,22 @@ const (
 // CallbackPath is the path suffix for backend provision callbacks.
 const CallbackPath = "/callbacks/provision"
 
+// CallbackOperationGenerationParam carries the initiating tracker's operation
+// identity in the callback URL. Callback HMACs cover RequestURI, so the value
+// cannot be changed independently of the signed backend request.
+const CallbackOperationGenerationParam = "operation_generation"
+
 // BuildCallbackURL constructs the full callback URL from a base URL.
 func BuildCallbackURL(baseURL string) string {
 	return baseURL + CallbackPath
+}
+
+// BuildCallbackURLForGeneration binds a callback to one in-flight operation.
+func BuildCallbackURLForGeneration(baseURL string, generation uint64) string {
+	if generation == 0 {
+		return BuildCallbackURL(baseURL)
+	}
+	return BuildCallbackURL(baseURL) + "?" + CallbackOperationGenerationParam + "=" + strconv.FormatUint(generation, 10)
 }
 
 // ChainClient defines the chain operations needed by the provisioner.

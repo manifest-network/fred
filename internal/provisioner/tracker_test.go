@@ -143,6 +143,88 @@ func TestTracker_UntrackInFlight(t *testing.T) {
 	assert.Equal(t, 0, tracker.InFlightCount())
 }
 
+func TestTracker_UntrackInFlightIfGeneration_PreservesReplacement(t *testing.T) {
+	tracker := NewInFlightTracker()
+	items := testItems("sku-1")
+
+	first, ok := tracker.TryTrackInFlightWithGeneration("lease-1", "tenant-a", items, "backend-a")
+	require.True(t, ok)
+	require.True(t, tracker.UntrackInFlightIfGeneration("lease-1", first))
+
+	second, ok := tracker.TryTrackInFlightWithGeneration("lease-1", "tenant-a", items, "backend-b")
+	require.True(t, ok)
+	require.NotEqual(t, first, second)
+
+	assert.False(t, tracker.UntrackInFlightIfGeneration("lease-1", first),
+		"late cleanup from the first operation must not remove its replacement")
+	p, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, second, p.Generation)
+	assert.Equal(t, "backend-b", p.Backend)
+}
+
+func TestTracker_ClaimBlocksRemovalAndReplacementUntilRelease(t *testing.T) {
+	tracker := NewInFlightTracker()
+	items := testItems("sku-1")
+	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-a", items, "backend-a",
+	)
+	require.True(t, tracked)
+
+	claimed, ok := tracker.TryClaimInFlight("lease-1", generation)
+	require.True(t, ok)
+	assert.Equal(t, generation, claimed.Generation)
+	assert.Equal(t, "backend-a", claimed.Backend)
+
+	tracker.UntrackInFlight("lease-1")
+	assert.True(t, tracker.IsInFlight("lease-1"), "legacy untrack must not bypass a claim")
+	assert.False(t, tracker.UntrackInFlightIfGeneration("lease-1", generation),
+		"generation-scoped untrack must not bypass a claim")
+	_, popped := tracker.PopInFlight("lease-1")
+	assert.False(t, popped, "pop must not bypass a claim")
+	_, tracked = tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-b", items, "backend-b",
+	)
+	assert.False(t, tracked, "a replacement must not start while settlement is claimed")
+	tracker.TrackInFlight("lease-1", "tenant-b", items, "backend-b")
+	current, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, generation, current.Generation, "legacy track must not overwrite a claim")
+	assert.Equal(t, "backend-a", current.Backend)
+
+	require.True(t, tracker.ReleaseInFlightClaim("lease-1", generation))
+	require.True(t, tracker.UntrackInFlightIfGeneration("lease-1", generation),
+		"release must restore ordinary generation-scoped cleanup")
+	replacementGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-b", items, "backend-b",
+	)
+	require.True(t, tracked, "a replacement may start after release and cleanup")
+	assert.NotEqual(t, generation, replacementGeneration)
+}
+
+func TestTracker_FinishClaimedInFlightRemovesGeneration(t *testing.T) {
+	tracker := NewInFlightTracker()
+	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-a", testItems("sku-1"), "backend-a",
+	)
+	require.True(t, tracked)
+	_, claimed := tracker.TryClaimInFlight("lease-1", generation)
+	require.True(t, claimed)
+
+	require.True(t, tracker.FinishClaimedInFlight("lease-1", generation))
+	assert.False(t, tracker.IsInFlight("lease-1"))
+	assert.False(t, tracker.ReleaseInFlightClaim("lease-1", generation),
+		"a finished claim no longer exists to release")
+	assert.False(t, tracker.FinishClaimedInFlight("lease-1", generation),
+		"finishing the same generation twice is a no-op")
+
+	replacementGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-b", testItems("sku-1"), "backend-b",
+	)
+	require.True(t, tracked)
+	assert.NotEqual(t, generation, replacementGeneration)
+}
+
 func TestTracker_PopInFlight(t *testing.T) {
 	tracker := NewInFlightTracker()
 	items := []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}

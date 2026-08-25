@@ -27,6 +27,7 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // ChainClient defines the chain operations needed by handlers.
@@ -46,7 +47,7 @@ type TokenTrackerInterface interface {
 
 // PlacementLookup provides lease→backend mapping for read-path routing.
 type PlacementLookup interface {
-	Get(leaseUUID string) string
+	Lookup(leaseUUID string) placement.Placement
 	Healthy() error
 }
 
@@ -83,27 +84,33 @@ type PayloadPersister interface {
 	OverwritePayload(leaseUUID string, payload []byte) error
 }
 
-// RestorePlacementRecorder records the NEW lease's placement after a successful
-// restore (it adopts the source's backend). The source placement is left for the
-// reconciler to prune. Optional — when nil, the reconciler still converges (ENG-333).
+// RestorePlacementRecorder persists the NEW lease's write-ahead placement
+// lifecycle around Restore. The attempt is written before the backend is
+// contacted, confirmed after an accepted request, and cleared only when the
+// backend positively refused the request. The source placement is never
+// changed; the reconciler prunes it after its retention disappears (ENG-632).
 type RestorePlacementRecorder interface {
-	RecordRestorePlacement(newLeaseUUID, backendName string)
+	// SetPlacementAttempting returns the non-zero revision of the exact attempt
+	// this call created. Settlement must carry that revision back so an older
+	// Restore response cannot mutate a callback/newer operation's record.
+	SetPlacementAttempting(leaseUUID, backendName string) (revision uint64, err error)
+	ConfirmPlacementIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
+	ClearPlacementAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
 }
 
 // RestoreInFlightTracker registers the NEW restore lease in the provisioner's
 // in-flight tracker so the restore's provision callback is acknowledged inline
 // (like a fresh provision) instead of ~one reconciler interval later (ENG-358).
-// Optional — when nil, restore still converges via the reconciler ack backstop.
+// Required whenever RestorePlacementRecorder is configured. Placement and
+// tracker tokens are the two halves of one causally scoped restore operation.
 type RestoreInFlightTracker interface {
-	// TryTrackRestoreInFlight registers the new lease as an in-flight restore.
-	// Returns false if the lease is already in-flight (a duplicate restore or a
-	// racing reconciler provision), in which case the caller must NOT call the
-	// backend and must NOT untrack — the entry is owned by the other writer.
-	TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
-	// UntrackInFlight removes the entry. Called only to undo a successful track
-	// when the synchronous Restore() call subsequently fails, so a failed restore
-	// never leaves a phantom in-flight lease for the TimeoutChecker to reject.
-	UntrackInFlight(leaseUUID string)
+	// TryTrackRestoreInFlightWithGeneration registers the new lease and returns
+	// its non-zero operation identity. False means another operation owns the
+	// entry; callers must neither contact the backend nor untrack it.
+	TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (generation uint64, tracked bool)
+	// UntrackInFlightIfGeneration removes only this operation's entry. A false
+	// result means a callback already removed it or a newer operation replaced it.
+	UntrackInFlightIfGeneration(leaseUUID string, generation uint64) bool
 }
 
 // Handlers contains HTTP request handlers.
@@ -133,8 +140,8 @@ type HandlersConfig struct {
 	TokenTracker       TokenTrackerInterface    // optional but recommended for replay attack protection
 	StatusChecker      StatusChecker            // optional but required for the /status endpoint
 	PlacementLookup    PlacementLookup          // optional — used for routing reads to the correct backend
-	RestoreRecorder    RestorePlacementRecorder // optional — restore placement bookkeeping (ENG-333)
-	RestoreTracker     RestoreInFlightTracker   // optional — inline-ack restore in-flight tracking (ENG-358)
+	RestoreRecorder    RestorePlacementRecorder // optional globally; required by the restore endpoint (ENG-632)
+	RestoreTracker     RestoreInFlightTracker   // required with RestoreRecorder — generation-scoped restore ownership (ENG-632)
 	PayloadPersister   PayloadPersister         // REQUIRED for /update — without it an update cannot be made durable (ENG-619)
 	PayloadStoreHealth PayloadStoreHealth       // optional — health probe for the payload store's bbolt DB
 	EventBroker        *EventBroker             // optional — if nil, the events endpoint will return 501
@@ -323,7 +330,10 @@ func (h *Handlers) authenticateLease(w http.ResponseWriter, r *http.Request, che
 // a confidently wrong answer.
 func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 	if h.placementLookup != nil {
-		if name := h.placementLookup.Get(leaseUUID); name != "" {
+		p := h.placementLookup.Lookup(leaseUUID)
+		switch p.State() {
+		case placement.StateConfirmed:
+			name := p.Backend
 			b := h.backendRouter.GetBackendByName(name)
 			if b == nil {
 				slog.Error("placement backend not found in router; refusing to serve from another backend",
@@ -332,6 +342,17 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 				)
 			}
 			return b
+		case placement.StateUnusable:
+			// A corrupt record is not absence. Refuse to guess a backend until a
+			// complete reconciliation repairs or prunes it.
+			slog.Error("placement record is unusable; refusing to serve from a guessed backend",
+				"lease_uuid", leaseUUID,
+			)
+			return nil
+		case placement.StateAbsent, placement.StateAttempting:
+			// Only confirmed ownership pins ordinary routing. An attempt records
+			// that a write may have reached a backend, but does not claim that it
+			// owns the lease (ENG-632).
 		}
 	}
 	return h.backendRouter.Route(sku)
@@ -461,10 +482,31 @@ func (h *Handlers) resolveBackendByPlacement(leaseUUID string) (backend.Backend,
 	if h.placementLookup == nil || h.backendRouter == nil {
 		return nil, nil
 	}
-	name := h.placementLookup.Get(leaseUUID)
-	if name == "" {
-		return nil, nil
+	p := h.placementLookup.Lookup(leaseUUID)
+	// Restore consumes retained source data and therefore needs one
+	// unambiguous owner. A confirmed owner plus a newer unresolved attempt is
+	// still ambiguous for this operation, even though ordinary reads may safely
+	// remain pinned to the confirmed owner.
+	if p.Attempt != "" {
+		return nil, fmt.Errorf("%w: lease %s has an unresolved placement attempt on %q",
+			provisioner.ErrPlacementUnresolvable, leaseUUID, p.Attempt)
 	}
+	switch p.State() {
+	case placement.StateAbsent:
+		return nil, nil
+	case placement.StateAttempting:
+		// Defensive fallback: StateAttempting currently implies Attempt != ""
+		// and is handled above, but keep the state fail-safe if that encoding
+		// evolves.
+		return nil, fmt.Errorf("%w: lease %s has an unresolved placement attempt",
+			provisioner.ErrPlacementUnresolvable, leaseUUID)
+	case placement.StateUnusable:
+		return nil, fmt.Errorf("%w: lease %s has an unusable placement record",
+			provisioner.ErrPlacementUnresolvable, leaseUUID)
+	case placement.StateConfirmed:
+		// Continue below.
+	}
+	name := p.Backend
 	b := h.backendRouter.GetBackendByName(name)
 	if b == nil {
 		return nil, fmt.Errorf("%w: lease %s is placed on %q",
@@ -1101,7 +1143,6 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
 		return
 	}
-
 	// Resolve the backend that holds the SOURCE lease's retained data. Restore
 	// is same-backend: the retained volumes live only where the source lease was
 	// provisioned (ENG-333).
@@ -1128,25 +1169,68 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "no retained data found for that lease", http.StatusNotFound)
 		return
 	}
+	if h.restoreRecorder == nil {
+		// Restore is a write path. A lookup alone can find the retained source,
+		// but without a fallible write-ahead recorder fred cannot distinguish
+		// "never contacted" from "request outcome was ambiguous" for the target.
+		slog.Error("placement recorder not configured; restore requires durable write-ahead placement")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
+	if h.restoreTracker == nil {
+		// The attempt revision protects placement settlement, while the tracker
+		// generation protects cleanup of the in-memory operation. Enabling only
+		// one recreates a causal hole: an older response could otherwise remove
+		// a newer operation's tracker entry.
+		slog.Error("restore in-flight tracker not configured; write-ahead restore requires generation-scoped tracking")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return
+	}
 
 	items := provisioner.ExtractLeaseItems(auth.Lease)
 
 	// Register the NEW lease in-flight as a restore BEFORE calling the backend, so
 	// the restore's provision callback is acknowledged inline rather than ~one
-	// reconciler interval later (ENG-358). This mirrors StartProvisioning, which
-	// tracks in-flight before backend.Provision. Optional: when no tracker is wired
-	// the restore still converges via the reconciler ack backstop.
-	tracked := false
-	if h.restoreTracker != nil {
-		if !h.restoreTracker.TryTrackRestoreInFlight(leaseUUID, auth.Token.Tenant, items, backendClient.Name()) {
-			// Already in-flight — a duplicate restore POST or a reconciler that
-			// raced in a fresh provision of this PENDING lease. Do NOT call the
-			// backend and do NOT untrack: the in-flight entry is owned by the other
-			// writer, and proceeding could race a second deployment onto the lease.
-			writeError(w, "lease is already being provisioned or restored", http.StatusConflict)
-			return
+	// reconciler interval later (ENG-358). Carry its generation through every
+	// cleanup so this response can remove only the entry it created.
+	inFlightGeneration, tracked := h.restoreTracker.TryTrackRestoreInFlightWithGeneration(
+		leaseUUID, auth.Token.Tenant, items, backendClient.Name(),
+	)
+	if !tracked {
+		// Already in-flight — a duplicate restore POST or a reconciler that raced
+		// in a fresh provision. The foreign entry must remain untouched.
+		writeError(w, "lease is already being provisioned or restored", http.StatusConflict)
+		return
+	}
+	untrackOwnGeneration := func() {
+		h.restoreTracker.UntrackInFlightIfGeneration(leaseUUID, inFlightGeneration)
+	}
+	if inFlightGeneration == 0 {
+		// Zero is reserved as "no operation". Treat a broken implementation as a
+		// configuration failure before writing placement or contacting a backend.
+		untrackOwnGeneration()
+		slog.Error("restore tracker returned a zero operation generation")
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Persist the target attempt before contacting the backend. Failure is
+	// fail-closed: without this record a timeout/reset could leave live data on
+	// the backend while fred later mistakes record absence for "never sent".
+	attemptRevision, err := h.restoreRecorder.SetPlacementAttempting(leaseUUID, backendClient.Name())
+	if err != nil || attemptRevision == 0 {
+		untrackOwnGeneration()
+		if err == nil {
+			err = errors.New("placement recorder returned a zero attempt revision")
 		}
-		tracked = true
+		slog.Error("failed to record restore placement attempt; refusing to contact backend",
+			"lease_uuid", leaseUUID,
+			"from_lease_uuid", body.FromLeaseUUID,
+			"backend", backendClient.Name(),
+			"error", err,
+		)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return
 	}
 
 	err = backendClient.Restore(r.Context(), backend.RestoreRequest{
@@ -1155,15 +1239,68 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		Tenant:        auth.Token.Tenant,
 		ProviderUUID:  h.providerUUID,
 		Items:         items,
-		CallbackURL:   provisioner.BuildCallbackURL(h.callbackBaseURL),
+		CallbackURL:   provisioner.BuildCallbackURLForGeneration(h.callbackBaseURL, inFlightGeneration),
 	})
 	if err != nil {
-		// Undo the in-flight registration on a synchronous restore failure so it
-		// does not leave a phantom entry the TimeoutChecker would later reject.
-		// (An ASYNC worker failure instead emits a failure callback that the
-		// in-flight branch of HandleBackendCallback untracks — a distinct path.)
-		if tracked {
-			h.restoreTracker.UntrackInFlight(leaseUUID)
+		if errors.Is(err, backend.ErrAlreadyProvisioned) {
+			// This backend did not accept NEW work, but it positively says the
+			// target already exists here. Promote the attempt rather than clearing
+			// the only durable ownership evidence. No new callback is coming from
+			// this request, so release its tracker entry after recording ownership.
+			confirmed, confirmErr := h.restoreRecorder.ConfirmPlacementIfRevision(
+				leaseUUID, backendClient.Name(), attemptRevision,
+			)
+			if confirmErr != nil {
+				slog.Error("failed to confirm already-provisioned restore placement",
+					"lease_uuid", leaseUUID,
+					"from_lease_uuid", body.FromLeaseUUID,
+					"backend", backendClient.Name(),
+					"error", confirmErr,
+				)
+			} else if !confirmed {
+				slog.Debug("already-provisioned restore placement was already superseded",
+					"lease_uuid", leaseUUID,
+					"backend", backendClient.Name(),
+					"attempt_revision", attemptRevision,
+				)
+			}
+			untrackOwnGeneration()
+		} else if restoreWasDefinitelyRefused(err) {
+			// These sentinels prove the backend did not accept new work. Clear the
+			// attempt before releasing the in-flight claim so the next tick can
+			// safely try another backend where routing permits it.
+			cleared, clearErr := h.restoreRecorder.ClearPlacementAttemptIfRevision(
+				leaseUUID, backendClient.Name(), attemptRevision,
+			)
+			if clearErr != nil {
+				slog.Error("failed to clear refused restore placement attempt",
+					"lease_uuid", leaseUUID,
+					"from_lease_uuid", body.FromLeaseUUID,
+					"backend", backendClient.Name(),
+					"error", clearErr,
+				)
+			} else if !cleared {
+				slog.Debug("refused restore placement attempt was already superseded",
+					"lease_uuid", leaseUUID,
+					"backend", backendClient.Name(),
+					"attempt_revision", attemptRevision,
+				)
+			}
+			untrackOwnGeneration()
+		} else {
+			// A transport error, timeout, generic 5xx, or off-contract response
+			// cannot prove whether the backend accepted the restore. Retain the
+			// durable attempt, which blocks a duplicate call even after releasing
+			// this synchronous in-flight claim. The tracker is not an ownership
+			// record and leaving it behind would let the TimeoutChecker reject a
+			// lease whose backend outcome is still unknown (ENG-632).
+			untrackOwnGeneration()
+			slog.Warn("restore outcome is ambiguous; retaining placement attempt",
+				"lease_uuid", leaseUUID,
+				"from_lease_uuid", body.FromLeaseUUID,
+				"backend", backendClient.Name(),
+				"error", err,
+			)
 		}
 		switch {
 		case errors.Is(err, backend.ErrNotRetained):
@@ -1176,6 +1313,8 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 			// 503, matching how Provision/StartProvisioning surface capacity to
 			// tenants: the provider is full, not a permanent client error.
 			writeError(w, "insufficient resources to restore", http.StatusServiceUnavailable)
+		case errors.Is(err, backend.ErrCircuitOpen):
+			writeError(w, "restore backend is temporarily unavailable", http.StatusServiceUnavailable)
 		case errors.Is(err, backend.ErrDemoteDataExceedsTier):
 			writeError(w, tenantDetail(err, "retained data exceeds the requested smaller tier"),
 				http.StatusUnprocessableEntity)
@@ -1202,12 +1341,27 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Adopt bookkeeping: optimistically record that the new lease now lives on the
-	// source's backend (closes the post-restore reconcile window). The SOURCE
-	// placement is intentionally left for the reconciler to prune once the
-	// retention is consumed — never deleted on this unconfirmed async step (ENG-333).
-	if h.restoreRecorder != nil {
-		h.restoreRecorder.RecordRestorePlacement(leaseUUID, backendClient.Name())
+	// The backend accepted the restore, so promote the write-ahead attempt to a
+	// confirmed owner. A failed confirm is still an accepted asynchronous
+	// operation: return 202 and retain the attempt, which the reconciler treats as
+	// potentially live and can repair from backend inventory. The SOURCE record
+	// remains untouched until retention reconciliation prunes it (ENG-333/632).
+	confirmed, err := h.restoreRecorder.ConfirmPlacementIfRevision(
+		leaseUUID, backendClient.Name(), attemptRevision,
+	)
+	if err != nil {
+		slog.Error("failed to confirm accepted restore placement; retaining unresolved attempt",
+			"lease_uuid", leaseUUID,
+			"from_lease_uuid", body.FromLeaseUUID,
+			"backend", backendClient.Name(),
+			"error", err,
+		)
+	} else if !confirmed {
+		slog.Debug("accepted restore placement was already superseded",
+			"lease_uuid", leaseUUID,
+			"backend", backendClient.Name(),
+			"attempt_revision", attemptRevision,
+		)
 	}
 
 	if h.eventBroker != nil {
@@ -1233,6 +1387,20 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 	// restore — even though internally the lease rides the restart machinery and
 	// its published status (above) is Restarting.
 	writeJSON(w, map[string]string{"status": "provisioning"}, http.StatusAccepted)
+}
+
+// restoreWasDefinitelyRefused reports whether Restore returned a typed result
+// proving that no new asynchronous work was accepted. Every other error is
+// ambiguous: a timeout/reset/generic 5xx can arrive after the backend committed
+// the request, so deleting its write-ahead attempt would be unsafe.
+func restoreWasDefinitelyRefused(err error) bool {
+	return errors.Is(err, backend.ErrNotRetained) ||
+		errors.Is(err, backend.ErrInvalidState) ||
+		errors.Is(err, backend.ErrInsufficientResources) ||
+		errors.Is(err, backend.ErrCircuitOpen) ||
+		errors.Is(err, backend.ErrDemoteDataExceedsTier) ||
+		errors.Is(err, backend.ErrValidation) ||
+		errors.Is(err, backend.ErrRestoreRefused)
 }
 
 // UpdateLease handles POST /v1/leases/{lease_uuid}/update
