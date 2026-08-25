@@ -320,7 +320,7 @@ func (h *Handlers) authenticateLease(w http.ResponseWriter, r *http.Request, che
 
 // resolveBackend determines the correct backend for a lease.
 // Checks placement first (handles round-robin routing), falls back to SKU routing
-// for a lease with no placement record.
+// only for a lease with no placement record.
 //
 // A record naming a backend the router does not know returns nil, which the
 // caller surfaces as 503 (ENG-635). It deliberately does NOT fall back to SKU
@@ -349,10 +349,19 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 				"lease_uuid", leaseUUID,
 			)
 			return nil
-		case placement.StateAbsent, placement.StateAttempting:
-			// Only confirmed ownership pins ordinary routing. An attempt records
-			// that a write may have reached a backend, but does not claim that it
-			// owns the lease (ENG-632).
+		case placement.StateAttempting:
+			// The attempted backend may already hold the lease even though its
+			// response was lost. SKU routing could select a different backend and
+			// turn that uncertainty into a false not-found response. Wait for
+			// authoritative inventory to confirm or disprove the attempt (ENG-632).
+			slog.Error("placement attempt is unresolved; refusing to serve from a guessed backend",
+				"lease_uuid", leaseUUID,
+				"placement_attempt", p.Attempt,
+			)
+			return nil
+		case placement.StateAbsent:
+			// A genuinely absent record has no backend evidence, so ordinary SKU
+			// routing remains safe.
 		}
 	}
 	return h.backendRouter.Route(sku)

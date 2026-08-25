@@ -4935,6 +4935,59 @@ func TestResolveBackend_PlacementRouting(t *testing.T) {
 				"pass even if the wrong backend had been asked and its answer discarded")
 	})
 
+	t.Run("unresolved_attempt_refuses_with_503", func(t *testing.T) {
+		var defaultQueried atomic.Int32
+		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defaultQueried.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"host":     "default-host.example.com",
+				"protocol": "https",
+				"ports":    map[string]any{},
+			})
+		}))
+		defer defaultServer.Close()
+
+		defaultBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name:    "default-backend",
+			BaseURL: defaultServer.URL,
+			Timeout: 5 * time.Second,
+		})
+
+		router, err := backend.NewRouter(backend.RouterConfig{
+			Backends: []backend.BackendEntry{
+				{Backend: defaultBackend, IsDefault: true},
+			},
+		})
+		require.NoError(t, err)
+
+		placementLookup := &mockPlacementLookup{
+			lookupFunc: func(uuid string) placement.Placement {
+				return placement.Placement{Attempt: "attempted-backend"}
+			},
+		}
+
+		h := &Handlers{
+			client:          chainClient,
+			backendRouter:   router,
+			placementLookup: placementLookup,
+			providerUUID:    providerUUID,
+			bech32Prefix:    "manifest",
+		}
+
+		req := httptest.NewRequest("GET", "/v1/leases/"+leaseUUID+"/connection", nil)
+		req.Header.Set("Authorization", "Bearer "+validToken)
+		req.SetPathValue("lease_uuid", leaseUUID)
+
+		rec := httptest.NewRecorder()
+		h.GetLeaseConnection(rec, req)
+
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code,
+			"an unresolved attempt must remain unavailable until inventory resolves it")
+		assert.Zero(t, defaultQueried.Load(),
+			"SKU routing must not query a potentially different backend")
+	})
+
 	t.Run("no_placement_uses_sku_routing", func(t *testing.T) {
 		defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
