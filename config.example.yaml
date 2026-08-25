@@ -471,19 +471,20 @@ token_tracker_db_path: "/var/lib/fred/tokens.db"
 payload_store_db_path: "/var/lib/fred/payloads.db"
 
 # =============================================================================
-# PLACEMENT STORE (optional — enables correct read routing across multiple backends)
+# PLACEMENT STORE (required for restore and correct multi-backend routing)
 # =============================================================================
 # Records which backend is serving each lease so that read operations
 # (connection details, logs, provision diagnostics) are routed correctly.
 #
-# Required when multiple backends share the same match criteria (skus list)
-# because provisions are spread across them. Without this, new provisions are
-# still distributed across matching backends (least-loaded, with round-robin
+# Required for POST /v1/leases/{uuid}/restore and when multiple backends share
+# the same match criteria (skus list). Restore returns 503 before contacting a
+# backend when this store is disabled. Without it, fresh provisions are still
+# distributed across matching backends (least-loaded, with round-robin
 # fallback), but reads fall back to match-based routing (first match) and may
 # hit the wrong backend.
 #
-# If not set, the placement store is disabled and all routing uses match-based
-# logic. This is fine for single-backend-per-SKU setups.
+# If not set, the placement store is disabled. This is supported only for
+# deployments that do not use restore and accept match-based read routing.
 #
 # The database file is created automatically. Ensure the directory exists
 # and fred has write permissions.

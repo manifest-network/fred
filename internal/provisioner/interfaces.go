@@ -35,14 +35,15 @@ type PlacementStore interface {
 	Lookup(leaseUUID string) placement.Placement
 	List() map[string]placement.Placement
 	SnapshotRevision() uint64
-	SetAttempting(leaseUUID, backendName string) error
+	SetAttempting(leaseUUID, backendName string) (uint64, error)
+	SetAttemptingIfNotNewer(leaseUUID, backendName string, maxRevision uint64) (uint64, bool, error)
 	Confirm(leaseUUID, backendName string) error
 	ConfirmAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
 	ClearAttempt(leaseUUID, backendName string) error
 	ClearAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
 	Delete(leaseUUID string) error
 	DeleteIfRevision(leaseUUID string, revision uint64) (bool, error)
-	SetBatchIfNotNewer(placements map[string]string, maxRevision uint64) error
+	SetBatchIfNotNewer(placements map[string]string, maxRevision uint64) (map[string]uint64, error)
 	SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) error
 	ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision uint64) error
 }

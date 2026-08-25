@@ -2,11 +2,13 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/ThreeDotsLabs/watermill/message"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -233,6 +235,8 @@ func TestOrchestrator_Deprovision_ViaInFlightTracking(t *testing.T) {
 	}
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	tracked, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
@@ -243,8 +247,157 @@ func TestOrchestrator_Deprovision_ViaInFlightTracking(t *testing.T) {
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
 	mb.mu.Unlock()
 
-	// Should have been popped from tracker
+	// Successful cleanup finishes only the exact generation it claimed.
 	assert.False(t, tracker.IsInFlight("lease-1"))
+	assert.False(t, tracker.UntrackInFlightIfGeneration("lease-1", tracked.Generation))
+}
+
+type panickingDeprovisionBackend struct {
+	*mockManagerBackend
+}
+
+func (b *panickingDeprovisionBackend) Deprovision(context.Context, string) error {
+	panic("backend deprovision panic")
+}
+
+type synchronousCallbackDeprovisionBackend struct {
+	*mockManagerBackend
+	callback func(context.Context, string) error
+}
+
+func (b *synchronousCallbackDeprovisionBackend) Deprovision(ctx context.Context, leaseUUID string) error {
+	b.mu.Lock()
+	b.deprovisionCalls = append(b.deprovisionCalls, leaseUUID)
+	b.mu.Unlock()
+	return b.callback(ctx, leaseUUID)
+}
+
+func TestOrchestrator_Deprovision_InlineCallbackDoesNotWaitForClaim(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      backend.CallbackStatus
+		retained    bool
+		callbackErr string
+		wantStatus  backend.ProvisionStatus
+	}{
+		{
+			name:       "retained success",
+			status:     backend.CallbackStatusDeprovisioned,
+			retained:   true,
+			wantStatus: backend.ProvisionStatusRetained,
+		},
+		{
+			name:        "cleanup exhausted",
+			status:      backend.CallbackStatusFailed,
+			callbackErr: "volume cleanup exhausted",
+			wantStatus:  backend.ProvisionStatusFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mb := &synchronousCallbackDeprovisionBackend{
+				mockManagerBackend: &mockManagerBackend{name: "test-backend"},
+			}
+			router := &mockBackendRouter{getBackendByNameFn: func(name string) backend.Backend {
+				if name == mb.Name() {
+					return mb
+				}
+				return nil
+			}}
+			tracker := NewInFlightTracker()
+			generation, tracked := tracker.TryTrackInFlightWithGeneration(
+				"lease-1", "tenant-a", testItems("sku-1"), mb.Name(),
+			)
+			require.True(t, tracked)
+			orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
+			pub := newMockPublisher()
+			hs := NewHandlerSet(HandlerDeps{Orchestrator: orch, Tracker: tracker, Publisher: pub})
+			callbackMsg := newCallbackMsg(t, backend.CallbackPayload{
+				LeaseUUID:           "lease-1",
+				Backend:             mb.Name(),
+				Status:              tt.status,
+				Error:               tt.callbackErr,
+				Retained:            tt.retained,
+				OperationGeneration: generation,
+			})
+			mb.callback = func(ctx context.Context, _ string) error {
+				callbackMsg.SetContext(ctx)
+				return hs.HandleBackendCallback(callbackMsg)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+			require.NoError(t, orch.Deprovision(ctx, "lease-1"))
+			assert.NoError(t, ctx.Err(), "the inline callback must return before the RPC context expires")
+			assert.False(t, tracker.IsInFlight("lease-1"),
+				"the close path settles its exact generation after the backend returns")
+
+			pub.mu.Lock()
+			msgs := append([]*message.Message(nil), pub.published[TopicLeaseEvent]...)
+			pub.mu.Unlock()
+			require.Len(t, msgs, 1)
+			var event backend.LeaseStatusEvent
+			require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+			assert.Equal(t, tt.wantStatus, event.Status)
+			if tt.callbackErr != "" {
+				assert.Equal(t, tt.callbackErr, event.Error)
+			}
+		})
+	}
+}
+
+func TestOrchestrator_Deprovision_PanicReleasesExactGenerationClaim(t *testing.T) {
+	mb := &panickingDeprovisionBackend{mockManagerBackend: &mockManagerBackend{name: "test-backend"}}
+	router := &mockBackendRouter{getBackendByNameFn: func(name string) backend.Backend {
+		if name == mb.Name() {
+			return mb
+		}
+		return nil
+	}}
+	tracker := NewInFlightTracker()
+	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-a", testItems("sku-1"), mb.Name(),
+	)
+	require.True(t, tracked)
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
+
+	assert.PanicsWithValue(t, "backend deprovision panic", func() {
+		_ = orch.Deprovision(context.Background(), "lease-1")
+	})
+	current, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, generation, current.Generation)
+	_, claimed := tracker.TryClaimInFlight("lease-1", generation)
+	require.True(t, claimed, "panic unwinding must release the exact generation claim")
+	require.True(t, tracker.ReleaseInFlightClaim("lease-1", generation))
+}
+
+func TestOrchestrator_Deprovision_ContendedGenerationFailsClosed(t *testing.T) {
+	mb := &mockManagerBackend{name: "test-backend"}
+	router := &mockBackendRouter{getBackendByNameFn: func(name string) backend.Backend {
+		if name == mb.Name() {
+			return mb
+		}
+		return nil
+	}}
+	tracker := NewInFlightTracker()
+	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-a", testItems("sku-1"), mb.Name(),
+	)
+	require.True(t, tracked)
+	_, claimed := tracker.TryClaimInFlight("lease-1", generation)
+	require.True(t, claimed)
+	t.Cleanup(func() { tracker.ReleaseInFlightClaim("lease-1", generation) })
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
+
+	err := orch.Deprovision(context.Background(), "lease-1")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	mb.mu.Lock()
+	assert.Empty(t, mb.deprovisionCalls, "deprovision must not proceed without owning the in-flight generation")
+	mb.mu.Unlock()
+	current, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, generation, current.Generation)
 }
 
 func TestOrchestrator_Deprovision_FallbackAllBackends(t *testing.T) {
@@ -448,6 +601,8 @@ func TestOrchestrator_Deprovision_InFlightBackendNotFound_SweepsButReportsUnreac
 	}
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlight("lease-1", "t", testItems("sku-1"), "deleted-backend")
+	tracked, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
 
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
 
@@ -458,6 +613,12 @@ func TestOrchestrator_Deprovision_InFlightBackendNotFound_SweepsButReportsUnreac
 	mb.mu.Lock()
 	assert.Equal(t, []string{"lease-1"}, mb.deprovisionCalls)
 	mb.mu.Unlock()
+	current, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists, "unreached positive candidate must keep the operation retryable")
+	assert.Equal(t, tracked.Generation, current.Generation)
+	_, claimed := tracker.TryClaimInFlight("lease-1", tracked.Generation)
+	require.True(t, claimed, "error return must release the settlement claim")
+	require.True(t, tracker.ReleaseInFlightClaim("lease-1", tracked.Generation))
 }
 
 // --- Placement integration tests ---
@@ -660,7 +821,7 @@ func TestRouteForProvisionHonoringPlacement_AttemptDoesNotPin(t *testing.T) {
 	attempted := &mockManagerBackend{name: "backend-a"}
 	freelyRouted := &mockManagerBackend{name: "backend-b"}
 	ps := &mockPlacementStore{}
-	require.NoError(t, ps.SetAttempting("lease-1", attempted.name))
+	requireSetPlacementAttempt(t, ps, "lease-1", attempted.name)
 	router := &mockBackendRouter{
 		getBackendByNameFn: func(name string) backend.Backend {
 			if name == attempted.name {
@@ -734,7 +895,7 @@ func TestOrchestrator_Deprovision_ViaAttemptOnlyPlacement(t *testing.T) {
 		},
 	}
 	ps := &mockPlacementStore{}
-	require.NoError(t, ps.SetAttempting("lease-attempt", mb.name))
+	requireSetPlacementAttempt(t, ps, "lease-attempt", mb.name)
 	orch := NewProvisionOrchestrator("prov-1", "http://cb", router, NewInFlightTracker(), ps)
 
 	require.NoError(t, orch.Deprovision(context.Background(), "lease-attempt"))
@@ -862,6 +1023,50 @@ func TestOrchestrator_Deprovision_UnionsPlacementAndInFlight(t *testing.T) {
 	mbInFlight.mu.Lock()
 	assert.Equal(t, []string{"lease-1"}, mbInFlight.deprovisionCalls)
 	mbInFlight.mu.Unlock()
+	assert.False(t, tracker.IsInFlight("lease-1"), "all positive candidates settled successfully")
+}
+
+func TestOrchestrator_Deprovision_PlacementAndInFlightFailureRetainsExactGeneration(t *testing.T) {
+	placementBackend := &mockManagerBackend{name: "placement-backend"}
+	inFlightErr := errors.New("in-flight backend unavailable")
+	inFlightBackend := &mockManagerBackend{name: "inflight-backend", deprovisionErr: inFlightErr}
+	byName := map[string]backend.Backend{
+		placementBackend.Name(): placementBackend,
+		inFlightBackend.Name():  inFlightBackend,
+	}
+	router := &mockBackendRouter{getBackendByNameFn: func(name string) backend.Backend { return byName[name] }}
+	tracker := NewInFlightTracker()
+	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-a", testItems("sku-1"), inFlightBackend.Name(),
+	)
+	require.True(t, tracked)
+	ps := &mockPlacementStore{}
+	require.NoError(t, ps.Set("lease-1", placementBackend.Name()))
+	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
+
+	err := orch.Deprovision(context.Background(), "lease-1")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	assert.ErrorIs(t, err, inFlightErr)
+	current, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists, "a candidate failure must retain the in-flight operation for retry")
+	assert.Equal(t, generation, current.Generation)
+	_, claimed := tracker.TryClaimInFlight("lease-1", generation)
+	require.True(t, claimed, "the failed attempt must release, not leak, its claim")
+	require.True(t, tracker.ReleaseInFlightClaim("lease-1", generation))
+
+	inFlightBackend.mu.Lock()
+	inFlightBackend.deprovisionErr = nil
+	inFlightBackend.mu.Unlock()
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
+	assert.False(t, tracker.IsInFlight("lease-1"), "the exact generation is removed only after every candidate settles")
+
+	placementBackend.mu.Lock()
+	assert.Equal(t, []string{"lease-1", "lease-1"}, placementBackend.deprovisionCalls,
+		"idempotent retry re-settles every positive candidate")
+	placementBackend.mu.Unlock()
+	inFlightBackend.mu.Lock()
+	assert.Equal(t, []string{"lease-1", "lease-1"}, inFlightBackend.deprovisionCalls)
+	inFlightBackend.mu.Unlock()
 }
 
 func TestOrchestrator_Deprovision_MixedKnownAndUnknownCandidate_KnownFailureIsNotMasked(t *testing.T) {
@@ -882,6 +1087,8 @@ func TestOrchestrator_Deprovision_MixedKnownAndUnknownCandidate_KnownFailureIsNo
 	require.NoError(t, ps.Set("lease-1", known.name))
 	tracker := NewInFlightTracker()
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "removed-backend")
+	tracked, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists)
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
 
 	err := orch.Deprovision(context.Background(), "lease-1")
@@ -895,6 +1102,12 @@ func TestOrchestrator_Deprovision_MixedKnownAndUnknownCandidate_KnownFailureIsNo
 	assert.Equal(t, []string{"lease-1"}, peer.deprovisionCalls,
 		"unknown candidate still requires the full fleet sweep")
 	peer.mu.Unlock()
+	current, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists, "the unconfigured in-flight candidate was not settled")
+	assert.Equal(t, tracked.Generation, current.Generation)
+	_, claimed := tracker.TryClaimInFlight("lease-1", tracked.Generation)
+	require.True(t, claimed, "unresolved candidate failure must release its claim for retry")
+	require.True(t, tracker.ReleaseInFlightClaim("lease-1", tracked.Generation))
 }
 
 func TestOrchestrator_Deprovision_FallbackAllBackends_KeepsPlacement(t *testing.T) {
@@ -941,23 +1154,6 @@ func TestOrchestrator_Deprovision_KeepsPlacement(t *testing.T) {
 	assert.Equal(t, "backend-a", ps.Get("lease-1"), "placement must survive deprovision for restore affinity (ENG-333)")
 }
 
-func TestOrchestrator_DeletePlacement(t *testing.T) {
-	ps := &mockPlacementStore{}
-	ps.Set("lease-1", "test-backend")
-
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", nil, nil, ps)
-
-	orch.DeletePlacement("lease-1")
-	assert.Empty(t, ps.Get("lease-1"), "placement should be deleted")
-}
-
-func TestOrchestrator_DeletePlacement_NilStore(t *testing.T) {
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", nil, nil, nil)
-
-	// Should not panic
-	orch.DeletePlacement("lease-1")
-}
-
 // Regression test: a typed-nil *placement.Store assigned to the PlacementStore
 // interface is non-nil (Go interface holds type info). The orchestrator's
 // != nil guards don't protect against this, so callers must use the interface
@@ -978,7 +1174,7 @@ func TestOrchestrator_TypedNilPlacementStore_Panics(t *testing.T) {
 	tracker := NewInFlightTracker()
 	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, iface)
 
-	// StartProvisioning passes the != nil check and calls Set on a nil receiver → panic
+	// StartProvisioning passes the != nil check and calls SetAttempting on a nil receiver → panic
 	assert.Panics(t, func() {
 		_ = orch.StartProvisioning(context.Background(), &billingtypes.Lease{
 			Uuid:   "lease-typed-nil",
@@ -994,11 +1190,78 @@ type errorPlacementStore struct {
 	setErr error
 }
 
-func (e *errorPlacementStore) SetAttempting(leaseUUID, backendName string) error {
+type committedRevisionPlacementStore struct {
+	PlacementStore
+	revision    uint64
+	setErr      error
+	setCalls    int
+	lookupCalls int
+}
+
+func (s *committedRevisionPlacementStore) Lookup(string) placement.Placement {
+	s.lookupCalls++
+	return placement.Placement{}
+}
+
+func (s *committedRevisionPlacementStore) SetAttempting(string, string) (uint64, error) {
+	s.setCalls++
+	return s.revision, s.setErr
+}
+
+func TestSetProvisionAttemptUsesAtomicStoreResult(t *testing.T) {
+	t.Run("returns exact committed revision without lookup", func(t *testing.T) {
+		store := &committedRevisionPlacementStore{revision: 42}
+
+		revision, err := setProvisionAttempt(store, "lease-1", "backend-a")
+
+		require.NoError(t, err)
+		assert.Equal(t, uint64(42), revision)
+		assert.Equal(t, 1, store.setCalls)
+		assert.Zero(t, store.lookupCalls,
+			"the atomic write result must not be replaced by a racy read")
+	})
+
+	t.Run("maps only attempt conflict to pending", func(t *testing.T) {
+		store := &committedRevisionPlacementStore{
+			setErr: fmt.Errorf("concurrent writer: %w", placement.ErrAttemptConflict),
+		}
+
+		revision, err := setProvisionAttempt(store, "lease-1", "backend-a")
+
+		assert.Zero(t, revision)
+		require.ErrorIs(t, err, ErrProvisionAttemptPending)
+		assert.Equal(t, 1, store.setCalls)
+		assert.Zero(t, store.lookupCalls)
+	})
+
+	t.Run("preserves storage error without lookup masking", func(t *testing.T) {
+		writeErr := errors.New("placement disk unavailable")
+		store := &committedRevisionPlacementStore{setErr: writeErr}
+
+		revision, err := setProvisionAttempt(store, "lease-1", "backend-a")
+
+		assert.Zero(t, revision)
+		require.ErrorIs(t, err, writeErr)
+		assert.Equal(t, 1, store.setCalls)
+		assert.Zero(t, store.lookupCalls)
+	})
+}
+
+func (e *errorPlacementStore) SetAttempting(leaseUUID, backendName string) (uint64, error) {
 	if e.setErr != nil {
-		return e.setErr
+		return 0, e.setErr
 	}
 	return e.mockPlacementStore.SetAttempting(leaseUUID, backendName)
+}
+
+func (e *errorPlacementStore) SetAttemptingIfNotNewer(
+	leaseUUID, backendName string,
+	maxRevision uint64,
+) (uint64, bool, error) {
+	if e.setErr != nil {
+		return 0, false, e.setErr
+	}
+	return e.mockPlacementStore.SetAttemptingIfNotNewer(leaseUUID, backendName, maxRevision)
 }
 
 func (e *errorPlacementStore) Confirm(leaseUUID, backendName string) error {
@@ -1030,12 +1293,16 @@ func (e *errorPlacementStore) ClearAttemptIfRevision(leaseUUID, backendName stri
 }
 
 func (e *errorPlacementStore) SetBatch(placements map[string]string) error {
-	return e.SetBatchIfNotNewer(placements, ^uint64(0))
+	_, err := e.SetBatchIfNotNewer(placements, ^uint64(0))
+	return err
 }
 
-func (e *errorPlacementStore) SetBatchIfNotNewer(placements map[string]string, maxRevision uint64) error {
+func (e *errorPlacementStore) SetBatchIfNotNewer(
+	placements map[string]string,
+	maxRevision uint64,
+) (map[string]uint64, error) {
 	if e.setErr != nil {
-		return e.setErr
+		return nil, e.setErr
 	}
 	return e.mockPlacementStore.SetBatchIfNotNewer(placements, maxRevision)
 }

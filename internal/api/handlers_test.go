@@ -26,6 +26,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testutil"
 )
@@ -6871,6 +6872,20 @@ func TestRestoreLease_AttemptWriteFailureFailsClosed(t *testing.T) {
 	assert.Equal(t, testutil.ValidUUID1, tracker.untrackLease)
 	assert.Equal(t, tracker.trackGeneration, tracker.untrackGeneration)
 	assert.True(t, tracker.untrackApplied)
+}
+
+func TestRestoreLease_UnresolvedDurableAttemptReturns409(t *testing.T) {
+	tracker := &fakeRestoreTracker{trackResult: true}
+	recorder := &fakeRestoreRecorder{attemptErr: provisioner.ErrProvisionAttemptPending}
+	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("backend must not be called while a durable attempt is unresolved: %s %s", r.Method, r.URL.Path)
+	})
+
+	require.Equal(t, http.StatusConflict, resp.Code, "body: %s", resp.Body.String())
+	assert.True(t, recorder.attemptCalled)
+	assert.False(t, recorder.called)
+	assert.False(t, recorder.clearCalled)
+	assert.True(t, tracker.untrackApplied, "the request must release only its own tracker generation")
 }
 
 func TestRestoreLease_PlacementRecorderDisabledReturns503(t *testing.T) {

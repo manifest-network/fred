@@ -395,7 +395,7 @@ func TestFleet_TerminalLease_PlacementIsPruned(t *testing.T) {
 	f.backendAt(2).mock.Clear()
 
 	require.NoError(t, f.sweep())
-	require.Empty(t, f.placement.Get("lease-x"),
+	require.Empty(t, f.placement.Lookup("lease-x").Backend,
 		"a chain-terminal lease absent from every backend should be pruned on a complete sweep")
 }
 
@@ -590,7 +590,7 @@ func TestFleet_DegradedSweep_PrunesOnlyAnsweringBackendsPlacements(t *testing.T)
 
 	require.NoError(t, f.sweep())
 
-	require.Empty(t, f.placement.Get("lease-on-2"),
+	require.Empty(t, f.placement.Lookup("lease-on-2").Backend,
 		"backend-2 answered, so absence from its report is evidence: prune")
 	f.assertPlacementPinned("lease-on-3", "backend-3")
 }
@@ -614,7 +614,7 @@ func TestFleet_RetentionsFailureOnOnePeer_StillPrunesElsewhere(t *testing.T) {
 
 	require.NoError(t, f.sweep())
 
-	require.Empty(t, f.placement.Get("lease-on-2"),
+	require.Empty(t, f.placement.Lookup("lease-on-2").Backend,
 		"a peer's retention outage says nothing about backend-2's records")
 }
 
@@ -681,7 +681,7 @@ func TestFleet_DegradedSweep_DoesNotManufacturePlacementFromRetention(t *testing
 
 	require.NoError(t, f.sweepN(2))
 
-	require.Empty(t, f.placement.Get("lease-r"),
+	require.Empty(t, f.placement.Lookup("lease-r").Backend,
 		"a degraded sweep must not write a placement derived from retention data")
 
 	// And the guard must still be deferring — otherwise the assertion above
@@ -703,7 +703,7 @@ func TestFleet_CompleteSweep_StillBackfillsPlacementFromRetention(t *testing.T) 
 
 	require.NoError(t, f.sweep())
 
-	require.Equal(t, "backend-1", f.placement.Get("lease-r"),
+	require.Equal(t, "backend-1", f.placement.Lookup("lease-r").Backend,
 		"a complete sweep must still backfill placement from retention data")
 }
 

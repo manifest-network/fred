@@ -61,7 +61,8 @@ backends:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
 
-# Required when multiple backends share SKUs — tracks which backend serves each lease
+# Required for restore and when multiple backends share SKUs — durably tracks
+# attempted and confirmed ownership for routing and reconciliation safety
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
@@ -145,7 +146,7 @@ Start provisioning a resource asynchronously.
     {"sku": "docker-nginx", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
     {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
   ],
-  "callback_url": "http://fred:8080/callbacks/provision",
+  "callback_url": "http://fred:8080/callbacks/provision?operation_generation=42",
   "payload": "base64-encoded-bytes",
   "payload_hash": "sha256-hex-string"
 }
@@ -166,7 +167,8 @@ Start provisioning a resource asynchronously.
 
 **Behavior:**
 1. Validate the request
-2. Store the `callback_url` for this `lease_uuid`
+2. Store the complete `callback_url` for this `lease_uuid` byte-for-byte,
+   including its query string
 3. Return 202 immediately (do NOT block on provisioning)
 4. Start provisioning in a background goroutine
 5. When complete, POST to the `callback_url` (see Callback Protocol below)
@@ -419,7 +421,7 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
-  "callback_url": "http://fred:8080/callbacks/provision"
+  "callback_url": "http://fred:8080/callbacks/provision?operation_generation=42"
 }
 ```
 
@@ -566,7 +568,11 @@ This endpoint is optional but recommended for production backends. The Docker ba
 
 ## Callback Protocol
 
-When provisioning completes (success or failure), POST to the `callback_url` from the provision request.
+When provisioning completes (success or failure), POST to the complete
+`callback_url` from the provision request. Provision and restore URLs carry an
+`operation_generation=<uint64>` query parameter. Treat the URL as opaque:
+preserve its path and query byte-for-byte rather than rebuilding or normalizing
+it. Fred uses that generation to reject stale callbacks from an older operation.
 
 ### Request Format
 
@@ -596,7 +602,7 @@ Fred verifies callbacks using HMAC-SHA256 with timestamp-based replay protection
 
 **Signature format:** `t=<unix-timestamp>,sha256=<hex-encoded-hmac>`
 
-The HMAC is computed over a four-field canonical string that binds the timestamp, HTTP method, request URI, and a hash of the body:
+The HMAC is computed over a four-field canonical string that binds the timestamp, HTTP method, complete request URI (path plus query), and a hash of the body:
 
 ```
 <timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>
@@ -645,7 +651,7 @@ The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration. Backend
 ### Security Notes
 
 - **Replay protection**: Callbacks older than 5 minutes are rejected
-- **Cross-endpoint binding**: Signature is bound to HTTP method + request URI; a captured signature cannot be replayed against a different endpoint
+- **Cross-endpoint and generation binding**: Signature is bound to HTTP method + complete request URI, including `operation_generation`; a captured signature cannot be replayed against another endpoint or operation
 - **Clock skew tolerance**: Timestamps up to 1 minute in the future are accepted
 - **Binary-safe body**: Body is hashed (SHA-256), so the canonical string is unaffected by embedded `\n`, NUL, or non-UTF-8 bytes
 
@@ -671,7 +677,9 @@ type provision struct {
 
 ### Callback URL Storage
 
-Store callback URLs per lease to handle concurrent provisions:
+Store callback URLs per lease to handle concurrent provisions. Store the
+complete opaque value, including `?operation_generation=...`; stripping or
+rebuilding the query makes the HMAC or operation identity fail verification.
 
 ```go
 type BackendServer struct {
@@ -875,7 +883,7 @@ curl -X POST http://localhost:9001/provision \
     "tenant": "manifest1test",
     "provider_uuid": "test-provider",
     "items": [{"sku": "docker-nginx", "quantity": 1}],
-    "callback_url": "http://localhost:8080/callbacks/provision"
+    "callback_url": "http://localhost:8080/callbacks/provision?operation_generation=42"
   }'
 ```
 
@@ -903,7 +911,7 @@ Before deploying your backend:
 - [ ] All 12 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{lease_uuid}`, `/logs/{lease_uuid}`, `/provisions/{lease_uuid}`, `/provisions`, `/restart`, `/update`, `/restore`, `/retentions`, `/reconcile_custom_domain`, `/releases/{lease_uuid}`) plus `/health`
 - [ ] **Inbound `X-Fred-Signature` verified on all contract endpoints** (401 on missing/invalid; only `/health`, `/stats`, `/metrics` are exempt)
 - [ ] Provision returns 202 and works asynchronously
-- [ ] Callbacks signed with HMAC-SHA256 with timestamp
+- [ ] Complete callback URL (including query) preserved byte-for-byte and signed with HMAC-SHA256 with timestamp
 - [ ] Deprovision is idempotent
 - [ ] ListProvisions returns all managed resources
 - [ ] `/reconcile_custom_domain` is idempotent and returns 204 on no-change (never 404 just because custom domains are unsupported — that pollutes Fred's reconciler every tick)

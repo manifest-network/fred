@@ -782,9 +782,10 @@ func (f *fleet) captureState(leaseUUIDs []string) worldState {
 
 	for _, uuid := range leaseUUIDs {
 		if f.placement != nil {
-			st.placements[uuid] = f.placement.Get(uuid)
-			if at, ok := f.placement.SetAt(uuid); ok {
-				st.placementSetAt[uuid] = at
+			p := f.placement.Lookup(uuid)
+			st.placements[uuid] = p.Backend
+			if p.State() != placement.StateAbsent {
+				st.placementSetAt[uuid] = p.SetAt
 			}
 		}
 		has, err := f.payloads.Has(uuid)
@@ -852,7 +853,7 @@ func sliceDiff(after, before []string) []string {
 func (f *fleet) assertPlacementPinned(leaseUUID, backendName string) {
 	f.t.Helper()
 	require.NotNil(f.t, f.placement, "placement store is disabled in this fleet")
-	require.Equal(f.t, backendName, f.placement.Get(leaseUUID),
+	require.Equal(f.t, backendName, f.placement.Lookup(leaseUUID).Backend,
 		"lease %s should still be pinned to %s", leaseUUID, backendName)
 }
 

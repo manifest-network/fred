@@ -1218,6 +1218,11 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 	// fail-closed: without this record a timeout/reset could leave live data on
 	// the backend while fred later mistakes record absence for "never sent".
 	attemptRevision, err := h.restoreRecorder.SetPlacementAttempting(leaseUUID, backendClient.Name())
+	if errors.Is(err, provisioner.ErrProvisionAttemptPending) {
+		untrackOwnGeneration()
+		writeError(w, "lease is already being provisioned or restored", http.StatusConflict)
+		return
+	}
 	if err != nil || attemptRevision == 0 {
 		untrackOwnGeneration()
 		if err == nil {
@@ -1242,7 +1247,8 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		CallbackURL:   provisioner.BuildCallbackURLForGeneration(h.callbackBaseURL, inFlightGeneration),
 	})
 	if err != nil {
-		if errors.Is(err, backend.ErrAlreadyProvisioned) {
+		switch {
+		case errors.Is(err, backend.ErrAlreadyProvisioned):
 			// This backend did not accept NEW work, but it positively says the
 			// target already exists here. Promote the attempt rather than clearing
 			// the only durable ownership evidence. No new callback is coming from
@@ -1265,7 +1271,7 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 			untrackOwnGeneration()
-		} else if restoreWasDefinitelyRefused(err) {
+		case restoreWasDefinitelyRefused(err):
 			// These sentinels prove the backend did not accept new work. Clear the
 			// attempt before releasing the in-flight claim so the next tick can
 			// safely try another backend where routing permits it.
@@ -1287,7 +1293,7 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 				)
 			}
 			untrackOwnGeneration()
-		} else {
+		default:
 			// A transport error, timeout, generic 5xx, or off-contract response
 			// cannot prove whether the backend accepted the restore. Retain the
 			// durable attempt, which blocks a duplicate call even after releasing

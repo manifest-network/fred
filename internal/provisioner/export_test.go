@@ -45,10 +45,13 @@ func handlersOf(m *Manager) *HandlerSet {
 // TrackInFlightWithStartTime records an in-flight provision with a
 // caller-supplied start time so timeout tests can simulate a provision
 // that began in the past. Production always stamps time.Now() via
-// TrackInFlight.
+// TryTrackInFlightWithGeneration.
 func (t *DefaultInFlightTracker) TrackInFlightWithStartTime(leaseUUID, tenant string, items []backend.LeaseItem, backendName string, startTime time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if _, claimed := t.reconcileClaims[leaseUUID]; claimed {
+		return
+	}
 	generation := t.allocateGenerationLocked()
 	t.inFlight[leaseUUID] = InFlightProvision{
 		LeaseUUID:  leaseUUID,
@@ -58,5 +61,6 @@ func (t *DefaultInFlightTracker) TrackInFlightWithStartTime(leaseUUID, tenant st
 		Generation: generation,
 		StartTime:  startTime,
 	}
+	t.markMutationLocked(leaseUUID)
 	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
 }

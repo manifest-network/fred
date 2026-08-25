@@ -546,7 +546,8 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
 - Read on every tenant API call (connection, logs, diagnostics) to route to the correct backend
 - Deleted only by the reconciler (`cleanupOrphanedPlacements`, ENG-333); survives lease close so a later restore can route to the source node. Deleted eagerly only when a never-provisioned `PENDING` lease is rejected (no retention to protect)
 - Rebuilt on startup from every backend's `/provisions` and `/retentions` inventories; only a complete snapshot may resolve an attempt or conflict
-- Optional — only needed when multiple backends share the same SKU list
+- Required for restore and for correct routing when multiple backends share the
+  same SKU list; deployments using neither may leave it disabled
 
 ### Payload Store
 
@@ -591,11 +592,12 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_provisioner_provisioning_total` | counter | `outcome, backend, operation` | Provisioning operations by outcome/backend. `operation` ∈ `provision`/`restore` separates fresh provisions from restores (ENG-358) |
 | `fred_provisioner_provisioning_duration_seconds` | histogram | `backend, operation` | Provisioning latency. `operation` ∈ `provision`/`restore` |
 | `fred_provisioner_callback_timeouts_total` | counter | — | Backend callback timeouts |
+| `fred_provisioner_callback_settlement_claim_wait_timeouts_total` | counter | — | Callback handlers that exhausted the bounded wait for another terminal actor's exact in-flight generation claim. Any increase indicates a stuck or unusually slow settlement actor |
 | `fred_provisioner_ack_batch_fee_gas_errors_total` | counter | `lane` | Ack-batch failures classified as insufficient-fee or out-of-gas — sustained non-zero indicates `gas_limit`/`max_gas_limit`/fee misconfiguration |
 | `fred_provisioner_ack_batch_individual_fallbacks_total` | counter | `lane` | Ack-batch failures that fell back to per-lease retries |
 | `fred_provisioner_reconciler_inflight_skips_total` | counter | — | Ready leases the reconciler skipped because the main flow owns them |
 | `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`, `fetch_retentions`) — any non-zero is a latent bug |
-| `fred_placement_write_failures_total` | counter | — | Failed durable placement mutations. Any increase is actionable: prewrite failures block the backend call, while later failures retain conservative state for reconciliation |
+| `fred_placement_write_failures_total` | counter | — | Failed durable placement mutations or sync verification. Any increase is actionable: prewrite failures block the backend call, while later failures retain conservative state for reconciliation |
 
 **Reconciler:**
 

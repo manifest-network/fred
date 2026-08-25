@@ -3,6 +3,7 @@ package placement
 import (
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -20,6 +21,30 @@ func newTestStore(t *testing.T, opts ...Option) *Store {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func requireSetAttempting(t *testing.T, s *Store, leaseUUID, backendName string) uint64 {
+	t.Helper()
+	revision, err := s.SetAttempting(leaseUUID, backendName)
+	require.NoError(t, err)
+	return revision
+}
+
+func setAttemptingErr(s *Store, leaseUUID, backendName string) error {
+	_, err := s.SetAttempting(leaseUUID, backendName)
+	return err
+}
+
+func requireSetBatchIfNotNewer(
+	t *testing.T,
+	s *Store,
+	placements map[string]string,
+	maxRevision uint64,
+) map[string]uint64 {
+	t.Helper()
+	applied, err := s.SetBatchIfNotNewer(placements, maxRevision)
+	require.NoError(t, err)
+	return applied
 }
 
 func writeRawRecords(t *testing.T, dbPath string, records map[string][]byte) {
@@ -93,24 +118,27 @@ func TestStore_AttemptConfirmAndClearLifecycle(t *testing.T) {
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State())
 	assert.Zero(t, s.SnapshotRevision())
 
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	attemptRevision := requireSetAttempting(t, s, "lease-1", "backend-a")
 	attempting := s.Lookup("lease-1")
 	assert.Equal(t, StateAttempting, attempting.State())
 	assert.Empty(t, attempting.Backend)
 	assert.Equal(t, "backend-a", attempting.Attempt)
 	assert.Equal(t, fixed.UTC(), attempting.SetAt)
 	assert.NotZero(t, attempting.Revision())
+	assert.Equal(t, attemptRevision, attempting.Revision(),
+		"SetAttempting must return the exact durably committed record revision")
 	assert.Equal(t, attempting.Revision(), s.SnapshotRevision())
-	assert.Empty(t, s.Get("lease-1"), "an attempt is not confirmed affinity")
+	assert.Empty(t, s.Lookup("lease-1").Backend, "an attempt is not confirmed affinity")
 
 	before := s.List()
 	beforeRevision := s.SnapshotRevision()
-	err := s.SetAttempting("lease-1", "backend-a")
+	failedRevision, err := s.SetAttempting("lease-1", "backend-a")
 	require.ErrorIs(t, err, ErrAttemptConflict)
+	assert.Zero(t, failedRevision, "a refused write has no committed revision")
 	assert.Equal(t, before, s.List())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
 
-	err = s.SetAttempting("lease-1", "backend-b")
+	_, err = s.SetAttempting("lease-1", "backend-b")
 	require.ErrorIs(t, err, ErrAttemptConflict)
 	err = s.Confirm("lease-1", "backend-b")
 	require.ErrorIs(t, err, ErrAttemptMismatch)
@@ -123,15 +151,15 @@ func TestStore_AttemptConfirmAndClearLifecycle(t *testing.T) {
 	assert.Empty(t, confirmed.Attempt)
 	assert.Equal(t, attempting.SetAt, confirmed.SetAt)
 	assert.Greater(t, confirmed.Revision(), attempting.Revision())
-	assert.Equal(t, "backend-a", s.Get("lease-1"))
+	assert.Equal(t, "backend-a", s.Lookup("lease-1").Backend)
 
 	idempotentRevision := s.SnapshotRevision()
 	require.NoError(t, s.Confirm("lease-1", "backend-a"))
 	assert.Equal(t, idempotentRevision, s.SnapshotRevision())
 
-	err = s.SetAttempting("lease-1", "backend-b")
+	_, err = s.SetAttempting("lease-1", "backend-b")
 	require.ErrorIs(t, err, ErrBackendConflict)
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	requireSetAttempting(t, s, "lease-1", "backend-a")
 	confirmedAttempt := s.Lookup("lease-1")
 	assert.Equal(t, StateConfirmed, confirmedAttempt.State())
 	assert.Equal(t, "backend-a", confirmedAttempt.Backend)
@@ -166,13 +194,50 @@ func TestStore_ConfirmAbsentCreatesPositiveObservation(t *testing.T) {
 	assert.NotZero(t, p.Revision())
 }
 
+func TestStore_SetAttemptingIfNotNewerFencesPostSnapshotMutation(t *testing.T) {
+	s := newTestStore(t)
+	cutoff := s.SnapshotRevision()
+	require.NoError(t, s.Confirm("lease-1", "backend-a"))
+	changed := s.Lookup("lease-1")
+
+	revision, set, err := s.SetAttemptingIfNotNewer("lease-1", "backend-a", cutoff)
+	require.NoError(t, err)
+	assert.False(t, set)
+	assert.Zero(t, revision)
+	assert.Equal(t, changed, s.Lookup("lease-1"),
+		"a stale reconciler snapshot must not write an attempt")
+
+	revision, set, err = s.SetAttemptingIfNotNewer(
+		"lease-1", "backend-a", changed.Revision(),
+	)
+	require.NoError(t, err)
+	require.True(t, set)
+	assert.Equal(t, revision, s.Lookup("lease-1").Revision())
+	assert.Equal(t, "backend-a", s.Lookup("lease-1").Attempt)
+}
+
+func TestStore_SetAttemptingIfNotNewerFencesPostSnapshotCreateDelete(t *testing.T) {
+	s := newTestStore(t)
+	cutoff := s.SnapshotRevision()
+	require.NoError(t, s.Confirm("lease-1", "backend-a"))
+	require.NoError(t, s.Delete("lease-1"))
+	require.Equal(t, StateAbsent, s.Lookup("lease-1").State())
+
+	revision, set, err := s.SetAttemptingIfNotNewer("lease-1", "backend-a", cutoff)
+	require.NoError(t, err)
+	assert.False(t, set)
+	assert.Zero(t, revision)
+	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State(),
+		"an absent key must retain the process-local deletion fence")
+}
+
 func TestStore_ClearAttemptOnlyDeletesRecord(t *testing.T) {
 	s := newTestStore(t)
 
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	requireSetAttempting(t, s, "lease-1", "backend-a")
 	require.NoError(t, s.ClearAttempt("lease-1", "backend-a"))
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State())
-	assert.Zero(t, s.Count())
+	assert.Empty(t, s.List())
 
 	// Clearing an already-absent matching attempt is idempotent.
 	require.NoError(t, s.ClearAttempt("lease-1", "backend-a"))
@@ -184,10 +249,10 @@ func TestStore_PersistsAllStatesAndRevisions(t *testing.T) {
 
 	s1, err := NewStore(dbPath, WithClock(func() time.Time { return fixed }))
 	require.NoError(t, err)
-	require.NoError(t, s1.SetAttempting("attempting", "backend-a"))
+	requireSetAttempting(t, s1, "attempting", "backend-a")
 	require.NoError(t, s1.Confirm("confirmed", "backend-b"))
 	require.NoError(t, s1.Confirm("confirmed-attempt", "backend-c"))
-	require.NoError(t, s1.SetAttempting("confirmed-attempt", "backend-c"))
+	requireSetAttempting(t, s1, "confirmed-attempt", "backend-c")
 	want := s1.List()
 	wantRevision := s1.SnapshotRevision()
 	require.NoError(t, s1.Close())
@@ -217,7 +282,7 @@ func TestStore_DeletePersists(t *testing.T) {
 	defer s2.Close()
 	assert.Equal(t, StateAbsent, s2.Lookup("lease-1").State())
 	assert.Equal(t, "backend-b", s2.Lookup("lease-2").Backend)
-	assert.Equal(t, 1, s2.Count())
+	assert.Len(t, s2.List(), 1)
 }
 
 func TestStore_SetBatchMergesInventoryAtomically(t *testing.T) {
@@ -227,18 +292,18 @@ func TestStore_SetBatchMergesInventoryAtomically(t *testing.T) {
 	s := newTestStore(t, WithClock(clock.Now))
 
 	require.NoError(t, s.Confirm("confirmed", "backend-a"))
-	require.NoError(t, s.SetAttempting("attempting", "backend-a"))
+	requireSetAttempting(t, s, "attempting", "backend-a")
 	require.NoError(t, s.Confirm("mixed", "backend-a"))
-	require.NoError(t, s.SetAttempting("mixed", "backend-a"))
+	requireSetAttempting(t, s, "mixed", "backend-a")
 	cutoff := s.SnapshotRevision()
 
 	clock.now = t1
-	require.NoError(t, s.SetBatch(map[string]string{
+	applied := requireSetBatchIfNotNewer(t, s, map[string]string{
 		"confirmed":  "backend-b", // positive inventory replaces old affinity
 		"attempting": "backend-a", // matching inventory confirms the attempt
 		"mixed":      "backend-b", // mismatched attempt remains unresolved
 		"new":        "backend-c",
-	}))
+	}, math.MaxUint64)
 
 	confirmed := s.Lookup("confirmed")
 	assert.Equal(t, "backend-b", confirmed.Backend)
@@ -264,18 +329,19 @@ func TestStore_SetBatchMergesInventoryAtomically(t *testing.T) {
 
 	for leaseUUID, p := range s.List() {
 		assert.Greater(t, p.Revision(), cutoff, leaseUUID)
+		assert.Equal(t, p.Revision(), applied[leaseUUID], leaseUUID)
 	}
 	assert.Equal(t, s.Lookup("new").Revision(), s.SnapshotRevision(),
 		"sorted batch keys make the final revision deterministic")
 
 	before := s.List()
 	beforeRevision := s.SnapshotRevision()
-	err := s.SetBatch(map[string]string{"valid": "backend-a", "invalid": ""})
+	_, err := s.SetBatchIfNotNewer(map[string]string{"valid": "backend-a", "invalid": ""}, math.MaxUint64)
 	require.ErrorIs(t, err, ErrInvalidPlacement)
 	assert.Equal(t, before, s.List(), "validation failure must reject the whole batch")
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
 
-	require.NoError(t, s.SetBatch(nil))
+	assert.Empty(t, requireSetBatchIfNotNewer(t, s, nil, math.MaxUint64))
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
 }
 
@@ -286,14 +352,14 @@ func TestStore_SetBatchIfNotNewerPreservesConcurrentAttempt(t *testing.T) {
 
 	// This write models a provision/restore that starts after backend inventory
 	// fetching began. Even a matching stale positive must not clear its attempt.
-	require.NoError(t, s.SetAttempting("new-attempt", "backend-b"))
+	requireSetAttempting(t, s, "new-attempt", "backend-b")
 	newAttempt := s.Lookup("new-attempt")
 	require.Greater(t, newAttempt.Revision(), cutoff)
 
-	require.NoError(t, s.SetBatchIfNotNewer(map[string]string{
+	requireSetBatchIfNotNewer(t, s, map[string]string{
 		"old-record":  "backend-b",
 		"new-attempt": "backend-b",
-	}, cutoff))
+	}, cutoff)
 
 	old := s.Lookup("old-record")
 	assert.Equal(t, "backend-b", old.Backend, "records covered by the inventory still converge")
@@ -302,17 +368,43 @@ func TestStore_SetBatchIfNotNewerPreservesConcurrentAttempt(t *testing.T) {
 		"inventory fetched before the attempt must not confirm or overwrite it")
 }
 
-func TestStore_SetCompatibilityHelperPreservesOverwriteSemantics(t *testing.T) {
+func TestStore_SetBatchIfNotNewerDoesNotReviseExactConfirmedObservation(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.Confirm("lease-1", "backend-a"))
+	before := s.Lookup("lease-1")
+	beforeGlobal := s.SnapshotRevision()
+
+	applied := requireSetBatchIfNotNewer(t, s,
+		map[string]string{"lease-1": "backend-a"}, beforeGlobal,
+	)
+	assert.Empty(t, applied)
+	assert.Equal(t, before, s.Lookup("lease-1"))
+	assert.Equal(t, beforeGlobal, s.SnapshotRevision(),
+		"an unchanged inventory must not keep the record newer than every sweep cutoff")
+
+	applied = requireSetBatchIfNotNewer(t, s,
+		map[string]string{"lease-1": "backend-b"}, beforeGlobal,
+	)
+	after := s.Lookup("lease-1")
+	assert.Equal(t, after.Revision(), applied["lease-1"])
+	assert.Equal(t, "backend-b", after.Backend)
+	assert.Greater(t, after.Revision(), before.Revision(),
+		"a real ownership transition must still advance the revision")
+}
+
+func TestStore_SetBatchIfNotNewerPreservesSetAtOnOverwrite(t *testing.T) {
 	s := newTestStore(t)
 
-	require.NoError(t, s.Set("lease-1", "backend-a"))
-	firstSetAt, ok := s.SetAt("lease-1")
-	require.True(t, ok)
-	require.NoError(t, s.Set("lease-1", "backend-b"))
-	assert.Equal(t, "backend-b", s.Get("lease-1"))
-	secondSetAt, ok := s.SetAt("lease-1")
-	require.True(t, ok)
-	assert.Equal(t, firstSetAt, secondSetAt)
+	requireSetBatchIfNotNewer(t, s,
+		map[string]string{"lease-1": "backend-a"}, math.MaxUint64,
+	)
+	firstSetAt := s.Lookup("lease-1").SetAt
+	requireSetBatchIfNotNewer(t, s,
+		map[string]string{"lease-1": "backend-b"}, math.MaxUint64,
+	)
+	current := s.Lookup("lease-1")
+	assert.Equal(t, "backend-b", current.Backend)
+	assert.Equal(t, firstSetAt, current.SetAt)
 }
 
 func TestStore_LoadsLegacyAndOldJSONRecords(t *testing.T) {
@@ -341,8 +433,45 @@ func TestStore_LoadsLegacyAndOldJSONRecords(t *testing.T) {
 	assert.Zero(t, s.SnapshotRevision())
 
 	// The first mutation of a legacy record moves it onto the revisioned schema.
-	require.NoError(t, s.SetAttempting("legacy", "backend-legacy"))
+	requireSetAttempting(t, s, "legacy", "backend-legacy")
 	assert.NotZero(t, s.Lookup("legacy").Revision())
+}
+
+func TestStore_LegacyRawBackendNamesRequirePrintableUTF8(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	valid := map[string]string{
+		"ascii":   "backend-legacy_01",
+		"unicode": "backend-montréal-東京",
+	}
+	writeRawRecords(t, dbPath, map[string][]byte{
+		"ascii":        []byte(valid["ascii"]),
+		"unicode":      []byte(valid["unicode"]),
+		"invalid-utf8": {0xff, 0xfe},
+		"nul":          []byte("backend\x00hidden"),
+		"newline":      []byte("backend-a\nbackend-b"),
+		"escape":       []byte("backend-\x1b[31m"),
+		"zero-width":   []byte("backend-\u200bhidden"),
+	})
+
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	for leaseUUID, backendName := range valid {
+		p := s.Lookup(leaseUUID)
+		assert.Equal(t, StateConfirmed, p.State(), leaseUUID)
+		assert.Equal(t, backendName, p.Backend, leaseUUID)
+		assert.Zero(t, p.Revision(), leaseUUID)
+	}
+	for _, leaseUUID := range []string{"invalid-utf8", "nul", "newline", "escape", "zero-width"} {
+		p := s.Lookup(leaseUUID)
+		assert.Equal(t, StateUnusable, p.State(), leaseUUID)
+		assert.Empty(t, p.Backend, leaseUUID)
+		assert.Contains(t, s.List(), leaseUUID,
+			"invalid legacy bytes must remain present and fail closed")
+		_, err := s.SetAttempting(leaseUUID, "backend-a")
+		require.ErrorIs(t, err, ErrUnusablePlacement, leaseUUID)
+	}
 }
 
 func TestStore_MalformedRecordsRemainUnusable(t *testing.T) {
@@ -364,11 +493,11 @@ func TestStore_MalformedRecordsRemainUnusable(t *testing.T) {
 		assert.Equal(t, StateUnusable, s.Lookup(leaseUUID).State(), leaseUUID)
 		assert.Contains(t, s.List(), leaseUUID, "unusable records remain visible in snapshots")
 	}
-	assert.Equal(t, 5, s.Count())
+	assert.Len(t, s.List(), 5)
 	assert.Equal(t, uint64(7), s.SnapshotRevision())
 	assert.Equal(t, uint64(7), s.Lookup("structured-empty").Revision())
 
-	err = s.SetAttempting("empty-object", "backend-a")
+	_, err = s.SetAttempting("empty-object", "backend-a")
 	require.ErrorIs(t, err, ErrUnusablePlacement)
 	err = s.Confirm("empty-object", "backend-a")
 	require.ErrorIs(t, err, ErrUnusablePlacement)
@@ -376,7 +505,9 @@ func TestStore_MalformedRecordsRemainUnusable(t *testing.T) {
 	require.ErrorIs(t, err, ErrUnusablePlacement)
 
 	// Positive fleet inventory may repair a corrupt derived-index entry.
-	require.NoError(t, s.SetBatch(map[string]string{"empty-object": "backend-a"}))
+	requireSetBatchIfNotNewer(t, s,
+		map[string]string{"empty-object": "backend-a"}, math.MaxUint64,
+	)
 	repaired := s.Lookup("empty-object")
 	assert.Equal(t, StateConfirmed, repaired.State())
 	assert.Equal(t, "backend-a", repaired.Backend)
@@ -393,7 +524,7 @@ func TestStore_MalformedRecordsRemainUnusable(t *testing.T) {
 func TestStore_ListReturnsIndependentAtomicSnapshot(t *testing.T) {
 	s := newTestStore(t)
 	require.NoError(t, s.Confirm("lease-1", "backend-a"))
-	require.NoError(t, s.SetAttempting("lease-2", "backend-b"))
+	requireSetAttempting(t, s, "lease-2", "backend-b")
 
 	snapshot := s.List()
 	assert.Len(t, snapshot, 2)
@@ -404,17 +535,21 @@ func TestStore_ListReturnsIndependentAtomicSnapshot(t *testing.T) {
 
 	assert.Equal(t, "backend-a", s.Lookup("lease-1").Backend)
 	assert.Equal(t, "backend-b", s.Lookup("lease-2").Attempt)
-	assert.Equal(t, 2, s.Count())
+	assert.Len(t, s.List(), 2)
 }
 
 func TestStore_DurableWriteFailuresLeaveCacheAndRevisionUnchanged(t *testing.T) {
 	s := newTestStore(t)
 	require.NoError(t, s.Confirm("confirmed", "backend-a"))
+	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
+		"conflict": {"backend-a", "backend-b"},
+	}, s.SnapshotRevision()))
 	before := s.List()
 	beforeRevision := s.SnapshotRevision()
+	beforeDeleteRevision := s.lastDeleteRevision
 	require.NoError(t, s.Close())
 
-	err := s.SetAttempting("confirmed", "backend-a")
+	_, err := s.SetAttempting("confirmed", "backend-a")
 	require.Error(t, err)
 	assert.Equal(t, before, s.List())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
@@ -424,12 +559,12 @@ func TestStore_DurableWriteFailuresLeaveCacheAndRevisionUnchanged(t *testing.T) 
 	assert.Equal(t, StateAbsent, s.Lookup("new").State())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
 
-	err = s.SetBatch(map[string]string{"batch": "backend-c"})
+	_, err = s.SetBatchIfNotNewer(map[string]string{"batch": "backend-c"}, math.MaxUint64)
 	require.Error(t, err)
 	assert.Equal(t, before, s.List())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
 
-	err = s.SetBatch(nil)
+	_, err = s.SetBatchIfNotNewer(nil, math.MaxUint64)
 	require.Error(t, err, "an empty inventory must not report a durable sync against a closed store")
 	assert.Equal(t, before, s.List())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
@@ -442,12 +577,23 @@ func TestStore_DurableWriteFailuresLeaveCacheAndRevisionUnchanged(t *testing.T) 
 	require.Error(t, err)
 	assert.False(t, deleted)
 	assert.Equal(t, before, s.List())
+
+	err = s.ClearConflictsIfNotNewer(
+		map[string]struct{}{"conflict": {}}, beforeRevision,
+	)
+	require.Error(t, err)
+	assert.Equal(t, before, s.List())
+	assert.Equal(t, beforeRevision, s.SnapshotRevision())
+	assert.Equal(t, beforeDeleteRevision, s.lastDeleteRevision,
+		"failed durable deletes must not advance the stale-snapshot barrier")
 }
 
 func TestStore_FailedClearLeavesAttemptCached(t *testing.T) {
 	s := newTestStore(t)
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	requireSetAttempting(t, s, "lease-1", "backend-a")
 	before := s.Lookup("lease-1")
+	beforeRevision := s.SnapshotRevision()
+	beforeDeleteRevision := s.lastDeleteRevision
 	require.NoError(t, s.Close())
 
 	err := s.ClearAttempt("lease-1", "backend-a")
@@ -458,6 +604,8 @@ func TestStore_FailedClearLeavesAttemptCached(t *testing.T) {
 	require.Error(t, err)
 	assert.False(t, cleared)
 	assert.Equal(t, before, s.Lookup("lease-1"))
+	assert.Equal(t, beforeRevision, s.SnapshotRevision())
+	assert.Equal(t, beforeDeleteRevision, s.lastDeleteRevision)
 }
 
 func TestStore_EncodingFailureLeavesCacheAndRevisionUnchanged(t *testing.T) {
@@ -470,7 +618,7 @@ func TestStore_EncodingFailureLeavesCacheAndRevisionUnchanged(t *testing.T) {
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State())
 	assert.Zero(t, s.SnapshotRevision())
 
-	err = s.SetBatch(map[string]string{"lease-2": "backend-b"})
+	_, err = s.SetBatchIfNotNewer(map[string]string{"lease-2": "backend-b"}, math.MaxUint64)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "encode batch placements")
 	assert.Equal(t, StateAbsent, s.Lookup("lease-2").State())
@@ -480,16 +628,16 @@ func TestStore_EncodingFailureLeavesCacheAndRevisionUnchanged(t *testing.T) {
 func TestStore_SemanticFailuresDoNotMutate(t *testing.T) {
 	s := newTestStore(t)
 	require.NoError(t, s.Confirm("lease-1", "backend-a"))
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	requireSetAttempting(t, s, "lease-1", "backend-a")
 	before := s.List()
 	beforeRevision := s.SnapshotRevision()
 
 	for _, err := range []error{
-		s.SetAttempting("lease-1", "backend-a"),
-		s.SetAttempting("lease-1", "backend-b"),
+		setAttemptingErr(s, "lease-1", "backend-a"),
+		setAttemptingErr(s, "lease-1", "backend-b"),
 		s.Confirm("lease-1", "backend-b"),
 		s.ClearAttempt("lease-1", "backend-b"),
-		s.SetAttempting("", "backend-a"),
+		setAttemptingErr(s, "", "backend-a"),
 		s.Confirm("lease-2", ""),
 	} {
 		require.Error(t, err)
@@ -503,7 +651,7 @@ func TestStore_RevisionConditionalMutationsRejectStaleSnapshots(t *testing.T) {
 	require.NoError(t, s.Confirm("lease-1", "backend-a"))
 	confirmed := s.Lookup("lease-1")
 
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	requireSetAttempting(t, s, "lease-1", "backend-a")
 	withAttempt := s.Lookup("lease-1")
 	require.Greater(t, withAttempt.Revision(), confirmed.Revision())
 
@@ -546,7 +694,7 @@ func TestStore_RevisionConditionalMutationsRejectStaleSnapshots(t *testing.T) {
 
 func TestStore_ConfirmAttemptIfRevisionNeverRecreatesOrOverwrites(t *testing.T) {
 	s := newTestStore(t)
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	requireSetAttempting(t, s, "lease-1", "backend-a")
 	first := s.Lookup("lease-1")
 
 	// A fast failure callback can delete the attempt before the synchronous 202
@@ -558,7 +706,7 @@ func TestStore_ConfirmAttemptIfRevisionNeverRecreatesOrOverwrites(t *testing.T) 
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State())
 
 	// Nor may an older response overwrite a newer attempt.
-	require.NoError(t, s.SetAttempting("lease-1", "backend-b"))
+	requireSetAttempting(t, s, "lease-1", "backend-b")
 	newer := s.Lookup("lease-1")
 	confirmed, err = s.ConfirmAttemptIfRevision("lease-1", "backend-a", first.Revision())
 	require.NoError(t, err)
@@ -574,16 +722,81 @@ func TestStore_ConfirmAttemptIfRevisionNeverRecreatesOrOverwrites(t *testing.T) 
 
 func TestStore_SetBatchIfNotNewerHonorsPostSnapshotDeleteTombstone(t *testing.T) {
 	s := newTestStore(t)
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	requireSetAttempting(t, s, "lease-1", "backend-a")
 	cutoff := s.SnapshotRevision()
 	require.NoError(t, s.Delete("lease-1"))
 	require.Greater(t, s.SnapshotRevision(), cutoff)
 
-	require.NoError(t, s.SetBatchIfNotNewer(
+	applied := requireSetBatchIfNotNewer(t, s,
 		map[string]string{"lease-1": "backend-a"}, cutoff,
-	))
+	)
+	assert.Empty(t, applied)
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State(),
 		"stale positive inventory must not recreate a record deleted after fetch began")
+}
+
+func TestStore_GlobalDeleteWatermarkBoundsTombstonesAndPreservesSnapshotCAS(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.Confirm("live", "backend-a"))
+	staleCutoff := s.SnapshotRevision()
+
+	const deletedKeys = 256
+	inventory := make(map[string]string, deletedKeys+2)
+	inventory["live"] = "backend-b"
+	inventory["new"] = "backend-new"
+	for i := range deletedKeys {
+		leaseUUID := fmt.Sprintf("deleted-%03d", i)
+		require.NoError(t, s.Confirm(leaseUUID, "backend-a"))
+		require.NoError(t, s.Delete(leaseUUID))
+		inventory[leaseUUID] = "backend-a"
+	}
+
+	deleteWatermark := s.lastDeleteRevision
+	assert.Equal(t, s.SnapshotRevision(), deleteWatermark)
+	assert.Len(t, s.List(), 1,
+		"deleted lease cardinality must not survive in an in-memory tombstone collection")
+
+	requireSetBatchIfNotNewer(t, s, inventory, staleCutoff)
+	assert.Equal(t, "backend-b", s.Lookup("live").Backend,
+		"an old snapshot may still converge a live record that did not race a mutation")
+	assert.Equal(t, StateAbsent, s.Lookup("new").State(),
+		"an old snapshot conservatively defers all absent-key creation after any deletion")
+	for i := range deletedKeys {
+		leaseUUID := fmt.Sprintf("deleted-%03d", i)
+		assert.Equal(t, StateAbsent, s.Lookup(leaseUUID).State(), leaseUUID)
+	}
+	assert.Equal(t, deleteWatermark, s.lastDeleteRevision,
+		"backfills must not grow or move the deletion watermark")
+
+	freshCutoff := s.SnapshotRevision()
+	requireSetBatchIfNotNewer(t, s, inventory, freshCutoff)
+	assert.Len(t, s.List(), len(inventory),
+		"a fresh inventory must converge every deferred absent key")
+}
+
+func TestStore_ClearConflictDeletionBlocksOlderInventory(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
+		"lease-1": {"backend-a", "backend-b"},
+	}, s.SnapshotRevision()))
+	staleCutoff := s.SnapshotRevision()
+
+	require.NoError(t, s.ClearConflictsIfNotNewer(
+		map[string]struct{}{"lease-1": {}}, staleCutoff,
+	))
+	require.Greater(t, s.lastDeleteRevision, staleCutoff)
+	applied := requireSetBatchIfNotNewer(t, s,
+		map[string]string{"lease-1": "backend-a"}, staleCutoff,
+	)
+	assert.Empty(t, applied)
+	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State(),
+		"inventory older than conflict deletion must not recreate the placement")
+
+	freshCutoff := s.SnapshotRevision()
+	requireSetBatchIfNotNewer(t, s,
+		map[string]string{"lease-1": "backend-a"}, freshCutoff,
+	)
+	assert.Equal(t, StateConfirmed, s.Lookup("lease-1").State())
 }
 
 func TestStore_ConflictQuarantineSurvivesRestartAndResolvesOnCompleteEvidence(t *testing.T) {
@@ -613,7 +826,7 @@ func TestStore_ConflictQuarantineSurvivesRestartAndResolvesOnCompleteEvidence(t 
 	assert.False(t, p.ConflictOwnersUnknown)
 
 	cutoff = s.SnapshotRevision()
-	require.NoError(t, s.SetBatchIfNotNewer(map[string]string{"lease-1": "backend-b"}, cutoff))
+	requireSetBatchIfNotNewer(t, s, map[string]string{"lease-1": "backend-b"}, cutoff)
 	p = s.Lookup("lease-1")
 	assert.False(t, p.Conflict)
 	assert.Equal(t, StateConfirmed, p.State())
@@ -660,7 +873,7 @@ func TestStore_LegacyConflictWithoutCandidatesLoadsFailClosed(t *testing.T) {
 func TestStore_StaleConflictSnapshotCannotOverwriteNewAttempt(t *testing.T) {
 	s := newTestStore(t)
 	cutoff := s.SnapshotRevision()
-	require.NoError(t, s.SetAttempting("lease-1", "backend-a"))
+	requireSetAttempting(t, s, "lease-1", "backend-a")
 
 	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
 		"lease-1": {"backend-a", "backend-b"},
@@ -692,7 +905,7 @@ func TestStore_DeleteCASCannotLoseRacingAttempt(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			attemptErr = s.SetAttempting(leaseUUID, "backend-a")
+			_, attemptErr = s.SetAttempting(leaseUUID, "backend-a")
 		}()
 		close(start)
 		wg.Wait()
@@ -725,7 +938,7 @@ func TestStore_ConcurrentIndependentTransitions(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			leaseUUID := fmt.Sprintf("lease-concurrent-%d", id)
-			if err := s.SetAttempting(leaseUUID, "backend-a"); err != nil {
+			if _, err := s.SetAttempting(leaseUUID, "backend-a"); err != nil {
 				errs <- err
 				return
 			}
@@ -742,7 +955,7 @@ func TestStore_ConcurrentIndependentTransitions(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
-	assert.Equal(t, goroutines, s.Count())
+	assert.Len(t, s.List(), goroutines)
 }
 
 func TestStore_HealthCloseAndConstruction(t *testing.T) {

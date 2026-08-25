@@ -43,11 +43,12 @@ const (
 
 // Provisioning metrics
 var (
-	// PlacementWriteFailuresTotal counts failed writes to the durable placement
-	// store. Placement transitions are write-ahead safety records: when one
-	// cannot be persisted, provisioning is either refused before contacting a
-	// backend or left with an unresolved attempt for a later sweep to resolve.
-	// Any increase therefore needs operator attention (ENG-632).
+	// PlacementWriteFailuresTotal counts failed writes and failed durable-sync
+	// verification in the placement store. Placement transitions are write-ahead
+	// safety records: when one cannot be persisted or verified, provisioning is
+	// either refused before contacting a backend or left with an unresolved
+	// attempt for a later sweep to resolve. Any increase therefore needs operator
+	// attention (ENG-632).
 	//
 	// Deliberately unlabelled. Backend and lease identifiers belong in the
 	// accompanying log; putting either on a counter would create an unbounded
@@ -56,7 +57,7 @@ var (
 		Namespace: namespace,
 		Subsystem: "placement",
 		Name:      "write_failures_total",
-		Help:      "Total failed writes to the durable placement store",
+		Help:      "Total failed writes or durable-sync verifications in the placement store",
 	})
 
 	// InFlightProvisions tracks the number of provisions currently in progress.
@@ -621,6 +622,16 @@ var (
 		Subsystem: "provisioner",
 		Name:      "callback_timeouts_total",
 		Help:      "Total number of provisions that timed out waiting for backend callback",
+	})
+
+	// CallbackSettlementClaimWaitTimeoutsTotal tracks callbacks that hit the
+	// hard bound while another terminal actor held their exact in-flight
+	// generation's settlement claim.
+	CallbackSettlementClaimWaitTimeoutsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "callback_settlement_claim_wait_timeouts_total",
+		Help:      "Total callback waits that timed out while an in-flight settlement claim remained contended",
 	})
 
 	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker,

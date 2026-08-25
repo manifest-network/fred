@@ -10,9 +10,12 @@ import (
 	"slices"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
+
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/metrics"
-	bolt "go.etcd.io/bbolt"
 )
 
 var bucketName = []byte("placements")
@@ -134,14 +137,19 @@ type record struct {
 // Store is a bbolt-backed placement store with an in-memory read cache. All
 // writes commit to bbolt before the cache or revision clock is changed.
 type Store struct {
-	db           *bolt.DB
-	cache        map[string]Placement
-	lastMutation map[string]uint64 // includes process-local tombstones for deleted keys
-	now          func() time.Time
-	revision     uint64
-	mu           sync.RWMutex
-	closeOnce    sync.Once
-	closeErr     error
+	db    *bolt.DB
+	cache map[string]Placement
+	// lastDeleteRevision is a process-local, global tombstone for absent keys.
+	// An inventory snapshot older than any deletion cannot distinguish which
+	// absent key was deleted, so it conservatively creates none. This O(1)
+	// watermark preserves stale-snapshot safety without retaining an unbounded
+	// per-lease tombstone map. No snapshot survives a process restart.
+	lastDeleteRevision uint64
+	now                func() time.Time
+	revision           uint64
+	mu                 sync.RWMutex
+	closeOnce          sync.Once
+	closeErr           error
 }
 
 // Option configures a Store at construction.
@@ -174,14 +182,12 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 	}
 
 	cache := make(map[string]Placement)
-	lastMutation := make(map[string]uint64)
 	var revision uint64
 	if err := db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
 		return b.ForEach(func(k, v []byte) error {
 			p := decodeRecord(string(k), v)
 			cache[string(k)] = p
-			lastMutation[string(k)] = p.revision
 			if p.revision > revision {
 				revision = p.revision
 			}
@@ -193,11 +199,10 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 	}
 
 	s := &Store{
-		db:           db,
-		cache:        cache,
-		lastMutation: lastMutation,
-		now:          time.Now,
-		revision:     revision,
+		db:       db,
+		cache:    cache,
+		now:      time.Now,
+		revision: revision,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -213,6 +218,9 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 // JSON object with neither Backend nor Attempt remains present but Unusable.
 func decodeRecord(leaseUUID string, v []byte) Placement {
 	if len(v) > 0 && v[0] != '{' {
+		if !validLegacyBackendName(v) {
+			return unusableRecord(leaseUUID, errors.New("legacy backend name is not printable UTF-8"))
+		}
 		return Placement{Backend: string(v)}
 	}
 
@@ -253,6 +261,18 @@ func decodeRecord(leaseUUID string, v []byte) Placement {
 	return p
 }
 
+func validLegacyBackendName(v []byte) bool {
+	if !utf8.Valid(v) {
+		return false
+	}
+	for _, r := range string(v) {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
 func unusableRecord(leaseUUID string, err error) Placement {
 	slog.Warn("placement: loaded unparseable record",
 		"lease_uuid", leaseUUID, "error", err)
@@ -279,6 +299,16 @@ func normalizeBackendNames(names []string) []string {
 		}
 	}
 	return slices.Sorted(maps.Keys(unique))
+}
+
+func equalPlacementIgnoringRevision(a, b Placement) bool {
+	return a.Backend == b.Backend &&
+		a.Attempt == b.Attempt &&
+		a.SetAt.Equal(b.SetAt) &&
+		a.Conflict == b.Conflict &&
+		slices.Equal(a.ConflictBackends, b.ConflictBackends) &&
+		a.ConflictOwnersUnknown == b.ConflictOwnersUnknown &&
+		a.unusable == b.unusable
 }
 
 // Lookup returns an immutable placement snapshot. A missing key returns the
@@ -313,53 +343,69 @@ func (s *Store) SnapshotRevision() uint64 {
 	return s.revision
 }
 
-// Get returns only a confirmed backend. Deprecated: use Lookup.
-func (s *Store) Get(leaseUUID string) string {
-	p := s.Lookup(leaseUUID)
-	if p.State() != StateConfirmed {
-		return ""
-	}
-	return p.Backend
-}
-
-// SetAt returns the snapshot's first-seen time and whether a record exists.
-// Deprecated: use Lookup.
-func (s *Store) SetAt(leaseUUID string) (time.Time, bool) {
-	p := s.Lookup(leaseUUID)
-	return p.SetAt, p.State() != StateAbsent
-}
-
-// Set records a positive backend observation with the legacy overwrite
-// semantics. Deprecated: use Confirm or SetBatch as appropriate.
-func (s *Store) Set(leaseUUID, backendName string) error {
-	return s.SetBatch(map[string]string{leaseUUID: backendName})
-}
-
 // SetAttempting durably records the target before any backend call. It refuses
 // to overwrite every unresolved attempt, including one for the same target.
-func (s *Store) SetAttempting(leaseUUID, backendName string) error {
+// On success it returns the exact revision committed with the attempt so the
+// caller can conditionally settle that write without a racy follow-up Lookup.
+func (s *Store) SetAttempting(leaseUUID, backendName string) (uint64, error) {
+	revision, _, err := s.setAttemptingIfNotNewer(leaseUUID, backendName, math.MaxUint64)
+	return revision, err
+}
+
+// SetAttemptingIfNotNewer is the reconciler's write-ahead fence. It records an
+// attempt only when the lease has not changed since the inventory revision
+// supplied by the caller. The revision check and attempt write share the store
+// lock, so an operation or placement transition that raced the inventory wins
+// before any backend side effect is sent.
+func (s *Store) SetAttemptingIfNotNewer(
+	leaseUUID, backendName string,
+	maxRevision uint64,
+) (uint64, bool, error) {
 	if err := validateIDs(leaseUUID, backendName); err != nil {
-		return err
+		return 0, false, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.setAttemptingIfNotNewerLocked(leaseUUID, backendName, maxRevision)
+}
+
+func (s *Store) setAttemptingIfNotNewer(
+	leaseUUID, backendName string,
+	maxRevision uint64,
+) (uint64, bool, error) {
+	if err := validateIDs(leaseUUID, backendName); err != nil {
+		return 0, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setAttemptingIfNotNewerLocked(leaseUUID, backendName, maxRevision)
+}
+
+// Caller holds s.mu.
+func (s *Store) setAttemptingIfNotNewerLocked(
+	leaseUUID, backendName string,
+	maxRevision uint64,
+) (uint64, bool, error) {
+	if s.mutationRevisionLocked(leaseUUID) > maxRevision {
+		return 0, false, nil
+	}
 
 	existing, exists := s.cache[leaseUUID]
 	if exists && existing.State() == StateUnusable {
-		return fmt.Errorf("%w: lease %q", ErrUnusablePlacement, leaseUUID)
+		return 0, false, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, leaseUUID)
 	}
 	if existing.Attempt != "" {
-		return fmt.Errorf("%w: lease %q targets %q", ErrAttemptConflict, leaseUUID, existing.Attempt)
+		return 0, false, fmt.Errorf("%w: lease %q targets %q", ErrAttemptConflict, leaseUUID, existing.Attempt)
 	}
 	if existing.Backend != "" && existing.Backend != backendName {
-		return fmt.Errorf("%w: lease %q is confirmed on %q, not %q",
+		return 0, false, fmt.Errorf("%w: lease %q is confirmed on %q, not %q",
 			ErrBackendConflict, leaseUUID, existing.Backend, backendName)
 	}
 
 	revision, err := s.nextRevision()
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	p := existing
 	if !exists {
@@ -368,10 +414,10 @@ func (s *Store) SetAttempting(leaseUUID, backendName string) error {
 	p.Attempt = backendName
 	p.revision = revision
 	if err := s.put(leaseUUID, p, "set attempting placement"); err != nil {
-		return err
+		return 0, false, err
 	}
 	s.revision = revision
-	return nil
+	return revision, true, nil
 }
 
 // Confirm records a positive observation. It promotes and clears a matching
@@ -575,14 +621,6 @@ func (s *Store) DeleteIfRevision(leaseUUID string, revision uint64) (bool, error
 	return true, nil
 }
 
-// SetBatch records positive backend inventory without a generation cutoff. It
-// is retained for compatibility helpers and tests; reconciliation must use
-// SetBatchIfNotNewer so an inventory fetched before a concurrent attempt cannot
-// overwrite or confirm that newer record.
-func (s *Store) SetBatch(placements map[string]string) error {
-	return s.SetBatchIfNotNewer(placements, math.MaxUint64)
-}
-
 // SetBatchIfNotNewer records positive backend inventory in one bbolt
 // transaction, but only for records whose revision is no newer than
 // maxRevision. It preserves SetAt for existing usable records, repairs unusable
@@ -592,11 +630,16 @@ func (s *Store) SetBatch(placements map[string]string) error {
 //
 // The generation cutoff is the write-side half of the reconciler's inventory
 // snapshot: a SetAttempting/Confirm that raced the fetch must win over its stale
-// result and remain for a later sweep.
-func (s *Store) SetBatchIfNotNewer(placements map[string]string, maxRevision uint64) error {
+// result and remain for a later sweep. The returned map identifies the exact
+// committed revision of every record this call changed; filtered and semantic
+// no-op observations are omitted.
+func (s *Store) SetBatchIfNotNewer(
+	placements map[string]string,
+	maxRevision uint64,
+) (map[string]uint64, error) {
 	for leaseUUID, backendName := range placements {
 		if err := validateIDs(leaseUUID, backendName); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -614,15 +657,15 @@ func (s *Store) SetBatchIfNotNewer(placements map[string]string, maxRevision uin
 			}
 			return nil
 		}); err != nil {
-			return mutationFailure("verify empty placement sync", err)
+			return nil, mutationFailure("verify empty placement sync", err)
 		}
-		return nil
+		return nil, nil
 	}
 
 	keys := slices.Sorted(maps.Keys(placements))
 	eligible := keys[:0]
 	for _, leaseUUID := range keys {
-		if s.lastMutation[leaseUUID] > maxRevision {
+		if s.mutationRevisionLocked(leaseUUID) > maxRevision {
 			continue
 		}
 		eligible = append(eligible, leaseUUID)
@@ -638,22 +681,19 @@ func (s *Store) SetBatchIfNotNewer(placements map[string]string, maxRevision uin
 			}
 			return nil
 		}); err != nil {
-			return mutationFailure("verify generation-filtered placement sync", err)
+			return nil, mutationFailure("verify generation-filtered placement sync", err)
 		}
-		return nil
+		return nil, nil
 	}
 	now := s.now().UTC()
 	nextRevision := s.revision
 	merged := make(map[string]Placement, len(placements))
 	encoded := make(map[string][]byte, len(placements))
+	mutated := keys[:0]
 	for _, leaseUUID := range keys {
-		if nextRevision == math.MaxUint64 {
-			return fmt.Errorf("placement revision exhausted")
-		}
-		nextRevision++
-
 		backendName := placements[leaseUUID]
-		p, exists := s.cache[leaseUUID]
+		existing, exists := s.cache[leaseUUID]
+		p := existing
 		if !exists || p.State() == StateUnusable {
 			p = Placement{SetAt: now}
 		}
@@ -662,13 +702,36 @@ func (s *Store) SetBatchIfNotNewer(placements map[string]string, maxRevision uin
 			p.Attempt = ""
 		}
 		p.unusable = false
+		if exists && equalPlacementIgnoringRevision(p, existing) {
+			continue
+		}
+		if nextRevision == math.MaxUint64 {
+			return nil, fmt.Errorf("placement revision exhausted")
+		}
+		nextRevision++
 		p.revision = nextRevision
 		enc, err := encodePlacement(p)
 		if err != nil {
-			return mutationFailure("encode batch placements", err)
+			return nil, mutationFailure("encode batch placements", err)
 		}
+		mutated = append(mutated, leaseUUID)
 		merged[leaseUUID] = p
 		encoded[leaseUUID] = enc
+	}
+	keys = mutated
+	if len(keys) == 0 {
+		// Exact confirmed inventory is idempotent. Verify bbolt even though no
+		// revision needs to move: callers use successful sync as authority for
+		// placement absence.
+		if err := s.db.View(func(tx *bolt.Tx) error {
+			if tx.Bucket(bucketName) == nil {
+				return errors.New("placements bucket missing")
+			}
+			return nil
+		}); err != nil {
+			return nil, mutationFailure("verify idempotent placement sync", err)
+		}
+		return nil, nil
 	}
 
 	if err := s.db.Update(func(tx *bolt.Tx) error {
@@ -680,15 +743,16 @@ func (s *Store) SetBatchIfNotNewer(placements map[string]string, maxRevision uin
 		}
 		return nil
 	}); err != nil {
-		return mutationFailure("set batch placements", err)
+		return nil, mutationFailure("set batch placements", err)
 	}
 
 	maps.Copy(s.cache, merged)
-	for leaseUUID, p := range merged {
-		s.lastMutation[leaseUUID] = p.revision
-	}
 	s.revision = nextRevision
-	return nil
+	applied := make(map[string]uint64, len(merged))
+	for leaseUUID, p := range merged {
+		applied[leaseUUID] = p.revision
+	}
+	return applied, nil
 }
 
 // SetConflictsIfNotNewer durably quarantines leases positively reported by
@@ -716,7 +780,7 @@ func (s *Store) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevisio
 	keys := slices.Sorted(maps.Keys(conflicts))
 	eligible := keys[:0]
 	for _, leaseUUID := range keys {
-		if s.lastMutation[leaseUUID] <= maxRevision {
+		if s.mutationRevisionLocked(leaseUUID) <= maxRevision {
 			eligible = append(eligible, leaseUUID)
 		}
 	}
@@ -785,9 +849,6 @@ func (s *Store) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevisio
 	}
 
 	maps.Copy(s.cache, quarantined)
-	for leaseUUID, p := range quarantined {
-		s.lastMutation[leaseUUID] = p.revision
-	}
 	s.revision = nextRevision
 	return nil
 }
@@ -811,7 +872,7 @@ func (s *Store) ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision
 	eligible := keys[:0]
 	for _, leaseUUID := range keys {
 		p, exists := s.cache[leaseUUID]
-		if exists && p.Conflict && s.lastMutation[leaseUUID] <= maxRevision {
+		if exists && p.Conflict && p.revision <= maxRevision {
 			eligible = append(eligible, leaseUUID)
 		}
 	}
@@ -821,13 +882,11 @@ func (s *Store) ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision
 	}
 
 	nextRevision := s.revision
-	tombstones := make(map[string]uint64, len(keys))
-	for _, leaseUUID := range keys {
+	for range keys {
 		if nextRevision == math.MaxUint64 {
 			return fmt.Errorf("placement revision exhausted")
 		}
 		nextRevision++
-		tombstones[leaseUUID] = nextRevision
 	}
 	if err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
@@ -842,18 +901,10 @@ func (s *Store) ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision
 	}
 	for _, leaseUUID := range keys {
 		delete(s.cache, leaseUUID)
-		s.lastMutation[leaseUUID] = tombstones[leaseUUID]
 	}
+	s.lastDeleteRevision = nextRevision
 	s.revision = nextRevision
 	return nil
-}
-
-// Count returns the number of durable keys represented in the cache, including
-// StateUnusable records.
-func (s *Store) Count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.cache)
 }
 
 // Healthy checks that the bbolt database and placement bucket are accessible.
@@ -891,6 +942,18 @@ func (s *Store) nextRevision() (uint64, error) {
 	return s.revision + 1, nil
 }
 
+// mutationRevisionLocked returns the per-record revision for a present key.
+// Absent keys share the latest deletion watermark: this may conservatively
+// defer an unrelated absent-key backfill from an old inventory, but guarantees
+// that no old inventory can recreate a key deleted after its snapshot.
+// Caller holds at least s.mu.RLock.
+func (s *Store) mutationRevisionLocked(leaseUUID string) uint64 {
+	if p, exists := s.cache[leaseUUID]; exists {
+		return p.revision
+	}
+	return s.lastDeleteRevision
+}
+
 // put writes one record to bbolt and updates the cache only after commit.
 // Caller holds s.mu.
 func (s *Store) put(leaseUUID string, p Placement, operation string) error {
@@ -904,14 +967,13 @@ func (s *Store) put(leaseUUID string, p Placement, operation string) error {
 		return mutationFailure(operation, err)
 	}
 	s.cache[leaseUUID] = p
-	s.lastMutation[leaseUUID] = p.revision
 	return nil
 }
 
-// deleteLocked durably removes one key and advances its process-local mutation
-// generation. The tombstone is intentionally in memory only: no inventory
-// snapshot survives a process restart, while retaining it in-process prevents
-// an older snapshot from recreating a record deleted by a concurrent callback.
+// deleteLocked durably removes one key and advances the process-local global
+// deletion watermark. The watermark is intentionally in memory only: no
+// inventory snapshot survives a process restart, while retaining it in-process
+// prevents an older snapshot from recreating a concurrently deleted record.
 // Caller holds s.mu.
 func (s *Store) deleteLocked(leaseUUID, operation string) error {
 	revision, err := s.nextRevision()
@@ -922,7 +984,7 @@ func (s *Store) deleteLocked(leaseUUID, operation string) error {
 		return err
 	}
 	delete(s.cache, leaseUUID)
-	s.lastMutation[leaseUUID] = revision
+	s.lastDeleteRevision = revision
 	s.revision = revision
 	return nil
 }

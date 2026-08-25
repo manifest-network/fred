@@ -58,6 +58,17 @@ func (t *testReconcilerTracker) PayloadStore() *payload.Store {
 	return t.store
 }
 
+// UntrackInFlight is a test-only cleanup adapter. Production intentionally
+// exposes only generation-scoped removal; snapshot and carry that generation
+// here so cleanup cannot delete a replacement operation that raced the test.
+func (t *testReconcilerTracker) UntrackInFlight(leaseUUID string) {
+	provision, exists := t.GetInFlight(leaseUUID)
+	if !exists {
+		return
+	}
+	t.UntrackInFlightIfGeneration(leaseUUID, provision.Generation)
+}
+
 // reconcilerTestEnv holds all components for a full-stack reconciler integration test.
 type reconcilerTestEnv struct {
 	backend      *Backend

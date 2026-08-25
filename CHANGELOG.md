@@ -8,13 +8,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fred_placement_write_failures_total` exposes failures to persist a placement
+  transition or verify a durable placement-sync point for operator alerting.
+  (ENG-632)
+- `fred_provisioner_callback_settlement_claim_wait_timeouts_total` exposes
+  callbacks that exhaust the bounded wait for another terminal settlement actor,
+  making stuck or unusually slow claim holders actionable. (ENG-632)
+
 ### Changed
+
+- Provision and restore callback URLs now carry an HMAC-covered
+  `operation_generation` query parameter. Backends must preserve and sign the
+  complete request URI, including its query, so stale callbacks cannot settle a
+  replacement operation. (ENG-632)
+- Restore now requires `placement_store_db_path`; when durable placement or the
+  generation-scoped tracker is unavailable, fred returns 503 before contacting
+  the backend. (ENG-632)
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+- Placement transitions are now write-ahead and fail closed: fred durably records
+  an attempted backend before provision or restore, distinguishes definitive
+  refusal from an ambiguous outcome, reconciles attempts only from authoritative
+  inventory, and deprovisions every known owner candidate. Callback and timeout
+  settlement is generation-scoped so an older operation cannot mutate or reject
+  its replacement. (ENG-632)
 
 ### Security
 

@@ -506,3 +506,56 @@ func TestDefaultInFlightTracker_InFlightCountsByBackend_Concurrent(t *testing.T)
 	wg.Wait()
 	assert.Equal(t, 100, tr.InFlightCountsByBackend()["docker-1"])
 }
+
+func TestTracker_LeaseActionMutationFence(t *testing.T) {
+	t.Run("completed action after boundary is stale", func(t *testing.T) {
+		tracker := NewInFlightTracker()
+		cutoff := tracker.SnapshotMutationRevision()
+		require.True(t, tracker.TryClaimLeaseAction("lease-1"))
+		require.True(t, tracker.ReleaseLeaseAction("lease-1"))
+
+		claimed, stale := tracker.TryClaimLeaseActionIfNotNewer("lease-1", cutoff)
+		assert.False(t, claimed)
+		assert.True(t, stale)
+	})
+
+	t.Run("action straddling boundary is stale after release", func(t *testing.T) {
+		tracker := NewInFlightTracker()
+		require.True(t, tracker.TryClaimLeaseAction("lease-1"))
+		cutoff := tracker.SnapshotMutationRevision()
+		require.True(t, tracker.ReleaseLeaseAction("lease-1"))
+
+		claimed, stale := tracker.TryClaimLeaseActionIfNotNewer("lease-1", cutoff)
+		assert.False(t, claimed)
+		assert.True(t, stale)
+	})
+
+	t.Run("reconciler claim blocks events through in-flight cleanup", func(t *testing.T) {
+		tracker := NewInFlightTracker()
+		cutoff := tracker.SnapshotMutationRevision()
+		claimed, stale := tracker.TryClaimLeaseActionIfNotNewer("lease-1", cutoff)
+		require.True(t, claimed)
+		require.False(t, stale)
+
+		_, eventTracked := tracker.TryTrackInFlightWithGeneration(
+			"lease-1", "tenant-a", nil, "backend-a",
+		)
+		assert.False(t, eventTracked)
+		generation, reconcileTracked, stale := tracker.TryTrackInFlightWithGenerationIfNotNewer(
+			"lease-1", "tenant-a", nil, "backend-a", cutoff,
+		)
+		assert.True(t, reconcileTracked)
+		assert.False(t, stale)
+
+		require.True(t, tracker.UntrackInFlightIfGeneration("lease-1", generation))
+		_, eventTracked = tracker.TryTrackInFlightWithGeneration(
+			"lease-1", "tenant-a", nil, "backend-a",
+		)
+		assert.False(t, eventTracked, "preflight cleanup must not expose the lease before the worker finishes")
+		require.True(t, tracker.ReleaseLeaseAction("lease-1"))
+		_, eventTracked = tracker.TryTrackInFlightWithGeneration(
+			"lease-1", "tenant-a", nil, "backend-a",
+		)
+		assert.True(t, eventTracked)
+	})
+}

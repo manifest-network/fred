@@ -65,7 +65,10 @@ type ProvisionOrchestrator struct {
 	placementStore  PlacementStore
 }
 
-var errProvisionAttemptPending = errors.New("lease already has an unresolved durable provision attempt")
+// ErrProvisionAttemptPending means a prior backend call still has an unknown
+// outcome. Callers must not send another operation until reconciliation settles
+// the durable attempt.
+var ErrProvisionAttemptPending = errors.New("lease already has an unresolved durable provision attempt")
 
 // ErrPlacementStoreUnavailable means a placement-dependent write path was
 // invoked without durable placement storage. Such paths must fail closed before
@@ -80,28 +83,14 @@ func setProvisionAttempt(store PlacementStore, leaseUUID, backendName string) (u
 	if store == nil {
 		return 0, nil
 	}
-	if p := store.Lookup(leaseUUID); p.Attempt != "" {
-		return 0, errProvisionAttemptPending
-	}
-	if err := store.SetAttempting(leaseUUID, backendName); err != nil {
-		// Close the check/write race without depending on a concrete-store
-		// sentinel: if another writer durably installed an attempt, this call is
-		// an idempotent skip. A genuine storage or semantic failure still fails
-		// closed.
+	revision, err := store.SetAttempting(leaseUUID, backendName)
+	if err != nil {
 		if errors.Is(err, placement.ErrAttemptConflict) {
-			return 0, errProvisionAttemptPending
-		}
-		if p := store.Lookup(leaseUUID); p.Attempt != "" {
-			return 0, errProvisionAttemptPending
+			return 0, ErrProvisionAttemptPending
 		}
 		return 0, err
 	}
-	p := store.Lookup(leaseUUID)
-	if p.Attempt != backendName {
-		return 0, fmt.Errorf("placement attempt changed before backend call: lease %s targets %q, expected %q",
-			leaseUUID, p.Attempt, backendName)
-	}
-	return p.Revision(), nil
+	return revision, nil
 }
 
 // settleProvisionAttempt applies the placement transition implied by a
@@ -177,7 +166,7 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	}
 
 	// Atomically track in-flight BEFORE calling Provision to prevent:
-	// 1. Race with reconciler (TOCTOU between IsInFlight check and TrackInFlight)
+	// 1. Race with reconciler (both use TryTrackInFlightWithGeneration)
 	// 2. Race with fast backend response (callback arriving before tracking)
 	inFlightGeneration, tracked := o.tracker.TryTrackInFlightWithGeneration(
 		lease.Uuid, lease.Tenant, items, backendClient.Name(),
@@ -209,7 +198,7 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	attemptRevision, err := setProvisionAttempt(o.placementStore, lease.Uuid, backendClient.Name())
 	if err != nil {
 		o.tracker.UntrackInFlightIfGeneration(lease.Uuid, inFlightGeneration)
-		if errors.Is(err, errProvisionAttemptPending) {
+		if errors.Is(err, ErrProvisionAttemptPending) {
 			slog.Debug("lease already has an unresolved durable attempt, skipping backend call",
 				"lease_uuid", lease.Uuid,
 				"routed_backend", backendClient.Name(),
@@ -337,17 +326,6 @@ func routeForProvisionHonoringPlacement(
 	return router.RouteForProvision(ctx, sku, inFlightByBackend), nil
 }
 
-// DeletePlacement removes a placement unconditionally. New callback paths use
-// DeletePlacementIfOwned below; this method remains for callers that have
-// already established exclusive terminal ownership.
-func (o *ProvisionOrchestrator) DeletePlacement(leaseUUID string) {
-	if o.placementStore != nil {
-		if err := o.placementStore.Delete(leaseUUID); err != nil {
-			slog.Warn("failed to delete placement", "lease_uuid", leaseUUID, "error", err)
-		}
-	}
-}
-
 // SetPlacementAttempting exposes the same fail-closed write-ahead primitive to
 // restore. The API must call it before backend.Restore.
 func (o *ProvisionOrchestrator) SetPlacementAttempting(leaseUUID, backendName string) (uint64, error) {
@@ -403,26 +381,6 @@ func (o *ProvisionOrchestrator) ClearPlacementAttempt(leaseUUID, backendName str
 	return err
 }
 
-// ConfirmPlacementAttempt confirms a callback only when the record still
-// carries the matching unresolved attempt. It is used for replayed/non-in-flight
-// callbacks after a process restart; unrelated restart/update callbacks are a
-// no-op because they have no attempt.
-func (o *ProvisionOrchestrator) ConfirmPlacementAttempt(leaseUUID, backendName string) error {
-	if o.placementStore == nil || backendName == "" {
-		return nil
-	}
-	p := o.placementStore.Lookup(leaseUUID)
-	if p.Attempt == "" {
-		return nil
-	}
-	if p.Attempt != backendName {
-		return fmt.Errorf("placement attempt for lease %s is %q, not callback backend %q",
-			leaseUUID, p.Attempt, backendName)
-	}
-	_, err := o.placementStore.ConfirmAttemptIfRevision(leaseUUID, backendName, p.Revision())
-	return err
-}
-
 // DeletePlacementIfOwned removes terminal PENDING placement only when every
 // backend named by the current record belongs to this operation. Delete uses
 // the observed revision so a concurrent sync/attempt wins rather than being
@@ -470,10 +428,63 @@ func (o *ProvisionOrchestrator) DeletePlacementIfOwned(leaseUUID, backendName st
 // an unresolved fallback sweep reaches every configured backend without error
 // and no positively named candidate lies outside the current configuration.
 func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID string) error {
-	provision, wasInFlight := o.tracker.PopInFlight(leaseUUID)
+	var provision InFlightProvision
+	wasInFlight := false
+	claimFinished := false
+	leaseActionClaimed := false
+	if observed, exists := o.tracker.GetInFlight(leaseUUID); exists {
+		claimed, ok := o.tracker.TryClaimInFlightForDeprovision(leaseUUID, observed.Generation)
+		if !ok {
+			// The observed generation either changed or is already owned by a
+			// callback/timeout settlement actor. Do not proceed without its backend
+			// candidate and do not steal its claim; the close event can retry after
+			// that exact generation settles or releases ownership.
+			return fmt.Errorf("%w: lease %s: in-flight generation %d is already being settled",
+				ErrDeprovisionFailed, leaseUUID, observed.Generation)
+		}
+		provision = claimed
+		wasInFlight = true
+		defer func() {
+			// Every fallible backend/routing path, and a backend panic unwinding the
+			// ordinary call stack, leaves this exact generation retryable.
+			if !claimFinished && !o.tracker.ReleaseInFlightClaim(leaseUUID, provision.Generation) {
+				slog.Error("failed to release deprovision settlement claim",
+					"lease_uuid", leaseUUID,
+					"backend", provision.Backend,
+					"generation", provision.Generation,
+				)
+			}
+		}()
+	} else {
+		// A close without an in-flight provision still races reconciliation. Hold
+		// the same lease action fence workers use so a stale chain/backend snapshot
+		// cannot provision while teardown is in progress (or vice versa).
+		if !o.tracker.TryClaimLeaseAction(leaseUUID) {
+			return fmt.Errorf("%w: lease %s: another lifecycle action owns the lease",
+				ErrDeprovisionFailed, leaseUUID)
+		}
+		leaseActionClaimed = true
+		defer func() {
+			if leaseActionClaimed && !o.tracker.ReleaseLeaseAction(leaseUUID) {
+				slog.Error("failed to release deprovision lease action claim",
+					"lease_uuid", leaseUUID)
+			}
+		}()
+	}
+	finishInFlight := func() error {
+		if !wasInFlight {
+			return nil
+		}
+		if !o.tracker.FinishClaimedInFlight(leaseUUID, provision.Generation) {
+			return fmt.Errorf("%w: lease %s: lost claim for in-flight generation %d",
+				ErrDeprovisionFailed, leaseUUID, provision.Generation)
+		}
+		claimFinished = true
+		return nil
+	}
 
 	// Every positively named backend is a possible holder. Backend and Attempt
-	// are independent facts, and the popped in-flight entry may predate either;
+	// are independent facts, and the claimed in-flight entry may predate either;
 	// deprovision all distinct candidates rather than allowing one to overwrite
 	// another.
 	candidateNames := make([]string, 0, 3)
@@ -552,7 +563,7 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 		// index of where the lease's data lives; if the backend retained the
 		// volumes, the placement must survive close so a restore can route to it.
 		// The reconciler is the sole pruner (cleanupOrphanedPlacements).
-		return nil
+		return finishInFlight()
 	}
 
 	// Fallback: backend could not be positively resolved → sweep all backends.
@@ -606,5 +617,5 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 	if len(sweepErrs) > 0 {
 		return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, errors.Join(sweepErrs...))
 	}
-	return nil
+	return finishInFlight()
 }

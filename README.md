@@ -198,8 +198,9 @@ backends:
 callback_base_url: "http://fred.provider.example.com:8080"
 callback_secret: "your-32-character-or-longer-secret-here"
 
-# Required for multi-backend setups (multiple backends sharing match criteria).
-# Records which backend serves each lease so reads hit the right machine.
+# Required for restore and multi-backend setups (multiple backends sharing
+# match criteria). Records durable attempts and confirmed ownership so reads,
+# reconciliation, restore, and deprovision reach the right machine.
 # placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
@@ -255,7 +256,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
-| `placement_store_db_path` | Path to bbolt database for lease→backend placement tracking (required for multi-backend routing) | (optional) |
+| `placement_store_db_path` | Path to the durable lease→backend placement database. Required for restore and correct multi-backend routing; restore returns 503 before contacting a backend when disabled | (optional only when restore and multi-backend routing are unused) |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 > **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
@@ -805,12 +806,12 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
 ### Provision Callback (Backend -> Fred)
 
 ```
-POST /callbacks/provision
+POST /callbacks/provision?operation_generation=<uint64>
 Content-Type: application/json
 X-Fred-Signature: t=<unix-timestamp>,sha256=<hmac-sha256-hex>
 ```
 
-Called by backends to report provisioning status. Requires HMAC-SHA256 authentication via the `X-Fred-Signature` header. See [SECURITY.md](SECURITY.md#callback-authentication-hmac-sha256) for signing details and replay protection.
+Called by backends to report provisioning status. Provision and restore callback URLs carry an `operation_generation` query parameter that must be preserved byte-for-byte; the HMAC covers the complete request URI, including this query. Requires HMAC-SHA256 authentication via the `X-Fred-Signature` header. See [SECURITY.md](SECURITY.md#callback-authentication-hmac-sha256) for signing details and replay protection.
 
 **Request:**
 ```json
@@ -883,7 +884,7 @@ Start provisioning a resource (async).
     {"sku": "k8s-small", "quantity": 2},
     {"sku": "k8s-large", "quantity": 1}
   ],
-  "callback_url": "http://fred.example.com:8080/callbacks/provision",
+  "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_generation=42",
   "payload": "<base64-encoded-bytes>",
   "payload_hash": "abc123..."
 }
@@ -1062,7 +1063,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
-  "callback_url": "http://fred.example.com:8080/callbacks/provision"
+  "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_generation=42"
 }
 ```
 
@@ -1213,7 +1214,7 @@ curl -X POST http://localhost:9000/provision \
     "tenant": "manifest1abc",
     "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
     "items": [{"sku": "mock-resource", "quantity": 1}],
-    "callback_url": "http://localhost:8080/callbacks/provision"
+    "callback_url": "http://localhost:8080/callbacks/provision?operation_generation=42"
   }'
 ```
 

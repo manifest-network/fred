@@ -7,37 +7,44 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 )
 
-// TrackInFlight delegates to the tracker.
-func (m *Manager) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
-	m.tracker.TrackInFlight(leaseUUID, tenant, items, backendName)
-}
-
-// TryTrackInFlight delegates to the tracker.
-func (m *Manager) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	return m.tracker.TryTrackInFlight(leaseUUID, tenant, items, backendName)
-}
-
 // TryTrackInFlightWithGeneration delegates to the tracker.
 func (m *Manager) TryTrackInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool) {
 	return m.tracker.TryTrackInFlightWithGeneration(leaseUUID, tenant, items, backendName)
 }
 
-// TryTrackRestoreInFlight delegates to the tracker. It lets the API restore
-// handler register the new lease in-flight (as a restore) so the restore's
-// provision callback is acknowledged inline rather than ~one reconciler interval
-// later (ENG-358).
-func (m *Manager) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	return m.tracker.TryTrackRestoreInFlight(leaseUUID, tenant, items, backendName)
+func (m *Manager) TryTrackInFlightWithGenerationIfNotNewer(
+	leaseUUID, tenant string,
+	items []backend.LeaseItem,
+	backendName string,
+	maxRevision uint64,
+) (uint64, bool, bool) {
+	return m.tracker.TryTrackInFlightWithGenerationIfNotNewer(
+		leaseUUID, tenant, items, backendName, maxRevision,
+	)
+}
+
+func (m *Manager) SnapshotMutationRevision() uint64 {
+	return m.tracker.SnapshotMutationRevision()
+}
+
+func (m *Manager) TryClaimLeaseActionIfNotNewer(
+	leaseUUID string,
+	maxRevision uint64,
+) (bool, bool) {
+	return m.tracker.TryClaimLeaseActionIfNotNewer(leaseUUID, maxRevision)
+}
+
+func (m *Manager) TryClaimLeaseAction(leaseUUID string) bool {
+	return m.tracker.TryClaimLeaseAction(leaseUUID)
+}
+
+func (m *Manager) ReleaseLeaseAction(leaseUUID string) bool {
+	return m.tracker.ReleaseLeaseAction(leaseUUID)
 }
 
 // TryTrackRestoreInFlightWithGeneration delegates to the tracker.
 func (m *Manager) TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool) {
 	return m.tracker.TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant, items, backendName)
-}
-
-// UntrackInFlight delegates to the tracker.
-func (m *Manager) UntrackInFlight(leaseUUID string) {
-	m.tracker.UntrackInFlight(leaseUUID)
 }
 
 // UntrackInFlightIfGeneration delegates to the tracker.
@@ -47,6 +54,10 @@ func (m *Manager) UntrackInFlightIfGeneration(leaseUUID string, generation uint6
 
 func (m *Manager) TryClaimInFlight(leaseUUID string, generation uint64) (InFlightProvision, bool) {
 	return m.tracker.TryClaimInFlight(leaseUUID, generation)
+}
+
+func (m *Manager) TryClaimInFlightForDeprovision(leaseUUID string, generation uint64) (InFlightProvision, bool) {
+	return m.tracker.TryClaimInFlightForDeprovision(leaseUUID, generation)
 }
 
 func (m *Manager) ReleaseInFlightClaim(leaseUUID string, generation uint64) bool {
@@ -60,11 +71,6 @@ func (m *Manager) FinishClaimedInFlight(leaseUUID string, generation uint64) boo
 // IsInFlight delegates to the tracker.
 func (m *Manager) IsInFlight(leaseUUID string) bool {
 	return m.tracker.IsInFlight(leaseUUID)
-}
-
-// PopInFlight delegates to the tracker.
-func (m *Manager) PopInFlight(leaseUUID string) (InFlightProvision, bool) {
-	return m.tracker.PopInFlight(leaseUUID)
 }
 
 // GetInFlight delegates to the tracker.
@@ -134,6 +140,5 @@ var _ interface {
 	ConfirmPlacementIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
 	ClearPlacementAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
 	TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool)
-	UntrackInFlight(leaseUUID string)
 	UntrackInFlightIfGeneration(leaseUUID string, generation uint64) bool
 } = (*Manager)(nil)

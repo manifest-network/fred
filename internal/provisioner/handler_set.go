@@ -18,7 +18,15 @@ import (
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
+
+const (
+	callbackSettlementClaimPollInterval = 25 * time.Millisecond
+	callbackSettlementClaimMaxWait      = 30 * time.Second
+)
+
+var errCallbackSettlementClaimTimeout = errors.New("timed out waiting for callback settlement claim")
 
 // HandlerDeps contains the dependencies needed by the handler set.
 type HandlerDeps struct {
@@ -37,6 +45,154 @@ type HandlerSet struct {
 	deps            HandlerDeps
 	awaitingMu      sync.Mutex
 	awaitingPayload map[string]struct{} // tracks lease UUIDs awaiting payload for gauge accuracy
+}
+
+// isPermanentPlacementVerdict reports semantic placement decisions that the
+// same callback can never repair by retrying. They are deliberately distinct
+// from storage/I/O failures: an authenticated success callback is still
+// positive backend evidence, while retrying a semantic conflict until the
+// poison queue drops it can leave a live lease to be rejected by the timeout
+// checker.
+func isPermanentPlacementVerdict(err error) bool {
+	return errors.Is(err, placement.ErrInvalidPlacement) ||
+		errors.Is(err, placement.ErrAttemptConflict) ||
+		errors.Is(err, placement.ErrBackendConflict) ||
+		errors.Is(err, placement.ErrUnusablePlacement) ||
+		errors.Is(err, placement.ErrAttemptMismatch)
+}
+
+// waitForCallbackSettlementClaim waits for ownership of one exact in-flight
+// generation. It returns ownsClaim=false when another actor completed or
+// replaced that generation while we waited, and reports a deprovision-owned
+// claim separately so backend status can be observed without settling the
+// provision operation. The hard deadline bounds a leaked/slow foreign claim
+// without stealing it: forced reclamation would let two concurrent chain
+// operations believe they both own terminal settlement.
+func waitForCallbackSettlementClaim(
+	ctx context.Context,
+	tracker InFlightTracker,
+	provision InFlightProvision,
+	maxWait time.Duration,
+) (claimed InFlightProvision, ownsClaim, deprovisionOwned bool, err error) {
+	if claimed, ok := tracker.TryClaimInFlight(provision.LeaseUUID, provision.Generation); ok {
+		return claimed, true, false, nil
+	}
+
+	started := time.Now()
+	timedOut := func() error {
+		waited := time.Since(started)
+		metrics.CallbackSettlementClaimWaitTimeoutsTotal.Inc()
+		slog.Error("timed out waiting for callback settlement claim",
+			"lease_uuid", provision.LeaseUUID,
+			"backend", provision.Backend,
+			"generation", provision.Generation,
+			"waited", waited,
+		)
+		return fmt.Errorf("%w after %s", errCallbackSettlementClaimTimeout, waited)
+	}
+	if maxWait <= 0 {
+		return InFlightProvision{}, false, false, timedOut()
+	}
+	ticker := time.NewTicker(callbackSettlementClaimPollInterval)
+	defer ticker.Stop()
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+
+	slog.Warn("callback settlement claim is contended; waiting for exact generation",
+		"lease_uuid", provision.LeaseUUID,
+		"backend", provision.Backend,
+		"generation", provision.Generation,
+		"max_wait", maxWait,
+	)
+
+	for {
+		// The timer case below wakes the loop efficiently. This elapsed check
+		// makes the bound strict even if the ticker and timer become ready in the
+		// same select and the runtime chooses the ticker first.
+		if time.Since(started) >= maxWait {
+			return InFlightProvision{}, false, false, timedOut()
+		}
+		current, stillExists := tracker.GetInFlight(provision.LeaseUUID)
+		if !stillExists {
+			slog.Info("callback generation settled while waiting for claim",
+				"lease_uuid", provision.LeaseUUID,
+				"backend", provision.Backend,
+				"generation", provision.Generation,
+				"waited", time.Since(started),
+			)
+			return InFlightProvision{}, false, false, nil
+		}
+		if current.Generation != provision.Generation {
+			slog.Info("callback generation was replaced while waiting for claim",
+				"lease_uuid", provision.LeaseUUID,
+				"backend", provision.Backend,
+				"generation", provision.Generation,
+				"replacement_generation", current.Generation,
+				"waited", time.Since(started),
+			)
+			return InFlightProvision{}, false, false, nil
+		}
+		if current.settlementOwner == inFlightSettlementDeprovision {
+			return current, false, true, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return InFlightProvision{}, false, false, ctx.Err()
+		case <-timer.C:
+			return InFlightProvision{}, false, false, timedOut()
+		case <-ticker.C:
+			// Both timer and ticker can become ready at the deadline. Recheck
+			// elapsed time before accepting a newly available claim so select's
+			// pseudo-random choice cannot extend the hard bound.
+			if time.Since(started) >= maxWait {
+				return InFlightProvision{}, false, false, timedOut()
+			}
+			claimed, ok := tracker.TryClaimInFlight(provision.LeaseUUID, provision.Generation)
+			if !ok {
+				continue
+			}
+			slog.Info("acquired callback settlement claim after contention",
+				"lease_uuid", provision.LeaseUUID,
+				"backend", provision.Backend,
+				"generation", provision.Generation,
+				"waited", time.Since(started),
+			)
+			return claimed, true, false, nil
+		}
+	}
+}
+
+func (h *HandlerSet) publishRetainedLeaseNotice(leaseUUID string) {
+	h.publishLeaseEvent(leaseUUID, backend.ProvisionStatusRetained,
+		"your lease data was retained and can be restored within the grace window: create a fresh PENDING lease of matching shape, then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID")
+}
+
+func (h *HandlerSet) handleDeprovisionOwnedCallback(
+	callback backend.CallbackPayload,
+	provision InFlightProvision,
+) {
+	switch callback.Status {
+	case backend.CallbackStatusDeprovisioned:
+		if callback.Retained {
+			h.publishRetainedLeaseNotice(callback.LeaseUUID)
+		}
+	case backend.CallbackStatusFailed:
+		h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
+	case backend.CallbackStatusSuccess:
+		slog.Warn("ignoring success callback emitted while deprovision owns the operation",
+			"lease_uuid", callback.LeaseUUID,
+			"backend", provision.Backend,
+			"generation", provision.Generation,
+		)
+	}
+	slog.Info("observed callback for deprovision-owned in-flight operation",
+		"lease_uuid", callback.LeaseUUID,
+		"backend", provision.Backend,
+		"generation", provision.Generation,
+		"status", callback.Status,
+		"retained", callback.Retained,
+	)
 }
 
 // NewHandlerSet creates a new HandlerSet with the given dependencies.
@@ -225,8 +381,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			// retention status is the durable backstop, so there is no marker or
 			// reaper here). A non-retain deprovision emits nothing.
 			if callback.Retained {
-				h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusRetained,
-					"your lease data was retained and can be restored within the grace window: create a fresh PENDING lease of matching shape, then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID")
+				h.publishRetainedLeaseNotice(callback.LeaseUUID)
 			}
 		default:
 			slog.Warn("unexpected callback status for non-in-flight lease",
@@ -265,26 +420,32 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		)
 		return nil
 	}
-	claimed, claimedOK := h.deps.Tracker.TryClaimInFlight(callback.LeaseUUID, provision.Generation)
-	for !claimedOK {
-		// A timeout or duplicate delivery may hold this generation's settlement
-		// claim across a slow chain call. Waiting here keeps the authenticated
-		// callback live; relying on Watermill's finite short retries could poison
-		// the only success callback before a transient timeout rejection releases
-		// its claim.
-		current, stillExists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
-		if !stillExists || current.Generation != provision.Generation {
-			// The claimant completed this generation. In particular, never fall
-			// through to the non-in-flight restart/update path or touch a replacement.
-			return nil
-		}
-		select {
-		case <-msg.Context().Done():
-			return fmt.Errorf("wait to settle callback for lease %s: %w",
-				callback.LeaseUUID, msg.Context().Err())
-		case <-time.After(25 * time.Millisecond):
-		}
-		claimed, claimedOK = h.deps.Tracker.TryClaimInFlight(callback.LeaseUUID, provision.Generation)
+	// A callback emitted by Backend.Deprovision is evidence about the close RPC,
+	// not a provisioning result to settle on chain. The close path deliberately
+	// owns the exact generation across every candidate RPC so a later candidate
+	// failure remains retryable. Consume the status notification without waiting
+	// for or finishing that claim; Deprovision will finish or release it. The
+	// owner tag is essential: an autonomous deprovision callback with no active
+	// close still follows ordinary terminal settlement below.
+	if provision.settlementOwner == inFlightSettlementDeprovision {
+		h.handleDeprovisionOwnedCallback(callback, provision)
+		return nil
+	}
+
+	claimed, ownsClaim, deprovisionOwned, err := waitForCallbackSettlementClaim(
+		msg.Context(), h.deps.Tracker, provision, callbackSettlementClaimMaxWait,
+	)
+	if err != nil {
+		return fmt.Errorf("wait to settle callback for lease %s: %w", callback.LeaseUUID, err)
+	}
+	if deprovisionOwned {
+		h.handleDeprovisionOwnedCallback(callback, claimed)
+		return nil
+	}
+	if !ownsClaim {
+		// The claimant completed or replaced this generation. Never fall through to
+		// the general non-in-flight restart/update path or touch a replacement.
+		return nil
 	}
 	provision = claimed
 	defer h.deps.Tracker.ReleaseInFlightClaim(callback.LeaseUUID, provision.Generation)
@@ -309,15 +470,28 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	switch callback.Status {
 	case backend.CallbackStatusSuccess:
 		// Repair any Attempt left behind by a failed synchronous Confirm before
-		// moving the lease on chain. On error, keep the in-flight entry and let
-		// Watermill retry this durable callback.
+		// moving the lease on chain. Storage errors retain the in-flight entry for
+		// retry; permanent semantic verdicts preserve the conflicting record but
+		// cannot be repaired by replaying this authenticated success callback.
 		if err := h.deps.Orchestrator.ConfirmPlacement(callback.LeaseUUID, provision.Backend); err != nil {
-			slog.Error("failed to confirm placement from success callback, keeping in-flight",
+			if !isPermanentPlacementVerdict(err) {
+				slog.Error("failed to confirm placement from success callback, keeping in-flight",
+					"lease_uuid", callback.LeaseUUID,
+					"backend", provision.Backend,
+					"error", err,
+				)
+				return fmt.Errorf("confirm placement for lease %s: %w", callback.LeaseUUID, err)
+			}
+			// The backend/generation checks above authenticate this positive result.
+			// A durable semantic conflict must remain untouched for inventory/operator
+			// repair, but it must not poison the success callback and let the timeout
+			// path reject a lease that is already live on this backend.
+			slog.Error("placement rejected success callback confirmation; continuing chain acknowledgement",
 				"lease_uuid", callback.LeaseUUID,
 				"backend", provision.Backend,
+				"generation", provision.Generation,
 				"error", err,
 			)
-			return fmt.Errorf("confirm placement for lease %s: %w", callback.LeaseUUID, err)
 		}
 
 		// Acknowledge the lease on chain via batcher to avoid sequence mismatch errors
@@ -458,6 +632,24 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			"rejected", rejected,
 			"tx_hashes", txHashes,
 			"reason", reason,
+		)
+
+	case backend.CallbackStatusDeprovisioned:
+		// Without a close-owned claim this is an autonomous terminal callback.
+		// Preserve the historical behavior of releasing the stuck provisioning
+		// entry, while still surfacing retained-data ground truth.
+		h.deps.Tracker.FinishClaimedInFlight(callback.LeaseUUID, provision.Generation)
+		recordDuration()
+		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, provision.Backend, operation).Inc()
+		if callback.Retained {
+			h.publishRetainedLeaseNotice(callback.LeaseUUID)
+		}
+		slog.Warn("deprovision callback settled an in-flight provisioning operation",
+			"lease_uuid", callback.LeaseUUID,
+			"tenant", provision.Tenant,
+			"backend", provision.Backend,
+			"generation", provision.Generation,
+			"retained", callback.Retained,
 		)
 
 	default:
