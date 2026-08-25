@@ -139,17 +139,20 @@ type record struct {
 type Store struct {
 	db    *bolt.DB
 	cache map[string]Placement
-	// lastDeleteRevision is a process-local, global tombstone for absent keys.
-	// An inventory snapshot older than any deletion cannot distinguish which
-	// absent key was deleted, so it conservatively creates none. This O(1)
-	// watermark preserves stale-snapshot safety without retaining an unbounded
-	// per-lease tombstone map. No snapshot survives a process restart.
-	lastDeleteRevision uint64
-	now                func() time.Time
-	revision           uint64
-	mu                 sync.RWMutex
-	closeOnce          sync.Once
-	closeErr           error
+	// deleteRevisions fences stale inventory from recreating an exact key that
+	// was deleted after its snapshot began. Entries exist only while at least one
+	// registered inventory snapshot could still need them, so unrelated keys do
+	// not share a global fence and tombstones do not grow for the process lifetime.
+	deleteRevisions map[string]uint64
+	// activeSnapshots counts registered inventory cutoffs. More than one caller
+	// may begin at the same revision, so a refcount is required before tombstones
+	// at that cutoff can be pruned.
+	activeSnapshots map[uint64]uint64
+	now             func() time.Time
+	revision        uint64
+	mu              sync.RWMutex
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // Option configures a Store at construction.
@@ -199,10 +202,12 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 	}
 
 	s := &Store{
-		db:       db,
-		cache:    cache,
-		now:      time.Now,
-		revision: revision,
+		db:              db,
+		cache:           cache,
+		deleteRevisions: make(map[string]uint64),
+		activeSnapshots: make(map[uint64]uint64),
+		now:             time.Now,
+		revision:        revision,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -334,13 +339,45 @@ func (s *Store) List() map[string]Placement {
 	return out
 }
 
-// SnapshotRevision returns the store's current global revision. Records written
-// after this call receive a greater revision, allowing a fleet inventory sweep
-// to reject placement decisions newer than the inventory it fetched.
+// SnapshotRevision returns the store's current global revision for immediate
+// identity/CAS checks on present records. It does not register deletion fences;
+// callers that will fetch external inventory or conditionally recreate absent
+// keys must keep that work inside BeginInventorySnapshot/EndInventorySnapshot.
 func (s *Store) SnapshotRevision() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.revision
+}
+
+// BeginInventorySnapshot registers the current revision as the causal cutoff
+// for one fleet inventory. Deletions committed while that snapshot is active
+// retain exact-key tombstones until EndInventorySnapshot releases the cutoff.
+// Ordinary identity checks that cannot recreate an absent key may use
+// SnapshotRevision instead.
+func (s *Store) BeginInventorySnapshot() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	revision := s.revision
+	s.activeSnapshots[revision]++
+	return revision
+}
+
+// EndInventorySnapshot releases a cutoff returned by BeginInventorySnapshot
+// and prunes deletion tombstones that no remaining inventory can predate.
+func (s *Store) EndInventorySnapshot(revision uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	count := s.activeSnapshots[revision]
+	switch count {
+	case 0:
+		return
+	case 1:
+		delete(s.activeSnapshots, revision)
+	default:
+		s.activeSnapshots[revision] = count - 1
+	}
+	s.pruneDeleteRevisionsLocked()
 }
 
 // SetAttempting durably records the target before any backend call. It refuses
@@ -630,16 +667,17 @@ func (s *Store) DeleteIfRevision(leaseUUID string, revision uint64) (bool, error
 //
 // The generation cutoff is the write-side half of the reconciler's inventory
 // snapshot: a SetAttempting/Confirm that raced the fetch must win over its stale
-// result and remain for a later sweep. The returned map identifies the exact
-// committed revision of every record this call changed; filtered and semantic
-// no-op observations are omitted.
+// result and remain for a later sweep. The first returned map identifies the
+// exact committed revision of every record this call changed. The second names
+// observations rejected by the revision fence, which callers must keep as
+// lease-local untrusted-absence exceptions. Semantic no-ops appear in neither.
 func (s *Store) SetBatchIfNotNewer(
 	placements map[string]string,
 	maxRevision uint64,
-) (map[string]uint64, error) {
+) (map[string]uint64, map[string]struct{}, error) {
 	for leaseUUID, backendName := range placements {
 		if err := validateIDs(leaseUUID, backendName); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -657,15 +695,17 @@ func (s *Store) SetBatchIfNotNewer(
 			}
 			return nil
 		}); err != nil {
-			return nil, mutationFailure("verify empty placement sync", err)
+			return nil, nil, mutationFailure("verify empty placement sync", err)
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	keys := slices.Sorted(maps.Keys(placements))
 	eligible := keys[:0]
+	fenced := make(map[string]struct{})
 	for _, leaseUUID := range keys {
 		if s.mutationRevisionLocked(leaseUUID) > maxRevision {
+			fenced[leaseUUID] = struct{}{}
 			continue
 		}
 		eligible = append(eligible, leaseUUID)
@@ -681,9 +721,9 @@ func (s *Store) SetBatchIfNotNewer(
 			}
 			return nil
 		}); err != nil {
-			return nil, mutationFailure("verify generation-filtered placement sync", err)
+			return nil, fenced, mutationFailure("verify generation-filtered placement sync", err)
 		}
-		return nil, nil
+		return nil, fenced, nil
 	}
 	now := s.now().UTC()
 	nextRevision := s.revision
@@ -706,13 +746,13 @@ func (s *Store) SetBatchIfNotNewer(
 			continue
 		}
 		if nextRevision == math.MaxUint64 {
-			return nil, fmt.Errorf("placement revision exhausted")
+			return nil, fenced, fmt.Errorf("placement revision exhausted")
 		}
 		nextRevision++
 		p.revision = nextRevision
 		enc, err := encodePlacement(p)
 		if err != nil {
-			return nil, mutationFailure("encode batch placements", err)
+			return nil, fenced, mutationFailure("encode batch placements", err)
 		}
 		mutated = append(mutated, leaseUUID)
 		merged[leaseUUID] = p
@@ -729,9 +769,9 @@ func (s *Store) SetBatchIfNotNewer(
 			}
 			return nil
 		}); err != nil {
-			return nil, mutationFailure("verify idempotent placement sync", err)
+			return nil, fenced, mutationFailure("verify idempotent placement sync", err)
 		}
-		return nil, nil
+		return nil, fenced, nil
 	}
 
 	if err := s.db.Update(func(tx *bolt.Tx) error {
@@ -743,16 +783,19 @@ func (s *Store) SetBatchIfNotNewer(
 		}
 		return nil
 	}); err != nil {
-		return nil, mutationFailure("set batch placements", err)
+		return nil, fenced, mutationFailure("set batch placements", err)
 	}
 
 	maps.Copy(s.cache, merged)
+	for leaseUUID := range merged {
+		delete(s.deleteRevisions, leaseUUID)
+	}
 	s.revision = nextRevision
 	applied := make(map[string]uint64, len(merged))
 	for leaseUUID, p := range merged {
 		applied[leaseUUID] = p.revision
 	}
-	return applied, nil
+	return applied, fenced, nil
 }
 
 // SetConflictsIfNotNewer durably quarantines leases positively reported by
@@ -760,33 +803,41 @@ func (s *Store) SetBatchIfNotNewer(
 // owner, but preserves those names together with every reporting backend in a
 // durable candidate set. No individual status may drive chain actions while the
 // conflict remains, yet deprovision and later reconciliation can still account
-// for every backend that was ever positively identified.
-func (s *Store) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) error {
+// for every backend that was ever positively identified. The returned set names
+// conflicts rejected by the revision fence so callers can preserve lease-local
+// untrusted-absence state instead of treating a filtered quarantine as durable.
+func (s *Store) SetConflictsIfNotNewer(
+	conflicts map[string][]string,
+	maxRevision uint64,
+) (map[string]struct{}, error) {
 	for leaseUUID, backendNames := range conflicts {
 		if leaseUUID == "" {
-			return fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
+			return nil, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
 		}
 		if len(normalizeBackendNames(backendNames)) < 2 {
-			return fmt.Errorf("%w: conflict for lease %q requires at least two backends",
+			return nil, fmt.Errorf("%w: conflict for lease %q requires at least two backends",
 				ErrInvalidPlacement, leaseUUID)
 		}
 	}
 	if len(conflicts) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	keys := slices.Sorted(maps.Keys(conflicts))
 	eligible := keys[:0]
+	fenced := make(map[string]struct{})
 	for _, leaseUUID := range keys {
 		if s.mutationRevisionLocked(leaseUUID) <= maxRevision {
 			eligible = append(eligible, leaseUUID)
+		} else {
+			fenced[leaseUUID] = struct{}{}
 		}
 	}
 	keys = eligible
 	if len(keys) == 0 {
-		return nil
+		return fenced, nil
 	}
 
 	now := s.now().UTC()
@@ -795,7 +846,7 @@ func (s *Store) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevisio
 	encoded := make(map[string][]byte, len(keys))
 	for _, leaseUUID := range keys {
 		if nextRevision == math.MaxUint64 {
-			return fmt.Errorf("placement revision exhausted")
+			return fenced, fmt.Errorf("placement revision exhausted")
 		}
 		nextRevision++
 		existing, exists := s.cache[leaseUUID]
@@ -830,7 +881,7 @@ func (s *Store) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevisio
 		}
 		enc, err := encodePlacement(p)
 		if err != nil {
-			return mutationFailure("encode placement conflicts", err)
+			return fenced, mutationFailure("encode placement conflicts", err)
 		}
 		quarantined[leaseUUID] = p
 		encoded[leaseUUID] = enc
@@ -845,12 +896,15 @@ func (s *Store) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevisio
 		}
 		return nil
 	}); err != nil {
-		return mutationFailure("set placement conflicts", err)
+		return fenced, mutationFailure("set placement conflicts", err)
 	}
 
 	maps.Copy(s.cache, quarantined)
+	for leaseUUID := range quarantined {
+		delete(s.deleteRevisions, leaseUUID)
+	}
 	s.revision = nextRevision
-	return nil
+	return fenced, nil
 }
 
 // ClearConflictsIfNotNewer removes conflict markers only after a complete
@@ -901,8 +955,10 @@ func (s *Store) ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision
 	}
 	for _, leaseUUID := range keys {
 		delete(s.cache, leaseUUID)
+		if len(s.activeSnapshots) > 0 {
+			s.deleteRevisions[leaseUUID] = nextRevision
+		}
 	}
-	s.lastDeleteRevision = nextRevision
 	s.revision = nextRevision
 	return nil
 }
@@ -942,16 +998,15 @@ func (s *Store) nextRevision() (uint64, error) {
 	return s.revision + 1, nil
 }
 
-// mutationRevisionLocked returns the per-record revision for a present key.
-// Absent keys share the latest deletion watermark: this may conservatively
-// defer an unrelated absent-key backfill from an old inventory, but guarantees
-// that no old inventory can recreate a key deleted after its snapshot.
+// mutationRevisionLocked returns the per-record revision for a present key or
+// the exact key's deletion revision while an older registered inventory remains
+// active. Unrelated deletions never fence this lease.
 // Caller holds at least s.mu.RLock.
 func (s *Store) mutationRevisionLocked(leaseUUID string) uint64 {
 	if p, exists := s.cache[leaseUUID]; exists {
 		return p.revision
 	}
-	return s.lastDeleteRevision
+	return s.deleteRevisions[leaseUUID]
 }
 
 // put writes one record to bbolt and updates the cache only after commit.
@@ -967,13 +1022,12 @@ func (s *Store) put(leaseUUID string, p Placement, operation string) error {
 		return mutationFailure(operation, err)
 	}
 	s.cache[leaseUUID] = p
+	delete(s.deleteRevisions, leaseUUID)
 	return nil
 }
 
-// deleteLocked durably removes one key and advances the process-local global
-// deletion watermark. The watermark is intentionally in memory only: no
-// inventory snapshot survives a process restart, while retaining it in-process
-// prevents an older snapshot from recreating a concurrently deleted record.
+// deleteLocked durably removes one key and retains its deletion revision only
+// while a registered inventory snapshot could otherwise recreate it.
 // Caller holds s.mu.
 func (s *Store) deleteLocked(leaseUUID, operation string) error {
 	revision, err := s.nextRevision()
@@ -984,9 +1038,32 @@ func (s *Store) deleteLocked(leaseUUID, operation string) error {
 		return err
 	}
 	delete(s.cache, leaseUUID)
-	s.lastDeleteRevision = revision
+	if len(s.activeSnapshots) > 0 {
+		s.deleteRevisions[leaseUUID] = revision
+	}
 	s.revision = revision
 	return nil
+}
+
+// pruneDeleteRevisionsLocked drops tombstones that are no newer than every
+// active inventory cutoff. Such inventories already observed the key absent.
+// Caller holds s.mu.
+func (s *Store) pruneDeleteRevisionsLocked() {
+	if len(s.activeSnapshots) == 0 {
+		clear(s.deleteRevisions)
+		return
+	}
+	oldest := uint64(math.MaxUint64)
+	for revision := range s.activeSnapshots {
+		if revision < oldest {
+			oldest = revision
+		}
+	}
+	for leaseUUID, revision := range s.deleteRevisions {
+		if revision <= oldest {
+			delete(s.deleteRevisions, leaseUUID)
+		}
+	}
 }
 
 // deleteDurable deletes one bbolt key without touching the cache. Caller holds

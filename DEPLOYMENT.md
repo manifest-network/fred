@@ -199,7 +199,7 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 - `callback_base_url` — URL where backends reach providerd (e.g. `https://fred.example.com:8443`)
 - `callback_secret` — shared HMAC secret (32+ chars; same value used by every backend)
 - `backends` — at least one entry with `name`, `url`, and either `skus` or `default: true`
-- `placement_store_db_path` — strongly recommended when multiple backends share `skus`. It is not startup-enforced: if unset, providerd logs a warning and read operations (connection details, logs) fall back to a fan-out across matching backends that may route incorrectly
+- `placement_store_db_path` — required for restore and for correct routing when multiple backends share match criteria; optional only when neither feature is used. It is not startup-enforced: if unset, providerd logs a warning, restore returns `503` before contacting a backend, and direct reads use match/SKU routing that may select the wrong backend (provision-discovery endpoints retain their bounded fan-out)
 - `production_mode: true` — strongly recommended in production (forces replay protection, blocks SSRF, blocks `grpc_tls_skip_verify`)
 - `token_tracker_db_path` — required when `production_mode: true`
 
@@ -401,7 +401,7 @@ backends:
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
-Identical `skus` lists on `docker-1` and `docker-2` make them a matching pool for those SKUs. Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. `placement_store_db_path` should be set so that read operations (connection details, logs) route directly to the backend holding each lease; it is not startup-enforced — without it, providerd logs a warning and reads fall back to a fan-out across matching backends.
+Identical `skus` lists on `docker-1` and `docker-2` make them a matching pool for those SKUs. Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. `placement_store_db_path` is required so direct read, restart, and update operations reach the backend holding each lease, and restore requires the same durable state. This is not startup-enforced: without it, providerd logs a warning, restore returns `503` before contacting a backend, and direct operations fall back to match/SKU routing that may select the wrong peer. Provision-discovery endpoints still use a bounded fan-out.
 
 To add a host: spin up another `docker-backend` with the same `skus` list, add it to `config.yaml`, and reload `providerd`. New provisions immediately distribute across the new host. To drain: remove its entry from `skus` (so it no longer receives new provisions) and let existing leases close naturally, or migrate them by deprovisioning + reprovisioning on the chain side.
 
@@ -409,7 +409,10 @@ To add a host: spin up another `docker-backend` with the same `skus` list, add i
 
 ## Backups
 
-The bbolt files are the persistent state. None of them is a single point of truth — most can be rebuilt from the chain or the docker daemon — but warm backups speed up disaster recovery.
+The bbolt files are persistent state. Some can be rebuilt from the chain or the
+docker daemon, but placement records also contain unresolved attempts and
+conflict candidates that are not fully reconstructible. Backups speed recovery
+and preserve that safety evidence.
 
 | File | Backup priority | Restore behavior |
 |---|---|---|
@@ -417,7 +420,7 @@ The bbolt files are the persistent state. None of them is a single point of trut
 | `<docker>/retention.db` | High — index of soft-deleted leases (tenant, manifest, retained volume names); not reconstructible from chain or daemon | Lost on disk failure → retained volumes can no longer be restored *or* reaped (orphaned on disk). Only present when `retain_on_close` is enabled |
 | `<docker>/diagnostics.db` | Medium — failure diagnostics for past 7 days | Lost on disk failure |
 | `<docker>/callbacks.db` | Low — pending callbacks, ephemeral | Bbolt rebuilds; some callbacks lost |
-| `placement_store_db_path` | Low — rebuilt by reconciler from backend `ListProvisions` on startup | Brief misroute window during rebuild |
+| `placement_store_db_path` | High for restore or multi-backend deployments — unresolved attempts and conflict candidates are safety evidence | Positive owners can be rebuilt as their backends answer inventory; a complete `/provisions` plus `/retentions` view is required to make absence authoritative and resolve conflicts. Unresolved history may be lost, so restore this file when possible and keep every former owner configured and reachable during any rebuild |
 | `payload_store_db_path` | Low — pending payloads, tenant can re-upload | Tenants must re-upload pending payloads |
 | `token_tracker_db_path` | None — replay protection has 30s window anyway | Empties on restart, acceptable |
 
@@ -488,4 +491,8 @@ docker run -d --name providerd \
   fred-providerd --config /config.yaml
 ```
 
-Configure `keyring_dir: /keyring` in `config.yaml`. If you set `token_tracker_db_path`, `payload_store_db_path`, or `placement_store_db_path`, also mount a writable host directory (the providerd image does not declare a default data volume).
+Configure `keyring_dir: /keyring` in `config.yaml`. If you use restore or pooled
+multi-backend routing, set `placement_store_db_path` and mount its writable host
+directory. Do the same for any configured `token_tracker_db_path` or
+`payload_store_db_path`; the providerd image does not declare a default data
+volume.

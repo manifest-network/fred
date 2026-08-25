@@ -55,6 +55,46 @@ func (s *concurrentClearPlacementStore) ClearAttemptIfRevision(
 	return s.PlacementStore.ClearAttemptIfRevision(leaseUUID, backendName, revision)
 }
 
+// mutateAfterSnapshotListStore arms after the inventory batch finishes, returns
+// the next stable List snapshot, then mutates the target before the worker's
+// immediate Lookup re-read. It pins the revision-only half of the post-sync
+// placement boundary guard with the real bbolt store; the shared map mock cannot
+// construct opaque revisions.
+type mutateAfterSnapshotListStore struct {
+	PlacementStore
+	targetBackend  string
+	targetLease    string
+	mu             sync.Mutex
+	mutateNextList bool
+	mutationDone   bool
+	mutationErr    error
+}
+
+func (s *mutateAfterSnapshotListStore) SetBatchIfNotNewer(
+	placements map[string]string,
+	maxRevision uint64,
+) (map[string]uint64, map[string]struct{}, error) {
+	applied, fenced, err := s.PlacementStore.SetBatchIfNotNewer(placements, maxRevision)
+	if err == nil {
+		s.mu.Lock()
+		s.mutateNextList = true
+		s.mu.Unlock()
+	}
+	return applied, fenced, err
+}
+
+func (s *mutateAfterSnapshotListStore) List() map[string]placement.Placement {
+	snapshot := s.PlacementStore.List()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mutateNextList {
+		s.mutateNextList = false
+		s.mutationDone = true
+		_, s.mutationErr = s.SetAttempting(s.targetLease, s.targetBackend)
+	}
+	return snapshot
+}
+
 // mockReconcilerBackend implements backend.Backend for testing.
 type mockReconcilerBackend struct {
 	mu                        sync.Mutex
@@ -70,6 +110,7 @@ type mockReconcilerBackend struct {
 	deprovisionErr            error
 	listErr                   error
 	refreshErr                error
+	onListProvisions          func()
 }
 
 type reconcileCustomDomainCall struct {
@@ -110,6 +151,9 @@ func (m *mockReconcilerBackend) ListProvisions(ctx context.Context) ([]backend.P
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.listProvisionsCalls++
+	if m.onListProvisions != nil {
+		m.onListProvisions()
+	}
 	if m.listErr != nil {
 		return nil, m.listErr
 	}
@@ -3324,6 +3368,265 @@ func TestReconciler_InFlightPlacementExclusionOnlyWithholdsAbsenceForThatLease(t
 	assert.Equal(t, "lease-independent", provisionCalls[0].LeaseUUID)
 }
 
+func TestReconciler_UnrelatedDeleteDoesNotSuppressObservedPlacement(t *testing.T) {
+	const (
+		leaseUUID = "lease-observed"
+		deleted   = "lease-deleted"
+	)
+	store, err := placement.NewStore(t.TempDir() + "/placements.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.Confirm(deleted, "backend-a"))
+
+	chainClient := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{{
+				Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_ACTIVE,
+			}}, nil
+		},
+	}
+	defaultBackend := &mockReconcilerBackend{name: "backend-a"}
+	var (
+		deleteOnce sync.Once
+		hookErr    error
+	)
+	ownerBackend := &mockReconcilerBackend{
+		name: "backend-b",
+		provisions: []backend.ProvisionInfo{{
+			LeaseUUID: leaseUUID,
+			Status:    backend.ProvisionStatusReady,
+		}},
+		onListProvisions: func() {
+			deleteOnce.Do(func() { hookErr = store.Delete(deleted) })
+		},
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: defaultBackend, IsDefault: true},
+		{Backend: ownerBackend},
+	}})
+	require.NoError(t, err)
+	r, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
+	require.NoError(t, err)
+
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	require.NoError(t, hookErr)
+	assert.Equal(t, placement.StateAbsent, store.Lookup(deleted).State(),
+		"the unrelated deletion hook must run after the inventory boundary")
+	p := store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, "backend-b", p.Backend,
+		"an unrelated post-snapshot delete must not fence this positive observation")
+
+	ownerBackend.mu.Lock()
+	ownerBackend.listErr = errors.New("backend-b unavailable")
+	ownerBackend.mu.Unlock()
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	defaultBackend.mu.Lock()
+	defer defaultBackend.mu.Unlock()
+	assert.Empty(t, defaultBackend.provisionCalls,
+		"a later degraded sweep must defer the lease pinned to the silent owner")
+}
+
+func TestReconciler_ExcludedAttemptSurvivesDegradedSweepUntilOwnerRecovery(t *testing.T) {
+	const leaseUUID = "lease-excluded-attempt"
+	store, err := placement.NewStore(t.TempDir() + "/placements.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	requireSetPlacementAttempt(t, store, leaseUUID, "backend-b")
+
+	chainClient := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{{
+				Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_ACTIVE,
+			}}, nil
+		},
+	}
+	attemptedBackend := &mockReconcilerBackend{name: "backend-b"}
+	actualOwner := &mockReconcilerBackend{name: "backend-c", provisions: []backend.ProvisionInfo{{
+		LeaseUUID: leaseUUID,
+		Status:    backend.ProvisionStatusReady,
+	}}}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: attemptedBackend, IsDefault: true},
+		{Backend: actualOwner},
+	}})
+	require.NoError(t, err)
+	tracker := newMockInFlightTracker(nil)
+	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+		leaseUUID, "tenant-a", testItems("sku-1"), attemptedBackend.Name(),
+	)
+	require.True(t, tracked)
+	r, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, tracker, store)
+	require.NoError(t, err)
+
+	// The complete sweep sees the real owner C, but the operation already active
+	// at its boundary excludes that positive from placement synchronization.
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	p := store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateAttempting, p.State())
+	assert.Equal(t, "backend-b", p.Attempt)
+	require.True(t, tracker.UntrackInFlightIfGeneration(leaseUUID, generation))
+
+	// On a later degraded view B proves its own absence while C is silent. The
+	// lease-local exclusion must outlive the partial sweep, preserve Attempt B,
+	// and prevent a fresh SKU-routed provision.
+	actualOwner.mu.Lock()
+	actualOwner.listErr = errors.New("backend-c unavailable")
+	actualOwner.mu.Unlock()
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	p = store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateAttempting, p.State())
+	assert.Equal(t, "backend-b", p.Attempt)
+	attemptedBackend.mu.Lock()
+	assert.Empty(t, attemptedBackend.provisionCalls)
+	attemptedBackend.mu.Unlock()
+
+	// Once C again participates in a complete inventory, that authoritative
+	// positive is persisted, the superseded B attempt is settled, and the marker
+	// can finally retire.
+	actualOwner.mu.Lock()
+	actualOwner.listErr = nil
+	actualOwner.mu.Unlock()
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID)
+	p = store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, "backend-c", p.Backend)
+	assert.Empty(t, p.Attempt)
+}
+
+func TestReconciler_ExcludedOwnerChangeDefersStaleConfirmedPlacement(t *testing.T) {
+	const leaseUUID = "lease-excluded-owner-change"
+	store, err := placement.NewStore(t.TempDir() + "/placements.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.Confirm(leaseUUID, "backend-b"))
+
+	chainClient := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{{
+				Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_ACTIVE,
+			}}, nil
+		},
+	}
+	staleOwner := &mockReconcilerBackend{name: "backend-b"}
+	actualOwner := &mockReconcilerBackend{name: "backend-c", provisions: []backend.ProvisionInfo{{
+		LeaseUUID: leaseUUID,
+		Status:    backend.ProvisionStatusReady,
+	}}}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: staleOwner, IsDefault: true},
+		{Backend: actualOwner},
+	}})
+	require.NoError(t, err)
+	tracker := newMockInFlightTracker(nil)
+	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+		leaseUUID, "tenant-a", testItems("sku-1"), staleOwner.Name(),
+	)
+	require.True(t, tracked)
+	r, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, tracker, store)
+	require.NoError(t, err)
+
+	// C's complete positive observation cannot overwrite the operation-owned B
+	// record while the operation straddles this inventory boundary.
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	p := store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, "backend-b", p.Backend)
+	require.True(t, tracker.UntrackInFlightIfGeneration(leaseUUID, generation))
+
+	// B answers absent while C is silent. Although the stale confirmed record's
+	// named backend answered, the excluded C-positive means no lifecycle action is
+	// safe until another complete sweep settles the owner change.
+	actualOwner.mu.Lock()
+	actualOwner.listErr = errors.New("backend-c unavailable")
+	actualOwner.mu.Unlock()
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	staleOwner.mu.Lock()
+	assert.Empty(t, staleOwner.provisionCalls)
+	staleOwner.mu.Unlock()
+	p = store.Lookup(leaseUUID)
+	assert.Equal(t, "backend-b", p.Backend)
+
+	actualOwner.mu.Lock()
+	actualOwner.listErr = nil
+	actualOwner.mu.Unlock()
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID)
+	p = store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, "backend-c", p.Backend)
+}
+
+func TestReconciler_FencedPositiveSurvivesUnrelatedPlacementSyncFailure(t *testing.T) {
+	const leaseUUID = "lease-fenced-write-error"
+	store := &errorPlacementStore{}
+	require.NoError(t, store.Confirm(leaseUUID, "backend-b"))
+	store.setErr = errors.New("placement disk unavailable")
+	store.batchFencedOnError = map[string]struct{}{leaseUUID: {}}
+
+	chainClient := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{{
+				Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_ACTIVE,
+			}}, nil
+		},
+	}
+	staleOwner := &mockReconcilerBackend{name: "backend-b"}
+	actualOwner := &mockReconcilerBackend{name: "backend-c", provisions: []backend.ProvisionInfo{{
+		LeaseUUID: leaseUUID,
+		Status:    backend.ProvisionStatusReady,
+	}}}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: staleOwner, IsDefault: true},
+		{Backend: actualOwner},
+	}})
+	require.NoError(t, err)
+	r, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
+	require.NoError(t, err)
+
+	// The C-positive is revision-fenced while another placement operation fails.
+	// Its exact-lease exception must still survive the failed synchronization.
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	p := store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, "backend-b", p.Backend)
+
+	store.setErr = nil
+	store.batchFencedOnError = nil
+	actualOwner.mu.Lock()
+	actualOwner.listErr = errors.New("backend-c unavailable")
+	actualOwner.mu.Unlock()
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	staleOwner.mu.Lock()
+	assert.Empty(t, staleOwner.provisionCalls,
+		"the surviving marker must gate an older confirmed owner on a degraded sweep")
+	staleOwner.mu.Unlock()
+
+	actualOwner.mu.Lock()
+	actualOwner.listErr = nil
+	actualOwner.mu.Unlock()
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID)
+	p = store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateConfirmed, p.State())
+	assert.Equal(t, "backend-c", p.Backend)
+}
+
 func TestReconciler_CallbackCompletionDuringInventoryDefersOnlyThatLease(t *testing.T) {
 	const (
 		completedLease   = "lease-callback-completed"
@@ -3521,6 +3824,81 @@ func TestReconciler_PostBoundaryPlacementRevisionDefersOnlyThatLease(t *testing.
 	p := placements.Lookup(completedLease)
 	assert.Equal(t, placement.StateConfirmed, p.State())
 	assert.Equal(t, backendName, p.Backend)
+}
+
+func TestReconciler_PostSyncPlacementRevisionDefersBeforeLifecycleAction(t *testing.T) {
+	const (
+		targetLease      = "lease-post-sync-mutation"
+		independentLease = "lease-independent"
+		backendName      = "backend-a"
+	)
+
+	realStore, err := placement.NewStore(t.TempDir() + "/placements.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, realStore.Close()) })
+	require.NoError(t, realStore.Confirm(targetLease, backendName))
+	store := &mutateAfterSnapshotListStore{
+		PlacementStore: realStore,
+		targetLease:    targetLease,
+		targetBackend:  backendName,
+	}
+	acknowledgeCalls := 0
+	ack := &mockAcknowledger{acknowledgeFn: func(context.Context, string) (bool, string, error) {
+		acknowledgeCalls++
+		return true, "tx", nil
+	}}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{
+				{Uuid: targetLease, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING},
+				{Uuid: independentLease, Tenant: "tenant-b", State: billingtypes.LEASE_STATE_PENDING},
+			}, nil
+		},
+	}
+	backendClient := &mockReconcilerBackend{name: backendName, provisions: []backend.ProvisionInfo{{
+		LeaseUUID: targetLease, Status: backend.ProvisionStatusReady,
+	}}}
+	silentBackend := &mockReconcilerBackend{
+		name:    "backend-silent",
+		listErr: errors.New("backend-silent unavailable"),
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: backendClient, IsDefault: true},
+			{Backend: silentBackend},
+		},
+	})
+	require.NoError(t, err)
+	tracker := newMockInFlightTracker(nil)
+	r, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, ack, router, tracker, store)
+	require.NoError(t, err)
+	// The intentionally partial sweep still has prior durable authority for an
+	// absent independent lease; this keeps the test focused on the post-sync
+	// target mutation rather than the ordinary incomplete-inventory gate.
+	r.placementSweepSeen.Store(true)
+
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	store.mu.Lock()
+	mutationErr := store.mutationErr
+	mutationDone := store.mutationDone
+	store.mu.Unlock()
+	require.NoError(t, mutationErr)
+	require.True(t, mutationDone)
+
+	backendClient.mu.Lock()
+	provisionCalls := append([]backend.ProvisionRequest(nil), backendClient.provisionCalls...)
+	backendClient.mu.Unlock()
+	require.Len(t, provisionCalls, 1,
+		"the revision-mutated lease must defer while the independent lease progresses")
+	assert.Equal(t, independentLease, provisionCalls[0].LeaseUUID)
+	assert.Zero(t, acknowledgeCalls,
+		"the ready target must not be acknowledged from a snapshot older than its placement revision")
+	p := realStore.Lookup(targetLease)
+	assert.Equal(t, placement.StateConfirmed, p.State(),
+		"adding an attempt preserves the derived state, so only the opaque revision catches this race")
+	assert.Equal(t, backendName, p.Attempt)
 }
 
 func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
@@ -3969,7 +4347,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		r := &Reconciler{placementStore: store}
 
 		require.True(t, r.resolvePlacementAttempt(
-			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
+			"lease-1", store.Lookup("lease-1"), false, absentSnapshot, cutoff, nil,
 			answeredSet{"backend-a": true}, nil,
 		))
 		require.Equal(t, placement.StateAbsent, store.Lookup("lease-1").State())
@@ -3982,7 +4360,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		r := &Reconciler{placementStore: store}
 
 		require.False(t, r.resolvePlacementAttempt(
-			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
+			"lease-1", store.Lookup("lease-1"), false, absentSnapshot, cutoff, nil,
 			answeredSet{"backend-a": true}, nil,
 		))
 		require.Equal(t, placement.StateAttempting, store.Lookup("lease-1").State())
@@ -3999,7 +4377,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		r := &Reconciler{placementStore: store}
 
 		require.False(t, r.resolvePlacementAttempt(
-			"lease-1", store.Lookup("lease-1"), snap, cutoff, nil,
+			"lease-1", store.Lookup("lease-1"), false, snap, cutoff, nil,
 			answeredSet{"backend-a": true}, nil,
 		))
 		require.Equal(t, placement.StateAttempting, store.Lookup("lease-1").State())
@@ -4012,7 +4390,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		r := &Reconciler{placementStore: store}
 
 		require.False(t, r.resolvePlacementAttempt(
-			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff,
+			"lease-1", store.Lookup("lease-1"), false, absentSnapshot, cutoff,
 			map[string]struct{}{"lease-1": {}}, answeredSet{"backend-a": true}, nil,
 		))
 		require.Equal(t, placement.StateAttempting, store.Lookup("lease-1").State(),
@@ -4026,10 +4404,28 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		r := &Reconciler{placementStore: store}
 
 		require.False(t, r.resolvePlacementAttempt(
-			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
+			"lease-1", store.Lookup("lease-1"), false, absentSnapshot, cutoff, nil,
 			answeredSet{"backend-a": false}, nil,
 		))
 		require.Equal(t, placement.StateAttempting, store.Lookup("lease-1").State())
+	})
+
+	t.Run("lease-local exclusion blocks attempt clear", func(t *testing.T) {
+		store := newStore(t)
+		requireSetPlacementAttempt(t, store, "lease-1", "backend-a")
+		cutoff := store.SnapshotRevision()
+		r := &Reconciler{placementStore: store}
+		r.placementSweepSeen.Store(true)
+		degradedSnapshot := absentSnapshot
+		degradedSnapshot.complete = false
+		degradedSnapshot.answered = answeredSet{"backend-a": true, "backend-c": false}
+
+		require.False(t, r.resolvePlacementAttempt(
+			"lease-1", store.Lookup("lease-1"), true, degradedSnapshot, cutoff, nil,
+			answeredSet{"backend-a": true, "backend-c": false}, nil,
+		))
+		require.Equal(t, placement.StateAttempting, store.Lookup("lease-1").State(),
+			"a prior excluded positive must outlive degraded attempted-backend absence")
 	})
 
 	t.Run("positive retention report never clears attempt", func(t *testing.T) {
@@ -4039,7 +4435,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		r := &Reconciler{placementStore: store}
 
 		require.False(t, r.resolvePlacementAttempt(
-			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
+			"lease-1", store.Lookup("lease-1"), false, absentSnapshot, cutoff, nil,
 			answeredSet{"backend-a": true},
 			map[string]map[string]struct{}{"backend-a": {"lease-1": {}}},
 		))
@@ -4061,7 +4457,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 
 		go func() {
 			resolved <- r.resolvePlacementAttempt(
-				"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
+				"lease-1", store.Lookup("lease-1"), false, absentSnapshot, cutoff, nil,
 				answeredSet{"backend-a": true}, nil,
 			)
 		}()

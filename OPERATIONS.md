@@ -55,7 +55,8 @@ The dependency signal did not disappear, it moved: the per-check map is still in
 | `fred_backend_insufficient_resources_total` rising on a backend | Backend at capacity | Reduce SKU sizes, add backend hosts, or check `docker-backend /stats` |
 | `fred_backend_malformed_error_body_total` rising on a backend | That backend answers 4xx with a body that is not the declared `{"error": ...}` envelope, so its tenants get a generic message instead of a diagnostic | Find the raw body in the `backend returned a malformed error body` log line and fix the backend to emit the envelope (BACKEND_GUIDE.md). If the backend looks correct, suspect an intermediary answering on its behalf |
 | `fred_provisioner_callback_timeouts_total` rising | Backend accepted provision but never called back | Backend logs; verify `callback_base_url` is reachable from backend; check HMAC secret match |
-| `increase(fred_provisioner_callback_settlement_claim_wait_timeouts_total[5m]) > 0` | A callback waited 30 seconds while another callback, timeout, or deprovision actor retained the same operation generation's settlement claim. The actor may be blocked on a slow chain/backend call, or a bug may have leaked its claim | Find the `callback settlement claim is contended` and timeout logs for the lease/generation; correlate concurrent timeout/deprovision/ack logs and downstream latency. If no actor completes and the counter repeats, restart providerd to clear the process-local claim, then file an issue with the logs |
+| `increase(fred_provisioner_callback_settlement_claim_wait_timeouts_total[5m]) > 0` | A callback waited 30 seconds while another callback or the timeout checker retained the same operation generation's terminal-settlement claim. The actor may be blocked on a slow chain call, or a bug may have leaked its claim | Find the `callback settlement claim is contended` and timeout logs for the lease/generation; correlate concurrent callback, timeout, acknowledge/reject, and downstream chain-latency logs. A deprovision-owned claim returns immediately and cannot increment this counter. If no actor completes and the counter repeats, restart providerd to clear the process-local claim, then file an issue with the logs |
+| `increase(fred_provisioner_callback_placement_semantic_conflicts_total[5m]) > 0` | A backend reported successful provisioning, but its authenticated callback contradicted the durable backend, attempt, or conflict record. Fred preserved that record for repair and continued toward chain acknowledgement | Find `placement rejected success callback confirmation; continuing chain acknowledgement`, then reconcile the logged `lease_uuid`, `backend`, `generation`, and `error` against backend inventory and the placement store before changing or deleting the record. Page on every increase. A later acknowledgement failure can retry and increment this attempt counter again, so correlate by lease and generation rather than treating the value as unique leases |
 | `fred_provisioner_ack_batch_fee_gas_errors_total` rising | Out-of-gas on lease acknowledgment txs | See [Out-of-gas tuning](#out-of-gas-tuning) |
 | `fred_chain_signer_oog_retries_total{result="exhausted"}` rising | Same; the broadcast retry loop hit `max_gas_limit` | Same as above |
 | `fred_docker_backend_die_event_dropped_total` sustained non-zero | Lease actor inbox is wedged | See [Wedged lease actor](#wedged-lease-actor-docker-backend) |
@@ -358,10 +359,13 @@ reconcile: refusing to provision, lease is placed on a backend the router does n
 refusing to provision: lease is placed on a backend the router does not know              # event path
 ```
 
-Both carry `lease_uuid` and an `error` field containing the recorded backend
-name (`placement backend not found in router: lease <uuid> is placed on "<name>"`),
-so the recorded name can be recovered from the logs even if the config entry is
-already gone.
+The reconciler line carries `lease_uuid`, `placement_backend`, and
+`placement_state`. It counts the lease as both deferred and a `lease_error`, so
+an otherwise complete sweep is reported as `partial`. The event-path line
+carries `lease_uuid`, `sku`, and an `error` field whose value includes the
+recorded backend name (`placement backend not found in router: lease <uuid> is
+placed on "<name>"`). In both cases the recorded name remains recoverable after
+the config entry is gone.
 
 This is deliberate (ENG-635). Substituting a healthy peer would provision a
 brand-new **empty volume** while the tenant's real data sits intact on the

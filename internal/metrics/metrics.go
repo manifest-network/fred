@@ -634,6 +634,23 @@ var (
 		Help:      "Total callback waits that timed out while an in-flight settlement claim remained contended",
 	})
 
+	// CallbackPlacementSemanticConflictsTotal counts authenticated success-
+	// callback settlement attempts whose positive backend evidence could not be
+	// merged into the durable placement record because that record contained a
+	// conflicting or otherwise unusable semantic fact. Processing continues
+	// toward chain acknowledgement; a retry can increment this again. The
+	// preserved placement record and accompanying ERROR log require operator
+	// reconciliation.
+	//
+	// Deliberately unlabelled. The log carries the lease, backend, generation and
+	// concrete verdict without turning any of them into an unbounded metric label.
+	CallbackPlacementSemanticConflictsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "callback_placement_semantic_conflicts_total",
+		Help:      "Total success-callback settlement attempts that continued toward chain acknowledgement after a conflicting durable placement verdict",
+	})
+
 	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker,
 	// labeled by the reporting backend and the callback status.
 	NonInFlightCallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{

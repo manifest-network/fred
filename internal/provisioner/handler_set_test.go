@@ -267,21 +267,25 @@ func (m *mockPlacementStore) DeleteIfRevision(leaseUUID string, revision uint64)
 }
 
 func (m *mockPlacementStore) SetBatch(placements map[string]string) error {
-	_, err := m.SetBatchIfNotNewer(placements, ^uint64(0))
+	_, _, err := m.SetBatchIfNotNewer(placements, ^uint64(0))
 	return err
 }
 
 func (m *mockPlacementStore) SetBatchIfNotNewer(
 	placements map[string]string,
 	maxRevision uint64,
-) (map[string]uint64, error) {
+) (map[string]uint64, map[string]struct{}, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// This shared mock has only a conservative global revision rather than the
 	// real store's per-record clock. If any mock mutation is newer than the
 	// cutoff, filter the whole batch without manufacturing another mutation.
 	if m.revision > maxRevision {
-		return nil, nil
+		fenced := make(map[string]struct{}, len(placements))
+		for leaseUUID := range placements {
+			fenced[leaseUUID] = struct{}{}
+		}
+		return nil, fenced, nil
 	}
 	if m.placements == nil {
 		m.placements = make(map[string]string)
@@ -323,17 +327,17 @@ func (m *mockPlacementStore) SetBatchIfNotNewer(
 		applied[k] = nextRevision
 	}
 	m.revision = nextRevision
-	return applied, nil
+	return applied, nil, nil
 }
 
 func TestMockPlacementStore_SetBatchIfNotNewerPreservesNoOpAndFilterSemantics(t *testing.T) {
 	store := &mockPlacementStore{}
 
-	_, err := store.SetBatchIfNotNewer(nil, store.SnapshotRevision())
+	_, _, err := store.SetBatchIfNotNewer(nil, store.SnapshotRevision())
 	require.NoError(t, err)
 	assert.Zero(t, store.SnapshotRevision(), "an empty inventory must not advance the mock clock")
 
-	_, err = store.SetBatchIfNotNewer(
+	_, _, err = store.SetBatchIfNotNewer(
 		map[string]string{"lease-1": "backend-a"}, store.SnapshotRevision(),
 	)
 	require.NoError(t, err)
@@ -341,7 +345,7 @@ func TestMockPlacementStore_SetBatchIfNotNewerPreservesNoOpAndFilterSemantics(t 
 	require.NotZero(t, cutoff)
 	before := store.Lookup("lease-1")
 
-	_, err = store.SetBatchIfNotNewer(
+	_, _, err = store.SetBatchIfNotNewer(
 		map[string]string{"lease-1": "backend-a"}, cutoff,
 	)
 	require.NoError(t, err)
@@ -349,7 +353,7 @@ func TestMockPlacementStore_SetBatchIfNotNewerPreservesNoOpAndFilterSemantics(t 
 		"an exact inventory observation must remain usable as the same sweep's cutoff")
 	assert.Equal(t, before, store.Lookup("lease-1"))
 
-	_, err = store.SetBatchIfNotNewer(
+	_, _, err = store.SetBatchIfNotNewer(
 		map[string]string{"lease-1": "backend-b"}, cutoff-1,
 	)
 	require.NoError(t, err)
@@ -361,12 +365,16 @@ func TestMockPlacementStore_SetBatchIfNotNewerPreservesNoOpAndFilterSemantics(t 
 	assert.True(t, set, "the no-op inventory must not falsely fence a same-sweep attempt")
 }
 
-func (m *mockPlacementStore) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) error {
+func (m *mockPlacementStore) SetConflictsIfNotNewer(
+	conflicts map[string][]string,
+	maxRevision uint64,
+) (map[string]struct{}, error) {
 	if len(conflicts) == 0 {
-		return nil
+		return nil, nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	fenced := make(map[string]struct{})
 	if m.conflicts == nil {
 		m.conflicts = make(map[string]bool)
 	}
@@ -381,6 +389,7 @@ func (m *mockPlacementStore) SetConflictsIfNotNewer(conflicts map[string][]strin
 	}
 	for leaseUUID, reportedBackends := range conflicts {
 		if m.revision > maxRevision {
+			fenced[leaseUUID] = struct{}{}
 			continue
 		}
 		candidateSet := make(map[string]struct{}, len(reportedBackends)+len(m.conflictBackends[leaseUUID])+2)
@@ -409,8 +418,10 @@ func (m *mockPlacementStore) SetConflictsIfNotNewer(conflicts map[string][]strin
 			m.setAt[leaseUUID] = time.Now()
 		}
 	}
-	m.revision++
-	return nil
+	if len(fenced) < len(conflicts) {
+		m.revision++
+	}
+	return fenced, nil
 }
 
 func (m *mockPlacementStore) ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision uint64) error {
@@ -437,6 +448,12 @@ func (m *mockPlacementStore) SnapshotRevision() uint64 {
 	defer m.mu.Unlock()
 	return m.revision
 }
+
+func (m *mockPlacementStore) BeginInventorySnapshot() uint64 {
+	return m.SnapshotRevision()
+}
+
+func (m *mockPlacementStore) EndInventorySnapshot(uint64) {}
 
 func (m *mockPlacementStore) SetAt(leaseUUID string) (time.Time, bool) {
 	m.mu.Lock()
@@ -2286,6 +2303,9 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictStill
 	}
 	for _, tt := range verdicts {
 		t.Run(tt.name, func(t *testing.T) {
+			semanticConflictsBefore := promtestutil.ToFloat64(
+				metrics.CallbackPlacementSemanticConflictsTotal,
+			)
 			ps := &errorPlacementStore{setErr: fmt.Errorf("semantic verdict: %w", tt.err)}
 			tracker := NewInFlightTracker()
 			tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
@@ -2314,6 +2334,10 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictStill
 			}))
 			require.NoError(t, err)
 			assert.Equal(t, 1, ackCalls, "semantic placement conflicts must not poison a live success callback")
+			assert.Equal(t, semanticConflictsBefore+1,
+				promtestutil.ToFloat64(metrics.CallbackPlacementSemanticConflictsTotal),
+				"every swallowed permanent verdict must remain observable",
+			)
 			assert.False(t, tracker.IsInFlight("lease-1"), "successful chain acknowledgement owns terminal cleanup")
 
 			checker := NewTimeoutChecker(TimeoutCheckerConfig{
@@ -2323,6 +2347,85 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictStill
 			})
 			checker.CheckOnce(context.Background())
 			assert.Zero(t, timeoutRejectCalls, "a handled success callback must never be rejected later as timed out")
+		})
+	}
+}
+
+func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPreservesRealRecord(t *testing.T) {
+	tests := []struct {
+		name string
+		seed func(t *testing.T, store *placement.Store)
+	}{
+		{
+			name: "durable conflict",
+			seed: func(t *testing.T, store *placement.Store) {
+				t.Helper()
+				fenced, err := store.SetConflictsIfNotNewer(
+					map[string][]string{"lease-1": {"backend-a", "backend-b"}},
+					store.SnapshotRevision(),
+				)
+				require.NoError(t, err)
+				require.Empty(t, fenced)
+			},
+		},
+		{
+			name: "confirmed backend mismatch",
+			seed: func(t *testing.T, store *placement.Store) {
+				t.Helper()
+				require.NoError(t, store.Confirm("lease-1", "backend-b"))
+			},
+		},
+		{
+			name: "attempt mismatch",
+			seed: func(t *testing.T, store *placement.Store) {
+				t.Helper()
+				_, err := store.SetAttempting("lease-1", "backend-b")
+				require.NoError(t, err)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			tt.seed(t, store)
+			before := store.Lookup("lease-1")
+			beforeRevision := store.SnapshotRevision()
+
+			tracker := NewInFlightTracker()
+			generation, tracked := tracker.TryTrackInFlightWithGeneration(
+				"lease-1", "tenant-a", testItems("sku-1"), "backend-a",
+			)
+			require.True(t, tracked)
+			ackCalls := 0
+			ack := &mockAcknowledger{acknowledgeFn: func(context.Context, string) (bool, string, error) {
+				ackCalls++
+				return true, "tx", nil
+			}}
+			orch := NewProvisionOrchestrator(
+				"provider-1", "http://cb", &mockBackendRouter{}, tracker, store,
+			)
+			hs := NewHandlerSet(HandlerDeps{
+				Orchestrator: orch,
+				Tracker:      tracker,
+				Acknowledger: ack,
+			})
+
+			require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
+				LeaseUUID:           "lease-1",
+				Status:              backend.CallbackStatusSuccess,
+				Backend:             "backend-a",
+				OperationGeneration: generation,
+			})))
+
+			assert.Equal(t, 1, ackCalls)
+			assert.False(t, tracker.IsInFlight("lease-1"))
+			assert.Equal(t, before, store.Lookup("lease-1"),
+				"semantic callback verdict must preserve the operator-repairable record")
+			assert.Equal(t, beforeRevision, store.SnapshotRevision(),
+				"semantic callback verdict must not manufacture a placement mutation")
 		})
 	}
 }

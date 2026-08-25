@@ -42,9 +42,21 @@ func requireSetBatchIfNotNewer(
 	maxRevision uint64,
 ) map[string]uint64 {
 	t.Helper()
-	applied, err := s.SetBatchIfNotNewer(placements, maxRevision)
+	applied, _, err := s.SetBatchIfNotNewer(placements, maxRevision)
 	require.NoError(t, err)
 	return applied
+}
+
+func requireSetConflictsIfNotNewer(
+	t *testing.T,
+	s *Store,
+	conflicts map[string][]string,
+	maxRevision uint64,
+) map[string]struct{} {
+	t.Helper()
+	fenced, err := s.SetConflictsIfNotNewer(conflicts, maxRevision)
+	require.NoError(t, err)
+	return fenced
 }
 
 func writeRawRecords(t *testing.T, dbPath string, records map[string][]byte) {
@@ -218,7 +230,8 @@ func TestStore_SetAttemptingIfNotNewerFencesPostSnapshotMutation(t *testing.T) {
 
 func TestStore_SetAttemptingIfNotNewerFencesPostSnapshotCreateDelete(t *testing.T) {
 	s := newTestStore(t)
-	cutoff := s.SnapshotRevision()
+	cutoff := s.BeginInventorySnapshot()
+	defer s.EndInventorySnapshot(cutoff)
 	require.NoError(t, s.Confirm("lease-1", "backend-a"))
 	require.NoError(t, s.Delete("lease-1"))
 	require.Equal(t, StateAbsent, s.Lookup("lease-1").State())
@@ -228,7 +241,7 @@ func TestStore_SetAttemptingIfNotNewerFencesPostSnapshotCreateDelete(t *testing.
 	assert.False(t, set)
 	assert.Zero(t, revision)
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State(),
-		"an absent key must retain the process-local deletion fence")
+		"an absent key must retain its deletion fence for the active inventory")
 }
 
 func TestStore_ClearAttemptOnlyDeletesRecord(t *testing.T) {
@@ -336,7 +349,7 @@ func TestStore_SetBatchMergesInventoryAtomically(t *testing.T) {
 
 	before := s.List()
 	beforeRevision := s.SnapshotRevision()
-	_, err := s.SetBatchIfNotNewer(map[string]string{"valid": "backend-a", "invalid": ""}, math.MaxUint64)
+	_, _, err := s.SetBatchIfNotNewer(map[string]string{"valid": "backend-a", "invalid": ""}, math.MaxUint64)
 	require.ErrorIs(t, err, ErrInvalidPlacement)
 	assert.Equal(t, before, s.List(), "validation failure must reject the whole batch")
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
@@ -541,12 +554,12 @@ func TestStore_ListReturnsIndependentAtomicSnapshot(t *testing.T) {
 func TestStore_DurableWriteFailuresLeaveCacheAndRevisionUnchanged(t *testing.T) {
 	s := newTestStore(t)
 	require.NoError(t, s.Confirm("confirmed", "backend-a"))
-	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
+	require.Empty(t, requireSetConflictsIfNotNewer(t, s, map[string][]string{
 		"conflict": {"backend-a", "backend-b"},
 	}, s.SnapshotRevision()))
 	before := s.List()
 	beforeRevision := s.SnapshotRevision()
-	beforeDeleteRevision := s.lastDeleteRevision
+	beforeDeleteRevisions := len(s.deleteRevisions)
 	require.NoError(t, s.Close())
 
 	_, err := s.SetAttempting("confirmed", "backend-a")
@@ -559,12 +572,12 @@ func TestStore_DurableWriteFailuresLeaveCacheAndRevisionUnchanged(t *testing.T) 
 	assert.Equal(t, StateAbsent, s.Lookup("new").State())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
 
-	_, err = s.SetBatchIfNotNewer(map[string]string{"batch": "backend-c"}, math.MaxUint64)
+	_, _, err = s.SetBatchIfNotNewer(map[string]string{"batch": "backend-c"}, math.MaxUint64)
 	require.Error(t, err)
 	assert.Equal(t, before, s.List())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
 
-	_, err = s.SetBatchIfNotNewer(nil, math.MaxUint64)
+	_, _, err = s.SetBatchIfNotNewer(nil, math.MaxUint64)
 	require.Error(t, err, "an empty inventory must not report a durable sync against a closed store")
 	assert.Equal(t, before, s.List())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
@@ -584,7 +597,7 @@ func TestStore_DurableWriteFailuresLeaveCacheAndRevisionUnchanged(t *testing.T) 
 	require.Error(t, err)
 	assert.Equal(t, before, s.List())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
-	assert.Equal(t, beforeDeleteRevision, s.lastDeleteRevision,
+	assert.Equal(t, beforeDeleteRevisions, len(s.deleteRevisions),
 		"failed durable deletes must not advance the stale-snapshot barrier")
 }
 
@@ -593,7 +606,7 @@ func TestStore_FailedClearLeavesAttemptCached(t *testing.T) {
 	requireSetAttempting(t, s, "lease-1", "backend-a")
 	before := s.Lookup("lease-1")
 	beforeRevision := s.SnapshotRevision()
-	beforeDeleteRevision := s.lastDeleteRevision
+	beforeDeleteRevisions := len(s.deleteRevisions)
 	require.NoError(t, s.Close())
 
 	err := s.ClearAttempt("lease-1", "backend-a")
@@ -605,7 +618,7 @@ func TestStore_FailedClearLeavesAttemptCached(t *testing.T) {
 	assert.False(t, cleared)
 	assert.Equal(t, before, s.Lookup("lease-1"))
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
-	assert.Equal(t, beforeDeleteRevision, s.lastDeleteRevision)
+	assert.Equal(t, beforeDeleteRevisions, len(s.deleteRevisions))
 }
 
 func TestStore_EncodingFailureLeavesCacheAndRevisionUnchanged(t *testing.T) {
@@ -618,7 +631,7 @@ func TestStore_EncodingFailureLeavesCacheAndRevisionUnchanged(t *testing.T) {
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State())
 	assert.Zero(t, s.SnapshotRevision())
 
-	_, err = s.SetBatchIfNotNewer(map[string]string{"lease-2": "backend-b"}, math.MaxUint64)
+	_, _, err = s.SetBatchIfNotNewer(map[string]string{"lease-2": "backend-b"}, math.MaxUint64)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "encode batch placements")
 	assert.Equal(t, StateAbsent, s.Lookup("lease-2").State())
@@ -723,72 +736,145 @@ func TestStore_ConfirmAttemptIfRevisionNeverRecreatesOrOverwrites(t *testing.T) 
 func TestStore_SetBatchIfNotNewerHonorsPostSnapshotDeleteTombstone(t *testing.T) {
 	s := newTestStore(t)
 	requireSetAttempting(t, s, "lease-1", "backend-a")
-	cutoff := s.SnapshotRevision()
+	cutoff := s.BeginInventorySnapshot()
+	defer s.EndInventorySnapshot(cutoff)
 	require.NoError(t, s.Delete("lease-1"))
 	require.Greater(t, s.SnapshotRevision(), cutoff)
 
-	applied := requireSetBatchIfNotNewer(t, s,
+	applied, fenced, err := s.SetBatchIfNotNewer(
 		map[string]string{"lease-1": "backend-a"}, cutoff,
 	)
+	require.NoError(t, err)
 	assert.Empty(t, applied)
+	assert.Contains(t, fenced, "lease-1")
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State(),
 		"stale positive inventory must not recreate a record deleted after fetch began")
 }
 
-func TestStore_GlobalDeleteWatermarkBoundsTombstonesAndPreservesSnapshotCAS(t *testing.T) {
+func TestStore_InventoryDeleteFencesAreLeaseLocal(t *testing.T) {
 	s := newTestStore(t)
-	require.NoError(t, s.Confirm("live", "backend-a"))
-	staleCutoff := s.SnapshotRevision()
+	require.NoError(t, s.Confirm("deleted", "backend-a"))
+	cutoff := s.BeginInventorySnapshot()
+	require.NoError(t, s.Delete("deleted"))
 
+	applied, fenced, err := s.SetBatchIfNotNewer(map[string]string{
+		"deleted":  "backend-a",
+		"observed": "backend-b",
+	}, cutoff)
+	require.NoError(t, err)
+	assert.Contains(t, fenced, "deleted")
+	assert.NotContains(t, fenced, "observed")
+	assert.Contains(t, applied, "observed")
+	assert.Equal(t, StateAbsent, s.Lookup("deleted").State())
+	assert.Equal(t, "backend-b", s.Lookup("observed").Backend,
+		"one lease's deletion must not suppress another lease's positive inventory")
+
+	_, set, err := s.SetAttemptingIfNotNewer("unrelated", "backend-c", cutoff)
+	require.NoError(t, err)
+	assert.True(t, set, "one lease's deletion must not fence another lease's write-ahead attempt")
+	_, set, err = s.SetAttemptingIfNotNewer("deleted", "backend-a", cutoff)
+	require.NoError(t, err)
+	assert.False(t, set, "the exact deleted lease must remain fenced from its older snapshot")
+
+	s.EndInventorySnapshot(cutoff)
+	assert.Empty(t, s.deleteRevisions, "ending the last snapshot releases every tombstone")
+}
+
+func TestStore_InventorySnapshotRefcountsAndPrunesDeleteFences(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.Confirm("lease-1", "backend-a"))
+	first := s.BeginInventorySnapshot()
+	second := s.BeginInventorySnapshot()
+	require.Equal(t, first, second)
+	require.NoError(t, s.Delete("lease-1"))
+	assert.Contains(t, s.deleteRevisions, "lease-1")
+
+	s.EndInventorySnapshot(first)
+	assert.Contains(t, s.deleteRevisions, "lease-1",
+		"one of two callers at the same cutoff still needs the exact-key fence")
+	_, fenced, err := s.SetBatchIfNotNewer(
+		map[string]string{"lease-1": "backend-a"}, second,
+	)
+	require.NoError(t, err)
+	assert.Contains(t, fenced, "lease-1")
+
+	s.EndInventorySnapshot(second)
+	assert.Empty(t, s.deleteRevisions)
+	assert.Empty(t, s.activeSnapshots)
+
+	require.NoError(t, s.Confirm("outside-snapshot", "backend-a"))
+	require.NoError(t, s.Delete("outside-snapshot"))
+	assert.Empty(t, s.deleteRevisions,
+		"ordinary mutations after every inventory ends must not retain tombstones")
+}
+
+func TestStore_InventorySnapshotPrunesAgainstOldestActiveCutoff(t *testing.T) {
+	t.Run("newer snapshot saw deletion", func(t *testing.T) {
+		s := newTestStore(t)
+		require.NoError(t, s.Confirm("lease-1", "backend-a"))
+		older := s.BeginInventorySnapshot()
+		require.NoError(t, s.Delete("lease-1"))
+		newer := s.BeginInventorySnapshot()
+		require.Greater(t, newer, older)
+
+		s.EndInventorySnapshot(older)
+		assert.NotContains(t, s.deleteRevisions, "lease-1",
+			"the remaining newer snapshot began after the deletion")
+		s.EndInventorySnapshot(newer)
+		assert.Empty(t, s.activeSnapshots)
+	})
+
+	t.Run("older snapshot still needs deletion", func(t *testing.T) {
+		s := newTestStore(t)
+		require.NoError(t, s.Confirm("lease-1", "backend-a"))
+		older := s.BeginInventorySnapshot()
+		require.NoError(t, s.Delete("lease-1"))
+		newer := s.BeginInventorySnapshot()
+		require.Greater(t, newer, older)
+
+		s.EndInventorySnapshot(newer)
+		assert.Contains(t, s.deleteRevisions, "lease-1",
+			"ending the newer snapshot cannot discard the older snapshot's fence")
+		s.EndInventorySnapshot(older)
+		assert.Empty(t, s.deleteRevisions)
+		assert.Empty(t, s.activeSnapshots)
+	})
+}
+
+func TestStore_DeleteFencesAreBoundedBySnapshotLifetime(t *testing.T) {
+	s := newTestStore(t)
+	cutoff := s.BeginInventorySnapshot()
 	const deletedKeys = 256
-	inventory := make(map[string]string, deletedKeys+2)
-	inventory["live"] = "backend-b"
-	inventory["new"] = "backend-new"
 	for i := range deletedKeys {
 		leaseUUID := fmt.Sprintf("deleted-%03d", i)
 		require.NoError(t, s.Confirm(leaseUUID, "backend-a"))
 		require.NoError(t, s.Delete(leaseUUID))
-		inventory[leaseUUID] = "backend-a"
 	}
+	assert.Len(t, s.deleteRevisions, deletedKeys)
 
-	deleteWatermark := s.lastDeleteRevision
-	assert.Equal(t, s.SnapshotRevision(), deleteWatermark)
-	assert.Len(t, s.List(), 1,
-		"deleted lease cardinality must not survive in an in-memory tombstone collection")
-
-	requireSetBatchIfNotNewer(t, s, inventory, staleCutoff)
-	assert.Equal(t, "backend-b", s.Lookup("live").Backend,
-		"an old snapshot may still converge a live record that did not race a mutation")
-	assert.Equal(t, StateAbsent, s.Lookup("new").State(),
-		"an old snapshot conservatively defers all absent-key creation after any deletion")
-	for i := range deletedKeys {
-		leaseUUID := fmt.Sprintf("deleted-%03d", i)
-		assert.Equal(t, StateAbsent, s.Lookup(leaseUUID).State(), leaseUUID)
-	}
-	assert.Equal(t, deleteWatermark, s.lastDeleteRevision,
-		"backfills must not grow or move the deletion watermark")
-
-	freshCutoff := s.SnapshotRevision()
-	requireSetBatchIfNotNewer(t, s, inventory, freshCutoff)
-	assert.Len(t, s.List(), len(inventory),
-		"a fresh inventory must converge every deferred absent key")
+	s.EndInventorySnapshot(cutoff)
+	assert.Empty(t, s.deleteRevisions,
+		"completed inventory cannot leave process-lifetime per-lease tombstones")
 }
 
 func TestStore_ClearConflictDeletionBlocksOlderInventory(t *testing.T) {
 	s := newTestStore(t)
-	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
+	require.Empty(t, requireSetConflictsIfNotNewer(t, s, map[string][]string{
 		"lease-1": {"backend-a", "backend-b"},
 	}, s.SnapshotRevision()))
-	staleCutoff := s.SnapshotRevision()
+	staleCutoff := s.BeginInventorySnapshot()
+	defer s.EndInventorySnapshot(staleCutoff)
 
 	require.NoError(t, s.ClearConflictsIfNotNewer(
 		map[string]struct{}{"lease-1": {}}, staleCutoff,
 	))
-	require.Greater(t, s.lastDeleteRevision, staleCutoff)
-	applied := requireSetBatchIfNotNewer(t, s,
+	require.Greater(t, s.deleteRevisions["lease-1"], staleCutoff)
+	applied, fenced, err := s.SetBatchIfNotNewer(
 		map[string]string{"lease-1": "backend-a"}, staleCutoff,
 	)
+	require.NoError(t, err)
 	assert.Empty(t, applied)
+	assert.Contains(t, fenced, "lease-1")
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State(),
 		"inventory older than conflict deletion must not recreate the placement")
 
@@ -799,13 +885,74 @@ func TestStore_ClearConflictDeletionBlocksOlderInventory(t *testing.T) {
 	assert.Equal(t, StateConfirmed, s.Lookup("lease-1").State())
 }
 
+func TestStore_ConflictDeleteFencesAreLeaseLocal(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.Confirm("deleted", "backend-a"))
+	cutoff := s.BeginInventorySnapshot()
+	defer s.EndInventorySnapshot(cutoff)
+	require.NoError(t, s.Delete("deleted"))
+
+	fenced := requireSetConflictsIfNotNewer(t, s, map[string][]string{
+		"deleted":  {"backend-a", "backend-b"},
+		"observed": {"backend-a", "backend-b"},
+	}, cutoff)
+	assert.Contains(t, fenced, "deleted")
+	assert.NotContains(t, fenced, "observed")
+	assert.Equal(t, StateAbsent, s.Lookup("deleted").State())
+	p := s.Lookup("observed")
+	assert.Equal(t, StateUnusable, p.State())
+	assert.Equal(t, []string{"backend-a", "backend-b"}, p.ConflictBackends)
+}
+
+func TestStore_ConditionalInventoryReturnsFencesWithWriteError(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(*Store, uint64) (map[string]struct{}, error)
+	}{
+		{
+			name: "positive batch",
+			call: func(s *Store, cutoff uint64) (map[string]struct{}, error) {
+				_, fenced, err := s.SetBatchIfNotNewer(map[string]string{
+					"deleted":  "backend-a",
+					"eligible": "backend-b",
+				}, cutoff)
+				return fenced, err
+			},
+		},
+		{
+			name: "conflict batch",
+			call: func(s *Store, cutoff uint64) (map[string]struct{}, error) {
+				return s.SetConflictsIfNotNewer(map[string][]string{
+					"deleted":  {"backend-a", "backend-b"},
+					"eligible": {"backend-a", "backend-b"},
+				}, cutoff)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			require.NoError(t, s.Confirm("deleted", "backend-a"))
+			cutoff := s.BeginInventorySnapshot()
+			require.NoError(t, s.Delete("deleted"))
+			require.NoError(t, s.Close())
+
+			fenced, err := tt.call(s, cutoff)
+			require.Error(t, err)
+			assert.Contains(t, fenced, "deleted",
+				"a known exact-key fence remains actionable when another write fails")
+		})
+	}
+}
+
 func TestStore_ConflictQuarantineSurvivesRestartAndResolvesOnCompleteEvidence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	s, err := NewStore(dbPath)
 	require.NoError(t, err)
 	require.NoError(t, s.Confirm("lease-1", "backend-a"))
 	cutoff := s.SnapshotRevision()
-	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
+	require.Empty(t, requireSetConflictsIfNotNewer(t, s, map[string][]string{
 		"lease-1": {"backend-b", "backend-a"},
 	}, cutoff))
 	p := s.Lookup("lease-1")
@@ -833,7 +980,7 @@ func TestStore_ConflictQuarantineSurvivesRestartAndResolvesOnCompleteEvidence(t 
 	assert.Equal(t, "backend-b", p.Backend)
 
 	cutoff = s.SnapshotRevision()
-	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
+	require.Empty(t, requireSetConflictsIfNotNewer(t, s, map[string][]string{
 		"lease-1": {"backend-a", "backend-b"},
 	}, cutoff))
 	cutoff = s.SnapshotRevision() // a later complete inventory proves absence
@@ -861,7 +1008,7 @@ func TestStore_LegacyConflictWithoutCandidatesLoadsFailClosed(t *testing.T) {
 	}
 
 	cutoff := s.SnapshotRevision()
-	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
+	require.Empty(t, requireSetConflictsIfNotNewer(t, s, map[string][]string{
 		"lease-partial-conflict": {"backend-a", "backend-b"},
 	}, cutoff))
 	p := s.Lookup("lease-partial-conflict")
@@ -875,9 +1022,10 @@ func TestStore_StaleConflictSnapshotCannotOverwriteNewAttempt(t *testing.T) {
 	cutoff := s.SnapshotRevision()
 	requireSetAttempting(t, s, "lease-1", "backend-a")
 
-	require.NoError(t, s.SetConflictsIfNotNewer(map[string][]string{
+	fenced := requireSetConflictsIfNotNewer(t, s, map[string][]string{
 		"lease-1": {"backend-a", "backend-b"},
-	}, cutoff))
+	}, cutoff)
+	assert.Contains(t, fenced, "lease-1")
 	p := s.Lookup("lease-1")
 	assert.False(t, p.Conflict)
 	assert.Equal(t, StateAttempting, p.State())

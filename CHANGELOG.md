@@ -14,16 +14,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `fred_provisioner_callback_settlement_claim_wait_timeouts_total` exposes
   callbacks that exhaust the bounded wait for another terminal settlement actor,
   making stuck or unusually slow claim holders actionable. (ENG-632)
+- `fred_provisioner_callback_placement_semantic_conflicts_total` exposes
+  authenticated success-callback settlement attempts that encounter a permanent
+  semantic placement verdict and continue toward chain acknowledgement while
+  preserving the durable record for operator repair. Retries may increment the
+  counter more than once. (ENG-632)
 
 ### Changed
 
 - Provision and restore callback URLs now carry an HMAC-covered
   `operation_generation` query parameter. Backends must preserve and sign the
   complete request URI, including its query, so stale callbacks cannot settle a
-  replacement operation. (ENG-632)
-- Restore now requires `placement_store_db_path`; when durable placement or the
-  generation-scoped tracker is unavailable, fred returns 503 before contacting
-  the backend. (ENG-632)
+  replacement operation. A non-empty malformed or zero generation is rejected
+  with 400. Requests with no parameter or an empty value remain syntactically
+  accepted for rolling compatibility, but generation-scoped operations still
+  require the echoed token to settle. (ENG-632)
+- Restore now requires a writable durable placement recorder and a non-zero
+  generation-scoped tracker token before contacting the backend. A target with
+  an unresolved durable provision/restore attempt returns 409, and an open
+  backend circuit returns 503 rather than 500. (ENG-632)
+- Direct placement-routed connection, log, release, restart, and update
+  operations now return 503 for an unusable/conflicting or attempt-only placement
+  instead of substituting a backend by SKU. Provision-discovery fan-out is
+  unchanged. (ENG-632)
+- Close/deprovision now fails and retries when a durably named owner, attempt, or
+  conflict candidate is unconfigured or cannot be reached, even if other
+  backends report a successful no-op. (ENG-632)
 
 ### Deprecated
 
@@ -31,12 +47,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Placement transitions are now write-ahead and fail closed: fred durably records
-  an attempted backend before provision or restore, distinguishes definitive
-  refusal from an ambiguous outcome, reconciles attempts only from authoritative
-  inventory, and deprovisions every known owner candidate. Callback and timeout
-  settlement is generation-scoped so an older operation cannot mutate or reject
-  its replacement. (ENG-632)
+- Placement-enabled provision and all restore transitions are now write-ahead
+  and fail closed: Fred durably records an attempted backend before the backend
+  call, distinguishes definitive refusal from an ambiguous outcome, reconciles
+  attempts only from authoritative inventory, and deprovisions every known owner
+  candidate. Callback and timeout settlement is generation-scoped so an older
+  operation cannot mutate or reject its replacement. (ENG-632)
 
 ### Security
 

@@ -718,10 +718,10 @@ Restore a soft-deleted lease's retained data into a **new** lease. The path `lea
 - `400 Bad Request` - Missing/invalid `from_lease_uuid`, or items don't match the retained set
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
-- `404 Not Found` - No retained data found for `from_lease_uuid` (absent, expired, cross-tenant, or its backend is gone)
-- `409 Conflict` - Target lease is not `PENDING`, is already provisioned, or is not in a restorable state
+- `404 Not Found` - No retained data found for `from_lease_uuid` (the source is absent, expired, cross-tenant, or its configured backend reports that it is not retained)
+- `409 Conflict` - Target lease is not `PENDING`, is already provisioned, has an unresolved durable provision/restore attempt, or is not in a restorable state
 - `422 Unprocessable Entity` - Requested a smaller SKU tier (demote) but the retained data exceeds the new tier's `disk_mb` cap; the `error` message begins `retained data exceeds the requested smaller tier`
-- `503 Service Unavailable` - Insufficient resources to restore, or placement routing is not configured
+- `503 Service Unavailable` - Insufficient resources, an open backend circuit, unavailable placement routing/recording/tracking, or a source placement that is unusable, unresolved, or names a backend Fred no longer knows
 
 ### Get Release History
 
@@ -1373,13 +1373,26 @@ Chain State (leases)     Backend State (provisions)
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |
-| *any* | Owning backend did not answer | **Defer — no action this sweep** |
+| PENDING/ACTIVE | Placement conflict/unusable, or attempt remains unresolved after authoritative settlement | **Defer — no action this sweep** |
+| PENDING/ACTIVE | Positive report disagrees with confirmed placement | **Defer — no action this sweep** |
+| PENDING/ACTIVE | Confirmed owner is not configured | **Defer and emit an operator-visible lease error** |
+| PENDING/ACTIVE | Owning backend did not answer | **Defer — no action this sweep** |
 
-The last row takes precedence over every other. A sweep applies the matrix only
-to leases whose owning backend reported: one present in the backend data, or one
-whose placement record names a backend that answered. Anything else is deferred
-and retried on the next sweep, because acting on a lease fred cannot see risks
-re-provisioning it onto a healthy peer and laying an empty volume over live data.
+For live (`PENDING`/`ACTIVE`) chain leases, the four placement-safety rows take
+precedence over every normal state row. A positive backend report is not
+sufficient when the durable record remains unusable, still has an unresolved
+attempt, or names a different confirmed owner.
+A confirmed owner must remain configured and must answer the sweep. Anything
+else is deferred and retried, because acting on a lease Fred cannot place
+unambiguously risks re-provisioning it onto a healthy peer and laying an empty
+volume over live data. Terminal and not-found provisions are handled by the
+separately gated destructive passes below.
+
+When both the placement record and positive backend report are absent, Fred
+applies a `Not provisioned` row only after the current sweep is complete, after
+a prior complete inventory was durably synchronized and made absence trustworthy
+for that lease, or after the current sweep authoritatively cleared its sole
+attempt. An incomplete sweep without one of those proofs defers the lease.
 
 A backend failing to answer therefore degrades only its own leases; it no longer
 stops reconciliation for the rest of the fleet. Sweeps that ran degraded are

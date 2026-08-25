@@ -346,6 +346,83 @@ func TestOrchestrator_Deprovision_InlineCallbackDoesNotWaitForClaim(t *testing.T
 	}
 }
 
+func TestOrchestrator_Deprovision_InlineCallbackThenCandidateFailureRemainsRetryable(t *testing.T) {
+	callbackBackend := &synchronousCallbackDeprovisionBackend{
+		mockManagerBackend: &mockManagerBackend{name: "backend-a"},
+	}
+	candidateErr := errors.New("backend-b temporarily unavailable")
+	failingBackend := &mockManagerBackend{name: "backend-b", deprovisionErr: candidateErr}
+	byName := map[string]backend.Backend{
+		callbackBackend.Name(): callbackBackend,
+		failingBackend.Name():  failingBackend,
+	}
+	router := &mockBackendRouter{getBackendByNameFn: func(name string) backend.Backend {
+		return byName[name]
+	}}
+	tracker := NewInFlightTracker()
+	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+		"lease-1", "tenant-a", testItems("sku-1"), callbackBackend.Name(),
+	)
+	require.True(t, tracked)
+	placements := &mockPlacementStore{}
+	fenced, err := placements.SetConflictsIfNotNewer(
+		map[string][]string{"lease-1": {callbackBackend.Name(), failingBackend.Name()}},
+		placements.SnapshotRevision(),
+	)
+	require.NoError(t, err)
+	require.Empty(t, fenced)
+
+	orch := NewProvisionOrchestrator(
+		"prov-1", "http://localhost:8080", router, tracker, placements,
+	)
+	hs := NewHandlerSet(HandlerDeps{Orchestrator: orch, Tracker: tracker})
+	callbackMsg := newCallbackMsg(t, backend.CallbackPayload{
+		LeaseUUID:           "lease-1",
+		Backend:             callbackBackend.Name(),
+		Status:              backend.CallbackStatusSuccess,
+		OperationGeneration: generation,
+	})
+	callbackDeliveries := 0
+	callbackBackend.callback = func(ctx context.Context, _ string) error {
+		// Model the one completion callback from the provision that the close
+		// overtook. The idempotent close retry does not manufacture a second one.
+		if callbackDeliveries > 0 {
+			return nil
+		}
+		callbackDeliveries++
+		callbackMsg.SetContext(ctx)
+		return hs.HandleBackendCallback(callbackMsg)
+	}
+
+	err = orch.Deprovision(context.Background(), "lease-1")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	require.ErrorIs(t, err, candidateErr)
+	assert.Equal(t, 1, callbackDeliveries)
+	current, exists := tracker.GetInFlight("lease-1")
+	require.True(t, exists, "the failed close must retain its exact positive backend candidate")
+	assert.Equal(t, generation, current.Generation)
+	assert.False(t, current.settlementClaimed,
+		"failure must release ownership so the close message can retry")
+	assert.Equal(t, inFlightSettlementUnclaimed, current.settlementOwner)
+	_, claimable := tracker.TryClaimInFlight("lease-1", generation)
+	require.True(t, claimable, "the consumed callback must not leak the close path's claim")
+	require.True(t, tracker.ReleaseInFlightClaim("lease-1", generation))
+
+	failingBackend.mu.Lock()
+	failingBackend.deprovisionErr = nil
+	failingBackend.mu.Unlock()
+	require.NoError(t, orch.Deprovision(context.Background(), "lease-1"))
+	assert.False(t, tracker.IsInFlight("lease-1"),
+		"a successful close retry must finish the retained exact generation")
+
+	callbackBackend.mu.Lock()
+	assert.Equal(t, []string{"lease-1", "lease-1"}, callbackBackend.deprovisionCalls)
+	callbackBackend.mu.Unlock()
+	failingBackend.mu.Lock()
+	assert.Equal(t, []string{"lease-1", "lease-1"}, failingBackend.deprovisionCalls)
+	failingBackend.mu.Unlock()
+}
+
 func TestOrchestrator_Deprovision_PanicReleasesExactGenerationClaim(t *testing.T) {
 	mb := &panickingDeprovisionBackend{mockManagerBackend: &mockManagerBackend{name: "test-backend"}}
 	router := &mockBackendRouter{getBackendByNameFn: func(name string) backend.Backend {
@@ -521,14 +598,16 @@ func TestOrchestrator_Deprovision_KnownConflictRequiresEveryNamedBackend(t *test
 		backendsFn: func() []backend.Backend { return []backend.Backend{configured} },
 	}
 	placements := &mockPlacementStore{}
-	require.NoError(t, placements.SetConflictsIfNotNewer(map[string][]string{
+	fenced, err := placements.SetConflictsIfNotNewer(map[string][]string{
 		"lease-1": {"backend-a", "backend-b"},
-	}, placements.SnapshotRevision()))
+	}, placements.SnapshotRevision())
+	require.NoError(t, err)
+	require.Empty(t, fenced)
 	orch := NewProvisionOrchestrator(
 		"prov-1", "http://localhost:8080", router, NewInFlightTracker(), placements,
 	)
 
-	err := orch.Deprovision(context.Background(), "lease-1")
+	err = orch.Deprovision(context.Background(), "lease-1")
 	require.ErrorIs(t, err, ErrDeprovisionFailed)
 	require.ErrorIs(t, err, ErrPlacementUnresolvable,
 		"backend-a remains a positive candidate after it is removed from the router")
@@ -551,9 +630,11 @@ func TestOrchestrator_Deprovision_KnownConflictSucceedsAfterEveryCandidate(t *te
 		backendsFn:         func() []backend.Backend { return []backend.Backend{backendA, backendB} },
 	}
 	placements := &mockPlacementStore{}
-	require.NoError(t, placements.SetConflictsIfNotNewer(map[string][]string{
+	fenced, err := placements.SetConflictsIfNotNewer(map[string][]string{
 		"lease-1": {"backend-a", "backend-b"},
-	}, placements.SnapshotRevision()))
+	}, placements.SnapshotRevision())
+	require.NoError(t, err)
+	require.Empty(t, fenced)
 	orch := NewProvisionOrchestrator(
 		"prov-1", "http://localhost:8080", router, NewInFlightTracker(), placements,
 	)
@@ -1187,7 +1268,9 @@ func TestOrchestrator_TypedNilPlacementStore_Panics(t *testing.T) {
 // errorPlacementStore is a PlacementStore that returns errors on write operations.
 type errorPlacementStore struct {
 	mockPlacementStore
-	setErr error
+	setErr                error
+	batchFencedOnError    map[string]struct{}
+	conflictFencedOnError map[string]struct{}
 }
 
 type committedRevisionPlacementStore struct {
@@ -1293,23 +1376,26 @@ func (e *errorPlacementStore) ClearAttemptIfRevision(leaseUUID, backendName stri
 }
 
 func (e *errorPlacementStore) SetBatch(placements map[string]string) error {
-	_, err := e.SetBatchIfNotNewer(placements, ^uint64(0))
+	_, _, err := e.SetBatchIfNotNewer(placements, ^uint64(0))
 	return err
 }
 
 func (e *errorPlacementStore) SetBatchIfNotNewer(
 	placements map[string]string,
 	maxRevision uint64,
-) (map[string]uint64, error) {
+) (map[string]uint64, map[string]struct{}, error) {
 	if e.setErr != nil {
-		return nil, e.setErr
+		return nil, e.batchFencedOnError, e.setErr
 	}
 	return e.mockPlacementStore.SetBatchIfNotNewer(placements, maxRevision)
 }
 
-func (e *errorPlacementStore) SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) error {
+func (e *errorPlacementStore) SetConflictsIfNotNewer(
+	conflicts map[string][]string,
+	maxRevision uint64,
+) (map[string]struct{}, error) {
 	if e.setErr != nil {
-		return e.setErr
+		return e.conflictFencedOnError, e.setErr
 	}
 	return e.mockPlacementStore.SetConflictsIfNotNewer(conflicts, maxRevision)
 }

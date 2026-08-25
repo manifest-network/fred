@@ -223,7 +223,8 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// placement revision, tracker tombstone, or live action claim.
 	var placementSnapshotRevision uint64
 	if r.placementStore != nil {
-		placementSnapshotRevision = r.placementStore.SnapshotRevision()
+		placementSnapshotRevision = r.placementStore.BeginInventorySnapshot()
+		defer r.placementStore.EndInventorySnapshot(placementSnapshotRevision)
 	}
 	inFlightAtSnapshot := make(map[string]struct{})
 	var trackerSnapshotRevision uint64
@@ -319,7 +320,12 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	sameSweepPlacementRevisions := make(map[string]uint64)
 	if r.placementStore != nil {
 		syncOK := true
-		if err := r.placementStore.SetConflictsIfNotNewer(currentAmbiguities, placementSnapshotRevision); err != nil {
+		placementObservationsExcluded := make(map[string]struct{})
+		fencedConflicts, err := r.placementStore.SetConflictsIfNotNewer(
+			currentAmbiguities, placementSnapshotRevision,
+		)
+		maps.Copy(placementObservationsExcluded, fencedConflicts)
+		if err != nil {
 			syncOK = false
 			slog.Warn("failed to persist ambiguous placement quarantine", "error", err)
 		}
@@ -394,7 +400,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		}
 
 		placements := make(map[string]string, len(allProvisions)+len(allRetentions))
-		placementObservationsExcluded := make(map[string]struct{})
 		for leaseUUID, provision := range allProvisions {
 			if _, ambiguous := currentAmbiguities[leaseUUID]; ambiguous {
 				continue
@@ -460,7 +465,10 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 			}
 			delete(placements, leaseUUID)
 		}
-		appliedRevisions, err := r.placementStore.SetBatchIfNotNewer(placements, placementSnapshotRevision)
+		appliedRevisions, fencedObservations, err := r.placementStore.SetBatchIfNotNewer(
+			placements, placementSnapshotRevision,
+		)
+		maps.Copy(placementObservationsExcluded, fencedObservations)
 		if err != nil {
 			syncOK = false
 			slog.Warn("failed to sync placements from backend state", "error", err)
@@ -534,34 +542,23 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				slog.Warn("failed to clear resolved placement quarantine", "error", err)
 			}
 		}
+		if r.placementAbsenceUntrusted == nil {
+			r.placementAbsenceUntrusted = make(map[string]struct{})
+		}
 		if syncOK {
 			placementSyncOK = true
 			ambiguousOwners = r.updatePlacementAmbiguities(currentAmbiguities, inventoryComplete)
 			placementRecords = r.placementStore.List()
-			if r.placementAbsenceUntrusted == nil {
-				r.placementAbsenceUntrusted = make(map[string]struct{})
-			}
 			if inventoryComplete {
 				// This snapshot accounts for every configured backend and therefore
 				// settles every older per-lease exception. Operations that straddled
 				// this very snapshot are re-added immediately below.
 				clear(r.placementAbsenceUntrusted)
-			} else {
-				// A partial inventory cannot prove absence, but a durable non-absent
-				// placement is enough to settle an older exception: future degraded
-				// sweeps will use that record rather than bare absence.
-				for leaseUUID := range r.placementAbsenceUntrusted {
-					if _, excluded := placementObservationsExcluded[leaseUUID]; excluded {
-						continue
-					}
-					if placementRecords[leaseUUID].State() != placement.StateAbsent {
-						delete(r.placementAbsenceUntrusted, leaseUUID)
-					}
-				}
 			}
-			for leaseUUID := range placementObservationsExcluded {
-				r.placementAbsenceUntrusted[leaseUUID] = struct{}{}
-			}
+			// A partial inventory cannot settle an older excluded positive merely
+			// because some durable record exists: that record may be the stale fact
+			// the excluded observation would have replaced. Only a later complete
+			// provision+retention sync may retire the lease-local exception.
 			if inventoryComplete && len(ambiguousOwners) == 0 {
 				r.placementSweepSeen.Store(true)
 			}
@@ -572,6 +569,13 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 			// sweep could treat a missing record as authority to route elsewhere.
 			r.placementSweepSeen.Store(false)
 			placementRecords = r.placementStore.List()
+		}
+		// Current positive observations excluded by an operation boundary or
+		// revision fence remain safety evidence even if another placement write in
+		// the same synchronization failed. The global latch protects only bare
+		// absence; this exact-lease marker also gates stale confirmed placements.
+		for leaseUUID := range placementObservationsExcluded {
+			r.placementAbsenceUntrusted[leaseUUID] = struct{}{}
 		}
 	}
 	// Reuse one immutable placement snapshot across the dispatch loop. Lookup is
@@ -712,8 +716,13 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 			// bounded worker rather than serializing every lease in the dispatch
 			// loop; its exact-revision CAS and the per-lease tracker snapshot make
 			// settlements for distinct leases safe to run concurrently.
+			_, absenceUntrustedForLease := r.placementAbsenceUntrusted[leaseUUID]
+			if absenceUntrustedForLease {
+				deferForSnapshotBoundary("placement_observation_excluded", 0)
+				return nil
+			}
 			attemptCleared := r.resolvePlacementAttempt(
-				leaseUUID, placementRecord, snapshot, placementSnapshotRevision,
+				leaseUUID, placementRecord, absenceUntrustedForLease, snapshot, placementSnapshotRevision,
 				inFlightAtSnapshot, retentionsAnswered, retentionsReportedByBackend,
 			)
 			if attemptCleared {
@@ -727,8 +736,8 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				// this point.
 				placementCASRevision = r.placementStore.SnapshotRevision()
 			}
-			_, absenceUntrustedForLease := r.placementAbsenceUntrusted[leaseUUID]
-			absenceTrusted := (r.placementSweepSeen.Load() && !absenceUntrustedForLease) || attemptCleared
+			absenceTrusted := !absenceUntrustedForLease &&
+				(r.placementSweepSeen.Load() || attemptCleared)
 
 			if placementRecord.State() == placement.StateConfirmed &&
 				!snapshot.answered.configured(placementRecord.Backend) {
@@ -1548,6 +1557,7 @@ func (r *Reconciler) placementFor(leaseUUID string) placement.Placement {
 func (r *Reconciler) resolvePlacementAttempt(
 	leaseUUID string,
 	p placement.Placement,
+	absenceUntrusted bool,
 	snap fleetSnapshot,
 	snapshotRevision uint64,
 	inFlightAtSnapshot map[string]struct{},
@@ -1555,6 +1565,13 @@ func (r *Reconciler) resolvePlacementAttempt(
 	retentionsReportedByBackend map[string]map[string]struct{},
 ) bool {
 	if r.placementStore == nil || p.Attempt == "" || p.Revision() > snapshotRevision {
+		return false
+	}
+	// A prior complete sweep may have excluded a positive observation for this
+	// exact lease because an operation straddled its snapshot boundary. Until a
+	// later complete view settles that exception, a degraded view cannot use only
+	// the attempted backend's absence to erase the remaining execution gate.
+	if absenceUntrusted {
 		return false
 	}
 	// At startup, or after any failed/excluded placement sync, there is no durable
@@ -2404,7 +2421,9 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 	return cleaned
 }
 
-// cleanupOrphanedPlacements is the SOLE pruner of the placement index (ENG-333).
+// cleanupOrphanedPlacements is the sole background/age-based pruner of the
+// placement index (ENG-333). A successfully rejected PENDING callback can also
+// conditionally delete the exact operation-owned record.
 // It deletes a placement only when ALL of these hold, so it never races a
 // concurrent StartProvisioning Set nor wipes valid placement on a backend
 // outage:

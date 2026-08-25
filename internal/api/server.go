@@ -107,7 +107,7 @@ type ServerDeps struct {
 	StatusChecker      StatusChecker
 	PlacementLookup    PlacementLookup          // Optional — if nil, placement routing is disabled.
 	RestoreRecorder    RestorePlacementRecorder // Optional globally; Restore returns 503 when absent (ENG-632).
-	RestoreTracker     RestoreInFlightTracker   // Optional — inline-ack restore in-flight tracking (ENG-358).
+	RestoreTracker     RestoreInFlightTracker   // Required with RestoreRecorder; Restore returns 503 when absent (ENG-632).
 	EventBroker        *EventBroker             // Optional — if nil, the events endpoint returns 501.
 }
 

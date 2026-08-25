@@ -486,6 +486,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			// A durable semantic conflict must remain untouched for inventory/operator
 			// repair, but it must not poison the success callback and let the timeout
 			// path reject a lease that is already live on this backend.
+			metrics.CallbackPlacementSemanticConflictsTotal.Inc()
 			slog.Error("placement rejected success callback confirmation; continuing chain acknowledgement",
 				"lease_uuid", callback.LeaseUUID,
 				"backend", provision.Backend,
