@@ -745,7 +745,8 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrNotProvisioned: 404 from GetInfo/GetProvision/GetLogs (valid "not found")
 			//   - ErrValidation: 400 from Provision/Update (permanent client error)
 			//   - ErrInsufficientResources: 503 from Provision (backend at capacity, not unhealthy)
-			//   - ErrAlreadyProvisioned: 409 from Provision (idempotent duplicate)
+			//   - ErrAlreadyProvisioned: 409 from Provision (breaker-exempt conflict;
+			//     not ownership proof until authoritative inventory validates it)
 			//   - ErrInvalidState: 409 from Restart/Update (wrong lease state for operation)
 			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
 			//   - ErrDemoteDataExceedsTier: 422 (code=demote_exceeds_tier) from Restore — data exceeds the tier cap, a permanent client error, not a backend failure
@@ -1104,7 +1105,8 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 				// 400: validation error — permanent, won't succeed on retry.
 				return nil, c.parseValidationError(readErrorBodyBytes(resp), "provision")
 			case http.StatusConflict:
-				// 409: lease already provisioned — idempotent duplicate.
+				// 409: the backend reports a conflict. Callers must validate it
+				// against authoritative inventory before treating it as ownership.
 				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
 			case http.StatusServiceUnavailable:
 				// 503: backend at capacity — not a health failure.

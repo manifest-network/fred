@@ -477,6 +477,14 @@ Returns connection details for an active lease from the backend. Requires ADR-03
 - `services` - Map of service name to connection details for stack (multi-service) leases. Each service contains its own `instances` array and optional `fqdn` (propagated from its first instance when not set explicitly).
 - `metadata` - Additional backend-specific data
 
+**Response Codes:**
+- `200 OK` - Connection details found
+- `401 Unauthorized` - Invalid signature or token
+- `403 Forbidden` - Lease does not belong to this tenant
+- `404 Not Found` - Lease not provisioned
+- `500 Internal Server Error` - The backend failed while reading connection details
+- `503 Service Unavailable` - A required authentication or routing service is unavailable, or durable placement is unusable or unresolved
+
 ### Get Lease Status
 
 ```
@@ -614,6 +622,7 @@ Returns container logs for a lease. Works for both active and non-active leases,
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Provision not found (never provisioned or logs expired)
+- `503 Service Unavailable` - Backend routing is unavailable, or durable placement is unusable or unresolved
 
 ### Upload Payload
 
@@ -658,6 +667,7 @@ Restart containers for a lease without changing the manifest. Containers are sto
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Lease is in a state that cannot be restarted (e.g., already restarting or updating)
+- `503 Service Unavailable` - A required authentication or routing service is unavailable, or durable placement is unusable or unresolved
 
 ### Update Lease
 
@@ -691,8 +701,9 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Lease is in a state that cannot be updated (e.g., currently restarting)
-- `500 Internal Server Error` - Applied to the backend but could not be persisted, or no payload store is configured
+- `500 Internal Server Error` - The backend update failed (including an open circuit), no payload store is configured, or the accepted update could not be persisted
 - `502 Bad Gateway` - The backend rejected the update with an unusable or off-contract error response
+- `503 Service Unavailable` - A required authentication or routing service is unavailable, or durable placement is unusable or unresolved
 
 ### Restore Lease
 
@@ -722,7 +733,8 @@ Restore a soft-deleted lease's retained data into a **new** lease. The path `lea
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - No retained data found for `from_lease_uuid` (the source is absent, expired, cross-tenant, or its configured backend reports that it is not retained)
 - `409 Conflict` - Target lease is not `PENDING`, is already provisioned, has an unresolved durable provision/restore attempt, or is not in a restorable state
-- `422 Unprocessable Entity` - Requested a smaller SKU tier (demote) but the retained data exceeds the new tier's `disk_mb` cap; the `error` message begins `retained data exceeds the requested smaller tier`
+- `422 Unprocessable Entity` - The retained data exceeds a requested smaller tier's `disk_mb` cap, or the backend otherwise refuses the restore with a well-formed error envelope; the response relays the backend's bounded `error` message
+- `500 Internal Server Error` - The restore failed with an unexpected or ambiguous backend error, such as a transport error, timeout, or generic 5xx
 - `502 Bad Gateway` - The backend rejected the restore with an unusable or off-contract error response
 - `503 Service Unavailable` - Insufficient resources, an open backend circuit, unavailable placement routing/recording/tracking, or a source placement that is unusable, unresolved, or names a backend Fred no longer knows
 
@@ -774,6 +786,7 @@ Returns the release (deployment) history for a lease, showing each version that 
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
+- `503 Service Unavailable` - Backend routing is unavailable, or durable placement is unusable or unresolved
 
 ### Stream Lease Events (WebSocket)
 
@@ -796,6 +809,7 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
 
 **Behavior:**
 - Events are delivered as WebSocket JSON frames
+- Events are best-effort notifications, not an ordered state log; delayed backend callbacks can arrive after a newer operation and may therefore produce an out-of-order status. Use the REST status endpoints for current state.
 - The server sends WebSocket ping frames every 30 seconds; the client must respond with pong within 40 seconds or the connection is closed
 - Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
 - The stream ends when the client disconnects or the server shuts down (clean close frame)
@@ -836,8 +850,10 @@ Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third i
 
 **Idempotency:**
 If a callback is received for a lease that has already been processed (no longer in-flight),
-the server still returns `200 OK` as a no-op. Response bodies are not guaranteed for this
-path, so callers should treat the HTTP status code as the source of truth.
+the server still returns `200 OK`. `success` and `failed` callbacks may publish a
+best-effort lease status event, but cannot acknowledge or reject the lease or mutate its
+placement. `deprovisioned` remains teardown evidence. Response bodies are not guaranteed
+for this path, so callers should treat the HTTP status code as the source of truth.
 
 ## Backend API Specification
 

@@ -431,7 +431,9 @@ When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather tha
 **What does NOT count as a failure (exempted via `IsSuccessful`):**
 - `ErrNotProvisioned` (HTTP 404) — valid "lease not found" from read endpoints
 - `ErrValidation` (HTTP 400) — permanent client error, won't succeed on retry
-- `ErrAlreadyProvisioned` (HTTP 409 from Provision) — idempotent duplicate
+- `ErrAlreadyProvisioned` (HTTP 409 from Provision) — exempt from circuit-breaker
+  failure counting, but not durable ownership proof because the client cannot
+  distinguish a backend-authored conflict from an intermediary-generated 409
 - `ErrInvalidState` (HTTP 409 from Restart/Update) — wrong lease state for operation
 - `ErrInsufficientResources` (HTTP 503 from Provision) — treated as a capacity signal for circuit-breaker health, but not as durable proof of refusal because an intermediary may have emitted the unvalidated 503 after backend acceptance
 
@@ -606,7 +608,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_provisioner_ack_batch_fee_gas_errors_total` | counter | `lane` | Ack-batch failures classified as insufficient-fee or out-of-gas — sustained non-zero indicates `gas_limit`/`max_gas_limit`/fee misconfiguration |
 | `fred_provisioner_ack_batch_individual_fallbacks_total` | counter | `lane` | Ack-batch failures that fell back to per-lease retries |
 | `fred_provisioner_reconciler_inflight_skips_total` | counter | — | Ready leases the reconciler skipped because the main flow owns them |
-| `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`, `fetch_retentions`) — any non-zero is a latent bug |
+| `fred_provisioner_reconciler_panics_total` | counter | `stage` | Panics recovered in reconciler goroutines (`process_lease`, `process_orphan`, `fetch_provisions`, `fetch_retentions`, `check_placement_marker`) — any non-zero is a latent bug |
 | `fred_placement_write_failures_total` | counter | — | Failed durable placement mutations or sync verification. Any increase is actionable: prewrite failures block the backend call, while later failures retain conservative state for reconciliation |
 
 **Reconciler:**
@@ -619,8 +621,8 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_reconciler_last_success_timestamp_seconds` | gauge | — | Unix timestamp of last **clean, complete** run — a degraded sweep does not advance it |
 | `fred_reconciler_conflicts_total` | counter | — | Reconciler conflicts (lease already in-flight) |
 | `fred_reconciler_backend_fetch_total` | counter | `backend`, `outcome` | Per-backend provision-list attempts (`ok`, `error`, `circuit_open`, `panic`). The signal that a single backend is unreachable, which no longer breaks the fleet-wide sweep |
-| `fred_reconciler_sweep_complete` | gauge | — | 1 if the last sweep saw every configured backend, 0 if degraded. Gates the meaning of the action counters above |
-| `fred_provisioner_reconciler_deferred_leases_total` | counter | — | Leases skipped because their owning backend did not report. Non-zero while `sweep_complete` is 1 would be a defect |
+| `fred_reconciler_sweep_complete` | gauge | — | 1 if the last sweep saw every configured backend, 0 if degraded. Gates the meaning of the action counters above, but does not rule out lease-local deferrals |
+| `fred_provisioner_reconciler_deferred_leases_total` | counter | — | Leases skipped because ownership or lifecycle evidence was not safe to act on: a backend was silent, placement was ambiguous/unresolved, or an operation or placement change crossed the inventory boundary. It can increase during a complete sweep under ordinary concurrent lease activity |
 | `fred_reconciler_cleanup_skips_total` | counter | `pass`, `reason` | Destructive cleanup withheld for lack of positive evidence. `pass`: `orphan`, `payload`, `placement`. `reason`: `chain_live`, `chain_unknown`, `chain_unknown_state`, `chain_error`, `backend_silent`. Every value is a deliberate fail-open; `chain_unknown` (no record — check the endpoint) and `chain_unknown_state` (fred is older than the chain — upgrade it) are the two that do not self-heal |
 
 **Backend:**

@@ -264,6 +264,7 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerPanicsTotal.WithLabelValues("process_orphan")
 		ReconcilerPanicsTotal.WithLabelValues("fetch_provisions")
 		ReconcilerPanicsTotal.WithLabelValues("fetch_retentions")
+		ReconcilerPanicsTotal.WithLabelValues("check_placement_marker")
 	})
 	assert.NotPanics(t, func() {
 		SignerOOGRetriesTotal.WithLabelValues("retried")

@@ -137,11 +137,13 @@ var (
 	})
 
 	// ReconcilerDeferredLeasesTotal counts leases the reconciler skipped because
-	// the sweep could not positively identify which backend owns them — the
-	// per-lease deferral that replaced the fleet-wide abort (ENG-356).
+	// the current sweep did not establish a safe lifecycle decision. Causes
+	// include a silent backend, ambiguous or unresolved placement, and an
+	// operation or placement change that crossed the inventory boundary.
 	//
-	// A sustained non-zero rate while fred_reconciler_sweep_complete is 1 would
-	// be a defect, not expected behavior: on a complete sweep nothing defers.
+	// The lease-local boundary cases can occur even when every backend answered,
+	// so a low rate while fred_reconciler_sweep_complete is 1 is expected during
+	// ordinary lease churn. A sustained rate still warrants investigation.
 	//
 	// Deliberately its own counter rather than a new label value on
 	// reconciler_actions_total: adding a label value there would silently change
@@ -150,7 +152,7 @@ var (
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "reconciler_deferred_leases_total",
-		Help:      "Total leases the reconciler skipped because their owning backend did not report",
+		Help:      "Total leases reconciliation deferred because ownership or lifecycle evidence was unsafe or changed during the sweep",
 	})
 
 	// ReconcilerPanicsTotal counts panics recovered inside reconciler
@@ -158,7 +160,8 @@ var (
 	// recover exists specifically to prevent one bad lease/orphan/backend
 	// from crashing the fred process. Any non-zero value is a latent bug
 	// to fix at its source — not business-as-usual. Label values:
-	// "process_lease", "process_orphan", "fetch_provisions", "fetch_retentions".
+	// "process_lease", "process_orphan", "fetch_provisions", "fetch_retentions",
+	// "check_placement_marker".
 	ReconcilerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",

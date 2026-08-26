@@ -572,7 +572,9 @@ When provisioning completes (success or failure), POST to the complete
 `callback_url` from the provision request. Provision and restore URLs carry an
 `operation_generation=<uint64>` query parameter. Treat the URL as opaque:
 preserve its path and query byte-for-byte rather than rebuilding or normalizing
-it. Fred uses that generation to reject stale callbacks from an older operation.
+it. Fred uses that generation to prevent a stale callback from settling a newer
+in-flight operation. After in-flight tracking ends, callback status events are
+best-effort and may be delivered out of order.
 
 ### Request Format
 

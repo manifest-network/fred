@@ -32,14 +32,17 @@ const (
 	DefaultReconcileWorkers = 10
 )
 
-// chainConfirmTimeout bounds ONE per-candidate lease lookup in confirmTerminal.
+// chainConfirmTimeout bounds ONE per-candidate lease lookup in
+// queryLeaseLiveness, shared by destructive cleanup confirmation and
+// conservative placement-marker retirement.
 //
 // The reconcile context is the process lifetime — Start passes it straight
 // through to every sweep — and neither the chain client nor gRPC imposes a
 // per-RPC deadline of its own, so without this an unanswered Lease query stalls
 // the sweep that issued it while ReconcileAll's CAS flag makes every later tick
-// a no-op. The fail-open path this guard exists to reach (count chain_error,
-// keep the state, retry next sweep) is only reachable if the call returns.
+// a no-op. The conservative path this guard exists to reach (keep the state or
+// marker and retry next sweep; destructive callers also count chain_error) is
+// only reachable if the call returns.
 //
 // Not a config knob: it is a liveness backstop on a single point query, not a
 // tuning parameter, and it matches the hardcoded budgets the chain client
@@ -592,28 +595,50 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		// not proof of terminality. Re-read absent markers and prune only a positive
 		// CLOSED/REJECTED/EXPIRED verdict. Queries run with the same bounded
 		// concurrency and per-call deadline as the destructive cleanup passes.
-		terminalMarkers := make(map[string]struct{})
-		var terminalMarkersMu sync.Mutex
-		markerChecks, markerCtx := errgroup.WithContext(ctx)
-		markerChecks.SetLimit(r.maxWorkers)
-		for leaseUUID := range r.placementAbsenceUntrusted {
-			if _, live := chainLeases[leaseUUID]; live {
-				continue
-			}
-			markerChecks.Go(func() error {
-				if r.confirmTerminal(markerCtx, metrics.CleanupPassPlacement, leaseUUID) {
-					terminalMarkersMu.Lock()
-					terminalMarkers[leaseUUID] = struct{}{}
-					terminalMarkersMu.Unlock()
+		// A complete, successfully persisted inventory immediately clears every
+		// older marker below, so point-reading their chain state would only lengthen
+		// the open inventory snapshot. Partial or failed syncs retain markers and
+		// prune them individually from positive terminal evidence.
+		if !inventoryComplete || !syncOK {
+			terminalMarkers := make(map[string]struct{})
+			var terminalMarkersMu sync.Mutex
+			markerChecks, markerCtx := errgroup.WithContext(ctx)
+			markerChecks.SetLimit(r.maxWorkers)
+			for leaseUUID := range r.placementAbsenceUntrusted {
+				if _, live := chainLeases[leaseUUID]; live {
+					continue
 				}
-				return nil
-			})
-		}
-		if err := markerChecks.Wait(); err != nil {
-			return err
-		}
-		for leaseUUID := range terminalMarkers {
-			delete(r.placementAbsenceUntrusted, leaseUUID)
+				markerChecks.Go(func() (goErr error) {
+					// GetLease ultimately crosses a gRPC boundary whose implementation is
+					// outside the reconciler. Contain a panic to this one marker just as the
+					// per-lease, per-orphan, and per-backend workers do. The marker remains
+					// fail-closed and a later sweep retries it.
+					defer func() {
+						if rec := recover(); rec != nil {
+							slog.Error("reconciler placement marker check panic — recovering to keep fred alive",
+								"lease_uuid", leaseUUID,
+								"panic", rec,
+								"stack", string(debug.Stack()),
+							)
+							metrics.ReconcilerPanicsTotal.WithLabelValues("check_placement_marker").Inc()
+							goErr = nil
+						}
+					}()
+
+					if r.placementMarkerLeaseTerminal(markerCtx, leaseUUID) {
+						terminalMarkersMu.Lock()
+						terminalMarkers[leaseUUID] = struct{}{}
+						terminalMarkersMu.Unlock()
+					}
+					return nil
+				})
+			}
+			if err := markerChecks.Wait(); err != nil {
+				return err
+			}
+			for leaseUUID := range terminalMarkers {
+				delete(r.placementAbsenceUntrusted, leaseUUID)
+			}
 		}
 		if syncOK {
 			placementSyncOK = true
@@ -1236,12 +1261,6 @@ func (r *Reconciler) doStartProvisioning(
 			// another backend; callback/SetBatch will repair confirmation.
 			return fmt.Errorf("confirm accepted provision placement for lease %s: %w", lease.Uuid, settleErr)
 		}
-	case provisionOutcomeAlreadyExists:
-		// A duplicate may not produce a callback. Positive inventory will drive
-		// acknowledgement, so release the ordinary in-flight gate after recording
-		// ownership (or leaving the conservative Attempt on write failure).
-		untrack()
-		return provisionErr
 	case provisionOutcomeDefinitiveFailure, provisionOutcomeAmbiguous:
 		// A definitive failure cleared Attempt when persistence succeeded. An
 		// ambiguous result keeps it. Either way the durable record, rather than
@@ -1877,6 +1896,42 @@ func leaseState(lease *billingtypes.Lease) string {
 	return lease.State.String()
 }
 
+// queryLeaseLiveness performs the bounded point read shared by destructive
+// cleanup confirmation and conservative placement-marker retirement. Keeping
+// the query separate from either caller's instrumentation prevents bookkeeping
+// checks from masquerading as withheld destructive cleanup.
+func (r *Reconciler) queryLeaseLiveness(
+	ctx context.Context,
+	leaseUUID string,
+) (leaseLiveness, string, *billingtypes.Lease, error) {
+	qctx, cancel := context.WithTimeout(ctx, chainConfirmTimeout)
+	defer cancel()
+
+	lease, err := r.chainClient.GetLease(qctx, leaseUUID)
+	liveness, reason := classifyLease(lease, err)
+	return liveness, reason, lease, err
+}
+
+// placementMarkerLeaseTerminal reports whether an in-memory placement-absence
+// marker may be retired. Keeping a marker only preserves a conservative routing
+// gate; it does not withhold or perform destructive cleanup. Consequently an
+// uncertain verdict is debug context only: it must not increment
+// cleanup_skips_total or tell an operator to deprovision a phantom resource.
+func (r *Reconciler) placementMarkerLeaseTerminal(ctx context.Context, leaseUUID string) bool {
+	liveness, reason, lease, err := r.queryLeaseLiveness(ctx, leaseUUID)
+	if liveness == leaseTerminal {
+		return true
+	}
+
+	slog.Debug("reconcile: retaining placement absence marker; chain does not confirm the lease is finished",
+		"lease_uuid", leaseUUID,
+		"reason", reason,
+		"lease_state", leaseState(lease),
+		"error", err,
+	)
+	return false
+}
+
 // confirmTerminal re-reads one lease from the chain and reports whether it is
 // positively finished. A false return has already counted itself and logged;
 // the caller just skips the lease.
@@ -1885,11 +1940,7 @@ func leaseState(lease *billingtypes.Lease) string {
 // guards against comes from the sweep's own non-atomic chain queries, and is
 // identical on a sweep that saw every backend.
 func (r *Reconciler) confirmTerminal(ctx context.Context, pass, leaseUUID string) bool {
-	qctx, cancel := context.WithTimeout(ctx, chainConfirmTimeout)
-	defer cancel()
-
-	lease, err := r.chainClient.GetLease(qctx, leaseUUID)
-	liveness, reason := classifyLease(lease, err)
+	liveness, reason, lease, err := r.queryLeaseLiveness(ctx, leaseUUID)
 	if liveness == leaseTerminal {
 		return true
 	}
@@ -1992,7 +2043,7 @@ func (r *Reconciler) fetchAllRetentions(ctx context.Context) (map[string]string,
 // handleProvisionError handles errors from provisioning attempts during reconciliation.
 // It determines the appropriate action based on error type and lease state:
 //   - errLeaseAlreadyInFlight: skip (not a real error)
-//   - backend.ErrAlreadyProvisioned: skip (transient race with concurrent Deprovision)
+//   - backend.ErrAlreadyProvisioned: transient (an unvalidated HTTP 409 is ambiguous)
 //   - errPayloadNotAvailable: reject (PENDING) or close (ACTIVE) the lease
 //   - backend.ErrValidation: reject (PENDING) or close (ACTIVE) the lease
 //   - backend.ErrMalformedErrorBody: transient (backend answered off-contract) — flag for retry, never terminate
@@ -2005,10 +2056,15 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		return
 	}
 	if errors.Is(err, backend.ErrAlreadyProvisioned) {
-		// Benign race: backend is concurrently Ready/Provisioning/Deprovisioning. Retry next cycle.
-		slog.Debug("reconcile: backend reports already-provisioned, retry next cycle",
+		// HTTPClient maps an unvalidated 409 to this sentinel, so it is not durable
+		// ownership proof. The write-ahead Attempt prevents substitution while a
+		// later complete inventory resolves whether the backend actually owns it.
+		slog.Warn("reconcile: backend returned ambiguous already-provisioned response, awaiting inventory",
 			"lease_uuid", leaseUUID,
+			"tenant", lease.Tenant,
+			"error", err,
 		)
+		*hadError = true
 		return
 	}
 	if errors.Is(err, ErrPlacementUnresolvable) {
@@ -2392,7 +2448,6 @@ func (r *Reconciler) processOrphan(
 	if !r.confirmTerminal(ctx, metrics.CleanupPassOrphan, leaseUUID) {
 		return
 	}
-
 	// Look up the backend that originally provisioned this resource.
 	// We must use the same backend for deprovisioning - falling back to a
 	// different backend would fail since it doesn't have the resource.

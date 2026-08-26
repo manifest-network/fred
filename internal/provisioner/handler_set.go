@@ -175,7 +175,10 @@ func (h *HandlerSet) handleDeprovisionOwnedCallback(
 	switch callback.Status {
 	case backend.CallbackStatusDeprovisioned:
 		if h.deps.Orchestrator != nil {
-			h.deps.Orchestrator.forgetDeprovisionCandidate(callback.LeaseUUID, callback.Backend)
+			// The in-flight tracker is the operation identity. Legacy callbacks may
+			// omit Backend, so retire the candidate bound to the owned generation
+			// rather than trusting the optional payload field.
+			h.deps.Orchestrator.forgetDeprovisionCandidate(callback.LeaseUUID, provision.Backend)
 		}
 		if callback.Retained {
 			h.publishRetainedLeaseNotice(callback.LeaseUUID)
@@ -349,12 +352,12 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		return nil
 	}
 
-	// Check if this lease is in-flight (idempotency check).
-	// Non-in-flight callbacks with no operation generation are expected for
-	// restart/update operations, which don't register in the in-flight tracker
-	// (the lease is already ACTIVE). Generation-scoped callbacks belong only to
-	// provision/restore operations; once that exact tracker entry is gone they are
-	// stale and must not masquerade as a restart/update status notification.
+	// Check if this lease is in-flight (idempotency check). An operation generation
+	// is authoritative only while its exact tracker entry exists: backends treat
+	// callback_url as an opaque, durable address and may reuse the provision URL
+	// for later ACTIVE-lease redeploys or autonomous status notifications. Once the
+	// tracker entry is gone, no callback may settle chain or placement state; both
+	// generated and generation-less callbacks are best-effort status notifications.
 	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
 	if !exists {
 		backendLabel := h.sanitizeBackendName(callback.Backend)
@@ -367,20 +370,11 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			)
 		}
 		metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
-		if callback.OperationGeneration != 0 && callback.Status == backend.CallbackStatusSuccess {
-			slog.Info("ignoring generation-scoped callback whose operation is no longer in flight",
-				"lease_uuid", callback.LeaseUUID,
-				"backend", callback.Backend,
-				"generation", callback.OperationGeneration,
-				"status", callback.Status,
-			)
-			return nil
-		}
 		// Without an in-flight entry, the callback cannot be tied to the operation
 		// that created the current placement Attempt. This is true even when the
 		// backend name matches: a delayed restart/update callback may predate a
-		// newer provision attempt. Treat legacy generation-less callbacks as
-		// status-event notifications only; authoritative inventory repairs placement.
+		// newer provision attempt. Publish only the best-effort status event;
+		// authoritative inventory repairs placement.
 
 		switch callback.Status {
 		case backend.CallbackStatusSuccess:
@@ -407,8 +401,9 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			)
 			return nil
 		}
-		slog.Info("published event for non-in-flight callback (restart/update)",
+		slog.Info("published status event for non-in-flight callback",
 			"lease_uuid", callback.LeaseUUID,
+			"generation", callback.OperationGeneration,
 			"status", callback.Status,
 		)
 		return nil

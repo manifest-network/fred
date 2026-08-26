@@ -59,7 +59,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   attempts only from authoritative inventory, and deprovisions every known owner
   candidate. Callback and timeout settlement is generation-scoped so an older
   operation cannot mutate or reject its replacement. (ENG-632)
-- Unvalidated HTTP 503 responses no longer clear provision or restore attempts;
+- Unvalidated HTTP 409 and 503 responses no longer confirm or clear provision
+  attempts (and unvalidated 503 responses no longer clear restore attempts);
   authenticated success callbacks continue to chain acknowledgement when
   placement persistence fails; and one lease's durable placement conflict no
   longer prevents unrelated leases from using a successfully synchronized

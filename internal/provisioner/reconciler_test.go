@@ -351,13 +351,10 @@ func TestNewReconciler_PlacementRequiresSharedTracker(t *testing.T) {
 	require.EqualError(t, err, "in-flight tracker is required when placement store is enabled")
 }
 
-// TestHandleProvisionError_AlreadyProvisionedBenign verifies that the
-// reconciler treats backend.ErrAlreadyProvisioned as a transient benign race
-// (e.g. concurrent Deprovision in progress) rather than setting hadError and
-// logging at Error level. Without this arm, every in-flight Deprovision spams
-// Error logs and flips the reconciler cycle from "success" to "partial" in
-// the aggregate metrics.
-func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
+// TestHandleProvisionError_AlreadyProvisionedAmbiguous verifies that an
+// unvalidated HTTP 409 remains transient but makes the incomplete sweep visible
+// to operators. Authoritative inventory, not this response, settles ownership.
+func TestHandleProvisionError_AlreadyProvisionedAmbiguous(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 	mockBackend := &mockReconcilerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -378,7 +375,7 @@ func TestHandleProvisionError_AlreadyProvisionedBenign(t *testing.T) {
 		lease,
 		&hadError,
 	)
-	assert.False(t, hadError, "ErrAlreadyProvisioned must be treated as benign")
+	assert.True(t, hadError, "an unvalidated 409 must remain operationally visible")
 }
 
 // TestHandleProvisionError_MalformedErrorBodyIsTransient is the reconciler half
@@ -3490,6 +3487,17 @@ func TestReconciler_PrunesOnlyPositivelyTerminalPlacementAbsenceMarkers(t *testi
 		"unknown-to-chain":         nil,
 		"query-error":              nil,
 	}
+	cleanupReasons := []string{
+		metrics.CleanupSkipChainLive,
+		metrics.CleanupSkipChainUnknown,
+		metrics.CleanupSkipChainError,
+	}
+	cleanupSkipsBefore := make(map[string]float64, len(cleanupReasons))
+	for _, reason := range cleanupReasons {
+		cleanupSkipsBefore[reason] = promtestutil.ToFloat64(
+			metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassPlacement, reason),
+		)
+	}
 
 	require.NoError(t, r.ReconcileAll(t.Context()))
 	assert.NotContains(t, r.placementAbsenceUntrusted, "closed-lease",
@@ -3500,6 +3508,72 @@ func TestReconciler_PrunesOnlyPositivelyTerminalPlacementAbsenceMarkers(t *testi
 		"a nil point lookup is not proof that a lease is terminal")
 	assert.Contains(t, r.placementAbsenceUntrusted, "query-error",
 		"a failed point lookup must keep the fail-closed marker")
+	for _, reason := range cleanupReasons {
+		assert.Equal(t, cleanupSkipsBefore[reason], promtestutil.ToFloat64(
+			metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassPlacement, reason),
+		), "marker retirement is bookkeeping, not withheld destructive cleanup (%s)", reason)
+	}
+}
+
+func TestReconciler_CompletePlacementSyncClearsMarkersWithoutPointReads(t *testing.T) {
+	store, err := placement.NewStore(t.TempDir() + "/placements.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	healthy := &mockReconcilerBackend{name: "backend-a"}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: healthy, IsDefault: true},
+	}})
+	require.NoError(t, err)
+	pointReads := 0
+	chainClient := &chaintest.MockClient{GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+		pointReads++
+		return nil, errors.New("marker point read should be unnecessary")
+	}}
+	r, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
+	require.NoError(t, err)
+	r.placementAbsenceUntrusted = map[string]map[string]struct{}{
+		"old-marker": {"backend-a": {}},
+	}
+
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	assert.Zero(t, pointReads,
+		"a complete durable inventory already retires every old marker")
+	assert.Empty(t, r.placementAbsenceUntrusted)
+}
+
+func TestReconciler_PlacementMarkerCheckPanicDoesNotCrashFred(t *testing.T) {
+	store, err := placement.NewStore(t.TempDir() + "/placements.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	unavailable := &mockReconcilerBackend{name: "backend-a", listErr: errors.New("backend unavailable")}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: unavailable, IsDefault: true},
+	}})
+	require.NoError(t, err)
+	chainClient := &chaintest.MockClient{GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+		panic("synthetic placement marker GetLease panic")
+	}}
+	r, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
+	require.NoError(t, err)
+	r.placementAbsenceUntrusted = map[string]map[string]struct{}{
+		"panic-marker": {"backend-a": {}},
+	}
+
+	panics := metrics.ReconcilerPanicsTotal.WithLabelValues("check_placement_marker")
+	before := promtestutil.ToFloat64(panics)
+	var reconcileErr error
+	require.NotPanics(t, func() {
+		reconcileErr = r.ReconcileAll(t.Context())
+	}, "one chain-client panic must stay inside its marker worker")
+	require.NoError(t, reconcileErr)
+	assert.Equal(t, before+1, promtestutil.ToFloat64(panics),
+		"the recovered marker-check panic must be operationally visible")
+	assert.Contains(t, r.placementAbsenceUntrusted, "panic-marker",
+		"a panicking point lookup provides no terminal proof, so the marker must remain fail-closed")
 }
 
 func TestReconciler_PairsInventorySnapshotLifetimeOnEveryReturn(t *testing.T) {

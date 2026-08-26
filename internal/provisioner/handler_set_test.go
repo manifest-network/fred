@@ -1096,28 +1096,34 @@ func TestHandlerSet_HandleBackendCallback_WaitsForContendedSettlementClaim(t *te
 
 func TestHandlerSet_HandleBackendCallback_DeprovisionOwnedCallbacksBypassClaimWait(t *testing.T) {
 	tests := []struct {
-		name        string
-		status      backend.CallbackStatus
-		retained    bool
-		callbackErr string
-		wantStatus  backend.ProvisionStatus
+		name                 string
+		status               backend.CallbackStatus
+		callbackBackend      string
+		retained             bool
+		callbackErr          string
+		wantStatus           backend.ProvisionStatus
+		wantCandidateRetired bool
 	}{
 		{
-			name:       "retained success",
-			status:     backend.CallbackStatusDeprovisioned,
-			retained:   true,
-			wantStatus: backend.ProvisionStatusRetained,
+			name:                 "legacy retained success without backend",
+			status:               backend.CallbackStatusDeprovisioned,
+			retained:             true,
+			wantStatus:           backend.ProvisionStatusRetained,
+			wantCandidateRetired: true,
 		},
 		{
-			name:        "cleanup exhausted",
-			status:      backend.CallbackStatusFailed,
-			callbackErr: "volume cleanup exhausted",
-			wantStatus:  backend.ProvisionStatusFailed,
+			name:            "cleanup exhausted",
+			status:          backend.CallbackStatusFailed,
+			callbackBackend: "test-backend",
+			callbackErr:     "volume cleanup exhausted",
+			wantStatus:      backend.ProvisionStatusFailed,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tracker := NewInFlightTracker()
+			orch := NewProvisionOrchestrator("provider-1", "http://callback", nil, tracker, nil)
+			orch.rememberDeprovisionCandidates("lease-1", []string{"test-backend"})
 			generation, tracked := tracker.TryTrackInFlightWithGeneration(
 				"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 			)
@@ -1130,10 +1136,14 @@ func TestHandlerSet_HandleBackendCallback_DeprovisionOwnedCallbacksBypassClaimWa
 				attempted:       make(chan struct{}),
 			}
 			pub := newMockPublisher()
-			hs := NewHandlerSet(HandlerDeps{Tracker: observed, Publisher: pub})
+			hs := NewHandlerSet(HandlerDeps{
+				Orchestrator: orch,
+				Tracker:      observed,
+				Publisher:    pub,
+			})
 			require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
 				LeaseUUID:           "lease-1",
-				Backend:             "test-backend",
+				Backend:             tt.callbackBackend,
 				Status:              tt.status,
 				Error:               tt.callbackErr,
 				Retained:            tt.retained,
@@ -1149,6 +1159,13 @@ func TestHandlerSet_HandleBackendCallback_DeprovisionOwnedCallbacksBypassClaimWa
 			require.True(t, exists, "the close path remains responsible for terminal settlement")
 			assert.Equal(t, generation, current.Generation)
 			assert.Equal(t, inFlightSettlementDeprovision, current.settlementOwner)
+			if tt.wantCandidateRetired {
+				assert.Empty(t, orch.rememberedDeprovisionCandidates("lease-1"),
+					"positive teardown evidence must retire this close retry candidate")
+			} else {
+				assert.Equal(t, []string{"test-backend"}, orch.rememberedDeprovisionCandidates("lease-1"),
+					"a failed teardown callback must leave its candidate retryable")
+			}
 			_, claimAvailable := tracker.TryClaimInFlight("lease-1", generation)
 			assert.False(t, claimAvailable, "the callback must leave the close path's claim untouched")
 
@@ -1661,30 +1678,6 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		assert.Equal(t, "container crashed", event.Error)
 	})
 
-	t.Run("generation_scoped_failed_remains_status_only_after_tracker_cleanup", func(t *testing.T) {
-		pub.mu.Lock()
-		pub.published = make(map[string][]*message.Message)
-		pub.mu.Unlock()
-
-		err := hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-			LeaseUUID:           "lease-late-failed",
-			Backend:             "test-backend",
-			Status:              backend.CallbackStatusFailed,
-			Error:               "close cleanup failed",
-			OperationGeneration: 42,
-		}))
-		require.NoError(t, err)
-
-		pub.mu.Lock()
-		msgs := append([]*message.Message(nil), pub.published[TopicLeaseEvent]...)
-		pub.mu.Unlock()
-		require.Len(t, msgs, 1)
-		var event backend.LeaseStatusEvent
-		require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
-		assert.Equal(t, backend.ProvisionStatusFailed, event.Status)
-		assert.Equal(t, "close cleanup failed", event.Error)
-	})
-
 	// ENG-329: a deprovisioned callback emits the retained notice on observed
 	// ground truth — only when payload.Retained is true.
 	t.Run("deprovisioned_retained_publishes_retained", func(t *testing.T) {
@@ -1755,6 +1748,103 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		pub.mu.Unlock()
 		assert.Empty(t, msgs, "non-retain deprovision must not emit any lease event")
 	})
+}
+
+func TestHandlerSet_HandleBackendCallback_GenerationScopedNonInFlightCallbacksAreStatusOnly(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      backend.CallbackStatus
+		callbackErr string
+		wantStatus  backend.ProvisionStatus
+	}{
+		{
+			name:       "success",
+			status:     backend.CallbackStatusSuccess,
+			wantStatus: backend.ProvisionStatusReady,
+		},
+		{
+			name:        "failure",
+			status:      backend.CallbackStatusFailed,
+			callbackErr: "custom-domain redeploy failed",
+			wantStatus:  backend.ProvisionStatusFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chainReads := 0
+			chainRejects := 0
+			chainClient := &chaintest.MockClient{
+				GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+					chainReads++
+					return &billingtypes.Lease{Uuid: "lease-1", State: billingtypes.LEASE_STATE_ACTIVE}, nil
+				},
+				RejectLeasesFunc: func(context.Context, []string, string) (uint64, []string, error) {
+					chainRejects++
+					return 1, []string{"tx-reject"}, nil
+				},
+			}
+			ackCalls := 0
+			ack := &mockAcknowledger{acknowledgeFn: func(context.Context, string) (bool, string, error) {
+				ackCalls++
+				return false, "", billingtypes.ErrLeaseNotPending
+			}}
+			tracker := NewInFlightTracker()
+			olderGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+				"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+			)
+			require.True(t, tracked)
+			require.True(t, tracker.UntrackInFlightIfGeneration("lease-1", olderGeneration))
+			newerGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+				"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+			)
+			require.True(t, tracked)
+			require.Greater(t, newerGeneration, olderGeneration)
+			_, claimed := tracker.TryClaimInFlight("lease-1", newerGeneration)
+			require.True(t, claimed)
+			require.True(t, tracker.FinishClaimedInFlight("lease-1", newerGeneration))
+
+			store := &mockPlacementStore{}
+			require.NoError(t, store.Set("lease-1", "test-backend"))
+			requireSetPlacementAttempt(t, store, "lease-1", "test-backend")
+			placementBefore := store.Lookup("lease-1")
+			orch := NewProvisionOrchestrator("provider-1", "http://callback", nil, tracker, store)
+			pub := newMockPublisher()
+			hs := NewHandlerSet(HandlerDeps{
+				ChainClient:  chainClient,
+				Orchestrator: orch,
+				Tracker:      tracker,
+				Acknowledger: ack,
+				Publisher:    pub,
+			})
+			// Backends retain the original opaque callback URL for later redeploys,
+			// so once no exact operation is tracked fred cannot distinguish a delayed
+			// old result from a legitimate current status. It may publish out of order,
+			// but it must never grant either event lifecycle or placement authority.
+			require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
+				LeaseUUID:           "lease-1",
+				Backend:             "test-backend",
+				Status:              tt.status,
+				Error:               tt.callbackErr,
+				OperationGeneration: olderGeneration,
+			})))
+
+			assert.Zero(t, chainReads, "a status-only callback must not inspect chain state")
+			assert.Zero(t, chainRejects, "a status-only callback must not reject the lease")
+			assert.Zero(t, ackCalls, "a status-only callback must not acknowledge the lease")
+			assert.Equal(t, placementBefore, store.Lookup("lease-1"),
+				"a callback without an in-flight claim must not mutate placement")
+
+			pub.mu.Lock()
+			msgs := append([]*message.Message(nil), pub.published[TopicLeaseEvent]...)
+			pub.mu.Unlock()
+			require.Len(t, msgs, 1)
+			var event backend.LeaseStatusEvent
+			require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+			assert.Equal(t, tt.wantStatus, event.Status)
+			assert.Equal(t, tt.callbackErr, event.Error)
+		})
+	}
 }
 
 func TestHandlerSet_HandleBackendCallback_LateDeprovisionedRetiresRetryCandidate(t *testing.T) {
@@ -2544,6 +2634,9 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPrese
 }
 
 func TestHandlerSet_HandleBackendCallback_Success_StoreIOFailureStillAcknowledgesAndCannotTimeoutReject(t *testing.T) {
+	semanticConflictsBefore := promtestutil.ToFloat64(
+		metrics.CallbackPlacementSemanticConflictsTotal,
+	)
 	ps := &errorPlacementStore{}
 	requireSetPlacementAttempt(t, &ps.mockPlacementStore, "lease-1", "test-backend")
 	ps.setErr = errors.New("placement disk unavailable")
@@ -2581,6 +2674,10 @@ func TestHandlerSet_HandleBackendCallback_Success_StoreIOFailureStillAcknowledge
 	require.Equal(t, placement.StateAttempting, p.State())
 	assert.Equal(t, "test-backend", p.Attempt,
 		"the failed placement write must leave its durable attempt for inventory repair")
+	assert.Equal(t, semanticConflictsBefore,
+		promtestutil.ToFloat64(metrics.CallbackPlacementSemanticConflictsTotal),
+		"ordinary placement I/O failures must not page as permanent semantic conflicts",
+	)
 
 	checker := NewTimeoutChecker(TimeoutCheckerConfig{
 		Tracker: tracker, Rejecter: chainClient, Timeout: time.Nanosecond,

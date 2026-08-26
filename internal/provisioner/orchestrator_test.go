@@ -430,8 +430,11 @@ func TestOrchestrator_Deprovision_InlineCallbackThenCandidateFailureMovesRetrySt
 	pub.mu.Lock()
 	lateEvents := append([]*message.Message(nil), pub.published[TopicLeaseEvent]...)
 	pub.mu.Unlock()
-	assert.Empty(t, lateEvents,
-		"the generation-scoped callback must not be reclassified as restart/update after close cleanup")
+	require.Len(t, lateEvents, 1,
+		"a non-in-flight generated callback remains a best-effort status notification")
+	var lateEvent backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(lateEvents[0].Payload, &lateEvent))
+	assert.Equal(t, backend.ProvisionStatusReady, lateEvent.Status)
 
 	failingBackend.mu.Lock()
 	failingBackend.deprovisionErr = nil
@@ -823,7 +826,7 @@ func TestClassifyProvisionOutcome(t *testing.T) {
 		want provisionOutcome
 	}{
 		{name: "accepted", want: provisionOutcomeAccepted},
-		{name: "already exists", err: fmt.Errorf("wrapped: %w", backend.ErrAlreadyProvisioned), want: provisionOutcomeAlreadyExists},
+		{name: "unvalidated conflict is ambiguous", err: fmt.Errorf("wrapped: %w", backend.ErrAlreadyProvisioned), want: provisionOutcomeAmbiguous},
 		{name: "validation refusal", err: fmt.Errorf("wrapped: %w", backend.ErrValidation), want: provisionOutcomeDefinitiveFailure},
 		{name: "unvalidated capacity response is ambiguous", err: fmt.Errorf("wrapped: %w", backend.ErrInsufficientResources), want: provisionOutcomeAmbiguous},
 		{name: "open circuit", err: fmt.Errorf("wrapped: %w", backend.ErrCircuitOpen), want: provisionOutcomeDefinitiveFailure},
@@ -962,7 +965,7 @@ func TestRouteForProvisionHonoringPlacement_AttemptDoesNotPin(t *testing.T) {
 	assert.Same(t, freelyRouted, got)
 }
 
-func TestOrchestrator_StartProvisioning_AlreadyProvisionedConfirmsAndStops(t *testing.T) {
+func TestOrchestrator_StartProvisioning_UnvalidatedConflictRemainsAttempting(t *testing.T) {
 	mb := &mockManagerBackend{name: "backend-a", provisionErr: backend.ErrAlreadyProvisioned}
 	router := &mockBackendRouter{routeFn: func(string) backend.Backend { return mb }}
 	tracker := NewInFlightTracker()
@@ -973,11 +976,21 @@ func TestOrchestrator_StartProvisioning_AlreadyProvisionedConfirmsAndStops(t *te
 		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 	}
 
-	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+	err := orch.StartProvisioning(context.Background(), lease, ProvisionOpts{})
+	require.ErrorIs(t, err, ErrProvisioningFailed)
+	require.ErrorIs(t, err, backend.ErrAlreadyProvisioned)
 	p := ps.Lookup(lease.Uuid)
-	assert.Equal(t, placement.StateConfirmed, p.State())
-	assert.Equal(t, mb.name, p.Backend)
-	assert.False(t, tracker.IsInFlight(lease.Uuid), "duplicate may not emit another callback")
+	assert.Equal(t, placement.StateAttempting, p.State())
+	assert.Equal(t, mb.name, p.Attempt)
+	assert.Empty(t, p.Backend, "an unvalidated 409 must not confirm ownership")
+	assert.False(t, tracker.IsInFlight(lease.Uuid), "inventory, not a callback, resolves the ambiguous attempt")
+
+	// Watermill or reconciliation may retry immediately. The durable Attempt
+	// must suppress another external call until a complete inventory settles it.
+	require.NoError(t, orch.StartProvisioning(context.Background(), lease, ProvisionOpts{}))
+	mb.mu.Lock()
+	assert.Len(t, mb.provisionCalls, 1)
+	mb.mu.Unlock()
 }
 
 func TestOrchestrator_Deprovision_ViaPlacement(t *testing.T) {

@@ -28,7 +28,6 @@ type provisionOutcome uint8
 
 const (
 	provisionOutcomeAccepted provisionOutcome = iota
-	provisionOutcomeAlreadyExists
 	provisionOutcomeDefinitiveFailure
 	provisionOutcomeAmbiguous
 )
@@ -42,8 +41,11 @@ func classifyProvisionOutcome(err error) provisionOutcome {
 	case err == nil:
 		return provisionOutcomeAccepted
 	case errors.Is(err, backend.ErrAlreadyProvisioned):
-		// A 409 is positive proof that this backend owns the lease.
-		return provisionOutcomeAlreadyExists
+		// HTTPClient maps every 409 response to this sentinel without validating
+		// a backend-authored error code. An intermediary-generated 409 therefore
+		// cannot prove that the selected backend owns the lease. Keep the durable
+		// Attempt until authoritative inventory confirms or clears it.
+		return provisionOutcomeAmbiguous
 	case errors.Is(err, backend.ErrValidation),
 		errors.Is(err, backend.ErrCircuitOpen):
 		// Validation errors carry a parsed backend-authored verdict, while an open
@@ -112,7 +114,7 @@ func settleProvisionAttempt(
 		return nil
 	}
 	switch outcome {
-	case provisionOutcomeAccepted, provisionOutcomeAlreadyExists:
+	case provisionOutcomeAccepted:
 		_, err := store.ConfirmAttemptIfRevision(leaseUUID, backendName, attemptRevision)
 		return err
 	case provisionOutcomeDefinitiveFailure:
@@ -303,15 +305,6 @@ func (o *ProvisionOrchestrator) StartProvisioning(ctx context.Context, lease *bi
 	switch outcome {
 	case provisionOutcomeAccepted:
 		// Keep in-flight until the async callback owns chain acknowledgement.
-	case provisionOutcomeAlreadyExists:
-		// A duplicate is positive ownership evidence, but it may not emit a new
-		// callback. Untrack and let the queryable reconciler state acknowledge it.
-		o.tracker.UntrackInFlightIfGeneration(lease.Uuid, inFlightGeneration)
-		slog.Info("backend already owns lease; confirmed placement and deferred to reconciliation",
-			"lease_uuid", lease.Uuid,
-			"backend", backendClient.Name(),
-		)
-		return nil
 	case provisionOutcomeDefinitiveFailure, provisionOutcomeAmbiguous:
 		o.tracker.UntrackInFlightIfGeneration(lease.Uuid, inFlightGeneration)
 		slog.Error("failed to start provisioning",
