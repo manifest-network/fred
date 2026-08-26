@@ -552,6 +552,7 @@ Returns provision diagnostics for a lease, including status, failure reason, and
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Provision not found (never provisioned or diagnostics expired)
+- `503 Service Unavailable` - Durable placement is unresolved, so absence cannot be reported safely
 
 #### Failure Reason Codes
 
@@ -691,6 +692,7 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 - `404 Not Found` - Lease not provisioned
 - `409 Conflict` - Lease is in a state that cannot be updated (e.g., currently restarting)
 - `500 Internal Server Error` - Applied to the backend but could not be persisted, or no payload store is configured
+- `502 Bad Gateway` - The backend rejected the update with an unusable or off-contract error response
 
 ### Restore Lease
 
@@ -721,6 +723,7 @@ Restore a soft-deleted lease's retained data into a **new** lease. The path `lea
 - `404 Not Found` - No retained data found for `from_lease_uuid` (the source is absent, expired, cross-tenant, or its configured backend reports that it is not retained)
 - `409 Conflict` - Target lease is not `PENDING`, is already provisioned, has an unresolved durable provision/restore attempt, or is not in a restorable state
 - `422 Unprocessable Entity` - Requested a smaller SKU tier (demote) but the retained data exceeds the new tier's `disk_mb` cap; the `error` message begins `retained data exceeds the requested smaller tier`
+- `502 Bad Gateway` - The backend rejected the restore with an unusable or off-contract error response
 - `503 Service Unavailable` - Insufficient resources, an open backend circuit, unavailable placement routing/recording/tracking, or a source placement that is unusable, unresolved, or names a backend Fred no longer knows
 
 ### Get Release History

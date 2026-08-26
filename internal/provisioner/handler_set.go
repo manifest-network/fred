@@ -174,12 +174,16 @@ func (h *HandlerSet) handleDeprovisionOwnedCallback(
 ) {
 	switch callback.Status {
 	case backend.CallbackStatusDeprovisioned:
+		if h.deps.Orchestrator != nil {
+			h.deps.Orchestrator.forgetDeprovisionCandidate(callback.LeaseUUID, callback.Backend)
+		}
 		if callback.Retained {
 			h.publishRetainedLeaseNotice(callback.LeaseUUID)
 		}
 	case backend.CallbackStatusFailed:
 		h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
 	case backend.CallbackStatusSuccess:
+		metrics.CallbackDeprovisionOwnedSuccessTotal.Inc()
 		slog.Warn("ignoring success callback emitted while deprovision owns the operation",
 			"lease_uuid", callback.LeaseUUID,
 			"backend", provision.Backend,
@@ -346,10 +350,11 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	}
 
 	// Check if this lease is in-flight (idempotency check).
-	// Non-in-flight callbacks are expected for restart/update operations, which
-	// don't register in the in-flight tracker (the lease is already ACTIVE).
-	// For these, we still publish the status event so WebSocket clients see
-	// the ready/failed transition, but skip chain operations.
+	// Non-in-flight callbacks with no operation generation are expected for
+	// restart/update operations, which don't register in the in-flight tracker
+	// (the lease is already ACTIVE). Generation-scoped callbacks belong only to
+	// provision/restore operations; once that exact tracker entry is gone they are
+	// stale and must not masquerade as a restart/update status notification.
 	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
 	if !exists {
 		backendLabel := h.sanitizeBackendName(callback.Backend)
@@ -362,11 +367,20 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 			)
 		}
 		metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
+		if callback.OperationGeneration != 0 && callback.Status == backend.CallbackStatusSuccess {
+			slog.Info("ignoring generation-scoped callback whose operation is no longer in flight",
+				"lease_uuid", callback.LeaseUUID,
+				"backend", callback.Backend,
+				"generation", callback.OperationGeneration,
+				"status", callback.Status,
+			)
+			return nil
+		}
 		// Without an in-flight entry, the callback cannot be tied to the operation
 		// that created the current placement Attempt. This is true even when the
 		// backend name matches: a delayed restart/update callback may predate a
-		// newer provision attempt. Treat all non-in-flight callbacks as status-event
-		// notifications only; authoritative inventory repairs placement.
+		// newer provision attempt. Treat legacy generation-less callbacks as
+		// status-event notifications only; authoritative inventory repairs placement.
 
 		switch callback.Status {
 		case backend.CallbackStatusSuccess:
@@ -374,6 +388,9 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		case backend.CallbackStatusFailed:
 			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
 		case backend.CallbackStatusDeprovisioned:
+			if h.deps.Orchestrator != nil {
+				h.deps.Orchestrator.forgetDeprovisionCandidate(callback.LeaseUUID, callback.Backend)
+			}
 			// No chain action: the backend tore down a lease that was not
 			// in-flight here. Chain state is unchanged. ENG-329: if the backend
 			// reports it actually retained the data, emit the retained notice on
@@ -426,7 +443,9 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	// failure remains retryable. Consume the status notification without waiting
 	// for or finishing that claim; Deprovision will finish or release it. The
 	// owner tag is essential: an autonomous deprovision callback with no active
-	// close still follows ordinary terminal settlement below.
+	// close still follows ordinary terminal settlement below. If this close later
+	// fails, the orchestrator moves its positive candidates out of the ordinary
+	// provisioning tracker before returning so timeout/load accounting cannot leak.
 	if provision.settlementOwner == inFlightSettlementDeprovision {
 		h.handleDeprovisionOwnedCallback(callback, provision)
 		return nil
@@ -470,27 +489,21 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	switch callback.Status {
 	case backend.CallbackStatusSuccess:
 		// Repair any Attempt left behind by a failed synchronous Confirm before
-		// moving the lease on chain. Storage errors retain the in-flight entry for
-		// retry; permanent semantic verdicts preserve the conflicting record but
-		// cannot be repaired by replaying this authenticated success callback.
+		// moving the lease on chain. The authenticated backend/generation pair is
+		// positive evidence that the lease is live even when placement persistence
+		// fails. In every error case the durable write-ahead Attempt or conflict is
+		// left untouched for inventory/operator repair; blocking acknowledgement
+		// would instead let the timeout path reject a lease that is already live.
 		if err := h.deps.Orchestrator.ConfirmPlacement(callback.LeaseUUID, provision.Backend); err != nil {
-			if !isPermanentPlacementVerdict(err) {
-				slog.Error("failed to confirm placement from success callback, keeping in-flight",
-					"lease_uuid", callback.LeaseUUID,
-					"backend", provision.Backend,
-					"error", err,
-				)
-				return fmt.Errorf("confirm placement for lease %s: %w", callback.LeaseUUID, err)
+			permanentVerdict := isPermanentPlacementVerdict(err)
+			if permanentVerdict {
+				metrics.CallbackPlacementSemanticConflictsTotal.Inc()
 			}
-			// The backend/generation checks above authenticate this positive result.
-			// A durable semantic conflict must remain untouched for inventory/operator
-			// repair, but it must not poison the success callback and let the timeout
-			// path reject a lease that is already live on this backend.
-			metrics.CallbackPlacementSemanticConflictsTotal.Inc()
-			slog.Error("placement rejected success callback confirmation; continuing chain acknowledgement",
+			slog.Error("failed to confirm placement from authenticated success callback; continuing chain acknowledgement",
 				"lease_uuid", callback.LeaseUUID,
 				"backend", provision.Backend,
 				"generation", provision.Generation,
+				"permanent_semantic_verdict", permanentVerdict,
 				"error", err,
 			)
 		}

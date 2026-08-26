@@ -75,6 +75,37 @@ func TestHandleProvisionCallback_PropagatesAuthenticatedOperationGeneration(t *t
 	assert.Equal(t, uint64(42), pub.callback.OperationGeneration)
 }
 
+func TestHandleProvisionCallback_RejectsInvalidAuthenticatedOperationGeneration(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "zero", raw: "0"},
+		{name: "non-numeric", raw: "not-a-number"},
+		{name: "negative", raw: "-1"},
+		{name: "uint64 overflow", raw: "18446744073709551616"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+			pub := &capturingCallbackPublisher{}
+			srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
+			body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success"}`
+			req := httptest.NewRequest(http.MethodPost,
+				"/callbacks/provision?operation_generation="+tt.raw, strings.NewReader(body))
+			req.Header.Set(CallbackSignatureHeader,
+				auth.ComputeSignature(req.Method, req.URL.RequestURI(), []byte(body)))
+
+			rr := httptest.NewRecorder()
+			srv.handleProvisionCallback(rr, req)
+
+			assert.Equal(t, http.StatusBadRequest, rr.Code)
+			assertErrorBody(t, rr, "operation_generation must be a non-zero uint64")
+			assert.False(t, pub.called, "an invalid generation must fail before publication")
+		})
+	}
+}
+
 func TestHandleProvisionCallback_SuccessFailedStatus(t *testing.T) {
 	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 	pub := &capturingCallbackPublisher{}

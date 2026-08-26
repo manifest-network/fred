@@ -651,6 +651,17 @@ var (
 		Help:      "Total success-callback settlement attempts that continued toward chain acknowledgement after a conflicting durable placement verdict",
 	})
 
+	// CallbackDeprovisionOwnedSuccessTotal counts provision-success callbacks
+	// observed while a chain-terminal deprovision invocation owns the exact
+	// generation. The callback cannot acknowledge the now-closing lease, but the
+	// overlap is operationally important and must not be visible only in logs.
+	CallbackDeprovisionOwnedSuccessTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "callback_deprovision_owned_success_total",
+		Help:      "Total provision-success callbacks observed while deprovision owned the exact in-flight generation",
+	})
+
 	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker,
 	// labeled by the reporting backend and the callback status.
 	NonInFlightCallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{

@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   semantic placement verdict and continue toward chain acknowledgement while
   preserving the durable record for operator repair. Retries may increment the
   counter more than once. (ENG-632)
+- `fred_provisioner_callback_deprovision_owned_success_total` exposes successful
+  provision callbacks that overlap close/deprovision ownership of the same
+  operation generation. Fred consumes these without acknowledging the closing
+  lease and continues teardown. (ENG-632)
 
 ### Changed
 
@@ -35,8 +39,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   backend circuit returns 503 rather than 500. (ENG-632)
 - Direct placement-routed connection, log, release, restart, and update
   operations now return 503 for an unusable/conflicting or attempt-only placement
-  instead of substituting a backend by SKU. Provision-discovery fan-out is
-  unchanged. (ENG-632)
+  instead of substituting a backend by SKU. Read-only provision discovery queries
+  every configured confirmed, attempted, or conflicting candidate before SKU
+  fan-out and returns 503, not a false 404, when unresolved evidence remains.
+  (ENG-632)
 - Close/deprovision now fails and retries when a durably named owner, attempt, or
   conflict candidate is unconfigured or cannot be reached, even if other
   backends report a successful no-op. (ENG-632)
@@ -53,6 +59,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   attempts only from authoritative inventory, and deprovisions every known owner
   candidate. Callback and timeout settlement is generation-scoped so an older
   operation cannot mutate or reject its replacement. (ENG-632)
+- Unvalidated HTTP 503 responses no longer clear provision or restore attempts;
+  authenticated success callbacks continue to chain acknowledgement when
+  placement persistence fails; and one lease's durable placement conflict no
+  longer prevents unrelated leases from using a successfully synchronized
+  full-fleet absence baseline. (ENG-632)
 
 ### Security
 

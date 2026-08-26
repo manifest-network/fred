@@ -46,7 +46,7 @@ type PlacementStore interface {
 	Delete(leaseUUID string) error
 	DeleteIfRevision(leaseUUID string, revision uint64) (bool, error)
 	SetBatchIfNotNewer(placements map[string]string, maxRevision uint64) (map[string]uint64, map[string]struct{}, error)
-	SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) (map[string]struct{}, error)
+	SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) (map[string]uint64, map[string]struct{}, error)
 	ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision uint64) error
 }
 

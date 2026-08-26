@@ -2991,6 +2991,103 @@ func TestGetLeaseProvision(t *testing.T) {
 		assert.Empty(t, response.Message)
 	})
 
+	t.Run("drained_placement_candidates_remain_readable", func(t *testing.T) {
+		var placedCalls, routedCalls atomic.Int32
+		placedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			placedCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(backend.ProvisionInfo{
+				LeaseUUID: leaseUUID,
+				Status:    backend.ProvisionStatusReady,
+			})
+		}))
+		defer placedServer.Close()
+		routedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			routedCalls.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer routedServer.Close()
+
+		placedBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name: "placed-drained", BaseURL: placedServer.URL, Timeout: 5 * time.Second,
+		})
+		routedBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+			Name: "sku-routed", BaseURL: routedServer.URL, Timeout: 5 * time.Second,
+		})
+		router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+			{Backend: placedBackend},
+			{Backend: routedBackend, Match: backend.MatchCriteria{SKUs: []string{"sku-1"}}, IsDefault: true},
+		}})
+		require.NoError(t, err)
+
+		readChain := &mockChainClient{getLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid: leaseUUID, Tenant: kp.Address, ProviderUuid: providerUUID,
+				State: billingtypes.LEASE_STATE_ACTIVE,
+				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}, nil
+		}}
+		currentPlacement := placement.Placement{}
+		h := &Handlers{
+			client: readChain, backendRouter: router,
+			placementLookup: &mockPlacementLookup{lookupFunc: func(string) placement.Placement {
+				return currentPlacement
+			}},
+			providerUUID: providerUUID, bech32Prefix: "manifest",
+		}
+		request := func() *httptest.ResponseRecorder {
+			req := httptest.NewRequest(http.MethodGet, "/v1/leases/"+leaseUUID+"/provision", nil)
+			req.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+			req.SetPathValue("lease_uuid", leaseUUID)
+			rec := httptest.NewRecorder()
+			h.GetLeaseProvision(rec, req)
+			return rec
+		}
+
+		for _, tc := range []struct {
+			name      string
+			placement placement.Placement
+		}{
+			{
+				name: "confirmed owner with unresolved attempt",
+				placement: placement.Placement{
+					Backend: placedBackend.Name(), Attempt: placedBackend.Name(),
+				},
+			},
+			{
+				name:      "attempt-only candidate",
+				placement: placement.Placement{Attempt: placedBackend.Name()},
+			},
+			{
+				name: "conflict candidate",
+				placement: placement.Placement{
+					Conflict: true, ConflictBackends: []string{placedBackend.Name(), routedBackend.Name()},
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				placedCalls.Store(0)
+				routedCalls.Store(0)
+				currentPlacement = tc.placement
+
+				rec := request()
+
+				require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+				assert.Equal(t, int32(1), placedCalls.Load())
+				assert.Zero(t, routedCalls.Load(),
+					"SKU fan-out must not skip a known placement candidate")
+			})
+		}
+
+		placedCalls.Store(0)
+		routedCalls.Store(0)
+		currentPlacement = placement.Placement{Attempt: "removed-backend"}
+		rec := request()
+		require.Equal(t, http.StatusServiceUnavailable, rec.Code, "body: %s", rec.Body.String())
+		assert.Zero(t, placedCalls.Load())
+		assert.Equal(t, int32(1), routedCalls.Load())
+	})
+
 	t.Run("happy_path_failed_with_error", func(t *testing.T) {
 		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/provisions/"+leaseUUID && r.Method == "GET" {
@@ -5925,12 +6022,14 @@ func TestRestoreLease_InsufficientResources503(t *testing.T) {
 		},
 	}
 
+	recorder := &fakeRestoreRecorder{}
+	tracker := &fakeRestoreTracker{trackResult: true}
 	h := &Handlers{
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreRecorder: &fakeRestoreRecorder{},
-		restoreTracker:  &fakeRestoreTracker{trackResult: true},
+		restoreRecorder: recorder,
+		restoreTracker:  tracker,
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -5949,6 +6048,11 @@ func TestRestoreLease_InsufficientResources503(t *testing.T) {
 	var errResp ErrorResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
 	assert.Equal(t, "insufficient resources to restore", errResp.Error)
+	assert.True(t, recorder.attemptCalled)
+	assert.False(t, recorder.clearCalled,
+		"an unvalidated HTTP 503 cannot prove that the backend refused the restore")
+	assert.True(t, tracker.untrackCalled,
+		"the durable attempt, not timeout tracking, owns the ambiguous outcome")
 }
 
 // TestRestoreLease_PendingLeaseAuthenticates verifies that requireActive=false
@@ -7111,12 +7215,12 @@ func TestRestoreWasDefinitelyRefused(t *testing.T) {
 		{"not retained", backend.ErrNotRetained, true},
 		{"invalid state", backend.ErrInvalidState, true},
 		{"already provisioned is positive ownership", backend.ErrAlreadyProvisioned, false},
-		{"insufficient resources", backend.ErrInsufficientResources, true},
+		{"unvalidated insufficient resources response", backend.ErrInsufficientResources, false},
 		{"circuit open", backend.ErrCircuitOpen, true},
 		{"demote exceeds tier", backend.ErrDemoteDataExceedsTier, true},
 		{"validation", backend.ErrValidation, true},
 		{"well formed refusal", backend.ErrRestoreRefused, true},
-		{"wrapped refusal", fmt.Errorf("restore: %w", backend.ErrInsufficientResources), true},
+		{"wrapped unvalidated 503", fmt.Errorf("restore: %w", backend.ErrInsufficientResources), false},
 		{"malformed response is ambiguous", backend.ErrMalformedErrorBody, false},
 		{"deadline is ambiguous", context.DeadlineExceeded, false},
 		{"generic 5xx is ambiguous", errors.New("restore failed with status 500"), false},

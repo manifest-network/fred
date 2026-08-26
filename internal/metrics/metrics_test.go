@@ -27,6 +27,7 @@ var unlabelledMetricNames = []string{
 	"fred_payload_size_bytes",
 	"fred_payload_stored_count",
 	"fred_placement_write_failures_total",
+	"fred_provisioner_callback_deprovision_owned_success_total",
 	"fred_provisioner_callback_placement_semantic_conflicts_total",
 	"fred_provisioner_callback_settlement_claim_wait_timeouts_total",
 	"fred_provisioner_callback_timeouts_total",
@@ -151,6 +152,7 @@ func allCollectors() []prometheus.Collector {
 		MalformedMessagesTotal,
 		ReconciliationConflictsTotal,
 		// Callback
+		CallbackDeprovisionOwnedSuccessTotal,
 		CallbackPlacementSemanticConflictsTotal,
 		CallbackSettlementClaimWaitTimeoutsTotal,
 		CallbackTimeoutsTotal,

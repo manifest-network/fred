@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
@@ -44,10 +45,11 @@ func classifyProvisionOutcome(err error) provisionOutcome {
 		// A 409 is positive proof that this backend owns the lease.
 		return provisionOutcomeAlreadyExists
 	case errors.Is(err, backend.ErrValidation),
-		errors.Is(err, backend.ErrInsufficientResources),
 		errors.Is(err, backend.ErrCircuitOpen):
-		// These errors are explicit refusals. In particular, an open circuit
-		// means the request was never sent.
+		// Validation errors carry a parsed backend-authored verdict, while an open
+		// circuit means the request was never sent. ErrInsufficientResources is not
+		// included: HTTPClient maps every unvalidated 503 response to that sentinel,
+		// and an intermediary can emit 503 after the backend accepted the request.
 		return provisionOutcomeDefinitiveFailure
 	default:
 		return provisionOutcomeAmbiguous
@@ -63,6 +65,9 @@ type ProvisionOrchestrator struct {
 	router          BackendRouter
 	tracker         InFlightTracker
 	placementStore  PlacementStore
+
+	deprovisionCandidatesMu sync.Mutex
+	deprovisionCandidates   map[string]map[string]struct{}
 }
 
 // ErrProvisionAttemptPending means a prior backend call still has an unknown
@@ -123,11 +128,72 @@ func settleProvisionAttempt(
 // NewProvisionOrchestrator creates a new ProvisionOrchestrator.
 func NewProvisionOrchestrator(providerUUID, callbackBaseURL string, router BackendRouter, tracker InFlightTracker, placementStore PlacementStore) *ProvisionOrchestrator {
 	return &ProvisionOrchestrator{
-		providerUUID:    providerUUID,
-		callbackBaseURL: callbackBaseURL,
-		router:          router,
-		tracker:         tracker,
-		placementStore:  placementStore,
+		providerUUID:          providerUUID,
+		callbackBaseURL:       callbackBaseURL,
+		router:                router,
+		tracker:               tracker,
+		placementStore:        placementStore,
+		deprovisionCandidates: make(map[string]map[string]struct{}),
+	}
+}
+
+// rememberedDeprovisionCandidates returns process-local positive candidates
+// retained from a failed close after its provisioning tracker entry was
+// released. They do not participate in load balancing, callback timeouts, or
+// provision admission, but let later close/orphan retries remain fail-closed.
+func (o *ProvisionOrchestrator) rememberedDeprovisionCandidates(leaseUUID string) []string {
+	o.deprovisionCandidatesMu.Lock()
+	defer o.deprovisionCandidatesMu.Unlock()
+
+	names := make([]string, 0, len(o.deprovisionCandidates[leaseUUID]))
+	for name := range o.deprovisionCandidates[leaseUUID] {
+		names = append(names, name)
+	}
+	return names
+}
+
+func (o *ProvisionOrchestrator) rememberDeprovisionCandidates(leaseUUID string, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	o.deprovisionCandidatesMu.Lock()
+	defer o.deprovisionCandidatesMu.Unlock()
+
+	if o.deprovisionCandidates == nil {
+		o.deprovisionCandidates = make(map[string]map[string]struct{})
+	}
+	remembered := o.deprovisionCandidates[leaseUUID]
+	if remembered == nil {
+		remembered = make(map[string]struct{}, len(names))
+		o.deprovisionCandidates[leaseUUID] = remembered
+	}
+	for _, name := range names {
+		if name != "" {
+			remembered[name] = struct{}{}
+		}
+	}
+}
+
+func (o *ProvisionOrchestrator) forgetDeprovisionCandidates(leaseUUID string) {
+	o.deprovisionCandidatesMu.Lock()
+	defer o.deprovisionCandidatesMu.Unlock()
+	delete(o.deprovisionCandidates, leaseUUID)
+}
+
+// forgetDeprovisionCandidate retires one outstanding teardown candidate after
+// a positive deprovisioned callback. This also lets a later reconciler/orphan
+// teardown clean up retry state left by a poisoned close message.
+func (o *ProvisionOrchestrator) forgetDeprovisionCandidate(leaseUUID, backendName string) {
+	if backendName == "" {
+		return
+	}
+	o.deprovisionCandidatesMu.Lock()
+	defer o.deprovisionCandidatesMu.Unlock()
+
+	remembered := o.deprovisionCandidates[leaseUUID]
+	delete(remembered, backendName)
+	if len(remembered) == 0 {
+		delete(o.deprovisionCandidates, leaseUUID)
 	}
 }
 
@@ -499,6 +565,9 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 		seenNames[name] = struct{}{}
 		candidateNames = append(candidateNames, name)
 	}
+	for _, name := range o.rememberedDeprovisionCandidates(leaseUUID) {
+		addCandidateName(name)
+	}
 
 	unresolved := false
 	unaccountablePlacement := false
@@ -529,6 +598,19 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 	if wasInFlight {
 		addCandidateName(provision.Backend)
 	}
+	finishWithError := func(deprovisionErr error, retryCandidates []string) error {
+		// Once this invocation has captured every positive candidate, the ordinary
+		// provisioning tracker must not survive a poisoned close message: it feeds
+		// load balancing and callback timeouts. Retain only candidates whose teardown
+		// failed or could not be attempted; successful candidates need no retry and
+		// a later deprovisioned callback can retire an outstanding entry. Then finish
+		// only the exact claimed generation. Durable placement remains untouched.
+		o.rememberDeprovisionCandidates(leaseUUID, retryCandidates)
+		if finishErr := finishInFlight(); finishErr != nil {
+			return errors.Join(deprovisionErr, finishErr)
+		}
+		return deprovisionErr
+	}
 
 	candidates := make([]backend.Backend, 0, len(candidateNames))
 	unreachedCandidates := make([]string, 0)
@@ -546,23 +628,28 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 
 	if !unresolved && len(candidates) > 0 {
 		var candidateErrs []error
+		failedCandidates := make([]string, 0)
 		for _, b := range candidates {
 			if err := b.Deprovision(ctx, leaseUUID); err != nil {
 				slog.Error("failed to deprovision candidate backend",
 					"lease_uuid", leaseUUID, "backend", b.Name(), "error", err)
 				candidateErrs = append(candidateErrs, fmt.Errorf("backend %s: %w", b.Name(), err))
+				failedCandidates = append(failedCandidates, b.Name())
 				continue
 			}
+			o.forgetDeprovisionCandidate(leaseUUID, b.Name())
 			slog.Info("deprovisioned successfully",
 				"lease_uuid", leaseUUID, "backend", b.Name())
 		}
 		if len(candidateErrs) > 0 {
-			return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, errors.Join(candidateErrs...))
+			return finishWithError(fmt.Errorf("%w: lease %s: %w",
+				ErrDeprovisionFailed, leaseUUID, errors.Join(candidateErrs...)), failedCandidates)
 		}
 		// Placement is intentionally NOT deleted here (ENG-333). It is a derived
 		// index of where the lease's data lives; if the backend retained the
 		// volumes, the placement must survive close so a restore can route to it.
 		// The reconciler is the sole pruner (cleanupOrphanedPlacements).
+		o.forgetDeprovisionCandidates(leaseUUID)
 		return finishInFlight()
 	}
 
@@ -581,6 +668,7 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 			sweepErrs = append(sweepErrs, fmt.Errorf("backend %s: %w", b.Name(), err))
 		} else {
 			swept = append(swept, b.Name())
+			o.forgetDeprovisionCandidate(leaseUUID, b.Name())
 		}
 	}
 	// Log level depends on whether an unresolved placement is expected. With the
@@ -615,7 +703,10 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 			ErrPlacementUnresolvable))
 	}
 	if len(sweepErrs) > 0 {
-		return fmt.Errorf("%w: lease %s: %w", ErrDeprovisionFailed, leaseUUID, errors.Join(sweepErrs...))
+		return finishWithError(fmt.Errorf("%w: lease %s: %w",
+			ErrDeprovisionFailed, leaseUUID, errors.Join(sweepErrs...)),
+			append(append([]string(nil), failed...), unreachedCandidates...))
 	}
+	o.forgetDeprovisionCandidates(leaseUUID)
 	return finishInFlight()
 }

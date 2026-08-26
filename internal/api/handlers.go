@@ -344,7 +344,8 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 			return b
 		case placement.StateUnusable:
 			// A corrupt record is not absence. Refuse to guess a backend until a
-			// complete reconciliation repairs or prunes it.
+			// durable conflict is reconciled or an operator repairs a structurally
+			// unreadable record.
 			slog.Error("placement record is unusable; refusing to serve from a guessed backend",
 				"lease_uuid", leaseUUID,
 			)
@@ -372,12 +373,12 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 const restoreHint = "to restore before retained_until: create a fresh PENDING lease of matching shape (the items above), then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
 
 // findProvisionAcrossBackends performs the bounded fan-out (ENG-329 #4): the
-// fallback used when placement can't resolve the holder — placement-disabled
-// deployments, or a lease with no surviving placement record. It queries
+// fallback used after placement candidates — placement-disabled deployments,
+// a lease with no surviving record, or a stale/unresolved record. It queries
 // GetProvision across every backend that could hold the lease: RouteAll(sku) when
-// the SKU is known, else Backends(). Returns the first found provision (live or
-// retained); non-holders return ErrNotProvisioned and are skipped; a single
-// backend is one call.
+// the SKU is known, else Backends(), skipping names already queried from durable
+// placement. Returns the first found provision (live or retained); non-holders
+// return ErrNotProvisioned and are skipped; a single backend is one call.
 //
 // Returns:
 //   - (info, nil)  when some backend holds the lease;
@@ -385,7 +386,11 @@ const restoreHint = "to restore before retained_until: create a fresh PENDING le
 //   - (nil, err)   when no backend held it AND at least one returned a genuine
 //     (non-ErrNotProvisioned) error — surfaced so the caller can 500 rather than
 //     mask a transient backend failure as a 404.
-func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, sku string) (*backend.ProvisionInfo, error) {
+func (h *Handlers) findProvisionAcrossBackends(
+	ctx context.Context,
+	leaseUUID, sku string,
+	previouslyQueried ...map[string]struct{},
+) (*backend.ProvisionInfo, error) {
 	if h.backendRouter == nil {
 		return nil, nil
 	}
@@ -395,8 +400,15 @@ func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, s
 		// item to derive it from): fan out over every backend.
 		candidates = h.backendRouter.Backends()
 	}
+	var alreadyQueried map[string]struct{}
+	if len(previouslyQueried) > 0 {
+		alreadyQueried = previouslyQueried[0]
+	}
 	var firstErr error
 	for _, b := range candidates {
+		if _, seen := alreadyQueried[b.Name()]; seen {
+			continue
+		}
 		info, err := b.GetProvision(ctx, leaseUUID)
 		if err != nil {
 			if !errors.Is(err, backend.ErrNotProvisioned) {
@@ -421,27 +433,18 @@ func (h *Handlers) findProvisionAcrossBackends(ctx context.Context, leaseUUID, s
 	return nil, firstErr
 }
 
-// findProvision locates a lease's provision, preferring an O(1) placement hit
-// (via resolveBackendByPlacement) before the bounded fan-out. Placement resolves
-// the holder directly — a single GetProvision call — for ACTIVE leases and for
-// retained leases too: ENG-333 keeps a retained lease's placement alive on close
-// (restore affinity), so it stays resolvable through the grace window. Only an
-// actual placement hit that yields a provision takes the fast path; a missing
-// placement, or ErrNotProvisioned on the placed backend, falls through to
-// findProvisionAcrossBackends.
-//
-// Uses resolveBackendByPlacement (not resolveBackend) so a placement miss goes
-// straight to the fan-out rather than guessing a single SKU-routed backend.
+// findProvision locates a lease's provision by querying every configured backend
+// named by durable placement before bounded SKU fan-out. This includes confirmed,
+// attempted, and conflicting candidates because discovery is read-only; it avoids
+// false 404s for holders drained from SKU routing. If all searches miss while the
+// durable evidence remains unresolved, the caller receives
+// ErrPlacementUnresolvable rather than absence.
 func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*backend.ProvisionInfo, error) {
 	var fastErr error
-	// An unresolvable placement is deliberately ignored here rather than
-	// refused. This is a SEARCH, not a selection: the fan-out asks every
-	// candidate whether it holds this lease and non-holders answer
-	// ErrNotProvisioned, so it can never serve a wrong backend's data the way
-	// resolveBackend could. Whether a read should 503 rather than 404 when the
-	// recorded backend is absent is a separate question from ENG-635's
-	// never-substitute rule, and is left as-is here.
-	if b, _ := h.resolveBackendByPlacement(leaseUUID); b != nil {
+	queried := make(map[string]struct{})
+	placedBackends, placementUnresolved := h.resolveReadBackendsByPlacement(leaseUUID)
+	for _, b := range placedBackends {
+		queried[b.Name()] = struct{}{}
 		info, err := b.GetProvision(ctx, leaseUUID)
 		if err == nil && info != nil {
 			// BackendName is json:"-", so HTTP backends leave it empty on the
@@ -455,12 +458,12 @@ func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*b
 		// the fan-out. A GENUINE error must NOT be swallowed: retain it
 		// so it can be surfaced if the fan-out finds nothing and has no error of
 		// its own (preserves the 500-not-404 error-surfacing contract).
-		if err != nil && !errors.Is(err, backend.ErrNotProvisioned) {
+		if err != nil && !errors.Is(err, backend.ErrNotProvisioned) && fastErr == nil {
 			fastErr = err
 		}
 	}
 
-	info, fanErr := h.findProvisionAcrossBackends(ctx, leaseUUID, sku)
+	info, fanErr := h.findProvisionAcrossBackends(ctx, leaseUUID, sku, queried)
 	if info != nil {
 		// A fan-out hit (e.g. stale placement but found elsewhere) wins even over a
 		// genuine placed-backend error.
@@ -470,7 +473,60 @@ func (h *Handlers) findProvision(ctx context.Context, leaseUUID, sku string) (*b
 		// A fan-out error takes precedence over the placed-backend's error.
 		return nil, fanErr
 	}
-	return nil, fastErr
+	if fastErr != nil {
+		return nil, fastErr
+	}
+	if placementUnresolved {
+		return nil, fmt.Errorf("%w: lease %s has unresolved placement evidence",
+			provisioner.ErrPlacementUnresolvable, leaseUUID)
+	}
+	return nil, nil
+}
+
+// resolveReadBackendsByPlacement returns every configured backend named by a
+// durable placement for read-only provision discovery. Reads may safely query a
+// confirmed owner, unresolved attempt, or conflict candidate: doing so cannot
+// create/move data and avoids false 404s when a possible holder has been drained
+// from SKU routing. The boolean remains true when unresolved evidence exists, so
+// an all-miss search surfaces temporary unavailability rather than absence.
+func (h *Handlers) resolveReadBackendsByPlacement(leaseUUID string) ([]backend.Backend, bool) {
+	if h.placementLookup == nil || h.backendRouter == nil {
+		return nil, false
+	}
+	p := h.placementLookup.Lookup(leaseUUID)
+	if p.State() == placement.StateAbsent {
+		return nil, false
+	}
+
+	names := make([]string, 0, 2+len(p.ConflictBackends))
+	seen := make(map[string]struct{}, cap(names))
+	addName := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, exists := seen[name]; exists {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	addName(p.Backend)
+	addName(p.Attempt)
+	for _, name := range p.ConflictBackends {
+		addName(name)
+	}
+
+	unresolved := p.State() != placement.StateConfirmed || p.Attempt != ""
+	backends := make([]backend.Backend, 0, len(names))
+	for _, name := range names {
+		b := h.backendRouter.GetBackendByName(name)
+		if b == nil {
+			unresolved = true
+			continue
+		}
+		backends = append(backends, b)
+	}
+	return backends, unresolved
 }
 
 // resolveBackendByPlacement returns the backend recorded in placement for the
@@ -962,6 +1018,10 @@ func (h *Handlers) GetLeaseProvision(w http.ResponseWriter, r *http.Request) {
 		// backend error (not ErrNotProvisioned) should surface as 500 rather than
 		// masking a transient failure as a 404.
 		slog.Error("failed to get provision from backend", "error", fanErr, "lease_uuid", leaseUUID)
+		if errors.Is(fanErr, provisioner.ErrPlacementUnresolvable) {
+			writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+			return
+		}
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	case info == nil:
@@ -1157,16 +1217,15 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 	// provisioned (ENG-333).
 	//
 	// The two misses are DIFFERENT answers and must not be collapsed:
-	//   - no placement record for the source  => no retained data here => 404
-	//   - a record naming a backend the router does not know => the data exists
-	//     on a machine we cannot currently reach => 503 (ENG-635)
+	//   - no placement record for the source => no retained data here => 404
+	//   - an unresolved, unusable, or unreachable placement record => Fred cannot
+	//     safely select the retained-data owner => 503
 	backendClient, err := h.resolveBackendByPlacement(body.FromLeaseUUID)
 	if err != nil {
-		// A record exists but names a backend the router does not know. The
-		// retained data is not gone — fred just cannot reach the machine
-		// holding it. 404 here would read as "your data no longer exists" and
-		// invite the tenant to give up on a recoverable outage (ENG-635).
-		slog.Error("restore source is placed on a backend the router does not know",
+		// A durable record exists, but it cannot currently name one safe source.
+		// The retained data is not known gone, so 404 would invite the tenant to
+		// give up on a recoverable placement or configuration problem.
+		slog.Error("restore source placement is unresolvable",
 			"lease_uuid", leaseUUID,
 			"from_lease_uuid", body.FromLeaseUUID,
 			"error", err,
@@ -1411,7 +1470,6 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 func restoreWasDefinitelyRefused(err error) bool {
 	return errors.Is(err, backend.ErrNotRetained) ||
 		errors.Is(err, backend.ErrInvalidState) ||
-		errors.Is(err, backend.ErrInsufficientResources) ||
 		errors.Is(err, backend.ErrCircuitOpen) ||
 		errors.Is(err, backend.ErrDemoteDataExceedsTier) ||
 		errors.Is(err, backend.ErrValidation) ||

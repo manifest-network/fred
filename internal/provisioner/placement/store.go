@@ -803,24 +803,25 @@ func (s *Store) SetBatchIfNotNewer(
 // owner, but preserves those names together with every reporting backend in a
 // durable candidate set. No individual status may drive chain actions while the
 // conflict remains, yet deprovision and later reconciliation can still account
-// for every backend that was ever positively identified. The returned set names
+// for every backend that was ever positively identified. The first returned map
+// contains exact revisions committed by this call. The returned set names
 // conflicts rejected by the revision fence so callers can preserve lease-local
 // untrusted-absence state instead of treating a filtered quarantine as durable.
 func (s *Store) SetConflictsIfNotNewer(
 	conflicts map[string][]string,
 	maxRevision uint64,
-) (map[string]struct{}, error) {
+) (map[string]uint64, map[string]struct{}, error) {
 	for leaseUUID, backendNames := range conflicts {
 		if leaseUUID == "" {
-			return nil, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
+			return nil, nil, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
 		}
 		if len(normalizeBackendNames(backendNames)) < 2 {
-			return nil, fmt.Errorf("%w: conflict for lease %q requires at least two backends",
+			return nil, nil, fmt.Errorf("%w: conflict for lease %q requires at least two backends",
 				ErrInvalidPlacement, leaseUUID)
 		}
 	}
 	if len(conflicts) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	s.mu.Lock()
@@ -837,18 +838,18 @@ func (s *Store) SetConflictsIfNotNewer(
 	}
 	keys = eligible
 	if len(keys) == 0 {
-		return fenced, nil
+		if err := s.verifyBucket(); err != nil {
+			return nil, fenced, mutationFailure("verify generation-filtered placement conflict sync", err)
+		}
+		return nil, fenced, nil
 	}
 
 	now := s.now().UTC()
 	nextRevision := s.revision
 	quarantined := make(map[string]Placement, len(keys))
 	encoded := make(map[string][]byte, len(keys))
+	mutated := keys[:0]
 	for _, leaseUUID := range keys {
-		if nextRevision == math.MaxUint64 {
-			return fenced, fmt.Errorf("placement revision exhausted")
-		}
-		nextRevision++
 		existing, exists := s.cache[leaseUUID]
 		setAt := existing.SetAt
 		if setAt.IsZero() {
@@ -877,14 +878,29 @@ func (s *Store) SetConflictsIfNotNewer(
 			Conflict:              true,
 			ConflictBackends:      slices.Sorted(maps.Keys(candidateSet)),
 			ConflictOwnersUnknown: unknownOwners,
-			revision:              nextRevision,
 		}
+		if exists && equalPlacementIgnoringRevision(p, existing) {
+			continue
+		}
+		if nextRevision == math.MaxUint64 {
+			return nil, fenced, fmt.Errorf("placement revision exhausted")
+		}
+		nextRevision++
+		p.revision = nextRevision
 		enc, err := encodePlacement(p)
 		if err != nil {
-			return fenced, mutationFailure("encode placement conflicts", err)
+			return nil, fenced, mutationFailure("encode placement conflicts", err)
 		}
+		mutated = append(mutated, leaseUUID)
 		quarantined[leaseUUID] = p
 		encoded[leaseUUID] = enc
+	}
+	keys = mutated
+	if len(keys) == 0 {
+		if err := s.verifyBucket(); err != nil {
+			return nil, fenced, mutationFailure("verify idempotent placement conflict sync", err)
+		}
+		return nil, fenced, nil
 	}
 
 	if err := s.db.Update(func(tx *bolt.Tx) error {
@@ -896,7 +912,7 @@ func (s *Store) SetConflictsIfNotNewer(
 		}
 		return nil
 	}); err != nil {
-		return fenced, mutationFailure("set placement conflicts", err)
+		return nil, fenced, mutationFailure("set placement conflicts", err)
 	}
 
 	maps.Copy(s.cache, quarantined)
@@ -904,7 +920,11 @@ func (s *Store) SetConflictsIfNotNewer(
 		delete(s.deleteRevisions, leaseUUID)
 	}
 	s.revision = nextRevision
-	return fenced, nil
+	applied := make(map[string]uint64, len(quarantined))
+	for leaseUUID, p := range quarantined {
+		applied[leaseUUID] = p.revision
+	}
+	return applied, fenced, nil
 }
 
 // ClearConflictsIfNotNewer removes conflict markers only after a complete
@@ -1007,6 +1027,18 @@ func (s *Store) mutationRevisionLocked(leaseUUID string) uint64 {
 		return p.revision
 	}
 	return s.deleteRevisions[leaseUUID]
+}
+
+// verifyBucket proves the durable store is readable even when an idempotent or
+// fully fenced synchronization has no mutation to commit.
+// Caller holds at least s.mu.RLock.
+func (s *Store) verifyBucket() error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketName) == nil {
+			return errors.New("placements bucket missing")
+		}
+		return nil
+	})
 }
 
 // put writes one record to bbolt and updates the cache only after commit.

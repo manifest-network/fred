@@ -54,7 +54,7 @@ func requireSetConflictsIfNotNewer(
 	maxRevision uint64,
 ) map[string]struct{} {
 	t.Helper()
-	fenced, err := s.SetConflictsIfNotNewer(conflicts, maxRevision)
+	_, fenced, err := s.SetConflictsIfNotNewer(conflicts, maxRevision)
 	require.NoError(t, err)
 	return fenced
 }
@@ -551,6 +551,37 @@ func TestStore_ListReturnsIndependentAtomicSnapshot(t *testing.T) {
 	assert.Len(t, s.List(), 2)
 }
 
+func TestStore_IdempotentConflictSyncDoesNotAdvanceRevision(t *testing.T) {
+	s := newTestStore(t)
+	applied, fenced, err := s.SetConflictsIfNotNewer(map[string][]string{
+		"lease-1": {"backend-b", "backend-a", "backend-a"},
+	}, s.SnapshotRevision())
+	require.NoError(t, err)
+	require.Empty(t, fenced)
+	require.Contains(t, applied, "lease-1")
+	before := s.Lookup("lease-1")
+	beforeRevision := s.SnapshotRevision()
+
+	applied, fenced, err = s.SetConflictsIfNotNewer(map[string][]string{
+		"lease-1": {"backend-a", "backend-b"},
+	}, beforeRevision)
+	require.NoError(t, err)
+	assert.Empty(t, fenced)
+	assert.Empty(t, applied, "the same normalized quarantine must be a durable no-op")
+	assert.Equal(t, beforeRevision, s.SnapshotRevision())
+	assert.Equal(t, before, s.Lookup("lease-1"))
+
+	applied, fenced, err = s.SetConflictsIfNotNewer(map[string][]string{
+		"lease-1": {"backend-a", "backend-b", "backend-c"},
+	}, beforeRevision)
+	require.NoError(t, err)
+	assert.Empty(t, fenced)
+	assert.Contains(t, applied, "lease-1")
+	assert.Equal(t, beforeRevision+1, s.SnapshotRevision())
+	assert.Equal(t, []string{"backend-a", "backend-b", "backend-c"},
+		s.Lookup("lease-1").ConflictBackends)
+}
+
 func TestStore_DurableWriteFailuresLeaveCacheAndRevisionUnchanged(t *testing.T) {
 	s := newTestStore(t)
 	require.NoError(t, s.Confirm("confirmed", "backend-a"))
@@ -579,6 +610,14 @@ func TestStore_DurableWriteFailuresLeaveCacheAndRevisionUnchanged(t *testing.T) 
 
 	_, _, err = s.SetBatchIfNotNewer(nil, math.MaxUint64)
 	require.Error(t, err, "an empty inventory must not report a durable sync against a closed store")
+	assert.Equal(t, before, s.List())
+	assert.Equal(t, beforeRevision, s.SnapshotRevision())
+
+	_, fenced, err := s.SetConflictsIfNotNewer(map[string][]string{
+		"conflict": {"backend-b", "backend-a"},
+	}, math.MaxUint64)
+	require.Error(t, err, "an idempotent conflict must still verify the durable store")
+	assert.Empty(t, fenced)
 	assert.Equal(t, before, s.List())
 	assert.Equal(t, beforeRevision, s.SnapshotRevision())
 
@@ -922,10 +961,11 @@ func TestStore_ConditionalInventoryReturnsFencesWithWriteError(t *testing.T) {
 		{
 			name: "conflict batch",
 			call: func(s *Store, cutoff uint64) (map[string]struct{}, error) {
-				return s.SetConflictsIfNotNewer(map[string][]string{
+				_, fenced, err := s.SetConflictsIfNotNewer(map[string][]string{
 					"deleted":  {"backend-a", "backend-b"},
 					"eligible": {"backend-a", "backend-b"},
 				}, cutoff)
+				return fenced, err
 			},
 		},
 	}
