@@ -80,13 +80,14 @@ func (t *testReconcilerTracker) finishProvisionCallback(leaseUUID string) bool {
 
 // reconcilerTestEnv holds all components for a full-stack reconciler integration test.
 type reconcilerTestEnv struct {
-	backend      *Backend
-	reconciler   *provisioner.Reconciler
-	tracker      *testReconcilerTracker
-	chainClient  *chaintest.MockClient
-	callbackCh   <-chan backend.CallbackPayload
-	callbackURL  string
-	providerUUID string
+	backend        *Backend
+	reconciler     *provisioner.Reconciler
+	tracker        *testReconcilerTracker
+	placementStore *placement.Store
+	chainClient    *chaintest.MockClient
+	callbackCh     <-chan backend.CallbackPayload
+	callbackURL    string
+	providerUUID   string
 }
 
 // installExactLeaseLookupFallback makes the integration chain double obey the
@@ -185,13 +186,14 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 	require.NoError(t, err)
 
 	return &reconcilerTestEnv{
-		backend:      b,
-		reconciler:   reconciler,
-		tracker:      tracker,
-		chainClient:  chainClient,
-		callbackCh:   callbackCh,
-		callbackURL:  callbackServer.URL,
-		providerUUID: providerUUID,
+		backend:        b,
+		reconciler:     reconciler,
+		tracker:        tracker,
+		placementStore: placementStore,
+		chainClient:    chainClient,
+		callbackCh:     callbackCh,
+		callbackURL:    callbackServer.URL,
+		providerUUID:   providerUUID,
 	}
 }
 
@@ -1238,9 +1240,15 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	require.NoError(t, env.reconciler.RunOnce(ctx))
 
 	// --- tenant /update: exactly what the API handler does, in the same order ---
+	lifecycleAuthorization := env.placementStore.CurrentLifecycle(leaseUUID)
+	require.Equal(t, placement.LifecycleVerdictAuthorized, lifecycleAuthorization.Verdict())
+	maintenanceCallbackURL, err := provisioner.BuildCallbackURLForLifecycle(
+		env.callbackURL, lifecycleAuthorization.ID(),
+	)
+	require.NoError(t, err)
 	require.NoError(t, env.backend.Update(ctx, backend.UpdateRequest{
 		LeaseUUID:   leaseUUID,
-		CallbackURL: env.callbackURL,
+		CallbackURL: maintenanceCallbackURL,
 		Payload:     payloadV2,
 		PayloadHash: hex.EncodeToString(payload.ComputeHash(payloadV2)),
 	}))

@@ -62,6 +62,7 @@ func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
 	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db")
+	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
 
 	if cfgFn != nil {
 		cfgFn(&cfg)
