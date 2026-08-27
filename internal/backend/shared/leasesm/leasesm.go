@@ -4,7 +4,7 @@
 // package; substrate-specific concerns are injected via the interfaces
 // declared here (InstanceInspector, DiagnosticsGatherer,
 // LeaseProvisionStore, SMMetrics) and the closure-bridge fields on
-// LeaseActorConfig (PersistDiagnosticsFn, SendCallbackFn,
+// LeaseActorConfig (PersistDiagnosticsFn, SendOperationCallbackFn,
 // DoDeprovisionFn, OnTerminated). The Docker backend implements those
 // against its DockerClient + provision-record map; future substrates
 // (K3s, etc.) implement them against their own primitives.
@@ -190,7 +190,7 @@ type ProvisionState struct {
 //	    callbackURL = p.CallbackURL // capture for post-Unlock use
 //	})
 //	// post-Unlock work uses the captured callbackURL
-//	cfg.SendCallbackFn(uuid, callbackURL, backend.CallbackStatusSuccess, "")
+//	cfg.SendOperationCallbackFn(uuid, callbackURL, backend.CallbackStatusSuccess, "")
 //
 // Pick outer-capture for ALL UpdateFn call sites — mixing capture-style
 // and a hypothetical "UpdateFn returns values" extension is a
@@ -335,16 +335,16 @@ type LeaseActorConfig struct {
 	// containers).
 	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
 
-	// SendCallbackFn dispatches a callback (success or failure) for
-	// the given lease/URL pair. The substrate adapter handles error
-	// truncation, HMAC signing, retry, and store persistence; the SM
-	// only supplies the inputs.
-	SendCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
+	// SendOperationCallbackFn dispatches an exact requested-operation
+	// completion for the given lease/URL pair. The substrate adapter handles
+	// error truncation, HMAC signing, ordered persistence, and retry.
+	SendOperationCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
 
-	// SendLifecycleCallbackFn dispatches a tokenless, observation-only callback
-	// for an autonomous workload event. Keeping it separate from
-	// SendCallbackFn makes it impossible for container death to reuse an expired
-	// provision/restore settlement capability by accident.
+	// SendLifecycleCallbackFn dispatches an observation-only callback carrying
+	// either a typed lifecycle capability or a migrated legacy tokenless route.
+	// Keeping it separate from
+	// SendOperationCallbackFn makes it impossible for container death to reuse
+	// an expired provision/restore settlement capability by accident.
 	SendLifecycleCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
 
 	// DoDeprovisionFn dispatches the substrate-specific deprovision

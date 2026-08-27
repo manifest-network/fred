@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -18,7 +19,9 @@ import (
 // errCallbackPublisher is a CallbackPublisher that always returns an error.
 type errCallbackPublisher struct{ err error }
 
-func (p *errCallbackPublisher) PublishCallback(backend.CallbackPayload) error { return p.err }
+func (p *errCallbackPublisher) PublishCallback(context.Context, backend.CallbackPayload) error {
+	return p.err
+}
 
 // capturingCallbackPublisher records the last published callback.
 type capturingCallbackPublisher struct {
@@ -26,7 +29,7 @@ type capturingCallbackPublisher struct {
 	callback backend.CallbackPayload
 }
 
-func (p *capturingCallbackPublisher) PublishCallback(cb backend.CallbackPayload) error {
+func (p *capturingCallbackPublisher) PublishCallback(_ context.Context, cb backend.CallbackPayload) error {
 	p.called = true
 	p.callback = cb
 	return nil
@@ -226,8 +229,8 @@ func TestHandleProvisionCallback_InvalidStatus(t *testing.T) {
 }
 
 // TestHandleProvisionCallback_AcceptsDeprovisioned verifies that the HTTP
-// validator lets the new CallbackStatusDeprovisioned reach the Watermill
-// publisher rather than returning 400. Without this, every deprovisioned
+// validator lets the new CallbackStatusDeprovisioned reach the callback
+// application rather than returning 400. Without this, every deprovisioned
 // callback fails at the API boundary.
 func TestHandleProvisionCallback_AcceptsDeprovisioned(t *testing.T) {
 	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
@@ -251,8 +254,8 @@ func TestHandleProvisionCallback_PublishError(t *testing.T) {
 	rr := httptest.NewRecorder()
 	srv.handleProvisionCallback(rr, signedRequest(t, auth, body))
 
-	assert.Equal(t, http.StatusInternalServerError, rr.Code)
-	assertErrorBody(t, rr, errMsgInternalServerError)
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	assertErrorBody(t, rr, errMsgServiceUnavailable)
 }
 
 func TestHandleProvisionCallback_WithErrorField(t *testing.T) {

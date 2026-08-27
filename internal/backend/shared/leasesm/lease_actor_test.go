@@ -428,7 +428,7 @@ func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
 	actor := newTestActor(t, "lease-1", testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
-		SendCallbackFn: func(string, string, backend.CallbackStatus, string) {
+		SendOperationCallbackFn: func(string, string, backend.CallbackStatus, string) {
 			t.Fatal("container death must not reuse the operation settlement callback path")
 		},
 		SendLifecycleCallbackFn: func(_ string, callbackURL string, status backend.CallbackStatus, _ string) {
@@ -869,19 +869,20 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 
 // TestRestartRequested_WritesStatusBeforeAck pins the ENG-230
 // handler-publish contract: the actor must write prov.Status=Restarting
-// (and apply the request's CallbackURL) BEFORE acking the
+// and apply the caller's prevalidated callback pair BEFORE acking the
 // RestartRequestedMsg, so api/handlers.go can publish a "restarting"
 // event after Restart() returns and have it reflect already-committed
 // state. The Status/CallbackURL writes now live in onEnterRestarting
 // (the actor goroutine), not the HTTP prelude.
 func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
+	const callbackID = "550e8400-e29b-41d4-a716-446655440000"
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
 		LeaseUUID:            "lease-1",
 		Tenant:               "tenant-a",
 		Status:               backend.ProvisionStatusReady,
-		CallbackURL:          "https://old.example/cb?operation_id=old",
-		LifecycleCallbackURL: "https://old.example/cb",
+		CallbackURL:          "https://old.example/cb?operation_id=" + callbackID,
+		LifecycleCallbackURL: "https://old.example/cb?lifecycle_id=" + callbackID,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -897,8 +898,8 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 	ack := make(chan error, 1)
 	require.True(t, actor.TryEnqueue(RestartRequestedMsg{
 		Cancel:               func() {},
-		CallbackURL:          "https://new.example/cb",
-		LifecycleCallbackURL: "https://new.example/cb",
+		CallbackURL:          "https://new.example/cb?operation_id=" + callbackID,
+		LifecycleCallbackURL: "https://new.example/cb?lifecycle_id=" + callbackID,
 		Work: func() ReplaceResult {
 			<-workerRelease
 			return ReplaceResult{Success: ReplaceSuccessResult{}}
@@ -917,10 +918,10 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status,
 		"actor must write Status=Restarting BEFORE acking (handler-publish contract)")
-	assert.Equal(t, "https://new.example/cb", prov.CallbackURL,
-		"actor must apply the message CallbackURL before acking")
-	assert.Equal(t, "https://new.example/cb", prov.LifecycleCallbackURL,
-		"actor must atomically rotate lifecycle observations to the new callback base")
+	assert.Equal(t, "https://new.example/cb?operation_id="+callbackID, prov.CallbackURL,
+		"actor must atomically apply the prevalidated same-authority operation route")
+	assert.Equal(t, "https://new.example/cb?lifecycle_id="+callbackID, prov.LifecycleCallbackURL,
+		"actor must atomically apply the prevalidated same-authority lifecycle route")
 
 	close(workerRelease) // let the worker finish so the actor can quiesce
 }
@@ -928,13 +929,14 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 // TestUpdateRequested_WritesStatusBeforeAck is the Update mirror of
 // TestRestartRequested_WritesStatusBeforeAck.
 func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
+	const callbackID = "550e8400-e29b-41d4-a716-446655440000"
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
 		LeaseUUID:            "lease-1",
 		Tenant:               "tenant-a",
 		Status:               backend.ProvisionStatusReady,
-		CallbackURL:          "https://old.example/cb?operation_id=old",
-		LifecycleCallbackURL: "https://old.example/cb",
+		CallbackURL:          "https://old.example/cb?operation_id=" + callbackID,
+		LifecycleCallbackURL: "https://old.example/cb?lifecycle_id=" + callbackID,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -948,8 +950,8 @@ func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 	ack := make(chan error, 1)
 	require.True(t, actor.TryEnqueue(UpdateRequestedMsg{
 		Cancel:               func() {},
-		CallbackURL:          "https://new.example/cb",
-		LifecycleCallbackURL: "https://new.example/cb",
+		CallbackURL:          "https://new.example/cb?operation_id=" + callbackID,
+		LifecycleCallbackURL: "https://new.example/cb?lifecycle_id=" + callbackID,
 		Work: func() ReplaceResult {
 			<-workerRelease
 			return ReplaceResult{Success: ReplaceSuccessResult{}}
@@ -968,10 +970,10 @@ func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusUpdating, prov.Status,
 		"actor must write Status=Updating BEFORE acking (handler-publish contract)")
-	assert.Equal(t, "https://new.example/cb", prov.CallbackURL,
-		"actor must apply the message CallbackURL before acking")
-	assert.Equal(t, "https://new.example/cb", prov.LifecycleCallbackURL,
-		"actor must atomically rotate lifecycle observations to the new callback base")
+	assert.Equal(t, "https://new.example/cb?operation_id="+callbackID, prov.CallbackURL,
+		"actor must atomically apply the prevalidated same-authority operation route")
+	assert.Equal(t, "https://new.example/cb?lifecycle_id="+callbackID, prov.LifecycleCallbackURL,
+		"actor must atomically apply the prevalidated same-authority lifecycle route")
 
 	close(workerRelease)
 }
@@ -981,9 +983,21 @@ func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 // so the restart and update paths are exercised by identical logic.
 func routeReplace(actor *LeaseActor, op, callbackURL string, cancelFn func(), work func() ReplaceResult, ack chan error) bool {
 	if op == "update" {
-		return actor.TryEnqueue(UpdateRequestedMsg{Cancel: cancelFn, CallbackURL: callbackURL, Work: work, Ack: ack})
+		return actor.TryEnqueue(UpdateRequestedMsg{
+			Cancel:               cancelFn,
+			CallbackURL:          callbackURL,
+			LifecycleCallbackURL: callbackURL,
+			Work:                 work,
+			Ack:                  ack,
+		})
 	}
-	return actor.TryEnqueue(RestartRequestedMsg{Cancel: cancelFn, CallbackURL: callbackURL, Work: work, Ack: ack})
+	return actor.TryEnqueue(RestartRequestedMsg{
+		Cancel:               cancelFn,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: callbackURL,
+		Work:                 work,
+		Ack:                  ack,
+	})
 }
 
 // busyStateFor maps a replace op to the busy SM state its entry action sets.
@@ -1135,19 +1149,32 @@ func TestUpdateLosesToDeprovision(t *testing.T)  { runReplaceLosesToDeprovisionT
 // fresh-actor-init-in-Failed path that this change unmasks (the old off-actor
 // pre-write hid it by initializing the SM in Restarting). A replace from
 // Status=Failed must SUCCEED: SM → Restarting/Updating via the Failed Permits
-// (lease_sm.go:236-240), Status (+CallbackURL) written before the ack, exactly
-// one worker spawned.
+// (lease_sm.go:236-240), Status and the prevalidated callback pair written
+// before the ack, exactly one worker spawned.
 func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
 	t.Helper()
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
-		LeaseUUID:   "lease-1",
-		Status:      backend.ProvisionStatusFailed,
-		CallbackURL: "old-cb",
+		LeaseUUID:            "lease-1",
+		Status:               backend.ProvisionStatusFailed,
+		CallbackURL:          "old-cb",
+		LifecycleCallbackURL: "old-lifecycle-cb",
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	actor := newTestActor(t, "lease-1", testActorOpts{StopCtx: ctx, ProvisionStore: store})
+	var operationCallbacks atomic.Int64
+	var lifecycleCallbacks atomic.Int64
+	actor := newTestActor(t, "lease-1", testActorOpts{
+		StopCtx:        ctx,
+		ProvisionStore: store,
+		SendOperationCallbackFn: func(string, string, backend.CallbackStatus, string) {
+			operationCallbacks.Add(1)
+		},
+		SendLifecycleCallbackFn: func(_ string, callbackURL string, _ backend.CallbackStatus, _ string) {
+			assert.Equal(t, "new-cb", callbackURL)
+			lifecycleCallbacks.Add(1)
+		},
+	})
 
 	var workerCount atomic.Int64
 	workerRelease := make(chan struct{})
@@ -1171,11 +1198,14 @@ func runReplaceFromFailedSucceedsTest(t *testing.T, op string) {
 	prov, ok := store.Get("lease-1")
 	require.True(t, ok)
 	assert.Equal(t, busyStateFor(op), prov.Status, "Status must be written before the ack")
-	assert.Equal(t, "new-cb", prov.CallbackURL, "CallbackURL must be applied by the entry action")
+	assert.Equal(t, "new-cb", prov.CallbackURL, "prevalidated operation route must be applied")
+	assert.Equal(t, "new-cb", prov.LifecycleCallbackURL, "prevalidated lifecycle route must be applied")
 
 	close(workerRelease) // let the worker finish so the actor can quiesce
-	require.Eventually(t, func() bool { return workerCount.Load() == 1 }, time.Second, 5*time.Millisecond,
-		"exactly one %s worker must be spawned", op)
+	require.Eventually(t, func() bool {
+		return workerCount.Load() == 1 && lifecycleCallbacks.Load() == 1
+	}, time.Second, 5*time.Millisecond, "exactly one %s worker and lifecycle completion must run", op)
+	assert.Zero(t, operationCallbacks.Load(), "%s completion must not enter the operation outbox", op)
 }
 
 func TestRestartFromFailed_Succeeds(t *testing.T) { runReplaceFromFailedSucceedsTest(t, "restart") }
@@ -1206,12 +1236,21 @@ func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
 	})
 
 	metrics := &countingMetrics{}
+	var operationCallbacks atomic.Int64
+	var lifecycleCallbacks atomic.Int64
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	actor := newTestActor(t, "lease-1", testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 		Metrics:        metrics,
+		SendOperationCallbackFn: func(_ string, callbackURL string, _ backend.CallbackStatus, _ string) {
+			assert.Equal(t, "new-cb", callbackURL)
+			operationCallbacks.Add(1)
+		},
+		SendLifecycleCallbackFn: func(string, string, backend.CallbackStatus, string) {
+			lifecycleCallbacks.Add(1)
+		},
 	})
 	require.Equal(t, backend.ProvisionStatusProvisioning, actor.State(),
 		"test precondition: SM must start in Provisioning (restore reserves the new lease there)")
@@ -1221,8 +1260,9 @@ func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
 	workerRelease := make(chan struct{})
 	ack := make(chan error, 1)
 	require.True(t, actor.TryEnqueue(RestoreRequestedMsg{
-		Cancel:      func() {},
-		CallbackURL: "new-cb",
+		Cancel:               func() {},
+		CallbackURL:          "new-cb",
+		LifecycleCallbackURL: "new-lifecycle-cb",
 		Work: func() ReplaceResult {
 			<-workerRelease
 			return ReplaceResult{Success: ReplaceSuccessResult{ContainerIDs: []string{"c1"}}}
@@ -1261,6 +1301,8 @@ func TestRestoreRequestedMsg_FiresEventAndSpawnsWorker(t *testing.T) {
 		"a restore that brings a lease from absent to active must Inc activeProvisions exactly once")
 	assert.Equal(t, int64(0), metrics.activeProvisionsDec.Load(),
 		"a successful restore must not Dec activeProvisions")
+	require.Eventually(t, func() bool { return operationCallbacks.Load() == 1 }, time.Second, 5*time.Millisecond)
+	assert.Zero(t, lifecycleCallbacks.Load(), "restore completion must use the exact operation outbox")
 }
 
 // TestRestoreRequested_RejectedFromBadState mirrors the restart

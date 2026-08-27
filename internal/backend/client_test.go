@@ -73,29 +73,288 @@ func TestHTTPClient_Provision(t *testing.T) {
 func TestResolveLifecycleCallbackURL(t *testing.T) {
 	const operationID = "550e8400-e29b-41d4-a716-446655440000"
 	completion := "https://fred.example/callbacks/provision?z=last&operation_id=" + operationID +
-		"&tenant=a%2Fb&operation%5Fid=duplicate&a=first#fragment"
-	want := "https://fred.example/callbacks/provision?z=last&tenant=a%2Fb&a=first#fragment"
+		"&tenant=a%2Fb&&a=first#fragment"
+	want := "https://fred.example/callbacks/provision?z=last&lifecycle_id=" + operationID +
+		"&tenant=a%2Fb&&a=first#fragment"
 
 	derived, err := ResolveLifecycleCallbackURL(completion, "")
 	require.NoError(t, err)
 	assert.Equal(t, want, derived,
-		"derivation must remove only operation identity and preserve unrelated raw query fields")
+		"derivation must replace only operation authority and preserve unrelated raw query fields")
 
 	explicit, err := ResolveLifecycleCallbackURL(completion, want)
 	require.NoError(t, err)
 	assert.Equal(t, want, explicit)
 }
 
-func TestResolveLifecycleCallbackURLRejectsUnrelatedOrScopedURL(t *testing.T) {
-	completion := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
+func TestResolveLifecycleCallbackURLKeepsLegacyOperationlessURLTokenless(t *testing.T) {
+	legacy := "https://fred.example/callbacks/provision?tenant=a%2Fb&&trace=keep#fragment"
+
+	derived, err := ResolveLifecycleCallbackURL(legacy, "")
+	require.NoError(t, err)
+	assert.Equal(t, legacy, derived)
+
+	explicit, err := ResolveLifecycleCallbackURL(legacy, legacy)
+	require.NoError(t, err)
+	assert.Equal(t, legacy, explicit)
+}
+
+func TestResolveLifecycleCallbackURLRejectsAmbiguousOrInvalidAuthority(t *testing.T) {
+	const (
+		canonical = "550e8400-e29b-41d4-a716-446655440000"
+		other     = "123e4567-e89b-42d3-a456-426614174000"
+	)
+	tests := []struct {
+		name       string
+		completion string
+	}{
+		{name: "duplicate operation IDs", completion: "https://fred.example/callback?operation_id=" + canonical + "&operation_id=" + other},
+		{name: "encoded duplicate operation key", completion: "https://fred.example/callback?operation_id=" + canonical + "&operation%5Fid=" + other},
+		{name: "both authority kinds", completion: "https://fred.example/callback?operation_id=" + canonical + "&lifecycle_id=" + canonical},
+		{name: "preexisting lifecycle ID", completion: "https://fred.example/callback?lifecycle_id=" + canonical},
+		{name: "duplicate lifecycle IDs", completion: "https://fred.example/callback?lifecycle_id=" + canonical + "&lifecycle%5Fid=" + other},
+		{name: "empty operation ID", completion: "https://fred.example/callback?operation_id="},
+		{name: "missing operation value", completion: "https://fred.example/callback?operation_id"},
+		{name: "malformed operation ID", completion: "https://fred.example/callback?operation_id=not-a-uuid"},
+		{name: "uppercase operation ID", completion: "https://fred.example/callback?operation_id=" + strings.ToUpper(canonical)},
+		{name: "non-v4 operation ID", completion: "https://fred.example/callback?operation_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{name: "malformed encoded query key", completion: "https://fred.example/callback?operation%ZZid=" + canonical},
+		{name: "malformed unrelated query value", completion: "https://fred.example/callback?trace=%ZZ&operation_id=" + canonical},
+		{name: "semicolon in unrelated query value", completion: "https://fred.example/callback?trace=x;y&operation_id=" + canonical},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ResolveLifecycleCallbackURL(test.completion, "")
+			require.ErrorIs(t, err, ErrInvalidLifecycleCallbackURL)
+		})
+	}
+}
+
+func TestResolveLifecycleCallbackURLRejectsMismatchedExplicitURL(t *testing.T) {
+	const (
+		canonical = "550e8400-e29b-41d4-a716-446655440000"
+		other     = "123e4567-e89b-42d3-a456-426614174000"
+	)
+	completion := "https://fred.example/callbacks/provision?trace=keep&operation_id=" + canonical
+	derived := "https://fred.example/callbacks/provision?trace=keep&lifecycle_id=" + canonical
 
 	for _, lifecycleURL := range []string{
 		completion,
+		"https://fred.example/callbacks/provision?trace=keep",
+		"https://fred.example/callbacks/provision?trace=keep&lifecycle_id=" + other,
+		derived + "&lifecycle_id=" + canonical,
+		derived + "&operation_id=" + canonical,
 		"https://other.example/callbacks/provision",
 		"https://fred.example/other",
 	} {
 		_, err := ResolveLifecycleCallbackURL(completion, lifecycleURL)
 		require.ErrorIs(t, err, ErrInvalidLifecycleCallbackURL)
+	}
+}
+
+func TestResolveMaintenanceCallbackURLs(t *testing.T) {
+	const (
+		currentID = "550e8400-e29b-41d4-a716-446655440000"
+		otherID   = "123e4567-e89b-42d3-a456-426614174000"
+	)
+	oldOperation := "https://old.example/callback?trace=keep&operation_id=" + currentID
+	oldLifecycle := "https://old.example/callback?trace=keep&lifecycle_id=" + currentID
+	newOperation := "https://new.example/v2/callback?tenant=a%2Fb&operation_id=" + currentID + "#fragment"
+	newLifecycle := "https://new.example/v2/callback?tenant=a%2Fb&lifecycle_id=" + currentID + "#fragment"
+
+	tests := []struct {
+		name             string
+		callbackURL      string
+		lifecycleURL     string
+		requestedURL     string
+		wantOperationURL string
+		wantLifecycleURL string
+		wantErr          bool
+	}{
+		{
+			name:             "typed pair moves base without rotating authority",
+			callbackURL:      oldOperation,
+			lifecycleURL:     oldLifecycle,
+			requestedURL:     newLifecycle,
+			wantOperationURL: newOperation,
+			wantLifecycleURL: newLifecycle,
+		},
+		{
+			name:             "typed lifecycle-only record moves base",
+			lifecycleURL:     oldLifecycle,
+			requestedURL:     newLifecycle,
+			wantOperationURL: newOperation,
+			wantLifecycleURL: newLifecycle,
+		},
+		{
+			name:             "empty autonomous request preserves typed pair",
+			callbackURL:      oldOperation,
+			lifecycleURL:     oldLifecycle,
+			wantOperationURL: oldOperation,
+			wantLifecycleURL: oldLifecycle,
+		},
+		{
+			name:             "legacy pair moves base tokenlessly",
+			callbackURL:      "https://old.example/callback?trace=keep",
+			lifecycleURL:     "https://old.example/callback?trace=keep",
+			requestedURL:     "https://new.example/callback?trace=new",
+			wantOperationURL: "https://new.example/callback?trace=new",
+			wantLifecycleURL: "https://new.example/callback?trace=new",
+		},
+		{
+			name:             "trusted typed request initializes oldest record",
+			requestedURL:     newLifecycle,
+			wantOperationURL: newOperation,
+			wantLifecycleURL: newLifecycle,
+		},
+		{
+			name:             "no callback remains empty for oldest autonomous record",
+			wantOperationURL: "",
+			wantLifecycleURL: "",
+		},
+		{
+			name:         "mismatched persisted pair fails closed",
+			callbackURL:  oldOperation,
+			lifecycleURL: "https://other.example/callback?trace=keep&lifecycle_id=" + currentID,
+			requestedURL: newLifecycle,
+			wantErr:      true,
+		},
+		{
+			name:         "typed request cannot rotate identity",
+			callbackURL:  oldOperation,
+			lifecycleURL: oldLifecycle,
+			requestedURL: "https://new.example/callback?lifecycle_id=" + otherID,
+			wantErr:      true,
+		},
+		{
+			name:         "typed route cannot downgrade",
+			callbackURL:  oldOperation,
+			lifecycleURL: oldLifecycle,
+			requestedURL: "https://new.example/callback",
+			wantErr:      true,
+		},
+		{
+			name:         "legacy route cannot acquire unrelated typed authority",
+			callbackURL:  "https://old.example/callback",
+			lifecycleURL: "https://old.example/callback",
+			requestedURL: newLifecycle,
+			wantErr:      true,
+		},
+		{
+			name:         "operation request is not a lifecycle route",
+			callbackURL:  oldOperation,
+			lifecycleURL: oldLifecycle,
+			requestedURL: newOperation,
+			wantErr:      true,
+		},
+		{
+			name:         "malformed requested unrelated query fails closed",
+			callbackURL:  oldOperation,
+			lifecycleURL: oldLifecycle,
+			requestedURL: "https://new.example/callback?trace=%ZZ&lifecycle_id=" + currentID,
+			wantErr:      true,
+		},
+		{
+			name:         "malformed persisted unrelated query fails closed",
+			callbackURL:  "https://old.example/callback?trace=x;y&operation_id=" + currentID,
+			lifecycleURL: oldLifecycle,
+			requestedURL: newLifecycle,
+			wantErr:      true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			operationURL, lifecycleURL, err := ResolveMaintenanceCallbackURLs(
+				test.callbackURL, test.lifecycleURL, test.requestedURL,
+			)
+			if test.wantErr {
+				require.ErrorIs(t, err, ErrInvalidLifecycleCallbackURL)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.wantOperationURL, operationURL)
+			assert.Equal(t, test.wantLifecycleURL, lifecycleURL)
+		})
+	}
+}
+
+func TestValidateLifecycleCallbackURL(t *testing.T) {
+	const canonical = "550e8400-e29b-41d4-a716-446655440000"
+
+	for _, callbackURL := range []string{
+		"https://fred.example/callback",
+		"https://fred.example/callback?trace=keep&tenant=a%2Fb",
+		"https://fred.example/callback?trace=keep&lifecycle_id=" + canonical,
+		"https://fred.example/callback?lifecycle%5Fid=" + canonical + "&trace=keep",
+	} {
+		t.Run("accept "+callbackURL, func(t *testing.T) {
+			require.NoError(t, ValidateLifecycleCallbackURL(callbackURL))
+		})
+	}
+
+	invalid := []struct {
+		name        string
+		callbackURL string
+	}{
+		{name: "operation authority", callbackURL: "https://fred.example/callback?operation_id=" + canonical},
+		{name: "both authority kinds", callbackURL: "https://fred.example/callback?operation_id=" + canonical + "&lifecycle_id=" + canonical},
+		{name: "duplicate lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id=" + canonical + "&lifecycle_id=" + canonical},
+		{name: "encoded duplicate lifecycle key", callbackURL: "https://fred.example/callback?lifecycle_id=" + canonical + "&lifecycle%5Fid=" + canonical},
+		{name: "empty lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id="},
+		{name: "missing lifecycle value", callbackURL: "https://fred.example/callback?lifecycle_id"},
+		{name: "malformed lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id=not-a-uuid"},
+		{name: "uppercase lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id=" + strings.ToUpper(canonical)},
+		{name: "non-v4 lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{name: "malformed encoded query key", callbackURL: "https://fred.example/callback?lifecycle%ZZid=" + canonical},
+		{name: "malformed unrelated query value", callbackURL: "https://fred.example/callback?trace=%ZZ&lifecycle_id=" + canonical},
+		{name: "semicolon in unrelated query value", callbackURL: "https://fred.example/callback?trace=x;y&lifecycle_id=" + canonical},
+	}
+	for _, test := range invalid {
+		t.Run("reject "+test.name, func(t *testing.T) {
+			err := ValidateLifecycleCallbackURL(test.callbackURL)
+			require.ErrorIs(t, err, ErrInvalidLifecycleCallbackURL)
+		})
+	}
+}
+
+func TestValidateOperationCallbackURL(t *testing.T) {
+	const canonical = "550e8400-e29b-41d4-a716-446655440000"
+
+	for _, callbackURL := range []string{
+		"https://fred.example/callback",
+		"https://fred.example/callback?trace=keep&tenant=a%2Fb",
+		"https://fred.example/callback?trace=keep&operation_id=" + canonical,
+		"https://fred.example/callback?operation%5Fid=" + canonical + "&trace=keep",
+	} {
+		t.Run("accept "+callbackURL, func(t *testing.T) {
+			require.NoError(t, ValidateOperationCallbackURL(callbackURL))
+		})
+	}
+
+	invalid := []struct {
+		name        string
+		callbackURL string
+	}{
+		{name: "lifecycle authority", callbackURL: "https://fred.example/callback?lifecycle_id=" + canonical},
+		{name: "both authority kinds", callbackURL: "https://fred.example/callback?operation_id=" + canonical + "&lifecycle_id=" + canonical},
+		{name: "duplicate operation ID", callbackURL: "https://fred.example/callback?operation_id=" + canonical + "&operation_id=" + canonical},
+		{name: "encoded duplicate operation key", callbackURL: "https://fred.example/callback?operation_id=" + canonical + "&operation%5Fid=" + canonical},
+		{name: "empty operation ID", callbackURL: "https://fred.example/callback?operation_id="},
+		{name: "missing operation value", callbackURL: "https://fred.example/callback?operation_id"},
+		{name: "malformed operation ID", callbackURL: "https://fred.example/callback?operation_id=not-a-uuid"},
+		{name: "uppercase operation ID", callbackURL: "https://fred.example/callback?operation_id=" + strings.ToUpper(canonical)},
+		{name: "non-v4 operation ID", callbackURL: "https://fred.example/callback?operation_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{name: "malformed encoded query key", callbackURL: "https://fred.example/callback?operation%ZZid=" + canonical},
+		{name: "malformed unrelated query value", callbackURL: "https://fred.example/callback?trace=%ZZ&operation_id=" + canonical},
+		{name: "semicolon in unrelated query value", callbackURL: "https://fred.example/callback?trace=x;y&operation_id=" + canonical},
+	}
+	for _, test := range invalid {
+		t.Run("reject "+test.name, func(t *testing.T) {
+			err := ValidateOperationCallbackURL(test.callbackURL)
+			require.ErrorIs(t, err, ErrInvalidOperationCallbackURL)
+		})
 	}
 }
 

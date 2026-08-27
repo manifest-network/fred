@@ -57,7 +57,7 @@ type provision struct {
 	// stores both here; Deprovision calls cancel() inside provisionsMu
 	// before deleting the map entry; runStubProvisioner captures ctx
 	// under the lock and checks ctx.Err() before each external write
-	// (diagnosticsStore.Store, callbackSender.SendCallback) so a
+	// (diagnosticsStore.Store, callbackSender.SendOperationCallback) so a
 	// concurrent Deprovision that wins the lock between the worker's
 	// unlock and its post-unlock store touches still aborts the writes
 	// for a torn-down lease. Mirrors docker-backend's leasesm.OnExit
@@ -125,9 +125,10 @@ type Backend struct {
 // at it (ENG-765 — a field only tests read is test scaffolding in a
 // production struct).
 func newCallbackHTTPClient(cfg Config, logger *slog.Logger) *http.Client {
-	c := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// CallbackSender installs the protocol delivery deadline on every request.
+	// Keep the client-wide timeout unset so that request context is the only
+	// authority and cannot be shortened independently.
+	c := &http.Client{}
 	if cfg.CallbackInsecureSkipVerify {
 		logger.Error("INSECURE: callback TLS verification disabled — do NOT use in production")
 		c.Transport = &http.Transport{
@@ -224,45 +225,28 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		OnStoreError: func() {
 			callbackStoreErrorsTotal.Inc()
 		},
+		OnReplayPanic: func(any) {
+			background.GoroutinePanicsTotal.WithLabelValues("callback_replay").Inc()
+		},
 	})
 
 	return b, nil
 }
 
-// Start initializes the backend. The ENG-133 scaffold has nothing to
-// recover from the cluster (no cluster-side resources yet) and no
-// reconcile / event loop, so the only startup action is replaying any
-// pending callbacks persisted by a previous run.
+// Start initializes the backend. The ENG-133 scaffold has nothing to recover
+// from the cluster, so it starts the durable callback replay lifecycle.
 //
 // The ctx parameter is kept on the signature to match docker.Backend.Start
-// for HTTP-server consumer parity; the scaffold discards it (`_ = ctx`)
-// because nothing here recovers state from the cluster yet. ENG-134+
-// will consume ctx for the real state-recovery path.
-//
-// # Synchronous Replay can outlive the caller's deadline
-//
-// `b.callbackSender.ReplayPendingCallbacks()` below runs synchronously
-// and does NOT consult ctx. When the persisted callback queue contains
-// destinations that are unreachable at boot, each entry can occupy the
-// callback-sender for ~36s (3 retries × ~10s HTTP timeout + backoff)
-// — a queue of N stale entries can block Start for up to N × 36s
-// regardless of whatever timeout the caller (cmd/k3s-backend/main.go)
-// puts on ctx. That undermines the 30s ctx deadline the bootstrap
-// applies before Start returns.
-//
-// This shape is NOT k3s-specific: docker-backend has the exact same
-// pattern (see internal/backend/docker/backend.go::Start, around L522
-// — it also calls ReplayPendingCallbacks() synchronously without
-// plumbing ctx). The clean fix lives in the shared package and benefits
-// both backends, so the work is filed as ENG-190 (plumb ctx into
-// shared.CallbackSender.ReplayPendingCallbacks and/or run the replay
-// async tracked by b.wg). Until ENG-190 lands, the scaffold tolerates
-// the issue: the queue is empty on first run, and is rarely non-empty
-// in production because Fred and k3s-backend typically run on the
-// same network with reachable destinations.
+// for HTTP-server consumer parity. ENG-134+ will use it for real cluster state
+// recovery; until then an already-canceled startup is still rejected.
 func (b *Backend) Start(ctx context.Context) error {
-	_ = ctx
-	b.callbackSender.ReplayPendingCallbacks()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// A Fred outage can consume the full delivery retry budget. Run both the
+	// initial and periodic replay on the tracked backend lifecycle so Start can
+	// return ready while Stop still cancels and joins in-flight delivery.
+	b.wg.Go(b.callbackSender.RunReplayLoop)
 	// The provisions map is always empty here in the ENG-133 scaffold —
 	// k3s-backend does not recover lease state from the cluster on boot
 	// (unlike docker.recoverState which scans the daemon). ENG-134+'s

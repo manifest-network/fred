@@ -121,6 +121,7 @@ type ReconcilerPlacement interface {
 type PlacementAuthorityStore interface {
 	ProvisionPlacement
 	ReconcilerPlacement
+	CallbackLifecycleAuthority
 	ConfirmOperation(leaseUUID, backendName string, operationID operation.OperationID) (bool, error)
 	RefuseOperation(leaseUUID, backendName string, operationID operation.OperationID) (bool, error)
 }

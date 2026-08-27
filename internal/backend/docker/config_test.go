@@ -99,7 +99,8 @@ func TestNewCallbackHTTPClient(t *testing.T) {
 	t.Run("verification on by default", func(t *testing.T) {
 		c := newCallbackHTTPClient(validConfig(), slog.Default())
 		require.NotNil(t, c)
-		assert.Equal(t, 30*time.Second, c.Timeout)
+		assert.Zero(t, c.Timeout,
+			"CallbackSender's per-request context must be the sole timeout authority")
 		assert.Nil(t, c.Transport,
 			"default client must use the stdlib transport, which verifies TLS")
 	})
@@ -110,7 +111,8 @@ func TestNewCallbackHTTPClient(t *testing.T) {
 
 		c := newCallbackHTTPClient(cfg, slog.Default())
 		require.NotNil(t, c)
-		assert.Equal(t, 30*time.Second, c.Timeout)
+		assert.Zero(t, c.Timeout,
+			"CallbackSender's per-request context must be the sole timeout authority")
 		tr, ok := c.Transport.(*http.Transport)
 		require.True(t, ok, "transport must be an *http.Transport")
 		require.NotNil(t, tr.TLSClientConfig)

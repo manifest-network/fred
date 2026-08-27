@@ -2291,8 +2291,9 @@ func TestRestore_SeparatesExactCompletionFromLifecycleCallbacks(t *testing.T) {
 		DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
 	}
 
-	lifecycleURL := server.URL
-	exactURL := lifecycleURL + "?" + backend.CallbackOperationIDQueryParameter + "=" + operationID
+	callbackBaseURL := server.URL
+	lifecycleURL := callbackBaseURL + "?" + backend.CallbackLifecycleIDQueryParameter + "=" + operationID
+	exactURL := callbackBaseURL + "?" + backend.CallbackOperationIDQueryParameter + "=" + operationID
 	req := restoreRequest("u2", "u1", exactURL)
 	req.LifecycleCallbackURL = lifecycleURL
 	require.NoError(t, b.Restore(context.Background(), req))
@@ -2337,7 +2338,8 @@ func TestRestore_SeparatesExactCompletionFromLifecycleCallbacks(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("deprovision lifecycle callback was not delivered")
 	}
-	assert.Empty(t, lifecycle.query, "post-restore lifecycle callbacks must be tokenless")
+	assert.Equal(t, backend.CallbackLifecycleIDQueryParameter+"="+operationID, lifecycle.query,
+		"post-restore lifecycle callbacks must carry typed observation authority")
 	assert.Equal(t, backend.CallbackStatusDeprovisioned, lifecycle.payload.Status)
 }
 

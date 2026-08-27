@@ -76,12 +76,6 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		return nil
 	}
 	overrides := b.computeCustomDomainOverrides(prov, items, dnsReady)
-	callbackURL := prov.LifecycleCallbackURL
-	if callbackURL == "" {
-		// Compatibility with containers created before lifecycle URLs were
-		// persisted separately. routeReplaceRestart derives the tokenless form.
-		callbackURL = prov.CallbackURL
-	}
 	b.provisionsMu.RUnlock()
 
 	if len(overrides) == 0 {
@@ -93,7 +87,10 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	// Route the redeploy through the lease actor (ENG-231): the worker renders
 	// the new domain from the override-applied snapshot; the actor commits
 	// prov.Items on success.
-	return b.routeReplaceRestart(ctx, leaseUUID, callbackURL, overrides)
+	// routeReplaceRestart re-reads and validates the provision's persisted
+	// lifecycle route. Passing no request URL prevents this autonomous path from
+	// accidentally treating a lifecycle_id URL as a fresh operation callback.
+	return b.routeReplaceRestart(ctx, leaseUUID, "", overrides)
 }
 
 // matchedDomain pairs a chain item's desired custom_domain with the matched

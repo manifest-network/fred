@@ -56,6 +56,10 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		provisionsTotal.WithLabelValues("rejected").Inc()
 		return fmt.Errorf("%w: callback_url is required", backend.ErrValidation)
 	}
+	if _, err := backend.ResolveLifecycleCallbackURL(req.CallbackURL, req.LifecycleCallbackURL); err != nil {
+		provisionsTotal.WithLabelValues("rejected").Inc()
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
 	if len(req.Items) == 0 {
 		provisionsTotal.WithLabelValues("rejected").Inc()
 		return fmt.Errorf("%w: items is required", backend.ErrValidation)
@@ -252,7 +256,7 @@ func (b *Backend) persistStubDiagnostic(f stubFailure) (canceled bool) {
 }
 
 // sendStubFailureCallback is checkpoint 2 and the callback send. ENG-189
-// case (c): shared.CallbackSender.SendCallback persists to bbolt BEFORE
+// case (c): shared.CallbackSender.SendOperationCallback persists to bbolt BEFORE
 // delivery, so without this guard a torn-down lease can still have a stale
 // status=failed callback queued for replay.
 //
@@ -276,13 +280,13 @@ func (b *Backend) sendStubFailureCallback(f stubFailure) {
 		return
 	}
 
-	b.callbackSender.SendCallback(
+	b.callbackSender.SendOperationCallbackContext(
+		f.leaseCtx,
 		f.leaseUUID,
 		f.callbackURL,
 		b.cfg.Name,
 		backend.CallbackStatusFailed,
 		stubProvisionerErrMsg,
-		false, // k3s stub never retains
 	)
 }
 
@@ -301,25 +305,12 @@ func (b *Backend) sendStubFailureCallback(f stubFailure) {
 // worker that already released the lock observes cancellation at its
 // next checkpoint and aborts.
 //
-// Residual TOCTOU (accepted scope, ENG-189 plan §7 / R1): cancellation
-// cannot stop an in-flight SendCallback once the worker's checkpoint-2
-// ctx.Err() check has passed. Between that check and SendCallback's
-// bbolt Store + outbound HTTP POST, nothing here can abort the
-// callback — shared.CallbackSender has no per-lease ctx today. The
-// callbackStore.Remove call below clears any pre-existing pending
-// entry (e.g., from a prior failed delivery on the same lease's replay
-// queue); it does NOT cancel an HTTP POST already in flight, and it
-// does NOT prevent a racing worker that passes its ctx.Err() check
-// from re-persisting its own status=failed entry after this Remove
-// runs as a no-op. The window is ns-scale by construction (the
-// worker's last instruction before SendCallback is the ctx.Err()
-// check). Closing it requires reshaping the seam — e.g., a
-// Deprovision-side barrier that waits for any in-flight SendCallback
-// to drain, or pairing a ctx-threaded SendCallback with
-// Store-under-provisionsMu discipline so the persist becomes part of
-// the cancellable critical section. Either approach is deferred to
-// ENG-134+, where the real K8s worker replaces runStubProvisioner and
-// reshapes this seam anyway.
+// Callback cancellation is serialized inside shared.CallbackSender. The worker
+// passes its lease context to SendOperationCallbackContext, which re-checks it
+// only after acquiring the same keyed lock used by the removal below. Therefore
+// either the worker persists/drains first and Deprovision removes any remaining
+// durable entry afterward, or Deprovision cancels first and the later enqueue is
+// suppressed under the lock.
 //
 // TestDeprovision_RemovesPendingCallback pins the replay-queue cleanup
 // regression: a failed delivery persists an entry; Deprovision must
@@ -334,13 +325,14 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 		existing.cancel()
 		delete(b.provisions, leaseUUID)
 	}
-	if err := b.callbackStore.Remove(leaseUUID); err != nil {
+	b.provisionsMu.Unlock()
+
+	if err := b.callbackSender.CancelLeaseCallbacks(leaseUUID); err != nil {
 		b.logger.Error("failed to remove pending callback on deprovision",
 			"lease_uuid", leaseUUID,
 			"error", err,
 		)
 	}
-	b.provisionsMu.Unlock()
 	return nil
 }
 

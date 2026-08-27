@@ -68,8 +68,9 @@ type EventOperations interface {
 	Contains(string) bool
 }
 
-// HandlerSet contains the Watermill message handlers for the provisioner.
-// It encapsulates all handler methods and their dependencies.
+// HandlerSet contains message adapters for the provisioner. Chain and payload
+// adapters are registered with Watermill; Manager invokes the callback adapter
+// synchronously to preserve backend outbox ordering.
 type HandlerSet struct {
 	deps            HandlerDeps
 	provisioner     EventProvisioner
@@ -263,15 +264,21 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 	return h.provisioner.Deprovision(msg.Context(), event.LeaseUUID)
 }
 
-// HandleBackendCallback decodes a Watermill message and delegates callback
-// authorization and lifecycle policy to the application service.
-func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
+// HandleBackendCallbackPayload is the synchronous, typed transport adapter
+// used by Manager. It returns only after CallbackService reaches a terminal
+// application result, preserving the backend's per-lease delivery order.
+func (h *HandlerSet) HandleBackendCallbackPayload(
+	ctx context.Context,
+	callback backend.CallbackPayload,
+) (err error) {
 	defer func() { recordWatermillMetrics(TopicBackendCallback, err) }()
+	return h.handleBackendCallbackPayload(ctx, callback)
+}
 
-	callback, ok := unmarshalMessagePayload[backend.CallbackPayload](msg, TopicBackendCallback)
-	if !ok {
-		return nil
-	}
+func (h *HandlerSet) handleBackendCallbackPayload(
+	ctx context.Context,
+	callback backend.CallbackPayload,
+) error {
 	command, err := NewCallbackCommand(callback)
 	if err != nil {
 		return fmt.Errorf("decode backend callback operation identity: %w", err)
@@ -279,7 +286,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	if h.callbacks == nil {
 		return errCallbackOperationsUnavailable
 	}
-	return h.callbacks.HandleCallback(msg.Context(), command)
+	return h.callbacks.HandleCallback(ctx, command)
 }
 
 // HandlePayloadReceived processes payload upload events.

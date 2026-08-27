@@ -7757,7 +7757,11 @@ func TestReconcilerAuthoritativeLeaseReadIsBoundedAndDoesNotWedgeLaterSweep(t *t
 	require.Len(t, provisionCalls, 1,
 		"the next sweep must retry the deferred lease")
 	provisionRequest := provisionCalls[0]
-	assert.Equal(t, BuildCallbackURL("http://callback"), provisionRequest.LifecycleCallbackURL)
+	wantLifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
+		provisionRequest.CallbackURL, "",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, wantLifecycleCallbackURL, provisionRequest.LifecycleCallbackURL)
 	assert.NotEqual(t, provisionRequest.CallbackURL, provisionRequest.LifecycleCallbackURL,
 		"reconciled provisions must not persist their settlement capability for lifecycle events")
 }

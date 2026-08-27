@@ -53,6 +53,13 @@ type PlacementLookup interface {
 	Healthy() error
 }
 
+// LifecycleCallbackAuthority exposes only the current durable callback route
+// needed for trusted Fred-to-backend maintenance requests. Authorization of an
+// inbound callback remains inside the provisioner callback service.
+type LifecycleCallbackAuthority interface {
+	CurrentLifecycle(leaseUUID string) placement.LifecycleAuthorization
+}
+
 // PlacementBootstrap reports whether this process has completed at least one
 // authoritative placement projection since startup. It is intentionally a
 // separate optional capability from PlacementLookup: ordinary read routing can
@@ -108,6 +115,7 @@ type Handlers struct {
 	tokenTracker       TokenTrackerInterface
 	statusChecker      StatusChecker
 	placementLookup    PlacementLookup
+	lifecycleCallbacks LifecycleCallbackAuthority
 	placementBootstrap PlacementBootstrap
 	restoreService     RestoreService
 	payloadPersister   PayloadPersister
@@ -125,13 +133,14 @@ type Handlers struct {
 type HandlersConfig struct {
 	Client             ChainClient
 	BackendRouter      *backend.Router
-	TokenTracker       TokenTrackerInterface // optional but recommended for replay attack protection
-	StatusChecker      StatusChecker         // optional but required for the /status endpoint
-	PlacementLookup    PlacementLookup       // optional — used for routing reads to the correct backend
-	RestoreService     RestoreService        // required by /restore; owns typed operation and placement capabilities
-	PayloadPersister   PayloadPersister      // REQUIRED for /update — without it an update cannot be made durable (ENG-619)
-	PayloadStoreHealth PayloadStoreHealth    // optional — health probe for the payload store's bbolt DB
-	EventBroker        *EventBroker          // optional — if nil, the events endpoint will return 501
+	TokenTracker       TokenTrackerInterface      // optional but recommended for replay attack protection
+	StatusChecker      StatusChecker              // optional but required for the /status endpoint
+	PlacementLookup    PlacementLookup            // optional — used for routing reads to the correct backend
+	LifecycleCallbacks LifecycleCallbackAuthority // optional for legacy embeddings; production uses the placement store
+	RestoreService     RestoreService             // required by /restore; owns typed operation and placement capabilities
+	PayloadPersister   PayloadPersister           // REQUIRED for /update — without it an update cannot be made durable (ENG-619)
+	PayloadStoreHealth PayloadStoreHealth         // optional — health probe for the payload store's bbolt DB
+	EventBroker        *EventBroker               // optional — if nil, the events endpoint will return 501
 	ProviderUUID       string
 	Bech32Prefix       string
 	CallbackBaseURL    string // used for restart/update callbacks to the backend
@@ -147,12 +156,23 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 	if util.IsNilInterface(restoreService) {
 		restoreService = nil
 	}
+	lifecycleCallbacks := cfg.LifecycleCallbacks
+	if util.IsNilInterface(lifecycleCallbacks) {
+		lifecycleCallbacks = nil
+	}
+	if lifecycleCallbacks == nil {
+		if authority, ok := cfg.PlacementLookup.(LifecycleCallbackAuthority); ok &&
+			!util.IsNilInterface(authority) {
+			lifecycleCallbacks = authority
+		}
+	}
 	return &Handlers{
 		client:             cfg.Client,
 		backendRouter:      cfg.BackendRouter,
 		tokenTracker:       cfg.TokenTracker,
 		statusChecker:      cfg.StatusChecker,
 		placementLookup:    cfg.PlacementLookup,
+		lifecycleCallbacks: lifecycleCallbacks,
 		placementBootstrap: placementBootstrap,
 		restoreService:     restoreService,
 		payloadPersister:   cfg.PayloadPersister,
@@ -171,6 +191,78 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		bech32Prefix:      cfg.Bech32Prefix,
 		callbackBaseURL:   cfg.CallbackBaseURL,
 	}
+}
+
+func (h *Handlers) maintenanceCallbackURL(
+	leaseUUID, backendName string,
+) (string, error) {
+	if h.lifecycleCallbacks == nil {
+		// Compatibility for isolated legacy embeddings that do not compose the
+		// durable placement store. Production providerd always supplies it.
+		return provisioner.BuildCallbackURL(h.callbackBaseURL), nil
+	}
+
+	authorization := h.lifecycleCallbacks.CurrentLifecycle(leaseUUID)
+	switch authorization.Verdict() {
+	case placement.LifecycleVerdictAuthorized:
+		if authorization.Backend() != backendName {
+			return "", fmt.Errorf(
+				"lifecycle callback backend %q does not match routed backend %q",
+				authorization.Backend(), backendName,
+			)
+		}
+		callbackURL, err := provisioner.BuildCallbackURLForLifecycle(
+			h.callbackBaseURL, authorization.ID(),
+		)
+		if err != nil {
+			return "", fmt.Errorf("build typed lifecycle callback URL: %w", err)
+		}
+		return callbackURL, nil
+	case placement.LifecycleVerdictLegacy:
+		if authorization.Backend() != backendName {
+			return "", fmt.Errorf(
+				"legacy lifecycle callback backend %q does not match routed backend %q",
+				authorization.Backend(), backendName,
+			)
+		}
+		return provisioner.BuildCallbackURL(h.callbackBaseURL), nil
+	case placement.LifecycleVerdictInvalid,
+		placement.LifecycleVerdictMissing,
+		placement.LifecycleVerdictStale,
+		placement.LifecycleVerdictUnusable,
+		placement.LifecycleVerdictTeardownOnly,
+		placement.LifecycleVerdictRetired:
+		return "", fmt.Errorf(
+			"lifecycle callback authority is not current: verdict %d",
+			authorization.Verdict(),
+		)
+	default:
+		return "", fmt.Errorf(
+			"unknown lifecycle callback authority verdict %d",
+			authorization.Verdict(),
+		)
+	}
+}
+
+// dispatchWithOrderedStart preserves subscriber-visible causality across the
+// asynchronous backend boundary. A backend may complete quickly enough to post
+// its callback before its acceptance response reaches this handler (both an
+// embedded actor and a remote HTTP backend can do so). EventBroker queues that
+// callback without blocking it, then publishes the accepted start first. A
+// synchronous refusal emits no start event.
+func (h *Handlers) dispatchWithOrderedStart(
+	leaseUUID string,
+	status backend.ProvisionStatus,
+	dispatch func() error,
+) error {
+	if h.eventBroker == nil {
+		return dispatch()
+	}
+	return h.eventBroker.DispatchWithOrderedStart(backend.LeaseStatusEvent{
+		LeaseUUID: leaseUUID,
+		Status:    status,
+		Timestamp: time.Now(),
+	}, dispatch)
 }
 
 // AuthenticatedRequest contains the result of a successful authentication.
@@ -1068,11 +1160,27 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	callbackURL, err := h.maintenanceCallbackURL(leaseUUID, backendClient.Name())
+	if err != nil {
+		slog.Error("restart rejected: lifecycle callback authority unavailable",
+			"error", err,
+			"lease_uuid", leaseUUID,
+			"backend", backendClient.Name(),
+		)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return
+	}
 
-	err := backendClient.Restart(r.Context(), backend.RestartRequest{
-		LeaseUUID:   leaseUUID,
-		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
-	})
+	err = h.dispatchWithOrderedStart(
+		leaseUUID,
+		backend.ProvisionStatusRestarting,
+		func() error {
+			return backendClient.Restart(r.Context(), backend.RestartRequest{
+				LeaseUUID:   leaseUUID,
+				CallbackURL: callbackURL,
+			})
+		},
+	)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			writeError(w, "lease not yet provisioned", http.StatusNotFound)
@@ -1085,19 +1193,6 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 		slog.Error("failed to restart lease", "error", err, "lease_uuid", leaseUUID)
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
-	}
-
-	// Publish "restarting" event after the backend accepts the request.
-	// This is safe: the lease actor writes prov.Status=Restarting before
-	// acking the request, so after Restart() returns the lease is already
-	// Restarting and the async work runs in a worker goroutine — the
-	// completion callback cannot arrive before Restart() returns.
-	if h.eventBroker != nil {
-		h.eventBroker.Publish(backend.LeaseStatusEvent{
-			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusRestarting,
-			Timestamp: time.Now(),
-		})
 	}
 
 	slog.Info("lease restart initiated",
@@ -1232,6 +1327,16 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "payload is required", http.StatusBadRequest)
 		return
 	}
+	callbackURL, err := h.maintenanceCallbackURL(leaseUUID, backendClient.Name())
+	if err != nil {
+		slog.Error("update rejected: lifecycle callback authority unavailable",
+			"error", err,
+			"lease_uuid", leaseUUID,
+			"backend", backendClient.Name(),
+		)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return
+	}
 
 	// Refuse before touching the backend rather than after. An update we cannot
 	// persist is one the next reprovision silently undoes (ENG-619), so a lease
@@ -1250,12 +1355,18 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 	// implementing the contract received a payload it could not check. Send the
 	// hash of the payload actually being sent — the same value the store records
 	// and the reprovision path later verifies against.
-	err := backendClient.Update(r.Context(), backend.UpdateRequest{
-		LeaseUUID:   leaseUUID,
-		CallbackURL: provisioner.BuildCallbackURL(h.callbackBaseURL),
-		Payload:     updateReq.Payload,
-		PayloadHash: hex.EncodeToString(payload.ComputeHash(updateReq.Payload)),
-	})
+	err = h.dispatchWithOrderedStart(
+		leaseUUID,
+		backend.ProvisionStatusUpdating,
+		func() error {
+			return backendClient.Update(r.Context(), backend.UpdateRequest{
+				LeaseUUID:   leaseUUID,
+				CallbackURL: callbackURL,
+				Payload:     updateReq.Payload,
+				PayloadHash: hex.EncodeToString(payload.ComputeHash(updateReq.Payload)),
+			})
+		},
+	)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			writeError(w, "lease not yet provisioned", http.StatusNotFound)
@@ -1307,19 +1418,6 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		metrics.PayloadPersistFailuresTotal.WithLabelValues("update").Inc()
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
-	}
-
-	// Publish "updating" event after the backend accepts the request.
-	// This is safe: the lease actor writes prov.Status=Updating before
-	// acking the request, so after Update() returns the lease is already
-	// Updating and the async work runs in a worker goroutine — the
-	// completion callback cannot arrive before Update() returns.
-	if h.eventBroker != nil {
-		h.eventBroker.Publish(backend.LeaseStatusEvent{
-			LeaseUUID: leaseUUID,
-			Status:    backend.ProvisionStatusUpdating,
-			Timestamp: time.Now(),
-		})
 	}
 
 	slog.Info("lease update initiated",

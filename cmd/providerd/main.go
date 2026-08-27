@@ -466,6 +466,7 @@ func run(cmd *cobra.Command, args []string) error {
 		PayloadStoreHealth: payloadStoreHealth,
 		StatusChecker:      provisionMgr,
 		PlacementLookup:    placementStore,
+		LifecycleCallbacks: placementStore,
 		RestoreService:     restoreService,
 		EventBroker:        eventBroker,
 	})
@@ -520,15 +521,15 @@ func run(cmd *cobra.Command, args []string) error {
 		return <-apiErrChan
 	})
 
-	// Start provisioner BEFORE reconciliation so Watermill handlers are subscribed
-	// before any callbacks can arrive. Without this, callbacks from backends
-	// triggered by reconciliation would fail with "No subscribers to send message".
+	// Start provisioner BEFORE reconciliation so its callback admission gate,
+	// acknowledgment lanes, and Watermill chain/payload handlers are live before
+	// reconciliation can trigger backend work.
 	safeGo(&wg, errChan, "provision manager", func() error {
 		return provisionMgr.Start(ctx)
 	})
 
-	// Wait for Watermill router to be running before proceeding.
-	// This ensures handlers are subscribed and ready to receive callbacks.
+	// Wait for the provisioner runtime to be running before proceeding. Callback
+	// admission opens just before Watermill starts its chain/payload handlers.
 	select {
 	case <-provisionMgr.Running():
 		slog.Info("provision manager handlers ready")
@@ -548,7 +549,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Run startup reconciliation to recover from any crash
 	// This compares chain state vs backend state and fixes inconsistencies
-	// Note: API server is already listening and handlers are subscribed, so callbacks can be received
+	// The API server is listening and callback application is admitted here.
 	slog.Info("performing startup reconciliation")
 	if err := reconciler.RunOnce(ctx); err != nil {
 		slog.Error("startup reconciliation failed", "error", err)

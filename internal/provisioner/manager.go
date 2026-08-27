@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/ThreeDotsLabs/watermill"
@@ -25,21 +26,36 @@ import (
 // poisonTopic is the Watermill dead-letter topic for messages that exhaust retries.
 const poisonTopic = "events.poison"
 
+var errCallbackRuntimeUnavailable = errors.New("backend callback runtime is not accepting callbacks")
+
 // Manager is the typed production runtime. Legacy tracker forwarding needed by
 // older package tests is compiled only into the test binary.
 var _ ReconcilerRuntime = (*Manager)(nil)
 
-// Manager handles the provisioning lifecycle using Watermill for event routing.
+// Manager handles the provisioning lifecycle. Chain and payload events use
+// Watermill; backend callbacks use a synchronous application path so the
+// backend's durable per-lease ordering survives provider ingress.
 type Manager struct {
 	providerUUID    string
 	callbackBaseURL string
 	router          *backend.Router
 	chainClient     ChainClient
 	publisher       message.Publisher
+	callbackHandler func(context.Context, backend.CallbackPayload) error
 	wmRouter        *message.Router
 	payloadStore    *payload.Store
 	placementStore  PlacementAuthorityStore
 	ackBatcher      *AckBatcher
+
+	// callbackAdmissionMu closes the admission gate atomically with respect to
+	// callbackWG.Add. Close can therefore wait for every admitted callback
+	// before stopping the ack batcher without racing a late HTTP request.
+	callbackAdmissionMu sync.Mutex
+	callbackAccepting   bool
+	callbackClosed      bool
+	callbackWG          sync.WaitGroup
+	callbackStopCtx     context.Context
+	callbackStopCancel  context.CancelFunc
 
 	// stopCtx bounds work that outlives the call which started it — today the
 	// ack batcher's lanes. It is created in NewManager and rooted at
@@ -167,34 +183,47 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	})
 	// The batcher is deliberately NOT started here: a long-lived goroutine set
 	// must be owned by a lifecycle, not by a constructor. Start() launches it
-	// (see the ordering note there). Nothing can reach the Acknowledger before
-	// then — the only two callers are the Watermill backend-callback handler,
-	// which does not exist until wmRouter.Run subscribes it, and the reconciler,
-	// whose first ack is gated behind <-Running() in cmd/providerd/main.go.
+	// (see the ordering note there). The synchronous callback admission gate is
+	// opened only after that launch, and the reconciler's first ack is gated
+	// behind <-Running() in cmd/providerd/main.go.
 
 	tracker := NewInFlightTracker()
 	operations := tracker.Operations()
 	orchestrator, err := NewProvisionOrchestrator(
 		cfg.ProviderUUID, cfg.CallbackBaseURL, router, operations, cfg.PlacementStore,
 		provisionStartEventSinkFunc(func(leaseUUID string) {
-			publishLeaseStatusEvent(pubSub, leaseUUID, backend.ProvisionStatusProvisioning, "")
+			// Provision start and callback completion use the same synchronous
+			// sink. Sending only the terminal side directly would let a queued
+			// Watermill Provisioning event overtake Ready/Failed at subscribers.
+			publishLeaseStatusToSink(
+				cfg.LeaseEventSink, leaseUUID, backend.ProvisionStatusProvisioning, "",
+			)
 		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create provision orchestrator: %w", err)
 	}
-	callbacks, err := NewCallbackService(CallbackServiceConfig{
-		Operations:   operations,
-		Chain:        chainClient,
-		Acknowledger: ackBatcher,
-		Placement:    cfg.PlacementStore,
-		Payloads:     cfg.PayloadStore,
-		Events: callbackEventSinkFunc(func(
+	var callbackEvents CallbackEventSink
+	if cfg.LeaseEventSink != nil {
+		callbackEvents = callbackEventSinkFunc(func(
 			leaseUUID string, status backend.ProvisionStatus, failure string,
 		) {
-			publishLeaseStatusEvent(pubSub, leaseUUID, status, failure)
-		}),
-		Backends: router,
+			// Callback application is synchronous so the backend's per-lease
+			// outbox order reaches subscribers unchanged. Routing these events
+			// back through Watermill would reintroduce concurrent handler
+			// execution after the callback itself had already been ordered.
+			publishLeaseStatusToSink(cfg.LeaseEventSink, leaseUUID, status, failure)
+		})
+	}
+	callbacks, err := NewCallbackService(CallbackServiceConfig{
+		Operations:         operations,
+		Chain:              chainClient,
+		Acknowledger:       ackBatcher,
+		Placement:          cfg.PlacementStore,
+		LifecycleAuthority: cfg.PlacementStore,
+		Payloads:           cfg.PayloadStore,
+		Events:             callbackEvents,
+		Backends:           router,
 		DeprovisionObserver: callbackDeprovisionObserverFunc(
 			orchestrator.forgetDeprovisionCandidate,
 		),
@@ -223,6 +252,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		router:               router,
 		chainClient:          chainClient,
 		publisher:            pubSub,
+		callbackHandler:      handlers.HandleBackendCallbackPayload,
 		wmRouter:             wmRouter,
 		payloadStore:         cfg.PayloadStore,
 		placementStore:       cfg.PlacementStore,
@@ -237,6 +267,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	}
 
 	m.stopCtx, m.stopCancel = context.WithCancel(context.Background())
+	m.callbackStopCtx, m.callbackStopCancel = context.WithCancel(context.Background())
 
 	// Register handlers
 	wmRouter.AddNoPublisherHandler(
@@ -258,13 +289,6 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		TopicLeaseExpired,
 		pubSub,
 		handlers.HandleLeaseExpired,
-	)
-
-	wmRouter.AddNoPublisherHandler(
-		"handle_backend_callback",
-		TopicBackendCallback,
-		pubSub,
-		handlers.HandleBackendCallback,
 	)
 
 	wmRouter.AddNoPublisherHandler(
@@ -337,12 +361,32 @@ func (m *Manager) forwardToEventSink(msg *message.Message) error {
 }
 
 // PublishProvisionStarting implements the narrow start-event capability used
-// by reconciliation. Publishing remains best-effort and preserves the same
-// Watermill ordering as event-driven provisioning and callbacks.
+// by reconciliation. Publishing remains best-effort and uses the same direct,
+// synchronous sink as event-driven provisioning start events.
 func (m *Manager) PublishProvisionStarting(leaseUUID string) {
-	publishLeaseStatusEvent(
-		m.publisher, leaseUUID, backend.ProvisionStatusProvisioning, "",
+	publishLeaseStatusToSink(
+		m.leaseEventSink, leaseUUID, backend.ProvisionStatusProvisioning, "",
 	)
+}
+
+// publishLeaseStatusToSink applies a subscriber-visible status synchronously.
+// Provision start and callback completion deliberately share this boundary so
+// their program order cannot be inverted by Watermill's concurrent handlers.
+func publishLeaseStatusToSink(
+	sink LeaseEventSink,
+	leaseUUID string,
+	status backend.ProvisionStatus,
+	errMsg string,
+) {
+	if sink == nil {
+		return
+	}
+	sink.Publish(backend.LeaseStatusEvent{
+		LeaseUUID: leaseUUID,
+		Status:    status,
+		Error:     errMsg,
+		Timestamp: time.Now(),
+	})
 }
 
 // Start begins the Watermill router and callback timeout checker.
@@ -352,17 +396,16 @@ func (m *Manager) Start(ctx context.Context) error {
 		"timeout_check_interval", m.timeoutCheckInterval,
 	)
 
-	// Start the ack batcher before wmRouter.Run below, which is what subscribes
-	// the handlers that call Acknowledge(). Watermill's Running() gate is not
-	// what protects this: Router.Run calls RunHandlers(ctx) — which subscribes
-	// each handler and spawns its goroutine — and only then closes the running
-	// channel, so a message can already be in a handler before any waiter
-	// observes Running().
+	// Start the ack batcher before opening synchronous callback admission or
+	// running the Watermill handlers. Watermill's Running() gate cannot protect
+	// the direct callback path, so admission is an explicit lifecycle boundary.
 	//
 	// It runs on m.stopCtx, not on ctx: ctx is canceled partway through main's
 	// shutdown sequence, several steps before Close(), and the batcher's
 	// lifetime belongs to Close(). Start is once-only; a second call is a no-op.
 	m.ackBatcher.Start(m.stopCtx)
+	m.openCallbackAdmission()
+	defer m.pauseCallbackAdmission()
 
 	// Start callback timeout checker in background.
 	// This goroutine exits when ctx is canceled, which happens before Close() in production.
@@ -385,6 +428,18 @@ func (m *Manager) AckBatcher() Acknowledger {
 
 // Close shuts down the provision manager.
 func (m *Manager) Close() error {
+	// Reject new callback requests before draining either execution path. Direct
+	// callbacks are not owned by Watermill, so the router alone cannot account
+	// for them during shutdown.
+	m.closeCallbackAdmission()
+	// Cancel every admitted callback before waiting. API shutdown is bounded,
+	// and a chain node may otherwise keep an HTTP-derived callback context alive
+	// far beyond that bound. The backend retains the durable outbox head on the
+	// resulting 503/canceled response and retries after restart or recovery.
+	if m.callbackStopCancel != nil {
+		m.callbackStopCancel()
+	}
+
 	// Log in-flight provisions to help operators understand state during shutdown
 	count := m.InFlightCount()
 	if count > 0 {
@@ -403,6 +458,10 @@ func (m *Manager) Close() error {
 	// would skip the batcher shutdown and the lifecycle-context cancellation,
 	// leaking exactly the goroutines this method exists to reclaim.
 	routerErr := m.wmRouter.Close()
+
+	// Every callback admitted before the gate closed may still be using the ack
+	// batcher. Drain them before stopping its lanes.
+	m.callbackWG.Wait()
 
 	// Stop ack batcher AFTER all handlers have finished.
 	// Stop() cancels the lanes' context, so each batchLoop takes its shutdown
@@ -465,16 +524,73 @@ func (m *Manager) PublishLeaseEvent(event chain.LeaseEvent) error {
 	return m.publisher.Publish(topic, msg)
 }
 
-// PublishCallback publishes a backend callback to Watermill.
-// This is called by the API server when it receives a callback.
-func (m *Manager) PublishCallback(callback backend.CallbackPayload) error {
-	data, err := json.Marshal(callback)
-	if err != nil {
-		return fmt.Errorf("marshal callback: %w", err)
+// PublishCallback applies a backend callback synchronously. The docker
+// backend's durable outbox waits for this call's HTTP response before sending
+// the next callback for the lease; returning only after application preserves
+// exact-completion-before-lifecycle ordering end to end. Chain and payload
+// events remain on Watermill, but its router intentionally starts each message
+// handler in a separate goroutine and therefore cannot provide this ordering
+// boundary.
+func (m *Manager) PublishCallback(ctx context.Context, callback backend.CallbackPayload) error {
+	if !m.admitCallback() {
+		return errCallbackRuntimeUnavailable
+	}
+	defer m.callbackWG.Done()
+
+	if m.callbackHandler == nil {
+		return errCallbackOperationsUnavailable
 	}
 
-	msg := message.NewMessage(watermill.NewUUID(), data)
-	return m.publisher.Publish(TopicBackendCallback, msg)
+	// Merge request cancellation with Manager ownership. Close cancels the
+	// latter before callbackWG.Wait, so shutdown cannot wedge behind a chain RPC
+	// whose client disconnected or whose request context was detached.
+	callbackCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(m.callbackStopCtx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	return m.callbackHandler(callbackCtx, callback)
+}
+
+// openCallbackAdmission makes the synchronous callback path available only
+// after its ack dependency has started. A manager that has begun Close remains
+// permanently closed even if Start is called out of lifecycle order.
+func (m *Manager) openCallbackAdmission() {
+	m.callbackAdmissionMu.Lock()
+	defer m.callbackAdmissionMu.Unlock()
+	if !m.callbackClosed {
+		m.callbackAccepting = true
+	}
+}
+
+// pauseCallbackAdmission rejects callbacks after Start's runtime has exited.
+// Admitted work remains owned by callbackWG and is drained by Close.
+func (m *Manager) pauseCallbackAdmission() {
+	m.callbackAdmissionMu.Lock()
+	m.callbackAccepting = false
+	m.callbackAdmissionMu.Unlock()
+}
+
+// closeCallbackAdmission permanently closes the gate. Holding the mutex while
+// changing callbackAccepting orders the change against callbackWG.Add in
+// admitCallback, making the subsequent Wait safe.
+func (m *Manager) closeCallbackAdmission() {
+	m.callbackAdmissionMu.Lock()
+	m.callbackClosed = true
+	m.callbackAccepting = false
+	m.callbackAdmissionMu.Unlock()
+}
+
+func (m *Manager) admitCallback() bool {
+	m.callbackAdmissionMu.Lock()
+	defer m.callbackAdmissionMu.Unlock()
+	if !m.callbackAccepting {
+		return false
+	}
+	m.callbackWG.Add(1)
+	return true
 }
 
 // PublishPayload publishes a payload received event to Watermill.

@@ -187,8 +187,10 @@ func (o *ProvisionOrchestrator) forgetDeprovisionCandidates(leaseUUID string) {
 }
 
 // forgetDeprovisionCandidate retires one outstanding teardown candidate after
-// a positive deprovisioned callback. This also lets a later reconciler/orphan
-// teardown clean up retry state left by a poisoned close message.
+// cleanup succeeds synchronously or an exact callback reports completion while
+// deprovision owns the operation. Observation-only lifecycle callbacks cannot
+// retire this retry state; an idempotent close/orphan retry does so after
+// reaching the backend successfully.
 func (o *ProvisionOrchestrator) forgetDeprovisionCandidate(leaseUUID, backendName string) {
 	if backendName == "" {
 		return
@@ -699,9 +701,11 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 		// Once this invocation has captured every positive candidate, the ordinary
 		// provisioning tracker must not survive a poisoned close message: it feeds
 		// load balancing and callback timeouts. Retain only candidates whose teardown
-		// failed or could not be attempted; successful candidates need no retry and
-		// a later deprovisioned callback can retire an outstanding entry. Then finish
-		// only the exact claimed operation. Durable placement remains untouched.
+		// failed or could not be attempted; successful candidates are retired at the
+		// call site. Observation-only lifecycle callbacks do not retire this state,
+		// so an ambiguous completion remains retryable until a later idempotent
+		// teardown succeeds. Then finish only the exact claimed operation. Durable
+		// placement remains untouched.
 		o.rememberDeprovisionCandidates(leaseUUID, retryCandidates)
 		if finishErr := finishInFlight(); finishErr != nil {
 			return errors.Join(deprovisionErr, finishErr)

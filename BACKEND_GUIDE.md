@@ -163,7 +163,7 @@ Start provisioning a resource asynchronously.
     {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
   ],
   "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
-  "lifecycle_callback_url": "http://fred:8080/callbacks/provision",
+  "lifecycle_callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "base64-encoded-bytes",
   "payload_hash": "sha256-hex-string"
 }
@@ -186,8 +186,9 @@ Start provisioning a resource asynchronously.
 1. Validate the request
 2. Store both callback URLs for this `lease_uuid` byte-for-byte. The complete
    `callback_url`, including its query, settles only this provision operation;
-   `lifecycle_callback_url` is tokenless and reports later autonomous failure
-   or teardown observations without reusing expired operation authority
+   `lifecycle_callback_url` carries a separate typed lifecycle capability and
+   reports later maintenance, autonomous failure, or teardown observations
+   without reusing expired operation authority
 3. Return 202 immediately (do NOT block on provisioning)
 4. Start provisioning in a background goroutine
 5. When complete, POST to `callback_url`. For later runtime failure or
@@ -371,7 +372,7 @@ Restart containers for a lease without changing the manifest. Stops existing con
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "callback_url": "http://fred:8080/callbacks/provision"
+  "callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
@@ -402,7 +403,7 @@ Deploy a new manifest for a lease, replacing containers with a new image/configu
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "callback_url": "http://fred:8080/callbacks/provision",
+  "callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "base64-encoded-manifest",
   "payload_hash": "sha256-hex-string"
 }
@@ -443,7 +444,7 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
   "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
-  "lifecycle_callback_url": "http://fred:8080/callbacks/provision"
+  "lifecycle_callback_url": "http://fred:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
@@ -619,18 +620,42 @@ a newer in-flight operation. An operation-ID callback is authoritative only whil
 that exact operation is current; after it ends or is replaced Fred returns 200
 and ignores the callback completely, including status publication.
 
-Provision and restore requests also carry a tokenless
-`lifecycle_callback_url`. Store it separately and use it only for subsequent
-autonomous observations such as container death or deprovision completion. A
-lifecycle callback never settles an operation, placement, or chain mutation;
-it can publish only best-effort, out-of-order status, including while a newer
-typed operation is current. Never use it for the original asynchronous result,
-which must go to the operation-scoped `callback_url`. The field is optional for
-rolling compatibility: the bundled Docker backend derives the same URL when an
-older Fred omits it by removing only `operation_id` and retaining every unrelated
-query component. External backends should consume the explicit field rather
-than interpreting either URL. Tokenless v0.13 and restart/update callbacks keep
-the same observation-only behavior.
+Provision and restore requests also carry a typed
+`lifecycle_callback_url` with `lifecycle_id=<uuid>`. Store it separately and use
+it for subsequent restart/update completion, autonomous container failure, and
+deprovision observations. Fred persists the current lifecycle capability with
+the lease's authoritative backend; a newer successful exact operation rotates
+it, and terminal deprovision atomically retires it. After Fred deletes the
+placement, the retained capability is teardown-only: success/failure is a 200
+no-op and only the exact `deprovisioned` observation can retire it and publish a
+retained notice. That consume is durable before the best-effort notice is
+published, so a process crash can lose the push but cannot resurrect its
+authority; the queryable retention status remains the backstop. A lifecycle
+callback never settles an operation or mutates placement/chain state: it may
+publish only `ready`, `failed`, or `retained` status. Never use it for the
+original provision/restore result, which must go to the operation-scoped
+`callback_url`.
+
+The field is optional for backend-first rolling compatibility. The bundled
+Docker backend derives the paired route when an older Fred omits it by replacing
+exactly one `operation_id` with `lifecycle_id` and preserving every unrelated
+raw query component. An operationless v0.13 URL remains tokenless and is
+authorized only for a lease whose durable placement was migrated as legacy.
+External backends should consume the explicit field rather than interpreting
+either URL.
+
+Upgrade backends before Fred. A new backend can persist the operationless route
+sent by v0.13.0 and continue using it after Fred migrates that owner as legacy.
+The reverse order is not lifecycle-compatible: a v0.13.0 backend ignores
+`lifecycle_callback_url` and later reuses the operation-scoped URL, whose expired
+`operation_id` a new Fred intentionally treats as a 200 no-op.
+
+Fred repeats the current lifecycle route as `callback_url` on `/restart` and
+`/update`. A backend with persisted state must require the same authority class
+and lifecycle UUID before accepting a replacement base/path; it must reject a
+typed-to-tokenless downgrade, a different UUID, or a malformed/mixed route.
+Reconciler-driven maintenance that carries no fresh URL reuses the persisted
+route. This lets `callback_base_url` change without minting or losing authority.
 
 ### Request Format
 
@@ -652,17 +677,28 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 **Fields:**
 - `status`: One of `"success"`, `"failed"`, or `"deprovisioned"`. Use `"deprovisioned"` when the backend has autonomously torn down a lease (e.g. after a failed provision rollback) so Fred records the lease as deprovisioned without firing failure-callback side effects.
 - `error`: Error message if status is `"failed"`, empty otherwise
-- `backend` (omitempty): Optional legacy sender metadata used only for bounded metrics when no current operation exists. It may be empty or differ from Fred's configured router name. It never authorizes or redirects a typed callback; the HMAC-covered callback URL and current operation ID select the authoritative backend.
+- `backend` (omitempty): Optional legacy sender metadata used only for bounded metrics when no current operation exists. It may be empty or differ from Fred's configured router name. It never authorizes or redirects a typed callback; the HMAC-covered callback URL plus Fred's current exact-operation or durable lifecycle record select the authoritative backend.
 - `operation_id` in the JSON body, if supplied, is untrusted metadata and is overwritten at Fred's ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
+- `lifecycle_id` in the JSON body is likewise overwritten. Only the authenticated URL query and Fred's current durable per-lease capability authorize a lifecycle observation.
 
 ### Fred Response Contract
 
-- `200 OK` — accepted for asynchronous processing. Duplicate or stale exact-operation callbacks are also acknowledged with 200 so a backend does not retry forever; this status does not promise lifecycle settlement.
-- `400 Bad Request` — malformed JSON, lease UUID, status, or `operation_id` query. A present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected.
+- `200 OK` — synchronously applied to a terminal application result, or
+  terminally ignored as a duplicate/stale exact-operation callback. A backend
+  may advance that lease's durable callback queue only after this response.
+- `400 Bad Request` — malformed JSON, lease UUID, status, or callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected.
 - `401 Unauthorized` — missing or invalid HMAC signature.
 - `429 Too Many Requests` — callback ingress rate limit exceeded; retry with backoff.
-- `500 Internal Server Error` — Fred could not publish the callback to its internal handler; retry with backoff.
-- `503 Service Unavailable` — callback authentication/application service is unavailable or request processing timed out; retry with backoff.
+- `503 Service Unavailable` — callback application is unavailable, has not
+  started, is shutting down, or failed/timed out; keep the callback durable and
+  retry with backoff.
+
+Fred's callback application budget is two minutes; it may wait for terminal
+chain settlement. Use a per-attempt deadline strictly longer than that budget
+(the bundled backends use two minutes fifteen seconds), and do not layer a
+shorter `http.Client.Timeout` over the request context. Remove a durable entry
+only after 2xx. A 503, client timeout, disconnect, or lost response leaves the
+same entry at the head of that lease's FIFO for retry.
 
 ### HMAC Signature with Replay Protection
 
@@ -740,7 +776,7 @@ type provision struct {
     Status               string    // "provisioning", "ready", "failed"
     CreatedAt            time.Time
     CallbackURL          string    // exact operation completion
-    LifecycleCallbackURL string    // tokenless later observations
+    LifecycleCallbackURL string    // typed later observations
     // ... your resource-specific fields
 }
 ```
@@ -748,11 +784,23 @@ type provision struct {
 ### Callback URL Storage
 
 Store callback URLs per lease to handle concurrent provisions. Keep the exact
-completion URL and tokenless lifecycle URL as distinct values. Preserve both
+completion URL and typed lifecycle URL as distinct values. Preserve both
 opaque values byte-for-byte: stripping or rebuilding the completion query makes
 the HMAC or operation identity fail verification, while retaining it for later
 lifecycle events causes valid observations to be discarded after that operation
 expires.
+
+Production backends also need a durable per-lease callback outbox. Classify each
+delivery explicitly as either an exact operation completion (provision/restore)
+or a typed lifecycle observation (restart/update completion, runtime
+failure, or deprovision). Allocate a monotonic sequence in the same transaction
+that enqueues the payload, then drain each lease in FIFO order and wait for
+Fred's HTTP result before advancing. Never let a lifecycle observation pass an
+older exact completion. A newer typed lifecycle observation may atomically
+replace older typed lifecycle observations for that lease because only the
+latest observed lifecycle state is useful; never coalesce exact, legacy, or
+unknown entries. Replay pending deliveries at startup and periodically, while
+allowing an unavailable lease to remain blocked without blocking other leases.
 
 ```go
 type BackendServer struct {
@@ -780,8 +828,9 @@ func (b *DockerBackend) recoverState(ctx context.Context) error {
         lifecycleCallbackURL := c.Labels["fred.lifecycle_callback_url"]
         if lifecycleCallbackURL == "" {
             // One-time migration for resources created by an older backend:
-            // remove only operation_id from callbackURL and preserve every
-            // unrelated raw query component.
+            // replace only operation_id with lifecycle_id and preserve every
+            // unrelated raw query component. An operationless legacy URL stays
+            // tokenless.
             lifecycleCallbackURL = migrateLegacyLifecycleURL(callbackURL)
         }
         b.provisions[c.Labels["fred.lease_uuid"]] = &provision{
@@ -980,7 +1029,7 @@ curl -X POST http://localhost:9001/provision \
     "provider_uuid": "test-provider",
     "items": [{"sku": "docker-nginx", "quantity": 1}],
     "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
-    "lifecycle_callback_url": "http://localhost:8080/callbacks/provision"
+    "lifecycle_callback_url": "http://localhost:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
   }'
 ```
 
@@ -1008,7 +1057,7 @@ Before deploying your backend:
 - [ ] All 12 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{lease_uuid}`, `/logs/{lease_uuid}`, `/provisions/{lease_uuid}`, `/provisions`, `/restart`, `/update`, `/restore`, `/retentions`, `/reconcile_custom_domain`, `/releases/{lease_uuid}`) plus `/health`
 - [ ] **Inbound `X-Fred-Signature` verified on all contract endpoints** (401 on missing/invalid; only `/health`, `/stats`, `/metrics` are exempt)
 - [ ] Provision returns 202 and works asynchronously
-- [ ] Exact `callback_url` and tokenless `lifecycle_callback_url` stored separately per lease; operation completion uses the exact URL and later autonomous lifecycle observations use only the tokenless URL
+- [ ] Exact `callback_url` and typed `lifecycle_callback_url` stored separately per lease; provision/restore completion uses the exact URL and later maintenance/autonomous observations use only the lifecycle URL
 - [ ] Complete selected callback URL (including unrelated query fields) preserved byte-for-byte and signed with HMAC-SHA256 with timestamp
 - [ ] Deprovision is idempotent
 - [ ] ListProvisions returns all managed resources

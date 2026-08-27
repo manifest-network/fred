@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -36,6 +37,31 @@ func testEvent(leaseUUID string, status backend.ProvisionStatus) backend.LeaseSt
 	}
 }
 
+func requireBrokerEvent(
+	t testing.TB,
+	events <-chan backend.LeaseStatusEvent,
+) backend.LeaseStatusEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for broker event")
+		return backend.LeaseStatusEvent{}
+	}
+}
+
+func requireDispatchResult(t testing.TB, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for maintenance dispatch")
+		return nil
+	}
+}
+
 // --- EventBroker unit tests ---
 
 func TestEventBroker_SubscribeAndPublish(t *testing.T) {
@@ -53,6 +79,227 @@ func TestEventBroker_SubscribeAndPublish(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for event")
 	}
+}
+
+func TestEventBroker_DispatchWithOrderedStartQueuesFastCallbackWithoutBlocking(t *testing.T) {
+	broker := NewEventBroker()
+	ch, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+
+	err = broker.DispatchWithOrderedStart(
+		testEvent("lease-1", backend.ProvisionStatusRestarting),
+		func() error {
+			// Model a remote backend that waits for Fred's callback response
+			// before returning its own 202. Publish must enqueue and return rather
+			// than deadlocking behind the backend response.
+			broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
+			select {
+			case event := <-ch:
+				t.Fatalf("event %s escaped before backend acceptance", event.Status)
+			default:
+			}
+			return nil
+		},
+	)
+	require.NoError(t, err)
+
+	first := requireBrokerEvent(t, ch)
+	second := requireBrokerEvent(t, ch)
+	assert.Equal(t, backend.ProvisionStatusRestarting, first.Status)
+	assert.Equal(t, backend.ProvisionStatusReady, second.Status)
+	assert.Empty(t, broker.transitions, "completed gates must be retired")
+}
+
+func TestEventBroker_DispatchWithOrderedStartRefusalDoesNotInventStart(t *testing.T) {
+	broker := NewEventBroker()
+	ch, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	wantErr := errors.New("backend refused")
+
+	err = broker.DispatchWithOrderedStart(
+		testEvent("lease-1", backend.ProvisionStatusRestarting),
+		func() error {
+			// This may be an independent runtime observation that raced the
+			// refused request. Preserve it, but do not claim the request started.
+			broker.Publish(testEvent("lease-1", backend.ProvisionStatusFailed))
+			return wantErr
+		},
+	)
+	require.ErrorIs(t, err, wantErr)
+
+	assert.Equal(t, backend.ProvisionStatusFailed, requireBrokerEvent(t, ch).Status)
+	select {
+	case event := <-ch:
+		t.Fatalf("unexpected event after refusal: %s", event.Status)
+	default:
+	}
+	assert.Empty(t, broker.transitions, "refused gates must be retired")
+}
+
+func TestEventBroker_DispatchWithOrderedStartSerializesOnlySameLease(t *testing.T) {
+	broker := NewEventBroker()
+	leaseOneEvents, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	leaseTwoEvents, err := broker.Subscribe("lease-2")
+	require.NoError(t, err)
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- broker.DispatchWithOrderedStart(
+			testEvent("lease-1", backend.ProvisionStatusRestarting),
+			func() error {
+				close(firstEntered)
+				broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
+				<-releaseFirst
+				return nil
+			},
+		)
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- broker.DispatchWithOrderedStart(
+			testEvent("lease-1", backend.ProvisionStatusUpdating),
+			func() error {
+				close(secondEntered)
+				broker.Publish(testEvent("lease-1", backend.ProvisionStatusFailed))
+				return nil
+			},
+		)
+	}()
+	require.Eventually(t, func() bool {
+		broker.transitionMu.Lock()
+		defer broker.transitionMu.Unlock()
+		transition := broker.transitions["lease-1"]
+		return transition != nil && transition.refs == 2
+	}, 2*time.Second, time.Millisecond,
+		"second same-lease dispatch never reached the active gate")
+	select {
+	case <-secondEntered:
+		t.Fatal("same-lease dispatch entered before the active gate completed")
+	default:
+	}
+
+	// A different lease is not serialized behind lease-1.
+	require.NoError(t, broker.DispatchWithOrderedStart(
+		testEvent("lease-2", backend.ProvisionStatusUpdating),
+		func() error { return nil },
+	))
+	assert.Equal(t, backend.ProvisionStatusUpdating,
+		requireBrokerEvent(t, leaseTwoEvents).Status)
+
+	close(releaseFirst)
+	require.NoError(t, requireDispatchResult(t, firstDone))
+	require.NoError(t, requireDispatchResult(t, secondDone))
+
+	for _, want := range []backend.ProvisionStatus{
+		backend.ProvisionStatusRestarting,
+		backend.ProvisionStatusReady,
+		backend.ProvisionStatusUpdating,
+		backend.ProvisionStatusFailed,
+	} {
+		assert.Equal(t, want, requireBrokerEvent(t, leaseOneEvents).Status)
+	}
+	assert.Empty(t, broker.transitions, "all waiter references must be retired")
+}
+
+func TestEventBroker_DispatchWithOrderedStartCleansUpOnPanicAndClose(t *testing.T) {
+	t.Run("panic", func(t *testing.T) {
+		broker := NewEventBroker()
+		ch, err := broker.Subscribe("lease-1")
+		require.NoError(t, err)
+
+		assert.Panics(t, func() {
+			_ = broker.DispatchWithOrderedStart(
+				testEvent("lease-1", backend.ProvisionStatusRestarting),
+				func() error {
+					broker.Publish(testEvent("lease-1", backend.ProvisionStatusFailed))
+					panic("backend panic")
+				},
+			)
+		})
+		assert.Equal(t, backend.ProvisionStatusFailed, requireBrokerEvent(t, ch).Status)
+		assert.Empty(t, broker.transitions)
+	})
+
+	t.Run("close", func(t *testing.T) {
+		broker := NewEventBroker()
+		ch, err := broker.Subscribe("lease-1")
+		require.NoError(t, err)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- broker.DispatchWithOrderedStart(
+				testEvent("lease-1", backend.ProvisionStatusRestarting),
+				func() error {
+					broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
+					close(entered)
+					<-release
+					return nil
+				},
+			)
+		}()
+		<-entered
+
+		broker.Close()
+		_, open := <-ch
+		assert.False(t, open)
+		close(release)
+		require.NoError(t, requireDispatchResult(t, done))
+		assert.Empty(t, broker.transitions, "close must not strand a completed gate")
+	})
+}
+
+func TestEventBroker_DispatchWithOrderedStartBoundsQueuedCallbacks(t *testing.T) {
+	broker := NewEventBroker()
+	events, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- broker.DispatchWithOrderedStart(
+			testEvent("lease-1", backend.ProvisionStatusUpdating),
+			func() error {
+				close(entered)
+				<-release
+				return nil
+			},
+		)
+	}()
+	<-entered
+
+	for index := range eventChannelBuffer * 3 {
+		event := testEvent("lease-1", backend.ProvisionStatusFailed)
+		event.Error = strconv.Itoa(index)
+		broker.Publish(event)
+	}
+
+	broker.transitionMu.Lock()
+	transition := broker.transitions["lease-1"]
+	require.NotNil(t, transition)
+	assert.Len(t, transition.pending, transitionEventBuffer)
+	assert.Equal(t, strconv.Itoa(eventChannelBuffer*3-1),
+		transition.pending[len(transition.pending)-1].Error,
+		"the bounded queue must preserve the newest observed state")
+	broker.transitionMu.Unlock()
+
+	close(release)
+	require.NoError(t, requireDispatchResult(t, done))
+	assert.Equal(t, backend.ProvisionStatusUpdating,
+		requireBrokerEvent(t, events).Status)
+	var newest backend.LeaseStatusEvent
+	for range transitionEventBuffer {
+		newest = requireBrokerEvent(t, events)
+	}
+	assert.Equal(t, strconv.Itoa(eventChannelBuffer*3-1), newest.Error,
+		"accepted flush must actually deliver the newest terminal after its start")
+	assert.Empty(t, broker.transitions)
 }
 
 func TestEventBroker_MultipleClientsForSameLease(t *testing.T) {

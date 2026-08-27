@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sony/gobreaker"
 
@@ -328,6 +329,20 @@ type ListRetentionsResponse struct {
 	Continue string `json:"continue,omitempty"`
 }
 
+const (
+	// DefaultCallbackApplicationTimeout bounds Fred's synchronous processing of
+	// one authenticated callback. The provider must return a terminal HTTP
+	// response within this budget so the backend can safely advance its durable
+	// per-lease callback queue.
+	DefaultCallbackApplicationTimeout = 2 * time.Minute
+
+	// DefaultCallbackDeliveryTimeout is the backend's per-attempt HTTP budget.
+	// It must remain strictly greater than DefaultCallbackApplicationTimeout so
+	// Fred owns the first timeout and has time to serialize a retryable response
+	// before the backend cancels the request.
+	DefaultCallbackDeliveryTimeout = DefaultCallbackApplicationTimeout + 15*time.Second
+)
+
 // CallbackPayload is sent by backends to fred's callback endpoint.
 type CallbackPayload struct {
 	LeaseUUID string         `json:"lease_uuid"`
@@ -335,12 +350,17 @@ type CallbackPayload struct {
 	Error     string         `json:"error,omitempty"`
 	// Backend is optional sender metadata retained for bounded metrics on
 	// callbacks that have no current operation. It is not lifecycle authority:
-	// the exact HMAC-authenticated operation URL selects the tracked backend.
+	// the exact HMAC-authenticated operation URL or durable lifecycle capability
+	// selects the store-authoritative backend.
 	Backend string `json:"backend,omitempty"`
 	// OperationID is injected by fred's callback HTTP endpoint from the
 	// HMAC-authenticated callback URL. Backends need only POST to the URL they
 	// received; they do not interpret or echo the token in their JSON body.
 	OperationID string `json:"operation_id,omitempty"`
+	// LifecycleID is likewise injected from an authenticated lifecycle callback
+	// URL. A provider overwrites either body field before application so backend
+	// JSON can never mint callback authority.
+	LifecycleID string `json:"lifecycle_id,omitempty"`
 	// Retained is set true on a deprovisioned callback when the backend actually
 	// soft-deleted (retained) the lease's volumes. Best-effort ground truth for
 	// the optimistic push; the queryable retention status is the durable backstop.
@@ -352,53 +372,362 @@ type CallbackPayload struct {
 // that operation-scoped URL for later autonomous lifecycle observations.
 const CallbackOperationIDQueryParameter = "operation_id"
 
-// ErrInvalidLifecycleCallbackURL reports that a separately supplied lifecycle
-// callback URL is not the exact completion URL with only operation_id removed.
-// Keeping this relationship strict prevents a backend request from silently
-// splitting settlement and observation traffic across unrelated endpoints.
-var ErrInvalidLifecycleCallbackURL = errors.New("invalid lifecycle callback URL")
+// CallbackLifecycleIDQueryParameter is the capability carried by an
+// observation-only lifecycle callback URL. It is deliberately distinct from
+// operation_id even though a paired URL derives both typed identities from the
+// same canonical UUIDv4 value.
+const CallbackLifecycleIDQueryParameter = "lifecycle_id"
+
+var (
+	// ErrInvalidOperationCallbackURL reports that an exact-completion URL mixes,
+	// duplicates, or malforms callback authority.
+	ErrInvalidOperationCallbackURL = errors.New("invalid operation callback URL")
+
+	// ErrInvalidLifecycleCallbackURL reports that a separately supplied lifecycle
+	// callback URL is not the exact lifecycle route derived from its completion
+	// URL. Keeping this relationship strict prevents a backend request from
+	// silently splitting settlement and observation traffic across unrelated
+	// endpoints or carrying both kinds of authority at once.
+	ErrInvalidLifecycleCallbackURL = errors.New("invalid lifecycle callback URL")
+)
 
 // ResolveLifecycleCallbackURL validates or derives the observation-only URL
-// paired with an operation-scoped completion URL. Derivation removes every
-// operation_id field while retaining all unrelated raw query fields byte for
-// byte and in their original order. An explicit lifecycle URL must equal that
-// derived value exactly and must therefore be tokenless.
+// paired with a completion URL. A current completion URL must contain exactly
+// one canonical UUIDv4 operation_id and no lifecycle_id; derivation replaces
+// that one field with lifecycle_id while retaining all unrelated raw query
+// fields byte for byte and in their original order. A legacy operationless URL
+// remains tokenless. Duplicate identities, preexisting lifecycle authority,
+// and non-canonical operation IDs are rejected.
 //
 // The optional explicit form lets current Fred versions make the distinction
-// visible on the wire. Derivation keeps upgraded backends compatible with
-// v0.13 and rolling deployments whose request shape contains only callback_url.
+// visible on the wire. It must equal the derived URL exactly. Operationless
+// derivation keeps upgraded backends compatible with v0.13 and rolling
+// deployments whose request shape contains only callback_url.
 func ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL string) (string, error) {
 	parsed, err := url.Parse(callbackURL)
 	if err != nil {
 		return "", fmt.Errorf("%w: parse callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
 	}
-
-	parts := strings.Split(parsed.RawQuery, "&")
-	kept := parts[:0]
-	for _, part := range parts {
-		key := part
-		if before, _, found := strings.Cut(part, "="); found {
-			key = before
-		}
-		decodedKey, decodeErr := url.QueryUnescape(key)
-		if decodeErr != nil {
-			return "", fmt.Errorf("%w: decode callback query key: %w", ErrInvalidLifecycleCallbackURL, decodeErr)
-		}
-		if decodedKey == CallbackOperationIDQueryParameter {
-			continue
-		}
-		kept = append(kept, part)
+	if err := validateCallbackRawQuery(parsed.RawQuery, ErrInvalidLifecycleCallbackURL); err != nil {
+		return "", err
 	}
-	parsed.RawQuery = strings.Join(kept, "&")
+
+	parsed.RawQuery, err = deriveLifecycleCallbackQuery(parsed.RawQuery)
+	if err != nil {
+		return "", err
+	}
 	derived := parsed.String()
 	if lifecycleCallbackURL == "" {
 		return derived, nil
 	}
 	if lifecycleCallbackURL != derived {
-		return "", fmt.Errorf("%w: lifecycle URL must equal callback_url without %s",
-			ErrInvalidLifecycleCallbackURL, CallbackOperationIDQueryParameter)
+		return "", fmt.Errorf("%w: lifecycle URL must exactly match the route derived from callback_url",
+			ErrInvalidLifecycleCallbackURL)
 	}
 	return lifecycleCallbackURL, nil
+}
+
+// ResolveMaintenanceCallbackURLs validates a trusted maintenance request
+// against the callback authority already persisted by a backend. Restart,
+// update, and autonomous reconciler replacement may move the callback route to
+// a new base, but they must retain the same authority class and exact lifecycle
+// UUID. A typed route can never be downgraded to tokenless (or vice versa), and
+// a different typed ID is stale or misrouted authority.
+//
+// requestedLifecycleURL may be empty for an autonomous backend operation; in
+// that case the persisted route is retained. The returned operation/lifecycle
+// pair uses the requested base and one shared identity, so it remains suitable
+// for durable labels and later exact pair validation. Legacy tokenless pairs
+// remain tokenless. When no route was persisted, the trusted requested route is
+// adopted after full lifecycle validation.
+func ResolveMaintenanceCallbackURLs(
+	callbackURL, lifecycleCallbackURL, requestedLifecycleURL string,
+) (string, string, error) {
+	currentLifecycleURL := lifecycleCallbackURL
+	switch {
+	case callbackURL != "":
+		resolved, err := ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL)
+		if err != nil {
+			return "", "", fmt.Errorf("validate persisted callback pair: %w", err)
+		}
+		currentLifecycleURL = resolved
+	case lifecycleCallbackURL != "":
+		if err := ValidateLifecycleCallbackURL(lifecycleCallbackURL); err != nil {
+			return "", "", fmt.Errorf("validate persisted lifecycle callback: %w", err)
+		}
+	}
+
+	if requestedLifecycleURL == "" {
+		requestedLifecycleURL = currentLifecycleURL
+	}
+	if err := ValidateLifecycleCallbackURL(requestedLifecycleURL); err != nil {
+		return "", "", fmt.Errorf("validate requested lifecycle callback: %w", err)
+	}
+
+	if currentLifecycleURL != "" {
+		currentID, currentTyped, err := lifecycleCallbackIdentity(currentLifecycleURL)
+		if err != nil {
+			return "", "", err
+		}
+		requestedID, requestedTyped, err := lifecycleCallbackIdentity(requestedLifecycleURL)
+		if err != nil {
+			return "", "", err
+		}
+		if currentTyped != requestedTyped {
+			return "", "", fmt.Errorf(
+				"%w: maintenance callback cannot change authority class",
+				ErrInvalidLifecycleCallbackURL,
+			)
+		}
+		if currentTyped && currentID != requestedID {
+			return "", "", fmt.Errorf(
+				"%w: maintenance lifecycle ID does not match persisted authority",
+				ErrInvalidLifecycleCallbackURL,
+			)
+		}
+	}
+
+	nextOperationURL, err := resolveOperationCallbackURL(requestedLifecycleURL)
+	if err != nil {
+		return "", "", err
+	}
+	nextLifecycleURL, err := ResolveLifecycleCallbackURL(nextOperationURL, "")
+	if err != nil {
+		return "", "", fmt.Errorf("derive canonical maintenance lifecycle callback: %w", err)
+	}
+	return nextOperationURL, nextLifecycleURL, nil
+}
+
+func lifecycleCallbackIdentity(callbackURL string) (string, bool, error) {
+	parsed, err := url.Parse(callbackURL)
+	if err != nil {
+		return "", false, fmt.Errorf("%w: parse lifecycle callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+	for _, part := range strings.Split(parsed.RawQuery, "&") {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, decodeErr := url.QueryUnescape(rawKey)
+		if decodeErr != nil {
+			return "", false, fmt.Errorf("%w: decode lifecycle callback query key: %w", ErrInvalidLifecycleCallbackURL, decodeErr)
+		}
+		if key != CallbackLifecycleIDQueryParameter {
+			continue
+		}
+		id, parseErr := parseCanonicalCallbackQueryID(
+			rawValue, CallbackLifecycleIDQueryParameter, ErrInvalidLifecycleCallbackURL,
+		)
+		return id, true, parseErr
+	}
+	return "", false, nil
+}
+
+func resolveOperationCallbackURL(lifecycleCallbackURL string) (string, error) {
+	parsed, err := url.Parse(lifecycleCallbackURL)
+	if err != nil {
+		return "", fmt.Errorf("%w: parse lifecycle callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+	if err := validateCallbackRawQuery(parsed.RawQuery, ErrInvalidLifecycleCallbackURL); err != nil {
+		return "", err
+	}
+	parsed.RawQuery, err = deriveOperationCallbackQuery(parsed.RawQuery)
+	if err != nil {
+		return "", err
+	}
+	return parsed.String(), nil
+}
+
+// ValidateOperationCallbackURL validates an exact requested-operation route.
+// Current routes carry exactly one canonical UUIDv4 operation_id and no
+// lifecycle_id. A legacy route with neither identity remains valid during the
+// rolling-upgrade window. Duplicate, mixed, or malformed authority is always
+// rejected.
+func ValidateOperationCallbackURL(callbackURL string) error {
+	parsed, err := url.Parse(callbackURL)
+	if err != nil {
+		return fmt.Errorf("%w: parse operation callback URL: %w", ErrInvalidOperationCallbackURL, err)
+	}
+	if err := validateCallbackRawQuery(parsed.RawQuery, ErrInvalidOperationCallbackURL); err != nil {
+		return err
+	}
+
+	operationSeen := false
+	for _, part := range strings.Split(parsed.RawQuery, "&") {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, decodeErr := url.QueryUnescape(rawKey)
+		if decodeErr != nil {
+			return fmt.Errorf("%w: decode operation callback query key: %w", ErrInvalidOperationCallbackURL, decodeErr)
+		}
+
+		switch key {
+		case CallbackLifecycleIDQueryParameter:
+			return fmt.Errorf("%w: operation URL must not contain %s",
+				ErrInvalidOperationCallbackURL, CallbackLifecycleIDQueryParameter)
+		case CallbackOperationIDQueryParameter:
+			if operationSeen {
+				return fmt.Errorf("%w: %s must occur exactly once",
+					ErrInvalidOperationCallbackURL, CallbackOperationIDQueryParameter)
+			}
+			if _, parseErr := parseCanonicalCallbackQueryID(
+				rawValue, CallbackOperationIDQueryParameter, ErrInvalidOperationCallbackURL,
+			); parseErr != nil {
+				return parseErr
+			}
+			operationSeen = true
+		}
+	}
+	return nil
+}
+
+// ValidateLifecycleCallbackURL validates an observation-only callback route.
+// Current routes carry exactly one canonical UUIDv4 lifecycle_id and no
+// operation_id. A legacy route with neither identity remains valid during the
+// rolling-upgrade window. Duplicate, mixed, or malformed authority is always
+// rejected.
+func ValidateLifecycleCallbackURL(callbackURL string) error {
+	parsed, err := url.Parse(callbackURL)
+	if err != nil {
+		return fmt.Errorf("%w: parse lifecycle callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+	if err := validateCallbackRawQuery(parsed.RawQuery, ErrInvalidLifecycleCallbackURL); err != nil {
+		return err
+	}
+
+	lifecycleSeen := false
+	for _, part := range strings.Split(parsed.RawQuery, "&") {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, decodeErr := url.QueryUnescape(rawKey)
+		if decodeErr != nil {
+			return fmt.Errorf("%w: decode lifecycle callback query key: %w", ErrInvalidLifecycleCallbackURL, decodeErr)
+		}
+
+		switch key {
+		case CallbackOperationIDQueryParameter:
+			return fmt.Errorf("%w: lifecycle URL must not contain %s",
+				ErrInvalidLifecycleCallbackURL, CallbackOperationIDQueryParameter)
+		case CallbackLifecycleIDQueryParameter:
+			if lifecycleSeen {
+				return fmt.Errorf("%w: %s must occur exactly once",
+					ErrInvalidLifecycleCallbackURL, CallbackLifecycleIDQueryParameter)
+			}
+			if _, parseErr := parseCanonicalCallbackQueryID(
+				rawValue, CallbackLifecycleIDQueryParameter, ErrInvalidLifecycleCallbackURL,
+			); parseErr != nil {
+				return parseErr
+			}
+			lifecycleSeen = true
+		}
+	}
+	return nil
+}
+
+// validateCallbackRawQuery keeps backend callback acceptance aligned with
+// Fred's ingress parser. url.URL.Query silently drops malformed fields, while
+// url.ParseQuery reports invalid escapes and semicolon separators. Validate
+// without re-encoding so a valid HMAC-covered RequestURI remains byte-for-byte
+// unchanged through derivation and durable persistence.
+func validateCallbackRawQuery(rawQuery string, invalidURL error) error {
+	if _, err := url.ParseQuery(rawQuery); err != nil {
+		return fmt.Errorf("%w: malformed callback query: %w", invalidURL, err)
+	}
+	return nil
+}
+
+func deriveLifecycleCallbackQuery(rawQuery string) (string, error) {
+	if rawQuery == "" {
+		return "", nil
+	}
+
+	parts := strings.Split(rawQuery, "&")
+	rewritten := append([]string(nil), parts...)
+	operationIndex := -1
+	operationID := ""
+	for index, part := range parts {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			return "", fmt.Errorf("%w: decode callback query key: %w", ErrInvalidLifecycleCallbackURL, err)
+		}
+
+		switch key {
+		case CallbackLifecycleIDQueryParameter:
+			return "", fmt.Errorf("%w: callback_url must not contain %s",
+				ErrInvalidLifecycleCallbackURL, CallbackLifecycleIDQueryParameter)
+		case CallbackOperationIDQueryParameter:
+			if operationIndex >= 0 {
+				return "", fmt.Errorf("%w: %s must occur exactly once",
+					ErrInvalidLifecycleCallbackURL, CallbackOperationIDQueryParameter)
+			}
+			parsedID, parseErr := parseCanonicalCallbackQueryID(
+				rawValue, CallbackOperationIDQueryParameter, ErrInvalidLifecycleCallbackURL,
+			)
+			if parseErr != nil {
+				return "", parseErr
+			}
+			operationIndex = index
+			operationID = parsedID
+		}
+	}
+
+	if operationIndex < 0 {
+		return rawQuery, nil
+	}
+	rewritten[operationIndex] = CallbackLifecycleIDQueryParameter + "=" + operationID
+	return strings.Join(rewritten, "&"), nil
+}
+
+func deriveOperationCallbackQuery(rawQuery string) (string, error) {
+	if rawQuery == "" {
+		return "", nil
+	}
+
+	parts := strings.Split(rawQuery, "&")
+	rewritten := append([]string(nil), parts...)
+	lifecycleIndex := -1
+	lifecycleID := ""
+	for index, part := range parts {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			return "", fmt.Errorf("%w: decode lifecycle callback query key: %w", ErrInvalidLifecycleCallbackURL, err)
+		}
+
+		switch key {
+		case CallbackOperationIDQueryParameter:
+			return "", fmt.Errorf("%w: lifecycle URL must not contain %s",
+				ErrInvalidLifecycleCallbackURL, CallbackOperationIDQueryParameter)
+		case CallbackLifecycleIDQueryParameter:
+			if lifecycleIndex >= 0 {
+				return "", fmt.Errorf("%w: %s must occur exactly once",
+					ErrInvalidLifecycleCallbackURL, CallbackLifecycleIDQueryParameter)
+			}
+			parsedID, parseErr := parseCanonicalCallbackQueryID(
+				rawValue, CallbackLifecycleIDQueryParameter, ErrInvalidLifecycleCallbackURL,
+			)
+			if parseErr != nil {
+				return "", parseErr
+			}
+			lifecycleIndex = index
+			lifecycleID = parsedID
+		}
+	}
+
+	if lifecycleIndex < 0 {
+		return rawQuery, nil
+	}
+	rewritten[lifecycleIndex] = CallbackOperationIDQueryParameter + "=" + lifecycleID
+	return strings.Join(rewritten, "&"), nil
+}
+
+func parseCanonicalCallbackQueryID(rawValue, parameter string, invalidURL error) (string, error) {
+	decodedValue, err := url.QueryUnescape(rawValue)
+	if err != nil {
+		return "", fmt.Errorf("%w: decode %s: %w", invalidURL, parameter, err)
+	}
+	parsedID, err := uuid.Parse(decodedValue)
+	if err != nil || parsedID.String() != decodedValue || parsedID.Version() != uuid.Version(4) ||
+		parsedID.Variant() != uuid.RFC4122 {
+		return "", fmt.Errorf("%w: %s must be a canonical UUIDv4", invalidURL, parameter)
+	}
+	return parsedID.String(), nil
 }
 
 // RestartRequest contains the data needed to restart a lease's containers.

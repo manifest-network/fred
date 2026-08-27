@@ -110,7 +110,9 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 		"https://fred.example/callback?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
 		labels[LabelCallbackURL],
 	)
-	assert.Equal(t, "https://fred.example/callback?trace=keep", labels[LabelLifecycleCallbackURL],
+	assert.Equal(t,
+		"https://fred.example/callback?trace=keep&lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+		labels[LabelLifecycleCallbackURL],
 		"legacy migration must persist the derived observation-only callback route")
 	if !fakeRelStore.hasWrappedRelease("lease-1") {
 		t.Fatalf("release store missing wrapped entry")

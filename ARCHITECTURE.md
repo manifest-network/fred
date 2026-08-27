@@ -101,9 +101,10 @@ The tenant shouldn't need to call Fred directly - provisioning should happen aut
 │  │  events.lease.closed        →  HandleLeaseClosed                    │   │
 │  │  events.lease.expired       →  HandleLeaseExpired                   │   │
 │  │  events.payload.received    →  HandlePayloadReceived                │   │
-│  │  events.backend.callback    →  HandleBackendCallback                │   │
 │  │  events.lease.event         →  (fan-out to WebSocket subscribers)   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  Backend callback HTTP ──typed/synchronous──> CallbackService              │
 │                                   │                                         │
 │                                   ▼                                         │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
@@ -238,13 +239,18 @@ The full transition matrix lives in [internal/backend/docker/README.md](internal
 6. Backend provisions resource asynchronously
 7. Backend calls POST /callbacks/provision (API server):
    a. Verify HMAC signature (CallbackAuthenticator)
-   b. Parse and validate callback payload
-   c. Publish to Watermill topic (events.backend.callback)
-8. handleBackendCallback (Watermill handler):
-   a. GetInFlight from in-flight tracker for lease (non-destructive)
+   b. Parse exactly one authenticated `operation_id` or `lifecycle_id` query
+      capability and overwrite any body-supplied identity
+   c. Admit the callback into Manager's synchronous typed application path
+8. CallbackService:
+   a. Match and claim an exact operation capability, or authorize a later
+      observation against the durable current lease/backend lifecycle capability
    b. If success: acknowledge lease on chain via AckBatcher
-   c. If failed + PENDING: reject lease on chain, then untrack
-   d. If failed + ACTIVE: untrack and defer to reconciler (retry/reject by FailCount)
+   c. If failed + PENDING: reject lease on chain, then finish the claim
+   d. If failed + ACTIVE: finish and defer recovery to reconciliation
+   e. Publish the callback-derived status before returning 200. Retryable
+      application failure or the dedicated deadline returns 503, so the
+      backend retains this lease's durable FIFO head
 ```
 
 ### Lease Creation (With Payload)
@@ -311,7 +317,7 @@ Reconciler interplay (level-triggered backstop):
 
 - **Inline ack, reconciler backstop.** Inline acknowledgement (ENG-358) is the fast path. Restore requires both durable placement authority and the typed operation registry; production composition cannot construct the service without either. Once accepted, the reconciler remains the level-triggered backstop for a lost callback and acks a `PENDING` + `ready` lease. It *skips* a lease the operation registry still owns (counted by `reconciler_inflight_skips_total`), avoiding a double-ack.
 - **Restore affinity sync (ENG-333).** Each reconcile tick fans out `GET /retentions` to every backend and syncs the `lease → backend` map into the placement store, so retained leases stay routable to their source node across restarts.
-- **Write-ahead placement (ENG-632).** Placement stores two independent facts: `Backend` is confirmed ownership and `Attempt` is an unresolved outbound call. Every provision, re-provision, and restore persists `Attempt` before contacting a backend. A failed prewrite makes zero backend calls; a transport/5xx ambiguity—including an unvalidated HTTP 503—retains the exact typed attempt and blocks substitution. Inventory silence never clears it because a delayed remote call can commit after an absence response; only a positive report from the attempted backend, a contract-conforming synchronous refusal trusted under the configured backend transport, or operator repair may settle it. The `insufficient_resources` response code establishes protocol conformance, not cryptographic authorship: Fred HMAC-signs backend-bound requests but does not authenticate response bodies, so plaintext deployments rely on their network trust boundary (TLS remains the stronger deployment option). Ordinary proxy HTML, foreign JSON, code-less legacy responses, and unknown codes stay ambiguous; the discriminator cannot detect a deliberate on-path forger. A positive report from another backend is accumulated with every prior owner/attempt into a durable quarantine instead of moving affinity. The first complete `/provisions` + `/retentions` projection atomically persists a baseline bound to the sorted set of immutable backend storage identities. That baseline survives process restarts and transient outages while the topology is unchanged; adding, removing, or renaming an identity invalidates admission until a complete projection safely establishes the new topology. A retired identity can never be reused, and replacement storage receives a new name. During a later partial sweep, a genuinely recordless `PENDING` lease may target only a backend that answered both inventories, while recordless `ACTIVE` recovery, confirmed work on a silent owner, and ambiguous/conflicting work remain deferred. A live chain lease positively reported in retention is also deferred lease-locally: ordinary provision cannot overwrite data that requires the restore path. One failed node therefore does not globally pause the reconciler's healthy-node admission. The tenant event path has no per-sweep witness: it is fenced by the durable baseline and immutable topology, live-routes by backend stats, and persists its exact attempt before dispatch. Callback URLs carry an HMAC-covered UUIDv4 operation ID, and callback/timeout settlement claims serialize terminal work so an older response cannot settle a replacement operation. An authenticated success continues to chain acknowledgement even if placement confirmation fails, preserving the write-ahead record for positive inventory or operator repair instead of allowing a timeout to reject a live lease.
+- **Write-ahead placement (ENG-632).** Placement stores two independent facts: `Backend` is confirmed ownership and `Attempt` is an unresolved outbound call. Every provision, re-provision, and restore persists `Attempt` before contacting a backend. A failed prewrite makes zero backend calls; a transport/5xx ambiguity—including an unvalidated HTTP 503—retains the exact typed attempt and blocks substitution. Inventory silence never clears it because a delayed remote call can commit after an absence response; only a positive report from the attempted backend, a contract-conforming synchronous refusal trusted under the configured backend transport, or operator repair may settle it. The `insufficient_resources` response code establishes protocol conformance, not cryptographic authorship: Fred HMAC-signs backend-bound requests but does not authenticate response bodies, so plaintext deployments rely on their network trust boundary (TLS remains the stronger deployment option). Ordinary proxy HTML, foreign JSON, code-less legacy responses, and unknown codes stay ambiguous; the discriminator cannot detect a deliberate on-path forger. A positive report from another backend is accumulated with every prior owner/attempt into a durable quarantine instead of moving affinity. The first complete `/provisions` + `/retentions` projection atomically persists a baseline bound to the sorted set of immutable backend storage identities. That baseline survives process restarts and transient outages while the topology is unchanged; adding, removing, or renaming an identity invalidates admission until a complete projection safely establishes the new topology. A retired identity can never be reused, and replacement storage receives a new name. During a later partial sweep, a genuinely recordless `PENDING` lease may target only a backend that answered both inventories, while recordless `ACTIVE` recovery, confirmed work on a silent owner, and ambiguous/conflicting work remain deferred. A live chain lease positively reported in retention is also deferred lease-locally: ordinary provision cannot overwrite data that requires the restore path. One failed node therefore does not globally pause the reconciler's healthy-node admission. The tenant event path has no per-sweep witness: it is fenced by the durable baseline and immutable topology, live-routes by backend stats, and persists its exact attempt before dispatch. Exact callback URLs carry an HMAC-covered UUIDv4 operation ID, and callback/timeout settlement claims serialize terminal work so an older response cannot settle a replacement operation. Each successful exact operation atomically promotes a separately typed lifecycle ID bound to the authoritative backend; that capability survives provider restart and ordinarily authorizes only status observations, rotates on a newer exact success, and retires on deprovision. Without a matching confirmed placement owner it narrows to teardown-only authority: success/failure is a 200 no-op, maintenance cannot reissue it, and only its exact deprovision observation may atomically retire it and publish retained status. Retirement commits before the best-effort push, so a process crash can lose that event but cannot resurrect authority; queryable retention remains the backstop. Existing v0.13 owners migrate explicitly as tokenless legacy rather than receiving a capability their backend never saw. An authenticated exact success continues to chain acknowledgement even if placement confirmation fails, preserving the write-ahead record for positive inventory or operator repair instead of allowing a timeout to reject a live lease.
 - **Placement prune grace + deprovision fail-safe (ENG-335).** The reconciler will not prune a placement set younger than a grace window (`2 × reconcile_interval`, measured from sweep start), so a lease that provisioned during a slow sweep is not mis-pruned. When a lease exhausts its re-provision attempts and is closed, the reconciler eagerly calls `backend.Deprovision` on its backend instead of waiting for the next orphan-cleanup cycle (logged at WARN, non-fatal).
 - **Destroy only on a positive fact (ENG-654).** The passes that delete durable state never infer "finished" from absence. A lease missing from the sweep's `chainLeases` proves nothing on its own: that map is built from two non-atomic queries filtered to `PENDING`/`ACTIVE`, so absence covers terminal, never-known, and just-created alike. Orphan deprovision and orphaned-payload cleanup therefore re-read the lease (`GetLease`) per candidate and act only on a positively reported `CLOSED`/`REJECTED`/`EXPIRED`; a query error, an `UNSPECIFIED` state, or a chain with no record of the lease all keep the state and bump `fred_reconciler_cleanup_skips_total`. The last of those is not a corner case — `x/billing` never deletes a lease, so "no record" means a phantom provision, a wrong or reset chain, or a lagging RPC node, and treating it as terminal would let one bad endpoint deprovision the fleet. Placement pruning asks a different question, per record rather than per sweep: it prunes only what the record's **own** backend accounted for on both `/provisions` and `/retentions`. Between them these replace the fleet-wide completeness gate ENG-356 left on all three passes, under which one silent machine paused cleanup — and stranded admission capacity — for every healthy one.
 
@@ -365,9 +371,9 @@ The startup order is critical to avoid race conditions:
    - Periodic reconciler
 ```
 
-**Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to Fred's API. If the API server isn't listening yet, callbacks fail with "connection refused". If the provision manager's Watermill handlers aren't subscribed yet, callbacks fail with "No subscribers to send message".
+**Why this order matters:** Startup reconciliation detects unprovisioned leases and sends provision requests to backends. Backends respond with callbacks to Fred's API. If the API server isn't listening yet, callbacks fail with "connection refused". If the provision manager has not started, its callback admission gate is closed and its acknowledgment lanes are unavailable, so it deliberately returns 503 and the backend retains the durable delivery.
 
-**Ack batcher ordering:** the batcher's lanes are launched by `Manager.Start`, before `wmRouter.Run` subscribes the backend-callback handler, which is one of only two callers of `Acknowledge()`. The other is the reconciler, whose first ack happens in step 4, well after the `Running()` gate in step 2. Watermill's `Running()` is not the protecting edge here: `Router.Run` calls `RunHandlers`, which subscribes each handler and spawns its goroutine, and only then closes the running channel. The batcher runs on the manager's own lifecycle context (`m.stopCtx`, rooted at `context.Background()`), *not* on the ctx passed to `Start`. That keeps the lanes' lifetime exactly what it was before ENG-723, when `NewManager` started them on a bare `context.Background()`: `Close()` is what ends them. Deriving the context from `Start`'s ctx would instead couple lane teardown to a context `main` cancels partway through its shutdown sequence, several steps before it calls `Close()`. Constructing a `Manager` starts no goroutines.
+**Ack batcher ordering:** `Manager.Start` launches the batcher's lanes before opening synchronous callback admission and before `wmRouter.Run` starts chain/payload handlers. The reconciler is the other caller of `Acknowledge()`; its first ack happens in step 4, after the `Running()` gate in step 2. The batcher runs on the manager's own lifecycle context (`m.stopCtx`, rooted at `context.Background()`), *not* on the ctx passed to `Start`. That keeps the lanes' lifetime exactly what it was before ENG-723, when `NewManager` started them on a bare `context.Background()`: `Close()` is what ends them. Direct callbacks have a second manager-owned cancellation context; `Close()` closes admission, cancels admitted application, waits for it to drain, and only then stops the batcher. Constructing a `Manager` starts no goroutines.
 
 ### State Protection
 
@@ -387,7 +393,8 @@ The startup order is critical to avoid race conditions:
 6. Stop withdrawal scheduler (wait for in-flight tx)
 7. Close event subscriber
 8. Wait for all goroutines (with timeout)
-9. Close provision manager (cleanup Watermill + stores)
+9. Close provision manager (close callback admission, cancel/drain admitted
+   application, then clean up Watermill + stores)
 10. If timed out: additional 2s grace period for lingering components
 ```
 
@@ -556,6 +563,9 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
 - Writes an operation-scoped attempt after `RouteForProvision` picks a backend
   but before the backend call; promotes it to confirmed ownership only from an
   exact accepted/positive result
+- Persists the current typed lifecycle callback capability in a sibling bucket,
+  promotes it atomically with positive ownership, and retains it long enough to
+  authorize and then retire delayed teardown observations
 - Read by direct-routed tenant operations such as connection details, logs,
   release history, restart, update, and restore. Provision/status discovery keeps
   its bounded fan-out behavior
@@ -707,7 +717,8 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_background_cleanup_panics_total` | providerd | `token` |
 | | docker-backend | `callback`, `diagnostics`, `releases`, `retention` |
 | | k3s-backend | `callback`, `diagnostics`, `releases` (no retention store — retention is docker-only, ENG-325) |
-| `fred_background_goroutine_panics_total` | providerd only | `payload_writer`, `ack_batcher`, `withdraw_scheduler` |
+| `fred_background_goroutine_panics_total` | providerd | `payload_writer`, `ack_batcher`, `withdraw_scheduler` |
+| | docker-backend, k3s-backend | `callback_replay` |
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|

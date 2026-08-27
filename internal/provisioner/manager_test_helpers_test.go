@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -25,17 +26,40 @@ import (
 // explicit composition as Manager; none of these compatibility inputs can
 // reach a production HandlerSet.
 type testHandlerDeps struct {
-	ChainClient     ChainClient
-	Orchestrator    *ProvisionOrchestrator
-	EventOperations EventOperations
-	Operations      CallbackOperations
-	Tracker         InFlightTracker
-	Acknowledger    Acknowledger
-	PayloadStore    *payload.Store
-	Publisher       message.Publisher
-	BackendRouter   BackendRouter
-	Placement       CallbackPlacement
-	Callbacks       CallbackApplication
+	ChainClient        ChainClient
+	Orchestrator       *ProvisionOrchestrator
+	EventOperations    EventOperations
+	Operations         CallbackOperations
+	Tracker            InFlightTracker
+	Acknowledger       Acknowledger
+	PayloadStore       *payload.Store
+	Publisher          message.Publisher
+	BackendRouter      BackendRouter
+	Placement          CallbackPlacement
+	LifecycleAuthority CallbackLifecycleAuthority
+	CallbackEvents     CallbackEventSink
+	Callbacks          CallbackApplication
+}
+
+// denyCallbackLifecycleAuthority is the explicit fail-closed lifecycle port
+// for unit fixtures that are not exercising an authorized lifecycle callback.
+// Production Manager always supplies its durable placement store; keeping this
+// non-nil in the compatibility composer prevents an unrelated missing
+// dependency from obscuring the behavior a unit test actually targets.
+type denyCallbackLifecycleAuthority struct{}
+
+func (denyCallbackLifecycleAuthority) AuthorizeLifecycle(
+	string,
+	lifecycle.ID,
+) placement.LifecycleAuthorization {
+	return placement.LifecycleAuthorization{}
+}
+
+func (denyCallbackLifecycleAuthority) RetireLifecycle(
+	string,
+	lifecycle.ID,
+) (placement.LifecycleAuthorization, error) {
+	return placement.LifecycleAuthorization{}, nil
 }
 
 type testProvisionStartSink struct {
@@ -90,6 +114,22 @@ func composeTestHandlerSet(t testing.TB, deps testHandlerDeps) *HandlerSet {
 
 	callbacks := deps.Callbacks
 	if callbacks == nil && callbackOperations != nil {
+		lifecycleAuthority := deps.LifecycleAuthority
+		if lifecycleAuthority == nil && deps.Orchestrator != nil {
+			lifecycleAuthority, _ = deps.Orchestrator.placementStore.(CallbackLifecycleAuthority)
+		}
+		if lifecycleAuthority == nil {
+			lifecycleAuthority = denyCallbackLifecycleAuthority{}
+		}
+		callbackEvents := deps.CallbackEvents
+		if callbackEvents == nil {
+			// Older handler-unit fixtures observe their adapter output as Watermill
+			// messages. Tests of the production ordering boundary inject a direct
+			// callback sink explicitly, as Manager does.
+			callbackEvents = callbackEventSinkFunc(func(leaseUUID string, status backend.ProvisionStatus, failure string) {
+				publishLeaseStatusEvent(deps.Publisher, leaseUUID, status, failure)
+			})
+		}
 		var deprovisionObserver CallbackDeprovisionObserver
 		if deps.Orchestrator != nil {
 			deprovisionObserver = callbackDeprovisionObserverFunc(
@@ -98,14 +138,13 @@ func composeTestHandlerSet(t testing.TB, deps testHandlerDeps) *HandlerSet {
 		}
 		var err error
 		callbacks, err = NewCallbackService(CallbackServiceConfig{
-			Operations:   callbackOperations,
-			Chain:        deps.ChainClient,
-			Acknowledger: deps.Acknowledger,
-			Placement:    deps.Placement,
-			Payloads:     deps.PayloadStore,
-			Events: callbackEventSinkFunc(func(leaseUUID string, status backend.ProvisionStatus, failure string) {
-				publishLeaseStatusEvent(deps.Publisher, leaseUUID, status, failure)
-			}),
+			Operations:          callbackOperations,
+			Chain:               deps.ChainClient,
+			Acknowledger:        deps.Acknowledger,
+			Placement:           deps.Placement,
+			LifecycleAuthority:  lifecycleAuthority,
+			Payloads:            deps.PayloadStore,
+			Events:              callbackEvents,
 			Backends:            deps.BackendRouter,
 			DeprovisionObserver: deprovisionObserver,
 		})
@@ -812,6 +851,20 @@ func (a *testPlacementAuthorityAdapter) RefuseOperation(
 		return false, err
 	}
 	return true, nil
+}
+
+func (a *testPlacementAuthorityAdapter) AuthorizeLifecycle(
+	leaseUUID string,
+	id lifecycle.ID,
+) placement.LifecycleAuthorization {
+	return a.authority.AuthorizeLifecycle(leaseUUID, id)
+}
+
+func (a *testPlacementAuthorityAdapter) RetireLifecycle(
+	leaseUUID string,
+	id lifecycle.ID,
+) (placement.LifecycleAuthorization, error) {
+	return a.authority.RetireLifecycle(leaseUUID, id)
 }
 
 func (a *testPlacementAuthorityAdapter) DeleteRecord(

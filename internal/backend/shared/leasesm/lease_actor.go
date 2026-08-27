@@ -328,6 +328,11 @@ type LeaseActor struct {
 	// SM permits at most one in-flight replace at a time and the actor is
 	// serial — same discipline as pendingDeathInfo.
 	replaceWasActive bool
+	// replaceCallbackKind distinguishes provision/restore operation completion
+	// from restart/update lifecycle observation. It is set by the serial actor
+	// with the replace entry transition and consumed by the terminal entry
+	// action, so callback classification never depends on URL inspection.
+	replaceCallbackKind replaceCallbackKind
 	// workers tracks every worker goroutine spawned by this actor
 	// (provision, restart, update, diag). The actor's run-loop exit path
 	// waits on workers.Zero() BEFORE the registry-delete / close-done /
@@ -781,11 +786,12 @@ func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
 		msg.Ack <- errActorTerminated
 		return
 	}
-	// onEnterRestarting writes Status=Restarting and the callback pair
-	// inside this Fire, before the ack — preserving the handler-publish contract.
+	// onEnterRestarting writes Status=Restarting and the prevalidated callback
+	// pair inside this Fire, before the ack — preserving the handler-publish contract.
 	if err := a.fireAndVerify(evRestartRequested, backend.ProvisionStatusRestarting,
 		replaceEntryArgs{
 			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+			CallbackKind: replaceCallbackLifecycle,
 		}); err != nil {
 		// A concurrent same-lease restart that lost the race finds the SM
 		// already busy → classifyReplaceReject returns ErrInvalidState (409).
@@ -823,6 +829,7 @@ func (a *LeaseActor) handleRestoreRequested(msg RestoreRequestedMsg) {
 	if err := a.fireAndVerify(evRestoreRequested, backend.ProvisionStatusRestarting,
 		replaceEntryArgs{
 			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+			CallbackKind: replaceCallbackOperation,
 		}); err != nil {
 		// Restore is permitted only from Provisioning; from any other state
 		// (e.g. a duplicate after the SM already left Provisioning, or a
@@ -843,11 +850,12 @@ func (a *LeaseActor) handleUpdateRequested(msg UpdateRequestedMsg) {
 		msg.Ack <- errActorTerminated
 		return
 	}
-	// onEnterUpdating writes Status=Updating and the callback pair inside
-	// this Fire, before the ack — preserving the handler-publish contract.
+	// onEnterUpdating writes Status=Updating and the prevalidated callback pair
+	// inside this Fire, before the ack — preserving the handler-publish contract.
 	if err := a.fireAndVerify(evUpdateRequested, backend.ProvisionStatusUpdating,
 		replaceEntryArgs{
 			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+			CallbackKind: replaceCallbackLifecycle,
 		}); err != nil {
 		// A concurrent same-lease update that lost the race finds the SM
 		// already busy → classifyReplaceReject returns ErrInvalidState (409).

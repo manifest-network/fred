@@ -453,9 +453,10 @@ func (b *Backend) dnsGateAllows(ctx context.Context, domain string) bool {
 // at it (ENG-765 — a field only tests read is test scaffolding in a
 // production struct).
 func newCallbackHTTPClient(cfg Config, logger *slog.Logger) *http.Client {
-	c := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// CallbackSender installs the protocol delivery deadline on every request.
+	// Keep the client-wide timeout unset so that request context is the only
+	// authority and cannot be shortened independently.
+	c := &http.Client{}
 	if cfg.CallbackInsecureSkipVerify {
 		logger.Error("INSECURE: callback TLS verification disabled — do NOT use in production")
 		c.Transport = &http.Transport{
@@ -628,6 +629,9 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 		OnStoreError: func() {
 			callbackStoreErrorsTotal.Inc()
 		},
+		OnReplayPanic: func(any) {
+			background.GoroutinePanicsTotal.WithLabelValues("callback_replay").Inc()
+		},
 	})
 
 	// Wire the substrate-agnostic seams the lease state machine consumes.
@@ -731,8 +735,11 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.logRetentionBudgetSanity()
 	b.startRetentionReaper()
 
-	// Replay any pending callbacks from a previous run
-	b.callbackSender.ReplayPendingCallbacks()
+	// Replay callbacks on the tracked lifecycle goroutine. A Fred outage can
+	// consume the full delivery retry budget, so replay must not delay backend
+	// readiness. Stop cancels the sender context and waits for this goroutine
+	// before closing the callback store.
+	b.wg.Go(b.callbackSender.RunReplayLoop)
 
 	// Start periodic reconciliation (using WaitGroup.Go for Go 1.25+)
 	b.wg.Go(b.reconcileLoop)
@@ -859,12 +866,10 @@ func (b *Backend) Health(ctx context.Context) error {
 	return nil
 }
 
-// sendCallback resolves the callback URL from the provisions map and delegates
-// to sendCallbackWithURL. Use this when the provision is still in the map. It
-// always passes retained=false: only the deprovision retain-success path (which
-// uses sendCallbackWithURL directly, since the map entry is being deleted)
-// carries retained=true.
-func (b *Backend) sendCallback(leaseUUID string, status backend.CallbackStatus, errMsg string) {
+// sendOperationCallback resolves the exact operation callback URL from the
+// provisions map and delegates to sendOperationCallbackWithURL. Use this when
+// the provision is still in the map.
+func (b *Backend) sendOperationCallback(leaseUUID string, status backend.CallbackStatus, errMsg string) {
 	b.provisionsMu.RLock()
 	var callbackURL string
 	if prov, ok := b.provisions[leaseUUID]; ok {
@@ -872,21 +877,29 @@ func (b *Backend) sendCallback(leaseUUID string, status backend.CallbackStatus, 
 	}
 	b.provisionsMu.RUnlock()
 
-	b.sendCallbackWithURL(leaseUUID, callbackURL, status, errMsg, false)
+	b.sendOperationCallbackWithURL(leaseUUID, callbackURL, status, errMsg)
 }
 
-// sendCallbackWithURL dispatches a callback using a caller-provided URL,
-// bypassing the provisions map. Use when the map entry is about to be deleted
-// (or is being deleted under the write lock) and the URL has been captured
-// earlier. retained is best-effort ground truth threaded into the payload; it
-// is true only on the deprovision retain-success path.
-func (b *Backend) sendCallbackWithURL(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string, retained bool) {
+// sendOperationCallbackWithURL dispatches an exact requested-operation
+// completion using a caller-provided URL.
+func (b *Backend) sendOperationCallbackWithURL(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string) {
 	// Truncate error to fit the on-chain rejection reason limit.
 	if len(errMsg) > callbackMaxErrorLen {
 		errMsg = errMsg[:callbackMaxErrorLen-3] + "..."
 	}
 
-	b.callbackSender.SendCallback(leaseUUID, callbackURL, b.Name(), status, errMsg, retained)
+	b.callbackSender.SendOperationCallback(leaseUUID, callbackURL, b.Name(), status, errMsg)
+}
+
+// sendLifecycleCallbackWithURL dispatches a typed, observation-only
+// lifecycle callback. retained is true only for successful retained teardown.
+func (b *Backend) sendLifecycleCallbackWithURL(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string, retained bool) {
+	// Truncate error to fit the on-chain rejection reason limit.
+	if len(errMsg) > callbackMaxErrorLen {
+		errMsg = errMsg[:callbackMaxErrorLen-3] + "..."
+	}
+
+	b.callbackSender.SendLifecycleCallback(leaseUUID, callbackURL, b.Name(), status, errMsg, retained)
 }
 
 // removeProvision removes a provision reservation. Used when pre-flight

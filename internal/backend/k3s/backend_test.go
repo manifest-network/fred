@@ -26,6 +26,8 @@ import (
 // failed callback deliveries. Mirrors docker/provision_test.go:64.
 var zeroBackoff = [shared.CallbackMaxAttempts]time.Duration{}
 
+const testCallbackAttemptTimeout = 5 * time.Second
+
 // testCallbackSecret is the HMAC secret the fake Fred receiver uses to
 // verify inbound callbacks. 32 chars to satisfy Config.Validate's floor.
 const testCallbackSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -61,19 +63,20 @@ func newBackendForTest(t *testing.T, fredURL string) *Backend {
 }
 
 // rebuildCallbackSender swaps b.callbackSender for one configured with
-// zeroBackoff and a short-timeout HTTP client. Same-package access lets
+// zeroBackoff and a scaled per-request attempt timeout. Same-package access lets
 // us replace a production field without production carrying a seam for
 // it; the client is a local here, because a *Backend field only tests
 // read would be test scaffolding in a production struct (ENG-765).
 func rebuildCallbackSender(b *Backend) {
-	httpClient := &http.Client{Timeout: 5 * time.Second}
+	httpClient := &http.Client{}
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
-		Store:      b.callbackStore,
-		HTTPClient: httpClient,
-		Secret:     string(b.cfg.CallbackSecret),
-		Logger:     b.logger,
-		StopCtx:    b.stopCtx,
-		Backoff:    &zeroBackoff,
+		Store:          b.callbackStore,
+		HTTPClient:     httpClient,
+		Secret:         string(b.cfg.CallbackSecret),
+		Logger:         b.logger,
+		StopCtx:        b.stopCtx,
+		Backoff:        &zeroBackoff,
+		AttemptTimeout: testCallbackAttemptTimeout,
 	})
 }
 
@@ -191,7 +194,8 @@ func TestNewCallbackHTTPClient(t *testing.T) {
 	t.Run("verification on by default", func(t *testing.T) {
 		c := newCallbackHTTPClient(validConfig(), slog.Default())
 		require.NotNil(t, c)
-		assert.Equal(t, 30*time.Second, c.Timeout)
+		assert.Zero(t, c.Timeout,
+			"CallbackSender's per-request context must be the sole timeout authority")
 		assert.Nil(t, c.Transport,
 			"default client must use the stdlib transport, which verifies TLS")
 	})
@@ -202,7 +206,8 @@ func TestNewCallbackHTTPClient(t *testing.T) {
 
 		c := newCallbackHTTPClient(cfg, slog.Default())
 		require.NotNil(t, c)
-		assert.Equal(t, 30*time.Second, c.Timeout)
+		assert.Zero(t, c.Timeout,
+			"CallbackSender's per-request context must be the sole timeout authority")
 		tr, ok := c.Transport.(*http.Transport)
 		require.True(t, ok, "transport must be an *http.Transport")
 		require.NotNil(t, tr.TLSClientConfig)
@@ -227,6 +232,10 @@ func TestBackend_Name_ReturnsCfgName(t *testing.T) {
 func TestProvision_RejectsInvalidRequests(t *testing.T) {
 	fred, _ := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	const (
+		callbackID = "550e8400-e29b-41d4-a716-446655440000"
+		otherID    = "123e4567-e89b-42d3-a456-426614174000"
+	)
 
 	tests := []struct {
 		name    string
@@ -242,6 +251,25 @@ func TestProvision_RejectsInvalidRequests(t *testing.T) {
 			name:    "empty callback_url",
 			req:     backend.ProvisionRequest{LeaseUUID: "lease-1", Items: []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}}},
 			wantMsg: "callback_url is required",
+		},
+		{
+			name: "lifecycle authority in operation callback_url",
+			req: backend.ProvisionRequest{
+				LeaseUUID:   "lease-1",
+				CallbackURL: fred.URL + "?lifecycle_id=" + callbackID,
+				Items:       []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}},
+			},
+			wantMsg: "invalid lifecycle callback URL",
+		},
+		{
+			name: "mismatched explicit lifecycle callback_url",
+			req: backend.ProvisionRequest{
+				LeaseUUID:            "lease-1",
+				CallbackURL:          fred.URL + "?operation_id=" + callbackID,
+				LifecycleCallbackURL: fred.URL + "?lifecycle_id=" + otherID,
+				Items:                []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}},
+			},
+			wantMsg: "invalid lifecycle callback URL",
 		},
 		{
 			name:    "empty items",
@@ -384,12 +412,13 @@ func TestDeprovision_RemovesPendingCallback(t *testing.T) {
 	// delivery hasn't succeeded yet". Bypasses Provision so the goroutine-
 	// timing path stays out of the test.
 	entry := shared.CallbackEntry{
-		LeaseUUID:   "lease-1",
-		CallbackURL: fred.URL + "/callbacks/provision",
-		Status:      backend.CallbackStatusFailed,
-		Backend:     b.cfg.Name,
-		Error:       "not implemented",
-		CreatedAt:   time.Now(),
+		LeaseUUID:    "lease-1",
+		CallbackURL:  fred.URL + "/callbacks/provision",
+		DeliveryKind: shared.CallbackDeliveryKindOperation,
+		Status:       backend.CallbackStatusFailed,
+		Backend:      b.cfg.Name,
+		Error:        "not implemented",
+		CreatedAt:    time.Now(),
 	}
 	require.NoError(t, b.callbackStore.Store(entry))
 
@@ -402,6 +431,52 @@ func TestDeprovision_RemovesPendingCallback(t *testing.T) {
 	pending, err = b.callbackStore.ListPending()
 	require.NoError(t, err)
 	assert.Empty(t, pending, "Deprovision must drop the pending callback so ReplayPendingCallbacks won't fire a stale status=failed")
+}
+
+func TestDeprovision_SerializesWithInFlightCallbackDelivery(t *testing.T) {
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var once sync.Once
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() {
+			close(callbackStarted)
+			<-releaseCallback
+		})
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(callbackServer.Close)
+	b := newBackendForTest(t, callbackServer.URL)
+
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", callbackServer.URL)))
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("stub provision callback did not begin delivery")
+	}
+
+	deprovisionDone := make(chan error, 1)
+	go func() { deprovisionDone <- b.Deprovision(context.Background(), "lease-1") }()
+	select {
+	case err := <-deprovisionDone:
+		t.Fatalf("deprovision bypassed the callback sender's in-flight lease lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseCallback)
+	select {
+	case err := <-deprovisionDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("deprovision did not finish after callback delivery released")
+	}
+
+	pending, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending,
+		"sender-owned cancellation must remove the failed in-flight callback after its drain releases")
+	provisions, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, provisions)
 }
 
 // --- GetProvision contract (architect's required test set) ---------------
@@ -716,8 +791,8 @@ func TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic(t *testin
 // covers ENG-189 case (c): a Deprovision that wins the lock between
 // the diagnostic store call and the callback send must cancel the
 // per-lease ctx; the worker's checkpoint-2 ctx.Err() check must
-// observe the cancellation and skip SendCallback (and therefore
-// also skip the bbolt persist that SendCallback would otherwise do
+// observe the cancellation and skip SendOperationCallback (and therefore
+// also skip the bbolt persist that SendOperationCallback would otherwise do
 // before delivery).
 //
 // The diagnostic IS allowed to persist — it was written before the
@@ -759,7 +834,7 @@ func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *test
 	assert.Equal(t, stubProvisionerErrMsg, diag.Error)
 
 	// The callback was guarded by ctx.Err() at checkpoint 2, so
-	// SendCallback must have been skipped — no bbolt persist, no HTTP POST.
+	// SendOperationCallback must have been skipped — no bbolt persist, no HTTP POST.
 	select {
 	case got := <-callbacks:
 		t.Fatalf("expected no callback after ctx cancel pre-callback, got: %+v", got)

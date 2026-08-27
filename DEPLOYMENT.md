@@ -232,7 +232,7 @@ The HMAC `callback_secret` is shared between `providerd` and every backend. Beca
 
 1. Stop traffic (or accept brief 401s during rotation).
 2. Update `callback_secret` in `config.yaml` and **every** `docker-backend.yaml`.
-3. Restart **every `docker-backend`** first, then `providerd` last. Rationale: with a fleet of backends, the rolling restart is the longer operation; finishing with `providerd` minimizes the total window where the old and new secrets are both in play. During the rotation window, in-flight requests in both directions will see 401s — the backend's persistent callback queue and Watermill's redelivery on the providerd side recover automatically once both ends are on the new secret.
+3. Restart **every `docker-backend`** first, then `providerd` last. Rationale: with a fleet of backends, the rolling restart is the longer operation; finishing with `providerd` minimizes the total window where the old and new secrets are both in play. During the rotation window, in-flight requests in both directions will see 401s; each backend keeps callback deliveries in its durable per-lease outbox and retries once both ends use the new secret.
 4. Verify with a test provision.
 
 There is no built-in support for two-secret rotation (active + previous), so
@@ -466,17 +466,24 @@ starts.
 
 The placement database is forward-compatible: when the new providerd opens it,
 unambiguous v0.13.0 `{backend,set_at}` owners are atomically assigned typed
-record revisions. Ambiguous, malformed, or otherwise unusable records remain
-byte-for-byte fail-closed. Configure a writable `placement_store_db_path` and
+record revisions and an explicit ID-empty legacy lifecycle binding. Fred does
+not mint a bearer capability that the existing backend never received; the
+binding becomes typed only after a later exact operation distributes and
+confirms the paired lifecycle URL. Ambiguous, malformed, or otherwise unusable
+records remain fail-closed. Configure a writable `placement_store_db_path` and
 take a stopped-process backup before upgrading.
 
 The new backend binaries accept v0.13.0 tokenless callback URLs, so roll every
 backend one at a time while the old providerd remains online. Complete that
 backend-first rollout before the provider cutover. A v0.13.0 backend can accept
-the new additive request fields, but it does not persist the separate
+the new additive request fields, but it does not persist the separate typed
 `lifecycle_callback_url`; leaving one in the fleet would keep suppressing later
-runtime-failure, deprovisioned, and retained observations after the exact
-provision/restore operation expires.
+restart/update completion, runtime-failure, deprovisioned, and retained
+observations after the exact provision/restore operation expires. The same
+ordering installs the new
+two-minute-fifteen-second callback delivery deadline before providerd begins
+using synchronous application with its two-minute budget; an old ten-second
+sender must not be the durability owner during that cutover.
 
 Before taking the rollback snapshot, remove tenant API ingress, pause the
 chain-facing path tenants use to create, close, or otherwise mutate leases, and
@@ -514,14 +521,35 @@ witness: it requires the same durable topology baseline, live-routes within that
 topology using backend stats, and records its exact write-ahead attempt before
 dispatch. Inventory silence never clears an attempt or conflict in either path.
 
-The callback URL is wire-compatible with v0.13.0 backends: the existing path is
-unchanged and the typed canonical UUIDv4 operation ID is an additive `operation_id` query
-parameter. Backends must continue treating the complete callback URL as opaque
-and must sign the complete request URI when posting it. The operation registry
-is intentionally process-local, so callbacks already queued across the provider
-restart do not regain lifecycle authority: tokenless v0.13.0 callbacks remain a
-status-only compatibility path, and callbacks naming an operation from the old
-process are acknowledged but ignored. Complete backend inventory and
+The callback upgrade is wire-compatible in one deliberate direction: **upgrade
+every backend before upgrading providerd**. A new backend accepts the v0.13.0
+request shape, derives a tokenless lifecycle route from its operationless
+`callback_url`, and persists that route. When providerd is upgraded afterward,
+the matching confirmed placement migrates as an explicitly legacy owner, so
+existing workloads keep reporting lifecycle observations without container
+replacement or downtime.
+
+Do not reverse that rolling order. A v0.13.0 backend preserves a new
+`operation_id` URL well enough to report the original provision/restore result,
+but it does not understand `lifecycle_callback_url`; it reuses the now-expired
+operation URL for later restart, failure, and teardown observations, which the
+new provider correctly acknowledges and ignores as stale. Upgrade and restart
+the backend fleet first, verify it has recovered its existing provisions, and
+only then start the new providerd.
+
+New exact completion URLs add a canonical UUIDv4 `operation_id`; current
+lifecycle URLs add a separately typed `lifecycle_id`. Backends must continue
+treating either complete URL as opaque and sign the complete request URI when
+posting it. The exact operation registry is intentionally process-local, so a
+callback naming an unfinished operation from the old process is acknowledged
+but ignored. In contrast, confirmed lifecycle capability bindings are durable
+in the placement database and remain valid across provider restarts. Tokenless
+v0.13.0 callbacks remain a status-only compatibility path only for owners
+explicitly migrated as legacy. When no matching confirmed placement owner
+remains, either kind narrows to teardown-only authority: runtime observations
+are ignored, maintenance cannot reissue it, and only exact terminal
+deprovision can durably retire it before the best-effort retained notice.
+Complete backend inventory and
 level-triggered reconciliation recover only from positive backend evidence;
 absence never clears an ambiguous pre-restart attempt or conflict.
 
@@ -538,15 +566,17 @@ absence never clears an ambiguous pre-restart attempt or conflict.
 > forward-fix.
 
 The docker backend's callback queue has its own rollback boundary. New binaries
-write independent deliveries to a `pending_callbacks_v2` bucket so an exact
-operation completion cannot be overwritten by a later lifecycle observation.
-v0.13.0 intentionally ignores that bucket: rolling only the backend binary back
-does not create a replay loop, but v2 callbacks remain undelivered until the new
-binary is restored. Preserve the current `callbacks.db` if they must survive for
-later forward recovery; restoring the pre-upgrade snapshot discards callbacks
-queued after that snapshot. An old binary cannot deliver v2 entries, so a pending
-exact completion that matters is another reason to forward-fix rather than
-downgrade.
+write explicitly typed deliveries with a durable monotonic sequence to a
+`pending_callbacks_v2` bucket. Exact operation completions remain FIFO;
+newer lifecycle observations coalesce only older typed lifecycle observations,
+and cannot pass an older exact, legacy, or pre-sequence entry for that lease.
+The queue retries during runtime as well as at startup. v0.13.0 intentionally
+ignores the v2 bucket: rolling only the backend binary back does not create a
+replay loop, but v2 callbacks remain undelivered until the new binary is
+restored. Preserve the current `callbacks.db` if they must survive for later
+forward recovery; restoring the pre-upgrade snapshot discards callbacks queued
+after that snapshot. An old binary cannot deliver v2 entries, so a pending exact
+completion that matters is another reason to forward-fix rather than downgrade.
 
 Schema compatibility is store-specific; the bbolt files carry no global schema
 version or automatic downgrade guard. In particular, the placement store retains

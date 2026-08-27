@@ -103,6 +103,17 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 	return b.routeReplaceRestart(ctx, req.LeaseUUID, req.CallbackURL, nil)
 }
 
+// resolveMaintenanceCallbackURLs validates a trusted maintenance route against
+// the authority already persisted with a lease. The callback base may move, but
+// typed identity can never rotate or downgrade; legacy routes remain tokenless.
+func resolveMaintenanceCallbackURLs(
+	callbackURL, lifecycleCallbackURL, requestedLifecycleURL string,
+) (string, string, error) {
+	return backend.ResolveMaintenanceCallbackURLs(
+		callbackURL, lifecycleCallbackURL, requestedLifecycleURL,
+	)
+}
+
 // routeReplaceRestart is the shared restart routing used by the public Restart
 // (overrides == nil) and by ReconcileCustomDomain (overrides carries the
 // per-ServiceName custom_domain changes). The SEAM-CLOSED (ENG-230) prelude is
@@ -117,10 +128,6 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 // entry action via OnSuccess (ENG-231).
 func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackURL string, overrides map[string]string) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
-	lifecycleCallbackURL, callbackErr := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	if callbackErr != nil {
-		return fmt.Errorf("%w: %w", backend.ErrValidation, callbackErr)
-	}
 
 	b.provisionsMu.Lock()
 	prov, exists := b.provisions[leaseUUID]
@@ -136,6 +143,13 @@ func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackUR
 	if prov.StackManifest == nil {
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: no stored manifest for restart (pre-migration legacy lease?)", backend.ErrInvalidState)
+	}
+	callbackURL, lifecycleCallbackURL, callbackErr := resolveMaintenanceCallbackURLs(
+		prov.CallbackURL, prov.LifecycleCallbackURL, callbackURL,
+	)
+	if callbackErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: maintenance lifecycle callback: %w", backend.ErrValidation, callbackErr)
 	}
 	stackManifest := prov.StackManifest
 	containerIDs := append([]string(nil), prov.ContainerIDs...)
@@ -170,9 +184,10 @@ func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackUR
 	}
 
 	// Hand off to the lease actor. The actor's onEnterRestarting writes
-	// Status=Restarting and both callback URLs BEFORE acking, then spawns the replace
-	// worker. On success, onEnterReadyFromReplaceCompleted runs onSuccess (the
-	// prov.Items custom_domain commit) under UpdateFn, atomic with Status->Ready.
+	// Status=Restarting and, when requested, moves the callback pair to a new base
+	// without changing its validated identity before acking. On success,
+	// onEnterReadyFromReplaceCompleted runs onSuccess (the prov.Items
+	// custom_domain commit) under UpdateFn, atomic with Status->Ready.
 	opCtx, opCancel := b.shutdownAwareContext()
 	onSuccess := customDomainOnSuccess(overrides)
 	work := func() leasesm.ReplaceResult {
@@ -581,16 +596,12 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, reason backend.Reason
 // Like Restart, the prelude is read-only: it fast-fails / validates
 // under provisionsMu, snapshots fields, then records the release. It
 // performs NO write to prov.Status or either callback URL — the actor's
-// onEnterUpdating entry action is the sole writer, firing inside
+// onEnterUpdating entry action is the sole status writer, firing inside
 // handleUpdateRequested BEFORE the ack, so the "Update() returns =>
 // Status is Updating" contract holds without an off-actor write. No
 // rollback is needed on any failure path (nothing on prov was mutated).
 func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
-	lifecycleCallbackURL, callbackErr := backend.ResolveLifecycleCallbackURL(req.CallbackURL, "")
-	if callbackErr != nil {
-		return fmt.Errorf("%w: %w", backend.ErrValidation, callbackErr)
-	}
 
 	// Synchronous phase: read-only validation + field snapshot (no
 	// prov.Status or callback URL writes — ENG-230).
@@ -604,6 +615,13 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		status := prov.Status
 		b.provisionsMu.Unlock()
 		return fmt.Errorf("%w: cannot update from status %s", backend.ErrInvalidState, status)
+	}
+	callbackURL, lifecycleCallbackURL, callbackErr := resolveMaintenanceCallbackURLs(
+		prov.CallbackURL, prov.LifecycleCallbackURL, req.CallbackURL,
+	)
+	if callbackErr != nil {
+		b.provisionsMu.Unlock()
+		return fmt.Errorf("%w: maintenance lifecycle callback: %w", backend.ErrValidation, callbackErr)
 	}
 
 	// Boundary normalization: prov.Items must be populated (it is set at
@@ -693,7 +711,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	}
 
 	// Hand off to the actor. The actor's onEnterUpdating writes Status=Updating
-	// and both callback URLs BEFORE acking. See
+	// and the prevalidated same-authority callback pair BEFORE acking. See
 	// handleUpdateRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
@@ -704,7 +722,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		Cancel:               opCancel,
 		Work:                 work,
 		Ack:                  ack,
-		CallbackURL:          req.CallbackURL,
+		CallbackURL:          callbackURL,
 		LifecycleCallbackURL: lifecycleCallbackURL,
 	}); routeErr != nil {
 		opCancel()

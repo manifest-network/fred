@@ -917,7 +917,7 @@ type CreateContainerParams struct {
 	// sent after a docker-backend restart (when in-memory state is lost).
 	CallbackURL string
 
-	// LifecycleCallbackURL is the tokenless observational endpoint used only
+	// LifecycleCallbackURL is the typed observational endpoint used only
 	// after provisioning/restoration, for autonomous failure and teardown
 	// events. It is persisted separately so restart recovery cannot resurrect
 	// an expired operation capability as the lifecycle route.

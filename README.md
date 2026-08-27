@@ -296,6 +296,13 @@ These options have sensible defaults but can be tuned for specific environments:
 | `credit_check_zero_grace_period` | How long a tenant's credit must stay empty before its leases are auto-closed. A single stale zero read (e.g. the chain node briefly lagging a top-up) is absorbed: closure only fires once the empty balance persists for this whole window, and any non-zero read clears it. Lower = faster reclaim of unpaid leases; higher = more tolerance for transient chain-node lag before soft-deleting tenant data. `0s` uses the 5m default. | `5m` |
 | `shutdown_timeout` | Maximum time for graceful shutdown (drain + cleanup) | `30s` |
 
+The callback route has a separate two-minute application budget because a
+terminal result may include chain settlement. It extends the connection write
+deadline for that request only; `http_write_timeout` and the generic 30-second
+request middleware continue to govern the other HTTP routes. Bundled backends
+wait an additional 15 seconds per delivery attempt, so providerd always returns
+a retryable 503 before the sender can time out.
+
 ### TLS Configuration
 
 See [SECURITY.md](SECURITY.md#transport-security) for TLS configuration details (API server HTTPS, gRPC to chain).
@@ -858,7 +865,13 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
 
 **Behavior:**
 - Events are delivered as WebSocket JSON frames
-- Events are best-effort notifications, not an ordered state log. An exact operation-ID callback is ignored after its operation ends or is replaced, so it cannot publish stale status. Tokenless lifecycle, v0.13 compatibility, and restart/update callbacks are observation-only and may still arrive out of order. Use the REST status endpoints for current state.
+- Events are best-effort notifications, not a globally ordered state log. An
+  exact operation-ID callback is ignored after its operation ends or is
+  replaced, so it cannot publish stale status. Bundled backends serialize each
+  lease's durable callback queue: exact completions remain FIFO, lifecycle
+  observations are latest-only, and synchronous provider application preserves
+  that relative order. Other event sources and custom/v0.13 backends do not
+  carry a global sequence; use the REST status endpoints for current state.
 - The server sends WebSocket ping frames every 30 seconds; the client must respond with pong within 40 seconds or the connection is closed
 - Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
 - The stream ends when the client disconnects or the server shuts down (clean close frame)
@@ -873,11 +886,18 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
 
 ```
 POST /callbacks/provision?operation_id=<uuid>
+POST /callbacks/provision?lifecycle_id=<uuid>
 Content-Type: application/json
 X-Fred-Signature: t=<unix-timestamp>,sha256=<hmac-sha256-hex>
 ```
 
-Called by backends to report provisioning status. Provision and restore callback URLs carry exactly one `operation_id` query parameter: a lowercase, hyphenated, canonical RFC-4122 UUIDv4. It must be preserved byte-for-byte; the HMAC covers the complete request URI, including this query. Requires HMAC-SHA256 authentication via the `X-Fred-Signature` header. See [SECURITY.md](SECURITY.md#callback-authentication-hmac-sha256) for signing details and replay protection.
+Called by backends to report operation results and later lease-lifecycle
+observations. Provision and restore completion URLs carry exactly one
+`operation_id`; their separately persisted lifecycle URLs carry exactly one
+`lifecycle_id`. Both are lowercase, hyphenated, canonical RFC-4122 UUIDv4
+values. Preserve the selected URL byte-for-byte: the HMAC covers the complete
+request URI, including its query. Requires HMAC-SHA256 authentication via the
+`X-Fred-Signature` header. See [SECURITY.md](SECURITY.md#callback-authentication-hmac-sha256) for signing details and replay protection.
 
 **Request:**
 ```json
@@ -892,29 +912,52 @@ Called by backends to report provisioning status. Provision and restore callback
 
 Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third is used by backends that perform autonomous deprovisioning, e.g. after a failed provision rollback).
 
-- `backend` (optional string) — legacy sender metadata used only for bounded metrics when no current operation exists. It need not equal Fred's configured router name and cannot authorize or redirect a typed callback; the HMAC-covered callback URL and current operation ID select the authoritative backend.
+- `backend` (optional string) — legacy sender metadata used only for bounded metrics when no current operation exists. It need not equal Fred's configured router name and cannot authorize or redirect a typed callback; the HMAC-covered callback URL plus Fred's exact-operation registry or durable lifecycle record select the authoritative backend.
 - `retained` (optional bool) — set `true` on a `deprovisioned` callback when the backend soft-deleted (retained) the lease's volumes instead of destroying them. Fred uses this to push the optimistic `retained` notice to the tenant; the queryable retained status (`GET /v1/leases/{uuid}/status`) is the durable backstop. Omitted/`false` means the volumes were destroyed.
 - `operation_id` in the JSON body, if sent by an older or custom backend, is untrusted metadata and is overwritten at ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
+- `lifecycle_id` in the JSON body is likewise overwritten. Fred authorizes the authenticated query only when it matches the current durable per-lease lifecycle capability and backend.
 
 **Response Codes:**
-- `200 OK` - Callback accepted for asynchronous processing; duplicates and stale exact-operation callbacks are also acknowledged so backends do not retry forever
-- `400 Bad Request` - Malformed JSON, lease UUID, status, or `operation_id` query. A present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected
+- `200 OK` - Callback synchronously reached a terminal application result, or
+  was terminally ignored as a duplicate/stale exact-operation callback; the
+  backend may advance this lease's durable callback queue
+- `400 Bad Request` - Malformed JSON, lease UUID, status, or callback capability query. `operation_id` and `lifecycle_id` are mutually exclusive; a present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected
 - `401 Unauthorized` - Missing or invalid signature
 - `429 Too Many Requests` - Global callback rate limit exceeded
-- `500 Internal Server Error` - Callback could not be published to the internal handler
-- `503 Service Unavailable` - Callback service/authenticator is not configured, or request processing timed out
+- `503 Service Unavailable` - Callback application is unavailable, not yet
+  started, shutting down, failed, or timed out; keep the delivery durable and
+  retry with backoff
+
+Callback application has a dedicated two-minute deadline. Bundled backends use
+a two-minute-fifteen-second per-attempt deadline, deliberately making the
+provider's 503 the first timeout. A backend must retain the FIFO head until a
+2xx response; a transport timeout or lost response is not delivery success.
+
+For a rolling upgrade from v0.13.0, upgrade and restart every backend before
+providerd. New backends accept the old operationless callback shape and persist
+its tokenless lifecycle route; the new provider then migrates the corresponding
+confirmed placement as legacy. The reverse order is not lifecycle-compatible:
+an old backend ignores `lifecycle_callback_url` and reuses the expired
+operation-scoped URL for later observations, which the new provider safely
+ignores.
 
 **Idempotency:**
 If a callback is received for a lease that has already been processed (no longer in-flight),
 the server still returns `200 OK`. A callback carrying an
 `operation_id` that is no longer current is ignored completely: it cannot publish
 status, acknowledge or reject the lease, retire teardown state, or mutate placement.
-Except when settling a current operation explicitly registered as legacy
-token-optional, tokenless callbacks are observation-only: they may publish
-best-effort status even while a typed provision or restore is current, but
-cannot settle that operation, mutate chain or placement state, or retire
-process-local teardown evidence. This is the path for the separate lifecycle
-callback URL, v0.13.0 compatibility, and restart/update callbacks.
+The current `lifecycle_id` is observation-only: it may publish successful
+maintenance (`ready`), runtime failure (`failed`), or retained teardown status,
+but cannot settle an exact operation or mutate chain/placement state. A
+deprovisioned observation atomically retires that capability. If no matching
+confirmed placement owner remains, the capability is teardown-only:
+success/failure is a 200 no-op, it cannot be reissued for maintenance, and only
+the exact deprovisioned observation may retire it and publish retained status.
+Retirement is durable before that best-effort push, so a process crash can lose
+the event but cannot resurrect authority; retention status remains queryable.
+A stale, missing,
+or retired ID is a 200 no-op. Tokenless callbacks are accepted only for durable
+owners migrated from v0.13.0 and retain the same observation-only limits.
 Response bodies are not guaranteed for this path, so callers should treat the HTTP status
 code as the source of truth.
 
@@ -972,7 +1015,7 @@ Start provisioning a resource (async).
     {"sku": "k8s-large", "quantity": 1}
   ],
   "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
-  "lifecycle_callback_url": "http://fred.example.com:8080/callbacks/provision",
+  "lifecycle_callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "<base64-encoded-bytes>",
   "payload_hash": "abc123..."
 }
@@ -981,7 +1024,7 @@ Start provisioning a resource (async).
 **Fields:**
 - `items` - Array of lease items with SKU and quantity. All items belong to the same provider.
 - `callback_url` - Exact operation-completion URL; preserve it byte-for-byte and use it only for this provision result.
-- `lifecycle_callback_url` - Tokenless URL for later autonomous failure and deprovision observations.
+- `lifecycle_callback_url` - Typed URL for later restart/update completion, autonomous failure, and deprovision observations.
 - `payload` - Optional base64-encoded deployment payload (only present if lease has meta_hash)
 - `payload_hash` - Optional hex-encoded SHA-256 hash of payload (only present with payload)
 
@@ -1100,7 +1143,7 @@ Restart containers for a lease without changing the manifest (async).
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "callback_url": "http://fred.example.com:8080/callbacks/provision"
+  "callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
@@ -1123,7 +1166,7 @@ Deploy a new manifest for a lease, replacing containers (async).
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "callback_url": "http://fred.example.com:8080/callbacks/provision",
+  "callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "<base64-encoded-manifest>",
   "payload_hash": "sha256-hex-string"
 }
@@ -1154,7 +1197,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
   "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
-  "lifecycle_callback_url": "http://fred.example.com:8080/callbacks/provision"
+  "lifecycle_callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
@@ -1307,7 +1350,7 @@ curl -X POST http://localhost:9000/provision \
     "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
     "items": [{"sku": "mock-resource", "quantity": 1}],
     "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
-    "lifecycle_callback_url": "http://localhost:8080/callbacks/provision"
+    "lifecycle_callback_url": "http://localhost:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
   }'
 ```
 
@@ -1393,8 +1436,8 @@ internal/
 ├── config/             # Configuration loading and validation
 ├── metrics/            # Prometheus metrics definitions
 ├── provisioner/        # Provision lifecycle application and runtime composition
-│   ├── manager.go      # Composition root and Watermill runtime ownership
-│   ├── handler_set.go  # Transport adapters from Watermill messages to application services
+│   ├── manager.go      # Composition root, callback admission, and runtime ownership
+│   ├── handler_set.go  # Internal message adapters to application services
 │   ├── orchestrator.go # Provision admission and backend dispatch
 │   ├── callback_service.go # Exact-operation callback authorization and settlement policy
 │   ├── restore/        # Atomic source/target restore application service
@@ -1409,7 +1452,7 @@ internal/
 │   ├── ack_batcher.go  # Batches lease acknowledgments
 │   ├── timeout_checker.go # Detects callback timeouts
 │   ├── leaseutil.go    # Lease helper utilities
-│   ├── topics.go       # Watermill topic name constants
+│   ├── topics.go       # Internal event topics and stable metric labels
 │   ├── payload/        # Lease-lifetime deployment payload storage (bbolt)
 │   ├── placement/      # Durable attempts, ownership, conflicts, and inventory authority
 │   ├── bridge.go       # Chain events -> Watermill

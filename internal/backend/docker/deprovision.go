@@ -605,7 +605,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			)
 
 			// Volume leak: operator must clean up manually. Not a retain-success.
-			b.sendCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted", false)
+			b.sendLifecycleCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted", false)
 			return nil
 		}
 
@@ -652,7 +652,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 
 	// Terminal success: carry the best-effort retained flag (true only when all
 	// volumes were soft-deleted into the retained namespace without error).
-	b.sendCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
+	b.sendLifecycleCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
 	return nil
 }
 

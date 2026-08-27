@@ -4,10 +4,13 @@
 // # Architecture
 //
 // Manager owns process lifetime and wires narrow consumer-owned ports. HandlerSet
-// adapts Watermill messages to application inputs; handlers do not own lifecycle
-// policy. ProvisionOrchestrator owns provision admission and backend dispatch,
-// CallbackService owns authenticated callback settlement policy, and the restore
-// package owns atomic source/target restore admission and dispatch.
+// adapts internal messages to application inputs; handlers do not own lifecycle
+// policy. Chain and payload messages run through Watermill. Authenticated backend
+// callbacks are applied synchronously so the backend's durable per-lease FIFO is
+// preserved through settlement and event delivery. ProvisionOrchestrator owns
+// provision admission and backend dispatch, CallbackService owns callback
+// settlement policy, and the restore package owns atomic source/target restore
+// admission and dispatch.
 //
 // The operation.Registry is the only process-local source of lifecycle operation
 // state. It issues typed OperationID values and opaque initiation, lease, token,
@@ -30,8 +33,10 @@
 //	TopicLeaseClosed      - Lease closed, deprovision resources
 //	TopicLeaseExpired     - Lease expired, deprovision resources
 //	TopicPayloadReceived  - Tenant uploaded payload, start provisioning
-//	TopicBackendCallback  - Backend reported provisioning result
 //	TopicLeaseEvent       - Real-time lease status events for WebSocket delivery
+
+// TopicBackendCallback remains only for the legacy message-shaped adapter;
+// production callbacks are not published through Watermill.
 //
 // # Reconciler
 //

@@ -603,7 +603,15 @@ func (s *Store) BeginOwnedAttempt(
 	existing.Attempt = backendName
 	existing.attemptOperationID = operationID
 	existing.revision = next
-	if err := s.put(revision.leaseUUID, existing, "begin exact-owner placement attempt"); err != nil {
+	capability, err := s.lifecycleWithAttemptLocked(
+		revision.leaseUUID, backendName, operationID,
+	)
+	if err != nil {
+		return AttemptToken{}, false, err
+	}
+	if err := s.putPlacementWithLifecycleLocked(
+		revision.leaseUUID, existing, capability, "begin exact-owner placement attempt",
+	); err != nil {
 		return AttemptToken{}, false, err
 	}
 	s.revision = next

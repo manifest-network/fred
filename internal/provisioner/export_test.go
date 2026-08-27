@@ -8,21 +8,32 @@ package provisioner
 import (
 	"time"
 
+	"github.com/ThreeDotsLabs/watermill/message"
+
 	"github.com/manifest-network/fred/internal/backend"
 )
 
-// handlersOf builds the HandlerSet that NewManager wires into the
-// Watermill router, from the same dependencies m already holds.
+// HandleBackendCallback preserves the old message-shaped test surface without
+// carrying a production method whose only callers are tests. Production HTTP
+// ingress already has a decoded DTO and calls HandleBackendCallbackPayload.
+func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
+	defer func() { recordWatermillMetrics(TopicBackendCallback, err) }()
+
+	callback, ok := unmarshalMessagePayload[backend.CallbackPayload](msg, TopicBackendCallback)
+	if !ok {
+		return nil
+	}
+	return h.handleBackendCallbackPayload(msg.Context(), callback)
+}
+
+// handlersOf builds a HandlerSet from the same dependencies Manager holds.
 //
-// NewManager keeps that set in a local and registers its methods as
-// router handlers; it deliberately keeps no field pointing at it, because
-// a field production writes and only tests read is test scaffolding in a
-// production struct (ENG-765). Tests that want to invoke a handler
-// directly — rather than by publishing a message and waiting on the
-// router — rebuild it here, through the production constructor, so this
-// stays honest if HandlerDeps grows a field: adding one to HandlerDeps
-// without adding it here yields a set the compiler accepts and the tests
-// exercise differently from production.
+// NewManager registers the chain and payload methods with Watermill and keeps
+// the callback method as its production synchronous ingress function. Older
+// manager tests that invoke an adapter directly rebuild the set here, through
+// the production constructors. Production callback ordering and direct event
+// delivery are covered through Manager.PublishCallback instead; this helper's
+// callback event sink intentionally retains the Watermill-shaped test fixture.
 //
 // Call this ONCE per test and reuse the result. HandlerSet carries mutable
 // state (awaitingPayload, which HandleLeaseCreated fills and the payload
@@ -31,11 +42,12 @@ import (
 // invocations in a test that spans more than one.
 func handlersOf(m *Manager) *HandlerSet {
 	callbacks, err := NewCallbackService(CallbackServiceConfig{
-		Operations:   m.operations,
-		Chain:        m.chainClient,
-		Acknowledger: m.ackBatcher,
-		Placement:    m.placementStore,
-		Payloads:     m.payloadStore,
+		Operations:         m.operations,
+		Chain:              m.chainClient,
+		Acknowledger:       m.ackBatcher,
+		Placement:          m.placementStore,
+		LifecycleAuthority: m.placementStore,
+		Payloads:           m.payloadStore,
 		Events: callbackEventSinkFunc(func(
 			leaseUUID string, status backend.ProvisionStatus, failure string,
 		) {

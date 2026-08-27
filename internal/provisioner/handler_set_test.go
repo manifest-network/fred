@@ -1568,7 +1568,7 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError(t *testing.T)
 	assert.False(t, tracker.IsInFlight("lease-1"))
 }
 
-func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError_PublishesReadyEvent(t *testing.T) {
+func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError_ActiveLeasePublishesReadyEvent(t *testing.T) {
 	pub := newMockPublisher()
 	ack := &mockAcknowledger{
 		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
@@ -1576,7 +1576,11 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError_PublishesRead
 		},
 	}
 	mb := &mockManagerBackend{name: "test-backend"}
-	mockChain := &chaintest.MockClient{}
+	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{State: billingtypes.LEASE_STATE_ACTIVE}, nil
+		},
+	}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil, pub)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
@@ -1770,17 +1774,33 @@ func TestHandlerSet_HandleBackendCallback_UnknownLease(t *testing.T) {
 // callbacks for non-in-flight leases (restart/update completions) publish a
 // status event so WebSocket clients see the ready/failed transition.
 func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.T) {
-	pub := newMockPublisher()
+	lifecycleAuthority := newTestPlacementAuthority(t)
+	seedTestConfirmedPlacements(t, lifecycleAuthority, []string{"test-backend"}, map[string]string{
+		"lease-restart":          "test-backend",
+		"lease-update":           "test-backend",
+		"lease-closed-retained":  "test-backend",
+		"lease-closed-destroyed": "test-backend",
+	})
+	events := &callbackEventRecorder{}
 
 	hs := composeTestHandlerSet(t, testHandlerDeps{
-		Tracker:   NewInFlightTracker(),
-		Publisher: pub,
+		Tracker:            NewInFlightTracker(),
+		LifecycleAuthority: lifecycleAuthority,
+		CallbackEvents:     events,
 	})
+	resetEvents := func() {
+		events.mu.Lock()
+		events.events = nil
+		events.mu.Unlock()
+	}
+	snapshotEvents := func() []backend.LeaseStatusEvent {
+		events.mu.Lock()
+		defer events.mu.Unlock()
+		return append([]backend.LeaseStatusEvent(nil), events.events...)
+	}
 
 	t.Run("success_publishes_ready", func(t *testing.T) {
-		pub.mu.Lock()
-		pub.published = make(map[string][]*message.Message)
-		pub.mu.Unlock()
+		resetEvents()
 
 		msg := newCallbackMsg(t, backend.CallbackPayload{
 			LeaseUUID: "lease-restart",
@@ -1790,21 +1810,15 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		err := hs.HandleBackendCallback(msg)
 		require.NoError(t, err)
 
-		pub.mu.Lock()
-		msgs := pub.published[TopicLeaseEvent]
-		pub.mu.Unlock()
-		require.Len(t, msgs, 1)
-
-		var event backend.LeaseStatusEvent
-		require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+		published := snapshotEvents()
+		require.Len(t, published, 1)
+		event := published[0]
 		assert.Equal(t, "lease-restart", event.LeaseUUID)
 		assert.Equal(t, backend.ProvisionStatusReady, event.Status)
 	})
 
 	t.Run("failed_publishes_failed", func(t *testing.T) {
-		pub.mu.Lock()
-		pub.published = make(map[string][]*message.Message)
-		pub.mu.Unlock()
+		resetEvents()
 
 		msg := newCallbackMsg(t, backend.CallbackPayload{
 			LeaseUUID: "lease-update",
@@ -1815,13 +1829,9 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		err := hs.HandleBackendCallback(msg)
 		require.NoError(t, err)
 
-		pub.mu.Lock()
-		msgs := pub.published[TopicLeaseEvent]
-		pub.mu.Unlock()
-		require.Len(t, msgs, 1)
-
-		var event backend.LeaseStatusEvent
-		require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+		published := snapshotEvents()
+		require.Len(t, published, 1)
+		event := published[0]
 		assert.Equal(t, "lease-update", event.LeaseUUID)
 		assert.Equal(t, backend.ProvisionStatusFailed, event.Status)
 		assert.Equal(t, "container crashed", event.Error)
@@ -1830,9 +1840,7 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 	// ENG-329: a deprovisioned callback emits the retained notice on observed
 	// ground truth — only when payload.Retained is true.
 	t.Run("deprovisioned_retained_publishes_retained", func(t *testing.T) {
-		pub.mu.Lock()
-		pub.published = make(map[string][]*message.Message)
-		pub.mu.Unlock()
+		resetEvents()
 
 		msg := newCallbackMsg(t, backend.CallbackPayload{
 			LeaseUUID: "lease-closed-retained",
@@ -1843,22 +1851,16 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		err := hs.HandleBackendCallback(msg)
 		require.NoError(t, err)
 
-		pub.mu.Lock()
-		msgs := pub.published[TopicLeaseEvent]
-		pub.mu.Unlock()
-		require.Len(t, msgs, 1, "retained deprovision must emit exactly one retained event")
-
-		var event backend.LeaseStatusEvent
-		require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+		published := snapshotEvents()
+		require.Len(t, published, 1, "retained deprovision must emit exactly one retained event")
+		event := published[0]
 		assert.Equal(t, "lease-closed-retained", event.LeaseUUID)
 		assert.Equal(t, backend.ProvisionStatusRetained, event.Status)
 		assert.NotEmpty(t, event.Error, "retained event should carry an informational message")
 	})
 
 	t.Run("generation_scoped_deprovisioned_is_ignored_after_tracker_cleanup", func(t *testing.T) {
-		pub.mu.Lock()
-		pub.published = make(map[string][]*message.Message)
-		pub.mu.Unlock()
+		resetEvents()
 
 		err := hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
 			LeaseUUID:   "lease-late-retained",
@@ -1869,17 +1871,12 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		}))
 		require.NoError(t, err)
 
-		pub.mu.Lock()
-		msgs := append([]*message.Message(nil), pub.published[TopicLeaseEvent]...)
-		pub.mu.Unlock()
-		assert.Empty(t, msgs,
+		assert.Empty(t, snapshotEvents(),
 			"a token-present callback without its exact operation is stale observation only")
 	})
 
 	t.Run("deprovisioned_not_retained_publishes_nothing", func(t *testing.T) {
-		pub.mu.Lock()
-		pub.published = make(map[string][]*message.Message)
-		pub.mu.Unlock()
+		resetEvents()
 
 		msg := newCallbackMsg(t, backend.CallbackPayload{
 			LeaseUUID: "lease-closed-destroyed",
@@ -1890,10 +1887,7 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		err := hs.HandleBackendCallback(msg)
 		require.NoError(t, err)
 
-		pub.mu.Lock()
-		msgs := pub.published[TopicLeaseEvent]
-		pub.mu.Unlock()
-		assert.Empty(t, msgs, "non-retain deprovision must not emit any lease event")
+		assert.Empty(t, snapshotEvents(), "non-retain deprovision must not emit any lease event")
 	})
 }
 
@@ -3014,8 +3008,9 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsNonInFlightCallb
 	})
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-not-in-flight",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-not-in-flight",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: "123e4567-e89b-42d3-a456-426614174000",
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -3050,9 +3045,10 @@ func TestHandleBackendCallback_DeprovisionedNonInFlight(t *testing.T) {
 	})
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusDeprovisioned,
-		Backend:   "docker",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusDeprovisioned,
+		Backend:     "docker",
+		OperationID: "123e4567-e89b-42d3-a456-426614174000",
 	})
 	require.NoError(t, hs.HandleBackendCallback(msg))
 
@@ -3103,9 +3099,10 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 				BackendRouter: router,
 			})
 			msg := newCallbackMsg(t, backend.CallbackPayload{
-				LeaseUUID: "lease-1",
-				Status:    tc.payloadStat,
-				Backend:   tc.payloadBE,
+				LeaseUUID:   "lease-1",
+				Status:      tc.payloadStat,
+				Backend:     tc.payloadBE,
+				OperationID: "123e4567-e89b-42d3-a456-426614174000",
 			})
 			require.NoError(t, hs.HandleBackendCallback(msg))
 

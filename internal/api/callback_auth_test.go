@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -475,10 +476,9 @@ func TestHandleProvisionCallback_ReplayAttack(t *testing.T) {
 }
 
 // TestHandleProvisionCallback_AlwaysPublished verifies that all valid callbacks
-// are published to Watermill regardless of in-flight status. Restart/update
-// operations don't register in-flight, so their completion callbacks must not
-// be short-circuited. The Watermill handler (HandleBackendCallback) handles
-// both in-flight and non-in-flight callbacks correctly.
+// reach the synchronous application boundary regardless of in-flight status.
+// Restart/update operations don't register in-flight, so their completion
+// callbacks must not be short-circuited.
 func TestHandleProvisionCallback_AlwaysPublished(t *testing.T) {
 	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 	publishedCallback := &mockCallbackPublisher{}
@@ -633,7 +633,7 @@ type mockCallbackPublisher struct {
 	called bool
 }
 
-func (m *mockCallbackPublisher) PublishCallback(callback backend.CallbackPayload) error {
+func (m *mockCallbackPublisher) PublishCallback(_ context.Context, callback backend.CallbackPayload) error {
 	m.called = true
 	return nil
 }

@@ -553,7 +553,9 @@ func TestServiceAcceptedBindsOneIdentityAndAuthority(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, present)
 	assert.Equal(t, fixture.registry.initiation().ID(), callbackID)
-	assert.Equal(t, "https://fred.example.test/base/callbacks/provision", request.LifecycleCallbackURL)
+	wantLifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(request.CallbackURL, "")
+	require.NoError(t, err)
+	assert.Equal(t, wantLifecycleCallbackURL, request.LifecycleCallbackURL)
 
 	target := fixture.store.Lookup(testTarget)
 	assert.Equal(t, placement.StateConfirmed, target.State())

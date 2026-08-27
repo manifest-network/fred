@@ -16,7 +16,7 @@ import (
 // run goroutine has already been spawned.
 //
 // Pattern matches PR4's seam-and-closure approach for PersistDiagnosticsFn /
-// SendCallbackFn / PersistDiagnosticsWithLogsFn and PR5b-1's Metrics
+// SendOperationCallbackFn / PersistDiagnosticsWithLogsFn and PR5b-1's Metrics
 // adapter — each substrate-private operation is reached via a closure
 // captured at construction, so the actor never holds a *Backend pointer
 // of its own.
@@ -59,10 +59,10 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 			PersistDiagnosticsWithLogsFn: func(entry shared.DiagnosticEntry, logs map[string]string) {
 				b.persistDiagnosticsWithLogs(entry, logs)
 			},
-			SendCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
-				// The actor SM only drives provision/restart/update callbacks —
-				// never the deprovision retain-success path — so retained=false.
-				b.sendCallbackWithURL(uuid, url, status, errMsg, false)
+			SendOperationCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
+				// Provision/restore operation completions never carry the
+				// deprovision retain-success flag.
+				b.sendOperationCallbackWithURL(uuid, url, status, errMsg)
 			},
 			SendLifecycleCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
 				if url == "" {
@@ -80,7 +80,7 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 					}
 					url = resolved
 				}
-				b.sendCallbackWithURL(uuid, url, status, errMsg, false)
+				b.sendLifecycleCallbackWithURL(uuid, url, status, errMsg, false)
 			},
 			DoDeprovisionFn: func(ctx context.Context, leaseUUID string) error {
 				return b.doDeprovision(ctx, leaseUUID)

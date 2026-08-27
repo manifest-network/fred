@@ -497,6 +497,7 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 
 	// Callback server signals redeploy completion.
 	var callbackPayload backend.CallbackPayload
+	var callbackRequestURI string
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p backend.CallbackPayload
@@ -504,6 +505,7 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 		w.WriteHeader(http.StatusOK)
 		mu.Lock()
 		callbackPayload = p
+		callbackRequestURI = r.URL.RequestURI()
 		mu.Unlock()
 		select {
 		case <-callbackReceived:
@@ -512,23 +514,27 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 		}
 	}))
 	defer callbackServer.Close()
+	const lifecycleID = "550e8400-e29b-41d4-a716-446655440000"
+	operationURL := callbackServer.URL + "?operation_id=" + lifecycleID
+	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + lifecycleID
 
 	// Fake managed container carrying the OLD domain label — what recoverState
 	// rebuilds prov.Items from.
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
 			return []ContainerInfo{{
-				ContainerID:   "old-app",
-				LeaseUUID:     "lease-1",
-				SKU:           "docker-small",
-				Tenant:        "tenant-a",
-				ProviderUUID:  "prov-1",
-				CallbackURL:   callbackServer.URL,
-				ServiceName:   "app",
-				InstanceIndex: 0,
-				Status:        "running",
-				CustomDomain:  "old.example.com",
-				Name:          "fred-lease-1-app-0",
+				ContainerID:          "old-app",
+				LeaseUUID:            "lease-1",
+				SKU:                  "docker-small",
+				Tenant:               "tenant-a",
+				ProviderUUID:         "prov-1",
+				CallbackURL:          operationURL,
+				LifecycleCallbackURL: lifecycleURL,
+				ServiceName:          "app",
+				InstanceIndex:        0,
+				Status:               "running",
+				CustomDomain:         "old.example.com",
+				Name:                 "fred-lease-1-app-0",
 			}}, nil
 		},
 		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
@@ -551,14 +557,15 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:            "tenant-a",
-			ProviderUUID:      "prov-1",
-			SKU:               "docker-small",
-			Status:            backend.ProvisionStatusReady,
-			StackManifest:     stack,
-			ContainerIDs:      []string{"old-app"},
-			ServiceContainers: map[string][]string{"app": {"old-app"}},
-			CallbackURL:       callbackServer.URL,
+			Tenant:               "tenant-a",
+			ProviderUUID:         "prov-1",
+			SKU:                  "docker-small",
+			Status:               backend.ProvisionStatusReady,
+			StackManifest:        stack,
+			ContainerIDs:         []string{"old-app"},
+			ServiceContainers:    map[string][]string{"app": {"old-app"}},
+			CallbackURL:          operationURL,
+			LifecycleCallbackURL: lifecycleURL,
 			Items: []backend.LeaseItem{
 				{SKU: "docker-small", Quantity: 1, ServiceName: "app", CustomDomain: "old.example.com"},
 			},
@@ -582,7 +589,6 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 	b.provisionsMu.Lock()
 	prov := b.provisions["lease-1"]
 	overrides := b.computeCustomDomainOverrides(prov, chain, map[string]bool{"new.example.com": true})
-	callbackURL := prov.CallbackURL
 	b.provisionsMu.Unlock()
 	require.Equal(t, map[string]string{"app": "new.example.com"}, overrides,
 		`chain service_name "" must normalize to "app" and stage the new domain`)
@@ -596,7 +602,7 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 	require.Equal(t, "old.example.com", swapped, "sanity: recoverState swapped prov.Items back to the old domain")
 
 	// 3. Route the redeploy with the pre-swap override.
-	require.NoError(t, b.routeReplaceRestart(context.Background(), "lease-1", callbackURL, overrides))
+	require.NoError(t, b.routeReplaceRestart(context.Background(), "lease-1", "", overrides))
 
 	// 4. Wait for the async redeploy to complete.
 	select {
@@ -606,8 +612,11 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 	}
 	mu.Lock()
 	gotStatus := callbackPayload.Status
+	gotCallbackRequestURI := callbackRequestURI
 	mu.Unlock()
 	require.Equal(t, backend.CallbackStatusSuccess, gotStatus)
+	require.Equal(t, "/?lifecycle_id="+lifecycleID, gotCallbackRequestURI,
+		"custom-domain redeploy must reuse the typed lifecycle capability")
 
 	// 5. The redeploy rendered the NEW domain despite the swap.
 	mu.Lock()
@@ -621,9 +630,15 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 	b.provisionsMu.RLock()
 	committed := b.provisions["lease-1"].Items[0].CustomDomain
 	status := b.provisions["lease-1"].Status
+	committedOperationURL := b.provisions["lease-1"].CallbackURL
+	committedLifecycleURL := b.provisions["lease-1"].LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, "new.example.com", committed, "actor must commit the new domain to prov.Items on success")
 	assert.Equal(t, backend.ProvisionStatusReady, status)
+	assert.Equal(t, operationURL, committedOperationURL,
+		"autonomous custom-domain reconciliation must preserve the operation half of the callback pair")
+	assert.Equal(t, lifecycleURL, committedLifecycleURL,
+		"autonomous custom-domain reconciliation must preserve lifecycle authority")
 
 	b.stopCancel()
 	b.wg.Wait()

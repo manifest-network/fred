@@ -75,11 +75,12 @@ Images are validated before pull. The registry is extracted from the image refer
 
 Provision and restore requests carry two callback endpoints. The Docker backend
 persists the exact operation completion URL as `fred.callback_url` and the
-tokenless observation endpoint as `fred.lifecycle_callback_url`. Initial
-success/failure uses the exact URL; later container-death and deprovision events
-use only the lifecycle URL. On upgrade, containers lacking the newer lifecycle
-label are recovered by removing only `operation_id` from the exact URL while
-preserving unrelated query fields.
+typed observation endpoint as `fred.lifecycle_callback_url`. Initial
+provision/restore success or failure uses the exact URL; later restart/update
+completion, container-death, and deprovision events use only the lifecycle URL.
+On upgrade, containers lacking the newer lifecycle label are recovered by
+replacing only `operation_id` with `lifecycle_id` in a typed exact URL while
+preserving unrelated query fields; an operationless legacy URL stays tokenless.
 
 Every outbound callback is persisted under its own delivery UUID before the
 first attempt. Exact completion and lifecycle events for one lease therefore
@@ -735,7 +736,7 @@ Re-deploys a lease with a new manifest (image/config change). The `payload` fiel
 
 ### `POST /restore` (authenticated)
 
-Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease), the exact operation `callback_url`, and the tokenless `lifecycle_callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`). `422` is **overloaded**: a **bare** `422` (no `code`) means no retained data exists (`ErrNotRetained`), while `422` with body `{"code":"demote_exceeds_tier"}` means the retained data exceeds the requested smaller SKU tier (`ErrDemoteDataExceedsTier`, see [Restore flow](#restore-flow)). Also `409` for invalid state / already provisioned, `400` (validation), and `503` with `code="insufficient_resources"` for a synchronous capacity refusal. Under the configured transport trust boundary the coded response makes the exact attempt clearable; it is not an HMAC-authenticated backend response. See [Soft-delete & Restore](#soft-delete--restore).
+Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease), the exact operation `callback_url`, and the typed `lifecycle_callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`). `422` is **overloaded**: a **bare** `422` (no `code`) means no retained data exists (`ErrNotRetained`), while `422` with body `{"code":"demote_exceeds_tier"}` means the retained data exceeds the requested smaller SKU tier (`ErrDemoteDataExceedsTier`, see [Restore flow](#restore-flow)). Also `409` for invalid state / already provisioned, `400` (validation), and `503` with `code="insufficient_resources"` for a synchronous capacity refusal. Under the configured transport trust boundary the coded response makes the exact attempt clearable; it is not an HMAC-authenticated backend response. See [Soft-delete & Restore](#soft-delete--restore).
 
 ### `GET /retentions` (authenticated)
 
@@ -838,7 +839,7 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.instance_index` | integer string | 0-based index within a multi-unit lease |
 | `fred.fail_count` | integer string | Number of provision failures for this lease at creation time |
 | `fred.callback_url` | URL string | Exact provision/restore completion URL; may contain an operation capability |
-| `fred.lifecycle_callback_url` | URL string | Tokenless endpoint for later runtime-failure and deprovision observations; persisted across backend restarts |
+| `fred.lifecycle_callback_url` | URL string | Typed endpoint for later maintenance, runtime-failure, and deprovision observations; persisted across backend restarts |
 | `fred.service_name` | service name string | Service name within a stack (stack provisions only) |
 | `fred.backend_name` | backend name string | Name of the backend managing the container; set on every managed container |
 | `fred.fqdn` | FQDN string | Assigned ingress FQDN; set on the ingress / custom-domain path |

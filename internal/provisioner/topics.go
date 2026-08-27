@@ -8,6 +8,7 @@ import (
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
+	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
@@ -52,12 +53,12 @@ var (
 	ErrPayloadStoreUnavailable = errors.New("payload store not configured")
 )
 
-// Watermill topic names for internal event routing.
+// Internal event-routing topics and stable message metric labels.
 const (
 	TopicLeaseCreated    = "events.lease.created"
 	TopicLeaseClosed     = "events.lease.closed"
 	TopicLeaseExpired    = "events.lease.expired"
-	TopicBackendCallback = "events.backend.callback"
+	TopicBackendCallback = "events.backend.callback" // legacy message-adapter label
 	TopicPayloadReceived = "events.payload.received"
 	TopicLeaseEvent      = "events.lease.event"
 )
@@ -79,15 +80,54 @@ func BuildCallbackURL(baseURL string) string {
 // Invalid IDs and malformed base URLs fail instead of silently emitting an
 // unscoped callback address.
 func BuildCallbackURLForOperation(baseURL string, operationID operation.OperationID) (string, error) {
-	callbackURL, err := url.Parse(BuildCallbackURL(baseURL))
+	text, err := operationID.MarshalText()
 	if err != nil {
-		return "", fmt.Errorf("parse callback URL: %w", err)
-	}
-	query := callbackURL.Query()
-	if err := operation.SetQuery(query, operationID); err != nil {
 		return "", fmt.Errorf("set callback operation ID: %w", err)
 	}
-	callbackURL.RawQuery = query.Encode()
+	return buildCallbackURLWithCapability(baseURL, operation.QueryParameter, string(text))
+}
+
+// BuildCallbackURLForLifecycle binds an observation callback to the current
+// typed lease-lifecycle capability. Invalid IDs and malformed base URLs fail
+// instead of silently falling back to a legacy tokenless address.
+func BuildCallbackURLForLifecycle(baseURL string, lifecycleID lifecycle.ID) (string, error) {
+	text, err := lifecycleID.MarshalText()
+	if err != nil {
+		return "", fmt.Errorf("set callback lifecycle ID: %w", err)
+	}
+	return buildCallbackURLWithCapability(baseURL, lifecycle.QueryParameter, string(text))
+}
+
+// buildCallbackURLWithCapability validates the base query with the same parser
+// used by callback ingress, then appends one typed capability without
+// re-encoding unrelated fields. The exact raw query is covered by callback
+// HMACs, so normalization here would create an avoidable second wire form.
+func buildCallbackURLWithCapability(baseURL, parameter, value string) (string, error) {
+	callbackURL, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("parse callback base URL: %w", err)
+	}
+	query, err := url.ParseQuery(callbackURL.RawQuery)
+	if err != nil {
+		return "", fmt.Errorf("parse callback base query: %w", err)
+	}
+	if _, exists := query[operation.QueryParameter]; exists {
+		return "", fmt.Errorf("callback base URL must not contain %s", operation.QueryParameter)
+	}
+	if _, exists := query[lifecycle.QueryParameter]; exists {
+		return "", fmt.Errorf("callback base URL must not contain %s", lifecycle.QueryParameter)
+	}
+
+	callbackURL.Path += CallbackPath
+	if callbackURL.RawPath != "" {
+		callbackURL.RawPath += CallbackPath
+	}
+	capability := url.QueryEscape(parameter) + "=" + url.QueryEscape(value)
+	if callbackURL.RawQuery == "" {
+		callbackURL.RawQuery = capability
+	} else {
+		callbackURL.RawQuery += "&" + capability
+	}
 	return callbackURL.String(), nil
 }
 

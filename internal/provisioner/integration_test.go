@@ -119,7 +119,7 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 	assert.True(t, manager.IsInFlight(leaseUUID))
 
 	// Step 3: Publish success callback.
-	err = manager.PublishCallback(backend.CallbackPayload{
+	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
 		LeaseUUID:   leaseUUID,
 		Status:      backend.CallbackStatusSuccess,
 		OperationID: mustInFlightOperationID(t, manager, leaseUUID),
@@ -187,7 +187,7 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 	assert.True(t, manager.IsInFlight(leaseUUID))
 
 	// Publish failure callback.
-	err = manager.PublishCallback(backend.CallbackPayload{
+	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
 		LeaseUUID:   leaseUUID,
 		Status:      backend.CallbackStatusFailed,
 		Error:       "container crashed",
@@ -263,7 +263,7 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 		return len(mockBackend.provisionCalls) > 0
 	}, 5*time.Second, 20*time.Millisecond)
 
-	err = manager.PublishCallback(backend.CallbackPayload{
+	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
 		LeaseUUID:   leaseUUID,
 		Status:      backend.CallbackStatusSuccess,
 		OperationID: mustInFlightOperationID(t, manager, leaseUUID),

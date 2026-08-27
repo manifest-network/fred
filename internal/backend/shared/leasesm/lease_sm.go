@@ -439,16 +439,21 @@ func (lsm *leaseSM) onEnterUpdating(ctx context.Context, args ...any) error {
 	return lsm.applyReplaceEntry(args, backend.ProvisionStatusUpdating)
 }
 
-// applyReplaceEntry flips Status to the requested replace state and applies
-// the exact-completion and lifecycle callback URLs in the same UpdateFn
-// critical section. No metric/log side effect belongs inside the closure,
-// per the LeaseProvisionStore idempotence contract.
+// applyReplaceEntry flips Status to the requested replace state. A provision or
+// restore operation installs its exact-completion/lifecycle callback pair in the
+// same UpdateFn critical section. Restart and update are lifecycle operations;
+// their caller supplies a pair whose identity was validated against the current
+// authority, allowing a callback-base move without rotating the capability. No
+// metric/log side effect belongs inside the closure, per the
+// LeaseProvisionStore idempotence contract.
 func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus) error {
 	var callbackURL, lifecycleCallbackURL string
+	callbackKind := replaceCallbackOperation
 	if len(args) > 0 {
 		if a, ok := args[0].(replaceEntryArgs); ok {
 			callbackURL = a.CallbackURL
 			lifecycleCallbackURL = a.LifecycleCallbackURL
+			callbackKind = a.CallbackKind
 		}
 	}
 	// Capture whether the lease was active (Status==Ready) BEFORE overwriting
@@ -469,7 +474,23 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 		}
 	})
 	lsm.actor.replaceWasActive = wasActive
+	lsm.actor.replaceCallbackKind = callbackKind
 	return nil
+}
+
+func (lsm *leaseSM) replaceCompletionCallbackURL(p *ProvisionState) string {
+	if lsm.actor.replaceCallbackKind == replaceCallbackLifecycle {
+		return p.LifecycleCallbackURL
+	}
+	return p.CallbackURL
+}
+
+func (lsm *leaseSM) sendReplaceCompletionCallback(callbackURL string, status backend.CallbackStatus, errMsg string) {
+	if lsm.actor.replaceCallbackKind == replaceCallbackLifecycle {
+		lsm.actor.cfg.SendLifecycleCallbackFn(lsm.actor.leaseUUID, callbackURL, status, errMsg)
+		return
+	}
+	lsm.actor.cfg.SendOperationCallbackFn(lsm.actor.leaseUUID, callbackURL, status, errMsg)
 }
 
 // diagnosticsGatherTimeout bounds the async diag goroutine's lifetime
@@ -559,7 +580,7 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 		cfg.Metrics.ActiveProvisionsInc()
 	}
 
-	// ORDERING CONTRACT: SendCallbackFn MUST remain the last statement of
+	// ORDERING CONTRACT: SendOperationCallbackFn MUST remain the last statement of
 	// this entry action. The docker provision tests synchronize on the
 	// callback round trip as their "entry action finished" barrier
 	// (docker.doProvisionAndFire / observeCallbacks), so a store write
@@ -575,7 +596,7 @@ func (lsm *leaseSM) onEnterReadyFromProvision(ctx context.Context, args ...any) 
 	// expects fails an assertion; a late write of the SAME value is
 	// invisible to the suite, with or without -race. Do not add a write
 	// here on the assumption that -race would have caught it.
-	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+	cfg.SendOperationCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
 	return nil
 }
 
@@ -618,7 +639,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		if result.OnSuccess != nil {
 			result.OnSuccess(p)
 		}
-		callbackURL = p.CallbackURL
+		callbackURL = lsm.replaceCompletionCallbackURL(p)
 	})
 	// Gate the gauge on applied (UpdateFn ran ⇒ lease still exists): never
 	// move the gauge for a lease the closure didn't touch. On every reachable
@@ -630,7 +651,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		cfg.Metrics.ActiveProvisionsInc()
 	}
 
-	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusSuccess, "")
+	lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusSuccess, "")
 	return nil
 }
 
@@ -674,7 +695,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 			p.Message = ""
 		}
 		diagSnap = DiagnosticSnapshot(p)
-		callbackURL = p.CallbackURL
+		callbackURL = lsm.replaceCompletionCallbackURL(p)
 	})
 	// Gate the gauge on applied (lease still exists); behavior-identical on
 	// reachable paths — see onEnterReadyFromReplaceCompleted.
@@ -689,7 +710,7 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.Logs)
 	}
 
-	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
+	lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
 	return nil
 }
 
@@ -721,7 +742,7 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 		p.FailCount++
 		p.Status = backend.ProvisionStatusFailed
 		diagSnap = DiagnosticSnapshot(p)
-		callbackURL = p.CallbackURL
+		callbackURL = lsm.replaceCompletionCallbackURL(p)
 	})
 	// Gate the gauge on applied (lease still exists); behavior-identical on
 	// reachable paths — see onEnterReadyFromReplaceCompleted.
@@ -736,7 +757,7 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.Logs)
 	}
 
-	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
+	lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
 	return nil
 }
 
@@ -776,7 +797,7 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.logs)
 	}
 
-	// ORDERING CONTRACT: SendCallbackFn MUST remain the last statement of
+	// ORDERING CONTRACT: SendOperationCallbackFn MUST remain the last statement of
 	// this entry action. The docker provision tests synchronize on the
 	// callback round trip as their "entry action finished" barrier
 	// (docker.doProvisionAndFire / observeCallbacks), so a store write
@@ -792,7 +813,7 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 	// expects fails an assertion; a late write of the SAME value is
 	// invisible to the suite, with or without -race. Do not add a write
 	// here on the assumption that -race would have caught it.
-	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
+	cfg.SendOperationCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, info.callbackErr)
 	return nil
 }
 
@@ -906,9 +927,17 @@ type provisionErrorInfo struct {
 // replaceEntryArgs carries the new exact-completion and lifecycle callback
 // URLs from a Restart/Update/Restore request into the replace entry actions,
 // so the actor (not the HTTP prelude) is the sole writer of the persisted pair.
+type replaceCallbackKind uint8
+
+const (
+	replaceCallbackOperation replaceCallbackKind = iota
+	replaceCallbackLifecycle
+)
+
 type replaceEntryArgs struct {
 	CallbackURL          string
 	LifecycleCallbackURL string
+	CallbackKind         replaceCallbackKind
 }
 
 // ReplaceSuccessResult carries doReplaceContainers / doReplaceStackContainers

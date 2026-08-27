@@ -148,7 +148,7 @@ type testActorOpts struct {
 	OnTerminated                 func(uuid string)
 	PersistDiagnosticsFn         func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
 	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
-	SendCallbackFn               func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	SendOperationCallbackFn      func(uuid, url string, status backend.CallbackStatus, errMsg string)
 	SendLifecycleCallbackFn      func(uuid, url string, status backend.CallbackStatus, errMsg string)
 	DoDeprovisionFn              func(ctx context.Context, leaseUUID string) error
 }
@@ -212,8 +212,8 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 	if opts.PersistDiagnosticsWithLogsFn == nil {
 		opts.PersistDiagnosticsWithLogsFn = func(shared.DiagnosticEntry, map[string]string) {}
 	}
-	if opts.SendCallbackFn == nil {
-		opts.SendCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	if opts.SendOperationCallbackFn == nil {
+		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
 	if opts.SendLifecycleCallbackFn == nil {
 		opts.SendLifecycleCallbackFn = func(string, string, backend.CallbackStatus, string) {}
@@ -236,7 +236,7 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 			OnTerminated:                 opts.OnTerminated,
 			PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
 			PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
-			SendCallbackFn:               opts.SendCallbackFn,
+			SendOperationCallbackFn:      opts.SendOperationCallbackFn,
 			SendLifecycleCallbackFn:      opts.SendLifecycleCallbackFn,
 			DoDeprovisionFn:              opts.DoDeprovisionFn,
 		}
@@ -292,8 +292,8 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	if opts.PersistDiagnosticsWithLogsFn == nil {
 		opts.PersistDiagnosticsWithLogsFn = func(shared.DiagnosticEntry, map[string]string) {}
 	}
-	if opts.SendCallbackFn == nil {
-		opts.SendCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	if opts.SendOperationCallbackFn == nil {
+		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
 	if opts.SendLifecycleCallbackFn == nil {
 		opts.SendLifecycleCallbackFn = func(string, string, backend.CallbackStatus, string) {}
@@ -321,7 +321,7 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		OnTerminated:                 opts.OnTerminated,
 		PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
 		PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
-		SendCallbackFn:               opts.SendCallbackFn,
+		SendOperationCallbackFn:      opts.SendOperationCallbackFn,
 		SendLifecycleCallbackFn:      opts.SendLifecycleCallbackFn,
 		DoDeprovisionFn:              opts.DoDeprovisionFn,
 	}

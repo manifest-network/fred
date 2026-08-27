@@ -116,8 +116,10 @@ func TestOrchestrator_StartProvisioning_Success(t *testing.T) {
 	require.True(t, exists)
 	wantCallbackURL, err := BuildCallbackURLForOperation("http://localhost:8080", tracked.ID)
 	require.NoError(t, err)
+	wantLifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(wantCallbackURL, "")
+	require.NoError(t, err)
 	assert.Equal(t, wantCallbackURL, req.CallbackURL)
-	assert.Equal(t, BuildCallbackURL("http://localhost:8080"), req.LifecycleCallbackURL)
+	assert.Equal(t, wantLifecycleCallbackURL, req.LifecycleCallbackURL)
 	assert.Nil(t, req.Payload)
 	assert.Empty(t, req.PayloadHash)
 

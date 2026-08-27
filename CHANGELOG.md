@@ -84,20 +84,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   accepted for callbacks emitted by v0.13.0 backends, but operation-ID-scoped
   operations still require the echoed ID to settle. (ENG-632)
 - Provision and restore requests now distinguish their exact, operation-scoped
-  `callback_url` from a tokenless `lifecycle_callback_url`. Backends use the
-  latter only for later autonomous failure and teardown observations, so a
-  completed operation cannot make legitimate runtime, deprovisioned, or
-  retained events disappear. The Docker backend persists both URLs in separate
-  container labels and safely derives the lifecycle URL when upgrading state
-  written by an older Fred. Tokenless lifecycle callbacks remain observation-only
-  even while a typed operation is current. Pending deliveries are also keyed by
-  independent UUIDs, so a later lifecycle observation cannot overwrite or
-  remove an undelivered exact completion for the same lease; v0.13 queue entries
-  remain replayable. (ENG-632)
+  `callback_url` from a typed `lifecycle_callback_url`. The latter carries a
+  canonical UUIDv4 `lifecycle_id` whose current lease/backend binding is durable
+  in the placement store and survives provider restarts. After placement
+  deletion it narrows to teardown-only authority: runtime success/failure is a
+  200 no-op, while the exact terminal deprovision observation can atomically
+  retire the capability and publish retained status at most once. It otherwise
+  rotates when a newer exact operation succeeds and is retired by terminal
+  deprovision. Backends use it for restart/update completion, autonomous failure,
+  and teardown observations, so a completed operation cannot make legitimate
+  runtime, deprovisioned, or retained events disappear. Lifecycle callbacks can
+  publish status but cannot settle operations or mutate placement/chain state;
+  stale and retired IDs are harmless 200 no-ops. Existing v0.13 owners migrate
+  explicitly as legacy and remain tokenless until a typed operation replaces
+  their callback route. The Docker backend persists both URLs in separate
+  container labels and safely derives the paired lifecycle URL when upgrading
+  state written by an older Fred. The durable callback outbox assigns
+  explicit operation/lifecycle kinds and monotonic per-store sequences: exact
+  completions remain FIFO, lifecycle observations are latest-only, and no newer
+  lifecycle state can pass an older exact, legacy, or pre-sequence delivery for
+  that lease. Unavailable leases do not block other leases, and pending work is
+  retried during runtime as well as at startup. Provider ingress now applies
+  callbacks and publishes callback-derived events synchronously before returning
+  200; startup, shutdown, and transient application failures return retryable
+  503 without advancing the backend outbox. Callback application has a dedicated
+  two-minute budget, its route extends the connection write deadline beyond the
+  generic 15-second server default, and bundled senders wait two minutes fifteen
+  seconds with no competing client-wide cap. The provider therefore owns the
+  first timeout and can return 503 while the same exact entry remains the durable
+  FIFO head. Shutdown cancels admitted application before draining it. v0.13
+  queue entries remain replayable. Rolling upgrades must update backends before
+  providerd: new backends understand the old tokenless shape, while a v0.13
+  backend cannot preserve the separate lifecycle route sent by a new provider.
+  (ENG-632)
 - The callback JSON `backend` field remains optional metrics-only sender
   metadata for v0.13 compatibility. It need not equal Fred's durable router
   name and cannot authorize or redirect a typed callback; the HMAC-covered URL
-  and current operation ID provide that authority. (ENG-632)
+  plus the current exact-operation or durable lifecycle capability provide that
+  authority. (ENG-632)
 - Restore now requires a writable durable placement recorder and a registry-issued
   non-nil `operation.OperationID` bound through an opaque initiation capability
   before contacting the backend. A target with
@@ -134,6 +158,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The final authoritative lease re-read before a reconciliation action now uses
+  the same bounded per-query timeout as other chain liveness checks. A stalled
+  point query defers that lease instead of blocking startup, the worker group,
+  and every later sweep behind the reconciliation guard. (ENG-632)
 - Placement-enabled provision and all restore transitions are now write-ahead
   and fail closed: Fred durably records an attempted backend before the backend
   call, distinguishes a contract-conforming synchronous refusal trusted under
@@ -536,10 +564,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   `/health` is now a liveness contract: **it returns 200 whenever the process can
   answer, and never 503s because a dependency is impaired.** No probe here justifies
-  de-registration — there is no peer to shed load onto, and accepting a callback
-  touches neither the chain, nor a backend, nor any store, so a 503 severs a working
-  path in order to report a broken one. The reconciler's behaviour is unchanged; it
-  was already correct throughout both incidents.
+  de-registration — there is no peer to shed load onto. Exact callback application
+  may itself need the chain or placement store; keeping the route reachable lets
+  providerd return a deliberate retryable 503 so the backend preserves its durable
+  FIFO head, whereas load-balancer removal severs that recovery protocol entirely.
+  The reconciler's behaviour is unchanged; it was already correct throughout both
+  incidents.
 
   Two things had to change for "never 503" to be literally true rather than merely
   true of the verdict. Both endpoints are wrapped in `requestTimeoutMiddleware`, which

@@ -21,6 +21,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
+	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -462,8 +463,55 @@ func TestBuildCallbackURL(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, expected+"?operation_id=123e4567-e89b-42d3-a456-426614174000", typedURL)
 
+	lifecycleID, err := lifecycle.FromOperationID(operationID)
+	require.NoError(t, err)
+	lifecycleURL, err := BuildCallbackURLForLifecycle("http://localhost:8080", lifecycleID)
+	require.NoError(t, err)
+	assert.Equal(t, expected+"?lifecycle_id=123e4567-e89b-42d3-a456-426614174000", lifecycleURL)
+
+	typedURL, err = BuildCallbackURLForOperation(
+		"http://localhost:8080/root?trace=a%2Fb&&z=last#fragment", operationID,
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"http://localhost:8080/root/callbacks/provision?trace=a%2Fb&&z=last&operation_id=123e4567-e89b-42d3-a456-426614174000#fragment",
+		typedURL,
+		"typed construction must preserve valid unrelated raw query bytes",
+	)
+
+	lifecycleURL, err = BuildCallbackURLForLifecycle(
+		"http://localhost:8080/root?trace=a%2Fb&&z=last#fragment", lifecycleID,
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"http://localhost:8080/root/callbacks/provision?trace=a%2Fb&&z=last&lifecycle_id=123e4567-e89b-42d3-a456-426614174000#fragment",
+		lifecycleURL,
+	)
+
+	for _, malformedBaseURL := range []string{
+		"http://localhost:8080?trace=%ZZ",
+		"http://localhost:8080?trace=x;y",
+	} {
+		_, err = BuildCallbackURLForOperation(malformedBaseURL, operationID)
+		require.Error(t, err, "operation builder must reject malformed base query %q", malformedBaseURL)
+		_, err = BuildCallbackURLForLifecycle(malformedBaseURL, lifecycleID)
+		require.Error(t, err, "lifecycle builder must reject malformed base query %q", malformedBaseURL)
+	}
+
+	for _, authoritativeBaseURL := range []string{
+		"http://localhost:8080?operation_id=123e4567-e89b-42d3-a456-426614174000",
+		"http://localhost:8080?lifecycle%5Fid=123e4567-e89b-42d3-a456-426614174000",
+	} {
+		_, err = BuildCallbackURLForOperation(authoritativeBaseURL, operationID)
+		require.Error(t, err, "operation builder must reject authority in base URL %q", authoritativeBaseURL)
+		_, err = BuildCallbackURLForLifecycle(authoritativeBaseURL, lifecycleID)
+		require.Error(t, err, "lifecycle builder must reject authority in base URL %q", authoritativeBaseURL)
+	}
+
 	_, err = BuildCallbackURLForOperation("http://localhost:8080", operation.OperationID{})
 	require.ErrorIs(t, err, operation.ErrInvalidID)
+	_, err = BuildCallbackURLForLifecycle("http://localhost:8080", lifecycle.ID{})
+	require.ErrorIs(t, err, lifecycle.ErrInvalidID)
 }
 
 func TestManager_HandleLeaseCreated(t *testing.T) {
@@ -984,7 +1032,7 @@ func TestManager_PublishLeaseEvent(t *testing.T) {
 	}
 }
 
-func TestManager_PublishCallback(t *testing.T) {
+func TestManager_PublishCallbackRequiresRunningRuntime(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -1002,8 +1050,8 @@ func TestManager_PublishCallback(t *testing.T) {
 		Status:    backend.CallbackStatusSuccess,
 	}
 
-	err = manager.PublishCallback(callback)
-	assert.NoError(t, err)
+	err = manager.PublishCallback(context.Background(), callback)
+	require.ErrorIs(t, err, errCallbackRuntimeUnavailable)
 }
 
 func TestManager_HandleLeaseExpired(t *testing.T) {
@@ -1207,6 +1255,9 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: "lease-1", State: billingtypes.LEASE_STATE_PENDING}, nil
+		},
 		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -1258,6 +1309,9 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: "lease-1", State: billingtypes.LEASE_STATE_PENDING}, nil
+		},
 		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -2525,13 +2579,14 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	assert.Equal(t, string(testPayload), string(retrievedPayload))
 }
 
-// TestCallbacksRequireRunningRouter is a regression test for the startup race condition
-// where callbacks could arrive before Watermill handlers were subscribed.
-// The fix ensures we wait for manager.Running() before accepting callbacks.
-func TestCallbacksRequireRunningRouter(t *testing.T) {
+// TestCallbacksRequireRunningManager is a regression test for the startup race
+// where the HTTP server can receive a callback before the ack batcher starts.
+// The backend must receive a retryable error before Start and a terminal result
+// only after the synchronous application path is ready.
+func TestCallbacksRequireRunningManager(t *testing.T) {
 	// This test verifies that:
-	// 1. Publishing before Running() results in lost messages
-	// 2. Publishing after Running() ensures messages are processed
+	// 1. Publishing before Start is rejected rather than partially applied.
+	// 2. Publishing after startup returns only after the callback is processed.
 
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -2561,27 +2616,26 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start manager in background
+	// The callback runtime is deliberately unavailable before Start. In
+	// production the API maps this to 503 so the backend's durable outbox keeps
+	// the delivery pending.
+	manager.TrackInFlight("lease-early", "tenant-1", testItems("sku-1"), "test")
+	require.ErrorIs(t, manager.PublishCallback(context.Background(), backend.CallbackPayload{
+		LeaseUUID: "lease-early",
+		Status:    backend.CallbackStatusSuccess,
+	}), errCallbackRuntimeUnavailable)
+	require.True(t, manager.IsInFlight("lease-early"))
+
+	// Start manager in background.
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- manager.Start(ctx)
 	}()
 
-	// Track a lease that will receive a callback
-	manager.TrackInFlight("lease-early", "tenant-1", testItems("sku-1"), "test")
-
-	// RACE CONDITION SCENARIO: Try to publish callback BEFORE Running()
-	// In production, this is what happened when backends sent callbacks
-	// before Watermill handlers were subscribed.
-	//
-	// Note: We can't reliably test the failure case because it depends on timing.
-	// The Watermill gochannel pubsub may or may not have subscribers yet.
-	// What we CAN test is that after Running(), callbacks always work.
-
-	// Wait for Running() - this is the fix that ensures handlers are subscribed
+	// Running is a convenient observable startup barrier. Callback admission is
+	// opened slightly earlier, immediately after the ack batcher starts.
 	select {
 	case <-manager.Running():
-		// Good - handlers are now subscribed
 	case <-time.After(5 * time.Second):
 		t.Fatal("manager did not start within timeout")
 	}
@@ -2589,33 +2643,18 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	// Track another lease for the "after Running()" test
 	manager.TrackInFlight("lease-after", "tenant-1", testItems("sku-1"), "test")
 
-	// AFTER Running(): Publish callback - this should always work
+	// After startup, PublishCallback applies synchronously.
 	callback := backend.CallbackPayload{
 		LeaseUUID: "lease-after",
 		Status:    backend.CallbackStatusSuccess,
 	}
-
-	// Use the manager's PublishCallback method which publishes to the internal topic
-	require.NoError(t, manager.PublishCallback(callback), "failed to publish callback")
-
-	// Wait for the full handler flow to complete: message → handler → batcher →
-	// chain ack → handler untrack. We poll on the final observable state
-	// (!IsInFlight) rather than an intermediate signal (ackCalled) to avoid
-	// a race where the chain mock has been called but the handler hasn't yet
-	// called UntrackInFlight.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !manager.IsInFlight("lease-after") {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	require.NoError(t, manager.PublishCallback(context.Background(), callback))
 
 	// Verify lease was removed from in-flight (full handler flow completed)
 	assert.False(t, manager.IsInFlight("lease-after"), "lease should not be in-flight after successful callback")
 
 	// If the lease was untracked, the acknowledge must have been called
-	assert.True(t, ackCalled.Load(), "REGRESSION: callback was not processed after Running() - handlers may not be subscribed")
+	assert.True(t, ackCalled.Load(), "callback returned before chain acknowledgment")
 
 	// Clean up
 	cancel()
@@ -2627,16 +2666,13 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	}
 }
 
-// TestManager_Close_NoPanicWithActiveHandler is a regression test for the
-// shutdown ordering bug where Manager.Close() stopped the ack batcher before
-// closing the Watermill router. If a handler was actively calling Acknowledge()
-// during shutdown, the batcher's batchLoop would close b.requests, and the
-// handler (or a Watermill retry of it) would panic with send-on-closed-channel.
-//
-// The fix ensures the Watermill router is closed first (draining all in-progress
-// handlers) before stopping the ack batcher.
-func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
+// TestManager_CloseCancelsAndDrainsActiveCallback verifies that callbacks
+// bypassing Watermill are still owned by Manager's shutdown boundary. Close
+// rejects new admissions, cancels active application, drains it, and only then
+// stops AckBatcher; it must not wait for an unresponsive chain indefinitely.
+func TestManager_CloseCancelsAndDrainsActiveCallback(t *testing.T) {
 	ackReached := make(chan struct{}, 1) // signals AcknowledgeLeases is executing
+	releaseAck := make(chan struct{})
 
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -2654,10 +2690,9 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 			case ackReached <- struct{}{}:
 			default:
 			}
-			// Simulate a slow chain response. Use a select so the call
-			// respects context cancellation (as real chain calls do).
+			// Hold the batch operation until Manager.Close cancels its lifecycle.
 			select {
-			case <-time.After(200 * time.Millisecond):
+			case <-releaseAck:
 				return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
 			case <-ctx.Done():
 				return 0, nil, ctx.Err()
@@ -2684,13 +2719,16 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 		t.Fatal("manager did not start")
 	}
 
-	// Track lease and publish a success callback. The handler will call
-	// Acknowledge(), which sends to the batcher's request channel.
+	// Track lease and publish a success callback asynchronously so Close can
+	// overlap the synchronous application call.
 	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
-	require.NoError(t, manager.PublishCallback(backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
-	}))
+	callbackErr := make(chan error, 1)
+	go func() {
+		callbackErr <- manager.PublishCallback(context.Background(), backend.CallbackPayload{
+			LeaseUUID: "lease-1",
+			Status:    backend.CallbackStatusSuccess,
+		})
+	}()
 
 	// Wait for the handler to reach AcknowledgeLeases inside the batcher.
 	select {
@@ -2699,17 +2737,30 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 		t.Fatal("handler did not reach AcknowledgeLeases")
 	}
 
-	// Call Close() while the handler is actively using the ack batcher.
-	// Do NOT cancel the context first — this exercises the path where
-	// Close() alone must safely drain handlers before stopping the batcher.
-	//
-	// With the old ordering (batcher stopped before router), the batcher's
-	// context cancellation causes AcknowledgeLeases to return an error,
-	// Watermill retries the handler, and the retried Acknowledge() call
-	// sends to the now-closed b.requests channel, panicking.
-	assert.NotPanics(t, func() {
-		assert.NoError(t, manager.Close())
-	})
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- manager.Close() }()
+
+	require.Eventually(t, func() bool {
+		manager.callbackAdmissionMu.Lock()
+		defer manager.callbackAdmissionMu.Unlock()
+		return manager.callbackClosed
+	}, time.Second, time.Millisecond)
+	require.ErrorIs(t, manager.PublishCallback(context.Background(), backend.CallbackPayload{
+		LeaseUUID: "lease-late",
+		Status:    backend.CallbackStatusFailed,
+	}), errCallbackRuntimeUnavailable)
+	select {
+	case err := <-callbackErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel the active callback")
+	}
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close remained blocked after canceling callback application")
+	}
 
 	cancel()
 	select {
@@ -2794,6 +2845,51 @@ func (s *mockLeaseEventSink) Publish(event backend.LeaseStatusEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = append(s.events, event)
+}
+
+type blockingLeaseEventSink struct {
+	entered chan struct{}
+	release chan struct{}
+	event   backend.LeaseStatusEvent
+}
+
+func (s *blockingLeaseEventSink) Publish(event backend.LeaseStatusEvent) {
+	close(s.entered)
+	<-s.release
+	s.event = event
+}
+
+func TestManager_PublishProvisionStartingAppliesSynchronously(t *testing.T) {
+	sink := &blockingLeaseEventSink{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := &Manager{leaseEventSink: sink}
+	done := make(chan struct{})
+	go func() {
+		manager.PublishProvisionStarting("lease-1")
+		close(done)
+	}()
+
+	select {
+	case <-sink.entered:
+	case <-time.After(time.Second):
+		t.Fatal("provisioning event did not reach the subscriber sink")
+	}
+	select {
+	case <-done:
+		t.Fatal("PublishProvisionStarting returned before the sink applied the event")
+	default:
+	}
+	close(sink.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("PublishProvisionStarting did not return after event application")
+	}
+
+	assert.Equal(t, "lease-1", sink.event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusProvisioning, sink.event.Status)
 }
 
 func TestForwardToEventSink_ForwardsToSink(t *testing.T) {

@@ -448,9 +448,11 @@ func TestStackRestart_Success(t *testing.T) {
 	}
 
 	var callbackPayload backend.CallbackPayload
+	var callbackRequestURI string
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		callbackRequestURI = r.URL.RequestURI()
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -459,6 +461,13 @@ func TestStackRestart_Success(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	const lifecycleID = "550e8400-e29b-41d4-a716-446655440000"
+	oldOperationURL := callbackServer.URL + "/old?operation_id=" + lifecycleID
+	oldLifecycleURL := callbackServer.URL + "/old?lifecycle_id=" + lifecycleID
+	newOperationURL := callbackServer.URL + "/new?operation_id=" + lifecycleID
+	newLifecycleURL := callbackServer.URL + "/new?lifecycle_id=" + lifecycleID
+	provisions["lease-1"].CallbackURL = oldOperationURL
+	provisions["lease-1"].LifecycleCallbackURL = oldLifecycleURL
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
@@ -467,7 +476,7 @@ func TestStackRestart_Success(t *testing.T) {
 
 	err := b.Restart(context.Background(), backend.RestartRequest{
 		LeaseUUID:   "lease-1",
-		CallbackURL: callbackServer.URL,
+		CallbackURL: newLifecycleURL,
 	})
 	require.NoError(t, err)
 
@@ -484,17 +493,23 @@ func TestStackRestart_Success(t *testing.T) {
 
 	// Verify callback indicates success.
 	assert.Equal(t, backend.CallbackStatusSuccess, callbackPayload.Status)
+	assert.Equal(t, "/new?lifecycle_id="+lifecycleID, callbackRequestURI,
+		"restart completion must use the same lifecycle capability at the current callback base")
 
 	// Verify final state: new containers, ready status.
 	b.provisionsMu.RLock()
 	prov := b.provisions["lease-1"]
 	status := prov.Status
 	svcContainers := prov.ServiceContainers
+	gotOperationURL := prov.CallbackURL
+	gotLifecycleURL := prov.LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status)
 	assert.Len(t, svcContainers, 2)
 	assert.Len(t, svcContainers["web"], 1)
 	assert.Len(t, svcContainers["db"], 1)
+	assert.Equal(t, newOperationURL, gotOperationURL, "restart must persist the relocated callback pair")
+	assert.Equal(t, newLifecycleURL, gotLifecycleURL, "restart must preserve lifecycle identity")
 
 	b.stopCancel()
 	b.wg.Wait()
@@ -609,6 +624,7 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 // --- Stack Update tests ---
 
 func TestStackUpdate_Success(t *testing.T) {
+	const lifecycleID = "550e8400-e29b-41d4-a716-446655440000"
 	oldStack := &manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:1.24"},
@@ -655,9 +671,11 @@ func TestStackUpdate_Success(t *testing.T) {
 	}
 
 	var callbackPayload backend.CallbackPayload
+	var callbackRequestURI string
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		callbackRequestURI = r.URL.RequestURI()
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -666,6 +684,12 @@ func TestStackUpdate_Success(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	oldOperationURL := callbackServer.URL + "/old?operation_id=" + lifecycleID
+	oldLifecycleURL := callbackServer.URL + "/old?lifecycle_id=" + lifecycleID
+	newOperationURL := callbackServer.URL + "/new?operation_id=" + lifecycleID
+	newLifecycleURL := callbackServer.URL + "/new?lifecycle_id=" + lifecycleID
+	provisions["lease-1"].CallbackURL = oldOperationURL
+	provisions["lease-1"].LifecycleCallbackURL = oldLifecycleURL
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
@@ -679,7 +703,7 @@ func TestStackUpdate_Success(t *testing.T) {
 
 	err := b.Update(context.Background(), backend.UpdateRequest{
 		LeaseUUID:   "lease-1",
-		CallbackURL: callbackServer.URL,
+		CallbackURL: newLifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)
@@ -691,6 +715,8 @@ func TestStackUpdate_Success(t *testing.T) {
 	}
 
 	assert.Equal(t, backend.CallbackStatusSuccess, callbackPayload.Status)
+	assert.Equal(t, "/new?lifecycle_id="+lifecycleID, callbackRequestURI,
+		"update completion must use the same lifecycle capability at the current callback base")
 
 	// Verify OnSuccess updated the manifest.StackManifest.
 	b.provisionsMu.RLock()
@@ -698,6 +724,8 @@ func TestStackUpdate_Success(t *testing.T) {
 	status := prov.Status
 	updatedManifest := prov.StackManifest
 	svcContainers := prov.ServiceContainers
+	gotOperationURL := prov.CallbackURL
+	gotLifecycleURL := prov.LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 
 	assert.Equal(t, backend.ProvisionStatusReady, status)
@@ -705,6 +733,8 @@ func TestStackUpdate_Success(t *testing.T) {
 	assert.Equal(t, "nginx:1.25", updatedManifest.Services["web"].Image)
 	assert.Equal(t, "postgres:16", updatedManifest.Services["db"].Image)
 	assert.Len(t, svcContainers, 2)
+	assert.Equal(t, newOperationURL, gotOperationURL, "update must persist the relocated callback pair")
+	assert.Equal(t, newLifecycleURL, gotLifecycleURL, "update must preserve lifecycle identity")
 
 	b.stopCancel()
 	b.wg.Wait()
