@@ -530,9 +530,11 @@ const CodeDemoteExceedsTier = "demote_exceeds_tier"
 // misclassification.
 const CodeAlreadyProvisioned = "already_provisioned"
 
-// CodeInsufficientResources is the machine-readable proof that a backend
-// itself refused a provision or restore request before starting asynchronous
-// work. A bare 503 is deliberately not equivalent: an intermediary can return
+// CodeInsufficientResources is the contract discriminator for a capacity
+// refusal before asynchronous work starts. It establishes response-envelope
+// conformance, not cryptographic authorship: backend responses are not HMAC
+// authenticated, so deployments still trust the configured transport. A bare
+// 503 is deliberately not equivalent because ordinary intermediaries may emit
 // one after the backend accepted the request.
 const CodeInsufficientResources = "insufficient_resources"
 
@@ -582,10 +584,11 @@ func ClassifyValidationError(err error) ValidationCode {
 // responses also map to it.
 var ErrInsufficientResources = errors.New("insufficient resources")
 
-// ErrCapacityRefused is returned only for a valid backend error envelope whose
-// code is CodeInsufficientResources. It wraps ErrInsufficientResources so
-// callers that only map the tenant-facing capacity result remain compatible,
-// while lifecycle coordinators can safely clear an exact durable attempt.
+// ErrCapacityRefused is returned only for a contract-conforming error envelope
+// whose code is CodeInsufficientResources. It wraps ErrInsufficientResources
+// so callers that only map the tenant-facing capacity result remain compatible,
+// while lifecycle coordinators can clear an exact durable attempt under the
+// configured backend transport's trust boundary.
 var ErrCapacityRefused = fmt.Errorf("%w: backend refused the request", ErrInsufficientResources)
 
 // ErrInvalidState is returned when an operation is not valid for the current lease state.
@@ -768,9 +771,10 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 			//   - ErrNotRetained: 422 from Restore (no retained data — benign client condition)
 			//   - ErrDemoteDataExceedsTier: 422 (code=demote_exceeds_tier) from Restore — data exceeds the tier cap, a permanent client error, not a backend failure
 			//   - ErrRestoreRefused: a well-formed Restore refusal whose code fred does not know.
-			//     Belongs here with the other authored refusals: the envelope was valid, so this is
-			//     a business outcome, and "code" is an open add-only set — a backend that ships a
-			//     new discriminator before providerd learns it must not open the breaker.
+			//     Belongs here with the other contract-conforming refusals: the envelope was
+			//     valid, so this is a business outcome, and "code" is an open add-only set — a
+			//     backend that ships a new discriminator before providerd learns it must not
+			//     open the breaker.
 			// ErrMalformedErrorBody is deliberately ABSENT from this list, unlike every
 			// other 4xx above: a body fred cannot parse is not an expected business
 			// outcome, it is a backend that is off-contract. Counting it makes the
@@ -992,10 +996,11 @@ func (c *HTTPClient) parseErrorCode(body []byte, operation string) (code, msg st
 	return resp.Code, resp.Error, nil
 }
 
-// parseCapacityError distinguishes a causally useful backend refusal from an
-// unvalidated 503. Only the declared envelope plus the shared capacity code
-// proves that no asynchronous work started. Empty, malformed, legacy, and
-// unknown-code responses retain their conservative classifications.
+// parseCapacityError distinguishes a contract-conforming refusal from an
+// unvalidated 503. The declared envelope plus shared code is sufficient under
+// the configured transport's trust boundary; it is not response authentication.
+// Empty, malformed, legacy, and unknown-code responses retain their conservative
+// classifications.
 func (c *HTTPClient) parseCapacityError(body []byte, operation string) error {
 	code, msg, err := c.parseErrorCode(body, operation)
 	if err != nil {
@@ -1144,8 +1149,8 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 				// against authoritative inventory before treating it as ownership.
 				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
 			case http.StatusServiceUnavailable:
-				// Only the shared machine code proves that the backend refused
-				// before starting work. A bare/proxy 503 remains ambiguous.
+				// Only the contract envelope and shared code authorize refusal
+				// settlement. A bare/proxy 503 remains ambiguous.
 				return nil, c.parseCapacityError(readErrorBodyBytes(resp), "provision")
 			default:
 				return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
@@ -1513,7 +1518,7 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			}
 			return nil, detailOr(ErrInvalidState, msg)
 		case http.StatusServiceUnavailable:
-			// Match Provision: only a coded backend refusal is causal proof.
+			// Match Provision: only a contract-conforming coded refusal may settle.
 			return nil, c.parseCapacityError(readErrorBodyBytes(resp), "restore")
 		case http.StatusBadRequest:
 			// Reconstruct the validation sub-category sentinel from the

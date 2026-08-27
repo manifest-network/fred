@@ -42,31 +42,8 @@ type PlacementView interface {
 	List() map[string]placement.Placement
 }
 
-// PlacementStore is the raw revision-based compatibility surface used only by
-// the unexported legacy reconciler constructor and its tests. Production
-// composition accepts PlacementAuthorityStore instead.
-type PlacementStore interface {
-	PlacementView
-	SnapshotRevision() uint64
-	BeginInventorySnapshot() uint64
-	EndInventorySnapshot(revision uint64)
-	SetAttempting(leaseUUID, backendName string) (uint64, error)
-	SetAttemptingIfNotNewer(leaseUUID, backendName string, maxRevision uint64) (uint64, bool, error)
-	Confirm(leaseUUID, backendName string) error
-	ConfirmAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
-	ClearAttempt(leaseUUID, backendName string) error
-	ClearAttemptIfRevision(leaseUUID, backendName string, revision uint64) (bool, error)
-	Delete(leaseUUID string) error
-	DeleteIfRevision(leaseUUID string, revision uint64) (bool, error)
-	SetBatchIfNotNewer(placements map[string]string, maxRevision uint64) (map[string]uint64, map[string]struct{}, error)
-	SetConflictsIfNotNewer(conflicts map[string][]string, maxRevision uint64) (map[string]uint64, map[string]struct{}, error)
-	ClearConflictsIfNotNewer(leases map[string]struct{}, maxRevision uint64) error
-}
-
-// Compile-time checks for the concrete durable store. These do not widen the
-// interfaces accepted by production constructors.
+// Compile-time check for the concrete durable store.
 var _ PlacementView = (*placement.Store)(nil)
-var _ PlacementStore = (*placement.Store)(nil)
 
 // ProvisionOperations is the process-local lifecycle authority needed by the
 // event-driven provision coordinator. Its opaque capabilities keep the
@@ -121,8 +98,8 @@ type ProvisionPlacement interface {
 }
 
 // ReconcilerPlacement is the inventory authority owned by reconciliation. It
-// deliberately excludes the event path's unfenced BeginAttempt and callback
-// settlement by operation identity.
+// deliberately excludes event-path admission scopes and attempt initiation,
+// along with callback settlement by operation identity.
 type ReconcilerPlacement interface {
 	PlacementView
 	ConfigureBackendTopology([]string) error

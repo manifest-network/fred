@@ -7,6 +7,92 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
+func (t *DefaultInFlightTracker) replaceForLegacy(
+	leaseUUID, tenant string,
+	items []backend.LeaseItem,
+	backendName string,
+	startedAt time.Time,
+) {
+	if t.registry == nil {
+		return
+	}
+	spec := operationTrackSpec(
+		leaseUUID, tenant, items, backendName, KindProvision, false, startedAt,
+	)
+	if !spec.Valid() {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ensureCapabilityMapsLocked()
+	if record, exists := t.registry.Lookup(leaseUUID); exists {
+		key, valid := t.legacyKeyFromRecordLocked(record)
+		if !valid {
+			return
+		}
+		token, owned := t.tokens[key]
+		if !owned || !t.registry.Abort(token) {
+			return
+		}
+		t.forgetOperationCapabilityLocked(key)
+	}
+	t.rememberTrackResultLocked(leaseUUID, t.registry.TryTrack(spec))
+}
+
+func (t *DefaultInFlightTracker) removeForLegacy(leaseUUID string) bool {
+	if t.registry == nil {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	record, exists := t.registry.Lookup(leaseUUID)
+	if !exists {
+		return false
+	}
+	key, valid := t.legacyKeyFromRecordLocked(record)
+	if !valid {
+		return false
+	}
+	token, owned := t.tokens[key]
+	if !owned || !t.registry.Abort(token) {
+		return false
+	}
+	t.forgetOperationCapabilityLocked(key)
+	return true
+}
+
+func (t *DefaultInFlightTracker) popForLegacy(leaseUUID string) (InFlightProvision, bool) {
+	if t.registry == nil {
+		return InFlightProvision{}, false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	record, exists := t.registry.Lookup(leaseUUID)
+	if !exists {
+		return InFlightProvision{}, false
+	}
+	key, valid := t.legacyKeyFromRecordLocked(record)
+	if !valid {
+		return InFlightProvision{}, false
+	}
+	token, owned := t.tokens[key]
+	if !owned || !t.registry.Abort(token) {
+		return InFlightProvision{}, false
+	}
+	t.forgetOperationCapabilityLocked(key)
+	return inFlightProvisionFromRecord(record), true
+}
+
+func (t *DefaultInFlightTracker) legacyKeyFromRecordLocked(record operation.Record) (legacyOperationKey, bool) {
+	if !record.ID.Valid() || record.LeaseUUID == "" {
+		return legacyOperationKey{}, false
+	}
+	return legacyOperationKey{leaseUUID: record.LeaseUUID, operationID: record.ID}, true
+}
+
 // These helpers preserve concise setup in older tests without exposing
 // operationID-free mutation on the production tracker API.
 
@@ -182,5 +268,3 @@ func (m *Manager) InFlightCountsByBackend() map[string]int {
 func (m *Manager) GetTimedOutProvisions(timeout time.Duration) []InFlightProvision {
 	return m.tracker.GetTimedOutProvisions(timeout)
 }
-
-var _ ReconcilerTracker = (*Manager)(nil)

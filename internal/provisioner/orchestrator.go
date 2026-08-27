@@ -43,23 +43,31 @@ func classifyProvisionOutcome(err error) provisionOutcome {
 	case err == nil:
 		return provisionOutcomeAccepted
 	case errors.Is(err, backend.ErrAlreadyProvisioned):
-		// HTTPClient maps every 409 response to this sentinel without validating
-		// a backend-authored error code. An intermediary-generated 409 therefore
-		// cannot prove that the selected backend owns the lease. Keep the durable
+		// HTTPClient maps every 409 response to this sentinel without validating a
+		// declared machine-readable error code. An intermediary-generated 409
+		// therefore cannot prove that the selected backend owns the lease. Keep the durable
 		// Attempt until matching positive inventory confirms it or an operator
 		// supplies a remote cancellation/refusal proof.
 		return provisionOutcomeAmbiguous
 	case errors.Is(err, backend.ErrValidation),
 		errors.Is(err, backend.ErrCapacityRefused),
 		errors.Is(err, backend.ErrCircuitOpen):
-		// Validation and coded capacity errors carry parsed backend-authored
-		// verdicts, while an open circuit means the request was never sent. The base
-		// ErrInsufficientResources is not included: legacy and intermediary 503s map
-		// to that sentinel without proving that the backend refused the request.
+		// Validation and coded capacity errors carry contract-conforming verdicts
+		// trusted under the configured backend transport, while an open circuit means
+		// the request was never sent. The base ErrInsufficientResources is not
+		// included: legacy and intermediary 503s map to it without satisfying that
+		// settlement contract.
 		return provisionOutcomeDefinitiveFailure
 	default:
 		return provisionOutcomeAmbiguous
 	}
+}
+
+func capacityVerdictLabel(err error) string {
+	if errors.Is(err, backend.ErrCapacityRefused) {
+		return metrics.CapacityVerdictCodedRefusal
+	}
+	return metrics.CapacityVerdictAmbiguous
 }
 
 // ProvisionOrchestrator coordinates the provisioning flow.
@@ -403,7 +411,9 @@ func (o *ProvisionOrchestrator) startProvisioning(
 	provisionErr := invokeBackendProvision(ctx, backendClient, req)
 	outcome := classifyProvisionOutcome(provisionErr)
 	if errors.Is(provisionErr, backend.ErrInsufficientResources) {
-		metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
+		metrics.BackendInsufficientResourcesTotal.WithLabelValues(
+			backendClient.Name(), capacityVerdictLabel(provisionErr),
+		).Inc()
 	}
 	var completion operation.InitiationCompletion
 	if outcome == provisionOutcomeAccepted {

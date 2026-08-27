@@ -78,7 +78,8 @@
 // A positive report from another backend is unioned with every existing owner
 // and attempt into durable conflict quarantine. Complete or partial inventory
 // silence never clears an ambiguous attempt or conflict: an old request can
-// commit after the list response. Only a causally validated synchronous refusal
-// or explicit operator proof may clear it. This makes timeout, panic, transport
-// failure, generic 5xx, callback loss, and restart conservative by construction.
+// commit after the list response. Only a contract-conforming synchronous
+// refusal trusted under the configured backend transport, or explicit operator
+// proof, may clear it. This makes timeout, panic, transport failure, generic
+// 5xx, callback loss, and restart conservative by construction.
 package provisioner

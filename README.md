@@ -751,8 +751,9 @@ lifecycle work sharing either lease is rejected before dispatch. The source
 reservation is process-local and lasts only through the synchronous backend call;
 the target attempt is durable and is later settled only by its exact operation ID.
 
-Backend acceptance (including a validated `already_provisioned` response) confirms
-the target, while a causally validated synchronous domain refusal clears it. A
+Backend acceptance (including a contract-conforming `already_provisioned`
+response trusted under the configured backend transport) confirms the target,
+while a contract-conforming synchronous domain refusal clears it. A
 timeout, transport error,
 panic, generic 5xx, malformed error envelope, or unvalidated 503 is ambiguous: Fred
 releases the short-lived source reservation but retains the target attempt because
@@ -761,8 +762,11 @@ normally return 409. A positive report from the attempted backend can confirm it
 a positive report from another backend creates a durable conflict containing
 every candidate. Inventory silence never disproves or clears an ambiguous
 attempt because the original request could commit after the list response.
-Retrying requires a causally validated synchronous refusal or explicit operator
-proof and repair.
+Retrying requires such a contract-conforming synchronous refusal or explicit
+operator proof and repair. Backend response bodies are not HMAC-authenticated:
+their codes establish protocol conformance under the deployment's transport
+trust, not cryptographic authorship. Use TLS or an equivalently trusted network
+between Fred and its configured backends when an on-path attacker is in scope.
 
 **Response:** `202 Accepted`
 ```json
@@ -922,6 +926,11 @@ Any backend must implement these HTTP endpoints. For a comprehensive implementat
 ### Endpoint Reference
 
 All endpoints except `/health`, `/stats`, and `/metrics` require HMAC-SHA256 signature authentication via the `X-Fred-Signature` header.
+
+That HMAC authenticates requests sent *to* a backend. Backend response bodies
+are not signed; machine-readable response codes are contract signals trusted
+under the configured transport. TLS or an equivalently trusted private network
+is required if response forgery by an on-path actor is in scope.
 
 #### Required
 
@@ -1157,7 +1166,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
 - `400 Bad Request` - Missing `lease_uuid`/`from_lease_uuid`/`callback_url`, equal source and target UUIDs, or items/manifest validation error
 - `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"`, so the two are distinguished by the presence of that discriminator
 - `422 Unprocessable Entity` - No retained data for the source lease (also returned by backends that don't support retention)
-- `503 Service Unavailable` - Insufficient resources
+- `503 Service Unavailable` - Insufficient resources. A synchronous refusal returns `{"error":"...","code":"insufficient_resources"}` so Fred can classify the exact attempt as clearable under the configured transport's trust boundary. A code-less or unknown-code 503 remains ambiguous `ErrInsufficientResources`; a malformed/non-envelope 503 becomes `ErrMalformedErrorBody`. Neither ambiguous class authorizes substitution.
 
 > Fred maps only the backend's **bare** `422` (`ErrNotRetained` — no retained data, no `code`) to a tenant-facing `404` on `POST /v1/leases/{uuid}/restore`. A `422` carrying `code: "demote_exceeds_tier"` (`ErrDemoteDataExceedsTier` — retained data exceeds the requested smaller tier) is forwarded to the tenant as `422`, not remapped.
 

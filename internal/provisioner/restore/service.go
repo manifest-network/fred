@@ -63,7 +63,7 @@ type Result struct {
 // Accepted reports whether the backend accepted asynchronous restore work.
 func (result Result) Accepted() bool { return result.Outcome == OutcomeAccepted }
 
-// Detail returns backend-authored detail from a validated error envelope.
+// Detail returns endpoint-provided detail from a validated error envelope.
 func (result Result) Detail() string { return result.detail }
 
 // Cause returns the operator-facing error underlying a non-success result.
@@ -309,6 +309,13 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		Items:         items,
 		CallbackURL:   callbackURL,
 	})
+	if errors.Is(callErr, backend.ErrInsufficientResources) {
+		verdict := metrics.CapacityVerdictAmbiguous
+		if errors.Is(callErr, backend.ErrCapacityRefused) {
+			verdict = metrics.CapacityVerdictCodedRefusal
+		}
+		metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendName, verdict).Inc()
+	}
 	if callErr == nil {
 		completion := service.operations.Activate(initiation)
 		if callbackCompleted(completion) {
@@ -360,7 +367,7 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 			backend.LeaseStatusEvent{
 				LeaseUUID: command.TargetLeaseUUID,
 				Status:    backend.ProvisionStatusFailed,
-				Error:     "restore request refused",
+				Error:     "restore did not start",
 				Timestamp: service.now(),
 			})
 	default:
@@ -601,9 +608,11 @@ func classifyBackendError(err error) Result {
 	return result
 }
 
-// definitelyRefused identifies typed results proving that no asynchronous work
-// was accepted. Transport failures, generic 5xx, malformed envelopes, and the
-// HTTP client's broad 503/capacity sentinel remain ambiguous.
+// definitelyRefused identifies typed results whose configured-backend protocol
+// contract says no asynchronous work was accepted. Responses are not HMAC
+// authenticated, so this verdict relies on the deployment's transport trust.
+// Transport failures, generic 5xx, malformed envelopes, and the HTTP client's
+// broad 503/capacity sentinel remain ambiguous.
 func definitelyRefused(err error) bool {
 	return errors.Is(err, backend.ErrNotRetained) ||
 		errors.Is(err, backend.ErrInvalidState) ||

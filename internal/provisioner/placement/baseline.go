@@ -329,7 +329,6 @@ func (s *Store) ConfigureBackendTopology(names []string) error {
 	for _, backendName := range metadata.KnownBackends {
 		s.knownBackendNames[backendName] = struct{}{}
 	}
-	s.inventoryReady = false
 	s.advanceAuthorityEpochLocked()
 	return nil
 }

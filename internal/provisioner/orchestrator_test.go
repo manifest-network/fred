@@ -309,7 +309,9 @@ func TestOrchestrator_StartProvisioning_BeginCallFailureRefusesUnsentAttempt(t *
 			operations := &beginCallRejectingProvisionOperations{ProvisionOperations: registry}
 			store := newTestPlacementAuthority(t)
 			if test.confirmed {
-				require.NoError(t, store.Confirm("lease-1", client.Name()))
+				seedTestConfirmedPlacements(t, store, []string{client.Name()}, map[string]string{
+					"lease-1": client.Name(),
+				})
 			}
 			armTestPlacementAdmission(t, store, router)
 			orchestrator, err := NewProvisionOrchestrator(
@@ -1319,6 +1321,14 @@ func TestClassifyProvisionOutcome(t *testing.T) {
 	}
 }
 
+func TestCapacityVerdictLabel(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, metrics.CapacityVerdictCodedRefusal,
+		capacityVerdictLabel(fmt.Errorf("wrapped: %w", backend.ErrCapacityRefused)))
+	assert.Equal(t, metrics.CapacityVerdictAmbiguous,
+		capacityVerdictLabel(fmt.Errorf("wrapped: %w", backend.ErrInsufficientResources)))
+}
+
 func TestOrchestrator_StartProvisioning_AmbiguousAttemptSuppressesSecondBackendCall(t *testing.T) {
 	first := &mockManagerBackend{name: "backend-a", provisionErr: errors.New("connection reset")}
 	second := &mockManagerBackend{name: "backend-b"}
@@ -1937,7 +1947,8 @@ func TestOrchestrator_StartProvisioningClaimed_RejectsNonPendingLeaseBeforeSideE
 	}
 }
 
-// errorPlacementStore is a PlacementStore that returns errors on write operations.
+// errorPlacementStore is a legacy raw-map fixture that injects write failures
+// behind typed test adapters.
 type errorPlacementStore struct {
 	mockPlacementStore
 	setErr                error
@@ -2156,28 +2167,33 @@ func TestOrchestrator_StartProvisioning_NoPlacementRecord_RoutesFreely(t *testin
 }
 
 func TestOrchestrator_StartProvisioning_IncrementsInsufficientResources(t *testing.T) {
-	mb := &mockManagerBackend{
-		name:         "test-backend",
-		provisionErr: fmt.Errorf("no capacity: %w", backend.ErrInsufficientResources),
+	tests := []struct {
+		name    string
+		err     error
+		verdict string
+	}{
+		{name: "coded refusal", err: backend.ErrCapacityRefused, verdict: metrics.CapacityVerdictCodedRefusal},
+		{name: "ambiguous legacy response", err: backend.ErrInsufficientResources, verdict: metrics.CapacityVerdictAmbiguous},
 	}
-	router := &mockBackendRouter{
-		routeFn: func(sku string) backend.Backend { return mb },
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mb := &mockManagerBackend{name: "test-backend", provisionErr: test.err}
+			router := &mockBackendRouter{routeFn: func(string) backend.Backend { return mb }}
+			orchestrator := newTestProvisionOrchestrator(
+				t, "prov-1", "http://localhost:8080", router, NewInFlightTracker(), nil,
+			)
+			counter := metrics.BackendInsufficientResourcesTotal.WithLabelValues(
+				"test-backend", test.verdict,
+			)
+			before := promtestutil.ToFloat64(counter)
+			lease := &billingtypes.Lease{
+				Uuid: "lease-capacity-" + test.verdict, Tenant: "tenant-a",
+				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}
+
+			err := startTestProvisioning(t, orchestrator, t.Context(), lease, ProvisionOpts{})
+			require.ErrorIs(t, err, backend.ErrInsufficientResources)
+			assert.Equal(t, before+1, promtestutil.ToFloat64(counter))
+		})
 	}
-	tracker := NewInFlightTracker()
-	orch := newTestProvisionOrchestrator(t, "prov-1", "http://localhost:8080", router, tracker, nil)
-
-	before := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("test-backend"))
-
-	lease := &billingtypes.Lease{
-		Uuid:   "lease-capacity",
-		Tenant: "tenant-a",
-		Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
-	}
-
-	err := startTestProvisioning(t, orch, context.Background(), lease, ProvisionOpts{})
-	require.Error(t, err)
-	assert.ErrorIs(t, err, backend.ErrInsufficientResources)
-
-	after := promtestutil.ToFloat64(metrics.BackendInsufficientResourcesTotal.WithLabelValues("test-backend"))
-	assert.Equal(t, 1.0, after-before, "BackendInsufficientResourcesTotal should increment by 1")
 }

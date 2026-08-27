@@ -303,8 +303,8 @@ func TestCallbackService_SuccessSettlesExactDurableAttempt(t *testing.T) {
 	registry := operation.NewRegistry()
 	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
 	store := newTestPlacementAuthority(t)
-	_, err := store.BeginAttempt("lease-1", "backend-a", token.ID())
-	require.NoError(t, err)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", token.ID())
 
 	var acknowledgeCalls atomic.Int32
 	service, err := NewCallbackService(CallbackServiceConfig{
@@ -340,8 +340,8 @@ func TestCallbackService_FailureCannotClearDifferentDurableOperation(t *testing.
 	store := newTestPlacementAuthority(t)
 	newerID, err := operation.ParseID("d9428888-122b-41e1-b85c-61c67afba0c6")
 	require.NoError(t, err)
-	_, err = store.BeginAttempt("lease-1", "backend-a", newerID)
-	require.NoError(t, err)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", newerID)
 
 	var rejectCalls atomic.Int32
 	service, err := NewCallbackService(CallbackServiceConfig{
@@ -376,8 +376,8 @@ func TestCallbackService_RetryableAcknowledgeFailureReleasesExactClaim(t *testin
 	registry := operation.NewRegistry()
 	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
 	store := newTestPlacementAuthority(t)
-	_, err := store.BeginAttempt("lease-1", "backend-a", token.ID())
-	require.NoError(t, err)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", token.ID())
 
 	var calls atomic.Int32
 	service, err := NewCallbackService(CallbackServiceConfig{
@@ -419,8 +419,8 @@ func TestCallbackService_ConcurrentDuplicateCallbacksAcknowledgeOnce(t *testing.
 	}
 	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
 	store := newTestPlacementAuthority(t)
-	_, err := store.BeginAttempt("lease-1", "backend-a", token.ID())
-	require.NoError(t, err)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", token.ID())
 
 	acknowledgeStarted := make(chan struct{})
 	releaseAcknowledge := make(chan struct{})

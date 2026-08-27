@@ -45,7 +45,8 @@ func (a *integrationAcknowledger) Acknowledge(ctx context.Context, leaseUUID str
 	return n > 0, hash, nil
 }
 
-// testReconcilerTracker adapts InFlightTracker + PayloadStore to satisfy ReconcilerTracker.
+// testReconcilerTracker adapts the shared operation registry and payload store
+// to the reconciler's narrow production runtime port.
 type testReconcilerTracker struct {
 	*provisioner.DefaultInFlightTracker
 	store *payload.Store
@@ -1063,11 +1064,11 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 	placementStore, err := placement.NewStore(filepath.Join(t.TempDir(), "manager-placements.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, placementStore.Close()) })
+	require.NoError(t, placementStore.ConfigureBackendTopology([]string{b.Name()}))
 	fence := placementStore.BeginInventorySession()
-	_, err = placementStore.ProjectInventory(fence, placement.InventoryProjection{})
+	_, err = placementStore.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
 	placementStore.EndInventorySession(fence)
 	require.NoError(t, err)
-	placementStore.MarkInventoryReady()
 	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
 		ProviderUUID:    "test-provider",
 		CallbackBaseURL: callbackServer.URL,

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	"github.com/prometheus/client_golang/prometheus"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -311,12 +312,10 @@ func newFixture(t *testing.T, inventoryReady bool) *fixture {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	require.NoError(t, store.ConfigureBackendTopology([]string{testBackend, "backend-b"}))
-	require.NoError(t, store.Confirm(testSource, testBackend))
+	projectRestoreTestPlacements(t, store, inventoryReady, map[string]string{
+		testSource: testBackend,
+	})
 	if inventoryReady {
-		fence := store.BeginInventorySession()
-		_, err = store.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
-		store.EndInventorySession(fence)
-		require.NoError(t, err)
 		require.True(t, store.CurrentAdmissionBaseline().Valid())
 	}
 	backendClient := &fakeBackend{name: testBackend}
@@ -340,6 +339,23 @@ func newFixture(t *testing.T, inventoryReady bool) *fixture {
 		Authority:    result.authority,
 		Events:       result.events,
 		Now:          func() time.Time { return time.Unix(123, 0).UTC() },
+	})
+	require.NoError(t, err)
+	return result
+}
+
+func projectRestoreTestPlacements(
+	t *testing.T,
+	store *placement.Store,
+	complete bool,
+	placements map[string]string,
+) placement.ProjectionResult {
+	t.Helper()
+	fence := store.BeginInventorySession()
+	defer store.EndInventorySession(fence)
+	result, err := store.ProjectInventory(fence, placement.InventoryProjection{
+		Complete:   complete,
+		Placements: placements,
 	})
 	require.NoError(t, err)
 	return result
@@ -637,7 +653,12 @@ func TestServiceClaimsAndProjectionFenceSynchronousRestore(t *testing.T) {
 	require.NoError(t, err)
 	fixture.store.EndInventorySession(fence)
 	assert.Contains(t, projection.Fenced, testSource)
-	_, err = fixture.store.BeginAttempt(testSource, testBackend, testOperationID(t, 9010))
+	_, _, err = fixture.store.BeginOwnedAttempt(
+		fixture.store.CurrentAdmissionBaseline(),
+		fixture.store.Lookup(testSource).RecordRevision(),
+		testBackend,
+		testOperationID(t, 9010),
+	)
 	require.ErrorIs(t, err, placement.ErrRestoreSourceClaimed)
 
 	close(release)
@@ -648,7 +669,9 @@ func TestServiceClaimsAndProjectionFenceSynchronousRestore(t *testing.T) {
 
 func TestServiceTargetPlacementAdmissionFailsBeforeDispatch(t *testing.T) {
 	fixture := newFixture(t, true)
-	require.NoError(t, fixture.store.Confirm(testTarget, testBackend))
+	projectRestoreTestPlacements(t, fixture.store, false, map[string]string{
+		testTarget: testBackend,
+	})
 	before := fixture.store.Lookup(testTarget)
 
 	result := fixture.service.Execute(t.Context(), validCommand())
@@ -813,17 +836,27 @@ func TestServiceSynchronousSettlementModes(t *testing.T) {
 		wantState  placement.State
 		settlement string
 		wantEvents []backend.ProvisionStatus
+		verdict    string
 	}{
 		{name: "accepted", outcome: OutcomeAccepted, wantState: placement.StateConfirmed, settlement: "confirm", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
 		{name: "already provisioned", err: backend.ErrAlreadyProvisioned, outcome: OutcomeAlreadyProvisioned, wantState: placement.StateConfirmed, settlement: "confirm", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
 		{name: "definitive refusal", err: backend.ErrValidation, outcome: OutcomeInvalidRequest, wantState: placement.StateAbsent, settlement: "refuse", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting, backend.ProvisionStatusFailed}},
-		{name: "coded capacity refusal", err: backend.ErrCapacityRefused, outcome: OutcomeInsufficientResources, wantState: placement.StateAbsent, settlement: "refuse", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting, backend.ProvisionStatusFailed}},
+		{name: "coded capacity refusal", err: backend.ErrCapacityRefused, outcome: OutcomeInsufficientResources, wantState: placement.StateAbsent, settlement: "refuse", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting, backend.ProvisionStatusFailed}, verdict: metrics.CapacityVerdictCodedRefusal},
+		{name: "ambiguous capacity response", err: backend.ErrInsufficientResources, outcome: OutcomeInsufficientResources, wantState: placement.StateAttempting, settlement: "abandon", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}, verdict: metrics.CapacityVerdictAmbiguous},
 		{name: "ambiguous error", err: context.DeadlineExceeded, outcome: OutcomeInternalFailure, wantState: placement.StateAttempting, settlement: "abandon", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newFixture(t, true)
 			fixture.backend.err = test.err
+			var capacityCounter prometheus.Counter
+			var capacityBefore float64
+			if test.verdict != "" {
+				capacityCounter = metrics.BackendInsufficientResourcesTotal.WithLabelValues(
+					testBackend, test.verdict,
+				)
+				capacityBefore = promtestutil.ToFloat64(capacityCounter)
+			}
 			result := fixture.service.Execute(t.Context(), validCommand())
 			assert.Equal(t, test.outcome, result.Outcome)
 			assert.Equal(t, test.wantState, fixture.store.Lookup(testTarget).State())
@@ -843,7 +876,10 @@ func TestServiceSynchronousSettlementModes(t *testing.T) {
 				assert.Equal(t, time.Unix(123, 0).UTC(), events[index].Timestamp)
 			}
 			if len(events) == 2 {
-				assert.Equal(t, "restore request refused", events[1].Error)
+				assert.Equal(t, "restore did not start", events[1].Error)
+			}
+			if capacityCounter != nil {
+				assert.Equal(t, capacityBefore+1, promtestutil.ToFloat64(capacityCounter))
 			}
 		})
 	}

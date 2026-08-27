@@ -177,8 +177,14 @@ func TestFleet_IncompleteInventoryKeepsUnresolvedAttempt(t *testing.T) {
 		TokenRequired: true,
 	})
 	require.True(t, tracked.Started())
-	_, err := f.placement.BeginAttempt("lease-unknown", "backend-2", tracked.Token().ID())
+	baseline := f.placement.CurrentAdmissionBaseline()
+	scope, err := f.placement.ScopeAdmission(baseline, backendTopologyNames(f.router))
 	require.NoError(t, err)
+	_, applied, err := f.placement.BeginNewAttempt(
+		scope, "lease-unknown", "backend-2", tracked.Token().ID(),
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
 	require.True(t, f.tracker.Operations().Abort(tracked.Token()))
 	f.backendAt(2).setFault(faultRetentionsOnly)
 
@@ -308,19 +314,14 @@ func TestFleet_ActiveLeaseOnFaultedBackend_IsNeverReprovisioned(t *testing.T) {
 	}
 }
 
-// The production data-loss shape, stated exactly. With no placement record to
-// pin it, a lease whose backend went quiet looks unprovisioned, and the
-// ACTIVE && !isProvisioned row hands it to least-loaded routing — which picks a
-// DIFFERENT machine and lays a brand-new empty volume over live tenant data.
-// Nothing about that is visible to the caller: the provision succeeds.
-//
-// The previous test pins the same rule with a placement record present (where
-// the pin happens to route it back to its real owner). This one removes the
-// pin, so a regression lands the provision on a peer — which is the failure
-// that actually destroys data.
+// The production data-loss shape, stated exactly. Before any complete fleet
+// projection establishes a durable absence baseline, a recordless lease whose
+// backend went quiet must not be treated as genuinely new. Otherwise the
+// ACTIVE && !isProvisioned row could hand it to a healthy peer and lay a new
+// empty volume over live tenant data.
 func TestFleet_UnplacedLeaseOnFaultedBackend_IsNotProvisionedOnAPeer(t *testing.T) {
 	t.Parallel()
-	f := newFleet(t, fleetOptions{noPlacement: true})
+	f := newFleet(t, fleetOptions{})
 
 	f.addLease("lease-unplaced", billingtypes.LEASE_STATE_ACTIVE)
 	f.backendAt(2).seedProvision(t, "lease-unplaced", f.providerUUID, backend.ProvisionStatusReady)

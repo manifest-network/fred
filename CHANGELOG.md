@@ -36,20 +36,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The existing `stateless` FSM continues to serialize each backend lease actor;
   fleet reconciliation is deliberately a level-triggered evidence join with a
   pure decision table rather than a second edge-triggered FSM. (ENG-632)
+- Reconciliation now has one construction and execution path: the exported
+  constructor requires typed operation and placement authorities, and the
+  legacy raw tracker/revision fallbacks have been removed. Reconciler tests use
+  that same production path, including exact lease re-reads, opaque claims,
+  operation-scoped callback URLs, inventory fences, and attempt tokens. (ENG-632)
 - Restore admission now atomically reserves the confirmed source placement and
   writes the absent target's operation-scoped attempt under ordered source and
   target lifecycle claims. Exact acceptance/positive evidence confirms it and a
-  causally validated synchronous refusal may clear it. An ambiguous return or
+  contract-conforming synchronous refusal, trusted under the configured backend
+  transport, may clear it. An ambiguous return or
   panic releases the transient source reservation but retains the durable target
   attempt; inventory absence never settles it. (ENG-632)
 - Bundled backends now tag synchronous provision/restore capacity refusals with
   `code="insufficient_resources"`. The HTTP client reconstructs a distinct
   `ErrCapacityRefused` that still matches `ErrInsufficientResources`, allowing
   only that exact write-ahead attempt to be cleared and retried elsewhere.
-  Legacy, code-less, unknown-code, and malformed 503 responses remain ambiguous
-  and retain their attempt. A definitively refused restore now follows its
-  pre-dispatch `restarting` event with a best-effort terminal `failed` event so
-  subscribers are not left on a stale lifecycle hint. (ENG-632)
+  The code establishes protocol conformance, not cryptographic authorship:
+  backend responses are not HMAC-authenticated and rely on the configured
+  transport trust boundary. Legacy, code-less, and unknown-code 503 responses
+  remain `ErrInsufficientResources` but ambiguous; malformed/non-envelope 503s
+  are `ErrMalformedErrorBody`. Both classes retain their attempt. The
+  `fred_backend_insufficient_resources_total` metric now separates
+  `verdict="coded_refusal"` from `verdict="ambiguous"`. A definitively refused
+  restore now follows its pre-dispatch `restarting` event with a best-effort
+  terminal `failed` event whose neutral diagnostic says the restore did not
+  start, so subscribers are not left on a stale lifecycle hint. (ENG-632)
 - `placement_store_db_path` is now required at startup. Production topology is
   multi-backend, and even single-backend development/test needs durable evidence
   after an ambiguous response or restart, so providerd no longer offers an unsafe
@@ -113,8 +125,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Placement-enabled provision and all restore transitions are now write-ahead
   and fail closed: Fred durably records an attempted backend before the backend
-  call, distinguishes a causally validated synchronous refusal from an ambiguous
-  outcome, reconciles attempts only from exact positive evidence (never inventory absence), and
+  call, distinguishes a contract-conforming synchronous refusal trusted under
+  the configured backend transport from an ambiguous outcome, reconciles
+  attempts only from exact positive evidence (never inventory absence), and
   deprovisions every known owner candidate. Callback and timeout settlement is
   exact-operation scoped so an older operation cannot mutate or reject its
   replacement. (ENG-632)

@@ -65,19 +65,17 @@ var errPlacementSnapshotStale = errors.New("placement changed after inventory sn
 var errTrackerSnapshotStale = errors.New("in-flight operation changed after inventory snapshot")
 
 // reconcileActionAuthority carries the exact process-local and durable
-// capabilities that authorize one action planned from a fleet snapshot. The
-// typed fields are intentionally opaque and safe-zero. Numeric revisions exist
-// only for compatibility with legacy test doubles while callers migrate.
+// capabilities that authorize one action planned from a fleet snapshot. Every
+// field is an opaque, safe-zero capability issued by the operation or placement
+// authority; raw numeric revisions cannot authorize a backend side effect.
 type reconcileActionAuthority struct {
-	leaseClaim        operation.LeaseClaim
-	baseline          placement.AdmissionBaseline
-	recordlessScope   placement.AdmissionScope
-	allowRecordless   bool
-	eligibleBackends  map[string]struct{}
-	ownedPlacement    placement.RecordRevision
-	ownedBackend      string
-	placementRevision uint64
-	trackerRevision   uint64
+	leaseClaim       operation.LeaseClaim
+	baseline         placement.AdmissionBaseline
+	recordlessScope  placement.AdmissionScope
+	allowRecordless  bool
+	eligibleBackends map[string]struct{}
+	ownedPlacement   placement.RecordRevision
+	ownedBackend     string
 }
 
 // errPayloadNotAvailable indicates the payload required for provisioning is
@@ -126,10 +124,7 @@ type Reconciler struct {
 	acknowledger       Acknowledger // Routes acks through the batcher for parallel signing
 	backendRouter      BackendRouter
 	payloads           ReconcilerPayloads
-	tracker            ReconcilerTracker // Legacy test-double compatibility only.
 	operations         ReconcilerOperations
-	placementView      PlacementView
-	legacyPlacement    PlacementStore // Non-nil only through newReconciler.
 	placementAuthority ReconcilerPlacement
 	startEvents        ProvisionStartEventSink
 
@@ -190,12 +185,46 @@ func NewReconciler(
 	if util.IsNilInterface(operations) {
 		return nil, errors.New("reconciler operations are required")
 	}
-	reconciler, err := buildReconciler(
-		cfg, chainClient, acknowledger, backendRouter,
-		runtime, operations, nil, placementStore, nil, placementStore,
-	)
-	if err != nil {
-		return nil, err
+	if chainClient == nil {
+		return nil, errors.New("chain client is required")
+	}
+	if acknowledger == nil {
+		return nil, errors.New("acknowledger is required")
+	}
+	if backendRouter == nil {
+		return nil, errors.New("backend router is required")
+	}
+	if cfg.ProviderUUID == "" {
+		return nil, errors.New("provider UUID is required")
+	}
+	if cfg.CallbackBaseURL == "" {
+		return nil, errors.New("callback base URL is required")
+	}
+
+	// Apply defaults using cmp.Or (returns first non-zero value).
+	interval := cmp.Or(cfg.Interval, 5*time.Minute)
+	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
+	maxReprovision := cmp.Or(max(cfg.MaxReprovisionAttempts, 0), DefaultMaxReprovisionAttempts)
+	startEvents := cfg.StartEvents
+	if util.IsNilInterface(startEvents) {
+		startEvents = nil
+	}
+
+	reconciler := &Reconciler{
+		providerUUID:              cfg.ProviderUUID,
+		callbackBaseURL:           cfg.CallbackBaseURL,
+		chainClient:               chainClient,
+		acknowledger:              acknowledger,
+		backendRouter:             backendRouter,
+		payloads:                  runtime,
+		operations:                operations,
+		placementAuthority:        placementStore,
+		startEvents:               startEvents,
+		interval:                  interval,
+		maxWorkers:                maxWorkers,
+		maxReprovisionAttempts:    maxReprovision,
+		placementAbsenceUntrusted: make(map[string]map[string]struct{}),
+		ambiguousPlacements:       make(map[string][]string),
 	}
 	// Reconciler is also exported as a standalone runtime. Keep its topology
 	// validation independent of NewManager: the production composition calls both,
@@ -207,103 +236,8 @@ func NewReconciler(
 	return reconciler, nil
 }
 
-// newReconciler retains the pre-typed dependency shape for isolated tests of
-// read-only planning and legacy safety barriers. Production composition must
-// use NewReconciler, whose signature makes both authorities mandatory.
-func newReconciler(
-	cfg ReconcilerConfig,
-	chainClient ReconcilerChainClient,
-	acknowledger Acknowledger,
-	backendRouter BackendRouter,
-	tracker ReconcilerTracker,
-	placementStore PlacementStore,
-) (*Reconciler, error) {
-	return buildReconciler(
-		cfg, chainClient, acknowledger, backendRouter,
-		tracker, operationRegistryFromReconcilerTracker(tracker), tracker,
-		placementStore, placementStore, nil,
-	)
-}
-
-func buildReconciler(
-	cfg ReconcilerConfig,
-	chainClient ReconcilerChainClient,
-	acknowledger Acknowledger,
-	backendRouter BackendRouter,
-	payloads ReconcilerPayloads,
-	operations ReconcilerOperations,
-	tracker ReconcilerTracker,
-	placementView PlacementView,
-	legacyPlacement PlacementStore,
-	placementAuthority ReconcilerPlacement,
-) (*Reconciler, error) {
-	if util.IsNilInterface(operations) {
-		operations = nil
-	}
-	if chainClient == nil {
-		return nil, errors.New("chain client is required")
-	}
-	if acknowledger == nil {
-		return nil, errors.New("acknowledger is required")
-	}
-	if backendRouter == nil {
-		return nil, errors.New("backend router is required")
-	}
-	if placementView != nil && tracker == nil && operations == nil {
-		return nil, errors.New("in-flight tracker is required when placement store is enabled")
-	}
-	if cfg.ProviderUUID == "" {
-		return nil, errors.New("provider UUID is required")
-	}
-	if cfg.CallbackBaseURL == "" {
-		return nil, errors.New("callback base URL is required")
-	}
-
-	// Apply defaults using cmp.Or (returns first non-zero value)
-	interval := cmp.Or(cfg.Interval, 5*time.Minute)
-	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
-	maxReprovision := cmp.Or(max(cfg.MaxReprovisionAttempts, 0), DefaultMaxReprovisionAttempts)
-	startEvents := cfg.StartEvents
-	if util.IsNilInterface(startEvents) {
-		startEvents = nil
-	}
-
-	return &Reconciler{
-		providerUUID:              cfg.ProviderUUID,
-		callbackBaseURL:           cfg.CallbackBaseURL,
-		chainClient:               chainClient,
-		acknowledger:              acknowledger,
-		backendRouter:             backendRouter,
-		payloads:                  payloads,
-		tracker:                   tracker,
-		operations:                operations,
-		placementView:             placementView,
-		legacyPlacement:           legacyPlacement,
-		placementAuthority:        placementAuthority,
-		startEvents:               startEvents,
-		interval:                  interval,
-		maxWorkers:                maxWorkers,
-		maxReprovisionAttempts:    maxReprovision,
-		placementAbsenceUntrusted: make(map[string]map[string]struct{}),
-		ambiguousPlacements:       make(map[string][]string),
-	}, nil
-}
-
-func operationRegistryFromReconcilerTracker(tracker ReconcilerTracker) *operation.Registry {
-	provider, ok := tracker.(interface {
-		Operations() *operation.Registry
-	})
-	if !ok {
-		return nil
-	}
-	return provider.Operations()
-}
-
 func (r *Reconciler) isInFlight(leaseUUID string) bool {
-	if r.operations != nil {
-		return r.operations.Contains(leaseUUID)
-	}
-	return r.tracker != nil && r.tracker.IsInFlight(leaseUUID)
+	return r.operations.Contains(leaseUUID)
 }
 
 // claimLeaseAction acquires the exact process-local capability that fences one
@@ -312,40 +246,24 @@ func (r *Reconciler) isInFlight(leaseUUID string) bool {
 // merely held a claim after that boundary makes the observation stale. Holding
 // the returned release function then prevents a delayed event from starting
 // until the caller's backend or placement mutation is complete.
-//
-// The raw tracker branch exists only for the legacy test constructor. The
-// exported production constructor always supplies Registry capabilities.
 func (r *Reconciler) claimLeaseAction(
 	leaseUUID string,
 	operationSnapshot operation.TrackerSnapshot,
-	trackerSnapshotRevision uint64,
 ) (release func(), acquired bool) {
-	if r.operations != nil {
-		if !operationSnapshot.Valid() {
-			return nil, false
-		}
-		result := r.operations.TryClaimLease(leaseUUID, operationSnapshot)
-		if !result.Acquired() {
-			return nil, false
-		}
-		claim := result.Claim()
-		return func() {
-			if !r.operations.ReleaseLease(claim) {
-				slog.Error("failed to release reconciler lease action claim",
-					"lease_uuid", leaseUUID)
-			}
-		}, true
+	if !operationSnapshot.Valid() {
+		return nil, false
 	}
-	if r.tracker != nil {
-		claimed, _ := r.tracker.TryClaimLeaseActionIfNotNewer(
-			leaseUUID, trackerSnapshotRevision,
-		)
-		if !claimed {
-			return nil, false
-		}
-		return func() { r.tracker.ReleaseLeaseAction(leaseUUID) }, true
+	result := r.operations.TryClaimLease(leaseUUID, operationSnapshot)
+	if !result.Acquired() {
+		return nil, false
 	}
-	return func() {}, true
+	claim := result.Claim()
+	return func() {
+		if !r.operations.ReleaseLease(claim) {
+			slog.Error("failed to release reconciler lease action claim",
+				"lease_uuid", leaseUUID)
+		}
+	}, true
 }
 
 func (r *Reconciler) payloadStore() *payload.Store {
@@ -404,7 +322,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	}()
 
 	slog.Info("starting reconciliation", "provider_uuid", r.providerUUID)
-	typedCoordination := r.operations != nil && r.placementAuthority != nil
 	// Sweep completeness describes current observability only. Beginning the
 	// typed inventory session invalidates older projection proofs, while the
 	// separately persisted topology baseline remains valid through a transient
@@ -415,33 +332,12 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// Every lifecycle decision below must be based on state no older than this
 	// boundary; an operation that starts or finishes afterward is deferred by its
 	// placement revision, tracker tombstone, or live action claim.
-	var placementSnapshotRevision uint64
-	if r.legacyPlacement != nil {
-		// Raw revision handles exist only for the compatibility adapter used by
-		// legacy unit tests. Production never retains this interface.
-		placementSnapshotRevision = r.legacyPlacement.BeginInventorySnapshot()
-		defer r.legacyPlacement.EndInventorySnapshot(placementSnapshotRevision)
-	}
-	var inventoryFence placement.InventoryFence
-	if r.placementAuthority != nil {
-		inventoryFence = r.placementAuthority.BeginInventorySession()
-		defer r.placementAuthority.EndInventorySession(inventoryFence)
-	}
+	inventoryFence := r.placementAuthority.BeginInventorySession()
+	defer r.placementAuthority.EndInventorySession(inventoryFence)
 	inFlightAtSnapshot := make(map[string]struct{})
-	var (
-		operationSnapshot       operation.TrackerSnapshot
-		trackerSnapshotRevision uint64
-	)
-	if typedCoordination {
-		operationSnapshot = r.operations.Snapshot()
-		for _, leaseUUID := range r.operations.LeaseUUIDs() {
-			inFlightAtSnapshot[leaseUUID] = struct{}{}
-		}
-	} else if r.tracker != nil {
-		trackerSnapshotRevision = r.tracker.SnapshotMutationRevision()
-		for _, leaseUUID := range r.tracker.GetInFlightLeases() {
-			inFlightAtSnapshot[leaseUUID] = struct{}{}
-		}
+	operationSnapshot := r.operations.Snapshot()
+	for _, leaseUUID := range r.operations.LeaseUUIDs() {
+		inFlightAtSnapshot[leaseUUID] = struct{}{}
 	}
 
 	// Collection is read-only. Its facts become authority only after the atomic
@@ -474,33 +370,25 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		)
 	}
 
-	// Retained leases also pin a backend (restore affinity, ENG-333). Fetch them
-	// only when placement tracking is enabled: the results feed solely the
-	// placement sync and the pruner below, both of which no-op without a
-	// placement store. Skipping avoids pointless per-backend /retentions calls and
-	// log noise on placement-disabled deployments.
+	// Retained leases also pin a backend (restore affinity, ENG-333).
 	allRetentions := inventory.retentions
 	retentionsAnswered := inventory.retentionsAnswered
-	if r.placementView != nil {
-		slog.Info("fetched backend retentions",
-			"total", len(allRetentions),
-			"complete", retentionsAnswered.complete(),
-			"unanswered", retentionsAnswered.unanswered(),
-		)
-	}
+	slog.Info("fetched backend retentions",
+		"total", len(allRetentions),
+		"complete", retentionsAnswered.complete(),
+		"unanswered", retentionsAnswered.unanswered(),
+	)
 	inventoryComplete := inventory.complete()
 	projection, err := r.projectPlacementInventory(ctx, reconcileProjectionInput{
-		inventory:                 inventory,
-		placementSnapshotRevision: placementSnapshotRevision,
-		inventoryFence:            inventoryFence,
-		inFlightAtSnapshot:        inFlightAtSnapshot,
+		inventory:          inventory,
+		inventoryFence:     inventoryFence,
+		inFlightAtSnapshot: inFlightAtSnapshot,
 	})
 	if err != nil {
 		return err
 	}
 	placementSyncOK := projection.syncOK
 	placementRecords := projection.records
-	sameSweepPlacementRevisions := projection.sameSweepPlacementRevisions
 	ambiguousOwners := projection.ambiguousOwners
 
 	// A fleet snapshot is authoritative only when both independent backend
@@ -508,17 +396,14 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// crossed the durable placement boundary. Provision inventory alone is not
 	// enough: retained data also pins ownership, and an unpersisted projection
 	// cannot safely authorize lifecycle work or advance the success heartbeat.
-	cycleComplete := inventoryComplete && (r.placementView == nil || placementSyncOK)
+	cycleComplete := inventoryComplete && placementSyncOK
 	if cycleComplete {
 		metrics.ReconcilerSweepComplete.Set(1)
 	} else {
 		metrics.ReconcilerSweepComplete.Set(0)
 	}
-	var admissionBaseline placement.AdmissionBaseline
-	if r.placementAuthority != nil {
-		admissionBaseline = r.placementAuthority.CurrentAdmissionBaseline()
-		r.placementSweepSeen.Store(admissionBaseline.Valid())
-	}
+	admissionBaseline := r.placementAuthority.CurrentAdmissionBaseline()
+	r.placementSweepSeen.Store(admissionBaseline.Valid())
 	// A degraded sweep may place genuinely new work only on a backend that
 	// answered both inventories. This is an immutable per-sweep hard boundary;
 	// routing fallback is not allowed to escape it.
@@ -529,7 +414,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		}
 	}
 	var recordlessScope placement.AdmissionScope
-	if r.placementAuthority != nil && admissionBaseline.Valid() {
+	if admissionBaseline.Valid() {
 		recordlessScope, err = r.placementAuthority.ScopeAdmission(
 			admissionBaseline, slices.Sorted(maps.Keys(eligibleBackends)),
 		)
@@ -660,7 +545,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 					"reason", reason,
 					"operation_id", operationID,
 					"placement_revision", placementRecord.Revision(),
-					"inventory_revision", placementSnapshotRevision,
 				)
 			}
 			if _, wasInFlight := inFlightAtSnapshot[leaseUUID]; wasInFlight {
@@ -671,32 +555,14 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				deferForSnapshotBoundary("in_flight_at_inventory_start", "")
 				return nil
 			}
-			appliedRevision, appliedThisSweep := sameSweepPlacementRevisions[leaseUUID]
-			if r.legacyPlacement != nil && placementRecord.State() != placement.StateAbsent &&
-				placementRecord.Revision() > placementSnapshotRevision &&
-				(!appliedThisSweep || appliedRevision != placementRecord.Revision()) {
-				deferForSnapshotBoundary("placement_changed_during_inventory", "")
-				return nil
-			}
-			placementCASRevision := placementSnapshotRevision
-			if appliedThisSweep {
-				// The store returned the exact revision committed by this inventory.
-				// Passing only that identity lets an ACTIVE/Failed row create its
-				// write-ahead attempt while any later placement mutation still wins.
-				placementCASRevision = appliedRevision
-			}
-
 			_, absenceUntrustedForLease := r.placementAbsenceUntrusted[leaseUUID]
 			if absenceUntrustedForLease {
 				deferForSnapshotBoundary("placement_observation_excluded", "")
 				return nil
 			}
-			allowRecordless := r.placementSweepSeen.Load() || cycleComplete
-			if typedCoordination {
-				allowRecordless = cycleComplete ||
-					(placementSyncOK && admissionBaseline.Valid() &&
-						lease.State == billingtypes.LEASE_STATE_PENDING && len(eligibleBackends) > 0)
-			}
+			allowRecordless := cycleComplete ||
+				(placementSyncOK && admissionBaseline.Valid() &&
+					lease.State == billingtypes.LEASE_STATE_PENDING && len(eligibleBackends) > 0)
 			absenceTrusted := allowRecordless
 
 			if placementRecord.State() == placement.StateConfirmed &&
@@ -741,11 +607,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				return nil
 			}
 			authority := reconcileActionAuthority{
-				baseline:          admissionBaseline,
-				recordlessScope:   recordlessScope,
-				allowRecordless:   allowRecordless,
-				placementRevision: placementCASRevision,
-				trackerRevision:   trackerSnapshotRevision,
+				baseline:        admissionBaseline,
+				recordlessScope: recordlessScope,
+				allowRecordless: allowRecordless,
 			}
 			if !cycleComplete {
 				authority.eligibleBackends = maps.Clone(eligibleBackends)
@@ -754,76 +618,53 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				authority.ownedPlacement = currentPlacement.RecordRevision()
 				authority.ownedBackend = currentPlacement.Backend
 			}
-			if typedCoordination {
-				if current, inFlight := r.operations.Lookup(leaseUUID); inFlight {
-					deferForSnapshotBoundary("operation_started_after_inventory", current.ID.String())
-					return nil
-				}
-				claimResult := r.operations.TryClaimLease(leaseUUID, operationSnapshot)
-				if !claimResult.Acquired() {
-					reason := "operation_started_before_action_claim"
-					if claimResult.Outcome() == operation.LeaseClaimSnapshotStale {
-						reason = "operation_completed_after_inventory"
-					}
-					deferForSnapshotBoundary(reason, "")
-					return nil
-				}
-				authority.leaseClaim = claimResult.Claim()
-				defer r.operations.ReleaseLease(authority.leaseClaim)
-			} else if r.tracker != nil {
-				if _, inFlight := r.tracker.GetInFlight(leaseUUID); inFlight {
-					deferForSnapshotBoundary("operation_started_after_inventory", "")
-					return nil
-				}
-				claimed, snapshotStale := r.tracker.TryClaimLeaseActionIfNotNewer(
-					leaseUUID, trackerSnapshotRevision,
-				)
-				if !claimed {
-					reason := "operation_started_before_action_claim"
-					if snapshotStale {
-						reason = "operation_completed_after_inventory"
-					}
-					deferForSnapshotBoundary(reason, "")
-					return nil
-				}
-				defer r.tracker.ReleaseLeaseAction(leaseUUID)
+			if current, inFlight := r.operations.Lookup(leaseUUID); inFlight {
+				deferForSnapshotBoundary("operation_started_after_inventory", current.ID.String())
+				return nil
 			}
+			claimResult := r.operations.TryClaimLease(leaseUUID, operationSnapshot)
+			if !claimResult.Acquired() {
+				reason := "operation_started_before_action_claim"
+				if claimResult.Outcome() == operation.LeaseClaimSnapshotStale {
+					reason = "operation_completed_after_inventory"
+				}
+				deferForSnapshotBoundary(reason, "")
+				return nil
+			}
+			authority.leaseClaim = claimResult.Claim()
+			defer r.operations.ReleaseLease(authority.leaseClaim)
 
 			// The list queries are only inventory candidates. Re-read the exact
 			// lease after acquiring its lifecycle claim so a close/reject/expiry
 			// cannot cross the final chain-read -> backend-dispatch boundary. The
-			// typed production path always has this authority; legacy test-double
-			// construction retains its historical snapshot behavior.
-			if typedCoordination {
-				currentLease, err := r.chainClient.GetLease(gctx, leaseUUID)
-				if err != nil {
-					deferred.Add(1)
-					leaseErrors.Add(1)
-					metrics.ReconcilerDeferredLeasesTotal.Inc()
-					slog.Error("reconcile: failed to re-read lease under lifecycle claim",
-						"lease_uuid", leaseUUID,
-						"error", err,
-					)
-					return nil
-				}
-				if currentLease == nil || currentLease.Uuid != leaseUUID ||
-					(currentLease.State != billingtypes.LEASE_STATE_PENDING &&
-						currentLease.State != billingtypes.LEASE_STATE_ACTIVE) {
-					deferred.Add(1)
-					metrics.ReconcilerDeferredLeasesTotal.Inc()
-					slog.Debug("reconcile: lease changed after inventory; skipping lifecycle action",
-						"lease_uuid", leaseUUID,
-						"lease_state", leaseState(currentLease),
-					)
-					return nil
-				}
-				lease = *currentLease
-				if !cycleComplete && lease.State != billingtypes.LEASE_STATE_PENDING {
-					// Degraded recordless admission is PENDING-only. Recompute that
-					// permission from the authoritative read under the lifecycle claim,
-					// not from the earlier list snapshot.
-					authority.allowRecordless = false
-				}
+			currentLease, err := r.chainClient.GetLease(gctx, leaseUUID)
+			if err != nil {
+				deferred.Add(1)
+				leaseErrors.Add(1)
+				metrics.ReconcilerDeferredLeasesTotal.Inc()
+				slog.Error("reconcile: failed to re-read lease under lifecycle claim",
+					"lease_uuid", leaseUUID,
+					"error", err,
+				)
+				return nil
+			}
+			if currentLease == nil || currentLease.Uuid != leaseUUID ||
+				(currentLease.State != billingtypes.LEASE_STATE_PENDING &&
+					currentLease.State != billingtypes.LEASE_STATE_ACTIVE) {
+				deferred.Add(1)
+				metrics.ReconcilerDeferredLeasesTotal.Inc()
+				slog.Debug("reconcile: lease changed after inventory; skipping lifecycle action",
+					"lease_uuid", leaseUUID,
+					"lease_state", leaseState(currentLease),
+				)
+				return nil
+			}
+			lease = *currentLease
+			if !cycleComplete && lease.State != billingtypes.LEASE_STATE_PENDING {
+				// Degraded recordless admission is PENDING-only. Recompute that
+				// permission from the authoritative read under the lifecycle claim,
+				// not from the earlier list snapshot.
+				authority.allowRecordless = false
 			}
 
 			r.processLease(gctx, leaseUUID, lease, provision, isProvisioned,
@@ -879,10 +720,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 					leaseErrors.Add(1)
 				}
 			}()
-			r.processOrphan(
-				ogctx, leaseUUID, provision, operationSnapshot, trackerSnapshotRevision,
-				&orphans, &leaseErrors,
-			)
+			r.processOrphan(ogctx, leaseUUID, provision, operationSnapshot, &orphans, &leaseErrors)
 			return nil // Don't fail fast - continue processing other orphans
 		})
 	}
@@ -953,8 +791,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	orphanedPayloads := r.cleanupOrphanedPayloads(ctx, chainLeases)
 	prunedPlacements := r.cleanupOrphanedPlacements(
 		ctx, chainLeases, backendLeases, snapshot.answered, retentionsAnswered,
-		startTime, placementSnapshotRevision, inFlightAtSnapshot,
-		operationSnapshot, trackerSnapshotRevision,
+		startTime, inFlightAtSnapshot, operationSnapshot,
 	)
 
 	logFunc := slog.Info
@@ -969,7 +806,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		"errors", leaseErrorCount,
 		"deferred", deferredCount,
 		"sweep_complete", cycleComplete,
-		"placement_sync_ok", r.placementView == nil || placementSyncOK,
+		"placement_sync_ok", placementSyncOK,
 		"placement_absence_trusted", r.placementSweepSeen.Load(),
 		"orphaned_payloads_cleaned", orphanedPayloads,
 		"orphaned_placements_pruned", prunedPlacements,
@@ -1010,20 +847,14 @@ func (r *Reconciler) doStartProvisioning(
 	sku := ExtractRoutingSKU(&lease)
 
 	// Route to appropriate backend, honoring existing placement for restored/placed leases (ENG-333)
-	typedCoordination := r.operations != nil && r.placementAuthority != nil
-	if typedCoordination && !authority.ownedPlacement.Valid() &&
+	if !authority.ownedPlacement.Valid() &&
 		(!authority.allowRecordless || !authority.recordlessScope.Valid()) {
 		return errPlacementSnapshotStale
 	}
-	var inFlightByBackend map[string]int
-	if r.operations != nil {
-		inFlightByBackend = r.operations.CountsByBackend()
-	} else if r.tracker != nil {
-		inFlightByBackend = r.tracker.InFlightCountsByBackend()
-	}
+	inFlightByBackend := r.operations.CountsByBackend()
 	var backendClient backend.Backend
 	var err error
-	if typedCoordination && authority.ownedPlacement.Valid() {
+	if authority.ownedPlacement.Valid() {
 		backendClient = r.backendRouter.GetBackendByName(authority.ownedBackend)
 		if backendClient == nil {
 			err = fmt.Errorf("%w: lease %s is placed on %q",
@@ -1031,7 +862,7 @@ func (r *Reconciler) doStartProvisioning(
 		}
 	} else {
 		backendClient, err = routeForProvisionHonoringPlacementAmong(
-			ctx, r.backendRouter, r.placementView, lease.Uuid, sku,
+			ctx, r.backendRouter, r.placementAuthority, lease.Uuid, sku,
 			authority.eligibleBackends, inFlightByBackend,
 		)
 	}
@@ -1045,7 +876,7 @@ func (r *Reconciler) doStartProvisioning(
 	if backendClient == nil {
 		return fmt.Errorf("no backend available")
 	}
-	if typedCoordination && !authority.ownedPlacement.Valid() &&
+	if !authority.ownedPlacement.Valid() &&
 		!authority.recordlessScope.Allows(backendClient.Name()) {
 		return fmt.Errorf("%w: router selected %q outside the scoped healthy set",
 			placement.ErrBackendOutsideAdmissionScope, backendClient.Name())
@@ -1055,59 +886,34 @@ func (r *Reconciler) doStartProvisioning(
 	// after inventory. That makes it impossible to lose the claim-to-operation
 	// transition to an event-driven request for the same lease.
 	items := ExtractLeaseItems(&lease)
-	var (
-		operationInitiation operation.Initiation
-		legacyOperationID   operation.OperationID
-	)
-	if typedCoordination {
-		if !authority.leaseClaim.Valid() || !authority.baseline.Valid() {
+	if !authority.leaseClaim.Valid() || !authority.baseline.Valid() {
+		return errTrackerSnapshotStale
+	}
+	initiated := r.operations.TryInitiateClaimed(authority.leaseClaim, operation.TrackSpec{
+		LeaseUUID:     lease.Uuid,
+		Tenant:        lease.Tenant,
+		Items:         items,
+		Backend:       backendClient.Name(),
+		Kind:          operation.KindProvision,
+		TokenRequired: true,
+	})
+	if !initiated.Started() {
+		metrics.ReconciliationConflictsTotal.Inc()
+		if initiated.Outcome() == operation.TrackSnapshotStale ||
+			initiated.Outcome() == operation.TrackInvalid {
 			return errTrackerSnapshotStale
 		}
-		initiated := r.operations.TryInitiateClaimed(authority.leaseClaim, operation.TrackSpec{
-			LeaseUUID:     lease.Uuid,
-			Tenant:        lease.Tenant,
-			Items:         items,
-			Backend:       backendClient.Name(),
-			Kind:          operation.KindProvision,
-			TokenRequired: true,
-		})
-		if !initiated.Started() {
-			metrics.ReconciliationConflictsTotal.Inc()
-			if initiated.Outcome() == operation.TrackSnapshotStale ||
-				initiated.Outcome() == operation.TrackInvalid {
-				return errTrackerSnapshotStale
-			}
-			return errLeaseAlreadyInFlight
-		}
-		operationInitiation = initiated.Capability()
-	} else if r.tracker != nil {
-		var tracked, snapshotStale bool
-		legacyOperationID, tracked, snapshotStale = r.tracker.TryTrackInFlightWithOperationIDIfNotNewer(
-			lease.Uuid, lease.Tenant, items, backendClient.Name(), authority.trackerRevision,
-		)
-		if !tracked {
-			metrics.ReconciliationConflictsTotal.Inc()
-			if snapshotStale {
-				return errTrackerSnapshotStale
-			}
-			return errLeaseAlreadyInFlight
-		}
+		return errLeaseAlreadyInFlight
 	}
+	operationInitiation := initiated.Capability()
 	untrack := func() {
-		if typedCoordination {
-			r.operations.AbortInitiation(operationInitiation)
-		} else if r.tracker != nil {
-			r.tracker.UntrackInFlightIfOperationID(lease.Uuid, legacyOperationID)
-		}
+		r.operations.AbortInitiation(operationInitiation)
 	}
 
-	callbackURL := BuildCallbackURL(r.callbackBaseURL)
-	if typedCoordination {
-		callbackURL, err = BuildCallbackURLForOperation(r.callbackBaseURL, operationInitiation.ID())
-		if err != nil {
-			untrack()
-			return fmt.Errorf("build callback URL for lease %s: %w", lease.Uuid, err)
-		}
+	callbackURL, err := BuildCallbackURLForOperation(r.callbackBaseURL, operationInitiation.ID())
+	if err != nil {
+		untrack()
+		return fmt.Errorf("build callback URL for lease %s: %w", lease.Uuid, err)
 	}
 
 	// Build provision request.
@@ -1199,30 +1005,21 @@ func (r *Reconciler) doStartProvisioning(
 	// Persist the target immediately before the external side effect. All local
 	// payload reads and validation above intentionally happen first so a local
 	// preflight failure never manufactures an attempt for a request not sent.
-	var (
-		attemptRevision uint64
-		attemptToken    placement.AttemptToken
-		attemptSet      = true
-	)
-	if typedCoordination {
-		switch {
-		case authority.ownedPlacement.Valid():
-			attemptToken, attemptSet, err = r.placementAuthority.BeginOwnedAttempt(
-				authority.baseline, authority.ownedPlacement,
-				authority.ownedBackend, operationInitiation.ID(),
-			)
-		case authority.allowRecordless:
-			attemptToken, attemptSet, err = r.placementAuthority.BeginNewAttempt(
-				authority.recordlessScope,
-				lease.Uuid, backendClient.Name(), operationInitiation.ID(),
-			)
-		default:
-			attemptSet = false
-		}
-	} else if r.legacyPlacement != nil {
-		attemptRevision, attemptSet, err = r.legacyPlacement.SetAttemptingIfNotNewer(
-			lease.Uuid, backendClient.Name(), authority.placementRevision,
+	var attemptToken placement.AttemptToken
+	var attemptSet bool
+	switch {
+	case authority.ownedPlacement.Valid():
+		attemptToken, attemptSet, err = r.placementAuthority.BeginOwnedAttempt(
+			authority.baseline, authority.ownedPlacement,
+			authority.ownedBackend, operationInitiation.ID(),
 		)
+	case authority.allowRecordless:
+		attemptToken, attemptSet, err = r.placementAuthority.BeginNewAttempt(
+			authority.recordlessScope,
+			lease.Uuid, backendClient.Name(), operationInitiation.ID(),
+		)
+	default:
+		attemptSet = false
 	}
 	if err != nil {
 		untrack()
@@ -1235,7 +1032,7 @@ func (r *Reconciler) doStartProvisioning(
 		untrack()
 		return errPlacementSnapshotStale
 	}
-	if typedCoordination && !r.operations.BeginCall(operationInitiation) {
+	if !r.operations.BeginCall(operationInitiation) {
 		refused, refuseErr := r.placementAuthority.RefuseAttempt(attemptToken)
 		untrack()
 		if refuseErr != nil {
@@ -1252,79 +1049,61 @@ func (r *Reconciler) doStartProvisioning(
 	provisionErr := invokeBackendProvision(ctx, backendClient, req)
 	outcome := classifyProvisionOutcome(provisionErr)
 	if errors.Is(provisionErr, backend.ErrInsufficientResources) {
-		metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendClient.Name()).Inc()
+		metrics.BackendInsufficientResourcesTotal.WithLabelValues(
+			backendClient.Name(), capacityVerdictLabel(provisionErr),
+		).Inc()
 	}
-	if typedCoordination {
-		var completion operation.InitiationCompletion
-		if outcome == provisionOutcomeAccepted {
-			completion = r.operations.Activate(operationInitiation)
-		} else {
-			completion = r.operations.AbortInitiation(operationInitiation)
-		}
-		switch completion {
-		case operation.InitiationSettling, operation.InitiationFinished:
-			// The exact callback owns every terminal side effect. In particular,
-			// a synchronous error arriving after an inline Ready/Failed verdict
-			// cannot clear its placement or trigger chain error handling.
-			slog.Info("reconcile: inline provision callback superseded synchronous backend result",
-				"lease_uuid", lease.Uuid,
-				"backend", backendClient.Name(),
-				"outcome", outcome,
-			)
-			return nil
-		case operation.InitiationActivated:
-			if outcome != provisionOutcomeAccepted {
-				return errTrackerSnapshotStale
-			}
-		case operation.InitiationAborted:
-			if outcome == provisionOutcomeAccepted {
-				return errTrackerSnapshotStale
-			}
-		default:
+	var completion operation.InitiationCompletion
+	if outcome == provisionOutcomeAccepted {
+		completion = r.operations.Activate(operationInitiation)
+	} else {
+		completion = r.operations.AbortInitiation(operationInitiation)
+	}
+	switch completion {
+	case operation.InitiationSettling, operation.InitiationFinished:
+		// The exact callback owns every terminal side effect. In particular,
+		// a synchronous error arriving after an inline Ready/Failed verdict
+		// cannot clear its placement or trigger chain error handling.
+		slog.Info("reconcile: inline provision callback superseded synchronous backend result",
+			"lease_uuid", lease.Uuid,
+			"backend", backendClient.Name(),
+			"outcome", outcome,
+		)
+		return nil
+	case operation.InitiationActivated:
+		if outcome != provisionOutcomeAccepted {
 			return errTrackerSnapshotStale
 		}
+	case operation.InitiationAborted:
+		if outcome == provisionOutcomeAccepted {
+			return errTrackerSnapshotStale
+		}
+	default:
+		return errTrackerSnapshotStale
 	}
 
 	var settleErr error
-	if typedCoordination {
-		var settled bool
-		switch outcome {
-		case provisionOutcomeAccepted:
-			settled, settleErr = r.placementAuthority.ConfirmAttempt(attemptToken)
-		case provisionOutcomeDefinitiveFailure:
-			settled, settleErr = r.placementAuthority.RefuseAttempt(attemptToken)
-		case provisionOutcomeAmbiguous:
-			// Unknown backend outcomes deliberately retain the durable attempt.
-			settled = true
-		}
-		if settleErr == nil && !settled && outcome == provisionOutcomeAccepted {
-			// A backend may deliver its callback before the initiating HTTP request
-			// returns. In that ordering the callback has already consumed the exact
-			// operation and confirmed placement, so this process-local token is
-			// expected to be stale and the positive durable fact wins.
-			current := r.placementAuthority.Lookup(lease.Uuid)
-			settled = current.State() == placement.StateConfirmed &&
-				current.Backend == backendClient.Name() && current.Attempt == ""
-		}
-		if settleErr == nil && !settled {
-			settleErr = errors.New("placement attempt is no longer current")
-		}
-	} else if r.legacyPlacement != nil {
-		// Compatibility-only raw CAS for the unexported legacy test adapter.
-		switch outcome {
-		case provisionOutcomeAccepted:
-			_, settleErr = r.legacyPlacement.ConfirmAttemptIfRevision(
-				lease.Uuid, backendClient.Name(), attemptRevision,
-			)
-		case provisionOutcomeDefinitiveFailure:
-			_, settleErr = r.legacyPlacement.ClearAttemptIfRevision(
-				lease.Uuid, backendClient.Name(), attemptRevision,
-			)
-		case provisionOutcomeAmbiguous:
-			// Preserve the durable attempt for a later authoritative inventory.
-		default:
-			settleErr = fmt.Errorf("unknown provision outcome %d", outcome)
-		}
+	var settled bool
+	switch outcome {
+	case provisionOutcomeAccepted:
+		settled, settleErr = r.placementAuthority.ConfirmAttempt(attemptToken)
+	case provisionOutcomeDefinitiveFailure:
+		settled, settleErr = r.placementAuthority.RefuseAttempt(attemptToken)
+	case provisionOutcomeAmbiguous:
+		// Unknown backend outcomes deliberately retain the durable attempt.
+		settled = true
+	}
+	if settleErr == nil && !settled && outcome == provisionOutcomeAccepted {
+		// A backend may deliver its callback before the initiating HTTP request
+		// returns. In that ordering the callback has already consumed the exact
+		// operation and confirmed placement, so this process-local token is
+		// expected to be stale and the positive durable fact wins.
+		current := r.placementAuthority.Lookup(lease.Uuid)
+		settled = current.State() == placement.StateConfirmed &&
+			current.Backend == backendClient.Name() && current.Attempt == ""
+	}
+	if settleErr == nil && !settled {
+		settleErr = errors.New("placement attempt is no longer current")
 	}
 	if settleErr != nil {
 		slog.Warn("reconcile: failed to settle provision placement",
@@ -1348,9 +1127,6 @@ func (r *Reconciler) doStartProvisioning(
 		// ambiguous result keeps it. Either way the durable record, rather than
 		// the ephemeral tracker, gates the next call; releasing tracking lets the
 		// reconciler consume a later authoritative inventory snapshot.
-		if !typedCoordination {
-			untrack()
-		}
 		return provisionErr
 	}
 
@@ -1723,15 +1499,9 @@ func (r *Reconciler) fetchFleetSnapshot(ctx context.Context) fleetSnapshot {
 	return snap
 }
 
-// placementFor returns the complete placement record. A deployment without a
-// placement store receives the zero (Absent) record and never arms the
-// complete-sweep latch, so unevidenced leases remain conservative whenever a
-// fleet snapshot is incomplete.
+// placementFor returns the complete durable placement record.
 func (r *Reconciler) placementFor(leaseUUID string) placement.Placement {
-	if r.placementView == nil {
-		return placement.Placement{}
-	}
-	return r.placementView.Lookup(leaseUUID)
+	return r.placementAuthority.Lookup(leaseUUID)
 }
 
 // markUnanswered records that a backend did not report this sweep. Callers must
@@ -2186,7 +1956,6 @@ func (r *Reconciler) processLease(
 			metrics.ReconcilerDeferredLeasesTotal.Inc()
 			slog.Debug("reconcile: deferring lease whose placement changed before the provision write-ahead fence",
 				"lease_uuid", leaseUUID,
-				"inventory_revision", authority.placementRevision,
 			)
 			return
 		}
@@ -2360,7 +2129,6 @@ func (r *Reconciler) processOrphan(
 	leaseUUID string,
 	provision backend.ProvisionInfo,
 	operationSnapshot operation.TrackerSnapshot,
-	trackerSnapshotRevision uint64,
 	orphans, leaseErrors *atomic.Int32,
 ) {
 	// Check context before doing any work to respect cancellation
@@ -2384,9 +2152,7 @@ func (r *Reconciler) processOrphan(
 	// point is still visible as a stale snapshot, while an operation that starts
 	// after this point is blocked until teardown returns. This closes both sides
 	// of the check-then-Deprovision race (ENG-594).
-	release, acquired := r.claimLeaseAction(
-		leaseUUID, operationSnapshot, trackerSnapshotRevision,
-	)
+	release, acquired := r.claimLeaseAction(leaseUUID, operationSnapshot)
 	if !acquired {
 		metrics.ReconcilerInflightSkipsTotal.Inc()
 		slog.Debug("reconcile: skipping orphan whose lifecycle crossed the inventory boundary",
@@ -2539,17 +2305,11 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 	provisionsAnswered answeredSet,
 	retentionsAnswered answeredSet,
 	now time.Time,
-	maxRevision uint64,
 	inFlightAtSnapshot map[string]struct{},
 	operationSnapshot operation.TrackerSnapshot,
-	trackerSnapshotRevision uint64,
 ) int {
-	if r.placementView == nil {
-		return 0
-	}
-
 	cleaned := 0
-	for leaseUUID, record := range r.placementView.List() {
+	for leaseUUID, record := range r.placementAuthority.List() {
 		if ctx.Err() != nil {
 			break
 		}
@@ -2570,19 +2330,9 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 			)
 			continue
 		}
-		// The backend inventories predate any record newer than the revision
-		// captured at fetch start, so they cannot justify deleting it. Likewise, an
-		// operation already in flight at that boundary may untrack after an
-		// ambiguous response before this late cleanup pass; preserve it for a later
-		// inventory that definitely started after the call.
-		if r.legacyPlacement != nil && record.Revision() > maxRevision {
-			slog.Debug("reconcile: keeping placement newer than fleet inventory",
-				"lease_uuid", leaseUUID,
-				"record_revision", record.Revision(),
-				"inventory_revision", maxRevision,
-			)
-			continue
-		}
+		// An operation already in flight at the inventory boundary may finish
+		// before this late cleanup pass; its typed snapshot tombstone keeps that
+		// boundary visible even after the active record disappears.
 		if _, wasInFlight := inFlightAtSnapshot[leaseUUID]; wasInFlight {
 			slog.Debug("reconcile: keeping placement whose operation was in flight when inventory began",
 				"lease_uuid", leaseUUID)
@@ -2671,9 +2421,7 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 		// before deleting: a lifecycle operation that crossed the boundary makes
 		// this candidate stale, and a delayed event cannot start while the claim
 		// is held. Re-read the placement under that fence before the final CAS.
-		release, acquired := r.claimLeaseAction(
-			leaseUUID, operationSnapshot, trackerSnapshotRevision,
-		)
+		release, acquired := r.claimLeaseAction(leaseUUID, operationSnapshot)
 		if !acquired {
 			continue
 		}
@@ -2683,24 +2431,14 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 			continue
 		}
 
-		var (
-			deleted bool
-			err     error
-		)
-		if r.placementAuthority != nil {
-			// New production records and unambiguous v0.13 owners migrated at open
-			// carry an opaque revision. A remaining invalid revision therefore names
-			// ambiguous or corrupt legacy evidence and cannot authorize deletion.
-			if !record.RecordRevision().Valid() {
-				release()
-				continue
-			}
-			deleted, err = r.placementAuthority.DeleteRecord(record.RecordRevision())
-		} else {
-			// Compatibility-only path for legacy mock stores used by the
-			// unexported test constructor.
-			deleted, err = r.legacyPlacement.DeleteIfRevision(leaseUUID, record.Revision())
+		// New production records and unambiguous v0.13 owners migrated at open
+		// carry an opaque revision. A remaining invalid revision therefore names
+		// ambiguous or corrupt legacy evidence and cannot authorize deletion.
+		if !record.RecordRevision().Valid() {
+			release()
+			continue
 		}
+		deleted, err := r.placementAuthority.DeleteRecord(record.RecordRevision())
 		release()
 		if err != nil {
 			slog.Error("reconcile: failed to prune orphaned placement",

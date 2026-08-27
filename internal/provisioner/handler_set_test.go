@@ -43,7 +43,8 @@ func (m *mockAcknowledger) Acknowledge(ctx context.Context, leaseUUID string) (b
 	return true, "tx-hash", nil
 }
 
-// mockPlacementStore implements PlacementStore for testing.
+// mockPlacementStore is the legacy raw-map fixture used behind typed test
+// adapters. Production accepts only narrow placement capability ports.
 type mockPlacementStore struct {
 	mu                    sync.Mutex
 	placements            map[string]string
@@ -2718,27 +2719,29 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPrese
 			name: "durable conflict",
 			seed: func(t *testing.T, store *placement.Store) {
 				t.Helper()
-				_, fenced, err := store.SetConflictsIfNotNewer(
-					map[string][]string{"lease-1": {"backend-a", "backend-b"}},
-					store.SnapshotRevision(),
-				)
-				require.NoError(t, err)
-				require.Empty(t, fenced)
+				projectTestPlacementInventory(t, store, []string{"backend-a", "backend-b"}, placement.InventoryProjection{
+					Complete:  true,
+					Conflicts: map[string][]string{"lease-1": {"backend-a", "backend-b"}},
+				})
 			},
 		},
 		{
 			name: "confirmed backend mismatch",
 			seed: func(t *testing.T, store *placement.Store) {
 				t.Helper()
-				require.NoError(t, store.Confirm("lease-1", "backend-b"))
+				seedTestConfirmedPlacements(t, store, []string{"backend-a", "backend-b"}, map[string]string{
+					"lease-1": "backend-b",
+				})
 			},
 		},
 		{
 			name: "attempt mismatch",
 			seed: func(t *testing.T, store *placement.Store) {
 				t.Helper()
-				_, err := store.SetAttempting("lease-1", "backend-b")
+				armTestPlacementTopology(t, store, []string{"backend-a", "backend-b"})
+				operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174000")
 				require.NoError(t, err)
+				beginTestNewPlacementAttempt(t, store, "lease-1", "backend-b", operationID)
 			},
 		},
 	}
@@ -2750,7 +2753,7 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPrese
 			t.Cleanup(func() { require.NoError(t, store.Close()) })
 			tt.seed(t, store)
 			before := store.Lookup("lease-1")
-			beforeRevision := store.SnapshotRevision()
+			beforeRevision := before.RecordRevision()
 
 			tracker := NewInFlightTracker()
 			generation, tracked := tracker.TryTrackInFlightWithOperationID(
@@ -2783,7 +2786,7 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPrese
 			assert.False(t, tracker.IsInFlight("lease-1"))
 			assert.Equal(t, before, store.Lookup("lease-1"),
 				"semantic callback verdict must preserve the operator-repairable record")
-			assert.Equal(t, beforeRevision, store.SnapshotRevision(),
+			assert.Equal(t, beforeRevision, store.Lookup("lease-1").RecordRevision(),
 				"semantic callback verdict must not manufacture a placement mutation")
 		})
 	}

@@ -58,10 +58,8 @@ func (r *Reconciler) collectInventory(ctx context.Context) (reconcileInventory, 
 		active:      len(activeLeases),
 		fleet:       r.fetchFleetSnapshot(ctx),
 	}
-	if r.placementView != nil {
-		inventory.retentions,
-			inventory.retentionsAnswered,
-			inventory.retentionsReportedByBackend = r.fetchAllRetentions(ctx)
-	}
+	inventory.retentions,
+		inventory.retentionsAnswered,
+		inventory.retentionsReportedByBackend = r.fetchAllRetentions(ctx)
 	return inventory, nil
 }

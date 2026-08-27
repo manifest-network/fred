@@ -75,7 +75,8 @@ The dependency signal did not disappear, it moved: the per-check map is still in
 | `increase(fred_placement_write_failures_total[5m]) > 0` | providerd could not durably record or verify a placement-store synchronization point. A write-ahead failure blocks a new provision, re-provision, or restore before the backend is contacted; a later confirm/cleanup failure leaves an explicit unresolved attempt for reconciliation rather than silently claiming no backend was contacted | Check the `failed to ... placement` or placement-sync verification log, then check free space, filesystem permissions and I/O errors at `placement_store_db_path`. The health gauge is only a read probe and can remain 1 on a full or read-only filesystem. Restore access; the next reconciliation retries safe work. Page on every increase — do not alert on the raw counter being non-zero, because counters remain non-zero after recovery |
 | `fred_backend_health_probe_panics_total > 0` | Bug — a backend health probe panicked. The probe is an HTTP call that should return an error, not panic. It is recovered (the probe runs on its own goroutine, where net/http's recovery does not reach it) and counts as unhealthy, so nothing crashes | Check logs for `backend health probe panicked` and the stack trace, then file an issue |
 | `fred_health_check_healthy` series absent, or frozen while nothing changes | Nothing is polling `/health`. Both this gauge and `fred_backend_healthy` are written **only** from inside the health handler, so with no prober they latch at their last value instead of going absent | Confirm the load balancer's health check on `/health` still exists and its interval (30s in the reference deployment). A latched 1 masks a real outage |
-| `fred_backend_insufficient_resources_total` rising on a backend | Backend at capacity | Reduce SKU sizes, add backend hosts, or check `docker-backend /stats` |
+| `fred_backend_insufficient_resources_total{backend="X",verdict="coded_refusal"}` rising | Backend X is returning contract-conforming capacity refusals; the matching attempt is normally clearable | Reduce SKU sizes, add backend hosts, or check `docker-backend /stats` |
+| `fred_backend_insufficient_resources_total{backend="X",verdict="ambiguous"}` rising | Backend X or an intermediary is returning legacy/code-less/unknown-code capacity 503s; Fred retains the write-ahead attempt | Fix the responder to emit the declared coded envelope, then reconcile the retained attempts from positive inventory or perform explicit operator repair. Malformed envelopes appear in `fred_backend_malformed_error_body_total` instead |
 | `fred_backend_malformed_error_body_total` rising on a backend | That backend answers 4xx with a body that is not the declared `{"error": ...}` envelope, so its tenants get a generic message instead of a diagnostic | Find the raw body in the `backend returned a malformed error body` log line and fix the backend to emit the envelope (BACKEND_GUIDE.md). If the backend looks correct, suspect an intermediary answering on its behalf |
 | `fred_provisioner_callback_timeouts_total` rising | Backend accepted provision but never called back | Backend logs; verify `callback_base_url` is reachable from backend; check HMAC secret match |
 | `increase(fred_provisioner_callback_settlement_claim_wait_timeouts_total[5m]) > 0` | A callback waited 30 seconds while another callback or the timeout checker retained the same operation ID's terminal-settlement claim. The actor may be blocked on a slow chain call, or a bug may have leaked its claim | Find the `callback settlement claim is contended` and timeout logs for the lease/operation ID; correlate concurrent callback, timeout, acknowledge/reject, and downstream chain-latency logs. A deprovision-owned claim returns immediately and cannot increment this counter. If no actor completes and the counter repeats, restart providerd to clear the process-local claim, then file an issue with the logs |
@@ -283,18 +284,26 @@ inode usage.
 
 When SKU resource pools are full, bundled backends return HTTP 503 with the
 declared error envelope and `code="insufficient_resources"`. That machine code
-produces the typed `ErrCapacityRefused` proof, so Fred clears only the matching
-write-ahead attempt and can route a later retry to another eligible backend.
+produces the typed `ErrCapacityRefused` contract verdict, so Fred clears only the
+matching write-ahead attempt and can route a later retry to another eligible
+backend. The response body is not HMAC-authenticated: the code establishes
+protocol conformance under the configured transport trust boundary, not
+cryptographic authorship. Use TLS or an equivalently trusted network if an
+on-path response forger is in scope.
 
-A legacy/code-less, malformed, or unknown-code 503 remains ambiguous: an
-intermediary could have emitted it after backend acceptance. Fred therefore keeps
-that write-ahead attempt and does not substitute another backend. Inventory
-absence does not clear the ambiguity because the original request could commit
-after the list response. Only a coded synchronous refusal, positive evidence
-that confirms ownership, or explicit operator proof and repair can settle it.
+A legacy/code-less or unknown-code 503 remains `ErrInsufficientResources` but is
+ambiguous; a malformed/non-envelope 503 is `ErrMalformedErrorBody` and is also
+ambiguous. An intermediary could have emitted either after backend acceptance.
+Fred therefore keeps that write-ahead attempt and does not substitute another
+backend. Inventory absence does not clear the ambiguity because the original
+request could commit after the list response. Only a contract-conforming coded
+synchronous refusal trusted under the transport boundary, positive evidence that
+confirms ownership, or explicit operator proof and repair can settle it.
 
 **Symptoms:**
-- `fred_backend_insufficient_resources_total{backend="X"}` rising
+- `fred_backend_insufficient_resources_total{backend="X",verdict="coded_refusal"}` rising for declared capacity refusals
+- `fred_backend_insufficient_resources_total{backend="X",verdict="ambiguous"}` rising for legacy/code-less/unknown-code 503s
+- `fred_backend_malformed_error_body_total{backend="X",operation=~"provision|restore"}` rising for malformed/non-envelope 503s
 - `docker-backend /stats` shows allocated == total or close to it
 - Active leases stay in `provisioning` state
 
@@ -792,8 +801,9 @@ source reservation is process-local and lasts only through the synchronous call;
 the target attempt survives restart.
 
 Acceptance, a matching exact-operation callback, or a validated
-`already_provisioned` response confirms the target. A causally validated
-synchronous domain refusal clears it. A timeout, transport error, panic, generic
+`already_provisioned` response confirms the target. A contract-conforming
+synchronous domain refusal trusted under the configured backend transport clears
+it. A timeout, transport error, panic, generic
 5xx, malformed error
 envelope, or unvalidated 503 is ambiguous, so providerd releases the source
 reservation but retains the target attempt. An immediate same-target retry then
@@ -801,13 +811,18 @@ normally returns 409. A positive report from the attempted backend confirms it;
 a positive report from another backend expands durable conflict quarantine.
 Inventory absence, complete or partial, never disproves or clears the attempt,
 because the original restore may commit after the list response. Do not delete
-the attempt merely to make the retry pass: retry requires a causally validated
-synchronous refusal or explicit operator proof and repair.
+the attempt merely to make the retry pass: retry requires a contract-conforming
+synchronous refusal trusted under the transport boundary or explicit operator
+proof and repair.
 
 The tenant event stream publishes `restarting` immediately before backend
 dispatch so an inline `ready`/`failed` callback cannot be followed by a stale
 start event. If the synchronous result definitively refuses the restore
 (including a coded capacity refusal), Fred follows that hint with `failed`.
+The compensating event uses the neutral diagnostic `restore did not start`, since
+the refusal class also includes local pre-dispatch conditions such as an open
+circuit breaker.
+
 Ambiguous outcomes intentionally keep `restarting`; REST and backend inventory
 remain authoritative because WebSocket delivery is best-effort and lossy.
 

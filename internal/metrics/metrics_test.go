@@ -271,6 +271,7 @@ func TestCounterVecLabels(t *testing.T) {
 	assert.NotPanics(t, func() {
 		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventProvisionStarting)
 		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRestarting)
+		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRefused)
 	})
 	assert.NotPanics(t, func() {
 		SignerOOGRetriesTotal.WithLabelValues("retried")
@@ -355,7 +356,8 @@ func TestCounterVecLabels(t *testing.T) {
 		PayloadPersistFailuresTotal.WithLabelValues("update")
 	})
 	assert.NotPanics(t, func() {
-		BackendInsufficientResourcesTotal.WithLabelValues("docker")
+		BackendInsufficientResourcesTotal.WithLabelValues("docker", CapacityVerdictCodedRefusal)
+		BackendInsufficientResourcesTotal.WithLabelValues("docker", CapacityVerdictAmbiguous)
 		BackendMalformedErrorBodyTotal.WithLabelValues("docker", "restore")
 	})
 	assert.NotPanics(t, func() {

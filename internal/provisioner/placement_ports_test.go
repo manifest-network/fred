@@ -19,16 +19,10 @@ var (
 )
 
 func TestPlacementPortsExcludeRawAndUnrelatedAuthority(t *testing.T) {
-	raw := reflect.TypeOf((*PlacementStore)(nil)).Elem()
 	provision := reflect.TypeOf((*ProvisionPlacement)(nil)).Elem()
 	reconciler := reflect.TypeOf((*ReconcilerPlacement)(nil)).Elem()
 	aggregate := reflect.TypeOf((*PlacementAuthorityStore)(nil)).Elem()
 
-	// A value statically held as the legacy raw interface cannot cross either
-	// production constructor boundary. The concrete durable store implements
-	// both, but callers must deliberately retain the corresponding safe port.
-	assert.False(t, raw.Implements(provision))
-	assert.False(t, raw.Implements(reconciler))
 	require.True(t, aggregate.Implements(provision))
 	require.True(t, aggregate.Implements(reconciler))
 
@@ -54,6 +48,22 @@ func TestPlacementPortsExcludeRawAndUnrelatedAuthority(t *testing.T) {
 		_, exposed := reconciler.MethodByName(method)
 		assert.False(t, exposed, "reconciler port exposes unrelated method %s", method)
 	}
+}
+
+func TestReconcilerRetainsOnlyConsumerOwnedAuthorityPorts(t *testing.T) {
+	reconcilerType := reflect.TypeOf(Reconciler{})
+	for _, forbidden := range []string{"tracker", "placementView", "legacyPlacement"} {
+		_, retained := reconcilerType.FieldByName(forbidden)
+		assert.False(t, retained, "Reconciler retains legacy field %s", forbidden)
+	}
+
+	operations, ok := reconcilerType.FieldByName("operations")
+	require.True(t, ok)
+	assert.Equal(t, reflect.TypeOf((*ReconcilerOperations)(nil)).Elem(), operations.Type)
+
+	placementAuthority, ok := reconcilerType.FieldByName("placementAuthority")
+	require.True(t, ok)
+	assert.Equal(t, reflect.TypeOf((*ReconcilerPlacement)(nil)).Elem(), placementAuthority.Type)
 }
 
 func TestHandlerAndTimeoutConfigurationExposeOnlyConsumerPorts(t *testing.T) {

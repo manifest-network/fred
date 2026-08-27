@@ -259,7 +259,9 @@ func TestNewManager_ConfiguresExactRouterTopologyBeforeServiceConstruction(t *te
 
 func TestNewManager_RejectsTopologyThatWouldRemoveDurableOwner(t *testing.T) {
 	store := newTestPlacementAuthority(t)
-	require.NoError(t, store.Confirm("lease-1", "removed-backend"))
+	seedTestConfirmedPlacements(t, store, []string{"removed-backend"}, map[string]string{
+		"lease-1": "removed-backend",
+	})
 	remaining := &mockManagerBackend{name: "remaining-backend"}
 	router, err := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: remaining, IsDefault: true}},

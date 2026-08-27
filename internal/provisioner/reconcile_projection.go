@@ -18,21 +18,17 @@ import (
 // and durable placement projection. The inventory itself contains observations;
 // the remaining fields fence those observations against concurrent operations.
 type reconcileProjectionInput struct {
-	inventory                 reconcileInventory
-	placementSnapshotRevision uint64
-	inventoryFence            placement.InventoryFence
-	inFlightAtSnapshot        map[string]struct{}
+	inventory          reconcileInventory
+	inventoryFence     placement.InventoryFence
+	inFlightAtSnapshot map[string]struct{}
 }
 
 // reconcileProjectionResult is the placement authority produced for one
 // reconciliation sweep. Its conservative zero value authorizes no work.
 type reconcileProjectionResult struct {
-	syncOK                      bool
-	records                     map[string]placement.Placement
-	sameSweepPlacementRevisions map[string]uint64
-	resolvedAttempts            map[string]struct{}
-	ambiguousOwners             map[string][]string
-	proof                       placement.ProjectionResult
+	syncOK          bool
+	records         map[string]placement.Placement
+	ambiguousOwners map[string][]string
 }
 
 // projectPlacementInventory turns collected backend observations into one
@@ -53,19 +49,10 @@ func (r *Reconciler) projectPlacementInventory(
 	inventoryComplete := inventory.complete()
 
 	result := reconcileProjectionResult{
-		sameSweepPlacementRevisions: make(map[string]uint64),
-		resolvedAttempts:            make(map[string]struct{}),
 		// Merge new conflicts immediately, but do not resolve an older quarantine
 		// until the corresponding durable placement sync has committed below.
 		ambiguousOwners: r.updatePlacementAmbiguities(currentAmbiguities, false),
 	}
-	if r.placementView == nil {
-		if inventoryComplete {
-			result.ambiguousOwners = r.updatePlacementAmbiguities(currentAmbiguities, true)
-		}
-		return result, nil
-	}
-
 	// Sync placements from actual backend state (handles cold start and drift).
 	// NOTE: This sync only adds/updates. Pruning of orphaned placements is done
 	// separately and gated — see cleanupOrphanedPlacements. A naive prune here
@@ -123,7 +110,7 @@ func (r *Reconciler) projectPlacementInventory(
 		if backendName == "" {
 			return false
 		}
-		p := r.placementView.Lookup(leaseUUID)
+		p := r.placementAuthority.Lookup(leaseUUID)
 		if !reporterFresh {
 			// A cached positive after RefreshState failed is not fresh enough to
 			// settle an Attempt or replace another known owner. It is still useful
@@ -207,93 +194,49 @@ func (r *Reconciler) projectPlacementInventory(
 	// so this snapshot must not clear or overwrite its attempt.
 	for leaseUUID := range input.inFlightAtSnapshot {
 		if observedBackend, observed := placements[leaseUUID]; observed {
-			p := r.placementView.Lookup(leaseUUID)
+			p := r.placementAuthority.Lookup(leaseUUID)
 			if p.State() != placement.StateConfirmed || p.Backend != observedBackend || p.Attempt != "" {
 				excludeObservation(leaseUUID, observedBackend)
 			}
 		}
 		delete(placements, leaseUUID)
 	}
-	if r.placementAuthority == nil {
-		appliedConflictRevisions, fencedConflicts, conflictErr :=
-			r.legacyPlacement.SetConflictsIfNotNewer(
-				projectionConflicts, input.placementSnapshotRevision,
-			)
-		for leaseUUID := range fencedConflicts {
-			excludeObservation(leaseUUID, projectionConflicts[leaseUUID]...)
-		}
-		if conflictErr != nil {
-			syncOK = false
-			slog.Warn("failed to persist ambiguous placement quarantine", "error", conflictErr)
-		} else {
-			maps.Copy(result.sameSweepPlacementRevisions, appliedConflictRevisions)
-		}
-
-		appliedRevisions, fencedObservations, err := r.legacyPlacement.SetBatchIfNotNewer(
-			placements, input.placementSnapshotRevision,
-		)
-		for leaseUUID := range fencedObservations {
-			excludeObservation(leaseUUID, placements[leaseUUID])
-		}
-		if err != nil {
-			syncOK = false
-			// An error gives no lease-level proof about which writes, if any,
-			// became durable. Keep every submitted observation untrusted.
-			for leaseUUID, backendName := range placements {
-				excludeObservation(leaseUUID, backendName)
-			}
-			slog.Warn("failed to sync placements from backend state", "error", err)
-		} else {
-			maps.Copy(result.sameSweepPlacementRevisions, appliedRevisions)
-		}
-	}
-
 	// Refresh the process-local quarantine view with contradictions discovered
 	// against durable records above. Silence never removes a quarantine; positive
 	// observations can only reaffirm or enlarge its candidate union. Resolution
 	// requires explicit operator action or future causally sufficient proof.
 	result.ambiguousOwners = r.updatePlacementAmbiguities(projectionConflicts, false)
-	if r.placementAuthority != nil {
-		var err error
-		result.proof, err = r.placementAuthority.ProjectInventory(
-			input.inventoryFence,
-			placement.InventoryProjection{
-				Complete:   inventoryComplete,
-				Placements: placements,
-				Conflicts:  projectionConflicts,
-			},
-		)
-		for leaseUUID := range result.proof.Fenced {
-			switch {
-			case placements[leaseUUID] != "":
-				excludeObservation(leaseUUID, placements[leaseUUID])
-			case len(projectionConflicts[leaseUUID]) > 0:
-				excludeObservation(leaseUUID, projectionConflicts[leaseUUID]...)
-			default:
-				// The concrete Store currently fences only submitted placements or
-				// conflicts. Keep this fail-closed arm because ReconcilerPlacement is an
-				// injected capability and a future implementation may conservatively
-				// fence an additional lease without attaching a backend name.
-				excludeObservation(leaseUUID)
-			}
+	proof, err := r.placementAuthority.ProjectInventory(
+		input.inventoryFence,
+		placement.InventoryProjection{
+			Complete:   inventoryComplete,
+			Placements: placements,
+			Conflicts:  projectionConflicts,
+		},
+	)
+	for leaseUUID := range proof.Fenced {
+		switch {
+		case placements[leaseUUID] != "":
+			excludeObservation(leaseUUID, placements[leaseUUID])
+		case len(projectionConflicts[leaseUUID]) > 0:
+			excludeObservation(leaseUUID, projectionConflicts[leaseUUID]...)
+		default:
+			// The concrete Store currently fences only submitted placements or
+			// conflicts. Keep this fail-closed arm because ReconcilerPlacement is an
+			// injected capability and a future implementation may conservatively
+			// fence an additional lease without attaching a backend name.
+			excludeObservation(leaseUUID)
 		}
-		if err != nil {
-			syncOK = false
-			for leaseUUID, backendName := range placements {
-				excludeObservation(leaseUUID, backendName)
-			}
-			for leaseUUID, backendNames := range projectionConflicts {
-				excludeObservation(leaseUUID, backendNames...)
-			}
-			slog.Warn("failed to atomically project backend inventory", "error", err)
-		} else {
-			for leaseUUID, appliedRevision := range result.proof.Applied {
-				p := r.placementView.Lookup(leaseUUID)
-				if p.RecordRevision() == appliedRevision {
-					result.sameSweepPlacementRevisions[leaseUUID] = p.Revision()
-				}
-			}
+	}
+	if err != nil {
+		syncOK = false
+		for leaseUUID, backendName := range placements {
+			excludeObservation(leaseUUID, backendName)
 		}
+		for leaseUUID, backendNames := range projectionConflicts {
+			excludeObservation(leaseUUID, backendNames...)
+		}
+		slog.Warn("failed to atomically project backend inventory", "error", err)
 	}
 
 	if r.placementAbsenceUntrusted == nil {
@@ -344,7 +287,7 @@ func (r *Reconciler) projectPlacementInventory(
 	if syncOK {
 		result.syncOK = true
 		result.ambiguousOwners = r.updatePlacementAmbiguities(projectionConflicts, inventoryComplete)
-		result.records = r.placementView.List()
+		result.records = r.placementAuthority.List()
 		// Positive evidence is lease-local. During a partial fleet outage, a
 		// fresh report can settle an older exclusion only when it is from the
 		// exact sole backend retained by that marker and the durable record agrees.
@@ -356,7 +299,7 @@ func (r *Reconciler) projectPlacementInventory(
 			if _, sameBackend := excludedBackends[observedBackend]; !sameBackend {
 				continue
 			}
-			p := r.placementView.Lookup(leaseUUID)
+			p := r.placementAuthority.Lookup(leaseUUID)
 			if p.State() == placement.StateConfirmed && p.Backend == observedBackend && p.Attempt == "" {
 				delete(r.placementAbsenceUntrusted, leaseUUID)
 			}
@@ -369,12 +312,7 @@ func (r *Reconciler) projectPlacementInventory(
 		// projection, but it does not erase a previously committed topology
 		// baseline. Baseline admission is checked again atomically when an attempt
 		// is inserted.
-		if r.placementAuthority == nil {
-			// The raw compatibility store has no durable topology capability, so its
-			// old process-local latch remains conservative on a failed write.
-			r.placementSweepSeen.Store(false)
-		}
-		result.records = r.placementView.List()
+		result.records = r.placementAuthority.List()
 	}
 	// Current positive observations excluded by an operation boundary or
 	// revision fence remain safety evidence even if another placement write in

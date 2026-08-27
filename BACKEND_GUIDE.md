@@ -130,7 +130,15 @@ Every non-2xx response **MUST** be JSON in this envelope:
 - `validation_code` (omitempty) — on a `400`, the sub-category of the validation failure. Fred parses it to reconstruct a precise sentinel error, which is what gives the on-chain rejection reason its precision; omit it and fred falls back to a generic validation failure.
 - `code` (omitempty) — a machine-readable discriminator. Today: `already_provisioned` on `/restore`'s `409`, `demote_exceeds_tier` on `/restore`'s `422`, and `insufficient_resources` on a capacity-refused `/provision` or `/restore` `503`. See those endpoints.
 
-The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. An empty or code-less legacy `503` still maps to insufficient resources for compatibility, but it is not causal proof that the backend refused before starting work, so fred retains its write-ahead attempt. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
+These response fields establish **protocol conformance, not cryptographic
+authorship**. Fred HMAC-signs requests to the backend, but the backend does not
+sign its response body. A coded refusal is therefore trusted under the
+deployment's configured transport boundary. Use TLS or an equivalently trusted
+network if an on-path response forger is in scope; the discriminator primarily
+separates bundled/backend-contract responses from ordinary proxy HTML, foreign
+JSON, legacy code-less envelopes, and unknown codes.
+
+The one exception fred tolerates is an **empty** body: a backend that answers a `409`/`422` with nothing at all is read as the plain meaning of that status. An empty or code-less legacy `503` still maps to insufficient resources for compatibility, but it does not satisfy the coded-refusal contract, so fred retains its write-ahead attempt. (Note that *bare*, everywhere else in this guide and in README/ARCHITECTURE/OPERATIONS, means a response carrying **no `code` discriminator** — a different thing, and one that still owes an `error` body.) Anything that is not empty must be the envelope with a non-empty `error`: an unparseable body, and a body that is valid JSON but omits `error` (`{}`, `null`, `{"message": "..."}`, or even `{"code": "..."}`), are contract violations. A discriminator alone does not substitute for `error` — send both.
 
 The `code` set is **open and add-only**. If fred receives a `code` it does not recognize for that status — including one that is valid for a *different* status — it does not guess: it relays your `error` message to the tenant at the status you sent and states no verdict of its own. That is not treated as a malformed body and does not count against the circuit breaker, so a new discriminator degrades safely against an older `providerd`. The practical consequence for backend authors: the precise mapping (and any tenant-facing status remap, e.g. a code-less `422` → `404`) only appears once `providerd` learns the code, so ship the fred side first if the mapping matters.
 
@@ -184,7 +192,7 @@ Start provisioning a resource asynchronously.
 **Error Responses:**
 - `400 Bad Request` - Invalid request body
 - `409 Conflict` - Lease already provisioned
-- `503 Service Unavailable` - Insufficient resources. A backend that definitely refused before starting work MUST return `{"error":"...","code":"insufficient_resources"}`. Fred then clears only that request's exact write-ahead attempt and may route a retry to another backend. A code-less, malformed, or unknown-code 503 remains ambiguous and blocks substitution because an intermediary could have emitted it after backend acceptance.
+- `503 Service Unavailable` - Insufficient resources. A backend that synchronously refuses before starting work MUST return `{"error":"...","code":"insufficient_resources"}`. Under the configured transport's trust boundary, Fred can then clear only that request's exact write-ahead attempt and may route a retry to another backend. A code-less, malformed, or unknown-code 503 remains ambiguous and blocks substitution because an intermediary could have emitted it after backend acceptance.
 
 ### GET /info/{lease_uuid}
 
@@ -470,7 +478,7 @@ leases must never both receive acceptance for the same retained source.
 - `400 Bad Request` - Missing required fields, equal source and target UUIDs, or items/manifest validation error
 - `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"` (the invalid-state case omits `code`), so the two are distinguished by that discriminator
 - `422 Unprocessable Entity` - Overloaded across two cases, distinguished by a `code` discriminator like the `409` above. Both return a JSON `{"error": "..."}` body; a **bare** `422` (no `code`) means no retained data for `from_lease_uuid` (also the correct response for backends without retention support), while a `422` with `code: "demote_exceeds_tier"` means the restore requested a **smaller** SKU disk tier whose `disk_mb` cap is below the retained volume's measured footprint (a refused demote)
-- `503 Service Unavailable` - Insufficient resources. A synchronous capacity refusal MUST carry `{"error":"...","code":"insufficient_resources"}`; this proves the target attempt can be cleared. A legacy/code-less or malformed 503 remains ambiguous and keeps the target attempt until positive inventory or operator repair.
+- `503 Service Unavailable` - Insufficient resources. A synchronous capacity refusal MUST carry `{"error":"...","code":"insufficient_resources"}`; under the configured transport's trust boundary this authorizes clearing the exact target attempt. A legacy/code-less, unknown-code, or malformed 503 remains ambiguous and keeps the target attempt until positive inventory or operator repair.
 
 ### GET /retentions (optional — retention support)
 

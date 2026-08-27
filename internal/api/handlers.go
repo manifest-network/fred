@@ -362,8 +362,8 @@ func (h *Handlers) resolveBackend(leaseUUID, sku string) backend.Backend {
 const restoreHint = "to restore before retained_until: create a fresh PENDING lease of matching shape (the items above), then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
 
 // findProvisionAcrossBackends performs the bounded fan-out (ENG-329 #4): the
-// fallback used after placement candidates — placement-disabled deployments,
-// a lease with no surviving record, or a stale/unresolved record. It queries
+// fallback used when a confirmed placement candidate did not hold the lease, or
+// when the caller has no durable owner candidate. It queries
 // GetProvision across every backend that could hold the lease: RouteAll(sku) when
 // the SKU is known, else Backends(), skipping names already queried from durable
 // placement. Returns the first found provision (live or retained); non-holders
@@ -590,7 +590,7 @@ const (
 	errMsgBackendUnusableError = "the provider backend returned an unusable error; the request was not applied"
 )
 
-// maxTenantDetailBytes bounds the backend-authored detail fred relays in a 4xx
+// maxTenantDetailBytes bounds the endpoint-provided detail fred relays in a 4xx
 // body. The client already caps a backend error body at 4 KiB, which is far
 // more than a tenant needs to fix a manifest and more than belongs in one
 // error line.
@@ -598,7 +598,7 @@ const maxTenantDetailBytes = 512
 
 // tenantDetail renders the tenant-facing message for a backend-originated 4xx.
 //
-// It returns ONLY the detail the backend authored inside a validated error
+// It returns ONLY the declared detail inside a validated error
 // envelope — never err.Error() of the whole wrapped chain, which is how a
 // stray verbose string reaches a tenant (ENG-508's rule, applied to the
 // synchronous path). An error carrying no such detail falls back to fred's own

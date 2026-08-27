@@ -393,13 +393,15 @@ var (
 		Help:      "Total number of backend requests",
 	}, []string{"backend", "operation", "status"})
 
-	// BackendInsufficientResourcesTotal tracks backend capacity rejections.
+	// BackendInsufficientResourcesTotal tracks backend capacity responses by
+	// whether the response satisfied the coded-refusal contract. The verdict set
+	// is closed below so producer drift cannot create unbounded cardinality.
 	BackendInsufficientResourcesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "backend",
 		Name:      "insufficient_resources_total",
-		Help:      "Total number of provisions rejected due to insufficient backend resources",
-	}, []string{"backend"})
+		Help:      "Total number of backend provision or restore capacity responses by contract verdict",
+	}, []string{"backend", "verdict"})
 
 	// BackendMalformedErrorBodyTotal counts client-error responses whose body was
 	// not the declared JSON error envelope, so fred answered the tenant with a
@@ -795,6 +797,16 @@ const (
 const (
 	OperationProvision = "provision"
 	OperationRestore   = "restore"
+)
+
+// Capacity verdict constants are the complete bounded vocabulary for the
+// verdict label on BackendInsufficientResourcesTotal. CodedRefusal means the
+// configured endpoint returned the declared envelope and machine code; it does
+// not mean the response was cryptographically authenticated. Ambiguous covers
+// legacy/code-less and unknown-code 503 responses.
+const (
+	CapacityVerdictCodedRefusal = "coded_refusal"
+	CapacityVerdictAmbiguous    = "ambiguous"
 )
 
 // Lifecycle event constants are the complete bounded label vocabulary for

@@ -16,7 +16,7 @@ import (
 func newRestoreTestStore(t *testing.T) *Store {
 	t.Helper()
 	s := newTestStore(t)
-	require.NoError(t, s.Confirm("source", "backend-a"))
+	requireConfirmedPlacement(t, s, "source", "backend-a")
 	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
 	return s
 }
@@ -27,17 +27,14 @@ func TestStore_InventoryBootstrappedIsDurableAndTopologyBound(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, s.InventoryBootstrapped())
 
-	s.InvalidateInventoryAuthority()
-	assert.False(t, s.InventoryBootstrapped(),
-		"process-local invalidation cannot grant a durable baseline")
-	s.MarkInventoryReady()
-	assert.False(t, s.InventoryBootstrapped(),
-		"the retired readiness adapter cannot manufacture a baseline")
 	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
 	assert.True(t, s.InventoryBootstrapped())
-	s.InvalidateInventoryAuthority()
+	fence := s.BeginInventorySession()
+	_, err = s.ProjectInventory(fence, InventoryProjection{})
+	s.EndInventorySession(fence)
+	require.NoError(t, err)
 	assert.True(t, s.InventoryBootstrapped(),
-		"process-local projection invalidation must not erase the baseline")
+		"a partial inventory session must not erase the durable baseline")
 
 	require.NoError(t, s.Close())
 	reopened, err := NewStore(dbPath)
@@ -51,7 +48,7 @@ func TestStore_BeginRestoreValidatesAuthorityAndSource(t *testing.T) {
 	opID := requireOperationID(t, "7001")
 
 	notReady := newTestStore(t)
-	require.NoError(t, notReady.Confirm("source", "backend-a"))
+	requireConfirmedPlacement(t, notReady, "source", "backend-a")
 	claim, err := notReady.BeginRestore(notReady.CurrentAdmissionBaseline(), "source", "target", opID)
 	require.ErrorIs(t, err, ErrInvalidAdmissionBaseline)
 	assert.False(t, claim.Valid())
@@ -102,8 +99,7 @@ func TestStore_BeginRestoreValidatesAuthorityAndSource(t *testing.T) {
 		{
 			name: "source has unresolved attempt",
 			prepare: func(t *testing.T, s *Store) {
-				_, err := s.BeginAttempt("source", "backend-a", requireOperationID(t, "7002"))
-				require.NoError(t, err)
+				requireTypedAttempt(t, s, "source", "backend-a", requireOperationID(t, "7002"))
 			},
 			source:  "source",
 			target:  "target",
@@ -113,11 +109,7 @@ func TestStore_BeginRestoreValidatesAuthorityAndSource(t *testing.T) {
 		{
 			name: "source is ambiguous",
 			prepare: func(t *testing.T, s *Store) {
-				_, _, err := s.SetConflictsIfNotNewer(
-					map[string][]string{"source": {"backend-a", "backend-b"}},
-					math.MaxUint64,
-				)
-				require.NoError(t, err)
+				requireConflictPlacement(t, s, "source", "backend-a", "backend-b")
 			},
 			source:  "source",
 			target:  "target",
@@ -169,32 +161,25 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 		{
 			name: "confirmed on source backend",
 			prepare: func(t *testing.T, s *Store) {
-				require.NoError(t, s.Confirm("target", "backend-a"))
+				requireConfirmedPlacement(t, s, "target", "backend-a")
 			},
 		},
 		{
 			name: "confirmed on different backend",
 			prepare: func(t *testing.T, s *Store) {
-				require.NoError(t, s.Confirm("target", "backend-b"))
+				requireConfirmedPlacement(t, s, "target", "backend-b")
 			},
 		},
 		{
 			name: "attempting",
 			prepare: func(t *testing.T, s *Store) {
-				_, err := s.BeginAttempt(
-					"target", "backend-a", requireOperationID(t, "7051"),
-				)
-				require.NoError(t, err)
+				requireTypedAttempt(t, s, "target", "backend-a", requireOperationID(t, "7051"))
 			},
 		},
 		{
 			name: "conflict",
 			prepare: func(t *testing.T, s *Store) {
-				_, _, err := s.SetConflictsIfNotNewer(
-					map[string][]string{"target": {"backend-a", "backend-b"}},
-					math.MaxUint64,
-				)
-				require.NoError(t, err)
+				requireConflictPlacement(t, s, "target", "backend-a", "backend-b")
 			},
 		},
 	}
@@ -205,7 +190,7 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 			tt.prepare(t, s)
 			beforeSource := s.Lookup("source")
 			beforeTarget := s.Lookup("target")
-			beforeRevision := s.SnapshotRevision()
+			beforeRevision := testRevision(s)
 
 			claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(),
 				"source", "target", requireOperationID(t, "7052"),
@@ -216,7 +201,7 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 			assert.Zero(t, s.restoreNonce)
 			assert.Equal(t, beforeSource, s.Lookup("source"))
 			assert.Equal(t, beforeTarget, s.Lookup("target"))
-			assert.Equal(t, beforeRevision, s.SnapshotRevision())
+			assert.Equal(t, beforeRevision, testRevision(s))
 		})
 	}
 
@@ -224,7 +209,7 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "placements.db")
 		configured, err := NewStore(dbPath)
 		require.NoError(t, err)
-		require.NoError(t, configured.Confirm("source", "backend-a"))
+		requireConfirmedPlacement(t, configured, "source", "backend-a")
 		requireAdmissionBaseline(t, configured, "backend-a", "backend-b")
 		require.NoError(t, configured.Close())
 
@@ -237,7 +222,7 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 		beforeSource := s.Lookup("source")
 		beforeTarget := s.Lookup("target")
 		require.Equal(t, StateUnusable, beforeTarget.State())
-		beforeRevision := s.SnapshotRevision()
+		beforeRevision := testRevision(s)
 
 		claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(),
 			"source", "target", requireOperationID(t, "7053"),
@@ -248,7 +233,7 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 		assert.Zero(t, s.restoreNonce)
 		assert.Equal(t, beforeSource, s.Lookup("source"))
 		assert.Equal(t, beforeTarget, s.Lookup("target"))
-		assert.Equal(t, beforeRevision, s.SnapshotRevision())
+		assert.Equal(t, beforeRevision, testRevision(s))
 	})
 }
 
@@ -423,13 +408,13 @@ func TestStore_BeginRestoreTargetAttemptIsAtomicWithSourceClaim(t *testing.T) {
 
 	t.Run("durable write failure", func(t *testing.T) {
 		s := newRestoreTestStore(t)
-		beforeRevision := s.SnapshotRevision()
+		beforeRevision := testRevision(s)
 		require.NoError(t, s.Close())
 		claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7403"))
 		require.Error(t, err)
 		assert.False(t, claim.Valid())
 		assert.Empty(t, s.restoreClaims)
-		assert.Equal(t, beforeRevision, s.SnapshotRevision())
+		assert.Equal(t, beforeRevision, testRevision(s))
 		assert.Equal(t, StateAbsent, s.Lookup("target").State())
 		assert.Equal(t, StateConfirmed, s.Lookup("source").State())
 	})
@@ -437,26 +422,12 @@ func TestStore_BeginRestoreTargetAttemptIsAtomicWithSourceClaim(t *testing.T) {
 
 func TestStore_RestoreClaimFencesTypedSourceMutations(t *testing.T) {
 	s := newRestoreTestStore(t)
-	proofFence := s.BeginInventorySession()
-	proof, err := s.ProjectInventory(proofFence, InventoryProjection{})
-	require.NoError(t, err)
-	s.EndInventorySession(proofFence)
-	beginFence := s.SnapshotFence()
 	sourceRevision := s.Lookup("source").RecordRevision()
 	claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7501"))
 	require.NoError(t, err)
 
-	token, err := s.BeginAttempt("source", "backend-a", requireOperationID(t, "7502"))
-	require.ErrorIs(t, err, ErrRestoreSourceClaimed)
-	assert.False(t, token.Valid())
-	token, applied, err := s.BeginAttemptIfNotNewer(
-		"source", "backend-a", requireOperationID(t, "7503"), beginFence,
-	)
-	require.ErrorIs(t, err, ErrRestoreSourceClaimed)
-	assert.False(t, applied)
-	assert.False(t, token.Valid())
-	token, applied, err = s.BeginAttemptFromProjection(
-		"source", "backend-a", requireOperationID(t, "7504"), proof,
+	token, applied, err := s.BeginOwnedAttempt(
+		s.CurrentAdmissionBaseline(), sourceRevision, "backend-a", requireOperationID(t, "7502"),
 	)
 	require.ErrorIs(t, err, ErrRestoreSourceClaimed)
 	assert.False(t, applied)
@@ -588,8 +559,8 @@ func TestStore_RestoreSettlementReleasesSourceClaimOnTargetWriteFailure(t *testi
 
 func TestStore_BeginRestoreRefusesLeaseAlreadyClaimedAsAnotherSource(t *testing.T) {
 	s := newTestStore(t)
-	require.NoError(t, s.Confirm("source-a", "backend-a"))
-	require.NoError(t, s.Confirm("source-b", "backend-a"))
+	requireConfirmedPlacement(t, s, "source-a", "backend-a")
+	requireConfirmedPlacement(t, s, "source-b", "backend-a")
 	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
 	first, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source-a", "target-a", requireOperationID(t, "7901"))
 	require.NoError(t, err)

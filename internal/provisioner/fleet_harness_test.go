@@ -548,9 +548,6 @@ type fleetOptions struct {
 	// maxProvisionsBytes caps the /provisions response so faultOversize is
 	// cheap to trigger.
 	maxProvisionsBytes int64
-	// noPlacement disables the placement store, modelling a deployment that has
-	// not enabled it.
-	noPlacement bool
 	// interval is the reconcile interval. Tests drive sweeps explicitly, so its
 	// only live effect is the placement pruner's grace window, which is
 	// 2 x interval. It defaults to an hour precisely so the pruner cannot fire
@@ -678,18 +675,16 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 		payloads:               payloads,
 	}
 
-	if !opts.noPlacement {
-		age := opts.placementAge
-		f.placementAge = age
-		f.placementPath = filepath.Join(t.TempDir(), "placements.db")
-		ps, err := placement.NewStore(
-			f.placementPath,
-			placement.WithClock(func() time.Time { return time.Now().Add(-age) }),
-		)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = ps.Close() })
-		f.placement = ps
-	}
+	age := opts.placementAge
+	f.placementAge = age
+	f.placementPath = filepath.Join(t.TempDir(), "placements.db")
+	ps, err := placement.NewStore(
+		f.placementPath,
+		placement.WithClock(func() time.Time { return time.Now().Add(-age) }),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ps.Close() })
+	f.placement = ps
 
 	f.chain = &chaintest.MockClient{
 		GetPendingLeasesFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
@@ -749,14 +744,7 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 		MaxReprovisionAttempts: 3,
 	}
 	f.reconcilerCfg = reconcilerConfig
-	var rec *Reconciler
-	if opts.noPlacement {
-		// Retained only to characterize the pre-mandatory-placement safety guard.
-		// Supported production composition goes through NewReconciler below.
-		rec, err = newReconciler(reconcilerConfig, f.chain, ack, router, f.tracker, nil)
-	} else {
-		rec, err = NewReconciler(reconcilerConfig, f.chain, ack, router, f.tracker, f.placement)
-	}
+	rec, err := NewReconciler(reconcilerConfig, f.chain, ack, router, f.tracker, f.placement)
 	require.NoError(t, err)
 	f.reconciler = rec
 

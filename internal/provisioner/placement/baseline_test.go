@@ -151,23 +151,20 @@ func TestStore_ConfigureBackendTopologyRejectsRemovedDurableReferences(t *testin
 		{
 			name: "confirmed Backend",
 			prepare: func(t *testing.T, s *Store) {
-				require.NoError(t, s.Confirm("lease", "backend-b"))
+				requireConfirmedPlacement(t, s, "lease", "backend-b")
 			},
 		},
 		{
 			name: "pending Attempt",
 			prepare: func(t *testing.T, s *Store) {
-				requireSetAttempting(t, s, "lease", "backend-b")
+				requireTestAdmission(t, s)
+				requireTypedAttempt(t, s, "lease", "backend-b", requireOperationID(t, "9051"))
 			},
 		},
 		{
 			name: "quarantine ConflictBackends",
 			prepare: func(t *testing.T, s *Store) {
-				_, _, err := s.SetConflictsIfNotNewer(
-					map[string][]string{"lease": {"backend-a", "backend-b"}},
-					s.SnapshotRevision(),
-				)
-				require.NoError(t, err)
+				requireConflictPlacement(t, s, "lease", "backend-a", "backend-b")
 			},
 		},
 	}
@@ -467,7 +464,7 @@ func TestStore_BeginNewAttemptIsExactInsertIfAbsentCAS(t *testing.T) {
 
 	// An observation inserted after a caller saw absence wins the admission CAS.
 	require.Equal(t, StateAbsent, s.Lookup("toctou").State())
-	require.NoError(t, s.Confirm("toctou", "backend-a"))
+	requireConfirmedPlacement(t, s, "toctou", "backend-a")
 	token, applied, err := s.BeginNewAttempt(
 		scope, "toctou", "backend-a", requireOperationID(t, "9050"),
 	)
@@ -521,7 +518,7 @@ func TestStore_BeginNewAttemptIsExactInsertIfAbsentCAS(t *testing.T) {
 
 func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T) {
 	s := newTestStore(t)
-	require.NoError(t, s.Confirm("owned", "backend-a"))
+	requireConfirmedPlacement(t, s, "owned", "backend-a")
 	baseline := requireAdmissionBaseline(t, s, "backend-a", "backend-b")
 	revision := s.Lookup("owned").RecordRevision()
 	require.True(t, revision.Valid())
@@ -551,7 +548,7 @@ func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T
 	assert.False(t, wrongOwner.Valid())
 
 	require.True(t, mustDeleteRecord(t, s, freshRevision))
-	require.NoError(t, s.Confirm("owned", "backend-a"))
+	requireConfirmedPlacement(t, s, "owned", "backend-a")
 	stale, applied, err := s.BeginOwnedAttempt(
 		baseline, freshRevision, "backend-a", requireOperationID(t, "9103"),
 	)
@@ -560,7 +557,7 @@ func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T
 	assert.False(t, stale.Valid())
 
 	other := newTestStore(t)
-	require.NoError(t, other.Confirm("owned", "backend-a"))
+	requireConfirmedPlacement(t, other, "owned", "backend-a")
 	foreignRevision := other.Lookup("owned").RecordRevision()
 	foreign, applied, err := s.BeginOwnedAttempt(
 		baseline, foreignRevision, "backend-a", requireOperationID(t, "9104"),
@@ -586,7 +583,7 @@ func mustDeleteRecord(t *testing.T, s *Store, revision RecordRevision) bool {
 
 func TestStore_BeginRestoreRequiresCurrentAdmissionBaseline(t *testing.T) {
 	s := newTestStore(t)
-	require.NoError(t, s.Confirm("source", "backend-a"))
+	requireConfirmedPlacement(t, s, "source", "backend-a")
 	baseline := requireAdmissionBaseline(t, s, "backend-a", "backend-b")
 	opID := requireOperationID(t, "9200")
 
@@ -666,7 +663,8 @@ func TestStore_TopologyMetadataErrorClassification(t *testing.T) {
 	// added. This is a small regression guard for callers' fail-closed handling.
 	s := newTestStore(t)
 	require.NoError(t, s.ConfigureBackendTopology([]string{"backend-a", "backend-b"}))
-	requireSetAttempting(t, s, "lease", "backend-b")
+	requireTestAdmission(t, s)
+	requireTypedAttempt(t, s, "lease", "backend-b", requireOperationID(t, "9251"))
 	err := s.ConfigureBackendTopology([]string{"backend-a"})
 	assert.True(t, errors.Is(err, ErrBackendTopologyInUse))
 }

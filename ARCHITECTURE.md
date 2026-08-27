@@ -147,20 +147,20 @@ Manager (coordinator)
 ├── ChainClient          interface → chain.Client (backed by SignerPool)
 │   └── SignerPool       primary + N sub-signers for authz parallel signing
 ├── BackendRouter        interface → *backend.Router (passed to Orchestrator)
-├── InFlightTracker      interface → DefaultInFlightTracker (sync.RWMutex-protected map)
-├── PlacementStore       interface → placement.Store (bbolt + cache, optional)
-├── Orchestrator         struct    → uses BackendRouter + InFlightTracker + PlacementStore
-├── HandlerSet           struct    → uses Orchestrator + Tracker + AckBatcher
+├── operation.Registry   concrete  → sole process-local lifecycle authority
+├── PlacementAuthorityStore interface → placement.Store (bbolt + cache, required)
+├── Orchestrator         struct    → uses BackendRouter + ProvisionOperations + ProvisionPlacement
+├── HandlerSet           struct    → uses EventOperations + application-service interfaces
 ├── AckBatcher           struct    → N parallel ackLane workers, round-robin dispatch
-├── TimeoutChecker       struct    → uses InFlightTracker + LeaseRejecter
+├── TimeoutChecker       struct    → uses TimeoutOperations + LeaseRejecter
 └── PayloadStore         struct    → bbolt-backed (optional)
 
 Reconciler (independent)
 ├── ReconcilerChainClient  interface → chain.Client
 ├── Acknowledger           interface → AckBatcher (routes acks through parallel lanes)
 ├── BackendRouter          interface → *backend.Router
-├── PlacementStore         interface → placement.Store (syncs on startup)
-└── ReconcilerTracker      interface → Manager (extends InFlightTracker)
+├── ReconcilerRuntime      interface → Manager (payload reads + narrow operation port)
+└── ReconcilerPlacement    interface → placement.Store (typed inventory and attempt authority)
 
 API Handlers
 ├── PlacementLookup        interface → placement.Store (read-only, optional)
@@ -175,7 +175,7 @@ Key interfaces defined where they're consumed:
 | `ReconcilerChainClient` | `provisioner/reconciler.go` | Reconciler |
 | `BackendRouter` | `provisioner/interfaces.go` | Orchestrator |
 | `operation.Registry` and its narrow capability ports | `provisioner/operation/registry.go` | Composition root, event handlers, callback service, restore service, orchestrator, reconciler, TimeoutChecker |
-| `InFlightTracker` / `ReconcilerTracker` | `provisioner/tracker.go` | Temporary compatibility adapters over the typed operation registry |
+| `InFlightTracker` | `provisioner/tracker.go` | Temporary Manager/shutdown compatibility adapter over the typed operation registry; the reconciler does not accept it |
 | `ProvisionPlacement` / `ReconcilerPlacement` / `PlacementAuthorityStore` | `provisioner/interfaces.go` | Orchestrator, reconciler, and composition root respectively |
 | `CallbackApplication` | `provisioner/callback_service.go` | HandlerSet transport adapter |
 | `restore.Service` and its narrow ports | `provisioner/restore/service.go` | Restore HTTP handler through the composition root |
@@ -296,8 +296,9 @@ Restore adopts a soft-deleted lease's retained data into a new lease (see the [d
       on that same backend (restore is same-backend, ENG-333)
    c. Bind the operation to that backend and build its HMAC-covered callback URL
    d. Call backend POST /restore, then confirm it from exact positive evidence,
-      clear it only after a causally validated synchronous refusal, or retain it
-      indefinitely after an ambiguous outcome
+      clear it only after a contract-conforming synchronous refusal trusted
+      under the configured backend transport, or retain it indefinitely after
+      an ambiguous outcome
 4. Backend adopts the retained volumes and re-deploys the retained manifest async
 5. Backend POSTs the success callback:
    a. Because the lease was tracked in-flight (step 3b), the callback is
@@ -310,7 +311,7 @@ Reconciler interplay (level-triggered backstop):
 
 - **Inline ack, reconciler backstop.** Inline acknowledgement (ENG-358) is the fast path. Restore requires both durable placement authority and the typed operation registry; production composition cannot construct the service without either. Once accepted, the reconciler remains the level-triggered backstop for a lost callback and acks a `PENDING` + `ready` lease. It *skips* a lease the operation registry still owns (counted by `reconciler_inflight_skips_total`), avoiding a double-ack.
 - **Restore affinity sync (ENG-333).** Each reconcile tick fans out `GET /retentions` to every backend and syncs the `lease → backend` map into the placement store, so retained leases stay routable to their source node across restarts.
-- **Write-ahead placement (ENG-632).** Placement stores two independent facts: `Backend` is confirmed ownership and `Attempt` is an unresolved outbound call. Every provision, re-provision, and restore persists `Attempt` before contacting a backend. A failed prewrite makes zero backend calls; a transport/5xx ambiguity—including an unvalidated HTTP 503—retains the exact typed attempt and blocks substitution. Inventory silence never clears it because a delayed remote call can commit after an absence response; only a positive report from the attempted backend, an exact synchronous refusal known to precede any call, or operator repair may settle it. A positive report from another backend is accumulated with every prior owner/attempt into a durable quarantine instead of moving affinity. The first complete `/provisions` + `/retentions` projection atomically persists a baseline bound to the sorted set of immutable backend storage identities. That baseline survives process restarts and transient outages while the topology is unchanged; adding, removing, or renaming an identity invalidates admission until a complete projection safely establishes the new topology. A retired identity can never be reused, and replacement storage receives a new name. During a later partial sweep, a genuinely recordless `PENDING` lease may target only a backend that answered both inventories, while recordless `ACTIVE` recovery, confirmed work on a silent owner, and ambiguous/conflicting work remain deferred. A live chain lease positively reported in retention is also deferred lease-locally: ordinary provision cannot overwrite data that requires the restore path. One failed node therefore does not globally pause the reconciler's healthy-node admission. The tenant event path has no per-sweep witness: it is fenced by the durable baseline and immutable topology, live-routes by backend stats, and persists its exact attempt before dispatch. Callback URLs carry an HMAC-covered UUIDv4 operation ID, and callback/timeout settlement claims serialize terminal work so an older response cannot settle a replacement operation. An authenticated success continues to chain acknowledgement even if placement confirmation fails, preserving the write-ahead record for positive inventory or operator repair instead of allowing a timeout to reject a live lease.
+- **Write-ahead placement (ENG-632).** Placement stores two independent facts: `Backend` is confirmed ownership and `Attempt` is an unresolved outbound call. Every provision, re-provision, and restore persists `Attempt` before contacting a backend. A failed prewrite makes zero backend calls; a transport/5xx ambiguity—including an unvalidated HTTP 503—retains the exact typed attempt and blocks substitution. Inventory silence never clears it because a delayed remote call can commit after an absence response; only a positive report from the attempted backend, a contract-conforming synchronous refusal trusted under the configured backend transport, or operator repair may settle it. The `insufficient_resources` response code establishes protocol conformance, not cryptographic authorship: Fred HMAC-signs backend-bound requests but does not authenticate response bodies, so plaintext deployments rely on their network trust boundary (TLS remains the stronger deployment option). Ordinary proxy HTML, foreign JSON, code-less legacy responses, and unknown codes stay ambiguous; the discriminator cannot detect a deliberate on-path forger. A positive report from another backend is accumulated with every prior owner/attempt into a durable quarantine instead of moving affinity. The first complete `/provisions` + `/retentions` projection atomically persists a baseline bound to the sorted set of immutable backend storage identities. That baseline survives process restarts and transient outages while the topology is unchanged; adding, removing, or renaming an identity invalidates admission until a complete projection safely establishes the new topology. A retired identity can never be reused, and replacement storage receives a new name. During a later partial sweep, a genuinely recordless `PENDING` lease may target only a backend that answered both inventories, while recordless `ACTIVE` recovery, confirmed work on a silent owner, and ambiguous/conflicting work remain deferred. A live chain lease positively reported in retention is also deferred lease-locally: ordinary provision cannot overwrite data that requires the restore path. One failed node therefore does not globally pause the reconciler's healthy-node admission. The tenant event path has no per-sweep witness: it is fenced by the durable baseline and immutable topology, live-routes by backend stats, and persists its exact attempt before dispatch. Callback URLs carry an HMAC-covered UUIDv4 operation ID, and callback/timeout settlement claims serialize terminal work so an older response cannot settle a replacement operation. An authenticated success continues to chain acknowledgement even if placement confirmation fails, preserving the write-ahead record for positive inventory or operator repair instead of allowing a timeout to reject a live lease.
 - **Placement prune grace + deprovision fail-safe (ENG-335).** The reconciler will not prune a placement set younger than a grace window (`2 × reconcile_interval`, measured from sweep start), so a lease that provisioned during a slow sweep is not mis-pruned. When a lease exhausts its re-provision attempts and is closed, the reconciler eagerly calls `backend.Deprovision` on its backend instead of waiting for the next orphan-cleanup cycle (logged at WARN, non-fatal).
 - **Destroy only on a positive fact (ENG-654).** The passes that delete durable state never infer "finished" from absence. A lease missing from the sweep's `chainLeases` proves nothing on its own: that map is built from two non-atomic queries filtered to `PENDING`/`ACTIVE`, so absence covers terminal, never-known, and just-created alike. Orphan deprovision and orphaned-payload cleanup therefore re-read the lease (`GetLease`) per candidate and act only on a positively reported `CLOSED`/`REJECTED`/`EXPIRED`; a query error, an `UNSPECIFIED` state, or a chain with no record of the lease all keep the state and bump `fred_reconciler_cleanup_skips_total`. The last of those is not a corner case — `x/billing` never deletes a lease, so "no record" means a phantom provision, a wrong or reset chain, or a lagging RPC node, and treating it as terminal would let one bad endpoint deprovision the fleet. Placement pruning asks a different question, per record rather than per sweep: it prunes only what the record's **own** backend accounted for on both `/provisions` and `/retentions`. Between them these replace the fleet-wide completeness gate ENG-356 left on all three passes, under which one silent machine paused cleanup — and stranded admission capacity — for every healthy one.
 
@@ -438,9 +439,9 @@ When a backend is unhealthy, requests fail fast with `ErrCircuitOpen` rather tha
 - `ErrValidation` (HTTP 400) — permanent client error, won't succeed on retry
 - `ErrAlreadyProvisioned` (HTTP 409 from Provision) — exempt from circuit-breaker
   failure counting, but not durable ownership proof because the client cannot
-  distinguish a backend-authored conflict from an intermediary-generated 409
+  distinguish a configured-endpoint conflict from an intermediary-generated 409
 - `ErrInvalidState` (HTTP 409 from Restart/Update) — wrong lease state for operation
-- `ErrInsufficientResources` (HTTP 503 from Provision) — treated as a capacity signal for circuit-breaker health, but not as durable proof of refusal because an intermediary may have emitted the unvalidated 503 after backend acceptance
+- `ErrInsufficientResources` (HTTP 503 from Provision) — treated as a capacity signal for circuit-breaker health, but not as a settlement verdict because an intermediary may have emitted an unvalidated 503 after backend acceptance. Its `ErrCapacityRefused` subtype requires the declared envelope plus `code="insufficient_resources"`; this is a contract verdict under transport trust, not an authenticated response.
 
 This ensures that expected business conditions don't trip the circuit breaker and block backend operations.
 
@@ -645,7 +646,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_backend_circuit_breaker_state` | gauge | `backend` | Circuit breaker state (0=closed, 1=half-open, 2=open) |
 | `fred_backend_healthy` | gauge | `backend` | Backend health (1=healthy, 0=unhealthy). Written **only** from inside the `/health` and `/readyz` handlers, so it is exactly as fresh as whatever polls them; with no prober it latches at its last value rather than going absent |
 | `fred_health_check_healthy` | gauge | `check` | Health of a non-backend dependency as observed by the health handler — `chain`, `token_tracker`, `placement_store`, `payload_store` (1=healthy, 0=unhealthy). Backends are excluded because `fred_backend_healthy` already carries a per-backend label this one cannot express. Same freshness caveat |
-| `fred_backend_insufficient_resources_total` | counter | `backend` | Capacity 503s |
+| `fred_backend_insufficient_resources_total` | counter | `backend`, `verdict` | Capacity 503s split into `coded_refusal` (contract-conforming; exact attempt is clearable) and `ambiguous` (legacy/code-less/unknown-code; attempt retained) |
 | `fred_backend_malformed_error_body_total` | counter | `backend`, `operation` | Client-error responses whose body was not the declared JSON error envelope |
 | `fred_backend_allocated_cpu_ratio` | gauge | `backend` | Allocated-CPU ratio observed by the router at provision time (allocated/total). Per-backend router-decision signal, event-sampled on multi-candidate routing; not intended for cross-backend aggregation — use the backends' own `/stats` component gauges for fleet views (ENG-318) |
 | `fred_backend_routing_fallback_total` | counter | — | Provision-routing decisions that fell back to round-robin (no usable backend load stats) |

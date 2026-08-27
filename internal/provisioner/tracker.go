@@ -9,7 +9,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
-	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // ProvisionKind distinguishes a fresh provision from a restore. A restore IS a
@@ -73,14 +72,6 @@ type InFlightTracker interface {
 	GetInFlightLeases() []string
 	WaitForDrain(ctx context.Context, timeout time.Duration) int
 	GetTimedOutProvisions(timeout time.Duration) []InFlightProvision
-}
-
-// ReconcilerTracker temporarily combines operation coordination and payload
-// reads. The reconciler migration splits these consumer-owned capabilities.
-type ReconcilerTracker interface {
-	InFlightTracker
-	HasPayload(leaseUUID string) (bool, error)
-	PayloadStore() *payload.Store
 }
 
 type legacyOperationKey struct {
@@ -560,90 +551,4 @@ func inFlightProvisionFromRecord(record operation.Record) InFlightProvision {
 		TokenRequired: record.TokenRequired, StartTime: record.StartedAt,
 		Kind: kind,
 	}
-}
-
-func (t *DefaultInFlightTracker) replaceForLegacy(
-	leaseUUID, tenant string,
-	items []backend.LeaseItem,
-	backendName string,
-	startedAt time.Time,
-) {
-	if t.registry == nil {
-		return
-	}
-	spec := operationTrackSpec(
-		leaseUUID, tenant, items, backendName, KindProvision, false, startedAt,
-	)
-	if !spec.Valid() {
-		return
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.ensureCapabilityMapsLocked()
-	if record, exists := t.registry.Lookup(leaseUUID); exists {
-		key, valid := t.legacyKeyFromRecordLocked(record)
-		if !valid {
-			return
-		}
-		token, owned := t.tokens[key]
-		if !owned || !t.registry.Abort(token) {
-			return
-		}
-		t.forgetOperationCapabilityLocked(key)
-	}
-	t.rememberTrackResultLocked(leaseUUID, t.registry.TryTrack(spec))
-}
-
-func (t *DefaultInFlightTracker) removeForLegacy(leaseUUID string) bool {
-	if t.registry == nil {
-		return false
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	record, exists := t.registry.Lookup(leaseUUID)
-	if !exists {
-		return false
-	}
-	key, valid := t.legacyKeyFromRecordLocked(record)
-	if !valid {
-		return false
-	}
-	token, owned := t.tokens[key]
-	if !owned || !t.registry.Abort(token) {
-		return false
-	}
-	t.forgetOperationCapabilityLocked(key)
-	return true
-}
-
-func (t *DefaultInFlightTracker) popForLegacy(leaseUUID string) (InFlightProvision, bool) {
-	if t.registry == nil {
-		return InFlightProvision{}, false
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	record, exists := t.registry.Lookup(leaseUUID)
-	if !exists {
-		return InFlightProvision{}, false
-	}
-	key, valid := t.legacyKeyFromRecordLocked(record)
-	if !valid {
-		return InFlightProvision{}, false
-	}
-	token, owned := t.tokens[key]
-	if !owned || !t.registry.Abort(token) {
-		return InFlightProvision{}, false
-	}
-	t.forgetOperationCapabilityLocked(key)
-	return inFlightProvisionFromRecord(record), true
-}
-
-func (t *DefaultInFlightTracker) legacyKeyFromRecordLocked(record operation.Record) (legacyOperationKey, bool) {
-	if !record.ID.Valid() || record.LeaseUUID == "" {
-		return legacyOperationKey{}, false
-	}
-	return legacyOperationKey{leaseUUID: record.LeaseUUID, operationID: record.ID}, true
 }

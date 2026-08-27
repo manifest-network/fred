@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -5803,15 +5804,25 @@ func newRestoreAuthorityForTest(
 	for _, backendClient := range router.Backends() {
 		backendNames = append(backendNames, backendClient.Name())
 	}
-	require.NoError(t, store.ConfigureBackendTopology(backendNames))
+	placements := make(map[string]string)
 	if sourcePlacements != nil {
 		source := sourcePlacements.Lookup(fromLeaseUUID)
 		if source.State() == placement.StateConfirmed && source.Attempt == "" {
-			require.NoError(t, store.Confirm(fromLeaseUUID, source.Backend))
+			placements[fromLeaseUUID] = source.Backend
+			// Some defensive API tests intentionally model a durable owner that
+			// the live backend resolver cannot reach. Keep the placement authority
+			// internally valid while leaving that owner absent from the resolver.
+			if !slices.Contains(backendNames, source.Backend) {
+				backendNames = append(backendNames, source.Backend)
+			}
 		}
 	}
+	require.NoError(t, store.ConfigureBackendTopology(backendNames))
 	fence := store.BeginInventorySession()
-	_, err = store.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
+	_, err = store.ProjectInventory(fence, placement.InventoryProjection{
+		Complete:   true,
+		Placements: placements,
+	})
 	require.NoError(t, err)
 	store.EndInventorySession(fence)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
