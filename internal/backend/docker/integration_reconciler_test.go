@@ -63,15 +63,18 @@ func (t *testReconcilerTracker) PayloadStore() *payload.Store {
 	return t.store
 }
 
-// UntrackInFlight is a test-only cleanup adapter. Production intentionally
-// exposes only operation-scoped removal; snapshot and carry that operation ID
-// here so cleanup cannot delete a replacement operation that raced the test.
-func (t *testReconcilerTracker) UntrackInFlight(leaseUUID string) {
-	provision, exists := t.GetInFlight(leaseUUID)
+// finishProvisionCallback settles the typed operation after this integration
+// harness receives a successful backend callback. The test callback server is
+// intentionally not wired through Manager's callback application service, so
+// the harness must perform the same claim-and-finish transition explicitly.
+func (t *testReconcilerTracker) finishProvisionCallback(leaseUUID string) bool {
+	operations := t.Operations()
+	record, exists := operations.Lookup(leaseUUID)
 	if !exists {
-		return
+		return false
 	}
-	t.UntrackInFlightIfOperationID(leaseUUID, provision.OperationID)
+	claimed := operations.TryClaimCallback(leaseUUID, record.ID)
+	return claimed.Claimed() && operations.FinishSettlement(claimed.Claim())
 }
 
 // reconcilerTestEnv holds all components for a full-stack reconciler integration test.
@@ -274,7 +277,7 @@ func TestIntegration_Reconciler_ContainerDied_ReProvisions(t *testing.T) {
 	}
 
 	// Untrack in-flight (simulates what the handler would do on callback)
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Transition lease to ACTIVE
 	mu.Lock()
@@ -389,7 +392,7 @@ func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for initial provision callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Transition to ACTIVE
 	mu.Lock()
@@ -425,7 +428,7 @@ func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
 			case <-time.After(2 * time.Minute):
 				t.Fatalf("timeout waiting for re-provision %d callback", i)
 			}
-			env.tracker.UntrackInFlight(leaseUUID)
+			require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 		}
 	}
 
@@ -510,7 +513,7 @@ func TestIntegration_Reconciler_OrphanCleanup(t *testing.T) {
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Verify container exists
 	containers := inspectProvisionContainers(t, leaseUUID)
@@ -603,7 +606,7 @@ func TestIntegration_Reconciler_MultiContainer_PartialKill_Recovers(t *testing.T
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision success callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Verify 2 containers are running
 	containers := inspectProvisionContainers(t, leaseUUID)
@@ -708,7 +711,7 @@ func TestIntegration_Reconciler_PendingReady_Acknowledges(t *testing.T) {
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Second RunOnce → chain still returns PENDING but backend has it Ready
 	// → should acknowledge
@@ -848,7 +851,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision success callback")
 	}
-	tracker.UntrackInFlight(leaseUUID)
+	require.True(t, tracker.finishProvisionCallback(leaseUUID))
 
 	// 2. Transition lease to ACTIVE
 	mu.Lock()
@@ -973,7 +976,7 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 	// 1. Chain-driven provision.
 	require.NoError(t, env.reconciler.RunOnce(ctx))
 	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, leaseUUID, 3*time.Minute).Status)
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// 2. Sentinel into the managed volume.
 	cid := getContainerID(t, leaseUUID)
@@ -1221,7 +1224,7 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision success callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.NotEmpty(t, containers)
