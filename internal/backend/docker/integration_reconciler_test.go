@@ -817,6 +817,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	t.Cleanup(func() { _ = placementStore.Close() })
 
 	providerUUID := "test-provider"
+	installExactLeaseLookupFallback(mockChain, providerUUID)
 	integrationAck2 := &integrationAcknowledger{chainClient: mockChain}
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
