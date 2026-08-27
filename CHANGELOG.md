@@ -42,6 +42,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   causally validated synchronous refusal may clear it. An ambiguous return or
   panic releases the transient source reservation but retains the durable target
   attempt; inventory absence never settles it. (ENG-632)
+- Bundled backends now tag synchronous provision/restore capacity refusals with
+  `code="insufficient_resources"`. The HTTP client reconstructs a distinct
+  `ErrCapacityRefused` that still matches `ErrInsufficientResources`, allowing
+  only that exact write-ahead attempt to be cleared and retried elsewhere.
+  Legacy, code-less, unknown-code, and malformed 503 responses remain ambiguous
+  and retain their attempt. A definitively refused restore now follows its
+  pre-dispatch `restarting` event with a best-effort terminal `failed` event so
+  subscribers are not left on a stale lifecycle hint. (ENG-632)
 - `placement_store_db_path` is now required at startup. Production topology is
   multi-backend, and even single-backend development/test needs durable evidence
   after an ambiguous response or restart, so providerd no longer offers an unsafe

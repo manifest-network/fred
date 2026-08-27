@@ -281,12 +281,16 @@ inode usage.
 
 ## Backend at capacity
 
-When SKU resource pools are full, provision requests get HTTP 503 with
-`insufficient resources`. Because the backend client cannot authenticate whether
-a 503 came from the backend or an intermediary after acceptance, Fred keeps the
-write-ahead attempt and does not substitute another backend. Inventory absence
-does not clear that ambiguity: the original request could commit after the list
-response. Only a refusal proven to precede any backend call, positive evidence
+When SKU resource pools are full, bundled backends return HTTP 503 with the
+declared error envelope and `code="insufficient_resources"`. That machine code
+produces the typed `ErrCapacityRefused` proof, so Fred clears only the matching
+write-ahead attempt and can route a later retry to another eligible backend.
+
+A legacy/code-less, malformed, or unknown-code 503 remains ambiguous: an
+intermediary could have emitted it after backend acceptance. Fred therefore keeps
+that write-ahead attempt and does not substitute another backend. Inventory
+absence does not clear the ambiguity because the original request could commit
+after the list response. Only a coded synchronous refusal, positive evidence
 that confirms ownership, or explicit operator proof and repair can settle it.
 
 **Symptoms:**
@@ -715,7 +719,42 @@ Fred uses bbolt (an embedded key-value store) for several persistent structures:
 | `<docker>/diagnostics.db` | Failure diagnostics (last_error, logs) | Older `failed` leases lose diagnostics; new failures still recorded |
 | `<docker>/releases.db` | Per-lease deployment history | Release history lost; provisioning still works |
 
-**If a bbolt file is corrupted** (file lock errors, bbolt panic on open, or known bad magic):
+### A logically corrupt placement row
+
+If `providerd` startup reports `lease "<key>" has uninterpretable durable
+placement`, the bbolt file opened successfully but that exact placement value
+cannot prove which backend may own, retain, or still be attempting the lease.
+The startup error quotes the exact bucket key and the decode reason; raw value
+bytes are deliberately not logged. This is different from a structurally
+unreadable bbolt file, and repeated restarts cannot repair it.
+
+Do not bypass the topology check, silently discard the row, or immediately
+replace the whole placement database. Any of those can erase the only evidence
+of a delayed backend call or retained tenant data. Recover it as follows:
+
+1. Stop `providerd` and take a byte-for-byte backup of the database before
+   inspecting or changing it.
+2. Record the quoted key and decode reason. Check that lease on chain and query
+   `/provisions` and `/retentions` on every configured backend plus every
+   historical backend that could have owned it.
+3. Prefer restoring a known-good stopped-process backup. If no backup exists,
+   preserve the row and escalate for operator repair unless the collected
+   evidence explicitly proves that it represents no owner, retained data, or
+   unresolved attempt.
+4. Only with that proof, remove the one quoted key using reviewed offline bbolt
+   tooling; never edit the live database. Restart with the unchanged backend
+   identities and require a complete inventory projection before reopening
+   tenant lifecycle ingress.
+
+Moving the entire placement database aside is a last resort that also loses
+attempts, conflict candidates, retired-name history, and the durable admission
+baseline. Inventory can rebuild positive owners, but it cannot reconstruct
+those absence-invisible safety facts.
+
+### A structurally unreadable bbolt file
+
+**If a bbolt file is structurally corrupted** (file lock errors, bbolt panic on
+open, or known bad magic):
 
 1. **Stop the service**.
 2. **Move the file aside** rather than deleting (`mv X.db X.db.broken`) so you can inspect it later if needed.
@@ -764,6 +803,13 @@ Inventory absence, complete or partial, never disproves or clears the attempt,
 because the original restore may commit after the list response. Do not delete
 the attempt merely to make the retry pass: retry requires a causally validated
 synchronous refusal or explicit operator proof and repair.
+
+The tenant event stream publishes `restarting` immediately before backend
+dispatch so an inline `ready`/`failed` callback cannot be followed by a stale
+start event. If the synchronous result definitively refuses the restore
+(including a coded capacity refusal), Fred follows that hint with `failed`.
+Ambiguous outcomes intentionally keep `restarting`; REST and backend inventory
+remain authoritative because WebSocket delivery is best-effort and lossy.
 
 **Restoring onto a different SKU tier.** A restore's new lease may target a
 different SKU than the source — only the item *shape* (service names + quantities)

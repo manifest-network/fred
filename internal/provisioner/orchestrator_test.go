@@ -1306,6 +1306,7 @@ func TestClassifyProvisionOutcome(t *testing.T) {
 		{name: "accepted", want: provisionOutcomeAccepted},
 		{name: "unvalidated conflict is ambiguous", err: fmt.Errorf("wrapped: %w", backend.ErrAlreadyProvisioned), want: provisionOutcomeAmbiguous},
 		{name: "validation refusal", err: fmt.Errorf("wrapped: %w", backend.ErrValidation), want: provisionOutcomeDefinitiveFailure},
+		{name: "coded capacity refusal", err: fmt.Errorf("wrapped: %w", backend.ErrCapacityRefused), want: provisionOutcomeDefinitiveFailure},
 		{name: "unvalidated capacity response is ambiguous", err: fmt.Errorf("wrapped: %w", backend.ErrInsufficientResources), want: provisionOutcomeAmbiguous},
 		{name: "open circuit", err: fmt.Errorf("wrapped: %w", backend.ErrCircuitOpen), want: provisionOutcomeDefinitiveFailure},
 		{name: "malformed response is ambiguous", err: backend.ErrMalformedErrorBody, want: provisionOutcomeAmbiguous},
@@ -1397,6 +1398,46 @@ func TestOrchestrator_StartProvisioning_InsufficientResourcesRetainsAttemptAndSu
 	second.mu.Lock()
 	assert.Empty(t, second.provisionCalls,
 		"an unvalidated 503 must not permit a second backend operation")
+	second.mu.Unlock()
+}
+
+func TestOrchestrator_StartProvisioning_CodedCapacityRefusalClearsAttemptAndAllowsReroute(t *testing.T) {
+	first := &mockManagerBackend{name: "backend-a", provisionErr: backend.ErrCapacityRefused}
+	second := &mockManagerBackend{name: "backend-b"}
+	routeCalls := 0
+	router := &mockBackendRouter{
+		backendsFn: func() []backend.Backend { return []backend.Backend{first, second} },
+		routeForProvisionFn: func(context.Context, string, map[string]int) backend.Backend {
+			routeCalls++
+			if routeCalls == 1 {
+				return first
+			}
+			return second
+		},
+	}
+	placements := newTestPlacementAuthority(t)
+	orchestrator := newTestProvisionOrchestrator(
+		t, "provider-1", "http://cb", router, NewInFlightTracker(), placements,
+	)
+	lease := &billingtypes.Lease{
+		Uuid: "lease-coded-capacity", Tenant: "tenant-a",
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+
+	err := startTestProvisioning(t, orchestrator, t.Context(), lease, ProvisionOpts{})
+	require.ErrorIs(t, err, backend.ErrCapacityRefused)
+	assert.Equal(t, placement.StateAbsent, placements.Lookup(lease.Uuid).State(),
+		"causally proven refusal must clear its exact write-ahead attempt")
+
+	require.NoError(t, startTestProvisioning(t, orchestrator, t.Context(), lease, ProvisionOpts{}))
+	record := placements.Lookup(lease.Uuid)
+	assert.Equal(t, placement.StateConfirmed, record.State())
+	assert.Equal(t, "backend-b", record.Backend)
+	first.mu.Lock()
+	assert.Len(t, first.provisionCalls, 1)
+	first.mu.Unlock()
+	second.mu.Lock()
+	assert.Len(t, second.provisionCalls, 1)
 	second.mu.Unlock()
 }
 

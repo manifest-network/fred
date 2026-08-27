@@ -210,9 +210,11 @@ func TestStore_ConfigureBackendTopologyRejectsRemovedDurableReferences(t *testin
 			s, err := NewStore(dbPath)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = s.Close() })
-			require.ErrorIs(t,
-				s.ConfigureBackendTopology([]string{"backend-a", "backend-b"}),
-				ErrBackendTopologyInUse,
+			err = s.ConfigureBackendTopology([]string{"backend-a", "backend-b"})
+			require.ErrorIs(t, err, ErrBackendTopologyInUse)
+			require.ErrorContains(t, err,
+				`lease "lease" has uninterpretable durable placement`,
+				"startup diagnostics must name the exact key that requires offline inspection",
 			)
 		})
 	}

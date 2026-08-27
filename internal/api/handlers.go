@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +29,7 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // ChainClient defines the chain operations needed by handlers.
@@ -144,7 +144,7 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		placementBootstrap = bootstrap
 	}
 	restoreService := cfg.RestoreService
-	if isNilInterface(restoreService) {
+	if util.IsNilInterface(restoreService) {
 		restoreService = nil
 	}
 	return &Handlers{
@@ -170,20 +170,6 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		providerUUID:      cfg.ProviderUUID,
 		bech32Prefix:      cfg.Bech32Prefix,
 		callbackBaseURL:   cfg.CallbackBaseURL,
-	}
-}
-
-func isNilInterface(value any) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
-		reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
-	default:
-		return false
 	}
 }
 

@@ -550,7 +550,7 @@ Starts async container provisioning. Pre-flight validation (SKU, manifest, image
 }
 ```
 
-**Errors:** `400` (validation), `409` (already provisioned), `503` (insufficient resources).
+**Errors:** `400` (validation), `409` (already provisioned), `503` (insufficient resources). A capacity refusal carries `{"error":"...","code":"insufficient_resources"}` so providerd can prove that no asynchronous work started and safely clear only the matching write-ahead attempt; an uncoded 503 remains ambiguous for compatibility.
 
 ### `POST /deprovision` (authenticated)
 
@@ -721,7 +721,7 @@ Re-deploys a lease with a new manifest (image/config change). The `payload` fiel
 
 ### `POST /restore` (authenticated)
 
-Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease) and `callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`). `422` is **overloaded**: a **bare** `422` (no `code`) means no retained data exists (`ErrNotRetained`), while `422` with body `{"code":"demote_exceeds_tier"}` means the retained data exceeds the requested smaller SKU tier (`ErrDemoteDataExceedsTier`, see [Restore flow](#restore-flow)). Also `409` for invalid state / already provisioned, `400` (validation), `503` (insufficient resources). See [Soft-delete & Restore](#soft-delete--restore).
+Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease) and `callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`). `422` is **overloaded**: a **bare** `422` (no `code`) means no retained data exists (`ErrNotRetained`), while `422` with body `{"code":"demote_exceeds_tier"}` means the retained data exceeds the requested smaller SKU tier (`ErrDemoteDataExceedsTier`, see [Restore flow](#restore-flow)). Also `409` for invalid state / already provisioned, `400` (validation), and `503` with `code="insufficient_resources"` for a synchronous capacity refusal. See [Soft-delete & Restore](#soft-delete--restore).
 
 ### `GET /retentions` (authenticated)
 

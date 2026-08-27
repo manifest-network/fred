@@ -137,7 +137,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, backend.ErrInsufficientResources) {
-			s.errorResponse(w, http.StatusServiceUnavailable, err.Error())
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
@@ -514,6 +516,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 type ErrorResponse struct {
 	Error          string                 `json:"error"`
 	ValidationCode backend.ValidationCode `json:"validation_code,omitempty"`
+	Code           string                 `json:"code,omitempty"`
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
@@ -534,6 +537,10 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 
 func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, ErrorResponse{Error: message})
+}
+
+func (s *Server) errorResponseWithCode(w http.ResponseWriter, status int, message, code string) {
+	s.writeJSON(w, status, ErrorResponse{Error: message, Code: code})
 }
 
 // validationErrorResponse writes a 400 response with a validation_code field

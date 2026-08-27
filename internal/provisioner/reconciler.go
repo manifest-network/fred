@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand/v2"
-	"reflect"
 	"runtime/debug"
 	"slices"
 	"sync"
@@ -25,6 +24,7 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // Default concurrency limits for reconciliation.
@@ -180,14 +180,14 @@ func NewReconciler(
 	runtime ReconcilerRuntime,
 	placementStore ReconcilerPlacement,
 ) (*Reconciler, error) {
-	if isNilReconcilerDependency(runtime) {
+	if util.IsNilInterface(runtime) {
 		return nil, errors.New("reconciler runtime is required")
 	}
-	if isNilReconcilerDependency(placementStore) {
+	if util.IsNilInterface(placementStore) {
 		return nil, errors.New("placement authority store is required")
 	}
 	operations := runtime.ReconcilerOperations()
-	if isNilReconcilerDependency(operations) {
+	if util.IsNilInterface(operations) {
 		return nil, errors.New("reconciler operations are required")
 	}
 	reconciler, err := buildReconciler(
@@ -197,6 +197,9 @@ func NewReconciler(
 	if err != nil {
 		return nil, err
 	}
+	// Reconciler is also exported as a standalone runtime. Keep its topology
+	// validation independent of NewManager: the production composition calls both,
+	// and the store's idempotent second call deliberately rechecks durable rows.
 	if err := placementStore.ConfigureBackendTopology(backendTopologyNames(backendRouter)); err != nil {
 		return nil, fmt.Errorf("configure reconciler backend topology: %w", err)
 	}
@@ -234,7 +237,7 @@ func buildReconciler(
 	legacyPlacement PlacementStore,
 	placementAuthority ReconcilerPlacement,
 ) (*Reconciler, error) {
-	if isNilReconcilerDependency(operations) {
+	if util.IsNilInterface(operations) {
 		operations = nil
 	}
 	if chainClient == nil {
@@ -261,7 +264,7 @@ func buildReconciler(
 	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
 	maxReprovision := cmp.Or(max(cfg.MaxReprovisionAttempts, 0), DefaultMaxReprovisionAttempts)
 	startEvents := cfg.StartEvents
-	if isNilCapability(startEvents) {
+	if util.IsNilInterface(startEvents) {
 		startEvents = nil
 	}
 
@@ -284,19 +287,6 @@ func buildReconciler(
 		placementAbsenceUntrusted: make(map[string]map[string]struct{}),
 		ambiguousPlacements:       make(map[string][]string),
 	}, nil
-}
-
-func isNilReconcilerDependency(dependency any) bool {
-	if dependency == nil {
-		return true
-	}
-	value := reflect.ValueOf(dependency)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
 }
 
 func operationRegistryFromReconcilerTracker(tracker ReconcilerTracker) *operation.Registry {
@@ -491,7 +481,6 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// log noise on placement-disabled deployments.
 	allRetentions := inventory.retentions
 	retentionsAnswered := inventory.retentionsAnswered
-	retentionsReportedByBackend := inventory.retentionsReportedByBackend
 	if r.placementView != nil {
 		slog.Info("fetched backend retentions",
 			"total", len(allRetentions),
@@ -697,30 +686,10 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				placementCASRevision = appliedRevision
 			}
 
-			// Attempt settlement can perform a bbolt write. Keep it inside the
-			// bounded worker rather than serializing every lease in the dispatch
-			// loop; its exact-revision CAS and the per-lease tracker snapshot make
-			// settlements for distinct leases safe to run concurrently.
 			_, absenceUntrustedForLease := r.placementAbsenceUntrusted[leaseUUID]
 			if absenceUntrustedForLease {
 				deferForSnapshotBoundary("placement_observation_excluded", "")
 				return nil
-			}
-			attemptCleared := false
-			if r.placementAuthority == nil {
-				attemptCleared = r.resolvePlacementAttempt(
-					leaseUUID, placementRecord, snapshot, placementSnapshotRevision,
-					inFlightAtSnapshot, retentionsAnswered, retentionsReportedByBackend,
-				)
-			}
-			if attemptCleared {
-				placementRecord = r.placementFor(leaseUUID)
-				if r.placementAuthority == nil {
-					// The legacy ClearAttemptIfRevision path may delete an attempt-only
-					// record, whose zero snapshot cannot expose the deletion revision.
-					// Typed production uses the projection proof/tombstone directly.
-					placementCASRevision = r.legacyPlacement.SnapshotRevision()
-				}
 			}
 			allowRecordless := r.placementSweepSeen.Load() || cycleComplete
 			if typedCoordination {
@@ -728,7 +697,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 					(placementSyncOK && admissionBaseline.Valid() &&
 						lease.State == billingtypes.LEASE_STATE_PENDING && len(eligibleBackends) > 0)
 			}
-			absenceTrusted := allowRecordless || attemptCleared
+			absenceTrusted := allowRecordless
 
 			if placementRecord.State() == placement.StateConfirmed &&
 				!snapshot.answered.configured(placementRecord.Backend) {
@@ -1765,32 +1734,6 @@ func (r *Reconciler) placementFor(leaseUUID string) placement.Placement {
 	return r.placementView.Lookup(leaseUUID)
 }
 
-// resolvePlacementAttempt is retained only for the raw compatibility adapter.
-// Inventory absence deliberately never settles an outbound attempt: it is not
-// causally ordered after the remote effect, so a delayed backend request could
-// still commit after both list endpoints answered without the lease. Typed
-// production confirms an attempt from positive inventory or clears it through
-// an exact synchronous-refusal capability.
-func (r *Reconciler) resolvePlacementAttempt(
-	leaseUUID string,
-	p placement.Placement,
-	snap fleetSnapshot,
-	snapshotRevision uint64,
-	inFlightAtSnapshot map[string]struct{},
-	retentionsAnswered answeredSet,
-	retentionsReportedByBackend map[string]map[string]struct{},
-) bool {
-	_ = r
-	_ = leaseUUID
-	_ = p
-	_ = snap
-	_ = snapshotRevision
-	_ = inFlightAtSnapshot
-	_ = retentionsAnswered
-	_ = retentionsReportedByBackend
-	return false
-}
-
 // markUnanswered records that a backend did not report this sweep. Callers must
 // hold the snapshot's mutex.
 func (s *fleetSnapshot) markUnanswered(name string) {
@@ -2649,7 +2592,7 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 		// with an unknown/incomplete candidate set and a generic unusable record can
 		// never satisfy that proof merely because today's configured fleet answered:
 		// an owner removed from configuration is exactly the one we must preserve.
-		owners := make([]string, 0, 2+len(record.ConflictBackends))
+		owners := make([]string, 0, 1+len(record.ConflictBackends))
 		addOwner := func(owner string) {
 			if owner == "" || slices.Contains(owners, owner) {
 				return
@@ -2657,7 +2600,6 @@ func (r *Reconciler) cleanupOrphanedPlacements(
 			owners = append(owners, owner)
 		}
 		addOwner(record.Backend)
-		addOwner(record.Attempt)
 		ownersAccountable := true
 		switch {
 		case record.Conflict:

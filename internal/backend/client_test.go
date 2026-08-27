@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -160,6 +161,67 @@ func TestHTTPClient_Provision_ValidationErrorCodes(t *testing.T) {
 			assert.ErrorIs(t, err, ErrValidation, "all validation errors should match ErrValidation")
 			assert.Contains(t, err.Error(), tt.wantMessage)
 		})
+	}
+}
+
+func TestHTTPClient_CapacityResponseRequiresCodedEnvelopeForRefusalProof(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		want          error
+		capacityProof bool
+	}{
+		{
+			name:          "coded backend refusal",
+			body:          `{"error":"backend is at capacity","code":"insufficient_resources"}`,
+			want:          ErrInsufficientResources,
+			capacityProof: true,
+		},
+		{
+			name: "legacy envelope without code",
+			body: `{"error":"backend is at capacity"}`,
+			want: ErrInsufficientResources,
+		},
+		{name: "empty intermediary response", want: ErrInsufficientResources},
+		{
+			name: "unknown code remains ambiguous",
+			body: `{"error":"backend is draining","code":"draining"}`,
+			want: ErrInsufficientResources,
+		},
+		{name: "malformed proxy response", body: `<html>unavailable</html>`, want: ErrMalformedErrorBody},
+	}
+	for _, operationName := range []string{"provision", "restore"} {
+		for _, test := range tests {
+			t.Run(operationName+"/"+test.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "/"+operationName, r.URL.Path)
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte(test.body))
+				}))
+				defer server.Close()
+
+				client := NewHTTPClient(HTTPClientConfig{
+					Name: operationName + "-capacity-proof", BaseURL: server.URL, Timeout: time.Second,
+				})
+				var err error
+				if operationName == "provision" {
+					err = client.Provision(t.Context(), ProvisionRequest{
+						LeaseUUID: "lease-1", Items: []LeaseItem{{SKU: "sku-1", Quantity: 1}},
+					})
+				} else {
+					err = client.Restore(t.Context(), RestoreRequest{
+						LeaseUUID: "lease-1", FromLeaseUUID: "source-1",
+					})
+				}
+
+				assert.ErrorIs(t, err, test.want)
+				assert.Equal(t, test.capacityProof, errors.Is(err, ErrCapacityRefused))
+				if test.capacityProof {
+					assert.ErrorIs(t, err, ErrInsufficientResources,
+						"the definitive subtype must preserve capacity-result compatibility")
+				}
+			})
+		}
 	}
 }
 

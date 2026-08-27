@@ -13,6 +13,7 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 const retainedLeaseNotice = "your lease data was retained and can be restored within the grace window: create a fresh PENDING lease of matching shape, then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
@@ -182,28 +183,28 @@ type CallbackService struct {
 // missing operation registry because no callback, including a tokenless legacy
 // callback, may authorize lifecycle mutation without a current operation.
 func NewCallbackService(cfg CallbackServiceConfig) (*CallbackService, error) {
-	if isNilCapability(cfg.Operations) {
+	if util.IsNilInterface(cfg.Operations) {
 		return nil, errCallbackOperationsUnavailable
 	}
-	if isNilCapability(cfg.Chain) {
+	if util.IsNilInterface(cfg.Chain) {
 		cfg.Chain = nil
 	}
-	if isNilCapability(cfg.Acknowledger) {
+	if util.IsNilInterface(cfg.Acknowledger) {
 		cfg.Acknowledger = nil
 	}
-	if isNilCapability(cfg.Placement) {
+	if util.IsNilInterface(cfg.Placement) {
 		cfg.Placement = nil
 	}
-	if isNilCapability(cfg.Payloads) {
+	if util.IsNilInterface(cfg.Payloads) {
 		cfg.Payloads = nil
 	}
-	if isNilCapability(cfg.Events) {
+	if util.IsNilInterface(cfg.Events) {
 		cfg.Events = nil
 	}
-	if isNilCapability(cfg.Backends) {
+	if util.IsNilInterface(cfg.Backends) {
 		cfg.Backends = nil
 	}
-	if isNilCapability(cfg.DeprovisionObserver) {
+	if util.IsNilInterface(cfg.DeprovisionObserver) {
 		cfg.DeprovisionObserver = nil
 	}
 	pollInterval := cfg.ClaimPollInterval

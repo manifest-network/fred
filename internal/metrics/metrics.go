@@ -802,6 +802,7 @@ const (
 const (
 	LifecycleEventProvisionStarting = "provision_starting"
 	LifecycleEventRestoreRestarting = "restore_restarting"
+	LifecycleEventRestoreRefused    = "restore_refused"
 )
 
 // Action constants for reconciliation

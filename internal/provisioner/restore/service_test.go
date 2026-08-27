@@ -768,6 +768,33 @@ func TestServiceEventSinkPanicDoesNotPreventRestoreDispatch(t *testing.T) {
 	requireSourceReusable(t, fixture, "probe-after-event-panic")
 }
 
+func TestServiceRefusalEventSinkPanicDoesNotUndoDefinitiveSettlement(t *testing.T) {
+	fixture := newFixture(t, true)
+	fixture.backend.err = backend.ErrValidation
+	fixture.events.hook = func(event backend.LeaseStatusEvent) {
+		if event.Status == backend.ProvisionStatusFailed {
+			panic("refusal event sink fault")
+		}
+	}
+	panics := metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
+		metrics.LifecycleEventRestoreRefused,
+	)
+	before := promtestutil.ToFloat64(panics)
+
+	result := fixture.service.Execute(t.Context(), validCommand())
+
+	require.Equal(t, OutcomeInvalidRequest, result.Outcome)
+	assert.Equal(t, placement.StateAbsent, fixture.store.Lookup(testTarget).State(),
+		"event delivery cannot roll back an exact refusal settlement")
+	assert.False(t, fixture.registry.registry.Contains(testTarget))
+	assert.Equal(t, before+1, promtestutil.ToFloat64(panics))
+	events := fixture.events.snapshot()
+	require.Len(t, events, 2)
+	assert.Equal(t, backend.ProvisionStatusRestarting, events[0].Status)
+	assert.Equal(t, backend.ProvisionStatusFailed, events[1].Status)
+	requireSourceReusable(t, fixture, "probe-after-refusal-event-panic")
+}
+
 func TestServiceInvalidRestoreClaimFailsClosed(t *testing.T) {
 	fixture := newFixture(t, true)
 	fixture.authority.invalid = true
@@ -785,11 +812,13 @@ func TestServiceSynchronousSettlementModes(t *testing.T) {
 		outcome    Outcome
 		wantState  placement.State
 		settlement string
+		wantEvents []backend.ProvisionStatus
 	}{
-		{name: "accepted", outcome: OutcomeAccepted, wantState: placement.StateConfirmed, settlement: "confirm"},
-		{name: "already provisioned", err: backend.ErrAlreadyProvisioned, outcome: OutcomeAlreadyProvisioned, wantState: placement.StateConfirmed, settlement: "confirm"},
-		{name: "definitive refusal", err: backend.ErrValidation, outcome: OutcomeInvalidRequest, wantState: placement.StateAbsent, settlement: "refuse"},
-		{name: "ambiguous error", err: context.DeadlineExceeded, outcome: OutcomeInternalFailure, wantState: placement.StateAttempting, settlement: "abandon"},
+		{name: "accepted", outcome: OutcomeAccepted, wantState: placement.StateConfirmed, settlement: "confirm", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
+		{name: "already provisioned", err: backend.ErrAlreadyProvisioned, outcome: OutcomeAlreadyProvisioned, wantState: placement.StateConfirmed, settlement: "confirm", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
+		{name: "definitive refusal", err: backend.ErrValidation, outcome: OutcomeInvalidRequest, wantState: placement.StateAbsent, settlement: "refuse", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting, backend.ProvisionStatusFailed}},
+		{name: "coded capacity refusal", err: backend.ErrCapacityRefused, outcome: OutcomeInsufficientResources, wantState: placement.StateAbsent, settlement: "refuse", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting, backend.ProvisionStatusFailed}},
+		{name: "ambiguous error", err: context.DeadlineExceeded, outcome: OutcomeInternalFailure, wantState: placement.StateAttempting, settlement: "abandon", wantEvents: []backend.ProvisionStatus{backend.ProvisionStatusRestarting}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -807,6 +836,15 @@ func TestServiceSynchronousSettlementModes(t *testing.T) {
 			}[test.settlement], [3]int{confirm, refuse, abandon})
 			assert.Equal(t, test.outcome == OutcomeAccepted,
 				fixture.registry.registry.Contains(testTarget))
+			events := fixture.events.snapshot()
+			require.Len(t, events, len(test.wantEvents))
+			for index, status := range test.wantEvents {
+				assert.Equal(t, status, events[index].Status)
+				assert.Equal(t, time.Unix(123, 0).UTC(), events[index].Timestamp)
+			}
+			if len(events) == 2 {
+				assert.Equal(t, "restore request refused", events[1].Error)
+			}
 		})
 	}
 }
@@ -894,6 +932,7 @@ func TestDefinitelyRefusedIsExhaustiveForSynchronousProofs(t *testing.T) {
 		{err: backend.ErrInvalidState, want: true},
 		{err: backend.ErrAlreadyProvisioned, want: false},
 		{err: backend.ErrInsufficientResources, want: false},
+		{err: backend.ErrCapacityRefused, want: true},
 		{err: backend.ErrCircuitOpen, want: true},
 		{err: backend.ErrDemoteDataExceedsTier, want: true},
 		{err: backend.ErrValidation, want: true},

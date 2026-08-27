@@ -24,29 +24,19 @@ const (
 	KindRestore
 )
 
-type inFlightSettlementOwner uint8
-
-const (
-	inFlightSettlementUnclaimed inFlightSettlementOwner = iota
-	inFlightSettlementTerminal
-	inFlightSettlementDeprovision
-)
-
 // InFlightProvision is the temporary compatibility view of an operation.Record.
-// New coordination code uses operation.Token and operation.OperationID. The
-// This view carries the same typed OperationID and never exposes a numeric wire
+// New coordination code uses operation.Token and operation.OperationID. This
+// view carries the same typed OperationID and never exposes a numeric wire
 // token.
 type InFlightProvision struct {
-	LeaseUUID         string
-	Tenant            string
-	Items             []backend.LeaseItem
-	Backend           string
-	OperationID       operation.OperationID
-	TokenRequired     bool
-	StartTime         time.Time
-	Kind              ProvisionKind
-	settlementClaimed bool
-	settlementOwner   inFlightSettlementOwner
+	LeaseUUID     string
+	Tenant        string
+	Items         []backend.LeaseItem
+	Backend       string
+	OperationID   operation.OperationID
+	TokenRequired bool
+	StartTime     time.Time
+	Kind          ProvisionKind
 }
 
 func (p InFlightProvision) RoutingSKU() string {
@@ -564,20 +554,11 @@ func inFlightProvisionFromRecord(record operation.Record) InFlightProvision {
 	if record.Kind == operation.KindRestore {
 		kind = KindRestore
 	}
-	owner := inFlightSettlementUnclaimed
-	switch record.Settlement {
-	case operation.SettlementTerminal:
-		owner = inFlightSettlementTerminal
-	case operation.SettlementDeprovision:
-		owner = inFlightSettlementDeprovision
-	case operation.SettlementUnclaimed:
-	}
 	return InFlightProvision{
 		LeaseUUID: record.LeaseUUID, Tenant: record.Tenant, Items: record.Items,
 		Backend: record.Backend, OperationID: record.ID,
 		TokenRequired: record.TokenRequired, StartTime: record.StartedAt,
-		Kind: kind, settlementClaimed: record.Settlement != operation.SettlementUnclaimed,
-		settlementOwner: owner,
+		Kind: kind,
 	}
 }
 

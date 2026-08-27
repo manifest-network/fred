@@ -19,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 const (
@@ -82,19 +83,19 @@ type HandlerSet struct {
 // NewHandlerSet creates a new HandlerSet with the given dependencies.
 func NewHandlerSet(deps HandlerDeps) *HandlerSet {
 	provisioner := deps.Orchestrator
-	if isNilCapability(provisioner) {
+	if util.IsNilInterface(provisioner) {
 		provisioner = nil
 	}
 	payloads := deps.PayloadStore
-	if isNilCapability(payloads) {
+	if util.IsNilInterface(payloads) {
 		payloads = nil
 	}
 	eventOperations := deps.EventOperations
-	if isNilCapability(eventOperations) {
+	if util.IsNilInterface(eventOperations) {
 		eventOperations = nil
 	}
 	callbacks := deps.Callbacks
-	if isNilCapability(callbacks) {
+	if util.IsNilInterface(callbacks) {
 		callbacks = nil
 	}
 	// The ports are retained in dedicated narrow fields, not duplicated in the

@@ -349,7 +349,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, backend.ErrInsufficientResources) {
-			s.errorResponse(w, http.StatusServiceUnavailable, err.Error())
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
@@ -531,8 +533,12 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrInsufficientResources) {
 			// 503 Service Unavailable, matching handleProvision: the backend is at
-			// capacity, not a permanent client error.
-			s.errorResponse(w, http.StatusServiceUnavailable, "insufficient resources for restore")
+			// capacity, not a permanent client error. The code proves that this
+			// backend refused before starting asynchronous restore work.
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, "insufficient resources for restore",
+				backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.logger.Error("restore failed", "lease_uuid", req.LeaseUUID, "from_lease_uuid", req.FromLeaseUUID, "error", err)

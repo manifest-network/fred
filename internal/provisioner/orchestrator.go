@@ -13,6 +13,7 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // ProvisionOpts contains optional parameters for provisioning.
@@ -49,11 +50,12 @@ func classifyProvisionOutcome(err error) provisionOutcome {
 		// supplies a remote cancellation/refusal proof.
 		return provisionOutcomeAmbiguous
 	case errors.Is(err, backend.ErrValidation),
+		errors.Is(err, backend.ErrCapacityRefused),
 		errors.Is(err, backend.ErrCircuitOpen):
-		// Validation errors carry a parsed backend-authored verdict, while an open
-		// circuit means the request was never sent. ErrInsufficientResources is not
-		// included: HTTPClient maps every unvalidated 503 response to that sentinel,
-		// and an intermediary can emit 503 after the backend accepted the request.
+		// Validation and coded capacity errors carry parsed backend-authored
+		// verdicts, while an open circuit means the request was never sent. The base
+		// ErrInsufficientResources is not included: legacy and intermediary 503s map
+		// to that sentinel without proving that the backend refused the request.
 		return provisionOutcomeDefinitiveFailure
 	default:
 		return provisionOutcomeAmbiguous
@@ -109,13 +111,13 @@ func NewProvisionOrchestrator(
 	placementStore ProvisionPlacement,
 	startEvents ProvisionStartEventSink,
 ) (*ProvisionOrchestrator, error) {
-	if isNilCapability(operations) {
+	if util.IsNilInterface(operations) {
 		return nil, errors.New("operation registry is required")
 	}
-	if isNilCapability(placementStore) {
+	if util.IsNilInterface(placementStore) {
 		return nil, ErrPlacementStoreUnavailable
 	}
-	if isNilCapability(startEvents) {
+	if util.IsNilInterface(startEvents) {
 		startEvents = nil
 	}
 	return &ProvisionOrchestrator{
@@ -130,7 +132,7 @@ func NewProvisionOrchestrator(
 }
 
 func isNilPlacementAuthorityStore(store PlacementAuthorityStore) bool {
-	return isNilCapability(store)
+	return util.IsNilInterface(store)
 }
 
 // rememberedDeprovisionCandidates returns process-local positive candidates
@@ -652,28 +654,26 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 
 	unresolved := false
 	unaccountablePlacement := false
-	if o.placementStore != nil {
-		p := o.placementStore.Lookup(leaseUUID)
-		addCandidateName(p.Backend)
-		addCandidateName(p.Attempt)
-		if p.State() == placement.StateUnusable {
-			for _, backendName := range p.ConflictBackends {
-				addCandidateName(backendName)
-			}
-			// A conflict with a complete durable candidate set can be settled by
-			// contacting every candidate. Legacy conflicts and malformed records do
-			// not identify the full historical owner set, so even a successful sweep
-			// of today's router cannot be reported as terminal success.
-			if !p.Conflict || p.ConflictOwnersUnknown || len(p.ConflictBackends) < 2 {
-				unresolved = true
-				unaccountablePlacement = true
-				slog.Warn("placement ownership is not fully accountable, will sweep all backends and fail closed",
-					"lease_uuid", leaseUUID,
-					"conflict", p.Conflict,
-					"conflict_backends", p.ConflictBackends,
-					"conflict_owners_unknown", p.ConflictOwnersUnknown,
-				)
-			}
+	p := o.placementStore.Lookup(leaseUUID)
+	addCandidateName(p.Backend)
+	addCandidateName(p.Attempt)
+	if p.State() == placement.StateUnusable {
+		for _, backendName := range p.ConflictBackends {
+			addCandidateName(backendName)
+		}
+		// A conflict with a complete durable candidate set can be settled by
+		// contacting every candidate. Legacy conflicts and malformed records do
+		// not identify the full historical owner set, so even a successful sweep
+		// of today's router cannot be reported as terminal success.
+		if !p.Conflict || p.ConflictOwnersUnknown || len(p.ConflictBackends) < 2 {
+			unresolved = true
+			unaccountablePlacement = true
+			slog.Warn("placement ownership is not fully accountable, will sweep all backends and fail closed",
+				"lease_uuid", leaseUUID,
+				"conflict", p.Conflict,
+				"conflict_backends", p.ConflictBackends,
+				"conflict_owners_unknown", p.ConflictOwnersUnknown,
+			)
 		}
 	}
 	if wasInFlight {
@@ -752,11 +752,9 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 			o.forgetDeprovisionCandidate(leaseUUID, b.Name())
 		}
 	}
-	// Log level depends on whether an unresolved placement is expected. With the
-	// placement store disabled, the sweep is the normal resolution path for any
-	// not-in-flight close, so it is not anomalous — reserve WARN for actual
-	// backend failures and for the ENG-335 case where placement IS enabled but
-	// could not resolve the backend.
+	// Placement authority is mandatory, so falling back to a fleet sweep always
+	// means ownership was unresolved. Reserve ERROR handling for the returned
+	// aggregate while keeping this per-sweep diagnostic at WARN.
 	logArgs := []any{
 		"lease_uuid", leaseUUID,
 		"swept_ok_or_noop", swept,
@@ -766,8 +764,6 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 	switch {
 	case len(failed) > 0:
 		slog.Warn("deprovision swept all backends with failures", logArgs...)
-	case o.placementStore == nil:
-		slog.Info("deprovision swept all backends (placement store disabled)", logArgs...)
 	default:
 		slog.Warn("deprovision swept all backends (placement unresolved, ENG-335)", logArgs...)
 	}

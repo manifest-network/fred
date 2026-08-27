@@ -7,6 +7,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // TimeoutOperations is the lifecycle authority needed by TimeoutChecker. The
@@ -41,11 +42,11 @@ type TimeoutCheckerConfig struct {
 // NewTimeoutChecker creates a new TimeoutChecker.
 func NewTimeoutChecker(cfg TimeoutCheckerConfig) *TimeoutChecker {
 	operations := cfg.Operations
-	if isNilCapability(operations) {
+	if util.IsNilInterface(operations) {
 		operations = nil
 	}
 	rejecter := cfg.Rejecter
-	if isNilCapability(rejecter) {
+	if util.IsNilInterface(rejecter) {
 		rejecter = nil
 	}
 	return &TimeoutChecker{

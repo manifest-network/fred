@@ -19,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // poisonTopic is the Watermill dead-letter topic for messages that exhaust retries.
@@ -109,6 +110,10 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	if isNilPlacementAuthorityStore(cfg.PlacementStore) {
 		return nil, ErrPlacementStoreUnavailable
 	}
+	// Manager is an independently constructible event-driven runtime; it cannot
+	// rely on a Reconciler being created later to establish this safety boundary.
+	// NewReconciler intentionally repeats the idempotent validation for its own
+	// standalone construction path.
 	if err := cfg.PlacementStore.ConfigureBackendTopology(
 		backendTopologyNames(router),
 	); err != nil {
@@ -303,7 +308,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 // It intentionally preserves the router's inventory boundary; canonical
 // sorting and validation belong to the placement store that persists it.
 func backendTopologyNames(router BackendRouter) []string {
-	if isNilCapability(router) {
+	if util.IsNilInterface(router) {
 		return nil
 	}
 	backends := router.Backends()

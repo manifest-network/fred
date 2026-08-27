@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -23,6 +22,7 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // Outcome is the transport-independent result of a restore command. Its zero
@@ -134,7 +134,8 @@ type RestoreAuthority interface {
 	AbandonRestore(placement.RestoreClaim) (bool, error)
 }
 
-// EventSink receives the status transition produced by an accepted restore.
+// EventSink receives ordered best-effort lifecycle hints around a dispatched
+// restore, including terminal compensation for a synchronous refusal.
 type EventSink interface {
 	Publish(event backend.LeaseStatusEvent)
 }
@@ -181,13 +182,13 @@ func NewService(config Config) (*Service, error) {
 		return nil, errors.New("restore provider UUID is required")
 	case config.CallbackURL == nil:
 		return nil, errors.New("restore callback URL builder is required")
-	case isNilCapability(config.Targets):
+	case util.IsNilInterface(config.Targets):
 		return nil, errors.New("restore target lease reader is required")
-	case isNilCapability(config.Backends):
+	case util.IsNilInterface(config.Backends):
 		return nil, errors.New("restore backend resolver is required")
-	case isNilCapability(config.Operations):
+	case util.IsNilInterface(config.Operations):
 		return nil, errors.New("restore operation registry is required")
-	case isNilCapability(config.Authority):
+	case util.IsNilInterface(config.Authority):
 		return nil, errors.New("restore placement authority is required")
 	}
 
@@ -196,7 +197,7 @@ func NewService(config Config) (*Service, error) {
 		now = time.Now
 	}
 	events := config.Events
-	if isNilCapability(events) {
+	if util.IsNilInterface(events) {
 		events = nil
 	}
 	return &Service{
@@ -209,20 +210,6 @@ func NewService(config Config) (*Service, error) {
 		events:       events,
 		now:          now,
 	}, nil
-}
-
-func isNilCapability(capability any) bool {
-	if capability == nil {
-		return true
-	}
-	value := reflect.ValueOf(capability)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
-		reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
 }
 
 // Execute performs one restore command. Both lifecycle claims fence the target
@@ -294,7 +281,7 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		return cleanupPreDispatch(errors.New("restore operation did not bind its authoritative backend"))
 	}
 	backendClient := service.backends.ResolveRestoreBackend(backendName)
-	if isNilCapability(backendClient) || backendClient.Name() != backendName {
+	if util.IsNilInterface(backendClient) || backendClient.Name() != backendName {
 		return cleanupPreDispatch(fmt.Errorf("restore backend %q is unavailable", backendName))
 	}
 	callbackURL, err := service.callbackURL(initiation.ID())
@@ -307,11 +294,12 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 
 	// The start event belongs immediately before the external call. An inline
 	// Ready/Failed callback can therefore never be followed by stale Restarting.
-	service.publishRestartingBestEffort(backendName, backend.LeaseStatusEvent{
-		LeaseUUID: command.TargetLeaseUUID,
-		Status:    backend.ProvisionStatusRestarting,
-		Timestamp: service.now(),
-	})
+	service.publishEventBestEffort(backendName, metrics.LifecycleEventRestoreRestarting,
+		backend.LeaseStatusEvent{
+			LeaseUUID: command.TargetLeaseUUID,
+			Status:    backend.ProvisionStatusRestarting,
+			Timestamp: service.now(),
+		})
 
 	callErr := invokeBackendRestore(ctx, backendName, backendClient, backend.RestoreRequest{
 		LeaseUUID:     command.TargetLeaseUUID,
@@ -368,6 +356,13 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		service.settleRestore("refuse synchronous restore", command, backendName, func() (bool, error) {
 			return service.authority.RefuseRestore(restoreClaim)
 		})
+		service.publishEventBestEffort(backendName, metrics.LifecycleEventRestoreRefused,
+			backend.LeaseStatusEvent{
+				LeaseUUID: command.TargetLeaseUUID,
+				Status:    backend.ProvisionStatusFailed,
+				Error:     "restore request refused",
+				Timestamp: service.now(),
+			})
 	default:
 		service.abandonRestore(command, backendName, restoreClaim,
 			"ambiguous synchronous restore outcome")
@@ -533,8 +528,9 @@ func (service *Service) settleRestore(
 	}
 }
 
-func (service *Service) publishRestartingBestEffort(
+func (service *Service) publishEventBestEffort(
 	backendName string,
+	eventName string,
 	event backend.LeaseStatusEvent,
 ) {
 	if service.events == nil {
@@ -543,12 +539,12 @@ func (service *Service) publishRestartingBestEffort(
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-				metrics.LifecycleEventRestoreRestarting,
+				eventName,
 			).Inc()
-			slog.Error("restore-restarting event sink panicked; continuing backend dispatch",
+			slog.Error("restore lifecycle event sink panicked; continuing lifecycle settlement",
 				"lease_uuid", event.LeaseUUID,
 				"backend", backendName,
-				"event", metrics.LifecycleEventRestoreRestarting,
+				"event", eventName,
 				"panic", recovered,
 				"stack", string(debug.Stack()),
 			)
@@ -612,6 +608,7 @@ func definitelyRefused(err error) bool {
 	return errors.Is(err, backend.ErrNotRetained) ||
 		errors.Is(err, backend.ErrInvalidState) ||
 		errors.Is(err, backend.ErrCircuitOpen) ||
+		errors.Is(err, backend.ErrCapacityRefused) ||
 		errors.Is(err, backend.ErrDemoteDataExceedsTier) ||
 		errors.Is(err, backend.ErrValidation) ||
 		errors.Is(err, backend.ErrRestoreRefused)

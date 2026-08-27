@@ -802,6 +802,9 @@ func TestHandleProvision(t *testing.T) {
 		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
 
 		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		var resp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, backend.CodeInsufficientResources, resp.Code)
 	})
 
 	t.Run("generic error returns 500", func(t *testing.T) {
@@ -1763,6 +1766,9 @@ func TestHandleRestore(t *testing.T) {
 
 		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 		assert.Contains(t, w.Body.String(), "insufficient resources")
+		var resp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, backend.CodeInsufficientResources, resp.Code)
 	})
 
 	t.Run("ErrDemoteDataExceedsTier returns 422 with demote_exceeds_tier code", func(t *testing.T) {

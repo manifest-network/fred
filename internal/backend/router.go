@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -14,6 +13,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // Router routes requests to backends based on SKU matching.
@@ -88,7 +89,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}
 
 	for i, entry := range cfg.Backends {
-		if isNilBackend(entry.Backend) {
+		if util.IsNilInterface(entry.Backend) {
 			return nil, fmt.Errorf("backend at index %d is nil", i)
 		}
 		name := entry.Backend.Name()
@@ -123,20 +124,6 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}
 
 	return r, nil
-}
-
-func isNilBackend(candidate Backend) bool {
-	if candidate == nil {
-		return true
-	}
-	value := reflect.ValueOf(candidate)
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
-		reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
 }
 
 // Route returns the appropriate backend for the given SKU.

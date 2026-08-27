@@ -1300,10 +1300,10 @@ func TestHandlerSet_HandleBackendCallback_DeprovisionOwnedCallbacksBypassClaimWa
 				t.Fatal("callback must not contend for the close path's settlement claim")
 			default:
 			}
-			current, exists := tracker.GetInFlight("lease-1")
+			current, exists := tracker.Operations().Lookup("lease-1")
 			require.True(t, exists, "the close path remains responsible for terminal settlement")
-			assert.Equal(t, generation, current.OperationID)
-			assert.Equal(t, inFlightSettlementDeprovision, current.settlementOwner)
+			assert.Equal(t, generation, current.ID)
+			assert.Equal(t, operation.SettlementDeprovision, current.Settlement)
 			if tt.wantCandidateRetired {
 				assert.Empty(t, orch.rememberedDeprovisionCandidates("lease-1"),
 					"positive teardown evidence must retire this close retry candidate")

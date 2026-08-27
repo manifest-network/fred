@@ -530,6 +530,12 @@ const CodeDemoteExceedsTier = "demote_exceeds_tier"
 // misclassification.
 const CodeAlreadyProvisioned = "already_provisioned"
 
+// CodeInsufficientResources is the machine-readable proof that a backend
+// itself refused a provision or restore request before starting asynchronous
+// work. A bare 503 is deliberately not equivalent: an intermediary can return
+// one after the backend accepted the request.
+const CodeInsufficientResources = "insufficient_resources"
+
 // Validation sub-category sentinels. These wrap ErrValidation so errors.Is(err, ErrValidation)
 // still works, while allowing callers to classify the failure without string matching.
 var (
@@ -571,8 +577,16 @@ func ClassifyValidationError(err error) ValidationCode {
 }
 
 // ErrInsufficientResources is returned when there are not enough resources
-// to fulfill a provision request.
+// to fulfill a provision or restore request. On its own this sentinel does not
+// prove whether the backend started work because legacy and intermediary 503
+// responses also map to it.
 var ErrInsufficientResources = errors.New("insufficient resources")
+
+// ErrCapacityRefused is returned only for a valid backend error envelope whose
+// code is CodeInsufficientResources. It wraps ErrInsufficientResources so
+// callers that only map the tenant-facing capacity result remain compatible,
+// while lifecycle coordinators can safely clear an exact durable attempt.
+var ErrCapacityRefused = fmt.Errorf("%w: backend refused the request", ErrInsufficientResources)
 
 // ErrInvalidState is returned when an operation is not valid for the current lease state.
 var ErrInvalidState = errors.New("invalid state for operation")
@@ -978,6 +992,24 @@ func (c *HTTPClient) parseErrorCode(body []byte, operation string) (code, msg st
 	return resp.Code, resp.Error, nil
 }
 
+// parseCapacityError distinguishes a causally useful backend refusal from an
+// unvalidated 503. Only the declared envelope plus the shared capacity code
+// proves that no asynchronous work started. Empty, malformed, legacy, and
+// unknown-code responses retain their conservative classifications.
+func (c *HTTPClient) parseCapacityError(body []byte, operation string) error {
+	code, msg, err := c.parseErrorCode(body, operation)
+	if err != nil {
+		return err
+	}
+	if code == CodeInsufficientResources {
+		return detailOr(ErrCapacityRefused, msg)
+	}
+	if code != "" {
+		c.noteUnrecognizedErrorCode(operation, http.StatusServiceUnavailable, code)
+	}
+	return detailOr(ErrInsufficientResources, msg)
+}
+
 // detailOr returns sentinel decorated with detail, or the bare sentinel when
 // the backend supplied no detail. Keeps an empty detail from rendering as an
 // empty tenant-facing message.
@@ -1112,8 +1144,9 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 				// against authoritative inventory before treating it as ownership.
 				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
 			case http.StatusServiceUnavailable:
-				// 503: backend at capacity — not a health failure.
-				return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))
+				// Only the shared machine code proves that the backend refused
+				// before starting work. A bare/proxy 503 remains ambiguous.
+				return nil, c.parseCapacityError(readErrorBodyBytes(resp), "provision")
 			default:
 				return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 			}
@@ -1480,8 +1513,8 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			}
 			return nil, detailOr(ErrInvalidState, msg)
 		case http.StatusServiceUnavailable:
-			// 503: backend at capacity — not a health failure (matches Provision).
-			return nil, fmt.Errorf("%w: %s", ErrInsufficientResources, readErrorBody(resp))
+			// Match Provision: only a coded backend refusal is causal proof.
+			return nil, c.parseCapacityError(readErrorBodyBytes(resp), "restore")
 		case http.StatusBadRequest:
 			// Reconstruct the validation sub-category sentinel from the
 			// validation_code body field (matching Provision/Update). Restore's

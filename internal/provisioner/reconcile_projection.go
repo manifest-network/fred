@@ -270,6 +270,10 @@ func (r *Reconciler) projectPlacementInventory(
 			case len(projectionConflicts[leaseUUID]) > 0:
 				excludeObservation(leaseUUID, projectionConflicts[leaseUUID]...)
 			default:
+				// The concrete Store currently fences only submitted placements or
+				// conflicts. Keep this fail-closed arm because ReconcilerPlacement is an
+				// injected capability and a future implementation may conservatively
+				// fence an additional lease without attaching a backend name.
 				excludeObservation(leaseUUID)
 			}
 		}
