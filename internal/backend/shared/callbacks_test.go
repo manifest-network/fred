@@ -1,12 +1,14 @@
 package shared
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestCallbackStore(t *testing.T) {
@@ -61,7 +63,7 @@ func TestCallbackStore(t *testing.T) {
 		assert.Equal(t, "container crashed", pending[0].Error)
 	})
 
-	t.Run("overwrite existing entry", func(t *testing.T) {
+	t.Run("append another delivery for the same lease", func(t *testing.T) {
 		entry := CallbackEntry{
 			LeaseUUID:   "lease-2",
 			CallbackURL: "http://localhost/cb2",
@@ -73,9 +75,18 @@ func TestCallbackStore(t *testing.T) {
 
 		pending, err := store.ListPending()
 		require.NoError(t, err)
-		require.Len(t, pending, 1)
-		assert.Equal(t, "http://localhost/cb2", pending[0].CallbackURL)
-		assert.True(t, pending[0].Success)
+		require.Len(t, pending, 2)
+		assert.NotEqual(t, pending[0].DeliveryID, pending[1].DeliveryID)
+		byURL := map[string]bool{}
+		for _, callback := range pending {
+			byURL[callback.CallbackURL] = callback.Success
+		}
+		assert.Equal(t, map[string]bool{
+			"http://localhost/cb":  false,
+			"http://localhost/cb2": true,
+		}, byURL)
+
+		require.NoError(t, store.Remove("lease-2"))
 	})
 
 	t.Run("remove nonexistent is noop", func(t *testing.T) {
@@ -252,33 +263,204 @@ func TestCallbackStore_RemoveOlderThan_AllFresh(t *testing.T) {
 	assert.Len(t, pending, 2)
 }
 
-func TestCallbackStore_StoreOverwrites(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "cb_overwrite.db")
+func TestCallbackStore_DistinctDeliveriesForSameLease(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cb_distinct_deliveries.db")
 	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
-	// Store initial entry
-	require.NoError(t, store.Store(CallbackEntry{
+	first, err := store.StoreEntry(CallbackEntry{
 		LeaseUUID:   "lease-1",
 		CallbackURL: "http://example.com/v1",
 		Success:     true,
 		CreatedAt:   time.Now(),
-	}))
+	})
+	require.NoError(t, err)
 
-	// Overwrite with new entry (same LeaseUUID)
-	require.NoError(t, store.Store(CallbackEntry{
+	second, err := store.StoreEntry(CallbackEntry{
 		LeaseUUID:   "lease-1",
 		CallbackURL: "http://example.com/v2",
 		Success:     false,
 		Error:       "updated error",
+		CreatedAt:   time.Now().Add(time.Second),
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, first.DeliveryID)
+	require.NotEmpty(t, second.DeliveryID)
+	require.NotEqual(t, first.DeliveryID, second.DeliveryID)
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 2, "independent deliveries must not overwrite each other")
+	assert.Equal(t, first.DeliveryID, pending[0].DeliveryID)
+	assert.Equal(t, second.DeliveryID, pending[1].DeliveryID)
+
+	require.NoError(t, store.RemoveEntry(pending[0]))
+	pending, err = store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, second.DeliveryID, pending[0].DeliveryID)
+
+	// Remove remains deliberately lease-wide for deprovision cleanup.
+	require.NoError(t, store.Remove("lease-1"))
+	pending, err = store.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
+}
+
+func TestCallbackStore_ReadsLegacyBucketAndRemovesPrecisely(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cb_legacy_and_v2.db")
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+
+	createdAt := time.Now()
+	storeLegacyCallback(t, store, CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "http://example.com/legacy",
+		Success:     false,
+		CreatedAt:   createdAt,
+	})
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "http://example.com/v2",
+		Success:     true,
+		CreatedAt:   createdAt.Add(time.Second),
+	}))
+	require.NoError(t, store.Close())
+
+	store, err = NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 2)
+	assert.Empty(t, pending[0].DeliveryID, "v0.13 entries do not carry a delivery ID")
+	assert.NotEmpty(t, pending[1].DeliveryID)
+
+	require.NoError(t, store.RemoveEntry(pending[0]))
+	pending, err = store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "http://example.com/v2", pending[0].CallbackURL)
+}
+
+func TestCallbackStore_RejectsDuplicateDeliveryID(t *testing.T) {
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	require.NoError(t, err)
+	defer store.Close()
+
+	const deliveryID = "550e8400-e29b-41d4-a716-446655440000"
+	first, err := store.StoreEntry(CallbackEntry{
+		DeliveryID:  deliveryID,
+		LeaseUUID:   "lease-1",
+		CallbackURL: "http://example.com/first",
 		CreatedAt:   time.Now(),
+	})
+	require.NoError(t, err)
+	_, err = store.StoreEntry(CallbackEntry{
+		DeliveryID:  deliveryID,
+		LeaseUUID:   "lease-2",
+		CallbackURL: "http://example.com/second",
+		CreatedAt:   time.Now(),
+	})
+	require.ErrorContains(t, err, "already exists")
+	require.ErrorContains(t, store.RemoveEntry(CallbackEntry{DeliveryID: deliveryID}), "no durable storage capability",
+		"a public identity without StoreEntry/ListPending's storage capability must not authorize deletion")
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, first.LeaseUUID, pending[0].LeaseUUID)
+	assert.Equal(t, first.CallbackURL, pending[0].CallbackURL)
+}
+
+func TestCallbackStore_RemoveLeaseDoesNotMatchV2DeliveryID(t *testing.T) {
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	require.NoError(t, err)
+	defer store.Close()
+
+	const deliveryID = "550e8400-e29b-41d4-a716-446655440000"
+	require.NoError(t, store.Store(CallbackEntry{
+		DeliveryID:  deliveryID,
+		LeaseUUID:   "actual-lease-owner",
+		CallbackURL: "http://example.com/callback",
+		CreatedAt:   time.Now(),
+	}))
+
+	// Lease-wide removal must inspect the v2 value, never confuse its UUID key
+	// with an unrelated lease that happens to have the same UUID.
+	require.NoError(t, store.Remove(deliveryID))
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "actual-lease-owner", pending[0].LeaseUUID)
+
+	require.NoError(t, store.Remove("actual-lease-owner"))
+	pending, err = store.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
+}
+
+func TestCallbackStore_RemoveEntryRejectsStaleCapabilityAfterIDReuse(t *testing.T) {
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	require.NoError(t, err)
+	defer store.Close()
+
+	const deliveryID = "550e8400-e29b-41d4-a716-446655440000"
+	first, err := store.StoreEntry(CallbackEntry{
+		DeliveryID:  deliveryID,
+		LeaseUUID:   "lease-1",
+		CallbackURL: "http://example.com/first",
+		CreatedAt:   time.Now(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RemoveEntry(first))
+	_, err = store.StoreEntry(CallbackEntry{
+		DeliveryID:  deliveryID,
+		LeaseUUID:   "lease-2",
+		CallbackURL: "http://example.com/reused",
+		CreatedAt:   time.Now().Add(time.Second),
+	})
+	require.NoError(t, err)
+
+	require.ErrorContains(t, store.RemoveEntry(first), "changed before precise removal",
+		"a stale storage capability must not delete a different delivery that reused its ID")
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "lease-2", pending[0].LeaseUUID)
+}
+
+func TestCallbackStore_ListPendingRejectsMismatchedV2Identity(t *testing.T) {
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	require.NoError(t, err)
+	defer store.Close()
+
+	entry := CallbackEntry{
+		DeliveryID:  "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+		LeaseUUID:   "lease-1",
+		CallbackURL: "http://example.com/callback",
+		CreatedAt:   time.Now(),
+	}
+	data, err := json.Marshal(entry)
+	require.NoError(t, err)
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(callbackV2BucketName).Put(
+			[]byte("6ba7b811-9dad-41d1-80b4-00c04fd430c8"), data,
+		)
 	}))
 
 	pending, err := store.ListPending()
 	require.NoError(t, err)
-	require.Len(t, pending, 1, "should have exactly one entry (overwritten)")
-	assert.Equal(t, "http://example.com/v2", pending[0].CallbackURL)
-	assert.False(t, pending[0].Success)
-	assert.Equal(t, "updated error", pending[0].Error)
+	assert.Empty(t, pending, "an entry must never be delivered under a different durable identity")
+}
+
+func storeLegacyCallback(t *testing.T, store *CallbackStore, entry CallbackEntry) {
+	t.Helper()
+	data, err := json.Marshal(entry)
+	require.NoError(t, err)
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(callbackBucketName).Put([]byte(entry.LeaseUUID), data)
+	}))
 }

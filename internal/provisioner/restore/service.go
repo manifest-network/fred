@@ -288,6 +288,10 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	if err != nil {
 		return cleanupPreDispatch(fmt.Errorf("build restore callback URL: %w", err))
 	}
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	if err != nil {
+		return cleanupPreDispatch(fmt.Errorf("build restore lifecycle callback URL: %w", err))
+	}
 	if !service.operations.BeginCall(initiation) {
 		return cleanupPreDispatch(errors.New("restore operation did not enter calling phase"))
 	}
@@ -302,12 +306,13 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		})
 
 	callErr := invokeBackendRestore(ctx, backendName, backendClient, backend.RestoreRequest{
-		LeaseUUID:     command.TargetLeaseUUID,
-		FromLeaseUUID: command.SourceLeaseUUID,
-		Tenant:        command.Tenant,
-		ProviderUUID:  service.providerUUID,
-		Items:         items,
-		CallbackURL:   callbackURL,
+		LeaseUUID:            command.TargetLeaseUUID,
+		FromLeaseUUID:        command.SourceLeaseUUID,
+		Tenant:               command.Tenant,
+		ProviderUUID:         service.providerUUID,
+		Items:                items,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
 	})
 	if errors.Is(callErr, backend.ErrInsufficientResources) {
 		verdict := metrics.CapacityVerdictAmbiguous

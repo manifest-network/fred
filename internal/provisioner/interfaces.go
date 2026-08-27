@@ -97,9 +97,9 @@ type ProvisionPlacement interface {
 	RefuseAttempt(placement.AttemptToken) (bool, error)
 }
 
-// ReconcilerPlacement is the inventory authority owned by reconciliation. It
-// deliberately excludes event-path admission scopes and attempt initiation,
-// along with callback settlement by operation identity.
+// ReconcilerPlacement is the inventory and repair authority owned by
+// reconciliation. It includes scoped attempt admission for repair work while
+// excluding callback settlement by operation identity.
 type ReconcilerPlacement interface {
 	PlacementView
 	ConfigureBackendTopology([]string) error

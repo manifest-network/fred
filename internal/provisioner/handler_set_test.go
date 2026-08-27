@@ -2753,7 +2753,6 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPrese
 			t.Cleanup(func() { require.NoError(t, store.Close()) })
 			tt.seed(t, store)
 			before := store.Lookup("lease-1")
-			beforeRevision := before.RecordRevision()
 
 			tracker := NewInFlightTracker()
 			generation, tracked := tracker.TryTrackInFlightWithOperationID(
@@ -2786,8 +2785,8 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPrese
 			assert.False(t, tracker.IsInFlight("lease-1"))
 			assert.Equal(t, before, store.Lookup("lease-1"),
 				"semantic callback verdict must preserve the operator-repairable record")
-			assert.Equal(t, beforeRevision, store.Lookup("lease-1").RecordRevision(),
-				"semantic callback verdict must not manufacture a placement mutation")
+			assert.Equal(t, map[string]placement.Placement{"lease-1": before}, store.List(),
+				"semantic callback verdict must not manufacture any placement mutation")
 		})
 	}
 }

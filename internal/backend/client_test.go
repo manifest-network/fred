@@ -54,17 +54,49 @@ func TestHTTPClient_Provision(t *testing.T) {
 
 	// Test provision
 	err := client.Provision(context.Background(), ProvisionRequest{
-		LeaseUUID:    "lease-uuid-1",
-		Tenant:       "tenant-1",
-		ProviderUUID: "provider-1",
-		Items:        []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
-		CallbackURL:  "http://fred/callback",
+		LeaseUUID:            "lease-uuid-1",
+		Tenant:               "tenant-1",
+		ProviderUUID:         "provider-1",
+		Items:                []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
+		CallbackURL:          "http://fred/callback?operation_id=550e8400-e29b-41d4-a716-446655440000",
+		LifecycleCallbackURL: "http://fred/callback",
 	})
 
 	require.NoError(t, err)
 
 	assert.Equal(t, "lease-uuid-1", receivedReq.LeaseUUID)
 	assert.Equal(t, "gpu-a100", receivedReq.RoutingSKU())
+	assert.Equal(t, "http://fred/callback?operation_id=550e8400-e29b-41d4-a716-446655440000", receivedReq.CallbackURL)
+	assert.Equal(t, "http://fred/callback", receivedReq.LifecycleCallbackURL)
+}
+
+func TestResolveLifecycleCallbackURL(t *testing.T) {
+	const operationID = "550e8400-e29b-41d4-a716-446655440000"
+	completion := "https://fred.example/callbacks/provision?z=last&operation_id=" + operationID +
+		"&tenant=a%2Fb&operation%5Fid=duplicate&a=first#fragment"
+	want := "https://fred.example/callbacks/provision?z=last&tenant=a%2Fb&a=first#fragment"
+
+	derived, err := ResolveLifecycleCallbackURL(completion, "")
+	require.NoError(t, err)
+	assert.Equal(t, want, derived,
+		"derivation must remove only operation identity and preserve unrelated raw query fields")
+
+	explicit, err := ResolveLifecycleCallbackURL(completion, want)
+	require.NoError(t, err)
+	assert.Equal(t, want, explicit)
+}
+
+func TestResolveLifecycleCallbackURLRejectsUnrelatedOrScopedURL(t *testing.T) {
+	completion := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
+
+	for _, lifecycleURL := range []string{
+		completion,
+		"https://other.example/callbacks/provision",
+		"https://fred.example/other",
+	} {
+		_, err := ResolveLifecycleCallbackURL(completion, lifecycleURL)
+		require.ErrorIs(t, err, ErrInvalidLifecycleCallbackURL)
+	}
 }
 
 // TestHTTPClient_Provision_ValidationError verifies that 400 Bad Request responses
@@ -2431,16 +2463,21 @@ func TestHTTPClientRestore_WithHMAC(t *testing.T) {
 	})
 
 	err := client.Restore(context.Background(), RestoreRequest{
-		LeaseUUID:     "new-lease-hmac",
-		FromLeaseUUID: "old-lease-hmac",
-		Tenant:        "tenant-1",
-		CallbackURL:   "http://fred/callback",
+		LeaseUUID:            "new-lease-hmac",
+		FromLeaseUUID:        "old-lease-hmac",
+		Tenant:               "tenant-1",
+		CallbackURL:          "http://fred/callback?operation_id=550e8400-e29b-41d4-a716-446655440000",
+		LifecycleCallbackURL: "http://fred/callback",
 	})
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, capturedSig, "X-Fred-Signature header should be present")
 	err = hmacauth.Verify(secret, capturedMethod, capturedURI, capturedBody, capturedSig, 5*time.Minute)
 	assert.NoError(t, err, "HMAC signature should verify successfully")
+	var receivedReq RestoreRequest
+	require.NoError(t, json.Unmarshal(capturedBody, &receivedReq))
+	assert.Equal(t, "http://fred/callback?operation_id=550e8400-e29b-41d4-a716-446655440000", receivedReq.CallbackURL)
+	assert.Equal(t, "http://fred/callback", receivedReq.LifecycleCallbackURL)
 }
 
 func TestHTTPClient_ListRetentions(t *testing.T) {

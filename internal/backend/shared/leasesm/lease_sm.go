@@ -205,7 +205,7 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// evReplaceFailed (ended up Failed).
 	//
 	// onEnterRestarting/onEnterUpdating are the SOLE writers of
-	// prov.Status (Restarting/Updating) + prov.CallbackURL for these
+	// prov.Status (Restarting/Updating) + the callback URL pair for these
 	// paths post-ENG-230. They run inside Fire on the actor goroutine,
 	// before handleRestartRequested/handleUpdateRequested ack the
 	// request — preserving the "Restart()/Update() returns ⇒ Status is
@@ -233,8 +233,8 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	sm.Configure(backend.ProvisionStatusRestarting).
 		OnEntryFrom(evRestartRequested, lsm.onEnterRestarting).
 		// Restore (ENG-325) enters Restarting from Provisioning and reuses the
-		// SAME entry action: applyReplaceEntry writes Status=Restarting +
-		// CallbackURL and captures replaceWasActive from the prior Status. For
+		// SAME entry action: applyReplaceEntry writes Status=Restarting + the
+		// callback URL pair and captures replaceWasActive from the prior Status. For
 		// the restore source (Provisioning) that read is false, which is exactly
 		// what the replace-completed entry action needs to Inc activeProvisions.
 		OnEntryFrom(evRestoreRequested, lsm.onEnterRestarting).
@@ -419,7 +419,7 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 
 // onEnterRestarting / onEnterUpdating are the Ready|Failed|Failing →
 // Restarting|Updating entry actions. They are the SOLE writers of
-// prov.Status (Restarting/Updating) and prov.CallbackURL for the
+// prov.Status (Restarting/Updating) and both callback URLs for the
 // restart/update paths (ENG-230). Fired synchronously inside
 // handleRestartRequested/handleUpdateRequested's fireAndVerify, BEFORE
 // the ack, so the "Restart()/Update() returns ⇒ Status is
@@ -439,15 +439,16 @@ func (lsm *leaseSM) onEnterUpdating(ctx context.Context, args ...any) error {
 	return lsm.applyReplaceEntry(args, backend.ProvisionStatusUpdating)
 }
 
-// applyReplaceEntry flips Status to the requested replace state and, when
-// the request carried a non-empty CallbackURL, applies it — all under one
-// UpdateFn critical section. No metric/log side effect inside the closure,
+// applyReplaceEntry flips Status to the requested replace state and applies
+// the exact-completion and lifecycle callback URLs in the same UpdateFn
+// critical section. No metric/log side effect belongs inside the closure,
 // per the LeaseProvisionStore idempotence contract.
 func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus) error {
-	var callbackURL string
+	var callbackURL, lifecycleCallbackURL string
 	if len(args) > 0 {
 		if a, ok := args[0].(replaceEntryArgs); ok {
 			callbackURL = a.CallbackURL
+			lifecycleCallbackURL = a.LifecycleCallbackURL
 		}
 	}
 	// Capture whether the lease was active (Status==Ready) BEFORE overwriting
@@ -462,6 +463,9 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 		p.Status = status
 		if callbackURL != "" {
 			p.CallbackURL = callbackURL
+		}
+		if lifecycleCallbackURL != "" {
+			p.LifecycleCallbackURL = lifecycleCallbackURL
 		}
 	})
 	lsm.actor.replaceWasActive = wasActive
@@ -823,7 +827,7 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 		if result.diag != "" {
 			p.LastError = errMsgContainerExited + ": " + result.diag
 		}
-		callbackURL = p.CallbackURL
+		callbackURL = p.LifecycleCallbackURL
 		failCount = p.FailCount
 		diagSnap = DiagnosticSnapshot(p)
 		diagContainerIDs = append([]string(nil), p.ContainerIDs...)
@@ -840,7 +844,7 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 		cfg.PersistDiagnosticsFn(diagSnap, diagContainerIDs, diagKeys)
 	}
 
-	cfg.SendCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
+	cfg.SendLifecycleCallbackFn(leaseUUID, callbackURL, backend.CallbackStatusFailed, errMsgContainerExited)
 
 	logAttrs := []any{
 		"lease_uuid", leaseUUID,
@@ -899,11 +903,13 @@ type provisionErrorInfo struct {
 	logs        map[string]string
 }
 
-// replaceEntryArgs carries the new CallbackURL from a Restart/Update
-// request message into the onEnterRestarting / onEnterUpdating entry
-// actions via Fire args, so the actor (not the HTTP prelude) is the
-// sole writer of prov.CallbackURL for these paths.
-type replaceEntryArgs struct{ CallbackURL string }
+// replaceEntryArgs carries the new exact-completion and lifecycle callback
+// URLs from a Restart/Update/Restore request into the replace entry actions,
+// so the actor (not the HTTP prelude) is the sole writer of the persisted pair.
+type replaceEntryArgs struct {
+	CallbackURL          string
+	LifecycleCallbackURL string
+}
 
 // ReplaceSuccessResult carries doReplaceContainers / doReplaceStackContainers
 // success output into onEnterReadyFromReplace. The goroutine returns these;

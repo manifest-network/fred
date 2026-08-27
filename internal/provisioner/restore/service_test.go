@@ -30,6 +30,15 @@ const (
 	testBackend  = "backend-a"
 )
 
+func TestRestoreAdmissionFailure_BackendOutsideTopologyIsServiceUnavailable(t *testing.T) {
+	cause := fmt.Errorf("retained source is unreachable: %w", placement.ErrBackendNotInTopology)
+
+	result := (&Service{}).restoreAdmissionFailure(cause)
+
+	assert.Equal(t, OutcomeServiceUnavailable, result.Outcome)
+	assert.ErrorIs(t, result.cause, placement.ErrBackendNotInTopology)
+}
+
 type targetReader struct {
 	mu     sync.Mutex
 	leases map[string]*billingtypes.Lease
@@ -544,6 +553,7 @@ func TestServiceAcceptedBindsOneIdentityAndAuthority(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, present)
 	assert.Equal(t, fixture.registry.initiation().ID(), callbackID)
+	assert.Equal(t, "https://fred.example.test/base/callbacks/provision", request.LifecycleCallbackURL)
 
 	target := fixture.store.Lookup(testTarget)
 	assert.Equal(t, placement.StateConfirmed, target.State())

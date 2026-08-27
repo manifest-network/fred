@@ -53,13 +53,14 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// window). Capture the teardown inputs inside the closure; the metric Dec is
 	// a side effect kept OUTSIDE the closure (UpdateFn no-side-effect contract).
 	var (
-		wasReady      bool
-		containerIDs  []string
-		items         []backend.LeaseItem
-		tenant        string
-		callbackURL   string
-		providerUUID  string
-		stackManifest *manifest.StackManifest
+		wasReady             bool
+		containerIDs         []string
+		items                []backend.LeaseItem
+		tenant               string
+		callbackURL          string
+		lifecycleCallbackURL string
+		providerUUID         string
+		stackManifest        *manifest.StackManifest
 		// volumesRetained is best-effort ground truth: set true only when the
 		// soft-delete path renamed all volumes into the retained namespace
 		// without error. Carried to the terminal deprovisioned callback so a
@@ -74,6 +75,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		items = append([]backend.LeaseItem(nil), p.Items...)
 		tenant = p.Tenant
 		callbackURL = p.CallbackURL
+		lifecycleCallbackURL = p.LifecycleCallbackURL
 		providerUUID = p.ProviderUUID
 		stackManifest = p.StackManifest
 	})
@@ -86,6 +88,13 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		// flags until the 90-day RemoveOlderThan TTL. (ENG-410)
 		b.purgeReleaseHistory(leaseUUID, logger)
 		return nil
+	}
+	resolvedLifecycleCallbackURL, resolveErr := backend.ResolveLifecycleCallbackURL(
+		callbackURL, lifecycleCallbackURL,
+	)
+	if resolveErr != nil {
+		logger.Error("cannot derive lifecycle callback URL; suppressing observational callback", "error", resolveErr)
+		resolvedLifecycleCallbackURL = ""
 	}
 	// Decrement activeProvisions on the Ready→Deprovisioning transition so the
 	// gauge stays accurate even if Deprovision later fails partially.
@@ -596,7 +605,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			)
 
 			// Volume leak: operator must clean up manually. Not a retain-success.
-			b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted", false)
+			b.sendCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted", false)
 			return nil
 		}
 
@@ -643,7 +652,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 
 	// Terminal success: carry the best-effort retained flag (true only when all
 	// volumes were soft-deleted into the retained namespace without error).
-	b.sendCallbackWithURL(leaseUUID, callbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
+	b.sendCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
 	return nil
 }
 

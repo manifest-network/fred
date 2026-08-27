@@ -82,7 +82,7 @@ func NewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 // TODO(ENG-134): no per-lease ctx seam — see k3s.Deprovision doc for
 // the residual deprovision-vs-callback TOCTOU this enables.
 //
-// SendCallback sends a provision result callback with HMAC signature.
+// SendCallback sends a backend callback with an HMAC signature.
 // It persists the callback before delivery and removes it on success.
 // The caller must provide the callbackURL (resolved from its own state) and
 // the backendName (so Fred can label metrics per-backend without a placement
@@ -110,35 +110,46 @@ func (s *CallbackSender) SendCallback(leaseUUID, callbackURL, backendName string
 		return
 	}
 
+	entry := CallbackEntry{
+		LeaseUUID:   leaseUUID,
+		CallbackURL: callbackURL,
+		Success:     status != backend.CallbackStatusFailed,
+		Status:      status,
+		Backend:     backendName,
+		Error:       errMsg,
+		Retained:    retained,
+		CreatedAt:   time.Now(),
+	}
+
 	// Persist callback before attempting delivery so it survives restarts.
-	// Success encodes "not failed" rather than "is success" so a rollback to a
-	// pre-Status binary replays a deprovisioned entry as 'success' (benign on
-	// dashboards) instead of 'failed' (which would re-introduce spurious
-	// failure events that the CallbackStatusDeprovisioned distinction eliminates).
+	// Success remains populated with the pre-Status encoding for schema
+	// continuity. New entries live in the v2 queue, which v0.13 deliberately does
+	// not read; see DEPLOYMENT.md for the callback-store rollback boundary.
+	var storedEntry CallbackEntry
+	stored := false
 	if s.store != nil {
-		if storeErr := s.store.Store(CallbackEntry{
-			LeaseUUID:   leaseUUID,
-			CallbackURL: callbackURL,
-			Success:     status != backend.CallbackStatusFailed,
-			Status:      status,
-			Backend:     backendName,
-			Error:       errMsg,
-			Retained:    retained,
-			CreatedAt:   time.Now(),
-		}); storeErr != nil {
+		var storeErr error
+		storedEntry, storeErr = s.store.StoreEntry(entry)
+		if storeErr != nil {
 			s.logger.Error("failed to persist callback", "error", storeErr, "lease_uuid", leaseUUID)
 			if s.onStoreError != nil {
 				s.onStoreError()
 			}
+		} else {
+			stored = true
 		}
 	}
 
 	delivered := s.DeliverCallback(leaseUUID, callbackURL, body)
 
 	// Remove from persistent store on successful delivery
-	if delivered && s.store != nil {
-		if rmErr := s.store.Remove(leaseUUID); rmErr != nil {
-			s.logger.Error("failed to remove delivered callback from store", "error", rmErr, "lease_uuid", leaseUUID)
+	if delivered && stored {
+		if rmErr := s.store.RemoveEntry(storedEntry); rmErr != nil {
+			s.logger.Error("failed to remove delivered callback from store",
+				"error", rmErr,
+				"lease_uuid", leaseUUID,
+				"delivery_id", storedEntry.DeliveryID,
+			)
 		}
 	}
 }
@@ -252,18 +263,23 @@ func (s *CallbackSender) ReplayPendingCallbacks() {
 		body, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {
 			s.logger.Error("removing malformed callback entry", "error", marshalErr, "lease_uuid", entry.LeaseUUID)
-			if rmErr := s.store.Remove(entry.LeaseUUID); rmErr != nil {
+			if rmErr := s.store.RemoveEntry(entry); rmErr != nil {
 				s.logger.Error("failed to remove malformed callback entry",
 					"error", rmErr,
 					"lease_uuid", entry.LeaseUUID,
+					"delivery_id", entry.DeliveryID,
 				)
 			}
 			continue
 		}
 
 		if s.DeliverCallback(entry.LeaseUUID, entry.CallbackURL, body) {
-			if rmErr := s.store.Remove(entry.LeaseUUID); rmErr != nil {
-				s.logger.Error("failed to remove replayed callback", "error", rmErr, "lease_uuid", entry.LeaseUUID)
+			if rmErr := s.store.RemoveEntry(entry); rmErr != nil {
+				s.logger.Error("failed to remove replayed callback",
+					"error", rmErr,
+					"lease_uuid", entry.LeaseUUID,
+					"delivery_id", entry.DeliveryID,
+				)
 			}
 		}
 	}

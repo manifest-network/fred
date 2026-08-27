@@ -83,6 +83,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the authenticated query grants authority. Requests with no parameter remain
   accepted for callbacks emitted by v0.13.0 backends, but operation-ID-scoped
   operations still require the echoed ID to settle. (ENG-632)
+- Provision and restore requests now distinguish their exact, operation-scoped
+  `callback_url` from a tokenless `lifecycle_callback_url`. Backends use the
+  latter only for later autonomous failure and teardown observations, so a
+  completed operation cannot make legitimate runtime, deprovisioned, or
+  retained events disappear. The Docker backend persists both URLs in separate
+  container labels and safely derives the lifecycle URL when upgrading state
+  written by an older Fred. Tokenless lifecycle callbacks remain observation-only
+  even while a typed operation is current. Pending deliveries are also keyed by
+  independent UUIDs, so a later lifecycle observation cannot overwrite or
+  remove an undelivered exact completion for the same lease; v0.13 queue entries
+  remain replayable. (ENG-632)
 - The callback JSON `backend` field remains optional metrics-only sender
   metadata for v0.13 compatibility. It need not equal Fred's durable router
   name and cannot authorize or redirect a typed callback; the HMAC-covered URL

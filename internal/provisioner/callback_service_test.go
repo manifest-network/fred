@@ -507,6 +507,60 @@ func TestCallbackService_DeprovisionOwnedCallbackIsObservationOnly(t *testing.T)
 	require.True(t, registry.FinishSettlement(deprovision.Claim()))
 }
 
+func TestCallbackService_TokenlessLifecycleObservationDoesNotSettleCurrentTypedOperation(t *testing.T) {
+	registry := operation.NewRegistry()
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+	events := &callbackEventRecorder{}
+	observer := &callbackDeprovisionRecorder{}
+	service, err := NewCallbackService(CallbackServiceConfig{
+		Operations:          registry,
+		Events:              events,
+		DeprovisionObserver: observer,
+		Acknowledger: callbackAcknowledgerFunc(func(context.Context, string) (bool, string, error) {
+			t.Fatal("an observational lifecycle callback must not acknowledge")
+			return false, "", nil
+		}),
+		Placement: &callbackPlacementSpy{
+			confirm: func(string, string, operation.OperationID) (bool, error) {
+				t.Fatal("an observational lifecycle callback must not confirm placement")
+				return false, nil
+			},
+			refuse: func(string, string, operation.OperationID) (bool, error) {
+				t.Fatal("an observational lifecycle callback must not refuse placement")
+				return false, nil
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID: "lease-1",
+			Status:    backend.CallbackStatusFailed,
+			Error:     "container exited",
+		},
+	)))
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID: "lease-1",
+			Status:    backend.CallbackStatusDeprovisioned,
+			Retained:  true,
+		},
+	)))
+
+	record, exists := registry.Lookup("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, token.ID(), record.ID)
+	assert.Equal(t, operation.SettlementUnclaimed, record.Settlement,
+		"tokenless lifecycle observations must leave exact settlement authority untouched")
+	assert.Zero(t, observer.calls,
+		"body metadata on an observational callback cannot retire a backend candidate")
+	require.Len(t, events.events, 2)
+	assert.Equal(t, backend.ProvisionStatusFailed, events.events[0].Status)
+	assert.Equal(t, "container exited", events.events[0].Error)
+	assert.Equal(t, backend.ProvisionStatusRetained, events.events[1].Status)
+}
+
 func TestCallbackService_TokenlessNonInFlightDeprovisionCannotRetireBackendCandidate(t *testing.T) {
 	registry := operation.NewRegistry()
 	events := &callbackEventRecorder{}

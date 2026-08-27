@@ -420,18 +420,49 @@ func runRecover(t *testing.T, existing map[string]*provision, containers []Conta
 
 func TestRecoverState_ReadyFromRunningContainers(t *testing.T) {
 	got := runRecover(t, nil, []ContainerInfo{
-		{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running", CallbackURL: "http://cb"},
+		{
+			ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small",
+			ServiceName: "app", Status: "running",
+			CallbackURL:          "http://cb?operation_id=550e8400-e29b-41d4-a716-446655440000",
+			LifecycleCallbackURL: "http://cb",
+		},
 	})
 	p, ok := got["L1"]
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusReady, p.Status)
 	assert.Equal(t, []string{"c1"}, p.ContainerIDs)
 	assert.Equal(t, 1, p.Quantity)
-	assert.Equal(t, "http://cb", p.CallbackURL)
+	assert.Equal(t, "http://cb?operation_id=550e8400-e29b-41d4-a716-446655440000", p.CallbackURL)
+	assert.Equal(t, "http://cb", p.LifecycleCallbackURL)
 	assert.Equal(t, map[string][]string{"app": {"c1"}}, p.ServiceContainers,
 		"ServiceContainers must be rebuilt from container labels")
 	assert.Equal(t, []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}, p.Items,
 		"Items must be rebuilt from container labels")
+}
+
+func TestRecoverState_DerivesLifecycleCallbackFromLegacyExactLabel(t *testing.T) {
+	got := runRecover(t, nil, []ContainerInfo{{
+		ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small",
+		ServiceName: "app", Status: "running",
+		CallbackURL: "http://cb?tenant=a%2Fb&operation_id=550e8400-e29b-41d4-a716-446655440000",
+	}})
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, "http://cb?tenant=a%2Fb", p.LifecycleCallbackURL,
+		"containers created before lifecycle labels were added must recover a tokenless observation route")
+}
+
+func TestRecoverState_ReplacesMismatchedLifecycleLabelWithSafeDerivedRoute(t *testing.T) {
+	got := runRecover(t, nil, []ContainerInfo{{
+		ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small",
+		ServiceName: "app", Status: "running",
+		CallbackURL:          "https://fred.example/callback?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
+		LifecycleCallbackURL: "https://unrelated.example/callback",
+	}})
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t, "https://fred.example/callback?trace=keep", p.LifecycleCallbackURL,
+		"recovery must never honor a persisted lifecycle endpoint unrelated to the exact route")
 }
 
 func TestRecoverState_ColdStartFailed_BumpsFailCountAndLastError(t *testing.T) {

@@ -992,8 +992,10 @@ func TestDeprovision_WithNetworkIsolation(t *testing.T) {
 // observed on the "Provision Rate by Outcome" dashboard.
 func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 	var received backend.CallbackPayload
+	var receivedRawQuery string
 	callbackDone := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedRawQuery = r.URL.RawQuery
 		json.NewDecoder(r.Body).Decode(&received)
 		w.WriteHeader(http.StatusOK)
 		select {
@@ -1012,7 +1014,7 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     1,
 			ContainerIDs: []string{"c1"},
-			CallbackURL:  server.URL},
+			CallbackURL:  server.URL + "?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000"},
 		},
 	})
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
@@ -1031,6 +1033,8 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 	assert.Empty(t, received.Error)
 	assert.NotEmpty(t, received.Backend, "backend name should be populated for per-backend metrics")
 	assert.False(t, received.Retained, "destroy path (RetainOnClose off) must report retained=false")
+	assert.Equal(t, "trace=keep", receivedRawQuery,
+		"deprovision must use the tokenless lifecycle URL and preserve unrelated query fields")
 }
 
 // TestDeprovision_RetainSuccessSendsRetainedCallback verifies the ENG-329 #6
@@ -1039,9 +1043,11 @@ func TestDeprovision_SendsDeprovisionedCallback(t *testing.T) {
 // carries retained=true.
 func TestDeprovision_RetainSuccessSendsRetainedCallback(t *testing.T) {
 	var received backend.CallbackPayload
+	var receivedRawQuery string
 	callbackDone := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&received)
+		receivedRawQuery = r.URL.RawQuery
 		w.WriteHeader(http.StatusOK)
 		select {
 		case callbackDone <- struct{}{}:
@@ -1061,9 +1067,11 @@ func TestDeprovision_RetainSuccessSendsRetainedCallback(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
 			Tenant: "tenant-a", ProviderUUID: "prov-1", Status: backend.ProvisionStatusReady, Quantity: 1,
-			ContainerIDs: []string{"c1"}, CallbackURL: server.URL,
-			Items:         []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
-			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}}},
+			ContainerIDs:         []string{"c1"},
+			CallbackURL:          server.URL + "?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
+			LifecycleCallbackURL: server.URL + "?trace=keep",
+			Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
+			StackManifest:        &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}}},
 		},
 	})
 	var renamed [][2]string
@@ -1089,6 +1097,8 @@ func TestDeprovision_RetainSuccessSendsRetainedCallback(t *testing.T) {
 
 	assert.Equal(t, backend.CallbackStatusDeprovisioned, received.Status)
 	assert.True(t, received.Retained, "retain-success path must report retained=true")
+	assert.Equal(t, "trace=keep", receivedRawQuery,
+		"retained observation must use the tokenless lifecycle route and preserve unrelated query fields")
 	require.Len(t, renamed, 1, "the one canonical volume should be renamed into the retained namespace")
 	assert.Equal(t, canonical, renamed[0][0])
 	assert.Equal(t, retainedName(canonical), renamed[0][1])

@@ -319,15 +319,21 @@ func (o *ProvisionOrchestrator) startProvisioning(
 		abortOperation("callback URL construction failed")
 		return fmt.Errorf("%w: build callback URL: %w", ErrProvisioningFailed, err)
 	}
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	if err != nil {
+		abortOperation("lifecycle callback URL construction failed")
+		return fmt.Errorf("%w: build lifecycle callback URL: %w", ErrProvisioningFailed, err)
+	}
 
 	// Build provision request
 	req := backend.ProvisionRequest{
-		LeaseUUID:    lease.Uuid,
-		Tenant:       lease.Tenant,
-		ProviderUUID: o.providerUUID,
-		Items:        items,
-		CallbackURL:  callbackURL,
-		Payload:      opts.Payload,
+		LeaseUUID:            lease.Uuid,
+		Tenant:               lease.Tenant,
+		ProviderUUID:         o.providerUUID,
+		Items:                items,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		Payload:              opts.Payload,
 	}
 	// Only include PayloadHash when we have the actual payload
 	if opts.Payload != nil && opts.PayloadHash != "" {

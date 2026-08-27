@@ -149,6 +149,7 @@ type testActorOpts struct {
 	PersistDiagnosticsFn         func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
 	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
 	SendCallbackFn               func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	SendLifecycleCallbackFn      func(uuid, url string, status backend.CallbackStatus, errMsg string)
 	DoDeprovisionFn              func(ctx context.Context, leaseUUID string) error
 }
 
@@ -214,6 +215,9 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 	if opts.SendCallbackFn == nil {
 		opts.SendCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
+	if opts.SendLifecycleCallbackFn == nil {
+		opts.SendLifecycleCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	}
 	if opts.DoDeprovisionFn == nil {
 		opts.DoDeprovisionFn = func(context.Context, string) error { return nil }
 	}
@@ -233,6 +237,7 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 			PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
 			PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
 			SendCallbackFn:               opts.SendCallbackFn,
+			SendLifecycleCallbackFn:      opts.SendLifecycleCallbackFn,
 			DoDeprovisionFn:              opts.DoDeprovisionFn,
 		}
 	})
@@ -290,6 +295,9 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	if opts.SendCallbackFn == nil {
 		opts.SendCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
+	if opts.SendLifecycleCallbackFn == nil {
+		opts.SendLifecycleCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	}
 	if opts.DoDeprovisionFn == nil {
 		opts.DoDeprovisionFn = func(context.Context, string) error { return nil }
 	}
@@ -314,6 +322,7 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
 		PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
 		SendCallbackFn:               opts.SendCallbackFn,
+		SendLifecycleCallbackFn:      opts.SendLifecycleCallbackFn,
 		DoDeprovisionFn:              opts.DoDeprovisionFn,
 	}
 	a.leaseUUID = a.cfg.LeaseUUID

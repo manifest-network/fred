@@ -81,6 +81,7 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 		Tenant:        "tenant-a",
 		SKU:           "docker-micro",
 		Image:         "nginx:1.25",
+		CallbackURL:   "https://fred.example/callback?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
 		InstanceIndex: 0,
 		// ServiceName empty: legacy
 	}}
@@ -102,6 +103,15 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 	if !strings.Contains(fakeDocker.lastComposeProjectName, "fred-lease-1") {
 		t.Fatalf("compose up not invoked for project: %v", fakeDocker.lastComposeProjectName)
 	}
+	require.NotNil(t, fakeDocker.lastComposeProject)
+	require.Contains(t, fakeDocker.lastComposeProject.Services, "app")
+	labels := fakeDocker.lastComposeProject.Services["app"].Labels
+	assert.Equal(t,
+		"https://fred.example/callback?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
+		labels[LabelCallbackURL],
+	)
+	assert.Equal(t, "https://fred.example/callback?trace=keep", labels[LabelLifecycleCallbackURL],
+		"legacy migration must persist the derived observation-only callback route")
 	if !fakeRelStore.hasWrappedRelease("lease-1") {
 		t.Fatalf("release store missing wrapped entry")
 	}

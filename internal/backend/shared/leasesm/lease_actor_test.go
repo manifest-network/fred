@@ -415,16 +415,26 @@ func TestLeaseActor_RestartDeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ContainerIDs: []string{"c1"},
-		Status:       backend.ProvisionStatusFailing,
+		LeaseUUID:            "lease-1",
+		Tenant:               "tenant-a",
+		ContainerIDs:         []string{"c1"},
+		Status:               backend.ProvisionStatusFailing,
+		CallbackURL:          "https://fred.example/callbacks/provision?operation_id=exact",
+		LifecycleCallbackURL: "https://fred.example/callbacks/provision",
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	var lifecycleURL string
 	actor := newTestActor(t, "lease-1", testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
+		SendCallbackFn: func(string, string, backend.CallbackStatus, string) {
+			t.Fatal("container death must not reuse the operation settlement callback path")
+		},
+		SendLifecycleCallbackFn: func(_ string, callbackURL string, status backend.CallbackStatus, _ string) {
+			lifecycleURL = callbackURL
+			assert.Equal(t, backend.CallbackStatusFailed, status)
+		},
 	})
 	require.Equal(t, backend.ProvisionStatusFailing, actor.State())
 
@@ -452,6 +462,8 @@ func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status,
 		"drained diagGatheredMsg must transition SM Failing→Failed")
+	assert.Equal(t, "https://fred.example/callbacks/provision", lifecycleURL,
+		"autonomous failure must use the observation-only lifecycle URL")
 }
 
 // TestSpawnProvisionWorker_PanicRecovery pins the invariant that a
@@ -865,10 +877,11 @@ func TestProvision_DeprovisionWaitsForInFlightGoroutine(t *testing.T) {
 func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
-		LeaseUUID:   "lease-1",
-		Tenant:      "tenant-a",
-		Status:      backend.ProvisionStatusReady,
-		CallbackURL: "old-cb",
+		LeaseUUID:            "lease-1",
+		Tenant:               "tenant-a",
+		Status:               backend.ProvisionStatusReady,
+		CallbackURL:          "https://old.example/cb?operation_id=old",
+		LifecycleCallbackURL: "https://old.example/cb",
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -883,8 +896,9 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 	workerRelease := make(chan struct{})
 	ack := make(chan error, 1)
 	require.True(t, actor.TryEnqueue(RestartRequestedMsg{
-		Cancel:      func() {},
-		CallbackURL: "new-cb",
+		Cancel:               func() {},
+		CallbackURL:          "https://new.example/cb",
+		LifecycleCallbackURL: "https://new.example/cb",
 		Work: func() ReplaceResult {
 			<-workerRelease
 			return ReplaceResult{Success: ReplaceSuccessResult{}}
@@ -903,8 +917,10 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status,
 		"actor must write Status=Restarting BEFORE acking (handler-publish contract)")
-	assert.Equal(t, "new-cb", prov.CallbackURL,
+	assert.Equal(t, "https://new.example/cb", prov.CallbackURL,
 		"actor must apply the message CallbackURL before acking")
+	assert.Equal(t, "https://new.example/cb", prov.LifecycleCallbackURL,
+		"actor must atomically rotate lifecycle observations to the new callback base")
 
 	close(workerRelease) // let the worker finish so the actor can quiesce
 }
@@ -914,10 +930,11 @@ func TestRestartRequested_WritesStatusBeforeAck(t *testing.T) {
 func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 	store := newMockProvisionStore()
 	store.put("lease-1", &ProvisionState{
-		LeaseUUID:   "lease-1",
-		Tenant:      "tenant-a",
-		Status:      backend.ProvisionStatusReady,
-		CallbackURL: "old-cb",
+		LeaseUUID:            "lease-1",
+		Tenant:               "tenant-a",
+		Status:               backend.ProvisionStatusReady,
+		CallbackURL:          "https://old.example/cb?operation_id=old",
+		LifecycleCallbackURL: "https://old.example/cb",
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -930,8 +947,9 @@ func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 	workerRelease := make(chan struct{})
 	ack := make(chan error, 1)
 	require.True(t, actor.TryEnqueue(UpdateRequestedMsg{
-		Cancel:      func() {},
-		CallbackURL: "new-cb",
+		Cancel:               func() {},
+		CallbackURL:          "https://new.example/cb",
+		LifecycleCallbackURL: "https://new.example/cb",
 		Work: func() ReplaceResult {
 			<-workerRelease
 			return ReplaceResult{Success: ReplaceSuccessResult{}}
@@ -950,8 +968,10 @@ func TestUpdateRequested_WritesStatusBeforeAck(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusUpdating, prov.Status,
 		"actor must write Status=Updating BEFORE acking (handler-publish contract)")
-	assert.Equal(t, "new-cb", prov.CallbackURL,
+	assert.Equal(t, "https://new.example/cb", prov.CallbackURL,
 		"actor must apply the message CallbackURL before acking")
+	assert.Equal(t, "https://new.example/cb", prov.LifecycleCallbackURL,
+		"actor must atomically rotate lifecycle observations to the new callback base")
 
 	close(workerRelease)
 }

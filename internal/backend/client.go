@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -182,13 +183,14 @@ func NormalizeProvisionRequest(req *ProvisionRequest) error {
 
 // ProvisionRequest contains the data needed to provision a resource.
 type ProvisionRequest struct {
-	LeaseUUID    string      `json:"lease_uuid"`
-	Tenant       string      `json:"tenant"`
-	ProviderUUID string      `json:"provider_uuid"`
-	Items        []LeaseItem `json:"items"`
-	CallbackURL  string      `json:"callback_url"`
-	Payload      []byte      `json:"payload,omitempty"`
-	PayloadHash  string      `json:"payload_hash,omitempty"`
+	LeaseUUID            string      `json:"lease_uuid"`
+	Tenant               string      `json:"tenant"`
+	ProviderUUID         string      `json:"provider_uuid"`
+	Items                []LeaseItem `json:"items"`
+	CallbackURL          string      `json:"callback_url"`
+	LifecycleCallbackURL string      `json:"lifecycle_callback_url,omitempty"`
+	Payload              []byte      `json:"payload,omitempty"`
+	PayloadHash          string      `json:"payload_hash,omitempty"`
 }
 
 // RoutingSKU returns the SKU of the first item for backend routing decisions.
@@ -345,6 +347,60 @@ type CallbackPayload struct {
 	Retained bool `json:"retained,omitempty"`
 }
 
+// CallbackOperationIDQueryParameter is the capability carried only by an
+// asynchronous provision or restore completion URL. A backend must not reuse
+// that operation-scoped URL for later autonomous lifecycle observations.
+const CallbackOperationIDQueryParameter = "operation_id"
+
+// ErrInvalidLifecycleCallbackURL reports that a separately supplied lifecycle
+// callback URL is not the exact completion URL with only operation_id removed.
+// Keeping this relationship strict prevents a backend request from silently
+// splitting settlement and observation traffic across unrelated endpoints.
+var ErrInvalidLifecycleCallbackURL = errors.New("invalid lifecycle callback URL")
+
+// ResolveLifecycleCallbackURL validates or derives the observation-only URL
+// paired with an operation-scoped completion URL. Derivation removes every
+// operation_id field while retaining all unrelated raw query fields byte for
+// byte and in their original order. An explicit lifecycle URL must equal that
+// derived value exactly and must therefore be tokenless.
+//
+// The optional explicit form lets current Fred versions make the distinction
+// visible on the wire. Derivation keeps upgraded backends compatible with
+// v0.13 and rolling deployments whose request shape contains only callback_url.
+func ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL string) (string, error) {
+	parsed, err := url.Parse(callbackURL)
+	if err != nil {
+		return "", fmt.Errorf("%w: parse callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+
+	parts := strings.Split(parsed.RawQuery, "&")
+	kept := parts[:0]
+	for _, part := range parts {
+		key := part
+		if before, _, found := strings.Cut(part, "="); found {
+			key = before
+		}
+		decodedKey, decodeErr := url.QueryUnescape(key)
+		if decodeErr != nil {
+			return "", fmt.Errorf("%w: decode callback query key: %w", ErrInvalidLifecycleCallbackURL, decodeErr)
+		}
+		if decodedKey == CallbackOperationIDQueryParameter {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	parsed.RawQuery = strings.Join(kept, "&")
+	derived := parsed.String()
+	if lifecycleCallbackURL == "" {
+		return derived, nil
+	}
+	if lifecycleCallbackURL != derived {
+		return "", fmt.Errorf("%w: lifecycle URL must equal callback_url without %s",
+			ErrInvalidLifecycleCallbackURL, CallbackOperationIDQueryParameter)
+	}
+	return lifecycleCallbackURL, nil
+}
+
 // RestartRequest contains the data needed to restart a lease's containers.
 type RestartRequest struct {
 	LeaseUUID   string `json:"lease_uuid"`
@@ -365,12 +421,13 @@ type UpdateRequest struct {
 // the data is restored into. Items must match the retained set's shape
 // (service-name → summed-quantity).
 type RestoreRequest struct {
-	LeaseUUID     string      `json:"lease_uuid"`      // NEW lease
-	FromLeaseUUID string      `json:"from_lease_uuid"` // original (retained) lease
-	Tenant        string      `json:"tenant"`
-	ProviderUUID  string      `json:"provider_uuid"` // when non-empty, cross-checked against the retained record
-	Items         []LeaseItem `json:"items"`         // must match the retained set
-	CallbackURL   string      `json:"callback_url"`
+	LeaseUUID            string      `json:"lease_uuid"`      // NEW lease
+	FromLeaseUUID        string      `json:"from_lease_uuid"` // original (retained) lease
+	Tenant               string      `json:"tenant"`
+	ProviderUUID         string      `json:"provider_uuid"` // when non-empty, cross-checked against the retained record
+	Items                []LeaseItem `json:"items"`         // must match the retained set
+	CallbackURL          string      `json:"callback_url"`
+	LifecycleCallbackURL string      `json:"lifecycle_callback_url,omitempty"`
 }
 
 // ErrNotRetained is returned when no retained data exists for the original

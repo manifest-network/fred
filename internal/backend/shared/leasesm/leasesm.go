@@ -129,20 +129,21 @@ type DiagnosticsGatherer interface {
 // though substrates translate them to substrate-specific shapes
 // (Docker compose-spec, K8s pod spec) at provision time.
 type ProvisionState struct {
-	LeaseUUID    string
-	Tenant       string
-	ProviderUUID string
-	SKU          string
-	Status       backend.ProvisionStatus
-	Quantity     int
-	CreatedAt    time.Time
-	FailCount    int
-	LastError    string
-	Reason       backend.Reason // curated failure-category code (ENG-508), authored at source
-	Message      string         // curated human message (== on-chain CallbackErr)
-	CallbackURL  string
-	Items        []backend.LeaseItem
-	ContainerIDs []string
+	LeaseUUID            string
+	Tenant               string
+	ProviderUUID         string
+	SKU                  string
+	Status               backend.ProvisionStatus
+	Quantity             int
+	CreatedAt            time.Time
+	FailCount            int
+	LastError            string
+	Reason               backend.Reason // curated failure-category code (ENG-508), authored at source
+	Message              string         // curated human message (== on-chain CallbackErr)
+	CallbackURL          string
+	LifecycleCallbackURL string
+	Items                []backend.LeaseItem
+	ContainerIDs         []string
 	// Manifest field deleted in Task 15 — all leases are stack-shaped
 	// post-migration; per-service refs go through StackManifest.Services.
 	StackManifest     *manifest.StackManifest
@@ -339,6 +340,12 @@ type LeaseActorConfig struct {
 	// truncation, HMAC signing, retry, and store persistence; the SM
 	// only supplies the inputs.
 	SendCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
+
+	// SendLifecycleCallbackFn dispatches a tokenless, observation-only callback
+	// for an autonomous workload event. Keeping it separate from
+	// SendCallbackFn makes it impossible for container death to reuse an expired
+	// provision/restore settlement capability by accident.
+	SendLifecycleCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
 
 	// DoDeprovisionFn dispatches the substrate-specific deprovision
 	// flow for the given lease. Called from handleDeprovision after

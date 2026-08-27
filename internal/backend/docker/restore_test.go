@@ -2241,6 +2241,106 @@ func TestRestore_Success_DeletesRecord(t *testing.T) {
 	b.wg.Wait()
 }
 
+func TestRestore_SeparatesExactCompletionFromLifecycleCallbacks(t *testing.T) {
+	const operationID = "550e8400-e29b-41d4-a716-446655440000"
+	type observedCallback struct {
+		query   string
+		payload backend.CallbackPayload
+	}
+	callbacks := make(chan observedCallback, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload backend.CallbackPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode callback: %v", err)
+			http.Error(w, "bad callback", http.StatusBadRequest)
+			return
+		}
+		callbacks <- observedCallback{query: r.URL.RawQuery, payload: payload}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	defer func() {
+		b.stopCancel()
+		b.wg.Wait()
+	}()
+	rs := attachRetentionStore(t, b)
+	attachReleaseStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedActiveRetained(t, rs, "u1")
+	b.volumes = &mockVolumeManager{RenameVolumeFn: func(_, _ string) error { return nil }}
+
+	projectReady := make(chan *composetypes.Project, 1)
+	b.compose = &mockComposeExecutor{
+		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
+			projectReady <- project
+			return nil
+		},
+		PSFn: func(_ context.Context, _ string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{
+				ID: "container-1", Service: manifest.DefaultServiceName, State: "running",
+			}}, nil
+		},
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+	}
+
+	lifecycleURL := server.URL
+	exactURL := lifecycleURL + "?" + backend.CallbackOperationIDQueryParameter + "=" + operationID
+	req := restoreRequest("u2", "u1", exactURL)
+	req.LifecycleCallbackURL = lifecycleURL
+	require.NoError(t, b.Restore(context.Background(), req))
+
+	var completion observedCallback
+	select {
+	case completion = <-callbacks:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore completion callback was not delivered")
+	}
+	assert.Equal(t, backend.CallbackOperationIDQueryParameter+"="+operationID, completion.query,
+		"restore settlement must use the exact operation-scoped route")
+	assert.Equal(t, backend.CallbackStatusSuccess, completion.payload.Status)
+
+	b.provisionsMu.RLock()
+	restored, restoredExists := b.provisions["u2"]
+	var restoredCallbackURL, restoredLifecycleCallbackURL string
+	if restoredExists {
+		restoredCallbackURL = restored.CallbackURL
+		restoredLifecycleCallbackURL = restored.LifecycleCallbackURL
+	}
+	b.provisionsMu.RUnlock()
+	require.True(t, restoredExists)
+	assert.Equal(t, exactURL, restoredCallbackURL)
+	assert.Equal(t, lifecycleURL, restoredLifecycleCallbackURL)
+
+	var project *composetypes.Project
+	select {
+	case project = <-projectReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore did not build a Compose project")
+	}
+	require.Contains(t, project.Services, manifest.DefaultServiceName)
+	labels := project.Services[manifest.DefaultServiceName].Labels
+	assert.Equal(t, exactURL, labels[LabelCallbackURL])
+	assert.Equal(t, lifecycleURL, labels[LabelLifecycleCallbackURL])
+
+	require.NoError(t, b.Deprovision(context.Background(), "u2"))
+	var lifecycle observedCallback
+	select {
+	case lifecycle = <-callbacks:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deprovision lifecycle callback was not delivered")
+	}
+	assert.Empty(t, lifecycle.query, "post-restore lifecycle callbacks must be tokenless")
+	assert.Equal(t, backend.CallbackStatusDeprovisioned, lifecycle.payload.Status)
+}
+
 // TestRestore_PartitionSurvivesLineage: restore a partition-labeled retained
 // record into a NEW lease, then close the new lease — its close re-extracts the
 // SAME partition from the manifest carried through the restore. The partition is

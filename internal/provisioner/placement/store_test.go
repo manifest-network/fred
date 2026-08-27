@@ -561,10 +561,8 @@ func TestStore_ProjectInventoryAcceptsExplicitRevisionZeroFence(t *testing.T) {
 		Placements: map[string]string{"lease-1": "backend-a"},
 	})
 	require.NoError(t, err)
-	revision, applied := result.Applied["lease-1"]
-	assert.True(t, applied)
+	revision := s.Lookup("lease-1").RecordRevision()
 	assert.True(t, revision.Valid())
-	assert.Equal(t, revision, s.Lookup("lease-1").RecordRevision())
 	assert.Empty(t, result.Fenced)
 }
 
@@ -580,12 +578,10 @@ func TestStore_ProjectInventoryUpgradesIdempotentV013RecordRevision(t *testing.T
 		"opening the store must make legacy ownership immediately usable by typed CAS")
 	fence := s.BeginInventorySession()
 
-	result, err := s.ProjectInventory(fence, InventoryProjection{
+	_, err = s.ProjectInventory(fence, InventoryProjection{
 		Placements: map[string]string{"lease-legacy": "backend-a"},
 	})
 	require.NoError(t, err)
-	assert.NotContains(t, result.Applied, "lease-legacy",
-		"an exact projection after open-time migration is idempotent")
 	assert.Equal(t, revision, s.Lookup("lease-legacy").RecordRevision())
 	s.EndInventorySession(fence)
 	require.NoError(t, s.Close())
@@ -625,10 +621,8 @@ func TestStore_ProjectInventoryAppliesPositiveAndConflictOutcomesAtomically(t *t
 	s.EndInventorySession(fence)
 	assert.Empty(t, result.Fenced)
 	for _, leaseUUID := range []string{"positive", "mismatched", "conflict"} {
-		revision, ok := result.Applied[leaseUUID]
-		require.True(t, ok, leaseUUID)
+		revision := s.Lookup(leaseUUID).RecordRevision()
 		assert.True(t, revision.Valid(), leaseUUID)
-		assert.Equal(t, revision, s.Lookup(leaseUUID).RecordRevision(), leaseUUID)
 	}
 
 	positive := s.Lookup("positive")
@@ -670,7 +664,6 @@ func TestStore_ProjectInventoryPositiveExactObservationConfirmsAttempt(t *testin
 		Placements: map[string]string{"lease-1": "backend-a"},
 	})
 	require.NoError(t, err)
-	assert.Contains(t, result.Applied, "lease-1")
 	assert.Empty(t, result.Fenced)
 
 	confirmed := s.Lookup("lease-1")
@@ -703,7 +696,6 @@ func TestStore_ProjectInventorySilencePreservesAttemptsAndConflicts(t *testing.T
 	result, err := s.ProjectInventory(silenceFence, InventoryProjection{Complete: true})
 	s.EndInventorySession(silenceFence)
 	require.NoError(t, err)
-	assert.Empty(t, result.Applied)
 	assert.Empty(t, result.Fenced)
 	assert.Equal(t, beforeRevision, testRevision(s))
 	assert.Equal(t, before, s.List())
@@ -751,6 +743,44 @@ func TestStore_ProjectInventoryFencesInvalidForeignAndStaleEvidence(t *testing.T
 	s.EndInventorySession(fence)
 }
 
+func TestStore_TypedAttemptAndInventoryRejectEmptyPlacementIDs(t *testing.T) {
+	s := newTestStore(t)
+	operationID := requireOperationID(t, "494")
+
+	for _, test := range []struct {
+		name        string
+		leaseUUID   string
+		backendName string
+	}{
+		{name: "attempt lease", backendName: "backend-a"},
+		{name: "attempt backend", leaseUUID: "lease-1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			token, applied, err := s.BeginNewAttempt(
+				AdmissionScope{}, test.leaseUUID, test.backendName, operationID,
+			)
+			require.ErrorIs(t, err, ErrInvalidPlacement)
+			assert.False(t, applied)
+			assert.False(t, token.Valid())
+		})
+	}
+
+	fence := s.BeginInventorySession()
+	defer s.EndInventorySession(fence)
+	for _, test := range []struct {
+		name       string
+		placements map[string]string
+	}{
+		{name: "inventory lease", placements: map[string]string{"": "backend-a"}},
+		{name: "inventory backend", placements: map[string]string{"lease-1": ""}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := s.ProjectInventory(fence, InventoryProjection{Placements: test.placements})
+			require.ErrorIs(t, err, ErrInvalidPlacement)
+		})
+	}
+}
+
 func TestStore_ProjectInventoryRollsBackEveryKeyWhenBoltRejectsOne(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	s, err := NewStore(dbPath)
@@ -791,7 +821,6 @@ func TestStore_ProjectInventoryVerifiesEmptyAndIdempotentProjection(t *testing.T
 		Placements: map[string]string{"lease-1": "backend-a"},
 	})
 	require.NoError(t, err)
-	assert.Empty(t, result.Applied)
 	assert.Empty(t, result.Fenced)
 	assert.Equal(t, beforeRevision, testRevision(s))
 
@@ -1112,7 +1141,6 @@ func TestStore_ProjectInventoryHonorsPostSnapshotDeleteTombstone(t *testing.T) {
 		Placements: map[string]string{"lease-1": "backend-a"},
 	})
 	require.NoError(t, err)
-	assert.Empty(t, result.Applied)
 	assert.Contains(t, result.Fenced, "lease-1")
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State(),
 		"stale positive inventory must not recreate a record deleted after fetch began")
@@ -1131,7 +1159,6 @@ func TestStore_InventoryDeleteFencesAreLeaseLocal(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, result.Fenced, "deleted")
 	assert.NotContains(t, result.Fenced, "observed")
-	assert.Contains(t, result.Applied, "observed")
 	assert.Equal(t, StateAbsent, s.Lookup("deleted").State())
 	assert.Equal(t, "backend-b", s.Lookup("observed").Backend,
 		"one lease's deletion must not suppress another lease's positive inventory")
@@ -1228,7 +1255,6 @@ func TestStore_ClearConflictDeletionBlocksOlderInventory(t *testing.T) {
 		Placements: map[string]string{"lease-1": "backend-a"},
 	})
 	require.NoError(t, err)
-	assert.Empty(t, result.Applied)
 	assert.Contains(t, result.Fenced, "lease-1")
 	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State(),
 		"inventory older than conflict deletion must not recreate the placement")

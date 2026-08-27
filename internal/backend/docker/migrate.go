@@ -467,16 +467,25 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 		}
 		networkName = TenantNetworkName(m.Tenant)
 	}
+	legacyCallbackURL := m.Instances[0].LegacyContainer.CallbackURL
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
+		legacyCallbackURL, m.Instances[0].LegacyContainer.LifecycleCallbackURL,
+	)
+	if err != nil {
+		return fmt.Errorf("resolve legacy callback routes: %w", err)
+	}
 
 	project := buildComposeProject(composeProjectParams{
-		LeaseUUID:   m.LeaseUUID,
-		Tenant:      m.Tenant,
-		Stack:       m.Stack,
-		Items:       items,
-		Profiles:    map[string]SKUProfile{m.SKU: profile},
-		NetworkName: networkName,
-		VolBinds:    volBinds,
-		Cfg:         &b.cfg,
+		LeaseUUID:            m.LeaseUUID,
+		Tenant:               m.Tenant,
+		CallbackURL:          legacyCallbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		Stack:                m.Stack,
+		Items:                items,
+		Profiles:             map[string]SKUProfile{m.SKU: profile},
+		NetworkName:          networkName,
+		VolBinds:             volBinds,
+		Cfg:                  &b.cfg,
 	})
 
 	// 4. Compose Up — brings up all instances at once.

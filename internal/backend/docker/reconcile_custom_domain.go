@@ -76,7 +76,12 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		return nil
 	}
 	overrides := b.computeCustomDomainOverrides(prov, items, dnsReady)
-	callbackURL := prov.CallbackURL
+	callbackURL := prov.LifecycleCallbackURL
+	if callbackURL == "" {
+		// Compatibility with containers created before lifecycle URLs were
+		// persisted separately. routeReplaceRestart derives the tokenless form.
+		callbackURL = prov.CallbackURL
+	}
 	b.provisionsMu.RUnlock()
 
 	if len(overrides) == 0 {

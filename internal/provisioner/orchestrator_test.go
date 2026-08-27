@@ -117,6 +117,7 @@ func TestOrchestrator_StartProvisioning_Success(t *testing.T) {
 	wantCallbackURL, err := BuildCallbackURLForOperation("http://localhost:8080", tracked.ID)
 	require.NoError(t, err)
 	assert.Equal(t, wantCallbackURL, req.CallbackURL)
+	assert.Equal(t, BuildCallbackURL("http://localhost:8080"), req.LifecycleCallbackURL)
 	assert.Nil(t, req.Payload)
 	assert.Empty(t, req.PayloadHash)
 
@@ -1437,7 +1438,7 @@ func TestOrchestrator_StartProvisioning_CodedCapacityRefusalClearsAttemptAndAllo
 	err := startTestProvisioning(t, orchestrator, t.Context(), lease, ProvisionOpts{})
 	require.ErrorIs(t, err, backend.ErrCapacityRefused)
 	assert.Equal(t, placement.StateAbsent, placements.Lookup(lease.Uuid).State(),
-		"causally proven refusal must clear its exact write-ahead attempt")
+		"a coded refusal must clear its exact write-ahead attempt")
 
 	require.NoError(t, startTestProvisioning(t, orchestrator, t.Context(), lease, ProvisionOpts{}))
 	record := placements.Lookup(lease.Uuid)

@@ -206,7 +206,7 @@ func (r *Reconciler) projectPlacementInventory(
 	// observations can only reaffirm or enlarge its candidate union. Resolution
 	// requires explicit operator action or future causally sufficient proof.
 	result.ambiguousOwners = r.updatePlacementAmbiguities(projectionConflicts, false)
-	proof, err := r.placementAuthority.ProjectInventory(
+	projectionResult, err := r.placementAuthority.ProjectInventory(
 		input.inventoryFence,
 		placement.InventoryProjection{
 			Complete:   inventoryComplete,
@@ -214,7 +214,7 @@ func (r *Reconciler) projectPlacementInventory(
 			Conflicts:  projectionConflicts,
 		},
 	)
-	for leaseUUID := range proof.Fenced {
+	for leaseUUID := range projectionResult.Fenced {
 		switch {
 		case placements[leaseUUID] != "":
 			excludeObservation(leaseUUID, placements[leaseUUID])
@@ -303,9 +303,6 @@ func (r *Reconciler) projectPlacementInventory(
 			if p.State() == placement.StateConfirmed && p.Backend == observedBackend && p.Attempt == "" {
 				delete(r.placementAbsenceUntrusted, leaseUUID)
 			}
-		}
-		if inventoryComplete {
-			r.placementSweepSeen.Store(true)
 		}
 	} else {
 		// A failed current projection authorizes no action derived from that

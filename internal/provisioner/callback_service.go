@@ -242,6 +242,16 @@ func (service *CallbackService) HandleCallback(ctx context.Context, command Call
 	}
 
 	if !callbackMatchesOperation(command, record) {
+		if !callback.token {
+			// A tokenless callback can only be a best-effort lifecycle
+			// observation. In particular, it must not claim or finish this
+			// token-required operation. Still publish it: docker-backend can
+			// observe a runtime failure immediately after its exact success
+			// callback receives HTTP 200, before asynchronous application
+			// settlement has retired the operation record.
+			service.observeTokenlessLifecycle(callback)
+			return nil
+		}
 		slog.Warn("ignoring callback whose operation token does not match the in-flight operation",
 			"lease_uuid", callback.leaseUUID,
 			"callback_operation_id", callback.operationID,
@@ -603,7 +613,19 @@ func (service *CallbackService) observeNonInFlight(callback CallbackCommand) {
 		)
 		return
 	}
+	service.observeTokenlessLifecycle(callback)
+	slog.Info("published status event for non-in-flight callback",
+		"lease_uuid", callback.leaseUUID,
+		"operation_id", callback.operationID,
+		"status", callback.status,
+	)
+}
 
+// observeTokenlessLifecycle applies only the observation surface shared with
+// v0.13 callbacks. It never claims an operation, mutates placement/chain state,
+// or retires a deprovision candidate, so calling it while a typed operation is
+// current cannot accidentally settle that operation.
+func (service *CallbackService) observeTokenlessLifecycle(callback CallbackCommand) {
 	switch callback.status {
 	case backend.CallbackStatusSuccess:
 		service.publish(callback.leaseUUID, backend.ProvisionStatusReady, "")
@@ -624,11 +646,6 @@ func (service *CallbackService) observeNonInFlight(callback CallbackCommand) {
 		)
 		return
 	}
-	slog.Info("published status event for non-in-flight callback",
-		"lease_uuid", callback.leaseUUID,
-		"operation_id", callback.operationID,
-		"status", callback.status,
-	)
 }
 
 func (service *CallbackService) observeDeprovisionOwned(

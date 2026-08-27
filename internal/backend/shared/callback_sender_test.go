@@ -171,6 +171,34 @@ func TestSendCallback_FailedDeliveryRemainsInStore(t *testing.T) {
 	assert.Equal(t, "lease-1", pending[0].LeaseUUID)
 }
 
+func TestSendCallback_LifecycleSuccessDoesNotRemovePendingExactCompletion(t *testing.T) {
+	exactServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer exactServer.Close()
+	lifecycleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer lifecycleServer.Close()
+
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	require.NoError(t, err)
+	defer store.Close()
+
+	s := newTestSender(t, store, http.DefaultClient, "secret")
+	// The exact operation completion cannot be delivered and must remain
+	// durable even if a later observation-only lifecycle event succeeds.
+	s.SendCallback("lease-1", exactServer.URL, "docker", backend.CallbackStatusSuccess, "", false)
+	s.SendCallback("lease-1", lifecycleServer.URL, "docker", backend.CallbackStatusFailed, "container exited", false)
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, exactServer.URL, pending[0].CallbackURL)
+	assert.Equal(t, backend.CallbackStatusSuccess, pending[0].Status)
+	assert.NotEmpty(t, pending[0].DeliveryID)
+}
+
 func TestDeliverCallback_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
@@ -332,6 +360,78 @@ func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 	assert.Equal(t, "lease-2", pending[0].LeaseUUID)
+}
+
+func TestReplayPendingCallbacks_PreciseRemovalAfterReopen(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/exact" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb.db")
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	createdAt := time.Now()
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: server.URL + "/exact",
+		Success:     true,
+		Status:      backend.CallbackStatusSuccess,
+		Backend:     "docker",
+		CreatedAt:   createdAt,
+	}))
+	require.NoError(t, store.Store(CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: server.URL + "/lifecycle",
+		Success:     false,
+		Status:      backend.CallbackStatusFailed,
+		Backend:     "docker",
+		Error:       "container exited",
+		CreatedAt:   createdAt.Add(time.Second),
+	}))
+	require.NoError(t, store.Close())
+
+	store, err = NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+	newTestSender(t, store, server.Client(), "secret").ReplayPendingCallbacks()
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, server.URL+"/exact", pending[0].CallbackURL)
+	assert.Equal(t, backend.CallbackStatusSuccess, pending[0].Status)
+}
+
+func TestReplayPendingCallbacks_LegacyV013Entry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "cb.db")
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	storeLegacyCallback(t, store, CallbackEntry{
+		LeaseUUID:   "lease-v013",
+		CallbackURL: server.URL,
+		Success:     true,
+		CreatedAt:   time.Now(),
+	})
+	require.NoError(t, store.Close())
+
+	store, err = NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+	newTestSender(t, store, server.Client(), "secret").ReplayPendingCallbacks()
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
 }
 
 // TestReplayPendingCallbacks_PreservesStatusAndBackend verifies that entries

@@ -46,7 +46,7 @@
 // # Required authority
 //
 // Every supported deployment uses multiple backends, so production startup
-// requires a writable placement database. Raw revision-based methods remain
-// only for compatibility tests; production consumers receive narrow typed
-// capability ports for provision, callback, restore, or reconciliation work.
+// requires a writable placement database. Production consumers receive narrow
+// typed capability ports for provision, callback, restore, or reconciliation
+// work.
 package placement

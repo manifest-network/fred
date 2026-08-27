@@ -89,6 +89,7 @@ type fakeDocker struct {
 	// Compose side.
 	composeUpErr           error  // returned by composeExecutor.Up if non-nil
 	lastComposeProjectName string // captured project.Name from the most recent Up call
+	lastComposeProject     *composetypes.Project
 }
 
 // fakeVolumeBackend records RenameVolume calls and stubs the rest of the
@@ -271,6 +272,7 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 				return state.composeUpErr
 			}
 			state.lastComposeProjectName = project.Name
+			state.lastComposeProject = project
 			if state.composeUpErr != nil {
 				return state.composeUpErr
 			}

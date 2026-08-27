@@ -556,11 +556,9 @@ func (s *Store) BeginNewAttempt(
 	if _, exists := s.cache[leaseUUID]; exists {
 		return AttemptToken{}, false, nil
 	}
-	revision, applied, err := s.setAttemptingIfNotNewerLocked(
-		leaseUUID, backendName, operationID, ^uint64(0),
-	)
-	if err != nil || !applied {
-		return AttemptToken{}, applied, err
+	revision, err := s.setAttemptingLocked(leaseUUID, backendName, operationID)
+	if err != nil {
+		return AttemptToken{}, false, err
 	}
 	return s.newAttemptToken(leaseUUID, backendName, operationID, revision), true, nil
 }

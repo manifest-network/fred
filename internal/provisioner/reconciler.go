@@ -35,8 +35,8 @@ const (
 )
 
 // chainConfirmTimeout bounds ONE per-candidate lease lookup in
-// queryLeaseLiveness, shared by destructive cleanup confirmation and
-// conservative placement-marker retirement.
+// getLeaseBounded, shared by lifecycle dispatch, destructive cleanup
+// confirmation, and conservative placement-marker retirement.
 //
 // The reconcile context is the process lifetime — Start passes it straight
 // through to every sweep — and neither the chain client nor gRPC imposes a
@@ -636,8 +636,10 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 
 			// The list queries are only inventory candidates. Re-read the exact
 			// lease after acquiring its lifecycle claim so a close/reject/expiry
-			// cannot cross the final chain-read -> backend-dispatch boundary. The
-			currentLease, err := r.chainClient.GetLease(gctx, leaseUUID)
+			// cannot cross the final chain-read -> backend-dispatch boundary. Bound
+			// the point query so an unresponsive chain node defers this lease rather
+			// than holding the claim and wedging every later sweep.
+			currentLease, err := r.getLeaseBounded(gctx, leaseUUID)
 			if err != nil {
 				deferred.Add(1)
 				leaseErrors.Add(1)
@@ -915,14 +917,20 @@ func (r *Reconciler) doStartProvisioning(
 		untrack()
 		return fmt.Errorf("build callback URL for lease %s: %w", lease.Uuid, err)
 	}
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	if err != nil {
+		untrack()
+		return fmt.Errorf("build lifecycle callback URL for lease %s: %w", lease.Uuid, err)
+	}
 
 	// Build provision request.
 	req := backend.ProvisionRequest{
-		LeaseUUID:    lease.Uuid,
-		Tenant:       lease.Tenant,
-		ProviderUUID: r.providerUUID,
-		Items:        items,
-		CallbackURL:  callbackURL,
+		LeaseUUID:            lease.Uuid,
+		Tenant:               lease.Tenant,
+		ProviderUUID:         r.providerUUID,
+		Items:                items,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
 	}
 
 	// Get the payload from the store WITHOUT removing it yet.
@@ -1648,6 +1656,20 @@ func leaseState(lease *billingtypes.Lease) string {
 	return lease.State.String()
 }
 
+// getLeaseBounded applies the reconciler's per-query liveness budget to an
+// exact lease read. ReconcileAll normally receives the process-lifetime
+// context, so relying on its deadline would let one stalled RPC retain a lease
+// claim and the sweep-wide reconciliation guard indefinitely.
+func (r *Reconciler) getLeaseBounded(
+	ctx context.Context,
+	leaseUUID string,
+) (*billingtypes.Lease, error) {
+	qctx, cancel := context.WithTimeout(ctx, chainConfirmTimeout)
+	defer cancel()
+
+	return r.chainClient.GetLease(qctx, leaseUUID)
+}
+
 // queryLeaseLiveness performs the bounded point read shared by destructive
 // cleanup confirmation and conservative placement-marker retirement. Keeping
 // the query separate from either caller's instrumentation prevents bookkeeping
@@ -1656,10 +1678,7 @@ func (r *Reconciler) queryLeaseLiveness(
 	ctx context.Context,
 	leaseUUID string,
 ) (leaseLiveness, string, *billingtypes.Lease, error) {
-	qctx, cancel := context.WithTimeout(ctx, chainConfirmTimeout)
-	defer cancel()
-
-	lease, err := r.chainClient.GetLease(qctx, leaseUUID)
+	lease, err := r.getLeaseBounded(ctx, leaseUUID)
 	liveness, reason := classifyLease(lease, err)
 	return liveness, reason, lease, err
 }

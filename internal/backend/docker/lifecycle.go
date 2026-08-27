@@ -38,19 +38,20 @@ import (
 
 // Labels used for tracking managed containers.
 const (
-	LabelManaged       = "fred.managed"
-	LabelLeaseUUID     = "fred.lease_uuid"
-	LabelTenant        = "fred.tenant"
-	LabelProviderUUID  = "fred.provider_uuid"
-	LabelSKU           = "fred.sku"
-	LabelCreatedAt     = "fred.created_at"
-	LabelInstanceIndex = "fred.instance_index"
-	LabelFailCount     = "fred.fail_count"
-	LabelCallbackURL   = "fred.callback_url"
-	LabelBackendName   = "fred.backend_name"
-	LabelServiceName   = "fred.service_name"
-	LabelFQDN          = "fred.fqdn"
-	LabelCustomDomain  = "fred.custom_domain"
+	LabelManaged              = "fred.managed"
+	LabelLeaseUUID            = "fred.lease_uuid"
+	LabelTenant               = "fred.tenant"
+	LabelProviderUUID         = "fred.provider_uuid"
+	LabelSKU                  = "fred.sku"
+	LabelCreatedAt            = "fred.created_at"
+	LabelInstanceIndex        = "fred.instance_index"
+	LabelFailCount            = "fred.fail_count"
+	LabelCallbackURL          = "fred.callback_url"
+	LabelLifecycleCallbackURL = "fred.lifecycle_callback_url"
+	LabelBackendName          = "fred.backend_name"
+	LabelServiceName          = "fred.service_name"
+	LabelFQDN                 = "fred.fqdn"
+	LabelCustomDomain         = "fred.custom_domain"
 )
 
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
@@ -65,24 +66,25 @@ type DaemonSecurityInfo struct {
 
 // ContainerInfo holds information about a managed container.
 type ContainerInfo struct {
-	ContainerID   string
-	LeaseUUID     string
-	Tenant        string
-	ProviderUUID  string
-	SKU           string
-	ServiceName   string // Stack service name (empty for single-container leases)
-	InstanceIndex int
-	FailCount     int
-	CallbackURL   string
-	Image         string
-	Status        string
-	Health        HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
-	ExitCode      int          // Process exit code (meaningful when Status is "exited"/"dead")
-	OOMKilled     bool         // True if container was killed by the OOM killer
-	CreatedAt     time.Time
-	Ports         map[string]PortBinding
-	FQDN          string
-	CustomDomain  string // Tenant-supplied custom FQDN (empty when not set)
+	ContainerID          string
+	LeaseUUID            string
+	Tenant               string
+	ProviderUUID         string
+	SKU                  string
+	ServiceName          string // Stack service name (empty for single-container leases)
+	InstanceIndex        int
+	FailCount            int
+	CallbackURL          string
+	LifecycleCallbackURL string
+	Image                string
+	Status               string
+	Health               HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
+	ExitCode             int          // Process exit code (meaningful when Status is "exited"/"dead")
+	OOMKilled            bool         // True if container was killed by the OOM killer
+	CreatedAt            time.Time
+	Ports                map[string]PortBinding
+	FQDN                 string
+	CustomDomain         string // Tenant-supplied custom FQDN (empty when not set)
 
 	// Name is the human-readable container name (without the leading "/"
 	// the Docker API prepends). Populated by both InspectContainer and
@@ -915,6 +917,12 @@ type CreateContainerParams struct {
 	// sent after a docker-backend restart (when in-memory state is lost).
 	CallbackURL string
 
+	// LifecycleCallbackURL is the tokenless observational endpoint used only
+	// after provisioning/restoration, for autonomous failure and teardown
+	// events. It is persisted separately so restart recovery cannot resurrect
+	// an expired operation capability as the lifecycle route.
+	LifecycleCallbackURL string
+
 	// Hardening parameters
 	HostBindIP     string
 	ReadonlyRootfs bool
@@ -1003,16 +1011,17 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 	defer cancel()
 	// Build labels
 	labels := map[string]string{
-		LabelManaged:       "true",
-		LabelLeaseUUID:     params.LeaseUUID,
-		LabelTenant:        params.Tenant,
-		LabelProviderUUID:  params.ProviderUUID,
-		LabelSKU:           params.SKU,
-		LabelCreatedAt:     time.Now().Format(time.RFC3339),
-		LabelInstanceIndex: strconv.Itoa(params.InstanceIndex),
-		LabelFailCount:     strconv.Itoa(params.FailCount),
-		LabelCallbackURL:   params.CallbackURL,
-		LabelBackendName:   params.BackendName,
+		LabelManaged:              "true",
+		LabelLeaseUUID:            params.LeaseUUID,
+		LabelTenant:               params.Tenant,
+		LabelProviderUUID:         params.ProviderUUID,
+		LabelSKU:                  params.SKU,
+		LabelCreatedAt:            time.Now().Format(time.RFC3339),
+		LabelInstanceIndex:        strconv.Itoa(params.InstanceIndex),
+		LabelFailCount:            strconv.Itoa(params.FailCount),
+		LabelCallbackURL:          params.CallbackURL,
+		LabelLifecycleCallbackURL: params.LifecycleCallbackURL,
+		LabelBackendName:          params.BackendName,
 	}
 	if params.ServiceName != "" {
 		labels[LabelServiceName] = params.ServiceName
@@ -1592,25 +1601,26 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 	}
 
 	info := &ContainerInfo{
-		ContainerID:   resp.ID,
-		LeaseUUID:     resp.Config.Labels[LabelLeaseUUID],
-		Tenant:        resp.Config.Labels[LabelTenant],
-		ProviderUUID:  resp.Config.Labels[LabelProviderUUID],
-		SKU:           resp.Config.Labels[LabelSKU],
-		ServiceName:   resp.Config.Labels[LabelServiceName],
-		CallbackURL:   resp.Config.Labels[LabelCallbackURL],
-		Image:         resp.Config.Image,
-		Status:        resp.State.Status,
-		Health:        health,
-		ExitCode:      resp.State.ExitCode,
-		OOMKilled:     resp.State.OOMKilled,
-		InstanceIndex: meta.InstanceIndex,
-		FailCount:     meta.FailCount,
-		CreatedAt:     meta.CreatedAt,
-		Ports:         make(map[string]PortBinding),
-		FQDN:          resp.Config.Labels[LabelFQDN],
-		CustomDomain:  resp.Config.Labels[LabelCustomDomain],
-		Name:          strings.TrimPrefix(resp.Name, "/"),
+		ContainerID:          resp.ID,
+		LeaseUUID:            resp.Config.Labels[LabelLeaseUUID],
+		Tenant:               resp.Config.Labels[LabelTenant],
+		ProviderUUID:         resp.Config.Labels[LabelProviderUUID],
+		SKU:                  resp.Config.Labels[LabelSKU],
+		ServiceName:          resp.Config.Labels[LabelServiceName],
+		CallbackURL:          resp.Config.Labels[LabelCallbackURL],
+		LifecycleCallbackURL: resp.Config.Labels[LabelLifecycleCallbackURL],
+		Image:                resp.Config.Image,
+		Status:               resp.State.Status,
+		Health:               health,
+		ExitCode:             resp.State.ExitCode,
+		OOMKilled:            resp.State.OOMKilled,
+		InstanceIndex:        meta.InstanceIndex,
+		FailCount:            meta.FailCount,
+		CreatedAt:            meta.CreatedAt,
+		Ports:                make(map[string]PortBinding),
+		FQDN:                 resp.Config.Labels[LabelFQDN],
+		CustomDomain:         resp.Config.Labels[LabelCustomDomain],
+		Name:                 strings.TrimPrefix(resp.Name, "/"),
 	}
 
 	// Extract mounts (used by recover-time migration to locate managed
@@ -1673,22 +1683,23 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 		}
 
 		info := ContainerInfo{
-			ContainerID:   c.ID,
-			LeaseUUID:     c.Labels[LabelLeaseUUID],
-			Tenant:        c.Labels[LabelTenant],
-			ProviderUUID:  c.Labels[LabelProviderUUID],
-			SKU:           c.Labels[LabelSKU],
-			ServiceName:   c.Labels[LabelServiceName],
-			CallbackURL:   c.Labels[LabelCallbackURL],
-			Image:         c.Image,
-			Status:        c.State,
-			InstanceIndex: meta.InstanceIndex,
-			FailCount:     meta.FailCount,
-			CreatedAt:     meta.CreatedAt,
-			Ports:         make(map[string]PortBinding),
-			FQDN:          c.Labels[LabelFQDN],
-			CustomDomain:  c.Labels[LabelCustomDomain],
-			Name:          name,
+			ContainerID:          c.ID,
+			LeaseUUID:            c.Labels[LabelLeaseUUID],
+			Tenant:               c.Labels[LabelTenant],
+			ProviderUUID:         c.Labels[LabelProviderUUID],
+			SKU:                  c.Labels[LabelSKU],
+			ServiceName:          c.Labels[LabelServiceName],
+			CallbackURL:          c.Labels[LabelCallbackURL],
+			LifecycleCallbackURL: c.Labels[LabelLifecycleCallbackURL],
+			Image:                c.Image,
+			Status:               c.State,
+			InstanceIndex:        meta.InstanceIndex,
+			FailCount:            meta.FailCount,
+			CreatedAt:            meta.CreatedAt,
+			Ports:                make(map[string]PortBinding),
+			FQDN:                 c.Labels[LabelFQDN],
+			CustomDomain:         c.Labels[LabelCustomDomain],
+			Name:                 name,
 		}
 
 		// Extract mounts from the list-containers payload (the API includes

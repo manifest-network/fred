@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -124,24 +125,51 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// Check if we already have a provision record for this lease
 		prov, exists := building[c.LeaseUUID]
 		if !exists {
+			lifecycleCallbackURL, lifecycleErr := backend.ResolveLifecycleCallbackURL(
+				c.CallbackURL, c.LifecycleCallbackURL,
+			)
+			if lifecycleErr != nil {
+				// A persisted explicit lifecycle label that no longer matches the
+				// exact callback route is not trusted. Re-derive only from the exact
+				// URL: this preserves autonomous observations without honoring a
+				// corrupted or unrelated endpoint. If the exact URL itself is invalid,
+				// derivation fails and later callback dispatch remains suppressed.
+				derivedURL, deriveErr := backend.ResolveLifecycleCallbackURL(c.CallbackURL, "")
+				if deriveErr != nil {
+					b.logger.Error("cannot recover lifecycle callback URL; autonomous callbacks will be suppressed",
+						"lease_uuid", c.LeaseUUID,
+						"container_id", leasesm.ShortID(c.ContainerID),
+						"error", errors.Join(lifecycleErr, deriveErr),
+					)
+					lifecycleCallbackURL = ""
+				} else {
+					b.logger.Warn("replaced invalid persisted lifecycle callback URL with safe derived route",
+						"lease_uuid", c.LeaseUUID,
+						"container_id", leasesm.ShortID(c.ContainerID),
+						"error", lifecycleErr,
+					)
+					lifecycleCallbackURL = derivedURL
+				}
+			}
 			prov = &recoveredProvision{ //exhaustruct:enforce
 				ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
-					LeaseUUID:         c.LeaseUUID,
-					Tenant:            c.Tenant,
-					ProviderUUID:      c.ProviderUUID,
-					SKU:               c.SKU,
-					Status:            containerStatusToProvisionStatus(c.Status),
-					Quantity:          0, // set from ContainerIDs below
-					CreatedAt:         c.CreatedAt,
-					FailCount:         c.FailCount,
-					LastError:         "", // populated by cold-start/transition logic below
-					Reason:            "", // populated by cold-start/transition logic below
-					Message:           "",
-					CallbackURL:       c.CallbackURL,
-					Items:             nil, // rebuilt from labels below
-					ContainerIDs:      make([]string, 0),
-					StackManifest:     nil, // restored below
-					ServiceContainers: nil, // rebuilt from labels below
+					LeaseUUID:            c.LeaseUUID,
+					Tenant:               c.Tenant,
+					ProviderUUID:         c.ProviderUUID,
+					SKU:                  c.SKU,
+					Status:               containerStatusToProvisionStatus(c.Status),
+					Quantity:             0, // set from ContainerIDs below
+					CreatedAt:            c.CreatedAt,
+					FailCount:            c.FailCount,
+					LastError:            "", // populated by cold-start/transition logic below
+					Reason:               "", // populated by cold-start/transition logic below
+					Message:              "",
+					CallbackURL:          c.CallbackURL,
+					LifecycleCallbackURL: lifecycleCallbackURL,
+					Items:                nil, // rebuilt from labels below
+					ContainerIDs:         make([]string, 0),
+					StackManifest:        nil, // restored below
+					ServiceContainers:    nil, // rebuilt from labels below
 				},
 				volumeCleanupAttempts: 0,
 			}

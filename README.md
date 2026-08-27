@@ -858,7 +858,7 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
 
 **Behavior:**
 - Events are delivered as WebSocket JSON frames
-- Events are best-effort notifications, not an ordered state log. An exact operation-ID callback is ignored after its operation ends or is replaced, so it cannot publish stale status. Tokenless v0.13 compatibility callbacks and the currently observational restart/update callbacks may still arrive out of order. Use the REST status endpoints for current state.
+- Events are best-effort notifications, not an ordered state log. An exact operation-ID callback is ignored after its operation ends or is replaced, so it cannot publish stale status. Tokenless lifecycle, v0.13 compatibility, and restart/update callbacks are observation-only and may still arrive out of order. Use the REST status endpoints for current state.
 - The server sends WebSocket ping frames every 30 seconds; the client must respond with pong within 40 seconds or the connection is closed
 - Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
 - The stream ends when the client disconnects or the server shuts down (clean close frame)
@@ -909,13 +909,12 @@ If a callback is received for a lease that has already been processed (no longer
 the server still returns `200 OK`. A callback carrying an
 `operation_id` that is no longer current is ignored completely: it cannot publish
 status, acknowledge or reject the lease, retire teardown state, or mutate placement.
-While an operation-ID-required provision or restore operation is current, a tokenless
-callback is ignored completely, including status publication. With no current
-operation, tokenless callbacks remain a rolling-compatibility/status-only path
-for v0.13.0 provision backends and for restart/update, whose callbacks are
-observational today. A tokenless `deprovisioned` callback may also retire
-process-local teardown evidence. Only a current operation explicitly registered
-as legacy token-optional can be settled without the query token.
+Except when settling a current operation explicitly registered as legacy
+token-optional, tokenless callbacks are observation-only: they may publish
+best-effort status even while a typed provision or restore is current, but
+cannot settle that operation, mutate chain or placement state, or retire
+process-local teardown evidence. This is the path for the separate lifecycle
+callback URL, v0.13.0 compatibility, and restart/update callbacks.
 Response bodies are not guaranteed for this path, so callers should treat the HTTP status
 code as the source of truth.
 
@@ -973,6 +972,7 @@ Start provisioning a resource (async).
     {"sku": "k8s-large", "quantity": 1}
   ],
   "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_callback_url": "http://fred.example.com:8080/callbacks/provision",
   "payload": "<base64-encoded-bytes>",
   "payload_hash": "abc123..."
 }
@@ -980,6 +980,8 @@ Start provisioning a resource (async).
 
 **Fields:**
 - `items` - Array of lease items with SKU and quantity. All items belong to the same provider.
+- `callback_url` - Exact operation-completion URL; preserve it byte-for-byte and use it only for this provision result.
+- `lifecycle_callback_url` - Tokenless URL for later autonomous failure and deprovision observations.
 - `payload` - Optional base64-encoded deployment payload (only present if lease has meta_hash)
 - `payload_hash` - Optional hex-encoded SHA-256 hash of payload (only present with payload)
 
@@ -1151,7 +1153,8 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
-  "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
+  "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_callback_url": "http://fred.example.com:8080/callbacks/provision"
 }
 ```
 
@@ -1303,7 +1306,8 @@ curl -X POST http://localhost:9000/provision \
     "tenant": "manifest1abc",
     "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
     "items": [{"sku": "mock-resource", "quantity": 1}],
-    "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
+    "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+    "lifecycle_callback_url": "http://localhost:8080/callbacks/provision"
   }'
 ```
 

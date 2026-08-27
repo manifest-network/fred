@@ -462,10 +462,11 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 func TestRestart_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:     "lease-1",
-			Status:        backend.ProvisionStatusReady,
-			CallbackURL:   "old-cb",
-			StackManifest: &manifest.StackManifest{},
+			LeaseUUID:            "lease-1",
+			Status:               backend.ProvisionStatusReady,
+			CallbackURL:          "https://old.example/cb?operation_id=old",
+			LifecycleCallbackURL: "https://old.example/cb",
+			StackManifest:        &manifest.StackManifest{},
 		}},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -476,18 +477,88 @@ func TestRestart_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 
 	err := b.Restart(context.Background(), backend.RestartRequest{
 		LeaseUUID:   "lease-1",
-		CallbackURL: "new-cb",
+		CallbackURL: "https://new.example/cb",
 	})
 	require.Error(t, err)
 
 	b.provisionsMu.RLock()
 	status := b.provisions["lease-1"].Status
 	callbackURL := b.provisions["lease-1"].CallbackURL
+	lifecycleCallbackURL := b.provisions["lease-1"].LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status,
 		"routing failure must leave Status unchanged (no speculative write)")
-	assert.Equal(t, "old-cb", callbackURL,
+	assert.Equal(t, "https://old.example/cb?operation_id=old", callbackURL,
 		"routing failure must leave CallbackURL unchanged (no speculative write)")
+	assert.Equal(t, "https://old.example/cb", lifecycleCallbackURL,
+		"routing failure must leave LifecycleCallbackURL unchanged (no speculative write)")
+}
+
+func TestRestart_ChangedCallbackBaseRotatesPairAndPersistsLifecycleLabel(t *testing.T) {
+	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer callbackServer.Close()
+
+	provisions := map[string]*provision{
+		"lease-1": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:            "lease-1",
+			Tenant:               "tenant-a",
+			ProviderUUID:         "provider-a",
+			Status:               backend.ProvisionStatusReady,
+			CallbackURL:          "https://old.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+			LifecycleCallbackURL: "https://old.example/callbacks/provision",
+			Items: []backend.LeaseItem{{
+				SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+			}},
+			ContainerIDs: []string{"old-container"},
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+				manifest.DefaultServiceName: {Image: "docker.io/library/nginx:latest"},
+			}},
+		}},
+	}
+	b := newBackendForTest(&mockDockerClient{}, provisions)
+	defer b.stopCancel()
+
+	projectReady := make(chan *composetypes.Project, 1)
+	releaseWorker := make(chan struct{})
+	b.compose = &mockComposeExecutor{
+		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
+			projectReady <- project
+			<-releaseWorker
+			return nil
+		},
+	}
+
+	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+		LeaseUUID:   "lease-1",
+		CallbackURL: callbackServer.URL,
+	}))
+
+	b.provisionsMu.RLock()
+	assert.Equal(t, callbackServer.URL, b.provisions["lease-1"].CallbackURL)
+	assert.Equal(t, callbackServer.URL, b.provisions["lease-1"].LifecycleCallbackURL,
+		"accepted restart must atomically rotate both callback routes before returning")
+	b.provisionsMu.RUnlock()
+
+	var project *composetypes.Project
+	select {
+	case project = <-projectReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart worker did not build the replacement project")
+	}
+	require.Contains(t, project.Services, manifest.DefaultServiceName)
+	labels := project.Services[manifest.DefaultServiceName].Labels
+	assert.Equal(t, callbackServer.URL, labels[LabelCallbackURL])
+	assert.Equal(t, callbackServer.URL, labels[LabelLifecycleCallbackURL],
+		"recreated containers must persist the rotated lifecycle route")
+
+	close(releaseWorker)
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		return b.provisions["lease-1"].Status == backend.ProvisionStatusReady
+	}, 2*time.Second, 5*time.Millisecond)
 }
 
 // blockingDiagGatherer pins a lease in Failing for the duration of a test by
@@ -616,11 +687,12 @@ func TestContainerDiedThenRestart_Succeeds(t *testing.T) {
 func TestUpdate_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 	provisions := map[string]*provision{
 		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:   "lease-1",
-			Status:      backend.ProvisionStatusReady,
-			SKU:         "docker-small",
-			CallbackURL: "old-cb",
-			Items:       []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+			LeaseUUID:            "lease-1",
+			Status:               backend.ProvisionStatusReady,
+			SKU:                  "docker-small",
+			CallbackURL:          "https://old.example/cb?operation_id=old",
+			LifecycleCallbackURL: "https://old.example/cb",
+			Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		}},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
@@ -628,7 +700,7 @@ func TestUpdate_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 
 	err := b.Update(context.Background(), backend.UpdateRequest{
 		LeaseUUID:   "lease-1",
-		CallbackURL: "new-cb",
+		CallbackURL: "https://new.example/cb",
 		Payload:     validManifestJSON("nginx:latest"),
 	})
 	require.Error(t, err)
@@ -636,11 +708,14 @@ func TestUpdate_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 	b.provisionsMu.RLock()
 	status := b.provisions["lease-1"].Status
 	callbackURL := b.provisions["lease-1"].CallbackURL
+	lifecycleCallbackURL := b.provisions["lease-1"].LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status,
 		"routing failure must leave Status unchanged (no speculative write)")
-	assert.Equal(t, "old-cb", callbackURL,
+	assert.Equal(t, "https://old.example/cb?operation_id=old", callbackURL,
 		"routing failure must leave CallbackURL unchanged (no speculative write)")
+	assert.Equal(t, "https://old.example/cb", lifecycleCallbackURL,
+		"routing failure must leave LifecycleCallbackURL unchanged (no speculative write)")
 }
 
 // --- ENG-230 / PR #93: restart-preflight recovered-vs-failed is derived by

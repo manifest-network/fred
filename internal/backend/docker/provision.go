@@ -87,6 +87,13 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	if err := backend.NormalizeProvisionRequest(&req); err != nil {
 		return err
 	}
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
+		req.CallbackURL, req.LifecycleCallbackURL,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
+	req.LifecycleCallbackURL = lifecycleCallbackURL
 
 	logger := b.logger.With(
 		"lease_uuid", req.LeaseUUID,
@@ -139,12 +146,15 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			LastError:    "",
 			Reason:       "", // fresh reservation, no failure
 			Message:      "",
-			CallbackURL:  req.CallbackURL, // MUST be set at reservation: a failure/Deprovision
-			// racing this provision in the validation window resolves CallbackURL from the map.
-			Items:             slices.Clone(req.Items), // the ownership claim; see above
-			ContainerIDs:      make([]string, 0, totalQuantity),
-			StackManifest:     nil, // set by enrichReserved
-			ServiceContainers: nil,
+			// Both routes are stored at reservation time so any failure or
+			// deprovision racing the validation window resolves the correct
+			// exact or observational capability from the map.
+			CallbackURL:          req.CallbackURL,
+			LifecycleCallbackURL: req.LifecycleCallbackURL,
+			Items:                slices.Clone(req.Items), // the ownership claim; see above
+			ContainerIDs:         make([]string, 0, totalQuantity),
+			StackManifest:        nil, // set by enrichReserved
+			ServiceContainers:    nil,
 		},
 		// VolumeCleanupAttempts: 0 by struct-zero — structural reset of the
 		// per-lease counter is the whole point of the wrapper.
@@ -937,20 +947,21 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 
 	// Build Compose project and bring it up.
 	project := buildComposeProject(composeProjectParams{
-		LeaseUUID:    req.LeaseUUID,
-		Tenant:       req.Tenant,
-		ProviderUUID: req.ProviderUUID,
-		CallbackURL:  req.CallbackURL,
-		BackendName:  b.cfg.Name,
-		FailCount:    failCount,
-		Stack:        stack,
-		Items:        req.Items,
-		Profiles:     profiles,
-		ImageSetups:  imageSetups,
-		NetworkName:  networkName,
-		VolBinds:     volBinds,
-		Cfg:          &b.cfg,
-		Ingress:      b.cfg.Ingress,
+		LeaseUUID:            req.LeaseUUID,
+		Tenant:               req.Tenant,
+		ProviderUUID:         req.ProviderUUID,
+		CallbackURL:          req.CallbackURL,
+		LifecycleCallbackURL: req.LifecycleCallbackURL,
+		BackendName:          b.cfg.Name,
+		FailCount:            failCount,
+		Stack:                stack,
+		Items:                req.Items,
+		Profiles:             profiles,
+		ImageSetups:          imageSetups,
+		NetworkName:          networkName,
+		VolBinds:             volBinds,
+		Cfg:                  &b.cfg,
+		Ingress:              b.cfg.Ingress,
 	})
 
 	logger.Info("compose up", "project", projectName, "services", len(project.Services))

@@ -152,10 +152,11 @@ type RestartRequestedMsg struct {
 	Cancel context.CancelFunc
 	Work   func() ReplaceResult
 	Ack    chan error
-	// CallbackURL is applied to prov.CallbackURL by onEnterRestarting
-	// before the actor acks — the actor, not the HTTP prelude, is the
-	// sole writer of that field for the restart path (ENG-230).
-	CallbackURL string
+	// The callback pair is applied to the provision state by
+	// onEnterRestarting before the actor acks — the actor, not the HTTP
+	// prelude, is the sole writer of those fields for restart (ENG-230).
+	CallbackURL          string
+	LifecycleCallbackURL string
 }
 
 func (RestartRequestedMsg) isLeaseMessage()         {}
@@ -171,10 +172,11 @@ type UpdateRequestedMsg struct {
 	Cancel context.CancelFunc
 	Work   func() ReplaceResult
 	Ack    chan error
-	// CallbackURL is applied to prov.CallbackURL by onEnterUpdating
-	// before the actor acks — the actor, not the HTTP prelude, is the
-	// sole writer of that field for the update path (ENG-230).
-	CallbackURL string
+	// The callback pair is applied to the provision state by
+	// onEnterUpdating before the actor acks — the actor, not the HTTP
+	// prelude, is the sole writer of those fields for update (ENG-230).
+	CallbackURL          string
+	LifecycleCallbackURL string
 }
 
 func (UpdateRequestedMsg) isLeaseMessage()         {}
@@ -187,7 +189,7 @@ func (m UpdateRequestedMsg) onPanic(err error) {
 }
 
 // RestoreRequestedMsg drives a restore (ENG-325) through the EXISTING
-// replace machinery — same Cancel/Work/Ack/CallbackURL shape as
+// replace machinery — same Cancel/Work/Ack/callback-pair shape as
 // RestartRequestedMsg. The difference is purely the SM event it fires:
 // evRestoreRequested, which is permitted only from Provisioning (a
 // restore's new lease is reserved there), versus evRestartRequested
@@ -199,10 +201,11 @@ type RestoreRequestedMsg struct {
 	Cancel context.CancelFunc
 	Work   func() ReplaceResult
 	Ack    chan error
-	// CallbackURL is applied to prov.CallbackURL by onEnterRestarting
-	// (reused for the restore path) before the actor acks — the actor,
-	// not the HTTP prelude, is the sole writer of that field (ENG-230).
-	CallbackURL string
+	// The callback pair is applied to the provision state by
+	// onEnterRestarting (reused for restore) before the actor acks — the
+	// actor, not the HTTP prelude, is the sole writer of those fields.
+	CallbackURL          string
+	LifecycleCallbackURL string
 }
 
 func (RestoreRequestedMsg) isLeaseMessage()         {}
@@ -778,10 +781,12 @@ func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
 		msg.Ack <- errActorTerminated
 		return
 	}
-	// onEnterRestarting writes Status=Restarting (+ CallbackURL) inside
-	// this Fire, before the ack — preserving the handler-publish contract.
+	// onEnterRestarting writes Status=Restarting and the callback pair
+	// inside this Fire, before the ack — preserving the handler-publish contract.
 	if err := a.fireAndVerify(evRestartRequested, backend.ProvisionStatusRestarting,
-		replaceEntryArgs{CallbackURL: msg.CallbackURL}); err != nil {
+		replaceEntryArgs{
+			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+		}); err != nil {
 		// A concurrent same-lease restart that lost the race finds the SM
 		// already busy → classifyReplaceReject returns ErrInvalidState (409).
 		msg.Ack <- a.classifyReplaceReject(err)
@@ -803,7 +808,7 @@ func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
 // Provisioning, the state a restore's new lease is reserved in) instead
 // of evRestartRequested. The destination state is still Restarting, so
 // onEnterRestarting (reused via OnEntryFrom(evRestoreRequested)) writes
-// Status=Restarting + CallbackURL before the ack, and spawnReplaceWorker
+// Status=Restarting + the callback pair before the ack, and spawnReplaceWorker
 // + the evReplace{Completed,Recovered,Failed} terminal events behave
 // identically. Because the prior Status was Provisioning (not Ready),
 // applyReplaceEntry sets replaceWasActive=false, so a successful restore
@@ -813,10 +818,12 @@ func (a *LeaseActor) handleRestoreRequested(msg RestoreRequestedMsg) {
 		msg.Ack <- errActorTerminated
 		return
 	}
-	// onEnterRestarting writes Status=Restarting (+ CallbackURL) inside this
-	// Fire, before the ack — preserving the handler-publish contract.
+	// onEnterRestarting writes Status=Restarting and the callback pair inside
+	// this Fire, before the ack — preserving the handler-publish contract.
 	if err := a.fireAndVerify(evRestoreRequested, backend.ProvisionStatusRestarting,
-		replaceEntryArgs{CallbackURL: msg.CallbackURL}); err != nil {
+		replaceEntryArgs{
+			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+		}); err != nil {
 		// Restore is permitted only from Provisioning; from any other state
 		// (e.g. a duplicate after the SM already left Provisioning, or a
 		// concurrent Deprovision) classifyReplaceReject yields ErrInvalidState
@@ -836,10 +843,12 @@ func (a *LeaseActor) handleUpdateRequested(msg UpdateRequestedMsg) {
 		msg.Ack <- errActorTerminated
 		return
 	}
-	// onEnterUpdating writes Status=Updating (+ CallbackURL) inside this
-	// Fire, before the ack — preserving the handler-publish contract.
+	// onEnterUpdating writes Status=Updating and the callback pair inside
+	// this Fire, before the ack — preserving the handler-publish contract.
 	if err := a.fireAndVerify(evUpdateRequested, backend.ProvisionStatusUpdating,
-		replaceEntryArgs{CallbackURL: msg.CallbackURL}); err != nil {
+		replaceEntryArgs{
+			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+		}); err != nil {
 		// A concurrent same-lease update that lost the race finds the SM
 		// already busy → classifyReplaceReject returns ErrInvalidState (409).
 		msg.Ack <- a.classifyReplaceReject(err)

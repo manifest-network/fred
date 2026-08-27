@@ -6625,13 +6625,14 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 // ENG-635: the sibling of the 404 case above, and the reason the two must not
 // be collapsed. A source lease with NO placement record genuinely has no
 // retained data anywhere, so 404 is truthful. A source lease WITH a record
-// naming a backend the router does not know is a different answer: the data
-// exists, on a machine fred currently cannot reach — usually one that was
-// paused, renamed or is mid-redeploy.
+// naming a backend the resolver does not know is a different answer: the data
+// may still exist even though this process cannot reach it.
 //
 // Answering 404 there tells a tenant their data is gone and invites them to
 // destroy and recreate the deployment, which turns a recoverable outage into
-// real data loss. 503 is both true and actionable.
+// real data loss. 503 is both true and actionable. The production composition
+// rejects topology/resolver drift during startup; this independently composed
+// fixture preserves the defensive HTTP boundary for alternate embeddings.
 func TestRestoreLease_UnresolvableSourcePlacement_Returns503(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
 	leaseUUID := testutil.ValidUUID1

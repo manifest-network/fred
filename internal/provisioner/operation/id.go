@@ -7,11 +7,13 @@ import (
 	"net/url"
 
 	"github.com/google/uuid"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // QueryParameter is the callback query parameter carrying an OperationID.
 // Backends treat the complete callback URL as opaque and need not interpret it.
-const QueryParameter = "operation_id"
+const QueryParameter = backend.CallbackOperationIDQueryParameter
 
 var (
 	// ErrInvalidID reports a non-canonical or non-v4 operation identity.

@@ -1184,6 +1184,19 @@ func TestHandleRestart(t *testing.T) {
 		assert.Contains(t, w.Body.String(), "invalid state for restart")
 	})
 
+	t.Run("ErrValidation returns 400", func(t *testing.T) {
+		mb := &mockBackend{
+			RestartFunc: func(context.Context, backend.RestartRequest) error {
+				return fmt.Errorf("%w: invalid lifecycle callback URL", backend.ErrValidation)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restart", validBody))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "invalid lifecycle callback URL")
+	})
+
 	t.Run("generic error returns 500", func(t *testing.T) {
 		mb := &mockBackend{
 			RestartFunc: func(context.Context, backend.RestartRequest) error {

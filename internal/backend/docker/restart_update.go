@@ -76,8 +76,8 @@ func customDomainOnSuccess(overrides map[string]string) func(*leasesm.ProvisionS
 // SEAM CLOSED (ENG-230). This prelude is read-only: it fast-fails on
 // ErrNotProvisioned / ErrInvalidState under provisionsMu, snapshots the
 // fields the worker needs, then does pure work (manifest marshal +
-// release-store Append). It performs NO write to prov.Status /
-// prov.CallbackURL — the lease actor's onEnterRestarting entry action is
+// release-store Append). It performs NO write to prov.Status or either
+// callback URL — the lease actor's onEnterRestarting entry action is
 // the sole writer of those fields, firing inside handleRestartRequested
 // BEFORE the ack. Because Restart() returns only after observing that
 // ack, the "Restart() returns => prov.Status == Restarting" invariant
@@ -117,6 +117,10 @@ func (b *Backend) Restart(ctx context.Context, req backend.RestartRequest) error
 // entry action via OnSuccess (ENG-231).
 func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackURL string, overrides map[string]string) error {
 	logger := b.logger.With("lease_uuid", leaseUUID)
+	lifecycleCallbackURL, callbackErr := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	if callbackErr != nil {
+		return fmt.Errorf("%w: %w", backend.ErrValidation, callbackErr)
+	}
 
 	b.provisionsMu.Lock()
 	prov, exists := b.provisions[leaseUUID]
@@ -166,7 +170,7 @@ func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackUR
 	}
 
 	// Hand off to the lease actor. The actor's onEnterRestarting writes
-	// Status=Restarting (+ CallbackURL) BEFORE acking, then spawns the replace
+	// Status=Restarting and both callback URLs BEFORE acking, then spawns the replace
 	// worker. On success, onEnterReadyFromReplaceCompleted runs onSuccess (the
 	// prov.Items custom_domain commit) under UpdateFn, atomic with Status->Ready.
 	opCtx, opCancel := b.shutdownAwareContext()
@@ -175,7 +179,13 @@ func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackUR
 		return b.doRestart(opCtx, leaseUUID, stackManifest, containerIDs, serviceContainers, items, onSuccess, logger)
 	}
 	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, leaseUUID, leasesm.RestartRequestedMsg{Cancel: opCancel, Work: work, Ack: ack, CallbackURL: callbackURL}); routeErr != nil {
+	if routeErr := b.routeToLeaseBlocking(ctx, leaseUUID, leasesm.RestartRequestedMsg{
+		Cancel:               opCancel,
+		Work:                 work,
+		Ack:                  ack,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+	}); routeErr != nil {
 		opCancel()
 		return routeErr
 	}
@@ -366,11 +376,13 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	tenant := ""
 	providerUUID := ""
 	callbackURL := ""
+	lifecycleCallbackURL := ""
 	if prov, ok := b.provisions[op.LeaseUUID]; ok {
 		failCount = prov.FailCount
 		tenant = prov.Tenant
 		providerUUID = prov.ProviderUUID
 		callbackURL = prov.CallbackURL
+		lifecycleCallbackURL = prov.LifecycleCallbackURL
 	}
 	b.provisionsMu.RUnlock()
 
@@ -398,20 +410,21 @@ func (b *Backend) doReplaceContainers(ctx context.Context, op replaceContainersO
 	// Build Compose project and bring it up.
 	// ForceRecreate is used for restarts (config unchanged but containers need replacing).
 	project := buildComposeProject(composeProjectParams{
-		LeaseUUID:    op.LeaseUUID,
-		Tenant:       tenant,
-		ProviderUUID: providerUUID,
-		CallbackURL:  callbackURL,
-		BackendName:  b.cfg.Name,
-		FailCount:    failCount,
-		Stack:        op.Stack,
-		Items:        op.Items,
-		Profiles:     op.Profiles,
-		ImageSetups:  imageSetups,
-		NetworkName:  networkName,
-		VolBinds:     volBinds,
-		Cfg:          &b.cfg,
-		Ingress:      b.cfg.Ingress,
+		LeaseUUID:            op.LeaseUUID,
+		Tenant:               tenant,
+		ProviderUUID:         providerUUID,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		BackendName:          b.cfg.Name,
+		FailCount:            failCount,
+		Stack:                op.Stack,
+		Items:                op.Items,
+		Profiles:             op.Profiles,
+		ImageSetups:          imageSetups,
+		NetworkName:          networkName,
+		VolBinds:             volBinds,
+		Cfg:                  &b.cfg,
+		Ingress:              b.cfg.Ingress,
 	})
 
 	op.Logger.Info("compose up for "+op.Operation, "project", projectName, "services", len(project.Services))
@@ -469,6 +482,7 @@ func (b *Backend) rollbackViaCompose(op replaceContainersOp) bool {
 	tenant := prov.Tenant
 	providerUUID := prov.ProviderUUID
 	callbackURL := prov.CallbackURL
+	lifecycleCallbackURL := prov.LifecycleCallbackURL
 	failCount := prov.FailCount
 	b.provisionsMu.RUnlock()
 
@@ -503,20 +517,21 @@ func (b *Backend) rollbackViaCompose(op replaceContainersOp) bool {
 
 	// Build project from previous manifest.
 	project := buildComposeProject(composeProjectParams{
-		LeaseUUID:    op.LeaseUUID,
-		Tenant:       tenant,
-		ProviderUUID: providerUUID,
-		CallbackURL:  callbackURL,
-		BackendName:  b.cfg.Name,
-		FailCount:    failCount,
-		Stack:        prevStack,
-		Items:        op.Items,
-		Profiles:     op.Profiles,
-		ImageSetups:  prevImageSetups,
-		NetworkName:  networkName,
-		VolBinds:     volBinds,
-		Cfg:          &b.cfg,
-		Ingress:      b.cfg.Ingress,
+		LeaseUUID:            op.LeaseUUID,
+		Tenant:               tenant,
+		ProviderUUID:         providerUUID,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		BackendName:          b.cfg.Name,
+		FailCount:            failCount,
+		Stack:                prevStack,
+		Items:                op.Items,
+		Profiles:             op.Profiles,
+		ImageSetups:          prevImageSetups,
+		NetworkName:          networkName,
+		VolBinds:             volBinds,
+		Cfg:                  &b.cfg,
+		Ingress:              b.cfg.Ingress,
 	})
 
 	// Compose Up with ForceRecreate to restore previous containers.
@@ -565,16 +580,20 @@ func (b *Backend) recordPreflightFailure(leaseUUID string, reason backend.Reason
 // SEAM CLOSED (ENG-230) — see the extended comment on Backend.Restart.
 // Like Restart, the prelude is read-only: it fast-fails / validates
 // under provisionsMu, snapshots fields, then records the release. It
-// performs NO write to prov.Status / prov.CallbackURL — the actor's
+// performs NO write to prov.Status or either callback URL — the actor's
 // onEnterUpdating entry action is the sole writer, firing inside
 // handleUpdateRequested BEFORE the ack, so the "Update() returns =>
 // Status is Updating" contract holds without an off-actor write. No
 // rollback is needed on any failure path (nothing on prov was mutated).
 func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
+	lifecycleCallbackURL, callbackErr := backend.ResolveLifecycleCallbackURL(req.CallbackURL, "")
+	if callbackErr != nil {
+		return fmt.Errorf("%w: %w", backend.ErrValidation, callbackErr)
+	}
 
 	// Synchronous phase: read-only validation + field snapshot (no
-	// prov.Status / prov.CallbackURL write — ENG-230).
+	// prov.Status or callback URL writes — ENG-230).
 	b.provisionsMu.Lock()
 	prov, exists := b.provisions[req.LeaseUUID]
 	if !exists {
@@ -652,7 +671,7 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		serviceContainers[k] = append([]string(nil), v...)
 	}
 	items := append([]backend.LeaseItem(nil), prov.Items...)
-	// No pre-replace status snapshot: Status/CallbackURL writes and gauge
+	// No pre-replace status snapshot: status/callback-pair writes and gauge
 	// bookkeeping are the actor's, keyed on the actor-observed
 	// replaceWasActive (onEnterUpdating). The update preflight is
 	// unconditionally Failed regardless, so the worker needs no status hint.
@@ -673,15 +692,21 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		}
 	}
 
-	// Hand off to the actor. The actor's onEnterUpdating writes
-	// Status=Updating (+ CallbackURL) BEFORE acking. See
+	// Hand off to the actor. The actor's onEnterUpdating writes Status=Updating
+	// and both callback URLs BEFORE acking. See
 	// handleUpdateRequested / spawnReplaceWorker.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
 		return b.doUpdate(opCtx, req.LeaseUUID, stackManifest, profiles, oldContainerIDs, serviceContainers, items, logger)
 	}
 	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{Cancel: opCancel, Work: work, Ack: ack, CallbackURL: req.CallbackURL}); routeErr != nil {
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.UpdateRequestedMsg{
+		Cancel:               opCancel,
+		Work:                 work,
+		Ack:                  ack,
+		CallbackURL:          req.CallbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+	}); routeErr != nil {
 		opCancel()
 		return routeErr
 	}

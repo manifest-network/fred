@@ -71,7 +71,7 @@ var (
 	// ErrUnusablePlacement means an on-disk record exists but cannot safely be
 	// used as either affinity or an attempt gate.
 	ErrUnusablePlacement = errors.New("placement record is unusable")
-	// ErrAttemptMismatch means Confirm or ClearAttempt did not name the current
+	// ErrAttemptMismatch means an attempt settlement did not name the current
 	// unresolved attempt.
 	ErrAttemptMismatch = errors.New("placement attempt does not match target")
 	// ErrInvalidAttemptToken means an attempt settlement capability was not
@@ -157,27 +157,13 @@ type InventoryProjection struct {
 	Conflicts  map[string][]string
 }
 
-// ProjectionResult reports material mutations and lease-local causal fences.
-// Applied contains exact revisions for records written by the transaction.
-// Fenced leases were left unchanged because their durable evidence was newer
-// than the input inventory or was source-claimed by a restore.
+// ProjectionResult reports leases left unchanged because their durable
+// evidence was newer than the input inventory or was source-claimed by a
+// restore.
 type ProjectionResult struct {
-	Applied map[string]RecordRevision
-	Fenced  map[string]struct{}
-
-	issuer         *Store
-	epoch          uint64
-	cutoff         uint64
-	finalMutations map[string]uint64
-	fencedLeases   map[string]struct{}
-}
-
-// Valid reports whether the result is an unforgeable proof returned by a
-// successful ProjectInventory call. The issuing store still validates its
-// authority epoch and lease-local mutation identity when consuming it.
-func (result ProjectionResult) Valid() bool {
-	return result.issuer != nil && result.epoch != 0 &&
-		result.finalMutations != nil && result.fencedLeases != nil
+	// Fenced contains the lease UUIDs whose submitted observations were not
+	// applied at this inventory boundary.
+	Fenced map[string]struct{}
 }
 
 // AttemptToken is the exclusive capability for settling one durable
@@ -199,15 +185,6 @@ func (token AttemptToken) Valid() bool {
 		token.operationID.Valid() && token.revision.Valid() &&
 		token.revision.issuer == token.issuer.recordIssuer &&
 		token.revision.leaseUUID == token.leaseUUID
-}
-
-// OperationID returns the operation identity that must be carried to the
-// backend. An invalid token returns an invalid OperationID.
-func (token AttemptToken) OperationID() operation.OperationID {
-	if !token.Valid() {
-		return operation.OperationID{}
-	}
-	return token.operationID
 }
 
 // RestoreClaim is the exclusive capability for settling one synchronous
@@ -695,7 +672,7 @@ func (s *Store) List() map[string]Placement {
 func (s *Store) BeginInventorySession() InventoryFence {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// A new collection supersedes every process-local projection proof issued
+	// A new collection supersedes every process-local inventory fence issued
 	// from an older collection. The durable admission baseline is deliberately
 	// independent and remains usable while the topology is unchanged.
 	s.advanceAuthorityEpochLocked()
@@ -823,7 +800,7 @@ func (s *Store) BeginRestore(
 		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, sourceLeaseUUID)
 	}
 	// A source-reserved lease cannot simultaneously become another restore's
-	// target. This is the BeginRestore counterpart to the typed BeginAttempt
+	// target. This is the restore counterpart to the typed attempt-admission
 	// fence and keeps the source immutable for the holder of the first claim.
 	if s.restoreSourceClaimedLocked(targetLeaseUUID) {
 		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, targetLeaseUUID)
@@ -851,16 +828,9 @@ func (s *Store) BeginRestore(
 	}
 	nonce := s.restoreNonce + 1
 
-	targetRevision, applied, err := s.setAttemptingIfNotNewerLocked(
-		targetLeaseUUID, source.Backend, operationID, math.MaxUint64,
-	)
+	targetRevision, err := s.setAttemptingLocked(targetLeaseUUID, source.Backend, operationID)
 	if err != nil {
 		return RestoreClaim{}, err
-	}
-	if !applied {
-		// A MaxUint64 fence cannot reject a normal revision. Keep this guard so a
-		// future helper change cannot mint a source claim without a target write.
-		return RestoreClaim{}, errors.New("restore target attempt was not applied")
 	}
 
 	claim := RestoreClaim{
@@ -1002,30 +972,25 @@ func (s *Store) restoreSourceClaimedLocked(leaseUUID string) bool {
 }
 
 // Caller holds s.mu.
-func (s *Store) setAttemptingIfNotNewerLocked(
+func (s *Store) setAttemptingLocked(
 	leaseUUID, backendName string,
 	operationID operation.OperationID,
-	maxRevision uint64,
-) (uint64, bool, error) {
-	if s.mutationRevisionLocked(leaseUUID) > maxRevision {
-		return 0, false, nil
-	}
-
+) (uint64, error) {
 	existing, exists := s.cache[leaseUUID]
 	if exists && existing.State() == StateUnusable {
-		return 0, false, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, leaseUUID)
+		return 0, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, leaseUUID)
 	}
 	if existing.Attempt != "" {
-		return 0, false, fmt.Errorf("%w: lease %q targets %q", ErrAttemptConflict, leaseUUID, existing.Attempt)
+		return 0, fmt.Errorf("%w: lease %q targets %q", ErrAttemptConflict, leaseUUID, existing.Attempt)
 	}
 	if existing.Backend != "" && existing.Backend != backendName {
-		return 0, false, fmt.Errorf("%w: lease %q is confirmed on %q, not %q",
+		return 0, fmt.Errorf("%w: lease %q is confirmed on %q, not %q",
 			ErrBackendConflict, leaseUUID, existing.Backend, backendName)
 	}
 
 	revision, err := s.nextRevision()
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
 	p := existing
 	if !exists {
@@ -1035,10 +1000,10 @@ func (s *Store) setAttemptingIfNotNewerLocked(
 	p.attemptOperationID = operationID
 	p.revision = revision
 	if err := s.put(leaseUUID, p, "set attempting placement"); err != nil {
-		return 0, false, err
+		return 0, err
 	}
 	s.revision = revision
-	return revision, true, nil
+	return revision, nil
 }
 
 // ConfirmAttempt promotes only the exact typed write-ahead attempt represented
@@ -1282,15 +1247,7 @@ func (s *Store) ProjectInventory(
 		return ProjectionResult{}, err
 	}
 
-	result := ProjectionResult{
-		Applied:        make(map[string]RecordRevision),
-		Fenced:         make(map[string]struct{}),
-		issuer:         s,
-		epoch:          fence.epoch,
-		cutoff:         fence.revision,
-		finalMutations: make(map[string]uint64),
-		fencedLeases:   make(map[string]struct{}),
-	}
+	result := ProjectionResult{Fenced: make(map[string]struct{})}
 	keySet := make(map[string]struct{}, len(projection.Placements)+len(projection.Conflicts))
 	for leaseUUID := range projection.Placements {
 		keySet[leaseUUID] = struct{}{}
@@ -1389,8 +1346,6 @@ func (s *Store) ProjectInventory(
 		mutation := mutations[leaseUUID]
 		s.cache[leaseUUID] = mutation.placement
 		delete(s.deleteRevisions, leaseUUID)
-		result.Applied[leaseUUID] = s.newRecordRevision(leaseUUID, mutation.revision)
-		result.finalMutations[leaseUUID] = mutation.revision
 	}
 	s.revision = nextRevision
 	if projection.Complete {
@@ -1402,7 +1357,6 @@ func (s *Store) ProjectInventory(
 
 func (result *ProjectionResult) markFenced(leaseUUID string) {
 	result.Fenced[leaseUUID] = struct{}{}
-	result.fencedLeases[leaseUUID] = struct{}{}
 }
 
 func normalizeInventoryProjection(input InventoryProjection) (InventoryProjection, error) {

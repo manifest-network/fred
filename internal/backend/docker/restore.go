@@ -1129,6 +1129,13 @@ func (b *Backend) adoptRetainedVolumes(newLease string, rec *shared.RetentionEnt
 // flow via the lease callback.
 func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error {
 	logger := b.logger.With("lease_uuid", req.LeaseUUID, "from_lease", req.FromLeaseUUID, "tenant", req.Tenant)
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
+		req.CallbackURL, req.LifecycleCallbackURL,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
+	req.LifecycleCallbackURL = lifecycleCallbackURL
 
 	if b.retentionStore == nil {
 		return backend.ErrNotRetained
@@ -1210,22 +1217,23 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	}
 	b.provisions[req.LeaseUUID] = recoveredProvision{ //exhaustruct:enforce
 		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
-			LeaseUUID:         req.LeaseUUID,
-			Tenant:            rec.Tenant,
-			ProviderUUID:      rec.ProviderUUID,
-			SKU:               req.Items[0].SKU,
-			Status:            backend.ProvisionStatusProvisioning,
-			Quantity:          totalQuantity(req.Items),
-			CreatedAt:         time.Now(),
-			FailCount:         0,
-			LastError:         "",
-			Reason:            "", // fresh reservation, no failure
-			Message:           "",
-			CallbackURL:       req.CallbackURL,
-			Items:             slices.Clone(req.Items),
-			ContainerIDs:      make([]string, 0),
-			StackManifest:     rec.StackManifest,
-			ServiceContainers: nil,
+			LeaseUUID:            req.LeaseUUID,
+			Tenant:               rec.Tenant,
+			ProviderUUID:         rec.ProviderUUID,
+			SKU:                  req.Items[0].SKU,
+			Status:               backend.ProvisionStatusProvisioning,
+			Quantity:             totalQuantity(req.Items),
+			CreatedAt:            time.Now(),
+			FailCount:            0,
+			LastError:            "",
+			Reason:               "", // fresh reservation, no failure
+			Message:              "",
+			CallbackURL:          req.CallbackURL,
+			LifecycleCallbackURL: req.LifecycleCallbackURL,
+			Items:                slices.Clone(req.Items),
+			ContainerIDs:         make([]string, 0),
+			StackManifest:        rec.StackManifest,
+			ServiceContainers:    nil,
 		},
 		volumeCleanupAttempts: 0,
 	}.materialize()
@@ -1318,7 +1326,11 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestoreRequestedMsg{
-		Cancel: opCancel, Work: work, Ack: ack, CallbackURL: req.CallbackURL,
+		Cancel:               opCancel,
+		Work:                 work,
+		Ack:                  ack,
+		CallbackURL:          req.CallbackURL,
+		LifecycleCallbackURL: req.LifecycleCallbackURL,
 	}); routeErr != nil {
 		opCancel()
 		// Worker never ran; no actor transition will flip Status — drop the

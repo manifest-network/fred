@@ -470,11 +470,13 @@ record revisions. Ambiguous, malformed, or otherwise unusable records remain
 byte-for-byte fail-closed. Configure a writable `placement_store_db_path` and
 take a stopped-process backup before upgrading.
 
-The new backend binaries accept v0.13.0 tokenless callback URLs, so roll them one
-at a time while the old providerd remains online. At provider cutover, any
-v0.13.0 backend still present preserves the new additive `operation_id` query
-and signs the complete request URI, so a mixed backend fleet remains wire
-compatible.
+The new backend binaries accept v0.13.0 tokenless callback URLs, so roll every
+backend one at a time while the old providerd remains online. Complete that
+backend-first rollout before the provider cutover. A v0.13.0 backend can accept
+the new additive request fields, but it does not persist the separate
+`lifecycle_callback_url`; leaving one in the fleet would keep suppressing later
+runtime-failure, deprovisioned, and retained observations after the exact
+provision/restore operation expires.
 
 Before taking the rollback snapshot, remove tenant API ingress, pause the
 chain-facing path tenants use to create, close, or otherwise mutate leases, and
@@ -534,6 +536,17 @@ absence never clears an ambiguous pre-restart attempt or conflict.
 > stop the new process and restore the pre-upgrade backup only if you can also
 > prove no chain or backend lifecycle state changed after that snapshot. Otherwise
 > forward-fix.
+
+The docker backend's callback queue has its own rollback boundary. New binaries
+write independent deliveries to a `pending_callbacks_v2` bucket so an exact
+operation completion cannot be overwritten by a later lifecycle observation.
+v0.13.0 intentionally ignores that bucket: rolling only the backend binary back
+does not create a replay loop, but v2 callbacks remain undelivered until the new
+binary is restored. Preserve the current `callbacks.db` if they must survive for
+later forward recovery; restoring the pre-upgrade snapshot discards callbacks
+queued after that snapshot. An old binary cannot deliver v2 entries, so a pending
+exact completion that matters is another reason to forward-fix rather than
+downgrade.
 
 Schema compatibility is store-specific; the bbolt files carry no global schema
 version or automatic downgrade guard. In particular, the placement store retains

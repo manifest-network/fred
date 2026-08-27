@@ -163,6 +163,7 @@ Start provisioning a resource asynchronously.
     {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
   ],
   "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_callback_url": "http://fred:8080/callbacks/provision",
   "payload": "base64-encoded-bytes",
   "payload_hash": "sha256-hex-string"
 }
@@ -183,11 +184,15 @@ Start provisioning a resource asynchronously.
 
 **Behavior:**
 1. Validate the request
-2. Store the complete `callback_url` for this `lease_uuid` byte-for-byte,
-   including its query string
+2. Store both callback URLs for this `lease_uuid` byte-for-byte. The complete
+   `callback_url`, including its query, settles only this provision operation;
+   `lifecycle_callback_url` is tokenless and reports later autonomous failure
+   or teardown observations without reusing expired operation authority
 3. Return 202 immediately (do NOT block on provisioning)
 4. Start provisioning in a background goroutine
-5. When complete, POST to the `callback_url` (see Callback Protocol below)
+5. When complete, POST to `callback_url`. For later runtime failure or
+   deprovision observations, POST to `lifecycle_callback_url` (see Callback
+   Protocol below)
 
 **Error Responses:**
 - `400 Bad Request` - Invalid request body
@@ -437,7 +442,8 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
-  "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
+  "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_callback_url": "http://fred:8080/callbacks/provision"
 }
 ```
 
@@ -603,17 +609,28 @@ This endpoint is optional but recommended for production backends. The Docker ba
 
 ## Callback Protocol
 
-When provisioning completes (success or failure), POST to the complete
-`callback_url` from the provision request. Provision and restore URLs carry an
+When provisioning or restoration completes (success or failure), POST to the
+complete `callback_url` from that request. Provision and restore URLs carry an
 `operation_id=<uuid>` query parameter whose value is one lowercase, hyphenated,
 canonical RFC-4122 UUIDv4. Treat the URL as opaque:
 preserve its path and query byte-for-byte rather than rebuilding or normalizing
 it. Fred uses that typed operation ID to prevent a stale callback from settling
 a newer in-flight operation. An operation-ID callback is authoritative only while
 that exact operation is current; after it ends or is replaced Fred returns 200
-and ignores the callback completely, including status publication. Only tokenless
-v0.13 compatibility callbacks and the currently observational restart/update
-callbacks may emit best-effort, out-of-order status.
+and ignores the callback completely, including status publication.
+
+Provision and restore requests also carry a tokenless
+`lifecycle_callback_url`. Store it separately and use it only for subsequent
+autonomous observations such as container death or deprovision completion. A
+lifecycle callback never settles an operation, placement, or chain mutation;
+it can publish only best-effort, out-of-order status, including while a newer
+typed operation is current. Never use it for the original asynchronous result,
+which must go to the operation-scoped `callback_url`. The field is optional for
+rolling compatibility: the bundled Docker backend derives the same URL when an
+older Fred omits it by removing only `operation_id` and retaining every unrelated
+query component. External backends should consume the explicit field rather
+than interpreting either URL. Tokenless v0.13 and restart/update callbacks keep
+the same observation-only behavior.
 
 ### Request Format
 
@@ -719,24 +736,30 @@ type MyBackend struct {
 }
 
 type provision struct {
-    LeaseUUID    string
-    Status       string    // "provisioning", "ready", "failed"
-    CreatedAt    time.Time
+    LeaseUUID            string
+    Status               string    // "provisioning", "ready", "failed"
+    CreatedAt            time.Time
+    CallbackURL          string    // exact operation completion
+    LifecycleCallbackURL string    // tokenless later observations
     // ... your resource-specific fields
 }
 ```
 
 ### Callback URL Storage
 
-Store callback URLs per lease to handle concurrent provisions. Store the
-complete opaque value, including `?operation_id=...`; stripping or
-rebuilding the query makes the HMAC or operation identity fail verification.
+Store callback URLs per lease to handle concurrent provisions. Keep the exact
+completion URL and tokenless lifecycle URL as distinct values. Preserve both
+opaque values byte-for-byte: stripping or rebuilding the completion query makes
+the HMAC or operation identity fail verification, while retaining it for later
+lifecycle events causes valid observations to be discarded after that operation
+expires.
 
 ```go
 type BackendServer struct {
-    backend        *MyBackend
-    callbackURLs   map[string]string  // lease_uuid -> callback_url
-    callbackURLsMu sync.Mutex
+    backend               *MyBackend
+    callbackURLs          map[string]string // lease_uuid -> exact callback_url
+    lifecycleCallbackURLs map[string]string // lease_uuid -> observational URL
+    callbackURLsMu        sync.Mutex
 }
 ```
 
@@ -753,9 +776,19 @@ func (b *DockerBackend) recoverState(ctx context.Context) error {
 
     // Rebuild in-memory state from container labels
     for _, c := range containers {
+        callbackURL := c.Labels["fred.callback_url"]
+        lifecycleCallbackURL := c.Labels["fred.lifecycle_callback_url"]
+        if lifecycleCallbackURL == "" {
+            // One-time migration for resources created by an older backend:
+            // remove only operation_id from callbackURL and preserve every
+            // unrelated raw query component.
+            lifecycleCallbackURL = migrateLegacyLifecycleURL(callbackURL)
+        }
         b.provisions[c.Labels["fred.lease_uuid"]] = &provision{
-            LeaseUUID: c.Labels["fred.lease_uuid"],
-            Status:    "ready",
+            LeaseUUID:            c.Labels["fred.lease_uuid"],
+            Status:               "ready",
+            CallbackURL:          callbackURL,
+            LifecycleCallbackURL: lifecycleCallbackURL,
             // ...
         }
     }
@@ -813,15 +846,17 @@ import (
 )
 
 type Backend struct {
-    provisions   map[string]*provision
-    callbackURLs map[string]string
-    mu           sync.RWMutex
+    provisions               map[string]*provision
+    callbackURLs             map[string]string
+    lifecycleCallbackURLs    map[string]string
+    mu                       sync.RWMutex
 }
 
 func main() {
     b := &Backend{
-        provisions:   make(map[string]*provision),
-        callbackURLs: make(map[string]string),
+        provisions:            make(map[string]*provision),
+        callbackURLs:          make(map[string]string),
+        lifecycleCallbackURLs: make(map[string]string),
     }
 
     mux := http.NewServeMux()
@@ -850,8 +885,9 @@ func (b *Backend) handleProvision(w http.ResponseWriter, r *http.Request) {
     json.NewDecoder(r.Body).Decode(&req)
 
     b.mu.Lock()
-    // Store callback URL
+    // Store operation completion and later lifecycle URLs separately.
     b.callbackURLs[req.LeaseUUID] = req.CallbackURL
+    b.lifecycleCallbackURLs[req.LeaseUUID] = req.LifecycleCallbackURL
     // Create provision record
     b.provisions[req.LeaseUUID] = &provision{
         LeaseUUID: req.LeaseUUID,
@@ -943,7 +979,8 @@ curl -X POST http://localhost:9001/provision \
     "tenant": "manifest1test",
     "provider_uuid": "test-provider",
     "items": [{"sku": "docker-nginx", "quantity": 1}],
-    "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
+    "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+    "lifecycle_callback_url": "http://localhost:8080/callbacks/provision"
   }'
 ```
 
@@ -971,12 +1008,12 @@ Before deploying your backend:
 - [ ] All 12 contract HTTP endpoints implemented (`/provision`, `/deprovision`, `/info/{lease_uuid}`, `/logs/{lease_uuid}`, `/provisions/{lease_uuid}`, `/provisions`, `/restart`, `/update`, `/restore`, `/retentions`, `/reconcile_custom_domain`, `/releases/{lease_uuid}`) plus `/health`
 - [ ] **Inbound `X-Fred-Signature` verified on all contract endpoints** (401 on missing/invalid; only `/health`, `/stats`, `/metrics` are exempt)
 - [ ] Provision returns 202 and works asynchronously
-- [ ] Complete callback URL (including query) preserved byte-for-byte and signed with HMAC-SHA256 with timestamp
+- [ ] Exact `callback_url` and tokenless `lifecycle_callback_url` stored separately per lease; operation completion uses the exact URL and later autonomous lifecycle observations use only the tokenless URL
+- [ ] Complete selected callback URL (including unrelated query fields) preserved byte-for-byte and signed with HMAC-SHA256 with timestamp
 - [ ] Deprovision is idempotent
 - [ ] ListProvisions returns all managed resources
 - [ ] `/reconcile_custom_domain` is idempotent and returns 204 on no-change (never 404 just because custom domains are unsupported — that pollutes Fred's reconciler every tick)
 - [ ] State protected with mutex for concurrent access
-- [ ] Callback URLs stored per-lease (not globally)
 - [ ] Health endpoint returns 200 when operational
 - [ ] Graceful shutdown (finish in-flight provisions)
 - [ ] (Optional) `/stats` endpoint for resource monitoring

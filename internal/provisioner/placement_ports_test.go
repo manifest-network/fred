@@ -18,7 +18,7 @@ var (
 	_ ReconcilerOperations = (*operation.Registry)(nil)
 )
 
-func TestPlacementPortsExcludeRawAndUnrelatedAuthority(t *testing.T) {
+func TestPlacementPortsExposeOnlyConsumerOwnedAuthority(t *testing.T) {
 	provision := reflect.TypeOf((*ProvisionPlacement)(nil)).Elem()
 	reconciler := reflect.TypeOf((*ReconcilerPlacement)(nil)).Elem()
 	aggregate := reflect.TypeOf((*PlacementAuthorityStore)(nil)).Elem()
@@ -27,24 +27,14 @@ func TestPlacementPortsExcludeRawAndUnrelatedAuthority(t *testing.T) {
 	require.True(t, aggregate.Implements(reconciler))
 
 	for _, method := range []string{
-		"SetAttempting", "SetAttemptingIfNotNewer", "Confirm",
-		"ConfirmAttemptIfRevision", "ClearAttemptIfRevision",
-		"SetBatchIfNotNewer", "DeleteIfRevision",
-	} {
-		_, provisionExposes := provision.MethodByName(method)
-		_, reconcilerExposes := reconciler.MethodByName(method)
-		assert.False(t, provisionExposes, "provision port exposes raw method %s", method)
-		assert.False(t, reconcilerExposes, "reconciler port exposes raw method %s", method)
-	}
-
-	for _, method := range []string{
-		"BeginInventorySession", "ProjectInventory", "MarkInventoryReady",
-		"InvalidateInventoryAuthority", "DeleteRecord",
+		"BeginInventorySession", "ProjectInventory", "DeleteRecord",
 	} {
 		_, exposed := provision.MethodByName(method)
 		assert.False(t, exposed, "provision port exposes reconciler method %s", method)
 	}
-	for _, method := range []string{"BeginAttempt", "ConfirmOperation", "RefuseOperation"} {
+	for _, method := range []string{
+		"BeginRestore", "ConfirmRestore", "ConfirmOperation", "RefuseOperation",
+	} {
 		_, exposed := reconciler.MethodByName(method)
 		assert.False(t, exposed, "reconciler port exposes unrelated method %s", method)
 	}

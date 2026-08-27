@@ -64,6 +64,24 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 				// never the deprovision retain-success path — so retained=false.
 				b.sendCallbackWithURL(uuid, url, status, errMsg, false)
 			},
+			SendLifecycleCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
+				if url == "" {
+					b.provisionsMu.RLock()
+					var completionURL string
+					if provision, exists := b.provisions[uuid]; exists {
+						completionURL = provision.CallbackURL
+					}
+					b.provisionsMu.RUnlock()
+					resolved, err := backend.ResolveLifecycleCallbackURL(completionURL, "")
+					if err != nil {
+						b.logger.Error("cannot derive lifecycle callback URL; suppressing observational callback",
+							"lease_uuid", uuid, "error", err)
+						return
+					}
+					url = resolved
+				}
+				b.sendCallbackWithURL(uuid, url, status, errMsg, false)
+			},
 			DoDeprovisionFn: func(ctx context.Context, leaseUUID string) error {
 				return b.doDeprovision(ctx, leaseUUID)
 			},

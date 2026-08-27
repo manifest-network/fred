@@ -333,6 +333,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
 		return
 	}
+	if req.LifecycleCallbackURL != "" {
+		if err := validateCallbackURL(req.LifecycleCallbackURL); err != nil {
+			s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid lifecycle_callback_url: %s", err))
+			return
+		}
+	}
 	if len(req.Items) == 0 {
 		s.errorResponse(w, http.StatusBadRequest, "items is required")
 		return
@@ -461,7 +467,6 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
 		return
 	}
-
 	err := s.backend.Restart(r.Context(), req)
 	if err != nil {
 		if errors.Is(err, backend.ErrNotProvisioned) {
@@ -470,6 +475,10 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrInvalidState) {
 			s.errorResponse(w, http.StatusConflict, "invalid state for restart")
+			return
+		}
+		if errors.Is(err, backend.ErrValidation) {
+			s.validationErrorResponse(w, err)
 			return
 		}
 		s.logger.Error("restart failed", "lease_uuid", req.LeaseUUID, "error", err)
@@ -502,6 +511,12 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	if err := validateCallbackURL(req.CallbackURL); err != nil {
 		s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid callback_url: %s", err))
 		return
+	}
+	if req.LifecycleCallbackURL != "" {
+		if err := validateCallbackURL(req.LifecycleCallbackURL); err != nil {
+			s.errorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid lifecycle_callback_url: %s", err))
+			return
+		}
 	}
 
 	err := s.backend.Restore(r.Context(), req)
