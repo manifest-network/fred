@@ -85,10 +85,48 @@ type reconcilerTestEnv struct {
 	providerUUID string
 }
 
+// installExactLeaseLookupFallback makes the integration chain double obey the
+// same list/get contract as the real ledger. Typed reconciliation re-reads a
+// lease under its lifecycle claim immediately before dispatch; returning nil
+// there means "the lease disappeared" and must safely defer the action. Tests
+// that need a different terminal-state answer install their own GetLeaseFunc,
+// which this helper deliberately preserves.
+func installExactLeaseLookupFallback(chainClient *chaintest.MockClient, providerUUID string) {
+	if chainClient.GetLeaseFunc != nil {
+		return
+	}
+	chainClient.GetLeaseFunc = func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+		pending, err := chainClient.GetPendingLeases(ctx, providerUUID)
+		if err != nil {
+			return nil, err
+		}
+		for i := range pending {
+			if pending[i].Uuid == leaseUUID {
+				lease := pending[i]
+				return &lease, nil
+			}
+		}
+
+		active, err := chainClient.GetActiveLeasesByProvider(ctx, providerUUID)
+		if err != nil {
+			return nil, err
+		}
+		for i := range active {
+			if active[i].Uuid == leaseUUID {
+				lease := active[i]
+				return &lease, nil
+			}
+		}
+		return nil, nil
+	}
+}
+
 // testReconcilerSetup creates a full-stack test environment:
 // real docker backend + reconciler + mock chain + tracker + payload store.
 func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraCfg ...func(*Config)) *reconcilerTestEnv {
 	t.Helper()
+	const providerUUID = "test-provider"
+	installExactLeaseLookupFallback(chainClient, providerUUID)
 
 	callbackServer, callbackCh := startCallbackServer(t)
 
@@ -123,8 +161,6 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 	placementStore, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = placementStore.Close() })
-
-	providerUUID := "test-provider"
 
 	// Create a simple acknowledger that delegates to chainClient for integration tests
 	integrationAck := &integrationAcknowledger{chainClient: chainClient}
