@@ -17,14 +17,16 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 )
 
 // poisonTopic is the Watermill dead-letter topic for messages that exhaust retries.
 const poisonTopic = "events.poison"
 
-// Compile-time check that Manager implements ReconcilerTracker.
-var _ ReconcilerTracker = (*Manager)(nil)
+// Manager is the typed production runtime. Legacy tracker forwarding needed by
+// older package tests is compiled only into the test binary.
+var _ ReconcilerRuntime = (*Manager)(nil)
 
 // Manager handles the provisioning lifecycle using Watermill for event routing.
 type Manager struct {
@@ -35,7 +37,7 @@ type Manager struct {
 	publisher       message.Publisher
 	wmRouter        *message.Router
 	payloadStore    *payload.Store
-	placementStore  PlacementStore
+	placementStore  PlacementAuthorityStore
 	ackBatcher      *AckBatcher
 
 	// stopCtx bounds work that outlives the call which started it — today the
@@ -53,6 +55,9 @@ type Manager struct {
 
 	// Track in-flight provisions (ephemeral - recovered via reconciliation)
 	tracker InFlightTracker
+	// operations is the single typed registry owned by this manager. tracker is
+	// only its temporary compatibility adapter; it holds no duplicate state.
+	operations *operation.Registry
 
 	// Orchestrator for provisioning coordination
 	orchestrator *ProvisionOrchestrator
@@ -76,15 +81,15 @@ type LeaseEventSink interface {
 // ManagerConfig configures the provision manager.
 type ManagerConfig struct {
 	ProviderUUID         string
-	CallbackBaseURL      string         // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
-	PayloadStore         *payload.Store // Optional external payload store (if nil, manager won't handle payloads)
-	PlacementStore       PlacementStore // Optional placement store for round-robin routing (nil = disabled)
-	LeaseEventSink       LeaseEventSink // Optional sink for real-time lease events (nil = disabled)
-	CallbackTimeout      time.Duration  // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
-	TimeoutCheckInterval time.Duration  // How often to check for timeouts (default: 1 minute)
-	AckBatchInterval     time.Duration  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
-	AckBatchSize         int            // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
-	AckLaneCount         int            // Number of parallel ack lanes (default: 1)
+	CallbackBaseURL      string                  // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
+	PayloadStore         *payload.Store          // Optional external payload store (if nil, manager won't handle payloads)
+	PlacementStore       PlacementAuthorityStore // Required durable multi-backend placement authority
+	LeaseEventSink       LeaseEventSink          // Optional sink for real-time lease events (nil = disabled)
+	CallbackTimeout      time.Duration           // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
+	TimeoutCheckInterval time.Duration           // How often to check for timeouts (default: 1 minute)
+	AckBatchInterval     time.Duration           // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
+	AckBatchSize         int                     // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
+	AckLaneCount         int                     // Number of parallel ack lanes (default: 1)
 }
 
 // NewManager creates a new provision manager with Watermill routing.
@@ -100,6 +105,14 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	}
 	if cfg.CallbackBaseURL == "" {
 		return nil, errors.New("callback base URL is required")
+	}
+	if isNilPlacementAuthorityStore(cfg.PlacementStore) {
+		return nil, ErrPlacementStoreUnavailable
+	}
+	if err := cfg.PlacementStore.ConfigureBackendTopology(
+		backendTopologyNames(router),
+	); err != nil {
+		return nil, fmt.Errorf("configure placement backend topology: %w", err)
 	}
 
 	// Apply defaults for callback timeout using cmp.Or
@@ -155,18 +168,45 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	// whose first ack is gated behind <-Running() in cmd/providerd/main.go.
 
 	tracker := NewInFlightTracker()
-	orchestrator := NewProvisionOrchestrator(cfg.ProviderUUID, cfg.CallbackBaseURL, router, tracker, cfg.PlacementStore)
+	operations := tracker.Operations()
+	orchestrator, err := NewProvisionOrchestrator(
+		cfg.ProviderUUID, cfg.CallbackBaseURL, router, operations, cfg.PlacementStore,
+		provisionStartEventSinkFunc(func(leaseUUID string) {
+			publishLeaseStatusEvent(pubSub, leaseUUID, backend.ProvisionStatusProvisioning, "")
+		}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create provision orchestrator: %w", err)
+	}
+	callbacks, err := NewCallbackService(CallbackServiceConfig{
+		Operations:   operations,
+		Chain:        chainClient,
+		Acknowledger: ackBatcher,
+		Placement:    cfg.PlacementStore,
+		Payloads:     cfg.PayloadStore,
+		Events: callbackEventSinkFunc(func(
+			leaseUUID string, status backend.ProvisionStatus, failure string,
+		) {
+			publishLeaseStatusEvent(pubSub, leaseUUID, status, failure)
+		}),
+		Backends: router,
+		DeprovisionObserver: callbackDeprovisionObserverFunc(
+			orchestrator.forgetDeprovisionCandidate,
+		),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create callback service: %w", err)
+	}
 	handlers := NewHandlerSet(HandlerDeps{
-		ChainClient:   chainClient,
-		Orchestrator:  orchestrator,
-		Tracker:       tracker,
-		Acknowledger:  ackBatcher,
-		PayloadStore:  cfg.PayloadStore,
-		Publisher:     pubSub,
-		BackendRouter: router,
+		ChainClient:     chainClient,
+		Orchestrator:    orchestrator,
+		EventOperations: operations,
+		PayloadStore:    cfg.PayloadStore,
+		Publisher:       pubSub,
+		Callbacks:       callbacks,
 	})
 	timeoutChecker := NewTimeoutChecker(TimeoutCheckerConfig{
-		Tracker:       tracker,
+		Operations:    operations,
 		Rejecter:      chainClient,
 		Timeout:       callbackTimeout,
 		CheckInterval: timeoutCheckInterval,
@@ -183,6 +223,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		placementStore:       cfg.PlacementStore,
 		ackBatcher:           ackBatcher,
 		tracker:              tracker,
+		operations:           operations,
 		orchestrator:         orchestrator,
 		timeoutChecker:       timeoutChecker,
 		callbackTimeout:      callbackTimeout,
@@ -258,6 +299,25 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	return m, nil
 }
 
+// backendTopologyNames returns the router's exact durable storage identities.
+// It intentionally preserves the router's inventory boundary; canonical
+// sorting and validation belong to the placement store that persists it.
+func backendTopologyNames(router BackendRouter) []string {
+	if isNilCapability(router) {
+		return nil
+	}
+	backends := router.Backends()
+	names := make([]string, 0, len(backends))
+	for _, candidate := range backends {
+		if candidate == nil {
+			names = append(names, "")
+			continue
+		}
+		names = append(names, candidate.Name())
+	}
+	return names
+}
+
 // forwardToEventSink is a Watermill handler that deserializes LeaseStatusEvent messages
 // and forwards them to the event sink for real-time client delivery.
 func (m *Manager) forwardToEventSink(msg *message.Message) error {
@@ -269,6 +329,15 @@ func (m *Manager) forwardToEventSink(msg *message.Message) error {
 
 	m.leaseEventSink.Publish(event)
 	return nil
+}
+
+// PublishProvisionStarting implements the narrow start-event capability used
+// by reconciliation. Publishing remains best-effort and preserves the same
+// Watermill ordering as event-driven provisioning and callbacks.
+func (m *Manager) PublishProvisionStarting(leaseUUID string) {
+	publishLeaseStatusEvent(
+		m.publisher, leaseUUID, backend.ProvisionStatusProvisioning, "",
+	)
 }
 
 // Start begins the Watermill router and callback timeout checker.

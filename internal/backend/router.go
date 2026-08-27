@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,8 +88,15 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}
 
 	for i, entry := range cfg.Backends {
-		if entry.Backend == nil {
+		if isNilBackend(entry.Backend) {
 			return nil, fmt.Errorf("backend at index %d is nil", i)
+		}
+		name := entry.Backend.Name()
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("backend at index %d has an empty name", i)
+		}
+		if _, exists := r.backendsByName[name]; exists {
+			return nil, fmt.Errorf("duplicate backend name %q", name)
 		}
 
 		r.backends = append(r.backends, backendEntry{
@@ -95,11 +104,10 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 			match:   entry.Match,
 		})
 
-		// Build name lookup map (first backend with a given name wins)
-		name := entry.Backend.Name()
-		if _, exists := r.backendsByName[name]; !exists {
-			r.backendsByName[name] = entry.Backend
-		}
+		// A backend name is durable placement identity. Ambiguous or empty names
+		// are rejected above instead of silently changing which machine owns a
+		// placement lookup.
+		r.backendsByName[name] = entry.Backend
 
 		if entry.IsDefault {
 			if r.defaultBackend != nil {
@@ -115,6 +123,20 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}
 
 	return r, nil
+}
+
+func isNilBackend(candidate Backend) bool {
+	if candidate == nil {
+		return true
+	}
+	value := reflect.ValueOf(candidate)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 // Route returns the appropriate backend for the given SKU.
@@ -147,15 +169,21 @@ func (r *Router) RouteAll(sku string) []Backend {
 // RouteRoundRobin distributes requests across all backends matching the SKU
 // using round-robin selection. Falls back to the default backend if no match.
 func (r *Router) RouteRoundRobin(sku string) Backend {
-	matches := r.RouteAll(sku)
-	switch len(matches) {
+	return r.routeRoundRobin(r.RouteAll(sku), r.defaultBackend)
+}
+
+// routeRoundRobin selects only from candidates. fallback is used solely when
+// candidates is empty, which lets eligibility-aware callers retain the normal
+// default-backend behavior without widening their candidate set.
+func (r *Router) routeRoundRobin(candidates []Backend, fallback Backend) Backend {
+	switch len(candidates) {
 	case 0:
-		return r.defaultBackend
+		return fallback
 	case 1:
-		return matches[0]
+		return candidates[0]
 	default:
 		idx := r.counter.Add(1) - 1
-		return matches[idx%uint64(len(matches))]
+		return candidates[idx%uint64(len(candidates))]
 	}
 }
 
@@ -192,10 +220,53 @@ const cpuRatioEpsilon = 1e-9
 // over-targeted backend and provision QPS is low. The round-robin counter is
 // shared with RouteRoundRobin, so tie rotation is intentionally approximate.
 func (r *Router) RouteForProvision(ctx context.Context, sku string, inFlightByBackend map[string]int) Backend {
-	candidates := r.RouteAll(sku)
+	return r.routeForProvision(ctx, r.RouteAll(sku), r.defaultBackend, inFlightByBackend)
+}
+
+// RouteForProvisionAmong selects a provision backend using the same SKU,
+// default, and load-balancing rules as RouteForProvision, but treats
+// eligibleNames as a hard routing boundary. An empty set, or a set containing
+// neither a matching backend nor the default backend, yields nil.
+//
+// When matching candidates expose no usable load stats, round-robin fallback is
+// restricted to those eligible candidates. The default backend is considered
+// only when no eligible backend matches the SKU, and only when it is itself
+// eligible.
+func (r *Router) RouteForProvisionAmong(
+	ctx context.Context,
+	sku string,
+	eligibleNames map[string]struct{},
+	inFlightByBackend map[string]int,
+) Backend {
+	if len(eligibleNames) == 0 {
+		return nil
+	}
+
+	allCandidates := r.RouteAll(sku)
+	candidates := make([]Backend, 0, len(allCandidates))
+	for _, candidate := range allCandidates {
+		if _, eligible := eligibleNames[candidate.Name()]; eligible {
+			candidates = append(candidates, candidate)
+		}
+	}
+
+	var fallback Backend
+	if _, eligible := eligibleNames[r.defaultBackend.Name()]; eligible {
+		fallback = r.defaultBackend
+	}
+
+	return r.routeForProvision(ctx, candidates, fallback, inFlightByBackend)
+}
+
+func (r *Router) routeForProvision(
+	ctx context.Context,
+	candidates []Backend,
+	fallback Backend,
+	inFlightByBackend map[string]int,
+) Backend {
 	switch len(candidates) {
 	case 0:
-		return r.defaultBackend
+		return fallback
 	case 1:
 		return candidates[0]
 	}
@@ -248,7 +319,7 @@ func (r *Router) RouteForProvision(ctx context.Context, sku string, inFlightByBa
 		if r.routingFallback != nil {
 			r.routingFallback.Inc()
 		}
-		return r.RouteRoundRobin(sku)
+		return r.routeRoundRobin(candidates, fallback)
 	}
 
 	// 1) Lowest CPU ratio.

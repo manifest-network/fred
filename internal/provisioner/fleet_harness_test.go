@@ -102,6 +102,10 @@ type fakeBackendServer struct {
 	listCalls         int
 	retentionCalls    int
 	provisionCalls    map[string]int
+	provisionRequests map[string]backend.ProvisionRequest
+	restoreCalls      map[string]int
+	restoreRequests   map[string]backend.RestoreRequest
+	restoreHook       func(context.Context, backend.RestoreRequest) error
 	deprovisionCalls  map[string]int
 	customDomainCalls map[string]int
 }
@@ -115,6 +119,9 @@ func newFakeBackendServer(t *testing.T, name string) *fakeBackendServer {
 		fault:             faultNone,
 		hangFor:           2 * time.Second,
 		provisionCalls:    make(map[string]int),
+		provisionRequests: make(map[string]backend.ProvisionRequest),
+		restoreCalls:      make(map[string]int),
+		restoreRequests:   make(map[string]backend.RestoreRequest),
 		deprovisionCalls:  make(map[string]int),
 		customDomainCalls: make(map[string]int),
 	}
@@ -126,6 +133,7 @@ func newFakeBackendServer(t *testing.T, name string) *fakeBackendServer {
 	mux.HandleFunc("GET /stats", f.handleStats)
 	mux.HandleFunc("GET /health", f.handleHealth)
 	mux.HandleFunc("POST /provision", f.handleProvision)
+	mux.HandleFunc("POST /restore", f.handleRestore)
 	mux.HandleFunc("POST /deprovision", f.handleDeprovision)
 	mux.HandleFunc("POST /reconcile_custom_domain", f.handleReconcileCustomDomain)
 
@@ -368,10 +376,37 @@ func (f *fakeBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 
 	f.mu.Lock()
 	f.provisionCalls[req.LeaseUUID]++
+	f.provisionRequests[req.LeaseUUID] = req
 	f.mu.Unlock()
 
 	if err := f.mock.Provision(r.Context(), req); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func (f *fakeBackendServer) handleRestore(w http.ResponseWriter, r *http.Request) {
+	var req backend.RestoreRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	f.mu.Lock()
+	f.restoreCalls[req.LeaseUUID]++
+	f.restoreRequests[req.LeaseUUID] = req
+	hook := f.restoreHook
+	f.mu.Unlock()
+
+	var err error
+	if hook != nil {
+		err = hook(r.Context(), req)
+	} else {
+		err = f.mock.Restore(r.Context(), req)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -439,6 +474,34 @@ func (f *fakeBackendServer) provisionCount(leaseUUID string) int {
 	return f.provisionCalls[leaseUUID]
 }
 
+func (f *fakeBackendServer) provisionRequest(leaseUUID string) (backend.ProvisionRequest, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	req, ok := f.provisionRequests[leaseUUID]
+	return req, ok
+}
+
+func (f *fakeBackendServer) setRestoreHook(
+	hook func(context.Context, backend.RestoreRequest) error,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restoreHook = hook
+}
+
+func (f *fakeBackendServer) restoreCount(leaseUUID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.restoreCalls[leaseUUID]
+}
+
+func (f *fakeBackendServer) restoreRequest(leaseUUID string) (backend.RestoreRequest, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	req, ok := f.restoreRequests[leaseUUID]
+	return req, ok
+}
+
 func (f *fakeBackendServer) deprovisionCount(leaseUUID string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -472,6 +535,10 @@ func (f *fakeBackendServer) listCallCount() int {
 // backends, generous page sizes, placement tracking on.
 type fleetOptions struct {
 	backendCount int
+	// backendSKUs assigns exact SKU matches by one-based backend index. It lets
+	// routing tests make an unhealthy backend uniquely preferable without
+	// changing the default-backend topology used by other scenarios.
+	backendSKUs map[int][]string
 	// pageLimit sets the client's requested page size for both list endpoints.
 	// Set it to 1 to force multi-page walks (needed by faultPage2).
 	pageLimit int
@@ -497,16 +564,20 @@ type fleetOptions struct {
 }
 
 type fleet struct {
-	t            *testing.T
-	servers      []*fakeBackendServer
-	byName       map[string]*fakeBackendServer
-	router       *backend.Router
-	reconciler   *Reconciler
-	chain        *chaintest.MockClient
-	placement    *placement.Store
-	payloads     *payload.Store
-	tracker      *mockInFlightTracker
-	providerUUID string
+	t             *testing.T
+	servers       []*fakeBackendServer
+	byName        map[string]*fakeBackendServer
+	router        *backend.Router
+	reconciler    *Reconciler
+	chain         *chaintest.MockClient
+	placement     *placement.Store
+	payloads      *payload.Store
+	tracker       *fleetReconcilerTracker
+	providerUUID  string
+	placementPath string
+	placementAge  time.Duration
+	acknowledger  Acknowledger
+	reconcilerCfg ReconcilerConfig
 
 	chainMu  sync.Mutex
 	acked    []string
@@ -516,6 +587,27 @@ type fleet struct {
 	leaseMu     sync.Mutex
 	leases      map[string]billingtypes.Lease
 	getLeaseErr error
+}
+
+// fleetReconcilerTracker composes the production operation registry with the
+// payload capabilities consumed by reconciliation. The loopback HTTP harness
+// therefore exercises the same typed claim/token path as providerd instead of
+// the raw-generation compatibility mock used by isolated unit tests.
+type fleetReconcilerTracker struct {
+	*DefaultInFlightTracker
+	payloads *payload.Store
+}
+
+func (tracker *fleetReconcilerTracker) ReconcilerOperations() ReconcilerOperations {
+	return tracker.Operations()
+}
+
+func (tracker *fleetReconcilerTracker) HasPayload(leaseUUID string) (bool, error) {
+	return tracker.payloads.Has(leaseUUID)
+}
+
+func (tracker *fleetReconcilerTracker) PayloadStore() *payload.Store {
+	return tracker.payloads
 }
 
 func newFleet(t *testing.T, opts fleetOptions) *fleet {
@@ -562,7 +654,13 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 			MaxRetentionsBytes:  opts.maxProvisionsBytes,
 		})
 
-		entries = append(entries, backend.BackendEntry{Backend: client, IsDefault: i == 0})
+		entries = append(entries, backend.BackendEntry{
+			Backend: client,
+			Match: backend.MatchCriteria{
+				SKUs: slices.Clone(opts.backendSKUs[i+1]),
+			},
+			IsDefault: i == 0,
+		})
 	}
 
 	router, err := backend.NewRouter(backend.RouterConfig{Backends: entries})
@@ -575,19 +673,22 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = payloads.Close() })
 	f.payloads = payloads
-	f.tracker = newMockInFlightTracker(payloads)
+	f.tracker = &fleetReconcilerTracker{
+		DefaultInFlightTracker: NewInFlightTracker(),
+		payloads:               payloads,
+	}
 
-	var placementStore PlacementStore
 	if !opts.noPlacement {
 		age := opts.placementAge
+		f.placementAge = age
+		f.placementPath = filepath.Join(t.TempDir(), "placements.db")
 		ps, err := placement.NewStore(
-			filepath.Join(t.TempDir(), "placements.db"),
+			f.placementPath,
 			placement.WithClock(func() time.Time { return time.Now().Add(-age) }),
 		)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = ps.Close() })
 		f.placement = ps
-		placementStore = ps
 	}
 
 	f.chain = &chaintest.MockClient{
@@ -639,17 +740,56 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 			return true, "tx-hash", nil
 		},
 	}
+	f.acknowledger = ack
 
-	rec, err := NewReconciler(ReconcilerConfig{
+	reconcilerConfig := ReconcilerConfig{
 		ProviderUUID:           f.providerUUID,
 		CallbackBaseURL:        "http://fred.invalid",
 		Interval:               opts.interval,
 		MaxReprovisionAttempts: 3,
-	}, f.chain, ack, router, f.tracker, placementStore)
+	}
+	f.reconcilerCfg = reconcilerConfig
+	var rec *Reconciler
+	if opts.noPlacement {
+		// Retained only to characterize the pre-mandatory-placement safety guard.
+		// Supported production composition goes through NewReconciler below.
+		rec, err = newReconciler(reconcilerConfig, f.chain, ack, router, f.tracker, nil)
+	} else {
+		rec, err = NewReconciler(reconcilerConfig, f.chain, ack, router, f.tracker, f.placement)
+	}
 	require.NoError(t, err)
 	f.reconciler = rec
 
 	return f
+}
+
+// restartReconciler closes and reopens the durable placement database, then
+// constructs a fresh reconciler over the same chain, router, payloads, and
+// operation registry. It models a fred process restart without restarting the
+// backend nodes.
+func (f *fleet) restartReconciler() {
+	f.t.Helper()
+	require.NotNil(f.t, f.placement)
+	require.NoError(f.t, f.placement.Close())
+
+	store, err := placement.NewStore(
+		f.placementPath,
+		placement.WithClock(func() time.Time { return time.Now().Add(-f.placementAge) }),
+	)
+	require.NoError(f.t, err)
+	f.t.Cleanup(func() { _ = store.Close() })
+	f.placement = store
+
+	reconciler, err := NewReconciler(
+		f.reconcilerCfg,
+		f.chain,
+		f.acknowledger,
+		f.router,
+		f.tracker,
+		store,
+	)
+	require.NoError(f.t, err)
+	f.reconciler = reconciler
 }
 
 // backendAt returns the i-th backend server (1-indexed to match its name).

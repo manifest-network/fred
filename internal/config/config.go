@@ -129,7 +129,8 @@ type Config struct {
 	// Payload store configuration
 	PayloadStoreDBPath string `mapstructure:"payload_store_db_path"`
 
-	// Placement store configuration (enables round-robin backend routing)
+	// Placement store configuration. This durable authority is required because
+	// providerd always operates against a multi-backend placement pool.
 	PlacementStoreDBPath string `mapstructure:"placement_store_db_path"`
 
 	// Shutdown configuration
@@ -557,6 +558,13 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("production_mode: backends[%d].url: %w", i, err)
 			}
 		}
+	}
+
+	// Durable placement is part of the correctness boundary for every
+	// deployment. Without it, a restart or ambiguous backend response could
+	// route the same lease to a different backend.
+	if c.PlacementStoreDBPath == "" {
+		return fmt.Errorf("placement_store_db_path is required for durable multi-backend placement")
 	}
 
 	return nil

@@ -239,7 +239,14 @@ tenant_rate_limit_burst: 10
 # BACKEND CONFIGURATION (required)
 # =============================================================================
 # Backends handle the actual provisioning of resources when leases are created.
-# At least one backend must be configured with default: true.
+# Configure at least one backend. At most one may set default: true; if none
+# does, the first configured backend is the fallback.
+#
+# name is a case-sensitive durable placement identity. It must be non-blank and
+# exactly unique, and must not change while placements or retained data refer to
+# it. Removing or renaming a referenced identity is rejected; it does not migrate
+# data. Once a drained name is removed, placement metadata retires it forever.
+# Never reuse it for the same or different storage; give a replacement a new name.
 #
 # ROUTING:
 #   Leases are routed to backends using the skus field — an exact list of
@@ -271,7 +278,7 @@ backends:
   - name: mock
     url: "http://localhost:9000"    # Backend API base URL
     timeout: 30s                     # Request timeout for backend API calls
-    default: true                    # Mark as default (exactly one required)
+    default: true                    # Optional fallback marker (at most one)
 
   # ---------------------------------------------------------------------------
   # Exact UUID matching examples (production with on-chain SKU UUIDs)
@@ -471,24 +478,28 @@ token_tracker_db_path: "/var/lib/fred/tokens.db"
 payload_store_db_path: "/var/lib/fred/payloads.db"
 
 # =============================================================================
-# PLACEMENT STORE (required for restore and correct multi-backend routing)
+# PLACEMENT STORE (required)
 # =============================================================================
 # Records which backend is serving each lease so that read operations
 # (connection details, logs, provision diagnostics) are routed correctly.
 #
-# Required for POST /v1/leases/{uuid}/restore and when multiple backends share
-# the same match criteria (skus list). Restore returns 503 before contacting a
-# backend when this store is disabled. Without it, fresh provisions are still
-# distributed across matching backends (least-loaded, with round-robin
-# fallback), but reads fall back to match-based routing (first match) and may
-# hit the wrong backend.
+# Production deployments use multiple backends. Providerd also refuses to start
+# without this path in single-backend development/test: the store provides
+# write-ahead placement safety, correct read routing, restore ownership, and
+# restart recovery in every mode.
 #
-# If not set, the placement store is disabled. This is supported only for
-# deployments that do not use restore and accept match-based read routing.
+# A complete /provisions plus /retentions inventory establishes a durable
+# baseline bound to the configured backend names. The baseline survives provider
+# restarts and transient backend outages while those names are unchanged. A new
+# database or topology change requires another complete inventory before
+# recordless admission. During a later partial sweep, only genuinely new
+# recordless PENDING work may use the typed set of backends that answered both
+# inventories; owned work, recordless ACTIVE recovery, attempts, and conflicts
+# remain deferred. Inventory silence never clears an attempt or conflict.
 #
 # The database file is created automatically. Ensure the directory exists
 # and fred has write permissions.
-# placement_store_db_path: "/var/lib/fred/placements.db"
+placement_store_db_path: "/var/lib/fred/placements.db"
 
 # =============================================================================
 # ADVANCED: HTTP SERVER TIMEOUTS

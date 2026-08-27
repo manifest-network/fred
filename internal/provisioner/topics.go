@@ -3,9 +3,12 @@ package provisioner
 import (
 	"context"
 	"errors"
-	"strconv"
+	"fmt"
+	"net/url"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
 // Sentinel errors for provisioner operations.
@@ -62,22 +65,30 @@ const (
 // CallbackPath is the path suffix for backend provision callbacks.
 const CallbackPath = "/callbacks/provision"
 
-// CallbackOperationGenerationParam carries the initiating tracker's operation
-// identity in the callback URL. Callback HMACs cover RequestURI, so the value
+// CallbackOperationIDParam carries the initiating operation's identity in the
+// callback URL. Callback HMACs cover RequestURI, so the value
 // cannot be changed independently of the signed backend request.
-const CallbackOperationGenerationParam = "operation_generation"
+const CallbackOperationIDParam = operation.QueryParameter
 
 // BuildCallbackURL constructs the full callback URL from a base URL.
 func BuildCallbackURL(baseURL string) string {
 	return baseURL + CallbackPath
 }
 
-// BuildCallbackURLForGeneration binds a callback to one in-flight operation.
-func BuildCallbackURLForGeneration(baseURL string, generation uint64) string {
-	if generation == 0 {
-		return BuildCallbackURL(baseURL)
+// BuildCallbackURLForOperation binds a callback to a validated operation ID.
+// Invalid IDs and malformed base URLs fail instead of silently emitting an
+// unscoped callback address.
+func BuildCallbackURLForOperation(baseURL string, operationID operation.OperationID) (string, error) {
+	callbackURL, err := url.Parse(BuildCallbackURL(baseURL))
+	if err != nil {
+		return "", fmt.Errorf("parse callback URL: %w", err)
 	}
-	return BuildCallbackURL(baseURL) + "?" + CallbackOperationGenerationParam + "=" + strconv.FormatUint(generation, 10)
+	query := callbackURL.Query()
+	if err := operation.SetQuery(query, operationID); err != nil {
+		return "", fmt.Errorf("set callback operation ID: %w", err)
+	}
+	callbackURL.RawQuery = query.Encode()
+	return callbackURL.String(), nil
 }
 
 // ChainClient defines the chain operations needed by the provisioner.

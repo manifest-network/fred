@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
 func newTestStore(t *testing.T, opts ...Option) *Store {
@@ -33,6 +37,35 @@ func requireSetAttempting(t *testing.T, s *Store, leaseUUID, backendName string)
 func setAttemptingErr(s *Store, leaseUUID, backendName string) error {
 	_, err := s.SetAttempting(leaseUUID, backendName)
 	return err
+}
+
+func requireOperationID(t *testing.T, value string) operation.OperationID {
+	t.Helper()
+	sequence, err := strconv.ParseUint(value, 10, 64)
+	require.NoError(t, err)
+	id, err := testOperationID(sequence)
+	require.NoError(t, err)
+	return id
+}
+
+func requireAdmissionBaseline(
+	t *testing.T,
+	s *Store,
+	backendNames ...string,
+) AdmissionBaseline {
+	t.Helper()
+	require.NoError(t, s.ConfigureBackendTopology(backendNames))
+	fence := s.BeginInventorySession()
+	_, err := s.ProjectInventory(fence, InventoryProjection{Complete: true})
+	s.EndInventorySession(fence)
+	require.NoError(t, err)
+	baseline := s.CurrentAdmissionBaseline()
+	require.True(t, baseline.Valid())
+	return baseline
+}
+
+func testOperationID(sequence uint64) (operation.OperationID, error) {
+	return operation.ParseID(fmt.Sprintf("00000000-0000-4000-8000-%012x", sequence))
 }
 
 func requireSetBatchIfNotNewer(
@@ -76,6 +109,26 @@ func writeRawRecords(t *testing.T, dbPath string, records map[string][]byte) {
 		return nil
 	}))
 	require.NoError(t, db.Close())
+}
+
+func readRawRecords(t *testing.T, dbPath string, leaseUUIDs ...string) map[string][]byte {
+	t.Helper()
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+
+	records := make(map[string][]byte, len(leaseUUIDs))
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		if b == nil {
+			return errors.New("placements bucket missing")
+		}
+		for _, leaseUUID := range leaseUUIDs {
+			records[leaseUUID] = append([]byte(nil), b.Get([]byte(leaseUUID))...)
+		}
+		return nil
+	}))
+	require.NoError(t, db.Close())
+	return records
 }
 
 func TestPlacement_StateAndString(t *testing.T) {
@@ -193,6 +246,767 @@ func TestStore_AttemptConfirmAndClearLifecycle(t *testing.T) {
 	assert.Equal(t, clearNoopRevision, s.SnapshotRevision())
 }
 
+func TestStore_TypedAttemptsRequireInventoryAuthority(t *testing.T) {
+	s := newTestStore(t)
+	op1 := requireOperationID(t, "101")
+
+	assert.False(t, (RecordRevision{}).Valid())
+	assert.False(t, (InventoryFence{}).Valid())
+	assert.False(t, (AttemptToken{}).Valid())
+	assert.False(t, (AttemptToken{}).OperationID().Valid())
+
+	startupFence := s.SnapshotFence()
+	assert.True(t, startupFence.Valid(), "an explicitly minted revision-zero fence is valid")
+	token, err := s.BeginAttempt("lease-1", "backend-a", operation.OperationID{})
+	require.ErrorIs(t, err, operation.ErrInvalidID)
+	assert.False(t, token.Valid())
+	token, err = s.BeginAttempt("lease-1", "backend-a", op1)
+	require.ErrorIs(t, err, ErrInventoryNotReady)
+	assert.False(t, token.Valid())
+	token, applied, err := s.BeginAttemptIfNotNewer(
+		"lease-1", "backend-a", op1, startupFence,
+	)
+	require.ErrorIs(t, err, ErrInventoryNotReady)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State())
+
+	s.MarkInventoryReady()
+	_, applied, err = s.BeginAttemptIfNotNewer(
+		"lease-zero-fence", "backend-a", requireOperationID(t, "100"), InventoryFence{},
+	)
+	require.ErrorIs(t, err, ErrInvalidInventoryFence)
+	assert.False(t, applied)
+	token, applied, err = s.BeginAttemptIfNotNewer(
+		"lease-1", "backend-a", op1, startupFence,
+	)
+	require.NoError(t, err)
+	assert.True(t, applied)
+	require.True(t, token.Valid())
+	assert.Equal(t, op1, token.OperationID())
+	p := s.Lookup("lease-1")
+	assert.Equal(t, StateAttempting, p.State())
+	assert.True(t, p.RecordRevision().Valid())
+	assert.Equal(t, op1, p.AttemptOperationID())
+
+	settled, err := s.RefuseAttempt(token)
+	require.NoError(t, err)
+	assert.True(t, settled)
+	s.InvalidateInventoryAuthority()
+	token, err = s.BeginAttempt("lease-2", "backend-a", requireOperationID(t, "102"))
+	require.ErrorIs(t, err, ErrInventoryNotReady)
+	assert.False(t, token.Valid())
+
+	// Re-establishing authority does not revive evidence minted before the
+	// invalidation boundary.
+	s.MarkInventoryReady()
+	token, applied, err = s.BeginAttemptIfNotNewer(
+		"lease-2", "backend-a", requireOperationID(t, "103"), startupFence,
+	)
+	require.ErrorIs(t, err, ErrInvalidInventoryFence)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+}
+
+func TestStore_TypedAttemptSettlementRequiresExactToken(t *testing.T) {
+	s := newTestStore(t)
+	s.MarkInventoryReady()
+
+	confirmed, err := s.ConfirmAttempt(AttemptToken{})
+	require.ErrorIs(t, err, ErrInvalidAttemptToken)
+	assert.False(t, confirmed)
+	refused, err := s.RefuseAttempt(AttemptToken{})
+	require.ErrorIs(t, err, ErrInvalidAttemptToken)
+	assert.False(t, refused)
+
+	first, err := s.BeginAttempt(
+		"lease-1", "backend-a", requireOperationID(t, "201"),
+	)
+	require.NoError(t, err)
+	require.True(t, first.Valid())
+	refused, err = s.RefuseAttempt(first)
+	require.NoError(t, err)
+	assert.True(t, refused)
+
+	secondID := requireOperationID(t, "202")
+	second, err := s.BeginAttempt("lease-1", "backend-a", secondID)
+	require.NoError(t, err)
+	require.True(t, second.Valid())
+	confirmed, err = s.ConfirmAttempt(first)
+	require.NoError(t, err)
+	assert.False(t, confirmed, "a stale token must not settle a later attempt")
+	assert.Equal(t, secondID, s.Lookup("lease-1").AttemptOperationID())
+
+	other := newTestStore(t)
+	other.MarkInventoryReady()
+	foreign, err := other.BeginAttempt(
+		"lease-1", "backend-a", requireOperationID(t, "203"),
+	)
+	require.NoError(t, err)
+	confirmed, err = s.ConfirmAttempt(foreign)
+	require.ErrorIs(t, err, ErrInvalidAttemptToken)
+	assert.False(t, confirmed, "a token from another store is not a capability here")
+	assert.Equal(t, secondID, s.Lookup("lease-1").AttemptOperationID())
+
+	confirmed, err = s.ConfirmAttempt(second)
+	require.NoError(t, err)
+	assert.True(t, confirmed)
+	p := s.Lookup("lease-1")
+	assert.Equal(t, StateConfirmed, p.State())
+	assert.Equal(t, "backend-a", p.Backend)
+	assert.False(t, p.AttemptOperationID().Valid())
+	confirmed, err = s.ConfirmAttempt(second)
+	require.NoError(t, err)
+	assert.False(t, confirmed, "a consumed token is stale")
+
+	third, err := s.BeginAttempt(
+		"lease-1", "backend-a", requireOperationID(t, "204"),
+	)
+	require.NoError(t, err)
+	refused, err = s.RefuseAttempt(third)
+	require.NoError(t, err)
+	assert.True(t, refused)
+	p = s.Lookup("lease-1")
+	assert.Equal(t, StateConfirmed, p.State(),
+		"refusing a new action must retain previously confirmed affinity")
+	assert.False(t, p.AttemptOperationID().Valid())
+}
+
+func TestStore_TypedAttemptFenceRejectsForeignAndNewerRecords(t *testing.T) {
+	s := newTestStore(t)
+	s.MarkInventoryReady()
+	stale := s.SnapshotFence()
+	require.NoError(t, s.Confirm("lease-1", "backend-a"))
+
+	token, applied, err := s.BeginAttemptIfNotNewer(
+		"lease-1", "backend-a", requireOperationID(t, "251"), stale,
+	)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+	assert.Empty(t, s.Lookup("lease-1").Attempt)
+
+	other := newTestStore(t)
+	foreign := other.SnapshotFence()
+	token, applied, err = s.BeginAttemptIfNotNewer(
+		"lease-2", "backend-a", requireOperationID(t, "252"), foreign,
+	)
+	require.ErrorIs(t, err, ErrInvalidInventoryFence)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+}
+
+func TestStore_CallbackOperationSettlementRequiresPersistedIdentity(t *testing.T) {
+	s := newTestStore(t)
+	s.MarkInventoryReady()
+	firstID := requireOperationID(t, "271")
+	secondID := requireOperationID(t, "272")
+
+	_, err := s.BeginAttempt("lease-1", "backend-a", firstID)
+	require.NoError(t, err)
+	settled, err := s.ConfirmOperation("lease-1", "backend-a", secondID)
+	require.NoError(t, err)
+	assert.False(t, settled)
+	settled, err = s.RefuseOperation("lease-1", "backend-a", secondID)
+	require.NoError(t, err)
+	assert.False(t, settled)
+	assert.Equal(t, firstID, s.Lookup("lease-1").AttemptOperationID())
+
+	settled, err = s.RefuseOperation("lease-1", "backend-a", firstID)
+	require.NoError(t, err)
+	assert.True(t, settled)
+	_, err = s.BeginAttempt("lease-1", "backend-a", secondID)
+	require.NoError(t, err)
+	settled, err = s.ConfirmOperation("lease-1", "backend-a", firstID)
+	require.NoError(t, err)
+	assert.False(t, settled,
+		"an older same-backend operation cannot settle the current attempt")
+	assert.Equal(t, secondID, s.Lookup("lease-1").AttemptOperationID())
+
+	settled, err = s.ConfirmOperation("lease-1", "backend-a", secondID)
+	require.NoError(t, err)
+	assert.True(t, settled)
+	confirmed := s.Lookup("lease-1")
+	assert.Equal(t, StateConfirmed, confirmed.State())
+	assert.False(t, confirmed.AttemptOperationID().Valid())
+	beforeRevision := confirmed.RecordRevision()
+	settled, err = s.ConfirmOperation("lease-1", "backend-a", firstID)
+	require.NoError(t, err)
+	assert.True(t, settled, "same-backend confirmation is idempotent after settlement")
+	assert.Equal(t, beforeRevision, s.Lookup("lease-1").RecordRevision(),
+		"idempotent success must not let an old ID mutate the record")
+
+	_, err = s.BeginAttempt(
+		"lease-1", "backend-a", requireOperationID(t, "273"),
+	)
+	require.NoError(t, err)
+	settled, err = s.RefuseOperation(
+		"lease-1", "backend-a", requireOperationID(t, "273"),
+	)
+	require.NoError(t, err)
+	assert.True(t, settled)
+	assert.Equal(t, StateConfirmed, s.Lookup("lease-1").State(),
+		"a refusal must preserve previously confirmed ownership")
+}
+
+func TestStore_CallbackOperationSettlementRejectsInvalidAndLegacyAttempts(t *testing.T) {
+	s := newTestStore(t)
+	s.MarkInventoryReady()
+
+	settled, err := s.ConfirmOperation(
+		"lease-1", "backend-a", operation.OperationID{},
+	)
+	require.ErrorIs(t, err, operation.ErrInvalidID)
+	assert.False(t, settled)
+	settled, err = s.RefuseOperation(
+		"lease-1", "backend-a", operation.OperationID{},
+	)
+	require.ErrorIs(t, err, operation.ErrInvalidID)
+	assert.False(t, settled)
+
+	requireSetAttempting(t, s, "legacy-attempt", "backend-a")
+	legacy := s.Lookup("legacy-attempt")
+	assert.False(t, legacy.AttemptOperationID().Valid())
+	validID := requireOperationID(t, "281")
+	settled, err = s.ConfirmOperation("legacy-attempt", "backend-a", validID)
+	require.NoError(t, err)
+	assert.False(t, settled)
+	settled, err = s.RefuseOperation("legacy-attempt", "backend-a", validID)
+	require.NoError(t, err)
+	assert.False(t, settled)
+	assert.Equal(t, legacy, s.Lookup("legacy-attempt"))
+}
+
+func TestStore_CallbackOperationSettlementSurvivesReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	opID := requireOperationID(t, "291")
+	s1, err := NewStore(dbPath)
+	require.NoError(t, err)
+	s1.MarkInventoryReady()
+	_, err = s1.BeginAttempt("lease-1", "backend-a", opID)
+	require.NoError(t, err)
+	require.NoError(t, s1.Close())
+
+	s2, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer s2.Close()
+	settled, err := s2.ConfirmOperation("lease-1", "backend-a", opID)
+	require.NoError(t, err)
+	assert.True(t, settled)
+	assert.Equal(t, StateConfirmed, s2.Lookup("lease-1").State())
+	assert.False(t, s2.Lookup("lease-1").AttemptOperationID().Valid())
+}
+
+func TestStore_DeleteRecordRequiresExactTypedRevision(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.Confirm("lease-1", "backend-a"))
+	require.NoError(t, s.Confirm("lease-2", "backend-a"))
+	lease1 := s.Lookup("lease-1")
+	lease2 := s.Lookup("lease-2")
+	require.True(t, lease1.RecordRevision().Valid())
+	require.True(t, lease2.RecordRevision().Valid())
+
+	deleted, err := s.DeleteRecord(RecordRevision{})
+	require.ErrorIs(t, err, ErrInvalidRecordRevision)
+	assert.False(t, deleted)
+
+	other := newTestStore(t)
+	require.NoError(t, other.Confirm("lease-1", "backend-a"))
+	deleted, err = s.DeleteRecord(other.Lookup("lease-1").RecordRevision())
+	require.ErrorIs(t, err, ErrInvalidRecordRevision)
+	assert.False(t, deleted)
+
+	deleted, err = s.DeleteRecord(lease2.RecordRevision())
+	require.NoError(t, err)
+	assert.True(t, deleted, "the capability derives its own lease target")
+	assert.Equal(t, lease1, s.Lookup("lease-1"))
+	assert.Equal(t, StateAbsent, s.Lookup("lease-2").State())
+
+	deleted, err = s.DeleteRecord(lease1.RecordRevision())
+	require.NoError(t, err)
+	assert.True(t, deleted)
+	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State())
+	deleted, err = s.DeleteRecord(lease1.RecordRevision())
+	require.NoError(t, err)
+	assert.False(t, deleted)
+}
+
+func TestStore_TypedAttemptPersistsAcrossReopenButAuthorityDoesNot(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	opID := requireOperationID(t, "301")
+	s1, err := NewStore(dbPath)
+	require.NoError(t, err)
+	s1.MarkInventoryReady()
+	token, err := s1.BeginAttempt("lease-1", "backend-a", opID)
+	require.NoError(t, err)
+	require.True(t, token.Valid())
+	wantRevision := s1.Lookup("lease-1").RecordRevision()
+	require.True(t, wantRevision.Valid())
+	require.NoError(t, s1.Close())
+	var encoded []byte
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		encoded = append(encoded, tx.Bucket(bucketName).Get([]byte("lease-1"))...)
+		return nil
+	}))
+	require.NoError(t, db.Close())
+	assert.Contains(t, string(encoded), `"operation_id":"00000000-0000-4000-8000-00000000012d"`,
+		"the durable operation identity is a canonical UUID string")
+
+	s2, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer s2.Close()
+	p := s2.Lookup("lease-1")
+	assert.Equal(t, StateAttempting, p.State())
+	assert.Equal(t, "backend-a", p.Attempt)
+	assert.Equal(t, opID, p.AttemptOperationID())
+	assert.Equal(t, wantRevision.value, p.RecordRevision().value,
+		"the durable record version survives restart")
+	assert.NotEqual(t, wantRevision, p.RecordRevision(),
+		"a reopened store mints a new process-local capability")
+	deleted, err := s2.DeleteRecord(wantRevision)
+	require.ErrorIs(t, err, ErrInvalidRecordRevision)
+	assert.False(t, deleted, "a revision from the closed issuer is foreign")
+
+	newToken, err := s2.BeginAttempt(
+		"lease-2", "backend-a", requireOperationID(t, "302"),
+	)
+	require.ErrorIs(t, err, ErrInventoryNotReady,
+		"a restart must re-establish complete fleet authority")
+	assert.False(t, newToken.Valid())
+	confirmed, err := s2.ConfirmAttempt(token)
+	require.ErrorIs(t, err, ErrInvalidAttemptToken,
+		"process-local capabilities are not transferable to a reopened store")
+	assert.False(t, confirmed)
+}
+
+func TestStore_TypedAttemptUpgradesV013Record(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	writeRawRecords(t, dbPath, map[string][]byte{
+		"lease-legacy":  []byte(`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`),
+		"lease-attempt": []byte(`{"backend":"","attempt":"backend-b","set_at":"2026-08-25T15:00:00Z","revision":7}`),
+	})
+
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	legacy := s.Lookup("lease-legacy")
+	assert.Equal(t, StateConfirmed, legacy.State())
+	assert.True(t, legacy.RecordRevision().Valid(),
+		"opening the store must migrate an unambiguous v0.13 owner")
+	assert.Greater(t, legacy.Revision(), uint64(7))
+	assert.False(t, legacy.AttemptOperationID().Valid())
+	oldAttempt := s.Lookup("lease-attempt")
+	assert.Equal(t, StateAttempting, oldAttempt.State())
+	assert.False(t, oldAttempt.AttemptOperationID().Valid(),
+		"pre-token attempts remain readable and fail closed")
+
+	opID := requireOperationID(t, "401")
+	_, err = s.BeginAttempt("lease-legacy", "backend-a", opID)
+	require.ErrorIs(t, err, ErrInventoryNotReady)
+	s.MarkInventoryReady()
+	token, err := s.BeginAttempt("lease-legacy", "backend-a", opID)
+	require.NoError(t, err)
+	require.True(t, token.Valid())
+	upgraded := s.Lookup("lease-legacy")
+	assert.True(t, upgraded.RecordRevision().Valid())
+	assert.Equal(t, opID, upgraded.AttemptOperationID())
+	require.NoError(t, s.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer reopened.Close()
+	upgraded = reopened.Lookup("lease-legacy")
+	assert.Equal(t, StateConfirmed, upgraded.State())
+	assert.Equal(t, "backend-a", upgraded.Attempt)
+	assert.Equal(t, opID, upgraded.AttemptOperationID())
+}
+
+func TestStore_ProjectInventoryAcceptsExplicitRevisionZeroFence(t *testing.T) {
+	s := newTestStore(t)
+	fence := s.BeginInventorySession()
+	defer s.EndInventorySession(fence)
+	require.True(t, fence.Valid())
+
+	result, err := s.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{"lease-1": "backend-a"},
+	})
+	require.NoError(t, err)
+	revision, applied := result.Applied["lease-1"]
+	assert.True(t, applied)
+	assert.True(t, revision.Valid())
+	assert.Equal(t, revision, s.Lookup("lease-1").RecordRevision())
+	assert.Empty(t, result.Fenced)
+}
+
+func TestStore_ProjectInventoryUpgradesIdempotentV013RecordRevision(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	writeRawRecords(t, dbPath, map[string][]byte{
+		"lease-legacy": []byte(`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`),
+	})
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	revision := s.Lookup("lease-legacy").RecordRevision()
+	require.True(t, revision.Valid(),
+		"opening the store must make legacy ownership immediately usable by typed CAS")
+	fence := s.BeginInventorySession()
+
+	result, err := s.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{"lease-legacy": "backend-a"},
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, result.Applied, "lease-legacy",
+		"an exact projection after open-time migration is idempotent")
+	assert.Equal(t, revision, s.Lookup("lease-legacy").RecordRevision())
+	s.EndInventorySession(fence)
+	require.NoError(t, s.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer reopened.Close()
+	reopenedRevision := reopened.Lookup("lease-legacy").RecordRevision()
+	assert.Equal(t, revision.value, reopenedRevision.value)
+	assert.NotEqual(t, revision, reopenedRevision,
+		"record capabilities are rebound to the reopened store")
+}
+
+func TestStore_ProjectInventoryAppliesPositiveAndConflictOutcomesAtomically(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+
+	requireSetAttempting(t, s, "mismatched", "backend-attempted")
+	requireSetAttempting(t, s, "conflict", "backend-possible")
+	fence := s.BeginInventorySession()
+
+	result, err := s.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{
+			"positive":   "backend-positive",
+			"mismatched": "backend-replacement",
+		},
+		Conflicts: map[string][]string{
+			"conflict": {"backend-a", "backend-b"},
+		},
+	})
+	require.NoError(t, err)
+	s.EndInventorySession(fence)
+	assert.Empty(t, result.Fenced)
+	for _, leaseUUID := range []string{"positive", "mismatched", "conflict"} {
+		revision, ok := result.Applied[leaseUUID]
+		require.True(t, ok, leaseUUID)
+		assert.True(t, revision.Valid(), leaseUUID)
+		assert.Equal(t, revision, s.Lookup(leaseUUID).RecordRevision(), leaseUUID)
+	}
+
+	positive := s.Lookup("positive")
+	assert.Equal(t, StateConfirmed, positive.State())
+	assert.Equal(t, "backend-positive", positive.Backend)
+	mismatched := s.Lookup("mismatched")
+	assert.Equal(t, StateConfirmed, mismatched.State())
+	assert.Equal(t, "backend-replacement", mismatched.Backend)
+	assert.Equal(t, "backend-attempted", mismatched.Attempt,
+		"an observation from another backend cannot disprove the pending attempt")
+	assert.False(t, mismatched.AttemptOperationID().Valid())
+	conflict := s.Lookup("conflict")
+	assert.Equal(t, StateUnusable, conflict.State())
+	assert.ElementsMatch(t,
+		[]string{"backend-a", "backend-b", "backend-possible"},
+		conflict.ConflictBackends,
+	)
+	require.NoError(t, s.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer reopened.Close()
+	assert.Equal(t, "backend-positive", reopened.Lookup("positive").Backend)
+	assert.Equal(t, "backend-replacement", reopened.Lookup("mismatched").Backend)
+	assert.Equal(t, "backend-attempted", reopened.Lookup("mismatched").Attempt)
+	assert.True(t, reopened.Lookup("conflict").Conflict)
+}
+
+func TestStore_ProjectInventoryPositiveExactObservationConfirmsAttempt(t *testing.T) {
+	s := newTestStore(t)
+	s.MarkInventoryReady()
+	opID := requireOperationID(t, "491")
+	_, err := s.BeginAttempt("lease-1", "backend-a", opID)
+	require.NoError(t, err)
+	fence := s.BeginInventorySession()
+	defer s.EndInventorySession(fence)
+
+	result, err := s.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{"lease-1": "backend-a"},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Applied, "lease-1")
+	assert.Empty(t, result.Fenced)
+
+	confirmed := s.Lookup("lease-1")
+	assert.Equal(t, StateConfirmed, confirmed.State())
+	assert.Equal(t, "backend-a", confirmed.Backend)
+	assert.Empty(t, confirmed.Attempt)
+	assert.False(t, confirmed.AttemptOperationID().Valid())
+}
+
+func TestStore_ProjectInventorySilencePreservesAttemptsAndConflicts(t *testing.T) {
+	s := newTestStore(t)
+	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
+
+	firstID := requireOperationID(t, "492")
+	_, err := s.BeginAttempt("attempt-only", "backend-a", firstID)
+	require.NoError(t, err)
+	require.NoError(t, s.Confirm("confirmed-attempt", "backend-b"))
+	secondID := requireOperationID(t, "493")
+	_, err = s.BeginAttempt("confirmed-attempt", "backend-b", secondID)
+	require.NoError(t, err)
+
+	conflictFence := s.BeginInventorySession()
+	_, err = s.ProjectInventory(conflictFence, InventoryProjection{
+		Conflicts: map[string][]string{"conflict": {"backend-a", "backend-b"}},
+	})
+	s.EndInventorySession(conflictFence)
+	require.NoError(t, err)
+
+	before := s.List()
+	beforeRevision := s.SnapshotRevision()
+	silenceFence := s.BeginInventorySession()
+	result, err := s.ProjectInventory(silenceFence, InventoryProjection{Complete: true})
+	s.EndInventorySession(silenceFence)
+	require.NoError(t, err)
+	assert.Empty(t, result.Applied)
+	assert.Empty(t, result.Fenced)
+	assert.Equal(t, beforeRevision, s.SnapshotRevision())
+	assert.Equal(t, before, s.List())
+	assert.Equal(t, firstID, s.Lookup("attempt-only").AttemptOperationID())
+	assert.Equal(t, secondID, s.Lookup("confirmed-attempt").AttemptOperationID())
+	assert.True(t, s.Lookup("conflict").Conflict)
+}
+
+func TestStore_ProjectInventoryFencesInvalidForeignAndStaleEvidence(t *testing.T) {
+	s := newTestStore(t)
+	input := InventoryProjection{
+		Placements: map[string]string{"lease-1": "backend-a"},
+	}
+
+	_, err := s.ProjectInventory(InventoryFence{}, input)
+	require.ErrorIs(t, err, ErrInvalidInventoryFence)
+	other := newTestStore(t)
+	_, err = s.ProjectInventory(other.SnapshotFence(), input)
+	require.ErrorIs(t, err, ErrInvalidInventoryFence)
+
+	invalidated := s.SnapshotFence()
+	s.InvalidateInventoryAuthority()
+	_, err = s.ProjectInventory(invalidated, input)
+	require.ErrorIs(t, err, ErrInvalidInventoryFence)
+	assert.Equal(t, StateAbsent, s.Lookup("lease-1").State())
+
+	fence := s.BeginInventorySession()
+	require.NoError(t, s.Confirm("lease-newer", "backend-current"))
+	result, err := s.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{"lease-newer": "backend-stale"},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, result.Fenced, "lease-newer")
+	assert.Equal(t, "backend-current", s.Lookup("lease-newer").Backend)
+	s.EndInventorySession(fence)
+}
+
+func TestStore_ProjectInventoryRollsBackEveryKeyWhenBoltRejectsOne(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	fence := s.BeginInventorySession()
+	beforeRevision := s.SnapshotRevision()
+	oversizedLease := strings.Repeat("z", bolt.MaxKeySize+1)
+
+	_, err = s.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{
+			"a-valid":      "backend-a",
+			oversizedLease: "backend-b",
+		},
+	})
+	require.Error(t, err)
+	assert.Equal(t, beforeRevision, s.SnapshotRevision())
+	assert.Equal(t, StateAbsent, s.Lookup("a-valid").State(),
+		"the earlier bbolt Put must roll back with the later rejected key")
+	assert.Equal(t, StateAbsent, s.Lookup(oversizedLease).State())
+	s.EndInventorySession(fence)
+	require.NoError(t, s.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer reopened.Close()
+	assert.Equal(t, StateAbsent, reopened.Lookup("a-valid").State())
+	assert.Equal(t, StateAbsent, reopened.Lookup(oversizedLease).State())
+}
+
+func TestStore_ProjectInventoryVerifiesEmptyAndIdempotentProjection(t *testing.T) {
+	s := newTestStore(t)
+	require.NoError(t, s.Confirm("lease-1", "backend-a"))
+	fence := s.SnapshotFence()
+	beforeRevision := s.SnapshotRevision()
+
+	result, err := s.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{"lease-1": "backend-a"},
+	})
+	require.NoError(t, err)
+	assert.Empty(t, result.Applied)
+	assert.Empty(t, result.Fenced)
+	assert.Equal(t, beforeRevision, s.SnapshotRevision())
+
+	require.NoError(t, s.Close())
+	_, err = s.ProjectInventory(fence, InventoryProjection{})
+	require.Error(t, err,
+		"an empty projection must still prove the durable store is readable")
+}
+
+func TestStore_BeginAttemptFromProjectionAcceptsRevisionZeroAbsenceProof(t *testing.T) {
+	s := newTestStore(t)
+	fence := s.BeginInventorySession()
+	proof, err := s.ProjectInventory(fence, InventoryProjection{})
+	require.NoError(t, err)
+	require.True(t, proof.Valid())
+	assert.Empty(t, proof.Applied)
+	s.MarkInventoryReady()
+
+	token, applied, err := s.BeginAttemptFromProjection(
+		"lease-1", "backend-a", requireOperationID(t, "501"), proof,
+	)
+	require.NoError(t, err)
+	assert.True(t, applied)
+	assert.True(t, token.Valid())
+	assert.Equal(t, StateAttempting, s.Lookup("lease-1").State())
+	s.EndInventorySession(fence)
+}
+
+func TestStore_BeginAttemptFromProjectionAcceptsAppliedAndNoopRecords(t *testing.T) {
+	t.Run("applied", func(t *testing.T) {
+		s := newTestStore(t)
+		fence := s.BeginInventorySession()
+		proof, err := s.ProjectInventory(fence, InventoryProjection{
+			Placements: map[string]string{"lease-1": "backend-a"},
+		})
+		require.NoError(t, err)
+		require.Contains(t, proof.Applied, "lease-1")
+		s.MarkInventoryReady()
+
+		token, applied, err := s.BeginAttemptFromProjection(
+			"lease-1", "backend-a", requireOperationID(t, "511"), proof,
+		)
+		require.NoError(t, err)
+		assert.True(t, applied)
+		assert.True(t, token.Valid())
+		s.EndInventorySession(fence)
+	})
+
+	t.Run("idempotent no-op", func(t *testing.T) {
+		s := newTestStore(t)
+		require.NoError(t, s.Confirm("lease-1", "backend-a"))
+		fence := s.BeginInventorySession()
+		proof, err := s.ProjectInventory(fence, InventoryProjection{
+			Placements: map[string]string{"lease-1": "backend-a"},
+		})
+		require.NoError(t, err)
+		assert.NotContains(t, proof.Applied, "lease-1")
+		s.MarkInventoryReady()
+
+		token, applied, err := s.BeginAttemptFromProjection(
+			"lease-1", "backend-a", requireOperationID(t, "512"), proof,
+		)
+		require.NoError(t, err)
+		assert.True(t, applied)
+		assert.True(t, token.Valid())
+		s.EndInventorySession(fence)
+	})
+}
+
+func TestStore_BeginAttemptFromProjectionRejectsZeroForeignAndOldEpochProof(t *testing.T) {
+	s := newTestStore(t)
+	s.MarkInventoryReady()
+	token, applied, err := s.BeginAttemptFromProjection(
+		"lease-zero", "backend-a", requireOperationID(t, "531"), ProjectionResult{},
+	)
+	require.ErrorIs(t, err, ErrInvalidProjectionProof)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+
+	other := newTestStore(t)
+	otherFence := other.BeginInventorySession()
+	foreign, err := other.ProjectInventory(otherFence, InventoryProjection{})
+	require.NoError(t, err)
+	token, applied, err = s.BeginAttemptFromProjection(
+		"lease-foreign", "backend-a", requireOperationID(t, "532"), foreign,
+	)
+	require.ErrorIs(t, err, ErrInvalidProjectionProof)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+	other.EndInventorySession(otherFence)
+
+	fence := s.BeginInventorySession()
+	oldEpoch, err := s.ProjectInventory(fence, InventoryProjection{})
+	require.NoError(t, err)
+	s.EndInventorySession(fence)
+	s.InvalidateInventoryAuthority()
+	s.MarkInventoryReady()
+	token, applied, err = s.BeginAttemptFromProjection(
+		"lease-old-epoch", "backend-a", requireOperationID(t, "533"), oldEpoch,
+	)
+	require.ErrorIs(t, err, ErrInvalidProjectionProof)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+}
+
+func TestStore_BeginAttemptFromProjectionRejectsLeaseMutationAfterProjection(t *testing.T) {
+	s := newTestStore(t)
+	fence := s.BeginInventorySession()
+	proof, err := s.ProjectInventory(fence, InventoryProjection{})
+	require.NoError(t, err)
+	require.NoError(t, s.Confirm("lease-mutated", "backend-a"))
+	require.NoError(t, s.Confirm("unrelated", "backend-a"))
+	s.MarkInventoryReady()
+
+	token, applied, err := s.BeginAttemptFromProjection(
+		"lease-mutated", "backend-a", requireOperationID(t, "541"), proof,
+	)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+	assert.Empty(t, s.Lookup("lease-mutated").Attempt)
+
+	token, applied, err = s.BeginAttemptFromProjection(
+		"lease-unmodified", "backend-a", requireOperationID(t, "542"), proof,
+	)
+	require.NoError(t, err)
+	assert.True(t, applied,
+		"an unrelated lease mutation must not invalidate a lease-local proof")
+	assert.True(t, token.Valid())
+	s.EndInventorySession(fence)
+}
+
+func TestStore_BeginAttemptFromProjectionDoesNotTrustDiagnosticMaps(t *testing.T) {
+	s := newTestStore(t)
+	fence := s.BeginInventorySession()
+	require.NoError(t, s.Confirm("lease-1", "backend-a"))
+	proof, err := s.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{"lease-1": "backend-a"},
+	})
+	require.NoError(t, err)
+	require.Contains(t, proof.Fenced, "lease-1")
+
+	// These maps are diagnostics for planners and logs, not capabilities. Even
+	// code that edits them cannot forge away the private per-lease fence.
+	delete(proof.Fenced, "lease-1")
+	proof.Applied["lease-1"] = s.Lookup("lease-1").RecordRevision()
+	s.MarkInventoryReady()
+	token, applied, err := s.BeginAttemptFromProjection(
+		"lease-1", "backend-a", requireOperationID(t, "551"), proof,
+	)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.False(t, token.Valid())
+	assert.Empty(t, s.Lookup("lease-1").Attempt)
+	s.EndInventorySession(fence)
+}
+
 func TestStore_ConfirmAbsentCreatesPositiveObservation(t *testing.T) {
 	fixed := time.Date(2026, 8, 25, 17, 0, 0, 0, time.UTC)
 	s := newTestStore(t, WithClock(func() time.Time { return fixed }))
@@ -274,7 +1088,17 @@ func TestStore_PersistsAllStatesAndRevisions(t *testing.T) {
 	require.NoError(t, err)
 	defer s2.Close()
 
-	assert.Equal(t, want, s2.List())
+	got := s2.List()
+	for leaseUUID, p := range want {
+		p.recordRevision = RecordRevision{}
+		want[leaseUUID] = p
+	}
+	for leaseUUID, p := range got {
+		p.recordRevision = RecordRevision{}
+		got[leaseUUID] = p
+	}
+	assert.Equal(t, want, got,
+		"durable placement facts persist while process-local capabilities rebind")
 	assert.Equal(t, wantRevision, s2.SnapshotRevision())
 	assert.Equal(t, StateAttempting, s2.Lookup("attempting").State())
 	assert.Equal(t, StateConfirmed, s2.Lookup("confirmed").State())
@@ -420,34 +1244,111 @@ func TestStore_SetBatchIfNotNewerPreservesSetAtOnOverwrite(t *testing.T) {
 	assert.Equal(t, firstSetAt, current.SetAt)
 }
 
-func TestStore_LoadsLegacyAndOldJSONRecords(t *testing.T) {
+func TestStore_OpenMigratesLegacyRawAndJSONRecordsMonotonically(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	setAt := "2026-08-25T15:00:00Z"
 	writeRawRecords(t, dbPath, map[string][]byte{
-		"legacy":   []byte("backend-legacy"),
-		"old-json": []byte(`{"backend":"backend-json","set_at":"` + setAt + `"}`),
+		"already-revised": []byte(`{"backend":"backend-current","set_at":"2026-08-24T15:00:00Z","revision":11}`),
+		"legacy":          []byte("backend-legacy"),
+		"old-json":        []byte(`{"backend":"backend-json","set_at":"` + setAt + `"}`),
 	})
 
 	s, err := NewStore(dbPath)
 	require.NoError(t, err)
-	defer s.Close()
 
 	legacy := s.Lookup("legacy")
 	assert.Equal(t, StateConfirmed, legacy.State())
 	assert.Equal(t, "backend-legacy", legacy.Backend)
 	assert.True(t, legacy.SetAt.IsZero())
-	assert.Zero(t, legacy.Revision())
+	assert.Equal(t, uint64(12), legacy.Revision(),
+		"migrated revisions start above the existing durable clock")
+	assert.True(t, legacy.RecordRevision().Valid())
 
 	oldJSON := s.Lookup("old-json")
 	assert.Equal(t, StateConfirmed, oldJSON.State())
 	assert.Equal(t, "backend-json", oldJSON.Backend)
 	assert.Equal(t, setAt, oldJSON.SetAt.Format(time.RFC3339))
-	assert.Zero(t, oldJSON.Revision())
-	assert.Zero(t, s.SnapshotRevision())
+	assert.Equal(t, uint64(13), oldJSON.Revision())
+	assert.True(t, oldJSON.RecordRevision().Valid())
+	assert.Equal(t, uint64(11), s.Lookup("already-revised").Revision())
+	assert.Equal(t, uint64(13), s.SnapshotRevision())
 
-	// The first mutation of a legacy record moves it onto the revisioned schema.
-	requireSetAttempting(t, s, "legacy", "backend-legacy")
-	assert.NotZero(t, s.Lookup("legacy").Revision())
+	require.NoError(t, s.Close())
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	defer reopened.Close()
+	assert.Equal(t, uint64(12), reopened.Lookup("legacy").Revision())
+	assert.Equal(t, "backend-legacy", reopened.Lookup("legacy").Backend)
+	assert.True(t, reopened.Lookup("legacy").SetAt.IsZero())
+	assert.Equal(t, uint64(13), reopened.Lookup("old-json").Revision())
+	assert.Equal(t, setAt, reopened.Lookup("old-json").SetAt.Format(time.RFC3339))
+	assert.Equal(t, uint64(13), reopened.SnapshotRevision(),
+		"reopening an already migrated store is idempotent")
+}
+
+func TestStore_OpenMigrationLeavesAmbiguousAndUnusableRecordsUntouched(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	records := map[string][]byte{
+		"confirmed": []byte(`{"backend":"backend-confirmed","set_at":"2026-08-25T15:00:00Z"}`),
+		"confirmed-with-attempt": []byte(
+			`{"backend":"backend-owner","attempt":"backend-target","set_at":"2026-08-25T15:00:00Z"}`,
+		),
+		"attempt-only": []byte(`{"attempt":"backend-target","set_at":"2026-08-25T15:00:00Z"}`),
+		"conflict": []byte(
+			`{"backend":"backend-owner","set_at":"2026-08-25T15:00:00Z","conflict":true,"conflict_backends":["backend-owner","backend-other"]}`,
+		),
+		"operation-without-attempt": []byte(
+			`{"backend":"backend-owner","operation_id":"00000000-0000-4000-8000-000000000001","set_at":"2026-08-25T15:00:00Z"}`,
+		),
+		"malformed-json": []byte(`{"backend":`),
+		"invalid-raw":    {0xff, 0xfe},
+	}
+	writeRawRecords(t, dbPath, records)
+
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	assert.True(t, s.Lookup("confirmed").RecordRevision().Valid())
+	assert.Equal(t, StateConfirmed, s.Lookup("confirmed-with-attempt").State())
+	assert.False(t, s.Lookup("confirmed-with-attempt").RecordRevision().Valid())
+	assert.Equal(t, StateAttempting, s.Lookup("attempt-only").State())
+	assert.False(t, s.Lookup("attempt-only").RecordRevision().Valid())
+	for _, leaseUUID := range []string{
+		"conflict", "operation-without-attempt", "malformed-json", "invalid-raw",
+	} {
+		assert.Equal(t, StateUnusable, s.Lookup(leaseUUID).State(), leaseUUID)
+		assert.False(t, s.Lookup(leaseUUID).RecordRevision().Valid(), leaseUUID)
+	}
+	require.NoError(t, s.Close())
+
+	unsafeKeys := []string{
+		"confirmed-with-attempt", "attempt-only", "conflict",
+		"operation-without-attempt", "malformed-json", "invalid-raw",
+	}
+	durable := readRawRecords(t, dbPath, unsafeKeys...)
+	for _, leaseUUID := range unsafeKeys {
+		assert.Equal(t, records[leaseUUID], durable[leaseUUID], leaseUUID)
+	}
+}
+
+func TestStore_OpenMigrationRollsBackAllRecordsOnRevisionExhaustion(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	records := map[string][]byte{
+		"a-legacy": []byte("backend-a"),
+		"b-legacy": []byte(`{"backend":"backend-b","set_at":"2026-08-25T15:00:00Z"}`),
+		"z-revised": []byte(fmt.Sprintf(
+			`{"backend":"backend-z","set_at":"2026-08-25T15:00:00Z","revision":%d}`,
+			uint64(math.MaxUint64-1),
+		)),
+	}
+	writeRawRecords(t, dbPath, records)
+
+	s, err := NewStore(dbPath)
+	require.ErrorContains(t, err, "placement revision exhausted during legacy migration")
+	assert.Nil(t, s)
+
+	durable := readRawRecords(t, dbPath, "a-legacy", "b-legacy", "z-revised")
+	assert.Equal(t, records, durable,
+		"a later migration failure must roll back every earlier record rewrite")
 }
 
 func TestStore_LegacyRawBackendNamesRequirePrintableUTF8(t *testing.T) {
@@ -474,7 +1375,8 @@ func TestStore_LegacyRawBackendNamesRequirePrintableUTF8(t *testing.T) {
 		p := s.Lookup(leaseUUID)
 		assert.Equal(t, StateConfirmed, p.State(), leaseUUID)
 		assert.Equal(t, backendName, p.Backend, leaseUUID)
-		assert.Zero(t, p.Revision(), leaseUUID)
+		assert.NotZero(t, p.Revision(), leaseUUID)
+		assert.True(t, p.RecordRevision().Valid(), leaseUUID)
 	}
 	for _, leaseUUID := range []string{"invalid-utf8", "nul", "newline", "escape", "zero-width"} {
 		p := s.Lookup(leaseUUID)
@@ -507,7 +1409,8 @@ func TestStore_MalformedRecordsRemainUnusable(t *testing.T) {
 		assert.Contains(t, s.List(), leaseUUID, "unusable records remain visible in snapshots")
 	}
 	assert.Len(t, s.List(), 5)
-	assert.Equal(t, uint64(7), s.SnapshotRevision())
+	assert.Equal(t, uint64(8), s.SnapshotRevision(),
+		"the valid legacy owner is migrated above the existing revision")
 	assert.Equal(t, uint64(7), s.Lookup("structured-empty").Revision())
 
 	_, err = s.SetAttempting("empty-object", "backend-a")
@@ -998,7 +1901,8 @@ func TestStore_ConflictQuarantineSurvivesRestartAndResolvesOnCompleteEvidence(t 
 	p := s.Lookup("lease-1")
 	assert.True(t, p.Conflict)
 	assert.Equal(t, StateUnusable, p.State())
-	assert.Empty(t, p.Backend)
+	assert.Equal(t, "backend-a", p.Backend,
+		"quarantine must preserve the last exact confirmed-owner fact")
 	assert.Equal(t, []string{"backend-a", "backend-b"}, p.ConflictBackends)
 	assert.False(t, p.ConflictOwnersUnknown)
 	require.NoError(t, s.Close())
@@ -1009,6 +1913,7 @@ func TestStore_ConflictQuarantineSurvivesRestartAndResolvesOnCompleteEvidence(t 
 	p = s.Lookup("lease-1")
 	assert.True(t, p.Conflict, "quarantine must survive a providerd restart")
 	assert.Equal(t, StateUnusable, p.State())
+	assert.Equal(t, "backend-a", p.Backend)
 	assert.Equal(t, []string{"backend-a", "backend-b"}, p.ConflictBackends)
 	assert.False(t, p.ConflictOwnersUnknown)
 
@@ -1167,6 +2072,11 @@ func TestErrorsAreDistinctSemanticSentinels(t *testing.T) {
 		ErrBackendConflict,
 		ErrUnusablePlacement,
 		ErrAttemptMismatch,
+		ErrInvalidAttemptToken,
+		ErrInvalidInventoryFence,
+		ErrInventoryNotReady,
+		ErrInvalidRecordRevision,
+		ErrInvalidProjectionProof,
 	}
 	for i, left := range sentinels {
 		for j, right := range sentinels {

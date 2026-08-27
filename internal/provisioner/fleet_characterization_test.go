@@ -20,6 +20,7 @@ package provisioner
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
@@ -61,6 +63,148 @@ func TestFleet_HealthyFleet_ProvisionsPendingLease(t *testing.T) {
 	// No SKUs configured, so routing falls to the default backend.
 	require.Equal(t, 1, f.backendAt(1).provisionCount("lease-new"))
 	f.assertProvisionedExactlyOnce("lease-new")
+}
+
+func TestFleet_V013UpgradeBackfillsExistingWorkloadsWithoutMovingThem(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	// Model the first current-version startup over a v0.13 environment: the
+	// process-local registry and the newly configured placement DB are empty,
+	// while multiple backends already own live and retained tenant data.
+	f.addLease("lease-pending-ready", billingtypes.LEASE_STATE_PENDING)
+	f.addLease("lease-active", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(2).seedProvision(
+		t, "lease-pending-ready", f.providerUUID, backend.ProvisionStatusReady,
+	)
+	f.backendAt(3).seedProvision(
+		t, "lease-active", f.providerUUID, backend.ProvisionStatusReady,
+	)
+	f.backendAt(1).seedRetention("lease-retained")
+	require.Zero(t, f.tracker.Operations().Count())
+	require.Empty(t, f.placement.List())
+
+	require.NoError(t, f.sweep())
+
+	for _, srv := range f.servers {
+		require.Zero(t, srv.totalProvisionCalls(),
+			"startup discovery must not restart or move an existing workload through %s", srv.name)
+		require.Zero(t, srv.deprovisionCount("lease-pending-ready"))
+		require.Zero(t, srv.deprovisionCount("lease-active"))
+		require.Zero(t, srv.deprovisionCount("lease-retained"))
+	}
+	f.assertPlacementPinned("lease-pending-ready", "backend-2")
+	f.assertPlacementPinned("lease-active", "backend-3")
+	f.assertPlacementPinned("lease-retained", "backend-1")
+	acked, _, _ := f.chainCalls()
+	require.Contains(t, acked, "lease-pending-ready",
+		"a ready v0.13 workload still pending on chain must be acknowledged, not reprovisioned")
+}
+
+func TestFleet_ProvisionCarriesExactTypedOperationAcrossHTTP(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+
+	f.addLease("lease-typed", billingtypes.LEASE_STATE_PENDING)
+	require.NoError(t, f.sweep())
+
+	req, ok := f.backendAt(1).provisionRequest("lease-typed")
+	require.True(t, ok, "real HTTP backend should receive the provision request")
+	callbackURL, err := url.Parse(req.CallbackURL)
+	require.NoError(t, err)
+	callbackID, present, err := operation.ParseQuery(callbackURL.Query())
+	require.NoError(t, err)
+	require.True(t, present)
+
+	record, tracked := f.tracker.Operations().Lookup("lease-typed")
+	require.True(t, tracked)
+	require.True(t, record.TokenRequired)
+	require.Equal(t, operation.KindProvision, record.Kind)
+	require.Equal(t, callbackID, record.ID,
+		"the callback capability crossing HTTP must identify the tracked operation")
+	require.Equal(t, "backend-1", record.Backend)
+
+	p := f.placement.Lookup("lease-typed")
+	require.Equal(t, placement.StateConfirmed, p.State())
+	require.Equal(t, "backend-1", p.Backend)
+	require.Empty(t, p.Attempt)
+}
+
+func TestFleet_CompleteInventoryNeverClearsAmbiguousAttemptFromSilence(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+	require.NoError(t, f.sweep(), "arm startup placement authority")
+
+	tracked := f.tracker.Operations().TryTrack(operation.TrackSpec{
+		LeaseUUID:     "lease-ambiguous",
+		Backend:       "backend-2",
+		Kind:          operation.KindProvision,
+		TokenRequired: true,
+	})
+	require.True(t, tracked.Started())
+	baseline := f.placement.CurrentAdmissionBaseline()
+	scope, err := f.placement.ScopeAdmission(baseline, backendTopologyNames(f.router))
+	require.NoError(t, err)
+	_, applied, err := f.placement.BeginNewAttempt(
+		scope,
+		"lease-ambiguous", "backend-2", tracked.Token().ID(),
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.True(t, f.tracker.Operations().Abort(tracked.Token()),
+		"model an ambiguous synchronous response that retained only durable intent")
+	require.Equal(t, placement.StateAttempting, f.placement.Lookup("lease-ambiguous").State())
+
+	require.NoError(t, f.sweep())
+
+	require.Equal(t, placement.StateAttempting, f.placement.Lookup("lease-ambiguous").State(),
+		"inventory silence cannot prove that an ambiguously timed-out request never committed later")
+	for _, srv := range f.servers {
+		require.Zero(t, srv.provisionCount("lease-ambiguous"),
+			"settling an inventory-disproved attempt must not manufacture a backend call")
+	}
+}
+
+func TestFleet_IncompleteInventoryKeepsUnresolvedAttempt(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+	require.NoError(t, f.sweep(), "arm startup placement authority")
+
+	tracked := f.tracker.Operations().TryTrack(operation.TrackSpec{
+		LeaseUUID:     "lease-unknown",
+		Backend:       "backend-2",
+		Kind:          operation.KindProvision,
+		TokenRequired: true,
+	})
+	require.True(t, tracked.Started())
+	_, err := f.placement.BeginAttempt("lease-unknown", "backend-2", tracked.Token().ID())
+	require.NoError(t, err)
+	require.True(t, f.tracker.Operations().Abort(tracked.Token()))
+	f.backendAt(2).setFault(faultRetentionsOnly)
+
+	require.NoError(t, f.sweep())
+
+	p := f.placement.Lookup("lease-unknown")
+	require.Equal(t, placement.StateAttempting, p.State())
+	require.Equal(t, "backend-2", p.Attempt,
+		"a missing half of the attempted backend's inventory cannot prove absence")
+}
+
+func TestFleet_IncompleteRetentionInventoryCannotAuthorizeProvision(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+	f.addLease("lease-no-authority", billingtypes.LEASE_STATE_PENDING)
+	f.backendAt(3).setFault(faultRetentionsOnly)
+
+	require.NoError(t, f.sweep())
+
+	for _, srv := range f.servers {
+		require.Zero(t, srv.provisionCount("lease-no-authority"),
+			"a partial retention inventory must not authorize a backend side effect on %s", srv.name)
+	}
+	require.False(t, f.tracker.Operations().Contains("lease-no-authority"),
+		"a refused pre-side-effect operation must be released")
+	require.Equal(t, placement.StateAbsent, f.placement.Lookup("lease-no-authority").State())
 }
 
 func TestFleet_HealthyFleet_AcknowledgesReadyLease(t *testing.T) {
@@ -192,28 +336,90 @@ func TestFleet_UnplacedLeaseOnFaultedBackend_IsNotProvisionedOnAPeer(t *testing.
 	}
 }
 
-// Once this process has completed and durably synced a healthy fleet sweep,
-// an absent placement is no longer legacy ambiguity: every accepted provision
-// since startup is write-ahead, and the complete sweep backfilled everything
-// older. That keeps the dropped-event reconciliation backstop live when an
-// unrelated backend later goes down.
-func TestFleet_CompletePlacementSweepArmsAbsentRecordTrust(t *testing.T) {
+// A complete inventory durably establishes that recordless means never placed
+// under this backend topology. A later outage therefore narrows new admission
+// to the backends that answered both endpoints instead of pausing the fleet.
+func TestFleet_PriorCompleteSweepAllowsNewPendingLeaseOnHealthyBackend(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
 
-	// Empty is intentional: a successful no-op SetBatch must still arm the
-	// process-local migration latch.
+	// Empty is intentional: a successful no-op projection establishes the
+	// durable topology-bound baseline used by later degraded sweeps.
 	require.NoError(t, f.sweep())
 	require.True(t, f.reconciler.placementSweepSeen.Load())
 
 	f.backendAt(3).setFault(faultConnReset)
 	f.addLease("lease-after-trust", billingtypes.LEASE_STATE_PENDING)
 	require.NoError(t, f.sweep())
-
+	require.Zero(t, f.backendAt(3).provisionCount("lease-after-trust"),
+		"routing must never escape the set of backends that answered both inventories")
 	f.assertProvisionedExactlyOnce("lease-after-trust")
-	record := f.placement.Lookup("lease-after-trust")
-	require.Equal(t, placement.StateConfirmed, record.State())
-	require.NotEmpty(t, record.Backend)
+	require.Equal(t, placement.StateConfirmed, f.placement.Lookup("lease-after-trust").State())
+
+	// Recovery must not duplicate the already admitted operation.
+	f.backendAt(3).setFault(faultNone)
+	require.NoError(t, f.sweep())
+	f.assertProvisionedExactlyOnce("lease-after-trust")
+}
+
+func TestFleet_DurableBaselineSurvivesRestartAndBackendOutage(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{})
+	require.NoError(t, f.sweep(), "establish durable topology baseline")
+	require.True(t, f.placement.CurrentAdmissionBaseline().Valid())
+
+	f.restartReconciler()
+	require.True(t, f.placement.CurrentAdmissionBaseline().Valid(),
+		"the admission baseline must survive reopening the placement database")
+
+	f.backendAt(3).setFault(faultConnReset)
+	f.addLease("lease-after-restart", billingtypes.LEASE_STATE_PENDING)
+	require.NoError(t, f.sweep())
+
+	require.Zero(t, f.backendAt(3).provisionCount("lease-after-restart"))
+	f.assertProvisionedExactlyOnce("lease-after-restart")
+
+	f.backendAt(3).setFault(faultNone)
+	require.NoError(t, f.sweep())
+	f.assertProvisionedExactlyOnce("lease-after-restart")
+}
+
+func TestFleet_DegradedAdmissionIsPendingOnlyAndRequiresBothInventories(t *testing.T) {
+	t.Parallel()
+	f := newFleet(t, fleetOptions{backendSKUs: map[int][]string{
+		2: {"sku-preferred-but-ineligible"},
+	}})
+	require.NoError(t, f.sweep(), "establish durable topology baseline")
+
+	// This ACTIVE lease may already have been placed after the baseline was
+	// recorded (for example by a v0.13 process). With its actual owner silent,
+	// recordlessness is not enough to authorize a move.
+	f.addLease("lease-active-unknown", billingtypes.LEASE_STATE_ACTIVE)
+	f.backendAt(3).seedProvision(
+		t, "lease-active-unknown", f.providerUUID, backend.ProvisionStatusReady,
+	)
+	f.backendAt(3).setFault(faultConnReset)
+
+	// backend-2 answers /provisions but not /retentions. Only backend-1 is an
+	// eligible destination for a genuinely new PENDING lease.
+	f.backendAt(2).setFault(faultRetentionsOnly)
+	f.addLease(
+		"lease-new-degraded", billingtypes.LEASE_STATE_PENDING,
+		"sku-preferred-but-ineligible",
+	)
+
+	require.NoError(t, f.sweep())
+
+	require.Equal(t, 1, f.backendAt(1).provisionCount("lease-new-degraded"))
+	require.Zero(t, f.backendAt(2).provisionCount("lease-new-degraded"))
+	require.Zero(t, f.backendAt(3).provisionCount("lease-new-degraded"))
+	f.assertProvisionedExactlyOnce("lease-new-degraded")
+	for _, srv := range f.servers {
+		require.Zero(t, srv.provisionCount("lease-active-unknown"),
+			"an ACTIVE recordless lease must not move during an outage via %s", srv.name)
+	}
+	require.Equal(t, placement.StateAbsent,
+		f.placement.Lookup("lease-active-unknown").State())
 }
 
 // A backend that dies partway through a paginated listing is the subtlest

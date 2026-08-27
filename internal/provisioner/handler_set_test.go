@@ -26,6 +26,7 @@ import (
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
@@ -419,8 +420,9 @@ func (m *mockPlacementStore) SetConflictsIfNotNewer(
 			m.conflictOwnersUnknown[leaseUUID] == unknownOwners {
 			continue
 		}
-		delete(m.placements, leaseUUID)
-		delete(m.attempts, leaseUUID)
+		// A conflict is an additional durable quarantine, not permission to erase
+		// the exact confirmed owner or outstanding attempt that led to it. Mirror
+		// placement.Store so legacy reconciler tests exercise the same sticky facts.
 		m.conflicts[leaseUUID] = true
 		m.conflictBackends[leaseUUID] = normalizedCandidates
 		m.conflictOwnersUnknown[leaseUUID] = unknownOwners
@@ -569,10 +571,12 @@ func (m *mockPlacementStore) Close() error   { return nil }
 
 // newTestHandlerSet creates a HandlerSet with mocked dependencies for testing.
 func newTestHandlerSet(
+	t testing.TB,
 	chainClient *chaintest.MockClient,
 	mb *mockManagerBackend,
 	ack *mockAcknowledger,
 	payloadStore *payload.Store,
+	publishers ...message.Publisher,
 ) (*HandlerSet, *DefaultInFlightTracker) {
 	tracker := NewInFlightTracker()
 	router := &mockBackendRouter{
@@ -596,15 +600,68 @@ func newTestHandlerSet(
 		},
 	}
 
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, nil)
-	hs := NewHandlerSet(HandlerDeps{
+	var publisher message.Publisher
+	if len(publishers) > 0 {
+		publisher = publishers[0]
+	}
+	orch := newTestProvisionOrchestrator(t, "prov-1", "http://localhost:8080", router, tracker, nil)
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		ChainClient:  chainClient,
 		Orchestrator: orch,
+		Placement:    testCallbackPlacement(t, orch),
 		Tracker:      tracker,
 		Acknowledger: ack,
 		PayloadStore: payloadStore,
+		Publisher:    publisher,
 	})
 	return hs, tracker
+}
+
+func TestHandlerSet_MissingOrTypedNilEventOperationsFailClosed(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		operations EventOperations
+	}{
+		{name: "missing"},
+		{name: "typed nil", operations: (*operation.Registry)(nil)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			chainReads := 0
+			handler := NewHandlerSet(HandlerDeps{
+				ChainClient: &chaintest.MockClient{GetLeaseFunc: func(
+					context.Context, string,
+				) (*billingtypes.Lease, error) {
+					chainReads++
+					return &billingtypes.Lease{}, nil
+				}},
+				EventOperations: test.operations,
+			})
+
+			err := handler.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
+				Type: chain.LeaseCreated, LeaseUUID: "lease-1",
+			}))
+			require.ErrorContains(t, err, "event lifecycle operation registry is unavailable")
+			assert.Zero(t, chainReads, "missing claim authority must fail before the chain read")
+		})
+	}
+}
+
+func TestHandlerSet_MissingOrTypedNilCallbackApplicationFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		callbacks CallbackApplication
+	}{
+		{name: "missing"},
+		{name: "typed nil", callbacks: (*typedNilCallbackApplication)(nil)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := NewHandlerSet(HandlerDeps{Callbacks: test.callbacks})
+			err := handler.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
+				LeaseUUID: "lease-1", Status: backend.CallbackStatusSuccess,
+			}))
+			require.ErrorIs(t, err, errCallbackOperationsUnavailable)
+		})
+	}
 }
 
 // --- HandleLeaseCreated tests ---
@@ -622,7 +679,7 @@ func TestHandlerSet_HandleLeaseCreated_Success(t *testing.T) {
 		},
 	}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, nil, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, nil, nil)
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
 		LeaseUUID: "lease-1",
@@ -654,7 +711,7 @@ func TestHandlerSet_HandleLeaseCreated_WithMetaHash_SkipsProvisioning(t *testing
 		},
 	}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, nil, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, nil, nil)
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
 		LeaseUUID: "lease-1",
@@ -671,6 +728,83 @@ func TestHandlerSet_HandleLeaseCreated_WithMetaHash_SkipsProvisioning(t *testing
 	assert.False(t, tracker.IsInFlight("lease-1"))
 }
 
+func TestHandlerSet_HandleLeaseCreated_DelayedTerminalStatesHaveNoSideEffects(t *testing.T) {
+	for _, state := range []billingtypes.LeaseState{
+		billingtypes.LEASE_STATE_ACTIVE,
+		billingtypes.LEASE_STATE_CLOSED,
+		billingtypes.LEASE_STATE_REJECTED,
+	} {
+		t.Run(state.String(), func(t *testing.T) {
+			mb := &mockManagerBackend{name: "test-backend"}
+			mockChain := &chaintest.MockClient{GetLeaseFunc: func(
+				context.Context,
+				string,
+			) (*billingtypes.Lease, error) {
+				return &billingtypes.Lease{
+					Uuid: "lease-1", Tenant: "tenant-a", State: state,
+					MetaHash: []byte{1},
+					Items:    []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+				}, nil
+			}}
+			publisher := newMockPublisher()
+			hs, tracker := newTestHandlerSet(t, mockChain, mb, nil, nil, publisher)
+
+			require.NoError(t, hs.HandleLeaseCreated(newLeaseEventMsg(t, chain.LeaseEvent{
+				Type: chain.LeaseCreated, LeaseUUID: "lease-1", Tenant: "tenant-a",
+			})))
+
+			assert.Empty(t, hs.awaitingPayload)
+			assert.False(t, tracker.IsInFlight("lease-1"))
+			mb.mu.Lock()
+			assert.Empty(t, mb.provisionCalls)
+			assert.Empty(t, mb.deprovisionCalls)
+			mb.mu.Unlock()
+			publisher.mu.Lock()
+			assert.Empty(t, publisher.published[TopicLeaseEvent])
+			publisher.mu.Unlock()
+		})
+	}
+}
+
+func TestHandlerSet_CreateClaimFencesChainReadThroughBackendDispatch(t *testing.T) {
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	mockChain := &chaintest.MockClient{GetLeaseFunc: func(
+		context.Context,
+		string,
+	) (*billingtypes.Lease, error) {
+		close(readStarted)
+		<-releaseRead
+		return &billingtypes.Lease{
+			Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+			Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+		}, nil
+	}}
+	mb := &mockManagerBackend{name: "test-backend"}
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, nil)
+	message := newLeaseEventMsg(t, chain.LeaseEvent{
+		Type: chain.LeaseCreated, LeaseUUID: "lease-1", Tenant: "tenant-a",
+	})
+	handled := make(chan error, 1)
+	go func() { handled <- hs.HandleLeaseCreated(message) }()
+	<-readStarted
+
+	orchestrator, ok := hs.provisioner.(*ProvisionOrchestrator)
+	require.True(t, ok)
+	require.Error(t, orchestrator.Deprovision(context.Background(), "lease-1"),
+		"close must retry while the create handler owns the authoritative read")
+	mb.mu.Lock()
+	assert.Empty(t, mb.provisionCalls)
+	assert.Empty(t, mb.deprovisionCalls)
+	mb.mu.Unlock()
+
+	close(releaseRead)
+	require.NoError(t, <-handled)
+	mb.mu.Lock()
+	assert.Len(t, mb.provisionCalls, 1)
+	mb.mu.Unlock()
+}
+
 func TestHandlerSet_HandleLeaseCreated_LeaseNotFound(t *testing.T) {
 	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
@@ -678,7 +812,7 @@ func TestHandlerSet_HandleLeaseCreated_LeaseNotFound(t *testing.T) {
 		},
 	}
 
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, nil)
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
 		LeaseUUID: "lease-1",
@@ -695,7 +829,7 @@ func TestHandlerSet_HandleLeaseCreated_ChainError(t *testing.T) {
 		},
 	}
 
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, nil)
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
 		LeaseUUID: "lease-1",
@@ -729,8 +863,7 @@ func TestHandlerSet_HandleLeaseCreated_ValidationError_PublishesFailedEvent(t *t
 		},
 	}
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, nil)
-	hs.deps.Publisher = pub
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, nil, pub)
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseCreated,
@@ -745,10 +878,12 @@ func TestHandlerSet_HandleLeaseCreated_ValidationError_PublishesFailedEvent(t *t
 	pub.mu.Lock()
 	msgs := pub.published[TopicLeaseEvent]
 	pub.mu.Unlock()
-	require.Len(t, msgs, 1, "should publish exactly one failed event")
+	require.Len(t, msgs, 2, "starting must precede the synchronous failure event")
 
-	var event backend.LeaseStatusEvent
-	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+	var starting, event backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(msgs[0].Payload, &starting))
+	require.NoError(t, json.Unmarshal(msgs[1].Payload, &event))
+	assert.Equal(t, backend.ProvisionStatusProvisioning, starting.Status)
 	assert.Equal(t, "lease-val", event.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusFailed, event.Status)
 	assert.Equal(t, "invalid SKU", event.Error)
@@ -768,7 +903,7 @@ func TestHandlerSet_HandleLeaseClosed_Success(t *testing.T) {
 		},
 	}
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, nil)
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseClosed,
 		LeaseUUID: "lease-1",
@@ -796,7 +931,7 @@ func TestHandlerSet_HandleLeaseClosed_CleansUpPayload(t *testing.T) {
 
 	ps.Store("lease-1", []byte("data"))
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, ps)
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, ps)
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseClosed,
 		LeaseUUID: "lease-1",
@@ -813,7 +948,7 @@ func TestHandlerSet_HandleLeaseExpired_DelegatesToClosed(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, nil)
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseExpired,
 		LeaseUUID: "lease-1",
@@ -846,8 +981,7 @@ func TestHandlerSet_HandleLeaseClosed_DoesNotEmitRetainedOnIntent(t *testing.T) 
 		},
 	}
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, nil)
-	hs.deps.Publisher = pub
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, nil, pub)
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseClosed,
@@ -872,8 +1006,7 @@ func TestHandlerSet_HandleLeaseExpired_DoesNotEmitRetainedOnIntent(t *testing.T)
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, nil)
-	hs.deps.Publisher = pub
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, nil, pub)
 
 	msg := newLeaseEventMsg(t, chain.LeaseEvent{
 		Type:      chain.LeaseExpired,
@@ -901,7 +1034,7 @@ func TestHandlerSet_HandleBackendCallback_Success(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -916,7 +1049,7 @@ func TestHandlerSet_HandleBackendCallback_Success(t *testing.T) {
 	assert.False(t, tracker.IsInFlight("lease-1"))
 }
 
-func TestHandlerSet_HandleBackendCallback_StaleBackendCannotSettleCurrentOperation(t *testing.T) {
+func TestHandlerSet_HandleBackendCallback_MetricsBackendCannotRedirectCurrentOperation(t *testing.T) {
 	for _, status := range []backend.CallbackStatus{backend.CallbackStatusSuccess, backend.CallbackStatusFailed} {
 		t.Run(string(status), func(t *testing.T) {
 			var ackCalls, leaseReads int
@@ -930,23 +1063,35 @@ func TestHandlerSet_HandleBackendCallback_StaleBackendCannotSettleCurrentOperati
 				ackCalls++
 				return true, "tx", nil
 			}}
-			f := newPlacementTestFixture(chainClient, ack)
+			f := newPlacementTestFixture(t, chainClient, ack)
 			requireSetPlacementAttempt(t, f.ps, "lease-1", "current-backend")
-			f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "current-backend")
+			generation, tracked := f.tracker.TryTrackInFlightWithOperationID(
+				"lease-1", "tenant-a", testItems("sku-1"), "current-backend",
+			)
+			require.True(t, tracked)
 
 			err := f.hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-				LeaseUUID: "lease-1",
-				Backend:   "stale-backend",
-				Status:    status,
-				Error:     "stale failure",
+				LeaseUUID:   "lease-1",
+				Backend:     "metrics-only-backend",
+				Status:      status,
+				Error:       "backend failure",
+				OperationID: generation.String(),
 			}))
 			require.NoError(t, err)
-			assert.Zero(t, ackCalls)
-			assert.Zero(t, leaseReads)
-			assert.True(t, f.tracker.IsInFlight("lease-1"))
+			assert.False(t, f.tracker.IsInFlight("lease-1"))
 			p := f.ps.Lookup("lease-1")
-			assert.Equal(t, "current-backend", p.Attempt)
-			assert.Empty(t, p.Backend)
+			switch status {
+			case backend.CallbackStatusSuccess:
+				assert.Equal(t, 1, ackCalls)
+				assert.Zero(t, leaseReads)
+				assert.Equal(t, "current-backend", p.Backend,
+					"the tracked operation, not callback JSON, selects placement")
+				assert.Empty(t, p.Attempt)
+			case backend.CallbackStatusFailed:
+				assert.Zero(t, ackCalls)
+				assert.Equal(t, 1, leaseReads)
+				assert.Equal(t, placement.StateAbsent, p.State())
+			}
 		})
 	}
 }
@@ -963,29 +1108,27 @@ func TestHandlerSet_HandleBackendCallback_StaleSameBackendGenerationCannotSettle
 				ackCalls++
 				return true, "tx", nil
 			}}
-			f := newPlacementTestFixture(chainClient, ack)
+			f := newPlacementTestFixture(t, chainClient, ack)
 			requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
-			generation, tracked := f.tracker.TryTrackInFlightWithGeneration(
+			generation, tracked := f.tracker.TryTrackInFlightWithOperationID(
 				"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 			)
 			require.True(t, tracked)
-			staleGeneration := generation + 1
-			if staleGeneration == 0 {
-				staleGeneration = 1
-			}
+			staleGeneration, err := operation.ParseID("d9428888-122b-41e1-b85c-61c67afba0c6")
+			require.NoError(t, err)
 
 			require.NoError(t, f.hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-				LeaseUUID:           "lease-1",
-				Backend:             "test-backend",
-				Status:              status,
-				Error:               "stale failure",
-				OperationGeneration: staleGeneration,
+				LeaseUUID:   "lease-1",
+				Backend:     "test-backend",
+				Status:      status,
+				Error:       "stale failure",
+				OperationID: staleGeneration.String(),
 			})))
 			assert.Zero(t, ackCalls)
 			assert.Zero(t, leaseReads)
 			current, exists := f.tracker.GetInFlight("lease-1")
 			require.True(t, exists)
-			assert.Equal(t, generation, current.Generation)
+			assert.Equal(t, generation, current.OperationID)
 			assert.Equal(t, "test-backend", f.ps.Lookup("lease-1").Attempt)
 		})
 	}
@@ -993,23 +1136,23 @@ func TestHandlerSet_HandleBackendCallback_StaleSameBackendGenerationCannotSettle
 
 func TestHandlerSet_HandleBackendCallback_MatchingGenerationSettlesOperation(t *testing.T) {
 	ackCalls := 0
-	f := newPlacementTestFixture(&chaintest.MockClient{}, &mockAcknowledger{
+	f := newPlacementTestFixture(t, &chaintest.MockClient{}, &mockAcknowledger{
 		acknowledgeFn: func(context.Context, string) (bool, string, error) {
 			ackCalls++
 			return true, "tx", nil
 		},
 	})
 	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
-	generation, tracked := f.tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := f.tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 	)
 	require.True(t, tracked)
 
 	require.NoError(t, f.hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID:           "lease-1",
-		Backend:             "test-backend",
-		Status:              backend.CallbackStatusSuccess,
-		OperationGeneration: generation,
+		LeaseUUID:   "lease-1",
+		Backend:     "test-backend",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: generation.String(),
 	})))
 	assert.Equal(t, 1, ackCalls)
 	assert.False(t, f.tracker.IsInFlight("lease-1"))
@@ -1017,14 +1160,14 @@ func TestHandlerSet_HandleBackendCallback_MatchingGenerationSettlesOperation(t *
 
 func TestHandlerSet_HandleBackendCallback_WaitsForContendedSettlementClaim(t *testing.T) {
 	ackCalls := make(chan struct{}, 2)
-	f := newPlacementTestFixture(&chaintest.MockClient{}, &mockAcknowledger{
+	f := newPlacementTestFixture(t, &chaintest.MockClient{}, &mockAcknowledger{
 		acknowledgeFn: func(context.Context, string) (bool, string, error) {
 			ackCalls <- struct{}{}
 			return true, "tx", nil
 		},
 	})
 	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
-	generation, tracked := f.tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := f.tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 	)
 	require.True(t, tracked)
@@ -1033,17 +1176,17 @@ func TestHandlerSet_HandleBackendCallback_WaitsForContendedSettlementClaim(t *te
 
 	// Observe the handler's first failed claim so the hold below measures actual
 	// contention rather than goroutine scheduling delay.
-	observed := &claimAttemptObservingTracker{
-		InFlightTracker: f.tracker,
-		attempted:       make(chan struct{}),
+	observed := &claimAttemptObservingOperations{
+		CallbackOperations: f.tracker.Operations(),
+		attempted:          make(chan struct{}),
 	}
-	f.hs.deps.Tracker = observed
+	observeCallbackClaims(t, f.hs, observed)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID:           "lease-1",
-		Backend:             "test-backend",
-		Status:              backend.CallbackStatusSuccess,
-		OperationGeneration: generation,
+		LeaseUUID:   "lease-1",
+		Backend:     "test-backend",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: generation.String(),
 	})
 	done := make(chan error, 1)
 	go func() {
@@ -1122,32 +1265,34 @@ func TestHandlerSet_HandleBackendCallback_DeprovisionOwnedCallbacksBypassClaimWa
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tracker := NewInFlightTracker()
-			orch := NewProvisionOrchestrator("provider-1", "http://callback", nil, tracker, nil)
+			orch := newTestProvisionOrchestrator(t, "provider-1", "http://callback", nil, tracker, nil)
 			orch.rememberDeprovisionCandidates("lease-1", []string{"test-backend"})
-			generation, tracked := tracker.TryTrackInFlightWithGeneration(
+			generation, tracked := tracker.TryTrackInFlightWithOperationID(
 				"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 			)
 			require.True(t, tracked)
 			_, claimed := tracker.TryClaimInFlightForDeprovision("lease-1", generation)
 			require.True(t, claimed)
 
-			observed := &claimAttemptObservingTracker{
-				InFlightTracker: tracker,
-				attempted:       make(chan struct{}),
+			observed := &claimAttemptObservingOperations{
+				CallbackOperations: tracker.Operations(),
+				attempted:          make(chan struct{}),
 			}
 			pub := newMockPublisher()
-			hs := NewHandlerSet(HandlerDeps{
+			hs := composeTestHandlerSet(t, testHandlerDeps{
 				Orchestrator: orch,
-				Tracker:      observed,
+				Placement:    testCallbackPlacement(t, orch),
+				Tracker:      tracker,
 				Publisher:    pub,
 			})
+			observeCallbackClaims(t, hs, observed)
 			require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-				LeaseUUID:           "lease-1",
-				Backend:             tt.callbackBackend,
-				Status:              tt.status,
-				Error:               tt.callbackErr,
-				Retained:            tt.retained,
-				OperationGeneration: generation,
+				LeaseUUID:   "lease-1",
+				Backend:     tt.callbackBackend,
+				Status:      tt.status,
+				Error:       tt.callbackErr,
+				Retained:    tt.retained,
+				OperationID: generation.String(),
 			})))
 
 			select {
@@ -1157,7 +1302,7 @@ func TestHandlerSet_HandleBackendCallback_DeprovisionOwnedCallbacksBypassClaimWa
 			}
 			current, exists := tracker.GetInFlight("lease-1")
 			require.True(t, exists, "the close path remains responsible for terminal settlement")
-			assert.Equal(t, generation, current.Generation)
+			assert.Equal(t, generation, current.OperationID)
 			assert.Equal(t, inFlightSettlementDeprovision, current.settlementOwner)
 			if tt.wantCandidateRetired {
 				assert.Empty(t, orch.rememberedDeprovisionCandidates("lease-1"),
@@ -1187,18 +1332,18 @@ func TestHandlerSet_HandleBackendCallback_DeprovisionOwnedCallbacksBypassClaimWa
 
 func TestHandlerSet_HandleBackendCallback_AutonomousDeprovisionedSettlesInFlight(t *testing.T) {
 	tracker := NewInFlightTracker()
-	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 	)
 	require.True(t, tracked)
 	pub := newMockPublisher()
-	hs := NewHandlerSet(HandlerDeps{Tracker: tracker, Publisher: pub})
+	hs := composeTestHandlerSet(t, testHandlerDeps{Tracker: tracker, Publisher: pub})
 	require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID:           "lease-1",
-		Backend:             "test-backend",
-		Status:              backend.CallbackStatusDeprovisioned,
-		Retained:            true,
-		OperationGeneration: generation,
+		LeaseUUID:   "lease-1",
+		Backend:     "test-backend",
+		Status:      backend.CallbackStatusDeprovisioned,
+		Retained:    true,
+		OperationID: generation.String(),
 	})))
 
 	assert.False(t, tracker.IsInFlight("lease-1"), "an autonomous terminal callback must not strand tracking")
@@ -1213,25 +1358,25 @@ func TestHandlerSet_HandleBackendCallback_AutonomousDeprovisionedSettlesInFlight
 
 func TestHandlerSet_HandleBackendCallback_StaleDeprovisionedGenerationPublishesNothing(t *testing.T) {
 	tracker := NewInFlightTracker()
-	staleGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+	staleGeneration, tracked := tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 	)
 	require.True(t, tracked)
 	_, claimed := tracker.TryClaimInFlight("lease-1", staleGeneration)
 	require.True(t, claimed)
 	require.True(t, tracker.FinishClaimedInFlight("lease-1", staleGeneration))
-	replacementGeneration, replacementTracked := tracker.TryTrackInFlightWithGeneration(
+	replacementGeneration, replacementTracked := tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-b", testItems("sku-1"), "test-backend",
 	)
 	require.True(t, replacementTracked)
 	pub := newMockPublisher()
-	hs := NewHandlerSet(HandlerDeps{Tracker: tracker, Publisher: pub})
+	hs := composeTestHandlerSet(t, testHandlerDeps{Tracker: tracker, Publisher: pub})
 	require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID:           "lease-1",
-		Backend:             "test-backend",
-		Status:              backend.CallbackStatusDeprovisioned,
-		Retained:            true,
-		OperationGeneration: staleGeneration,
+		LeaseUUID:   "lease-1",
+		Backend:     "test-backend",
+		Status:      backend.CallbackStatusDeprovisioned,
+		Retained:    true,
+		OperationID: staleGeneration.String(),
 	})))
 
 	pub.mu.Lock()
@@ -1240,29 +1385,33 @@ func TestHandlerSet_HandleBackendCallback_StaleDeprovisionedGenerationPublishesN
 	assert.Empty(t, msgs, "a callback replaced by a newer generation must not publish retained status")
 	current, exists := tracker.GetInFlight("lease-1")
 	require.True(t, exists)
-	assert.Equal(t, replacementGeneration, current.Generation)
-	require.True(t, tracker.UntrackInFlightIfGeneration("lease-1", replacementGeneration))
+	assert.Equal(t, replacementGeneration, current.OperationID)
+	require.True(t, tracker.UntrackInFlightIfOperationID("lease-1", replacementGeneration))
 }
 
-func TestWaitForCallbackSettlementClaim_BoundsLeakedClaimWait(t *testing.T) {
+func TestCallbackService_WaitForSettlementClaim_BoundsLeakedClaimWait(t *testing.T) {
 	tracker := NewInFlightTracker()
-	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 	)
 	require.True(t, tracked)
-	provision, exists := tracker.GetInFlight("lease-1")
+	record, exists := tracker.Operations().Lookup("lease-1")
 	require.True(t, exists)
 	_, claimed := tracker.TryClaimInFlight("lease-1", generation)
 	require.True(t, claimed)
 
 	before := promtestutil.ToFloat64(metrics.CallbackSettlementClaimWaitTimeoutsTotal)
 	started := time.Now()
-	_, ownsClaim, deprovisionOwned, err := waitForCallbackSettlementClaim(
-		context.Background(), tracker, provision, 60*time.Millisecond,
-	)
+	service, err := NewCallbackService(CallbackServiceConfig{
+		Operations:        tracker.Operations(),
+		ClaimPollInterval: 5 * time.Millisecond,
+		ClaimMaxWait:      60 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	result, _, deprovisionOwned, err := service.waitForSettlementClaim(context.Background(), record)
 	elapsed := time.Since(started)
 	require.ErrorIs(t, err, errCallbackSettlementClaimTimeout)
-	assert.False(t, ownsClaim)
+	assert.False(t, result.Claimed())
 	assert.False(t, deprovisionOwned)
 	assert.GreaterOrEqual(t, elapsed, 50*time.Millisecond)
 	assert.Less(t, elapsed, 500*time.Millisecond, "a leaked claim must not block a callback forever")
@@ -1271,57 +1420,57 @@ func TestWaitForCallbackSettlementClaim_BoundsLeakedClaimWait(t *testing.T) {
 
 	current, stillExists := tracker.GetInFlight("lease-1")
 	require.True(t, stillExists)
-	assert.Equal(t, generation, current.Generation)
+	assert.Equal(t, generation, current.OperationID)
 	_, stolen := tracker.TryClaimInFlight("lease-1", generation)
 	assert.False(t, stolen, "the timeout bounds waiting but must not steal a live claim")
 	require.True(t, tracker.ReleaseInFlightClaim("lease-1", generation))
 }
 
-func TestWaitForCallbackSettlementClaim_ObservesDeprovisionOwnerAfterStaleRead(t *testing.T) {
+func TestCallbackService_WaitForSettlementClaim_ObservesDeprovisionOwnerAfterStaleRead(t *testing.T) {
 	tracker := NewInFlightTracker()
-	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 	)
 	require.True(t, tracked)
-	stale, exists := tracker.GetInFlight("lease-1")
+	stale, exists := tracker.Operations().Lookup("lease-1")
 	require.True(t, exists)
 	_, claimed := tracker.TryClaimInFlightForDeprovision("lease-1", generation)
 	require.True(t, claimed)
 
-	observed, ownsClaim, deprovisionOwned, err := waitForCallbackSettlementClaim(
-		context.Background(), tracker, stale, time.Second,
-	)
+	service, err := NewCallbackService(CallbackServiceConfig{Operations: tracker.Operations()})
 	require.NoError(t, err)
-	assert.False(t, ownsClaim)
+	result, observed, deprovisionOwned, err := service.waitForSettlementClaim(context.Background(), stale)
+	require.NoError(t, err)
+	assert.False(t, result.Claimed())
 	assert.True(t, deprovisionOwned)
-	assert.Equal(t, generation, observed.Generation)
-	assert.Equal(t, inFlightSettlementDeprovision, observed.settlementOwner)
+	assert.Equal(t, generation, observed.ID)
+	assert.Equal(t, operation.SettlementDeprovision, observed.Settlement)
 	require.True(t, tracker.ReleaseInFlightClaim("lease-1", generation))
 }
 
 func TestHandlerSet_HandleBackendCallback_PanicReleasesSettlementClaim(t *testing.T) {
-	f := newPlacementTestFixture(&chaintest.MockClient{}, &mockAcknowledger{
+	f := newPlacementTestFixture(t, &chaintest.MockClient{}, &mockAcknowledger{
 		acknowledgeFn: func(context.Context, string) (bool, string, error) {
 			panic("acknowledger panic")
 		},
 	})
 	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
-	generation, tracked := f.tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := f.tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 	)
 	require.True(t, tracked)
 
 	assert.PanicsWithValue(t, "acknowledger panic", func() {
 		_ = f.hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-			LeaseUUID:           "lease-1",
-			Backend:             "test-backend",
-			Status:              backend.CallbackStatusSuccess,
-			OperationGeneration: generation,
+			LeaseUUID:   "lease-1",
+			Backend:     "test-backend",
+			Status:      backend.CallbackStatusSuccess,
+			OperationID: generation.String(),
 		}))
 	})
 	current, exists := f.tracker.GetInFlight("lease-1")
 	require.True(t, exists)
-	assert.Equal(t, generation, current.Generation)
+	assert.Equal(t, generation, current.OperationID)
 	_, claimed := f.tracker.TryClaimInFlight("lease-1", generation)
 	require.True(t, claimed, "panic unwinding must release callback settlement ownership")
 	require.True(t, f.tracker.ReleaseInFlightClaim("lease-1", generation))
@@ -1343,7 +1492,7 @@ func TestHandlerSet_HandleBackendCallback_Restore_InlineAcksWithOperationLabel(t
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	// Mirror what the fixed RestoreLease handler does: track the new lease as a restore.
 	require.True(t, tracker.TryTrackRestoreInFlight("lease-r", "tenant-a", testItems("sku-1"), "test-backend"))
 
@@ -1382,7 +1531,7 @@ func TestHandlerSet_HandleBackendCallback_UntrackedRestore_SkipsAck(t *testing.T
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, _ := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	// Intentionally do NOT track the lease in-flight.
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1405,7 +1554,7 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError(t *testing.T)
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1428,8 +1577,7 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError_PublishesRead
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
-	hs.deps.Publisher = pub
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil, pub)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1461,7 +1609,7 @@ func TestHandlerSet_HandleBackendCallback_Success_TransientAckError(t *testing.T
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1496,7 +1644,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_PendingLease(t *testing.T) {
 		},
 	}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1523,7 +1671,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease(t *testing.T) {
 		},
 	}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1554,7 +1702,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_RejectFails(t *testing.T) {
 		},
 	}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1587,7 +1735,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_EmptyReason(t *testing.T) {
 		},
 	}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1606,7 +1754,7 @@ func TestHandlerSet_HandleBackendCallback_UnknownLease(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, _ := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, mb, ack, nil)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
 		LeaseUUID: "unknown-lease",
@@ -1623,7 +1771,7 @@ func TestHandlerSet_HandleBackendCallback_UnknownLease(t *testing.T) {
 func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.T) {
 	pub := newMockPublisher()
 
-	hs := NewHandlerSet(HandlerDeps{
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		Tracker:   NewInFlightTracker(),
 		Publisher: pub,
 	})
@@ -1706,27 +1854,25 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		assert.NotEmpty(t, event.Error, "retained event should carry an informational message")
 	})
 
-	t.Run("generation_scoped_deprovisioned_retained_survives_tracker_cleanup", func(t *testing.T) {
+	t.Run("generation_scoped_deprovisioned_is_ignored_after_tracker_cleanup", func(t *testing.T) {
 		pub.mu.Lock()
 		pub.published = make(map[string][]*message.Message)
 		pub.mu.Unlock()
 
 		err := hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-			LeaseUUID:           "lease-late-retained",
-			Backend:             "test-backend",
-			Status:              backend.CallbackStatusDeprovisioned,
-			Retained:            true,
-			OperationGeneration: 42,
+			LeaseUUID:   "lease-late-retained",
+			Backend:     "test-backend",
+			Status:      backend.CallbackStatusDeprovisioned,
+			Retained:    true,
+			OperationID: "123e4567-e89b-42d3-a456-426614174000",
 		}))
 		require.NoError(t, err)
 
 		pub.mu.Lock()
 		msgs := append([]*message.Message(nil), pub.published[TopicLeaseEvent]...)
 		pub.mu.Unlock()
-		require.Len(t, msgs, 1)
-		var event backend.LeaseStatusEvent
-		require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
-		assert.Equal(t, backend.ProvisionStatusRetained, event.Status)
+		assert.Empty(t, msgs,
+			"a token-present callback without its exact operation is stale observation only")
 	})
 
 	t.Run("deprovisioned_not_retained_publishes_nothing", func(t *testing.T) {
@@ -1750,23 +1896,20 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 	})
 }
 
-func TestHandlerSet_HandleBackendCallback_GenerationScopedNonInFlightCallbacksAreStatusOnly(t *testing.T) {
+func TestHandlerSet_HandleBackendCallback_GenerationScopedNonInFlightCallbacksAreIgnored(t *testing.T) {
 	tests := []struct {
 		name        string
 		status      backend.CallbackStatus
 		callbackErr string
-		wantStatus  backend.ProvisionStatus
 	}{
 		{
-			name:       "success",
-			status:     backend.CallbackStatusSuccess,
-			wantStatus: backend.ProvisionStatusReady,
+			name:   "success",
+			status: backend.CallbackStatusSuccess,
 		},
 		{
 			name:        "failure",
 			status:      backend.CallbackStatusFailed,
 			callbackErr: "custom-domain redeploy failed",
-			wantStatus:  backend.ProvisionStatusFailed,
 		},
 	}
 
@@ -1790,16 +1933,16 @@ func TestHandlerSet_HandleBackendCallback_GenerationScopedNonInFlightCallbacksAr
 				return false, "", billingtypes.ErrLeaseNotPending
 			}}
 			tracker := NewInFlightTracker()
-			olderGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+			olderGeneration, tracked := tracker.TryTrackInFlightWithOperationID(
 				"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 			)
 			require.True(t, tracked)
-			require.True(t, tracker.UntrackInFlightIfGeneration("lease-1", olderGeneration))
-			newerGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+			require.True(t, tracker.UntrackInFlightIfOperationID("lease-1", olderGeneration))
+			newerGeneration, tracked := tracker.TryTrackInFlightWithOperationID(
 				"lease-1", "tenant-a", testItems("sku-1"), "test-backend",
 			)
 			require.True(t, tracked)
-			require.Greater(t, newerGeneration, olderGeneration)
+			require.NotEqual(t, newerGeneration, olderGeneration)
 			_, claimed := tracker.TryClaimInFlight("lease-1", newerGeneration)
 			require.True(t, claimed)
 			require.True(t, tracker.FinishClaimedInFlight("lease-1", newerGeneration))
@@ -1808,73 +1951,67 @@ func TestHandlerSet_HandleBackendCallback_GenerationScopedNonInFlightCallbacksAr
 			require.NoError(t, store.Set("lease-1", "test-backend"))
 			requireSetPlacementAttempt(t, store, "lease-1", "test-backend")
 			placementBefore := store.Lookup("lease-1")
-			orch := NewProvisionOrchestrator("provider-1", "http://callback", nil, tracker, store)
+			orch := newTestProvisionOrchestrator(t, "provider-1", "http://callback", nil, tracker, store)
 			pub := newMockPublisher()
-			hs := NewHandlerSet(HandlerDeps{
+			hs := composeTestHandlerSet(t, testHandlerDeps{
 				ChainClient:  chainClient,
 				Orchestrator: orch,
+				Placement:    testCallbackPlacement(t, orch),
 				Tracker:      tracker,
 				Acknowledger: ack,
 				Publisher:    pub,
 			})
-			// Backends retain the original opaque callback URL for later redeploys,
-			// so once no exact operation is tracked fred cannot distinguish a delayed
-			// old result from a legitimate current status. It may publish out of order,
-			// but it must never grant either event lifecycle or placement authority.
+			// Once no exact operation is tracked fred cannot distinguish a delayed
+			// old result from a legitimate current status. The callback is therefore
+			// observation-only and cannot publish an out-of-order terminal event.
 			require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-				LeaseUUID:           "lease-1",
-				Backend:             "test-backend",
-				Status:              tt.status,
-				Error:               tt.callbackErr,
-				OperationGeneration: olderGeneration,
+				LeaseUUID:   "lease-1",
+				Backend:     "test-backend",
+				Status:      tt.status,
+				Error:       tt.callbackErr,
+				OperationID: olderGeneration.String(),
 			})))
 
-			assert.Zero(t, chainReads, "a status-only callback must not inspect chain state")
-			assert.Zero(t, chainRejects, "a status-only callback must not reject the lease")
-			assert.Zero(t, ackCalls, "a status-only callback must not acknowledge the lease")
+			assert.Zero(t, chainReads, "a stale callback must not inspect chain state")
+			assert.Zero(t, chainRejects, "a stale callback must not reject the lease")
+			assert.Zero(t, ackCalls, "a stale callback must not acknowledge the lease")
 			assert.Equal(t, placementBefore, store.Lookup("lease-1"),
 				"a callback without an in-flight claim must not mutate placement")
 
 			pub.mu.Lock()
 			msgs := append([]*message.Message(nil), pub.published[TopicLeaseEvent]...)
 			pub.mu.Unlock()
-			require.Len(t, msgs, 1)
-			var event backend.LeaseStatusEvent
-			require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
-			assert.Equal(t, tt.wantStatus, event.Status)
-			assert.Equal(t, tt.callbackErr, event.Error)
+			assert.Empty(t, msgs)
 		})
 	}
 }
 
-func TestHandlerSet_HandleBackendCallback_LateDeprovisionedRetiresRetryCandidate(t *testing.T) {
+func TestHandlerSet_HandleBackendCallback_LateTokenedDeprovisionCannotRetireRetryCandidate(t *testing.T) {
 	tracker := NewInFlightTracker()
-	orch := NewProvisionOrchestrator("provider-1", "http://callback", nil, tracker, nil)
+	orch := newTestProvisionOrchestrator(t, "provider-1", "http://callback", nil, tracker, nil)
 	orch.rememberDeprovisionCandidates("lease-1", []string{"backend-a"})
 	pub := newMockPublisher()
-	hs := NewHandlerSet(HandlerDeps{
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		Orchestrator: orch,
+		Placement:    testCallbackPlacement(t, orch),
 		Tracker:      tracker,
 		Publisher:    pub,
 	})
 
 	require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID:           "lease-1",
-		Backend:             "backend-a",
-		Status:              backend.CallbackStatusDeprovisioned,
-		Retained:            true,
-		OperationGeneration: 42,
+		LeaseUUID:   "lease-1",
+		Backend:     "backend-a",
+		Status:      backend.CallbackStatusDeprovisioned,
+		Retained:    true,
+		OperationID: "123e4567-e89b-42d3-a456-426614174000",
 	})))
 
-	assert.Empty(t, orch.rememberedDeprovisionCandidates("lease-1"),
-		"a later orphan/backend completion must retire poisoned-close retry state")
+	assert.Equal(t, []string{"backend-a"}, orch.rememberedDeprovisionCandidates("lease-1"),
+		"a callback without its exact operation cannot retire current retry state")
 	pub.mu.Lock()
 	msgs := append([]*message.Message(nil), pub.published[TopicLeaseEvent]...)
 	pub.mu.Unlock()
-	require.Len(t, msgs, 1)
-	var event backend.LeaseStatusEvent
-	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
-	assert.Equal(t, backend.ProvisionStatusRetained, event.Status)
+	assert.Empty(t, msgs)
 }
 
 func TestHandlerSet_HandleBackendCallback_UnknownStatus(t *testing.T) {
@@ -1882,7 +2019,7 @@ func TestHandlerSet_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -1923,7 +2060,7 @@ func TestHandlerSet_HandlePayloadReceived_Success(t *testing.T) {
 	payloadData := []byte(`{"image":"nginx:latest"}`)
 	ps.Store("lease-1", payloadData)
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, nil, ps)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, nil, ps)
 
 	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID:   "lease-1",
@@ -1968,8 +2105,7 @@ func TestHandlerSet_HandlePayloadReceived_Success_PublishesProvisioningEvent(t *
 	payloadData := []byte(`{"image":"nginx:latest"}`)
 	ps.Store("lease-1", payloadData)
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, ps)
-	hs.deps.Publisher = pub
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, ps, pub)
 
 	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID:   "lease-1",
@@ -1994,7 +2130,7 @@ func TestHandlerSet_HandlePayloadReceived_Success_PublishesProvisioningEvent(t *
 
 func TestHandlerSet_HandlePayloadReceived_NilPayloadStore(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, nil)
 
 	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID: "lease-1",
@@ -2020,7 +2156,7 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 
 	ps.Store("lease-1", []byte("data"))
 
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, ps)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, ps)
 	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID: "lease-1",
 	})
@@ -2051,7 +2187,7 @@ func TestHandlerSet_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 
 	ps.Store("lease-1", []byte("data"))
 
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, ps)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, ps)
 	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID: "lease-1",
 	})
@@ -2079,7 +2215,7 @@ func TestHandlerSet_HandlePayloadReceived_ChainError(t *testing.T) {
 
 	ps.Store("lease-1", []byte("data"))
 
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, ps)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, ps)
 	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID: "lease-1",
 	})
@@ -2122,7 +2258,7 @@ func TestHandlerSet_HandlePayloadReceived_HashMismatch(t *testing.T) {
 
 	ps.Store("lease-1", []byte("data"))
 
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, ps)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, ps)
 	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID:   "lease-1",
 		MetaHashHex: "0000000000000000000000000000000000000000000000000000000000000000",
@@ -2171,8 +2307,7 @@ func TestHandlerSet_HandlePayloadReceived_ValidationError_PublishesFailedEvent(t
 	payloadData := []byte(`{"image":"evil.io/malware"}`)
 	ps.Store("lease-val", payloadData)
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, ps)
-	hs.deps.Publisher = pub
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, ps, pub)
 
 	msg := newPayloadEventMsg(t, payload.Event{
 		LeaseUUID:   "lease-val",
@@ -2192,10 +2327,12 @@ func TestHandlerSet_HandlePayloadReceived_ValidationError_PublishesFailedEvent(t
 	pub.mu.Lock()
 	msgs := pub.published[TopicLeaseEvent]
 	pub.mu.Unlock()
-	require.Len(t, msgs, 1, "should publish exactly one failed event")
+	require.Len(t, msgs, 2, "starting must precede the synchronous failure event")
 
-	var event backend.LeaseStatusEvent
-	require.NoError(t, json.Unmarshal(msgs[0].Payload, &event))
+	var starting, event backend.LeaseStatusEvent
+	require.NoError(t, json.Unmarshal(msgs[0].Payload, &starting))
+	require.NoError(t, json.Unmarshal(msgs[1].Payload, &event))
+	assert.Equal(t, backend.ProvisionStatusProvisioning, starting.Status)
 	assert.Equal(t, "lease-val", event.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusFailed, event.Status)
 	assert.Equal(t, "image not allowed", event.Error)
@@ -2273,7 +2410,7 @@ func TestHandlerSet_HandleBackendCallback_LongReasonTruncated(t *testing.T) {
 		},
 	}
 
-	hs, tracker := newTestHandlerSet(mockChain, mb, ack, nil)
+	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	longReason := strings.Repeat("x", 500)
@@ -2322,26 +2459,42 @@ type placementTestFixture struct {
 	mb      *mockManagerBackend
 }
 
-// claimAttemptObservingTracker exposes when a callback first tries to acquire
-// settlement ownership while delegating all tracker behavior to the real
-// implementation.
-type claimAttemptObservingTracker struct {
-	InFlightTracker
+// claimAttemptObservingOperations exposes when a callback first tries to
+// acquire typed settlement ownership while delegating all registry behavior.
+type claimAttemptObservingOperations struct {
+	CallbackOperations
 	attempted chan struct{}
 	once      sync.Once
 }
 
-func (t *claimAttemptObservingTracker) TryClaimInFlight(
+func (operations *claimAttemptObservingOperations) TryClaimCallback(
 	leaseUUID string,
-	generation uint64,
-) (InFlightProvision, bool) {
-	claimed, ok := t.InFlightTracker.TryClaimInFlight(leaseUUID, generation)
-	t.once.Do(func() { close(t.attempted) })
-	return claimed, ok
+	id operation.OperationID,
+) operation.SettlementResult {
+	claimed := operations.CallbackOperations.TryClaimCallback(leaseUUID, id)
+	operations.once.Do(func() { close(operations.attempted) })
+	return claimed
+}
+
+func observeCallbackClaims(
+	t testing.TB,
+	handler *HandlerSet,
+	operations CallbackOperations,
+) {
+	t.Helper()
+	service, ok := handler.callbacks.(*CallbackService)
+	require.True(t, ok)
+	observed := *service
+	observed.operations = operations
+	handler.callbacks = &observed
 }
 
 // newPlacementTestFixture creates a HandlerSet wired with a mockPlacementStore.
-func newPlacementTestFixture(chainClient *chaintest.MockClient, ack *mockAcknowledger) placementTestFixture {
+func newPlacementTestFixture(
+	t testing.TB,
+	chainClient *chaintest.MockClient,
+	ack *mockAcknowledger,
+) placementTestFixture {
 	mb := &mockManagerBackend{name: "test-backend"}
 	ps := &mockPlacementStore{}
 	tracker := NewInFlightTracker()
@@ -2355,10 +2508,11 @@ func newPlacementTestFixture(chainClient *chaintest.MockClient, ack *mockAcknowl
 		},
 		backendsFn: func() []backend.Backend { return []backend.Backend{mb} },
 	}
-	orch := NewProvisionOrchestrator("prov-1", "http://localhost:8080", router, tracker, ps)
-	hs := NewHandlerSet(HandlerDeps{
+	orch := newTestProvisionOrchestrator(t, "prov-1", "http://localhost:8080", router, tracker, ps)
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		ChainClient:  chainClient,
 		Orchestrator: orch,
+		Placement:    testCallbackPlacement(t, orch),
 		Tracker:      tracker,
 		Acknowledger: ack,
 	})
@@ -2375,8 +2529,8 @@ func TestHandlerSet_HandleBackendCallback_Failed_PendingLease_CleansUpPlacement(
 		},
 	}
 
-	f := newPlacementTestFixture(mockChain, &mockAcknowledger{})
-	f.ps.Set("lease-1", "test-backend")
+	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
+	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
 	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
@@ -2401,7 +2555,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_RejectFails_PreservesPlacement(
 		},
 	}
 
-	f := newPlacementTestFixture(mockChain, &mockAcknowledger{})
+	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	f.ps.Set("lease-1", "test-backend")
 	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
@@ -2426,7 +2580,7 @@ func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease_PreservesPlacement(
 		},
 	}
 
-	f := newPlacementTestFixture(mockChain, &mockAcknowledger{})
+	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	f.ps.Set("lease-1", "test-backend")
 	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
@@ -2452,7 +2606,7 @@ func TestHandlerSet_HandleBackendCallback_Success_PreservesPlacement(t *testing.
 		},
 	}
 
-	f := newPlacementTestFixture(mockChain, ack)
+	f := newPlacementTestFixture(t, mockChain, ack)
 	f.ps.Set("lease-1", "test-backend")
 	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
@@ -2476,7 +2630,7 @@ func TestHandlerSet_HandleBackendCallback_Success_RepairsAttemptBeforeAcknowledg
 		ackCalled = true
 		return true, "tx-abc", nil
 	}}
-	f := newPlacementTestFixture(&chaintest.MockClient{}, ack)
+	f := newPlacementTestFixture(t, &chaintest.MockClient{}, ack)
 	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
 	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
@@ -2522,10 +2676,11 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictStill
 				timeoutRejectCalls++
 				return 1, []string{"timeout-reject"}, nil
 			}}
-			orch := NewProvisionOrchestrator("provider-1", "http://cb", &mockBackendRouter{}, tracker, ps)
-			hs := NewHandlerSet(HandlerDeps{
+			orch := newTestProvisionOrchestrator(t, "provider-1", "http://cb", &mockBackendRouter{}, tracker, ps)
+			hs := composeTestHandlerSet(t, testHandlerDeps{
 				ChainClient:  chainClient,
 				Orchestrator: orch,
+				Placement:    testCallbackPlacement(t, orch),
 				Tracker:      tracker,
 				Acknowledger: ack,
 			})
@@ -2544,9 +2699,9 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictStill
 			assert.False(t, tracker.IsInFlight("lease-1"), "successful chain acknowledgement owns terminal cleanup")
 
 			checker := NewTimeoutChecker(TimeoutCheckerConfig{
-				Tracker:  tracker,
-				Rejecter: chainClient,
-				Timeout:  time.Nanosecond,
+				Operations: tracker.Operations(),
+				Rejecter:   chainClient,
+				Timeout:    time.Nanosecond,
 			})
 			checker.CheckOnce(context.Background())
 			assert.Zero(t, timeoutRejectCalls, "a handled success callback must never be rejected later as timed out")
@@ -2598,7 +2753,7 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPrese
 			beforeRevision := store.SnapshotRevision()
 
 			tracker := NewInFlightTracker()
-			generation, tracked := tracker.TryTrackInFlightWithGeneration(
+			generation, tracked := tracker.TryTrackInFlightWithOperationID(
 				"lease-1", "tenant-a", testItems("sku-1"), "backend-a",
 			)
 			require.True(t, tracked)
@@ -2607,20 +2762,21 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictPrese
 				ackCalls++
 				return true, "tx", nil
 			}}
-			orch := NewProvisionOrchestrator(
+			orch := newTestProvisionOrchestrator(t,
 				"provider-1", "http://cb", &mockBackendRouter{}, tracker, store,
 			)
-			hs := NewHandlerSet(HandlerDeps{
+			hs := composeTestHandlerSet(t, testHandlerDeps{
 				Orchestrator: orch,
+				Placement:    testCallbackPlacement(t, orch),
 				Tracker:      tracker,
 				Acknowledger: ack,
 			})
 
 			require.NoError(t, hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-				LeaseUUID:           "lease-1",
-				Status:              backend.CallbackStatusSuccess,
-				Backend:             "backend-a",
-				OperationGeneration: generation,
+				LeaseUUID:   "lease-1",
+				Status:      backend.CallbackStatusSuccess,
+				Backend:     "backend-a",
+				OperationID: generation.String(),
 			})))
 
 			assert.Equal(t, 1, ackCalls)
@@ -2652,10 +2808,11 @@ func TestHandlerSet_HandleBackendCallback_Success_StoreIOFailureStillAcknowledge
 		timeoutRejectCalls++
 		return 1, []string{"timeout-reject"}, nil
 	}}
-	orch := NewProvisionOrchestrator("provider-1", "http://cb", &mockBackendRouter{}, tracker, ps)
-	hs := NewHandlerSet(HandlerDeps{
+	orch := newTestProvisionOrchestrator(t, "provider-1", "http://cb", &mockBackendRouter{}, tracker, ps)
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		ChainClient:  chainClient,
 		Orchestrator: orch,
+		Placement:    testCallbackPlacement(t, orch),
 		Tracker:      tracker,
 		Acknowledger: ack,
 	})
@@ -2680,7 +2837,7 @@ func TestHandlerSet_HandleBackendCallback_Success_StoreIOFailureStillAcknowledge
 	)
 
 	checker := NewTimeoutChecker(TimeoutCheckerConfig{
-		Tracker: tracker, Rejecter: chainClient, Timeout: time.Nanosecond,
+		Operations: tracker.Operations(), Rejecter: chainClient, Timeout: time.Nanosecond,
 	})
 	checker.CheckOnce(context.Background())
 	assert.Zero(t, timeoutRejectCalls,
@@ -2691,7 +2848,7 @@ func TestHandlerSet_HandleBackendCallback_ActiveFailure_ClearsAttemptAndPreserve
 	mockChain := &chaintest.MockClient{GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
 		return &billingtypes.Lease{Uuid: "lease-1", State: billingtypes.LEASE_STATE_ACTIVE}, nil
 	}}
-	f := newPlacementTestFixture(mockChain, &mockAcknowledger{})
+	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	require.NoError(t, f.ps.Set("lease-1", "test-backend"))
 	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
 	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
@@ -2716,7 +2873,7 @@ func TestHandlerSet_HandleBackendCallback_PendingFailure_DoesNotDeleteDifferentO
 			return 1, []string{"tx-rej"}, nil
 		},
 	}
-	f := newPlacementTestFixture(mockChain, &mockAcknowledger{})
+	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	require.NoError(t, f.ps.Set("lease-1", "newer-backend"))
 	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
 
@@ -2731,18 +2888,18 @@ func TestHandlerSet_HandleBackendCallback_PendingFailure_DoesNotDeleteDifferentO
 }
 
 func TestHandlerSet_HandleBackendCallback_NonInFlightCallbackCannotSettleAttempt(t *testing.T) {
-	for _, generation := range []uint64{0, 41} {
+	for _, generation := range []string{"", "123e4567-e89b-42d3-a456-426614174000"} {
 		for _, status := range []backend.CallbackStatus{backend.CallbackStatusSuccess, backend.CallbackStatusFailed} {
-			name := fmt.Sprintf("generation_%d/%s", generation, status)
+			name := fmt.Sprintf("operation_%s/%s", generation, status)
 			t.Run(name, func(t *testing.T) {
-				f := newPlacementTestFixture(&chaintest.MockClient{}, &mockAcknowledger{})
+				f := newPlacementTestFixture(t, &chaintest.MockClient{}, &mockAcknowledger{})
 				requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
 
 				require.NoError(t, f.hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-					LeaseUUID:           "lease-1",
-					Status:              status,
-					Backend:             "test-backend",
-					OperationGeneration: generation,
+					LeaseUUID:   "lease-1",
+					Status:      status,
+					Backend:     "test-backend",
+					OperationID: generation,
 				})))
 				p := f.ps.Lookup("lease-1")
 				assert.Equal(t, placement.StateAttempting, p.State(),
@@ -2781,7 +2938,7 @@ func (p *mockPublisher) Close() error { return nil }
 
 func TestPublishLeaseEvent_PublishesToTopic(t *testing.T) {
 	pub := newMockPublisher()
-	hs := NewHandlerSet(HandlerDeps{
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		Publisher: pub,
 	})
 
@@ -2803,7 +2960,7 @@ func TestPublishLeaseEvent_PublishesToTopic(t *testing.T) {
 
 func TestPublishLeaseEvent_IncludesError(t *testing.T) {
 	pub := newMockPublisher()
-	hs := NewHandlerSet(HandlerDeps{
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		Publisher: pub,
 	})
 
@@ -2823,7 +2980,7 @@ func TestPublishLeaseEvent_IncludesError(t *testing.T) {
 }
 
 func TestPublishLeaseEvent_NilPublisher(t *testing.T) {
-	hs := NewHandlerSet(HandlerDeps{
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		Publisher: nil,
 	})
 
@@ -2834,7 +2991,7 @@ func TestPublishLeaseEvent_NilPublisher(t *testing.T) {
 func TestPublishLeaseEvent_PublishError(t *testing.T) {
 	pub := newMockPublisher()
 	pub.publishErr = errors.New("pubsub down")
-	hs := NewHandlerSet(HandlerDeps{
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		Publisher: pub,
 	})
 
@@ -2850,7 +3007,7 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_IncrementsNonInFlightCallb
 	labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues("unknown", "success")
 	before := promtestutil.ToFloat64(labeled)
 
-	hs := NewHandlerSet(HandlerDeps{
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		Tracker: NewInFlightTracker(),
 	})
 
@@ -2884,7 +3041,7 @@ func TestHandleBackendCallback_DeprovisionedNonInFlight(t *testing.T) {
 		},
 	}
 	pub := newMockPublisher()
-	hs := NewHandlerSet(HandlerDeps{
+	hs := composeTestHandlerSet(t, testHandlerDeps{
 		Tracker:       NewInFlightTracker(),
 		Publisher:     pub,
 		BackendRouter: router,
@@ -2938,7 +3095,7 @@ func TestHandleBackendCallback_SanitizesLabels(t *testing.T) {
 			labeled := metrics.NonInFlightCallbacksTotal.WithLabelValues(tc.wantBackend, tc.wantStatus)
 			before := promtestutil.ToFloat64(labeled)
 
-			hs := NewHandlerSet(HandlerDeps{
+			hs := composeTestHandlerSet(t, testHandlerDeps{
 				Tracker:       NewInFlightTracker(),
 				Publisher:     newMockPublisher(),
 				BackendRouter: router,
@@ -2969,7 +3126,7 @@ func TestHandlerSet_LeasesAwaitingGauge_MatchesMapSize(t *testing.T) {
 		},
 	}
 
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, nil)
 
 	// Create two leases awaiting payload
 	for _, id := range []string{"lease-1", "lease-2"} {
@@ -3025,7 +3182,7 @@ func TestHandlerSet_LeasesAwaitingGauge_DuplicateLeaseCreatedDoesNotDrift(t *tes
 		},
 	}
 
-	hs, _ := newTestHandlerSet(mockChain, nil, nil, nil)
+	hs, _ := newTestHandlerSet(t, mockChain, nil, nil, nil)
 
 	// Send the same lease-created event twice (Watermill retry)
 	for range 2 {
@@ -3079,7 +3236,7 @@ func TestHandlerSet_LeasesAwaitingGauge_PayloadReceivedDecrementsGauge(t *testin
 		},
 	}
 
-	hs, _ := newTestHandlerSet(mockChain, mb, nil, store)
+	hs, _ := newTestHandlerSet(t, mockChain, mb, nil, store)
 
 	// Create lease awaiting payload
 	createMsg := newLeaseEventMsg(t, chain.LeaseEvent{

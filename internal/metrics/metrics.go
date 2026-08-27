@@ -169,6 +169,19 @@ var (
 		Help:      "Panics recovered in reconciler per-unit goroutines, by stage",
 	}, []string{"stage"})
 
+	// LifecycleEventSinkPanicsTotal counts panics recovered from best-effort
+	// lifecycle event sinks immediately before a backend provision or restore
+	// call. Event delivery is observational and must never prevent the durable
+	// operation from reaching the backend after it has entered the Calling
+	// phase. The event label is selected exclusively from the constants below,
+	// keeping cardinality bounded.
+	LifecycleEventSinkPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "lifecycle_event_sink_panics_total",
+		Help:      "Panics recovered from best-effort lifecycle event sinks before backend dispatch, by event",
+	}, []string{"event"})
+
 	// The fred_background_* panic counters live in the `background`
 	// subpackage: they are the only collectors written by more than one fred
 	// binary, and importing this package to reach them is what made every
@@ -259,18 +272,20 @@ var (
 		Help:      "Per-backend provision-list attempts during reconciliation, by outcome",
 	}, []string{"backend", "outcome"})
 
-	// ReconcilerSweepComplete reports whether the most recent sweep saw every
-	// configured backend (1) or ran degraded (0).
+	// ReconcilerSweepComplete reports current full-fleet mutation authority. It is
+	// set to 0 before every sweep's first external read and returns to 1 only after
+	// complete provision and retention inventory has been projected durably.
 	//
-	// It gates the meaning of every other reconciler metric: on a degraded sweep
-	// the action counters describe only the leases fred could positively place,
-	// so reading them as fleet-wide totals overstates what was skipped. A
+	// It gates the meaning of every other reconciler metric: while 0, the sweep may
+	// be in progress or may have failed a chain read, backend inventory fetch, or
+	// durable projection. Action counters then describe only positively evidenced
+	// work, so reading them as fleet-wide totals overstates what was skipped. A
 	// boolean state gauge rather than an _info metric, since the value changes.
 	ReconcilerSweepComplete = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "sweep_complete",
-		Help:      "1 if the last reconciliation saw every configured backend, 0 if it ran degraded",
+		Help:      "1 only while a complete full-fleet inventory is durably projected and no newer sweep has invalidated authority; 0 during startup, an in-progress sweep, or any incomplete or failed read or projection",
 	})
 
 	// ReconcilerCleanupSkipsTotal counts destructive cleanup actions the
@@ -295,6 +310,8 @@ var (
 	//   - chain_error: the per-candidate chain re-check failed. Transient.
 	//   - backend_silent: a placement record's own backend did not answer this
 	//     sweep, so its absence from the backend data proves nothing.
+	//   - attempt_pending: an ambiguous remote effect is still possible. Backend
+	//     silence cannot order or cancel that effect, even on a complete sweep.
 	//
 	// A separate metric rather than new label values on actions_total, for the
 	// same reason deferred_leases_total is separate: adding a value there would
@@ -768,6 +785,7 @@ const (
 	CleanupSkipChainUnknownState = "chain_unknown_state"
 	CleanupSkipChainError        = "chain_error"
 	CleanupSkipBackendSilent     = "backend_silent"
+	CleanupSkipAttemptPending    = "attempt_pending"
 )
 
 // Operation constants for the `operation` label on provisioning_total /
@@ -777,6 +795,13 @@ const (
 const (
 	OperationProvision = "provision"
 	OperationRestore   = "restore"
+)
+
+// Lifecycle event constants are the complete bounded label vocabulary for
+// LifecycleEventSinkPanicsTotal.
+const (
+	LifecycleEventProvisionStarting = "provision_starting"
+	LifecycleEventRestoreRestarting = "restore_restarting"
 )
 
 // Action constants for reconciliation

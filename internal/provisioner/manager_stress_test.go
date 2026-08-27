@@ -106,7 +106,7 @@ func runManagerStressTest(t *testing.T, numEvents, numGoroutines int) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
+	mgr, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -239,7 +239,7 @@ func TestManager_SustainedLoad(t *testing.T) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
+	mgr, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -385,7 +385,7 @@ func TestManager_WithBackendLatency(t *testing.T) {
 				},
 			}
 
-			mgr, err := NewManager(ManagerConfig{
+			mgr, err := newTestManager(t, ManagerConfig{
 				ProviderUUID:    "provider-uuid",
 				CallbackBaseURL: "http://localhost:8080",
 			}, router, mockChain)
@@ -532,7 +532,7 @@ func TestManager_HighConcurrencySustained(t *testing.T) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
+	mgr, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -680,7 +680,7 @@ func BenchmarkManager_EndToEnd(b *testing.B) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
+	mgr, err := newTestManager(b, ManagerConfig{
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)

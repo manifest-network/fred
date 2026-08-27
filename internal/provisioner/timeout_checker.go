@@ -6,13 +6,25 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
+
+// TimeoutOperations is the lifecycle authority needed by TimeoutChecker. The
+// checker deliberately depends on this narrow capability surface instead of
+// the legacy tracker API, so a timeout can only release or finish the exact
+// operation claim it acquired.
+type TimeoutOperations interface {
+	TimedOut(time.Duration) []operation.Record
+	TryClaimTimeout(string, operation.OperationID) operation.SettlementResult
+	ReleaseSettlement(operation.SettlementClaim) bool
+	FinishSettlement(operation.SettlementClaim) bool
+}
 
 // TimeoutChecker monitors in-flight provisions and rejects timed-out ones.
 // It runs as a background goroutine and periodically checks for provisions
 // that have exceeded the callback timeout.
 type TimeoutChecker struct {
-	tracker       InFlightTracker
+	operations    TimeoutOperations
 	rejecter      LeaseRejecter
 	timeout       time.Duration
 	checkInterval time.Duration
@@ -20,7 +32,7 @@ type TimeoutChecker struct {
 
 // TimeoutCheckerConfig configures the timeout checker.
 type TimeoutCheckerConfig struct {
-	Tracker       InFlightTracker
+	Operations    TimeoutOperations
 	Rejecter      LeaseRejecter
 	Timeout       time.Duration // Callback timeout (how long to wait before considering a provision timed out)
 	CheckInterval time.Duration // How often to check for timeouts
@@ -28,9 +40,17 @@ type TimeoutCheckerConfig struct {
 
 // NewTimeoutChecker creates a new TimeoutChecker.
 func NewTimeoutChecker(cfg TimeoutCheckerConfig) *TimeoutChecker {
+	operations := cfg.Operations
+	if isNilCapability(operations) {
+		operations = nil
+	}
+	rejecter := cfg.Rejecter
+	if isNilCapability(rejecter) {
+		rejecter = nil
+	}
 	return &TimeoutChecker{
-		tracker:       cfg.Tracker,
-		rejecter:      cfg.Rejecter,
+		operations:    operations,
+		rejecter:      rejecter,
 		timeout:       cfg.Timeout,
 		checkInterval: cfg.CheckInterval,
 	}
@@ -56,7 +76,14 @@ func (c *TimeoutChecker) Start(ctx context.Context) {
 // only once that rejection has either succeeded or become impossible.
 // This is the body of Start's ticker loop, run on every tick.
 func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
-	timedOut := c.tracker.GetTimedOutProvisions(c.timeout)
+	if c.operations == nil || c.rejecter == nil {
+		slog.Error("timeout checker is missing lifecycle authority",
+			"operations_configured", c.operations != nil,
+			"rejecter_configured", c.rejecter != nil,
+		)
+		return
+	}
+	timedOut := c.operations.TimedOut(c.timeout)
 
 	if len(timedOut) == 0 {
 		return
@@ -77,26 +104,31 @@ func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 		}
 
 		// The timeout snapshot can race a callback or another timeout sweep. Claim
-		// this exact generation before making the on-chain rejection so only one
+		// this exact operation before making the on-chain rejection so only one
 		// actor can settle it, and so no replacement can be installed underneath
 		// the eventual cleanup.
-		p, claimed := c.tracker.TryClaimInFlight(candidate.LeaseUUID, candidate.Generation)
-		if !claimed {
+		result := c.operations.TryClaimTimeout(candidate.LeaseUUID, candidate.ID)
+		if !result.Claimed() {
 			continue
 		}
 
-		c.settleTimedOutProvision(ctx, p, now)
+		c.settleTimedOutProvision(ctx, result.Record(), result.Claim(), now)
 	}
 }
 
-func (c *TimeoutChecker) settleTimedOutProvision(ctx context.Context, p InFlightProvision, now time.Time) {
+func (c *TimeoutChecker) settleTimedOutProvision(
+	ctx context.Context,
+	p operation.Record,
+	claim operation.SettlementClaim,
+	now time.Time,
+) {
 	claimFinished := false
 	defer func() {
 		// A retryable chain failure must leave the provision available to the
 		// next timeout sweep. This also releases the claim if a future early exit
 		// or panic is added before terminal settlement completes.
 		if !claimFinished {
-			c.tracker.ReleaseInFlightClaim(p.LeaseUUID, p.Generation)
+			c.operations.ReleaseSettlement(claim)
 		}
 	}()
 
@@ -111,19 +143,19 @@ func (c *TimeoutChecker) settleTimedOutProvision(ctx context.Context, p InFlight
 			// it. This can be a reconciler-registered ACTIVE-lease re-provision
 			// (reconciler.go) whose callback was lost, or an originally-PENDING
 			// entry whose state changed concurrently in the unlocked window
-			// between GetTimedOutProvisions and this reject (e.g. a racing
+			// between the timeout snapshot and this reject (e.g. a racing
 			// success-ack that already flipped it ACTIVE). Either way, retrying
 			// forever would wedge the lease in-flight permanently and inflate
 			// InFlightProvisions (which also skews capacity/routing signals).
 			// Untrack it and hand it back to the reconciler, which owns the
 			// re-provision / FailCount / close path. (ENG-337)
-			claimFinished = c.tracker.FinishClaimedInFlight(p.LeaseUUID, p.Generation)
+			claimFinished = c.operations.FinishSettlement(claim)
 			metrics.CallbackTimeoutsTotal.Inc()
 			slog.Warn("timed-out provision is not a pending lease; untracked and handed back to reconciler",
 				"lease_uuid", p.LeaseUUID,
 				"tenant", p.Tenant,
 				"backend", p.Backend,
-				"age", now.Sub(p.StartTime),
+				"age", now.Sub(p.StartedAt),
 				"error", err,
 			)
 			return
@@ -138,22 +170,31 @@ func (c *TimeoutChecker) settleTimedOutProvision(ctx context.Context, p InFlight
 	}
 
 	// Only untrack AFTER successful rejection
-	operation := p.Kind.operationLabel()
-	claimFinished = c.tracker.FinishClaimedInFlight(p.LeaseUUID, p.Generation)
+	operationLabel := timeoutOperationLabel(p.Kind)
+	claimFinished = c.operations.FinishSettlement(claim)
 	metrics.CallbackTimeoutsTotal.Inc()
-	metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend, operation).Inc()
+	metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend, operationLabel).Inc()
 
 	// Record duration (from start until timeout)
-	duration := now.Sub(p.StartTime).Seconds()
-	metrics.ProvisioningDuration.WithLabelValues(p.Backend, operation).Observe(duration)
+	duration := now.Sub(p.StartedAt).Seconds()
+	metrics.ProvisioningDuration.WithLabelValues(p.Backend, operationLabel).Observe(duration)
 
 	slog.Warn("rejected timed-out provision",
 		"lease_uuid", p.LeaseUUID,
 		"tenant", p.Tenant,
 		"backend", p.Backend,
-		"operation", operation,
-		"age", now.Sub(p.StartTime),
+		"operation", operationLabel,
+		"age", now.Sub(p.StartedAt),
 		"rejected", rejected,
 		"tx_hashes", txHashes,
 	)
 }
+
+func timeoutOperationLabel(kind operation.Kind) string {
+	if kind == operation.KindRestore {
+		return metrics.OperationRestore
+	}
+	return metrics.OperationProvision
+}
+
+var _ TimeoutOperations = (*operation.Registry)(nil)

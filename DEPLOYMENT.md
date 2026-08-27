@@ -199,7 +199,7 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 - `callback_base_url` — URL where backends reach providerd (e.g. `https://fred.example.com:8443`)
 - `callback_secret` — shared HMAC secret (32+ chars; same value used by every backend)
 - `backends` — at least one entry with `name`, `url`, and either `skus` or `default: true`
-- `placement_store_db_path` — required for restore and for correct routing when multiple backends share match criteria; optional only when neither feature is used. It is not startup-enforced: if unset, providerd logs a warning, restore returns `503` before contacting a backend, and direct reads use match/SKU routing that may select the wrong backend (provision-discovery endpoints retain their bounded fan-out)
+- `placement_store_db_path` — required durable placement database; providerd refuses to start without it because supported deployments always use multiple backends
 - `production_mode: true` — strongly recommended in production (forces replay protection, blocks SSRF, blocks `grpc_tls_skip_verify`)
 - `token_tracker_db_path` — required when `production_mode: true`
 
@@ -235,7 +235,12 @@ The HMAC `callback_secret` is shared between `providerd` and every backend. Beca
 3. Restart **every `docker-backend`** first, then `providerd` last. Rationale: with a fleet of backends, the rolling restart is the longer operation; finishing with `providerd` minimizes the total window where the old and new secrets are both in play. During the rotation window, in-flight requests in both directions will see 401s — the backend's persistent callback queue and Watermill's redelivery on the providerd side recover automatically once both ends are on the new secret.
 4. Verify with a test provision.
 
-There is no built-in support for two-secret rotation (active + previous). If you need zero-downtime rotation, deploy a second `providerd` with the new secret on a separate hostname and migrate traffic.
+There is no built-in support for two-secret rotation (active + previous), so
+secret rotation includes a brief `providerd` outage. Do not overlap two
+`providerd` instances for the same provider and backend fleet: the placement
+database is a single-writer bbolt file, while the lifecycle-operation registry
+is process-local and has no cross-process coordinator. A second instance with a
+different database is therefore not a safe active-active workaround.
 
 The Cosmos keyring's signing key is not rotatable — it's the provider's chain identity.
 
@@ -401,9 +406,19 @@ backends:
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
-Identical `skus` lists on `docker-1` and `docker-2` make them a matching pool for those SKUs. Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. `placement_store_db_path` is required so direct read, restart, and update operations reach the backend holding each lease, and restore requires the same durable state. This is not startup-enforced: without it, providerd logs a warning, restore returns `503` before contacting a backend, and direct operations fall back to match/SKU routing that may select the wrong peer. Provision-discovery endpoints still use a bounded fan-out.
+Identical `skus` lists on `docker-1` and `docker-2` make them a matching pool for those SKUs. Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. `placement_store_db_path` is required so direct read, restart, and update operations reach the backend holding each lease, and restore uses the same durable state. Providerd refuses to start if it is absent or cannot be opened.
 
-To add a host: spin up another `docker-backend` with the same `skus` list, add it to `config.yaml`, and reload `providerd`. New provisions immediately distribute across the new host. To drain: remove its entry from `skus` (so it no longer receives new provisions) and let existing leases close naturally, or migrate them by deprovisioning + reprovisioning on the chain side.
+To add a host, spin up another `docker-backend` with the same `skus` list, add
+it to `config.yaml`, and restart `providerd`; it has no configuration reload
+signal. Admit new work after startup reconciliation has completed a durable
+full-fleet inventory for the changed topology. To drain a host, remove its SKUs so it no longer receives
+new provisions, restart `providerd`, and keep the backend entry configured,
+reachable, and under the same stable name until every placement and retention
+on it is gone. Existing leases may close naturally or be deliberately migrated
+through the chain lifecycle; deleting or renaming the backend entry does not
+migrate them. Backend names are immutable storage identities: once a drained
+name is removed, it remains retired in the placement database and cannot be
+reused. Give replacement storage a new unique name.
 
 ---
 
@@ -420,7 +435,7 @@ and preserve that safety evidence.
 | `<docker>/retention.db` | High — index of soft-deleted leases (tenant, manifest, retained volume names); not reconstructible from chain or daemon | Lost on disk failure → retained volumes can no longer be restored *or* reaped (orphaned on disk). Only present when `retain_on_close` is enabled |
 | `<docker>/diagnostics.db` | Medium — failure diagnostics for past 7 days | Lost on disk failure |
 | `<docker>/callbacks.db` | Low — pending callbacks, ephemeral | Bbolt rebuilds; some callbacks lost |
-| `placement_store_db_path` | High for restore or multi-backend deployments — unresolved attempts and conflict candidates are safety evidence | Positive owners can be rebuilt as their backends answer inventory; a complete `/provisions` plus `/retentions` view is required to make absence authoritative and resolve conflicts. Unresolved history may be lost, so restore this file when possible and keep every former owner configured and reachable during any rebuild |
+| `placement_store_db_path` | High — unresolved attempts, conflict candidates, topology history, and the durable inventory baseline are safety evidence | Positive owners can be rebuilt as their backends report them, and one complete `/provisions` plus `/retentions` view can bootstrap a new baseline. Inventory absence cannot reconstruct or clear attempts/conflicts, and retired backend identities cannot be safely rediscovered, so restore this file whenever possible |
 | `payload_store_db_path` | Low — pending payloads, tenant can re-upload | Tenants must re-upload pending payloads |
 | `token_tracker_db_path` | None — replay protection has 30s window anyway | Empties on restart, acceptable |
 
@@ -434,11 +449,98 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
 
 1. Tag a release on GitHub. `goreleaser` publishes the `providerd` and `docker-backend` binary archives plus a single Docker image — `ghcr.io/manifest-network/fred` — which contains **only** `providerd`. There is no published `docker-backend` (or `k3s-backend`) image; run the `docker-backend` binary from its archive, or build its image locally (see [Docker images](#docker-images)).
 2. Pull the new binary or image to your hosts.
-3. Restart `providerd` and each `docker-backend`. Order does not matter — the HMAC handshake is symmetric.
+3. Roll the backend binaries one at a time when the release's backend protocol
+   is backward-compatible, then stop the single `providerd` instance and start
+   the upgraded binary. Never overlap the old and new `providerd` processes for
+   the same provider and backend fleet.
 
-Fred does not currently support graceful in-place upgrades. The startup sequence (chain reconnect, reconciliation, accept callbacks) takes seconds; the brief downtime is generally acceptable. For zero-downtime, use the multi-instance pattern under [Secret rotation](#secret-rotation).
+`providerd` upgrades are stop/start and include a brief outage. Active-active or
+rolling `providerd` instances for one provider/backend fleet are unsupported:
+bbolt enforces one writer when the instances share databases, and separate
+databases would also split the process-local lifecycle-operation registry. The
+startup sequence (chain reconnect, inventory projection, reconciliation) usually
+takes seconds; keep the callback path available again as soon as the new process
+starts.
 
-Schema migrations: the bbolt files carry no explicit schema version, and Fred does **not** run schema migrations on them. An entry a newer build cannot decode is dropped (not migrated) the next time that store's age-based cleanup runs. Rolling back to an older Fred after a newer version has written is likewise not guaranteed. **Take a backup before upgrading.**
+### Upgrading from v0.13.0
+
+The placement database is forward-compatible: when the new providerd opens it,
+unambiguous v0.13.0 `{backend,set_at}` owners are atomically assigned typed
+record revisions. Ambiguous, malformed, or otherwise unusable records remain
+byte-for-byte fail-closed. Configure a writable `placement_store_db_path` and
+take a stopped-process backup before upgrading.
+
+The new backend binaries accept v0.13.0 tokenless callback URLs, so roll them one
+at a time while the old providerd remains online. At provider cutover, any
+v0.13.0 backend still present preserves the new additive `operation_id` query
+and signs the complete request URI, so a mixed backend fleet remains wire
+compatible.
+
+Before taking the rollback snapshot, remove tenant API ingress, pause the
+chain-facing path tenants use to create, close, or otherwise mutate leases, and
+wait for `stats.in_flight_provisions` to reach zero. Then stop the single v0.13.0
+providerd and verify shutdown reports no remaining provision operations before
+backing up its bbolt files. Replace it and start exactly one new providerd. Do
+not run the two providerd versions concurrently. Existing tenant containers are
+not restarted or moved by this upgrade; startup reconciliation reads backend
+inventories and rebuilds the placement index before it enables new lifecycle
+side effects.
+
+Keep tenant API ingress out of the load balancer until all of these hold from
+the same new process:
+
+1. `GET /readyz` returns 200 **and its top-level `status` is `healthy`**. HTTP
+   200 alone is insufficient because a remote dependency failure is `degraded`
+   and deliberately also maps to 200.
+2. The response reports `checks.placement_inventory.status=healthy`, plus
+   healthy chain and configured-backend checks.
+3. `fred_reconciler_sweep_complete == 1` after that health sample.
+
+The callback path itself must remain reachable while this cutover gate is
+closed. This first complete projection is mandatory for a v0.13.0 placement
+database (and for any new or topology-changed database) before degraded
+admission is safe. Once established, `placement_inventory` is a durable baseline
+bound to the configured backend identities and survives provider restarts and
+transient inventory outages.
+
+After bootstrap, `fred_reconciler_sweep_complete` is only a last-sweep
+observation. During a partial sweep, the reconciler may place genuinely new
+recordless `PENDING` work only on its typed intersection of nodes that answered
+both inventories. It defers recordless `ACTIVE` recovery and work tied to a
+silent owner, attempt, or conflict. The tenant event path has no per-sweep
+witness: it requires the same durable topology baseline, live-routes within that
+topology using backend stats, and records its exact write-ahead attempt before
+dispatch. Inventory silence never clears an attempt or conflict in either path.
+
+The callback URL is wire-compatible with v0.13.0 backends: the existing path is
+unchanged and the typed canonical UUIDv4 operation ID is an additive `operation_id` query
+parameter. Backends must continue treating the complete callback URL as opaque
+and must sign the complete request URI when posting it. The operation registry
+is intentionally process-local, so callbacks already queued across the provider
+restart do not regain lifecycle authority: tokenless v0.13.0 callbacks remain a
+status-only compatibility path, and callbacks naming an operation from the old
+process are acknowledged but ignored. Complete backend inventory and
+level-triggered reconciliation recover only from positive backend evidence;
+absence never clears an ambiguous pre-restart attempt or conflict.
+
+> **Rollback boundary:** the stopped v0.13.0 backup is the only supported direct
+> downgrade point. Treat the compatibility floor as crossed as soon as the new
+> providerd starts: opening the placement store migrates unambiguous owners, and
+> startup inventory can persist conflict quarantine before tenant traffic is
+> accepted. Never open a
+> placement database touched by the new version with v0.13.0; the old reader does
+> not understand unresolved attempts, conflict quarantine, or operation IDs and a
+> later old-version write can silently discard those safety facts. To roll back,
+> stop the new process and restore the pre-upgrade backup only if you can also
+> prove no chain or backend lifecycle state changed after that snapshot. Otherwise
+> forward-fix.
+
+Schema compatibility is store-specific; the bbolt files carry no global schema
+version or automatic downgrade guard. In particular, the placement store retains
+an undecodable entry as unusable, fail-closed safety evidence rather than dropping
+it during cleanup. Do not assume an older Fred can safely read a file after a newer
+version has written it. Follow the release-specific notes and take a stopped-process
+backup before upgrading.
 
 > **Upgrading an XFS backend from before ENG-454/ENG-459:** it may carry orphaned XFS project-quota table entries left by volumes destroyed under the older build. New leaks are prevented going forward, but pre-existing entries are not swept automatically — `xfs_quota report -p` is filesystem-global, so Fred cannot distinguish its own orphaned entries from live foreign project limits. Clear each stale project ID with a one-time manual `xfs_quota -x -c 'limit -p bhard=0 bsoft=0 ihard=0 isoft=0 <projid>' <mount>` (matching what `Destroy` does).
 >
@@ -491,8 +593,8 @@ docker run -d --name providerd \
   fred-providerd --config /config.yaml
 ```
 
-Configure `keyring_dir: /keyring` in `config.yaml`. If you use restore or pooled
-multi-backend routing, set `placement_store_db_path` and mount its writable host
-directory. Do the same for any configured `token_tracker_db_path` or
+Configure `keyring_dir: /keyring` in `config.yaml`. Set
+`placement_store_db_path` and mount its writable host directory; providerd will
+not start without it. Do the same for any configured `token_tracker_db_path` or
 `payload_store_db_path`; the providerd image does not declare a default data
 volume.

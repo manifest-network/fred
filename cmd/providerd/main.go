@@ -24,8 +24,10 @@ import (
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
 	"github.com/manifest-network/fred/internal/scheduler"
 	"github.com/manifest-network/fred/internal/tlsconfig"
 	"github.com/manifest-network/fred/internal/watcher"
@@ -354,43 +356,14 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}
 
-	// Create placement store if database path is configured (enables round-robin routing).
-	// Use the interface type so that an unset store remains a true nil interface
-	// (a typed nil *placement.Store would pass != nil checks and panic).
-	var placementStore provisioner.PlacementStore
-	var placementLookup api.PlacementLookup
-	if cfg.PlacementStoreDBPath != "" {
-		ps, err := placement.NewStore(cfg.PlacementStoreDBPath)
-		if err != nil {
-			return fmt.Errorf("failed to create placement store: %w", err)
-		}
-		defer ps.Close()
-		placementStore = ps
-		placementLookup = ps
-		slog.Info("placement store enabled", "db_path", cfg.PlacementStoreDBPath)
-	} else {
-		slog.Warn("placement store disabled (no placement_store_db_path configured)")
+	// Durable placement is mandatory: all supported deployments use multiple
+	// backends, so there is no safe match-routing fallback after provisioning.
+	placementStore, err := placement.NewStore(cfg.PlacementStoreDBPath)
+	if err != nil {
+		return fmt.Errorf("failed to create placement store: %w", err)
 	}
-
-	// Warn if multiple backends share the same SKU without a placement store.
-	// Round-robin will still distribute provisions, but read operations (connection,
-	// logs, provision diagnostics) may route to the wrong backend.
-	if placementStore == nil {
-		matchCount := make(map[string]int)
-		for _, bcfg := range cfg.Backends {
-			for _, sku := range bcfg.SKUs {
-				matchCount["sku:"+sku]++
-			}
-		}
-		for key, count := range matchCount {
-			if count > 1 {
-				slog.Warn("multiple backends share the same SKU match criteria without a placement store; read operations may route incorrectly",
-					"match_key", key,
-					"backend_count", count,
-				)
-			}
-		}
-	}
+	defer placementStore.Close()
+	slog.Info("placement store enabled", "db_path", cfg.PlacementStoreDBPath)
 
 	// Create event broker for real-time lease event delivery
 	eventBroker := api.NewEventBroker()
@@ -406,6 +379,26 @@ func run(cmd *cobra.Command, args []string) error {
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
+	}
+
+	// Restore is one application workflow with one typed capability graph. The
+	// same operation ID is held by the registry, persisted in the placement
+	// attempt, and carried on the backend callback URL.
+	restoreService, err := restoreapp.NewService(restoreapp.Config{
+		ProviderUUID: cfg.ProviderUUID,
+		CallbackURL: func(operationID operation.OperationID) (string, error) {
+			return provisioner.BuildCallbackURLForOperation(cfg.CallbackBaseURL, operationID)
+		},
+		Targets: chainClient,
+		Backends: restoreapp.BackendResolverFunc(func(name string) restoreapp.RestoreBackend {
+			return backendRouter.GetBackendByName(name)
+		}),
+		Operations: provisionMgr.Operations(),
+		Authority:  placementStore,
+		Events:     eventBroker,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create restore service: %w", err)
 	}
 
 	// Create event bridge to forward chain events to Watermill
@@ -426,7 +419,8 @@ func run(cmd *cobra.Command, args []string) error {
 	// that will merely fail later moves the refusal to *after* the backend has
 	// already applied the update, leaving the lease running a manifest fred has
 	// no durable record of — the ENG-619 outcome the guard exists to prevent.
-	// Same typed-nil gotcha as placementStore above.
+	// Keep an absent payload store as a true nil interface; a typed nil
+	// *payload.Store would pass != nil checks and panic.
 	var payloadPersister api.PayloadPersister
 	if payloadStore != nil {
 		payloadPersister = provisionMgr
@@ -434,22 +428,12 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// The health probe goes straight to the store rather than through the
 	// Manager: it asks whether payloads.db is readable, which is a property of
-	// the store alone. Same typed-nil gotcha as placementStore — a nil
+	// the store alone. A nil
 	// *payload.Store assigned to an interface is not a nil interface, and the
 	// health handler would call Healthy() on it.
 	var payloadStoreHealth api.PayloadStoreHealth
 	if payloadStore != nil {
 		payloadStoreHealth = payloadStore
-	}
-
-	// Restore is also a write path: expose its recorder only when the placement
-	// store exists. Passing Manager unconditionally would make a placement-disabled
-	// deployment look durable because its bridge methods intentionally no-op when
-	// no store is configured, allowing Restore to contact a backend without a
-	// write-ahead attempt.
-	var restoreRecorder api.RestorePlacementRecorder
-	if placementStore != nil {
-		restoreRecorder = provisionMgr
 	}
 
 	apiServer, err := api.NewServer(api.ServerConfig{
@@ -481,9 +465,8 @@ func run(cmd *cobra.Command, args []string) error {
 		PayloadPersister:   payloadPersister,
 		PayloadStoreHealth: payloadStoreHealth,
 		StatusChecker:      provisionMgr,
-		PlacementLookup:    placementLookup,
-		RestoreRecorder:    restoreRecorder,
-		RestoreTracker:     provisionMgr,
+		PlacementLookup:    placementStore,
+		RestoreService:     restoreService,
 		EventBroker:        eventBroker,
 	})
 	if err != nil {
@@ -506,6 +489,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ProviderUUID:    cfg.ProviderUUID,
 		CallbackBaseURL: cfg.CallbackBaseURL,
 		Interval:        cfg.ReconciliationInterval,
+		StartEvents:     provisionMgr,
 	}, chainClient, provisionMgr.AckBatcher(), backendRouter, provisionMgr, placementStore)
 	if err != nil {
 		return fmt.Errorf("failed to create reconciler: %w", err)

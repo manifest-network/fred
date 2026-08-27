@@ -21,7 +21,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
-	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
 const (
@@ -105,10 +105,9 @@ type ServerDeps struct {
 	PayloadPersister   PayloadPersister   // Required — /update returns 500 without it (ENG-619).
 	PayloadStoreHealth PayloadStoreHealth // Optional — health probe for the payload store's bbolt DB.
 	StatusChecker      StatusChecker
-	PlacementLookup    PlacementLookup          // Optional — if nil, placement routing is disabled.
-	RestoreRecorder    RestorePlacementRecorder // Optional globally; Restore returns 503 when absent (ENG-632).
-	RestoreTracker     RestoreInFlightTracker   // Required with RestoreRecorder; Restore returns 503 when absent (ENG-632).
-	EventBroker        *EventBroker             // Optional — if nil, the events endpoint returns 501.
+	PlacementLookup    PlacementLookup // Required by providerd; nil is supported only by isolated/test API embeddings.
+	RestoreService     RestoreService  // Required by /restore; missing service returns 503.
+	EventBroker        *EventBroker    // Optional — if nil, the events endpoint returns 501.
 }
 
 // NewServer creates a new API server.
@@ -149,8 +148,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		TokenTracker:       tracker,
 		StatusChecker:      statusChecker,
 		PlacementLookup:    placementLookup,
-		RestoreRecorder:    deps.RestoreRecorder,
-		RestoreTracker:     deps.RestoreTracker,
+		RestoreService:     deps.RestoreService,
 		PayloadPersister:   deps.PayloadPersister,
 		PayloadStoreHealth: deps.PayloadStoreHealth,
 		EventBroker:        eventBroker,
@@ -350,14 +348,14 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 	// The backend posts to the callback URL fred supplied. RequestURI is part of
 	// the verified HMAC, so this token is authenticated even though legacy
 	// backends need not understand or copy it into their JSON payload.
-	callback.OperationGeneration = 0
-	if raw := r.URL.Query().Get(provisioner.CallbackOperationGenerationParam); raw != "" {
-		generation, parseErr := strconv.ParseUint(raw, 10, 64)
-		if parseErr != nil || generation == 0 {
-			writeError(w, "operation_generation must be a non-zero uint64", http.StatusBadRequest)
-			return
-		}
-		callback.OperationGeneration = generation
+	callback.OperationID = ""
+	operationID, present, err := operation.ParseQuery(r.URL.Query())
+	if err != nil {
+		writeError(w, "operation_id must be a single canonical UUIDv4", http.StatusBadRequest)
+		return
+	}
+	if present {
+		callback.OperationID = operationID.String()
 	}
 
 	switch callback.Status {

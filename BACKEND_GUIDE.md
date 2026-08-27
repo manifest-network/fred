@@ -61,14 +61,22 @@ backends:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
 
-# Required for restore and when multiple backends share SKUs — durably tracks
-# attempted and confirmed ownership for routing and reconciliation safety
+# Required in every deployment — durably tracks attempted and confirmed
+# ownership for routing, reconciliation, restore, and restart safety
 placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
 Fred does NOT interpret the SKU — it only uses exact UUID matching to decide which backend receives the request.
 
-**Load-balanced placement:** Multiple backends can share the same `skus` list. When this happens, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. Fred records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. This requires `placement_store_db_path` to be configured.
+Backend names are case-sensitive durable placement identities. They must be
+non-blank and exactly unique, and they must remain stable for as long as any
+placement or retained data refers to them. Renaming a backend is equivalent to
+removing its owner identity; it does not migrate its leases, and providerd
+rejects the change while durable placement still refers to that identity. After
+a name is safely drained and removed it is retired forever and cannot identify
+the same or different storage later. Give every replacement a new unique name.
+
+**Load-balanced placement:** Multiple backends can share the same `skus` list. When this happens, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats. Fred records a placement (lease->backend) so that subsequent read operations (connection details, logs, diagnostics) reach the correct machine. `providerd` requires `placement_store_db_path` in every mode, including single-backend development, because ambiguous responses and restart recovery still require durable ownership evidence.
 
 ### Level 2: Backend Interprets Full SKU
 
@@ -146,7 +154,7 @@ Start provisioning a resource asynchronously.
     {"sku": "docker-nginx", "quantity": 1, "service_name": "web", "custom_domain": "app.example.com"},
     {"sku": "docker-redis", "quantity": 2, "service_name": "cache"}
   ],
-  "callback_url": "http://fred:8080/callbacks/provision?operation_generation=42",
+  "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "base64-encoded-bytes",
   "payload_hash": "sha256-hex-string"
 }
@@ -421,11 +429,29 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
-  "callback_url": "http://fred:8080/callbacks/provision?operation_generation=42"
+  "callback_url": "http://fred:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
 `lease_uuid` is the new lease; `from_lease_uuid` is the original retained lease. `items` must shape-match (service name → summed quantity) the retained set. The new lease's `items` MAY specify a **different SKU disk tier** than the source — only the item *shape* (service names + summed quantities) must match, not the resource/disk tier. A **promote** (same-or-larger disk tier) is always allowed and applies the new `disk_mb` cap. A **demote** (smaller disk tier) is allowed only if the retained volume's measured data fits the new tier's `disk_mb` cap; the backend runs a demote-fit check before adopting and otherwise refuses with `422` `code=demote_exceeds_tier` (see below).
+
+**Exclusive source reservation is mandatory.** Before accepting the restore or
+performing an irreversible volume adoption, a backend **MUST** durably and
+atomically compare-and-transition the retained source from its restorable state
+to an exclusive restoring claim bound to this target and a claim/version token.
+A separate read followed by an unconditional write is not sufficient. Only one
+target may own a source claim at a time, and terminal commit or rollback
+**MUST** use compare-and-set against the same claim so an older worker cannot
+delete or re-activate a newer incarnation.
+
+A request whose response is delayed, lost, or otherwise ambiguous may still be
+active after the caller retries. While its source claim remains unresolved, a
+backend **MUST NOT** accept another restore from that source; it returns the
+invalid-state `409` instead. Caller cancellation, timeout, duplicate delivery,
+or a read showing no finished target is not proof that the first request did not
+start. The claim must survive backend restart and remain exclusive until the
+original operation commits or a safe exact-claim rollback completes. Two target
+leases must never both receive acceptance for the same retained source.
 
 **Response:** `202 Accepted`
 ```json
@@ -436,11 +462,12 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
 
 **Behavior:**
 1. Validate the retained record exists and is owned by `tenant`; re-deploy strictly from the **retained manifest** captured at close time (the request carries no manifest)
-2. Adopt the retained volumes into the new lease's namespace, then bring up the stack and POST a callback
-3. On failure, re-quarantine the volumes (data preserved) and POST a failure callback
+2. Atomically acquire the durable, exclusive source claim described above
+3. Adopt the retained volumes into the new lease's namespace, then bring up the stack and POST a callback
+4. On failure, re-quarantine the volumes and return the exact claim to restorable state with CAS (data preserved), then POST a failure callback
 
 **Error Responses:**
-- `400 Bad Request` - Missing required fields or items/manifest validation error
+- `400 Bad Request` - Missing required fields, equal source and target UUIDs, or items/manifest validation error
 - `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"` (the invalid-state case omits `code`), so the two are distinguished by that discriminator
 - `422 Unprocessable Entity` - Overloaded across two cases, distinguished by a `code` discriminator like the `409` above. Both return a JSON `{"error": "..."}` body; a **bare** `422` (no `code`) means no retained data for `from_lease_uuid` (also the correct response for backends without retention support), while a `422` with `code: "demote_exceeds_tier"` means the restore requested a **smaller** SKU disk tier whose `disk_mb` cap is below the retained volume's measured footprint (a refused demote)
 - `503 Service Unavailable` - Insufficient resources
@@ -570,11 +597,15 @@ This endpoint is optional but recommended for production backends. The Docker ba
 
 When provisioning completes (success or failure), POST to the complete
 `callback_url` from the provision request. Provision and restore URLs carry an
-`operation_generation=<uint64>` query parameter. Treat the URL as opaque:
+`operation_id=<uuid>` query parameter whose value is one lowercase, hyphenated,
+canonical RFC-4122 UUIDv4. Treat the URL as opaque:
 preserve its path and query byte-for-byte rather than rebuilding or normalizing
-it. Fred uses that generation to prevent a stale callback from settling a newer
-in-flight operation. After in-flight tracking ends, callback status events are
-best-effort and may be delivered out of order.
+it. Fred uses that typed operation ID to prevent a stale callback from settling
+a newer in-flight operation. An operation-ID callback is authoritative only while
+that exact operation is current; after it ends or is replaced Fred returns 200
+and ignores the callback completely, including status publication. Only tokenless
+v0.13 compatibility callbacks and the currently observational restart/update
+callbacks may emit best-effort, out-of-order status.
 
 ### Request Format
 
@@ -596,7 +627,17 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
 **Fields:**
 - `status`: One of `"success"`, `"failed"`, or `"deprovisioned"`. Use `"deprovisioned"` when the backend has autonomously torn down a lease (e.g. after a failed provision rollback) so Fred records the lease as deprovisioned without firing failure-callback side effects.
 - `error`: Error message if status is `"failed"`, empty otherwise
-- `backend` (omitempty): The backend's configured name. Lets Fred label metrics per-backend without a placement lookup. Empty from pre-upgrade senders.
+- `backend` (omitempty): Optional legacy sender metadata used only for bounded metrics when no current operation exists. It may be empty or differ from Fred's configured router name. It never authorizes or redirects a typed callback; the HMAC-covered callback URL and current operation ID select the authoritative backend.
+- `operation_id` in the JSON body, if supplied, is untrusted metadata and is overwritten at Fred's ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
+
+### Fred Response Contract
+
+- `200 OK` — accepted for asynchronous processing. Duplicate or stale exact-operation callbacks are also acknowledged with 200 so a backend does not retry forever; this status does not promise lifecycle settlement.
+- `400 Bad Request` — malformed JSON, lease UUID, status, or `operation_id` query. A present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected.
+- `401 Unauthorized` — missing or invalid HMAC signature.
+- `429 Too Many Requests` — callback ingress rate limit exceeded; retry with backoff.
+- `500 Internal Server Error` — Fred could not publish the callback to its internal handler; retry with backoff.
+- `503 Service Unavailable` — callback authentication/application service is unavailable or request processing timed out; retry with backoff.
 
 ### HMAC Signature with Replay Protection
 
@@ -653,7 +694,7 @@ The `CALLBACK_SECRET` must match Fred's `callback_secret` configuration. Backend
 ### Security Notes
 
 - **Replay protection**: Callbacks older than 5 minutes are rejected
-- **Cross-endpoint and generation binding**: Signature is bound to HTTP method + complete request URI, including `operation_generation`; a captured signature cannot be replayed against another endpoint or operation
+- **Cross-endpoint and operation binding**: Signature is bound to HTTP method + complete request URI, including `operation_id`; a captured signature cannot be replayed against another endpoint or operation
 - **Clock skew tolerance**: Timestamps up to 1 minute in the future are accepted
 - **Binary-safe body**: Body is hashed (SHA-256), so the canonical string is unaffected by embedded `\n`, NUL, or non-UTF-8 bytes
 
@@ -680,7 +721,7 @@ type provision struct {
 ### Callback URL Storage
 
 Store callback URLs per lease to handle concurrent provisions. Store the
-complete opaque value, including `?operation_generation=...`; stripping or
+complete opaque value, including `?operation_id=...`; stripping or
 rebuilding the query makes the HMAC or operation identity fail verification.
 
 ```go
@@ -724,21 +765,30 @@ Fred periodically calls `GET /provisions` to detect:
 Your `ListProvisions` must return ALL resources you're managing, so Fred can reconcile correctly.
 
 **What a failed `GET /provisions` costs.** Returning a non-200 (or timing out) is
-not fatal to the provider: Fred marks your backend unanswered for that sweep and
-reconciles every other backend normally. But it is not free either — Fred cannot
-tell "this lease is gone" from "this backend did not tell me about it", so every
-lease it believes lives on your backend is **deferred**: not acknowledged, not
-re-provisioned, not deprovisioned, until you answer again. Fred will not move
-those leases elsewhere, and will not tear them down on the strength of a reply it
-did not get.
+not fatal to the provider: existing workloads keep serving, and Fred continues
+exact callbacks plus reconciliation actions backed by sufficient positive or
+terminal evidence. Before the first baseline for a new or changed topology, one
+failed provision or retention inventory blocks bootstrap. After that complete
+baseline has been persisted, a partial sweep does not revoke it: the reconciler
+may place genuinely new recordless `PENDING` work only on its typed set of nodes
+that answered **both** inventories. Recordless `ACTIVE` recovery and work tied
+to your backend, an attempt, or a conflict remain deferred. Fred neither moves
+them elsewhere nor clears evidence on the strength of a reply it did not get.
+
+That answering-node set is specifically a reconciler sweep witness. The tenant
+event path has no such witness: it requires the durable topology baseline,
+live-routes by backend stats within the configured topology, and writes the
+exact attempted backend durably before dispatch. An ambiguous result remains
+pinned regardless of a later empty inventory response.
 
 Two practical consequences:
 
 - **Prefer a slow complete answer to a fast partial one.** Fred treats a
   successful response as authoritative for your backend, so omitting a resource
-  you still hold is far worse than taking longer to list it — an omitted lease
-  looks unprovisioned and may be re-provisioned. If you cannot enumerate
-  everything, fail the request instead.
+  you still hold is far worse than taking longer to list it — a confirmed lease
+  may enter exact-owner recovery, while attempts/conflicts remain quarantined
+  rather than being cleared. If you cannot enumerate everything, fail the
+  request instead.
 - **Pagination is complete-or-error.** Fred walks `continue` tokens and discards
   the whole walk if any page fails, precisely so a mid-walk failure cannot look
   like a short list.
@@ -885,7 +935,7 @@ curl -X POST http://localhost:9001/provision \
     "tenant": "manifest1test",
     "provider_uuid": "test-provider",
     "items": [{"sku": "docker-nginx", "quantity": 1}],
-    "callback_url": "http://localhost:8080/callbacks/provision?operation_generation=42"
+    "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
   }'
 ```
 

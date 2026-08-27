@@ -4,11 +4,11 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
 // These helpers preserve concise setup in older tests without exposing
-// generation-free mutation on the production tracker API.
+// operationID-free mutation on the production tracker API.
 
 // TrackInFlight installs or replaces an entry for legacy test setup.
 func (t *DefaultInFlightTracker) TrackInFlight(
@@ -16,28 +16,11 @@ func (t *DefaultInFlightTracker) TrackInFlight(
 	items []backend.LeaseItem,
 	backendName string,
 ) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if p, exists := t.inFlight[leaseUUID]; exists && p.settlementClaimed {
-		return
-	}
-	if _, claimed := t.reconcileClaims[leaseUUID]; claimed {
-		return
-	}
-	t.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID:  leaseUUID,
-		Tenant:     tenant,
-		Items:      items,
-		Backend:    backendName,
-		Generation: t.allocateGenerationLocked(),
-		StartTime:  time.Now(),
-	}
-	t.markMutationLocked(leaseUUID)
-	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
+	t.replaceForLegacy(leaseUUID, tenant, items, backendName, time.Now())
 }
 
 // TryTrackInFlight installs a provision entry without requiring a callback
-// generation, matching the historical test helper contract.
+// operationID, matching the historical test helper contract.
 func (t *DefaultInFlightTracker) TryTrackInFlight(
 	leaseUUID, tenant string,
 	items []backend.LeaseItem,
@@ -57,31 +40,14 @@ func (t *DefaultInFlightTracker) TryTrackRestoreInFlight(
 	return ok
 }
 
-// UntrackInFlight removes an unclaimed test entry regardless of generation.
+// UntrackInFlight removes an unclaimed test entry regardless of operationID.
 func (t *DefaultInFlightTracker) UntrackInFlight(leaseUUID string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if p, exists := t.inFlight[leaseUUID]; exists && !p.settlementClaimed {
-		delete(t.inFlight, leaseUUID)
-		t.markMutationLocked(leaseUUID)
-		metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
-	}
+	t.removeForLegacy(leaseUUID)
 }
 
 // PopInFlight removes and returns an unclaimed test entry.
 func (t *DefaultInFlightTracker) PopInFlight(leaseUUID string) (InFlightProvision, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	provision, exists := t.inFlight[leaseUUID]
-	if exists && provision.settlementClaimed {
-		return InFlightProvision{}, false
-	}
-	if exists {
-		delete(t.inFlight, leaseUUID)
-		t.markMutationLocked(leaseUUID)
-		metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
-	}
-	return provision, exists
+	return t.popForLegacy(leaseUUID)
 }
 
 type legacyInFlightTestTracker interface {
@@ -115,7 +81,7 @@ func (m *Manager) TryTrackRestoreInFlight(leaseUUID, tenant string, items []back
 	return m.legacyTestTracker().TryTrackRestoreInFlight(leaseUUID, tenant, items, backendName)
 }
 
-// UntrackInFlight delegates generation-free test cleanup to the tracker.
+// UntrackInFlight delegates operationID-free test cleanup to the tracker.
 func (m *Manager) UntrackInFlight(leaseUUID string) {
 	m.legacyTestTracker().UntrackInFlight(leaseUUID)
 }
@@ -124,3 +90,97 @@ func (m *Manager) UntrackInFlight(leaseUUID string) {
 func (m *Manager) PopInFlight(leaseUUID string) (InFlightProvision, bool) {
 	return m.legacyTestTracker().PopInFlight(leaseUUID)
 }
+
+// GetInFlight exposes tracker state only to package tests. Production lifecycle
+// consumers coordinate through Manager.Operations and opaque capabilities.
+func (m *Manager) GetInFlight(leaseUUID string) (InFlightProvision, bool) {
+	return m.tracker.GetInFlight(leaseUUID)
+}
+
+// GetInFlightLeases exposes the tracker inventory only to package tests.
+// Production shutdown uses the narrower WaitForDrain method.
+func (m *Manager) GetInFlightLeases() []string {
+	return m.tracker.GetInFlightLeases()
+}
+
+func (m *Manager) TryTrackInFlightWithOperationID(
+	leaseUUID, tenant string,
+	items []backend.LeaseItem,
+	backendName string,
+) (operation.OperationID, bool) {
+	return m.tracker.TryTrackInFlightWithOperationID(leaseUUID, tenant, items, backendName)
+}
+
+func (m *Manager) TryTrackInFlightWithOperationIDIfNotNewer(
+	leaseUUID, tenant string,
+	items []backend.LeaseItem,
+	backendName string,
+	maxRevision uint64,
+) (operation.OperationID, bool, bool) {
+	return m.tracker.TryTrackInFlightWithOperationIDIfNotNewer(
+		leaseUUID, tenant, items, backendName, maxRevision,
+	)
+}
+
+func (m *Manager) SnapshotMutationRevision() uint64 {
+	return m.tracker.SnapshotMutationRevision()
+}
+
+func (m *Manager) TryClaimLeaseActionIfNotNewer(
+	leaseUUID string,
+	maxRevision uint64,
+) (bool, bool) {
+	return m.tracker.TryClaimLeaseActionIfNotNewer(leaseUUID, maxRevision)
+}
+
+func (m *Manager) TryClaimLeaseAction(leaseUUID string) bool {
+	return m.tracker.TryClaimLeaseAction(leaseUUID)
+}
+
+func (m *Manager) ReleaseLeaseAction(leaseUUID string) bool {
+	return m.tracker.ReleaseLeaseAction(leaseUUID)
+}
+
+func (m *Manager) TryTrackRestoreInFlightWithOperationID(
+	leaseUUID, tenant string,
+	items []backend.LeaseItem,
+	backendName string,
+) (operation.OperationID, bool) {
+	return m.tracker.TryTrackRestoreInFlightWithOperationID(leaseUUID, tenant, items, backendName)
+}
+
+func (m *Manager) UntrackInFlightIfOperationID(leaseUUID string, operationID operation.OperationID) bool {
+	return m.tracker.UntrackInFlightIfOperationID(leaseUUID, operationID)
+}
+
+func (m *Manager) TryClaimInFlight(
+	leaseUUID string,
+	operationID operation.OperationID,
+) (InFlightProvision, bool) {
+	return m.tracker.TryClaimInFlight(leaseUUID, operationID)
+}
+
+func (m *Manager) TryClaimInFlightForDeprovision(
+	leaseUUID string,
+	operationID operation.OperationID,
+) (InFlightProvision, bool) {
+	return m.tracker.TryClaimInFlightForDeprovision(leaseUUID, operationID)
+}
+
+func (m *Manager) ReleaseInFlightClaim(leaseUUID string, operationID operation.OperationID) bool {
+	return m.tracker.ReleaseInFlightClaim(leaseUUID, operationID)
+}
+
+func (m *Manager) FinishClaimedInFlight(leaseUUID string, operationID operation.OperationID) bool {
+	return m.tracker.FinishClaimedInFlight(leaseUUID, operationID)
+}
+
+func (m *Manager) InFlightCountsByBackend() map[string]int {
+	return m.tracker.InFlightCountsByBackend()
+}
+
+func (m *Manager) GetTimedOutProvisions(timeout time.Duration) []InFlightProvision {
+	return m.tracker.GetTimedOutProvisions(timeout)
+}
+
+var _ ReconcilerTracker = (*Manager)(nil)

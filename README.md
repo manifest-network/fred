@@ -171,6 +171,7 @@ All required fields are validated at startup. The daemon will fail to start with
 | `backends` | At least one backend must be configured (multiple backends may share `skus` for load-based routing) |
 | `callback_base_url` | URL where backends send callbacks (must be absolute http/https URL) |
 | `callback_secret` | Shared secret for HMAC callback authentication (minimum 32 characters) |
+| `placement_store_db_path` | Writable path for the durable lease-to-backend placement database |
 
 ### Backend Configuration
 
@@ -198,24 +199,26 @@ backends:
 callback_base_url: "http://fred.provider.example.com:8080"
 callback_secret: "your-32-character-or-longer-secret-here"
 
-# Required for restore and multi-backend setups (multiple backends sharing
-# match criteria). Records durable attempts and confirmed ownership so reads,
-# reconciliation, restore, and deprovision reach the right machine.
-# placement_store_db_path: "/var/lib/fred/placements.db"
+# Required. Records durable attempts and confirmed ownership so reads,
+# reconciliation, restore, and deprovision reach the right backend.
+placement_store_db_path: "/var/lib/fred/placements.db"
 ```
 
 **Per-backend fields:**
 
 | Field | Description | Default |
 |-------|-------------|---------|
-| `name` | Unique backend identifier | (required) |
+| `name` | Stable, case-sensitive durable backend identity; must be non-blank and unique | (required) |
 | `url` | Absolute `http://` or `https://` URL with a host | (required) |
 | `skus` | Exact list of on-chain SKU UUIDs this backend serves | `[]` |
 | `default` | Use as fallback when no SKU match | `false` |
 | `timeout` | HTTP request timeout for calls to this backend | `30s` |
 
 **Validation rules:**
-- Backend names must be unique
+- Backend names must be non-blank after trimming and exactly unique (comparison is case-sensitive)
+- Treat a backend name as an immutable storage identity: removing or renaming it
+  while a durable placement refers to it is rejected, and after it is safely
+  drained and retired it can never be reused for the same or different storage
 - Backend URLs must be absolute `http://` or `https://` URLs with a host
 - `callback_base_url` must be an absolute `http://` or `https://` URL
 - Trailing slashes on `callback_base_url` are automatically stripped
@@ -256,7 +259,7 @@ callback_secret: "your-32-character-or-longer-secret-here"
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
-| `placement_store_db_path` | Path to the durable lease→backend placement database. Required for restore and correct multi-backend routing; restore returns 503 before contacting a backend when disabled | (optional only when restore and multi-backend routing are unused) |
+| `placement_store_db_path` | Path to the durable lease→backend placement database used for write-ahead placement, routing, restore, and restart recovery | (required) |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 > **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
@@ -348,7 +351,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
 | `GET` | `/health` | None | Liveness. Probes chain, backends and DBs, but **no verdict ever makes it 503** — poll this from a load balancer |
-| `GET` | `/readyz` | None | Deep readiness. Same body; 503 when a local bbolt store is unreadable. **Not** for load balancers |
+| `GET` | `/readyz` | None | Deep readiness. Same body; 503 when a local bbolt store is unreadable or no durable inventory baseline matches the configured backend topology. **Not** for load balancers |
 | `GET` | `/metrics` | None | Prometheus metrics |
 | `GET` | `/workloads?lease_uuid=<u1>&lease_uuid=<u2>...` | None | Bulk workload metadata lookup by lease UUID (1..MaxLookupUUIDs). Used by the manifest-admin SPA. |
 | `POST` | `/callbacks/provision` | HMAC-SHA256 | Backend → Fred callback (5-min replay window) |
@@ -359,7 +362,7 @@ See [SECURITY.md](SECURITY.md) for replay protection rationale per endpoint.
 
 ```
 GET /health     # liveness — no verdict returns 503
-GET /readyz     # deep readiness — 503 when a local store is unreadable
+GET /readyz     # deep readiness — also 503 until placement inventory bootstraps
 ```
 
 Both probe the same things — chain connectivity, every registered backend, and
@@ -369,8 +372,27 @@ same body. They differ only in how the verdict maps onto the status code:
 | `status` | Meaning | `/health` | `/readyz` |
 |---|---|---|---|
 | `healthy` | Every configured probe passed | 200 | 200 |
-| `degraded` | A remote, shared dependency is impaired (chain, or one or more backends). Backend down: the rest keep serving and reconciling. Chain down: reconciliation halts and lease-resolving calls fail. Both still accept backend callbacks | 200 | 200 |
-| `unhealthy` | A local, process-owned bbolt store is unreadable. Restart-worthy | 200 | 503 |
+| `degraded` | A remote, shared dependency is impaired (chain, or one or more backends). Existing workloads keep serving and exact callbacks plus safely evidenced reconciliation work continue. After inventory bootstrap, the reconciler may place genuinely new recordless `PENDING` work only on backends that answered both inventories; work pinned to a silent owner, `ACTIVE` recordless work, unresolved attempts, and conflicts remain deferred. A chain outage halts reconciliation and lease-resolving calls. Both conditions still accept backend callbacks | 200 | 200 |
+| `unhealthy` | A local, process-owned bbolt store is unreadable, or no durable inventory baseline matches the configured backend topology | 200 | 503 |
+
+`checks.placement_inventory` reports a durable baseline bound to the exact set of
+configured backend storage identities. A complete `/provisions` plus
+`/retentions` projection establishes it; it survives process restarts and
+transient incomplete sweeps while that topology is unchanged. A new placement
+database or topology change requires another complete projection.
+
+`fred_reconciler_sweep_complete` describes only whether the **last** sweep heard
+both inventories from every configured backend; it is not a fleet-wide admission
+gate. With a valid baseline, a partial sweep issues a typed scope containing only
+the backends that answered both inventories. That scope can authorize genuinely
+recordless `PENDING` work on those nodes. It cannot move or retry work tied to a
+silent owner, clear an attempt or conflict from silence, or authorize recordless
+`ACTIVE` recovery.
+
+Tenant event dispatch has no per-sweep inventory witness. It instead requires
+the durable topology baseline, live-routes by backend stats within that topology,
+and durably records the exact attempted backend before making the call. A later
+ambiguous result remains pinned regardless of an empty inventory response.
 
 `/health` is a **liveness** contract: no dependency verdict makes it 503, because
 providerd runs as the single server of its load-balancer pool and the backends'
@@ -388,8 +410,9 @@ request timeout — the last of which would otherwise answer 503 from
 Being unauthenticated, both endpoints do still sit behind the global IP rate limiter
 and can return `429`; the default budget is far above any sane probe interval.
 
-A check absent from `checks` means that dependency is not configured, not that it
-passed.
+A check absent from `checks` means an optional dependency is not configured, not
+that it passed. `placement_store` and `placement_inventory` are mandatory in
+`providerd` and are therefore always present.
 
 **Response:**
 ```json
@@ -402,6 +425,7 @@ passed.
     "backend:docker-2": {"status": "unhealthy", "message": "backend health check failed"},
     "token_tracker": {"status": "healthy"},
     "placement_store": {"status": "healthy"},
+    "placement_inventory": {"status": "healthy"},
     "payload_store": {"status": "healthy"}
   }
 }
@@ -719,6 +743,27 @@ Content-Type: application/json
 
 Restore a soft-deleted lease's retained data into a **new** lease. The path `lease_uuid` is the new, fresh `PENDING` lease the data is adopted into; `from_lease_uuid` in the body names the original closed/expired lease whose volumes were retained (see [retention](internal/backend/docker/README.md#soft-delete--restore)). Fred resolves the backend that holds the source lease's retained data (restore is same-backend, ENG-333), then re-deploys the retained manifest onto the adopted volumes. Only the item **shape** must match: the new lease's requested service names and quantities must equal the original's, but its SKU/disk tier MAY differ. A promote (same-or-larger disk tier) is always allowed and the new `disk_mb` cap is applied; a demote (smaller disk tier) is allowed only if the retained volume's measured data still fits the new tier's `disk_mb` cap (the backend runs `checkDemoteFit` before adopting). A refused demote returns `422 Unprocessable Entity`; the JSON body's `error` message begins `retained data exceeds the requested smaller tier` (the body's `code` field is the numeric HTTP status, not a string discriminator).
 
+Admission is safe by construction. Fred acquires ordered lifecycle claims for the
+source and target, re-reads the target while those claims are held, and atomically
+reserves the exact confirmed source placement while durably writing the absent
+target's operation-scoped attempt before it contacts the backend. Concurrent
+lifecycle work sharing either lease is rejected before dispatch. The source
+reservation is process-local and lasts only through the synchronous backend call;
+the target attempt is durable and is later settled only by its exact operation ID.
+
+Backend acceptance (including a validated `already_provisioned` response) confirms
+the target, while a causally validated synchronous domain refusal clears it. A
+timeout, transport error,
+panic, generic 5xx, malformed error envelope, or unvalidated 503 is ambiguous: Fred
+releases the short-lived source reservation but retains the target attempt because
+the backend may have accepted the request. An immediate retry of that target will
+normally return 409. A positive report from the attempted backend can confirm it;
+a positive report from another backend creates a durable conflict containing
+every candidate. Inventory silence never disproves or clears an ambiguous
+attempt because the original request could commit after the list response.
+Retrying requires a causally validated synchronous refusal or explicit operator
+proof and repair.
+
 **Response:** `202 Accepted`
 ```json
 {
@@ -728,13 +773,13 @@ Restore a soft-deleted lease's retained data into a **new** lease. The path `lea
 
 **Response Codes:**
 - `202 Accepted` - Restore initiated (the lease then transitions through `restarting` to `ready`/`failed`)
-- `400 Bad Request` - Missing/invalid `from_lease_uuid`, or items don't match the retained set
+- `400 Bad Request` - Missing/invalid `from_lease_uuid`, source and target UUIDs are equal, or items don't match the retained set
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - No retained data found for `from_lease_uuid` (the source is absent, expired, cross-tenant, or its configured backend reports that it is not retained)
-- `409 Conflict` - Target lease is not `PENDING`, is already provisioned, has an unresolved durable provision/restore attempt, or is not in a restorable state
+- `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING`, is already provisioned, has an unresolved durable provision/restore attempt, or is not in a restorable state
 - `422 Unprocessable Entity` - The retained data exceeds a requested smaller tier's `disk_mb` cap, or the backend otherwise refuses the restore with a well-formed error envelope; the response relays the backend's bounded `error` message
-- `500 Internal Server Error` - The restore failed with an unexpected or ambiguous backend error, such as a transport error, timeout, or generic 5xx
+- `500 Internal Server Error` - The restore returned an unexpected or ambiguous backend result, such as a transport error, timeout, or generic 5xx; the durable target attempt is retained until positive evidence confirms it or an operator safely repairs it
 - `502 Bad Gateway` - The backend rejected the restore with an unusable or off-contract error response
 - `503 Service Unavailable` - Insufficient resources, an open backend circuit, unavailable placement routing/recording/tracking, or a source placement that is unusable, unresolved, or names a backend Fred no longer knows
 
@@ -809,7 +854,7 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
 
 **Behavior:**
 - Events are delivered as WebSocket JSON frames
-- Events are best-effort notifications, not an ordered state log; delayed backend callbacks can arrive after a newer operation and may therefore produce an out-of-order status. Use the REST status endpoints for current state.
+- Events are best-effort notifications, not an ordered state log. An exact operation-ID callback is ignored after its operation ends or is replaced, so it cannot publish stale status. Tokenless v0.13 compatibility callbacks and the currently observational restart/update callbacks may still arrive out of order. Use the REST status endpoints for current state.
 - The server sends WebSocket ping frames every 30 seconds; the client must respond with pong within 40 seconds or the connection is closed
 - Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
 - The stream ends when the client disconnects or the server shuts down (clean close frame)
@@ -823,12 +868,12 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
 ### Provision Callback (Backend -> Fred)
 
 ```
-POST /callbacks/provision?operation_generation=<uint64>
+POST /callbacks/provision?operation_id=<uuid>
 Content-Type: application/json
 X-Fred-Signature: t=<unix-timestamp>,sha256=<hmac-sha256-hex>
 ```
 
-Called by backends to report provisioning status. Provision and restore callback URLs carry an `operation_generation` query parameter that must be preserved byte-for-byte; the HMAC covers the complete request URI, including this query. Requires HMAC-SHA256 authentication via the `X-Fred-Signature` header. See [SECURITY.md](SECURITY.md#callback-authentication-hmac-sha256) for signing details and replay protection.
+Called by backends to report provisioning status. Provision and restore callback URLs carry exactly one `operation_id` query parameter: a lowercase, hyphenated, canonical RFC-4122 UUIDv4. It must be preserved byte-for-byte; the HMAC covers the complete request URI, including this query. Requires HMAC-SHA256 authentication via the `X-Fred-Signature` header. See [SECURITY.md](SECURITY.md#callback-authentication-hmac-sha256) for signing details and replay protection.
 
 **Request:**
 ```json
@@ -836,24 +881,39 @@ Called by backends to report provisioning status. Provision and restore callback
   "lease_uuid": "...",
   "status": "success",
   "error": "",
+  "backend": "optional-sender-label",
   "retained": false
 }
 ```
 
 Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third is used by backends that perform autonomous deprovisioning, e.g. after a failed provision rollback).
 
+- `backend` (optional string) — legacy sender metadata used only for bounded metrics when no current operation exists. It need not equal Fred's configured router name and cannot authorize or redirect a typed callback; the HMAC-covered callback URL and current operation ID select the authoritative backend.
 - `retained` (optional bool) — set `true` on a `deprovisioned` callback when the backend soft-deleted (retained) the lease's volumes instead of destroying them. Fred uses this to push the optimistic `retained` notice to the tenant; the queryable retained status (`GET /v1/leases/{uuid}/status`) is the durable backstop. Omitted/`false` means the volumes were destroyed.
+- `operation_id` in the JSON body, if sent by an older or custom backend, is untrusted metadata and is overwritten at ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
 
 **Response Codes:**
-- `200 OK` - Callback processed successfully (or already processed)
+- `200 OK` - Callback accepted for asynchronous processing; duplicates and stale exact-operation callbacks are also acknowledged so backends do not retry forever
+- `400 Bad Request` - Malformed JSON, lease UUID, status, or `operation_id` query. A present empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed, or duplicate value is rejected
 - `401 Unauthorized` - Missing or invalid signature
+- `429 Too Many Requests` - Global callback rate limit exceeded
+- `500 Internal Server Error` - Callback could not be published to the internal handler
+- `503 Service Unavailable` - Callback service/authenticator is not configured, or request processing timed out
 
 **Idempotency:**
 If a callback is received for a lease that has already been processed (no longer in-flight),
-the server still returns `200 OK`. `success` and `failed` callbacks may publish a
-best-effort lease status event, but cannot acknowledge or reject the lease or mutate its
-placement. `deprovisioned` remains teardown evidence. Response bodies are not guaranteed
-for this path, so callers should treat the HTTP status code as the source of truth.
+the server still returns `200 OK`. A callback carrying an
+`operation_id` that is no longer current is ignored completely: it cannot publish
+status, acknowledge or reject the lease, retire teardown state, or mutate placement.
+While an operation-ID-required provision or restore operation is current, a tokenless
+callback is ignored completely, including status publication. With no current
+operation, tokenless callbacks remain a rolling-compatibility/status-only path
+for v0.13.0 provision backends and for restart/update, whose callbacks are
+observational today. A tokenless `deprovisioned` callback may also retire
+process-local teardown evidence. Only a current operation explicitly registered
+as legacy token-optional can be settled without the query token.
+Response bodies are not guaranteed for this path, so callers should treat the HTTP status
+code as the source of truth.
 
 ## Backend API Specification
 
@@ -903,7 +963,7 @@ Start provisioning a resource (async).
     {"sku": "k8s-small", "quantity": 2},
     {"sku": "k8s-large", "quantity": 1}
   ],
-  "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_generation=42",
+  "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "<base64-encoded-bytes>",
   "payload_hash": "abc123..."
 }
@@ -1082,7 +1142,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
   "tenant": "manifest1abc...",
   "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
   "items": [{"sku": "docker-redis", "quantity": 1, "service_name": "app"}],
-  "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_generation=42"
+  "callback_url": "http://fred.example.com:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
@@ -1094,7 +1154,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
 ```
 
 **Error Responses:**
-- `400 Bad Request` - Missing `lease_uuid`/`from_lease_uuid`/`callback_url`, or items/manifest validation error
+- `400 Bad Request` - Missing `lease_uuid`/`from_lease_uuid`/`callback_url`, equal source and target UUIDs, or items/manifest validation error
 - `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"`, so the two are distinguished by the presence of that discriminator
 - `422 Unprocessable Entity` - No retained data for the source lease (also returned by backends that don't support retention)
 - `503 Service Unavailable` - Insufficient resources
@@ -1209,6 +1269,7 @@ backends:
 
 callback_base_url: "http://localhost:8080"
 callback_secret: "test-secret-at-least-32-characters-long"
+placement_store_db_path: "/tmp/fred-test-placements.db"
 ```
 
 ### 3. Run Fred
@@ -1233,7 +1294,7 @@ curl -X POST http://localhost:9000/provision \
     "tenant": "manifest1abc",
     "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
     "items": [{"sku": "mock-resource", "quantity": 1}],
-    "callback_url": "http://localhost:8080/callbacks/provision?operation_generation=42"
+    "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
   }'
 ```
 
@@ -1318,22 +1379,28 @@ internal/
 │   └── chaintest/      # Test-only mock chain client (not imported by providerd)
 ├── config/             # Configuration loading and validation
 ├── metrics/            # Prometheus metrics definitions
-├── provisioner/        # Provision lifecycle management
-│   ├── manager.go      # Coordinator (wires components together)
-│   ├── orchestrator.go # Routes to backends, starts provisioning
-│   ├── handlers.go     # Shared handler logic and lease item extraction
-│   ├── handler_set.go  # Watermill message handlers
-│   ├── reconciler.go   # Level-triggered state reconciliation
-│   ├── tracker.go      # InFlightTracker interface + DefaultInFlightTracker implementation
-│   ├── inflight.go     # Manager delegation methods to the tracker
+├── provisioner/        # Provision lifecycle application and runtime composition
+│   ├── manager.go      # Composition root and Watermill runtime ownership
+│   ├── handler_set.go  # Transport adapters from Watermill messages to application services
+│   ├── orchestrator.go # Provision admission and backend dispatch
+│   ├── callback_service.go # Exact-operation callback authorization and settlement policy
+│   ├── restore/        # Atomic source/target restore application service
+│   ├── operation/      # Typed operation IDs, opaque capabilities, and process-local registry
+│   ├── reconciler.go   # Level-triggered reconciliation runtime
+│   ├── reconcile_inventory.go # Read-only chain/backend inventory collection
+│   ├── reconcile_plan.go # Pure evidence-to-action decision table
+│   ├── reconcile_projection.go # Atomic durable inventory projection
+│   ├── tracker.go      # Temporary compatibility adapter over operation.Registry
+│   ├── inflight.go     # Legacy tracker delegation kept for compatibility tests
+│   ├── handlers.go     # Shared transport helpers and lease item extraction
 │   ├── ack_batcher.go  # Batches lease acknowledgments
 │   ├── timeout_checker.go # Detects callback timeouts
 │   ├── leaseutil.go    # Lease helper utilities
 │   ├── topics.go       # Watermill topic name constants
-│   ├── payload/        # Temporary payload storage (bbolt)
-│   ├── placement/      # Lease→backend placement store (bbolt)
+│   ├── payload/        # Lease-lifetime deployment payload storage (bbolt)
+│   ├── placement/      # Durable attempts, ownership, conflicts, and inventory authority
 │   ├── bridge.go       # Chain events -> Watermill
-│   └── interfaces.go   # BackendRouter, LeaseRejecter, PlacementStore interfaces
+│   └── interfaces.go   # Narrow consumer-owned routing, chain, and placement ports
 ├── scheduler/          # Periodic withdrawal and credit monitoring
 ├── testutil/           # Test fixtures and helpers
 ├── tlsconfig/          # TLS config builders for the providerd<->backend hop (mTLS, identity pinning)
@@ -1392,7 +1459,7 @@ Chain State (leases)     Backend State (provisions)
 | ACTIVE | Not provisioned | Anomaly: provision |
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |
-| PENDING/ACTIVE | Placement conflict/unusable, or attempt remains unresolved after authoritative settlement | **Defer — no action this sweep** |
+| PENDING/ACTIVE | Placement conflict/unusable, or unresolved attempt | **Defer — no action this sweep** |
 | PENDING/ACTIVE | Positive report disagrees with confirmed placement | **Defer — no action this sweep** |
 | PENDING/ACTIVE | Confirmed owner is not configured | **Defer and emit an operator-visible lease error** |
 | PENDING/ACTIVE | Owning backend did not answer | **Defer — no action this sweep** |
@@ -1407,16 +1474,24 @@ unambiguously risks re-provisioning it onto a healthy peer and laying an empty
 volume over live data. Terminal and not-found provisions are handled by the
 separately gated destructive passes below.
 
-When both the placement record and positive backend report are absent, Fred
-applies a `Not provisioned` row only after the current sweep is complete, after
-a prior complete inventory was durably synchronized and made absence trustworthy
-for that lease, or after the current sweep authoritatively cleared its sole
-attempt. An incomplete sweep without one of those proofs defers the lease.
+When both the placement record and positive backend report are absent, a durable
+baseline for the configured topology proves only that Fred completed its initial
+inventory bootstrap; it does not turn silence in the current sweep into a
+lease-specific fact. On a later partial sweep, the reconciler may dispatch a
+genuinely recordless `PENDING` lease only through a typed admission scope
+containing backends that answered both `/provisions` and `/retentions`. A
+recordless `ACTIVE` lease is deferred until a complete current view, and any
+confirmed owner, attempt, or conflict stays pinned or quarantined when one of
+its candidates is silent.
 
-A backend failing to answer therefore degrades only its own leases; it no longer
-stops reconciliation for the rest of the fleet. Sweeps that ran degraded are
-reported by `fred_reconciler_sweep_complete` (0) and counted as
-`fred_reconciler_runs_total{outcome="degraded"}`.
+Exact callbacks, chain acknowledgements, status observation, and the safely
+evidenced cleanup passes below can continue. A positive observation from the
+attempted backend can confirm an attempt. A contradictory positive observation
+is unioned with all durable candidates into conflict quarantine. Inventory
+absence never clears an attempt or conflict. Incomplete sweeps report
+`fred_reconciler_sweep_complete` as 0 and increment
+`fred_reconciler_runs_total{outcome="degraded"}`; that gauge is an observation,
+not a global write-authority switch.
 
 The three passes that **delete durable state** — orphan deprovision, payload
 cleanup, placement pruning — keep running on a degraded sweep, scoped to what

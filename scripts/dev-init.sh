@@ -427,6 +427,9 @@ token_tracker_db_path: "$REPO_ROOT/tokens.db"
 # Payload store
 payload_store_db_path: "$REPO_ROOT/payloads.db"
 
+# Durable lease-to-backend placement authority
+placement_store_db_path: "$REPO_ROOT/placements.db"
+
 # Transaction configuration
 gas_limit: 1500000
 gas_price: 0

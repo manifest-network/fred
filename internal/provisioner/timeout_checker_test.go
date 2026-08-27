@@ -13,6 +13,8 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
 // mockRejecter implements LeaseRejecter for testing.
@@ -26,11 +28,66 @@ func (m *mockRejecter) RejectLeases(ctx context.Context, uuids []string, reason 
 
 func newTimeoutCheckerForTest(tracker *DefaultInFlightTracker, rejecter LeaseRejecter, timeout time.Duration) *TimeoutChecker {
 	return NewTimeoutChecker(TimeoutCheckerConfig{
-		Tracker:       tracker,
+		Operations:    tracker.Operations(),
 		Rejecter:      rejecter,
 		Timeout:       timeout,
 		CheckInterval: time.Hour, // irrelevant; we call CheckOnce directly
 	})
+}
+
+func TestNewTimeoutChecker_RetainsOnlyTypedCapabilities(t *testing.T) {
+	registry := operation.NewRegistry()
+	checker := NewTimeoutChecker(TimeoutCheckerConfig{
+		Operations: registry,
+		Rejecter: &mockRejecter{rejectFn: func(
+			context.Context, []string, string,
+		) (uint64, []string, error) {
+			return 0, nil, nil
+		}},
+	})
+	assert.Same(t, registry, checker.operations)
+
+	var typedNilOperations *operation.Registry
+	checker = NewTimeoutChecker(TimeoutCheckerConfig{
+		Operations: typedNilOperations,
+	})
+	assert.Nil(t, checker.operations, "a typed-nil operations port must fail closed")
+	assert.NotPanics(t, func() { checker.CheckOnce(context.Background()) })
+
+	var typedNilRejecter *mockRejecter
+	checker = NewTimeoutChecker(TimeoutCheckerConfig{
+		Operations: registry,
+		Rejecter:   typedNilRejecter,
+	})
+	assert.Nil(t, checker.rejecter)
+	assert.NotPanics(t, func() { checker.CheckOnce(context.Background()) })
+}
+
+func TestTimeoutChecker_StartStopsWithContext(t *testing.T) {
+	checker := NewTimeoutChecker(TimeoutCheckerConfig{
+		Operations:    operation.NewRegistry(),
+		Rejecter:      &mockRejecter{},
+		CheckInterval: time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		checker.Start(ctx)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout checker did not stop after context cancellation")
+	}
+}
+
+func TestTimeoutOperationLabel(t *testing.T) {
+	assert.Equal(t, metrics.OperationProvision, timeoutOperationLabel(operation.KindProvision))
+	assert.Equal(t, metrics.OperationRestore, timeoutOperationLabel(operation.KindRestore))
+	assert.Equal(t, metrics.OperationProvision, timeoutOperationLabel(operation.KindInvalid),
+		"invalid records cannot come from Registry; the fallback remains bounded")
 }
 
 func TestCheckOnce_NoTimeouts(t *testing.T) {
@@ -84,13 +141,13 @@ func TestCheckOnce_ClaimPreventsReplacementDuringReject(t *testing.T) {
 	require.True(t, exists)
 
 	rejecter := &mockRejecter{rejectFn: func(_ context.Context, _ []string, _ string) (uint64, []string, error) {
-		assert.False(t, tracker.UntrackInFlightIfGeneration("lease-old", old.Generation),
+		assert.False(t, tracker.UntrackInFlightIfOperationID("lease-old", old.OperationID),
 			"callback cleanup must not remove a generation while timeout settlement owns it")
 		_, popped := tracker.PopInFlight("lease-old")
 		assert.False(t, popped, "legacy pop must not bypass a settlement claim")
-		_, claimed := tracker.TryClaimInFlight("lease-old", old.Generation)
+		_, claimed := tracker.TryClaimInFlight("lease-old", old.OperationID)
 		assert.False(t, claimed, "a second settlement actor must not claim the same generation")
-		_, tracked := tracker.TryTrackInFlightWithGeneration(
+		_, tracked := tracker.TryTrackInFlightWithOperationID(
 			"lease-old", "tenant-1", []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-b",
 		)
 		assert.False(t, tracked, "a replacement must not start while the old generation is claimed")
@@ -100,13 +157,13 @@ func TestCheckOnce_ClaimPreventsReplacementDuringReject(t *testing.T) {
 	newTimeoutCheckerForTest(tracker, rejecter, 10*time.Minute).CheckOnce(context.Background())
 	assert.False(t, tracker.IsInFlight("lease-old"), "successful settlement must finish the claimed generation")
 
-	replacementGeneration, tracked := tracker.TryTrackInFlightWithGeneration(
+	replacementGeneration, tracked := tracker.TryTrackInFlightWithOperationID(
 		"lease-old", "tenant-1", []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-b",
 	)
 	require.True(t, tracked)
 	current, exists := tracker.GetInFlight("lease-old")
 	require.True(t, exists)
-	assert.Equal(t, replacementGeneration, current.Generation)
+	assert.Equal(t, replacementGeneration, current.OperationID)
 	assert.Equal(t, "backend-b", current.Backend)
 }
 
@@ -117,7 +174,7 @@ func TestCheckOnce_AlreadyClaimedGenerationIsSkipped(t *testing.T) {
 		time.Now().Add(-20*time.Minute))
 	p, exists := tracker.GetInFlight("lease-old")
 	require.True(t, exists)
-	_, claimed := tracker.TryClaimInFlight(p.LeaseUUID, p.Generation)
+	_, claimed := tracker.TryClaimInFlight(p.LeaseUUID, p.OperationID)
 	require.True(t, claimed)
 
 	rejectCalls := 0
@@ -131,7 +188,7 @@ func TestCheckOnce_AlreadyClaimedGenerationIsSkipped(t *testing.T) {
 	assert.Equal(t, 0, rejectCalls, "the actor holding the claim owns settlement")
 	assert.True(t, tracker.IsInFlight("lease-old"))
 
-	require.True(t, tracker.ReleaseInFlightClaim(p.LeaseUUID, p.Generation))
+	require.True(t, tracker.ReleaseInFlightClaim(p.LeaseUUID, p.OperationID))
 	checker.CheckOnce(context.Background())
 	assert.Equal(t, 1, rejectCalls)
 	assert.False(t, tracker.IsInFlight("lease-old"))

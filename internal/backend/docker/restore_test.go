@@ -3068,6 +3068,136 @@ func TestRestore_RaceWithProvision(t *testing.T) {
 	b.wg.Wait()
 }
 
+// TestRestore_ConcurrentTargetsClaimSourceAtMostOnce pins the backend contract
+// behind provider-side ambiguous-result handling: two requests may both pass the
+// read-only prelude, but the retained source's atomic active->restoring CAS lets
+// at most one target receive acceptance. The winning worker is deliberately
+// delayed after acceptance so caller retry cannot mistake a slow response for an
+// available source.
+func TestRestore_ConcurrentTargetsClaimSourceAtMostOnce(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	rs := attachRetentionStore(t, b)
+	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	seedActiveRetained(t, rs, "u1")
+
+	workerStarted := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var workerStartedOnce sync.Once
+	var releaseWorkerOnce sync.Once
+	release := func() {
+		releaseWorkerOnce.Do(func() { close(releaseWorker) })
+	}
+	t.Cleanup(func() {
+		release()
+		b.stopCancel()
+		b.wg.Wait()
+	})
+
+	b.compose = &mockComposeExecutor{
+		UpFn: func(_ context.Context, _ *composetypes.Project, _ composeUpOpts) error {
+			workerStartedOnce.Do(func() { close(workerStarted) })
+			<-releaseWorker
+			return nil
+		},
+		PSFn: func(_ context.Context, _ string) ([]composeContainerSummary, error) {
+			return []composeContainerSummary{{
+				ID: "container-1", Service: manifest.DefaultServiceName, State: "running",
+			}}, nil
+		},
+		DownFn: func(_ context.Context, _ string, _ time.Duration) error { return nil },
+	}
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(_, _ string) error { return nil },
+	}
+
+	callbackSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case callbackSeen <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	type restoreResult struct {
+		target string
+		err    error
+	}
+	results := make(chan restoreResult, 2)
+	start := make(chan struct{})
+	for _, target := range []string{"u2", "u3"} {
+		go func() {
+			<-start
+			results <- restoreResult{
+				target: target,
+				err:    b.Restore(context.Background(), restoreRequest(target, "u1", server.URL)),
+			}
+		}()
+	}
+	close(start)
+
+	got := make([]restoreResult, 0, 2)
+	for range 2 {
+		select {
+		case result := <-results:
+			got = append(got, result)
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent restore calls did not return while the winning worker was delayed")
+		}
+	}
+
+	accepted := make([]string, 0, 1)
+	for _, result := range got {
+		if result.err == nil {
+			accepted = append(accepted, result.target)
+			continue
+		}
+		assert.ErrorIs(t, result.err, backend.ErrInvalidState,
+			"the losing target must observe the source's exclusive restoring claim")
+	}
+	require.Len(t, accepted, 1, "one and only one target may receive restore acceptance")
+
+	select {
+	case <-workerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted restore worker did not start")
+	}
+	entry, err := rs.Get("u1")
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
+	assert.Equal(t, accepted[0], entry.NewLeaseUUID,
+		"the durable source claim must name exactly the accepted target")
+
+	loser := "u2"
+	if accepted[0] == loser {
+		loser = "u3"
+	}
+	b.provisionsMu.RLock()
+	_, winnerTracked := b.provisions[accepted[0]]
+	_, loserTracked := b.provisions[loser]
+	b.provisionsMu.RUnlock()
+	assert.True(t, winnerTracked)
+	assert.False(t, loserTracked, "a failed source claim must roll back the losing target reservation")
+
+	release()
+	select {
+	case <-callbackSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted restore worker did not finish after release")
+	}
+	b.stopCancel()
+	b.wg.Wait()
+}
+
 // ---------------------------------------------------------------------------
 // ENG-325 fix: drive restore volume ops off RetainedVolumeNames (not Items×Qty)
 // ---------------------------------------------------------------------------

@@ -174,9 +174,11 @@ Key interfaces defined where they're consumed:
 | `ChainClient` | `provisioner/topics.go` | Manager, HandlerSet, AckBatcher |
 | `ReconcilerChainClient` | `provisioner/reconciler.go` | Reconciler |
 | `BackendRouter` | `provisioner/interfaces.go` | Orchestrator |
-| `InFlightTracker` | `provisioner/tracker.go` | Orchestrator, HandlerSet, TimeoutChecker |
-| `ReconcilerTracker` | `provisioner/tracker.go` | Reconciler |
-| `PlacementStore` | `provisioner/interfaces.go` | Orchestrator, Reconciler |
+| `operation.Registry` and its narrow capability ports | `provisioner/operation/registry.go` | Composition root, event handlers, callback service, restore service, orchestrator, reconciler, TimeoutChecker |
+| `InFlightTracker` / `ReconcilerTracker` | `provisioner/tracker.go` | Temporary compatibility adapters over the typed operation registry |
+| `ProvisionPlacement` / `ReconcilerPlacement` / `PlacementAuthorityStore` | `provisioner/interfaces.go` | Orchestrator, reconciler, and composition root respectively |
+| `CallbackApplication` | `provisioner/callback_service.go` | HandlerSet transport adapter |
+| `restore.Service` and its narrow ports | `provisioner/restore/service.go` | Restore HTTP handler through the composition root |
 | `PlacementLookup` | `api/handlers.go` | API read handlers |
 | `LeaseRejecter` | `provisioner/interfaces.go` | TimeoutChecker |
 | `Acknowledger` | `provisioner/ack_batcher.go` | HandlerSet, Reconciler (lease acknowledgement via parallel lanes) |
@@ -287,12 +289,15 @@ Restore adopts a soft-deleted lease's retained data into a new lease (see the [d
 1. Tenant opens a fresh PENDING lease matching the closed lease's shape
 2. Tenant POSTs /v1/leases/{new}/restore with from_lease_uuid = {closed}
 3. RestoreLease:
-   a. Resolve the backend that holds the SOURCE lease's retained data, via the
-      source lease's surviving placement (restore is same-backend, ENG-333)
-   b. Track the new lease in-flight as a restore BEFORE calling the backend
-   c. Durably record the new lease's unresolved attempt on the source backend
-   d. Call backend POST /restore, then confirm or retain/clear that attempt by
-      the same outcome rules as fresh provisioning
+   a. Acquire ordered lifecycle claims for source and target and re-read the
+      target as a tenant/provider-owned PENDING lease
+   b. Initiate a typed restore operation, then atomically reserve the source's
+      exact confirmed placement and durably write the absent target's attempt
+      on that same backend (restore is same-backend, ENG-333)
+   c. Bind the operation to that backend and build its HMAC-covered callback URL
+   d. Call backend POST /restore, then confirm it from exact positive evidence,
+      clear it only after a causally validated synchronous refusal, or retain it
+      indefinitely after an ambiguous outcome
 4. Backend adopts the retained volumes and re-deploys the retained manifest async
 5. Backend POSTs the success callback:
    a. Because the lease was tracked in-flight (step 3b), the callback is
@@ -303,9 +308,9 @@ The new lease **may target a different SKU tier** than the source (promote/demot
 
 Reconciler interplay (level-triggered backstop):
 
-- **Inline ack, reconciler backstop.** Inline acknowledgement (ENG-358) is the fast path. Restore requires both the durable placement recorder and generation-scoped tracker; a deployment missing either returns 503 before contacting a backend. Once accepted, the reconciler remains the level-triggered backstop for a lost callback and acks a `PENDING` + `ready` lease. It *skips* a lease the in-flight tracker still owns (counted by `reconciler_inflight_skips_total`), avoiding a double-ack.
+- **Inline ack, reconciler backstop.** Inline acknowledgement (ENG-358) is the fast path. Restore requires both durable placement authority and the typed operation registry; production composition cannot construct the service without either. Once accepted, the reconciler remains the level-triggered backstop for a lost callback and acks a `PENDING` + `ready` lease. It *skips* a lease the operation registry still owns (counted by `reconciler_inflight_skips_total`), avoiding a double-ack.
 - **Restore affinity sync (ENG-333).** Each reconcile tick fans out `GET /retentions` to every backend and syncs the `lease → backend` map into the placement store, so retained leases stay routable to their source node across restarts.
-- **Write-ahead placement (ENG-632).** Placement stores two independent facts: `Backend` is confirmed ownership and `Attempt` is an unresolved outbound call. Every placement-enabled provision, and every restore (which requires placement), persists `Attempt` before contacting a backend. A failed prewrite makes zero backend calls; a transport/5xx ambiguity—including an unvalidated HTTP 503—retains the attempt and blocks substitution until authoritative `/provisions` and `/retentions` inventories settle it. Confirmed ownership is never erased by a failed re-provision. If multiple backends report the same lease, the store durably quarantines the lease with the sorted set of every known owner; reconciliation cannot resolve the conflict until each recorded candidate answers both inventories, and deprovision fails closed if any candidate is no longer configured or cannot be reached. After one complete inventory is durably synchronized, record absence may be trusted during a later degraded sweep; a durable conflict remains a lease-local gate and does not withhold that fleet baseline. Callback URLs carry an HMAC-covered operation generation, and callback/timeout settlement claims serialize terminal work so an older response cannot settle a replacement operation. An authenticated success continues to chain acknowledgement even if placement confirmation fails, preserving the write-ahead record for inventory or operator repair instead of allowing a timeout to reject a live lease.
+- **Write-ahead placement (ENG-632).** Placement stores two independent facts: `Backend` is confirmed ownership and `Attempt` is an unresolved outbound call. Every provision, re-provision, and restore persists `Attempt` before contacting a backend. A failed prewrite makes zero backend calls; a transport/5xx ambiguity—including an unvalidated HTTP 503—retains the exact typed attempt and blocks substitution. Inventory silence never clears it because a delayed remote call can commit after an absence response; only a positive report from the attempted backend, an exact synchronous refusal known to precede any call, or operator repair may settle it. A positive report from another backend is accumulated with every prior owner/attempt into a durable quarantine instead of moving affinity. The first complete `/provisions` + `/retentions` projection atomically persists a baseline bound to the sorted set of immutable backend storage identities. That baseline survives process restarts and transient outages while the topology is unchanged; adding, removing, or renaming an identity invalidates admission until a complete projection safely establishes the new topology. A retired identity can never be reused, and replacement storage receives a new name. During a later partial sweep, a genuinely recordless `PENDING` lease may target only a backend that answered both inventories, while recordless `ACTIVE` recovery, confirmed work on a silent owner, and ambiguous/conflicting work remain deferred. A live chain lease positively reported in retention is also deferred lease-locally: ordinary provision cannot overwrite data that requires the restore path. One failed node therefore does not globally pause the reconciler's healthy-node admission. The tenant event path has no per-sweep witness: it is fenced by the durable baseline and immutable topology, live-routes by backend stats, and persists its exact attempt before dispatch. Callback URLs carry an HMAC-covered UUIDv4 operation ID, and callback/timeout settlement claims serialize terminal work so an older response cannot settle a replacement operation. An authenticated success continues to chain acknowledgement even if placement confirmation fails, preserving the write-ahead record for positive inventory or operator repair instead of allowing a timeout to reject a live lease.
 - **Placement prune grace + deprovision fail-safe (ENG-335).** The reconciler will not prune a placement set younger than a grace window (`2 × reconcile_interval`, measured from sweep start), so a lease that provisioned during a slow sweep is not mis-pruned. When a lease exhausts its re-provision attempts and is closed, the reconciler eagerly calls `backend.Deprovision` on its backend instead of waiting for the next orphan-cleanup cycle (logged at WARN, non-fatal).
 - **Destroy only on a positive fact (ENG-654).** The passes that delete durable state never infer "finished" from absence. A lease missing from the sweep's `chainLeases` proves nothing on its own: that map is built from two non-atomic queries filtered to `PENDING`/`ACTIVE`, so absence covers terminal, never-known, and just-created alike. Orphan deprovision and orphaned-payload cleanup therefore re-read the lease (`GetLease`) per candidate and act only on a positively reported `CLOSED`/`REJECTED`/`EXPIRED`; a query error, an `UNSPECIFIED` state, or a chain with no record of the lease all keep the state and bump `fred_reconciler_cleanup_skips_total`. The last of those is not a corner case — `x/billing` never deletes a lease, so "no record" means a phantom provision, a wrong or reset chain, or a lagging RPC node, and treating it as terminal would let one bad endpoint deprovision the fleet. Placement pruning asks a different question, per record rather than per sweep: it prunes only what the record's **own** backend accounted for on both `/provisions` and `/retentions`. Between them these replace the fleet-wide completeness gate ENG-356 left on all three passes, under which one silent machine paused cleanup — and stranded admission capacity — for every healthy one.
 
@@ -547,17 +552,23 @@ The SM/actor machinery (`internal/backend/shared/leasesm`) is **shared across ba
 ### Placement Store
 
 Tracks which backend serves each lease (bbolt + in-memory cache):
-- Written when provisioning starts (after `RouteForProvision` picks a backend)
+- Writes an operation-scoped attempt after `RouteForProvision` picks a backend
+  but before the backend call; promotes it to confirmed ownership only from an
+  exact accepted/positive result
 - Read by direct-routed tenant operations such as connection details, logs,
   release history, restart, update, and restore. Provision/status discovery keeps
   its bounded fan-out behavior
 - Deleted normally by the reconciler (`cleanupOrphanedPlacements`, ENG-333); survives lease close so a later restore can route to the source node. After a `PENDING` provisioning operation is rejected, the callback may delete the whole record eagerly, but only when its revision and every named backend still belong to that failed operation. An `ACTIVE` re-provision failure clears only its attempt
-- Rebuilt from backend `/provisions` and `/retentions` inventories. Positive
-  owners can be recorded from a partial sweep; resolving a conflict requires a
-  complete view of every candidate, while an older attempt may be cleared after
-  its candidate backend authoritatively answers both inventories
-- Required for restore and for correct routing when multiple backends share the
-  same SKU list; deployments using neither may leave it disabled
+- Rebuilt from backend `/provisions` and `/retentions` inventories. Exact
+  positive reports confirm attempted ownership; contradictory positives are
+  unioned with every prior owner/attempt into durable conflict quarantine.
+  Inventory absence never clears an attempt or resolves a conflict, even after
+  every backend answers
+- Stores the immutable backend-identity history and the topology-bound admission
+  baseline. A later partial sweep attenuates that baseline to a typed scope for
+  recordless `PENDING` reconciliation on nodes that answered both inventories
+- Required in every deployment for write-ahead safety, restore ownership,
+  restart recovery, and correct routing
 
 ### Payload Store
 
@@ -602,9 +613,9 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_provisioner_provisioning_total` | counter | `outcome, backend, operation` | Provisioning operations by outcome/backend. `operation` ∈ `provision`/`restore` separates fresh provisions from restores (ENG-358) |
 | `fred_provisioner_provisioning_duration_seconds` | histogram | `backend, operation` | Provisioning latency. `operation` ∈ `provision`/`restore` |
 | `fred_provisioner_callback_timeouts_total` | counter | — | Backend callback timeouts |
-| `fred_provisioner_callback_settlement_claim_wait_timeouts_total` | counter | — | Callback handlers that exhausted the bounded wait for another terminal actor's exact in-flight generation claim. Any increase indicates a stuck or unusually slow settlement actor |
+| `fred_provisioner_callback_settlement_claim_wait_timeouts_total` | counter | — | Callback handlers that exhausted the bounded wait for another terminal actor's exact in-flight operation claim. Any increase indicates a stuck or unusually slow settlement actor |
 | `fred_provisioner_callback_placement_semantic_conflicts_total` | counter | — | Authenticated success-callback settlement attempts that encountered a permanent semantic placement verdict and continued toward chain acknowledgement while preserving the durable record. Retries may increment the counter more than once |
-| `fred_provisioner_callback_deprovision_owned_success_total` | counter | — | Provision-success callbacks observed while close/deprovision owned that exact operation generation. Fred consumes the callback without acknowledging the closing lease; any increase identifies a provision/close overlap |
+| `fred_provisioner_callback_deprovision_owned_success_total` | counter | — | Provision-success callbacks observed while close/deprovision owned that exact operation ID. Fred consumes the callback without acknowledging the closing lease; any increase identifies a provision/close overlap |
 | `fred_provisioner_ack_batch_fee_gas_errors_total` | counter | `lane` | Ack-batch failures classified as insufficient-fee or out-of-gas — sustained non-zero indicates `gas_limit`/`max_gas_limit`/fee misconfiguration |
 | `fred_provisioner_ack_batch_individual_fallbacks_total` | counter | `lane` | Ack-batch failures that fell back to per-lease retries |
 | `fred_provisioner_reconciler_inflight_skips_total` | counter | — | Ready leases the reconciler skipped because the main flow owns them |
@@ -621,7 +632,7 @@ All metrics use the `fred_` namespace and are exposed at `/metrics`. The docker-
 | `fred_reconciler_last_success_timestamp_seconds` | gauge | — | Unix timestamp of last **clean, complete** run — a degraded sweep does not advance it |
 | `fred_reconciler_conflicts_total` | counter | — | Reconciler conflicts (lease already in-flight) |
 | `fred_reconciler_backend_fetch_total` | counter | `backend`, `outcome` | Per-backend provision-list attempts (`ok`, `error`, `circuit_open`, `panic`). The signal that a single backend is unreachable, which no longer breaks the fleet-wide sweep |
-| `fred_reconciler_sweep_complete` | gauge | — | 1 if the last sweep saw every configured backend, 0 if degraded. Gates the meaning of the action counters above, but does not rule out lease-local deferrals |
+| `fred_reconciler_sweep_complete` | gauge | — | 1 if the last sweep saw both inventories from every configured backend, 0 if degraded. This is an observability signal, not a global admission gate; a matching durable topology baseline survives a 0 |
 | `fred_provisioner_reconciler_deferred_leases_total` | counter | — | Leases skipped because ownership or lifecycle evidence was not safe to act on: a backend was silent, placement was ambiguous/unresolved, or an operation or placement change crossed the inventory boundary. It can increase during a complete sweep under ordinary concurrent lease activity |
 | `fred_reconciler_cleanup_skips_total` | counter | `pass`, `reason` | Destructive cleanup withheld for lack of positive evidence. `pass`: `orphan`, `payload`, `placement`. `reason`: `chain_live`, `chain_unknown`, `chain_unknown_state`, `chain_error`, `backend_silent`. Every value is a deliberate fail-open; `chain_unknown` (no record — check the endpoint) and `chain_unknown_state` (fred is older than the chain — upgrade it) are the two that do not self-heal |
 

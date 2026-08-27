@@ -25,6 +25,7 @@ import (
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // integrationAcknowledger wraps a chain client as an Acknowledger for integration tests.
@@ -46,8 +47,12 @@ func (a *integrationAcknowledger) Acknowledge(ctx context.Context, leaseUUID str
 
 // testReconcilerTracker adapts InFlightTracker + PayloadStore to satisfy ReconcilerTracker.
 type testReconcilerTracker struct {
-	provisioner.InFlightTracker
+	*provisioner.DefaultInFlightTracker
 	store *payload.Store
+}
+
+func (t *testReconcilerTracker) ReconcilerOperations() provisioner.ReconcilerOperations {
+	return t.DefaultInFlightTracker.Operations()
 }
 
 func (t *testReconcilerTracker) HasPayload(leaseUUID string) (bool, error) {
@@ -59,14 +64,14 @@ func (t *testReconcilerTracker) PayloadStore() *payload.Store {
 }
 
 // UntrackInFlight is a test-only cleanup adapter. Production intentionally
-// exposes only generation-scoped removal; snapshot and carry that generation
+// exposes only operation-scoped removal; snapshot and carry that operation ID
 // here so cleanup cannot delete a replacement operation that raced the test.
 func (t *testReconcilerTracker) UntrackInFlight(leaseUUID string) {
 	provision, exists := t.GetInFlight(leaseUUID)
 	if !exists {
 		return
 	}
-	t.UntrackInFlightIfGeneration(leaseUUID, provision.Generation)
+	t.UntrackInFlightIfOperationID(leaseUUID, provision.OperationID)
 }
 
 // reconcilerTestEnv holds all components for a full-stack reconciler integration test.
@@ -112,9 +117,12 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 	// Create in-flight tracker + reconciler tracker adapter
 	inFlight := provisioner.NewInFlightTracker()
 	tracker := &testReconcilerTracker{
-		InFlightTracker: inFlight,
-		store:           store,
+		DefaultInFlightTracker: inFlight,
+		store:                  store,
 	}
+	placementStore, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = placementStore.Close() })
 
 	providerUUID := "test-provider"
 
@@ -132,7 +140,7 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 		integrationAck,
 		router,
 		tracker,
-		nil,
+		placementStore,
 	)
 	require.NoError(t, err)
 
@@ -762,9 +770,12 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 
 	inFlight := provisioner.NewInFlightTracker()
 	tracker := &testReconcilerTracker{
-		InFlightTracker: inFlight,
-		store:           store,
+		DefaultInFlightTracker: inFlight,
+		store:                  store,
 	}
+	placementStore, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = placementStore.Close() })
 
 	providerUUID := "test-provider"
 	integrationAck2 := &integrationAcknowledger{chainClient: mockChain}
@@ -779,7 +790,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 		integrationAck2,
 		router,
 		tracker,
-		nil,
+		placementStore,
 	)
 	require.NoError(t, err)
 
@@ -1009,9 +1020,18 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
 	})
 	require.NoError(t, err)
+	placementStore, err := placement.NewStore(filepath.Join(t.TempDir(), "manager-placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, placementStore.Close()) })
+	fence := placementStore.BeginInventorySession()
+	_, err = placementStore.ProjectInventory(fence, placement.InventoryProjection{})
+	placementStore.EndInventorySession(fence)
+	require.NoError(t, err)
+	placementStore.MarkInventoryReady()
 	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
 		ProviderUUID:    "test-provider",
 		CallbackBaseURL: callbackServer.URL,
+		PlacementStore:  placementStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())

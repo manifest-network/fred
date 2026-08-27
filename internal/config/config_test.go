@@ -183,9 +183,26 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 		CallbackBaseURL:           "http://localhost:8080",
 		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+		PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 	}
 
 	assert.NoError(t, cfg.Validate())
+}
+
+func TestConfig_Validate_PlacementStoreDBPath(t *testing.T) {
+	t.Run("missing path is rejected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.PlacementStoreDBPath = ""
+
+		require.ErrorContains(t, cfg.Validate(), "placement_store_db_path is required")
+	})
+
+	t.Run("configured path is accepted", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.PlacementStoreDBPath = "/var/lib/fred/placements.db"
+
+		require.NoError(t, cfg.Validate())
+	})
 }
 
 func TestConfig_Validate_NoBackends(t *testing.T) {
@@ -259,6 +276,7 @@ func TestConfig_Validate_CallbackSecret(t *testing.T) {
 			ShutdownTimeout:           30 * time.Second,
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -338,6 +356,7 @@ func TestConfig_Validate_WithdrawLimit(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -405,6 +424,7 @@ func TestConfig_Validate_CallbackCanonicalPathPrefix(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -494,6 +514,7 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -683,6 +704,7 @@ func TestConfig_Validate_URLFields(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -777,6 +799,7 @@ func TestConfig_Validate_TLSPair(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://localhost:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -878,6 +901,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "mock"
     url: "http://localhost:9000"
@@ -916,6 +940,7 @@ chain_id: "test-chain-1"
 rate_limit_rps: 50
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "mock"
     url: "http://localhost:9000"
@@ -942,6 +967,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 cors_origins:
   - "https://admin.example.com"
 backends:
@@ -963,6 +989,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 cors_origins: []
 backends:
   - name: "mock"
@@ -1008,6 +1035,7 @@ func TestConfig_Validate_BackendURLs(t *testing.T) {
 			ReconciliationInterval:    5 * time.Minute,
 			ShutdownTimeout:           30 * time.Second,
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -1129,6 +1157,7 @@ func TestConfig_Validate_CallbackURLNormalization(t *testing.T) {
 			ReconciliationInterval:    5 * time.Minute,
 			ShutdownTimeout:           30 * time.Second,
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -1205,6 +1234,7 @@ func TestConfig_Validate_ProductionMode(t *testing.T) {
 			Backends:                  []BackendConfig{{Name: "mock", URL: "http://10.0.0.1:9000", IsDefault: true}},
 			CallbackBaseURL:           "http://10.0.0.1:8080",
 			CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+			PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 		}
 	}
 
@@ -1422,6 +1452,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "docker-1"
     url: "http://10.0.0.1:9000"
@@ -1467,6 +1498,7 @@ key_name: "provider"
 keyring_dir: "/home/provider/.manifest"
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "gpu"
     url: "http://10.0.0.1:9000"
@@ -1496,6 +1528,7 @@ bech32_prefix: "manifest"
 rate_limit_rps: 100
 callback_base_url: "http://localhost:8080"
 callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
 backends:
   - name: "mock"
     url: "http://localhost:9000"
@@ -1548,6 +1581,7 @@ func validConfig() Config {
 		Backends:                  []BackendConfig{{Name: "mock", URL: "http://localhost:9000", IsDefault: true}},
 		CallbackBaseURL:           "http://localhost:8080",
 		CallbackSecret:            "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq",
+		PlacementStoreDBPath:      "/var/lib/fred/placements.db",
 	}
 }
 

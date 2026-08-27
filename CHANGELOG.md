@@ -21,20 +21,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   counter more than once. (ENG-632)
 - `fred_provisioner_callback_deprovision_owned_success_total` exposes successful
   provision callbacks that overlap close/deprovision ownership of the same
-  operation generation. Fred consumes these without acknowledging the closing
+  operation ID. Fred consumes these without acknowledging the closing
   lease and continues teardown. (ENG-632)
 
 ### Changed
 
-- Provision and restore callback URLs now carry an HMAC-covered
-  `operation_generation` query parameter. Backends must preserve and sign the
-  complete request URI, including its query, so stale callbacks cannot settle a
-  replacement operation. A non-empty malformed or zero generation is rejected
-  with 400. Requests with no parameter or an empty value remain syntactically
-  accepted for rolling compatibility, but generation-scoped operations still
-  require the echoed token to settle. (ENG-632)
-- Restore now requires a writable durable placement recorder and a non-zero
-  generation-scoped tracker token before contacting the backend. A target with
+- Provision lifecycle coordination now has one typed `operation.Registry` as
+  its process-local source of truth. Opaque initiation, lease, and settlement
+  capabilities enforce Preparing → Calling → Active ordering; callback,
+  timeout, deprovision, and reconciliation consumers receive narrow ports
+  instead of raw wire IDs or the legacy all-purpose tracker. Watermill
+  handlers remain transport adapters, while callback and restore policy live
+  in application services and backend dispatch remains in the orchestrator.
+  The existing `stateless` FSM continues to serialize each backend lease actor;
+  fleet reconciliation is deliberately a level-triggered evidence join with a
+  pure decision table rather than a second edge-triggered FSM. (ENG-632)
+- Restore admission now atomically reserves the confirmed source placement and
+  writes the absent target's operation-scoped attempt under ordered source and
+  target lifecycle claims. Exact acceptance/positive evidence confirms it and a
+  causally validated synchronous refusal may clear it. An ambiguous return or
+  panic releases the transient source reservation but retains the durable target
+  attempt; inventory absence never settles it. (ENG-632)
+- `placement_store_db_path` is now required at startup. Production topology is
+  multi-backend, and even single-backend development/test needs durable evidence
+  after an ambiguous response or restart, so providerd no longer offers an unsafe
+  placement-disabled routing mode. Existing deployments must configure a
+  writable path before upgrading; the file is created automatically and this
+  does not restart or otherwise mutate running tenant workloads. (ENG-632)
+- Backend router construction now rejects nil, empty-name, and duplicate-name
+  backends. Backend names are durable placement identities, so silently keeping
+  the first duplicate could route a recorded lease to the wrong machine. Names
+  are now persisted as immutable storage identities: removing a referenced name
+  is rejected, and a safely retired name can never be reused for replacement
+  storage.
+- Provision and restore callback URLs now carry an HMAC-covered `operation_id`
+  query parameter containing one lowercase, hyphenated, canonical RFC-4122
+  UUIDv4. Backends must preserve and sign the complete request URI, including its
+  query, so stale callbacks cannot settle a replacement operation. A present
+  empty, nil, non-v4, non-RFC-variant, uppercase, compact, braced, URN, malformed,
+  or duplicate value is rejected with 400. Body metadata is overwritten; only
+  the authenticated query grants authority. Requests with no parameter remain
+  accepted for callbacks emitted by v0.13.0 backends, but operation-ID-scoped
+  operations still require the echoed ID to settle. (ENG-632)
+- The callback JSON `backend` field remains optional metrics-only sender
+  metadata for v0.13 compatibility. It need not equal Fred's durable router
+  name and cannot authorize or redirect a typed callback; the HMAC-covered URL
+  and current operation ID provide that authority. (ENG-632)
+- Restore now requires a writable durable placement recorder and a registry-issued
+  non-nil `operation.OperationID` bound through an opaque initiation capability
+  before contacting the backend. A target with
   an unresolved durable provision/restore attempt returns 409, and an open
   backend circuit returns 503 rather than 500. (ENG-632)
 - Direct placement-routed connection, log, release, restart, and update
@@ -46,6 +81,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Close/deprovision now fails and retries when a durably named owner, attempt, or
   conflict candidate is unconfigured or cannot be reached, even if other
   backends report a successful no-op. (ENG-632)
+- A first complete `/provisions` plus `/retentions` projection now establishes a
+  durable admission baseline bound to the configured backend identities. The
+  matching baseline survives provider restarts and transient incomplete sweeps.
+  On a later partial sweep, the reconciler issues a typed admission scope only
+  for nodes that answered both inventories and uses it only for genuinely new
+  recordless `PENDING` work. Recordless `ACTIVE` recovery, work pinned to a
+  silent owner, attempts, and conflicts remain deferred; inventory silence never
+  clears ambiguity, and contradictory positive reports expand durable conflict
+  quarantine. The tenant event path has no sweep witness: it uses the durable
+  topology baseline, live backend stats, and an exact write-ahead attempt.
+  (ENG-632)
+- Upgrading from v0.13.0 now requires quiescing provisioning before provider
+  cutover and keeping tenant lifecycle ingress closed until the first complete
+  inventory establishes that durable baseline. Existing containers are not
+  restarted or moved. (ENG-632)
 
 ### Deprecated
 
@@ -55,16 +105,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Placement-enabled provision and all restore transitions are now write-ahead
   and fail closed: Fred durably records an attempted backend before the backend
-  call, distinguishes definitive refusal from an ambiguous outcome, reconciles
-  attempts only from authoritative inventory, and deprovisions every known owner
-  candidate. Callback and timeout settlement is generation-scoped so an older
-  operation cannot mutate or reject its replacement. (ENG-632)
+  call, distinguishes a causally validated synchronous refusal from an ambiguous
+  outcome, reconciles attempts only from exact positive evidence (never inventory absence), and
+  deprovisions every known owner candidate. Callback and timeout settlement is
+  exact-operation scoped so an older operation cannot mutate or reject its
+  replacement. (ENG-632)
 - Unvalidated HTTP 409 and 503 responses no longer confirm or clear provision
   attempts (and unvalidated 503 responses no longer clear restore attempts);
   authenticated success callbacks continue to chain acknowledgement when
   placement persistence fails; and one lease's durable placement conflict no
-  longer prevents unrelated leases from using a successfully synchronized
-  full-fleet absence baseline. (ENG-632)
+  longer prevents unrelated recordless `PENDING` leases from using a typed scope
+  of nodes that answered both inventories after durable topology bootstrap.
+  (ENG-632)
 
 ### Security
 

@@ -78,6 +78,7 @@ var labelledMetricNames = []string{
 	"fred_provisioner_ack_batcher_lane_restarts_total",
 	"fred_provisioner_provisioning_duration_seconds",
 	"fred_provisioner_provisioning_total",
+	"fred_provisioner_lifecycle_event_sink_panics_total",
 	"fred_provisioner_reconciler_panics_total",
 	"fred_reconciler_actions_total",
 	"fred_reconciler_backend_fetch_total",
@@ -105,6 +106,7 @@ func allCollectors() []prometheus.Collector {
 		ReconcilerInflightSkipsTotal,
 		ReconcilerDeferredLeasesTotal,
 		ReconcilerPanicsTotal,
+		LifecycleEventSinkPanicsTotal,
 		SignerOOGRetriesTotal,
 		GasSimulationTotal,
 		GasSimulated,
@@ -267,6 +269,10 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerPanicsTotal.WithLabelValues("check_placement_marker")
 	})
 	assert.NotPanics(t, func() {
+		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventProvisionStarting)
+		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRestarting)
+	})
+	assert.NotPanics(t, func() {
 		SignerOOGRetriesTotal.WithLabelValues("retried")
 		SignerOOGRetriesTotal.WithLabelValues("exhausted")
 	})
@@ -295,7 +301,7 @@ func TestCounterVecLabels(t *testing.T) {
 		for _, pass := range []string{CleanupPassOrphan, CleanupPassPayload, CleanupPassPlacement} {
 			for _, reason := range []string{
 				CleanupSkipChainLive, CleanupSkipChainUnknown, CleanupSkipChainUnknownState,
-				CleanupSkipChainError, CleanupSkipBackendSilent,
+				CleanupSkipChainError, CleanupSkipBackendSilent, CleanupSkipAttemptPending,
 			} {
 				ReconcilerCleanupSkipsTotal.WithLabelValues(pass, reason)
 			}

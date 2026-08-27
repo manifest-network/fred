@@ -12,8 +12,8 @@ Both `providerd` and `docker-backend` expose `GET /health`. **`providerd /health
 
 | Endpoint | Probes | 503 when |
 |---|---|---|
-| `providerd /health` | Chain gRPC, every backend, plus token-tracker, placement-store and payload-store DB readability *for whichever of those stores are configured*. The whole sweep is bounded (3s) and backends are probed concurrently, so no dependency can make this endpoint slow enough for a prober to give up on it | Never |
-| `providerd /readyz` | Same probes, same budget | A configured bbolt store is unreadable (verdict `unhealthy`) |
+| `providerd /health` | Chain gRPC, every backend, mandatory placement-store readability and placement-inventory bootstrap, plus token-tracker and payload-store DB readability when those optional stores are configured. The whole sweep is bounded (3s) and backends are probed concurrently, so no dependency can make this endpoint slow enough for a prober to give up on it | Never |
+| `providerd /readyz` | Same probes, same budget | A configured bbolt store is unreadable, or no durable inventory baseline matches the configured backend topology (verdict `unhealthy`) |
 | `docker-backend /health` | Docker daemon reachable, plus the callback, diagnostics, release, and retention bbolt stores open and carry their expected buckets | Any of them is unhealthy |
 
 All bbolt probes are read-only opens: they prove the database is present and structurally intact, **not** that a write would succeed. A full or read-only filesystem passes them.
@@ -23,10 +23,32 @@ Both `providerd` endpoints return the same JSON body, whose `status` is one of t
 | `status` | Meaning | `/health` | `/readyz` |
 |---|---|---|---|
 | `healthy` | Every configured probe passed | 200 | 200 |
-| `degraded` | A **remote, shared** dependency is impaired — the chain, or one or more backends. What survives depends which: a backend down leaves the other backends' leases serving and reconciling; the chain down halts reconciliation entirely and fails every lease-resolving tenant call. Either way providerd still accepts backend callbacks, which is why it must stay in rotation | 200 | 200 |
-| `unhealthy` | A **local, process-owned** bbolt store is unreadable. Restart-worthy | 200 | 503 |
+| `degraded` | A **remote, shared** dependency is impaired — the chain, or one or more backends. Existing workloads keep serving. After inventory bootstrap, exact callbacks and safely evidenced reconciliation continue, and the reconciler may place genuinely new recordless `PENDING` work only on nodes that answered both inventories. Work pinned to a silent owner, recordless `ACTIVE` work, attempts, and conflicts remain deferred. A chain outage halts reconciliation entirely and fails every lease-resolving tenant call. Either way providerd still accepts backend callbacks, which is why it must stay in rotation | 200 | 200 |
+| `unhealthy` | A **local, process-owned** bbolt store is unreadable, or no durable inventory baseline matches the configured backend topology. Restart a broken store; let an incomplete bootstrap inventory retry | 200 | 503 |
 
-A check absent from `checks` means that dependency is **not configured**, not that it passed — a dev-mode instance without the bbolt stores simply omits them.
+A check absent from `checks` means an optional dependency is **not configured**,
+not that it passed. Every `providerd`, including development instances, reports
+the mandatory `placement_store` and `placement_inventory` checks. The
+`token_tracker` and `payload_store` checks may be absent when their optional
+stores are not configured.
+
+`checks.placement_inventory` is a durable, topology-bound bootstrap latch. A
+complete `/provisions` plus `/retentions` projection establishes it, and the
+matching placement database restores it across process restarts. Transient
+incomplete sweeps do not revoke it; changing the configured backend identities
+does.
+
+`fred_reconciler_sweep_complete` reports only whether the last sweep heard both
+inventories from every configured backend. A 0 narrows the reconciler's
+recordless `PENDING` admission to a typed scope of nodes that answered both
+inventories; it does not globally revoke the durable baseline. Owner-affine work
+stays pinned, and recordless `ACTIVE` work plus unresolved attempts/conflicts
+remain deferred.
+
+Tenant event dispatch has no per-sweep witness. It requires the durable baseline,
+live-routes by backend stats inside the configured topology, and durably records
+the exact attempted backend before dispatch. A later ambiguous result stays
+pinned even if inventory omits the lease.
 
 ### Why `/health` never 503s
 
@@ -47,17 +69,18 @@ The dependency signal did not disappear, it moved: the per-check map is still in
 |---|---|---|
 | `fred_backend_circuit_breaker_state{backend="X"} == 2` (open) | Backend X has been unhealthy long enough to trip the breaker | `curl backendX/health`, check backend logs |
 | `fred_backend_healthy{backend="X"} == 0` for >1 min | Backend health probe failing | Same as above. Note this no longer affects the tenant API's availability — the provider reports `degraded` and keeps serving |
-| `fred_health_check_healthy{check="chain"} == 0` | providerd cannot reach the chain gRPC endpoint (or it answered slower than the health probe's budget). Every tenant endpoint that resolves a lease fails, **and reconciliation stops entirely** — a sweep returns as soon as the pending- or active-lease query errors, because everything downstream treats "absent from chain" as ground truth. Backend callbacks are still accepted: they touch neither the chain nor any store | Check the node and `grpc_endpoint`. This is the ENG-522 trigger, and it is now a metric rather than a 503 — providerd deliberately stays in rotation, because dropping out would sever the callback path too without restoring anything |
+| `fred_health_check_healthy{check="chain"} == 0` | providerd cannot reach the chain gRPC endpoint (or it answered slower than the health probe's budget). Every tenant endpoint that resolves a lease fails, **and reconciliation stops entirely** — a sweep returns as soon as the pending- or active-lease query errors, because everything downstream treats "absent from chain" as ground truth. Callback HTTP ingress remains reachable and can enqueue work into the in-process handler path; applying an exact callback may still need placement or chain access and will retry failures asynchronously | Check the node and `grpc_endpoint`. This is the ENG-522 trigger, and it is now a metric rather than a 503 — providerd deliberately stays in rotation, because dropping out would sever the callback path too without restoring anything |
 | `fred_health_check_healthy{check=~"token_tracker\|placement_store\|payload_store"} == 0` | That bbolt store could not be opened, or is missing the buckets it should have. `/readyz` is 503 and `/health` reports `unhealthy` while still answering 200 | Check the store's `*_db_path` — that it exists, is the intended file, and is readable — then **restart providerd**; a load balancer cannot fix this and deliberately is not asked to. Note the probe is a read-only check, so a full or read-only filesystem passes it and still breaks writes: check disk space too even when this gauge reads 1 |
-| `increase(fred_placement_write_failures_total[5m]) > 0` | providerd could not durably record or verify a placement-store synchronization point. A write-ahead failure blocks a new provision or restore before the backend is contacted; a later confirm/cleanup failure leaves an explicit unresolved attempt for reconciliation rather than silently claiming no backend was contacted | Check the `failed to ... placement` or placement-sync verification log, then check free space, filesystem permissions and I/O errors at `placement_store_db_path`. The health gauge is only a read probe and can remain 1 on a full or read-only filesystem. Restore access; the next reconciliation retries safe work. Page on every increase — do not alert on the raw counter being non-zero, because counters remain non-zero after recovery |
+| `fred_health_check_healthy{check="placement_inventory"} == 0` | The placement database has no complete inventory baseline for the configured backend identities. `/readyz` is 503, but `/health` and the callback route remain available | Restore every configured backend's `/provisions` and `/retentions` responses and let reconciliation commit the bootstrap projection. Do not admit new tenant lifecycle traffic until the check becomes 1 |
+| `increase(fred_placement_write_failures_total[5m]) > 0` | providerd could not durably record or verify a placement-store synchronization point. A write-ahead failure blocks a new provision, re-provision, or restore before the backend is contacted; a later confirm/cleanup failure leaves an explicit unresolved attempt for reconciliation rather than silently claiming no backend was contacted | Check the `failed to ... placement` or placement-sync verification log, then check free space, filesystem permissions and I/O errors at `placement_store_db_path`. The health gauge is only a read probe and can remain 1 on a full or read-only filesystem. Restore access; the next reconciliation retries safe work. Page on every increase — do not alert on the raw counter being non-zero, because counters remain non-zero after recovery |
 | `fred_backend_health_probe_panics_total > 0` | Bug — a backend health probe panicked. The probe is an HTTP call that should return an error, not panic. It is recovered (the probe runs on its own goroutine, where net/http's recovery does not reach it) and counts as unhealthy, so nothing crashes | Check logs for `backend health probe panicked` and the stack trace, then file an issue |
 | `fred_health_check_healthy` series absent, or frozen while nothing changes | Nothing is polling `/health`. Both this gauge and `fred_backend_healthy` are written **only** from inside the health handler, so with no prober they latch at their last value instead of going absent | Confirm the load balancer's health check on `/health` still exists and its interval (30s in the reference deployment). A latched 1 masks a real outage |
 | `fred_backend_insufficient_resources_total` rising on a backend | Backend at capacity | Reduce SKU sizes, add backend hosts, or check `docker-backend /stats` |
 | `fred_backend_malformed_error_body_total` rising on a backend | That backend answers 4xx with a body that is not the declared `{"error": ...}` envelope, so its tenants get a generic message instead of a diagnostic | Find the raw body in the `backend returned a malformed error body` log line and fix the backend to emit the envelope (BACKEND_GUIDE.md). If the backend looks correct, suspect an intermediary answering on its behalf |
 | `fred_provisioner_callback_timeouts_total` rising | Backend accepted provision but never called back | Backend logs; verify `callback_base_url` is reachable from backend; check HMAC secret match |
-| `increase(fred_provisioner_callback_settlement_claim_wait_timeouts_total[5m]) > 0` | A callback waited 30 seconds while another callback or the timeout checker retained the same operation generation's terminal-settlement claim. The actor may be blocked on a slow chain call, or a bug may have leaked its claim | Find the `callback settlement claim is contended` and timeout logs for the lease/generation; correlate concurrent callback, timeout, acknowledge/reject, and downstream chain-latency logs. A deprovision-owned claim returns immediately and cannot increment this counter. If no actor completes and the counter repeats, restart providerd to clear the process-local claim, then file an issue with the logs |
-| `increase(fred_provisioner_callback_placement_semantic_conflicts_total[5m]) > 0` | A backend reported successful provisioning, but its authenticated callback contradicted the durable backend, attempt, or conflict record. Fred preserved that record for repair and continued toward chain acknowledgement | Find `failed to confirm placement from authenticated success callback; continuing chain acknowledgement` with `permanent_semantic_verdict=true`, then reconcile the logged `lease_uuid`, `backend`, `generation`, and `error` against backend inventory and the placement store before changing or deleting the record. Page on every increase. A later acknowledgement failure can retry and increment this attempt counter again, so correlate by lease and generation rather than treating the value as unique leases |
-| `increase(fred_provisioner_callback_deprovision_owned_success_total[5m]) > 0` | A backend completed provisioning while close/deprovision owned the same operation generation. Fred consumed the success without acknowledging the closing lease and continued teardown | Correlate `ignoring success callback emitted while deprovision owns the operation` with close/deprovision logs for the same lease, backend, and generation. A one-off race is safe; sustained increases suggest slow provisioning or unusually fast lease closure |
+| `increase(fred_provisioner_callback_settlement_claim_wait_timeouts_total[5m]) > 0` | A callback waited 30 seconds while another callback or the timeout checker retained the same operation ID's terminal-settlement claim. The actor may be blocked on a slow chain call, or a bug may have leaked its claim | Find the `callback settlement claim is contended` and timeout logs for the lease/operation ID; correlate concurrent callback, timeout, acknowledge/reject, and downstream chain-latency logs. A deprovision-owned claim returns immediately and cannot increment this counter. If no actor completes and the counter repeats, restart providerd to clear the process-local claim, then file an issue with the logs |
+| `increase(fred_provisioner_callback_placement_semantic_conflicts_total[5m]) > 0` | A backend reported successful provisioning, but its authenticated callback contradicted the durable backend, attempt, or conflict record. Fred preserved that record for repair and continued toward chain acknowledgement | Find `failed to confirm placement from authenticated success callback; continuing chain acknowledgement` with `permanent_semantic_verdict=true`, then reconcile the logged `lease_uuid`, `backend`, `operation_id`, and `error` against backend inventory and the placement store before changing or deleting the record. Page on every increase. A later acknowledgement failure can retry and increment this attempt counter again, so correlate by lease and operation ID rather than treating the value as unique leases |
+| `increase(fred_provisioner_callback_deprovision_owned_success_total[5m]) > 0` | A backend completed provisioning while close/deprovision owned the same operation ID. Fred consumed the success without acknowledging the closing lease and continued teardown | Correlate `ignoring success callback emitted while deprovision owns the operation` with close/deprovision logs for the same lease, backend, and operation ID. A one-off race is safe; sustained increases suggest slow provisioning or unusually fast lease closure |
 | `fred_provisioner_ack_batch_fee_gas_errors_total` rising | Out-of-gas on lease acknowledgment txs | See [Out-of-gas tuning](#out-of-gas-tuning) |
 | `fred_chain_signer_oog_retries_total{result="exhausted"}` rising | Same; the broadcast retry loop hit `max_gas_limit` | Same as above |
 | `fred_docker_backend_die_event_dropped_total` sustained non-zero | Lease actor inbox is wedged | See [Wedged lease actor](#wedged-lease-actor-docker-backend) |
@@ -69,15 +92,15 @@ The dependency signal did not disappear, it moved: the per-check map is still in
 | `fred_api_rate_limit_rejections_total{limiter="tenant"}` spike | Specific tenant exceeded their bucket | Expected if a tenant is bursting; sustained spikes indicate a misbehaving client |
 | `fred_payload_leases_awaiting > 0` for >5 min | Tenant created lease with `meta_hash` but never uploaded payload | Tenant-side issue; the lease will eventually expire |
 | `fred_payload_persist_failures_total > 0` | A tenant `/update` reached the backend but could not be written to `payloads.db`. That lease is now running a manifest fred has no durable record of, and the next reprovision will revert it to its as-created deployment | Check disk space and permissions on `payload_store_db_path`, then confirm the store is healthy. The tenant received a `500` and can retry — a retry re-applies **and** re-persists. Nothing in fred retries on their behalf, so a lease left in this state stays exposed until the tenant acts |
-| `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck, panicking, **or running degraded** — a sweep that could not see every backend deliberately does not advance this | Check `fred_reconciler_sweep_complete` first: 0 means degraded, and `fred_reconciler_backend_fetch_total{outcome!="ok"}` names the backend. Otherwise logs + `fred_reconciler_runs_total{outcome="error"}` |
-| `fred_reconciler_backend_fetch_total{outcome!="ok"}` sustained for one backend across ≥3 sweeps (~6 min at a 2m interval) | That backend is unreachable from providerd. Its leases are deferred — not re-provisioned, not deprovisioned — while the rest of the fleet reconciles normally | [Backend unreachable during reconciliation](#backend-unreachable-during-reconciliation) |
-| `fred_reconciler_sweep_complete == 0` sustained | Same condition, viewed fleet-wide. The action counters describe only the leases fred could positively place, so do not read them as fleet totals while this is 0 | Same |
+| `fred_reconciler_last_success_timestamp_seconds` stalled | Reconciler is stuck, panicking, running with incomplete inventory, or failing an external read/durable projection — only a complete successful projection advances this | Check `fred_reconciler_sweep_complete` first: 0 means the last sweep was incomplete, not that the durable topology baseline was revoked. Then inspect `fred_reconciler_backend_fetch_total{outcome!="ok"}`, chain health, placement-write logs, and `fred_reconciler_runs_total{outcome="error"}` |
+| `fred_reconciler_backend_fetch_total{outcome!="ok"}` sustained for one backend across ≥3 sweeps (~6 min at a 2m interval) | That backend is unreachable from providerd. Its owner-affine leases are deferred and inventory silence changes no attempt or conflict. With an established baseline, safe callbacks/status/cleanup can continue and the reconciler may use nodes that answered both inventories for genuinely new recordless `PENDING` work | [Backend unreachable during reconciliation](#backend-unreachable-during-reconciliation) |
+| `fred_reconciler_sweep_complete == 0` sustained | The last fleet observation was incomplete. The gauge becomes 0 before every sweep and remains there while it is in progress or after any chain read, provision/retention inventory, or durable projection failure. It is observability, not a fleet-wide authority switch: a matching durable baseline may remain healthy, while the reconciler narrows recordless `PENDING` admission to the exact answering-node scope and defers lease-specific unsafe work | Inspect backend fetch outcomes, chain health, reconciliation errors, placement-write failures, and deferred lease logs. Do not infer that all mutations are blocked or that absence on a silent node is evidence |
 | `fred_provisioner_reconciler_deferred_leases_total` rising while `fred_reconciler_sweep_complete == 1` | Every backend answered, but one or more leases still lacked a safe, current lifecycle decision: ownership was ambiguous, placement was unusable or unresolved, or an operation/placement change crossed the inventory boundary. A low rate during provisioning, restore, or other lease churn is expected | Correlate the lease-level `reconcile: deferring lease` logs with tracker and placement changes. Investigate a sustained rate or the same lease repeating without concurrent work; it can indicate a stuck unresolved record or unusually slow sweeps |
 | `fred_reconciler_cleanup_skips_total{reason="chain_unknown"}` rising | Fred is declining to clean up state for a lease **the chain has no record of**, and will decline again every sweep — this one does not self-heal. Either providerd is pointed at the wrong or a reset chain (check the `pass` label spread: fleet-wide means config, one lease means a phantom), or a provision exists that no lease ever created | Confirm the chain endpoint and provider UUID first. If the chain is right, the resource is genuinely unowned: deprovision it by hand once you have confirmed the tenant is gone |
 | `fred_reconciler_cleanup_skips_total{reason="chain_unknown_state"}` rising | The chain reports a lease state this providerd build cannot classify — either the zero `UNSPECIFIED`, or a state added to the ledger after this binary shipped. Cleanup is withheld, which is data-safe but permanent for those leases | **Upgrade fred** to a build whose `manifest-ledger` pin knows the new state. Unlike `chain_unknown` the chain is fine and providerd is behind it, so do not go looking for a phantom provision |
 | `fred_reconciler_cleanup_skips_total{reason="chain_error"}` sustained | The per-candidate chain re-check is failing, so cleanup is paused (data-safe). Usually the same cause as any other chain-query failure, or a lookup that blew its 10s budget — that budget exists so a stalled query cannot wedge the sweep, and it reports as an error rather than as evidence | Check `fred_chain_query_duration_seconds{query="get_lease"}` and the node's health; self-heals |
 | `fred_reconciler_cleanup_skips_total{reason="chain_live"}` rising steadily | The sweep's lease snapshot is often stale by the time cleanup runs — expected at a low rate, but a high one means sweeps are slow relative to lease churn | Compare `fred_reconciler_duration_seconds` against the reconcile interval; no action if the rate is low |
-| `fred_reconciler_cleanup_skips_total{pass="placement",reason="backend_silent"}` steady on a removed backend | Expected: a decommissioned backend's placement records are never auto-pruned | [Removing, renaming or pausing a backend](#removing-renaming-or-pausing-a-backend) |
+| `fred_reconciler_cleanup_skips_total{pass="placement",reason="backend_silent"}` steady for an unreachable backend | Expected: that backend's placement records are never pruned from silence. Removing its name while records refer to it is rejected at startup | [Removing, renaming or pausing a backend](#removing-renaming-or-pausing-a-backend) |
 | `fred_watermill_poisoned_messages_total > 0` | A handler exhausted retries on a message | Logs around the topic in question; the poison log identifies the message |
 | `fred_docker_backend_retention_refused_total` increasing / `fred_docker_backend_retained_volume_bytes` approaching `fred_docker_backend_disk_pool_bytes` | Retained tier is crowding out provisioning | [Reclaiming retained volumes under disk pressure](#reclaiming-retained-volumes-under-disk-pressure) |
 | `fred_docker_backend_retention_reaping_bytes` > 0 sustained across several sweeps | A `fred-retained-*`/leaked volume the sweep can't destroy — its footprint **is** counted in the admission pool (no over-admit) but pins capacity and likely needs manual reclaim. A rising `..._retention_leaked_total` with `reaping_bytes` flat is instead the self-healing rollback store-error case (no action). | [Reclaiming leaked / stuck-reaping orphan volumes](#reclaiming-leaked--stuck-reaping-orphan-volumes) |
@@ -258,7 +281,13 @@ inode usage.
 
 ## Backend at capacity
 
-When SKU resource pools are full, provision requests get HTTP 503 with `insufficient resources`. Because the backend client cannot authenticate whether a 503 came from the backend or an intermediary after acceptance, Fred keeps the write-ahead attempt and does not immediately substitute another backend. Authoritative `/provisions` and `/retentions` inventory must first confirm the attempted backend has no copy; reconciliation can then clear the attempt and retry safely.
+When SKU resource pools are full, provision requests get HTTP 503 with
+`insufficient resources`. Because the backend client cannot authenticate whether
+a 503 came from the backend or an intermediary after acceptance, Fred keeps the
+write-ahead attempt and does not substitute another backend. Inventory absence
+does not clear that ambiguity: the original request could commit after the list
+response. Only a refusal proven to precede any backend call, positive evidence
+that confirms ownership, or explicit operator proof and repair can settle it.
 
 **Symptoms:**
 - `fred_backend_insufficient_resources_total{backend="X"}` rising
@@ -266,19 +295,31 @@ When SKU resource pools are full, provision requests get HTTP 503 with `insuffic
 - Active leases stay in `provisioning` state
 
 **Options:**
-1. **Add capacity**: spin up another docker-backend on a different host with the same `skus`. Fred routes each new provision to the least-loaded matching backend — the one reporting the lowest allocated-CPU ratio from its `/stats` endpoint — so a fresh, empty host preferentially absorbs new provisions (requires `placement_store_db_path`).
+1. **Add capacity**: spin up another docker-backend on a different host with the
+   same `skus` and a new unique backend name. Fred routes each new provision to
+   the least-loaded matching backend — the one reporting the lowest
+   allocated-CPU ratio from its `/stats` endpoint — so a fresh, empty host
+   preferentially absorbs new provisions. Adding an identity invalidates the old
+   topology baseline; keep lifecycle ingress closed until a complete inventory
+   establishes the new one. The mandatory `placement_store_db_path` records
+   every resulting ownership decision.
 2. **Tighten SKU profiles**: smaller CPU/memory/disk per SKU lets more leases fit.
 3. **Tenant quotas**: if one tenant is hogging resources, set `tenant_quota` in `docker-backend.yaml` to cap them.
-4. **Force reconciliation**: orphan provisions (lease closed but containers still running) consume budget. The reconciler removes them on its cycle, but you can restart the backend to force an immediate cleanup.
+4. **Force reconciliation**: orphan provisions (lease closed but containers still running) consume budget. The reconciler removes them on its cycle. Restarting a backend does not trigger a provider sweep; wait for the next cycle or, during a deliberate maintenance window, restart `providerd` to run startup reconciliation immediately.
 
 ---
 
 ## Backend unreachable during reconciliation
 
-A backend that is configured but not answering `GET /provisions` — down, wedged,
-partitioned, or with its circuit breaker open — no longer stops reconciliation
-for the rest of the fleet. Fred marks it unanswered for that sweep and **defers**
-the leases it cannot positively place, then retries on the next cycle.
+A backend that is configured but not answering `GET /provisions` or
+`GET /retentions` — down, wedged, partitioned, or with its circuit breaker open
+— no longer aborts the whole reconciliation sweep. Fred marks the inventory
+incomplete and retries on the next cycle. Existing workloads continue serving;
+exact callbacks and safely evidenced status/cleanup work can continue. Once a
+complete inventory has established the durable baseline for this topology, a
+partial sweep can also admit genuinely new recordless `PENDING` work on the
+typed set of nodes that answered **both** inventories. It never treats a silent
+node as evidence about the leases it may hold.
 
 **Symptoms**
 
@@ -298,24 +339,30 @@ the leases it cannot positively place, then retries on the next cycle.
 
 | Lease | Behavior |
 |---|---|
-| On a backend that answered | Reconciled normally — this is the whole point of the change |
-| On the unreachable backend | Deferred: not acknowledged, re-provisioned, or deprovisioned |
-| With no placement record | Deferred until this providerd process has completed one full backend inventory and durably synchronized its placements. After that startup proof, absence means no provision attempt was recorded, so a PENDING lease can be routed to a healthy backend even while another backend is silent |
-| With an unresolved placement attempt | Treated as possibly live on the attempted backend. If that backend is silent the lease is deferred; an attempt is never treated as proof that the backend rejected the request |
+| In the reconciler's answering-node scope | Positive observations, acknowledgements, and safely evidenced cleanup may progress. Genuinely new recordless `PENDING` reconciliation may route only within this scope |
+| On the unreachable backend | Inventory-driven work is pinned and deferred rather than re-provisioned or deprovisioned elsewhere. An exact authenticated callback may still settle through the callback path |
+| With no placement record | A `PENDING` lease may use the answering-node scope after bootstrap. A recordless `ACTIVE` lease is deferred during an incomplete sweep because recovery cannot safely infer its owner |
+| With a confirmed owner | Pinned to that exact backend. If it did not answer, the lease is deferred rather than routed elsewhere |
+| With an unresolved placement attempt | Treated as possibly live on the attempted backend and deferred even when an inventory response omits it. An exact positive report can confirm it; silence can never prove rejection |
+| With a placement conflict | Quarantined with every durable candidate. A positive report from another backend expands that union; another candidate going silent never resolves it |
 | Orphans on the backends that answered | Deprovisioned normally. A silent backend reports no provisions, so it contributes no orphan candidates of its own and cannot mask anyone else's |
 | Orphaned payloads | Cleaned normally — that pass compares the payload store against the chain and reads no backend state at all |
 | Placements of leases on the unreachable backend | Not pruned: only that backend's own report can turn "absent from the backend data" into evidence about its records |
 
-Nothing is destroyed and nothing migrates. The cost is latency: affected leases
-stop making progress until the backend returns.
+Nothing migrates. Partial inventory permits only the narrow recordless
+`PENDING` case above; owner-affine work, recordless `ACTIVE` recovery, attempts,
+and conflicts remain pinned or deferred. Cleanup stays lease-local: a positively
+reported terminal orphan or payload may still be removed under its own guards.
+The operational cost is therefore concentrated on work whose safety evidence
+depends on the unavailable backend, not every healthy node.
 
 **What to do**
 
 1. Identify the backend from the `backend` label and check it directly
    (`GET /health`, `GET /stats`, its own logs).
-2. Bring it back. Recovery needs no action on fred's side — the next sweep sees a
-   complete fleet, resumes the deferred leases, and prunes any of its placement
-   records that turn out to be stale.
+2. Bring it back. Recovery needs no action on fred's side — the next sweep can
+   resume its pinned leases. Exact positive observations can confirm attempts;
+   inventory absence never clears attempts or conflict quarantine.
 3. If it is gone for good, that is a **removal**, not an outage — see the next
    section. Do not leave it configured-but-absent indefinitely: PENDING leases on
    it are on a ~30-minute chain expiry clock the whole time.
@@ -328,29 +375,29 @@ stop making progress until the backend returns.
 > cleanup re-read the lease from the chain per candidate and act only on a
 > positively reported terminal state, which addresses the real hazard (the sweep's
 > two lease queries are not atomic) on every sweep rather than only on degraded
-> ones. Placement pruning asks whether *that record's* backend answered, which is
-> a per-record question. Skipped cleanup still costs only a cycle of latency;
+> ones. Placement pruning asks whether *that record's* backend answered both
+> inventories, which is a per-record question. Skipped cleanup still costs only a cycle of latency;
 > mistaken cleanup still costs a tenant their workload.
 
 ---
 
 ## Removing, renaming or pausing a backend
 
-**Fred never moves a lease between backends.** A lease is pinned to the backend
-holding its data for its lifetime, and a backend absent from the router is
-treated as *temporarily unreachable*, never as *gone*.
-
-So when a backend disappears from `providerd.yaml` — removed, renamed, or its
-entry commented out during maintenance — leases placed on it stop making
-progress rather than migrating:
+**Fred never moves a lease between backends.** A backend `name` is a
+case-sensitive, immutable storage identity persisted in the placement database.
+Keep a paused or unreachable backend configured under the same name. Removing
+or renaming a name while any confirmed owner, attempt, or conflict still refers
+to it is rejected at `providerd` startup; Fred will not orphan those references
+or silently reinterpret another machine as their owner.
 
 | Operation | Behavior |
 |---|---|
-| Provision / re-provision | Refused, retried every reconcile cycle. See log lines below |
-| Read (connection details, logs) | `503`, not `404` |
-| Restore from that backend's retained data | `503`, not `404` |
-| Close / deprovision | Every durably known owner, attempt, and conflict candidate is targeted. Reachable peers are still swept, but the close fails rather than acknowledging success if any recorded name is no longer configured or cannot be contacted |
-| Leases on *other* backends | Unaffected |
+| Reconciler recovery for a new recordless `PENDING` lease | After bootstrap, may use another backend only when that node answered both inventories and belongs to the typed per-sweep admission scope |
+| Live chain lease positively present in retention | Deferred lease-locally; ordinary provision cannot replace data that requires the restore path |
+| Re-provision, read, or restore tied to the paused backend | Pinned and deferred/`503`, never routed to a peer |
+| Close / deprovision | Every durably known owner, attempt, and conflict candidate is targeted. Reachable peers are still swept, but the close fails rather than acknowledging success while the recorded backend cannot be contacted |
+| Recordless `ACTIVE`, unresolved attempt, or conflict | Deferred; inventory silence cannot clear or resolve it |
+| Leases safely owned by other answering backends | Unaffected |
 
 Two ERROR log lines cover the two paths, and the reconciler one is the one you
 will actually see, since it fires unattended on every cycle:
@@ -360,13 +407,10 @@ reconcile: refusing to provision, lease is placed on a backend the router does n
 refusing to provision: lease is placed on a backend the router does not know              # event path
 ```
 
-The reconciler line carries `lease_uuid`, `placement_backend`, and
-`placement_state`. It counts the lease as both deferred and a `lease_error`, so
-an otherwise complete sweep is reported as `partial`. The event-path line
-carries `lease_uuid`, `sku`, and an `error` field whose value includes the
-recorded backend name (`placement backend not found in router: lease <uuid> is
-placed on "<name>"`). In both cases the recorded name remains recoverable after
-the config entry is gone.
+These log lines are defensive checks for legacy/corrupt composition; normal
+startup now rejects a topology that omits a referenced name. The reconciler line
+carries `lease_uuid`, `placement_backend`, and `placement_state`. The event-path
+line carries `lease_uuid`, `sku`, and the recorded backend name.
 
 This is deliberate (ENG-635). Substituting a healthy peer would provision a
 brand-new **empty volume** while the tenant's real data sits intact on the
@@ -378,31 +422,27 @@ loses data.
 their deployment no longer exists and invites them to destroy and recreate it,
 turning a recoverable outage into real data loss.
 
-**Recovery is to put the backend back under its original `name` and then restart
-`providerd`.** The restart is required, not optional: providerd reads its config
-and constructs the backend router once at startup and handles no reload signal
-(only SIGINT/SIGTERM), so restoring the YAML entry alone leaves the running
-process still treating the backend as unknown. After the restart, the next
-reconcile cycle resumes those leases with no further action.
+Recovery from an outage is to restore the same storage under its original
+configured `name`; the durable topology baseline survives, and the next sweep
+resumes work that now has sufficient evidence. If you edited the YAML despite
+the rule above, restore the original entry and restart `providerd`, because the
+router has no configuration reload signal.
 
-Note that the name is the identity key: renaming a backend in config is
-equivalent to removing it, and re-adding it under a *different* name will not
-reunite it with its leases. If a backend is genuinely gone for good, its leases
-are dead — the tenant must create new ones.
+Renaming does not migrate data. Once all references are safely drained and a
+name is removed, that identity is **retired forever** in placement metadata and
+cannot later name the same or a different machine. A replacement storage system
+must receive a new globally unique name and complete a full inventory bootstrap
+for the changed topology before degraded admission resumes.
 
-Its **placement records outlive it**, deliberately. The pruner deletes a record
-only when the named backend answered this sweep, and a decommissioned backend
-never will, so its records stay in the index — each one counted under
+Its **placement records outlive an outage**, deliberately. The pruner deletes a
+record only under its lease-local positive guards; a silent backend contributes
+no proof, so its records stay in the index and are counted under
 `fred_reconciler_cleanup_skips_total{pass="placement",reason="backend_silent"}`.
-They are a few bytes of bbolt each and they are the only surviving pointer to
-where that machine's data was, which is why they are kept rather than reaped by a
-process that cannot tell "decommissioned" from "down since Tuesday". Deleting
-them is part of the manual decommission, once the data is confirmed migrated or
-gone. A lease ever reported by multiple backends retains the sorted set of all
-those candidates in the same record. Removing one candidate from configuration
-does not let the remaining backend become authoritative: put every candidate
-back under its original name and obtain a complete `/provisions` plus
-`/retentions` sweep before expecting the quarantine to clear.
+They are the only surviving pointers to where that machine's data may be. A
+lease ever reported by multiple backends retains the sorted union of every
+candidate in conflict quarantine. A complete sweep with one candidate absent
+does not clear that ambiguity; resolution requires explicit operator proof and
+repair.
 
 > **Ansible caution.** `roles/fred/templates/providerd.yaml.j2` derives backend
 > names positionally, so removing a mid-list host renumbers every host below it.
@@ -670,7 +710,7 @@ Fred uses bbolt (an embedded key-value store) for several persistent structures:
 |---|---|---|
 | `token_tracker_db_path` | Replay protection for tenant tokens | Brief replay window after restart; tokens are 30s anyway |
 | `payload_store_db_path` | Tenant deployment payloads awaiting provisioning | Tenants must re-upload pending payloads |
-| `placement_store_db_path` | Durable confirmed and attempted lease→backend ownership used by routing and degraded-sweep safety | Existing leases and unresolved attempts are unknown. On restart fred defers recordless leases until one complete backend inventory has durably rebuilt placements; it does not trust an incomplete first sweep |
+| `placement_store_db_path` | Durable confirmed and attempted lease→backend ownership, conflict quarantine, immutable topology history, and the topology-bound inventory baseline | Positive owners can be rebuilt only as backends report them. Attempts, conflicts, and retired-name history are not reconstructible from inventory absence. A new store admits no recordless work until one complete inventory establishes its baseline |
 | `<docker>/callbacks.db` | Pending callbacks (delivery retry) | Some callbacks may not be redelivered after restart |
 | `<docker>/diagnostics.db` | Failure diagnostics (last_error, logs) | Older `failed` leases lose diagnostics; new failures still recorded |
 | `<docker>/releases.db` | Per-lease deployment history | Release history lost; provisioning still works |
@@ -680,7 +720,7 @@ Fred uses bbolt (an embedded key-value store) for several persistent structures:
 1. **Stop the service**.
 2. **Move the file aside** rather than deleting (`mv X.db X.db.broken`) so you can inspect it later if needed.
 3. **Restart the service**. It will recreate an empty database.
-4. **Run a manual reconciliation** (it runs automatically on startup) while every configured backend is reachable. Only a complete backend inventory can rebuild the placement store and make record absence trustworthy; during an outage fred deliberately keeps recordless leases deferred. The payload store stays empty (tenants re-upload), the token tracker is empty (acceptable, see above), and the docker callback store starts fresh.
+4. **Run a manual reconciliation** (it runs automatically on startup) while every configured backend is reachable. A new placement database needs one complete `/provisions` plus `/retentions` projection to establish its topology baseline; before that, recordless work is deferred. Positive reports rebuild owners, but absence cannot reconstruct or clear lost attempts/conflicts. Recover the original database whenever possible, and require explicit operator proof before repairing ambiguous leases. The payload store stays empty (tenants re-upload), the token tracker is empty (acceptable, see above), and the docker callback store starts fresh.
 
 Never run two `providerd` or `docker-backend` instances against the same bbolt files — bbolt enforces single-writer with a file lock and the second process will fail to start. If it doesn't fail, you have data corruption coming.
 
@@ -703,6 +743,27 @@ Never run two `providerd` or `docker-backend` instances against the same bbolt f
 ### Restore operations
 
 `POST /v1/leases/{lease_uuid}/restore` (on providerd; `POST /restore` on the docker-backend) re-deploys a lease onto its **retained** (soft-deleted) volumes — the v0.5.0 headline feature. It runs through the same replace machinery as restart/update, so the rollback semantics above apply, with one extra synchronous *adopt prelude* up front that renames the `fred-retained-*` volumes back to their canonical names before the worker spawns.
+
+**Provider-side admission and recovery.** Before contacting a backend, providerd
+acquires ordered lifecycle claims for both source and target, re-reads the target
+as tenant/provider-owned `PENDING`, and atomically reserves the exact confirmed
+source while writing an operation-scoped durable attempt for the absent target.
+Concurrent lifecycle work sharing either lease returns 409 before dispatch. The
+source reservation is process-local and lasts only through the synchronous call;
+the target attempt survives restart.
+
+Acceptance, a matching exact-operation callback, or a validated
+`already_provisioned` response confirms the target. A causally validated
+synchronous domain refusal clears it. A timeout, transport error, panic, generic
+5xx, malformed error
+envelope, or unvalidated 503 is ambiguous, so providerd releases the source
+reservation but retains the target attempt. An immediate same-target retry then
+normally returns 409. A positive report from the attempted backend confirms it;
+a positive report from another backend expands durable conflict quarantine.
+Inventory absence, complete or partial, never disproves or clears the attempt,
+because the original restore may commit after the list response. Do not delete
+the attempt merely to make the retry pass: retry requires a causally validated
+synchronous refusal or explicit operator proof and repair.
 
 **Restoring onto a different SKU tier.** A restore's new lease may target a
 different SKU than the source — only the item *shape* (service names + quantities)
@@ -765,7 +826,12 @@ While the pool is demoted, `fred_signer_balance{role="sub_signer"}` series stop 
 
 `shutdown_timeout` (default 30s) bounds the in-flight drain. Increase it if you observe `lease_terminal_event_dropped_total` spikes during routine restarts — this means workers were still mid-flight when the actor was forced to exit.
 
-For zero-downtime upgrades, run two providerd instances against different sets of backends and shift traffic, or use the chain's own redundancy (Fred is per-provider; failover is not a Fred concern).
+Upgrade the backend binaries one at a time when their wire protocol is backward-compatible,
+then stop and replace the single `providerd` process. Do not run active-active or
+overlapping rolling `providerd` instances for one provider/backend fleet: bbolt is
+single-writer, and separate databases would split the process-local lifecycle-operation
+registry without a cross-process coordinator. See [DEPLOYMENT.md](DEPLOYMENT.md#upgrades)
+for the stop/start and rollback procedure.
 
 ---
 

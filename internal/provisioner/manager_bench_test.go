@@ -211,7 +211,7 @@ func TestManager_HighThroughput(t *testing.T) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
+	mgr, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -305,7 +305,7 @@ func TestManager_BurstTraffic(t *testing.T) {
 		},
 	}
 
-	mgr, err := NewManager(ManagerConfig{
+	mgr, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-uuid",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)

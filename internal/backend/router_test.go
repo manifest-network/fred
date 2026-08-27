@@ -16,6 +16,13 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 )
 
+type routerNamedBackend struct {
+	Backend
+	name string
+}
+
+func (backend routerNamedBackend) Name() string { return backend.name }
+
 func TestRouter_Route(t *testing.T) {
 	// Create mock backends
 	k8sBackend := NewMockBackend(MockBackendConfig{Name: "kubernetes"})
@@ -175,6 +182,7 @@ func TestRouter_GetBackendByName(t *testing.T) {
 
 func TestRouter_NilBackend(t *testing.T) {
 	validBackend := NewMockBackend(MockBackendConfig{Name: "valid"})
+	var typedNilBackend *MockBackend
 
 	tests := []struct {
 		name     string
@@ -203,6 +211,13 @@ func TestRouter_NilBackend(t *testing.T) {
 			},
 			wantErr: "backend at index 0 is nil",
 		},
+		{
+			name: "typed nil backend",
+			backends: []BackendEntry{
+				{Backend: typedNilBackend},
+			},
+			wantErr: "backend at index 0 is nil",
+		},
 	}
 
 	for _, tt := range tests {
@@ -212,6 +227,28 @@ func TestRouter_NilBackend(t *testing.T) {
 			assert.Equal(t, tt.wantErr, err.Error())
 		})
 	}
+}
+
+func TestRouter_RejectsEmptyAndDuplicateBackendNames(t *testing.T) {
+	t.Run("empty name", func(t *testing.T) {
+		unnamed := routerNamedBackend{
+			Backend: NewMockBackend(MockBackendConfig{Name: "delegate"}),
+		}
+		_, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+			{Backend: unnamed},
+		}})
+
+		require.EqualError(t, err, "backend at index 0 has an empty name")
+	})
+
+	t.Run("duplicate name", func(t *testing.T) {
+		_, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+			{Backend: NewMockBackend(MockBackendConfig{Name: "same"})},
+			{Backend: NewMockBackend(MockBackendConfig{Name: "same"})},
+		}})
+
+		require.EqualError(t, err, `duplicate backend name "same"`)
+	})
 }
 
 func TestRouter_RouteAll(t *testing.T) {
@@ -245,21 +282,16 @@ func TestRouter_RouteAll(t *testing.T) {
 	assert.Nil(t, matches)
 }
 
-func TestRouter_RouteAll_Deduplicates(t *testing.T) {
+func TestRouter_RouteAll_RejectsDuplicateRegistration(t *testing.T) {
 	backendA := NewMockBackend(MockBackendConfig{Name: "shared"})
 
-	router, err := NewRouter(RouterConfig{
+	_, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
 			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}, IsDefault: true},
 			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
 		},
 	})
-	require.NoError(t, err)
-
-	// Same backend registered twice for matching SKU — should deduplicate
-	matches := router.RouteAll("gpu-a100")
-	assert.Len(t, matches, 1)
-	assert.Equal(t, "shared", matches[0].Name())
+	require.EqualError(t, err, `duplicate backend name "shared"`)
 }
 
 func TestRouter_RouteRoundRobin_Distribution(t *testing.T) {
@@ -941,4 +973,75 @@ func TestRouter_RouteForProvision_ConcurrentBurstSpread(t *testing.T) {
 	// silently tolerate, e.g. replacing the shared counter with a per-goroutine source.)
 	assert.Equal(t, 100, seen["b1"], "exact-tie burst must split evenly via the RR counter")
 	assert.Equal(t, 100, seen["b2"], "exact-tie burst must split evenly via the RR counter")
+}
+
+func TestRouter_RouteForProvisionAmong_ExcludesDownIneligibleBackend(t *testing.T) {
+	downMock := NewMockBackend(MockBackendConfig{Name: "down"})
+	downMock.SetLoadStats(&LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 1})
+	down := &unhealthyBackend{MockBackend: downMock}
+
+	eligibleBusy := NewMockBackend(MockBackendConfig{Name: "eligible-busy"})
+	eligibleBusy.SetLoadStats(&LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 80})
+	eligibleLeastLoaded := NewMockBackend(MockBackendConfig{Name: "eligible-least-loaded"})
+	eligibleLeastLoaded.SetLoadStats(&LoadStats{TotalCPUCores: 100, AllocatedCPUCores: 20})
+
+	router, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+		{Backend: down, Match: MatchCriteria{SKUs: []string{"s"}}, IsDefault: true},
+		{Backend: eligibleBusy, Match: MatchCriteria{SKUs: []string{"s"}}},
+		{Backend: eligibleLeastLoaded, Match: MatchCriteria{SKUs: []string{"s"}}},
+	}})
+	require.NoError(t, err)
+	require.Error(t, down.Health(context.Background()), "fixture must represent a down backend")
+
+	got := router.RouteForProvisionAmong(context.Background(), "s", map[string]struct{}{
+		"eligible-busy":         {},
+		"eligible-least-loaded": {},
+	}, nil)
+	require.NotNil(t, got)
+	assert.Equal(t, "eligible-least-loaded", got.Name(),
+		"the lower-load but ineligible backend must not participate")
+}
+
+func TestRouter_RouteForProvisionAmong_FallbackNeverEscapesEligibleSet(t *testing.T) {
+	excludedDefault := NewMockBackend(MockBackendConfig{Name: "excluded-default"})
+	eligibleA := NewMockBackend(MockBackendConfig{Name: "eligible-a"})
+	eligibleB := NewMockBackend(MockBackendConfig{Name: "eligible-b"})
+	router, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+		{Backend: excludedDefault, Match: MatchCriteria{SKUs: []string{"s"}}, IsDefault: true},
+		{Backend: eligibleA, Match: MatchCriteria{SKUs: []string{"s"}}},
+		{Backend: eligibleB, Match: MatchCriteria{SKUs: []string{"s"}}},
+	}})
+	require.NoError(t, err)
+
+	eligible := map[string]struct{}{"eligible-a": {}, "eligible-b": {}}
+	seen := map[string]int{}
+	for i := 0; i < 40; i++ {
+		got := router.RouteForProvisionAmong(context.Background(), "s", eligible, nil)
+		require.NotNil(t, got)
+		seen[got.Name()]++
+	}
+
+	assert.Zero(t, seen["excluded-default"], "degraded fallback must not widen eligibility")
+	assert.Equal(t, 20, seen["eligible-a"])
+	assert.Equal(t, 20, seen["eligible-b"])
+}
+
+func TestRouter_RouteForProvisionAmong_DefaultMustBeEligible(t *testing.T) {
+	matching := NewMockBackend(MockBackendConfig{Name: "matching"})
+	fallback := NewMockBackend(MockBackendConfig{Name: "fallback"})
+	router, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+		{Backend: matching, Match: MatchCriteria{SKUs: []string{"s"}}},
+		{Backend: fallback, Match: MatchCriteria{SKUs: []string{"other"}}, IsDefault: true},
+	}})
+	require.NoError(t, err)
+
+	got := router.RouteForProvisionAmong(context.Background(), "unknown", map[string]struct{}{"fallback": {}}, nil)
+	require.NotNil(t, got)
+	assert.Equal(t, "fallback", got.Name())
+
+	assert.Nil(t, router.RouteForProvisionAmong(
+		context.Background(), "unknown", map[string]struct{}{"matching": {}}, nil,
+	), "an ineligible default must not be used")
+	assert.Nil(t, router.RouteForProvisionAmong(context.Background(), "s", nil, nil),
+		"an empty eligibility set must not route anywhere")
 }

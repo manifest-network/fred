@@ -9,6 +9,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -16,9 +17,15 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
 var bucketName = []byte("placements")
+
+// recordIssuerSequence provides process-local identities for opaque record
+// capabilities. RecordRevision is never serialized, so reopening a Store
+// deliberately mints a different issuer.
+var recordIssuerSequence atomic.Uint64
 
 // State describes what is durably known about one lease placement.
 type State uint8
@@ -67,7 +74,191 @@ var (
 	// ErrAttemptMismatch means Confirm or ClearAttempt did not name the current
 	// unresolved attempt.
 	ErrAttemptMismatch = errors.New("placement attempt does not match target")
+	// ErrInvalidAttemptToken means an attempt settlement capability was not
+	// issued by this store or does not contain all required placement evidence.
+	ErrInvalidAttemptToken = errors.New("invalid placement attempt token")
+	// ErrInvalidInventoryFence means a typed inventory fence was not issued by
+	// this store or was invalidated after it was issued.
+	ErrInvalidInventoryFence = errors.New("invalid placement inventory fence")
+	// ErrInventoryNotReady means no complete backend inventory has been durably
+	// projected since startup or since inventory authority was invalidated.
+	ErrInventoryNotReady = errors.New("placement inventory authority is not ready")
+	// ErrInvalidRecordRevision means a typed record mutation was attempted with
+	// the invalid zero revision, including an unupgraded legacy record.
+	ErrInvalidRecordRevision = errors.New("invalid placement record revision")
+	// ErrInvalidProjectionProof means a reconciliation side effect did not carry
+	// a successful projection proof issued by this store's current authority
+	// epoch.
+	ErrInvalidProjectionProof = errors.New("invalid placement projection proof")
+	// ErrInvalidRestoreClaim means a restore settlement capability was not
+	// issued by this store or is missing facts needed for exact settlement.
+	ErrInvalidRestoreClaim = errors.New("invalid placement restore claim")
+	// ErrRestoreSourceNotFound means no durable placement identifies the
+	// retained source requested by a restore.
+	ErrRestoreSourceNotFound = errors.New("restore source placement not found")
+	// ErrRestoreSourceUnavailable means the requested source is not one
+	// unambiguous, confirmed, revisioned placement with no unresolved attempt.
+	ErrRestoreSourceUnavailable = errors.New("restore source placement is unavailable")
+	// ErrRestoreSourceClaimed means another synchronous restore dispatch already
+	// holds the exclusive process-local claim for this source.
+	ErrRestoreSourceClaimed = errors.New("restore source placement is claimed")
+	// ErrRestoreTargetUnavailable means the target already has durable placement
+	// evidence. Restore admission requires a truly absent target and never
+	// adopts, retries, or overwrites an existing placement.
+	ErrRestoreTargetUnavailable = errors.New("restore target placement is unavailable")
 )
+
+// RecordRevision is the opaque identity of one durable placement record
+// version. Its private fields bind the capability to the issuing store, lease,
+// and exact revision. The zero value is invalid. It deliberately has no
+// numeric or lease accessor: callers can only present it back to its issuer.
+type RecordRevision struct {
+	issuer    uint64
+	leaseUUID string
+	value     uint64
+}
+
+// Valid reports whether the revision identifies a durably written record.
+func (revision RecordRevision) Valid() bool {
+	return revision.issuer != 0 && revision.leaseUUID != "" && revision.value != 0
+}
+
+func (s *Store) newRecordRevision(leaseUUID string, value uint64) RecordRevision {
+	if s == nil || s.recordIssuer == 0 || leaseUUID == "" || value == 0 {
+		return RecordRevision{}
+	}
+	return RecordRevision{issuer: s.recordIssuer, leaseUUID: leaseUUID, value: value}
+}
+
+// InventoryFence is a causal placement-store boundary. Unlike RecordRevision,
+// an explicitly issued fence may represent revision zero. The private issuer
+// and authority epoch prevent mixing stores or reusing evidence collected
+// before InvalidateInventoryAuthority.
+type InventoryFence struct {
+	issuer   *Store
+	revision uint64
+	epoch    uint64
+}
+
+// Valid reports whether the fence was explicitly issued by a placement store.
+// A store still revalidates the issuer and authority epoch when consuming it.
+func (fence InventoryFence) Valid() bool {
+	return fence.issuer != nil && fence.epoch != 0
+}
+
+// InventoryProjection is one fleet observation to be applied at a single
+// causal boundary. Complete must be true only when every backend in the
+// configured topology was authoritatively observed. A complete projection
+// establishes the durable admission baseline in the same transaction as its
+// placement mutations. Placements contains unique positive owners. A positive
+// observation from the exact attempted backend may confirm that attempt.
+// Conflicts contains leases reported by at least two backends. Inventory
+// silence is deliberately not representable: it cannot clear an attempt or a
+// durable conflict because an earlier backend request may commit after the
+// inventory response.
+//
+// ProjectInventory defensively copies all maps and slices before use.
+type InventoryProjection struct {
+	Complete   bool
+	Placements map[string]string
+	Conflicts  map[string][]string
+}
+
+// ProjectionResult reports material mutations and lease-local causal fences.
+// Applied contains exact revisions for records written by the transaction.
+// Fenced leases were left unchanged because their durable evidence was newer
+// than the input inventory or was source-claimed by a restore.
+type ProjectionResult struct {
+	Applied map[string]RecordRevision
+	Fenced  map[string]struct{}
+
+	issuer         *Store
+	epoch          uint64
+	cutoff         uint64
+	finalMutations map[string]uint64
+	fencedLeases   map[string]struct{}
+}
+
+// Valid reports whether the result is an unforgeable proof returned by a
+// successful ProjectInventory call. The issuing store still validates its
+// authority epoch and lease-local mutation identity when consuming it.
+func (result ProjectionResult) Valid() bool {
+	return result.issuer != nil && result.epoch != 0 &&
+		result.finalMutations != nil && result.fencedLeases != nil
+}
+
+// AttemptToken is the exclusive capability for settling one durable
+// write-ahead attempt. Its private fields bind the settlement to the issuing
+// store, lease, backend, operation, and exact record revision. The zero value
+// is invalid.
+type AttemptToken struct {
+	issuer      *Store
+	leaseUUID   string
+	backendName string
+	operationID operation.OperationID
+	revision    RecordRevision
+}
+
+// Valid reports whether the token contains every fact required to identify a
+// typed write-ahead attempt. The issuing store still performs an exact CAS.
+func (token AttemptToken) Valid() bool {
+	return token.issuer != nil && token.leaseUUID != "" && token.backendName != "" &&
+		token.operationID.Valid() && token.revision.Valid() &&
+		token.revision.issuer == token.issuer.recordIssuer &&
+		token.revision.leaseUUID == token.leaseUUID
+}
+
+// OperationID returns the operation identity that must be carried to the
+// backend. An invalid token returns an invalid OperationID.
+func (token AttemptToken) OperationID() operation.OperationID {
+	if !token.Valid() {
+		return operation.OperationID{}
+	}
+	return token.operationID
+}
+
+// RestoreClaim is the exclusive capability for settling one synchronous
+// restore dispatch. Its private fields bind it to the issuing store, exact
+// source record, target attempt, backend, operation, and process-local nonce.
+// The zero value is invalid.
+//
+// The source claim is intentionally process-local and short-lived: it fences
+// source mutation only until the backend synchronously accepts, refuses, or
+// returns an ambiguous outcome. The target attempt remains durable across
+// process restarts and is the authority after dispatch returns.
+type RestoreClaim struct {
+	issuer          *Store
+	sourceLeaseUUID string
+	targetLeaseUUID string
+	backendName     string
+	operationID     operation.OperationID
+	sourceRevision  RecordRevision
+	targetRevision  RecordRevision
+	nonce           uint64
+}
+
+// Valid reports whether the claim carries every fact required to identify an
+// exact restore dispatch. The issuing store still checks its live reservation
+// before consuming the claim.
+func (claim RestoreClaim) Valid() bool {
+	return claim.issuer != nil && claim.sourceLeaseUUID != "" &&
+		claim.targetLeaseUUID != "" && claim.sourceLeaseUUID != claim.targetLeaseUUID &&
+		claim.backendName != "" && claim.operationID.Valid() &&
+		claim.sourceRevision.Valid() && claim.targetRevision.Valid() && claim.nonce != 0 &&
+		claim.sourceRevision.issuer == claim.issuer.recordIssuer &&
+		claim.sourceRevision.leaseUUID == claim.sourceLeaseUUID &&
+		claim.targetRevision.issuer == claim.issuer.recordIssuer &&
+		claim.targetRevision.leaseUUID == claim.targetLeaseUUID
+}
+
+// Backend returns the confirmed source owner bound to the claim. An invalid
+// claim returns an empty backend.
+func (claim RestoreClaim) Backend() string {
+	if !claim.Valid() {
+		return ""
+	}
+	return claim.backendName
+}
 
 // Placement is an immutable snapshot of one cached placement record. Backend
 // is the last positively observed owner. Attempt is a write-ahead record of a
@@ -97,6 +288,12 @@ type Placement struct {
 
 	unusable bool
 	revision uint64
+	// recordRevision is attached only to immutable snapshots returned by a Store.
+	// It is neither persisted nor trusted independently by another store.
+	recordRevision RecordRevision
+	// attemptOperationID is present only for attempts begun through the typed
+	// API. Legacy records remain readable with an invalid operation identity.
+	attemptOperationID operation.OperationID
 }
 
 // State returns the placement's derived state. The zero Placement is Absent.
@@ -121,12 +318,31 @@ func (p Placement) State() State {
 // Revision returns the opaque per-record revision used by conditional writes.
 func (p Placement) Revision() uint64 { return p.revision }
 
+// RecordRevision returns the opaque identity of this exact durable snapshot.
+// The zero Placement and legacy unrevisioned records return an invalid value.
+func (p Placement) RecordRevision() RecordRevision {
+	if !p.recordRevision.Valid() || p.recordRevision.value != p.revision {
+		return RecordRevision{}
+	}
+	return p.recordRevision
+}
+
+// AttemptOperationID returns the operation identity associated with the
+// unresolved attempt. Legacy attempts return an invalid ID.
+func (p Placement) AttemptOperationID() operation.OperationID {
+	if p.Attempt == "" {
+		return operation.OperationID{}
+	}
+	return p.attemptOperationID
+}
+
 // record is the version-tolerant bbolt representation. The backend and set_at
 // field names retain compatibility with the ENG-335 JSON format. Before that
 // change, values were raw backend names; decodeRecord still accepts them.
 type record struct {
 	Backend               string    `json:"backend"`
 	Attempt               string    `json:"attempt,omitempty"`
+	OperationID           string    `json:"operation_id,omitempty"`
 	SetAt                 time.Time `json:"set_at"`
 	Revision              uint64    `json:"revision,omitempty"`
 	Conflict              bool      `json:"conflict,omitempty"`
@@ -150,9 +366,29 @@ type Store struct {
 	activeSnapshots map[uint64]uint64
 	now             func() time.Time
 	revision        uint64
-	mu              sync.RWMutex
-	closeOnce       sync.Once
-	closeErr        error
+	// inventoryReady remains only for the legacy typed adapters. New lifecycle
+	// admission is authorized exclusively by an AdmissionBaseline.
+	inventoryReady bool
+	authorityEpoch uint64
+	// Backend topology and its admission baseline are loaded from the metadata
+	// bucket. The baseline remains durable across process restart, but is usable
+	// only while it exactly matches the current topology identity.
+	backendTopology     []string
+	backendTopologySet  map[string]struct{}
+	knownBackendNames   map[string]struct{}
+	topologyFingerprint string
+	topologyID          uint64
+	baselineFingerprint string
+	baselineTopologyID  uint64
+	// restoreClaims are process-local source reservations held only across a
+	// synchronous backend Restore call. The durable target attempt is the
+	// authority after dispatch returns or this process restarts.
+	restoreClaims map[string]RestoreClaim
+	restoreNonce  uint64
+	recordIssuer  uint64
+	mu            sync.RWMutex
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 // Option configures a Store at construction.
@@ -163,9 +399,10 @@ func WithClock(now func() time.Time) Option {
 	return func(s *Store) { s.now = now }
 }
 
-// NewStore opens or creates a bbolt database and loads all existing placement
-// records into memory. Corrupt records remain present as StateUnusable so a
-// missing placement can never be inferred from unreadable durable state.
+// NewStore opens or creates a bbolt database, atomically migrates unambiguous
+// revision-zero confirmed owners, and loads all placement records into memory.
+// Corrupt records remain present as StateUnusable so a missing placement can
+// never be inferred from unreadable durable state.
 func NewStore(dbPath string, opts ...Option) (*Store, error) {
 	if dbPath == "" {
 		return nil, fmt.Errorf("placement db path is required")
@@ -177,30 +414,49 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 	}
 
 	if err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(bucketName)
-		return err
+		if _, err := tx.CreateBucketIfNotExists(bucketName); err != nil {
+			return err
+		}
+		if err := initializeMetadata(tx); err != nil {
+			return err
+		}
+		return migrateLegacyConfirmedRevisions(tx)
 	}); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("failed to create placement bucket: %w", err)
+		return nil, fmt.Errorf("failed to initialize placement store: %w", err)
 	}
 
 	cache := make(map[string]Placement)
 	var revision uint64
+	var metadata topologyMetadata
 	if err := db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
-		return b.ForEach(func(k, v []byte) error {
+		if b == nil {
+			return errors.New("placements bucket missing")
+		}
+		if err := b.ForEach(func(k, v []byte) error {
 			p := decodeRecord(string(k), v)
 			cache[string(k)] = p
 			if p.revision > revision {
 				revision = p.revision
 			}
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
+		var err error
+		metadata, err = loadTopologyMetadata(tx)
+		return err
 	}); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("failed to load placements into cache: %w", err)
+		return nil, fmt.Errorf("failed to load placement store: %w", err)
 	}
 
+	recordIssuer := recordIssuerSequence.Add(1)
+	if recordIssuer == 0 {
+		_ = db.Close()
+		return nil, errors.New("placement record capability issuer exhausted")
+	}
 	s := &Store{
 		db:              db,
 		cache:           cache,
@@ -208,6 +464,28 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 		activeSnapshots: make(map[uint64]uint64),
 		now:             time.Now,
 		revision:        revision,
+		authorityEpoch:  1,
+		backendTopology: slices.Clone(metadata.Topology),
+		backendTopologySet: func() map[string]struct{} {
+			set := make(map[string]struct{}, len(metadata.Topology))
+			for _, backendName := range metadata.Topology {
+				set[backendName] = struct{}{}
+			}
+			return set
+		}(),
+		knownBackendNames: func() map[string]struct{} {
+			set := make(map[string]struct{}, len(metadata.KnownBackends))
+			for _, backendName := range metadata.KnownBackends {
+				set[backendName] = struct{}{}
+			}
+			return set
+		}(),
+		topologyFingerprint: metadata.TopologyFingerprint,
+		topologyID:          metadata.TopologyID,
+		baselineFingerprint: metadata.BaselineFingerprint,
+		baselineTopologyID:  metadata.BaselineTopologyID,
+		restoreClaims:       make(map[string]RestoreClaim),
+		recordIssuer:        recordIssuer,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -216,6 +494,62 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 		s.now = time.Now
 	}
 	return s, nil
+}
+
+// migrateLegacyConfirmedRevisions upgrades the unambiguous confirmed-owner
+// records written by v0.13 and earlier onto the revisioned schema. All records
+// are examined before any write so new revisions start strictly above every
+// existing durable revision. The caller's bbolt update transaction makes the
+// entire migration atomic, including revision exhaustion or a failed Put.
+//
+// Attempts, conflicts, and unusable records deliberately remain byte-for-byte
+// untouched. None of them is safe to turn into an exact confirmed-owner
+// capability merely because it predates record revisions.
+func migrateLegacyConfirmedRevisions(tx *bolt.Tx) error {
+	b := tx.Bucket(bucketName)
+	if b == nil {
+		return errors.New("placements bucket missing")
+	}
+
+	type migration struct {
+		leaseUUID string
+		placement Placement
+	}
+	var migrations []migration
+	var revision uint64
+	if err := b.ForEach(func(k, v []byte) error {
+		leaseUUID := string(k)
+		p := decodeRecord(leaseUUID, v)
+		if p.revision > revision {
+			revision = p.revision
+		}
+		if leaseUUID != "" && p.revision == 0 && p.State() == StateConfirmed &&
+			p.Attempt == "" && !p.Conflict {
+			migrations = append(migrations, migration{
+				leaseUUID: leaseUUID,
+				placement: p,
+			})
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("scan legacy placement revisions: %w", err)
+	}
+
+	for _, migration := range migrations {
+		if revision == math.MaxUint64 {
+			return errors.New("placement revision exhausted during legacy migration")
+		}
+		revision++
+		migration.placement.revision = revision
+		encoded, err := encodePlacement(migration.placement)
+		if err != nil {
+			return fmt.Errorf("encode migrated placement %q: %w", migration.leaseUUID, err)
+		}
+		if err := b.Put([]byte(migration.leaseUUID), encoded); err != nil {
+			return fmt.Errorf("write migrated placement %q: %w", migration.leaseUUID, err)
+		}
+	}
+	return nil
 }
 
 // decodeRecord parses the current JSON representation or the pre-ENG-335 raw
@@ -237,6 +571,7 @@ func decodeRecord(leaseUUID string, v []byte) Placement {
 		return unusableRecord(leaseUUID, err)
 	}
 
+	operationID, operationErr := decodeOperationID(r.OperationID)
 	p := Placement{
 		Backend:               r.Backend,
 		Attempt:               r.Attempt,
@@ -245,6 +580,10 @@ func decodeRecord(leaseUUID string, v []byte) Placement {
 		ConflictBackends:      normalizeBackendNames(r.ConflictBackends),
 		ConflictOwnersUnknown: r.ConflictOwnersUnknown,
 		revision:              r.Revision,
+		attemptOperationID:    operationID,
+	}
+	if operationErr != nil {
+		return unusableRecord(leaseUUID, operationErr)
 	}
 	if p.Conflict {
 		// Records written before conflict candidates were introduced contain only
@@ -258,12 +597,26 @@ func decodeRecord(leaseUUID string, v []byte) Placement {
 		p.ConflictBackends = nil
 		p.ConflictOwnersUnknown = false
 	}
+	if p.Attempt == "" && p.attemptOperationID.Valid() {
+		return unusableRecord(leaseUUID, errors.New("operation identity exists without an attempt"))
+	}
 	if p.Backend == "" && p.Attempt == "" && !p.Conflict {
 		p.unusable = true
 		slog.Warn("placement: loaded record with no backend or attempt",
 			"lease_uuid", leaseUUID)
 	}
 	return p
+}
+
+func decodeOperationID(value string) (operation.OperationID, error) {
+	if value == "" {
+		return operation.OperationID{}, nil
+	}
+	id, err := operation.ParseID(value)
+	if err != nil {
+		return operation.OperationID{}, fmt.Errorf("invalid persisted operation identity: %w", err)
+	}
+	return id, nil
 }
 
 func validLegacyBackendName(v []byte) bool {
@@ -285,9 +638,14 @@ func unusableRecord(leaseUUID string, err error) Placement {
 }
 
 func encodePlacement(p Placement) ([]byte, error) {
+	operationID := ""
+	if p.attemptOperationID.Valid() {
+		operationID = p.attemptOperationID.String()
+	}
 	return json.Marshal(record{
 		Backend:               p.Backend,
 		Attempt:               p.Attempt,
+		OperationID:           operationID,
 		SetAt:                 p.SetAt,
 		Revision:              p.revision,
 		Conflict:              p.Conflict,
@@ -313,6 +671,7 @@ func equalPlacementIgnoringRevision(a, b Placement) bool {
 		a.Conflict == b.Conflict &&
 		slices.Equal(a.ConflictBackends, b.ConflictBackends) &&
 		a.ConflictOwnersUnknown == b.ConflictOwnersUnknown &&
+		a.attemptOperationID == b.attemptOperationID &&
 		a.unusable == b.unusable
 }
 
@@ -323,6 +682,7 @@ func (s *Store) Lookup(leaseUUID string) Placement {
 	defer s.mu.RUnlock()
 	p := s.cache[leaseUUID]
 	p.ConflictBackends = slices.Clone(p.ConflictBackends)
+	p.recordRevision = s.newRecordRevision(leaseUUID, p.revision)
 	return p
 }
 
@@ -334,6 +694,7 @@ func (s *Store) List() map[string]Placement {
 	out := maps.Clone(s.cache)
 	for leaseUUID, p := range out {
 		p.ConflictBackends = slices.Clone(p.ConflictBackends)
+		p.recordRevision = s.newRecordRevision(leaseUUID, p.revision)
 		out[leaseUUID] = p
 	}
 	return out
@@ -349,6 +710,16 @@ func (s *Store) SnapshotRevision() uint64 {
 	return s.revision
 }
 
+// SnapshotFence returns an explicitly valid, non-registering causal boundary
+// for typed placement mutations. A new store can issue a valid revision-zero
+// fence, but BeginAttemptIfNotNewer will still reject it until a complete
+// durable inventory projection marks authority ready.
+func (s *Store) SnapshotFence() InventoryFence {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.inventoryFenceLocked()
+}
+
 // BeginInventorySnapshot registers the current revision as the causal cutoff
 // for one fleet inventory. Deletions committed while that snapshot is active
 // retain exact-key tombstones until EndInventorySnapshot releases the cutoff.
@@ -362,11 +733,91 @@ func (s *Store) BeginInventorySnapshot() uint64 {
 	return revision
 }
 
+// BeginInventorySession registers and returns a typed inventory boundary.
+// Callers must pair it with EndInventorySession even when collection fails.
+func (s *Store) BeginInventorySession() InventoryFence {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A new collection supersedes every process-local projection proof issued
+	// from an older collection. The durable admission baseline is deliberately
+	// independent and remains usable while the topology is unchanged.
+	s.advanceAuthorityEpochLocked()
+	fence := s.inventoryFenceLocked()
+	s.activeSnapshots[fence.revision]++
+	return fence
+}
+
 // EndInventorySnapshot releases a cutoff returned by BeginInventorySnapshot
 // and prunes deletion tombstones that no remaining inventory can predate.
 func (s *Store) EndInventorySnapshot(revision uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.endInventorySnapshotLocked(revision)
+}
+
+// EndInventorySession releases a typed boundary returned by
+// BeginInventorySession. Invalid or foreign fences are harmless no-ops. An
+// authority-invalidated fence still releases its registered snapshot.
+func (s *Store) EndInventorySession(fence InventoryFence) {
+	if !fence.Valid() || fence.issuer != s {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.endInventorySnapshotLocked(fence.revision)
+}
+
+// MarkInventoryReady enables only the legacy typed mutation adapters.
+//
+// Deprecated: production admission must use a durable AdmissionBaseline
+// established atomically by ProjectInventory with Complete set.
+func (s *Store) MarkInventoryReady() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inventoryReady = true
+}
+
+// InventoryBootstrapped reports whether a complete fleet inventory was
+// durably committed for the currently configured backend topology. It remains
+// true across process restart and ordinary inventory sessions. A topology
+// change makes the prior baseline inapplicable until a complete projection
+// commits for the new topology.
+func (s *Store) InventoryBootstrapped() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hasCurrentAdmissionBaselineLocked()
+}
+
+// InvalidateInventoryAuthority blocks legacy typed mutations and invalidates
+// all previously issued process-local inventory fences. It does not erase a
+// durable AdmissionBaseline.
+//
+// Deprecated: begin a new InventorySession to supersede projection authority;
+// baseline validity is determined by durable topology metadata.
+func (s *Store) InvalidateInventoryAuthority() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inventoryReady = false
+	s.advanceAuthorityEpochLocked()
+}
+
+// Caller holds s.mu.
+func (s *Store) advanceAuthorityEpochLocked() {
+	s.authorityEpoch++
+	if s.authorityEpoch == 0 {
+		// Epoch wrap is not operationally reachable, but zero is reserved for an
+		// invalid fence and must never be issued.
+		s.authorityEpoch = 1
+	}
+}
+
+// Caller holds at least s.mu.RLock.
+func (s *Store) inventoryFenceLocked() InventoryFence {
+	return InventoryFence{issuer: s, revision: s.revision, epoch: s.authorityEpoch}
+}
+
+// Caller holds s.mu.
+func (s *Store) endInventorySnapshotLocked(revision uint64) {
 
 	count := s.activeSnapshots[revision]
 	switch count {
@@ -378,6 +829,364 @@ func (s *Store) EndInventorySnapshot(revision uint64) {
 		s.activeSnapshots[revision] = count - 1
 	}
 	s.pruneDeleteRevisionsLocked()
+}
+
+// BeginAttempt durably records a typed write-ahead attempt before any backend
+// side effect. The returned token is the only capability that can confirm or
+// refuse this exact attempt. Ambiguous backend outcomes deliberately perform
+// no settlement and leave the attempt for authoritative inventory repair.
+func (s *Store) BeginAttempt(
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+) (AttemptToken, error) {
+	if err := validateTypedAttempt(leaseUUID, backendName, operationID); err != nil {
+		return AttemptToken{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inventoryReady {
+		return AttemptToken{}, ErrInventoryNotReady
+	}
+	if s.restoreSourceClaimedLocked(leaseUUID) {
+		return AttemptToken{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, leaseUUID)
+	}
+	revision, _, err := s.setAttemptingIfNotNewerLocked(
+		leaseUUID, backendName, operationID, math.MaxUint64,
+	)
+	if err != nil {
+		return AttemptToken{}, err
+	}
+	return s.newAttemptToken(leaseUUID, backendName, operationID, revision), nil
+}
+
+// BeginAttemptIfNotNewer is the typed inventory fence for reconciler-issued
+// side effects. It atomically refuses a record changed after fence was minted.
+// A false applied result carries an invalid token and must not reach a backend.
+func (s *Store) BeginAttemptIfNotNewer(
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+	fence InventoryFence,
+) (token AttemptToken, applied bool, err error) {
+	if err := validateTypedAttempt(leaseUUID, backendName, operationID); err != nil {
+		return AttemptToken{}, false, err
+	}
+	if !fence.Valid() || fence.issuer != s {
+		return AttemptToken{}, false, ErrInvalidInventoryFence
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inventoryReady {
+		return AttemptToken{}, false, ErrInventoryNotReady
+	}
+	if fence.epoch != s.authorityEpoch {
+		return AttemptToken{}, false, ErrInvalidInventoryFence
+	}
+	if s.restoreSourceClaimedLocked(leaseUUID) {
+		return AttemptToken{}, false, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, leaseUUID)
+	}
+	revision, applied, err := s.setAttemptingIfNotNewerLocked(
+		leaseUUID, backendName, operationID, fence.revision,
+	)
+	if err != nil || !applied {
+		return AttemptToken{}, applied, err
+	}
+	return s.newAttemptToken(leaseUUID, backendName, operationID, revision), true, nil
+}
+
+// BeginAttemptFromProjection authorizes a reconciler side effect from the
+// exact atomic projection that planned it. The proof is store- and epoch-bound;
+// its public diagnostic maps are never trusted. A lease is eligible only when
+// it was unchanged after the input inventory cutoff, or when its current
+// record is the exact final mutation committed by that projection.
+func (s *Store) BeginAttemptFromProjection(
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+	proof ProjectionResult,
+) (token AttemptToken, applied bool, err error) {
+	if err := validateTypedAttempt(leaseUUID, backendName, operationID); err != nil {
+		return AttemptToken{}, false, err
+	}
+	if !proof.Valid() || proof.issuer != s {
+		return AttemptToken{}, false, ErrInvalidProjectionProof
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.inventoryReady {
+		return AttemptToken{}, false, ErrInventoryNotReady
+	}
+	if proof.epoch != s.authorityEpoch {
+		return AttemptToken{}, false, ErrInvalidProjectionProof
+	}
+	if s.restoreSourceClaimedLocked(leaseUUID) {
+		return AttemptToken{}, false, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, leaseUUID)
+	}
+	if _, fenced := proof.fencedLeases[leaseUUID]; fenced {
+		return AttemptToken{}, false, nil
+	}
+
+	currentRevision := s.mutationRevisionLocked(leaseUUID)
+	if projectedRevision, projected := proof.finalMutations[leaseUUID]; projected {
+		if currentRevision != projectedRevision {
+			return AttemptToken{}, false, nil
+		}
+	} else if currentRevision > proof.cutoff {
+		return AttemptToken{}, false, nil
+	}
+
+	revision, applied, err := s.setAttemptingIfNotNewerLocked(
+		leaseUUID, backendName, operationID, math.MaxUint64,
+	)
+	if err != nil || !applied {
+		return AttemptToken{}, applied, err
+	}
+	return s.newAttemptToken(leaseUUID, backendName, operationID, revision), true, nil
+}
+
+func validateTypedAttempt(
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+) error {
+	if err := validateIDs(leaseUUID, backendName); err != nil {
+		return err
+	}
+	if !operationID.Valid() {
+		return operation.ErrInvalidID
+	}
+	return nil
+}
+
+// Caller holds at least s.mu.RLock.
+func (s *Store) newAttemptToken(
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+	revision uint64,
+) AttemptToken {
+	token := AttemptToken{
+		issuer:      s,
+		leaseUUID:   leaseUUID,
+		backendName: backendName,
+		operationID: operationID,
+		revision:    s.newRecordRevision(leaseUUID, revision),
+	}
+	if !token.Valid() {
+		return AttemptToken{}
+	}
+	return token
+}
+
+// BeginRestore atomically claims one confirmed source for synchronous restore
+// dispatch and durably records the target attempt on that same source backend.
+// No claim becomes visible unless the target write commits. The source and
+// target must be different leases, the admission baseline must match the
+// current durable topology, the source must be one revisioned confirmed owner
+// with no unresolved attempt, and the target must have no placement record at
+// all.
+func (s *Store) BeginRestore(
+	baseline AdmissionBaseline,
+	sourceLeaseUUID, targetLeaseUUID string,
+	operationID operation.OperationID,
+) (RestoreClaim, error) {
+	if sourceLeaseUUID == "" {
+		return RestoreClaim{}, fmt.Errorf("%w: source lease UUID is required", ErrInvalidPlacement)
+	}
+	if targetLeaseUUID == "" {
+		return RestoreClaim{}, fmt.Errorf("%w: target lease UUID is required", ErrInvalidPlacement)
+	}
+	if sourceLeaseUUID == targetLeaseUUID {
+		return RestoreClaim{}, fmt.Errorf("%w: source and target lease UUIDs must differ", ErrInvalidPlacement)
+	}
+	if !operationID.Valid() {
+		return RestoreClaim{}, operation.ErrInvalidID
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.validateAdmissionBaselineLocked(baseline); err != nil {
+		return RestoreClaim{}, err
+	}
+	if s.restoreSourceClaimedLocked(sourceLeaseUUID) {
+		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, sourceLeaseUUID)
+	}
+	// A source-reserved lease cannot simultaneously become another restore's
+	// target. This is the BeginRestore counterpart to the typed BeginAttempt
+	// fence and keeps the source immutable for the holder of the first claim.
+	if s.restoreSourceClaimedLocked(targetLeaseUUID) {
+		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, targetLeaseUUID)
+	}
+
+	source, exists := s.cache[sourceLeaseUUID]
+	if !exists || source.State() == StateAbsent {
+		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceNotFound, sourceLeaseUUID)
+	}
+	sourceRevision := s.newRecordRevision(sourceLeaseUUID, source.revision)
+	if source.State() != StateConfirmed || source.Attempt != "" ||
+		!sourceRevision.Valid() {
+		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceUnavailable, sourceLeaseUUID)
+	}
+	if err := s.validateConfiguredBackendLocked(source.Backend); err != nil {
+		return RestoreClaim{}, err
+	}
+	target, targetExists := s.cache[targetLeaseUUID]
+	if targetExists || target.State() != StateAbsent {
+		return RestoreClaim{}, fmt.Errorf("%w: lease %q is %s",
+			ErrRestoreTargetUnavailable, targetLeaseUUID, target.State())
+	}
+	if s.restoreNonce == math.MaxUint64 {
+		return RestoreClaim{}, errors.New("placement restore nonce exhausted")
+	}
+	nonce := s.restoreNonce + 1
+
+	targetRevision, applied, err := s.setAttemptingIfNotNewerLocked(
+		targetLeaseUUID, source.Backend, operationID, math.MaxUint64,
+	)
+	if err != nil {
+		return RestoreClaim{}, err
+	}
+	if !applied {
+		// A MaxUint64 fence cannot reject a normal revision. Keep this guard so a
+		// future helper change cannot mint a source claim without a target write.
+		return RestoreClaim{}, errors.New("restore target attempt was not applied")
+	}
+
+	claim := RestoreClaim{
+		issuer:          s,
+		sourceLeaseUUID: sourceLeaseUUID,
+		targetLeaseUUID: targetLeaseUUID,
+		backendName:     source.Backend,
+		operationID:     operationID,
+		sourceRevision:  sourceRevision,
+		targetRevision:  s.newRecordRevision(targetLeaseUUID, targetRevision),
+		nonce:           nonce,
+	}
+	if !claim.Valid() {
+		// This is unreachable after the validation above. Returning an error is
+		// still safer than exposing a durable attempt with no settlement claim.
+		return RestoreClaim{}, ErrInvalidRestoreClaim
+	}
+	s.restoreNonce = nonce
+	s.restoreClaims[sourceLeaseUUID] = claim
+	return claim, nil
+}
+
+// ConfirmRestore consumes the exact live source claim and promotes the target
+// attempt after synchronous backend acceptance. If an exact fast callback has
+// already settled the target, it leaves that result untouched and still
+// consumes the source claim successfully.
+func (s *Store) ConfirmRestore(claim RestoreClaim) (bool, error) {
+	return s.settleRestore(claim, restoreSettlementConfirm)
+}
+
+// RefuseRestore consumes the exact live source claim and clears the target
+// attempt after a definitive synchronous refusal. An exact fast callback wins:
+// its already-settled target is never deleted or rewritten.
+func (s *Store) RefuseRestore(claim RestoreClaim) (bool, error) {
+	return s.settleRestore(claim, restoreSettlementRefuse)
+}
+
+// AbandonRestore consumes the exact live source claim without changing the
+// durable target attempt. Call it for an ambiguous synchronous outcome: the
+// backend (or later complete inventory) owns settlement after dispatch.
+func (s *Store) AbandonRestore(claim RestoreClaim) (bool, error) {
+	return s.settleRestore(claim, restoreSettlementAbandon)
+}
+
+type restoreSettlement uint8
+
+const (
+	restoreSettlementConfirm restoreSettlement = iota + 1
+	restoreSettlementRefuse
+	restoreSettlementAbandon
+)
+
+func (s *Store) settleRestore(claim RestoreClaim, settlement restoreSettlement) (bool, error) {
+	if !claim.Valid() || claim.issuer != s {
+		return false, ErrInvalidRestoreClaim
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, exists := s.restoreClaims[claim.sourceLeaseUUID]
+	if !exists || current != claim {
+		return false, nil
+	}
+	// Source reservations must never leak beyond synchronous dispatch, even if
+	// the target settlement write itself fails. The unresolved durable target
+	// attempt is the conservative recovery state in that case.
+	defer delete(s.restoreClaims, claim.sourceLeaseUUID)
+
+	if settlement == restoreSettlementAbandon {
+		return true, nil
+	}
+
+	targetToken := AttemptToken{
+		issuer:      s,
+		leaseUUID:   claim.targetLeaseUUID,
+		backendName: claim.backendName,
+		operationID: claim.operationID,
+		revision:    claim.targetRevision,
+	}
+	target, matches := s.matchAttemptTokenLocked(targetToken)
+	if !matches {
+		// Exact callback settlement (or a later authoritative mutation) wins. A
+		// synchronous response must never recreate or delete that result.
+		return true, nil
+	}
+	if target.State() == StateUnusable {
+		return true, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, claim.targetLeaseUUID)
+	}
+
+	switch settlement {
+	case restoreSettlementConfirm:
+		if target.Backend != "" && target.Backend != claim.backendName {
+			return true, fmt.Errorf("%w: lease %q is confirmed on %q, not %q",
+				ErrBackendConflict, claim.targetLeaseUUID, target.Backend, claim.backendName)
+		}
+		next, err := s.nextRevision()
+		if err != nil {
+			return true, err
+		}
+		target.Backend = claim.backendName
+		target.Attempt = ""
+		target.attemptOperationID = operation.OperationID{}
+		target.revision = next
+		if err := s.put(claim.targetLeaseUUID, target, "confirm restore placement"); err != nil {
+			return true, err
+		}
+		s.revision = next
+		return true, nil
+
+	case restoreSettlementRefuse:
+		if target.Backend == "" {
+			if err := s.deleteLocked(claim.targetLeaseUUID, "refuse restore placement"); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
+		next, err := s.nextRevision()
+		if err != nil {
+			return true, err
+		}
+		target.Attempt = ""
+		target.attemptOperationID = operation.OperationID{}
+		target.revision = next
+		if err := s.put(claim.targetLeaseUUID, target, "refuse restore placement"); err != nil {
+			return true, err
+		}
+		s.revision = next
+		return true, nil
+
+	default:
+		return true, ErrInvalidRestoreClaim
+	}
+}
+
+// Caller holds at least s.mu.RLock.
+func (s *Store) restoreSourceClaimedLocked(leaseUUID string) bool {
+	_, claimed := s.restoreClaims[leaseUUID]
+	return claimed
 }
 
 // SetAttempting durably records the target before any backend call. It refuses
@@ -404,7 +1213,9 @@ func (s *Store) SetAttemptingIfNotNewer(
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.setAttemptingIfNotNewerLocked(leaseUUID, backendName, maxRevision)
+	return s.setAttemptingIfNotNewerLocked(
+		leaseUUID, backendName, operation.OperationID{}, maxRevision,
+	)
 }
 
 func (s *Store) setAttemptingIfNotNewer(
@@ -416,12 +1227,15 @@ func (s *Store) setAttemptingIfNotNewer(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.setAttemptingIfNotNewerLocked(leaseUUID, backendName, maxRevision)
+	return s.setAttemptingIfNotNewerLocked(
+		leaseUUID, backendName, operation.OperationID{}, maxRevision,
+	)
 }
 
 // Caller holds s.mu.
 func (s *Store) setAttemptingIfNotNewerLocked(
 	leaseUUID, backendName string,
+	operationID operation.OperationID,
 	maxRevision uint64,
 ) (uint64, bool, error) {
 	if s.mutationRevisionLocked(leaseUUID) > maxRevision {
@@ -449,12 +1263,196 @@ func (s *Store) setAttemptingIfNotNewerLocked(
 		p.SetAt = s.now().UTC()
 	}
 	p.Attempt = backendName
+	p.attemptOperationID = operationID
 	p.revision = revision
 	if err := s.put(leaseUUID, p, "set attempting placement"); err != nil {
 		return 0, false, err
 	}
 	s.revision = revision
 	return revision, true, nil
+}
+
+// ConfirmAttempt promotes only the exact typed write-ahead attempt represented
+// by token. A stale token returns false without writing; it can never confirm a
+// later attempt even when that attempt targets the same backend.
+func (s *Store) ConfirmAttempt(token AttemptToken) (bool, error) {
+	if err := s.validateAttemptToken(token); err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, matches := s.matchAttemptTokenLocked(token)
+	if !matches {
+		return false, nil
+	}
+	if p.State() == StateUnusable {
+		return false, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, token.leaseUUID)
+	}
+	if p.Backend != "" && p.Backend != token.backendName {
+		return false, fmt.Errorf("%w: lease %q is confirmed on %q, not %q",
+			ErrBackendConflict, token.leaseUUID, p.Backend, token.backendName)
+	}
+
+	next, err := s.nextRevision()
+	if err != nil {
+		return false, err
+	}
+	p.Backend = token.backendName
+	p.Attempt = ""
+	p.attemptOperationID = operation.OperationID{}
+	p.revision = next
+	if err := s.put(token.leaseUUID, p, "confirm typed placement attempt"); err != nil {
+		return false, err
+	}
+	s.revision = next
+	return true, nil
+}
+
+// RefuseAttempt clears only the exact typed write-ahead attempt represented by
+// token after a definitive synchronous refusal. Ambiguous outcomes must not
+// call this method. A stale token returns false without writing.
+func (s *Store) RefuseAttempt(token AttemptToken) (bool, error) {
+	if err := s.validateAttemptToken(token); err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, matches := s.matchAttemptTokenLocked(token)
+	if !matches {
+		return false, nil
+	}
+	if p.State() == StateUnusable {
+		return false, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, token.leaseUUID)
+	}
+
+	if p.Backend == "" {
+		if err := s.deleteLocked(token.leaseUUID, "refuse typed placement attempt"); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	next, err := s.nextRevision()
+	if err != nil {
+		return false, err
+	}
+	p.Attempt = ""
+	p.attemptOperationID = operation.OperationID{}
+	p.revision = next
+	if err := s.put(token.leaseUUID, p, "refuse typed placement attempt"); err != nil {
+		return false, err
+	}
+	s.revision = next
+	return true, nil
+}
+
+// ConfirmOperation promotes a typed attempt identified by durable operation
+// identity. It is the callback-safe counterpart to ConfirmAttempt: callbacks
+// need not retain the process-local AttemptToken, but still cannot settle a
+// legacy, mismatched, or newer same-backend operation. An already-confirmed
+// same-backend record with no attempt is an idempotent success and is not
+// mutated.
+func (s *Store) ConfirmOperation(
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+) (bool, error) {
+	if err := validateTypedAttempt(leaseUUID, backendName, operationID); err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, exists := s.cache[leaseUUID]
+	if !exists {
+		return false, nil
+	}
+	if p.State() == StateUnusable {
+		return false, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, leaseUUID)
+	}
+	if p.Attempt == "" {
+		return p.Backend == backendName, nil
+	}
+	if p.Attempt != backendName || p.attemptOperationID != operationID {
+		return false, nil
+	}
+	if p.Backend != "" && p.Backend != backendName {
+		return false, fmt.Errorf("%w: lease %q is confirmed on %q, not %q",
+			ErrBackendConflict, leaseUUID, p.Backend, backendName)
+	}
+
+	next, err := s.nextRevision()
+	if err != nil {
+		return false, err
+	}
+	p.Backend = backendName
+	p.Attempt = ""
+	p.attemptOperationID = operation.OperationID{}
+	p.revision = next
+	if err := s.put(leaseUUID, p, "confirm placement operation"); err != nil {
+		return false, err
+	}
+	s.revision = next
+	return true, nil
+}
+
+// RefuseOperation clears only the typed attempt whose persisted operation
+// identity exactly matches. It never removes an already-confirmed owner.
+func (s *Store) RefuseOperation(
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+) (bool, error) {
+	if err := validateTypedAttempt(leaseUUID, backendName, operationID); err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, exists := s.cache[leaseUUID]
+	if !exists || p.Attempt != backendName || p.attemptOperationID != operationID {
+		return false, nil
+	}
+	if p.State() == StateUnusable {
+		return false, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, leaseUUID)
+	}
+	if p.Backend == "" {
+		if err := s.deleteLocked(leaseUUID, "refuse placement operation"); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	next, err := s.nextRevision()
+	if err != nil {
+		return false, err
+	}
+	p.Attempt = ""
+	p.attemptOperationID = operation.OperationID{}
+	p.revision = next
+	if err := s.put(leaseUUID, p, "refuse placement operation"); err != nil {
+		return false, err
+	}
+	s.revision = next
+	return true, nil
+}
+
+func (s *Store) validateAttemptToken(token AttemptToken) error {
+	if !token.Valid() || token.issuer != s {
+		return ErrInvalidAttemptToken
+	}
+	return nil
+}
+
+// matchAttemptTokenLocked checks every durable token component in one critical
+// section. Caller holds s.mu.
+func (s *Store) matchAttemptTokenLocked(token AttemptToken) (Placement, bool) {
+	p, exists := s.cache[token.leaseUUID]
+	if !exists || p.revision != token.revision.value ||
+		p.Attempt != token.backendName || p.attemptOperationID != token.operationID {
+		return Placement{}, false
+	}
+	return p, true
 }
 
 // Confirm records a positive observation. It promotes and clears a matching
@@ -493,6 +1491,7 @@ func (s *Store) Confirm(leaseUUID, backendName string) error {
 	}
 	p.Backend = backendName
 	p.Attempt = ""
+	p.attemptOperationID = operation.OperationID{}
 	p.revision = revision
 	if err := s.put(leaseUUID, p, "confirm placement"); err != nil {
 		return err
@@ -538,6 +1537,7 @@ func (s *Store) ConfirmAttemptIfRevision(
 	}
 	p.Backend = backendName
 	p.Attempt = ""
+	p.attemptOperationID = operation.OperationID{}
 	p.revision = next
 	if err := s.put(leaseUUID, p, "conditionally confirm placement attempt"); err != nil {
 		return false, err
@@ -614,6 +1614,7 @@ func (s *Store) clearAttemptLocked(
 		return false, err
 	}
 	p.Attempt = ""
+	p.attemptOperationID = operation.OperationID{}
 	p.revision = revision
 	if err := s.put(leaseUUID, p, "clear placement attempt"); err != nil {
 		return false, err
@@ -656,6 +1657,286 @@ func (s *Store) DeleteIfRevision(leaseUUID string, revision uint64) (bool, error
 		return false, err
 	}
 	return true, nil
+}
+
+// DeleteRecord removes only the exact store- and lease-bound placement record
+// represented by revision. The target is derived from the capability itself;
+// callers cannot transplant a numerically equal revision to another lease or
+// store. Invalid and foreign revisions are rejected.
+func (s *Store) DeleteRecord(revision RecordRevision) (bool, error) {
+	if !revision.Valid() || revision.issuer != s.recordIssuer {
+		return false, ErrInvalidRecordRevision
+	}
+	leaseUUID := revision.leaseUUID
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.restoreSourceClaimedLocked(leaseUUID) {
+		return false, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, leaseUUID)
+	}
+	p, exists := s.cache[leaseUUID]
+	if !exists || p.revision != revision.value {
+		return false, nil
+	}
+	if err := s.deleteLocked(leaseUUID, "delete typed placement record"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+type projectionMutation struct {
+	placement Placement
+	encoded   []byte
+	revision  uint64
+}
+
+// ProjectInventory computes a placement projection against fence and persists
+// every material write in one bbolt transaction. When Complete is true, that
+// same transaction also establishes the durable admission baseline for the
+// configured topology, including for empty or idempotent projections. No
+// cache, baseline, or revision-clock change is visible unless the transaction
+// commits. A partial projection never erases an existing matching baseline.
+func (s *Store) ProjectInventory(
+	fence InventoryFence,
+	input InventoryProjection,
+) (ProjectionResult, error) {
+	projection, err := normalizeInventoryProjection(input)
+	if err != nil {
+		return ProjectionResult{}, err
+	}
+	if !fence.Valid() || fence.issuer != s {
+		return ProjectionResult{}, ErrInvalidInventoryFence
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fence.epoch != s.authorityEpoch {
+		return ProjectionResult{}, ErrInvalidInventoryFence
+	}
+	if err := s.validateProjectionBackendsLocked(projection); err != nil {
+		return ProjectionResult{}, err
+	}
+
+	result := ProjectionResult{
+		Applied:        make(map[string]RecordRevision),
+		Fenced:         make(map[string]struct{}),
+		issuer:         s,
+		epoch:          fence.epoch,
+		cutoff:         fence.revision,
+		finalMutations: make(map[string]uint64),
+		fencedLeases:   make(map[string]struct{}),
+	}
+	keySet := make(map[string]struct{}, len(projection.Placements)+len(projection.Conflicts))
+	for leaseUUID := range projection.Placements {
+		keySet[leaseUUID] = struct{}{}
+	}
+	for leaseUUID := range projection.Conflicts {
+		keySet[leaseUUID] = struct{}{}
+	}
+	keys := slices.Sorted(maps.Keys(keySet))
+
+	now := s.now().UTC()
+	nextRevision := s.revision
+	mutations := make(map[string]projectionMutation, len(keys))
+	for _, leaseUUID := range keys {
+		if s.restoreSourceClaimedLocked(leaseUUID) {
+			result.markFenced(leaseUUID)
+			continue
+		}
+		if s.mutationRevisionLocked(leaseUUID) > fence.revision {
+			result.markFenced(leaseUUID)
+			continue
+		}
+
+		existing, exists := s.cache[leaseUUID]
+		var candidate Placement
+		var mutate bool
+		switch {
+		case projection.Conflicts[leaseUUID] != nil:
+			candidate = projectConflict(existing, exists, projection.Conflicts[leaseUUID], now)
+			mutate = !exists || existing.revision == 0 ||
+				!equalPlacementIgnoringRevision(candidate, existing)
+
+		case projection.Placements[leaseUUID] != "":
+			candidate = projectPositivePlacement(
+				existing,
+				exists,
+				projection.Placements[leaseUUID],
+				now,
+			)
+			mutate = !exists || existing.revision == 0 ||
+				!equalPlacementIgnoringRevision(candidate, existing)
+		}
+		if !mutate {
+			continue
+		}
+		if nextRevision == math.MaxUint64 {
+			return ProjectionResult{}, fmt.Errorf("placement revision exhausted")
+		}
+		nextRevision++
+		candidate.revision = nextRevision
+		encoded, err := encodePlacement(candidate)
+		if err != nil {
+			return ProjectionResult{}, mutationFailure("encode inventory projection", err)
+		}
+		mutations[leaseUUID] = projectionMutation{
+			placement: candidate,
+			encoded:   encoded,
+			revision:  nextRevision,
+		}
+	}
+
+	if len(mutations) == 0 && !projection.Complete {
+		if err := s.verifyBucket(); err != nil {
+			return ProjectionResult{}, mutationFailure("verify inventory projection", err)
+		}
+		return result, nil
+	}
+
+	mutationKeys := slices.Sorted(maps.Keys(mutations))
+	nextMetadata := s.topologyMetadataLocked()
+	if projection.Complete {
+		nextMetadata.BaselineFingerprint = s.topologyFingerprint
+		nextMetadata.BaselineTopologyID = s.topologyID
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		if b == nil {
+			return errors.New("placements bucket missing")
+		}
+		for _, leaseUUID := range mutationKeys {
+			mutation := mutations[leaseUUID]
+			if err := b.Put([]byte(leaseUUID), mutation.encoded); err != nil {
+				return err
+			}
+		}
+		if projection.Complete {
+			if err := putTopologyMetadata(tx, nextMetadata); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return ProjectionResult{}, mutationFailure("project placement inventory", err)
+	}
+
+	for _, leaseUUID := range mutationKeys {
+		mutation := mutations[leaseUUID]
+		s.cache[leaseUUID] = mutation.placement
+		delete(s.deleteRevisions, leaseUUID)
+		result.Applied[leaseUUID] = s.newRecordRevision(leaseUUID, mutation.revision)
+		result.finalMutations[leaseUUID] = mutation.revision
+	}
+	s.revision = nextRevision
+	if projection.Complete {
+		s.baselineFingerprint = nextMetadata.BaselineFingerprint
+		s.baselineTopologyID = nextMetadata.BaselineTopologyID
+		// Keep the legacy adapter functional while production consumers migrate to
+		// explicit AdmissionBaseline capabilities.
+		s.inventoryReady = true
+	}
+	return result, nil
+}
+
+func (result *ProjectionResult) markFenced(leaseUUID string) {
+	result.Fenced[leaseUUID] = struct{}{}
+	result.fencedLeases[leaseUUID] = struct{}{}
+}
+
+func normalizeInventoryProjection(input InventoryProjection) (InventoryProjection, error) {
+	projection := InventoryProjection{
+		Complete:   input.Complete,
+		Placements: maps.Clone(input.Placements),
+		Conflicts:  make(map[string][]string, len(input.Conflicts)),
+	}
+	for leaseUUID, backendName := range projection.Placements {
+		if err := validateIDs(leaseUUID, backendName); err != nil {
+			return InventoryProjection{}, err
+		}
+	}
+	for leaseUUID, backendNames := range input.Conflicts {
+		if leaseUUID == "" {
+			return InventoryProjection{}, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
+		}
+		normalized := normalizeBackendNames(backendNames)
+		if len(normalized) < 2 {
+			return InventoryProjection{}, fmt.Errorf(
+				"%w: conflict for lease %q requires at least two backends",
+				ErrInvalidPlacement, leaseUUID,
+			)
+		}
+		projection.Conflicts[leaseUUID] = normalized
+	}
+	for leaseUUID := range projection.Conflicts {
+		if _, overlaps := projection.Placements[leaseUUID]; overlaps {
+			return InventoryProjection{}, projectionOverlapError(leaseUUID)
+		}
+	}
+	return projection, nil
+}
+
+func projectionOverlapError(leaseUUID string) error {
+	return fmt.Errorf("%w: projection contains contradictory outcomes for lease %q",
+		ErrInvalidPlacement, leaseUUID)
+}
+
+func projectConflict(
+	existing Placement,
+	exists bool,
+	backendNames []string,
+	now time.Time,
+) Placement {
+	setAt := existing.SetAt
+	if setAt.IsZero() {
+		setAt = now
+	}
+	candidateSet := make(map[string]struct{}, len(backendNames)+len(existing.ConflictBackends)+2)
+	for _, backendName := range backendNames {
+		candidateSet[backendName] = struct{}{}
+	}
+	for _, backendName := range existing.ConflictBackends {
+		candidateSet[backendName] = struct{}{}
+	}
+	if existing.Backend != "" {
+		candidateSet[existing.Backend] = struct{}{}
+	}
+	if existing.Attempt != "" {
+		candidateSet[existing.Attempt] = struct{}{}
+	}
+	unknownOwners := existing.ConflictOwnersUnknown ||
+		(existing.Conflict && len(existing.ConflictBackends) < 2) ||
+		(exists && existing.State() == StateUnusable && !existing.Conflict)
+	return Placement{
+		Backend:               existing.Backend,
+		Attempt:               existing.Attempt,
+		SetAt:                 setAt,
+		Conflict:              true,
+		ConflictBackends:      slices.Sorted(maps.Keys(candidateSet)),
+		ConflictOwnersUnknown: unknownOwners,
+		attemptOperationID:    existing.attemptOperationID,
+	}
+}
+
+func projectPositivePlacement(
+	existing Placement,
+	exists bool,
+	backendName string,
+	now time.Time,
+) Placement {
+	p := existing
+	if !exists || p.unusable {
+		p = Placement{SetAt: now}
+	}
+	p.Backend = backendName
+	if p.Attempt == backendName {
+		p.Attempt = ""
+		p.attemptOperationID = operation.OperationID{}
+	}
+	p.Conflict = false
+	p.ConflictBackends = nil
+	p.ConflictOwnersUnknown = false
+	p.unusable = false
+	return p
 }
 
 // SetBatchIfNotNewer records positive backend inventory in one bbolt
@@ -740,6 +2021,7 @@ func (s *Store) SetBatchIfNotNewer(
 		p.Backend = backendName
 		if p.Attempt == backendName {
 			p.Attempt = ""
+			p.attemptOperationID = operation.OperationID{}
 		}
 		p.unusable = false
 		if exists && equalPlacementIgnoringRevision(p, existing) {
@@ -799,9 +2081,9 @@ func (s *Store) SetBatchIfNotNewer(
 }
 
 // SetConflictsIfNotNewer durably quarantines leases positively reported by
-// multiple backends. It replaces any individual Backend/Attempt as the selected
-// owner, but preserves those names together with every reporting backend in a
-// durable candidate set. No individual status may drive chain actions while the
+// multiple backends. It preserves any exact Backend/Attempt evidence and adds
+// those names together with every reporting backend to a durable candidate
+// set. No individual status may drive chain actions while the
 // conflict remains, yet deprovision and later reconciliation can still account
 // for every backend that was ever positively identified. The first returned map
 // contains exact revisions committed by this call. The returned set names
@@ -874,10 +2156,13 @@ func (s *Store) SetConflictsIfNotNewer(
 			(existing.Conflict && len(existing.ConflictBackends) < 2) ||
 			(exists && existing.State() == StateUnusable && !existing.Conflict)
 		p := Placement{
+			Backend:               existing.Backend,
+			Attempt:               existing.Attempt,
 			SetAt:                 setAt,
 			Conflict:              true,
 			ConflictBackends:      slices.Sorted(maps.Keys(candidateSet)),
 			ConflictOwnersUnknown: unknownOwners,
+			attemptOperationID:    existing.attemptOperationID,
 		}
 		if exists && equalPlacementIgnoringRevision(p, existing) {
 			continue

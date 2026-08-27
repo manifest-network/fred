@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // handlersOf builds the HandlerSet that NewManager wires into the
@@ -31,36 +30,39 @@ import (
 // so a fresh set per call would silently drop it between handler
 // invocations in a test that spans more than one.
 func handlersOf(m *Manager) *HandlerSet {
+	callbacks, err := NewCallbackService(CallbackServiceConfig{
+		Operations:   m.operations,
+		Chain:        m.chainClient,
+		Acknowledger: m.ackBatcher,
+		Placement:    m.placementStore,
+		Payloads:     m.payloadStore,
+		Events: callbackEventSinkFunc(func(
+			leaseUUID string, status backend.ProvisionStatus, failure string,
+		) {
+			publishLeaseStatusEvent(m.publisher, leaseUUID, status, failure)
+		}),
+		Backends: m.router,
+		DeprovisionObserver: callbackDeprovisionObserverFunc(
+			m.orchestrator.forgetDeprovisionCandidate,
+		),
+	})
+	if err != nil {
+		panic(err)
+	}
 	return NewHandlerSet(HandlerDeps{
-		ChainClient:   m.chainClient,
-		Orchestrator:  m.orchestrator,
-		Tracker:       m.tracker,
-		Acknowledger:  m.ackBatcher,
-		PayloadStore:  m.payloadStore,
-		Publisher:     m.publisher,
-		BackendRouter: m.router,
+		ChainClient:     m.chainClient,
+		Orchestrator:    m.orchestrator,
+		EventOperations: m.operations,
+		PayloadStore:    m.payloadStore,
+		Publisher:       m.publisher,
+		Callbacks:       callbacks,
 	})
 }
 
 // TrackInFlightWithStartTime records an in-flight provision with a
 // caller-supplied start time so timeout tests can simulate a provision
 // that began in the past. Production always stamps time.Now() via
-// TryTrackInFlightWithGeneration.
+// TryTrackInFlightWithOperationID.
 func (t *DefaultInFlightTracker) TrackInFlightWithStartTime(leaseUUID, tenant string, items []backend.LeaseItem, backendName string, startTime time.Time) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if _, claimed := t.reconcileClaims[leaseUUID]; claimed {
-		return
-	}
-	generation := t.allocateGenerationLocked()
-	t.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID:  leaseUUID,
-		Tenant:     tenant,
-		Items:      items,
-		Backend:    backendName,
-		Generation: generation,
-		StartTime:  startTime,
-	}
-	t.markMutationLocked(leaseUUID)
-	metrics.InFlightProvisions.Set(float64(len(t.inFlight)))
+	t.replaceForLegacy(leaseUUID, tenant, items, backendName, startTime)
 }

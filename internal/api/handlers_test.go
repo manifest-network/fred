@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,9 +28,20 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
 	"github.com/manifest-network/fred/internal/testutil"
 )
+
+type restoreServiceFunc func(context.Context, restoreapp.Command) restoreapp.Result
+
+func (execute restoreServiceFunc) Execute(
+	ctx context.Context,
+	command restoreapp.Command,
+) restoreapp.Result {
+	return execute(ctx, command)
+}
 
 // TestNewHandlers_AppliesWebSocketDefaults pins the WebSocket security
 // defaults set by NewHandlers. StreamLeaseEvents has a defensive fallback
@@ -50,6 +62,14 @@ func TestNewHandlers_AppliesWebSocketDefaults(t *testing.T) {
 		"NewHandlers must set wsMaxMessageSize so the production path doesn't fall through to StreamLeaseEvents' defensive default (which would log an slog.Error per connection)")
 	assert.Equal(t, wsDefaultMaxConnLifetime, h.wsMaxConnLifetime,
 		"NewHandlers must set wsMaxConnLifetime so the production path doesn't fall through to StreamLeaseEvents' defensive default (which would log an slog.Error per connection)")
+}
+
+func TestNewHandlers_NormalizesTypedNilRestoreService(t *testing.T) {
+	t.Parallel()
+	var typedNil restoreServiceFunc
+	handlers := NewHandlers(HandlersConfig{RestoreService: typedNil})
+	assert.Nil(t, handlers.restoreService,
+		"a typed-nil optional service must behave like an unwired restore endpoint")
 }
 
 func TestHealthCheck(t *testing.T) {
@@ -819,6 +839,36 @@ func TestReadyz_AllHealthy(t *testing.T) {
 	assert.Equal(t, "healthy", response.Checks["token_tracker"].Status)
 	require.NotNil(t, response.Stats)
 	assert.Equal(t, 7, response.Stats.InFlightProvisions)
+}
+
+func TestReadyz_WaitsForFirstAuthoritativePlacementInventory(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		bootstrapped bool
+		wantStatus   int
+		wantCheck    string
+	}{
+		{name: "startup inventory pending", wantStatus: http.StatusServiceUnavailable, wantCheck: "unhealthy"},
+		{name: "startup inventory complete", bootstrapped: true, wantStatus: http.StatusOK, wantCheck: "healthy"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := NewHandlers(HandlersConfig{
+				PlacementLookup: &mockBootstrapPlacementLookup{bootstrapped: tt.bootstrapped},
+				ProviderUUID:    testutil.ValidUUID1,
+				Bech32Prefix:    "manifest",
+			})
+
+			rec := httptest.NewRecorder()
+			h.Readyz(rec, httptest.NewRequest("GET", "/readyz", nil))
+
+			assert.Equal(t, tt.wantStatus, rec.Code)
+			var response HealthResponse
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
+			assert.Equal(t, tt.wantCheck, response.Checks["placement_inventory"].Status)
+			assert.Equal(t, "healthy", response.Checks["placement_store"].Status,
+				"database health and startup authority are independent checks")
+		})
+	}
 }
 
 func TestWriteError(t *testing.T) {
@@ -4852,6 +4902,15 @@ type mockPlacementLookup struct {
 	healthyFunc func() error
 }
 
+type mockBootstrapPlacementLookup struct {
+	mockPlacementLookup
+	bootstrapped bool
+}
+
+func (m *mockBootstrapPlacementLookup) InventoryBootstrapped() bool {
+	return m.bootstrapped
+}
+
 func (m *mockPlacementLookup) Lookup(leaseUUID string) placement.Placement {
 	if m.lookupFunc != nil {
 		return m.lookupFunc(leaseUUID)
@@ -5732,6 +5791,62 @@ func TestGetWorkloads_ContextCancelled(t *testing.T) {
 // path) so the handler can't accidentally confuse the two.
 const fromLeaseUUID = "fedcba98-7654-3210-fedc-ba9876543210"
 
+func newRestoreAuthorityForTest(
+	t *testing.T,
+	sourcePlacements PlacementLookup,
+	router *backend.Router,
+) *placement.Store {
+	t.Helper()
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "restore-placements.db"))
+	require.NoError(t, err)
+	backendNames := make([]string, 0, len(router.Backends()))
+	for _, backendClient := range router.Backends() {
+		backendNames = append(backendNames, backendClient.Name())
+	}
+	require.NoError(t, store.ConfigureBackendTopology(backendNames))
+	if sourcePlacements != nil {
+		source := sourcePlacements.Lookup(fromLeaseUUID)
+		if source.State() == placement.StateConfirmed && source.Attempt == "" {
+			require.NoError(t, store.Confirm(fromLeaseUUID, source.Backend))
+		}
+	}
+	fence := store.BeginInventorySession()
+	_, err = store.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
+	require.NoError(t, err)
+	store.EndInventorySession(fence)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	return store
+}
+
+func newRestoreServiceForTest(
+	t *testing.T,
+	providerUUID string,
+	targets restoreapp.TargetLeaseReader,
+	router *backend.Router,
+	sourcePlacements PlacementLookup,
+	events restoreapp.EventSink,
+) RestoreService {
+	t.Helper()
+	if sourcePlacements == nil || targets == nil || router == nil {
+		return nil
+	}
+	service, err := restoreapp.NewService(restoreapp.Config{
+		ProviderUUID: providerUUID,
+		CallbackURL: func(operationID operation.OperationID) (string, error) {
+			return provisioner.BuildCallbackURLForOperation("https://fred.example.test", operationID)
+		},
+		Targets: targets,
+		Backends: restoreapp.BackendResolverFunc(func(name string) restoreapp.RestoreBackend {
+			return router.GetBackendByName(name)
+		}),
+		Operations: operation.NewRegistry(),
+		Authority:  newRestoreAuthorityForTest(t, sourcePlacements, router),
+		Events:     events,
+	})
+	require.NoError(t, err)
+	return service
+}
+
 // TestRestoreLease_ForwardsAnd202 verifies the happy path: backend /restore
 // returns 202 and the handler responds 202 {"status":"provisioning"}, forwarding
 // the from_lease_uuid in the body sent to the backend.
@@ -5795,8 +5910,7 @@ func TestRestoreLease_ForwardsAnd202(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreRecorder: &fakeRestoreRecorder{},
-		restoreTracker:  &fakeRestoreTracker{trackResult: true},
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -5890,6 +6004,71 @@ func TestRestoreLease_RejectsNonPendingLease(t *testing.T) {
 	}
 }
 
+func TestRestoreLease_RereadRejectsTargetThatBecameTerminal(t *testing.T) {
+	kp := testutil.NewTestKeyPair("test-tenant")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	var reads atomic.Int32
+	chainClient := &mockChainClient{
+		getLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid != leaseUUID {
+				return nil, nil
+			}
+			state := billingtypes.LEASE_STATE_PENDING
+			if reads.Add(1) > 1 {
+				state = billingtypes.LEASE_STATE_CLOSED
+			}
+			return &billingtypes.Lease{
+				Uuid: uuid, Tenant: kp.Address,
+				ProviderUuid: providerUUID, State: state,
+			}, nil
+		},
+	}
+
+	var backendCalls atomic.Int32
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backendCalls.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer backendServer.Close()
+	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		Name: "test-backend", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	sourcePlacements := &mockPlacementLookup{getFunc: func(uuid string) string {
+		if uuid == fromLeaseUUID {
+			return "test-backend"
+		}
+		return ""
+	}}
+	handlers := NewHandlers(HandlersConfig{
+		Client:          chainClient,
+		BackendRouter:   router,
+		PlacementLookup: sourcePlacements,
+		RestoreService: newRestoreServiceForTest(
+			t, providerUUID, chainClient, router, sourcePlacements, nil,
+		),
+		ProviderUUID: providerUUID,
+		Bech32Prefix: "manifest",
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/leases/"+leaseUUID+"/restore",
+		strings.NewReader(`{"from_lease_uuid":"`+fromLeaseUUID+`"}`))
+	request.Header.Set("Authorization", "Bearer "+testutil.CreateTestToken(kp, leaseUUID, time.Now()))
+	request.SetPathValue("lease_uuid", leaseUUID)
+	response := httptest.NewRecorder()
+
+	handlers.RestoreLease(response, request)
+
+	assert.Equal(t, http.StatusConflict, response.Code, "body: %s", response.Body.String())
+	assert.Equal(t, int32(2), reads.Load(),
+		"restore must re-read after HTTP authentication while lifecycle claims are held")
+	assert.Zero(t, backendCalls.Load(), "a target that closed in the delay must never dispatch")
+}
+
 // TestRestoreLease_NoRetention404 verifies that a 422 from the backend
 // (ErrNotRetained) is surfaced as a 404 to the caller.
 func TestRestoreLease_NoRetention404(t *testing.T) {
@@ -5946,8 +6125,7 @@ func TestRestoreLease_NoRetention404(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreRecorder: &fakeRestoreRecorder{},
-		restoreTracker:  &fakeRestoreTracker{trackResult: true},
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6022,14 +6200,11 @@ func TestRestoreLease_InsufficientResources503(t *testing.T) {
 		},
 	}
 
-	recorder := &fakeRestoreRecorder{}
-	tracker := &fakeRestoreTracker{trackResult: true}
 	h := &Handlers{
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreRecorder: recorder,
-		restoreTracker:  tracker,
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6048,11 +6223,6 @@ func TestRestoreLease_InsufficientResources503(t *testing.T) {
 	var errResp ErrorResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
 	assert.Equal(t, "insufficient resources to restore", errResp.Error)
-	assert.True(t, recorder.attemptCalled)
-	assert.False(t, recorder.clearCalled,
-		"an unvalidated HTTP 503 cannot prove that the backend refused the restore")
-	assert.True(t, tracker.untrackCalled,
-		"the durable attempt, not timeout tracking, owns the ambiguous outcome")
 }
 
 // TestRestoreLease_PendingLeaseAuthenticates verifies that requireActive=false
@@ -6118,8 +6288,7 @@ func TestRestoreLease_PendingLeaseAuthenticates(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreRecorder: &fakeRestoreRecorder{},
-		restoreTracker:  &fakeRestoreTracker{trackResult: true},
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6139,8 +6308,8 @@ func TestRestoreLease_PendingLeaseAuthenticates(t *testing.T) {
 	assert.True(t, backendCalled, "backend should have been called for a PENDING lease")
 }
 
-// TestRestoreLease_MalformedFromLease400 verifies that a syntactically invalid
-// from_lease_uuid is rejected with 400 before the backend is contacted.
+// TestRestoreLease_MalformedFromLease400 verifies that an invalid source UUID,
+// including the target itself, is rejected with 400 before backend dispatch.
 func TestRestoreLease_MalformedFromLease400(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
 	leaseUUID := testutil.ValidUUID1
@@ -6182,7 +6351,10 @@ func TestRestoreLease_MalformedFromLease400(t *testing.T) {
 		bech32Prefix:  "manifest",
 	}
 
-	invalidValues := []string{"not-a-uuid", "../etc/passwd", "short", "00000000000000000000000000000000x"}
+	invalidValues := []string{
+		"not-a-uuid", "../etc/passwd", "short", "00000000000000000000000000000000x",
+		leaseUUID,
+	}
 	for _, bad := range invalidValues {
 		t.Run(bad, func(t *testing.T) {
 			validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -6353,8 +6525,7 @@ func TestRestoreLease_RoutesToSourcePlacementBackend(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreRecorder: &fakeRestoreRecorder{},
-		restoreTracker:  &fakeRestoreTracker{trackResult: true},
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6419,6 +6590,7 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6492,6 +6664,7 @@ func TestRestoreLease_UnresolvableSourcePlacement_Returns503(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6576,661 +6749,6 @@ func TestRestoreLease_PlacementDisabled_Returns503(t *testing.T) {
 	var errResp ErrorResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
 	assert.Equal(t, errMsgServiceNotConfigured, errResp.Error)
-}
-
-// fakeRestoreRecorder captures the write-ahead placement lifecycle driven by
-// RestoreLease. Per-transition errors let tests pin fail-closed prewrites and
-// the accepted-but-unconfirmed recovery path independently.
-type fakeRestoreRecorder struct {
-	newLease, backend string
-	called            bool
-	attemptCalled     bool
-	clearCalled       bool
-	attemptErr        error
-	confirmErr        error
-	clearErr          error
-	calls             []string
-	attemptRevision   uint64
-	confirmRevision   uint64
-	clearRevision     uint64
-	currentRevision   uint64
-	zeroAttemptRev    bool
-	confirmCASMiss    bool
-	clearCASMiss      bool
-	confirmApplied    bool
-	clearApplied      bool
-	supersedingRev    atomic.Uint64
-}
-
-func (f *fakeRestoreRecorder) SetPlacementAttempting(n, b string) (uint64, error) {
-	f.attemptCalled, f.newLease, f.backend = true, n, b
-	f.calls = append(f.calls, "attempt")
-	if f.attemptErr != nil {
-		return 0, f.attemptErr
-	}
-	if f.zeroAttemptRev {
-		return 0, nil
-	}
-	if f.attemptRevision == 0 {
-		f.attemptRevision = 1
-	}
-	f.currentRevision = f.attemptRevision
-	return f.attemptRevision, nil
-}
-
-func (f *fakeRestoreRecorder) ConfirmPlacementIfRevision(n, b string, revision uint64) (bool, error) {
-	f.called, f.newLease, f.backend = true, n, b
-	f.confirmRevision = revision
-	f.calls = append(f.calls, "confirm")
-	if f.confirmErr != nil {
-		return false, f.confirmErr
-	}
-	if superseding := f.supersedingRev.Load(); superseding != 0 {
-		f.currentRevision = superseding
-	}
-	if f.confirmCASMiss || f.currentRevision != revision {
-		return false, nil
-	}
-	f.confirmApplied = true
-	f.currentRevision++
-	return true, nil
-}
-
-func (f *fakeRestoreRecorder) ClearPlacementAttemptIfRevision(n, b string, revision uint64) (bool, error) {
-	f.clearCalled, f.newLease, f.backend = true, n, b
-	f.clearRevision = revision
-	f.calls = append(f.calls, "clear")
-	if f.clearErr != nil {
-		return false, f.clearErr
-	}
-	if superseding := f.supersedingRev.Load(); superseding != 0 {
-		f.currentRevision = superseding
-	}
-	if f.clearCASMiss || f.currentRevision != revision {
-		return false, nil
-	}
-	f.clearApplied = true
-	f.currentRevision++
-	return true, nil
-}
-
-// fakeRestoreTracker records how RestoreLease drives the in-flight tracker (ENG-358).
-type fakeRestoreTracker struct {
-	trackResult       bool // what TryTrackRestoreInFlightWithGeneration returns
-	trackGeneration   uint64
-	zeroGeneration    bool
-	currentGeneration uint64
-
-	tryCalled  bool
-	tryLease   string
-	tryTenant  string
-	tryBackend string
-
-	untrackCalled     bool
-	untrackLease      string
-	untrackGeneration uint64
-	untrackApplied    bool
-	supersedingGen    atomic.Uint64
-}
-
-func (f *fakeRestoreTracker) TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool) {
-	f.tryCalled = true
-	f.tryLease, f.tryTenant, f.tryBackend = leaseUUID, tenant, backendName
-	if !f.trackResult {
-		return 0, false
-	}
-	if f.zeroGeneration {
-		return 0, true
-	}
-	if f.trackGeneration == 0 {
-		f.trackGeneration = 1
-	}
-	f.currentGeneration = f.trackGeneration
-	return f.trackGeneration, true
-}
-
-func (f *fakeRestoreTracker) UntrackInFlightIfGeneration(leaseUUID string, generation uint64) bool {
-	f.untrackCalled = true
-	f.untrackLease = leaseUUID
-	f.untrackGeneration = generation
-	if superseding := f.supersedingGen.Load(); superseding != 0 {
-		f.currentGeneration = superseding
-	}
-	if f.currentGeneration != generation {
-		return false
-	}
-	f.untrackApplied = true
-	f.currentGeneration = 0
-	return true
-}
-
-// TestRestoreLease_RecorderCalledOnSuccess verifies the target lifecycle around
-// an accepted restore: attempt before the call, then confirm. The backend name
-// must be the source-placement backend, not an arbitrary routed backend.
-func TestRestoreLease_RecorderCalledOnSuccess(t *testing.T) {
-	kp := testutil.NewTestKeyPair("test-tenant")
-	leaseUUID := testutil.ValidUUID1
-	providerUUID := testutil.ValidUUID2
-
-	chainClient := &mockChainClient{
-		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid == leaseUUID {
-				return &billingtypes.Lease{
-					Uuid:         leaseUUID,
-					Tenant:       kp.Address,
-					ProviderUuid: providerUUID,
-					State:        billingtypes.LEASE_STATE_PENDING,
-				}, nil
-			}
-			return nil, nil
-		},
-	}
-
-	// A backend named "backend-src" that accepts the restore and returns 202.
-	srcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/restore" && r.Method == "POST" {
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-		t.Errorf("unexpected request on src backend: %s %s", r.Method, r.URL.Path)
-	}))
-	defer srcServer.Close()
-
-	srcBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
-		Name:    "backend-src",
-		BaseURL: srcServer.URL,
-		Timeout: 5 * time.Second,
-	})
-	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{
-			{Backend: srcBackend, IsDefault: true},
-		},
-	})
-	require.NoError(t, err)
-
-	// Placement maps the SOURCE lease to "backend-src".
-	placement := &mockPlacementLookup{
-		getFunc: func(uuid string) string {
-			if uuid == fromLeaseUUID {
-				return "backend-src"
-			}
-			return ""
-		},
-	}
-
-	recorder := &fakeRestoreRecorder{}
-
-	h := NewHandlers(HandlersConfig{
-		Client:          chainClient,
-		BackendRouter:   router,
-		PlacementLookup: placement,
-		RestoreRecorder: recorder,
-		RestoreTracker:  &fakeRestoreTracker{trackResult: true},
-		ProviderUUID:    providerUUID,
-		Bech32Prefix:    "manifest",
-	})
-
-	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
-	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
-	req.Header.Set("Authorization", "Bearer "+validToken)
-	req.SetPathValue("lease_uuid", leaseUUID)
-
-	resp := httptest.NewRecorder()
-	h.RestoreLease(resp, req)
-
-	require.Equal(t, http.StatusAccepted, resp.Code, "body: %s", resp.Body.String())
-	assert.True(t, recorder.attemptCalled, "target attempt must be recorded before Restore")
-	assert.True(t, recorder.called, "accepted restore must confirm its placement")
-	assert.Equal(t, []string{"attempt", "confirm"}, recorder.calls)
-	assert.Equal(t, recorder.attemptRevision, recorder.confirmRevision,
-		"confirmation must be scoped to the attempt this request created")
-	assert.True(t, recorder.confirmApplied)
-	assert.Equal(t, leaseUUID, recorder.newLease, "recorder should receive the new lease UUID")
-	assert.Equal(t, "backend-src", recorder.backend, "recorder should receive the source-placement backend name")
-}
-
-// TestRestoreLease_RecorderNotCalledOnMissingSourcePlacement verifies that when
-// the source lease has no recorded placement (404, restore never reaches the
-// success path), the RestorePlacementRecorder is NOT invoked. The recorder must
-// only fire on a confirmed adopt, never on an error path (ENG-333).
-func TestRestoreLease_RecorderNotCalledOnMissingSourcePlacement(t *testing.T) {
-	kp := testutil.NewTestKeyPair("test-tenant")
-	leaseUUID := testutil.ValidUUID1
-	providerUUID := testutil.ValidUUID2
-
-	chainClient := &mockChainClient{
-		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid == leaseUUID {
-				return &billingtypes.Lease{
-					Uuid:         leaseUUID,
-					Tenant:       kp.Address,
-					ProviderUuid: providerUUID,
-					State:        billingtypes.LEASE_STATE_PENDING,
-				}, nil
-			}
-			return nil, nil
-		},
-	}
-
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("no backend should be called when placement is missing: %s %s", r.Method, r.URL.Path)
-	}))
-	defer backendServer.Close()
-
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
-		Name:    "test-backend",
-		BaseURL: backendServer.URL,
-		Timeout: 5 * time.Second,
-	})
-	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
-	})
-	require.NoError(t, err)
-
-	// placementLookup always returns "" — no recorded placement for the source lease.
-	placement := &mockPlacementLookup{
-		getFunc: func(uuid string) string { return "" },
-	}
-
-	recorder := &fakeRestoreRecorder{}
-
-	h := NewHandlers(HandlersConfig{
-		Client:          chainClient,
-		BackendRouter:   router,
-		PlacementLookup: placement,
-		RestoreRecorder: recorder,
-		ProviderUUID:    providerUUID,
-		Bech32Prefix:    "manifest",
-	})
-
-	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
-	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
-	req.Header.Set("Authorization", "Bearer "+validToken)
-	req.SetPathValue("lease_uuid", leaseUUID)
-
-	resp := httptest.NewRecorder()
-	h.RestoreLease(resp, req)
-
-	require.Equal(t, http.StatusNotFound, resp.Code, "body: %s", resp.Body.String())
-	assert.False(t, recorder.attemptCalled, "target attempt must not be written without a source placement")
-	assert.False(t, recorder.called, "target placement must not be confirmed without a restore")
-}
-
-// restoreLifecycleTestSetup builds a RestoreLease request with explicit source
-// placement, target recorder and in-flight tracker. It is the focused seam for
-// ENG-632's write-ahead transition and error-taxonomy tests.
-func restoreLifecycleTestSetup(
-	t *testing.T,
-	tracker RestoreInFlightTracker,
-	recorder RestorePlacementRecorder,
-	sourcePlacement placement.Placement,
-	backendHandler http.HandlerFunc,
-) *httptest.ResponseRecorder {
-	t.Helper()
-	kp := testutil.NewTestKeyPair("test-tenant")
-	leaseUUID := testutil.ValidUUID1
-	providerUUID := testutil.ValidUUID2
-
-	chainClient := &mockChainClient{
-		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid == leaseUUID {
-				return &billingtypes.Lease{
-					Uuid:         leaseUUID,
-					Tenant:       kp.Address,
-					ProviderUuid: providerUUID,
-					State:        billingtypes.LEASE_STATE_PENDING,
-				}, nil
-			}
-			return nil, nil
-		},
-	}
-
-	srcServer := httptest.NewServer(backendHandler)
-	t.Cleanup(srcServer.Close)
-
-	srcBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
-		Name:    "backend-src",
-		BaseURL: srcServer.URL,
-		Timeout: 5 * time.Second,
-	})
-	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: srcBackend, IsDefault: true}},
-	})
-	require.NoError(t, err)
-
-	placement := &mockPlacementLookup{
-		lookupFunc: func(uuid string) placement.Placement {
-			if uuid == fromLeaseUUID {
-				return sourcePlacement
-			}
-			return placement.Placement{}
-		},
-	}
-
-	h := NewHandlers(HandlersConfig{
-		Client:          chainClient,
-		BackendRouter:   router,
-		PlacementLookup: placement,
-		RestoreRecorder: recorder,
-		RestoreTracker:  tracker,
-		ProviderUUID:    providerUUID,
-		Bech32Prefix:    "manifest",
-	})
-
-	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
-	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
-	req.Header.Set("Authorization", "Bearer "+validToken)
-	req.SetPathValue("lease_uuid", leaseUUID)
-
-	resp := httptest.NewRecorder()
-	h.RestoreLease(resp, req)
-	return resp
-}
-
-func restoreTrackerTestSetup(t *testing.T, tracker RestoreInFlightTracker, backendHandler http.HandlerFunc) *httptest.ResponseRecorder {
-	t.Helper()
-	return restoreLifecycleTestSetup(t, tracker, &fakeRestoreRecorder{}, placement.Placement{Backend: "backend-src"}, backendHandler)
-}
-
-// TestRestoreLease_TracksRestoreInFlightOnSuccess is the API half of ENG-358: a
-// successful restore must register the NEW lease in the in-flight tracker (so its
-// provision callback is acked inline), keyed on the new lease and the SOURCE
-// backend, and must NOT untrack on the success path.
-func TestRestoreLease_TracksRestoreInFlightOnSuccess(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true}
-	resp := restoreTrackerTestSetup(t, tracker, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/restore" && r.Method == "POST" {
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
-		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusAccepted, resp.Code, "body: %s", resp.Body.String())
-	assert.True(t, tracker.tryCalled, "restore must register the new lease in-flight")
-	assert.Equal(t, testutil.ValidUUID1, tracker.tryLease, "must track the NEW lease UUID")
-	assert.Equal(t, "backend-src", tracker.tryBackend, "must track against the SOURCE backend (ENG-333)")
-	assert.NotEmpty(t, tracker.tryTenant, "must track the authenticated tenant")
-	assert.False(t, tracker.untrackCalled, "must NOT untrack on the success path")
-}
-
-// An untyped 5xx cannot prove whether the backend committed the restore before
-// answering. Keep the durable attempt (which blocks duplicates), but release the
-// synchronous tracker entry so the TimeoutChecker cannot reject an unknown result.
-func TestRestoreLease_AmbiguousBackendErrorRetainsAttemptAndUntracks(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true}
-	recorder := &fakeRestoreRecorder{}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-
-	require.NotEqual(t, http.StatusAccepted, resp.Code, "backend error must not yield 202")
-	assert.True(t, tracker.tryCalled, "restore must have registered in-flight before calling the backend")
-	assert.True(t, tracker.untrackCalled, "the durable attempt, not the timeout tracker, owns an ambiguous outcome")
-	assert.Equal(t, tracker.trackGeneration, tracker.untrackGeneration)
-	assert.True(t, tracker.untrackApplied)
-	assert.True(t, recorder.attemptCalled)
-	assert.False(t, recorder.clearCalled, "ambiguous outcome must retain the durable attempt")
-	assert.False(t, recorder.called, "an error cannot confirm placement")
-}
-
-// A typed 422/ErrNotRetained proves that the backend refused the restore. That
-// positive negative result clears the attempt and releases the tracker, unlike
-// the ambiguous 5xx case above which retains the attempt.
-func TestRestoreLease_UntracksOnNonDefaultErrorBranch(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true}
-	recorder := &fakeRestoreRecorder{}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		// 422 → backend.ErrNotRetained → the handler's first (non-default) error branch.
-		w.WriteHeader(http.StatusUnprocessableEntity)
-	})
-
-	require.Equal(t, http.StatusNotFound, resp.Code, "422/ErrNotRetained must map to 404, body: %s", resp.Body.String())
-	assert.True(t, tracker.untrackCalled, "must untrack on a non-default sync Restore() error branch too")
-	assert.Equal(t, testutil.ValidUUID1, tracker.untrackLease, "must untrack the NEW lease UUID")
-	assert.True(t, recorder.clearCalled, "a typed refusal must clear the write-ahead attempt")
-	assert.Equal(t, []string{"attempt", "clear"}, recorder.calls)
-	assert.Equal(t, recorder.attemptRevision, recorder.clearRevision)
-	assert.True(t, recorder.clearApplied)
-}
-
-// TestRestoreLease_AlreadyInFlightReturns409 verifies that when the new lease is
-// already being provisioned/restored (generation-scoped TryTrack returns false — e.g. a
-// duplicate POST or a racing reconciler fresh-provision), the handler returns 409,
-// never calls the backend, and never untracks the foreign entry.
-func TestRestoreLease_AlreadyInFlightReturns409(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: false}
-	recorder := &fakeRestoreRecorder{}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called when the lease is already in-flight: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusConflict, resp.Code, "already-in-flight restore must be 409, body: %s", resp.Body.String())
-	assert.True(t, tracker.tryCalled, "handler must have attempted to track in-flight")
-	assert.False(t, tracker.untrackCalled, "must NOT untrack a foreign in-flight entry it does not own")
-	assert.False(t, recorder.attemptCalled, "must not write an attempt for work owned by another in-flight entry")
-}
-
-func TestRestoreLease_AttemptWriteFailureFailsClosed(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true}
-	recorder := &fakeRestoreRecorder{attemptErr: errors.New("placement disk full")}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called when the target attempt cannot be persisted: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
-	assert.True(t, recorder.attemptCalled)
-	assert.False(t, recorder.called)
-	assert.False(t, recorder.clearCalled)
-	assert.True(t, tracker.untrackCalled, "failed prewrite must undo the tracker entry it created")
-	assert.Equal(t, testutil.ValidUUID1, tracker.untrackLease)
-	assert.Equal(t, tracker.trackGeneration, tracker.untrackGeneration)
-	assert.True(t, tracker.untrackApplied)
-}
-
-func TestRestoreLease_UnresolvedDurableAttemptReturns409(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true}
-	recorder := &fakeRestoreRecorder{attemptErr: provisioner.ErrProvisionAttemptPending}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called while a durable attempt is unresolved: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusConflict, resp.Code, "body: %s", resp.Body.String())
-	assert.True(t, recorder.attemptCalled)
-	assert.False(t, recorder.called)
-	assert.False(t, recorder.clearCalled)
-	assert.True(t, tracker.untrackApplied, "the request must release only its own tracker generation")
-}
-
-func TestRestoreLease_PlacementRecorderDisabledReturns503(t *testing.T) {
-	resp := restoreLifecycleTestSetup(t, nil, nil, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called without durable target placement writes: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
-}
-
-func TestRestoreLease_TrackerDisabledReturns503(t *testing.T) {
-	recorder := &fakeRestoreRecorder{}
-	resp := restoreLifecycleTestSetup(t, nil, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called when placement is enabled without causal tracker tokens: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
-	assert.False(t, recorder.attemptCalled, "tracker configuration must fail before the placement prewrite")
-}
-
-func TestRestoreLease_ZeroTrackerGenerationFailsClosed(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true, zeroGeneration: true}
-	recorder := &fakeRestoreRecorder{}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called without a valid tracker generation: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
-	assert.False(t, recorder.attemptCalled)
-	assert.True(t, tracker.untrackCalled)
-	assert.Equal(t, uint64(0), tracker.untrackGeneration)
-}
-
-func TestRestoreLease_ZeroAttemptRevisionFailsClosed(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true, trackGeneration: 17}
-	recorder := &fakeRestoreRecorder{zeroAttemptRev: true}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called without a valid placement revision: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
-	assert.True(t, recorder.attemptCalled)
-	assert.True(t, tracker.untrackApplied)
-	assert.Equal(t, uint64(17), tracker.untrackGeneration)
-}
-
-func TestRestoreLease_AcceptedConfirmFailureStillReturns202(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true}
-	recorder := &fakeRestoreRecorder{confirmErr: errors.New("placement disk full")}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, []string{"attempt"}, recorder.calls,
-			"attempt must be durable before Restore is contacted")
-		w.WriteHeader(http.StatusAccepted)
-	})
-
-	require.Equal(t, http.StatusAccepted, resp.Code, "an accepted backend operation remains 202: %s", resp.Body.String())
-	assert.Equal(t, []string{"attempt", "confirm"}, recorder.calls)
-	assert.Equal(t, recorder.attemptRevision, recorder.confirmRevision)
-	assert.False(t, recorder.clearCalled, "failed confirm must leave the attempt for reconciliation")
-	assert.False(t, tracker.untrackCalled, "accepted restore keeps its tracker entry for the callback")
-}
-
-func TestRestoreLease_AcceptedResponseCannotConfirmSupersedingPlacement(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true, trackGeneration: 31}
-	recorder := &fakeRestoreRecorder{attemptRevision: 7}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		// Simulate a fast callback or inventory sync replacing the attempt while
-		// this HTTP request was in flight.
-		recorder.supersedingRev.Store(8)
-		w.WriteHeader(http.StatusAccepted)
-	})
-
-	require.Equal(t, http.StatusAccepted, resp.Code, "body: %s", resp.Body.String())
-	assert.Equal(t, uint64(7), recorder.confirmRevision)
-	assert.False(t, recorder.confirmApplied, "an old 202 must not confirm revision 8")
-	assert.Equal(t, uint64(8), recorder.currentRevision)
-}
-
-func TestRestoreLease_DefinitiveRefusalCannotClearSupersedingPlacement(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true, trackGeneration: 31}
-	recorder := &fakeRestoreRecorder{attemptRevision: 7}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		recorder.supersedingRev.Store(8)
-		w.WriteHeader(http.StatusUnprocessableEntity) // ErrNotRetained: definitive refusal.
-	})
-
-	require.Equal(t, http.StatusNotFound, resp.Code, "body: %s", resp.Body.String())
-	assert.Equal(t, uint64(7), recorder.clearRevision)
-	assert.False(t, recorder.clearApplied, "an old refusal must not clear revision 8")
-	assert.Equal(t, uint64(8), recorder.currentRevision)
-}
-
-func TestRestoreLease_OldResponseCannotUntrackNewerOperation(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true, trackGeneration: 41}
-	recorder := &fakeRestoreRecorder{attemptRevision: 7}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		// A fast callback removed generation 41 and generation 42 began before
-		// the older HTTP response returned.
-		tracker.supersedingGen.Store(42)
-		w.WriteHeader(http.StatusInternalServerError) // ambiguous: retain attempt.
-	})
-
-	require.Equal(t, http.StatusInternalServerError, resp.Code, "body: %s", resp.Body.String())
-	assert.True(t, tracker.untrackCalled)
-	assert.Equal(t, uint64(41), tracker.untrackGeneration)
-	assert.False(t, tracker.untrackApplied, "generation 41 must not remove generation 42")
-	assert.Equal(t, uint64(42), tracker.currentGeneration)
-	assert.False(t, recorder.clearCalled, "ambiguous result still retains its attempt")
-}
-
-func TestRestoreLease_AlreadyProvisionedConfirmsOwnership(t *testing.T) {
-	tracker := &fakeRestoreTracker{trackResult: true}
-	recorder := &fakeRestoreRecorder{}
-	resp := restoreLifecycleTestSetup(t, tracker, recorder, placement.Placement{Backend: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		_, _ = io.WriteString(w, `{"error":"target already exists","code":"`+backend.CodeAlreadyProvisioned+`"}`)
-	})
-
-	require.Equal(t, http.StatusConflict, resp.Code, "body: %s", resp.Body.String())
-	assert.Equal(t, []string{"attempt", "confirm"}, recorder.calls,
-		"already-provisioned is positive ownership evidence, not a refusal to clear")
-	assert.Equal(t, recorder.attemptRevision, recorder.confirmRevision)
-	assert.True(t, recorder.confirmApplied)
-	assert.False(t, recorder.clearCalled)
-	assert.True(t, tracker.untrackCalled, "this request accepted no new async work, so no callback is expected")
-}
-
-func TestRestoreLease_AttemptOnlySourceReturns503(t *testing.T) {
-	recorder := &fakeRestoreRecorder{}
-	resp := restoreLifecycleTestSetup(t, nil, recorder, placement.Placement{Attempt: "backend-src"}, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called for an unresolved source attempt: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
-	assert.False(t, recorder.attemptCalled, "source ambiguity must be resolved before writing the target")
-}
-
-func TestRestoreLease_ConfirmedSourceWithUnresolvedAttemptReturns503(t *testing.T) {
-	recorder := &fakeRestoreRecorder{}
-	source := placement.Placement{Backend: "backend-src", Attempt: "backend-other"}
-	resp := restoreLifecycleTestSetup(t, nil, recorder, source, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called while the source has two possible owners: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
-	assert.False(t, recorder.attemptCalled)
-}
-
-func TestRestoreLease_UnusableSourceReturns503(t *testing.T) {
-	recorder := &fakeRestoreRecorder{}
-	// The store represents a decoded-but-unusable record as empty ownership
-	// fields with record metadata. It must never collapse to ordinary absence.
-	unusable := placement.Placement{SetAt: time.Unix(1, 0)}
-	resp := restoreLifecycleTestSetup(t, nil, recorder, unusable, func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("backend must not be called for an unusable source record: %s %s", r.Method, r.URL.Path)
-	})
-
-	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
-	assert.False(t, recorder.attemptCalled)
-}
-
-func TestRestoreWasDefinitelyRefused(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"not retained", backend.ErrNotRetained, true},
-		{"invalid state", backend.ErrInvalidState, true},
-		{"already provisioned is positive ownership", backend.ErrAlreadyProvisioned, false},
-		{"unvalidated insufficient resources response", backend.ErrInsufficientResources, false},
-		{"circuit open", backend.ErrCircuitOpen, true},
-		{"demote exceeds tier", backend.ErrDemoteDataExceedsTier, true},
-		{"validation", backend.ErrValidation, true},
-		{"well formed refusal", backend.ErrRestoreRefused, true},
-		{"wrapped unvalidated 503", fmt.Errorf("restore: %w", backend.ErrInsufficientResources), false},
-		{"malformed response is ambiguous", backend.ErrMalformedErrorBody, false},
-		{"deadline is ambiguous", context.DeadlineExceeded, false},
-		{"generic 5xx is ambiguous", errors.New("restore failed with status 500"), false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tc.want, restoreWasDefinitelyRefused(tc.err))
-		})
-	}
 }
 
 // --- ENG-361: restore-route security gates (pre-mainnet) -------------------
@@ -7437,8 +6955,7 @@ func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreRecorder: &fakeRestoreRecorder{},
-		restoreTracker:  &fakeRestoreTracker{trackResult: true},
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -7529,8 +7046,7 @@ func TestRestoreLease_DemoteExceedsTier422(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreRecorder: &fakeRestoreRecorder{},
-		restoreTracker:  &fakeRestoreTracker{trackResult: true},
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -7626,8 +7142,7 @@ func TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 				client:          chainClient,
 				backendRouter:   router,
 				placementLookup: placement,
-				restoreRecorder: &fakeRestoreRecorder{},
-				restoreTracker:  &fakeRestoreTracker{trackResult: true},
+				restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
 				providerUUID:    providerUUID,
 				bech32Prefix:    "manifest",
 			}
@@ -7794,20 +7309,20 @@ func TestRestoreLease_422KeepsLoadtestContract(t *testing.T) {
 				Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
 			})
 			require.NoError(t, rerr)
+			placement := &mockPlacementLookup{getFunc: func(uuid string) string {
+				if uuid == fromLeaseUUID {
+					return "loadtest-contract"
+				}
+				return ""
+			}}
 
 			h := &Handlers{
 				client:          chainClient,
 				backendRouter:   router,
-				restoreRecorder: &fakeRestoreRecorder{},
-				restoreTracker:  &fakeRestoreTracker{trackResult: true},
-				placementLookup: &mockPlacementLookup{getFunc: func(uuid string) string {
-					if uuid == fromLeaseUUID {
-						return "loadtest-contract"
-					}
-					return ""
-				}},
-				providerUUID: providerUUID,
-				bech32Prefix: "manifest",
+				placementLookup: placement,
+				restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+				providerUUID:    providerUUID,
+				bech32Prefix:    "manifest",
 			}
 
 			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore",
@@ -7954,20 +7469,20 @@ func TestRestoreLease_UnrecognizedBackendCodeRelays422(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
 	})
 	require.NoError(t, err)
+	placement := &mockPlacementLookup{getFunc: func(uuid string) string {
+		if uuid == fromLeaseUUID {
+			return "unknown-code"
+		}
+		return ""
+	}}
 
 	h := &Handlers{
 		client:          chainClient,
 		backendRouter:   router,
-		restoreRecorder: &fakeRestoreRecorder{},
-		restoreTracker:  &fakeRestoreTracker{trackResult: true},
-		placementLookup: &mockPlacementLookup{getFunc: func(uuid string) string {
-			if uuid == fromLeaseUUID {
-				return "unknown-code"
-			}
-			return ""
-		}},
-		providerUUID: providerUUID,
-		bech32Prefix: "manifest",
+		placementLookup: placement,
+		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		providerUUID:    providerUUID,
+		bech32Prefix:    "manifest",
 	}
 
 	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore",

@@ -6,7 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +23,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
@@ -27,6 +31,15 @@ import (
 // noopAck is a no-op acknowledger for tests that don't exercise the ack path.
 // The zero-value mockAcknowledger returns (true, "tx-hash", nil) by default.
 var noopAck = &mockAcknowledger{}
+
+type typedTestReconcilerRuntime struct {
+	*mockInFlightTracker
+	operations ReconcilerOperations
+}
+
+func (runtime *typedTestReconcilerRuntime) ReconcilerOperations() ReconcilerOperations {
+	return runtime.operations
+}
 
 type blockingClearPlacementStore struct {
 	PlacementStore
@@ -96,6 +109,39 @@ type mutateAfterSnapshotListStore struct {
 	mutateNextList bool
 	mutationDone   bool
 	mutationErr    error
+}
+
+// failNextBatchPlacementStore injects a one-shot failure at the exact durable
+// boundary used to project positive fleet observations. Other placement writes
+// continue to use the embedded store so tests can distinguish a projection
+// failure from an entirely unavailable placement database.
+type failNextBatchPlacementStore struct {
+	PlacementStore
+	mu      sync.Mutex
+	failErr error
+}
+
+func (s *failNextBatchPlacementStore) SetBatchIfNotNewer(
+	placements map[string]string,
+	maxRevision uint64,
+) (map[string]uint64, map[string]struct{}, error) {
+	s.mu.Lock()
+	err := s.failErr
+	s.failErr = nil
+	s.mu.Unlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	return s.PlacementStore.SetBatchIfNotNewer(placements, maxRevision)
+}
+
+type retentionErrorReconcilerBackend struct {
+	*mockReconcilerBackend
+	err error
+}
+
+func (b *retentionErrorReconcilerBackend) ListRetentions(context.Context) ([]backend.RetainedLease, error) {
+	return nil, b.err
 }
 
 func (s *mutateAfterSnapshotListStore) SetBatchIfNotNewer(
@@ -326,7 +372,7 @@ func TestNewReconciler_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewReconciler(tt.cfg, tt.chainClient, tt.ack, tt.router, nil, nil)
+			_, err := newReconciler(tt.cfg, tt.chainClient, tt.ack, tt.router, nil, nil)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
@@ -344,11 +390,119 @@ func TestNewReconciler_PlacementRequiresSharedTracker(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = NewReconciler(
+	_, err = newReconciler(
 		ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
 		&chaintest.MockClient{}, noopAck, router, nil, &mockPlacementStore{},
 	)
 	require.EqualError(t, err, "in-flight tracker is required when placement store is enabled")
+}
+
+func TestNewReconciler_RequiresTypedAuthorities(t *testing.T) {
+	backendClient := &mockReconcilerBackend{name: "backend-a"}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	store, err := placement.NewStore(t.TempDir() + "/placements.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil),
+		operations:          operation.NewRegistry(),
+	}
+	cfg := ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"}
+	chainClient := &chaintest.MockClient{}
+
+	reconciler, err := NewReconciler(cfg, chainClient, noopAck, router, runtime, store)
+	require.NoError(t, err)
+	require.Same(t, runtime.operations, reconciler.operations)
+	require.Same(t, store, reconciler.placementAuthority)
+	require.Same(t, store, reconciler.placementView)
+	require.Nil(t, reconciler.legacyPlacement,
+		"production construction must not retain raw placement mutation")
+	require.Nil(t, reconciler.tracker, "production construction must not retain the raw tracker surface")
+
+	_, err = NewReconciler(cfg, chainClient, noopAck, router, nil, store)
+	require.EqualError(t, err, "reconciler runtime is required")
+
+	var typedNilRuntime *typedTestReconcilerRuntime
+	_, err = NewReconciler(cfg, chainClient, noopAck, router, typedNilRuntime, store)
+	require.EqualError(t, err, "reconciler runtime is required")
+
+	_, err = NewReconciler(cfg, chainClient, noopAck, router, runtime, nil)
+	require.EqualError(t, err, "placement authority store is required")
+
+	var typedNilStore *placement.Store
+	_, err = NewReconciler(cfg, chainClient, noopAck, router, runtime, typedNilStore)
+	require.EqualError(t, err, "placement authority store is required")
+
+	runtimeWithoutOperations := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil),
+	}
+	_, err = NewReconciler(cfg, chainClient, noopAck, router, runtimeWithoutOperations, store)
+	require.EqualError(t, err, "reconciler operations are required")
+}
+
+func TestReconciler_ChainCollectionFailurePreservesDurableTopologyBaseline(t *testing.T) {
+	backendClient := &mockReconcilerBackend{name: "backend-a"}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	store, err := placement.NewStore(t.TempDir() + "/placements.db")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil),
+		operations:          operation.NewRegistry(),
+	}
+
+	var pendingErr error
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return nil, pendingErr
+		},
+	}
+	reconciler, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
+		chainClient, noopAck, router, runtime, store,
+	)
+	require.NoError(t, err)
+
+	// A complete projection establishes durable topology-bound admission.
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+	baseline := store.CurrentAdmissionBaseline()
+	require.True(t, baseline.Valid())
+	scope, err := store.ScopeAdmission(baseline, backendTopologyNames(router))
+	require.NoError(t, err)
+	operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174000")
+	require.NoError(t, err)
+	attempt, applied, err := store.BeginNewAttempt(
+		scope, "probe-before-error", "backend-a", operationID,
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	cleared, err := store.RefuseAttempt(attempt)
+	require.NoError(t, err)
+	require.True(t, cleared)
+
+	// A failed later collection authorizes no actions from that failed sweep, but
+	// it must not erase the previously committed topology fact. Event admission
+	// and a later partial sweep can still safely use that baseline.
+	pendingErr = errors.New("chain list unavailable")
+	require.ErrorIs(t, reconciler.ReconcileAll(t.Context()), pendingErr)
+	assert.True(t, store.CurrentAdmissionBaseline().Valid())
+	attempt, applied, err = store.BeginNewAttempt(
+		scope, "probe-after-error", "backend-a", operationID,
+	)
+	require.NoError(t, err)
+	require.True(t, applied)
+	_, err = store.RefuseAttempt(attempt)
+	require.NoError(t, err)
+	require.Zero(t, promtestutil.ToFloat64(metrics.ReconcilerSweepComplete))
 }
 
 // TestHandleProvisionError_AlreadyProvisionedAmbiguous verifies that an
@@ -360,7 +514,7 @@ func TestHandleProvisionError_AlreadyProvisionedAmbiguous(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	r, err := NewReconciler(
+	r, err := newReconciler(
 		ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 		mockChain, noopAck, router, nil, nil,
 	)
@@ -421,7 +575,7 @@ func TestHandleProvisionError_MalformedErrorBodyIsTransient(t *testing.T) {
 			router, _ := backend.NewRouter(backend.RouterConfig{
 				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 			})
-			r, err := NewReconciler(
+			r, err := newReconciler(
 				ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 				mockChain, noopAck, router, nil, nil,
 			)
@@ -464,7 +618,7 @@ func TestHandleProvisionError_CircuitOpenIsTransient(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	r, err := NewReconciler(
+	r, err := newReconciler(
 		ReconcilerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
 		mockChain, noopAck, router, nil, nil,
 	)
@@ -504,7 +658,7 @@ func TestReconciler_ReconcileAll_PendingNotProvisioned(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -551,7 +705,7 @@ func TestReconciler_ReconcileAll_PendingProvisionedReady(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, nil, nil)
@@ -602,7 +756,7 @@ func TestReconciler_SkipsInFlightReadyLease(t *testing.T) {
 	mockTracker := newMockInFlightTracker(nil)
 	mockTracker.TrackInFlight("lease-1", "tenant-1", nil, "test")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, mockTracker, nil)
@@ -652,7 +806,7 @@ func TestReconciler_AcksNotInFlightReadyLease(t *testing.T) {
 
 	mockTracker := newMockInFlightTracker(nil) // empty — lease is NOT in-flight
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, mockTracker, nil)
@@ -697,12 +851,12 @@ func TestReconciler_InFlightFailedLeaseDefersUntilOperationSettles(t *testing.T)
 	})
 
 	mockTracker := newMockInFlightTracker(nil)
-	generation, tracked := mockTracker.TryTrackInFlightWithGeneration(
+	generation, tracked := mockTracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-1", nil, "test",
 	)
 	require.True(t, tracked)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, mockTracker, nil)
@@ -716,7 +870,7 @@ func TestReconciler_InFlightFailedLeaseDefersUntilOperationSettles(t *testing.T)
 		"a Failed row must not reject while a possibly newer operation is still in flight")
 	mu.Unlock()
 
-	require.True(t, mockTracker.UntrackInFlightIfGeneration("lease-1", generation))
+	require.True(t, mockTracker.UntrackInFlightIfOperationID("lease-1", generation))
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
 
 	mu.Lock()
@@ -743,7 +897,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisioned(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -787,7 +941,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -837,7 +991,7 @@ func TestReconciler_ReconcileAll_ActiveProvisioned_CallsReconcileCustomDomain(t 
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -879,7 +1033,7 @@ func TestReconciler_ReconcileAll_ReconcileCustomDomainErrorDoesNotAbortTick(t *t
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -913,7 +1067,7 @@ func TestReconciler_ReconcileAll_OrphanProvision(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -954,7 +1108,7 @@ func TestReconciler_ReconcileAll_SkipsInFlightOrphan(t *testing.T) {
 	mockTracker := newMockInFlightTracker(nil)
 	mockTracker.TrackInFlight("inflight-orphan", "tenant-1", nil, "test")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, mockTracker, nil)
@@ -969,6 +1123,44 @@ func TestReconciler_ReconcileAll_SkipsInFlightOrphan(t *testing.T) {
 	assert.Equal(t, []string{"real-orphan"}, mockBackend.deprovisionCalls,
 		"in-flight lease must be skipped; only the genuine orphan is deprovisioned")
 	assert.Equal(t, 1.0, after-before, "orphan in-flight skip must increment ReconcilerInflightSkipsTotal")
+}
+
+func TestReconciler_ProcessOrphan_TypedLeaseClaimFencesInventoryBoundary(t *testing.T) {
+	mockBackend := &mockReconcilerBackend{name: "backend-a"}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	operations := operation.NewRegistry()
+	inventoryBoundary := operations.Snapshot()
+	eventClaim := operations.TryClaimLeaseNow("orphan-lease")
+	require.True(t, eventClaim.Acquired())
+
+	r := &Reconciler{
+		providerUUID:  "provider-1",
+		chainClient:   &chaintest.MockClient{GetLeaseFunc: chaintest.ClosedLeaseFunc("provider-1")},
+		backendRouter: router,
+		operations:    operations,
+	}
+	info := backend.ProvisionInfo{
+		LeaseUUID: "orphan-lease", ProviderUUID: "provider-1", BackendName: "backend-a",
+	}
+	var orphans, leaseErrors atomic.Int32
+	r.processOrphan(t.Context(), "orphan-lease", info, inventoryBoundary, 0, &orphans, &leaseErrors)
+	assert.Empty(t, mockBackend.deprovisionCalls,
+		"a lifecycle claim acquired after inventory must fence orphan teardown")
+
+	require.True(t, operations.ReleaseLease(eventClaim.Claim()))
+	r.processOrphan(t.Context(), "orphan-lease", info, inventoryBoundary, 0, &orphans, &leaseErrors)
+	assert.Empty(t, mockBackend.deprovisionCalls,
+		"a completed lifecycle action must remain visible to the old boundary")
+
+	r.processOrphan(t.Context(), "orphan-lease", info, operations.Snapshot(), 0, &orphans, &leaseErrors)
+	assert.Equal(t, []string{"orphan-lease"}, mockBackend.deprovisionCalls,
+		"a claim-free inventory boundary may perform the proven teardown")
+	assert.Equal(t, int32(1), orphans.Load())
+	assert.Zero(t, leaseErrors.Load())
 }
 
 func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
@@ -1011,7 +1203,7 @@ func TestReconciler_ReconcileAll_ChainErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mockChain := tt.setup()
 
-			reconciler, err := NewReconciler(ReconcilerConfig{
+			reconciler, err := newReconciler(ReconcilerConfig{
 				ProviderUUID:    "provider-1",
 				CallbackBaseURL: "http://localhost:8080",
 			}, mockChain, noopAck, router, nil, nil)
@@ -1039,7 +1231,7 @@ func TestReconciler_ReconcileAll_ContextCancellation(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1061,7 +1253,7 @@ func TestReconciler_Start_ContextCancellation(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		Interval:        100 * time.Millisecond, // Short interval for test
@@ -1097,7 +1289,7 @@ func TestReconciler_DefaultInterval(t *testing.T) {
 	})
 
 	// Create with no interval specified
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// Interval not set
@@ -1125,7 +1317,7 @@ func TestReconciler_RunOnce(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1158,13 +1350,13 @@ func TestReconciler_ReconcileAll_SkipsInFlightLeases(t *testing.T) {
 	})
 
 	// Create a manager and mark the lease as in-flight
-	manager, _ := NewManager(ManagerConfig{
+	manager, _ := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, &chaintest.MockClient{})
 	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, manager, nil)
@@ -1203,7 +1395,7 @@ func TestReconciler_MultipleBackends(t *testing.T) {
 		},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1254,7 +1446,7 @@ func TestReconciler_ReconcileAll_PendingProvisioning(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1309,7 +1501,7 @@ func TestReconciler_ReconcileAll_PendingFailed(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1365,7 +1557,7 @@ func TestReconciler_ReconcileAll_AcknowledgeFailure(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, failingAck, router, nil, nil)
@@ -1398,7 +1590,7 @@ func TestReconciler_ReconcileAll_DeprovisionFailure(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1440,7 +1632,7 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1490,13 +1682,13 @@ func TestReconciler_ConcurrentProvisioningRace(t *testing.T) {
 	})
 
 	// Create manager (shared between reconciler and simulated event handler)
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, &chaintest.MockClient{})
 	require.NoError(t, err)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, manager, nil)
@@ -1584,7 +1776,7 @@ func TestReconciler_ConcurrentReconciliation_NonBlocking(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1660,7 +1852,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringLoop(t *testing.T) {
 	})
 
 	// Use MaxWorkers=1 to ensure sequential processing for this cancellation test
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
@@ -1716,7 +1908,7 @@ func TestReconciler_ReconcileAll_ContextCancelledDuringOrphanLoop(t *testing.T) 
 	})
 
 	// Use MaxWorkers=1 to ensure sequential processing for this cancellation test
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      1,
@@ -1854,7 +2046,7 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 		},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -1899,7 +2091,7 @@ func TestReconciler_MaxWorkers_Default(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// MaxWorkers not set - should use default
@@ -1918,7 +2110,7 @@ func TestReconciler_MaxWorkers_Custom(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5,
@@ -1977,7 +2169,7 @@ func TestReconciler_ParallelProcessing(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      5, // Limit to 5 concurrent workers
@@ -2048,7 +2240,7 @@ func TestReconciler_ParallelOrphanProcessing(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		MaxWorkers:      4, // Limit to 4 concurrent workers
@@ -2149,7 +2341,7 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 		},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2263,6 +2455,14 @@ type mockInFlightTracker struct {
 	hasPayloadFunc       func(leaseUUID string) (bool, error) // optional override
 }
 
+func mockOperationID(sequence uint64) operation.OperationID {
+	id, err := operation.ParseID(fmt.Sprintf("00000000-0000-4000-8000-%012x", sequence))
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
 func newMockInFlightTracker(payloadStore *payload.Store) *mockInFlightTracker {
 	return &mockInFlightTracker{
 		payloadStore:    payloadStore,
@@ -2273,58 +2473,60 @@ func newMockInFlightTracker(payloadStore *payload.Store) *mockInFlightTracker {
 }
 
 func (m *mockInFlightTracker) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	_, ok := m.TryTrackInFlightWithGeneration(leaseUUID, tenant, items, backendName)
+	_, ok := m.TryTrackInFlightWithOperationID(leaseUUID, tenant, items, backendName)
 	return ok
 }
 
-func (m *mockInFlightTracker) TryTrackInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool) {
+func (m *mockInFlightTracker) TryTrackInFlightWithOperationID(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (operation.OperationID, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, claimed := m.reconcileClaims[leaseUUID]; claimed {
-		return 0, false
+		return operation.OperationID{}, false
 	}
 	if _, exists := m.inFlight[leaseUUID]; exists {
-		return 0, false
+		return operation.OperationID{}, false
 	}
 	m.nextGeneration++
+	operationID := mockOperationID(m.nextGeneration)
 	m.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID:  leaseUUID,
-		Tenant:     tenant,
-		Items:      items,
-		Backend:    backendName,
-		Generation: m.nextGeneration,
+		LeaseUUID:   leaseUUID,
+		Tenant:      tenant,
+		Items:       items,
+		Backend:     backendName,
+		OperationID: operationID,
 	}
 	m.markMutationLocked(leaseUUID)
-	return m.nextGeneration, true
+	return operationID, true
 }
 
-func (m *mockInFlightTracker) TryTrackInFlightWithGenerationIfNotNewer(
+func (m *mockInFlightTracker) TryTrackInFlightWithOperationIDIfNotNewer(
 	leaseUUID, tenant string,
 	items []backend.LeaseItem,
 	backendName string,
 	maxRevision uint64,
-) (uint64, bool, bool) {
+) (operation.OperationID, bool, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lastMutation[leaseUUID] > maxRevision {
-		return 0, false, true
+		return operation.OperationID{}, false, true
 	}
 	if _, claimed := m.reconcileClaims[leaseUUID]; !claimed {
-		return 0, false, false
+		return operation.OperationID{}, false, false
 	}
 	if _, exists := m.inFlight[leaseUUID]; exists {
-		return 0, false, false
+		return operation.OperationID{}, false, false
 	}
 	m.nextGeneration++
+	operationID := mockOperationID(m.nextGeneration)
 	m.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID:  leaseUUID,
-		Tenant:     tenant,
-		Items:      items,
-		Backend:    backendName,
-		Generation: m.nextGeneration,
+		LeaseUUID:   leaseUUID,
+		Tenant:      tenant,
+		Items:       items,
+		Backend:     backendName,
+		OperationID: operationID,
 	}
 	m.markMutationLocked(leaseUUID)
-	return m.nextGeneration, true, false
+	return operationID, true, false
 }
 
 func (m *mockInFlightTracker) TryClaimLeaseActionIfNotNewer(
@@ -2389,30 +2591,31 @@ func (m *mockInFlightTracker) markMutationLocked(leaseUUID string) {
 }
 
 func (m *mockInFlightTracker) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	_, ok := m.TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant, items, backendName)
+	_, ok := m.TryTrackRestoreInFlightWithOperationID(leaseUUID, tenant, items, backendName)
 	return ok
 }
 
-func (m *mockInFlightTracker) TryTrackRestoreInFlightWithGeneration(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (uint64, bool) {
+func (m *mockInFlightTracker) TryTrackRestoreInFlightWithOperationID(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) (operation.OperationID, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, claimed := m.reconcileClaims[leaseUUID]; claimed {
-		return 0, false
+		return operation.OperationID{}, false
 	}
 	if _, exists := m.inFlight[leaseUUID]; exists {
-		return 0, false
+		return operation.OperationID{}, false
 	}
 	m.nextGeneration++
+	operationID := mockOperationID(m.nextGeneration)
 	m.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID:  leaseUUID,
-		Tenant:     tenant,
-		Items:      items,
-		Backend:    backendName,
-		Generation: m.nextGeneration,
-		Kind:       KindRestore,
+		LeaseUUID:   leaseUUID,
+		Tenant:      tenant,
+		Items:       items,
+		Backend:     backendName,
+		OperationID: operationID,
+		Kind:        KindRestore,
 	}
 	m.markMutationLocked(leaseUUID)
-	return m.nextGeneration, true
+	return operationID, true
 }
 
 func (m *mockInFlightTracker) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
@@ -2425,12 +2628,13 @@ func (m *mockInFlightTracker) TrackInFlight(leaseUUID, tenant string, items []ba
 		return
 	}
 	m.nextGeneration++
+	operationID := mockOperationID(m.nextGeneration)
 	m.inFlight[leaseUUID] = InFlightProvision{
-		LeaseUUID:  leaseUUID,
-		Tenant:     tenant,
-		Items:      items,
-		Backend:    backendName,
-		Generation: m.nextGeneration,
+		LeaseUUID:   leaseUUID,
+		Tenant:      tenant,
+		Items:       items,
+		Backend:     backendName,
+		OperationID: operationID,
 	}
 	m.markMutationLocked(leaseUUID)
 }
@@ -2444,11 +2648,11 @@ func (m *mockInFlightTracker) UntrackInFlight(leaseUUID string) {
 	}
 }
 
-func (m *mockInFlightTracker) UntrackInFlightIfGeneration(leaseUUID string, generation uint64) bool {
+func (m *mockInFlightTracker) UntrackInFlightIfOperationID(leaseUUID string, generation operation.OperationID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, exists := m.inFlight[leaseUUID]
-	if !exists || p.Generation != generation || p.settlementClaimed {
+	if !exists || p.OperationID != generation || p.settlementClaimed {
 		return false
 	}
 	delete(m.inFlight, leaseUUID)
@@ -2456,26 +2660,26 @@ func (m *mockInFlightTracker) UntrackInFlightIfGeneration(leaseUUID string, gene
 	return true
 }
 
-func (m *mockInFlightTracker) TryClaimInFlight(leaseUUID string, generation uint64) (InFlightProvision, bool) {
+func (m *mockInFlightTracker) TryClaimInFlight(leaseUUID string, generation operation.OperationID) (InFlightProvision, bool) {
 	return m.tryClaimInFlight(leaseUUID, generation, inFlightSettlementTerminal)
 }
 
 func (m *mockInFlightTracker) TryClaimInFlightForDeprovision(
 	leaseUUID string,
-	generation uint64,
+	generation operation.OperationID,
 ) (InFlightProvision, bool) {
 	return m.tryClaimInFlight(leaseUUID, generation, inFlightSettlementDeprovision)
 }
 
 func (m *mockInFlightTracker) tryClaimInFlight(
 	leaseUUID string,
-	generation uint64,
+	generation operation.OperationID,
 	owner inFlightSettlementOwner,
 ) (InFlightProvision, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, exists := m.inFlight[leaseUUID]
-	if !exists || p.Generation != generation || p.settlementClaimed {
+	if !exists || p.OperationID != generation || p.settlementClaimed {
 		return InFlightProvision{}, false
 	}
 	p.settlementClaimed = true
@@ -2484,11 +2688,11 @@ func (m *mockInFlightTracker) tryClaimInFlight(
 	return p, true
 }
 
-func (m *mockInFlightTracker) ReleaseInFlightClaim(leaseUUID string, generation uint64) bool {
+func (m *mockInFlightTracker) ReleaseInFlightClaim(leaseUUID string, generation operation.OperationID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, exists := m.inFlight[leaseUUID]
-	if !exists || p.Generation != generation || !p.settlementClaimed {
+	if !exists || p.OperationID != generation || !p.settlementClaimed {
 		return false
 	}
 	p.settlementClaimed = false
@@ -2497,11 +2701,11 @@ func (m *mockInFlightTracker) ReleaseInFlightClaim(leaseUUID string, generation 
 	return true
 }
 
-func (m *mockInFlightTracker) FinishClaimedInFlight(leaseUUID string, generation uint64) bool {
+func (m *mockInFlightTracker) FinishClaimedInFlight(leaseUUID string, generation operation.OperationID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, exists := m.inFlight[leaseUUID]
-	if !exists || p.Generation != generation || !p.settlementClaimed {
+	if !exists || p.OperationID != generation || !p.settlementClaimed {
 		return false
 	}
 	delete(m.inFlight, leaseUUID)
@@ -2639,7 +2843,7 @@ func TestReconciler_CleansUpOrphanedPayloads(t *testing.T) {
 
 	mockTracker := newMockInFlightTracker(payloadStore)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, mockTracker, nil)
@@ -2709,7 +2913,7 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2783,7 +2987,7 @@ func TestReconciler_ReconcileAll_UnresolvablePlacement_RefusesWithoutTerminating
 	ps := &mockPlacementStore{}
 	require.NoError(t, ps.Set("lease-1", "removed-backend"))
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -2838,7 +3042,7 @@ func TestReconciler_ReconcileAll_ActiveFailedBelowMax(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -2885,7 +3089,7 @@ func TestReconciler_ConcurrentReconcileAll(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080/callbacks",
 		MaxWorkers:      2,
@@ -2966,7 +3170,7 @@ func TestReconciler_ReconcileAll_PendingValidationError_Rejects(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -3008,7 +3212,7 @@ func TestReconciler_ReconcileAll_PreflightFailureKeepsLeaseFencedThroughRejectio
 	})
 	require.NoError(t, err)
 	tracker := newMockInFlightTracker(nil)
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -3026,7 +3230,7 @@ func TestReconciler_ReconcileAll_PreflightFailureKeepsLeaseFencedThroughRejectio
 	// doStartProvisioning has removed its failed in-flight entry by this point.
 	// The worker's lease-action claim must remain, otherwise an event/restore or
 	// close can enter between that cleanup and the terminal chain transaction.
-	_, eventTracked := tracker.TryTrackInFlightWithGeneration(
+	_, eventTracked := tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-racer", nil, "test",
 	)
 	close(allowReject)
@@ -3034,12 +3238,12 @@ func TestReconciler_ReconcileAll_PreflightFailureKeepsLeaseFencedThroughRejectio
 	if eventTracked {
 		current, exists := tracker.GetInFlight("lease-1")
 		if exists {
-			tracker.UntrackInFlightIfGeneration("lease-1", current.Generation)
+			tracker.UntrackInFlightIfOperationID("lease-1", current.OperationID)
 		}
 	}
 	assert.False(t, eventTracked, "the worker must retain its action fence through rejection")
 
-	_, eventTracked = tracker.TryTrackInFlightWithGeneration(
+	_, eventTracked = tracker.TryTrackInFlightWithOperationID(
 		"lease-1", "tenant-after", nil, "test",
 	)
 	assert.True(t, eventTracked, "the action fence must be released after the worker finishes")
@@ -3075,7 +3279,7 @@ func TestReconciler_ReconcileAll_PendingCircuitOpen_Retries(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -3139,7 +3343,7 @@ func TestReconciler_ReconcileAll_PendingWithPayloadValidationError_Rejects(t *te
 
 	mockTracker := newMockInFlightTracker(payloadStore)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, mockTracker, nil)
@@ -3186,7 +3390,7 @@ func TestReconciler_ReconcileAll_ActiveNotProvisionedValidationError_Closes(t *t
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -3240,7 +3444,7 @@ func TestReconciler_ReconcileAll_ActiveFailedValidationError_Closes(t *testing.T
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -3282,7 +3486,7 @@ func TestReconciler_PlacementSweepTrustRequiresSuccessfulSync(t *testing.T) {
 
 	t.Run("successful empty sync arms latch", func(t *testing.T) {
 		chainClient, router := newDependencies(t)
-		r, err := NewReconciler(ReconcilerConfig{
+		r, err := newReconciler(ReconcilerConfig{
 			ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 		}, chainClient, noopAck, router, newMockInFlightTracker(nil), &mockPlacementStore{})
 		require.NoError(t, err)
@@ -3293,7 +3497,7 @@ func TestReconciler_PlacementSweepTrustRequiresSuccessfulSync(t *testing.T) {
 
 	t.Run("failed empty sync does not arm latch", func(t *testing.T) {
 		chainClient, router := newDependencies(t)
-		r, err := NewReconciler(ReconcilerConfig{
+		r, err := newReconciler(ReconcilerConfig{
 			ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 		}, chainClient, noopAck, router, newMockInFlightTracker(nil), &errorPlacementStore{setErr: errors.New("disk full")})
 		require.NoError(t, err)
@@ -3305,7 +3509,7 @@ func TestReconciler_PlacementSweepTrustRequiresSuccessfulSync(t *testing.T) {
 	t.Run("later write failure disarms an earlier trust proof", func(t *testing.T) {
 		chainClient, router := newDependencies(t)
 		store := &errorPlacementStore{}
-		r, err := NewReconciler(ReconcilerConfig{
+		r, err := newReconciler(ReconcilerConfig{
 			ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 		}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
 		require.NoError(t, err)
@@ -3320,7 +3524,7 @@ func TestReconciler_PlacementSweepTrustRequiresSuccessfulSync(t *testing.T) {
 
 	t.Run("new process starts conservative", func(t *testing.T) {
 		chainClient, router := newDependencies(t)
-		r, err := NewReconciler(ReconcilerConfig{
+		r, err := newReconciler(ReconcilerConfig{
 			ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 		}, chainClient, noopAck, router, newMockInFlightTracker(nil), &mockPlacementStore{})
 		require.NoError(t, err)
@@ -3329,7 +3533,7 @@ func TestReconciler_PlacementSweepTrustRequiresSuccessfulSync(t *testing.T) {
 
 	t.Run("placement-disabled process never arms latch", func(t *testing.T) {
 		chainClient, router := newDependencies(t)
-		r, err := NewReconciler(ReconcilerConfig{
+		r, err := newReconciler(ReconcilerConfig{
 			ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 		}, chainClient, noopAck, router, nil, nil)
 		require.NoError(t, err)
@@ -3337,6 +3541,490 @@ func TestReconciler_PlacementSweepTrustRequiresSuccessfulSync(t *testing.T) {
 		require.NoError(t, r.ReconcileAll(t.Context()))
 		require.False(t, r.placementSweepSeen.Load())
 	})
+}
+
+func TestReconciler_DegradedAdmissionRechecksPendingStateUnderLeaseClaim(t *testing.T) {
+	const leaseUUID = "lease-became-active"
+	var exposeLease bool
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			if !exposeLease {
+				return nil, nil
+			}
+			return []billingtypes.Lease{{
+				Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+			}}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
+	}
+	healthy := &mockReconcilerBackend{name: "backend-a"}
+	peer := &mockReconcilerBackend{name: "backend-b"}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: healthy, IsDefault: true}, {Backend: peer},
+	}})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil), operations: operation.NewRegistry(),
+	}
+	reconciler, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
+		chainClient, noopAck, router, runtime, store,
+	)
+	require.NoError(t, err)
+	require.NoError(t, reconciler.ReconcileAll(t.Context()), "establish durable baseline")
+	require.True(t, store.CurrentAdmissionBaseline().Valid())
+
+	exposeLease = true
+	peer.mu.Lock()
+	peer.listErr = errors.New("backend-b unavailable")
+	peer.mu.Unlock()
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	healthy.mu.Lock()
+	assert.Empty(t, healthy.provisionCalls,
+		"a PENDING list row that is ACTIVE at the authoritative read must not use degraded recordless admission")
+	healthy.mu.Unlock()
+	assert.False(t, runtime.operations.Contains(leaseUUID))
+	assert.Equal(t, placement.StateAbsent, store.Lookup(leaseUUID).State())
+}
+
+func TestReconciler_DegradedAdmissionRejectsRouterEscapeBeforeAttempt(t *testing.T) {
+	const leaseUUID = "lease-router-escape"
+	lease := billingtypes.Lease{
+		Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+	}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{lease}, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			copy := lease
+			return &copy, nil
+		},
+	}
+	healthy := &mockReconcilerBackend{name: "backend-a"}
+	excluded := &mockReconcilerBackend{
+		name: "backend-b", listErr: errors.New("backend-b unavailable"),
+	}
+	router := &mockBackendRouter{
+		routeFn: func(string) backend.Backend { return excluded },
+		routeForProvisionAmongFn: func(
+			context.Context, string, map[string]struct{}, map[string]int,
+		) backend.Backend {
+			return excluded // deliberately violate the routing port contract
+		},
+		backendsFn: func() []backend.Backend { return []backend.Backend{healthy, excluded} },
+	}
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil), operations: operation.NewRegistry(),
+	}
+	reconciler, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
+		chainClient, noopAck, router, runtime, store,
+	)
+	require.NoError(t, err)
+	fence := store.BeginInventorySession()
+	_, err = store.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
+	store.EndInventorySession(fence)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	for _, candidate := range []*mockReconcilerBackend{healthy, excluded} {
+		candidate.mu.Lock()
+		assert.Empty(t, candidate.provisionCalls)
+		candidate.mu.Unlock()
+	}
+	assert.False(t, runtime.operations.Contains(leaseUUID))
+	assert.Equal(t, placement.StateAbsent, store.Lookup(leaseUUID).State(),
+		"the typed scope must reject an excluded route before any durable attempt")
+}
+
+func TestReconciler_DegradedAdmissionRacingEventPathDispatchesExactlyOnce(t *testing.T) {
+	const leaseUUID = "lease-event-reconcile-race"
+	lease := &billingtypes.Lease{
+		Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{*lease}, nil
+		},
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			copy := *lease
+			return &copy, nil
+		},
+	}
+	healthy := &mockReconcilerBackend{name: "backend-a"}
+	unavailable := &mockReconcilerBackend{
+		name: "backend-b", listErr: errors.New("backend-b unavailable"),
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: healthy, IsDefault: true}, {Backend: unavailable},
+	}})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	registry := operation.NewRegistry()
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil), operations: registry,
+	}
+	reconciler, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
+		chainClient, noopAck, router, runtime, store,
+	)
+	require.NoError(t, err)
+	fence := store.BeginInventorySession()
+	_, err = store.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
+	store.EndInventorySession(fence)
+	require.NoError(t, err)
+	orchestrator, err := NewProvisionOrchestrator(
+		"provider-1", "http://callback", router, registry, store, nil,
+	)
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		errs <- reconciler.ReconcileAll(t.Context())
+	}()
+	go func() {
+		<-start
+		claimResult := registry.TryClaimLeaseNow(leaseUUID)
+		if !claimResult.Acquired() {
+			errs <- nil
+			return
+		}
+		claim := claimResult.Claim()
+		err := orchestrator.StartProvisioningClaimed(
+			t.Context(), claim, lease, ProvisionOpts{},
+		)
+		_ = registry.ReleaseLease(claim)
+		errs <- err
+	}()
+	close(start)
+	require.NoError(t, <-errs)
+	require.NoError(t, <-errs)
+
+	healthy.mu.Lock()
+	assert.Len(t, healthy.provisionCalls, 1,
+		"the shared lease claim and write-ahead CAS must collapse event/reconcile dispatch")
+	healthy.mu.Unlock()
+	unavailable.mu.Lock()
+	assert.Empty(t, unavailable.provisionCalls)
+	unavailable.mu.Unlock()
+	assert.Equal(t, placement.StateConfirmed, store.Lookup(leaseUUID).State())
+}
+
+func TestReconciler_DegradedPositiveRetentionDefersOnlyThatLiveLease(t *testing.T) {
+	const (
+		retainedLease    = "lease-retained-live"
+		independentLease = "lease-independent"
+	)
+	var exposeLeases bool
+	leases := []billingtypes.Lease{
+		{Uuid: retainedLease, Tenant: "tenant-retained", State: billingtypes.LEASE_STATE_PENDING},
+		{Uuid: independentLease, Tenant: "tenant-independent", State: billingtypes.LEASE_STATE_PENDING},
+	}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			if !exposeLeases {
+				return nil, nil
+			}
+			return slices.Clone(leases), nil
+		},
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return nil, nil
+		},
+		GetLeaseFunc: func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			for _, lease := range leases {
+				if lease.Uuid == leaseUUID {
+					copy := lease
+					return &copy, nil
+				}
+			}
+			return nil, nil
+		},
+	}
+	healthy := &mockReconcilerBackend{name: "backend-a"}
+	peer := &mockReconcilerBackend{name: "backend-b"}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: healthy, IsDefault: true}, {Backend: peer},
+	}})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil), operations: operation.NewRegistry(),
+	}
+	reconciler, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
+		chainClient, noopAck, router, runtime, store,
+	)
+	require.NoError(t, err)
+	require.NoError(t, reconciler.ReconcileAll(t.Context()), "establish durable baseline")
+
+	exposeLeases = true
+	healthy.mu.Lock()
+	healthy.retentions = []backend.RetainedLease{{LeaseUUID: retainedLease}}
+	healthy.mu.Unlock()
+	peer.mu.Lock()
+	peer.listErr = errors.New("backend-b unavailable")
+	peer.mu.Unlock()
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	healthy.mu.Lock()
+	require.Len(t, healthy.provisionCalls, 1,
+		"a positive retention must defer only its lease, not healthy-node admission")
+	assert.Equal(t, independentLease, healthy.provisionCalls[0].LeaseUUID)
+	healthy.mu.Unlock()
+	peer.mu.Lock()
+	assert.Empty(t, peer.provisionCalls)
+	peer.mu.Unlock()
+	assert.Equal(t, placement.StateAbsent, store.Lookup(retainedLease).State(),
+		"partial retention evidence must neither manufacture placement nor permit provisioning")
+	assert.Equal(t, placement.StateConfirmed, store.Lookup(independentLease).State())
+}
+
+func TestReconciler_DegradedConfirmedOwnerNeedsRetentionEvidenceBeforeReprovision(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		retentionFailure  bool
+		positiveRetention bool
+		peerOutage        bool
+	}{
+		{name: "retention inventory failed", retentionFailure: true},
+		{
+			name:              "retention positively reports the lease during peer outage",
+			positiveRetention: true,
+			peerOutage:        true,
+		},
+		{name: "complete inventory positively reports the lease", positiveRetention: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const (
+				ownedLease       = "lease-owned-active"
+				independentLease = "lease-independent"
+			)
+			var exposeLeases bool
+			active := billingtypes.Lease{
+				Uuid: ownedLease, Tenant: "tenant-owned", State: billingtypes.LEASE_STATE_ACTIVE,
+			}
+			pending := billingtypes.Lease{
+				Uuid: independentLease, Tenant: "tenant-independent", State: billingtypes.LEASE_STATE_PENDING,
+			}
+			chainClient := &chaintest.MockClient{
+				GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+					if !exposeLeases {
+						return nil, nil
+					}
+					return []billingtypes.Lease{pending}, nil
+				},
+				GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+					if !exposeLeases {
+						return nil, nil
+					}
+					return []billingtypes.Lease{active}, nil
+				},
+				GetLeaseFunc: func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+					switch leaseUUID {
+					case ownedLease:
+						copy := active
+						return &copy, nil
+					case independentLease:
+						copy := pending
+						return &copy, nil
+					default:
+						return nil, nil
+					}
+				},
+			}
+			ownerBase := &mockReconcilerBackend{name: "backend-owner"}
+			var owner backend.Backend = ownerBase
+			var ownerRetentionFailure *retentionErrorReconcilerBackend
+			if test.retentionFailure {
+				ownerRetentionFailure = &retentionErrorReconcilerBackend{mockReconcilerBackend: ownerBase}
+				owner = ownerRetentionFailure
+			}
+			healthy := &mockReconcilerBackend{name: "backend-healthy"}
+			outage := &mockReconcilerBackend{name: "backend-outage"}
+			router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+				{Backend: owner}, {Backend: healthy, IsDefault: true}, {Backend: outage},
+			}})
+			require.NoError(t, err)
+			store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			runtime := &typedTestReconcilerRuntime{
+				mockInFlightTracker: newMockInFlightTracker(nil), operations: operation.NewRegistry(),
+			}
+			reconciler, err := NewReconciler(
+				ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
+				chainClient, noopAck, router, runtime, store,
+			)
+			require.NoError(t, err)
+			require.NoError(t, reconciler.ReconcileAll(t.Context()), "establish durable baseline")
+			require.NoError(t, store.Confirm(ownedLease, ownerBase.Name()))
+
+			exposeLeases = true
+			if test.retentionFailure {
+				ownerRetentionFailure.err = errors.New("owner retentions unavailable")
+			}
+			if test.positiveRetention {
+				ownerBase.mu.Lock()
+				ownerBase.retentions = []backend.RetainedLease{{LeaseUUID: ownedLease}}
+				ownerBase.mu.Unlock()
+			}
+			if test.peerOutage {
+				outage.mu.Lock()
+				outage.listErr = errors.New("unrelated backend unavailable")
+				outage.mu.Unlock()
+			}
+
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+			ownerBase.mu.Lock()
+			assert.Empty(t, ownerBase.provisionCalls,
+				"negative provision evidence must not overwrite possibly retained owner data")
+			ownerBase.mu.Unlock()
+			healthy.mu.Lock()
+			require.Len(t, healthy.provisionCalls, 1,
+				"the owner-specific retention gate must not pause unrelated admission")
+			assert.Equal(t, independentLease, healthy.provisionCalls[0].LeaseUUID)
+			healthy.mu.Unlock()
+			assert.Equal(t, placement.StateConfirmed, store.Lookup(ownedLease).State())
+			assert.Equal(t, placement.StateConfirmed, store.Lookup(independentLease).State())
+		})
+	}
+}
+
+func TestReconciler_DegradedAdmissionRequiresOneBackendToAnswerBothInventories(t *testing.T) {
+	const leaseUUID = "lease-no-common-responder"
+	var exposeLease bool
+	lease := billingtypes.Lease{
+		Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+	}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			if !exposeLease {
+				return nil, nil
+			}
+			return []billingtypes.Lease{lease}, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			copy := lease
+			return &copy, nil
+		},
+	}
+	provisionsResponderBase := &mockReconcilerBackend{name: "backend-provisions"}
+	provisionsResponder := &retentionErrorReconcilerBackend{
+		mockReconcilerBackend: provisionsResponderBase,
+	}
+	retentionsResponder := &mockReconcilerBackend{name: "backend-retentions"}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: provisionsResponder, IsDefault: true}, {Backend: retentionsResponder},
+	}})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil), operations: operation.NewRegistry(),
+	}
+	reconciler, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
+		chainClient, noopAck, router, runtime, store,
+	)
+	require.NoError(t, err)
+	require.NoError(t, reconciler.ReconcileAll(t.Context()), "establish durable baseline")
+
+	exposeLease = true
+	provisionsResponder.err = errors.New("retention inventory unavailable")
+	retentionsResponder.mu.Lock()
+	retentionsResponder.listErr = errors.New("provision inventory unavailable")
+	retentionsResponder.mu.Unlock()
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	for _, candidate := range []*mockReconcilerBackend{
+		provisionsResponderBase, retentionsResponder,
+	} {
+		candidate.mu.Lock()
+		assert.Empty(t, candidate.provisionCalls)
+		candidate.mu.Unlock()
+	}
+	assert.Equal(t, placement.StateAbsent, store.Lookup(leaseUUID).State())
+	assert.False(t, runtime.operations.Contains(leaseUUID))
+}
+
+func TestReconciler_PlacementProjectionFailureDefersPositiveActiveFailure(t *testing.T) {
+	const leaseUUID = "lease-positive-write-error"
+	chainClient := &chaintest.MockClient{
+		GetActiveLeasesByProviderFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{{
+				Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_ACTIVE,
+			}}, nil
+		},
+	}
+	b := &mockReconcilerBackend{
+		name: "backend-a",
+		provisions: []backend.ProvisionInfo{{
+			LeaseUUID: leaseUUID, Status: backend.ProvisionStatusFailed,
+			FailCount: 1, BackendName: "backend-a",
+		}},
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	store := &failNextBatchPlacementStore{
+		PlacementStore: &mockPlacementStore{},
+		failErr:        errors.New("placement projection unavailable"),
+	}
+	payloadStore := newReconcilerPayloadStore(t, t.TempDir()+"/payloads.db")
+	t.Cleanup(func() { require.NoError(t, payloadStore.Close()) })
+	r, err := newReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, newMockInFlightTracker(payloadStore), store)
+	require.NoError(t, err)
+
+	// The positive failed provision would normally trigger an immediate
+	// re-provision. Because its placement projection failed, the observation must
+	// instead become a lease-local fence for the remainder of this sweep.
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	b.mu.Lock()
+	assert.Empty(t, b.provisionCalls,
+		"an unpersisted positive observation must not authorize same-sweep reprovisioning")
+	b.mu.Unlock()
+	require.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	assert.Contains(t, r.placementAbsenceUntrusted[leaseUUID], "backend-a")
+
+	// The injected failure is one-shot. A later complete, durable projection
+	// settles the marker and allows the ordinary ACTIVE/Failed repair path.
+	require.NoError(t, r.ReconcileAll(t.Context()))
+	b.mu.Lock()
+	assert.Len(t, b.provisionCalls, 1)
+	b.mu.Unlock()
+	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID)
 }
 
 func TestReconciler_InFlightPlacementExclusionOnlyWithholdsAbsenceForThatLease(t *testing.T) {
@@ -3358,18 +4046,19 @@ func TestReconciler_InFlightPlacementExclusionOnlyWithholdsAbsenceForThatLease(t
 	b := &mockReconcilerBackend{name: "backend-a", provisions: []backend.ProvisionInfo{{
 		LeaseUUID: "lease-inflight", Status: backend.ProvisionStatusProvisioning,
 	}}}
+	peer := &mockReconcilerBackend{name: "backend-b"}
 	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
+		Backends: []backend.BackendEntry{{Backend: b}, {Backend: peer, IsDefault: true}},
 	})
 	require.NoError(t, err)
 	tracker := newMockInFlightTracker(nil)
-	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := tracker.TryTrackInFlightWithOperationID(
 		"lease-inflight", "tenant-a", testItems("sku-1"), "backend-a",
 	)
 	require.True(t, tracked)
 	placements := &mockPlacementStore{}
 	require.NoError(t, placements.Set("lease-inflight", "backend-a"))
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, tracker, placements)
 	require.NoError(t, err)
@@ -3380,16 +4069,16 @@ func TestReconciler_InFlightPlacementExclusionOnlyWithholdsAbsenceForThatLease(t
 	require.NoError(t, r.ReconcileAll(t.Context()))
 	require.True(t, r.placementSweepSeen.Load())
 	assert.NotContains(t, r.placementAbsenceUntrusted, "lease-inflight")
-	require.True(t, tracker.UntrackInFlightIfGeneration("lease-inflight", generation))
+	require.True(t, tracker.UntrackInFlightIfOperationID("lease-inflight", generation))
 
 	b.mu.Lock()
 	b.listErr = errors.New("backend-a unavailable")
 	b.mu.Unlock()
 	require.NoError(t, r.ReconcileAll(t.Context()))
 
-	b.mu.Lock()
-	provisionCalls := append([]backend.ProvisionRequest(nil), b.provisionCalls...)
-	b.mu.Unlock()
+	peer.mu.Lock()
+	provisionCalls := append([]backend.ProvisionRequest(nil), peer.provisionCalls...)
+	peer.mu.Unlock()
 	require.Len(t, provisionCalls, 1,
 		"the later degraded sweep should progress only the independently trusted lease")
 	assert.Equal(t, "lease-independent", provisionCalls[0].LeaseUUID)
@@ -3416,7 +4105,7 @@ func TestReconciler_ExcludedAttemptMatchingPositiveRetiresDuringPartialSweep(t *
 	}})
 	require.NoError(t, err)
 	tracker := newMockInFlightTracker(nil)
-	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := tracker.TryTrackInFlightWithOperationID(
 		leaseUUID, "tenant-a", testItems("sku-1"), owner.Name(),
 	)
 	require.True(t, tracked)
@@ -3425,7 +4114,7 @@ func TestReconciler_ExcludedAttemptMatchingPositiveRetiresDuringPartialSweep(t *
 		acknowledged++
 		return true, "tx", nil
 	}}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, ack, router, tracker, store)
 	require.NoError(t, err)
@@ -3437,7 +4126,7 @@ func TestReconciler_ExcludedAttemptMatchingPositiveRetiresDuringPartialSweep(t *
 	// sweep. The following partial inventory must retire the marker from an exact
 	// confirmed no-op, not rely on SetBatch performing a mutation.
 	require.NoError(t, store.Confirm(leaseUUID, owner.Name()))
-	require.True(t, tracker.UntrackInFlightIfGeneration(leaseUUID, generation))
+	require.True(t, tracker.UntrackInFlightIfOperationID(leaseUUID, generation))
 	peer.mu.Lock()
 	peer.listErr = errors.New("backend-b unavailable")
 	peer.mu.Unlock()
@@ -3477,7 +4166,7 @@ func TestReconciler_PrunesOnlyPositivelyTerminalPlacementAbsenceMarkers(t *testi
 			return nil, nil
 		}
 	}}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
 	require.NoError(t, err)
@@ -3515,10 +4204,11 @@ func TestReconciler_PrunesOnlyPositivelyTerminalPlacementAbsenceMarkers(t *testi
 	}
 }
 
-func TestReconciler_CompletePlacementSyncClearsMarkersWithoutPointReads(t *testing.T) {
+func TestReconciler_CompletePlacementSyncDoesNotClearMarkersFromSilence(t *testing.T) {
 	store, err := placement.NewStore(t.TempDir() + "/placements.db")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.ConfigureBackendTopology([]string{"backend-a"}))
 	healthy := &mockReconcilerBackend{name: "backend-a"}
 	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
 		{Backend: healthy, IsDefault: true},
@@ -3527,9 +4217,11 @@ func TestReconciler_CompletePlacementSyncClearsMarkersWithoutPointReads(t *testi
 	pointReads := 0
 	chainClient := &chaintest.MockClient{GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
 		pointReads++
-		return nil, errors.New("marker point read should be unnecessary")
+		return chaintest.NewMockLease(
+			"old-marker", "tenant-a", "provider-1", billingtypes.LEASE_STATE_ACTIVE,
+		), nil
 	}}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
 	require.NoError(t, err)
@@ -3538,9 +4230,10 @@ func TestReconciler_CompletePlacementSyncClearsMarkersWithoutPointReads(t *testi
 	}
 
 	require.NoError(t, r.ReconcileAll(t.Context()))
-	assert.Zero(t, pointReads,
-		"a complete durable inventory already retires every old marker")
-	assert.Empty(t, r.placementAbsenceUntrusted)
+	assert.Equal(t, 1, pointReads,
+		"complete inventory silence is not proof that a previously excluded operation cannot commit")
+	assert.Contains(t, r.placementAbsenceUntrusted, "old-marker",
+		"a positive live chain verdict must keep the marker fail-closed")
 }
 
 func TestReconciler_PlacementMarkerCheckPanicDoesNotCrashFred(t *testing.T) {
@@ -3555,7 +4248,7 @@ func TestReconciler_PlacementMarkerCheckPanicDoesNotCrashFred(t *testing.T) {
 	chainClient := &chaintest.MockClient{GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
 		panic("synthetic placement marker GetLease panic")
 	}}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
 	require.NoError(t, err)
@@ -3588,7 +4281,7 @@ func TestReconciler_PairsInventorySnapshotLifetimeOnEveryReturn(t *testing.T) {
 			{Backend: b, IsDefault: true},
 		}})
 		require.NoError(t, err)
-		r, err := NewReconciler(ReconcilerConfig{
+		r, err := newReconciler(ReconcilerConfig{
 			ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 		}, chainClient, noopAck, router, newMockInFlightTracker(nil), wrapped)
 		require.NoError(t, err)
@@ -3635,6 +4328,7 @@ func TestReconciler_UnrelatedDeleteDoesNotSuppressObservedPlacement(t *testing.T
 	store, err := placement.NewStore(t.TempDir() + "/placements.db")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.ConfigureBackendTopology([]string{"backend-a", "backend-b"}))
 	require.NoError(t, store.Confirm(deleted, "backend-a"))
 
 	chainClient := &chaintest.MockClient{
@@ -3664,7 +4358,7 @@ func TestReconciler_UnrelatedDeleteDoesNotSuppressObservedPlacement(t *testing.T
 		{Backend: ownerBackend},
 	}})
 	require.NoError(t, err)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
 	require.NoError(t, err)
@@ -3688,11 +4382,12 @@ func TestReconciler_UnrelatedDeleteDoesNotSuppressObservedPlacement(t *testing.T
 		"a later degraded sweep must defer the lease pinned to the silent owner")
 }
 
-func TestReconciler_ExcludedAttemptSurvivesDegradedSweepUntilOwnerRecovery(t *testing.T) {
+func TestReconciler_ContradictoryPositiveQuarantinesAttemptAcrossRecovery(t *testing.T) {
 	const leaseUUID = "lease-excluded-attempt"
 	store, err := placement.NewStore(t.TempDir() + "/placements.db")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.ConfigureBackendTopology([]string{"backend-b", "backend-c"}))
 	requireSetPlacementAttempt(t, store, leaseUUID, "backend-b")
 
 	chainClient := &chaintest.MockClient{
@@ -3713,58 +4408,62 @@ func TestReconciler_ExcludedAttemptSurvivesDegradedSweepUntilOwnerRecovery(t *te
 	}})
 	require.NoError(t, err)
 	tracker := newMockInFlightTracker(nil)
-	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := tracker.TryTrackInFlightWithOperationID(
 		leaseUUID, "tenant-a", testItems("sku-1"), attemptedBackend.Name(),
 	)
 	require.True(t, tracked)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, tracker, store)
 	require.NoError(t, err)
 
-	// The complete sweep sees the real owner C, but the operation already active
-	// at its boundary excludes that positive from placement synchronization.
+	// A positive C observation while the durable attempt still names B cannot
+	// disprove a delayed B commit. It becomes a durable conflict union even though
+	// the original operation was already active at the inventory boundary.
 	require.NoError(t, r.ReconcileAll(t.Context()))
-	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID,
+		"the durable conflict, rather than a process-local absence marker, owns the safety decision")
 	p := store.Lookup(leaseUUID)
-	require.Equal(t, placement.StateAttempting, p.State())
+	require.Equal(t, placement.StateUnusable, p.State())
+	assert.True(t, p.Conflict)
+	assert.ElementsMatch(t, []string{"backend-b", "backend-c"}, p.ConflictBackends)
 	assert.Equal(t, "backend-b", p.Attempt)
-	require.True(t, tracker.UntrackInFlightIfGeneration(leaseUUID, generation))
+	require.True(t, tracker.UntrackInFlightIfOperationID(leaseUUID, generation))
 
-	// On a later degraded view B proves its own absence while C is silent. The
-	// lease-local exclusion must outlive the partial sweep, preserve Attempt B,
-	// and prevent a fresh SKU-routed provision.
+	// On a later degraded view, neither B's silence nor C's outage can shrink the
+	// conflict, clear Attempt B, or authorize a fresh SKU-routed provision.
 	actualOwner.mu.Lock()
 	actualOwner.listErr = errors.New("backend-c unavailable")
 	actualOwner.mu.Unlock()
 	require.NoError(t, r.ReconcileAll(t.Context()))
-	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
 	p = store.Lookup(leaseUUID)
-	require.Equal(t, placement.StateAttempting, p.State())
+	require.Equal(t, placement.StateUnusable, p.State())
+	assert.True(t, p.Conflict)
+	assert.ElementsMatch(t, []string{"backend-b", "backend-c"}, p.ConflictBackends)
 	assert.Equal(t, "backend-b", p.Attempt)
 	attemptedBackend.mu.Lock()
 	assert.Empty(t, attemptedBackend.provisionCalls)
 	attemptedBackend.mu.Unlock()
 
-	// Once C again participates in a complete inventory, that authoritative
-	// positive is persisted, the superseded B attempt is settled, and the marker
-	// can finally retire.
+	// C's later recovery reaffirms one candidate but still cannot prove that the
+	// ambiguous B request did not commit after an earlier inventory response.
 	actualOwner.mu.Lock()
 	actualOwner.listErr = nil
 	actualOwner.mu.Unlock()
 	require.NoError(t, r.ReconcileAll(t.Context()))
-	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID)
 	p = store.Lookup(leaseUUID)
-	require.Equal(t, placement.StateConfirmed, p.State())
-	assert.Equal(t, "backend-c", p.Backend)
-	assert.Empty(t, p.Attempt)
+	require.Equal(t, placement.StateUnusable, p.State())
+	assert.True(t, p.Conflict)
+	assert.ElementsMatch(t, []string{"backend-b", "backend-c"}, p.ConflictBackends)
+	assert.Equal(t, "backend-b", p.Attempt)
 }
 
-func TestReconciler_ExcludedOwnerChangeDefersStaleConfirmedPlacement(t *testing.T) {
+func TestReconciler_ContradictoryPositiveQuarantinesConfirmedOwnerAcrossRecovery(t *testing.T) {
 	const leaseUUID = "lease-excluded-owner-change"
 	store, err := placement.NewStore(t.TempDir() + "/placements.db")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.ConfigureBackendTopology([]string{"backend-b", "backend-c"}))
 	require.NoError(t, store.Confirm(leaseUUID, "backend-b"))
 
 	chainClient := &chaintest.MockClient{
@@ -3785,26 +4484,29 @@ func TestReconciler_ExcludedOwnerChangeDefersStaleConfirmedPlacement(t *testing.
 	}})
 	require.NoError(t, err)
 	tracker := newMockInFlightTracker(nil)
-	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := tracker.TryTrackInFlightWithOperationID(
 		leaseUUID, "tenant-a", testItems("sku-1"), staleOwner.Name(),
 	)
 	require.True(t, tracked)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, tracker, store)
 	require.NoError(t, err)
 
-	// C's complete positive observation cannot overwrite the operation-owned B
-	// record while the operation straddles this inventory boundary.
+	// C's positive observation cannot overwrite the durable B owner. The
+	// contradiction is persisted as a conflict union while the operation
+	// straddles this inventory boundary.
 	require.NoError(t, r.ReconcileAll(t.Context()))
-	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
+	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID)
 	p := store.Lookup(leaseUUID)
-	require.Equal(t, placement.StateConfirmed, p.State())
+	require.Equal(t, placement.StateUnusable, p.State())
+	assert.True(t, p.Conflict)
+	assert.ElementsMatch(t, []string{"backend-b", "backend-c"}, p.ConflictBackends)
 	assert.Equal(t, "backend-b", p.Backend)
-	require.True(t, tracker.UntrackInFlightIfGeneration(leaseUUID, generation))
+	require.True(t, tracker.UntrackInFlightIfOperationID(leaseUUID, generation))
 
-	// B now reports a matching positive while C is silent. That semantic no-op
-	// must not clear the older marker for C's excluded owner-change evidence.
+	// B now reports a matching positive while C is silent. Reaffirming one
+	// candidate cannot clear the durable conflict or forget C.
 	staleOwner.mu.Lock()
 	staleOwner.provisions = []backend.ProvisionInfo{{
 		LeaseUUID: leaseUUID, Status: backend.ProvisionStatusReady,
@@ -3814,11 +4516,13 @@ func TestReconciler_ExcludedOwnerChangeDefersStaleConfirmedPlacement(t *testing.
 	actualOwner.listErr = errors.New("backend-c unavailable")
 	actualOwner.mu.Unlock()
 	require.NoError(t, r.ReconcileAll(t.Context()))
-	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
 	staleOwner.mu.Lock()
 	assert.Empty(t, staleOwner.provisionCalls)
 	staleOwner.mu.Unlock()
 	p = store.Lookup(leaseUUID)
+	require.Equal(t, placement.StateUnusable, p.State())
+	assert.True(t, p.Conflict)
+	assert.ElementsMatch(t, []string{"backend-b", "backend-c"}, p.ConflictBackends)
 	assert.Equal(t, "backend-b", p.Backend)
 
 	staleOwner.mu.Lock()
@@ -3828,13 +4532,14 @@ func TestReconciler_ExcludedOwnerChangeDefersStaleConfirmedPlacement(t *testing.
 	actualOwner.listErr = nil
 	actualOwner.mu.Unlock()
 	require.NoError(t, r.ReconcileAll(t.Context()))
-	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID)
 	p = store.Lookup(leaseUUID)
-	require.Equal(t, placement.StateConfirmed, p.State())
-	assert.Equal(t, "backend-c", p.Backend)
+	require.Equal(t, placement.StateUnusable, p.State())
+	assert.True(t, p.Conflict)
+	assert.ElementsMatch(t, []string{"backend-b", "backend-c"}, p.ConflictBackends)
+	assert.Equal(t, "backend-b", p.Backend)
 }
 
-func TestReconciler_FencedPositiveSurvivesUnrelatedPlacementSyncFailure(t *testing.T) {
+func TestReconciler_FencedContradictionSurvivesUnrelatedPlacementSyncFailure(t *testing.T) {
 	const leaseUUID = "lease-fenced-write-error"
 	store := &errorPlacementStore{}
 	require.NoError(t, store.Confirm(leaseUUID, "backend-b"))
@@ -3858,13 +4563,13 @@ func TestReconciler_FencedPositiveSurvivesUnrelatedPlacementSyncFailure(t *testi
 		{Backend: actualOwner},
 	}})
 	require.NoError(t, err)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
 	require.NoError(t, err)
 
-	// The C-positive is revision-fenced while another placement operation fails.
-	// Its exact-lease exception must still survive the failed synchronization.
+	// The C-positive contradicts durable owner B while placement persistence
+	// fails. Its exact-lease exception must survive the failed synchronization.
 	require.NoError(t, r.ReconcileAll(t.Context()))
 	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID)
 	p := store.Lookup(leaseUUID)
@@ -3887,10 +4592,13 @@ func TestReconciler_FencedPositiveSurvivesUnrelatedPlacementSyncFailure(t *testi
 	actualOwner.listErr = nil
 	actualOwner.mu.Unlock()
 	require.NoError(t, r.ReconcileAll(t.Context()))
-	assert.NotContains(t, r.placementAbsenceUntrusted, leaseUUID)
+	assert.Contains(t, r.placementAbsenceUntrusted, leaseUUID,
+		"complete inventory cannot erase a multi-owner marker by silence")
 	p = store.Lookup(leaseUUID)
-	require.Equal(t, placement.StateConfirmed, p.State())
-	assert.Equal(t, "backend-c", p.Backend)
+	require.Equal(t, placement.StateUnusable, p.State())
+	assert.True(t, p.Conflict)
+	assert.ElementsMatch(t, []string{"backend-b", "backend-c"}, p.ConflictBackends)
+	assert.Equal(t, "backend-b", p.Backend)
 }
 
 func TestReconciler_FencedConflictSurvivesPlacementSyncFailure(t *testing.T) {
@@ -3915,7 +4623,7 @@ func TestReconciler_FencedConflictSurvivesPlacementSyncFailure(t *testing.T) {
 		{Backend: backendA, IsDefault: true}, {Backend: backendB},
 	}})
 	require.NoError(t, err)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), store)
 	require.NoError(t, err)
@@ -3941,7 +4649,7 @@ func TestReconciler_CallbackCompletionDuringInventoryDefersOnlyThatLease(t *test
 		},
 	}
 	tracker := newMockInFlightTracker(nil)
-	generation, tracked := tracker.TryTrackInFlightWithGeneration(
+	generation, tracked := tracker.TryTrackInFlightWithOperationID(
 		completedLease, "tenant-a", testItems("sku-1"), "backend-a",
 	)
 	require.True(t, tracked)
@@ -3969,7 +4677,7 @@ func TestReconciler_CallbackCompletionDuringInventoryDefersOnlyThatLease(t *test
 		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
 	})
 	require.NoError(t, err)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, tracker, nil)
 	require.NoError(t, err)
@@ -3995,7 +4703,7 @@ func TestReconciler_OperationCompletionDuringChainSnapshotDefersDestructiveActio
 	var rejected []string
 	chainClient := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
-			generation, tracked := tracker.TryTrackInFlightWithGeneration(
+			generation, tracked := tracker.TryTrackInFlightWithOperationID(
 				completedLease, "tenant-a", testItems("sku-1"), backendName,
 			)
 			require.True(t, tracked)
@@ -4022,7 +4730,7 @@ func TestReconciler_OperationCompletionDuringChainSnapshotDefersDestructiveActio
 		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
 	})
 	require.NoError(t, err)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, tracker, nil)
 	require.NoError(t, err)
@@ -4069,7 +4777,7 @@ func TestReconciler_PostBoundaryPlacementRevisionDefersOnlyThatLease(t *testing.
 			// This complete operation starts after both causal-boundary snapshots and
 			// finishes before inventory returns. Its confirmed revision is therefore
 			// newer than the inventory even though no tracker entry remains for workers.
-			generation, tracked := tracker.TryTrackInFlightWithGeneration(
+			generation, tracked := tracker.TryTrackInFlightWithOperationID(
 				completedLease, "tenant-a", testItems("sku-1"), backendName,
 			)
 			if !tracked {
@@ -4102,7 +4810,7 @@ func TestReconciler_PostBoundaryPlacementRevisionDefersOnlyThatLease(t *testing.
 		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
 	})
 	require.NoError(t, err)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, tracker, placements)
 	require.NoError(t, err)
@@ -4169,7 +4877,7 @@ func TestReconciler_PostSyncPlacementRevisionDefersBeforeLifecycleAction(t *test
 	})
 	require.NoError(t, err)
 	tracker := newMockInFlightTracker(nil)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, ack, router, tracker, store)
 	require.NoError(t, err)
@@ -4234,7 +4942,7 @@ func TestReconciler_ReconcileAll_SyncsPlacementsFromBackends(t *testing.T) {
 
 	ps := &mockPlacementStore{}
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -4268,7 +4976,7 @@ func TestReconciler_ReconcileAll_StartProvisioning_RecordsPlacement(t *testing.T
 
 	ps := &mockPlacementStore{}
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -4309,7 +5017,7 @@ func TestReconciler_ReconcileAll_RejectLease_LeavesPlacementForGatedPruner(t *te
 	ps := &mockPlacementStore{}
 	ps.Set("lease-1", "test")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -4349,7 +5057,7 @@ func TestReconciler_ReconcileAll_OrphanDeprovision_CleansUpPlacement(t *testing.
 	ps := &mockPlacementStore{}
 	ps.Set("orphan-1", "test")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -4406,7 +5114,7 @@ func TestReconciler_ReconcileAll_CloseLease_CleansUpPlacement(t *testing.T) {
 	ps := &mockPlacementStore{}
 	ps.Set("lease-1", "test")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -4460,7 +5168,7 @@ func TestReconciler_ReconcileAll_RetainedOrphan_KeepsPlacement(t *testing.T) {
 	ps := &mockPlacementStore{}
 	ps.Set("lease-ret", "backend-a")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -4495,6 +5203,7 @@ func TestDeferLease(t *testing.T) {
 	tests := []struct {
 		name            string
 		snap            fleetSnapshot
+		retentions      answeredSet
 		isProvisioned   bool
 		reportedBackend string
 		placement       placement.Placement
@@ -4567,6 +5276,23 @@ func TestDeferLease(t *testing.T) {
 			why:       "backend a answered and did not report it, so it really is absent from a",
 		},
 		{
+			name:       "confirmed owner provision absence defers when retention inventory is silent",
+			snap:       snap(false, map[string]bool{"a": true, "b": false}),
+			retentions: answeredSet{"a": false, "b": true},
+			placement:  placement.Placement{Backend: "a"},
+			wantDefer:  true,
+			why:        "negative provision evidence cannot rule out retained data while the exact owner's retention inventory is unavailable",
+		},
+		{
+			name:            "matching positive provision does not require retention absence",
+			snap:            snap(false, map[string]bool{"a": true, "b": false}),
+			retentions:      answeredSet{"a": false, "b": true},
+			isProvisioned:   true,
+			reportedBackend: "a",
+			placement:       placement.Placement{Backend: "a"},
+			why:             "a fresh matching positive provision does not depend on negative retention evidence",
+		},
+		{
 			name:      "incomplete sweep DEFERS when the owning backend is silent",
 			snap:      snap(false, map[string]bool{"a": true, "b": false}),
 			placement: placement.Placement{Backend: "b"},
@@ -4617,13 +5343,20 @@ func TestDeferLease(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := deferLease(tc.snap, tc.isProvisioned, tc.reportedBackend, tc.placement, tc.absenceTrusted)
+			retentions := tc.retentions
+			if retentions == nil {
+				retentions = tc.snap.answered
+			}
+			got := deferLease(
+				tc.snap, retentions,
+				tc.isProvisioned, tc.reportedBackend, tc.placement, tc.absenceTrusted,
+			)
 			assert.Equal(t, tc.wantDefer, got, tc.why)
 		})
 	}
 }
 
-func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T) {
+func TestResolvePlacementAttempt_InventorySilenceNeverSettlesAttempt(t *testing.T) {
 	t.Parallel()
 
 	newStore := func(t *testing.T) *placement.Store {
@@ -4639,24 +5372,24 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		complete:          true,
 	}
 
-	t.Run("attempt older than snapshot is cleared", func(t *testing.T) {
+	t.Run("attempt older than complete snapshot remains sticky", func(t *testing.T) {
 		store := newStore(t)
 		requireSetPlacementAttempt(t, store, "lease-1", "backend-a")
 		cutoff := store.SnapshotRevision()
-		r := &Reconciler{placementStore: store}
+		r := &Reconciler{placementView: store, legacyPlacement: store}
 
-		require.True(t, r.resolvePlacementAttempt(
+		require.False(t, r.resolvePlacementAttempt(
 			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
 			answeredSet{"backend-a": true}, nil,
 		))
-		require.Equal(t, placement.StateAbsent, store.Lookup("lease-1").State())
+		require.Equal(t, placement.StateAttempting, store.Lookup("lease-1").State())
 	})
 
 	t.Run("attempt newer than snapshot survives", func(t *testing.T) {
 		store := newStore(t)
 		cutoff := store.SnapshotRevision()
 		requireSetPlacementAttempt(t, store, "lease-1", "backend-a")
-		r := &Reconciler{placementStore: store}
+		r := &Reconciler{placementView: store, legacyPlacement: store}
 
 		require.False(t, r.resolvePlacementAttempt(
 			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
@@ -4673,7 +5406,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		snap.reportedByBackend = map[string]map[string]struct{}{
 			"backend-a": {"lease-1": {}},
 		}
-		r := &Reconciler{placementStore: store}
+		r := &Reconciler{placementView: store, legacyPlacement: store}
 
 		require.False(t, r.resolvePlacementAttempt(
 			"lease-1", store.Lookup("lease-1"), snap, cutoff, nil,
@@ -4686,7 +5419,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		store := newStore(t)
 		requireSetPlacementAttempt(t, store, "lease-1", "backend-a")
 		cutoff := store.SnapshotRevision()
-		r := &Reconciler{placementStore: store}
+		r := &Reconciler{placementView: store, legacyPlacement: store}
 
 		require.False(t, r.resolvePlacementAttempt(
 			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff,
@@ -4700,7 +5433,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		store := newStore(t)
 		requireSetPlacementAttempt(t, store, "lease-1", "backend-a")
 		cutoff := store.SnapshotRevision()
-		r := &Reconciler{placementStore: store}
+		r := &Reconciler{placementView: store, legacyPlacement: store}
 
 		require.False(t, r.resolvePlacementAttempt(
 			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
@@ -4713,7 +5446,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		store := newStore(t)
 		requireSetPlacementAttempt(t, store, "lease-1", "backend-a")
 		cutoff := store.SnapshotRevision()
-		r := &Reconciler{placementStore: store}
+		r := &Reconciler{placementView: store, legacyPlacement: store}
 
 		require.False(t, r.resolvePlacementAttempt(
 			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
@@ -4723,7 +5456,7 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 		require.Equal(t, placement.StateAttempting, store.Lookup("lease-1").State())
 	})
 
-	t.Run("operation starting during clear keeps its tracker entry", func(t *testing.T) {
+	t.Run("attempt settlement never invokes the legacy clear path", func(t *testing.T) {
 		store := newStore(t)
 		requireSetPlacementAttempt(t, store, "lease-1", "backend-a")
 		cutoff := store.SnapshotRevision()
@@ -4732,31 +5465,22 @@ func TestResolvePlacementAttempt_RequiresPostAttemptBackendEvidence(t *testing.T
 			entered:        make(chan struct{}),
 			release:        make(chan struct{}),
 		}
-		tracker := newMockInFlightTracker(nil)
-		r := &Reconciler{placementStore: blocking, tracker: tracker}
-		resolved := make(chan bool, 1)
+		r := &Reconciler{placementView: blocking, legacyPlacement: blocking}
 
-		go func() {
-			resolved <- r.resolvePlacementAttempt(
-				"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
-				answeredSet{"backend-a": true}, nil,
-			)
-		}()
-		<-blocking.entered
-		generation, tracked := tracker.TryTrackInFlightWithGeneration(
-			"lease-1", "tenant-a", testItems("sku-1"), "backend-a",
-		)
-		require.True(t, tracked)
-		close(blocking.release)
-		require.True(t, <-resolved)
-
-		current, exists := tracker.GetInFlight("lease-1")
-		require.True(t, exists, "settling the old attempt must not untrack the new operation")
-		assert.Equal(t, generation, current.Generation)
+		require.False(t, r.resolvePlacementAttempt(
+			"lease-1", store.Lookup("lease-1"), absentSnapshot, cutoff, nil,
+			answeredSet{"backend-a": true}, nil,
+		))
+		select {
+		case <-blocking.entered:
+			t.Fatal("inventory silence reached the placement clear path")
+		default:
+		}
+		require.Equal(t, placement.StateAttempting, store.Lookup("lease-1").State())
 	})
 }
 
-func TestReconciler_AttemptSettlementsRunInsideBoundedWorkers(t *testing.T) {
+func TestReconciler_AmbiguousAttemptsNeverReachLegacyClearWorkers(t *testing.T) {
 	chainClient := &chaintest.MockClient{
 		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
 			return []billingtypes.Lease{
@@ -4778,33 +5502,19 @@ func TestReconciler_AttemptSettlementsRunInsideBoundedWorkers(t *testing.T) {
 		entered:        make(chan string, 2),
 		release:        make(chan struct{}),
 	}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback", MaxWorkers: 2,
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), blocking)
 	require.NoError(t, err)
 
-	done := make(chan error, 1)
-	go func() { done <- r.ReconcileAll(t.Context()) }()
-
-	entered := make(map[string]struct{}, 2)
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for len(entered) < 2 {
-		select {
-		case leaseUUID := <-blocking.entered:
-			entered[leaseUUID] = struct{}{}
-		case <-timer.C:
-			close(blocking.release)
-			t.Fatalf("attempt settlement remained serial at the dispatch head; entered=%v", entered)
-		}
-	}
-	close(blocking.release)
+	require.NoError(t, r.ReconcileAll(t.Context()))
 	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(3 * time.Second):
-		t.Fatal("reconcile did not finish after releasing concurrent attempt settlements")
+	case leaseUUID := <-blocking.entered:
+		t.Fatalf("inventory silence attempted to clear sticky operation for %s", leaseUUID)
+	default:
 	}
+	require.Equal(t, placement.StateAttempting, placements.Lookup("lease-1").State())
+	require.Equal(t, placement.StateAttempting, placements.Lookup("lease-2").State())
 }
 
 // TestClassifyLease is the exhaustive table for the other safety decision the
@@ -4969,7 +5679,7 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 				Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 			})
 
-			reconciler, err := NewReconciler(ReconcilerConfig{
+			reconciler, err := newReconciler(ReconcilerConfig{
 				ProviderUUID:    "provider-1",
 				CallbackBaseURL: "http://localhost:8080",
 			}, mockChain, noopAck, router, nil, nil)
@@ -5033,7 +5743,7 @@ func TestReconciler_ConfirmTerminal_BoundsTheChainLookup(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -5082,7 +5792,7 @@ func TestReconciler_CleanupOrphanedPayloads_ChainErrorKeepsPayload(t *testing.T)
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(payloadStore), nil)
@@ -5124,7 +5834,7 @@ func TestReconciler_ReconcileAll_ListProvisionError_DefersWithoutAborting(t *tes
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -5197,7 +5907,7 @@ func TestReconciler_ReconcileAll_ActiveFailedPayloadNotAvailable_Closes(t *testi
 
 	tracker := newMockInFlightTracker(payloadStore)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -5268,7 +5978,7 @@ func TestReconciler_ReconcileAll_PendingWithMetaHash_NoPayload_Waits(t *testing.
 
 	tracker := newMockInFlightTracker(payloadStore)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -5368,7 +6078,7 @@ func TestReconciler_ReconcileAll_PayloadCorruption_DeletesCorruptPayload(t *test
 
 	tracker := newMockInFlightTracker(payloadStore)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -5426,7 +6136,7 @@ func TestReconciler_ReconcileAll_UpdatedPayload_ProvisionsAndKeepsIt(t *testing.
 
 	tracker := newMockInFlightTracker(payloadStore)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -5486,7 +6196,7 @@ func TestReconciler_ReconcileAll_LegacyPayloadWithoutRecordedHash_UsesMetaHash(t
 	defer payloadStore.Close()
 
 	tracker := newMockInFlightTracker(payloadStore)
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -5540,7 +6250,7 @@ func TestReconciler_ReconcileAll_LegacyPayloadMismatchingMetaHash_IsDeleted(t *t
 	defer payloadStore.Close()
 
 	tracker := newMockInFlightTracker(payloadStore)
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -5606,7 +6316,7 @@ func TestReconciler_ReconcileAll_PayloadStoreGetError_TransientError(t *testing.
 
 	tracker := newMockInFlightTracker(payloadStore)
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -5649,7 +6359,7 @@ func TestReconciler_ReconcileAll_RefreshStateError_ContinuesWithStaleData(t *tes
 	})
 
 	placements := &mockPlacementStore{}
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), placements)
@@ -5702,7 +6412,7 @@ func TestReconciler_PartialInventoryCannotReplaceSilentConfirmedOwner(t *testing
 	require.NoError(t, err)
 	placements := &mockPlacementStore{}
 	require.NoError(t, placements.Set("lease-1", "backend-a"))
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, ack, router, newMockInFlightTracker(nil), placements)
 	require.NoError(t, err)
@@ -5717,7 +6427,7 @@ func TestReconciler_PartialInventoryCannotReplaceSilentConfirmedOwner(t *testing
 	backendB.mu.Unlock()
 }
 
-func TestReconciler_CompleteInventoryPersistsReplacementBeforeClearingOldAttempt(t *testing.T) {
+func TestReconciler_PositiveDifferentBackendQuarantinesStickyAttempt(t *testing.T) {
 	lease := billingtypes.Lease{
 		Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_ACTIVE,
 	}
@@ -5742,19 +6452,20 @@ func TestReconciler_CompleteInventoryPersistsReplacementBeforeClearingOldAttempt
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, placements.Close()) })
 	requireSetPlacementAttempt(t, placements, "lease-1", "backend-a")
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), placements)
 	require.NoError(t, err)
 
-	// The complete first sweep disproves old attempt A and positively finds B.
-	// B must become durable before A is cleared; recordless success would make
-	// the startup trust latch unsafe on the degraded sweep below.
+	// Even a complete inventory is not ordered after the outbound call against A.
+	// A positive B is therefore contradictory evidence, not permission to move
+	// affinity or erase the exact pending operation.
 	require.NoError(t, r.ReconcileAll(t.Context()))
 	p := placements.Lookup("lease-1")
-	require.Equal(t, placement.StateConfirmed, p.State())
-	require.Equal(t, "backend-b", p.Backend)
-	require.Empty(t, p.Attempt)
+	require.Equal(t, placement.StateUnusable, p.State())
+	require.True(t, p.Conflict)
+	require.ElementsMatch(t, []string{"backend-a", "backend-b"}, p.ConflictBackends)
+	require.Equal(t, "backend-a", p.Attempt)
 	require.True(t, r.placementSweepSeen.Load())
 
 	backendB.mu.Lock()
@@ -5767,7 +6478,7 @@ func TestReconciler_CompleteInventoryPersistsReplacementBeforeClearingOldAttempt
 	backendA.mu.Unlock()
 	backendC.mu.Lock()
 	assert.Empty(t, backendC.provisionCalls,
-		"a silent replacement owner must remain pinned after the old attempt was disproved")
+		"a contradictory positive must remain quarantined after its reporter goes silent")
 	backendC.mu.Unlock()
 }
 
@@ -5814,7 +6525,7 @@ func TestReconciler_RefreshFailureCannotActOnStaleFailedStatus(t *testing.T) {
 				Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
 			})
 			require.NoError(t, err)
-			r, err := NewReconciler(ReconcilerConfig{
+			r, err := newReconciler(ReconcilerConfig{
 				ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 			}, chainClient, noopAck, router, nil, nil)
 			require.NoError(t, err)
@@ -5859,7 +6570,7 @@ func TestReconciler_DuplicateBackendOwnersDeferAndPersistQuarantine(t *testing.T
 	placements := &mockPlacementStore{}
 	require.NoError(t, placements.Set("lease-1", "backend-a"))
 	tracker := newMockInFlightTracker(nil)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, ack, router, tracker, placements)
 	require.NoError(t, err)
@@ -5871,8 +6582,10 @@ func TestReconciler_DuplicateBackendOwnersDeferAndPersistQuarantine(t *testing.T
 	assert.Zero(t, acked)
 	p := placements.Lookup("lease-1")
 	assert.Equal(t, placement.StateUnusable, p.State())
-	assert.True(t, p.Conflict, "an arbitrary inventory winner must be replaced by a durable quarantine")
-	assert.Empty(t, p.Backend)
+	assert.True(t, p.Conflict, "contradictory positive owners must create a durable quarantine")
+	assert.Equal(t, "backend-a", p.Backend,
+		"quarantine must preserve the last confirmed owner instead of erasing evidence")
+	assert.ElementsMatch(t, []string{"backend-a", "backend-b"}, p.ConflictBackends)
 }
 
 func TestReconciler_DuplicateOwnerQuarantineSurvivesPartialNextSweep(t *testing.T) {
@@ -5902,7 +6615,7 @@ func TestReconciler_DuplicateOwnerQuarantineSurvivesPartialNextSweep(t *testing.
 	require.NoError(t, err)
 	placements := &mockPlacementStore{}
 	tracker := newMockInFlightTracker(nil)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, tracker, placements)
 	require.NoError(t, err)
@@ -5959,7 +6672,7 @@ func TestReconciler_DurableDuplicateQuarantineSurvivesRestart(t *testing.T) {
 		require.NoError(t, routerErr)
 		return router
 	}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, newRouter(t), newMockInFlightTracker(nil), placements)
 	require.NoError(t, err)
@@ -5977,7 +6690,7 @@ func TestReconciler_DurableDuplicateQuarantineSurvivesRestart(t *testing.T) {
 	backendB.mu.Lock()
 	backendB.listErr = errors.New("backend-b unavailable")
 	backendB.mu.Unlock()
-	r, err = NewReconciler(ReconcilerConfig{
+	r, err = newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, newRouter(t), newMockInFlightTracker(nil), placements)
 	require.NoError(t, err)
@@ -6017,7 +6730,7 @@ func TestReconciler_DurableConflictDoesNotResolveAgainstReducedConfiguration(t *
 		{Backend: backendA, IsDefault: true}, {Backend: backendB},
 	}})
 	require.NoError(t, err)
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, ack, router, newMockInFlightTracker(nil), placements)
 	require.NoError(t, err)
@@ -6037,7 +6750,7 @@ func TestReconciler_DurableConflictDoesNotResolveAgainstReducedConfiguration(t *
 		{Backend: backendB, IsDefault: true},
 	}})
 	require.NoError(t, err)
-	r, err = NewReconciler(ReconcilerConfig{
+	r, err = newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, ack, reducedRouter, newMockInFlightTracker(nil), placements)
 	require.NoError(t, err)
@@ -6103,7 +6816,7 @@ func TestReconciler_InventoryCannotAutoRepairUnreadablePlacementRecord(t *testin
 		acknowledged++
 		return true, "tx", nil
 	}}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, ack, router, newMockInFlightTracker(nil), store)
 	require.NoError(t, err)
@@ -6137,7 +6850,7 @@ func TestReconciler_InventoryCannotAutoRepairUnreadablePlacementRecord(t *testin
 		"reconciliation must preserve the unreadable bytes for operator diagnosis/repair")
 }
 
-func TestReconciler_DuplicateQuarantineResolvesToDurableUniqueOwner(t *testing.T) {
+func TestReconciler_DuplicateQuarantinePersistsWhenPeerGoesSilent(t *testing.T) {
 	chainClient := &chaintest.MockClient{GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
 		return []billingtypes.Lease{{
 			Uuid: "lease-1", Tenant: "tenant-1", State: billingtypes.LEASE_STATE_PENDING,
@@ -6155,7 +6868,7 @@ func TestReconciler_DuplicateQuarantineResolvesToDurableUniqueOwner(t *testing.T
 	}})
 	require.NoError(t, err)
 	placements := &mockPlacementStore{}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, chainClient, noopAck, router, newMockInFlightTracker(nil), placements)
 	require.NoError(t, err)
@@ -6163,13 +6876,14 @@ func TestReconciler_DuplicateQuarantineResolvesToDurableUniqueOwner(t *testing.T
 	require.True(t, placements.Lookup("lease-1").Conflict)
 
 	backendB.mu.Lock()
-	backendB.provisions = nil // a complete sweep now proves A is the sole owner
+	backendB.provisions = nil
 	backendB.mu.Unlock()
 	require.NoError(t, r.ReconcileAll(t.Context()))
 	p := placements.Lookup("lease-1")
-	require.Equal(t, placement.StateConfirmed, p.State())
-	require.Equal(t, "backend-a", p.Backend)
-	require.False(t, p.Conflict)
+	require.Equal(t, placement.StateUnusable, p.State())
+	require.True(t, p.Conflict,
+		"B's silence cannot prove that its earlier positive ownership or a delayed mutation is gone")
+	assert.ElementsMatch(t, []string{"backend-a", "backend-b"}, p.ConflictBackends)
 
 	backendA.mu.Lock()
 	backendA.listErr = errors.New("backend-a unavailable")
@@ -6181,10 +6895,10 @@ func TestReconciler_DuplicateQuarantineResolvesToDurableUniqueOwner(t *testing.T
 	defer backendC.mu.Unlock()
 	assert.Empty(t, backendB.provisionCalls)
 	assert.Empty(t, backendC.provisionCalls,
-		"a silent confirmed owner must not be substituted after conflict resolution")
+		"a durable conflict must not be substituted when one candidate later goes silent")
 }
 
-func TestReconciler_DuplicateRetentionQuarantineResolvesOnCompleteEvidence(t *testing.T) {
+func TestReconciler_DuplicateRetentionQuarantinePersistsWhenPeerGoesSilent(t *testing.T) {
 	backendA := &mockReconcilerBackend{name: "backend-a", retentions: []backend.RetainedLease{{
 		LeaseUUID: "lease-1",
 	}}}
@@ -6196,7 +6910,7 @@ func TestReconciler_DuplicateRetentionQuarantineResolvesOnCompleteEvidence(t *te
 	}})
 	require.NoError(t, err)
 	placements := &mockPlacementStore{}
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, &chaintest.MockClient{}, noopAck, router, newMockInFlightTracker(nil), placements)
 	require.NoError(t, err)
@@ -6212,10 +6926,10 @@ func TestReconciler_DuplicateRetentionQuarantineResolvesOnCompleteEvidence(t *te
 	require.NoError(t, r.ReconcileAll(t.Context()))
 
 	p = placements.Lookup("lease-1")
-	require.Equal(t, placement.StateConfirmed, p.State())
-	assert.Equal(t, "backend-a", p.Backend)
-	assert.False(t, p.Conflict,
-		"a complete pair of provision and retention inventories may resolve the durable candidate set")
+	require.Equal(t, placement.StateUnusable, p.State())
+	assert.True(t, p.Conflict,
+		"a complete inventory response cannot turn B's missing retention into causal non-execution proof")
+	assert.ElementsMatch(t, []string{"backend-a", "backend-b"}, p.ConflictBackends)
 }
 
 func TestReconciler_RefreshFailureCannotClearAttemptOrArmTrust(t *testing.T) {
@@ -6239,7 +6953,7 @@ func TestReconciler_RefreshFailureCannotClearAttemptOrArmTrust(t *testing.T) {
 	requireSetPlacementAttempt(t, placements, "lease-1", "backend-a")
 	tracker := newMockInFlightTracker(nil)
 
-	r, err := NewReconciler(ReconcilerConfig{
+	r, err := newReconciler(ReconcilerConfig{
 		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
 	}, mockChain, noopAck, router, tracker, placements)
 	require.NoError(t, err)
@@ -6291,7 +7005,7 @@ func TestReconciler_ReconcileAll_HasPayloadError_CountsAsError(t *testing.T) {
 	tracker := newMockInFlightTracker(nil) // no payload store needed
 	tracker.hasPayloadErr = errors.New("disk I/O error")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -6329,7 +7043,7 @@ func TestReconciler_ReconcileAll_SetsLastSuccessTimestamp(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -6343,6 +7057,69 @@ func TestReconciler_ReconcileAll_SetsLastSuccessTimestamp(t *testing.T) {
 	after := promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp)
 	assert.Greater(t, after, before, "ReconcilerLastSuccessTimestamp should be updated after reconciliation")
 	assert.Greater(t, after, float64(0), "ReconcilerLastSuccessTimestamp should be a positive unix timestamp")
+}
+
+func TestReconciler_CycleCompletenessRequiresInventoriesAndProjection(t *testing.T) {
+	// Deliberately not parallel: this test verifies process-global Prometheus
+	// collectors through before/after deltas.
+	tests := []struct {
+		name       string
+		newBackend func() backend.Backend
+		newStore   func() PlacementStore
+	}{
+		{
+			name: "retention inventory outage",
+			newBackend: func() backend.Backend {
+				return &retentionErrorReconcilerBackend{
+					mockReconcilerBackend: &mockReconcilerBackend{name: "backend-a"},
+					err:                   errors.New("retentions unavailable"),
+				}
+			},
+			newStore: func() PlacementStore { return &mockPlacementStore{} },
+		},
+		{
+			name:       "placement projection write failure",
+			newBackend: func() backend.Backend { return &mockReconcilerBackend{name: "backend-a"} },
+			newStore: func() PlacementStore {
+				return &failNextBatchPlacementStore{
+					PlacementStore: &mockPlacementStore{},
+					failErr:        errors.New("placement projection unavailable"),
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chainClient := &chaintest.MockClient{}
+			router, err := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: tt.newBackend(), IsDefault: true}},
+			})
+			require.NoError(t, err)
+			r, err := newReconciler(ReconcilerConfig{
+				ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+			}, chainClient, noopAck, router, newMockInFlightTracker(nil), tt.newStore())
+			require.NoError(t, err)
+
+			const previousSuccess = 123
+			metrics.ReconcilerLastSuccessTimestamp.Set(previousSuccess)
+			metrics.ReconcilerSweepComplete.Set(1)
+			degraded := metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeDegraded)
+			success := metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess)
+			degradedBefore := promtestutil.ToFloat64(degraded)
+			successBefore := promtestutil.ToFloat64(success)
+
+			require.NoError(t, r.ReconcileAll(t.Context()))
+
+			assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.ReconcilerSweepComplete),
+				"an incomplete or unpersisted fleet projection must disarm sweep_complete")
+			assert.Equal(t, float64(previousSuccess),
+				promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp),
+				"an incomplete or unpersisted fleet projection must not advance last-success")
+			assert.Equal(t, degradedBefore+1, promtestutil.ToFloat64(degraded))
+			assert.Equal(t, successBefore, promtestutil.ToFloat64(success))
+		})
+	}
 }
 
 func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
@@ -6367,7 +7144,7 @@ func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
 	})
 
 	tracker := newMockInFlightTracker(nil)
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -6405,7 +7182,7 @@ func TestReconciler_ReconcileAll_PartialFailureDoesNotUpdateTimestamp(t *testing
 	})
 
 	tracker := newMockInFlightTracker(nil)
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)
@@ -6467,7 +7244,7 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 		},
 	}
 	mockTracker := newMockInFlightTracker(nil)
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, mockTracker, nil)
@@ -6536,7 +7313,7 @@ func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
 		return false, nil
 	}
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, ack, router, mockTracker, nil)
@@ -6565,6 +7342,389 @@ func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
 		"the non-panicking lease must still be processed; one bad lease must not block others")
 }
 
+type controlledReconcilerProvisionBackend struct {
+	*mockReconcilerBackend
+	provision func(context.Context, backend.ProvisionRequest) error
+}
+
+func (controlled *controlledReconcilerProvisionBackend) Provision(
+	ctx context.Context,
+	request backend.ProvisionRequest,
+) error {
+	controlled.mu.Lock()
+	controlled.provisionCalls = append(controlled.provisionCalls, request)
+	controlled.mu.Unlock()
+	return controlled.provision(ctx, request)
+}
+
+func TestReconcilerTypedInitiationOrdersEventAndFencesCloseDuringCall(t *testing.T) {
+	registry := operation.NewRegistry()
+	var events []backend.ProvisionStatus
+	client := &controlledReconcilerProvisionBackend{
+		mockReconcilerBackend: &mockReconcilerBackend{name: "backend-a"},
+	}
+	client.provision = func(_ context.Context, request backend.ProvisionRequest) error {
+		record, exists := registry.Lookup(request.LeaseUUID)
+		require.True(t, exists)
+		assert.Equal(t, operation.PhaseCalling, record.Phase)
+		assert.Equal(t, []backend.ProvisionStatus{backend.ProvisionStatusProvisioning}, events)
+		closeClaim := registry.TryClaimDeprovision(request.LeaseUUID, record.ID)
+		assert.Equal(t, operation.SettlementBusy, closeClaim.Outcome())
+		return nil
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil),
+		operations:          registry,
+	}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{{
+				Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}}, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}, nil
+		},
+	}
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+		StartEvents: provisionStartEventSinkFunc(func(string) {
+			events = append(events, backend.ProvisionStatusProvisioning)
+		}),
+	}, chainClient, noopAck, router, runtime, store)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(context.Background()))
+	record, exists := registry.Lookup("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, operation.PhaseActive, record.Phase)
+	assert.Equal(t, []backend.ProvisionStatus{backend.ProvisionStatusProvisioning}, events)
+}
+
+func TestReconcilerInlineCallbackOverridesLaterSynchronousError(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      backend.CallbackStatus
+		wantStatus  backend.ProvisionStatus
+		wantAck     int
+		wantRejects int
+		wantState   placement.State
+	}{
+		{
+			name: "success", status: backend.CallbackStatusSuccess,
+			wantStatus: backend.ProvisionStatusReady, wantAck: 1,
+			wantState: placement.StateConfirmed,
+		},
+		{
+			name: "failure", status: backend.CallbackStatusFailed,
+			wantStatus: backend.ProvisionStatusFailed, wantRejects: 1,
+			wantState: placement.StateAbsent,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registry := operation.NewRegistry()
+			store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			var acknowledgeCalls, rejectCalls int
+			lease := billingtypes.Lease{
+				Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}
+			chainClient := &chaintest.MockClient{
+				GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+					return []billingtypes.Lease{lease}, nil
+				},
+				GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+					copy := lease
+					return &copy, nil
+				},
+				RejectLeasesFunc: func(context.Context, []string, string) (uint64, []string, error) {
+					rejectCalls++
+					return 1, []string{"tx-reject"}, nil
+				},
+			}
+			events := &callbackEventRecorder{}
+			callbacks, err := NewCallbackService(CallbackServiceConfig{
+				Operations: registry,
+				Chain:      chainClient,
+				Placement:  store,
+				Acknowledger: callbackAcknowledgerFunc(func(context.Context, string) (bool, string, error) {
+					acknowledgeCalls++
+					return true, "tx-ack", nil
+				}),
+				Events: events,
+			})
+			require.NoError(t, err)
+
+			client := &controlledReconcilerProvisionBackend{
+				mockReconcilerBackend: &mockReconcilerBackend{name: "backend-a"},
+			}
+			client.provision = func(ctx context.Context, request backend.ProvisionRequest) error {
+				record, exists := registry.Lookup(request.LeaseUUID)
+				if !exists {
+					return errors.New("operation missing during backend call")
+				}
+				command, commandErr := NewCallbackCommand(backend.CallbackPayload{
+					LeaseUUID: request.LeaseUUID, Backend: client.Name(), Status: test.status,
+					Error: "inline terminal failure", OperationID: record.ID.String(),
+				})
+				if commandErr != nil {
+					return commandErr
+				}
+				if callbackErr := callbacks.HandleCallback(ctx, command); callbackErr != nil {
+					return callbackErr
+				}
+				return fmt.Errorf("late synchronous response: %w", backend.ErrValidation)
+			}
+			router, err := backend.NewRouter(backend.RouterConfig{
+				Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
+			})
+			require.NoError(t, err)
+			runtime := &typedTestReconcilerRuntime{
+				mockInFlightTracker: newMockInFlightTracker(nil), operations: registry,
+			}
+			reconciler, err := NewReconciler(ReconcilerConfig{
+				ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+			}, chainClient, noopAck, router, runtime, store)
+			require.NoError(t, err)
+
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+			assert.Equal(t, test.wantAck, acknowledgeCalls)
+			assert.Equal(t, test.wantRejects, rejectCalls,
+				"the synchronous validation error must not apply chain cleanup after the callback")
+			assert.False(t, registry.Contains(lease.Uuid))
+			assert.Equal(t, test.wantState, store.Lookup(lease.Uuid).State())
+			events.mu.Lock()
+			require.Len(t, events.events, 1)
+			assert.Equal(t, test.wantStatus, events.events[0].Status)
+			events.mu.Unlock()
+		})
+	}
+}
+
+func TestReconcilerBackendProvisionPanicAbortsCallingAndRetainsAttempt(t *testing.T) {
+	registry := operation.NewRegistry()
+	client := &controlledReconcilerProvisionBackend{
+		mockReconcilerBackend: &mockReconcilerBackend{name: "backend-a"},
+		provision: func(context.Context, backend.ProvisionRequest) error {
+			panic("backend implementation fault")
+		},
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	lease := billingtypes.Lease{
+		Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{lease}, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			copy := lease
+			return &copy, nil
+		},
+	}
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil), operations: registry,
+	}
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, runtime, store)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+	assert.False(t, registry.Contains(lease.Uuid),
+		"a backend panic must not strand the reconciler operation in Calling")
+	record := store.Lookup(lease.Uuid)
+	assert.Equal(t, placement.StateAttempting, record.State())
+	assert.Equal(t, client.Name(), record.Attempt)
+}
+
+type beginCallRejectingReconcilerOperations struct {
+	ReconcilerOperations
+}
+
+func (*beginCallRejectingReconcilerOperations) BeginCall(operation.Initiation) bool {
+	return false
+}
+
+func TestReconcilerBeginCallFailureRefusesUnsentAttempt(t *testing.T) {
+	registry := operation.NewRegistry()
+	operations := &beginCallRejectingReconcilerOperations{ReconcilerOperations: registry}
+	client := &mockReconcilerBackend{name: "backend-a"}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	lease := billingtypes.Lease{
+		Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{lease}, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			copy := lease
+			return &copy, nil
+		},
+	}
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil),
+		operations:          operations,
+	}
+	reconciler, err := NewReconciler(
+		ReconcilerConfig{ProviderUUID: "provider-1", CallbackBaseURL: "http://callback"},
+		chainClient, noopAck, router, runtime, store,
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	client.mu.Lock()
+	assert.Empty(t, client.provisionCalls,
+		"a failed call-phase transition must never contact the backend")
+	client.mu.Unlock()
+	assert.False(t, registry.Contains(lease.Uuid))
+	record := store.Lookup(lease.Uuid)
+	assert.Equal(t, placement.StateAbsent, record.State())
+	assert.Empty(t, record.Attempt,
+		"the exact unsent attempt must be refused before aborting the operation")
+	assert.False(t, record.AttemptOperationID().Valid())
+}
+
+func TestReconcilerEventSinkPanicDoesNotPreventProvisionDispatch(t *testing.T) {
+	registry := operation.NewRegistry()
+	client := &mockReconcilerBackend{name: "backend-a"}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	lease := billingtypes.Lease{
+		Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+	}
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{lease}, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			copy := lease
+			return &copy, nil
+		},
+	}
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil), operations: registry,
+	}
+	panics := metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
+		metrics.LifecycleEventProvisionStarting,
+	)
+	before := promtestutil.ToFloat64(panics)
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+		StartEvents: provisionStartEventSinkFunc(func(string) { panic("event sink fault") }),
+	}, chainClient, noopAck, router, runtime, store)
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+
+	client.mu.Lock()
+	require.Len(t, client.provisionCalls, 1,
+		"best-effort event delivery must not suppress provision dispatch")
+	client.mu.Unlock()
+	record, exists := registry.Lookup(lease.Uuid)
+	require.True(t, exists)
+	assert.Equal(t, operation.PhaseActive, record.Phase,
+		"the recovered panic must not strand the operation in Calling")
+	assert.Equal(t, placement.StateConfirmed, store.Lookup(lease.Uuid).State())
+	assert.Equal(t, before+1, promtestutil.ToFloat64(panics))
+}
+
+func TestReconcilerAuthoritativeLeaseReadSkipsClosedLeaseBeforeProvision(t *testing.T) {
+	registry := operation.NewRegistry()
+	client := &mockReconcilerBackend{name: "backend-a"}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	runtime := &typedTestReconcilerRuntime{
+		mockInFlightTracker: newMockInFlightTracker(nil),
+		operations:          registry,
+	}
+
+	readEntered := make(chan struct{})
+	releaseRead := make(chan struct{})
+	chainClient := &chaintest.MockClient{
+		GetPendingLeasesFunc: func(context.Context, string) ([]billingtypes.Lease, error) {
+			return []billingtypes.Lease{{
+				Uuid: "lease-1", Tenant: "tenant-a", State: billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
+			}}, nil
+		},
+		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+			close(readEntered)
+			select {
+			case <-releaseRead:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return &billingtypes.Lease{
+				Uuid: leaseUUID, Tenant: "tenant-a", State: billingtypes.LEASE_STATE_CLOSED,
+			}, nil
+		},
+	}
+	reconciler, err := NewReconciler(ReconcilerConfig{
+		ProviderUUID: "provider-1", CallbackBaseURL: "http://callback",
+	}, chainClient, noopAck, router, runtime, store)
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() { done <- reconciler.ReconcileAll(t.Context()) }()
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for authoritative lease re-read")
+	}
+	assert.Equal(t, operation.LeaseClaimBusy, registry.TryClaimLeaseNow("lease-1").Outcome(),
+		"the authoritative read must run under the lifecycle claim")
+	close(releaseRead)
+	require.NoError(t, <-done)
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	assert.Empty(t, client.provisionCalls,
+		"a lease closed after inventory must never reach Provision")
+	assert.False(t, registry.Contains("lease-1"))
+}
+
 func TestReconciler_doStartProvisioning_HonorsPlacement(t *testing.T) {
 	// When a placement record exists, doStartProvisioning (via ReconcileAll) must
 	// route to the placement-pinned backend, not the least-loaded default (ENG-333).
@@ -6591,7 +7751,7 @@ func TestReconciler_doStartProvisioning_HonorsPlacement(t *testing.T) {
 	ps := &mockPlacementStore{}
 	ps.Set("lease-1", "backend-pinned")
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -6650,20 +7810,61 @@ func TestCleanupOrphanedPlacements_GateD(t *testing.T) {
 	backendLeases := map[string]struct{}{} // empty — none on a backend
 	tracker := newMockInFlightTracker(nil) // empty — none in-flight
 
-	// cleanupOrphanedPlacements reads ONLY r.placementStore and r.tracker (plus
+	// cleanupOrphanedPlacements reads ONLY r.placementView, r.legacyPlacement,
+	// and r.tracker (plus
 	// the passed-in maps), so this hand-built literal is safe. Any future change
 	// that makes the pruner read other Reconciler fields must set them here too,
 	// or this white-box test will nil-panic.
-	r := &Reconciler{placementStore: ps, tracker: tracker, interval: time.Minute}
+	r := &Reconciler{placementView: ps, legacyPlacement: ps, tracker: tracker, interval: time.Minute}
 	answered := answeredSet{"backend-a": true, "backend-b": true}
 	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases,
-		answered, answered, time.Now().Add(time.Hour), ^uint64(0), nil)
+		answered, answered, time.Now().Add(time.Hour), ^uint64(0), nil,
+		operation.TrackerSnapshot{}, 0)
 
 	assert.Equal(t, 2, pruned)
 	assert.Equal(t, "backend-a", ps.Get("active-chain-lease"), "gate d: ACTIVE on chain must keep")
 	assert.Equal(t, "backend-b", ps.Get("pending-chain-lease"), "gate d: PENDING on chain must keep")
 	assert.Equal(t, "", ps.Get("closed-chain-lease"), "gate d: CLOSED on chain must prune")
 	assert.Equal(t, "", ps.Get("off-chain-lease"), "absent from chain must prune")
+}
+
+func TestCleanupOrphanedPlacements_TypedLeaseClaimFencesSnapshotAndDelete(t *testing.T) {
+	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.Confirm("lease-1", "backend-a"))
+
+	operations := operation.NewRegistry()
+	inventoryBoundary := operations.Snapshot()
+	eventClaim := operations.TryClaimLeaseNow("lease-1")
+	require.True(t, eventClaim.Acquired())
+
+	r := &Reconciler{
+		placementView:      store,
+		placementAuthority: store,
+		operations:         operations,
+		interval:           time.Minute,
+	}
+	answered := answeredSet{"backend-a": true}
+	prune := func(snapshot operation.TrackerSnapshot) int {
+		return r.cleanupOrphanedPlacements(
+			context.Background(), nil, nil, answered, answered,
+			time.Now().Add(time.Hour), store.SnapshotRevision(), nil, snapshot, 0,
+		)
+	}
+
+	assert.Zero(t, prune(inventoryBoundary),
+		"a lifecycle claim acquired after inventory must fence its placement")
+	assert.Equal(t, placement.StateConfirmed, store.Lookup("lease-1").State())
+
+	require.True(t, operations.ReleaseLease(eventClaim.Claim()))
+	assert.Zero(t, prune(inventoryBoundary),
+		"a completed lifecycle action must remain visible to the old inventory boundary")
+	assert.Equal(t, placement.StateConfirmed, store.Lookup("lease-1").State())
+
+	assert.Equal(t, 1, prune(operations.Snapshot()),
+		"a claim-free inventory boundary may perform the proven cleanup")
+	assert.Equal(t, placement.StateAbsent, store.Lookup("lease-1").State())
 }
 
 // TestCleanupOrphanedPlacements_PerRecordAnswered pins the ENG-654 rescoping:
@@ -6688,14 +7889,15 @@ func TestCleanupOrphanedPlacements_PerRecordAnswered(t *testing.T) {
 	provisionsAnswered := answeredSet{"backend-a": true, "backend-b": false, "backend-c": true}
 	retentionsAnswered := answeredSet{"backend-a": true, "backend-b": true, "backend-c": false}
 
-	r := &Reconciler{placementStore: ps, tracker: tracker, interval: time.Minute}
+	r := &Reconciler{placementView: ps, legacyPlacement: ps, tracker: tracker, interval: time.Minute}
 	skips := metrics.ReconcilerCleanupSkipsTotal.
 		WithLabelValues(metrics.CleanupPassPlacement, metrics.CleanupSkipBackendSilent)
 	before := promtestutil.ToFloat64(skips)
 
 	// now far in the future so the ENG-335 grace window is not what is being tested.
 	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases,
-		provisionsAnswered, retentionsAnswered, time.Now().Add(time.Hour), ^uint64(0), nil)
+		provisionsAnswered, retentionsAnswered, time.Now().Add(time.Hour), ^uint64(0), nil,
+		operation.TrackerSnapshot{}, 0)
 
 	assert.Equal(t, 1, pruned)
 	assert.Equal(t, "", ps.Get("on-answering"),
@@ -6733,14 +7935,15 @@ func TestCleanupOrphanedPlacements_ConflictCandidatesMustAllBeAccounted(t *testi
 	}
 	answered := answeredSet{"backend-a": true, "backend-b": true}
 	r := &Reconciler{
-		placementStore: ps,
-		tracker:        newMockInFlightTracker(nil),
-		interval:       time.Minute,
+		placementView:   ps,
+		legacyPlacement: ps,
+		tracker:         newMockInFlightTracker(nil),
+		interval:        time.Minute,
 	}
 
 	pruned := r.cleanupOrphanedPlacements(
 		context.Background(), nil, nil, answered, answered,
-		time.Now(), ^uint64(0), nil,
+		time.Now(), ^uint64(0), nil, operation.TrackerSnapshot{}, 0,
 	)
 
 	assert.Equal(t, 1, pruned)
@@ -6778,7 +7981,7 @@ func TestReconciler_PrunesOrphanedPlacement(t *testing.T) {
 	require.NoError(t, err)
 
 	// Chain returns no leases → gone-lease is chain-terminal (absent).
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -6806,18 +8009,20 @@ func TestCleanupOrphanedPlacements_GraceWindow(t *testing.T) {
 	chainLeases := map[string]billingtypes.Lease{}
 	backendLeases := map[string]struct{}{}
 	tracker := newMockInFlightTracker(nil)
-	r := &Reconciler{placementStore: ps, tracker: tracker, interval: interval}
+	r := &Reconciler{placementView: ps, legacyPlacement: ps, tracker: tracker, interval: interval}
 	answered := answeredSet{"backend-a": true}
 
 	// now = t0 + 1m  → within the 2m grace → KEEP.
 	pruned := r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases,
-		answered, answered, t0.Add(time.Minute), ^uint64(0), nil)
+		answered, answered, t0.Add(time.Minute), ^uint64(0), nil,
+		operation.TrackerSnapshot{}, 0)
 	assert.Equal(t, 0, pruned, "young placement within grace must be kept")
 	assert.Equal(t, "backend-a", ps.Get("young-lease"))
 
 	// now = t0 + 2m + 1s → past grace → PRUNE.
 	pruned = r.cleanupOrphanedPlacements(context.Background(), chainLeases, backendLeases,
-		answered, answered, t0.Add(2*time.Minute+time.Second), ^uint64(0), nil)
+		answered, answered, t0.Add(2*time.Minute+time.Second), ^uint64(0), nil,
+		operation.TrackerSnapshot{}, 0)
 	assert.Equal(t, 1, pruned, "aged placement past grace must be pruned")
 	assert.Equal(t, "", ps.Get("young-lease"))
 }
@@ -6843,7 +8048,7 @@ func TestReconciler_DoesNotPruneOnIncompleteRetentions(t *testing.T) {
 
 	// Chain returns no leases → gone-lease would be chain-terminal, but its
 	// backend not answering /retentions must block the prune.
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -6897,7 +8102,7 @@ func TestReconciler_DoesNotPruneActiveOrInFlight(t *testing.T) {
 		},
 	}
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, ps)
@@ -6929,7 +8134,7 @@ func TestReconciler_SyncsPlacementFromRetentions(t *testing.T) {
 
 	ps := &mockPlacementStore{}
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -6969,7 +8174,7 @@ func TestReconciler_SkipsRetentionFetch_WhenPlacementDisabled(t *testing.T) {
 	require.NoError(t, err)
 
 	// nil tracker AND nil placementStore => placement subsystem disabled.
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, nil, nil)
@@ -7004,7 +8209,7 @@ func TestReconciler_RetentionFetchPanic_RecordsMetric(t *testing.T) {
 	require.NoError(t, err)
 
 	// Non-nil placementStore so the retentions fetch actually runs.
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, newMockInFlightTracker(nil), &mockPlacementStore{})
@@ -7045,7 +8250,7 @@ func TestRestoreAffinity_EndToEnd_MultiBackend(t *testing.T) {
 
 	// Chain returns no leases — the reconciler must derive placement[source]
 	// purely from b2's /retentions response, not from active-provision syncing.
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, &chaintest.MockClient{}, noopAck, router, newMockInFlightTracker(nil), ps)
@@ -7077,7 +8282,7 @@ func TestReconciler_ReconcileAll_OmittedProvisionNotDeprovisioned(t *testing.T) 
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, nil, nil)
@@ -7137,7 +8342,7 @@ func TestReconciler_ReconcileAll_MalformedRecordedHash_KeepsPayload(t *testing.T
 	defer payloadStore.Close()
 
 	tracker := newMockInFlightTracker(payloadStore)
-	reconciler, err := NewReconciler(ReconcilerConfig{
+	reconciler, err := newReconciler(ReconcilerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, mockChain, noopAck, router, tracker, nil)

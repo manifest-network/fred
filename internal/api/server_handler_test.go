@@ -47,7 +47,8 @@ func TestHandleProvisionCallback_Success(t *testing.T) {
 	pub := &capturingCallbackPublisher{}
 	srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
 
-	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success"}`
+	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success",` +
+		`"operation_id":"d9428888-122b-41e1-b85c-61c67afba0c6"}`
 	rr := httptest.NewRecorder()
 	srv.handleProvisionCallback(rr, signedRequest(t, auth, body))
 
@@ -55,15 +56,17 @@ func TestHandleProvisionCallback_Success(t *testing.T) {
 	require.True(t, pub.called)
 	assert.Equal(t, testutil.ValidUUID1, pub.callback.LeaseUUID)
 	assert.Equal(t, backend.CallbackStatusSuccess, pub.callback.Status)
+	assert.Empty(t, pub.callback.OperationID, "JSON metadata cannot manufacture callback authority")
 }
 
-func TestHandleProvisionCallback_PropagatesAuthenticatedOperationGeneration(t *testing.T) {
+func TestHandleProvisionCallback_PropagatesAuthenticatedOperationID(t *testing.T) {
 	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
 	pub := &capturingCallbackPublisher{}
 	srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
-	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success"}`
+	body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success",` +
+		`"operation_id":"d9428888-122b-41e1-b85c-61c67afba0c6"}`
 	req := httptest.NewRequest(http.MethodPost,
-		"/callbacks/provision?operation_generation=42", strings.NewReader(body))
+		"/callbacks/provision?operation_id=123e4567-e89b-42d3-a456-426614174000", strings.NewReader(body))
 	req.Header.Set(CallbackSignatureHeader,
 		auth.ComputeSignature(req.Method, req.URL.RequestURI(), []byte(body)))
 
@@ -72,18 +75,19 @@ func TestHandleProvisionCallback_PropagatesAuthenticatedOperationGeneration(t *t
 
 	assert.Equal(t, http.StatusOK, rr.Code)
 	require.True(t, pub.called)
-	assert.Equal(t, uint64(42), pub.callback.OperationGeneration)
+	assert.Equal(t, "123e4567-e89b-42d3-a456-426614174000", pub.callback.OperationID)
 }
 
-func TestHandleProvisionCallback_RejectsInvalidAuthenticatedOperationGeneration(t *testing.T) {
+func TestHandleProvisionCallback_RejectsInvalidAuthenticatedOperationID(t *testing.T) {
 	tests := []struct {
-		name string
-		raw  string
+		name  string
+		query string
 	}{
-		{name: "zero", raw: "0"},
-		{name: "non-numeric", raw: "not-a-number"},
-		{name: "negative", raw: "-1"},
-		{name: "uint64 overflow", raw: "18446744073709551616"},
+		{name: "empty", query: "operation_id="},
+		{name: "malformed", query: "operation_id=not-a-uuid"},
+		{name: "uppercase non-canonical", query: "operation_id=123E4567-E89B-42D3-A456-426614174000"},
+		{name: "non-v4", query: "operation_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{name: "duplicate", query: "operation_id=123e4567-e89b-42d3-a456-426614174000&operation_id=d9428888-122b-41e1-b85c-61c67afba0c6"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -92,7 +96,7 @@ func TestHandleProvisionCallback_RejectsInvalidAuthenticatedOperationGeneration(
 			srv := &Server{callbackPublisher: pub, callbackAuthenticator: auth}
 			body := `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"success"}`
 			req := httptest.NewRequest(http.MethodPost,
-				"/callbacks/provision?operation_generation="+tt.raw, strings.NewReader(body))
+				"/callbacks/provision?"+tt.query, strings.NewReader(body))
 			req.Header.Set(CallbackSignatureHeader,
 				auth.ComputeSignature(req.Method, req.URL.RequestURI(), []byte(body)))
 
@@ -100,8 +104,8 @@ func TestHandleProvisionCallback_RejectsInvalidAuthenticatedOperationGeneration(
 			srv.handleProvisionCallback(rr, req)
 
 			assert.Equal(t, http.StatusBadRequest, rr.Code)
-			assertErrorBody(t, rr, "operation_generation must be a non-zero uint64")
-			assert.False(t, pub.called, "an invalid generation must fail before publication")
+			assertErrorBody(t, rr, "operation_id must be a single canonical UUIDv4")
+			assert.False(t, pub.called, "an invalid operation ID must fail before publication")
 		})
 	}
 }
