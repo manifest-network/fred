@@ -41,41 +41,232 @@ func requireLifecycleVerdict(
 	return result
 }
 
-func TestStore_LifecycleMigrationKeepsExistingOwnerLegacyAcrossReopen(t *testing.T) {
+func requirePersistedUnusableLifecycle(
+	t testing.TB,
+	s *Store,
+	leaseUUID string,
+) {
+	t.Helper()
+	require.NoError(t, s.db.View(func(tx *bolt.Tx) error {
+		encoded := tx.Bucket(lifecycleCapabilityBucketName).Get([]byte(leaseUUID))
+		require.NotNil(t, encoded, "durable lifecycle quarantine must exist")
+		capability, err := decodeLifecycleCapability(encoded)
+		require.NoError(t, err)
+		require.True(t, capability.unusable)
+		require.False(t, capability.rawCorrupt)
+		return nil
+	}))
+}
+
+func TestStore_InitialLegacyOwnerAdoptsTokenlessThenRotatesOnExactOperation(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	writeRawRecords(t, dbPath, map[string][]byte{
-		"legacy": []byte(`{"backend":"backend-a","set_at":"2026-08-27T12:00:00Z"}`),
+		"lease": []byte(`{"backend":"backend-a","set_at":"2026-08-27T12:00:00Z"}`),
 	})
 
 	s, err := NewStore(dbPath)
 	require.NoError(t, err)
-	assert.Equal(t, StateConfirmed, s.Lookup("legacy").State())
-	legacy := requireLifecycleVerdict(
-		t, s, "legacy", lifecycle.ID{}, LifecycleVerdictLegacy,
-	)
-	assert.Equal(t, "backend-a", legacy.Backend(),
-		"legacy observation routing comes from durable placement, never callback JSON")
-	assert.Equal(t, LifecycleVerdictLegacy, s.CurrentLifecycle("legacy").Verdict())
-	assert.False(t, s.CurrentLifecycle("legacy").ID().Valid())
+	assert.Equal(t, StateConfirmed, s.Lookup("lease").State())
+	assert.NotZero(t, s.Lookup("lease").Revision(),
+		"placement revision migration remains independent of lifecycle authority")
+	legacy := requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictLegacy)
+	assert.Equal(t, "backend-a", legacy.Backend())
 	requireLifecycleVerdict(
-		t, s, "legacy", requireLifecycleID(t, "8101"), LifecycleVerdictStale,
+		t, s, "lease", requireLifecycleID(t, "8101"), LifecycleVerdictStale,
 	)
+	assert.Equal(t, LifecycleVerdictLegacy, s.CurrentLifecycle("lease").Verdict())
+	require.NoError(t, s.ConfigureBackendTopology([]string{"backend-a"}))
+	requireAdmissionBaseline(t, s, "backend-a")
+
+	operationID := requireOperationID(t, "8102")
+	id := lifecycleIDFromOperation(t, operationID)
+	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
+	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictLegacy)
+	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictStale)
+	confirmed, err := s.ConfirmAttempt(token)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictAuthorized)
 	require.NoError(t, s.Close())
 
 	reopened, err := NewStore(dbPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
 	requireLifecycleVerdict(
-		t, reopened, "legacy", lifecycle.ID{}, LifecycleVerdictLegacy,
+		t, reopened, "lease", id, LifecycleVerdictAuthorized,
 	)
+}
 
-	retired, err := reopened.RetireLifecycle("legacy", lifecycle.ID{})
+func TestStore_ExistingLifecycleBucketDoesNotBackfillDowngradeWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
 	require.NoError(t, err)
-	assert.True(t, retired.Retired())
-	assert.Equal(t, "backend-a", retired.Backend())
-	retiredAgain, err := reopened.RetireLifecycle("legacy", lifecycle.ID{})
+	require.NoError(t, s.Close())
+
+	db, err := bolt.Open(dbPath, 0600, nil)
 	require.NoError(t, err)
-	assert.True(t, retiredAgain.Retired())
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		placements := tx.Bucket(bucketName)
+		if placements == nil {
+			return errors.New("placements bucket missing")
+		}
+		if err := placements.Put([]byte("v013-owner"), []byte("backend-a")); err != nil {
+			return err
+		}
+		return placements.Put(
+			[]byte("revisioned-missing"),
+			[]byte(`{"backend":"backend-a","set_at":"2026-08-27T12:00:00Z","revision":9}`),
+		)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireLifecycleVerdict(
+		t, reopened, "v013-owner", lifecycle.ID{}, LifecycleVerdictUnusable,
+	)
+	assert.NotZero(t, reopened.Lookup("v013-owner").Revision())
+	requireLifecycleVerdict(
+		t, reopened, "revisioned-missing", lifecycle.ID{}, LifecycleVerdictUnusable,
+	)
+	requireLifecycleVerdict(
+		t, reopened, "revisioned-missing", requireLifecycleID(t, "8110"),
+		LifecycleVerdictUnusable,
+	)
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(
+		t, reopenedAgain, "v013-owner", lifecycle.ID{}, LifecycleVerdictUnusable,
+	)
+	requireLifecycleVerdict(
+		t, reopenedAgain, "revisioned-missing", lifecycle.ID{}, LifecycleVerdictUnusable,
+	)
+}
+
+func TestStore_RecreatedLifecycleBucketCannotDowngradeTypedPlacements(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a")
+	operationID := requireOperationID(t, "8111")
+	id := lifecycleIDFromOperation(t, operationID)
+	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
+	confirmed, err := s.ConfirmAttempt(token)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictAuthorized)
+	require.NoError(t, s.Close())
+
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.DeleteBucket(lifecycleCapabilityBucketName)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	assert.Equal(t, StateConfirmed, reopened.Lookup("lease").State(),
+		"placement routing remains available for operator recovery")
+	requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(
+		t, reopened, "lease", lifecycle.ID{}, LifecycleVerdictUnusable,
+	)
+	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+		assert.Nil(t, tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease")),
+			"bucket recreation must not manufacture tokenless authority")
+		return nil
+	}))
+}
+
+func TestStore_RecreatedInitializationBucketsCannotAdoptMixedRevisionEpoch(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a")
+	typedOperation := requireOperationID(t, "8112")
+	typedID := lifecycleIDFromOperation(t, typedOperation)
+	token := requireTypedAttempt(t, s, "typed", "backend-a", typedOperation)
+	confirmed, err := s.ConfirmAttempt(token)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	require.NoError(t, s.Close())
+
+	// Simulate destructive bucket recreation beside a mixed placement epoch.
+	// Even though both post-v0.13 buckets are now absent, the revisioned typed
+	// row proves the database has already crossed the upgrade boundary, so the
+	// injected revision-zero row cannot acquire tokenless authority.
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		if err := tx.DeleteBucket(lifecycleCapabilityBucketName); err != nil {
+			return err
+		}
+		if err := tx.DeleteBucket(metadataBucketName); err != nil {
+			return err
+		}
+		return tx.Bucket(bucketName).Put(
+			[]byte("revision-zero"),
+			[]byte(`{"backend":"backend-a","set_at":"2026-08-27T12:00:00Z"}`),
+		)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	requireLifecycleVerdict(t, reopened, "typed", typedID, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(
+		t, reopened, "revision-zero", lifecycle.ID{}, LifecycleVerdictUnusable,
+	)
+	assert.NotZero(t, reopened.Lookup("revision-zero").Revision(),
+		"placement revision migration remains independent of denied lifecycle adoption")
+	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+		assert.Nil(t, tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("revision-zero")))
+		return nil
+	}))
+}
+
+func TestStore_DeletedLifecycleBucketCannotAdoptLaterRevisionZeroWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+
+	// A current store has already durably recorded its initialization epoch in
+	// placement_metadata. Deleting only the lifecycle bucket and then writing a
+	// v0.13-shaped row must not resurrect first-upgrade adoption.
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket(metadataBucketName) == nil {
+			return errors.New("placement metadata bucket missing")
+		}
+		if err := tx.DeleteBucket(lifecycleCapabilityBucketName); err != nil {
+			return err
+		}
+		return tx.Bucket(bucketName).Put(
+			[]byte("simulated-v013"),
+			[]byte(`{"backend":"backend-a","set_at":"2026-08-27T12:00:00Z"}`),
+		)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	requireLifecycleVerdict(
+		t, reopened, "simulated-v013", lifecycle.ID{}, LifecycleVerdictUnusable,
+	)
+	assert.NotZero(t, reopened.Lookup("simulated-v013").Revision())
+	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+		assert.Nil(t, tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("simulated-v013")))
+		return nil
+	}))
 }
 
 func TestStore_LifecycleAttemptPromotionRotationAndReopen(t *testing.T) {
@@ -219,7 +410,7 @@ func TestStore_RestoreLifecyclePromotionAndRefusal(t *testing.T) {
 	requireLifecycleVerdict(t, s, "refused-target", refusedID, LifecycleVerdictMissing)
 }
 
-func TestStore_InventoryPromotesTypedAttemptButLegacyAttemptStaysLegacy(t *testing.T) {
+func TestStore_InventoryPromotesMarkedAttemptButCannotRepairMissingCapability(t *testing.T) {
 	s := newTestStore(t)
 	requireAdmissionBaseline(t, s, "backend-a")
 	typedOperation := requireOperationID(t, "8501")
@@ -230,32 +421,230 @@ func TestStore_InventoryPromotesTypedAttemptButLegacyAttemptStaysLegacy(t *testi
 	})
 	requireLifecycleVerdict(t, s, "typed", typedID, LifecycleVerdictAuthorized)
 
-	dbPath := filepath.Join(t.TempDir(), "legacy-attempt.db")
-	legacyOperation := requireOperationID(t, "8502")
-	legacyID := lifecycleIDFromOperation(t, legacyOperation)
+	dbPath := filepath.Join(t.TempDir(), "missing-capability.db")
+	missingOperation := requireOperationID(t, "8502")
+	missingID := lifecycleIDFromOperation(t, missingOperation)
 	writeRawRecords(t, dbPath, map[string][]byte{
-		"legacy-attempt": []byte(`{"attempt":"backend-a","operation_id":"` +
-			legacyOperation.String() + `","set_at":"2026-08-27T12:00:00Z","revision":1}`),
+		"missing-capability": []byte(`{"attempt":"backend-a","operation_id":"` +
+			missingOperation.String() + `","set_at":"2026-08-27T12:00:00Z","revision":1}`),
 	})
-	legacyStore, err := NewStore(dbPath)
+	missingStore, err := NewStore(dbPath)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = legacyStore.Close() })
-	require.NoError(t, legacyStore.ConfigureBackendTopology([]string{"backend-a"}))
-	fence := legacyStore.BeginInventorySession()
-	_, err = legacyStore.ProjectInventory(fence, InventoryProjection{
-		Placements: map[string]string{"legacy-attempt": "backend-a"},
+	t.Cleanup(func() { _ = missingStore.Close() })
+	require.NoError(t, missingStore.ConfigureBackendTopology([]string{"backend-a"}))
+	fence := missingStore.BeginInventorySession()
+	_, err = missingStore.ProjectInventory(fence, InventoryProjection{
+		Placements: map[string]string{"missing-capability": "backend-a"},
 	})
-	legacyStore.EndInventorySession(fence)
+	missingStore.EndInventorySession(fence)
 	require.NoError(t, err)
 	requireLifecycleVerdict(
-		t, legacyStore, "legacy-attempt", lifecycle.ID{}, LifecycleVerdictLegacy,
+		t, missingStore, "missing-capability", lifecycle.ID{}, LifecycleVerdictUnusable,
 	)
 	requireLifecycleVerdict(
-		t, legacyStore, "legacy-attempt", legacyID, LifecycleVerdictStale,
+		t, missingStore, "missing-capability", missingID, LifecycleVerdictUnusable,
 	)
+	requirePersistedUnusableLifecycle(t, missingStore, "missing-capability")
 }
 
-func TestStore_LifecycleCapabilitySurvivesPlacementDeleteAndRetiresExactly(t *testing.T) {
+func TestStore_InventoryPersistsAttemptMarkerMismatchQuarantineAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a")
+	oldOperation := requireOperationID(t, "8511")
+	oldID := lifecycleIDFromOperation(t, oldOperation)
+	oldAttempt := requireTypedAttempt(t, s, "lease", "backend-a", oldOperation)
+	confirmed, err := s.ConfirmAttempt(oldAttempt)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+
+	newOperation := requireOperationID(t, "8512")
+	newID := lifecycleIDFromOperation(t, newOperation)
+	requireTypedAttempt(t, s, "lease", "backend-a", newOperation)
+	require.NoError(t, s.Close())
+
+	// Replace the durable row with an older, valid capability that omits the
+	// newer attempt marker. On load it is a decodable binding mismatch, not raw
+	// corruption, and therefore can be replaced by explicit fail-closed state.
+	oldEncoded, err := encodeLifecycleCapability(lifecycleCapability{
+		backend: "backend-a",
+		id:      oldID,
+	})
+	require.NoError(t, err)
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(lifecycleCapabilityBucketName).Put([]byte("lease"), oldEncoded)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireLifecycleVerdict(t, reopened, "lease", oldID, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, reopened, "lease", newID, LifecycleVerdictUnusable)
+	projectInventoryForTest(t, reopened, InventoryProjection{
+		Placements: map[string]string{"lease": "backend-a"},
+	})
+	assert.Empty(t, reopened.Lookup("lease").Attempt,
+		"positive inventory should still settle the placement attempt")
+	requirePersistedUnusableLifecycle(t, reopened, "lease")
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(t, reopenedAgain, "lease", oldID, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, reopenedAgain, "lease", newID, LifecycleVerdictUnusable)
+	requirePersistedUnusableLifecycle(t, reopenedAgain, "lease")
+}
+
+func TestStore_InventoryPersistsBackendBindingMismatchQuarantineAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
+	operationID := requireOperationID(t, "8513")
+	id := lifecycleIDFromOperation(t, operationID)
+	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
+	confirmed, err := s.ConfirmAttempt(token)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	require.NoError(t, s.Close())
+
+	// This valid row initially conflicts with the backend-a placement. If its
+	// cache-only quarantine were lost while inventory moved placement to
+	// backend-b, reopening would incorrectly authorize this stale ID.
+	mismatchedEncoded, err := encodeLifecycleCapability(lifecycleCapability{
+		backend: "backend-b",
+		id:      id,
+	})
+	require.NoError(t, err)
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(lifecycleCapabilityBucketName).Put(
+			[]byte("lease"), mismatchedEncoded,
+		)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
+	projectInventoryForTest(t, reopened, InventoryProjection{
+		Placements: map[string]string{"lease": "backend-b"},
+	})
+	assert.Equal(t, "backend-b", reopened.Lookup("lease").Backend)
+	requirePersistedUnusableLifecycle(t, reopened, "lease")
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(t, reopenedAgain, "lease", id, LifecycleVerdictUnusable)
+	requirePersistedUnusableLifecycle(t, reopenedAgain, "lease")
+}
+
+func TestStore_InventoryPreservesRawCorruptLifecycleEvidence(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
+	operationID := requireOperationID(t, "8514")
+	id := lifecycleIDFromOperation(t, operationID)
+	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
+	confirmed, err := s.ConfirmAttempt(token)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	require.NoError(t, s.Close())
+
+	rawCorrupt := []byte(`{"backend":`)
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(lifecycleCapabilityBucketName).Put([]byte("lease"), rawCorrupt)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
+	projectInventoryForTest(t, reopened, InventoryProjection{
+		Placements: map[string]string{"lease": "backend-b"},
+	})
+	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+		assert.Equal(t, rawCorrupt,
+			tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease")),
+			"inventory must not erase undecodable operator evidence")
+		return nil
+	}))
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(t, reopenedAgain, "lease", id, LifecycleVerdictUnusable)
+}
+
+func TestStore_ExactOperationRepairsRawCorruptionAfterInventoryClearsAttempt(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a")
+
+	oldOperationID := requireOperationID(t, "8515")
+	oldID := lifecycleIDFromOperation(t, oldOperationID)
+	oldToken := requireTypedAttempt(t, s, "lease", "backend-a", oldOperationID)
+	confirmed, err := s.ConfirmAttempt(oldToken)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+
+	newOperationID := requireOperationID(t, "8516")
+	newID := lifecycleIDFromOperation(t, newOperationID)
+	requireTypedAttempt(t, s, "lease", "backend-a", newOperationID)
+	assert.Equal(t, "backend-a", s.Lookup("lease").Attempt)
+	require.NoError(t, s.Close())
+
+	rawCorrupt := []byte(`{"backend":`)
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(lifecycleCapabilityBucketName).Put([]byte("lease"), rawCorrupt)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireLifecycleVerdict(t, reopened, "lease", oldID, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, reopened, "lease", newID, LifecycleVerdictUnusable)
+	projectInventoryForTest(t, reopened, InventoryProjection{
+		Placements: map[string]string{"lease": "backend-a"},
+	})
+	assert.Empty(t, reopened.Lookup("lease").Attempt,
+		"positive inventory settles the matching placement attempt")
+	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+		assert.Equal(t, rawCorrupt,
+			tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease")),
+			"inventory must preserve raw evidence until exact settlement")
+		return nil
+	}))
+
+	repaired, err := reopened.ConfirmOperation("lease", "backend-a", newOperationID)
+	require.NoError(t, err)
+	require.True(t, repaired)
+	requireLifecycleVerdict(t, reopened, "lease", newID, LifecycleVerdictAuthorized)
+	requireLifecycleVerdict(t, reopened, "lease", oldID, LifecycleVerdictStale)
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(t, reopenedAgain, "lease", newID, LifecycleVerdictAuthorized)
+	requireLifecycleVerdict(t, reopenedAgain, "lease", oldID, LifecycleVerdictStale)
+}
+
+func TestStore_LifecycleCapabilitySurvivesPlacementDeleteAndPrunesOnExactRetirement(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	s, err := NewStore(dbPath)
 	require.NoError(t, err)
@@ -278,25 +667,28 @@ func TestStore_LifecycleCapabilitySurvivesPlacementDeleteAndRetiresExactly(t *te
 		"teardown-only authority must not be reissued for maintenance")
 	staleID := requireLifecycleID(t, "8602")
 	requireLifecycleVerdict(t, s, "lease", staleID, LifecycleVerdictStale)
-
-	retired, err := s.RetireLifecycle("lease", id)
-	require.NoError(t, err)
-	assert.True(t, retired.Retired())
-	assert.True(t, retired.RetiredNow())
-	assert.Equal(t, LifecycleVerdictRetired, s.CurrentLifecycle("lease").Verdict())
-	retired, err = s.RetireLifecycle("lease", id)
-	require.NoError(t, err)
-	assert.True(t, retired.Retired())
-	assert.False(t, retired.RetiredNow(), "idempotent retirement is not a new consume")
 	require.NoError(t, s.Close())
 
 	reopened, err := NewStore(dbPath)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = reopened.Close() })
-	retired = requireLifecycleVerdict(
-		t, reopened, "lease", id, LifecycleVerdictRetired,
-	)
+	requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictTeardownOnly)
+
+	retired, err := reopened.RetireLifecycle("lease", id)
+	require.NoError(t, err)
+	assert.True(t, retired.Retired())
+	assert.True(t, retired.RetiredNow())
 	assert.Equal(t, "backend-a", retired.Backend())
+	assert.Equal(t, LifecycleVerdictMissing, reopened.CurrentLifecycle("lease").Verdict())
+	retired, err = reopened.RetireLifecycle("lease", id)
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleVerdictMissing, retired.Verdict())
+	assert.False(t, retired.RetiredNow(), "a duplicate cannot cross the durable delete boundary")
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(t, reopenedAgain, "lease", id, LifecycleVerdictMissing)
 }
 
 func TestStore_InventoryRecreationPreservesRetainedTypedLifecycle(t *testing.T) {
@@ -321,11 +713,12 @@ func TestStore_InventoryRecreationPreservesRetainedTypedLifecycle(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, retired.Retired())
 	requireDeleteRecord(t, s, "lease")
+	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictMissing)
 	projectInventoryForTest(t, s, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-a"},
 	})
-	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictRetired)
-	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictStale)
+	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictUnusable)
 }
 
 func TestStore_ConflictResolutionPreservesMatchingRetainedTypedLifecycle(t *testing.T) {
@@ -377,27 +770,143 @@ func TestStore_RefusedRecreationRetainsPriorLifecycleWithoutWedge(t *testing.T) 
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictTeardownOnly)
 }
 
-func TestStore_LegacyCapabilityBecomesTeardownOnlyAfterPlacementDelete(t *testing.T) {
+func TestStore_DetachedRetirementPreservesConcurrentNewAttemptMarker(t *testing.T) {
 	s := newTestStore(t)
 	requireAdmissionBaseline(t, s, "backend-a")
-	projectInventoryForTest(t, s, InventoryProjection{
-		Placements: map[string]string{"legacy": "backend-a"},
-	})
-	requireLifecycleVerdict(t, s, "legacy", lifecycle.ID{}, LifecycleVerdictLegacy)
+	firstOperation := requireOperationID(t, "8634")
+	firstID := lifecycleIDFromOperation(t, firstOperation)
+	first := requireTypedAttempt(t, s, "lease", "backend-a", firstOperation)
+	confirmed, err := s.ConfirmAttempt(first)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	requireDeleteRecord(t, s, "lease")
 
+	secondOperation := requireOperationID(t, "8635")
+	secondID := lifecycleIDFromOperation(t, secondOperation)
+	second := requireTypedAttempt(t, s, "lease", "backend-a", secondOperation)
+	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictTeardownOnly)
+
+	retired, err := s.RetireLifecycle("lease", firstID)
+	require.NoError(t, err)
+	require.True(t, retired.RetiredNow())
+	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictRetired)
+	requireLifecycleVerdict(t, s, "lease", secondID, LifecycleVerdictStale)
+
+	confirmed, err = s.ConfirmAttempt(second)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictStale)
+	requireLifecycleVerdict(t, s, "lease", secondID, LifecycleVerdictAuthorized)
+}
+
+func TestStore_ReopenPrunesDetachedRetiredButRetainsOutstandingTeardown(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a")
+
+	activeOperation := requireOperationID(t, "8636")
+	activeID := lifecycleIDFromOperation(t, activeOperation)
+	active := requireTypedAttempt(t, s, "active", "backend-a", activeOperation)
+	confirmed, err := s.ConfirmAttempt(active)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	requireDeleteRecord(t, s, "active")
+
+	retiredOperation := requireOperationID(t, "8637")
+	retiredID := lifecycleIDFromOperation(t, retiredOperation)
+	retiredToken := requireTypedAttempt(t, s, "retired", "backend-a", retiredOperation)
+	confirmed, err = s.ConfirmAttempt(retiredToken)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	retired, err := s.RetireLifecycle("retired", retiredID)
+	require.NoError(t, err)
+	require.True(t, retired.RetiredNow())
+	require.NoError(t, s.Close())
+
+	// Reproduce the older store's leaked completed history: placement vanished,
+	// but its already-consumed lifecycle row remained.
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketName).Delete([]byte("retired"))
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	requireLifecycleVerdict(t, reopened, "active", activeID, LifecycleVerdictTeardownOnly)
+	requireLifecycleVerdict(t, reopened, "retired", retiredID, LifecycleVerdictMissing)
+
+	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(lifecycleCapabilityBucketName)
+		assert.NotNil(t, bucket.Get([]byte("active")))
+		assert.Nil(t, bucket.Get([]byte("retired")))
+		return nil
+	}))
+}
+
+func TestStore_ZeroIDCannotConsumeTypedTeardownCapability(t *testing.T) {
+	s := newTestStore(t)
+	requireAdmissionBaseline(t, s, "backend-a")
+	operationID := requireOperationID(t, "8633")
+	id := lifecycleIDFromOperation(t, operationID)
+	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
+	confirmed, err := s.ConfirmAttempt(token)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+
+	requireDeleteRecord(t, s, "lease")
+	teardown := requireLifecycleVerdict(
+		t, s, "lease", id, LifecycleVerdictTeardownOnly,
+	)
+	assert.Equal(t, "backend-a", teardown.Backend())
+	requireLifecycleVerdict(
+		t, s, "lease", lifecycle.ID{}, LifecycleVerdictStale,
+	)
+	assert.Equal(t, LifecycleVerdictTeardownOnly, s.CurrentLifecycle("lease").Verdict())
+
+	retired, err := s.RetireLifecycle("lease", lifecycle.ID{})
+	require.NoError(t, err)
+	assert.Equal(t, LifecycleVerdictStale, retired.Verdict())
+	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictTeardownOnly)
+}
+
+func TestStore_DetachedLegacyTeardownRetirementDeletesCapability(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	writeRawRecords(t, dbPath, map[string][]byte{
+		"legacy": []byte(`{"backend":"backend-a","set_at":"2026-08-27T12:00:00Z"}`),
+	})
+
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireLifecycleVerdict(t, s, "legacy", lifecycle.ID{}, LifecycleVerdictLegacy)
 	requireDeleteRecord(t, s, "legacy")
 	teardown := requireLifecycleVerdict(
 		t, s, "legacy", lifecycle.ID{}, LifecycleVerdictTeardownOnly,
 	)
 	assert.Equal(t, "backend-a", teardown.Backend())
-	requireLifecycleVerdict(
-		t, s, "legacy", requireLifecycleID(t, "8633"), LifecycleVerdictStale,
-	)
-	assert.Equal(t, LifecycleVerdictTeardownOnly, s.CurrentLifecycle("legacy").Verdict())
+	require.NoError(t, s.Close())
 
-	retired, err := s.RetireLifecycle("legacy", lifecycle.ID{})
+	reopened, err := NewStore(dbPath)
 	require.NoError(t, err)
-	assert.True(t, retired.RetiredNow())
+	requireLifecycleVerdict(
+		t, reopened, "legacy", lifecycle.ID{}, LifecycleVerdictTeardownOnly,
+	)
+	retired, err := reopened.RetireLifecycle("legacy", lifecycle.ID{})
+	require.NoError(t, err)
+	require.True(t, retired.RetiredNow())
+	assert.Equal(t, "backend-a", retired.Backend())
+	requireLifecycleVerdict(t, reopened, "legacy", lifecycle.ID{}, LifecycleVerdictMissing)
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(
+		t, reopenedAgain, "legacy", lifecycle.ID{}, LifecycleVerdictMissing,
+	)
 }
 
 func TestStore_NewAttemptSupersedesRetiredCapabilityAfterPlacementDeletion(t *testing.T) {
@@ -413,12 +922,13 @@ func TestStore_NewAttemptSupersedesRetiredCapabilityAfterPlacementDeletion(t *te
 	require.NoError(t, err)
 	require.True(t, retired.Retired())
 	requireDeleteRecord(t, s, "lease")
+	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictMissing)
 
 	secondOperation := requireOperationID(t, "8642")
 	secondID := lifecycleIDFromOperation(t, secondOperation)
 	second := requireTypedAttempt(t, s, "lease", "backend-a", secondOperation)
-	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictRetired)
-	requireLifecycleVerdict(t, s, "lease", secondID, LifecycleVerdictStale)
+	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictMissing)
+	requireLifecycleVerdict(t, s, "lease", secondID, LifecycleVerdictMissing)
 	confirmed, err = s.ConfirmAttempt(second)
 	require.NoError(t, err)
 	require.True(t, confirmed)
@@ -448,12 +958,12 @@ func TestStore_LifecycleCapabilityWithdrawsAuthorityDuringPlacementConflict(t *t
 		"a conflicted backend cannot consume the capability before repair")
 
 	requireDeleteRecord(t, s, "lease")
-	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictRetired)
+	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictMissing)
 	projectInventoryForTest(t, s, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-a"},
 	})
-	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictRetired)
-	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictStale)
+	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictUnusable)
 }
 
 func TestStore_LifecyclePromotionIsAtomicWithPlacement(t *testing.T) {
@@ -559,7 +1069,7 @@ func TestStore_RetiringCurrentLifecyclePreservesNewAttemptMarker(t *testing.T) {
 	requireLifecycleVerdict(t, s, "lease", secondID, LifecycleVerdictAuthorized)
 }
 
-func TestStore_MalformedLifecycleCapabilitiesFailClosedOnReopen(t *testing.T) {
+func TestStore_MalformedLifecycleCapabilitiesAreIsolatedPerLeaseOnReopen(t *testing.T) {
 	tests := []struct {
 		name       string
 		capability []byte
@@ -591,6 +1101,14 @@ func TestStore_MalformedLifecycleCapabilitiesFailClosedOnReopen(t *testing.T) {
 			s, err := NewStore(dbPath)
 			require.NoError(t, err)
 			requireAdmissionBaseline(t, s, "backend-a")
+			healthyOperation := requireOperationID(t, "8951")
+			healthyID := lifecycleIDFromOperation(t, healthyOperation)
+			healthy := requireTypedAttempt(
+				t, s, "healthy", "backend-a", healthyOperation,
+			)
+			confirmed, confirmErr := s.ConfirmAttempt(healthy)
+			require.NoError(t, confirmErr)
+			require.True(t, confirmed)
 			requireConfirmedPlacement(t, s, "lease", "backend-a")
 			require.NoError(t, s.Close())
 
@@ -606,8 +1124,113 @@ func TestStore_MalformedLifecycleCapabilitiesFailClosedOnReopen(t *testing.T) {
 			require.NoError(t, db.Close())
 
 			reopened, err := NewStore(dbPath)
-			require.Error(t, err)
-			assert.Nil(t, reopened)
+			require.NoError(t, err)
+			requireLifecycleVerdict(
+				t, reopened, "healthy", healthyID, LifecycleVerdictAuthorized,
+			)
+			requireLifecycleVerdict(
+				t, reopened, "lease", lifecycle.ID{}, LifecycleVerdictUnusable,
+			)
+			requireLifecycleVerdict(
+				t, reopened, "lease", requireLifecycleID(t, "8952"),
+				LifecycleVerdictUnusable,
+			)
+			require.NoError(t, reopened.Close())
+
+			db, err = bolt.Open(dbPath, 0600, nil)
+			require.NoError(t, err)
+			require.NoError(t, db.View(func(tx *bolt.Tx) error {
+				got := tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease"))
+				assert.Equal(t, test.capability, got,
+					"opening must preserve corrupt authority evidence byte-for-byte")
+				return nil
+			}))
+			require.NoError(t, db.Close())
 		})
 	}
+}
+
+func TestStore_RevisionedConfirmedMissingCapabilityIsIsolatedAndNeverBackfilled(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a")
+
+	healthyOperation := requireOperationID(t, "8961")
+	healthyID := lifecycleIDFromOperation(t, healthyOperation)
+	healthy := requireTypedAttempt(t, s, "healthy", "backend-a", healthyOperation)
+	confirmed, err := s.ConfirmAttempt(healthy)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+
+	missing := requireTypedAttempt(
+		t, s, "missing", "backend-a", requireOperationID(t, "8962"),
+	)
+	confirmed, err = s.ConfirmAttempt(missing)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	require.NoError(t, s.Close())
+
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(lifecycleCapabilityBucketName).Delete([]byte("missing"))
+	}))
+	require.NoError(t, db.Close())
+
+	for range 2 {
+		reopened, openErr := NewStore(dbPath)
+		require.NoError(t, openErr)
+		requireLifecycleVerdict(
+			t, reopened, "healthy", healthyID, LifecycleVerdictAuthorized,
+		)
+		requireLifecycleVerdict(
+			t, reopened, "missing", lifecycle.ID{}, LifecycleVerdictUnusable,
+		)
+		requireLifecycleVerdict(
+			t, reopened, "missing", requireLifecycleID(t, "8963"),
+			LifecycleVerdictUnusable,
+		)
+		require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+			assert.Nil(t, tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("missing")),
+				"revisioned missing authority must never be recreated as legacy")
+			return nil
+		}))
+		require.NoError(t, reopened.Close())
+	}
+
+	repair, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, repair, "backend-a")
+	refusedOperation := requireOperationID(t, "8964")
+	refused := requireTypedAttempt(
+		t, repair, "missing", "backend-a", refusedOperation,
+	)
+	requireLifecycleVerdict(
+		t, repair, "missing", lifecycleIDFromOperation(t, refusedOperation),
+		LifecycleVerdictUnusable,
+	)
+	refusedNow, err := repair.RefuseAttempt(refused)
+	require.NoError(t, err)
+	require.True(t, refusedNow)
+	requireLifecycleVerdict(
+		t, repair, "missing", lifecycle.ID{}, LifecycleVerdictUnusable,
+	)
+
+	repairOperation := requireOperationID(t, "8965")
+	repairID := lifecycleIDFromOperation(t, repairOperation)
+	repairToken := requireTypedAttempt(
+		t, repair, "missing", "backend-a", repairOperation,
+	)
+	requireLifecycleVerdict(t, repair, "missing", repairID, LifecycleVerdictUnusable)
+	confirmed, err = repair.ConfirmAttempt(repairToken)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	requireLifecycleVerdict(t, repair, "missing", repairID, LifecycleVerdictAuthorized)
+	require.NoError(t, repair.Close())
+
+	repaired, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = repaired.Close() })
+	requireLifecycleVerdict(t, repaired, "missing", repairID, LifecycleVerdictAuthorized)
 }

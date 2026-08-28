@@ -731,12 +731,14 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 	startAckBatcherForTest(t, manager)
 
 	// Track the lease first
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
 		LeaseUUID:   "lease-1",
 		Status:      backend.CallbackStatusSuccess,
-		OperationID: mustInFlightOperationID(t, manager, "lease-1"),
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -768,12 +770,15 @@ func TestManager_HandleBackendCallback_Failed(t *testing.T) {
 	require.NoError(t, err)
 
 	// Track the lease first
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "out of resources",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "out of resources",
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -843,11 +848,14 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 	startAckBatcherForTest(t, manager)
 
 	// Track the lease
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -895,11 +903,14 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 	startAckBatcherForTest(t, manager)
 
 	// Track the lease
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -972,11 +983,14 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	require.NoError(t, err)
 
 	// Track the lease
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    "unknown-status",
+		LeaseUUID:   "lease-1",
+		Status:      "unknown-status",
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -1274,13 +1288,16 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 	require.NoError(t, err)
 
 	// Track the lease first
-	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems("sku-1"), "test",
+	)
 
 	// Send failed callback with error message
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "out of GPU resources",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "out of GPU resources",
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -1327,13 +1344,16 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 	require.NoError(t, err)
 
 	// Track the lease first
-	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems("sku-1"), "test",
+	)
 
 	// Send failed callback WITHOUT error message
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "", // Empty error
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "", // Empty error
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -2619,10 +2639,13 @@ func TestCallbacksRequireRunningManager(t *testing.T) {
 	// The callback runtime is deliberately unavailable before Start. In
 	// production the API maps this to 503 so the backend's durable outbox keeps
 	// the delivery pending.
-	manager.TrackInFlight("lease-early", "tenant-1", testItems("sku-1"), "test")
+	earlyOperationID := requireProvisionCallbackOperation(
+		t, manager, "lease-early", "tenant-1", testItems("sku-1"), "test",
+	)
 	require.ErrorIs(t, manager.PublishCallback(context.Background(), backend.CallbackPayload{
-		LeaseUUID: "lease-early",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-early",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: earlyOperationID.String(),
 	}), errCallbackRuntimeUnavailable)
 	require.True(t, manager.IsInFlight("lease-early"))
 
@@ -2641,12 +2664,15 @@ func TestCallbacksRequireRunningManager(t *testing.T) {
 	}
 
 	// Track another lease for the "after Running()" test
-	manager.TrackInFlight("lease-after", "tenant-1", testItems("sku-1"), "test")
+	afterOperationID := requireProvisionCallbackOperation(
+		t, manager, "lease-after", "tenant-1", testItems("sku-1"), "test",
+	)
 
 	// After startup, PublishCallback applies synchronously.
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-after",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-after",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: afterOperationID.String(),
 	}
 	require.NoError(t, manager.PublishCallback(context.Background(), callback))
 
@@ -2721,12 +2747,15 @@ func TestManager_CloseCancelsAndDrainsActiveCallback(t *testing.T) {
 
 	// Track lease and publish a success callback asynchronously so Close can
 	// overlap the synchronous application call.
-	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems("sku-1"), "test",
+	)
 	callbackErr := make(chan error, 1)
 	go func() {
 		callbackErr <- manager.PublishCallback(context.Background(), backend.CallbackPayload{
-			LeaseUUID: "lease-1",
-			Status:    backend.CallbackStatusSuccess,
+			LeaseUUID:   "lease-1",
+			Status:      backend.CallbackStatusSuccess,
+			OperationID: operationID.String(),
 		})
 	}()
 

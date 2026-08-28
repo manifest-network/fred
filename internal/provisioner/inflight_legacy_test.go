@@ -17,7 +17,7 @@ func (t *DefaultInFlightTracker) replaceForLegacy(
 		return
 	}
 	spec := operationTrackSpec(
-		leaseUUID, tenant, items, backendName, KindProvision, false, startedAt,
+		leaseUUID, tenant, items, backendName, KindProvision, startedAt,
 	)
 	if !spec.Valid() {
 		return
@@ -112,7 +112,7 @@ func (t *DefaultInFlightTracker) TryTrackInFlight(
 	items []backend.LeaseItem,
 	backendName string,
 ) bool {
-	_, ok := t.tryTrack(leaseUUID, tenant, items, backendName, KindProvision, false)
+	_, ok := t.tryTrack(leaseUUID, tenant, items, backendName, KindProvision)
 	return ok
 }
 
@@ -122,7 +122,7 @@ func (t *DefaultInFlightTracker) TryTrackRestoreInFlight(
 	items []backend.LeaseItem,
 	backendName string,
 ) bool {
-	_, ok := t.tryTrack(leaseUUID, tenant, items, backendName, KindRestore, false)
+	_, ok := t.tryTrack(leaseUUID, tenant, items, backendName, KindRestore)
 	return ok
 }
 

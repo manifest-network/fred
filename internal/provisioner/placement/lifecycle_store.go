@@ -1,9 +1,11 @@
 package placement
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	bolt "go.etcd.io/bbolt"
 
@@ -33,8 +35,9 @@ const (
 )
 
 // LifecycleAuthorization is an immutable authorization result. Backend is
-// exposed only when the store has a current, teardown-only, or already-retired
-// owner; callback payload metadata never selects it.
+// exposed only when the store has a current, teardown-only, already-retired,
+// or explicitly adopted legacy owner; callback payload metadata never selects
+// it.
 type LifecycleAuthorization struct {
 	backend string
 	id      lifecycle.ID
@@ -66,8 +69,8 @@ func (result LifecycleAuthorization) RetiredNow() bool {
 }
 
 // Backend returns the store-authoritative backend for a typed active/retired,
-// teardown-only capability or an explicitly migrated legacy owner. Every
-// other verdict returns an empty name.
+// teardown-only, or explicitly adopted legacy capability. Every other verdict
+// returns an empty name.
 func (result LifecycleAuthorization) Backend() string {
 	if !result.Authorized() && !result.Retired() &&
 		result.verdict != LifecycleVerdictLegacy &&
@@ -78,8 +81,8 @@ func (result LifecycleAuthorization) Backend() string {
 }
 
 // ID returns the exact typed capability only for a current authorized or
-// already-retired lifecycle. Legacy, missing, stale, and invalid results never
-// expose an ID that a caller could mistake for authority.
+// already-retired lifecycle. Legacy, missing, stale, unusable, and invalid
+// results never expose an ID that a caller could mistake for authority.
 func (result LifecycleAuthorization) ID() lifecycle.ID {
 	if !result.Authorized() && !result.Retired() {
 		return lifecycle.ID{}
@@ -93,6 +96,15 @@ type lifecycleCapability struct {
 	retired        bool
 	attemptBackend string
 	attemptID      lifecycle.ID
+	// unusable is a fail-closed per-lease quarantine. A decoded persisted
+	// sentinel may carry a new exact attempt marker, while an undecodable row is
+	// represented only in memory so its original bytes remain available for
+	// operator diagnosis.
+	unusable bool
+	// rawCorrupt distinguishes an undecodable durable row from a missing or
+	// decodable-but-invalid binding. Inventory may durably replace the latter
+	// with an explicit unusable sentinel, but must preserve the former's bytes.
+	rawCorrupt bool
 }
 
 type persistedLifecycleCapability struct {
@@ -101,17 +113,70 @@ type persistedLifecycleCapability struct {
 	Retired        bool   `json:"retired,omitempty"`
 	AttemptBackend string `json:"attempt_backend,omitempty"`
 	AttemptID      string `json:"attempt_id,omitempty"`
+	Unusable       bool   `json:"unusable,omitempty"`
 }
 
-func initializeLifecycleCapabilities(tx *bolt.Tx) error {
-	// The bucket's creation is the one-way migration boundary. Once it exists,
-	// a missing record is corruption rather than another opportunity to mint a
-	// legacy authority record for a placement that may previously have been
-	// typed.
-	if tx.Bucket(lifecycleCapabilityBucketName) != nil {
-		return nil
+// lifecycleInitializationEpoch captures upgrade provenance before NewStore
+// creates either post-v0.13 bucket or migrates any placement revision. Legacy
+// adoption is safe only when the whole database, not merely one lease, is
+// provably crossing that boundary for the first time.
+type lifecycleInitializationEpoch struct {
+	lifecycleBucketAbsent  bool
+	metadataBucketAbsent   bool
+	noRevisionedPlacements bool
+}
+
+func captureLifecycleInitializationEpoch(
+	tx *bolt.Tx,
+) (lifecycleInitializationEpoch, error) {
+	epoch := lifecycleInitializationEpoch{
+		lifecycleBucketAbsent:  tx.Bucket(lifecycleCapabilityBucketName) == nil,
+		metadataBucketAbsent:   tx.Bucket(metadataBucketName) == nil,
+		noRevisionedPlacements: true,
 	}
-	capabilities, err := tx.CreateBucketIfNotExists(lifecycleCapabilityBucketName)
+	placements := tx.Bucket(bucketName)
+	if placements == nil {
+		return epoch, nil
+	}
+	if err := placements.ForEach(func(_ []byte, value []byte) error {
+		trimmed := bytes.TrimSpace(value)
+		if len(trimmed) == 0 || trimmed[0] != '{' {
+			// Pre-revision raw backend records cannot carry a revision field.
+			return nil
+		}
+		var header struct {
+			Revision uint64 `json:"revision"`
+		}
+		if decodeErr := json.Unmarshal(trimmed, &header); decodeErr != nil {
+			// An unreadable object cannot prove that it lacks a revision, so the
+			// entire epoch is ineligible even though that row is also quarantined.
+			epoch.noRevisionedPlacements = false
+		} else if header.Revision != 0 {
+			epoch.noRevisionedPlacements = false
+		}
+		return nil
+	}); err != nil {
+		return lifecycleInitializationEpoch{}, fmt.Errorf(
+			"scan placement revisions for lifecycle initialization: %w", err,
+		)
+	}
+	return epoch, nil
+}
+
+func (epoch lifecycleInitializationEpoch) permitsLegacyAdoption() bool {
+	return epoch.lifecycleBucketAbsent && epoch.metadataBucketAbsent &&
+		epoch.noRevisionedPlacements
+}
+
+func initializeLifecycleCapabilities(
+	tx *bolt.Tx,
+	epoch lifecycleInitializationEpoch,
+) error {
+	capabilities := tx.Bucket(lifecycleCapabilityBucketName)
+	var err error
+	if capabilities == nil {
+		capabilities, err = tx.CreateBucketIfNotExists(lifecycleCapabilityBucketName)
+	}
 	if err != nil {
 		return fmt.Errorf("create placement lifecycle capability bucket: %w", err)
 	}
@@ -120,28 +185,65 @@ func initializeLifecycleCapabilities(tx *bolt.Tx) error {
 		return errors.New("placements bucket missing")
 	}
 
-	// A confirmed owner written before lifecycle capabilities existed remains a
-	// deliberately legacy, ID-empty owner. Minting an ID here would create a
-	// bearer capability that the live backend has never received.
+	// Only a first-open v0.13 epoch plus a revision-zero placement proves this
+	// database has never issued typed lifecycle authority. If either post-v0.13
+	// bucket already existed, or any placement was already revisioned before
+	// initialization, every missing row remains fail-closed: recreating it as
+	// tokenless could downgrade formerly typed authority after corruption,
+	// pruning, downgrade, or bucket deletion.
+	if !epoch.permitsLegacyAdoption() {
+		return nil
+	}
 	return placements.ForEach(func(key, value []byte) error {
-		if capabilities.Get(key) != nil {
-			return nil
-		}
 		placement := decodeRecord(string(key), value)
-		if placement.State() != StateConfirmed || placement.Backend == "" {
+		if placement.revision != 0 ||
+			placement.State() != StateConfirmed || placement.Backend == "" ||
+			placement.Attempt != "" || placement.Conflict ||
+			capabilities.Get(key) != nil {
 			return nil
 		}
 		encoded, encodeErr := encodeLifecycleCapability(lifecycleCapability{
 			backend: placement.Backend,
 		})
 		if encodeErr != nil {
-			return fmt.Errorf("encode legacy lifecycle capability %q: %w", string(key), encodeErr)
+			return fmt.Errorf("encode adopted legacy lifecycle capability %q: %w", string(key), encodeErr)
 		}
 		if putErr := capabilities.Put(key, encoded); putErr != nil {
-			return fmt.Errorf("write legacy lifecycle capability %q: %w", string(key), putErr)
+			return fmt.Errorf("write adopted legacy lifecycle capability %q: %w", string(key), putErr)
 		}
 		return nil
 	})
+}
+
+// pruneDetachedRetiredLifecycleCapabilities removes completed lifecycle
+// history left by older versions. An active capability without a placement is
+// outstanding teardown authority and must remain durable until its exact
+// terminal observation consumes it. A retired capability that still shares a
+// row with an unresolved typed attempt must likewise remain until settlement.
+func pruneDetachedRetiredLifecycleCapabilities(tx *bolt.Tx) error {
+	placements := tx.Bucket(bucketName)
+	capabilities := tx.Bucket(lifecycleCapabilityBucketName)
+	if placements == nil || capabilities == nil {
+		return errors.New("placement lifecycle buckets missing")
+	}
+
+	var prune [][]byte
+	if err := capabilities.ForEach(func(key, value []byte) error {
+		capability, decodeErr := decodeLifecycleCapability(value)
+		if decodeErr == nil && capability.retired && capability.attemptBackend == "" &&
+			placements.Get(key) == nil {
+			prune = append(prune, append([]byte(nil), key...))
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("scan detached retired lifecycle capabilities: %w", err)
+	}
+	for _, key := range prune {
+		if err := capabilities.Delete(key); err != nil {
+			return fmt.Errorf("delete detached retired lifecycle capability %q: %w", string(key), err)
+		}
+	}
+	return nil
 }
 
 func loadLifecycleCapabilities(tx *bolt.Tx) (map[string]lifecycleCapability, error) {
@@ -153,11 +255,18 @@ func loadLifecycleCapabilities(tx *bolt.Tx) (map[string]lifecycleCapability, err
 	err := bucket.ForEach(func(key, value []byte) error {
 		leaseUUID := string(key)
 		if leaseUUID == "" {
-			return errors.New("placement lifecycle capability has empty lease UUID")
+			slog.Warn("placement: loaded lifecycle capability with empty lease UUID")
+			return nil
 		}
 		capability, decodeErr := decodeLifecycleCapability(value)
 		if decodeErr != nil {
-			return fmt.Errorf("decode placement lifecycle capability %q: %w", leaseUUID, decodeErr)
+			slog.Warn("placement: loaded unparseable lifecycle capability",
+				"lease_uuid", leaseUUID, "error", decodeErr)
+			cache[leaseUUID] = lifecycleCapability{
+				unusable:   true,
+				rawCorrupt: true,
+			}
+			return nil
 		}
 		cache[leaseUUID] = capability
 		return nil
@@ -168,70 +277,69 @@ func loadLifecycleCapabilities(tx *bolt.Tx) (map[string]lifecycleCapability, err
 	return cache, nil
 }
 
-// validateLifecycleBindings rejects durable capability state that could grant
-// authority different from the placement state loaded in the same snapshot.
-// A current capability may intentionally outlive its placement, and an old
-// typed attempt may intentionally have no marker, but a persisted attempt
-// marker must always describe the exact durable attempt that created it.
-func validateLifecycleBindings(
+// quarantineLifecycleBindings withdraws lifecycle authority only for leases
+// whose two durable records cannot be interpreted together. A bad row must not
+// prevent unrelated leases or the provider process from starting. Current
+// capabilities may intentionally outlive placement deletion, but every typed
+// placement attempt must have the exact marker written in the same transaction.
+func quarantineLifecycleBindings(
 	placements map[string]Placement,
 	capabilities map[string]lifecycleCapability,
-) error {
+) {
+	quarantine := func(leaseUUID, reason string) {
+		slog.Warn("placement: lifecycle capability is unusable",
+			"lease_uuid", leaseUUID, "reason", reason)
+		capabilities[leaseUUID] = lifecycleCapability{
+			unusable:   true,
+			rawCorrupt: capabilities[leaseUUID].rawCorrupt,
+		}
+	}
+
 	for leaseUUID, placement := range placements {
-		if placement.State() != StateConfirmed || placement.Backend == "" {
+		capability, exists := capabilities[leaseUUID]
+		if placement.State() == StateUnusable {
+			quarantine(leaseUUID, "placement record is unusable")
 			continue
 		}
-		capability, exists := capabilities[leaseUUID]
 		if !exists {
-			return fmt.Errorf(
-				"confirmed placement %q has no lifecycle capability",
-				leaseUUID,
-			)
+			quarantine(leaseUUID, "placement has no lifecycle capability")
+			continue
 		}
-		if capability.backend != placement.Backend {
-			return fmt.Errorf(
-				"lifecycle capability %q binds backend %q, placement binds %q",
-				leaseUUID, capability.backend, placement.Backend,
-			)
+		if capability.unusable {
+			continue
+		}
+		if placement.State() == StateConfirmed && capability.backend != placement.Backend {
+			quarantine(leaseUUID, fmt.Sprintf(
+				"capability backend %q does not match confirmed backend %q",
+				capability.backend, placement.Backend,
+			))
+			continue
+		}
+		if placement.Attempt == "" {
+			if capability.attemptBackend != "" {
+				quarantine(leaseUUID, "capability attempt marker has no placement attempt")
+			}
+			continue
+		}
+		wantID, err := lifecycleIDForOperation(placement.attemptOperationID)
+		if err != nil || capability.attemptBackend != placement.Attempt ||
+			capability.attemptID != wantID {
+			quarantine(leaseUUID, "capability attempt marker does not match placement attempt")
 		}
 	}
 
 	for leaseUUID, capability := range capabilities {
-		placement, exists := placements[leaseUUID]
+		if capability.unusable {
+			continue
+		}
+		_, exists := placements[leaseUUID]
 		if !exists {
 			if capability.attemptBackend != "" {
-				return fmt.Errorf(
-					"lifecycle capability %q has an attempt marker without a placement",
-					leaseUUID,
-				)
+				quarantine(leaseUUID, "capability attempt marker has no placement")
 			}
 			continue
 		}
-
-		if placement.Backend != "" && capability.backend != placement.Backend {
-			return fmt.Errorf(
-				"lifecycle capability %q binds backend %q, placement binds %q",
-				leaseUUID, capability.backend, placement.Backend,
-			)
-		}
-		if capability.attemptBackend == "" {
-			continue
-		}
-		if placement.Attempt != capability.attemptBackend {
-			return fmt.Errorf(
-				"lifecycle capability %q binds attempt backend %q, placement binds %q",
-				leaseUUID, capability.attemptBackend, placement.Attempt,
-			)
-		}
-		wantID, err := lifecycleIDForOperation(placement.attemptOperationID)
-		if err != nil || wantID != capability.attemptID {
-			return fmt.Errorf(
-				"lifecycle capability %q does not match its placement attempt identity",
-				leaseUUID,
-			)
-		}
 	}
-	return nil
 }
 
 func decodeLifecycleCapability(value []byte) (lifecycleCapability, error) {
@@ -257,6 +365,7 @@ func decodeLifecycleCapability(value []byte) (lifecycleCapability, error) {
 		retired:        persisted.Retired,
 		attemptBackend: persisted.AttemptBackend,
 		attemptID:      attemptID,
+		unusable:       persisted.Unusable,
 	}
 	if err := validateLifecycleCapability(capability); err != nil {
 		return lifecycleCapability{}, err
@@ -279,6 +388,7 @@ func encodeLifecycleCapability(capability lifecycleCapability) ([]byte, error) {
 		Backend:        capability.backend,
 		Retired:        capability.retired,
 		AttemptBackend: capability.attemptBackend,
+		Unusable:       capability.unusable,
 	}
 	if capability.id.Valid() {
 		persisted.ID = capability.id.String()
@@ -290,6 +400,18 @@ func encodeLifecycleCapability(capability lifecycleCapability) ([]byte, error) {
 }
 
 func validateLifecycleCapability(capability lifecycleCapability) error {
+	if capability.rawCorrupt {
+		return errors.New("raw corrupt lifecycle capability cannot be encoded")
+	}
+	if capability.unusable {
+		if capability.backend != "" || capability.id.Valid() || capability.retired {
+			return errors.New("unusable lifecycle capability grants current authority")
+		}
+		if (capability.attemptBackend == "") != !capability.attemptID.Valid() {
+			return errors.New("lifecycle attempt marker is incomplete")
+		}
+		return nil
+	}
 	if capability.backend == "" && capability.id.Valid() {
 		return errors.New("lifecycle capability ID has no backend")
 	}
@@ -309,8 +431,8 @@ func lifecycleIDForOperation(operationID operation.OperationID) (lifecycle.ID, e
 	return lifecycle.FromOperationID(operationID)
 }
 
-// AuthorizeLifecycle checks one exact typed bearer capability, or the explicit
-// zero-ID selector for a migrated legacy owner, without consulting
+// AuthorizeLifecycle checks one exact typed bearer capability, or the zero-ID
+// selector for a provenance-gated legacy owner, without consulting
 // payload-supplied backend metadata. Pending attempt markers never grant
 // authority.
 func (s *Store) AuthorizeLifecycle(
@@ -323,11 +445,14 @@ func (s *Store) AuthorizeLifecycle(
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.lifecyclePlacementUnusableLocked(leaseUUID) {
+		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
+	}
 	capability, exists := s.lifecycleCache[leaseUUID]
 	if !exists {
 		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}
 	}
-	if s.lifecyclePlacementUnusableLocked(leaseUUID) {
+	if capability.unusable {
 		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
 	}
 	result := authorizeLifecycleCapability(capability, id)
@@ -341,7 +466,7 @@ func (s *Store) AuthorizeLifecycle(
 // CurrentLifecycle returns the store-authoritative callback capability for a
 // lease without accepting caller-supplied authority. It is used only to place
 // the current typed route on trusted Fred-to-backend maintenance requests.
-// Legacy owners remain explicitly tokenless. Missing, retired, and
+// Legacy owners remain explicitly tokenless. Missing, unusable, retired, and
 // teardown-only owners grant no new callback route.
 func (s *Store) CurrentLifecycle(leaseUUID string) LifecycleAuthorization {
 	if leaseUUID == "" {
@@ -350,11 +475,14 @@ func (s *Store) CurrentLifecycle(leaseUUID string) LifecycleAuthorization {
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.lifecyclePlacementUnusableLocked(leaseUUID) {
+		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
+	}
 	capability, exists := s.lifecycleCache[leaseUUID]
 	if !exists {
 		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}
 	}
-	if s.lifecyclePlacementUnusableLocked(leaseUUID) {
+	if capability.unusable {
 		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
 	}
 	result := authorizeLifecycleCapability(capability, capability.id)
@@ -392,6 +520,9 @@ func authorizeLifecycleCapability(
 	capability lifecycleCapability,
 	id lifecycle.ID,
 ) LifecycleAuthorization {
+	if capability.unusable {
+		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}
+	}
 	if capability.backend == "" {
 		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}
 	}
@@ -429,8 +560,10 @@ func authorizeLifecycleCapability(
 
 // RetireLifecycle atomically consumes one exact active capability. Repeating
 // retirement with the same ID returns LifecycleVerdictRetired without another
-// write. The zero ID consumes only an active legacy capability; it can never
-// consume a typed capability, and a typed ID can never consume a legacy one.
+// write while a placement record still needs the tombstone. If placement was
+// already deleted, the exact retirement deletes the capability itself; a
+// duplicate then returns Missing. The durable delete is still the at-most-once
+// publication boundary.
 func (s *Store) RetireLifecycle(
 	leaseUUID string,
 	id lifecycle.ID,
@@ -441,17 +574,39 @@ func (s *Store) RetireLifecycle(
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.lifecyclePlacementUnusableLocked(leaseUUID) {
+		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}, nil
+	}
 	capability, exists := s.lifecycleCache[leaseUUID]
 	if !exists {
 		return LifecycleAuthorization{verdict: LifecycleVerdictMissing}, nil
 	}
-	if s.lifecyclePlacementUnusableLocked(leaseUUID) {
+	if capability.unusable {
 		return LifecycleAuthorization{verdict: LifecycleVerdictUnusable}, nil
 	}
 	result := authorizeLifecycleCapability(capability, id)
 	legacy := result.verdict == LifecycleVerdictLegacy && !id.Valid()
 	if !result.Authorized() && !legacy {
 		return result, nil
+	}
+
+	if _, placementExists := s.cache[leaseUUID]; !placementExists {
+		if err := s.db.Update(func(tx *bolt.Tx) error {
+			bucket := tx.Bucket(lifecycleCapabilityBucketName)
+			if bucket == nil {
+				return errors.New("placement lifecycle capability bucket missing")
+			}
+			return bucket.Delete([]byte(leaseUUID))
+		}); err != nil {
+			return LifecycleAuthorization{}, mutationFailure("retire detached lifecycle capability", err)
+		}
+		delete(s.lifecycleCache, leaseUUID)
+		return LifecycleAuthorization{
+			backend: capability.backend,
+			id:      capability.id,
+			verdict: LifecycleVerdictRetired,
+			retired: true,
+		}, nil
 	}
 
 	capability.retired = true
@@ -485,32 +640,24 @@ func (s *Store) lifecycleWithAttemptLocked(
 	if err != nil {
 		return lifecycleCapability{}, err
 	}
-	capability := s.lifecycleCache[leaseUUID]
+	capability, capabilityExists := s.lifecycleCache[leaseUUID]
+	placement := s.cache[leaseUUID]
+	if capability.unusable || (!capabilityExists && placement.State() == StateConfirmed) {
+		// A new exact operation may replace quarantined authority, but the old
+		// owner remains unusable until that operation settles successfully.
+		capability = lifecycleCapability{unusable: true}
+	}
 	capability.attemptBackend = backendName
 	capability.attemptID = id
 	return capability, nil
 }
 
 func promoteAttemptLifecycle(
-	capability lifecycleCapability,
 	backendName string,
 	operationID operation.OperationID,
 ) lifecycleCapability {
 	wantID, _ := lifecycleIDForOperation(operationID)
-	if capability.attemptBackend == backendName && capability.attemptID == wantID {
-		capability.backend = backendName
-		capability.id = capability.attemptID
-		capability.retired = false
-	} else if capability.backend != backendName {
-		// A pre-capability attempt has no marker to promote. Record the positive
-		// owner as legacy rather than minting authority after the fact.
-		capability.backend = backendName
-		capability.id = lifecycle.ID{}
-		capability.retired = false
-	}
-	capability.attemptBackend = ""
-	capability.attemptID = lifecycle.ID{}
-	return capability
+	return lifecycleCapability{backend: backendName, id: wantID}
 }
 
 func rotateMaintenanceLifecycle(
@@ -527,6 +674,8 @@ func rotateMaintenanceLifecycle(
 	capability.retired = false
 	capability.attemptBackend = ""
 	capability.attemptID = lifecycle.ID{}
+	capability.unusable = false
+	capability.rawCorrupt = false
 	return capability, nil
 }
 
@@ -545,27 +694,50 @@ func clearAttemptLifecycle(
 
 func projectPositiveLifecycle(
 	capability lifecycleCapability,
+	capabilityExists bool,
 	existing Placement,
 	exists bool,
 	backendName string,
-) lifecycleCapability {
-	if exists && existing.Attempt == backendName {
-		return promoteAttemptLifecycle(
-			capability, backendName, existing.attemptOperationID,
-		)
+) (lifecycleCapability, bool) {
+	if exists && existing.Attempt == backendName &&
+		existing.attemptOperationID.Valid() {
+		wantID, err := lifecycleIDForOperation(existing.attemptOperationID)
+		if err == nil && capabilityExists && !capability.unusable &&
+			capability.attemptBackend == backendName && capability.attemptID == wantID {
+			return promoteAttemptLifecycle(backendName, existing.attemptOperationID), true
+		}
+		// Inventory is observation-only. A missing or corrupt marker cannot be
+		// reconstructed from it, even if the placement still records an operation
+		// ID; only an exact operation settlement may establish new authority.
+		return quarantineProjectedLifecycle(capability, capabilityExists)
 	}
-	if capability.backend == backendName {
+	if capabilityExists && !capability.unusable && capability.backend == backendName {
 		// A capability intentionally outlives placement deletion. Rediscovering
 		// that same backend must preserve both its typed identity and retirement
 		// state; inventory neither delivers a new token nor proves that a retired
 		// generation is safe to resurrect. This also prevents a delete/recreate
 		// cycle from silently downgrading typed authority to legacy.
-		return capability
+		return capability, true
 	}
-	// Inventory discovered an owner that was not introduced by a typed attempt.
-	// Preserve the positive binding but keep it tokenless: the backend never
-	// received a lifecycle ID from this store.
-	return lifecycleCapability{backend: backendName}
+	// Inventory discovered an owner without an exact durable capability it can
+	// prove the backend received. Preserve placement routing, but quarantine
+	// lifecycle authority instead of manufacturing or downgrading a token.
+	return quarantineProjectedLifecycle(capability, capabilityExists)
+}
+
+func quarantineProjectedLifecycle(
+	capability lifecycleCapability,
+	capabilityExists bool,
+) (lifecycleCapability, bool) {
+	if capabilityExists && capability.rawCorrupt {
+		// Keep undecodable bytes intact. The cache remains fail-closed, and every
+		// reopen reconstructs the same raw-corruption quarantine.
+		return capability, false
+	}
+	// Missing rows and decodable mismatches have no diagnostic bytes that must
+	// survive. Persisting an explicit sentinel prevents a later placement change
+	// from making an older decodable capability current again after restart.
+	return lifecycleCapability{unusable: true}, true
 }
 
 func lifecycleAfterPlacementDelete(
@@ -574,11 +746,11 @@ func lifecycleAfterPlacementDelete(
 ) (lifecycleCapability, bool) {
 	capability.attemptBackend = ""
 	capability.attemptID = lifecycle.ID{}
-	if placement.State() == StateUnusable && capability.backend != "" {
-		// Deleting a conflict/corruption quarantine must not accidentally make
-		// its formerly bound backend authoritative again merely because the
-		// placement record is now absent.
-		capability.retired = true
+	if capability.unusable || capability.retired || placement.State() == StateUnusable {
+		// Exact placement deletion may remove fail-closed evidence tied to that
+		// placement. A consumed or conflict-withdrawn capability cannot regain
+		// authority because later inventory without a capability is quarantined.
+		return lifecycleCapability{}, false
 	}
 	return capability, capability.backend != ""
 }

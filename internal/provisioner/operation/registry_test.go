@@ -28,9 +28,8 @@ func testTrackSpec(leaseUUID string) TrackSpec {
 		Items: []backend.LeaseItem{
 			{SKU: "sku-a", Quantity: 1},
 		},
-		Backend:       "backend-a",
-		Kind:          KindProvision,
-		TokenRequired: true,
+		Backend: "backend-a",
+		Kind:    KindProvision,
 	}
 }
 
@@ -239,7 +238,6 @@ func TestRegistryTryTrackRecordsDetachedOperation(t *testing.T) {
 	assert.Equal(t, "sku-a", record.Items[0].SKU)
 	assert.Equal(t, "sku-a", record.RoutingSKU())
 	assert.Equal(t, id, record.ID)
-	assert.True(t, record.TokenRequired)
 	assert.Equal(t, startedAt, record.StartedAt)
 	assert.Equal(t, KindProvision, record.Kind)
 	assert.Equal(t, SettlementUnclaimed, record.Settlement)

@@ -44,12 +44,12 @@ func TestStart_PendingCallbackReplayDoesNotWaitForDelivery(t *testing.T) {
 	require.NoError(t, err)
 	b.callbackStore = store
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
-		Store:          store,
-		HTTPClient:     client,
-		Logger:         slog.Default(),
-		StopCtx:        b.stopCtx,
-		Backoff:        &zeroBackoff,
-		AttemptTimeout: 2 * time.Second,
+		Store:           store,
+		HTTPClient:      client,
+		Logger:          slog.Default(),
+		StopCtx:         b.stopCtx,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: 2 * time.Second,
 	})
 	_, err = store.StoreEntry(shared.CallbackEntry{
 		LeaseUUID:    "lease-start-replay",

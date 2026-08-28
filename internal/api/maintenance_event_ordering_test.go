@@ -100,6 +100,9 @@ func TestMaintenanceHandlers_OrderFastRemoteCallbackAfterAcceptedStart(t *testin
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			lifecycleCallbacks, _ := typedMaintenanceLifecycleStore(
+				t, leaseUUID, "test-backend",
+			)
 			broker := NewEventBroker()
 			events, err := broker.Subscribe(leaseUUID)
 			require.NoError(t, err)
@@ -115,12 +118,13 @@ func TestMaintenanceHandlers_OrderFastRemoteCallbackAfterAcceptedStart(t *testin
 				w.WriteHeader(http.StatusAccepted)
 			}))
 			handlers := NewHandlers(HandlersConfig{
-				Client:           chain,
-				BackendRouter:    router,
-				EventBroker:      broker,
-				PayloadPersister: maintenanceOrderingPersister{},
-				ProviderUUID:     providerUUID,
-				Bech32Prefix:     "manifest",
+				Client:             chain,
+				BackendRouter:      router,
+				EventBroker:        broker,
+				PayloadPersister:   maintenanceOrderingPersister{},
+				LifecycleCallbacks: lifecycleCallbacks,
+				ProviderUUID:       providerUUID,
+				Bech32Prefix:       "manifest",
 			})
 
 			token := testutil.CreateTestToken(keyPair, leaseUUID, time.Now())
@@ -157,12 +161,16 @@ func TestMaintenanceHandlers_SynchronousRefusalPublishesNoStart(t *testing.T) {
 	) {
 		w.WriteHeader(http.StatusConflict)
 	}))
+	lifecycleCallbacks, _ := typedMaintenanceLifecycleStore(
+		t, leaseUUID, "test-backend",
+	)
 	handlers := NewHandlers(HandlersConfig{
-		Client:        maintenanceOrderingChain(leaseUUID, providerUUID, keyPair.Address),
-		BackendRouter: router,
-		EventBroker:   broker,
-		ProviderUUID:  providerUUID,
-		Bech32Prefix:  "manifest",
+		Client:             maintenanceOrderingChain(leaseUUID, providerUUID, keyPair.Address),
+		BackendRouter:      router,
+		EventBroker:        broker,
+		LifecycleCallbacks: lifecycleCallbacks,
+		ProviderUUID:       providerUUID,
+		Bech32Prefix:       "manifest",
 	})
 	token := testutil.CreateTestToken(keyPair, leaseUUID, time.Now())
 	request := httptest.NewRequest(

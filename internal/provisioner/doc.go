@@ -34,7 +34,7 @@
 //	TopicLeaseExpired     - Lease expired, deprovision resources
 //	TopicPayloadReceived  - Tenant uploaded payload, start provisioning
 //	TopicLeaseEvent       - Real-time lease status events for WebSocket delivery
-
+//
 // TopicBackendCallback remains only for the legacy message-shaped adapter;
 // production callbacks are not published through Watermill.
 //

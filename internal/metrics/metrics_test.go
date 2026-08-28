@@ -78,6 +78,7 @@ var labelledMetricNames = []string{
 	"fred_provisioner_ack_batcher_lane_restarts_total",
 	"fred_provisioner_provisioning_duration_seconds",
 	"fred_provisioner_provisioning_total",
+	"fred_provisioner_lifecycle_callback_outcomes_total",
 	"fred_provisioner_lifecycle_event_sink_panics_total",
 	"fred_provisioner_reconciler_panics_total",
 	"fred_reconciler_actions_total",
@@ -158,6 +159,7 @@ func allCollectors() []prometheus.Collector {
 		CallbackPlacementSemanticConflictsTotal,
 		CallbackSettlementClaimWaitTimeoutsTotal,
 		CallbackTimeoutsTotal,
+		LifecycleCallbackOutcomesTotal,
 		NonInFlightCallbacksTotal,
 		// Signer pool
 		SignerPoolSize,
@@ -364,6 +366,11 @@ func TestCounterVecLabels(t *testing.T) {
 		BackendHealthy.WithLabelValues("docker")
 	})
 	assert.NotPanics(t, func() {
+		LifecycleCallbackOutcomesTotal.WithLabelValues(
+			LifecycleCallbackOutcomeApplied,
+			LifecycleCallbackVerdictAuthorized,
+			"success",
+		)
 		NonInFlightCallbacksTotal.WithLabelValues("docker", "success")
 	})
 	assert.NotPanics(t, func() {
@@ -385,6 +392,38 @@ func TestOutcomeConstants(t *testing.T) {
 	for _, o := range outcomes {
 		assert.False(t, seen[o], "duplicate outcome constant: %s", o)
 		seen[o] = true
+	}
+}
+
+func TestLifecycleCallbackMetricVocabulary(t *testing.T) {
+	outcomes := []string{
+		LifecycleCallbackOutcomeApplied,
+		LifecycleCallbackOutcomeDropped,
+		LifecycleCallbackOutcomeRetryable,
+	}
+	verdicts := []string{
+		LifecycleCallbackVerdictAuthorized,
+		LifecycleCallbackVerdictLegacy,
+		LifecycleCallbackVerdictTeardownOnly,
+		LifecycleCallbackVerdictRetired,
+		LifecycleCallbackVerdictInvalid,
+		LifecycleCallbackVerdictMissing,
+		LifecycleCallbackVerdictStale,
+		LifecycleCallbackVerdictUnusable,
+		LifecycleCallbackVerdictUnavailable,
+		LifecycleCallbackVerdictUnknown,
+	}
+	for name, values := range map[string][]string{
+		"outcome": outcomes,
+		"verdict": verdicts,
+	} {
+		seen := make(map[string]struct{}, len(values))
+		for _, value := range values {
+			assert.NotEmpty(t, value, "%s label must not be empty", name)
+			_, duplicate := seen[value]
+			assert.False(t, duplicate, "duplicate %s label %q", name, value)
+			seen[value] = struct{}{}
+		}
 	}
 }
 

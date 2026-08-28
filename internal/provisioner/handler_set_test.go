@@ -1026,6 +1026,50 @@ func TestHandlerSet_HandleLeaseExpired_DoesNotEmitRetainedOnIntent(t *testing.T)
 
 // --- HandleBackendCallback tests ---
 
+type typedProvisionCallbackTracker interface {
+	TryTrackInFlightWithOperationID(
+		string, string, []backend.LeaseItem, string,
+	) (operation.OperationID, bool)
+}
+
+type typedRestoreCallbackTracker interface {
+	TryTrackRestoreInFlightWithOperationID(
+		string, string, []backend.LeaseItem, string,
+	) (operation.OperationID, bool)
+}
+
+func requireProvisionCallbackOperation(
+	t testing.TB,
+	tracker typedProvisionCallbackTracker,
+	leaseUUID, tenant string,
+	items []backend.LeaseItem,
+	backendName string,
+) operation.OperationID {
+	t.Helper()
+	operationID, tracked := tracker.TryTrackInFlightWithOperationID(
+		leaseUUID, tenant, items, backendName,
+	)
+	require.True(t, tracked)
+	require.True(t, operationID.Valid())
+	return operationID
+}
+
+func requireRestoreCallbackOperation(
+	t testing.TB,
+	tracker typedRestoreCallbackTracker,
+	leaseUUID, tenant string,
+	items []backend.LeaseItem,
+	backendName string,
+) operation.OperationID {
+	t.Helper()
+	operationID, tracked := tracker.TryTrackRestoreInFlightWithOperationID(
+		leaseUUID, tenant, items, backendName,
+	)
+	require.True(t, tracked)
+	require.True(t, operationID.Valid())
+	return operationID
+}
+
 func TestHandlerSet_HandleBackendCallback_Success(t *testing.T) {
 	ack := &mockAcknowledger{
 		acknowledgeFn: func(ctx context.Context, leaseUUID string) (bool, string, error) {
@@ -1036,11 +1080,14 @@ func TestHandlerSet_HandleBackendCallback_Success(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1495,14 +1542,17 @@ func TestHandlerSet_HandleBackendCallback_Restore_InlineAcksWithOperationLabel(t
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
 	// Mirror what the fixed RestoreLease handler does: track the new lease as a restore.
-	require.True(t, tracker.TryTrackRestoreInFlight("lease-r", "tenant-a", testItems("sku-1"), "test-backend"))
+	operationID := requireRestoreCallbackOperation(
+		t, tracker, "lease-r", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	before := promtestutil.ToFloat64(
 		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, "test-backend", metrics.OperationRestore))
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-r",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-r",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1556,11 +1606,14 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError(t *testing.T)
 	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1583,11 +1636,14 @@ func TestHandlerSet_HandleBackendCallback_Success_TerminalAckError_ActiveLeasePu
 	}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil, pub)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1615,11 +1671,14 @@ func TestHandlerSet_HandleBackendCallback_Success_TransientAckError(t *testing.T
 	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1650,12 +1709,15 @@ func TestHandlerSet_HandleBackendCallback_Failed_PendingLease(t *testing.T) {
 	}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "container crash",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "container crash",
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1677,12 +1739,15 @@ func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease(t *testing.T) {
 	}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "re-provision failed",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "re-provision failed",
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1708,12 +1773,15 @@ func TestHandlerSet_HandleBackendCallback_Failed_RejectFails(t *testing.T) {
 	}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "failed",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "failed",
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1741,12 +1809,15 @@ func TestHandlerSet_HandleBackendCallback_Failed_EmptyReason(t *testing.T) {
 	}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "", // Empty
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "", // Empty
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -1775,7 +1846,7 @@ func TestHandlerSet_HandleBackendCallback_UnknownLease(t *testing.T) {
 // status event so WebSocket clients see the ready/failed transition.
 func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.T) {
 	lifecycleAuthority := newTestPlacementAuthority(t)
-	seedTestConfirmedPlacements(t, lifecycleAuthority, []string{"test-backend"}, map[string]string{
+	seedTestTypedConfirmedPlacements(t, lifecycleAuthority, []string{"test-backend"}, map[string]string{
 		"lease-restart":          "test-backend",
 		"lease-update":           "test-backend",
 		"lease-closed-retained":  "test-backend",
@@ -1803,8 +1874,9 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		resetEvents()
 
 		msg := newCallbackMsg(t, backend.CallbackPayload{
-			LeaseUUID: "lease-restart",
-			Status:    backend.CallbackStatusSuccess,
+			LeaseUUID:   "lease-restart",
+			Status:      backend.CallbackStatusSuccess,
+			LifecycleID: lifecycleAuthority.CurrentLifecycle("lease-restart").ID().String(),
 		})
 
 		err := hs.HandleBackendCallback(msg)
@@ -1821,9 +1893,10 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		resetEvents()
 
 		msg := newCallbackMsg(t, backend.CallbackPayload{
-			LeaseUUID: "lease-update",
-			Status:    backend.CallbackStatusFailed,
-			Error:     "container crashed",
+			LeaseUUID:   "lease-update",
+			Status:      backend.CallbackStatusFailed,
+			Error:       "container crashed",
+			LifecycleID: lifecycleAuthority.CurrentLifecycle("lease-update").ID().String(),
 		})
 
 		err := hs.HandleBackendCallback(msg)
@@ -1843,9 +1916,10 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		resetEvents()
 
 		msg := newCallbackMsg(t, backend.CallbackPayload{
-			LeaseUUID: "lease-closed-retained",
-			Status:    backend.CallbackStatusDeprovisioned,
-			Retained:  true,
+			LeaseUUID:   "lease-closed-retained",
+			Status:      backend.CallbackStatusDeprovisioned,
+			Retained:    true,
+			LifecycleID: lifecycleAuthority.CurrentLifecycle("lease-closed-retained").ID().String(),
 		})
 
 		err := hs.HandleBackendCallback(msg)
@@ -1879,9 +1953,10 @@ func TestHandlerSet_HandleBackendCallback_NonInFlight_PublishesEvent(t *testing.
 		resetEvents()
 
 		msg := newCallbackMsg(t, backend.CallbackPayload{
-			LeaseUUID: "lease-closed-destroyed",
-			Status:    backend.CallbackStatusDeprovisioned,
-			Retained:  false,
+			LeaseUUID:   "lease-closed-destroyed",
+			Status:      backend.CallbackStatusDeprovisioned,
+			Retained:    false,
+			LifecycleID: lifecycleAuthority.CurrentLifecycle("lease-closed-destroyed").ID().String(),
 		})
 
 		err := hs.HandleBackendCallback(msg)
@@ -2015,11 +2090,14 @@ func TestHandlerSet_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    "weird-status",
+		LeaseUUID:   "lease-1",
+		Status:      "weird-status",
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -2406,13 +2484,16 @@ func TestHandlerSet_HandleBackendCallback_LongReasonTruncated(t *testing.T) {
 	}
 
 	hs, tracker := newTestHandlerSet(t, mockChain, mb, ack, nil)
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	longReason := strings.Repeat("x", 500)
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     longReason,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       longReason,
+		OperationID: operationID.String(),
 	})
 
 	err := hs.HandleBackendCallback(msg)
@@ -2526,12 +2607,15 @@ func TestHandlerSet_HandleBackendCallback_Failed_PendingLease_CleansUpPlacement(
 
 	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
-	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, f.tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "container crash",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "container crash",
+		OperationID: operationID.String(),
 	})
 
 	err := f.hs.HandleBackendCallback(msg)
@@ -2552,12 +2636,15 @@ func TestHandlerSet_HandleBackendCallback_Failed_RejectFails_PreservesPlacement(
 
 	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	f.ps.Set("lease-1", "test-backend")
-	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, f.tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "failed",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "failed",
+		OperationID: operationID.String(),
 	})
 
 	err := f.hs.HandleBackendCallback(msg)
@@ -2577,12 +2664,15 @@ func TestHandlerSet_HandleBackendCallback_Failed_ActiveLease_PreservesPlacement(
 
 	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	f.ps.Set("lease-1", "test-backend")
-	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, f.tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "re-provision failed",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "re-provision failed",
+		OperationID: operationID.String(),
 	})
 
 	err := f.hs.HandleBackendCallback(msg)
@@ -2603,11 +2693,14 @@ func TestHandlerSet_HandleBackendCallback_Success_PreservesPlacement(t *testing.
 
 	f := newPlacementTestFixture(t, mockChain, ack)
 	f.ps.Set("lease-1", "test-backend")
-	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, f.tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	msg := newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	})
 
 	err := f.hs.HandleBackendCallback(msg)
@@ -2627,12 +2720,15 @@ func TestHandlerSet_HandleBackendCallback_Success_RepairsAttemptBeforeAcknowledg
 	}}
 	f := newPlacementTestFixture(t, &chaintest.MockClient{}, ack)
 	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
-	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, f.tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	err := f.hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
-		Backend:   "test-backend",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		Backend:     "test-backend",
+		OperationID: operationID.String(),
 	}))
 	require.NoError(t, err)
 	assert.True(t, ackCalled)
@@ -2660,7 +2756,9 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictStill
 			)
 			ps := &errorPlacementStore{setErr: fmt.Errorf("semantic verdict: %w", tt.err)}
 			tracker := NewInFlightTracker()
-			tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+			operationID := requireProvisionCallbackOperation(
+				t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+			)
 			ackCalls := 0
 			timeoutRejectCalls := 0
 			ack := &mockAcknowledger{acknowledgeFn: func(context.Context, string) (bool, string, error) {
@@ -2681,9 +2779,10 @@ func TestHandlerSet_HandleBackendCallback_Success_PermanentPlacementVerdictStill
 			})
 
 			err := hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-				LeaseUUID: "lease-1",
-				Status:    backend.CallbackStatusSuccess,
-				Backend:   "test-backend",
+				LeaseUUID:   "lease-1",
+				Status:      backend.CallbackStatusSuccess,
+				Backend:     "test-backend",
+				OperationID: operationID.String(),
 			}))
 			require.NoError(t, err)
 			assert.Equal(t, 1, ackCalls, "semantic placement conflicts must not poison a live success callback")
@@ -2793,7 +2892,9 @@ func TestHandlerSet_HandleBackendCallback_Success_StoreIOFailureStillAcknowledge
 	requireSetPlacementAttempt(t, &ps.mockPlacementStore, "lease-1", "test-backend")
 	ps.setErr = errors.New("placement disk unavailable")
 	tracker := NewInFlightTracker()
-	tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 	ackCalls := 0
 	timeoutRejectCalls := 0
 	ack := &mockAcknowledger{acknowledgeFn: func(context.Context, string) (bool, string, error) {
@@ -2814,9 +2915,10 @@ func TestHandlerSet_HandleBackendCallback_Success_StoreIOFailureStillAcknowledge
 	})
 
 	err := hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
-		Backend:   "test-backend",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		Backend:     "test-backend",
+		OperationID: operationID.String(),
 	}))
 	require.NoError(t, err)
 	assert.Equal(t, 1, ackCalls,
@@ -2847,12 +2949,15 @@ func TestHandlerSet_HandleBackendCallback_ActiveFailure_ClearsAttemptAndPreserve
 	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	require.NoError(t, f.ps.Set("lease-1", "test-backend"))
 	requireSetPlacementAttempt(t, f.ps, "lease-1", "test-backend")
-	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, f.tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	require.NoError(t, f.hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Backend:   "test-backend",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Backend:     "test-backend",
+		OperationID: operationID.String(),
 	})))
 	p := f.ps.Lookup("lease-1")
 	assert.Equal(t, placement.StateConfirmed, p.State())
@@ -2871,12 +2976,15 @@ func TestHandlerSet_HandleBackendCallback_PendingFailure_DoesNotDeleteDifferentO
 	}
 	f := newPlacementTestFixture(t, mockChain, &mockAcknowledger{})
 	require.NoError(t, f.ps.Set("lease-1", "newer-backend"))
-	f.tracker.TrackInFlight("lease-1", "tenant-a", testItems("sku-1"), "test-backend")
+	operationID := requireProvisionCallbackOperation(
+		t, f.tracker, "lease-1", "tenant-a", testItems("sku-1"), "test-backend",
+	)
 
 	require.NoError(t, f.hs.HandleBackendCallback(newCallbackMsg(t, backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Backend:   "test-backend",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Backend:     "test-backend",
+		OperationID: operationID.String(),
 	})))
 	p := f.ps.Lookup("lease-1")
 	assert.Equal(t, placement.StateConfirmed, p.State())

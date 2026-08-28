@@ -38,12 +38,12 @@ func TestBackend_Start_PendingCallbackReplayDoesNotWaitForDelivery(t *testing.T)
 	b, err := New(cfg, slog.Default())
 	require.NoError(t, err)
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
-		Store:          b.callbackStore,
-		HTTPClient:     client,
-		Logger:         slog.Default(),
-		StopCtx:        b.stopCtx,
-		Backoff:        &zeroBackoff,
-		AttemptTimeout: 2 * time.Second,
+		Store:           b.callbackStore,
+		HTTPClient:      client,
+		Logger:          slog.Default(),
+		StopCtx:         b.stopCtx,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: 2 * time.Second,
 	})
 	_, err = b.callbackStore.StoreEntry(shared.CallbackEntry{
 		LeaseUUID:    "lease-start-replay",

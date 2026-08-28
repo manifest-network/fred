@@ -382,16 +382,23 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 	}
 
 	if err := db.Update(func(tx *bolt.Tx) error {
+		initializationEpoch, err := captureLifecycleInitializationEpoch(tx)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.CreateBucketIfNotExists(bucketName); err != nil {
 			return err
 		}
 		if err := initializeMetadata(tx); err != nil {
 			return err
 		}
+		if err := initializeLifecycleCapabilities(tx, initializationEpoch); err != nil {
+			return err
+		}
 		if err := migrateLegacyConfirmedRevisions(tx); err != nil {
 			return err
 		}
-		return initializeLifecycleCapabilities(tx)
+		return pruneDetachedRetiredLifecycleCapabilities(tx)
 	}); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to initialize placement store: %w", err)
@@ -421,9 +428,7 @@ func NewStore(dbPath string, opts ...Option) (*Store, error) {
 		if err != nil {
 			return err
 		}
-		if bindingErr := validateLifecycleBindings(cache, lifecycleCache); bindingErr != nil {
-			return bindingErr
-		}
+		quarantineLifecycleBindings(cache, lifecycleCache)
 		metadata, err = loadTopologyMetadata(tx)
 		return err
 	}); err != nil {
@@ -948,7 +953,7 @@ func (s *Store) settleRestore(claim RestoreClaim, settlement restoreSettlement) 
 		target.attemptOperationID = operation.OperationID{}
 		target.revision = next
 		capability := promoteAttemptLifecycle(
-			s.lifecycleCache[claim.targetLeaseUUID], claim.backendName, claim.operationID,
+			claim.backendName, claim.operationID,
 		)
 		if err := s.putPlacementWithLifecycleLocked(
 			claim.targetLeaseUUID, target, capability, "confirm restore placement",
@@ -1066,7 +1071,7 @@ func (s *Store) ConfirmAttempt(token AttemptToken) (bool, error) {
 	p.attemptOperationID = operation.OperationID{}
 	p.revision = next
 	capability := promoteAttemptLifecycle(
-		s.lifecycleCache[token.leaseUUID], token.backendName, token.operationID,
+		token.backendName, token.operationID,
 	)
 	if err := s.putPlacementWithLifecycleLocked(
 		token.leaseUUID, p, capability, "confirm typed placement attempt",
@@ -1182,7 +1187,7 @@ func (s *Store) ConfirmOperation(
 	p.attemptOperationID = operation.OperationID{}
 	p.revision = next
 	capability := promoteAttemptLifecycle(
-		s.lifecycleCache[leaseUUID], backendName, operationID,
+		backendName, operationID,
 	)
 	if err := s.putPlacementWithLifecycleLocked(
 		leaseUUID, p, capability, "confirm placement operation",
@@ -1290,6 +1295,7 @@ type projectionMutation struct {
 type projectionLifecycleMutation struct {
 	capability lifecycleCapability
 	encoded    []byte
+	persist    bool
 }
 
 // ProjectInventory computes a placement projection against fence and persists
@@ -1375,18 +1381,24 @@ func (s *Store) ProjectInventory(
 			return ProjectionResult{}, mutationFailure("encode inventory projection", err)
 		}
 		if backendName := projection.Placements[leaseUUID]; backendName != "" {
-			capability := projectPositiveLifecycle(
-				s.lifecycleCache[leaseUUID], existing, exists, backendName,
+			currentCapability, capabilityExists := s.lifecycleCache[leaseUUID]
+			capability, persist := projectPositiveLifecycle(
+				currentCapability, capabilityExists, existing, exists, backendName,
 			)
-			capabilityEncoded, capabilityErr := encodeLifecycleCapability(capability)
-			if capabilityErr != nil {
-				return ProjectionResult{}, mutationFailure(
-					"encode inventory lifecycle projection", capabilityErr,
-				)
+			var capabilityEncoded []byte
+			if persist {
+				var capabilityErr error
+				capabilityEncoded, capabilityErr = encodeLifecycleCapability(capability)
+				if capabilityErr != nil {
+					return ProjectionResult{}, mutationFailure(
+						"encode inventory lifecycle projection", capabilityErr,
+					)
+				}
 			}
 			lifecycleMutations[leaseUUID] = projectionLifecycleMutation{
 				capability: capability,
 				encoded:    capabilityEncoded,
+				persist:    persist,
 			}
 		}
 		mutations[leaseUUID] = projectionMutation{
@@ -1420,7 +1432,8 @@ func (s *Store) ProjectInventory(
 			if err := b.Put([]byte(leaseUUID), mutation.encoded); err != nil {
 				return err
 			}
-			if lifecycleMutation, ok := lifecycleMutations[leaseUUID]; ok {
+			if lifecycleMutation, ok := lifecycleMutations[leaseUUID]; ok &&
+				lifecycleMutation.persist {
 				if err := capabilities.Put(
 					[]byte(leaseUUID), lifecycleMutation.encoded,
 				); err != nil {

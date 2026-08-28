@@ -2,22 +2,65 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
+
+func newTestV013PlacementAuthority(
+	t testing.TB,
+	placements map[string]string,
+) *placement.Store {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("placements"))
+		if err != nil {
+			return err
+		}
+		for leaseUUID, backendName := range placements {
+			value, marshalErr := json.Marshal(struct {
+				Backend string    `json:"backend"`
+				SetAt   time.Time `json:"set_at"`
+			}{
+				Backend: backendName,
+				SetAt:   time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC),
+			})
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if err := bucket.Put([]byte(leaseUUID), value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	require.NoError(t, db.Close())
+
+	store, err := placement.NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	return store
+}
 
 type callbackAcknowledgerFunc func(context.Context, string) (bool, string, error)
 
@@ -142,15 +185,13 @@ func trackCallbackOperation(
 	t testing.TB,
 	registry *operation.Registry,
 	leaseUUID, backendName string,
-	tokenRequired bool,
 ) operation.Token {
 	t.Helper()
 	result := registry.TryTrack(operation.TrackSpec{
-		LeaseUUID:     leaseUUID,
-		Tenant:        "tenant-a",
-		Backend:       backendName,
-		Kind:          operation.KindProvision,
-		TokenRequired: tokenRequired,
+		LeaseUUID: leaseUUID,
+		Tenant:    "tenant-a",
+		Backend:   backendName,
+		Kind:      operation.KindProvision,
 	})
 	require.True(t, result.Started())
 	return result.Token()
@@ -241,33 +282,23 @@ func TestNewCallbackCommand_ConvertsWireIdentityAtBoundary(t *testing.T) {
 
 func TestCallbackService_AuthorizesOnlyMatchingOperation(t *testing.T) {
 	tests := []struct {
-		name          string
-		tokenRequired bool
-		callbackID    func(testing.TB, operation.OperationID) string
-		backend       string
-		wantApplied   bool
+		name        string
+		callbackID  func(testing.TB, operation.OperationID) string
+		backend     string
+		wantApplied bool
 	}{
 		{
-			name:          "tokenless legacy callback remains accepted for legacy operation",
-			tokenRequired: false,
-			callbackID:    func(testing.TB, operation.OperationID) string { return "" },
-			wantApplied:   true,
+			name:       "missing token is structurally rejected",
+			callbackID: func(testing.TB, operation.OperationID) string { return "" },
 		},
 		{
-			name:          "missing token is rejected when operation requires it",
-			tokenRequired: true,
-			callbackID:    func(testing.TB, operation.OperationID) string { return "" },
+			name:        "exact token is accepted",
+			callbackID:  callbackWireID,
+			backend:     "backend-a",
+			wantApplied: true,
 		},
 		{
-			name:          "exact token is accepted",
-			tokenRequired: true,
-			callbackID:    callbackWireID,
-			backend:       "backend-a",
-			wantApplied:   true,
-		},
-		{
-			name:          "different nonzero token is rejected",
-			tokenRequired: true,
+			name: "different nonzero token is rejected",
 			callbackID: func(t testing.TB, id operation.OperationID) string {
 				t.Helper()
 				return "d9428888-122b-41e1-b85c-61c67afba0c6"
@@ -275,18 +306,17 @@ func TestCallbackService_AuthorizesOnlyMatchingOperation(t *testing.T) {
 			backend: "backend-a",
 		},
 		{
-			name:          "legacy metrics backend cannot redirect exact token",
-			tokenRequired: true,
-			callbackID:    callbackWireID,
-			backend:       "backend-b",
-			wantApplied:   true,
+			name:        "legacy metrics backend cannot redirect exact token",
+			callbackID:  callbackWireID,
+			backend:     "backend-b",
+			wantApplied: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			registry := operation.NewRegistry()
-			token := trackCallbackOperation(t, registry, "lease-1", "backend-a", tt.tokenRequired)
+			token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 			lifecycleAuthority := newTestPlacementAuthority(t)
 			var placementCalls atomic.Int32
 			var acknowledgeCalls atomic.Int32
@@ -334,7 +364,7 @@ func TestCallbackService_AuthorizesOnlyMatchingOperation(t *testing.T) {
 
 func TestCallbackService_SuccessSettlesExactDurableAttempt(t *testing.T) {
 	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, []string{"backend-a"})
 	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", token.ID())
@@ -369,7 +399,7 @@ func TestCallbackService_SuccessSettlesExactDurableAttempt(t *testing.T) {
 
 func TestCallbackService_FailureCannotClearDifferentDurableOperation(t *testing.T) {
 	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 	store := newTestPlacementAuthority(t)
 	newerID, err := operation.ParseID("d9428888-122b-41e1-b85c-61c67afba0c6")
 	require.NoError(t, err)
@@ -407,7 +437,7 @@ func TestCallbackService_FailureCannotClearDifferentDurableOperation(t *testing.
 
 func TestCallbackService_RetryableAcknowledgeFailureReleasesExactClaim(t *testing.T) {
 	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, []string{"backend-a"})
 	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", token.ID())
@@ -489,7 +519,7 @@ func TestCallbackService_TerminalAcknowledgeErrorUsesCurrentLeaseState(t *testin
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			registry := operation.NewRegistry()
-			token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+			token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 			events := &callbackEventRecorder{}
 			var reads atomic.Int32
 			service, err := NewCallbackService(CallbackServiceConfig{
@@ -550,7 +580,7 @@ func TestCallbackService_TerminalAcknowledgeErrorUsesCurrentLeaseState(t *testin
 
 func TestCallbackService_RejectResponseLossUsesCurrentLeaseState(t *testing.T) {
 	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 	payloads := &callbackPayloadRecorder{}
 	events := &callbackEventRecorder{}
 	var reads atomic.Int32
@@ -704,7 +734,7 @@ func TestCallbackService_FailureSettlementUsesCurrentLeaseState(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			registry := operation.NewRegistry()
-			token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+			token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 			payloads := &callbackPayloadRecorder{}
 			events := &callbackEventRecorder{}
 			var reads atomic.Int32
@@ -776,7 +806,7 @@ func TestCallbackService_ConcurrentDuplicateCallbacksAcknowledgeOnce(t *testing.
 		CallbackOperations: registry,
 		secondAttempt:      make(chan struct{}),
 	}
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, []string{"backend-a"})
 	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", token.ID())
@@ -830,7 +860,7 @@ func TestCallbackService_ConcurrentDuplicateCallbacksAcknowledgeOnce(t *testing.
 
 func TestCallbackService_DeprovisionOwnedCallbackIsObservationOnly(t *testing.T) {
 	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 	deprovision := registry.TryClaimDeprovision("lease-1", token.ID())
 	require.True(t, deprovision.Claimed())
 	events := &callbackEventRecorder{}
@@ -868,11 +898,11 @@ func TestCallbackService_DeprovisionOwnedCallbackIsObservationOnly(t *testing.T)
 
 func TestCallbackService_LegacyLifecycleObservationDoesNotSettleCurrentTypedOperation(t *testing.T) {
 	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
-	lifecycleAuthority := newTestPlacementAuthority(t)
-	seedTestConfirmedPlacements(t, lifecycleAuthority, []string{"backend-a"}, map[string]string{
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
+	lifecycleAuthority := newTestV013PlacementAuthority(t, map[string]string{
 		"lease-1": "backend-a",
 	})
+	armTestPlacementTopology(t, lifecycleAuthority, []string{"backend-a"})
 	events := &callbackEventRecorder{}
 	observer := &callbackDeprovisionRecorder{}
 	service, err := NewCallbackService(CallbackServiceConfig{
@@ -927,10 +957,10 @@ func TestCallbackService_LegacyLifecycleObservationDoesNotSettleCurrentTypedOper
 
 func TestCallbackService_LegacyNonInFlightDeprovisionCannotRetireBackendCandidate(t *testing.T) {
 	registry := operation.NewRegistry()
-	lifecycleAuthority := newTestPlacementAuthority(t)
-	seedTestConfirmedPlacements(t, lifecycleAuthority, []string{"backend-a"}, map[string]string{
+	lifecycleAuthority := newTestV013PlacementAuthority(t, map[string]string{
 		"lease-1": "backend-a",
 	})
+	armTestPlacementTopology(t, lifecycleAuthority, []string{"backend-a"})
 	events := &callbackEventRecorder{}
 	observer := &callbackDeprovisionRecorder{}
 	service, err := NewCallbackService(CallbackServiceConfig{
@@ -1026,6 +1056,184 @@ func TestCallbackService_TypedLifecycleCapabilityIsRevocableAndObservationOnly(t
 	assert.Len(t, events.events, 3, "a retired capability must be an idempotent no-op")
 }
 
+func TestCallbackService_LifecycleMetricsClassifyEveryReceivedCallback(t *testing.T) {
+	store := newTestPlacementAuthority(t)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174095")
+	require.NoError(t, err)
+	attempt := beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", operationID)
+	confirmed, err := store.ConfirmAttempt(attempt)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	lifecycleID, err := lifecycle.FromOperationID(operationID)
+	require.NoError(t, err)
+	staleID, err := lifecycle.ParseID("123e4567-e89b-42d3-a456-426614174094")
+	require.NoError(t, err)
+
+	service, err := NewCallbackService(CallbackServiceConfig{
+		Operations:         operation.NewRegistry(),
+		LifecycleAuthority: store,
+	})
+	require.NoError(t, err)
+
+	metric := func(outcome, verdict, status string) float64 {
+		t.Helper()
+		return promtestutil.ToFloat64(
+			metrics.LifecycleCallbackOutcomesTotal.WithLabelValues(outcome, verdict, status),
+		)
+	}
+	metricTotal := func(status string) float64 {
+		t.Helper()
+		var total float64
+		for _, outcome := range []string{
+			metrics.LifecycleCallbackOutcomeApplied,
+			metrics.LifecycleCallbackOutcomeDropped,
+			metrics.LifecycleCallbackOutcomeRetryable,
+		} {
+			for _, verdict := range []string{
+				metrics.LifecycleCallbackVerdictAuthorized,
+				metrics.LifecycleCallbackVerdictLegacy,
+				metrics.LifecycleCallbackVerdictTeardownOnly,
+				metrics.LifecycleCallbackVerdictRetired,
+				metrics.LifecycleCallbackVerdictInvalid,
+				metrics.LifecycleCallbackVerdictMissing,
+				metrics.LifecycleCallbackVerdictStale,
+				metrics.LifecycleCallbackVerdictUnusable,
+				metrics.LifecycleCallbackVerdictUnavailable,
+				metrics.LifecycleCallbackVerdictUnknown,
+			} {
+				total += metric(outcome, verdict, status)
+			}
+		}
+		return total
+	}
+	received := func(status string) float64 {
+		t.Helper()
+		return promtestutil.ToFloat64(
+			metrics.NonInFlightCallbacksTotal.WithLabelValues(labelBackendUnknown, status),
+		)
+	}
+
+	appliedSuccessBefore := metric(
+		metrics.LifecycleCallbackOutcomeApplied,
+		metrics.LifecycleCallbackVerdictAuthorized,
+		string(backend.CallbackStatusSuccess),
+	)
+	successTotalBefore := metricTotal(string(backend.CallbackStatusSuccess))
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID:   "lease-1",
+			Status:      backend.CallbackStatusSuccess,
+			LifecycleID: lifecycleID.String(),
+		},
+	)))
+	assert.Equal(t, 1.0, metric(
+		metrics.LifecycleCallbackOutcomeApplied,
+		metrics.LifecycleCallbackVerdictAuthorized,
+		string(backend.CallbackStatusSuccess),
+	)-appliedSuccessBefore)
+	assert.Equal(t, 1.0, metricTotal(string(backend.CallbackStatusSuccess))-successTotalBefore,
+		"one lifecycle callback must increment exactly one outcome series")
+
+	receivedFailedBefore := received(string(backend.CallbackStatusFailed))
+	failedTotalBefore := metricTotal(string(backend.CallbackStatusFailed))
+	droppedStaleBefore := metric(
+		metrics.LifecycleCallbackOutcomeDropped,
+		metrics.LifecycleCallbackVerdictStale,
+		string(backend.CallbackStatusFailed),
+	)
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID:   "lease-1",
+			Status:      backend.CallbackStatusFailed,
+			LifecycleID: staleID.String(),
+		},
+	)))
+	assert.Equal(t, 1.0, received(string(backend.CallbackStatusFailed))-receivedFailedBefore,
+		"the compatibility metric must count a received lifecycle callback even when authorization drops it")
+	assert.Equal(t, 1.0, metric(
+		metrics.LifecycleCallbackOutcomeDropped,
+		metrics.LifecycleCallbackVerdictStale,
+		string(backend.CallbackStatusFailed),
+	)-droppedStaleBefore)
+	assert.Equal(t, 1.0, metricTotal(string(backend.CallbackStatusFailed))-failedTotalBefore,
+		"one lifecycle callback must increment exactly one outcome series")
+
+	deprovisionedTotalBefore := metricTotal(string(backend.CallbackStatusDeprovisioned))
+	appliedTeardownBefore := metric(
+		metrics.LifecycleCallbackOutcomeApplied,
+		metrics.LifecycleCallbackVerdictAuthorized,
+		string(backend.CallbackStatusDeprovisioned),
+	)
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID:   "lease-1",
+			Status:      backend.CallbackStatusDeprovisioned,
+			LifecycleID: lifecycleID.String(),
+		},
+	)))
+	assert.Equal(t, 1.0, metric(
+		metrics.LifecycleCallbackOutcomeApplied,
+		metrics.LifecycleCallbackVerdictAuthorized,
+		string(backend.CallbackStatusDeprovisioned),
+	)-appliedTeardownBefore)
+	assert.Equal(t, 1.0,
+		metricTotal(string(backend.CallbackStatusDeprovisioned))-deprovisionedTotalBefore,
+		"one lifecycle callback must increment exactly one outcome series")
+
+	receivedDeprovisionedBefore := received(string(backend.CallbackStatusDeprovisioned))
+	deprovisionedTotalBefore = metricTotal(string(backend.CallbackStatusDeprovisioned))
+	droppedRetiredBefore := metric(
+		metrics.LifecycleCallbackOutcomeDropped,
+		metrics.LifecycleCallbackVerdictRetired,
+		string(backend.CallbackStatusDeprovisioned),
+	)
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID:   "lease-1",
+			Status:      backend.CallbackStatusDeprovisioned,
+			LifecycleID: lifecycleID.String(),
+		},
+	)))
+	assert.Equal(t, 1.0,
+		received(string(backend.CallbackStatusDeprovisioned))-receivedDeprovisionedBefore,
+		"a replay after retirement remains visible as received")
+	assert.Equal(t, 1.0, metric(
+		metrics.LifecycleCallbackOutcomeDropped,
+		metrics.LifecycleCallbackVerdictRetired,
+		string(backend.CallbackStatusDeprovisioned),
+	)-droppedRetiredBefore)
+	assert.Equal(t, 1.0,
+		metricTotal(string(backend.CallbackStatusDeprovisioned))-deprovisionedTotalBefore,
+		"one lifecycle callback must increment exactly one outcome series")
+
+	noAuthority, err := NewCallbackService(CallbackServiceConfig{
+		Operations: operation.NewRegistry(),
+	})
+	require.NoError(t, err)
+	retryableBefore := metric(
+		metrics.LifecycleCallbackOutcomeRetryable,
+		metrics.LifecycleCallbackVerdictUnavailable,
+		string(backend.CallbackStatusSuccess),
+	)
+	successTotalBefore = metricTotal(string(backend.CallbackStatusSuccess))
+	err = noAuthority.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID:   "lease-2",
+			Status:      backend.CallbackStatusSuccess,
+			LifecycleID: lifecycleID.String(),
+		},
+	))
+	require.ErrorIs(t, err, errCallbackLifecycleUnavailable)
+	assert.Equal(t, 1.0, metric(
+		metrics.LifecycleCallbackOutcomeRetryable,
+		metrics.LifecycleCallbackVerdictUnavailable,
+		string(backend.CallbackStatusSuccess),
+	)-retryableBefore)
+	assert.Equal(t, 1.0, metricTotal(string(backend.CallbackStatusSuccess))-successTotalBefore,
+		"one lifecycle callback must increment exactly one outcome series")
+}
+
 func TestCallbackService_TeardownOnlyCapabilityAcceptsOnlyTerminalConsume(t *testing.T) {
 	registry := operation.NewRegistry()
 	store := newTestPlacementAuthority(t)
@@ -1095,7 +1303,8 @@ func TestCallbackService_TeardownOnlyCapabilityAcceptsOnlyTerminalConsume(t *tes
 	))
 	require.Len(t, events.events, 1)
 	assert.Equal(t, backend.ProvisionStatusRetained, events.events[0].Status)
-	assert.True(t, store.AuthorizeLifecycle("lease-1", lifecycleID).Retired())
+	assert.Equal(t, placement.LifecycleVerdictMissing,
+		store.AuthorizeLifecycle("lease-1", lifecycleID).Verdict())
 
 	require.NoError(t, service.HandleCallback(
 		context.Background(), callbackCommand(t, terminal),
@@ -1104,12 +1313,10 @@ func TestCallbackService_TeardownOnlyCapabilityAcceptsOnlyTerminalConsume(t *tes
 }
 
 func TestCallbackService_LegacyTeardownOnlyCapabilityIsTerminalOnly(t *testing.T) {
-	store := newTestPlacementAuthority(t)
+	store := newTestV013PlacementAuthority(t, map[string]string{
+		"legacy": "backend-a",
+	})
 	armTestPlacementTopology(t, store, []string{"backend-a"})
-	projectTestPlacementInventory(t, store, []string{"backend-a"},
-		placement.InventoryProjection{Placements: map[string]string{
-			"legacy": "backend-a",
-		}})
 	record := store.Lookup("legacy")
 	deleted, err := store.DeleteRecord(record.RecordRevision())
 	require.NoError(t, err)
@@ -1142,7 +1349,8 @@ func TestCallbackService_LegacyTeardownOnlyCapabilityIsTerminalOnly(t *testing.T
 	))
 	require.Len(t, events.events, 1)
 	assert.Equal(t, backend.ProvisionStatusRetained, events.events[0].Status)
-	assert.True(t, store.AuthorizeLifecycle("legacy", lifecycle.ID{}).Retired())
+	assert.Equal(t, placement.LifecycleVerdictMissing,
+		store.AuthorizeLifecycle("legacy", lifecycle.ID{}).Verdict())
 }
 
 func TestCallbackService_PlacementConflictWithdrawsLifecycleObservationAuthority(t *testing.T) {
@@ -1197,7 +1405,7 @@ func TestCallbackService_PlacementConflictWithdrawsLifecycleObservationAuthority
 
 func TestCallbackService_MissingMutationCapabilityFailsClosedAndReleasesClaim(t *testing.T) {
 	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a", true)
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 	service, err := NewCallbackService(CallbackServiceConfig{Operations: registry})
 	require.NoError(t, err)
 

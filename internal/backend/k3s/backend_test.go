@@ -26,7 +26,7 @@ import (
 // failed callback deliveries. Mirrors docker/provision_test.go:64.
 var zeroBackoff = [shared.CallbackMaxAttempts]time.Duration{}
 
-const testCallbackAttemptTimeout = 5 * time.Second
+const testCallbackDeliveryTimeout = 5 * time.Second
 
 // testCallbackSecret is the HMAC secret the fake Fred receiver uses to
 // verify inbound callbacks. 32 chars to satisfy Config.Validate's floor.
@@ -70,13 +70,13 @@ func newBackendForTest(t *testing.T, fredURL string) *Backend {
 func rebuildCallbackSender(b *Backend) {
 	httpClient := &http.Client{}
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
-		Store:          b.callbackStore,
-		HTTPClient:     httpClient,
-		Secret:         string(b.cfg.CallbackSecret),
-		Logger:         b.logger,
-		StopCtx:        b.stopCtx,
-		Backoff:        &zeroBackoff,
-		AttemptTimeout: testCallbackAttemptTimeout,
+		Store:           b.callbackStore,
+		HTTPClient:      httpClient,
+		Secret:          string(b.cfg.CallbackSecret),
+		Logger:          b.logger,
+		StopCtx:         b.stopCtx,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: testCallbackDeliveryTimeout,
 	})
 }
 

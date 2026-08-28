@@ -28,22 +28,34 @@ const (
 	callbackReplayWorkerLimit = 16
 )
 
+type callbackAttemptOutcome uint8
+
+const (
+	callbackAttemptRetry callbackAttemptOutcome = iota
+	callbackAttemptDelivered
+	// callbackAttemptDeferReplay means this attempt consumed its complete
+	// request-context budget (or backend shutdown canceled it). Running the
+	// remaining inline attempts would hold the same lease's FIFO lock for
+	// another full budget each. The durable head remains for RunReplayLoop.
+	callbackAttemptDeferReplay
+)
+
 // defaultCallbackBackoff defines the default delay before each retry attempt.
 var defaultCallbackBackoff = [CallbackMaxAttempts]time.Duration{0, 1 * time.Second, 5 * time.Second}
 
 // CallbackSender handles HMAC-signed callback delivery with retry and persistence.
 type CallbackSender struct {
-	store          *CallbackStore
-	httpClient     *http.Client
-	secret         string
-	logger         *slog.Logger
-	stopCtx        context.Context
-	backoff        [CallbackMaxAttempts]time.Duration
-	attemptTimeout time.Duration
-	replayInterval time.Duration
-	onDelivery     func(outcome string) // nil-safe; injected by the caller for metrics
-	onStoreError   func()               // nil-safe; called when bbolt persistence fails
-	onReplayPanic  func(any)            // nil-safe; called when one lease replay panics
+	store           *CallbackStore
+	httpClient      *http.Client
+	secret          string
+	logger          *slog.Logger
+	stopCtx         context.Context
+	backoff         [CallbackMaxAttempts]time.Duration
+	deliveryTimeout time.Duration
+	replayInterval  time.Duration
+	onDelivery      func(outcome string) // nil-safe; injected by the caller for metrics
+	onStoreError    func()               // nil-safe; called when bbolt persistence fails
+	onReplayPanic   func(any)            // nil-safe; called when one lease replay panics
 	// deliveryLocks serialize enqueue + FIFO drain for exactly one lease. Each
 	// entry is reference-counted and deleted after its final holder unlocks, so
 	// tenant-controlled lease IDs cannot grow the registry indefinitely and an
@@ -59,17 +71,17 @@ type callbackLeaseLock struct {
 
 // CallbackSenderConfig configures a CallbackSender.
 type CallbackSenderConfig struct {
-	Store          *CallbackStore
-	HTTPClient     *http.Client
-	Secret         string
-	Logger         *slog.Logger
-	StopCtx        context.Context
-	OnDelivery     func(outcome string)                // optional metrics callback
-	OnStoreError   func()                              // optional; called when bbolt persistence fails
-	OnReplayPanic  func(any)                           // optional; called after recovering a lease replay panic
-	Backoff        *[CallbackMaxAttempts]time.Duration // retry delays; nil uses default {0, 1s, 5s}
-	AttemptTimeout time.Duration                       // per-request timeout; zero uses backend.DefaultCallbackDeliveryTimeout
-	ReplayInterval time.Duration                       // zero uses DefaultCallbackReplayInterval
+	Store           *CallbackStore
+	HTTPClient      *http.Client
+	Secret          string
+	Logger          *slog.Logger
+	StopCtx         context.Context
+	OnDelivery      func(outcome string)                // optional metrics callback
+	OnStoreError    func()                              // optional; called when bbolt persistence fails
+	OnReplayPanic   func(any)                           // optional; called after recovering a lease replay panic
+	Backoff         *[CallbackMaxAttempts]time.Duration // retry delays; nil uses default {0, 1s, 5s}
+	DeliveryTimeout time.Duration                       // total inline delivery budget; zero uses backend.DefaultCallbackDeliveryTimeout
+	ReplayInterval  time.Duration                       // zero uses DefaultCallbackReplayInterval
 }
 
 // NewCallbackSender creates a new CallbackSender.
@@ -88,8 +100,8 @@ func NewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 	if cfg.ReplayInterval < 0 {
 		panic("shared.NewCallbackSender: ReplayInterval must not be negative")
 	}
-	if cfg.AttemptTimeout < 0 {
-		panic("shared.NewCallbackSender: AttemptTimeout must not be negative")
+	if cfg.DeliveryTimeout < 0 {
+		panic("shared.NewCallbackSender: DeliveryTimeout must not be negative")
 	}
 
 	backoff := defaultCallbackBackoff
@@ -100,9 +112,9 @@ func NewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 	if replayInterval == 0 {
 		replayInterval = DefaultCallbackReplayInterval
 	}
-	attemptTimeout := cfg.AttemptTimeout
-	if attemptTimeout == 0 {
-		attemptTimeout = backend.DefaultCallbackDeliveryTimeout
+	deliveryTimeout := cfg.DeliveryTimeout
+	if deliveryTimeout == 0 {
+		deliveryTimeout = backend.DefaultCallbackDeliveryTimeout
 	}
 
 	deliveryLocksMu := &sync.Mutex{}
@@ -119,7 +131,7 @@ func NewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 		logger:          cfg.Logger,
 		stopCtx:         cfg.StopCtx,
 		backoff:         backoff,
-		attemptTimeout:  attemptTimeout,
+		deliveryTimeout: deliveryTimeout,
 		replayInterval:  replayInterval,
 		onDelivery:      cfg.OnDelivery,
 		onStoreError:    cfg.OnStoreError,
@@ -284,24 +296,47 @@ func (s *CallbackSender) CancelLeaseCallbacks(leaseUUID string) error {
 // DeliverCallback attempts to deliver a callback with retries.
 // Returns true if delivery succeeded.
 func (s *CallbackSender) DeliverCallback(leaseUUID, callbackURL string, body []byte) bool {
+	// Share one deadline across the complete inline retry chain, including
+	// backoff. A slow 503 must not receive a fresh full application budget on
+	// every retry and hold this lease's FIFO lock for CallbackMaxAttempts times
+	// the configured timeout. Quick failures can still retry with whatever
+	// budget remains; durable replay owns the head after this context expires.
+	deliveryCtx, cancel := context.WithTimeout(s.stopCtx, s.deliveryTimeout)
+	defer cancel()
+
 	for attempt := range CallbackMaxAttempts {
 		if attempt > 0 {
-			// Wait with backoff, but abort if shutting down
+			// Keep retry backoff inside the same total delivery budget.
+			timer := time.NewTimer(s.backoff[attempt])
 			select {
-			case <-s.stopCtx.Done():
-				s.logger.Warn("callback retry aborted by shutdown",
+			case <-deliveryCtx.Done():
+				timer.Stop()
+				s.logger.Warn("callback retry deferred after inline delivery context ended",
 					"lease_uuid", leaseUUID,
 					"attempt", attempt+1,
+					"error", deliveryCtx.Err(),
 				)
 				s.reportDelivery("failure")
 				return false
-			case <-time.After(s.backoff[attempt]):
+			case <-timer.C:
 			}
 		}
 
-		if s.trySendCallback(leaseUUID, callbackURL, body) {
+		switch s.trySendCallback(deliveryCtx, leaseUUID, callbackURL, body) {
+		case callbackAttemptDelivered:
 			s.reportDelivery("success")
 			return true
+		case callbackAttemptDeferReplay:
+			s.reportDelivery("failure")
+			s.logger.Warn("callback delivery deferred to durable replay after request context ended",
+				"lease_uuid", leaseUUID,
+				"attempt", attempt+1,
+				"replay_interval", s.replayInterval,
+			)
+			return false
+		case callbackAttemptRetry:
+			// A quick transport or HTTP failure remains eligible for the
+			// existing bounded inline retry chain.
 		}
 	}
 
@@ -313,18 +348,17 @@ func (s *CallbackSender) DeliverCallback(leaseUUID, callbackURL string, body []b
 	return false
 }
 
-// trySendCallback makes a single callback attempt. Returns true on success.
-func (s *CallbackSender) trySendCallback(leaseUUID, callbackURL string, body []byte) bool {
-	// The request context is the single authoritative deadline. Bundled backend
-	// clients deliberately leave http.Client.Timeout unset so a shorter client-
-	// wide cap cannot race Fred's synchronous application timeout.
-	ctx, cancel := context.WithTimeout(s.stopCtx, s.attemptTimeout)
-	defer cancel()
-
+// trySendCallback makes one request attempt and tells the caller whether to
+// retry inline, finish, or leave the durable head for periodic replay.
+func (s *CallbackSender) trySendCallback(
+	ctx context.Context,
+	leaseUUID, callbackURL string,
+	body []byte,
+) callbackAttemptOutcome {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
 	if err != nil {
 		s.logger.Error("failed to create callback request", "error", err, "lease_uuid", leaseUUID)
-		return false
+		return callbackAttemptRetry
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -336,7 +370,10 @@ func (s *CallbackSender) trySendCallback(leaseUUID, callbackURL string, body []b
 			"error", err,
 			"lease_uuid", leaseUUID,
 		)
-		return false
+		if ctx.Err() != nil {
+			return callbackAttemptDeferReplay
+		}
+		return callbackAttemptRetry
 	}
 
 	// Always read and close the response body to allow connection reuse.
@@ -346,7 +383,10 @@ func (s *CallbackSender) trySendCallback(leaseUUID, callbackURL string, body []b
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		s.logger.Debug("callback sent", "lease_uuid", leaseUUID)
-		return true
+		return callbackAttemptDelivered
+	}
+	if ctx.Err() != nil {
+		return callbackAttemptDeferReplay
 	}
 
 	s.logger.Warn("callback returned error status",
@@ -354,7 +394,7 @@ func (s *CallbackSender) trySendCallback(leaseUUID, callbackURL string, body []b
 		"lease_uuid", leaseUUID,
 		"body", string(respBody),
 	)
-	return false
+	return callbackAttemptRetry
 }
 
 // ReplayPendingCallbacks drains callbacks that remain durable after a failed

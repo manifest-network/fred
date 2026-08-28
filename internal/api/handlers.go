@@ -136,7 +136,7 @@ type HandlersConfig struct {
 	TokenTracker       TokenTrackerInterface      // optional but recommended for replay attack protection
 	StatusChecker      StatusChecker              // optional but required for the /status endpoint
 	PlacementLookup    PlacementLookup            // optional — used for routing reads to the correct backend
-	LifecycleCallbacks LifecycleCallbackAuthority // optional for legacy embeddings; production uses the placement store
+	LifecycleCallbacks LifecycleCallbackAuthority // required for restart/update; legacy owners are explicit store verdicts
 	RestoreService     RestoreService             // required by /restore; owns typed operation and placement capabilities
 	PayloadPersister   PayloadPersister           // REQUIRED for /update — without it an update cannot be made durable (ENG-619)
 	PayloadStoreHealth PayloadStoreHealth         // optional — health probe for the payload store's bbolt DB
@@ -197,9 +197,7 @@ func (h *Handlers) maintenanceCallbackURL(
 	leaseUUID, backendName string,
 ) (string, error) {
 	if h.lifecycleCallbacks == nil {
-		// Compatibility for isolated legacy embeddings that do not compose the
-		// durable placement store. Production providerd always supplies it.
-		return provisioner.BuildCallbackURL(h.callbackBaseURL), nil
+		return "", errors.New("lifecycle callback authority is unavailable")
 	}
 
 	authorization := h.lifecycleCallbacks.CurrentLifecycle(leaseUUID)

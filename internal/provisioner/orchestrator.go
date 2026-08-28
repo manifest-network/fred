@@ -284,12 +284,11 @@ func (o *ProvisionOrchestrator) startProvisioning(
 	// Provision. The returned capability owns exact abort and callback identity;
 	// opaque operation IDs cannot be confused with placement revisions.
 	spec := operation.TrackSpec{
-		LeaseUUID:     lease.Uuid,
-		Tenant:        lease.Tenant,
-		Items:         items,
-		Backend:       backendClient.Name(),
-		Kind:          operation.KindProvision,
-		TokenRequired: true,
+		LeaseUUID: lease.Uuid,
+		Tenant:    lease.Tenant,
+		Items:     items,
+		Backend:   backendClient.Name(),
+		Kind:      operation.KindProvision,
 	}
 	initiationResult := o.operations.TryInitiateClaimed(claim, spec)
 	if !initiationResult.Started() {

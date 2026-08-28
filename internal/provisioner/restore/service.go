@@ -232,12 +232,11 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	}
 	items := extractLeaseItems(targetLease)
 	initiated := service.operations.TryInitiateClaimed(claims.target, operation.TrackSpec{
-		LeaseUUID:     command.TargetLeaseUUID,
-		Tenant:        command.Tenant,
-		Items:         items,
-		Backend:       "",
-		Kind:          operation.KindRestore,
-		TokenRequired: true,
+		LeaseUUID: command.TargetLeaseUUID,
+		Tenant:    command.Tenant,
+		Items:     items,
+		Backend:   "",
+		Kind:      operation.KindRestore,
 	})
 	if !initiated.Started() {
 		if initiated.Outcome() == operation.TrackBusy {

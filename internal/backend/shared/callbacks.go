@@ -208,6 +208,7 @@ func (s *CallbackStore) storeEntryLocked(entry CallbackEntry) (CallbackEntry, er
 		if entry.DeliveryKind != CallbackDeliveryKindLifecycle {
 			return nil
 		}
+		var keysToDelete [][]byte
 		c := b.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			if string(k) == entry.DeliveryID {
@@ -222,7 +223,13 @@ func (s *CallbackStore) storeEntryLocked(entry CallbackEntry) (CallbackEntry, er
 				validateCallbackDeliveryID(candidate.DeliveryID) != nil {
 				continue
 			}
-			if deleteErr := c.Delete(); deleteErr != nil {
+			// Cursor keys are only valid until the next cursor operation, and
+			// deleting in-place can skip an adjacent key. Copy every match and
+			// delete it after the read-only traversal completes.
+			keysToDelete = append(keysToDelete, append([]byte(nil), k...))
+		}
+		for _, key := range keysToDelete {
+			if deleteErr := b.Delete(key); deleteErr != nil {
 				return deleteErr
 			}
 		}
@@ -340,7 +347,13 @@ func (s *CallbackStore) ListPending() ([]CallbackEntry, error) {
 
 // listPending returns the durable FIFO for one lease, or every lease when
 // leaseUUID is empty. Callers use the all-leases form only for discovery;
-// delivery re-lists a lease while holding its keyed drain lock.
+// delivery re-lists a lease while holding its keyed drain lock. Validation is
+// deliberately store-wide even for a filtered read: a malformed v2 value has
+// only a delivery UUID in its key, so its lease identity and operation-vs-
+// lifecycle ordering are unrecoverable. Letting another row advance could
+// overtake an unknown exact completion for that same lease. The preserved row
+// therefore poisons this backend's outbox until repaired or restored, and
+// Healthy reports the same error for operator action.
 func (s *CallbackStore) listPending(leaseUUID string) ([]CallbackEntry, error) {
 	var entries []CallbackEntry
 
@@ -416,13 +429,13 @@ func (s *CallbackStore) listPending(leaseUUID string) ([]CallbackEntry, error) {
 	return entries, nil
 }
 
-// RemoveOlderThan expires callback deliveries without creating a hole in a
-// lease FIFO. A typed queue is deleted only when every record for that lease is
-// expired; retaining a fresh suffix while deleting an older exact completion
-// would let that suffix overtake the completion. Legacy, pre-kind, and
-// pre-sequence records are protected indefinitely because their operation-vs-
-// lifecycle meaning is unknowable. Malformed data fails the whole pass closed
-// and remains available for operator recovery instead of being silently erased.
+// RemoveOlderThan expires each callback delivery whose explicit maximum age
+// has elapsed. FIFO remains strict among live deliveries; expiry is the
+// configured abandonment point after which a newer same-lease delivery may
+// proceed. This applies equally to legacy and pre-kind records so an
+// undeliverable v0.13 row cannot pin a live suffix forever. Malformed data fails
+// the whole pass closed and remains available for operator recovery instead of
+// being silently erased.
 func (s *CallbackStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 	if maxAge <= 0 {
 		return 0, nil
@@ -454,7 +467,7 @@ func (s *CallbackStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 		return 0, nil
 	}
 
-	removed, err = s.removeExpiredLeasesLocked(lockedLeases, maxAge)
+	removed, err = s.removeExpiredEntriesLocked(lockedLeases, maxAge)
 	if err != nil {
 		return 0, err
 	}
@@ -462,10 +475,9 @@ func (s *CallbackStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 }
 
 type callbackExpiryRef struct {
-	bucket  []byte
-	key     string
-	entry   CallbackEntry
-	unknown bool
+	bucket []byte
+	key    string
+	entry  CallbackEntry
 }
 
 // callbackLeaseUUIDs validates the complete durable queue before cleanup makes
@@ -489,41 +501,32 @@ func (s *CallbackStore) callbackLeaseUUIDs() ([]string, error) {
 	return leaseUUIDs, nil
 }
 
-func (s *CallbackStore) removeExpiredLeasesLocked(leaseUUIDs map[string]struct{}, maxAge time.Duration) (int, error) {
+func (s *CallbackStore) removeExpiredEntriesLocked(leaseUUIDs map[string]struct{}, maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
 	removed := 0
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		refsByLease := make(map[string][]callbackExpiryRef, len(leaseUUIDs))
+		var refs []callbackExpiryRef
 		if err := walkCallbackEntries(tx, func(ref callbackExpiryRef) error {
 			if _, locked := leaseUUIDs[ref.entry.LeaseUUID]; locked {
-				refsByLease[ref.entry.LeaseUUID] = append(refsByLease[ref.entry.LeaseUUID], ref)
+				refs = append(refs, ref)
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
 
-		for _, refs := range refsByLease {
-			eligible := len(refs) != 0
-			for _, ref := range refs {
-				if ref.unknown || !ref.entry.CreatedAt.Before(cutoff) {
-					eligible = false
-					break
-				}
-			}
-			if !eligible {
+		for _, ref := range refs {
+			if !ref.entry.CreatedAt.Before(cutoff) {
 				continue
 			}
-			for _, ref := range refs {
-				b := tx.Bucket(ref.bucket)
-				if b == nil {
-					return fmt.Errorf("callback bucket %q not found", string(ref.bucket))
-				}
-				if err := b.Delete([]byte(ref.key)); err != nil {
-					return err
-				}
-				removed++
+			b := tx.Bucket(ref.bucket)
+			if b == nil {
+				return fmt.Errorf("callback bucket %q not found", string(ref.bucket))
 			}
+			if err := b.Delete([]byte(ref.key)); err != nil {
+				return err
+			}
+			removed++
 		}
 		return nil
 	})
@@ -531,9 +534,10 @@ func (s *CallbackStore) removeExpiredLeasesLocked(leaseUUIDs map[string]struct{}
 }
 
 // walkCallbackEntries validates identities and exposes immutable references
-// while its caller's bbolt transaction is active. Unknown-but-decodable schema
-// is marked protected; malformed data returns an error so the transaction rolls
-// back and health can surface the poison barrier.
+// while its caller's bbolt transaction is active. Malformed data returns an
+// error so the transaction rolls back and health can surface the backend-wide
+// poison barrier. The v2 key cannot identify which lease owned corrupt bytes,
+// so TTL cannot safely let any possibly-related suffix overtake that record.
 func walkCallbackEntries(tx *bolt.Tx, visit func(callbackExpiryRef) error) error {
 	for _, source := range []struct {
 		bucket  []byte
@@ -572,10 +576,9 @@ func walkCallbackEntries(tx *bolt.Tx, visit func(callbackExpiryRef) error) error
 				}
 			}
 			if err := visit(callbackExpiryRef{
-				bucket:  source.bucket,
-				key:     string(k),
-				entry:   entry,
-				unknown: source.version != callbackStorageV2 || entry.Sequence == 0 || !entry.DeliveryKind.known(),
+				bucket: source.bucket,
+				key:    string(k),
+				entry:  entry,
 			}); err != nil {
 				return err
 			}
@@ -592,8 +595,11 @@ func (s *CallbackStore) tryLockDeliveryLease(leaseUUID string) (func(), bool) {
 	return tryLockCallbackLease(s.deliveryLocksMu, s.deliveryLocks, leaseUUID)
 }
 
-// Healthy checks both the legacy compatibility queue and the v2 delivery-ID
-// queue. The embedded boltStore health check only knows its legacy bucket.
+// Healthy checks both queue buckets and validates every durable row. A row
+// whose lease identity or ordering cannot be recovered is a deliberate
+// backend-wide poison barrier; callers must keep the node unhealthy until the
+// database is repaired or restored. The embedded boltStore health check only
+// knows its legacy bucket and cannot enforce that contract.
 func (s *CallbackStore) Healthy() error {
 	if err := s.db.View(func(tx *bolt.Tx) error {
 		if tx.Bucket(callbackBucketName) == nil {

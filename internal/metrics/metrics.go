@@ -684,13 +684,30 @@ var (
 		Help:      "Total provision-success callbacks observed while deprovision owned the exact in-flight generation",
 	})
 
-	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker,
-	// labeled by the reporting backend and the callback status.
+	// LifecycleCallbackOutcomesTotal classifies every authenticated callback
+	// routed to lifecycle policy exactly once. Summing all outcomes is the
+	// lifecycle-specific received count; outcome separates an applied observation
+	// from an acknowledged stale/retired drop and a retryable application failure.
+	// Verdict and status use closed vocabularies
+	// declared below, so malformed or future values cannot create unbounded
+	// series.
+	LifecycleCallbackOutcomesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "lifecycle_callback_outcomes_total",
+		Help:      "Authenticated lifecycle callbacks by terminal application outcome, authorization verdict, and bounded callback status",
+	}, []string{"outcome", "verdict", "status"})
+
+	// NonInFlightCallbacksTotal retains its original received-at-ingress
+	// semantics for compatibility with existing dashboards. It increments before
+	// lifecycle authorization, including when the callback is then dropped as
+	// stale or retired. LifecycleCallbackOutcomesTotal is the separate policy
+	// result; do not reinterpret this counter as "applied".
 	NonInFlightCallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "non_in_flight_callbacks_total",
-		Help:      "Callbacks received for leases not in the in-flight tracker (restart/update completions, late delivery, or intentional deprovision), labeled by backend and status",
+		Help:      "Callbacks received outside exact in-flight operation settlement (restart/update completions, late delivery, or intentional deprovision), labeled by reporting backend and status",
 	}, []string{"backend", "status"})
 )
 
@@ -815,6 +832,27 @@ const (
 	LifecycleEventProvisionStarting = "provision_starting"
 	LifecycleEventRestoreRestarting = "restore_restarting"
 	LifecycleEventRestoreRefused    = "restore_refused"
+)
+
+// Lifecycle callback constants are the complete bounded vocabularies for
+// LifecycleCallbackOutcomesTotal. Retryable means Fred returned a non-2xx and
+// the backend must retain the durable FIFO head; Dropped is a terminal 2xx
+// no-op for stale or otherwise unauthorized observational input.
+const (
+	LifecycleCallbackOutcomeApplied   = "applied"
+	LifecycleCallbackOutcomeDropped   = "dropped"
+	LifecycleCallbackOutcomeRetryable = "retryable"
+
+	LifecycleCallbackVerdictAuthorized   = "authorized"
+	LifecycleCallbackVerdictLegacy       = "legacy"
+	LifecycleCallbackVerdictTeardownOnly = "teardown_only"
+	LifecycleCallbackVerdictRetired      = "retired"
+	LifecycleCallbackVerdictInvalid      = "invalid"
+	LifecycleCallbackVerdictMissing      = "missing"
+	LifecycleCallbackVerdictStale        = "stale"
+	LifecycleCallbackVerdictUnusable     = "unusable"
+	LifecycleCallbackVerdictUnavailable  = "unavailable"
+	LifecycleCallbackVerdictUnknown      = "unknown"
 )
 
 // Action constants for reconciliation

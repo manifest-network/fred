@@ -274,6 +274,36 @@ func seedTestConfirmedPlacements(
 	})
 }
 
+// seedTestTypedConfirmedPlacements establishes confirmed ownership through the
+// same write-ahead attempt transition as production. Use it when a fixture
+// needs lifecycle callback authority; passive inventory projection deliberately
+// cannot manufacture that authority after the typed-capability migration.
+func seedTestTypedConfirmedPlacements(
+	t testing.TB,
+	store PlacementAuthorityStore,
+	backendNames []string,
+	placements map[string]string,
+) {
+	t.Helper()
+	armTestPlacementTopology(t, store, backendNames)
+	operations := operation.NewRegistry()
+	for leaseUUID, backendName := range placements {
+		tracked := operations.TryTrack(operation.TrackSpec{
+			LeaseUUID: leaseUUID,
+			Backend:   backendName,
+			Kind:      operation.KindProvision,
+		})
+		require.True(t, tracked.Started())
+		attempt := beginTestNewPlacementAttempt(
+			t, store, leaseUUID, backendName, tracked.Token().ID(),
+		)
+		confirmed, err := store.ConfirmAttempt(attempt)
+		require.NoError(t, err)
+		require.True(t, confirmed)
+		require.True(t, operations.Abort(tracked.Token()))
+	}
+}
+
 func deleteTestPlacement(
 	t testing.TB,
 	store ReconcilerPlacement,

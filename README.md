@@ -300,8 +300,11 @@ The callback route has a separate two-minute application budget because a
 terminal result may include chain settlement. It extends the connection write
 deadline for that request only; `http_write_timeout` and the generic 30-second
 request middleware continue to govern the other HTTP routes. Bundled backends
-wait an additional 15 seconds per delivery attempt, so providerd always returns
-a retryable 503 before the sender can time out.
+give the complete inline delivery chain an additional 15 seconds, so providerd
+always owns the first timeout and can return a retryable 503. All quick retries
+and their 0/1s/5s backoffs share that one two-minute-fifteen-second budget; when
+it expires, the durable FIFO head remains for the 30-second replay loop instead
+of holding the same lease for another full application budget.
 
 ### TLS Configuration
 
@@ -928,10 +931,13 @@ Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third i
   started, shutting down, failed, or timed out; keep the delivery durable and
   retry with backoff
 
-Callback application has a dedicated two-minute deadline. Bundled backends use
-a two-minute-fifteen-second per-attempt deadline, deliberately making the
-provider's 503 the first timeout. A backend must retain the FIFO head until a
-2xx response; a transport timeout or lost response is not delivery success.
+Callback application has a dedicated two-minute deadline. Bundled backends give
+the complete inline delivery chain two minutes fifteen seconds, deliberately
+making the provider's 503 the first timeout. Quick retries and backoff share
+that deadline. A backend must retain the FIFO head until a 2xx response; a
+transport timeout or lost response is not delivery success. When the shared
+budget expires, bundled backends defer to their 30-second durable replay loop
+instead of holding that lease's FIFO lock for consecutive application budgets.
 
 For a rolling upgrade from v0.13.0, upgrade and restart every backend before
 providerd. New backends accept the old operationless callback shape and persist

@@ -892,12 +892,11 @@ func (r *Reconciler) doStartProvisioning(
 		return errTrackerSnapshotStale
 	}
 	initiated := r.operations.TryInitiateClaimed(authority.leaseClaim, operation.TrackSpec{
-		LeaseUUID:     lease.Uuid,
-		Tenant:        lease.Tenant,
-		Items:         items,
-		Backend:       backendClient.Name(),
-		Kind:          operation.KindProvision,
-		TokenRequired: true,
+		LeaseUUID: lease.Uuid,
+		Tenant:    lease.Tenant,
+		Items:     items,
+		Backend:   backendClient.Name(),
+		Kind:      operation.KindProvision,
 	})
 	if !initiated.Started() {
 		metrics.ReconciliationConflictsTotal.Inc()

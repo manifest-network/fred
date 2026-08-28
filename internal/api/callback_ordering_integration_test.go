@@ -187,11 +187,10 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 	})
 
 	tracked := manager.Operations().TryTrack(operation.TrackSpec{
-		LeaseUUID:     leaseUUID,
-		Tenant:        "tenant-1",
-		Backend:       backendName,
-		Kind:          operation.KindProvision,
-		TokenRequired: true,
+		LeaseUUID: leaseUUID,
+		Tenant:    "tenant-1",
+		Backend:   backendName,
+		Kind:      operation.KindProvision,
 	})
 	require.True(t, tracked.Started())
 	operationID := tracked.Token().ID()
@@ -253,13 +252,13 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 	t.Cleanup(cancelSender)
 	zeroBackoff := [shared.CallbackMaxAttempts]time.Duration{}
 	sender := shared.NewCallbackSender(shared.CallbackSenderConfig{
-		Store:          callbackStore,
-		HTTPClient:     &http.Client{},
-		Secret:         secret,
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		StopCtx:        senderCtx,
-		Backoff:        &zeroBackoff,
-		AttemptTimeout: 3 * time.Second,
+		Store:           callbackStore,
+		HTTPClient:      &http.Client{},
+		Secret:          secret,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		StopCtx:         senderCtx,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: 3 * time.Second,
 	})
 
 	exactDone := make(chan struct{})
@@ -363,7 +362,7 @@ func TestCallbackOrdering_ProviderDeadlineKeepsDurableHead(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
 	zeroBackoff := [shared.CallbackMaxAttempts]time.Duration{}
-	const attemptTimeout = 250 * time.Millisecond
+	const deliveryTimeout = 250 * time.Millisecond
 	observations := make(chan callbackHTTPObservation, shared.CallbackMaxAttempts)
 	sender := shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store: store,
@@ -371,11 +370,11 @@ func TestCallbackOrdering_ProviderDeadlineKeepsDurableHead(t *testing.T) {
 			base:         http.DefaultTransport,
 			observations: observations,
 		}},
-		Secret:         secret,
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
-		StopCtx:        t.Context(),
-		Backoff:        &zeroBackoff,
-		AttemptTimeout: attemptTimeout,
+		Secret:          secret,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		StopCtx:         t.Context(),
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: deliveryTimeout,
 	})
 	sender.SendLifecycleCallback(
 		leaseUUID,
@@ -397,7 +396,7 @@ func TestCallbackOrdering_ProviderDeadlineKeepsDurableHead(t *testing.T) {
 				"callback attempt %d",
 				attempt,
 			)
-			assert.Less(t, observation.elapsed, attemptTimeout,
+			assert.Less(t, observation.elapsed, deliveryTimeout,
 				"Fred must serialize its retryable verdict before the sender cancels the attempt")
 		case <-time.After(time.Second):
 			t.Fatalf("callback attempt %d did not return an observable HTTP response", attempt)

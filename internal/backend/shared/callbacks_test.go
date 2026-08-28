@@ -299,7 +299,7 @@ func TestCallbackStore_RemoveOlderThan_AllFresh(t *testing.T) {
 	assert.Len(t, pending, 2)
 }
 
-func TestCallbackStore_RemoveOlderThan_DoesNotAdvanceFreshSuffixPastExpiredExact(t *testing.T) {
+func TestCallbackStore_RemoveOlderThan_ExpiresOldHeadAndKeepsFreshSuffix(t *testing.T) {
 	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
@@ -321,12 +321,11 @@ func TestCallbackStore_RemoveOlderThan_DoesNotAdvanceFreshSuffixPastExpiredExact
 
 	removed, err := store.RemoveOlderThan(24 * time.Hour)
 	require.NoError(t, err)
-	assert.Zero(t, removed)
+	assert.Equal(t, 1, removed)
 	pending, err := store.ListPending()
 	require.NoError(t, err)
-	require.Len(t, pending, 2)
-	assert.Equal(t, CallbackDeliveryKindOperation, pending[0].DeliveryKind)
-	assert.Equal(t, CallbackDeliveryKindLifecycle, pending[1].DeliveryKind)
+	require.Len(t, pending, 1)
+	assert.Equal(t, CallbackDeliveryKindLifecycle, pending[0].DeliveryKind)
 }
 
 func TestCallbackStore_RemoveOlderThan_ExpiresWholeTypedLeaseQueueAtomically(t *testing.T) {
@@ -355,7 +354,7 @@ func TestCallbackStore_RemoveOlderThan_ExpiresWholeTypedLeaseQueueAtomically(t *
 	assert.Empty(t, pending)
 }
 
-func TestCallbackStore_RemoveOlderThan_ProtectsLegacyAndUnknownBarriers(t *testing.T) {
+func TestCallbackStore_RemoveOlderThan_ExpiresLegacyAndUnknownHeads(t *testing.T) {
 	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
@@ -369,7 +368,7 @@ func TestCallbackStore_RemoveOlderThan_ProtectsLegacyAndUnknownBarriers(t *testi
 		LeaseUUID:    "legacy-lease",
 		CallbackURL:  "https://fred.example/typed-after-legacy",
 		DeliveryKind: CallbackDeliveryKindOperation,
-		CreatedAt:    time.Now().Add(-48 * time.Hour),
+		CreatedAt:    time.Now(),
 	})
 	require.NoError(t, err)
 	storePreKindV2Callback(t, store, CallbackEntry{
@@ -382,17 +381,45 @@ func TestCallbackStore_RemoveOlderThan_ProtectsLegacyAndUnknownBarriers(t *testi
 		LeaseUUID:    "unknown-lease",
 		CallbackURL:  "https://fred.example/typed-after-unknown",
 		DeliveryKind: CallbackDeliveryKindOperation,
-		CreatedAt:    time.Now().Add(-48 * time.Hour),
+		CreatedAt:    time.Now(),
 	})
 	require.NoError(t, err)
 
 	removed, err := store.RemoveOlderThan(24 * time.Hour)
 	require.NoError(t, err)
-	assert.Zero(t, removed)
+	assert.Equal(t, 2, removed)
 	pending, err := store.ListPending()
 	require.NoError(t, err)
-	assert.Len(t, pending, 4,
-		"protected legacy/unknown heads must retain every newer typed suffix entry")
+	require.Len(t, pending, 2)
+	assert.Equal(t, "https://fred.example/typed-after-legacy", pending[0].CallbackURL)
+	assert.Equal(t, "https://fred.example/typed-after-unknown", pending[1].CallbackURL)
+}
+
+func TestCallbackStore_RemoveOlderThan_ExpiresAgedLegacyAndV2SameLease(t *testing.T) {
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	require.NoError(t, err)
+	defer store.Close()
+
+	createdAt := time.Now().Add(-48 * time.Hour)
+	storeLegacyCallback(t, store, CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "https://fred.example/legacy",
+		CreatedAt:   createdAt,
+	})
+	_, err = store.StoreEntry(CallbackEntry{
+		LeaseUUID:    "lease-1",
+		CallbackURL:  "https://fred.example/typed",
+		DeliveryKind: CallbackDeliveryKindOperation,
+		CreatedAt:    createdAt,
+	})
+	require.NoError(t, err)
+
+	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 2, removed)
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
 }
 
 func TestCallbackStore_RemoveOlderThan_FailsClosedWithoutDeletingMalformedData(t *testing.T) {
@@ -407,16 +434,17 @@ func TestCallbackStore_RemoveOlderThan_FailsClosedWithoutDeletingMalformedData(t
 		CreatedAt:    time.Now().Add(-48 * time.Hour),
 	})
 	require.NoError(t, err)
+	corruptDeliveryID := "123e4567-e89b-42d3-a456-426614174099"
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(callbackBucketName).Put([]byte("corrupt-lease"), []byte("{"))
+		return tx.Bucket(callbackV2BucketName).Put([]byte(corruptDeliveryID), []byte("{"))
 	}))
 
 	removed, err := store.RemoveOlderThan(24 * time.Hour)
 	require.ErrorContains(t, err, "failed to decode callback entry")
 	assert.Zero(t, removed)
 	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
-		assert.NotNil(t, tx.Bucket(callbackBucketName).Get([]byte("corrupt-lease")),
-			"cleanup must retain malformed data as a poison barrier")
+		assert.NotNil(t, tx.Bucket(callbackV2BucketName).Get([]byte(corruptDeliveryID)),
+			"cleanup must retain a malformed delivery whose lease identity is unrecoverable")
 		assert.NotNil(t, tx.Bucket(callbackV2BucketName).Get([]byte(stored.DeliveryID)),
 			"global validation must happen before cleanup deletes any other lease")
 		return nil
@@ -543,6 +571,59 @@ func TestCallbackStore_LifecycleEnqueueCoalescesOnlyOlderTypedLifecycle(t *testi
 	allPending, err := store.ListPending()
 	require.NoError(t, err)
 	assert.Len(t, allPending, 5, "another lease's lifecycle observation must remain independent")
+}
+
+func TestCallbackStore_LifecycleEnqueueCoalescesAdjacentKeys(t *testing.T) {
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	require.NoError(t, err)
+	defer store.Close()
+
+	const (
+		staleLifecycle1 = "00000000-0000-4000-8000-000000000001"
+		staleLifecycle2 = "00000000-0000-4000-8000-000000000002"
+		staleLifecycle3 = "00000000-0000-4000-8000-000000000003"
+		exactDelivery   = "00000000-0000-4000-8000-000000000004"
+		otherLease      = "00000000-0000-4000-8000-000000000005"
+		latestLifecycle = "00000000-0000-4000-8000-000000000006"
+	)
+	seed := []CallbackEntry{
+		{DeliveryID: staleLifecycle1, LeaseUUID: "lease-1", DeliveryKind: CallbackDeliveryKindLifecycle, Sequence: 1},
+		{DeliveryID: staleLifecycle2, LeaseUUID: "lease-1", DeliveryKind: CallbackDeliveryKindLifecycle, Sequence: 2},
+		{DeliveryID: staleLifecycle3, LeaseUUID: "lease-1", DeliveryKind: CallbackDeliveryKindLifecycle, Sequence: 3},
+		{DeliveryID: exactDelivery, LeaseUUID: "lease-1", DeliveryKind: CallbackDeliveryKindOperation, Sequence: 4},
+		{DeliveryID: otherLease, LeaseUUID: "lease-2", DeliveryKind: CallbackDeliveryKindLifecycle, Sequence: 5},
+	}
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(callbackV2BucketName)
+		for _, entry := range seed {
+			data, marshalErr := json.Marshal(entry)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if putErr := b.Put([]byte(entry.DeliveryID), data); putErr != nil {
+				return putErr
+			}
+		}
+		return b.SetSequence(5)
+	}))
+
+	stored, err := store.StoreEntry(CallbackEntry{
+		DeliveryID:   latestLifecycle,
+		LeaseUUID:    "lease-1",
+		DeliveryKind: CallbackDeliveryKindLifecycle,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(6), stored.Sequence)
+
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 3)
+	assert.Equal(t, exactDelivery, pending[0].DeliveryID)
+	assert.Equal(t, otherLease, pending[1].DeliveryID)
+	assert.Equal(t, latestLifecycle, pending[2].DeliveryID)
+	for _, entry := range pending {
+		assert.NotContains(t, []string{staleLifecycle1, staleLifecycle2, staleLifecycle3}, entry.DeliveryID)
+	}
 }
 
 func TestCallbackStore_RequiresTypedKindAndAssignsSequence(t *testing.T) {

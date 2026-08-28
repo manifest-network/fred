@@ -64,10 +64,10 @@ func newBackendForProvisionTest(t *testing.T, mock *mockDockerClient, provisions
 // zeroBackoff eliminates retry delays in tests.
 var zeroBackoff = [shared.CallbackMaxAttempts]time.Duration{}
 
-// testCallbackAttemptTimeout keeps deliberately parked callback handlers from
+// testCallbackDeliveryTimeout keeps deliberately parked callback handlers from
 // consuming the production protocol budget while preserving the production
 // rule that the request context, not http.Client.Timeout, owns cancellation.
-const testCallbackAttemptTimeout = 5 * time.Second
+const testCallbackDeliveryTimeout = 5 * time.Second
 
 // testCallbackClient is the default callback client for tests that rebuild
 // the sender for some reason OTHER than pointing it at a server — a swapped
@@ -95,13 +95,13 @@ var testCallbackClient = &http.Client{}
 // not verify the signature.
 func rebuildCallbackSender(b *Backend, hc *http.Client) {
 	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
-		Store:          b.callbackStore,
-		HTTPClient:     hc,
-		Secret:         string(b.cfg.CallbackSecret),
-		Logger:         b.logger,
-		StopCtx:        b.stopCtx,
-		Backoff:        &zeroBackoff,
-		AttemptTimeout: testCallbackAttemptTimeout,
+		Store:           b.callbackStore,
+		HTTPClient:      hc,
+		Secret:          string(b.cfg.CallbackSecret),
+		Logger:          b.logger,
+		StopCtx:         b.stopCtx,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: testCallbackDeliveryTimeout,
 	})
 }
 
@@ -187,10 +187,10 @@ func observeCallbacks(b *Backend) <-chan struct{} {
 // RETURNING that releases this helper, so a handler that parks — an
 // unbuffered channel send with no receiver waiting yet, say — parks the
 // POST with it. Nothing deadlocks, which is why this is worth writing
-// down: trySendCallback bounds the attempt at testCallbackAttemptTimeout,
-// so the handler costs a 5s stall and then DeliverCallback re-POSTs
-// (shared.CallbackMaxAttempts attempts, zeroBackoff here) and the
-// handler runs again. Signal completion the way the handlers below do —
+// down: DeliverCallback bounds the complete inline chain at
+// testCallbackDeliveryTimeout, so the handler costs at most one 5s stall and
+// the durable replay loop owns any later POST. Signal completion the way the
+// handlers below do —
 // close() under a select/default, or a buffered send — never a send
 // that can block.
 //

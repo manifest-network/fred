@@ -39,11 +39,10 @@ func TestTracker_TrackInFlight(t *testing.T) {
 func TestTracker_OperationsExposesSoleRegistry(t *testing.T) {
 	tracker := NewInFlightTracker()
 	result := tracker.Operations().TryTrack(operation.TrackSpec{
-		LeaseUUID:     "lease-typed",
-		Tenant:        "tenant-a",
-		Backend:       "backend-a",
-		Kind:          operation.KindProvision,
-		TokenRequired: true,
+		LeaseUUID: "lease-typed",
+		Tenant:    "tenant-a",
+		Backend:   "backend-a",
+		Kind:      operation.KindProvision,
 	})
 	require.True(t, result.Started())
 	t.Cleanup(func() { tracker.Operations().Abort(result.Token()) })

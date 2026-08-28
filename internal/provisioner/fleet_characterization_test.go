@@ -118,7 +118,6 @@ func TestFleet_ProvisionCarriesExactTypedOperationAcrossHTTP(t *testing.T) {
 
 	record, tracked := f.tracker.Operations().Lookup("lease-typed")
 	require.True(t, tracked)
-	require.True(t, record.TokenRequired)
 	require.Equal(t, operation.KindProvision, record.Kind)
 	require.Equal(t, callbackID, record.ID,
 		"the callback capability crossing HTTP must identify the tracked operation")
@@ -136,10 +135,9 @@ func TestFleet_CompleteInventoryNeverClearsAmbiguousAttemptFromSilence(t *testin
 	require.NoError(t, f.sweep(), "arm startup placement authority")
 
 	tracked := f.tracker.Operations().TryTrack(operation.TrackSpec{
-		LeaseUUID:     "lease-ambiguous",
-		Backend:       "backend-2",
-		Kind:          operation.KindProvision,
-		TokenRequired: true,
+		LeaseUUID: "lease-ambiguous",
+		Backend:   "backend-2",
+		Kind:      operation.KindProvision,
 	})
 	require.True(t, tracked.Started())
 	baseline := f.placement.CurrentAdmissionBaseline()
@@ -171,10 +169,9 @@ func TestFleet_IncompleteInventoryKeepsUnresolvedAttempt(t *testing.T) {
 	require.NoError(t, f.sweep(), "arm startup placement authority")
 
 	tracked := f.tracker.Operations().TryTrack(operation.TrackSpec{
-		LeaseUUID:     "lease-unknown",
-		Backend:       "backend-2",
-		Kind:          operation.KindProvision,
-		TokenRequired: true,
+		LeaseUUID: "lease-unknown",
+		Backend:   "backend-2",
+		Kind:      operation.KindProvision,
 	})
 	require.True(t, tracked.Started())
 	baseline := f.placement.CurrentAdmissionBaseline()

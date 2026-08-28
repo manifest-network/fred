@@ -28,14 +28,13 @@ const (
 // view carries the same typed OperationID and never exposes a numeric wire
 // token.
 type InFlightProvision struct {
-	LeaseUUID     string
-	Tenant        string
-	Items         []backend.LeaseItem
-	Backend       string
-	OperationID   operation.OperationID
-	TokenRequired bool
-	StartTime     time.Time
-	Kind          ProvisionKind
+	LeaseUUID   string
+	Tenant      string
+	Items       []backend.LeaseItem
+	Backend     string
+	OperationID operation.OperationID
+	StartTime   time.Time
+	Kind        ProvisionKind
 }
 
 func (p InFlightProvision) RoutingSKU() string {
@@ -127,7 +126,7 @@ func (t *DefaultInFlightTracker) TryTrackInFlightWithOperationID(
 	items []backend.LeaseItem,
 	backendName string,
 ) (operation.OperationID, bool) {
-	return t.tryTrack(leaseUUID, tenant, items, backendName, KindProvision, true)
+	return t.tryTrack(leaseUUID, tenant, items, backendName, KindProvision)
 }
 
 func (t *DefaultInFlightTracker) TryTrackInFlightWithOperationIDIfNotNewer(
@@ -137,7 +136,7 @@ func (t *DefaultInFlightTracker) TryTrackInFlightWithOperationIDIfNotNewer(
 	snapshotHandle uint64,
 ) (operation.OperationID, bool, bool) {
 	spec := operationTrackSpec(
-		leaseUUID, tenant, items, backendName, KindProvision, true, time.Time{},
+		leaseUUID, tenant, items, backendName, KindProvision, time.Time{},
 	)
 	if !spec.Valid() || t.registry == nil {
 		return operation.OperationID{}, false, false
@@ -169,7 +168,7 @@ func (t *DefaultInFlightTracker) TryTrackRestoreInFlightWithOperationID(
 	items []backend.LeaseItem,
 	backendName string,
 ) (operation.OperationID, bool) {
-	return t.tryTrack(leaseUUID, tenant, items, backendName, KindRestore, true)
+	return t.tryTrack(leaseUUID, tenant, items, backendName, KindRestore)
 }
 
 func (t *DefaultInFlightTracker) tryTrack(
@@ -177,10 +176,9 @@ func (t *DefaultInFlightTracker) tryTrack(
 	items []backend.LeaseItem,
 	backendName string,
 	kind ProvisionKind,
-	generationRequired bool,
 ) (operation.OperationID, bool) {
 	spec := operationTrackSpec(
-		leaseUUID, tenant, items, backendName, kind, generationRequired, time.Time{},
+		leaseUUID, tenant, items, backendName, kind, time.Time{},
 	)
 	if !spec.Valid() || t.registry == nil {
 		return operation.OperationID{}, false
@@ -527,7 +525,6 @@ func operationTrackSpec(
 	items []backend.LeaseItem,
 	backendName string,
 	kind ProvisionKind,
-	tokenRequired bool,
 	startedAt time.Time,
 ) operation.TrackSpec {
 	operationKind := operation.KindProvision
@@ -536,7 +533,7 @@ func operationTrackSpec(
 	}
 	return operation.TrackSpec{
 		LeaseUUID: leaseUUID, Tenant: tenant, Items: items, Backend: backendName,
-		StartedAt: startedAt, Kind: operationKind, TokenRequired: tokenRequired,
+		StartedAt: startedAt, Kind: operationKind,
 	}
 }
 
@@ -548,7 +545,6 @@ func inFlightProvisionFromRecord(record operation.Record) InFlightProvision {
 	return InFlightProvision{
 		LeaseUUID: record.LeaseUUID, Tenant: record.Tenant, Items: record.Items,
 		Backend: record.Backend, OperationID: record.ID,
-		TokenRequired: record.TokenRequired, StartTime: record.StartedAt,
-		Kind: kind,
+		StartTime: record.StartedAt, Kind: kind,
 	}
 }

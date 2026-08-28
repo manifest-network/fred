@@ -694,11 +694,14 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
   retry with backoff.
 
 Fred's callback application budget is two minutes; it may wait for terminal
-chain settlement. Use a per-attempt deadline strictly longer than that budget
-(the bundled backends use two minutes fifteen seconds), and do not layer a
-shorter `http.Client.Timeout` over the request context. Remove a durable entry
-only after 2xx. A 503, client timeout, disconnect, or lost response leaves the
-same entry at the head of that lease's FIFO for retry.
+chain settlement. Give an inline delivery chain a deadline strictly longer than
+that budget (the bundled backends use two minutes fifteen seconds), and do not
+layer a shorter `http.Client.Timeout` over the request context. Remove a durable
+entry only after 2xx. A 503, client timeout, disconnect, or lost response leaves
+the same entry at the head of that lease's FIFO for retry. Quick connection or
+HTTP failures may retry, but every attempt and backoff should share the same
+deadline; the bundled sender gives the head back to its 30-second durable replay
+loop when that budget expires.
 
 ### HMAC Signature with Replay Protection
 

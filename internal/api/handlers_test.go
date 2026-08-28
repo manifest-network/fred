@@ -112,7 +112,6 @@ func TestHealthCheck_ChainUnavailable(t *testing.T) {
 			return fmt.Errorf("connection refused")
 		},
 	}
-
 	h := &Handlers{
 		client:       chainClient,
 		providerUUID: testutil.ValidUUID1,
@@ -3847,6 +3846,9 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 			return nil, nil
 		},
 	}
+	lifecycleCallbacks, _ := typedMaintenanceLifecycleStore(
+		t, leaseUUID, "test-backend",
+	)
 
 	t.Run("router_missing_returns_503", func(t *testing.T) {
 		h := &Handlers{
@@ -3895,10 +3897,11 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:             chainClient,
+			backendRouter:      router,
+			lifecycleCallbacks: lifecycleCallbacks,
+			providerUUID:       providerUUID,
+			bech32Prefix:       "manifest",
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3940,10 +3943,11 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:             chainClient,
+			backendRouter:      router,
+			lifecycleCallbacks: lifecycleCallbacks,
+			providerUUID:       providerUUID,
+			bech32Prefix:       "manifest",
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -3985,10 +3989,11 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:             chainClient,
+			backendRouter:      router,
+			lifecycleCallbacks: lifecycleCallbacks,
+			providerUUID:       providerUUID,
+			bech32Prefix:       "manifest",
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -4030,10 +4035,11 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, err)
 
 		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
+			client:             chainClient,
+			backendRouter:      router,
+			lifecycleCallbacks: lifecycleCallbacks,
+			providerUUID:       providerUUID,
+			bech32Prefix:       "manifest",
 		}
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
@@ -4119,15 +4125,25 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 			return nil, nil
 		},
 	}
+	lifecycleCallbacks, _ := typedMaintenanceLifecycleStore(
+		t, leaseUUID, "test-backend",
+	)
+	newUpdateHandlers := func(
+		router *backend.Router,
+		persister PayloadPersister,
+	) *Handlers {
+		return &Handlers{
+			client:             chainClient,
+			backendRouter:      router,
+			lifecycleCallbacks: lifecycleCallbacks,
+			providerUUID:       providerUUID,
+			bech32Prefix:       "manifest",
+			payloadPersister:   persister,
+		}
+	}
 
 	t.Run("router_missing_returns_503", func(t *testing.T) {
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    nil,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(nil, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		body := `{"payload":"dGVzdA=="}`
@@ -4164,13 +4180,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(router, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		body := `{"payload":""}`
@@ -4207,13 +4217,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(router, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader("not json"))
@@ -4253,13 +4257,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(router, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		body := `{"payload":"dGVzdA=="}`
@@ -4300,13 +4298,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(router, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		body := `{"payload":"dGVzdA=="}`
@@ -4349,13 +4341,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(router, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		body := `{"payload":"dGVzdA=="}`
@@ -4392,13 +4378,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(router, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		body := `{"payload":"dGVzdA=="}`
@@ -4439,13 +4419,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(router, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		body := `{"payload":"dGVzdA=="}`
@@ -4469,13 +4443,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		router, _ := updateTestBackend(t, http.StatusAccepted, "")
 		persister := &mockPayloadPersister{}
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: persister,
-		}
+		h := newUpdateHandlers(router, persister)
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		body := `{"payload":"dGVzdA=="}` // "test"
@@ -4500,13 +4468,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		router, _ := updateTestBackend(t, http.StatusBadRequest, `{"error":"invalid manifest"}`)
 		persister := &mockPayloadPersister{}
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: persister,
-		}
+		h := newUpdateHandlers(router, persister)
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
@@ -4527,13 +4489,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		router, updateCalls := updateTestBackend(t, http.StatusAccepted, "")
 		persister := &mockPayloadPersister{err: errors.New("disk full")}
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: persister,
-		}
+		h := newUpdateHandlers(router, persister)
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
@@ -4557,13 +4513,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		// has no durable record of is worse than an update that never happened.
 		router, updateCalls := updateTestBackend(t, http.StatusAccepted, "")
 
-		h := &Handlers{
-			client:        chainClient,
-			backendRouter: router,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
-			// payloadPersister deliberately nil
-		}
+		h := newUpdateHandlers(router, nil) // payloadPersister deliberately nil
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
@@ -4595,13 +4545,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		h := &Handlers{
-			client:           chainClient,
-			backendRouter:    router,
-			providerUUID:     providerUUID,
-			bech32Prefix:     "manifest",
-			payloadPersister: &mockPayloadPersister{},
-		}
+		h := newUpdateHandlers(router, &mockPayloadPersister{})
 
 		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
 		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
@@ -7402,13 +7346,17 @@ func TestUpdateLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 
 			router, calls := updateTestBackend(t, http.StatusBadRequest, body)
 			persister := &mockPayloadPersister{}
+			lifecycleCallbacks, _ := typedMaintenanceLifecycleStore(
+				t, leaseUUID, "test-backend",
+			)
 
 			h := &Handlers{
-				client:           chainClient,
-				backendRouter:    router,
-				providerUUID:     providerUUID,
-				bech32Prefix:     "manifest",
-				payloadPersister: persister,
+				client:             chainClient,
+				backendRouter:      router,
+				lifecycleCallbacks: lifecycleCallbacks,
+				providerUUID:       providerUUID,
+				bech32Prefix:       "manifest",
+				payloadPersister:   persister,
 			}
 
 			validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())

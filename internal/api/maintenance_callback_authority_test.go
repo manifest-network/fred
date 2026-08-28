@@ -1,15 +1,56 @@
 package api
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
+
+func legacyMaintenanceLifecycleStore(
+	t *testing.T,
+	leaseUUID, backendName string,
+) *placement.Store {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("placements"))
+		if err != nil {
+			return err
+		}
+		value, err := json.Marshal(struct {
+			Backend string    `json:"backend"`
+			SetAt   time.Time `json:"set_at"`
+		}{
+			Backend: backendName,
+			SetAt:   time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC),
+		})
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(leaseUUID), value)
+	}))
+	require.NoError(t, db.Close())
+
+	store, err := placement.NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.ConfigureBackendTopology([]string{backendName}))
+	fence := store.BeginInventorySession()
+	_, err = store.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
+	store.EndInventorySession(fence)
+	require.NoError(t, err)
+	return store
+}
 
 func typedMaintenanceLifecycleStore(
 	t *testing.T,
@@ -73,23 +114,20 @@ func TestHandlers_MaintenanceCallbackURLUsesCurrentDurableCapability(t *testing.
 	assert.Error(t, err, "a retired capability must never be reissued")
 }
 
+func TestHandlers_MaintenanceCallbackURLRejectsMissingAuthority(t *testing.T) {
+	handlers := &Handlers{callbackBaseURL: "https://fred.example/base"}
+	_, err := handlers.maintenanceCallbackURL("lease-1", "backend-a")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "authority is unavailable")
+}
+
 func TestHandlers_MaintenanceCallbackURLKeepsMigratedLeaseLegacy(t *testing.T) {
 	const (
 		leaseUUID   = "legacy-lease"
 		backendName = "backend-a"
 		baseURL     = "https://fred.example/base"
 	)
-	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	require.NoError(t, store.ConfigureBackendTopology([]string{backendName}))
-	fence := store.BeginInventorySession()
-	_, err = store.ProjectInventory(fence, placement.InventoryProjection{
-		Complete:   true,
-		Placements: map[string]string{leaseUUID: backendName},
-	})
-	store.EndInventorySession(fence)
-	require.NoError(t, err)
+	store := legacyMaintenanceLifecycleStore(t, leaseUUID, backendName)
 
 	handlers := &Handlers{
 		callbackBaseURL:    baseURL,
@@ -119,17 +157,7 @@ func TestHandlers_MaintenanceCallbackURLRejectsTeardownOnlyCapability(t *testing
 	})
 
 	t.Run("legacy", func(t *testing.T) {
-		store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-		require.NoError(t, store.ConfigureBackendTopology([]string{"backend-a"}))
-		fence := store.BeginInventorySession()
-		_, err = store.ProjectInventory(fence, placement.InventoryProjection{
-			Complete:   true,
-			Placements: map[string]string{"legacy": "backend-a"},
-		})
-		store.EndInventorySession(fence)
-		require.NoError(t, err)
+		store := legacyMaintenanceLifecycleStore(t, "legacy", "backend-a")
 		current := store.Lookup("legacy")
 		deleted, err := store.DeleteRecord(current.RecordRevision())
 		require.NoError(t, err)

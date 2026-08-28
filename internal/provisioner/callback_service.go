@@ -347,7 +347,6 @@ func (service *CallbackService) HandleCallback(ctx context.Context, command Call
 			"lease_uuid", callback.leaseUUID,
 			"callback_operation_id", callback.operationID,
 			"operation_id", record.ID,
-			"token_required", record.TokenRequired,
 		)
 		return nil
 	}
@@ -376,7 +375,7 @@ func (service *CallbackService) HandleCallback(ctx context.Context, command Call
 func callbackMatchesOperation(command CallbackCommand, record operation.Record) bool {
 	switch command.selector {
 	case callbackSelectorLegacy:
-		return !record.TokenRequired
+		return false
 	case callbackSelectorOperation:
 		return command.operationID == record.ID
 	case callbackSelectorInvalid, callbackSelectorLifecycle:
@@ -779,16 +778,7 @@ func (service *CallbackService) settleClaimed(
 }
 
 func (service *CallbackService) observeNonInFlightOperation(callback CallbackCommand) {
-	backendLabel := sanitizeCallbackBackend(service.backends, callback.backendName)
-	statusLabel := sanitizeCallbackStatus(callback.status)
-	if backendLabel == labelBackendInvalid || statusLabel == labelStatusOther {
-		slog.Warn("sanitized callback label to bounded value",
-			"lease_uuid", callback.leaseUUID,
-			"received_backend", callback.backendName,
-			"received_status", callback.status,
-		)
-	}
-	metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
+	service.recordNonInFlightCallbackReceived(callback)
 	// An operation-scoped callback is authority only while its exact operation
 	// is present. Once gone, it is indistinguishable from a delayed older result.
 	slog.Warn("ignoring callback for an operation that is no longer current",
@@ -799,17 +789,51 @@ func (service *CallbackService) observeNonInFlightOperation(callback CallbackCom
 	)
 }
 
+// recordNonInFlightCallbackReceived preserves the existing metric's ingress
+// meaning independently of the lifecycle policy decision that follows. The
+// body backend remains reporting metadata only; authorization may replace it
+// with a store-owned backend for application, but must not rewrite what the
+// compatibility counter has historically described.
+func (service *CallbackService) recordNonInFlightCallbackReceived(
+	callback CallbackCommand,
+) string {
+	backendLabel := sanitizeCallbackBackend(service.backends, callback.backendName)
+	statusLabel := sanitizeCallbackStatus(callback.status)
+	if backendLabel == labelBackendInvalid || statusLabel == labelStatusOther {
+		slog.Warn("sanitized callback label to bounded value",
+			"lease_uuid", callback.leaseUUID,
+			"received_backend", callback.backendName,
+			"received_status", callback.status,
+		)
+	}
+	metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
+	return statusLabel
+}
+
 // observeAuthorizedLifecycle validates a revocable, placement-store-backed
 // lifecycle capability before publishing an observation. The zero ID reaches
 // only an explicitly migrated legacy record; a zero selector can never match a
 // typed current capability. Stale and missing capabilities are acknowledged as
 // harmless no-ops so a backend can discard obsolete durable outbox records.
 func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackCommand) error {
+	statusLabel := service.recordNonInFlightCallbackReceived(callback)
+	outcomeLabel := metrics.LifecycleCallbackOutcomeRetryable
+	verdictLabel := metrics.LifecycleCallbackVerdictUnavailable
+	// Every lifecycle callback receives exactly one terminal classification.
+	// Retryable is the fail-closed default: only an explicit application or
+	// terminal no-op below may narrow it to applied or dropped.
+	defer func() {
+		metrics.LifecycleCallbackOutcomesTotal.WithLabelValues(
+			outcomeLabel, verdictLabel, statusLabel,
+		).Inc()
+	}()
+
 	if service.lifecycleAuthority == nil {
 		return errCallbackLifecycleUnavailable
 	}
 	id := callback.lifecycleID
 	authorization := service.lifecycleAuthority.AuthorizeLifecycle(callback.leaseUUID, id)
+	verdictLabel = lifecycleCallbackVerdictLabel(authorization.Verdict())
 	switch authorization.Verdict() {
 	case placement.LifecycleVerdictAuthorized:
 		// The durable capability, never body metadata, selects the backend.
@@ -820,6 +844,7 @@ func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackComm
 				"lease_uuid", callback.leaseUUID,
 				"lifecycle_id", callback.lifecycleID,
 			)
+			outcomeLabel = metrics.LifecycleCallbackOutcomeDropped
 			return nil
 		}
 		callback.backendName = authorization.Backend()
@@ -830,6 +855,7 @@ func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackComm
 				"lifecycle_id", callback.lifecycleID,
 				"status", callback.status,
 			)
+			outcomeLabel = metrics.LifecycleCallbackOutcomeDropped
 			return nil
 		}
 		callback.backendName = authorization.Backend()
@@ -839,6 +865,7 @@ func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackComm
 			"backend", authorization.Backend(),
 			"lifecycle_id", callback.lifecycleID,
 		)
+		outcomeLabel = metrics.LifecycleCallbackOutcomeDropped
 		return nil
 	case placement.LifecycleVerdictInvalid,
 		placement.LifecycleVerdictMissing,
@@ -850,6 +877,7 @@ func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackComm
 			"lifecycle_id", callback.lifecycleID,
 			"verdict", authorization.Verdict(),
 		)
+		outcomeLabel = metrics.LifecycleCallbackOutcomeDropped
 		return nil
 	default:
 		return fmt.Errorf("unknown lifecycle authorization verdict %d", authorization.Verdict())
@@ -866,52 +894,82 @@ func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackComm
 			return fmt.Errorf("retire lifecycle capability for lease %s: %w", callback.leaseUUID, err)
 		}
 		if !retired.Retired() {
+			verdictLabel = lifecycleCallbackVerdictLabel(retired.Verdict())
 			slog.Info("lifecycle capability changed before terminal teardown retirement",
 				"lease_uuid", callback.leaseUUID,
 				"lifecycle_id", callback.lifecycleID,
 				"verdict", retired.Verdict(),
 			)
+			outcomeLabel = metrics.LifecycleCallbackOutcomeDropped
 			return nil
 		}
 		if !retired.RetiredNow() {
+			verdictLabel = metrics.LifecycleCallbackVerdictRetired
+			outcomeLabel = metrics.LifecycleCallbackOutcomeDropped
 			return nil
 		}
 		callback.backendName = retired.Backend()
 	}
-
-	backendLabel := sanitizeCallbackBackend(service.backends, callback.backendName)
-	statusLabel := sanitizeCallbackStatus(callback.status)
-	metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
 
 	if callback.status == backend.CallbackStatusSuccess {
 		// A lifecycle capability may report successful restart/update completion,
 		// but it remains observation-only: it publishes Ready without settling an
 		// operation or mutating durable placement/chain state. Provision and
 		// restore success still require the exact operation route.
+		outcomeLabel = metrics.LifecycleCallbackOutcomeApplied
 		service.publish(callback.leaseUUID, backend.ProvisionStatusReady, "")
 		return nil
 	}
 
-	service.observeLifecycle(callback)
+	if service.observeLifecycle(callback) {
+		outcomeLabel = metrics.LifecycleCallbackOutcomeApplied
+	} else {
+		outcomeLabel = metrics.LifecycleCallbackOutcomeDropped
+	}
 	return nil
 }
 
 // observeLifecycle owns only subscriber-visible status. It never claims an
 // operation or mutates placement/chain state.
-func (service *CallbackService) observeLifecycle(callback CallbackCommand) {
+func (service *CallbackService) observeLifecycle(callback CallbackCommand) bool {
 	switch callback.status {
 	case backend.CallbackStatusFailed:
 		service.publish(callback.leaseUUID, backend.ProvisionStatusFailed, callback.failure)
+		return true
 	case backend.CallbackStatusDeprovisioned:
 		if callback.retained {
 			service.publish(callback.leaseUUID, backend.ProvisionStatusRetained, retainedLeaseNotice)
 		}
+		return true
 	default:
 		slog.Warn("unexpected callback status for non-in-flight lease",
 			"lease_uuid", callback.leaseUUID,
 			"status", callback.status,
 		)
-		return
+		return false
+	}
+}
+
+func lifecycleCallbackVerdictLabel(verdict placement.LifecycleVerdict) string {
+	switch verdict {
+	case placement.LifecycleVerdictAuthorized:
+		return metrics.LifecycleCallbackVerdictAuthorized
+	case placement.LifecycleVerdictLegacy:
+		return metrics.LifecycleCallbackVerdictLegacy
+	case placement.LifecycleVerdictTeardownOnly:
+		return metrics.LifecycleCallbackVerdictTeardownOnly
+	case placement.LifecycleVerdictRetired:
+		return metrics.LifecycleCallbackVerdictRetired
+	case placement.LifecycleVerdictInvalid:
+		return metrics.LifecycleCallbackVerdictInvalid
+	case placement.LifecycleVerdictMissing:
+		return metrics.LifecycleCallbackVerdictMissing
+	case placement.LifecycleVerdictStale:
+		return metrics.LifecycleCallbackVerdictStale
+	case placement.LifecycleVerdictUnusable:
+		return metrics.LifecycleCallbackVerdictUnusable
+	default:
+		return metrics.LifecycleCallbackVerdictUnknown
 	}
 }
 

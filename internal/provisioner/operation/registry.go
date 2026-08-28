@@ -37,13 +37,12 @@ func (kind Kind) valid() bool {
 // TrackSpec contains the immutable facts recorded when an operation starts.
 // StartedAt defaults to time.Now when it is zero. Its zero value is invalid.
 type TrackSpec struct {
-	LeaseUUID     string
-	Tenant        string
-	Items         []backend.LeaseItem
-	Backend       string
-	StartedAt     time.Time
-	Kind          Kind
-	TokenRequired bool
+	LeaseUUID string
+	Tenant    string
+	Items     []backend.LeaseItem
+	Backend   string
+	StartedAt time.Time
+	Kind      Kind
 }
 
 // Valid reports whether spec contains the minimum identity needed by the
@@ -56,16 +55,15 @@ func (spec TrackSpec) Valid() bool {
 // Record is an immutable snapshot of one tracked operation. Mutating the Items
 // slice returned by Registry methods cannot mutate registry state.
 type Record struct {
-	LeaseUUID     string
-	Tenant        string
-	Items         []backend.LeaseItem
-	Backend       string
-	ID            OperationID
-	TokenRequired bool
-	StartedAt     time.Time
-	Kind          Kind
-	Phase         Phase
-	Settlement    SettlementKind
+	LeaseUUID  string
+	Tenant     string
+	Items      []backend.LeaseItem
+	Backend    string
+	ID         OperationID
+	StartedAt  time.Time
+	Kind       Kind
+	Phase      Phase
+	Settlement SettlementKind
 }
 
 // Valid reports whether record represents a tracked operation.
@@ -520,16 +518,15 @@ func (registry *Registry) installRecordLocked(
 		startedAt = time.Now()
 	}
 	record := Record{
-		LeaseUUID:     spec.LeaseUUID,
-		Tenant:        spec.Tenant,
-		Items:         slices.Clone(spec.Items),
-		Backend:       spec.Backend,
-		ID:            token.ID(),
-		TokenRequired: spec.TokenRequired,
-		StartedAt:     startedAt,
-		Kind:          spec.Kind,
-		Phase:         phase,
-		Settlement:    SettlementUnclaimed,
+		LeaseUUID:  spec.LeaseUUID,
+		Tenant:     spec.Tenant,
+		Items:      slices.Clone(spec.Items),
+		Backend:    spec.Backend,
+		ID:         token.ID(),
+		StartedAt:  startedAt,
+		Kind:       spec.Kind,
+		Phase:      phase,
+		Settlement: SettlementUnclaimed,
 	}
 	registry.operations[spec.LeaseUUID] = trackedOperation{
 		record:     record,

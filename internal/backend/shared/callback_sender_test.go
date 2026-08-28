@@ -88,7 +88,7 @@ func TestNewCallbackSender_DefaultBackoff(t *testing.T) {
 	assert.Equal(t, 2*time.Minute, backend.DefaultCallbackApplicationTimeout)
 	assert.Equal(t, 2*time.Minute+15*time.Second, backend.DefaultCallbackDeliveryTimeout)
 	assert.Greater(t, backend.DefaultCallbackDeliveryTimeout, backend.DefaultCallbackApplicationTimeout)
-	assert.Equal(t, backend.DefaultCallbackDeliveryTimeout, s.attemptTimeout)
+	assert.Equal(t, backend.DefaultCallbackDeliveryTimeout, s.deliveryTimeout)
 	assert.Equal(t, DefaultCallbackReplayInterval, s.replayInterval)
 }
 
@@ -114,13 +114,13 @@ func TestNewCallbackSender_PanicsOnNegativeReplayInterval(t *testing.T) {
 	})
 }
 
-func TestNewCallbackSender_PanicsOnNegativeAttemptTimeout(t *testing.T) {
+func TestNewCallbackSender_PanicsOnNegativeDeliveryTimeout(t *testing.T) {
 	assert.Panics(t, func() {
 		NewCallbackSender(CallbackSenderConfig{
-			HTTPClient:     http.DefaultClient,
-			Logger:         slog.Default(),
-			StopCtx:        context.Background(),
-			AttemptTimeout: -time.Nanosecond,
+			HTTPClient:      http.DefaultClient,
+			Logger:          slog.Default(),
+			StopCtx:         context.Background(),
+			DeliveryTimeout: -time.Nanosecond,
 		})
 	})
 }
@@ -952,7 +952,7 @@ func TestDeliverCallback_ShutdownAbortsRetry(t *testing.T) {
 	assert.LessOrEqual(t, attempts.Load(), int32(2))
 }
 
-func TestDeliverCallback_ConfiguredAttemptTimeoutOutlivesFormerCaps(t *testing.T) {
+func TestDeliverCallback_ConfiguredDeliveryTimeoutOutlivesFormerCaps(t *testing.T) {
 	// Scale the former 10-second sender and 30-second client caps down to
 	// milliseconds. A synchronous Fred application that finishes after both
 	// boundaries must still succeed when the sender owns the request deadline.
@@ -980,11 +980,11 @@ func TestDeliverCallback_ConfiguredAttemptTimeoutOutlivesFormerCaps(t *testing.T
 	})}
 	assert.Zero(t, client.Timeout)
 	s := NewCallbackSender(CallbackSenderConfig{
-		HTTPClient:     client,
-		Logger:         slog.Default(),
-		StopCtx:        context.Background(),
-		Backoff:        &zeroBackoff,
-		AttemptTimeout: deliveryTimeout,
+		HTTPClient:      client,
+		Logger:          slog.Default(),
+		StopCtx:         context.Background(),
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: deliveryTimeout,
 	})
 
 	started := time.Now()
@@ -993,6 +993,78 @@ func TestDeliverCallback_ConfiguredAttemptTimeoutOutlivesFormerCaps(t *testing.T
 	assert.True(t, ok)
 	assert.Equal(t, int32(1), attempts.Load())
 	assert.GreaterOrEqual(t, time.Since(started), applicationDelay)
+}
+
+func TestDeliverCallback_AttemptDeadlineDefersRemainingRetries(t *testing.T) {
+	const deliveryTimeout = 25 * time.Millisecond
+	var attempts atomic.Int32
+	client := &http.Client{Transport: callbackRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts.Add(1)
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	s := NewCallbackSender(CallbackSenderConfig{
+		HTTPClient:      client,
+		Logger:          slog.Default(),
+		StopCtx:         context.Background(),
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: deliveryTimeout,
+	})
+
+	delivered := s.DeliverCallback(
+		"lease-1", "https://fred.example/callback", []byte(`{}`),
+	)
+
+	assert.False(t, delivered)
+	assert.Equal(t, int32(1), attempts.Load(),
+		"one exhausted request budget must defer to periodic replay instead of starting two more full-budget attempts")
+}
+
+func TestDeliverCallback_SlowHTTPFailureSharesInlineDeadline(t *testing.T) {
+	const (
+		deliveryTimeout = 200 * time.Millisecond
+		firstDelay      = 50 * time.Millisecond
+	)
+	var attempts atomic.Int32
+	deadlines := make(chan time.Time, 2)
+	client := &http.Client{Transport: callbackRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		deadline, ok := req.Context().Deadline()
+		if !ok {
+			return nil, fmt.Errorf("callback request has no deadline")
+		}
+		deadlines <- deadline
+		attempt := attempts.Add(1)
+		if attempt == 1 {
+			time.Sleep(firstDelay)
+			return callbackHTTPResponse(http.StatusServiceUnavailable), nil
+		}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	s := NewCallbackSender(CallbackSenderConfig{
+		HTTPClient:      client,
+		Logger:          slog.Default(),
+		StopCtx:         context.Background(),
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: deliveryTimeout,
+	})
+
+	started := time.Now()
+	delivered := s.DeliverCallback(
+		"lease-1", "https://fred.example/callback", []byte(`{}`),
+	)
+	elapsed := time.Since(started)
+
+	assert.False(t, delivered)
+	assert.Equal(t, int32(2), attempts.Load(),
+		"a slow response may use the remaining budget once but must not mint another full timeout")
+	firstDeadline := <-deadlines
+	secondDeadline := <-deadlines
+	assert.True(t, firstDeadline.Equal(secondDeadline),
+		"all inline attempts must inherit the exact same delivery deadline")
+	assert.GreaterOrEqual(t, elapsed, deliveryTimeout)
+	assert.Less(t, elapsed, 3*deliveryTimeout,
+		"the complete inline retry chain must share one timeout budget")
 }
 
 func TestDeliverCallback_StopContextCancelsInFlightRequest(t *testing.T) {
@@ -1009,10 +1081,10 @@ func TestDeliverCallback_StopContextCancelsInFlightRequest(t *testing.T) {
 		return nil, req.Context().Err()
 	})}
 	s := NewCallbackSender(CallbackSenderConfig{
-		HTTPClient:     client,
-		Logger:         slog.Default(),
-		StopCtx:        stopCtx,
-		AttemptTimeout: time.Minute,
+		HTTPClient:      client,
+		Logger:          slog.Default(),
+		StopCtx:         stopCtx,
+		DeliveryTimeout: time.Minute,
 	})
 
 	delivered := make(chan bool, 1)
@@ -1495,6 +1567,62 @@ func TestReplayPendingCallbacks_LegacyV013Entry(t *testing.T) {
 	newTestSender(t, store, server.Client(), "secret").ReplayPendingCallbacks()
 
 	pending, err := store.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
+}
+
+func TestReplayPendingCallbacks_FailedLegacyHeadExpiresThenFreshV2Drains(t *testing.T) {
+	var legacyAttempts atomic.Int32
+	var typedAttempts atomic.Int32
+	client := &http.Client{Transport: callbackRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/legacy":
+			legacyAttempts.Add(1)
+			return callbackHTTPResponse(http.StatusServiceUnavailable), nil
+		case "/typed":
+			typedAttempts.Add(1)
+			return callbackHTTPResponse(http.StatusNoContent), nil
+		default:
+			return callbackHTTPResponse(http.StatusNotFound), nil
+		}
+	})}
+
+	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	require.NoError(t, err)
+	defer store.Close()
+	storeLegacyCallback(t, store, CallbackEntry{
+		LeaseUUID:   "lease-1",
+		CallbackURL: "https://fred.example/legacy",
+		CreatedAt:   time.Now().Add(-48 * time.Hour),
+	})
+	_, err = store.StoreEntry(CallbackEntry{
+		LeaseUUID:    "lease-1",
+		CallbackURL:  "https://fred.example/typed",
+		DeliveryKind: CallbackDeliveryKindOperation,
+		Status:       backend.CallbackStatusSuccess,
+		CreatedAt:    time.Now(),
+	})
+	require.NoError(t, err)
+
+	sender := newTestSender(t, store, client, "secret")
+	sender.ReplayPendingCallbacks()
+	assert.Equal(t, int32(CallbackMaxAttempts), legacyAttempts.Load())
+	assert.Zero(t, typedAttempts.Load(), "a live legacy head remains a strict FIFO barrier")
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 2)
+
+	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed)
+	pending, err = store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "https://fred.example/typed", pending[0].CallbackURL)
+
+	sender.ReplayPendingCallbacks()
+	assert.Equal(t, int32(1), typedAttempts.Load())
+	pending, err = store.ListPending()
 	require.NoError(t, err)
 	assert.Empty(t, pending)
 }

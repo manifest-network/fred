@@ -23,8 +23,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   provision callbacks that overlap close/deprovision ownership of the same
   operation ID. Fred consumes these without acknowledging the closing
   lease and continues teardown. (ENG-632)
+- `fred_provisioner_lifecycle_callback_outcomes_total{outcome,verdict,status}`
+  classifies every authenticated lifecycle callback exactly once as applied,
+  terminally dropped, or retryable. Its labels use closed vocabularies, so
+  stale/retired replay drops are distinguishable from live authority or storage
+  failures without tenant-controlled cardinality. The existing
+  `fred_api_non_in_flight_callbacks_total` retains its received-at-ingress
+  meaning. (ENG-632)
+- `fred_background_goroutine_panics_total{component="callback_replay"}` now
+  exposes a recovered panic in a bundled backend's durable callback replay
+  worker. The affected lease remains queued and other lease workers continue;
+  any increase is still a bug requiring investigation. (ENG-632)
 
 ### Changed
+
+- Bundled callback senders give the complete inline retry chain one
+  two-minute-fifteen-second budget so Fred owns its two-minute application
+  timeout without letting slow HTTP failures multiply that deadline by the
+  retry count. Quick transport and HTTP failures retain their immediate retries
+  and 0/1s/5s backoff within the shared budget; afterward the durable per-lease
+  FIFO head is retried by the 30-second replay loop.
+  (ENG-632)
 
 - Provision lifecycle coordination now has one typed `operation.Registry` as
   its process-local source of truth. Opaque initiation, lease, and settlement
@@ -95,9 +114,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   and teardown observations, so a completed operation cannot make legitimate
   runtime, deprovisioned, or retained events disappear. Lifecycle callbacks can
   publish status but cannot settle operations or mutate placement/chain state;
-  stale and retired IDs are harmless 200 no-ops. Existing v0.13 owners migrate
-  explicitly as legacy and remain tokenless until a typed operation replaces
-  their callback route. The Docker backend persists both URLs in separate
+  stale and consumed IDs are harmless 200 no-ops. Completed capability history
+  is pruned when exact teardown consumption and placement deletion make it safe,
+  while active teardown-only authority remains durable without a fixed TTL.
+  Corrupt or revisioned-missing capability rows quarantine only their lease and
+  passive inventory cannot recreate tokenless authority. Existing v0.13 owners
+  migrate explicitly as legacy only when the lifecycle and metadata buckets are
+  both absent at transaction entry, the database has no revisioned row, and the
+  individual placement is a confirmed revision-zero owner; they remain tokenless
+  until a typed operation replaces their callback route. The Docker backend
+  persists both URLs in separate
   container labels and safely derives the paired lifecycle URL when upgrading
   state written by an older Fred. The durable callback outbox assigns
   explicit operation/lifecycle kinds and monotonic per-store sequences: exact
@@ -158,6 +184,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Callback outbox age cleanup once again expires v0.13, pre-kind, and typed
+  records individually, so an undeliverable legacy FIFO head cannot pin newer
+  same-lease observations beyond `callback_max_age`. Lifecycle coalescing now
+  collects bbolt keys before deletion instead of mutating a live cursor and
+  skipping adjacent stale entries. Malformed v2 rows remain a deliberate
+  backend-wide fail-closed barrier because their lease identity is
+  unrecoverable. (ENG-632)
+- A malformed lifecycle-capability row or a revisioned placement whose
+  capability is missing now quarantines only that lease instead of preventing
+  providerd startup or silently restoring tokenless authority. Exact terminal
+  consumption and later placement deletion prune completed capability state;
+  active teardown authority remains durable until consumed. (ENG-632)
 - The final authoritative lease re-read before a reconciliation action now uses
   the same bounded per-query timeout as other chain liveness checks. A stalled
   point query defers that lease instead of blocking startup, the worker group,

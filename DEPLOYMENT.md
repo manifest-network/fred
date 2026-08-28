@@ -470,8 +470,23 @@ record revisions and an explicit ID-empty legacy lifecycle binding. Fred does
 not mint a bearer capability that the existing backend never received; the
 binding becomes typed only after a later exact operation distributes and
 confirms the paired lifecycle URL. Ambiguous, malformed, or otherwise unusable
-records remain fail-closed. Configure a writable `placement_store_db_path` and
-take a stopped-process backup before upgrading.
+records remain fail-closed. Lifecycle adoption runs before record-revision
+migration and requires a database-wide first-open epoch: both
+`placement_lifecycle_capabilities` and `placement_metadata` must be absent at
+transaction entry, no placement row may already carry a revision, and the
+individual owner must be revision-zero and confirmed. Once either new bucket
+has existed, no missing row is backfilled—even if an unsupported downgrade
+later writes a revision-zero placement—because Fred cannot prove it did not
+replace formerly typed authority. Likewise, one revisioned row disqualifies
+legacy adoption for every revision-zero row in that mixed database. A placement
+whose capability is missing or corrupt is quarantined for lifecycle callbacks
+on that lease rather than downgraded to tokenless authority or preventing
+unrelated leases from loading. This is an in-place
+migration of the exact v0.13.0 placement database, not an inventory backfill:
+`placement_store_db_path` must name the existing file that already records every
+surviving provision and retention. Pointing the upgraded process at a newly
+created or empty file cannot recreate legacy lifecycle authority from later
+backend inventory and quarantines those workloads for lifecycle callbacks.
 
 The new backend binaries accept v0.13.0 tokenless callback URLs, so roll every
 backend one at a time while the old providerd remains online. Complete that
@@ -483,17 +498,47 @@ observations after the exact provision/restore operation expires. The same
 ordering installs the new
 two-minute-fifteen-second callback delivery deadline before providerd begins
 using synchronous application with its two-minute budget; an old ten-second
-sender must not be the durability owner during that cutover.
+sender must not be the durability owner during that cutover. The new sender
+shares that one deadline across all inline attempts and backoff, leaving the
+durable FIFO head for the 30-second replay loop when the budget ends. Slow HTTP
+failures and black-holed requests therefore cannot block one lease for three
+consecutive full application budgets.
 
 Before taking the rollback snapshot, remove tenant API ingress, pause the
 chain-facing path tenants use to create, close, or otherwise mutate leases, and
 wait for `stats.in_flight_provisions` to reach zero. Then stop the single v0.13.0
 providerd and verify shutdown reports no remaining provision operations before
-backing up its bbolt files. Replace it and start exactly one new providerd. Do
-not run the two providerd versions concurrently. Existing tenant containers are
-not restarted or moved by this upgrade; startup reconciliation reads backend
-inventories and rebuilds the placement index before it enables new lifecycle
-side effects.
+backing up its bbolt files. Before any upgraded process opens that placement
+database, inspect the stopped file and the complete `/provisions` plus
+`/retentions` inventory from every configured backend. Require all of the
+following:
+
+1. Every surviving backend-reported lease has exactly one unambiguous confirmed
+   placement row, and every confirmed placement intended to survive is present
+   in the backend inventory.
+2. Each row names the exact backend that reported the lease and is still a
+   revision-zero v0.13.0 record. A missing row, backend mismatch, attempt,
+   conflict, malformed record, or already-revisioned record is not eligible for
+   automatic legacy adoption.
+3. Both `placement_lifecycle_capabilities` and `placement_metadata` are absent.
+   Their joint first creation, combined with the absence of any revisioned row
+   in the database, is the one-time provenance proof that permits Fred to adopt
+   revision-zero owners as ID-empty legacy bindings before assigning revisions.
+
+Abort the cutover on any discrepancy. If either new bucket already exists, or
+any placement row is revisioned, the file has already crossed (or cannot prove
+it has not crossed) the first-open boundary; restarting the upgraded binary
+will not backfill missing bindings. Stop it and restore the known-good snapshot
+taken before that first upgraded open, then repeat the preflight. Do not attempt
+to repair coverage from passive inventory or proceed with an empty replacement
+database.
+
+Only after this preflight passes should you replace v0.13.0 and start exactly
+one new providerd. Do not run the two providerd versions concurrently. Existing
+tenant containers are not restarted or moved by this upgrade; startup
+reconciliation validates backend inventory against the migrated placement
+index before it enables new lifecycle side effects. It cannot reconstruct a
+missing legacy lifecycle binding.
 
 Keep tenant API ingress out of the load balancer until all of these hold from
 the same new process:
@@ -548,7 +593,14 @@ v0.13.0 callbacks remain a status-only compatibility path only for owners
 explicitly migrated as legacy. When no matching confirmed placement owner
 remains, either kind narrows to teardown-only authority: runtime observations
 are ignored, maintenance cannot reissue it, and only exact terminal
-deprovision can durably retire it before the best-effort retained notice.
+deprovision can durably consume it before the best-effort retained notice. If
+the placement is already absent, that consume deletes the capability at the
+at-most-once boundary; a duplicate is therefore missing rather than retired.
+If a placement or newer attempt still exists, retirement remains durable until
+its later settlement or placement deletion can safely prune it. Active
+teardown-only capabilities have no fixed TTL because backend retry horizons are
+configurable; they remain as outstanding authority until exact terminal
+consumption or authoritative conflict cleanup.
 Complete backend inventory and
 level-triggered reconciliation recover only from positive backend evidence;
 absence never clears an ambiguous pre-restart attempt or conflict.
@@ -579,11 +631,15 @@ after that snapshot. An old binary cannot deliver v2 entries, so a pending exact
 completion that matters is another reason to forward-fix rather than downgrade.
 
 Schema compatibility is store-specific; the bbolt files carry no global schema
-version or automatic downgrade guard. In particular, the placement store retains
-an undecodable entry as unusable, fail-closed safety evidence rather than dropping
-it during cleanup. Do not assume an older Fred can safely read a file after a newer
-version has written it. Follow the release-specific notes and take a stopped-process
-backup before upgrading.
+version or automatic downgrade guard. In particular, the placement store
+retains an undecodable placement or lifecycle-capability entry as per-lease
+unusable, fail-closed safety evidence rather than dropping it during cleanup or
+making the whole provider unstartable. A confirmed revisioned placement with a
+missing capability is isolated the same way and passive inventory cannot mint a
+replacement token; a later exact typed operation may safely establish new
+authority. Do not assume an older Fred can safely read a file after a newer
+version has written it. Follow the release-specific notes and take a
+stopped-process backup before upgrading.
 
 > **Upgrading an XFS backend from before ENG-454/ENG-459:** it may carry orphaned XFS project-quota table entries left by volumes destroyed under the older build. New leaks are prevented going forward, but pre-existing entries are not swept automatically — `xfs_quota report -p` is filesystem-global, so Fred cannot distinguish its own orphaned entries from live foreign project limits. Clear each stale project ID with a one-time manual `xfs_quota -x -c 'limit -p bhard=0 bsoft=0 ihard=0 isoft=0 <projid>' <mount>` (matching what `Destroy` does).
 >
