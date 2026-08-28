@@ -201,7 +201,8 @@ type Config struct {
 
 	// CallbackMaxAge is the maximum age of a persisted callback entry.
 	// Entries older than this are removed by the callback store's background cleanup.
-	// Defaults to 24h.
+	// It must be positive so an undeliverable FIFO head cannot block newer
+	// callbacks forever. Defaults to 24h.
 	CallbackMaxAge time.Duration `yaml:"callback_max_age"`
 
 	// DiagnosticsDBPath is the path to the bbolt database for persisting failure diagnostics.
@@ -606,8 +607,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("container_tmpfs_size_mb must be >= 0")
 	}
 
-	if c.CallbackMaxAge < 0 {
-		return fmt.Errorf("callback_max_age must be non-negative")
+	if c.CallbackMaxAge <= 0 {
+		return fmt.Errorf("callback_max_age must be positive")
 	}
 
 	if c.DiagnosticsMaxAge < 0 {

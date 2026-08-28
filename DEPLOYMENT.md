@@ -212,6 +212,10 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 
 - `host_address` — public IP or hostname tenants will use to reach containers
 - `callback_secret` — must match `providerd`'s value
+- `callback_max_age` — must be positive (default `24h`) in both Docker and k3s
+  production backends. Strict same-lease FIFO needs this finite abandonment
+  point so a permanently undeliverable exact or legacy head cannot block all
+  later observations for that lease; zero and negative values are rejected
 - `sku_mapping` — maps on-chain SKU UUIDs to local profile names (provisioning fails otherwise)
 - `volume_data_path` — required when any SKU has `disk_mb > 0`
 
@@ -477,12 +481,18 @@ transaction entry, no placement row may already carry a revision, and the
 individual owner must be revision-zero and confirmed. Once either new bucket
 has existed, no missing row is backfilled—even if an unsupported downgrade
 later writes a revision-zero placement—because Fred cannot prove it did not
-replace formerly typed authority. Likewise, one revisioned row disqualifies
-legacy adoption for every revision-zero row in that mixed database. A placement
-whose capability is missing or corrupt is quarantined for lifecycle callbacks
-on that lease rather than downgraded to tokenless authority or preventing
-unrelated leases from loading. This is an in-place
-migration of the exact v0.13.0 placement database, not an inventory backfill:
+replace formerly typed authority. The epoch proof is database-wide: one
+nonzero-revision row, or one JSON-object-shaped row whose revision header cannot
+be decoded, disqualifies legacy adoption for every otherwise valid revision-zero
+row because Fred cannot prove the whole file is pristine v0.13.0 state. A
+semantically invalid but decodable revision-zero row is quarantined lease-locally
+and does not disqualify another clean owner. The first upgraded open still
+creates the new schema boundary, so repairing a disqualifying row afterward
+cannot rerun adoption. A placement whose capability is missing or corrupt is
+quarantined for lifecycle callbacks on that lease rather than downgraded to
+tokenless authority; it does not prevent unrelated leases from loading. This is
+an in-place migration of the exact v0.13.0 placement database, not an inventory
+backfill:
 `placement_store_db_path` must name the existing file that already records every
 surviving provision and retention. Pointing the upgraded process at a newly
 created or empty file cannot recreate legacy lifecycle authority from later
@@ -519,16 +529,22 @@ following:
 2. Each row names the exact backend that reported the lease and is still a
    revision-zero v0.13.0 record. A missing row, backend mismatch, attempt,
    conflict, malformed record, or already-revisioned record is not eligible for
-   automatic legacy adoption.
+   automatic legacy adoption. The revision-epoch check is global: one
+   nonzero-revision row, or one `{`-prefixed row whose revision header cannot be
+   decoded, invalidates the first-open provenance proof for every owner in the
+   file, not just that lease. Other malformed revision-zero rows remain
+   lease-local but are still ineligible themselves.
 3. Both `placement_lifecycle_capabilities` and `placement_metadata` are absent.
    Their joint first creation, combined with the absence of any revisioned row
-   in the database, is the one-time provenance proof that permits Fred to adopt
-   revision-zero owners as ID-empty legacy bindings before assigning revisions.
+   or JSON-object-shaped row whose revision header cannot be decoded, is the
+   one-time provenance proof that permits Fred to adopt revision-zero owners as
+   ID-empty legacy bindings before assigning revisions.
 
-Abort the cutover on any discrepancy. If either new bucket already exists, or
-any placement row is revisioned, the file has already crossed (or cannot prove
-it has not crossed) the first-open boundary; restarting the upgraded binary
-will not backfill missing bindings. Stop it and restore the known-good snapshot
+Abort the cutover on any discrepancy. If either new bucket already exists, any
+placement row is revisioned, or any JSON-object-shaped row has an undecodable
+revision header, the file has already crossed (or cannot prove it has not
+crossed) the first-open boundary; restarting the upgraded binary will not
+backfill missing bindings. Stop it and restore the known-good snapshot
 taken before that first upgraded open, then repeat the preflight. Do not attempt
 to repair coverage from passive inventory or proceed with an empty replacement
 database.
@@ -600,7 +616,14 @@ If a placement or newer attempt still exists, retirement remains durable until
 its later settlement or placement deletion can safely prune it. Active
 teardown-only capabilities have no fixed TTL because backend retry horizons are
 configurable; they remain as outstanding authority until exact terminal
-consumption or authoritative conflict cleanup.
+consumption or authoritative conflict cleanup. In particular, if reconciliation
+removes an orphan's placement after the chain is terminal and every backend
+reports the lease absent, no backend may remain to send that terminal callback;
+the teardown-only record can then persist indefinitely. This is deliberate
+fail-closed residual authority: it cannot publish runtime success or failure,
+be reissued for maintenance, or mutate placement or chain state, and passive
+inventory cannot rotate it. Do not delete it merely because inventory is absent;
+it preserves authorization for a delayed exact deprovision observation.
 Complete backend inventory and
 level-triggered reconciliation recover only from positive backend evidence;
 absence never clears an ambiguous pre-restart attempt or conflict.

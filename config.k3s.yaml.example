@@ -191,7 +191,8 @@ callback_db_path: "k3s-callbacks.db"
 # Maximum age of persisted callback entries. Entries older than this are
 # removed when the callback store opens (one synchronous sweep inside
 # shared.NewCallbackStore at backend startup) AND by a periodic background
-# loop while the backend runs. Default: 24h.
+# loop while the backend runs. Must be positive so a failed FIFO head is
+# eventually abandoned instead of blocking newer callbacks forever. Default: 24h.
 callback_max_age: 24h
 
 # =============================================================================

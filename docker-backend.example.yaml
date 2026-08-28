@@ -177,7 +177,8 @@ callback_db_path: "callbacks.db"
 
 # Maximum age of persisted callback entries. Entries older than this are
 # removed by background cleanup (an initial sweep runs at startup, then
-# periodically). Default: 24h.
+# periodically). Must be positive so a failed FIFO head is eventually
+# abandoned instead of blocking newer callbacks forever. Default: 24h.
 callback_max_age: 24h
 
 # =============================================================================

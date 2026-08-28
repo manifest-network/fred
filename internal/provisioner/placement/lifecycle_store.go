@@ -297,10 +297,6 @@ func quarantineLifecycleBindings(
 
 	for leaseUUID, placement := range placements {
 		capability, exists := capabilities[leaseUUID]
-		if placement.State() == StateUnusable {
-			quarantine(leaseUUID, "placement record is unusable")
-			continue
-		}
 		if !exists {
 			quarantine(leaseUUID, "placement has no lifecycle capability")
 			continue
@@ -308,9 +304,14 @@ func quarantineLifecycleBindings(
 		if capability.unusable {
 			continue
 		}
-		if placement.State() == StateConfirmed && capability.backend != placement.Backend {
+		// Placement usability is checked before lifecycle authority is exposed.
+		// Keep an independently valid capability behind that gate so matching
+		// positive inventory can repair a conflict or damaged placement without
+		// destroying the exact ID. The binding checks below still quarantine any
+		// owner or attempt mismatch.
+		if placement.Backend != "" && capability.backend != placement.Backend {
 			quarantine(leaseUUID, fmt.Sprintf(
-				"capability backend %q does not match confirmed backend %q",
+				"capability backend %q does not match placement backend %q",
 				capability.backend, placement.Backend,
 			))
 			continue

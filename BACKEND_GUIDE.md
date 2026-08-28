@@ -694,14 +694,17 @@ X-Fred-Signature: t=<unix-timestamp>,sha256=<hex-encoded-hmac>
   retry with backoff.
 
 Fred's callback application budget is two minutes; it may wait for terminal
-chain settlement. Give an inline delivery chain a deadline strictly longer than
-that budget (the bundled backends use two minutes fifteen seconds), and do not
-layer a shorter `http.Client.Timeout` over the request context. Remove a durable
-entry only after 2xx. A 503, client timeout, disconnect, or lost response leaves
-the same entry at the head of that lease's FIFO for retry. Quick connection or
-HTTP failures may retry, but every attempt and backoff should share the same
-deadline; the bundled sender gives the head back to its 30-second durable replay
-loop when that budget expires.
+chain settlement. Give the complete inline delivery chain a deadline strictly
+longer than that budget (the bundled backends use two minutes fifteen seconds),
+and do not layer a shorter `http.Client.Timeout` over the request context. On a
+fresh first attempt, that normally leaves time for Fred to return its retryable
+503 after its application timer expires. The chain deadline is not renewed for
+retries: after an earlier connection or HTTP failure and backoff consume part of
+it, a later attempt may be canceled by the sender's remaining deadline before
+Fred's per-request timer. Remove a durable entry only after 2xx. A 503, client
+timeout, disconnect, or lost response leaves the same entry at the head of that
+lease's FIFO; the bundled sender gives it back to the 30-second durable replay
+loop when the shared budget expires.
 
 ### HMAC Signature with Replay Protection
 
@@ -977,9 +980,17 @@ The production backends (docker-backend, k3s-backend) are configured via a YAML 
 ```yaml
 listen_addr: ":9001"             # Listen address
 callback_secret: "32-char-min"   # HMAC secret (must match Fred's config)
+callback_max_age: 24h            # Required finite FIFO abandonment boundary
 name: "my-backend"               # For logging/metrics
 host_address: "192.168.1.100"    # For connection info
 ```
+
+The bundled Docker and k3s production configurations reject a zero or negative
+`callback_max_age`. Strict per-lease FIFO cannot allow a newer callback to pass
+an undeliverable exact or legacy head, so every implementation needs a finite,
+operator-chosen abandonment point; `24h` is the bundled default. Expiry is not a
+successful delivery and can lose an event, so size the window above expected
+provider outages and monitor outbox health rather than setting it to unlimited.
 
 The Docker backend takes a `--config` flag (path to the YAML file, default `docker-backend.yaml`) and a `--version` flag that prints the build-injected version and exits 0 without loading config or connecting to Docker.
 

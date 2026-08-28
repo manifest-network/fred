@@ -1020,11 +1020,13 @@ func TestDeliverCallback_AttemptDeadlineDefersRemainingRetries(t *testing.T) {
 		"one exhausted request budget must defer to periodic replay instead of starting two more full-budget attempts")
 }
 
-func TestDeliverCallback_SlowHTTPFailureSharesInlineDeadline(t *testing.T) {
-	const (
-		deliveryTimeout = 200 * time.Millisecond
-		firstDelay      = 50 * time.Millisecond
-	)
+func TestDeliverCallback_HTTPFailureRetrySharesInlineDeadline(t *testing.T) {
+	const deliveryTimeout = time.Minute
+	stopCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	firstAttemptStarted := make(chan struct{})
+	releaseFirstAttempt := make(chan struct{})
+	secondAttemptStarted := make(chan struct{})
 	var attempts atomic.Int32
 	deadlines := make(chan time.Time, 2)
 	client := &http.Client{Transport: callbackRoundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -1034,37 +1036,64 @@ func TestDeliverCallback_SlowHTTPFailureSharesInlineDeadline(t *testing.T) {
 		}
 		deadlines <- deadline
 		attempt := attempts.Add(1)
-		if attempt == 1 {
-			time.Sleep(firstDelay)
+		switch attempt {
+		case 1:
+			close(firstAttemptStarted)
+			select {
+			case <-releaseFirstAttempt:
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
 			return callbackHTTPResponse(http.StatusServiceUnavailable), nil
+		case 2:
+			close(secondAttemptStarted)
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		default:
+			return nil, fmt.Errorf("unexpected callback attempt %d", attempt)
 		}
-		<-req.Context().Done()
-		return nil, req.Context().Err()
 	})}
 	s := NewCallbackSender(CallbackSenderConfig{
 		HTTPClient:      client,
 		Logger:          slog.Default(),
-		StopCtx:         context.Background(),
+		StopCtx:         stopCtx,
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: deliveryTimeout,
 	})
 
-	started := time.Now()
-	delivered := s.DeliverCallback(
-		"lease-1", "https://fred.example/callback", []byte(`{}`),
-	)
-	elapsed := time.Since(started)
+	delivered := make(chan bool, 1)
+	go func() {
+		delivered <- s.DeliverCallback(
+			"lease-1", "https://fred.example/callback", []byte(`{}`),
+		)
+	}()
+	select {
+	case <-firstAttemptStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first callback attempt did not start")
+	}
+	// Keep the first request parked until the test deliberately returns its
+	// 503, avoiding sleeps and elapsed-time assertions for synchronization.
+	close(releaseFirstAttempt)
+	select {
+	case <-secondAttemptStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second callback attempt did not start")
+	}
+	cancel()
+	select {
+	case ok := <-delivered:
+		assert.False(t, ok)
+	case <-time.After(time.Second):
+		t.Fatal("callback delivery did not stop after sender cancellation")
+	}
 
-	assert.False(t, delivered)
 	assert.Equal(t, int32(2), attempts.Load(),
-		"a slow response may use the remaining budget once but must not mint another full timeout")
+		"a failed response may use the remaining budget once but must not mint another full timeout")
 	firstDeadline := <-deadlines
 	secondDeadline := <-deadlines
 	assert.True(t, firstDeadline.Equal(secondDeadline),
 		"all inline attempts must inherit the exact same delivery deadline")
-	assert.GreaterOrEqual(t, elapsed, deliveryTimeout)
-	assert.Less(t, elapsed, 3*deliveryTimeout,
-		"the complete inline retry chain must share one timeout budget")
 }
 
 func TestDeliverCallback_StopContextCancelsInFlightRequest(t *testing.T) {

@@ -38,11 +38,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Bundled callback senders give the complete inline retry chain one
-  two-minute-fifteen-second budget so Fred owns its two-minute application
-  timeout without letting slow HTTP failures multiply that deadline by the
-  retry count. Quick transport and HTTP failures retain their immediate retries
-  and 0/1s/5s backoff within the shared budget; afterward the durable per-lease
-  FIFO head is retried by the 30-second replay loop.
+  two-minute-fifteen-second budget. A fresh first attempt normally gives Fred
+  time to return 503 after its two-minute application timer, without letting
+  slow HTTP failures multiply that deadline by the retry count. Quick transport
+  and HTTP failures retain their immediate retries and 0/1s/5s backoff within
+  the shared budget; a later attempt may hit the sender's remaining deadline
+  first. Afterward the durable per-lease FIFO head is retried by the 30-second
+  replay loop.
   (ENG-632)
 
 - Provision lifecycle coordination now has one typed `operation.Registry` as
@@ -116,7 +118,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   publish status but cannot settle operations or mutate placement/chain state;
   stale and consumed IDs are harmless 200 no-ops. Completed capability history
   is pruned when exact teardown consumption and placement deletion make it safe,
-  while active teardown-only authority remains durable without a fixed TTL.
+  while active teardown-only authority remains durable without a fixed TTL. An
+  orphan-pruned placement whose backend reports it absent can therefore leave a
+  teardown-only row indefinitely if no terminal callback arrives; that residual
+  authority cannot publish runtime status, be reissued for maintenance, or
+  mutate placement or chain state.
   Corrupt or revisioned-missing capability rows quarantine only their lease and
   passive inventory cannot recreate tokenless authority. Existing v0.13 owners
   migrate explicitly as legacy only when the lifecycle and metadata buckets are
@@ -136,9 +142,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   503 without advancing the backend outbox. Callback application has a dedicated
   two-minute budget, its route extends the connection write deadline beyond the
   generic 15-second server default, and bundled senders wait two minutes fifteen
-  seconds with no competing client-wide cap. The provider therefore owns the
-  first timeout and can return 503 while the same exact entry remains the durable
-  FIFO head. Shutdown cancels admitted application before draining it. v0.13
+  seconds with no competing client-wide cap. A fresh first attempt normally
+  leaves time for the provider to return 503; retries use only the shared
+  deadline's remainder and may be canceled by the sender first. Either result
+  leaves the same exact entry as the durable FIFO head. Shutdown cancels admitted
+  application before draining it. v0.13
   queue entries remain replayable. Rolling upgrades must update backends before
   providerd: new backends understand the old tokenless shape, while a v0.13
   backend cannot preserve the separate lifecycle route sent by a new provider.
@@ -190,7 +198,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   collects bbolt keys before deletion instead of mutating a live cursor and
   skipping adjacent stale entries. Malformed v2 rows remain a deliberate
   backend-wide fail-closed barrier because their lease identity is
-  unrecoverable. (ENG-632)
+  unrecoverable. Docker and k3s production configs now require a positive
+  `callback_max_age`; strict per-lease FIFO needs a finite abandonment point, so
+  zero or negative values are rejected instead of requesting unbounded
+  retention. (ENG-632)
 - A malformed lifecycle-capability row or a revisioned placement whose
   capability is missing now quarantines only that lease instead of preventing
   providerd startup or silently restoring tokenless authority. Exact terminal

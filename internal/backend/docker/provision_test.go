@@ -2620,8 +2620,9 @@ func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 
 // Fix 1: Total deprovision failure — ALL container removals fail.
 
-// Fix 2: CallbackMaxAge=0 skips expiry in ReplayPendingCallbacks.
-func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
+// A directly constructed callback store may disable cleanup for tests even
+// though production backend configuration requires callback_max_age > 0.
+func TestReplayPendingCallbacks_StoreWithoutCleanupReplaysOldEntry(t *testing.T) {
 
 	var received []backend.CallbackPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2649,7 +2650,6 @@ func TestReplayPendingCallbacks_ZeroMaxAge_SkipsExpiry(t *testing.T) {
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.callbackStore = cbStore
 	rebuildCallbackSender(b, server.Client())
-	b.cfg.CallbackMaxAge = 0 // Zero means "don't expire"
 
 	b.callbackSender.ReplayPendingCallbacks()
 

@@ -264,6 +264,12 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 
 > **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
 
+Bundled Docker and k3s backends require a positive `callback_max_age` (default
+`24h`). Strict per-lease FIFO keeps an undeliverable exact or legacy callback at
+the head, so a finite maximum age is the safety boundary that eventually permits
+newer observations to proceed. Zero or negative values are rejected at startup;
+do not use them to request unbounded callback retention.
+
 ### Advanced Configuration
 
 These options have sensible defaults but can be tuned for specific environments:
@@ -300,10 +306,13 @@ The callback route has a separate two-minute application budget because a
 terminal result may include chain settlement. It extends the connection write
 deadline for that request only; `http_write_timeout` and the generic 30-second
 request middleware continue to govern the other HTTP routes. Bundled backends
-give the complete inline delivery chain an additional 15 seconds, so providerd
-always owns the first timeout and can return a retryable 503. All quick retries
-and their 0/1s/5s backoffs share that one two-minute-fifteen-second budget; when
-it expires, the durable FIFO head remains for the 30-second replay loop instead
+give the complete inline delivery chain an additional 15 seconds. A fresh first
+attempt therefore normally leaves time for providerd to return its retryable
+503 after the application budget expires. Quick retries and their 0/1s/5s
+backoffs share that one two-minute-fifteen-second deadline rather than resetting
+it; after an earlier failure consumes part of the budget, a later attempt may
+reach the sender's remaining deadline before providerd's per-request timer.
+Either result keeps the durable FIFO head for the 30-second replay loop instead
 of holding the same lease for another full application budget.
 
 ### TLS Configuration
@@ -932,12 +941,14 @@ Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third i
   retry with backoff
 
 Callback application has a dedicated two-minute deadline. Bundled backends give
-the complete inline delivery chain two minutes fifteen seconds, deliberately
-making the provider's 503 the first timeout. Quick retries and backoff share
-that deadline. A backend must retain the FIFO head until a 2xx response; a
-transport timeout or lost response is not delivery success. When the shared
-budget expires, bundled backends defer to their 30-second durable replay loop
-instead of holding that lease's FIFO lock for consecutive application budgets.
+the complete inline delivery chain two minutes fifteen seconds, so a fresh first
+attempt normally leaves response time after the provider's application timer
+returns 503. Quick retries and backoff consume that same deadline; a later
+attempt may instead be canceled when the sender's remaining budget expires.
+A backend must retain the FIFO head until a 2xx response; a 503, transport
+timeout, or lost response is not delivery success. When the shared budget
+expires, bundled backends defer to their 30-second durable replay loop instead
+of holding that lease's FIFO lock for consecutive application budgets.
 
 For a rolling upgrade from v0.13.0, upgrade and restart every backend before
 providerd. New backends accept the old operationless callback shape and persist

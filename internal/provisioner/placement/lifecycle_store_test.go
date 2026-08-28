@@ -97,6 +97,66 @@ func TestStore_InitialLegacyOwnerAdoptsTokenlessThenRotatesOnExactOperation(t *t
 	)
 }
 
+func TestStore_LegacyAdoptionEpochUsesOnlyRevisionEvidenceOrUnreadableJSON(t *testing.T) {
+	tests := []struct {
+		name                 string
+		otherRecord          []byte
+		wantGoodOwnerVerdict LifecycleVerdict
+	}{
+		{
+			name:                 "unreadable JSON object disqualifies database",
+			otherRecord:          []byte(`{"backend":`),
+			wantGoodOwnerVerdict: LifecycleVerdictUnusable,
+		},
+		{
+			name: "undecodable revision header disqualifies database",
+			otherRecord: []byte(
+				`{"backend":"backend-b","revision":"not-a-number"}`,
+			),
+			wantGoodOwnerVerdict: LifecycleVerdictUnusable,
+		},
+		{
+			name: "nonzero revision disqualifies database",
+			otherRecord: []byte(
+				`{"backend":"backend-b","set_at":"2026-08-27T12:00:00Z","revision":7}`,
+			),
+			wantGoodOwnerVerdict: LifecycleVerdictUnusable,
+		},
+		{
+			name:                 "invalid raw row remains lease local",
+			otherRecord:          []byte{0xff},
+			wantGoodOwnerVerdict: LifecycleVerdictLegacy,
+		},
+		{
+			name: "semantically invalid revision-zero object remains lease local",
+			otherRecord: []byte(
+				`{"backend":"","set_at":"2026-08-27T12:00:00Z"}`,
+			),
+			wantGoodOwnerVerdict: LifecycleVerdictLegacy,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "placements.db")
+			writeRawRecords(t, dbPath, map[string][]byte{
+				"good":  []byte("backend-a"),
+				"other": test.otherRecord,
+			})
+
+			s, err := NewStore(dbPath)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = s.Close() })
+			requireLifecycleVerdict(
+				t, s, "good", lifecycle.ID{}, test.wantGoodOwnerVerdict,
+			)
+			requireLifecycleVerdict(
+				t, s, "other", lifecycle.ID{}, LifecycleVerdictUnusable,
+			)
+		})
+	}
+}
+
 func TestStore_ExistingLifecycleBucketDoesNotBackfillDowngradeWrites(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	s, err := NewStore(dbPath)
@@ -743,6 +803,155 @@ func TestStore_ConflictResolutionPreservesMatchingRetainedTypedLifecycle(t *test
 	})
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictAuthorized)
 	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictStale)
+}
+
+func TestStore_ConflictResolutionAfterReopenPreservesOnlyMatchingTypedLifecycle(t *testing.T) {
+	tests := []struct {
+		name            string
+		resolvedBackend string
+		wantVerdict     LifecycleVerdict
+		wantQuarantined bool
+	}{
+		{
+			name:            "matching owner",
+			resolvedBackend: "backend-a",
+			wantVerdict:     LifecycleVerdictAuthorized,
+		},
+		{
+			name:            "different owner",
+			resolvedBackend: "backend-b",
+			wantVerdict:     LifecycleVerdictUnusable,
+			wantQuarantined: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "placements.db")
+			s, err := NewStore(dbPath)
+			require.NoError(t, err)
+			requireAdmissionBaseline(t, s, "backend-a", "backend-b")
+			operationID := requireOperationID(t, "8623")
+			id := lifecycleIDFromOperation(t, operationID)
+			token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
+			confirmed, err := s.ConfirmAttempt(token)
+			require.NoError(t, err)
+			require.True(t, confirmed)
+			requireConflictPlacement(t, s, "lease", "backend-a", "backend-b")
+			requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictUnusable)
+			require.NoError(t, s.Close())
+
+			reopened, err := NewStore(dbPath)
+			require.NoError(t, err)
+			placement := reopened.Lookup("lease")
+			require.Equal(t, StateUnusable, placement.State())
+			require.True(t, placement.Conflict)
+			requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
+			capability := reopened.lifecycleCache["lease"]
+			assert.False(t, capability.unusable,
+				"placement quarantine must gate, not discard, valid lifecycle authority")
+			assert.Equal(t, "backend-a", capability.backend)
+			assert.Equal(t, id, capability.id)
+
+			projectInventoryForTest(t, reopened, InventoryProjection{
+				Placements: map[string]string{"lease": test.resolvedBackend},
+			})
+			placement = reopened.Lookup("lease")
+			require.Equal(t, StateConfirmed, placement.State())
+			require.Equal(t, test.resolvedBackend, placement.Backend)
+			requireLifecycleVerdict(t, reopened, "lease", id, test.wantVerdict)
+			if test.wantQuarantined {
+				requirePersistedUnusableLifecycle(t, reopened, "lease")
+			} else {
+				persisted := reopened.lifecycleCache["lease"]
+				assert.False(t, persisted.unusable)
+				assert.Equal(t, "backend-a", persisted.backend)
+				assert.Equal(t, id, persisted.id)
+			}
+			require.NoError(t, reopened.Close())
+
+			reopenedAgain, err := NewStore(dbPath)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = reopenedAgain.Close() })
+			requireLifecycleVerdict(
+				t, reopenedAgain, "lease", id, test.wantVerdict,
+			)
+			if test.wantQuarantined {
+				requirePersistedUnusableLifecycle(t, reopenedAgain, "lease")
+			}
+		})
+	}
+}
+
+func TestStore_MatchingInventoryRepairsUnusablePlacementWithoutLosingTypedLifecycle(t *testing.T) {
+	tests := []struct {
+		name         string
+		record       []byte
+		wantRevision uint64
+		wantSetAt    bool
+	}{
+		{
+			name:   "malformed JSON",
+			record: []byte(`{"backend":`),
+		},
+		{
+			name: "structurally empty",
+			record: []byte(
+				`{"backend":"","set_at":"2026-08-28T12:00:00Z","revision":7}`,
+			),
+			wantRevision: 7,
+			wantSetAt:    true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "placements.db")
+			s, err := NewStore(dbPath)
+			require.NoError(t, err)
+			requireAdmissionBaseline(t, s, "backend-a")
+			operationID := requireOperationID(t, "8624")
+			id := lifecycleIDFromOperation(t, operationID)
+			token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
+			confirmed, err := s.ConfirmAttempt(token)
+			require.NoError(t, err)
+			require.True(t, confirmed)
+			require.NoError(t, s.Close())
+
+			db, err := bolt.Open(dbPath, 0600, nil)
+			require.NoError(t, err)
+			require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+				return tx.Bucket(bucketName).Put([]byte("lease"), test.record)
+			}))
+			require.NoError(t, db.Close())
+
+			reopened, err := NewStore(dbPath)
+			require.NoError(t, err)
+			placement := reopened.Lookup("lease")
+			require.Equal(t, StateUnusable, placement.State())
+			assert.Equal(t, test.wantRevision, placement.Revision())
+			assert.Equal(t, test.wantSetAt, !placement.SetAt.IsZero())
+			requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
+			capability := reopened.lifecycleCache["lease"]
+			assert.False(t, capability.unusable,
+				"unusable placement must not flatten an independently valid capability")
+			assert.Equal(t, "backend-a", capability.backend)
+			assert.Equal(t, id, capability.id)
+
+			projectInventoryForTest(t, reopened, InventoryProjection{
+				Placements: map[string]string{"lease": "backend-a"},
+			})
+			requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictAuthorized)
+			require.NoError(t, reopened.Close())
+
+			reopenedAgain, err := NewStore(dbPath)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = reopenedAgain.Close() })
+			requireLifecycleVerdict(
+				t, reopenedAgain, "lease", id, LifecycleVerdictAuthorized,
+			)
+		})
+	}
 }
 
 func TestStore_RefusedRecreationRetainsPriorLifecycleWithoutWedge(t *testing.T) {
