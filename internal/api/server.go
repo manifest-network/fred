@@ -36,8 +36,9 @@ const (
 
 	// callbackWriteDeadlineGrace leaves enough time for http.TimeoutHandler to
 	// serialize its retryable 503 after canceling callback application. The
-	// backend protocol's delivery deadline has a larger grace window, so the
-	// provider always owns the first timeout.
+	// bundled backend's fresh first attempt normally has a larger delivery
+	// window. A retry may have less of its shared delivery budget remaining and
+	// cancel the request first.
 	callbackWriteDeadlineGrace = 5 * time.Second
 
 	// readHeaderTimeout caps how long the server waits for request headers.

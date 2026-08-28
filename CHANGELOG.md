@@ -46,6 +46,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   first. Afterward the durable per-lease FIFO head is retried by the 30-second
   replay loop.
   (ENG-632)
+- Docker and k3s production configs now require a positive
+  `callback_max_age`. Zero previously disabled cleanup, but strict per-lease
+  FIFO needs a finite abandonment point; an omitted value still defaults to
+  `24h`. Before restarting each backend in the backend-first rolling upgrade,
+  operators with an explicit zero must choose a positive duration or the
+  upgraded process refuses to start. (ENG-632)
 
 - Provision lifecycle coordination now has one typed `operation.Registry` as
   its process-local source of truth. Opaque initiation, lease, and settlement
@@ -198,10 +204,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   collects bbolt keys before deletion instead of mutating a live cursor and
   skipping adjacent stale entries. Malformed v2 rows remain a deliberate
   backend-wide fail-closed barrier because their lease identity is
-  unrecoverable. Docker and k3s production configs now require a positive
-  `callback_max_age`; strict per-lease FIFO needs a finite abandonment point, so
-  zero or negative values are rejected instead of requesting unbounded
-  retention. (ENG-632)
+  unrecoverable. (ENG-632)
 - A malformed lifecycle-capability row or a revisioned placement whose
   capability is missing now quarantines only that lease instead of preventing
   providerd startup or silently restoring tokenless authority. Exact terminal

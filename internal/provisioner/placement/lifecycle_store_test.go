@@ -606,6 +606,59 @@ func TestStore_InventoryPersistsBackendBindingMismatchQuarantineAcrossReopen(t *
 	requirePersistedUnusableLifecycle(t, reopenedAgain, "lease")
 }
 
+func TestStore_ConflictBackendMismatchQuarantinePersistsAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
+	operationID := requireOperationID(t, "8515")
+	id := lifecycleIDFromOperation(t, operationID)
+	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
+	confirmed, err := s.ConfirmAttempt(token)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	requireConflictPlacement(t, s, "lease", "backend-a", "backend-b")
+	conflict := s.Lookup("lease")
+	require.Equal(t, StateUnusable, conflict.State())
+	require.Equal(t, "backend-a", conflict.Backend)
+	require.NoError(t, s.Close())
+
+	// Inject a well-formed capability whose owner contradicts the non-empty
+	// Backend retained by the conflict. Load must quarantine this binding even
+	// though the placement is already unusable for an independent reason.
+	mismatchedEncoded, err := encodeLifecycleCapability(lifecycleCapability{
+		backend: "backend-b",
+		id:      id,
+	})
+	require.NoError(t, err)
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(lifecycleCapabilityBucketName).Put(
+			[]byte("lease"), mismatchedEncoded,
+		)
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	require.True(t, reopened.lifecycleCache["lease"].unusable,
+		"a conflict must not hide a mismatched lifecycle owner")
+	projectInventoryForTest(t, reopened, InventoryProjection{
+		Placements: map[string]string{"lease": "backend-b"},
+	})
+	require.Equal(t, StateConfirmed, reopened.Lookup("lease").State())
+	requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictUnusable)
+	requirePersistedUnusableLifecycle(t, reopened, "lease")
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(t, reopenedAgain, "lease", id, LifecycleVerdictUnusable)
+	requirePersistedUnusableLifecycle(t, reopenedAgain, "lease")
+}
+
 func TestStore_InventoryPreservesRawCorruptLifecycleEvidence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	s, err := NewStore(dbPath)
@@ -952,6 +1005,74 @@ func TestStore_MatchingInventoryRepairsUnusablePlacementWithoutLosingTypedLifecy
 			)
 		})
 	}
+}
+
+func TestStore_UnreadablePlacementWithOutstandingAttemptRemainsFailClosed(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a")
+
+	currentOperation := requireOperationID(t, "8625")
+	currentID := lifecycleIDFromOperation(t, currentOperation)
+	current := requireTypedAttempt(t, s, "lease", "backend-a", currentOperation)
+	confirmed, err := s.ConfirmAttempt(current)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+
+	pendingOperation := requireOperationID(t, "8626")
+	pendingID := lifecycleIDFromOperation(t, pendingOperation)
+	requireTypedAttempt(t, s, "lease", "backend-a", pendingOperation)
+	require.NoError(t, s.Close())
+
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketName).Put([]byte("lease"), []byte(`{"backend":`))
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	require.Equal(t, StateUnusable, reopened.Lookup("lease").State())
+	requireLifecycleVerdict(t, reopened, "lease", currentID, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, reopened, "lease", pendingID, LifecycleVerdictUnusable)
+	assert.True(t, reopened.lifecycleCache["lease"].unusable,
+		"the lost placement attempt must quarantine the in-memory binding")
+	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+		encoded := tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease"))
+		capability, decodeErr := decodeLifecycleCapability(encoded)
+		require.NoError(t, decodeErr)
+		assert.False(t, capability.unusable,
+			"opening must not overwrite recoverable durable evidence")
+		assert.Equal(t, "backend-a", capability.backend)
+		assert.Equal(t, currentID, capability.id)
+		assert.Equal(t, "backend-a", capability.attemptBackend)
+		assert.Equal(t, pendingID, capability.attemptID)
+		return nil
+	}))
+
+	// The unreadable placement erased the exact attempt pairing. A positive
+	// owner observation can repair routing, but cannot prove which lifecycle ID
+	// the backend received, so passive repair must persist fail-closed authority.
+	projectInventoryForTest(t, reopened, InventoryProjection{
+		Placements: map[string]string{"lease": "backend-a"},
+	})
+	require.Equal(t, StateConfirmed, reopened.Lookup("lease").State())
+	requireLifecycleVerdict(t, reopened, "lease", currentID, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, reopened, "lease", pendingID, LifecycleVerdictUnusable)
+	requirePersistedUnusableLifecycle(t, reopened, "lease")
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(
+		t, reopenedAgain, "lease", currentID, LifecycleVerdictUnusable,
+	)
+	requireLifecycleVerdict(
+		t, reopenedAgain, "lease", pendingID, LifecycleVerdictUnusable,
+	)
 }
 
 func TestStore_RefusedRecreationRetainsPriorLifecycleWithoutWedge(t *testing.T) {

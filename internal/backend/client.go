@@ -337,10 +337,11 @@ const (
 	DefaultCallbackApplicationTimeout = 2 * time.Minute
 
 	// DefaultCallbackDeliveryTimeout is the bundled backend sender's total
-	// inline HTTP delivery budget. It must remain strictly greater than
-	// DefaultCallbackApplicationTimeout so Fred owns the first timeout and has
-	// time to serialize a retryable response before the backend cancels the
-	// request. Quick retries share whatever remains of this budget.
+	// inline HTTP delivery budget. It remains strictly greater than
+	// DefaultCallbackApplicationTimeout so a fresh first attempt normally gives
+	// Fred time to serialize a retryable response after its application timeout.
+	// Quick retries share whatever remains of this budget, so a later attempt may
+	// reach the sender's deadline first.
 	DefaultCallbackDeliveryTimeout = DefaultCallbackApplicationTimeout + 15*time.Second
 )
 

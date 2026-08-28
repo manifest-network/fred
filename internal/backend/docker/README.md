@@ -71,7 +71,7 @@ Images are validated before pull. The registry is extracted from the image refer
 | CallbackSecret | `callback_secret` | string | *(required, min 32 chars)* | HMAC-SHA256 secret for signing callbacks |
 | CallbackInsecureSkipVerify | `callback_insecure_skip_verify` | bool | `false` | Skip TLS verification for callbacks (dev only) |
 | CallbackDBPath | `callback_db_path` | string | `"callbacks.db"` | Path to bbolt database for persisting pending callbacks |
-| CallbackMaxAge | `callback_max_age` | duration | `24h` | Maximum age of persisted callback entries before cleanup |
+| CallbackMaxAge | `callback_max_age` | duration | `24h` | Maximum age of persisted callback entries before cleanup; must be positive (the finite FIFO abandonment boundary) |
 
 Provision and restore requests carry two callback endpoints. The Docker backend
 persists the exact operation completion URL as `fred.callback_url` and the
