@@ -500,8 +500,12 @@ backend inventory and quarantines those workloads for lifecycle callbacks.
 
 The new backend binaries accept v0.13.0 tokenless callback URLs, so roll every
 backend one at a time while the old providerd remains online. Complete that
-backend-first rollout before the provider cutover. A v0.13.0 backend can accept
-the new additive request fields, but it does not persist the separate typed
+backend-first rollout before the provider cutover. v0.13.0 allowed an explicit
+`callback_max_age: 0`; before restarting each upgraded backend, replace that
+value with a positive duration because current Docker and k3s binaries reject
+zero at startup. If the key is omitted, the `24h` default remains in effect and
+no config edit is needed. A v0.13.0 backend can accept the new additive request
+fields, but it does not persist the separate typed
 `lifecycle_callback_url`; leaving one in the fleet would keep suppressing later
 restart/update completion, runtime-failure, deprovisioned, and retained
 observations after the exact provision/restore operation expires. The same

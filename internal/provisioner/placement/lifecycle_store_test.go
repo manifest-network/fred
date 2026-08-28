@@ -559,6 +559,57 @@ func TestStore_InventoryPersistsAttemptMarkerMismatchQuarantineAcrossReopen(t *t
 	requirePersistedUnusableLifecycle(t, reopenedAgain, "lease")
 }
 
+func TestStore_OutstandingAttemptWithoutPlacementRemainsUnusableAcrossReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	s, err := NewStore(dbPath)
+	require.NoError(t, err)
+	requireAdmissionBaseline(t, s, "backend-a")
+	currentOperation := requireOperationID(t, "8518")
+	currentID := lifecycleIDFromOperation(t, currentOperation)
+	currentAttempt := requireTypedAttempt(t, s, "lease", "backend-a", currentOperation)
+	confirmed, err := s.ConfirmAttempt(currentAttempt)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	pendingOperation := requireOperationID(t, "8519")
+	pendingID := lifecycleIDFromOperation(t, pendingOperation)
+	requireTypedAttempt(t, s, "lease", "backend-a", pendingOperation)
+	require.NoError(t, s.Close())
+
+	// Simulate external corruption by removing only the placement row. The
+	// valid capability still contains both the confirmed and pending IDs, but
+	// losing the placement-side attempt pairing makes both IDs unusable.
+	var originalCapability []byte
+	db, err := bolt.Open(dbPath, 0600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		originalCapability = append(
+			[]byte(nil), tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease"))...,
+		)
+		require.NotEmpty(t, originalCapability)
+		return tx.Bucket(bucketName).Delete([]byte("lease"))
+	}))
+	require.NoError(t, db.Close())
+
+	reopened, err := NewStore(dbPath)
+	require.NoError(t, err)
+	require.Equal(t, StateAbsent, reopened.Lookup("lease").State())
+	requireLifecycleVerdict(t, reopened, "lease", currentID, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, reopened, "lease", pendingID, LifecycleVerdictUnusable)
+	require.NoError(t, reopened.db.View(func(tx *bolt.Tx) error {
+		assert.Equal(t, originalCapability,
+			tx.Bucket(lifecycleCapabilityBucketName).Get([]byte("lease")),
+			"opening the store must not overwrite the original capability evidence")
+		return nil
+	}))
+	require.NoError(t, reopened.Close())
+
+	reopenedAgain, err := NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedAgain.Close() })
+	requireLifecycleVerdict(t, reopenedAgain, "lease", currentID, LifecycleVerdictUnusable)
+	requireLifecycleVerdict(t, reopenedAgain, "lease", pendingID, LifecycleVerdictUnusable)
+}
+
 func TestStore_InventoryPersistsBackendBindingMismatchQuarantineAcrossReopen(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	s, err := NewStore(dbPath)

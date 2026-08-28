@@ -305,9 +305,10 @@ func quarantineLifecycleBindings(
 			continue
 		}
 		// Placement usability is checked before lifecycle authority is exposed.
-		// Keep an independently valid capability behind that gate so a later
-		// matching repair of the durable placement can retain the exact ID. The
-		// binding checks below still quarantine any owner or attempt mismatch.
+		// Keep an independently valid capability behind that gate so a future
+		// explicit repair path can retain the exact ID. No current reconciler caller
+		// supplies such a repair. The binding checks below still quarantine any
+		// owner or attempt mismatch.
 		if placement.Backend != "" && capability.backend != placement.Backend {
 			quarantine(leaseUUID, fmt.Sprintf(
 				"capability backend %q does not match placement backend %q",
