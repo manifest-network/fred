@@ -53,6 +53,7 @@ func FuzzParsePayload(f *testing.F) {
 		}
 		if stack == nil {
 			t.Fatal("ParsePayload returned nil stack with nil error")
+			return
 		}
 
 		// Invariant 1: at least one service.
@@ -70,6 +71,7 @@ func FuzzParsePayload(f *testing.F) {
 			}
 			if svc == nil {
 				t.Fatalf("accepted service %q has nil manifest", name)
+				return
 			}
 
 			// Invariant 3: no label uses a reserved (fred/traefik/…) prefix.
