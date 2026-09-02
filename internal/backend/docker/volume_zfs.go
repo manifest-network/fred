@@ -23,6 +23,10 @@ type zfsVolumeManager struct {
 	rootWatch volumeRootWatch
 }
 
+func (z *zfsVolumeManager) PinIdentityRoot() error { return z.rootWatch.pin(z.dataPath) }
+
+func (z *zfsVolumeManager) VerifyIdentityRoot() error { return z.rootWatch.verify(z.dataPath) }
+
 // resolveParentDataset looks up the ZFS dataset name for the data path.
 func resolveParentDataset(ctx context.Context, dataPath string) (string, error) {
 	out, err := exec.CommandContext(ctx, "zfs", "list", "-H", "-o", "name", dataPath).CombinedOutput()
@@ -78,7 +82,7 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	if out, err := exec.CommandContext(ctx, "zfs", "create", "-o", "refquota="+quota, dataset).CombinedOutput(); err != nil {
 		// Best-effort cleanup in case the failed create still left a dataset
 		// behind (zfs create -o refquota is atomic, so this is defensive).
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cleanupCancel()
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "zfs", "destroy", "-f", dataset).CombinedOutput(); cleanupErr != nil {
 			z.logger.Warn("failed to cleanup zfs dataset after create failure", "dataset", dataset, "error", cleanupErr, "output", string(cleanupOut))
@@ -91,7 +95,7 @@ func (z *zfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) 
 	// canmount=noauto would cause data to land on the parent filesystem
 	// without quota enforcement.
 	if _, err := os.Stat(mountpoint); err != nil {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cleanupCancel()
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "zfs", "destroy", "-f", dataset).CombinedOutput(); cleanupErr != nil {
 			z.logger.Warn("failed to cleanup zfs dataset after mountpoint check failure", "dataset", dataset, "error", cleanupErr, "output", string(cleanupOut))
@@ -165,11 +169,11 @@ func (z *zfsVolumeManager) datasetExists(ctx context.Context, dataset string) (b
 //
 // Idempotency mirrors atomicRenameVolumeDir's semantics — if the old
 // dataset is gone and the new one exists, the rename was already done.
-func (z *zfsVolumeManager) RenameVolume(oldName, newName string) error {
+func (z *zfsVolumeManager) RenameVolume(ctx context.Context, oldName, newName string) error {
 	oldDataset := z.parentDataset + "/" + oldName
 	newDataset := z.parentDataset + "/" + newName
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	oldExists, err := z.datasetExists(ctx, oldDataset)

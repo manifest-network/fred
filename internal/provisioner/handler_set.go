@@ -324,8 +324,12 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	}
 	defer h.releaseEventLease(claim, event.LeaseUUID)
 
-	// Fetch lease details from chain to get SKU for routing
-	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)
+	// Fetch lease details from chain to get SKU for routing. The subscriber's
+	// context may live for the whole process, so bound this point read: a stalled
+	// RPC must release the lease claim and let Watermill retry.
+	leaseCtx, cancelLease := context.WithTimeout(msg.Context(), chainConfirmTimeout)
+	lease, err := h.deps.ChainClient.GetLease(leaseCtx, event.LeaseUUID)
+	cancelLease()
 	if err != nil {
 		slog.Error("failed to fetch lease details",
 			"lease_uuid", event.LeaseUUID,
@@ -333,25 +337,38 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		)
 		return fmt.Errorf("failed to fetch lease %s: %w", event.LeaseUUID, err)
 	}
-	if lease == nil {
-		slog.Warn("lease not found, cleaning up payload",
+	liveness, reason := classifyLease(lease, nil)
+	switch liveness {
+	case leaseTerminal:
+		slog.Info("payload event observed terminal lease; deleting payload",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
+			"state", leaseState(lease),
 		)
 		h.payloads.Delete(event.LeaseUUID)
 		return nil
-	}
-
-	// Verify lease is still pending
-	if lease.State != billingtypes.LEASE_STATE_PENDING {
-		slog.Warn("lease is no longer pending, skipping provisioning",
+	case leaseUnknown:
+		// Absence and unknown/future states are not terminal evidence. A lagging or
+		// reset RPC node must never delete the only manifest needed to provision or
+		// recover a live lease.
+		slog.Warn("payload event cannot confirm lease state; preserving payload for retry",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
-			"state", lease.State.String(),
+			"state", leaseState(lease),
+			"reason", reason,
 		)
-		// Clean up the stored payload
-		h.payloads.Delete(event.LeaseUUID)
-		return nil
+		return fmt.Errorf("cannot confirm payload lease %s state", event.LeaseUUID)
+	case leaseLive:
+		if lease.State == billingtypes.LEASE_STATE_ACTIVE {
+			// A delayed duplicate payload event can arrive after a successful callback.
+			// ACTIVE leases intentionally retain their manifest for crash recovery and
+			// reprovision, so acknowledge the duplicate without touching the payload.
+			slog.Debug("payload event arrived after lease became active; preserving payload",
+				"lease_uuid", event.LeaseUUID,
+				"tenant", event.Tenant,
+			)
+			return nil
+		}
 	}
 
 	// Get the payload from the store WITHOUT removing it yet.
@@ -370,12 +387,18 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		return fmt.Errorf("payload store read error: %w", err)
 	}
 	if payloadData == nil {
-		// This shouldn't happen in normal operation since payload is stored
-		// before publishing the event, but handle it gracefully
-		slog.Warn("payload not found in store, proceeding without payload",
+		// The event may outlive or race the durable payload write. Retrying is
+		// safe; dispatching without bytes is not, because the chain still names a
+		// payload-bearing request and no exact fingerprint could be persisted.
+		h.awaitingMu.Lock()
+		h.awaitingPayload[event.LeaseUUID] = struct{}{}
+		metrics.LeasesAwaitingPayload.Set(float64(len(h.awaitingPayload)))
+		h.awaitingMu.Unlock()
+		slog.Warn("payload not found in store, deferring payload event",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
 		)
+		return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, event.LeaseUUID)
 	} else if event.MetaHashHex != "" {
 		// Re-verify payload hash before provisioning to catch any corruption.
 		// The payload was validated on upload, but disk corruption could occur.
@@ -480,15 +503,4 @@ func publishLeaseStatusEvent(
 const (
 	labelBackendUnknown = "unknown"
 	labelBackendInvalid = "invalid"
-	labelStatusOther    = "other"
 )
-
-// Keep in sync with CallbackStatus* constants in internal/backend/client.go.
-func sanitizeCallbackStatus(s backend.CallbackStatus) string {
-	switch s {
-	case backend.CallbackStatusSuccess, backend.CallbackStatusFailed, backend.CallbackStatusDeprovisioned:
-		return string(s)
-	default:
-		return labelStatusOther
-	}
-}

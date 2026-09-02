@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
@@ -148,14 +149,14 @@ func TestReconcileOrphaned_ReappearanceResetsStreak(t *testing.T) {
 // Test #4: a restoring record with absent volumes is never pruned.
 func TestReconcileOrphaned_SkipsRestoringRecords(t *testing.T) {
 	b, s := newOrphanReconcileBackend(t, 1, true, nil, nil) // N=1: would prune immediately if active
-	require.NoError(t, s.Put(shared.RetentionEntry{
+	putRestoringRetention(t, s, shared.RetentionEntry{
 		OriginalLeaseUUID:   "uR",
 		Tenant:              "t1",
 		Status:              shared.RetentionStatusRestoring,
 		NewLeaseUUID:        "uNew",
 		RetainedVolumeNames: []string{"fred-retained-uR-app-0"},
 		CreatedAt:           time.Now(),
-	}))
+	})
 	pruned, err := b.reconcileOrphanedRetentions()
 	require.NoError(t, err)
 	assert.Equal(t, 0, pruned)
@@ -256,7 +257,7 @@ func TestReconcileOrphaned_PartialPresenceNeverPruned(t *testing.T) {
 	assert.NotNil(t, got, "a record with any present volume must never be pruned")
 }
 
-// Test #8: a real restore (ClaimForRestore active→restoring) racing the reconcile's
+// Test #8: a real restore (ClaimForRestoreWithAuthority active→restoring) racing the reconcile's
 // DeleteIfActive must never corrupt state — the record ends EITHER pruned (reconcile
 // won) OR restoring under the new lease (restore won), never deleted-while-restoring.
 //
@@ -270,9 +271,14 @@ func TestReconcileOrphaned_ConcurrentRestoreRace(t *testing.T) {
 
 	var sawPruned, sawRestored bool
 	for i := 0; i < 100; i++ {
+		items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
+		profiles := testResourceProfiles(t, items)
+		operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
 		require.NoError(t, s.Put(shared.RetentionEntry{
 			OriginalLeaseUUID:   "uA",
 			Tenant:              "t1",
+			Items:               items,
+			ResourceProfiles:    profiles,
 			Status:              shared.RetentionStatusActive,
 			RetainedVolumeNames: []string{"fred-retained-uA-app-0"},
 			CreatedAt:           time.Now(),
@@ -283,7 +289,14 @@ func TestReconcileOrphaned_ConcurrentRestoreRace(t *testing.T) {
 		wg.Add(2)
 		var claimErr, reconcileErr error
 		go func() { defer wg.Done(); _, reconcileErr = b.reconcileOrphanedRetentions() }()
-		go func() { defer wg.Done(); _, claimErr = s.ClaimForRestore("uA", "uNew", time.Hour) }()
+		go func() {
+			defer wg.Done()
+			_, claimErr = s.ClaimForRestoreWithAuthority(
+				"uA", "uNew", time.Hour,
+				items, profiles,
+				operationID, callbackURL, lifecycleCallbackURL,
+			)
+		}()
 		wg.Wait()
 		require.NoError(t, reconcileErr) // reconcile must not error on this happy path; guards future regressions
 
@@ -297,7 +310,7 @@ func TestReconcileOrphaned_ConcurrentRestoreRace(t *testing.T) {
 			sawRestored = true
 		} else {
 			// Reconcile won: record pruned, claim observed it gone. Assert the SPECIFIC
-			// error (record absent), so an unexpected ClaimForRestore failure
+			// error (record absent), so an unexpected ClaimForRestoreWithAuthority failure
 			// (ErrNotRestorable, store error) fails the test loudly instead of masquerading
 			// as a successful prune.
 			require.ErrorIs(t, claimErr, shared.ErrNoRetention)

@@ -12,14 +12,17 @@
 //
 // Usage:
 //
-//	MOCK_BACKEND_CALLBACK_SECRET="your-32-char-secret" ./mock-backend
+//	MOCK_BACKEND_STORAGE_ID="your-stable-uuidv4" \
+//	MOCK_BACKEND_CALLBACK_SECRET="replace-with-at-least-32-random-bytes" \
+//	MOCK_BACKEND_ADDR="127.0.0.1:9000" ./mock-backend
 //
 // Environment Variables:
 //
-//	MOCK_BACKEND_ADDR             - Listen address (default: ":9000")
+//	MOCK_BACKEND_ADDR             - Listen address (default: "127.0.0.1:9000")
 //	MOCK_BACKEND_NAME             - Backend name for logging (default: "mock-backend")
+//	MOCK_BACKEND_STORAGE_ID       - Stable canonical UUIDv4 for this mock storage (required)
 //	MOCK_BACKEND_DELAY            - Simulated provisioning delay (default: "0s")
-//	MOCK_BACKEND_CALLBACK_SECRET  - HMAC secret for callbacks (required, min 32 chars)
+//	MOCK_BACKEND_CALLBACK_SECRET  - HMAC secret for inbound requests and callbacks (required, min 32 bytes)
 //	MOCK_BACKEND_TLS_SKIP_VERIFY  - Skip TLS verification for callbacks (default: "false")
 //	MOCK_BACKEND_CLIENT_TIMEOUT   - HTTP client timeout for callbacks (default: "10s")
 //	MOCK_BACKEND_READ_TIMEOUT     - HTTP server read timeout (default: "15s")
@@ -38,9 +41,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -49,7 +52,16 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/hmacauth"
+)
+
+const (
+	defaultMockBackendAddr        = "127.0.0.1:9000"
+	mockBackendMaxRequestBodySize = 2 << 20 // 2 MiB; leaves headroom above providerd's 1 MiB tenant-body cap.
+	mockBackendSignatureMaxAge    = 5 * time.Minute
 )
 
 func main() {
@@ -60,14 +72,19 @@ func main() {
 	slog.SetDefault(logger)
 
 	// Get configuration from environment
-	addr := os.Getenv("MOCK_BACKEND_ADDR")
-	if addr == "" {
-		addr = ":9000"
-	}
+	addr := mockBackendAddr()
 
 	name := os.Getenv("MOCK_BACKEND_NAME")
 	if name == "" {
 		name = "mock-backend"
+	}
+
+	storageID, err := backendidentity.Parse(os.Getenv("MOCK_BACKEND_STORAGE_ID"))
+	if err != nil {
+		slog.Error("MOCK_BACKEND_STORAGE_ID must be a stable canonical UUIDv4",
+			"error", err,
+		)
+		os.Exit(1)
 	}
 
 	delayStr := os.Getenv("MOCK_BACKEND_DELAY")
@@ -116,14 +133,15 @@ func main() {
 		}
 	}
 
-	// Get callback secret for signing
+	// The per-backend HMAC secret authenticates requests from providerd and
+	// callbacks sent back to providerd.
 	callbackSecret := os.Getenv("MOCK_BACKEND_CALLBACK_SECRET")
 	if callbackSecret == "" {
-		slog.Error("MOCK_BACKEND_CALLBACK_SECRET is required for callback authentication")
+		slog.Error("MOCK_BACKEND_CALLBACK_SECRET is required for backend request and callback authentication")
 		os.Exit(1)
 	}
-	if len(callbackSecret) < 32 {
-		slog.Error("MOCK_BACKEND_CALLBACK_SECRET must be at least 32 characters")
+	if len(callbackSecret) < hmacauth.MinSecretLength {
+		slog.Error("MOCK_BACKEND_CALLBACK_SECRET must be at least 32 bytes")
 		os.Exit(1)
 	}
 
@@ -133,26 +151,16 @@ func main() {
 		httpClient:     httpClient,
 		callbackSecret: callbackSecret,
 		name:           name,
+		storageID:      storageID,
 		callbackURLs:   make(map[string]string),
 	}
 
 	// Set up a single callback function that routes by lease UUID
 	mockBackend.SetCallbackFunc(server.handleCallback)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /provision", server.handleProvision)
-	mux.HandleFunc("GET /info/{lease_uuid}", server.handleGetInfo)
-	mux.HandleFunc("POST /deprovision", server.handleDeprovision)
-	mux.HandleFunc("GET /provisions", server.handleListProvisions)
-	mux.HandleFunc("GET /provisions/{lease_uuid}", server.handleGetProvision)
-	mux.HandleFunc("GET /retentions", server.handleListRetentions)
-	mux.HandleFunc("GET /stats", server.handleStats)
-	mux.HandleFunc("GET /logs/{lease_uuid}", server.handleGetLogs)
-	mux.HandleFunc("GET /health", server.handleHealth)
-
 	httpServer := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      server.Handler(),
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  idleTimeout,
@@ -194,12 +202,109 @@ func main() {
 type MockBackendServer struct {
 	backend        *backend.MockBackend
 	httpClient     *http.Client
-	callbackSecret string // HMAC secret for signing callbacks
+	callbackSecret string // HMAC secret for verifying requests and signing callbacks
 	name           string // backend name, set on callback payloads for per-backend metrics
+	storageID      backendidentity.ID
 
 	// Per-lease callback URLs to avoid race conditions with concurrent provisions
 	callbackURLs   map[string]string
 	callbackURLsMu sync.Mutex
+}
+
+// Handler exposes both the legacy read/side-effect paths used by an older
+// provider and the upgraded-only identity-bound side-effect paths used by a
+// current provider. The response header and optional expected-ID query let the
+// provider prove every observation came from this configured mock lineage.
+//
+// The mock keeps its resources in memory and is development-only. Operators
+// must persist MOCK_BACKEND_STORAGE_ID alongside its deployment configuration;
+// changing it deliberately models replacing the mock's storage substrate.
+func (s *MockBackendServer) Handler() http.Handler {
+	mux := http.NewServeMux()
+	protected := func(handler http.Handler) http.Handler {
+		return s.authenticate(handler)
+	}
+	mux.Handle("POST /provision", protected(http.HandlerFunc(s.handleProvision)))
+	mux.Handle("GET /info/{lease_uuid}", protected(http.HandlerFunc(s.handleGetInfo)))
+	mux.Handle("POST /deprovision", protected(http.HandlerFunc(s.handleDeprovision)))
+	mux.Handle("GET /provisions", protected(http.HandlerFunc(s.handleListProvisions)))
+	mux.Handle("GET /provisions/{lease_uuid}", protected(http.HandlerFunc(s.handleGetProvision)))
+	mux.Handle("GET /retentions", protected(http.HandlerFunc(s.handleListRetentions)))
+	mux.Handle("GET /logs/{lease_uuid}", protected(http.HandlerFunc(s.handleGetLogs)))
+
+	// Operational endpoints remain public so local health and load probes do
+	// not need the backend's authority-bearing HMAC key.
+	mux.HandleFunc("GET /stats", s.handleStats)
+	mux.HandleFunc("GET /health", s.handleHealth)
+
+	bind := func(handler http.Handler) http.Handler {
+		bound, err := backendidentity.RequireBoundPath(s.storageID, handler)
+		if err != nil {
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "mock backend storage identity unavailable", http.StatusServiceUnavailable)
+			})
+		}
+		return bound
+	}
+	prefix := backendidentity.BoundPathPrefix + "{storage_id}"
+	mux.Handle("POST "+prefix+"/provision", bind(protected(http.HandlerFunc(s.handleProvision))))
+	mux.Handle("POST "+prefix+"/deprovision", bind(protected(http.HandlerFunc(s.handleDeprovision))))
+
+	identityHandler, err := backendidentity.ResponseMiddleware(s.storageID, mux)
+	if err != nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "mock backend storage identity unavailable", http.StatusServiceUnavailable)
+		})
+	}
+	return identityHandler
+}
+
+// authenticate verifies the same method/URI/body-bound HMAC envelope used by
+// the production backends. It also caps bodies before buffering them, so an
+// authenticated endpoint cannot be used for unbounded memory consumption.
+func (s *MockBackendServer) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(s.callbackSecret) < hmacauth.MinSecretLength {
+			slog.Error("mock backend request authentication unavailable")
+			errorResponse(w, http.StatusServiceUnavailable, "request authentication unavailable")
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, mockBackendMaxRequestBodySize)
+
+		signature := r.Header.Get(hmacauth.SignatureHeader)
+		if signature == "" {
+			slog.Warn("missing backend request signature", "remote", r.RemoteAddr, "path", r.URL.Path)
+			errorResponse(w, http.StatusUnauthorized, "missing signature")
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			slog.Warn("failed to read backend request body", "error", err, "path", r.URL.Path)
+			errorResponse(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+
+		if err := hmacauth.VerifyRequest(
+			s.callbackSecret,
+			r,
+			body,
+			signature,
+			mockBackendSignatureMaxAge,
+		); err != nil {
+			slog.Warn("backend request signature verification failed",
+				"error", err,
+				"remote", r.RemoteAddr,
+				"path", r.URL.Path,
+			)
+			errorResponse(w, http.StatusUnauthorized, "invalid signature")
+			return
+		}
+
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		next.ServeHTTP(w, r)
+	})
 }
 
 // errorBody is the declared error envelope every backend must emit for a
@@ -256,7 +361,6 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		"tenant", req.Tenant,
 		"sku", req.RoutingSKU(),
 		"quantity", req.TotalQuantity(),
-		"callback_url", req.CallbackURL,
 		"has_payload", len(req.Payload) > 0,
 	}
 	if len(req.Payload) > 0 {
@@ -271,8 +375,7 @@ func (s *MockBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 	slog.Info("provision request", logAttrs...)
 
 	// Validate callback URL format and store for this lease (thread-safe)
-	parsedURL, err := url.Parse(req.CallbackURL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+	if _, err := callbackurl.ParseEndpoint(req.CallbackURL); err != nil {
 		errorResponse(w, http.StatusBadRequest, "invalid callback_url: must be a valid http/https URL")
 		return
 	}
@@ -546,6 +649,7 @@ func (s *MockBackendServer) handleCallback(payload backend.CallbackPayload) {
 	}
 
 	payload.Backend = s.name
+	payload.BackendStorageID = s.storageID.String()
 	s.sendCallback(callbackURL, payload)
 }
 
@@ -557,14 +661,13 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 	}
 
 	slog.Info("sending callback",
-		"url", callbackURL,
 		"lease_uuid", payload.LeaseUUID,
 		"status", payload.Status,
 	)
 
 	req, err := http.NewRequest(http.MethodPost, callbackURL, bytes.NewReader(body))
 	if err != nil {
-		slog.Error("failed to create callback request", "error", err, "url", callbackURL)
+		slog.Error("failed to create callback request", "error_type", fmt.Sprintf("%T", err), "lease_uuid", payload.LeaseUUID)
 		return
 	}
 
@@ -577,13 +680,13 @@ func (s *MockBackendServer) sendCallback(callbackURL string, payload backend.Cal
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		slog.Error("failed to send callback", "error", err, "url", callbackURL)
+		slog.Error("failed to send callback", "error_type", fmt.Sprintf("%T", err), "lease_uuid", payload.LeaseUUID)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		slog.Error("callback returned error", "status", resp.StatusCode, "url", callbackURL)
+		slog.Error("callback returned error", "status", resp.StatusCode, "lease_uuid", payload.LeaseUUID)
 		return
 	}
 
@@ -614,6 +717,13 @@ func (s *MockBackendServer) computeSignature(method, uri string, payload []byte)
 	sig := hex.EncodeToString(mac.Sum(nil))
 
 	return fmt.Sprintf("t=%d,sha256=%s", timestamp, sig)
+}
+
+func mockBackendAddr() string {
+	if addr := os.Getenv("MOCK_BACKEND_ADDR"); addr != "" {
+		return addr
+	}
+	return defaultMockBackendAddr
 }
 
 // parseDurationEnv parses a duration from an environment variable with a default fallback.

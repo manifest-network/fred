@@ -82,6 +82,17 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 				}
 				b.sendLifecycleCallbackWithURL(uuid, url, status, errMsg, false)
 			},
+			SendMaintenanceCallbackFn: func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string) {
+				if b.callbackSender == nil {
+					b.logger.Error("cannot settle maintenance callback without durable sender",
+						"lease_uuid", claim.LeaseUUID())
+					return
+				}
+				if err := b.callbackSender.SendMaintenanceCallback(claim, status, errMsg); err != nil {
+					b.logger.Error("failed to settle maintenance callback; durable intent retained for recovery",
+						"lease_uuid", claim.LeaseUUID(), "maintenance_id", claim.MaintenanceID(), "error", err)
+				}
+			},
 			DoDeprovisionFn: func(ctx context.Context, leaseUUID string) error {
 				return b.doDeprovision(ctx, leaseUUID)
 			},

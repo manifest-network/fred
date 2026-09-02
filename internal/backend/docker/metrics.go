@@ -244,12 +244,35 @@ var (
 		Help:      "Total number of callback delivery attempts by outcome",
 	}, []string{"outcome"})
 
-	// callbackStoreErrorsTotal tracks bbolt persistence failures for callbacks.
+	// callbackStoreErrorsTotal tracks failures reading or writing durable
+	// callback evidence, including fail-closed interrupted-operation recovery.
 	callbackStoreErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "callback_store_errors_total",
-		Help:      "Total number of callback persistence failures (bbolt store errors)",
+		Help:      "Total failures accessing durable callback evidence, including interrupted-operation recovery.",
+	})
+
+	// pendingCloseIntents is the aggregate number of non-expiring destructive
+	// close finalizers in callbacks.db. It intentionally carries no lease label:
+	// operators use the matching oldest-age gauge to alert, then the recovery log
+	// or an offline store inspection to identify the affected lease.
+	pendingCloseIntents = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "pending_close_intents",
+		Help:      "Current number of non-expiring durable close intents awaiting finalization",
+	})
+
+	// oldestCloseIntentAgeSeconds distinguishes ordinary short-lived close
+	// finalizers from one whose retry dependency has remained unavailable. It is
+	// sampled from durable CreatedAt timestamps and resets to zero when none are
+	// pending.
+	oldestCloseIntentAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "oldest_close_intent_age_seconds",
+		Help:      "Age in seconds of the oldest pending durable close intent; 0 when none are pending",
 	})
 
 	// imagePullDurationSeconds tracks image pull duration.
@@ -848,14 +871,14 @@ var (
 	// restoreFinalizerPendingTotal counts restore finalizations kept pending: a restore
 	// succeeded (new lease Ready) but its active-release write failed, so the retention
 	// record is LEFT restoring to keep protecting the adopted volume as its finalizer
-	// (ENG-523). Reconcile sweeps retry, so a lingering record re-increments this each
-	// sweep — a sustained rate means the release store is failing (mirrors the
-	// observable-backstop role of retentionLeakedTotal).
+	// (ENG-523). The initial failed finalization increments once; reconcile sweeps retry
+	// without incrementing. Alert on increases and use the retained row plus WARN log
+	// to follow convergence rather than treating the counter value as a pending gauge.
 	restoreFinalizerPendingTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "restore_finalizer_pending_total",
-		Help:      "Restore-finalizer kept-pending events: a successful restore whose active-release write failed, so the retention record stays restoring to keep protecting the adopted volume (ENG-523). A sustained rate means the release store is failing.",
+		Help:      "Restore-finalizer kept-pending events: increments when a successful restore cannot durably commit or verify its active Release, so the retention record stays restoring to protect adopted data; reconciliation retries without incrementing (ENG-523).",
 	})
 
 	// retentionReapingBytes is the reserved disk footprint (SKU quota) of records in

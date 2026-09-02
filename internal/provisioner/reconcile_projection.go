@@ -10,7 +10,9 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
@@ -75,15 +77,55 @@ func (r *Reconciler) projectPlacementInventory(
 			}
 		}
 	}
+	// A rejected endpoint cannot contribute a placement payload, but its positive
+	// lease membership remains safety evidence. Carry that evidence into the
+	// lease-local exclusion map before any lifecycle planning can interpret the
+	// now-incomplete union as absence.
+	for leaseUUID, backendNames := range inventory.untrustedPositiveObservations {
+		excludeObservation(leaseUUID, slices.Collect(maps.Keys(backendNames))...)
+	}
 	// Inventory silence is not a remote execution barrier. A request can be
 	// durably recorded here, time out ambiguously, and commit on the backend
-	// after an arbitrarily later inventory response. Consequently, a positive
-	// observation may confirm the exact recorded owner/attempt, but absence can
-	// never clear an attempt or move a confirmed owner to another backend.
+	// after an arbitrarily later inventory response. Consequently, only a
+	// positive observation carrying the exact paired typed generation may
+	// confirm an attempt; absence can never clear one or move a confirmed owner
+	// to another backend.
 	// Contradictory positive evidence is accumulated into a durable quarantine.
 	projectionConflicts := make(map[string][]string, len(currentAmbiguities))
+	durableCandidateUnion := func(leaseUUID string, backendNames ...string) []string {
+		p := r.placementAuthority.Lookup(leaseUUID)
+		candidateSet := make(map[string]struct{}, len(backendNames)+len(p.ConflictBackends)+2)
+		for _, candidate := range append(
+			slices.Clone(p.ConflictBackends), p.Backend, p.Attempt,
+		) {
+			if candidate != "" {
+				candidateSet[candidate] = struct{}{}
+			}
+		}
+		for _, candidate := range backendNames {
+			if candidate != "" {
+				candidateSet[candidate] = struct{}{}
+			}
+		}
+		return slices.Sorted(maps.Keys(candidateSet))
+	}
 	for leaseUUID, backendNames := range currentAmbiguities {
-		projectionConflicts[leaseUUID] = slices.Clone(backendNames)
+		projectionConflicts[leaseUUID] = durableCandidateUnion(leaseUUID, backendNames...)
+	}
+	// Rejected positive payloads cannot establish an owner, but their membership
+	// fact must survive process restart. Project them into a distinct durable
+	// quarantine. A current multi-reporter conflict already carries stronger
+	// evidence and takes precedence.
+	projectionUntrustedPositives := make(
+		map[string][]string, len(inventory.untrustedPositiveObservations),
+	)
+	for leaseUUID, backendNames := range inventory.untrustedPositiveObservations {
+		if _, conflicted := projectionConflicts[leaseUUID]; conflicted {
+			continue
+		}
+		projectionUntrustedPositives[leaseUUID] = durableCandidateUnion(
+			leaseUUID, slices.Collect(maps.Keys(backendNames))...,
+		)
 	}
 	quarantineContradiction := func(
 		leaseUUID, observedBackend string,
@@ -102,10 +144,11 @@ func (r *Reconciler) projectPlacementInventory(
 			projectionConflicts[leaseUUID] = candidates
 		}
 	}
-	// A positive report may establish an absent placement or confirm the exact
-	// backend already recorded. It must never silently move a durable owner or
-	// supersede an ambiguous attempt: inventory has no causal fence against a
-	// delayed remote commit. Such contradictions are quarantined durably.
+	// A positive report may establish routing for an absent placement. It can
+	// consume an attempt only when the backend also reports its exact paired typed
+	// lifecycle generation. It must never silently move a durable owner: inventory
+	// has no causal fence against a delayed remote commit, so contradictions are
+	// quarantined durably.
 	acceptObservation := func(leaseUUID, backendName string, reporterFresh bool) bool {
 		if backendName == "" {
 			return false
@@ -127,6 +170,9 @@ func (r *Reconciler) projectPlacementInventory(
 			return false
 		}
 		if p.Conflict {
+			if inventoryComplete && p.CanResolveUntrustedPositive(backendName) {
+				return true
+			}
 			// Positive evidence can enlarge or reaffirm a conflict, but inventory
 			// silence cannot prove that any previously recorded candidate is gone.
 			// Keep the durable union until an explicit operator repair or a future
@@ -146,6 +192,9 @@ func (r *Reconciler) projectPlacementInventory(
 	}
 
 	placements := make(map[string]string, len(allProvisions)+len(allRetentions))
+	lifecycleObservations := make(
+		map[string]placement.LifecycleObservation, len(allProvisions),
+	)
 	for leaseUUID, provision := range allProvisions {
 		if _, ambiguous := projectionConflicts[leaseUUID]; ambiguous {
 			continue
@@ -157,7 +206,14 @@ func (r *Reconciler) projectPlacementInventory(
 		if acceptObservation(leaseUUID, provision.BackendName, reporterFresh) {
 			placements[leaseUUID] = provision.BackendName
 			if reporterFresh {
+				lifecycleObservations[leaseUUID] = placementLifecycleObservation(
+					provision.LifecycleGeneration,
+				)
 				freshPositiveObservations[leaseUUID] = provision.BackendName
+			} else {
+				lifecycleObservations[leaseUUID] = placement.LifecycleObservation{
+					Kind: placement.LifecycleObservationUnknown,
+				}
 			}
 		}
 	}
@@ -200,18 +256,26 @@ func (r *Reconciler) projectPlacementInventory(
 			}
 		}
 		delete(placements, leaseUUID)
+		delete(lifecycleObservations, leaseUUID)
 	}
 	// Refresh the process-local quarantine view with contradictions discovered
 	// against durable records above. Silence never removes a quarantine; positive
 	// observations can only reaffirm or enlarge its candidate union. Resolution
 	// requires explicit operator action or future causally sufficient proof.
 	result.ambiguousOwners = r.updatePlacementAmbiguities(projectionConflicts, false)
+	emptyBackends := withoutConflictCandidates(
+		inventory.emptyBackendNames(), projectionConflicts, projectionUntrustedPositives,
+	)
 	projectionResult, err := r.placementAuthority.ProjectInventory(
 		input.inventoryFence,
 		placement.InventoryProjection{
-			Complete:   inventoryComplete,
-			Placements: placements,
-			Conflicts:  projectionConflicts,
+			Complete:                 inventoryComplete,
+			BackendStorageIdentities: inventory.backendStorageIdentities,
+			EmptyBackends:            emptyBackends,
+			Placements:               placements,
+			Lifecycles:               lifecycleObservations,
+			Conflicts:                projectionConflicts,
+			UntrustedPositives:       projectionUntrustedPositives,
 		},
 	)
 	for leaseUUID := range projectionResult.Fenced {
@@ -220,6 +284,8 @@ func (r *Reconciler) projectPlacementInventory(
 			excludeObservation(leaseUUID, placements[leaseUUID])
 		case len(projectionConflicts[leaseUUID]) > 0:
 			excludeObservation(leaseUUID, projectionConflicts[leaseUUID]...)
+		case len(projectionUntrustedPositives[leaseUUID]) > 0:
+			excludeObservation(leaseUUID, projectionUntrustedPositives[leaseUUID]...)
 		default:
 			// The concrete Store currently fences only submitted placements or
 			// conflicts. Keep this fail-closed arm because ReconcilerPlacement is an
@@ -234,6 +300,9 @@ func (r *Reconciler) projectPlacementInventory(
 			excludeObservation(leaseUUID, backendName)
 		}
 		for leaseUUID, backendNames := range projectionConflicts {
+			excludeObservation(leaseUUID, backendNames...)
+		}
+		for leaseUUID, backendNames := range projectionUntrustedPositives {
 			excludeObservation(leaseUUID, backendNames...)
 		}
 		slog.Warn("failed to atomically project backend inventory", "error", err)
@@ -324,4 +393,37 @@ func (r *Reconciler) projectPlacementInventory(
 	}
 
 	return result, nil
+}
+
+func placementLifecycleObservation(
+	observation *backend.LifecycleGenerationObservation,
+) placement.LifecycleObservation {
+	if observation == nil {
+		return placement.LifecycleObservation{Kind: placement.LifecycleObservationUnknown}
+	}
+	switch observation.Kind {
+	case backend.LifecycleGenerationUnknown:
+		if observation.ID == "" {
+			return placement.LifecycleObservation{Kind: placement.LifecycleObservationUnknown}
+		}
+	case backend.LifecycleGenerationLegacy:
+		if observation.ID == "" {
+			return placement.LifecycleObservation{Kind: placement.LifecycleObservationLegacy}
+		}
+	case backend.LifecycleGenerationTyped:
+		id, err := lifecycle.ParseID(observation.ID)
+		if err == nil {
+			return placement.LifecycleObservation{
+				Kind: placement.LifecycleObservationTyped,
+				ID:   id,
+			}
+		}
+	case backend.LifecycleGenerationUnusable:
+		if observation.ID == "" {
+			return placement.LifecycleObservation{Kind: placement.LifecycleObservationUnusable}
+		}
+	}
+	// A malformed upgraded wire observation is itself evidence that lifecycle
+	// authority cannot be interpreted safely for this lease.
+	return placement.LifecycleObservation{Kind: placement.LifecycleObservationUnusable}
 }

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,10 +21,12 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 )
 
 func newTestV013PlacementAuthority(
@@ -29,7 +34,8 @@ func newTestV013PlacementAuthority(
 	placements map[string]string,
 ) *placement.Store {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "placements.db")
 	db, err := bolt.Open(dbPath, 0600, nil)
 	require.NoError(t, err)
 	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
@@ -56,7 +62,61 @@ func newTestV013PlacementAuthority(
 	}))
 	require.NoError(t, db.Close())
 
-	store, err := placement.NewStore(dbPath)
+	backendSet := make(map[string]struct{})
+	inventories := make(map[string]placement.BackendInventory)
+	for leaseUUID, backendName := range placements {
+		backendSet[backendName] = struct{}{}
+		inventory := inventories[backendName]
+		inventory.StorageIdentity = testBackendStorageID(backendName)
+		inventory.Provisions = append(inventory.Provisions, leaseUUID)
+		if inventory.ProvisionProviderUUIDs == nil {
+			inventory.ProvisionProviderUUIDs = make(map[string]string)
+		}
+		inventory.ProvisionProviderUUIDs[leaseUUID] = ""
+		if inventory.ProvisionItems == nil {
+			inventory.ProvisionItems = make(map[string][]backend.LeaseItem)
+		}
+		inventory.ProvisionItems[leaseUUID] = []backend.LeaseItem{{
+			SKU: "sku-test", Quantity: 1, ServiceName: "app",
+		}}
+		if inventory.Retentions == nil {
+			inventory.Retentions = []string{}
+		}
+		inventories[backendName] = inventory
+	}
+	backendNames := make([]string, 0, len(backendSet))
+	for backendName := range backendSet {
+		backendNames = append(backendNames, backendName)
+	}
+	slices.Sort(backendNames)
+	for backendName, inventory := range inventories {
+		slices.Sort(inventory.Provisions)
+		inventories[backendName] = inventory
+	}
+	preparer, err := placement.OpenLegacyUpgradePreparer(dbPath)
+	require.NoError(t, err)
+	leaseUUIDs := slices.Sorted(maps.Keys(placements))
+	chainProof, err := placementstore.LegacyUpgradeChainProof(testProviderUUID, leaseUUIDs...)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backupPath := filepath.Join(tempDir, "placements.v013.bak")
+	backupTarget, err := placement.BindExactBackupTarget(backupPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, backupTarget.Close()) })
+	capability, err := preparer.AuthorizePreparation(
+		ctx, testProviderUUID, backendNames, inventories, chainProof, backupTarget,
+		placement.LegacyPreparationDrainAttestation,
+	)
+	require.NoError(t, err)
+	_, err = preparer.PrepareContext(
+		ctx, testProviderUUID, backendNames, inventories,
+		chainProof, capability,
+	)
+	require.NoError(t, err)
+	require.NoError(t, preparer.Close())
+
+	store, err := placement.OpenStore(dbPath, testProviderUUID)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	return store
@@ -98,8 +158,21 @@ func (chain *callbackChainStub) RejectLeases(
 }
 
 type callbackPlacementSpy struct {
-	confirm func(string, string, operation.OperationID) (bool, error)
-	refuse  func(string, string, operation.OperationID) (bool, error)
+	confirm        func(string, string, operation.OperationID) (bool, error)
+	refuse         func(string, string, operation.OperationID) (bool, error)
+	claim          func(string, operation.OperationID) (placement.AttemptClaim, bool, error)
+	releaseClaim   func(placement.AttemptClaim) bool
+	confirmClaimed func(placement.AttemptClaim) (bool, error)
+	refuseClaimed  func(placement.AttemptClaim) (bool, error)
+}
+
+type callbackStorageIdentityResolver map[string]backendidentity.ID
+
+func (resolver callbackStorageIdentityResolver) ExpectedBackendStorageIdentity(
+	backendName string,
+) (backendidentity.ID, bool) {
+	id, ok := resolver[backendName]
+	return id, ok
 }
 
 type callbackClaimObserver struct {
@@ -138,6 +211,54 @@ func (placementSpy *callbackPlacementSpy) RefuseOperation(
 		return false, nil
 	}
 	return placementSpy.refuse(leaseUUID, backendName, id)
+}
+
+func (placementSpy *callbackPlacementSpy) ClaimAttempt(
+	leaseUUID string,
+	id operation.OperationID,
+) (placement.AttemptClaim, bool, error) {
+	if placementSpy.claim == nil {
+		return placement.AttemptClaim{}, false, nil
+	}
+	return placementSpy.claim(leaseUUID, id)
+}
+
+func (placementSpy *callbackPlacementSpy) ReleaseAttemptClaim(
+	claim placement.AttemptClaim,
+) bool {
+	if placementSpy.releaseClaim == nil {
+		return false
+	}
+	return placementSpy.releaseClaim(claim)
+}
+
+func (placementSpy *callbackPlacementSpy) ConfirmClaimedAttempt(
+	claim placement.AttemptClaim,
+) (bool, error) {
+	if placementSpy.confirmClaimed == nil {
+		return false, nil
+	}
+	return placementSpy.confirmClaimed(claim)
+}
+
+func (placementSpy *callbackPlacementSpy) RefuseClaimedAttempt(
+	claim placement.AttemptClaim,
+) (bool, error) {
+	if placementSpy.refuseClaimed == nil {
+		return false, nil
+	}
+	return placementSpy.refuseClaimed(claim)
+}
+
+func callbackPlacementStoreAdapter(store *placement.Store) *callbackPlacementSpy {
+	return &callbackPlacementSpy{
+		confirm:        store.ConfirmOperation,
+		refuse:         store.RefuseOperation,
+		claim:          store.ClaimAttempt,
+		releaseClaim:   store.ReleaseAttemptClaim,
+		confirmClaimed: store.ConfirmClaimedAttempt,
+		refuseClaimed:  store.RefuseClaimedAttempt,
+	}
 }
 
 type callbackEventRecorder struct {
@@ -185,17 +306,28 @@ func trackCallbackOperation(
 	t testing.TB,
 	registry *operation.Registry,
 	leaseUUID, backendName string,
-) operation.Token {
+) callbackOperationToken {
 	t.Helper()
-	result := registry.TryTrack(operation.TrackSpec{
+	claimResult := registry.TryClaimLeaseNow(leaseUUID)
+	require.True(t, claimResult.Acquired())
+	claim := claimResult.Claim()
+	result := registry.TryInitiateClaimed(claim, operation.TrackSpec{
 		LeaseUUID: leaseUUID,
 		Tenant:    "tenant-a",
 		Backend:   backendName,
 		Kind:      operation.KindProvision,
 	})
 	require.True(t, result.Started())
-	return result.Token()
+	initiation := result.Capability()
+	require.True(t, registry.BeginCall(initiation))
+	require.Equal(t, operation.InitiationActivated, registry.Activate(initiation))
+	require.True(t, registry.ReleaseLease(claim))
+	return callbackOperationToken{id: initiation.ID()}
 }
+
+type callbackOperationToken struct{ id operation.OperationID }
+
+func (token callbackOperationToken) ID() operation.OperationID { return token.id }
 
 func callbackWireID(t testing.TB, id operation.OperationID) string {
 	t.Helper()
@@ -203,14 +335,29 @@ func callbackWireID(t testing.TB, id operation.OperationID) string {
 	return id.String()
 }
 
+func callbackBackendStorageID(t testing.TB, value string) backendidentity.ID {
+	t.Helper()
+	id, err := backendidentity.Parse(value)
+	require.NoError(t, err)
+	return id
+}
+
 func callbackCommand(t testing.TB, callback backend.CallbackPayload) CallbackCommand {
+	t.Helper()
+	if callback.BackendStorageID == "" {
+		callback.BackendStorageID = defaultCallbackTestStorageIdentity.String()
+	}
+	return callbackCommandRaw(t, callback)
+}
+
+func callbackCommandRaw(t testing.TB, callback backend.CallbackPayload) CallbackCommand {
 	t.Helper()
 	command, err := NewCallbackCommand(callback)
 	require.NoError(t, err)
 	return command
 }
 
-func TestNewCallbackService_RequiresNonNilOperationAuthority(t *testing.T) {
+func TestNewCallbackService_RequiresCompleteAuthority(t *testing.T) {
 	_, err := NewCallbackService(CallbackServiceConfig{})
 	require.ErrorIs(t, err, errCallbackOperationsUnavailable)
 
@@ -218,10 +365,40 @@ func TestNewCallbackService_RequiresNonNilOperationAuthority(t *testing.T) {
 	_, err = NewCallbackService(CallbackServiceConfig{Operations: typedNil})
 	require.ErrorIs(t, err, errCallbackOperationsUnavailable)
 
-	service, err := NewCallbackService(CallbackServiceConfig{
+	store := newTestPlacementAuthority(t)
+	valid := CallbackServiceConfig{
 		Operations: operation.NewRegistry(),
-		Payloads:   (*typedNilCallbackPayloadStore)(nil),
-	})
+		Chain:      &callbackChainStub{},
+		Acknowledger: callbackAcknowledgerFunc(func(
+			context.Context, string,
+		) (bool, string, error) {
+			return true, "", nil
+		}),
+		Placement:          store,
+		StorageIdentities:  store,
+		LifecycleAuthority: store,
+		Payloads:           (*typedNilCallbackPayloadStore)(nil),
+	}
+	for _, test := range []struct {
+		name string
+		omit func(*CallbackServiceConfig)
+		want error
+	}{
+		{name: "chain", omit: func(cfg *CallbackServiceConfig) { cfg.Chain = nil }, want: errCallbackChainUnavailable},
+		{name: "acknowledger", omit: func(cfg *CallbackServiceConfig) { cfg.Acknowledger = nil }, want: errCallbackAcknowledgerUnavailable},
+		{name: "placement", omit: func(cfg *CallbackServiceConfig) { cfg.Placement = nil }, want: errCallbackPlacementUnavailable},
+		{name: "storage identities", omit: func(cfg *CallbackServiceConfig) { cfg.StorageIdentities = nil }, want: errCallbackStorageIdentityUnavailable},
+		{name: "lifecycle authority", omit: func(cfg *CallbackServiceConfig) { cfg.LifecycleAuthority = nil }, want: errCallbackLifecycleUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := valid
+			test.omit(&cfg)
+			_, err := NewCallbackService(cfg)
+			require.ErrorIs(t, err, test.want)
+		})
+	}
+
+	service, err := NewCallbackService(valid)
 	require.NoError(t, err)
 	assert.Nil(t, service.payloads, "typed-nil optional capabilities must be normalized")
 	require.ErrorIs(t,
@@ -231,12 +408,53 @@ func TestNewCallbackService_RequiresNonNilOperationAuthority(t *testing.T) {
 	)
 }
 
+func TestCallbackServiceRejectsMissingOrMismatchedStorageIdentityBeforeSettlement(t *testing.T) {
+	t.Parallel()
+
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	registry := operation.NewRegistry()
+	token := trackCallbackOperation(t, registry, leaseUUID, "docker-a")
+	expected := callbackBackendStorageID(t, "6ba7b811-9dad-41d1-80b4-00c04fd430c8")
+	wrong := callbackBackendStorageID(t, "550e8400-e29b-41d4-a716-446655440000")
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations:        registry,
+		StorageIdentities: callbackStorageIdentityResolver{"docker-a": expected},
+	})
+	require.NoError(t, err)
+
+	for _, test := range []struct {
+		name      string
+		storageID string
+		want      error
+	}{
+		{name: "missing", want: errCallbackStorageIdentityMissing},
+		{name: "mismatch", storageID: wrong.String(), want: errCallbackStorageIdentityMismatch},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := callbackCommandRaw(t, backend.CallbackPayload{
+				LeaseUUID:        leaseUUID,
+				Status:           backend.CallbackStatusSuccess,
+				OperationID:      callbackWireID(t, token.ID()),
+				BackendStorageID: test.storageID,
+			})
+			err := service.HandleCallback(context.Background(), command)
+			assert.ErrorIs(t, err, test.want)
+			record, exists := registry.Lookup(leaseUUID)
+			require.True(t, exists)
+			assert.Equal(t, token.ID(), record.ID)
+		})
+	}
+}
+
 type typedNilCallbackPayloadStore struct{}
 
 func (*typedNilCallbackPayloadStore) Delete(string) {}
 
 func TestNewCallbackCommand_ConvertsWireIdentityAtBoundary(t *testing.T) {
-	legacy, err := NewCallbackCommand(backend.CallbackPayload{LeaseUUID: "legacy"})
+	legacy, err := NewCallbackCommand(backend.CallbackPayload{
+		LeaseUUID: "legacy",
+		Status:    backend.CallbackStatusSuccess,
+	})
 	require.NoError(t, err)
 	assert.True(t, legacy.valid)
 	assert.Equal(t, callbackSelectorLegacy, legacy.selector)
@@ -245,6 +463,7 @@ func TestNewCallbackCommand_ConvertsWireIdentityAtBoundary(t *testing.T) {
 
 	command, err := NewCallbackCommand(backend.CallbackPayload{
 		LeaseUUID:   "typed",
+		Status:      backend.CallbackStatusSuccess,
 		OperationID: "123e4567-e89b-42d3-a456-426614174000",
 	})
 	require.NoError(t, err)
@@ -255,6 +474,7 @@ func TestNewCallbackCommand_ConvertsWireIdentityAtBoundary(t *testing.T) {
 
 	lifecycleCommand, err := NewCallbackCommand(backend.CallbackPayload{
 		LeaseUUID:   "lifecycle",
+		Status:      backend.CallbackStatusSuccess,
 		LifecycleID: "123e4567-e89b-42d3-a456-426614174001",
 	})
 	require.NoError(t, err)
@@ -268,16 +488,74 @@ func TestNewCallbackCommand_ConvertsWireIdentityAtBoundary(t *testing.T) {
 
 	_, err = NewCallbackCommand(backend.CallbackPayload{
 		LeaseUUID:   "malformed",
+		Status:      backend.CallbackStatusSuccess,
 		OperationID: "not-a-uuid",
 	})
 	assert.ErrorIs(t, err, operation.ErrInvalidID)
 
 	_, err = NewCallbackCommand(backend.CallbackPayload{
 		LeaseUUID:   "ambiguous",
+		Status:      backend.CallbackStatusSuccess,
 		OperationID: "123e4567-e89b-42d3-a456-426614174000",
 		LifecycleID: "123e4567-e89b-42d3-a456-426614174001",
 	})
 	assert.Error(t, err)
+}
+
+func TestNewCallbackCommand_RejectsStructurallyInvalidEnvelope(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload backend.CallbackPayload
+		wantErr string
+	}{
+		{
+			name:    "empty lease UUID",
+			payload: backend.CallbackPayload{Status: backend.CallbackStatusSuccess},
+			wantErr: "lease UUID is required",
+		},
+		{
+			name:    "empty status",
+			payload: backend.CallbackPayload{LeaseUUID: "lease"},
+			wantErr: "invalid callback status",
+		},
+		{
+			name: "unknown status",
+			payload: backend.CallbackPayload{
+				LeaseUUID: "lease", Status: backend.CallbackStatus("unknown"),
+			},
+			wantErr: "invalid callback status",
+		},
+		{
+			name: "retained success",
+			payload: backend.CallbackPayload{
+				LeaseUUID: "lease", Status: backend.CallbackStatusSuccess, Retained: true,
+			},
+			wantErr: "retained flag requires deprovisioned status",
+		},
+		{
+			name: "deprovisioned operation callback",
+			payload: backend.CallbackPayload{
+				LeaseUUID:   "lease",
+				Status:      backend.CallbackStatusDeprovisioned,
+				OperationID: "123e4567-e89b-42d3-a456-426614174000",
+			},
+			wantErr: "requires lifecycle or legacy authority",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command, err := NewCallbackCommand(test.payload)
+			assert.ErrorContains(t, err, test.wantErr)
+			assert.False(t, command.valid)
+		})
+	}
+
+	command, err := NewCallbackCommand(backend.CallbackPayload{
+		LeaseUUID: "non-uuid-test-lease", Status: backend.CallbackStatusDeprovisioned,
+		Retained: true,
+	})
+	require.NoError(t, err)
+	assert.True(t, command.valid, "internal test lease IDs deliberately need not be UUIDs")
 }
 
 func TestCallbackService_AuthorizesOnlyMatchingOperation(t *testing.T) {
@@ -320,7 +598,7 @@ func TestCallbackService_AuthorizesOnlyMatchingOperation(t *testing.T) {
 			lifecycleAuthority := newTestPlacementAuthority(t)
 			var placementCalls atomic.Int32
 			var acknowledgeCalls atomic.Int32
-			service, err := NewCallbackService(CallbackServiceConfig{
+			service, err := newCallbackServiceForTest(CallbackServiceConfig{
 				Operations:         registry,
 				LifecycleAuthority: lifecycleAuthority,
 				Placement: &callbackPlacementSpy{confirm: func(
@@ -362,6 +640,78 @@ func TestCallbackService_AuthorizesOnlyMatchingOperation(t *testing.T) {
 	}
 }
 
+func TestCallbackService_EventSinkPanicDoesNotRetryOrWedgeLaterCallback(t *testing.T) {
+	const leaseUUID = "lease-1"
+
+	registry := operation.NewRegistry()
+	token := trackCallbackOperation(t, registry, leaseUUID, "backend-a")
+	store := newTestPlacementAuthority(t)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	beginTestNewPlacementAttempt(t, store, leaseUUID, "backend-a", token.ID())
+
+	var publishCalls int
+	var observed []backend.LeaseStatusEvent
+	events := callbackEventSinkFunc(func(
+		leaseUUID string,
+		status backend.ProvisionStatus,
+		errMsg string,
+	) {
+		publishCalls++
+		if publishCalls == 1 {
+			panic("subscriber failure")
+		}
+		observed = append(observed, backend.LeaseStatusEvent{
+			LeaseUUID: leaseUUID,
+			Status:    status,
+			Error:     errMsg,
+		})
+	})
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations:         registry,
+		Placement:          store,
+		LifecycleAuthority: store,
+		Acknowledger: callbackAcknowledgerFunc(func(
+			context.Context, string,
+		) (bool, string, error) {
+			return true, "tx-ack", nil
+		}),
+		Events: events,
+	})
+	require.NoError(t, err)
+
+	before := promtestutil.ToFloat64(metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
+		metrics.LifecycleEventCallback,
+	))
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID:   leaseUUID,
+			Status:      backend.CallbackStatusSuccess,
+			OperationID: token.ID().String(),
+		},
+	)))
+	assert.False(t, registry.Contains(leaseUUID),
+		"an observational sink panic must not turn completed settlement into a retry")
+	assert.Equal(t, placement.StateConfirmed, store.Lookup(leaseUUID).State())
+	assert.Equal(t, before+1, promtestutil.ToFloat64(
+		metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(metrics.LifecycleEventCallback),
+	))
+
+	lifecycleID, err := lifecycle.FromOperationID(token.ID())
+	require.NoError(t, err)
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID:   leaseUUID,
+			Status:      backend.CallbackStatusFailed,
+			Error:       "runtime failure",
+			LifecycleID: lifecycleID.String(),
+		},
+	)))
+	require.Len(t, observed, 1,
+		"the callback after the panicking delivery must still reach the per-lease sink")
+	assert.Equal(t, backend.ProvisionStatusFailed, observed[0].Status)
+	assert.Equal(t, "runtime failure", observed[0].Error)
+}
+
 func TestCallbackService_SuccessSettlesExactDurableAttempt(t *testing.T) {
 	registry := operation.NewRegistry()
 	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
@@ -370,7 +720,7 @@ func TestCallbackService_SuccessSettlesExactDurableAttempt(t *testing.T) {
 	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", token.ID())
 
 	var acknowledgeCalls atomic.Int32
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations: registry,
 		Placement:  store,
 		Acknowledger: callbackAcknowledgerFunc(func(
@@ -397,6 +747,167 @@ func TestCallbackService_SuccessSettlesExactDurableAttempt(t *testing.T) {
 	assert.False(t, confirmed.AttemptOperationID().Valid())
 }
 
+func TestCallbackService_SuccessPlacementIOFailureAcknowledgesAndRecoversDurably(
+	t *testing.T,
+) {
+	const leaseUUID = "lease-success-placement-io"
+	registry := operation.NewRegistry()
+	token := trackCallbackOperation(t, registry, leaseUUID, "backend-a")
+	store := newTestPlacementAuthority(t)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	beginTestNewPlacementAttempt(t, store, leaseUUID, "backend-a", token.ID())
+
+	placementWriteErr := errors.New("placement disk temporarily unavailable")
+	placementAdapter := callbackPlacementStoreAdapter(store)
+	confirm := placementAdapter.confirm
+	var confirmCalls atomic.Int32
+	placementAdapter.confirm = func(
+		leaseUUID, backendName string,
+		operationID operation.OperationID,
+	) (bool, error) {
+		if confirmCalls.Add(1) == 1 {
+			return false, placementWriteErr
+		}
+		return confirm(leaseUUID, backendName, operationID)
+	}
+
+	var (
+		acknowledgeCalls atomic.Int32
+		timeoutRejects   atomic.Int32
+		chainActive      atomic.Bool
+	)
+	chain := &callbackChainStub{
+		getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+			state := billingtypes.LEASE_STATE_PENDING
+			if chainActive.Load() {
+				state = billingtypes.LEASE_STATE_ACTIVE
+			}
+			return &billingtypes.Lease{Uuid: leaseUUID, State: state}, nil
+		},
+		reject: func(context.Context, []string, string) (uint64, []string, error) {
+			timeoutRejects.Add(1)
+			require.True(t, chainActive.Load(),
+				"the positive callback must acknowledge before releasing its claim")
+			return 0, nil, billingtypes.ErrLeaseNotPending
+		},
+	}
+	events := &callbackEventRecorder{}
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations: registry,
+		Placement:  placementAdapter,
+		Acknowledger: callbackAcknowledgerFunc(func(
+			context.Context, string,
+		) (bool, string, error) {
+			if acknowledgeCalls.Add(1) == 1 {
+				chainActive.Store(true)
+				return true, "tx-ack", nil
+			}
+			return false, "", billingtypes.ErrLeaseNotPending
+		}),
+		Chain:  chain,
+		Events: events,
+	})
+	require.NoError(t, err)
+	callback := callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID: leaseUUID, Status: backend.CallbackStatusSuccess,
+		OperationID: token.ID().String(),
+	})
+
+	err = service.HandleCallback(context.Background(), callback)
+	require.ErrorIs(t, err, placementWriteErr)
+	assert.Equal(t, int32(1), acknowledgeCalls.Load(),
+		"placement I/O must not prevent the authoritative positive result from reaching chain")
+	record, exists := registry.Lookup(leaseUUID)
+	require.True(t, exists, "transient placement failure must preserve volatile settlement authority")
+	assert.Equal(t, operation.SettlementUnclaimed, record.Settlement)
+	assert.Equal(t, placement.StateAttempting, store.Lookup(leaseUUID).State())
+	assert.Empty(t, events.events, "Ready must wait for both chain and durable placement")
+
+	NewTimeoutChecker(TimeoutCheckerConfig{
+		Operations: registry,
+		Rejecter:   chain,
+		Timeout:    -time.Nanosecond,
+	}).CheckOnce(context.Background())
+	assert.Equal(t, int32(1), timeoutRejects.Load())
+	assert.False(t, registry.Contains(leaseUUID),
+		"an ACTIVE chain verdict lets timeout retire only the volatile operation")
+	assert.Equal(t, placement.StateAttempting, store.Lookup(leaseUUID).State(),
+		"timeout must leave exact durable evidence for callback recovery")
+
+	require.NoError(t, service.HandleCallback(context.Background(), callback))
+	assert.Equal(t, int32(2), acknowledgeCalls.Load())
+	assert.Equal(t, placement.StateConfirmed, store.Lookup(leaseUUID).State())
+	require.Len(t, events.events, 1)
+	assert.Equal(t, backend.ProvisionStatusReady, events.events[0].Status)
+}
+
+func TestCallbackService_FailurePlacementIOAfterRejectRetriesWithoutRejectingAgain(
+	t *testing.T,
+) {
+	const leaseUUID = "lease-failure-placement-io"
+	registry := operation.NewRegistry()
+	token := trackCallbackOperation(t, registry, leaseUUID, "backend-a")
+	store := newTestPlacementAuthority(t)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	beginTestNewPlacementAttempt(t, store, leaseUUID, "backend-a", token.ID())
+
+	placementWriteErr := errors.New("placement disk temporarily unavailable")
+	placementAdapter := callbackPlacementStoreAdapter(store)
+	refuse := placementAdapter.refuse
+	var refuseCalls atomic.Int32
+	placementAdapter.refuse = func(
+		leaseUUID, backendName string,
+		operationID operation.OperationID,
+	) (bool, error) {
+		if refuseCalls.Add(1) == 1 {
+			return false, placementWriteErr
+		}
+		return refuse(leaseUUID, backendName, operationID)
+	}
+
+	chainState := billingtypes.LEASE_STATE_PENDING
+	var rejectCalls atomic.Int32
+	chain := &callbackChainStub{
+		getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: leaseUUID, State: chainState}, nil
+		},
+		reject: func(context.Context, []string, string) (uint64, []string, error) {
+			rejectCalls.Add(1)
+			chainState = billingtypes.LEASE_STATE_REJECTED
+			return 1, []string{"tx-reject"}, nil
+		},
+	}
+	events := &callbackEventRecorder{}
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations: registry,
+		Placement:  placementAdapter,
+		Chain:      chain,
+		Events:     events,
+	})
+	require.NoError(t, err)
+	callback := callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID: leaseUUID, Status: backend.CallbackStatusFailed,
+		OperationID: token.ID().String(), Error: "backend refused provision",
+	})
+
+	err = service.HandleCallback(context.Background(), callback)
+	require.ErrorIs(t, err, placementWriteErr)
+	assert.Equal(t, int32(1), rejectCalls.Load())
+	record, exists := registry.Lookup(leaseUUID)
+	require.True(t, exists, "transient placement failure must preserve exact settlement")
+	assert.Equal(t, operation.SettlementUnclaimed, record.Settlement)
+	assert.Equal(t, placement.StateAttempting, store.Lookup(leaseUUID).State())
+	assert.Empty(t, events.events)
+
+	require.NoError(t, service.HandleCallback(context.Background(), callback))
+	assert.Equal(t, int32(1), rejectCalls.Load(),
+		"retry must observe the terminal chain state instead of issuing a second rejection")
+	assert.False(t, registry.Contains(leaseUUID))
+	assert.Equal(t, placement.StateAbsent, store.Lookup(leaseUUID).State())
+	require.Len(t, events.events, 1)
+	assert.Equal(t, backend.ProvisionStatusFailed, events.events[0].Status)
+}
+
 func TestCallbackService_FailureCannotClearDifferentDurableOperation(t *testing.T) {
 	registry := operation.NewRegistry()
 	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
@@ -407,7 +918,7 @@ func TestCallbackService_FailureCannotClearDifferentDurableOperation(t *testing.
 	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", newerID)
 
 	var rejectCalls atomic.Int32
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations: registry,
 		Placement:  store,
 		Chain: &callbackChainStub{
@@ -443,7 +954,7 @@ func TestCallbackService_RetryableAcknowledgeFailureReleasesExactClaim(t *testin
 	beginTestNewPlacementAttempt(t, store, "lease-1", "backend-a", token.ID())
 
 	var calls atomic.Int32
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations: registry,
 		Placement:  store,
 		Acknowledger: callbackAcknowledgerFunc(func(
@@ -496,8 +1007,8 @@ func TestCallbackService_TerminalAcknowledgeErrorUsesCurrentLeaseState(t *testin
 			wantFinished: true,
 		},
 		{
-			name:         "missing lease is terminal without ready",
-			wantFinished: true,
+			name:      "missing lease remains retryable",
+			wantRetry: true,
 		},
 		{
 			name:      "pending lease remains retryable",
@@ -522,7 +1033,7 @@ func TestCallbackService_TerminalAcknowledgeErrorUsesCurrentLeaseState(t *testin
 			token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
 			events := &callbackEventRecorder{}
 			var reads atomic.Int32
-			service, err := NewCallbackService(CallbackServiceConfig{
+			service, err := newCallbackServiceForTest(CallbackServiceConfig{
 				Operations: registry,
 				Chain: &callbackChainStub{getLease: func(
 					context.Context, string,
@@ -586,7 +1097,7 @@ func TestCallbackService_RejectResponseLossUsesCurrentLeaseState(t *testing.T) {
 	var reads atomic.Int32
 	var rejects atomic.Int32
 	var refusals atomic.Int32
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations: registry,
 		Chain: &callbackChainStub{
 			getLease: func(context.Context, string) (*billingtypes.Lease, error) {
@@ -666,8 +1177,8 @@ func TestCallbackService_FailureSettlementUsesCurrentLeaseState(t *testing.T) {
 			wantCleanup:  true,
 		},
 		{
-			name:        "missing lease finishes without rejection",
-			wantCleanup: true,
+			name:      "missing lease remains retryable",
+			wantRetry: true,
 		},
 		{
 			name:         "unknown initial state remains retryable",
@@ -699,11 +1210,11 @@ func TestCallbackService_FailureSettlementUsesCurrentLeaseState(t *testing.T) {
 			wantCleanup:  true,
 		},
 		{
-			name:         "terminal reject verdict with missing reread suppresses stale failed event",
+			name:         "terminal reject verdict with missing reread remains retryable",
 			initialLease: &billingtypes.Lease{Uuid: "lease-1", State: billingtypes.LEASE_STATE_PENDING},
 			rejectErr:    billingtypes.ErrLeaseNotFound,
 			wantReject:   true,
-			wantCleanup:  true,
+			wantRetry:    true,
 		},
 		{
 			name:         "terminal reject verdict with pending reread remains retryable",
@@ -740,7 +1251,7 @@ func TestCallbackService_FailureSettlementUsesCurrentLeaseState(t *testing.T) {
 			var reads atomic.Int32
 			var rejects atomic.Int32
 			var refusals atomic.Int32
-			service, err := NewCallbackService(CallbackServiceConfig{
+			service, err := newCallbackServiceForTest(CallbackServiceConfig{
 				Operations: registry,
 				Chain: &callbackChainStub{
 					getLease: func(context.Context, string) (*billingtypes.Lease, error) {
@@ -814,7 +1325,7 @@ func TestCallbackService_ConcurrentDuplicateCallbacksAcknowledgeOnce(t *testing.
 	acknowledgeStarted := make(chan struct{})
 	releaseAcknowledge := make(chan struct{})
 	var acknowledgeCalls atomic.Int32
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:        operations,
 		Placement:         store,
 		ClaimPollInterval: time.Millisecond,
@@ -858,54 +1369,69 @@ func TestCallbackService_ConcurrentDuplicateCallbacksAcknowledgeOnce(t *testing.
 	assert.False(t, registry.Contains("lease-1"))
 }
 
-func TestCallbackService_DeprovisionOwnedCallbackIsObservationOnly(t *testing.T) {
-	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
-	deprovision := registry.TryClaimDeprovision("lease-1", token.ID())
-	require.True(t, deprovision.Claimed())
-	events := &callbackEventRecorder{}
-	observer := &callbackDeprovisionRecorder{}
-	service, err := NewCallbackService(CallbackServiceConfig{
-		Operations:          registry,
-		Events:              events,
-		DeprovisionObserver: observer,
-		Acknowledger: callbackAcknowledgerFunc(func(
-			context.Context, string,
-		) (bool, string, error) {
-			t.Fatal("deprovision-owned callback must not acknowledge")
-			return false, "", nil
-		}),
-	})
-	require.NoError(t, err)
-	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t, backend.CallbackPayload{
-		LeaseUUID:   "lease-1",
-		Status:      backend.CallbackStatusDeprovisioned,
-		OperationID: callbackWireID(t, token.ID()),
-		Retained:    true,
-	})))
+func TestCallbackService_DeprovisionOwnedExactCallbackSettlesDurableAttemptWithoutChainMutation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		status    backend.CallbackStatus
+		wantState placement.State
+	}{
+		{name: "success confirms affinity", status: backend.CallbackStatusSuccess, wantState: placement.StateConfirmed},
+		{name: "failure refuses attempt", status: backend.CallbackStatusFailed, wantState: placement.StateAbsent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const leaseUUID = "lease-1"
+			const backendName = "backend-a"
+			registry := operation.NewRegistry()
+			token := trackCallbackOperation(t, registry, leaseUUID, backendName)
+			store := newTestPlacementAuthority(t)
+			armTestPlacementTopology(t, store, []string{backendName})
+			beginTestNewPlacementAttempt(t, store, leaseUUID, backendName, token.ID())
 
-	record, exists := registry.Lookup("lease-1")
-	require.True(t, exists)
-	assert.Equal(t, operation.SettlementDeprovision, record.Settlement)
-	assert.Equal(t, 1, observer.calls)
-	assert.Equal(t, "lease-1", observer.leaseUUID)
-	assert.Equal(t, "backend-a", observer.backendName)
-	require.Len(t, events.events, 1)
-	assert.Equal(t, backend.ProvisionStatusRetained, events.events[0].Status)
-	assert.Equal(t, retainedLeaseNotice, events.events[0].Error)
-	require.True(t, registry.FinishSettlement(deprovision.Claim()))
+			deprovision := registry.TryClaimDeprovision(leaseUUID, token.ID())
+			require.True(t, deprovision.Claimed())
+			service, err := newCallbackServiceForTest(CallbackServiceConfig{
+				Operations: registry,
+				Placement:  store,
+				Acknowledger: callbackAcknowledgerFunc(func(
+					context.Context, string,
+				) (bool, string, error) {
+					t.Fatal("deprovision-owned callback must not mutate chain state")
+					return false, "", nil
+				}),
+			})
+			require.NoError(t, err)
+			require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+				backend.CallbackPayload{
+					LeaseUUID:   leaseUUID,
+					Status:      test.status,
+					OperationID: callbackWireID(t, token.ID()),
+				},
+			)))
+
+			record, exists := registry.Lookup(leaseUUID)
+			require.True(t, exists)
+			assert.Equal(t, operation.SettlementDeprovision, record.Settlement,
+				"callback must leave close in control of the volatile operation")
+			assert.Equal(t, test.wantState, store.Lookup(leaseUUID).State())
+			assert.Empty(t, store.Lookup(leaseUUID).Attempt,
+				"a 2xx callback response must never strand its durable write-ahead attempt")
+			require.True(t, registry.FinishSettlement(deprovision.Claim()))
+			assert.False(t, registry.Contains(leaseUUID))
+		})
+	}
 }
 
 func TestCallbackService_LegacyLifecycleObservationDoesNotSettleCurrentTypedOperation(t *testing.T) {
+	const leaseUUID = "018f47a2-8b1c-7def-8123-456789abcde1"
 	registry := operation.NewRegistry()
-	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
+	token := trackCallbackOperation(t, registry, leaseUUID, "backend-a")
 	lifecycleAuthority := newTestV013PlacementAuthority(t, map[string]string{
-		"lease-1": "backend-a",
+		leaseUUID: "backend-a",
 	})
 	armTestPlacementTopology(t, lifecycleAuthority, []string{"backend-a"})
 	events := &callbackEventRecorder{}
 	observer := &callbackDeprovisionRecorder{}
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:          registry,
 		LifecycleAuthority:  lifecycleAuthority,
 		Events:              events,
@@ -929,20 +1455,20 @@ func TestCallbackService_LegacyLifecycleObservationDoesNotSettleCurrentTypedOper
 
 	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
 		backend.CallbackPayload{
-			LeaseUUID: "lease-1",
+			LeaseUUID: leaseUUID,
 			Status:    backend.CallbackStatusFailed,
 			Error:     "container exited",
 		},
 	)))
 	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
 		backend.CallbackPayload{
-			LeaseUUID: "lease-1",
+			LeaseUUID: leaseUUID,
 			Status:    backend.CallbackStatusDeprovisioned,
 			Retained:  true,
 		},
 	)))
 
-	record, exists := registry.Lookup("lease-1")
+	record, exists := registry.Lookup(leaseUUID)
 	require.True(t, exists)
 	assert.Equal(t, token.ID(), record.ID)
 	assert.Equal(t, operation.SettlementUnclaimed, record.Settlement,
@@ -956,14 +1482,15 @@ func TestCallbackService_LegacyLifecycleObservationDoesNotSettleCurrentTypedOper
 }
 
 func TestCallbackService_LegacyNonInFlightDeprovisionCannotRetireBackendCandidate(t *testing.T) {
+	const leaseUUID = "018f47a2-8b1c-7def-8123-456789abcde1"
 	registry := operation.NewRegistry()
 	lifecycleAuthority := newTestV013PlacementAuthority(t, map[string]string{
-		"lease-1": "backend-a",
+		leaseUUID: "backend-a",
 	})
 	armTestPlacementTopology(t, lifecycleAuthority, []string{"backend-a"})
 	events := &callbackEventRecorder{}
 	observer := &callbackDeprovisionRecorder{}
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:          registry,
 		LifecycleAuthority:  lifecycleAuthority,
 		Events:              events,
@@ -973,7 +1500,7 @@ func TestCallbackService_LegacyNonInFlightDeprovisionCannotRetireBackendCandidat
 
 	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
 		backend.CallbackPayload{
-			LeaseUUID: "lease-1",
+			LeaseUUID: leaseUUID,
 			Backend:   "body-supplied-backend",
 			Status:    backend.CallbackStatusDeprovisioned,
 			Retained:  true,
@@ -1004,7 +1531,7 @@ func TestCallbackService_TypedLifecycleCapabilityIsRevocableAndObservationOnly(t
 	require.NoError(t, err)
 
 	events := &callbackEventRecorder{}
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:         registry,
 		LifecycleAuthority: store,
 		Events:             events,
@@ -1070,7 +1597,7 @@ func TestCallbackService_LifecycleMetricsClassifyEveryReceivedCallback(t *testin
 	staleID, err := lifecycle.ParseID("123e4567-e89b-42d3-a456-426614174094")
 	require.NoError(t, err)
 
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:         operation.NewRegistry(),
 		LifecycleAuthority: store,
 	})
@@ -1207,7 +1734,7 @@ func TestCallbackService_LifecycleMetricsClassifyEveryReceivedCallback(t *testin
 		metricTotal(string(backend.CallbackStatusDeprovisioned))-deprovisionedTotalBefore,
 		"one lifecycle callback must increment exactly one outcome series")
 
-	noAuthority, err := NewCallbackService(CallbackServiceConfig{
+	noAuthority, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations: operation.NewRegistry(),
 	})
 	require.NoError(t, err)
@@ -1257,7 +1784,7 @@ func TestCallbackService_TeardownOnlyCapabilityAcceptsOnlyTerminalConsume(t *tes
 		store.AuthorizeLifecycle("lease-1", lifecycleID).Verdict())
 
 	events := &callbackEventRecorder{}
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:         registry,
 		LifecycleAuthority: store,
 		Events:             events,
@@ -1313,19 +1840,20 @@ func TestCallbackService_TeardownOnlyCapabilityAcceptsOnlyTerminalConsume(t *tes
 }
 
 func TestCallbackService_LegacyTeardownOnlyCapabilityIsTerminalOnly(t *testing.T) {
+	const leaseUUID = "018f47a2-8b1c-7def-8123-456789abcde2"
 	store := newTestV013PlacementAuthority(t, map[string]string{
-		"legacy": "backend-a",
+		leaseUUID: "backend-a",
 	})
 	armTestPlacementTopology(t, store, []string{"backend-a"})
-	record := store.Lookup("legacy")
+	record := store.Lookup(leaseUUID)
 	deleted, err := store.DeleteRecord(record.RecordRevision())
 	require.NoError(t, err)
 	require.True(t, deleted)
 	require.Equal(t, placement.LifecycleVerdictTeardownOnly,
-		store.AuthorizeLifecycle("legacy", lifecycle.ID{}).Verdict())
+		store.AuthorizeLifecycle(leaseUUID, lifecycle.ID{}).Verdict())
 
 	events := &callbackEventRecorder{}
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:         operation.NewRegistry(),
 		LifecycleAuthority: store,
 		Events:             events,
@@ -1333,14 +1861,14 @@ func TestCallbackService_LegacyTeardownOnlyCapabilityIsTerminalOnly(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
 		backend.CallbackPayload{
-			LeaseUUID: "legacy",
+			LeaseUUID: leaseUUID,
 			Status:    backend.CallbackStatusFailed,
 		},
 	)))
 	assert.Empty(t, events.events)
 
 	terminal := backend.CallbackPayload{
-		LeaseUUID: "legacy",
+		LeaseUUID: leaseUUID,
 		Status:    backend.CallbackStatusDeprovisioned,
 		Retained:  true,
 	}
@@ -1350,7 +1878,7 @@ func TestCallbackService_LegacyTeardownOnlyCapabilityIsTerminalOnly(t *testing.T
 	require.Len(t, events.events, 1)
 	assert.Equal(t, backend.ProvisionStatusRetained, events.events[0].Status)
 	assert.Equal(t, placement.LifecycleVerdictMissing,
-		store.AuthorizeLifecycle("legacy", lifecycle.ID{}).Verdict())
+		store.AuthorizeLifecycle(leaseUUID, lifecycle.ID{}).Verdict())
 }
 
 func TestCallbackService_PlacementConflictWithdrawsLifecycleObservationAuthority(t *testing.T) {
@@ -1377,7 +1905,7 @@ func TestCallbackService_PlacementConflictWithdrawsLifecycleObservationAuthority
 	)
 
 	events := &callbackEventRecorder{}
-	service, err := NewCallbackService(CallbackServiceConfig{
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:         operation.NewRegistry(),
 		LifecycleAuthority: store,
 		Events:             events,
@@ -1406,7 +1934,7 @@ func TestCallbackService_PlacementConflictWithdrawsLifecycleObservationAuthority
 func TestCallbackService_MissingMutationCapabilityFailsClosedAndReleasesClaim(t *testing.T) {
 	registry := operation.NewRegistry()
 	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
-	service, err := NewCallbackService(CallbackServiceConfig{Operations: registry})
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{Operations: registry})
 	require.NoError(t, err)
 
 	err = service.HandleCallback(context.Background(), callbackCommand(t, backend.CallbackPayload{
@@ -1423,4 +1951,603 @@ func TestCallbackService_MissingMutationCapabilityFailsClosedAndReleasesClaim(t 
 	claim := registry.TryClaimCallback("lease-1", token.ID())
 	require.True(t, claim.Claimed(), "failed callback must release its exact claim")
 	require.True(t, registry.FinishSettlement(claim.Claim()))
+}
+
+func TestCallbackService_ExactCallbackWithoutRegistryRequiresDurablePlacementAuthority(t *testing.T) {
+	registry := operation.NewRegistry()
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{Operations: registry})
+	require.NoError(t, err)
+	operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174099")
+	require.NoError(t, err)
+
+	err = service.HandleCallback(context.Background(), callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID:   "lease-1",
+		Backend:     "backend-a",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: callbackWireID(t, operationID),
+	}))
+	require.ErrorIs(t, err, errCallbackPlacementUnavailable)
+	_, exists := registry.Lookup("lease-1")
+	assert.False(t, exists,
+		"an exact callback must not manufacture volatile authority without durable placement")
+}
+
+func TestCallbackService_MissingStorageIdentityAuthorityFailsClosed(t *testing.T) {
+	registry := operation.NewRegistry()
+	token := trackCallbackOperation(t, registry, "lease-1", "backend-a")
+	service, err := newCallbackService(CallbackServiceConfig{
+		Operations: registry,
+	})
+	require.NoError(t, err)
+
+	err = service.HandleCallback(context.Background(), callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID:        "lease-1",
+		Backend:          "backend-a",
+		Status:           backend.CallbackStatusSuccess,
+		OperationID:      callbackWireID(t, token.ID()),
+		BackendStorageID: "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+	}))
+	require.ErrorIs(t, err, errCallbackStorageIdentityUnavailable)
+	record, exists := registry.Lookup("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, operation.SettlementUnclaimed, record.Settlement)
+
+	claim := registry.TryClaimCallback("lease-1", token.ID())
+	require.True(t, claim.Claimed(), "failed identity verification must release exact settlement")
+	require.True(t, registry.FinishSettlement(claim.Claim()))
+}
+
+func TestCallbackService_RecoversExactDurableAttemptWithoutRegistryRecord(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     backend.CallbackStatus
+		wantState  placement.State
+		wantAck    int
+		wantReject int
+	}{
+		{
+			name:      "success confirms and acknowledges",
+			status:    backend.CallbackStatusSuccess,
+			wantState: placement.StateConfirmed,
+			wantAck:   1,
+		},
+		{
+			name:       "failure refuses and rejects",
+			status:     backend.CallbackStatusFailed,
+			wantState:  placement.StateAbsent,
+			wantReject: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestPlacementAuthority(t)
+			armTestPlacementTopology(t, store, []string{"backend-a"})
+			operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174090")
+			require.NoError(t, err)
+			beginTestNewPlacementAttempt(t, store, "lease-recovered", "backend-a", operationID)
+
+			var acknowledgeCalls atomic.Int32
+			var rejectCalls atomic.Int32
+			operations := operation.NewRegistry()
+			operations.BeginDrain()
+			service, err := newCallbackServiceForTest(CallbackServiceConfig{
+				Operations: operations,
+				Placement:  store,
+				Acknowledger: callbackAcknowledgerFunc(func(
+					context.Context, string,
+				) (bool, string, error) {
+					acknowledgeCalls.Add(1)
+					return true, "tx-ack", nil
+				}),
+				Chain: &callbackChainStub{
+					getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+						return &billingtypes.Lease{
+							Uuid: "lease-recovered", State: billingtypes.LEASE_STATE_PENDING,
+						}, nil
+					},
+					reject: func(context.Context, []string, string) (uint64, []string, error) {
+						rejectCalls.Add(1)
+						return 1, []string{"tx-reject"}, nil
+					},
+				},
+				LifecycleAuthority: store,
+			})
+			require.NoError(t, err)
+
+			require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+				backend.CallbackPayload{
+					LeaseUUID:   "lease-recovered",
+					Status:      tt.status,
+					Error:       "backend refused",
+					Backend:     "body-controlled-backend",
+					OperationID: operationID.String(),
+				},
+			)))
+
+			current := store.Lookup("lease-recovered")
+			assert.Equal(t, tt.wantState, current.State())
+			assert.Empty(t, current.Attempt)
+			assert.False(t, current.AttemptOperationID().Valid())
+			assert.Equal(t, int32(tt.wantAck), acknowledgeCalls.Load())
+			assert.Equal(t, int32(tt.wantReject), rejectCalls.Load())
+			if tt.wantState == placement.StateConfirmed {
+				assert.Equal(t, "backend-a", current.Backend,
+					"the callback body must not select recovered ownership")
+			}
+		})
+	}
+}
+
+func TestCallbackService_RecoveredFailureRetainsAttemptAcrossUnknownChainRead(t *testing.T) {
+	store := newTestPlacementAuthority(t)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	operationID, err := operation.ParseID("a65e5ccb-2423-45be-8fc2-01388b16728e")
+	require.NoError(t, err)
+	beginTestNewPlacementAttempt(t, store, "lease-recovered-lag", "backend-a", operationID)
+
+	payloads := &callbackPayloadRecorder{}
+	var reads atomic.Int32
+	var rejects atomic.Int32
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations: operation.NewRegistry(),
+		Placement:  store,
+		Chain: &callbackChainStub{
+			getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+				if reads.Add(1) == 1 {
+					return nil, nil
+				}
+				return &billingtypes.Lease{
+					Uuid: "lease-recovered-lag", State: billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			},
+			reject: func(context.Context, []string, string) (uint64, []string, error) {
+				rejects.Add(1)
+				return 1, []string{"tx-reject"}, nil
+			},
+		},
+		Payloads:           payloads,
+		LifecycleAuthority: store,
+	})
+	require.NoError(t, err)
+	command := callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID:   "lease-recovered-lag",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "backend refused",
+		OperationID: operationID.String(),
+	})
+
+	err = service.HandleCallback(context.Background(), command)
+	require.ErrorContains(t, err, "unknown state")
+	assert.Equal(t, placement.StateAttempting, store.Lookup("lease-recovered-lag").State(),
+		"an absent RPC view cannot erase exact redelivery authority")
+	assert.Empty(t, payloads.deleted,
+		"an absent RPC view cannot erase the payload needed by a later sweep")
+	assert.Zero(t, rejects.Load())
+
+	require.NoError(t, service.HandleCallback(context.Background(), command))
+	assert.Equal(t, placement.StateAbsent, store.Lookup("lease-recovered-lag").State())
+	assert.Equal(t, []string{"lease-recovered-lag"}, payloads.deleted)
+	assert.Equal(t, int32(1), rejects.Load())
+}
+
+func TestCallbackService_RecoveredFailureFencesOlderPositiveInventory(t *testing.T) {
+	store := newTestPlacementAuthority(t)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174091")
+	require.NoError(t, err)
+	beginTestNewPlacementAttempt(t, store, "lease-race", "backend-a", operationID)
+
+	// Register the inventory snapshot before callback recovery claims the
+	// attempt. Projection happens while chain settlement is blocked.
+	fence := store.BeginInventorySession()
+	getLeaseEntered := make(chan struct{})
+	allowGetLease := make(chan struct{})
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations: operation.NewRegistry(),
+		Placement:  store,
+		Chain: &callbackChainStub{
+			getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+				close(getLeaseEntered)
+				<-allowGetLease
+				return &billingtypes.Lease{
+					Uuid: "lease-race", State: billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			},
+			reject: func(context.Context, []string, string) (uint64, []string, error) {
+				return 1, []string{"tx-reject"}, nil
+			},
+		},
+		LifecycleAuthority: store,
+	})
+	require.NoError(t, err)
+
+	command := callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID:   "lease-race",
+		Status:      backend.CallbackStatusFailed,
+		OperationID: operationID.String(),
+	})
+	callbackResult := make(chan error, 1)
+	go func() {
+		callbackResult <- service.HandleCallback(context.Background(), command)
+	}()
+	<-getLeaseEntered
+
+	projection, err := store.ProjectInventory(fence, placement.InventoryProjection{
+		Placements: map[string]string{"lease-race": "backend-a"},
+	})
+	store.EndInventorySession(fence)
+	require.NoError(t, err)
+	assert.Contains(t, projection.Fenced, "lease-race",
+		"positive inventory cannot overtake a claimed negative callback")
+	assert.Equal(t, placement.StateAttempting, store.Lookup("lease-race").State())
+
+	close(allowGetLease)
+	require.NoError(t, <-callbackResult)
+	assert.Equal(t, placement.StateAbsent, store.Lookup("lease-race").State())
+}
+
+func TestCallbackService_RecoveredAttemptReleasesClaimForChainRetry(t *testing.T) {
+	store := newTestPlacementAuthority(t)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174092")
+	require.NoError(t, err)
+	beginTestNewPlacementAttempt(t, store, "lease-retry", "backend-a", operationID)
+
+	var calls atomic.Int32
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations: operation.NewRegistry(),
+		Placement:  store,
+		Acknowledger: callbackAcknowledgerFunc(func(
+			context.Context, string,
+		) (bool, string, error) {
+			if calls.Add(1) == 1 {
+				return false, "", errors.New("temporary chain outage")
+			}
+			return true, "tx-ack", nil
+		}),
+		LifecycleAuthority: store,
+	})
+	require.NoError(t, err)
+	command := callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID:   "lease-retry",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
+	})
+
+	err = service.HandleCallback(context.Background(), command)
+	require.ErrorIs(t, err, ErrAcknowledgeFailed)
+	assert.Equal(t, placement.StateAttempting, store.Lookup("lease-retry").State(),
+		"retryable chain failure must preserve the durable recovery authority")
+	require.NoError(t, service.HandleCallback(context.Background(), command))
+	assert.Equal(t, placement.StateConfirmed, store.Lookup("lease-retry").State())
+	assert.Equal(t, int32(2), calls.Load())
+}
+
+func TestCallbackService_RecoveredCallbackFencesPlanAndDeprovision(t *testing.T) {
+	const leaseUUID = "lease-recovery-claim"
+	store := newTestPlacementAuthority(t)
+	armTestPlacementTopology(t, store, []string{"backend-a"})
+	operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174093")
+	require.NoError(t, err)
+	beginTestNewPlacementAttempt(t, store, leaseUUID, "backend-a", operationID)
+
+	tracker := newTestOperationRegistry()
+	registry := tracker.Operations()
+	backendClient := &mockManagerBackend{name: "backend-a"}
+	router := &mockBackendRouter{
+		routeFn: func(string) backend.Backend { return backendClient },
+		getBackendByNameFn: func(name string) backend.Backend {
+			if name == backendClient.name {
+				return backendClient
+			}
+			return nil
+		},
+		backendsFn: func() []backend.Backend { return []backend.Backend{backendClient} },
+	}
+	orchestrator := newTestProvisionOrchestrator(
+		t, "provider-a", "http://callback.example", router, tracker, store,
+	)
+
+	acknowledgeEntered := make(chan struct{})
+	releaseAcknowledge := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseAcknowledge) }) })
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations: registry,
+		Placement:  store,
+		Acknowledger: callbackAcknowledgerFunc(func(
+			context.Context, string,
+		) (bool, string, error) {
+			close(acknowledgeEntered)
+			<-releaseAcknowledge
+			return true, "tx-ack", nil
+		}),
+	})
+	require.NoError(t, err)
+	command := callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID: leaseUUID, Status: backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
+	})
+
+	callbackResult := make(chan error, 1)
+	go func() { callbackResult <- service.HandleCallback(context.Background(), command) }()
+	<-acknowledgeEntered
+
+	assert.Equal(t, operation.LeaseClaimBusy, registry.TryClaimLeaseNow(leaseUUID).Outcome(),
+		"a competing plan action cannot cross callback recovery")
+	deprovisionErr := orchestrator.Deprovision(context.Background(), leaseUUID)
+	require.ErrorIs(t, deprovisionErr, ErrDeprovisionFailed)
+	backendClient.mu.Lock()
+	assert.Empty(t, backendClient.deprovisionCalls,
+		"deprovision must not contact a backend while callback recovery owns the lease")
+	backendClient.mu.Unlock()
+
+	releaseOnce.Do(func() { close(releaseAcknowledge) })
+	require.NoError(t, <-callbackResult)
+	assert.Equal(t, placement.StateConfirmed, store.Lookup(leaseUUID).State())
+	available := registry.TryClaimLeaseNow(leaseUUID)
+	require.True(t, available.Acquired(), "callback must release its exact Registry capability")
+	require.True(t, registry.ReleaseLease(available.Claim()))
+}
+
+func TestCallbackService_InventoryConfirmedGenerationSettlesChainWithoutDemotion(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      backend.CallbackStatus
+		chainState  billingtypes.LeaseState
+		wantAck     int32
+		wantReads   int32
+		wantRejects int32
+		wantEvent   backend.ProvisionStatus
+	}{
+		{
+			name: "later success acknowledges", status: backend.CallbackStatusSuccess,
+			chainState: billingtypes.LEASE_STATE_PENDING, wantAck: 1,
+			wantEvent: backend.ProvisionStatusReady,
+		},
+		{
+			name: "active stale failure preserves live owner", status: backend.CallbackStatusFailed,
+			chainState: billingtypes.LEASE_STATE_ACTIVE, wantReads: 1,
+		},
+		{
+			name: "pending failure still rejects and settles", status: backend.CallbackStatusFailed,
+			chainState: billingtypes.LEASE_STATE_PENDING, wantReads: 1,
+			wantRejects: 1, wantEvent: backend.ProvisionStatusFailed,
+		},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			const leaseUUID = "lease-inventory-before-callback"
+			dbPath := filepath.Join(t.TempDir(), "placements.db")
+			storeBeforeRestart, err := placementstore.NewStore(dbPath)
+			require.NoError(t, err)
+			armTestPlacementTopology(t, storeBeforeRestart, []string{"backend-a"})
+			operationID, err := operation.ParseID(fmt.Sprintf(
+				"123e4567-e89b-42d3-a456-4266141741%02d", index,
+			))
+			require.NoError(t, err)
+			generation, err := lifecycle.FromOperationID(operationID)
+			require.NoError(t, err)
+			beginTestNewPlacementAttempt(
+				t, storeBeforeRestart, leaseUUID, "backend-a", operationID,
+			)
+			projectTestPlacementInventory(t, storeBeforeRestart, []string{"backend-a"}, placement.InventoryProjection{
+				Placements: map[string]string{leaseUUID: "backend-a"},
+				Lifecycles: map[string]placement.LifecycleObservation{
+					leaseUUID: {
+						Kind: placement.LifecycleObservationTyped,
+						ID:   generation,
+					},
+				},
+			})
+			require.NoError(t, storeBeforeRestart.Close())
+
+			store, err := placementstore.NewStore(dbPath)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			before := store.Lookup(leaseUUID)
+			require.Equal(t, placement.StateConfirmed, before.State())
+			require.Empty(t, before.Attempt)
+
+			registry := operation.NewRegistry()
+			var acknowledgeCalls atomic.Int32
+			var chainReads atomic.Int32
+			var rejectCalls atomic.Int32
+			events := &callbackEventRecorder{}
+			service, err := newCallbackServiceForTest(CallbackServiceConfig{
+				Operations: registry,
+				Placement:  store,
+				Acknowledger: callbackAcknowledgerFunc(func(
+					context.Context, string,
+				) (bool, string, error) {
+					acknowledgeCalls.Add(1)
+					return true, "tx-ack", nil
+				}),
+				Chain: &callbackChainStub{
+					getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+						chainReads.Add(1)
+						return &billingtypes.Lease{
+							Uuid: leaseUUID, State: test.chainState,
+						}, nil
+					},
+					reject: func(context.Context, []string, string) (uint64, []string, error) {
+						rejectCalls.Add(1)
+						return 1, []string{"tx-reject"}, nil
+					},
+				},
+				Events: events,
+			})
+			require.NoError(t, err)
+
+			require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+				backend.CallbackPayload{
+					LeaseUUID: leaseUUID, Status: test.status,
+					OperationID: operationID.String(), Error: "stale failure",
+				},
+			)))
+			assert.Equal(t, test.wantAck, acknowledgeCalls.Load())
+			assert.Equal(t, test.wantReads, chainReads.Load())
+			assert.Equal(t, test.wantRejects, rejectCalls.Load())
+			if test.wantEvent != "" {
+				require.Len(t, events.events, 1)
+				assert.Equal(t, test.wantEvent, events.events[0].Status)
+			} else {
+				assert.Empty(t, events.events)
+			}
+			assert.Equal(t, before, store.Lookup(leaseUUID),
+				"inventory-confirmed ownership must remain exact and unchanged")
+			available := registry.TryClaimLeaseNow(leaseUUID)
+			require.True(t, available.Acquired())
+			require.True(t, registry.ReleaseLease(available.Claim()))
+		})
+	}
+}
+
+func TestCallbackService_PendingFailureSettlesAttemptWithOlderObservedOwner(t *testing.T) {
+	const leaseUUID = "lease-older-generation-before-failure"
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	storeBeforeRestart, err := placementstore.NewStore(dbPath)
+	require.NoError(t, err)
+	armTestPlacementTopology(t, storeBeforeRestart, []string{"backend-a"})
+	newOperationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174110")
+	require.NoError(t, err)
+	olderOperationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174109")
+	require.NoError(t, err)
+	olderGeneration, err := lifecycle.FromOperationID(olderOperationID)
+	require.NoError(t, err)
+	beginTestNewPlacementAttempt(
+		t, storeBeforeRestart, leaseUUID, "backend-a", newOperationID,
+	)
+	projectTestPlacementInventory(t, storeBeforeRestart, []string{"backend-a"}, placement.InventoryProjection{
+		Placements: map[string]string{leaseUUID: "backend-a"},
+		Lifecycles: map[string]placement.LifecycleObservation{
+			leaseUUID: {
+				Kind: placement.LifecycleObservationTyped,
+				ID:   olderGeneration,
+			},
+		},
+	})
+	beforeRestart := storeBeforeRestart.Lookup(leaseUUID)
+	require.Equal(t, placement.StateConfirmed, beforeRestart.State())
+	require.Equal(t, "backend-a", beforeRestart.Attempt)
+	require.Equal(t, newOperationID, beforeRestart.AttemptOperationID())
+	require.NoError(t, storeBeforeRestart.Close())
+
+	store, err := placementstore.NewStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	current := store.CurrentLifecycle(leaseUUID)
+	require.Equal(t, placement.LifecycleVerdictTeardownOnly, current.Verdict(),
+		"an unresolved newer attempt must fence reissuing the older generation for maintenance")
+	require.Equal(t, "backend-a", current.Backend())
+
+	var chainReads atomic.Int32
+	var rejectCalls atomic.Int32
+	events := &callbackEventRecorder{}
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations: operation.NewRegistry(),
+		Placement:  store,
+		Chain: &callbackChainStub{
+			getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+				chainReads.Add(1)
+				return &billingtypes.Lease{
+					Uuid: leaseUUID, State: billingtypes.LEASE_STATE_PENDING,
+				}, nil
+			},
+			reject: func(context.Context, []string, string) (uint64, []string, error) {
+				rejectCalls.Add(1)
+				return 1, []string{"tx-reject"}, nil
+			},
+		},
+		Events: events,
+	})
+	require.NoError(t, err)
+	require.NoError(t, service.HandleCallback(context.Background(), callbackCommand(t,
+		backend.CallbackPayload{
+			LeaseUUID: leaseUUID, Status: backend.CallbackStatusFailed,
+			OperationID: newOperationID.String(), Error: "new attempt failed",
+		},
+	)))
+
+	assert.Equal(t, int32(1), chainReads.Load())
+	assert.Equal(t, int32(1), rejectCalls.Load())
+	require.Len(t, events.events, 1)
+	assert.Equal(t, backend.ProvisionStatusFailed, events.events[0].Status)
+	settled := store.Lookup(leaseUUID)
+	assert.Equal(t, placement.StateConfirmed, settled.State())
+	assert.Equal(t, "backend-a", settled.Backend)
+	assert.Empty(t, settled.Attempt)
+	assert.False(t, settled.AttemptOperationID().Valid())
+	current = store.CurrentLifecycle(leaseUUID)
+	assert.True(t, current.Authorized())
+	assert.Equal(t, olderGeneration, current.ID(),
+		"failure of the newer attempt must not rotate or demote the older observed owner")
+}
+
+func TestCallbackService_RegistryBackedRestoreFencesRecoveredCallback(t *testing.T) {
+	const (
+		sourceLease = "restore-source"
+		targetLease = "restore-target"
+	)
+	store := newTestPlacementAuthority(t)
+	seedTestConfirmedPlacements(t, store, []string{"backend-a"}, map[string]string{
+		sourceLease: "backend-a",
+	})
+	registry := operation.NewRegistry()
+	targetClaim := registry.TryClaimLeaseNow(targetLease)
+	require.True(t, targetClaim.Acquired())
+	initiated := registry.TryInitiateClaimed(targetClaim.Claim(), operation.TrackSpec{
+		LeaseUUID: targetLease, Tenant: "tenant-a", Kind: operation.KindRestore,
+	})
+	require.True(t, initiated.Started())
+	initiation := initiated.Capability()
+	restoreClaim, err := store.BeginAuthorizedRestore(
+		store.CurrentAdmissionBaseline(),
+		store.Lookup(sourceLease).RecordRevision(),
+		targetLease,
+		initiation.ID(),
+		testBackendRequestSnapshot(t),
+		testPlacementCallbackPair(t, initiation.ID()),
+	)
+	require.NoError(t, err)
+	require.True(t, registry.BindBackend(initiation, "backend-a"))
+	require.True(t, registry.BeginCall(initiation))
+	require.Equal(t, operation.InitiationAborted, registry.AbortInitiation(initiation))
+	assert.False(t, registry.Contains(targetLease),
+		"the recovery window begins after synchronous restore removes its operation")
+
+	var acknowledgeCalls atomic.Int32
+	service, err := newCallbackServiceForTest(CallbackServiceConfig{
+		Operations: registry,
+		Placement:  store,
+		Acknowledger: callbackAcknowledgerFunc(func(
+			context.Context, string,
+		) (bool, string, error) {
+			acknowledgeCalls.Add(1)
+			return true, "tx-ack", nil
+		}),
+	})
+	require.NoError(t, err)
+	command := callbackCommand(t, backend.CallbackPayload{
+		LeaseUUID: targetLease, Status: backend.CallbackStatusSuccess,
+		OperationID: initiation.ID().String(),
+	})
+
+	err = service.HandleCallback(context.Background(), command)
+	require.ErrorIs(t, err, errCallbackRecoveryLeaseBusy)
+	assert.Zero(t, acknowledgeCalls.Load())
+	assert.Equal(t, placement.StateAttempting, store.Lookup(targetLease).State())
+
+	confirmed, err := store.ConfirmRestore(restoreClaim)
+	require.NoError(t, err)
+	require.True(t, confirmed)
+	require.True(t, registry.ReleaseLease(targetClaim.Claim()))
+
+	require.NoError(t, service.HandleCallback(context.Background(), command))
+	assert.Equal(t, int32(1), acknowledgeCalls.Load(),
+		"retry uses the exact restore lifecycle generation after Registry exclusion ends")
+	assert.Equal(t, placement.StateConfirmed, store.Lookup(targetLease).State())
+	assert.Equal(t, "backend-a", store.Lookup(targetLease).Backend)
 }

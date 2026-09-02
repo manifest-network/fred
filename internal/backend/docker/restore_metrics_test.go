@@ -2,9 +2,11 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +19,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+)
+
+const (
+	restoreMetricsSourceLease = "11111111-1111-4111-8111-111111111111"
+	restoreMetricsTargetLease = "22222222-2222-4222-8222-222222222222"
 )
 
 // observerSampleCount reads the number of observations recorded by a prometheus
@@ -39,9 +47,13 @@ func observerSampleCount(t *testing.T, o prometheus.Observer) uint64 {
 // internal phases (image_setup, volume_setup, compose_up, verify_startup),
 // labeled by the operation it was invoked for ("restart" here).
 func TestReplaceContainers_RecordsPhaseDurationsByOperation(t *testing.T) {
+	var strictContainers []ContainerInfo
 	mock := &mockDockerClient{
 		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
 			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
+		},
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return append([]ContainerInfo(nil), strictContainers...), nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
@@ -56,16 +68,92 @@ func TestReplaceContainers_RecordsPhaseDurationsByOperation(t *testing.T) {
 	}
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	profile, err := b.cfg.GetSKUProfile("docker-small")
+	const (
+		leaseUUID    = "11111111-1111-4111-8111-111111111113"
+		providerUUID = "22222222-2222-4222-8222-222222222223"
+	)
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}}
+	profiles := testResourceProfiles(t, items)
+	stack := restoreStackManifest()
+	manifestBytes, err := json.Marshal(stack)
+	require.NoError(t, err)
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	runtimeAuthority := mustTestReleaseRuntimeAuthority(
+		t, operationID, "tenant-a", providerUUID, callbackURL, lifecycleCallbackURL,
+	)
+
+	releases := attachReleaseStore(t, b)
+	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
+		Manifest:         manifestBytes,
+		Image:            "stack",
+		OperationID:      operationID,
+		Items:            items,
+		ResourceProfiles: profiles,
+		RuntimeAuthority: runtimeAuthority,
+		Status:           "active",
+		CreatedAt:        time.Now(),
+	}))
+	active, sourceClaim, err := releases.ClaimLatestActive(leaseUUID)
+	require.NoError(t, err)
+	source, err := newReplaceSourceSnapshot(active)
 	require.NoError(t, err)
 
+	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "maintenance.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, callbacks.Close()) })
+	admission, err := callbacks.BeginMaintenanceIntent(shared.MaintenanceIntentSpec{
+		Kind:          shared.MaintenanceIntentRestart,
+		SourceRelease: sourceClaim,
+		TargetRelease: shared.Release{
+			Manifest:         manifestBytes,
+			Image:            "stack",
+			OperationID:      operationID,
+			Items:            items,
+			ResourceProfiles: profiles,
+			RuntimeAuthority: runtimeAuthority,
+			Status:           "deploying",
+			CreatedAt:        time.Now(),
+		},
+		Backend:          b.Name(),
+		BackendStorageID: b.storageIdentity,
+	})
+	require.NoError(t, err)
+	appendClaim, err := callbacks.StartMaintenanceAppend(admission)
+	require.NoError(t, err)
+	targetRelease, err := releases.AppendMaintenance(appendClaim)
+	require.NoError(t, err)
+	maintenance, err := callbacks.BindMaintenanceIntentTarget(appendClaim.Intent(), targetRelease)
+	require.NoError(t, err)
+	strictContainers = []ContainerInfo{{
+		ContainerID:          "c1",
+		LeaseUUID:            leaseUUID,
+		Tenant:               "tenant-a",
+		ProviderUUID:         providerUUID,
+		SKU:                  "docker-small",
+		ServiceName:          manifest.DefaultServiceName,
+		InstanceIndex:        0,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		MaintenanceID:        maintenance.MaintenanceID(),
+		Image:                "nginx:latest",
+		Status:               "running",
+	}}
+
 	op := replaceContainersOp{
-		LeaseUUID: "lease-1",
-		Stack:     restoreStackManifest(),
-		Items:     []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		Profiles:  map[string]SKUProfile{"docker-small": profile},
-		Operation: "restart",
-		Logger:    b.logger,
+		LeaseUUID:            leaseUUID,
+		Stack:                stack,
+		Items:                items,
+		ResourceProfiles:     profiles,
+		Operation:            "restart",
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		Maintenance:          maintenance,
+		TargetRelease:        targetRelease,
+		Source:               source,
+		TargetMaintenanceID:  maintenance.MaintenanceID(),
+		Logger:               b.logger,
 	}
 
 	phases := []string{phaseImageSetup, phaseVolumeSetup, phaseComposeUp, phaseVerifyStartup}
@@ -105,7 +193,7 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, restoreMetricsSourceLease)
 
 	var mu sync.Mutex
 	var downProjects []string
@@ -125,7 +213,11 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 	succBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("success"))
 	failBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("failure"))
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", server.URL))
+	err := b.Restore(context.Background(), restoreRequest(
+		restoreMetricsTargetLease,
+		restoreMetricsSourceLease,
+		server.URL+"/callbacks/provision",
+	))
 	require.NoError(t, err)
 
 	// The restore worker records restore_duration_seconds in its terminal defer,
@@ -134,9 +226,9 @@ func TestRestore_RecordsRestoreDurationAndPhases(t *testing.T) {
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions[restoreMetricsTargetLease]
 		return ok && p.Status == backend.ProvisionStatusReady
-	}, 5*time.Second, 20*time.Millisecond, "u2 must reach Ready")
+	}, 5*time.Second, 20*time.Millisecond, "restore target must reach Ready")
 
 	assert.Equal(t, durBefore+1, observerSampleCount(t, restoreDurationSeconds),
 		"restore_duration_seconds must record exactly one observation on a successful restore")
@@ -166,7 +258,7 @@ func TestRestore_FailedWorker_IncrementsRestoreTotalFailure(t *testing.T) {
 	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, restoreMetricsSourceLease)
 
 	var mu sync.Mutex
 	var downProjects []string
@@ -179,7 +271,11 @@ func TestRestore_FailedWorker_IncrementsRestoreTotalFailure(t *testing.T) {
 	failBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("failure"))
 	durBefore := observerSampleCount(t, restoreDurationSeconds)
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://127.0.0.1:0/cb"))
+	err := b.Restore(context.Background(), restoreRequest(
+		restoreMetricsTargetLease,
+		restoreMetricsSourceLease,
+		"http://127.0.0.1:1/callbacks/provision",
+	))
 	require.NoError(t, err) // route+ack succeed; the failure is asynchronous
 
 	// The worker's terminal defer (which increments restore_total) runs before the
@@ -187,9 +283,9 @@ func TestRestore_FailedWorker_IncrementsRestoreTotalFailure(t *testing.T) {
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions[restoreMetricsTargetLease]
 		return ok && p.Status == backend.ProvisionStatusFailed
-	}, 5*time.Second, 20*time.Millisecond, "u2 must settle Failed")
+	}, 5*time.Second, 20*time.Millisecond, "restore target must settle Failed")
 
 	assert.Equal(t, failBefore+1, testutil.ToFloat64(restoresTotal.WithLabelValues("failure")),
 		"a failed restore worker must increment restore_total{outcome=\"failure\"}")
@@ -211,7 +307,7 @@ func TestRestore_WorkerPanic_IncrementsRestoreTotalFailure(t *testing.T) {
 	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, restoreMetricsSourceLease)
 
 	b.compose = &mockComposeExecutor{
 		UpFn: func(_ context.Context, _ *composetypes.Project, _ composeUpOpts) error {
@@ -226,15 +322,19 @@ func TestRestore_WorkerPanic_IncrementsRestoreTotalFailure(t *testing.T) {
 	succBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("success"))
 	failBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("failure"))
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://127.0.0.1:0/cb"))
+	err := b.Restore(context.Background(), restoreRequest(
+		restoreMetricsTargetLease,
+		restoreMetricsSourceLease,
+		"http://127.0.0.1:1/callbacks/provision",
+	))
 	require.NoError(t, err) // route+ack succeed; the panic is asynchronous
 
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		p, ok := b.provisions["u2"]
+		p, ok := b.provisions[restoreMetricsTargetLease]
 		return ok && p.Status == backend.ProvisionStatusFailed
-	}, 5*time.Second, 20*time.Millisecond, "u2 must settle Failed after panic")
+	}, 5*time.Second, 20*time.Millisecond, "restore target must settle Failed after panic")
 
 	assert.Equal(t, failBefore+1, testutil.ToFloat64(restoresTotal.WithLabelValues("failure")),
 		"a restore worker panic must increment restore_total{outcome=\"failure\"}")
@@ -258,7 +358,7 @@ func TestRestore_SyncAdoptFailure_DoesNotIncrementRestoreTotal(t *testing.T) {
 	defer func() { b.stopCancel(); b.wg.Wait() }()
 	rs := attachRetentionStore(t, b)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	seedActiveRetained(t, rs, "u1")
+	seedActiveRetained(t, rs, restoreMetricsSourceLease)
 
 	// Fail the synchronous adopt rename (retained→canonical): Restore() returns an
 	// error before doRestore spawns, so neither outcome series moves.
@@ -269,7 +369,11 @@ func TestRestore_SyncAdoptFailure_DoesNotIncrementRestoreTotal(t *testing.T) {
 	succBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("success"))
 	failBefore := testutil.ToFloat64(restoresTotal.WithLabelValues("failure"))
 
-	err := b.Restore(context.Background(), restoreRequest("u2", "u1", "http://127.0.0.1:0/cb"))
+	err := b.Restore(context.Background(), restoreRequest(
+		restoreMetricsTargetLease,
+		restoreMetricsSourceLease,
+		"http://127.0.0.1:1/callbacks/provision",
+	))
 	require.Error(t, err, "a synchronous adopt-rename failure must return an error from Restore()")
 
 	assert.Equal(t, succBefore, testutil.ToFloat64(restoresTotal.WithLabelValues("success")),

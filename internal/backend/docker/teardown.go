@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // teardownLeaseContainers removes every container fred owns for a lease, and with
@@ -52,10 +53,20 @@ import (
 func (b *Backend) teardownLeaseContainers(ctx context.Context, leaseUUID string, recordedIDs []string,
 	stopTimeout time.Duration, operation string, logger *slog.Logger) ([]string, error) {
 	projectName := composeProjectName(leaseUUID)
-	downErr := b.compose.Down(ctx, projectName, stopTimeout)
+	downErr := b.mutationAdapter().composeDown(ctx, projectName, stopTimeout)
 	if downErr == nil {
 		logger.Info("compose down completed", "project", projectName)
 		return nil, nil
+	}
+	// A lifecycle cancellation or permanent lineage contradiction is an
+	// authority failure, not a Compose implementation failure. Do not query a
+	// replacement daemon and do not attempt the per-container fallback after the
+	// guarded Down refused to mutate; durable recovery retries on the next valid
+	// backend lifetime.
+	if errors.Is(downErr, context.Canceled) || errors.Is(downErr, context.DeadlineExceeded) ||
+		errors.Is(downErr, backendidentity.ErrIdentityDrift) {
+		teardownFallbackTotal.WithLabelValues(operation, teardownOutcomeFailed).Inc()
+		return recordedIDs, downErr
 	}
 	// No lease_uuid field here: most callers hand in a logger that already binds it,
 	// and slog would emit the key twice. The project name carries the lease anyway.
@@ -76,7 +87,7 @@ func (b *Backend) teardownLeaseContainers(ctx context.Context, leaseUUID string,
 		remaining []string
 	)
 	for _, id := range ids {
-		if rmErr := b.docker.RemoveContainer(ctx, id); rmErr != nil {
+		if rmErr := b.mutationAdapter().removeContainer(ctx, id); rmErr != nil {
 			logger.Error("failed to remove container", "container_id", leasesm.ShortID(id), "error", rmErr)
 			errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(id), rmErr))
 			remaining = append(remaining, id)

@@ -122,7 +122,7 @@ sequenceDiagram
 ## Building
 
 ```bash
-# Build all binaries (providerd, mock-backend, docker-backend, k3s-backend)
+# Build all binaries (including placement-preflight and placement-repair)
 make all
 
 # Build only providerd
@@ -136,6 +136,10 @@ go build -o build/docker-backend ./cmd/docker-backend
 
 # Build only k3s-backend
 go build -o build/k3s-backend ./cmd/k3s-backend
+
+# Build the offline placement tools
+go build -o build/placement-preflight ./cmd/placement-preflight
+go build -o build/placement-repair ./cmd/placement-repair
 ```
 
 > **k3s-backend is currently an experimental, non-functional scaffold (ENG-133):** the binary boots, serves the backend HTTP contract, and signs/verifies callbacks, but its provisioner returns `status=failed, error="not implemented"` for every provision. It is **not usable in production**; real Kubernetes provisioning lands in ENG-134+.
@@ -148,7 +152,7 @@ For a one-shot dev environment against a running local chain, use:
 bash scripts/dev-init.sh
 ```
 
-This registers a provider and SKUs on-chain, generates `config.docker.yaml` (the `providerd` config) and `docker-backend.yaml`, and writes a callback secret. All settings are overridable via environment variables — see the script header for the full list. Requires `manifestd`, `jq`, `curl`, and `openssl` on `PATH` plus a running local chain.
+This registers a provider and SKUs on-chain, generates `config.docker.yaml` (the `providerd` config) and `docker-backend.yaml`, and writes a callback secret. Its final output gives the required fresh-start order: seal the empty backend, start it, drain mutation/callback work while leaving its inventory endpoints live, run `placement-preflight -initialize-fresh` with `providerd` plus tenant/chain mutation ingress fenced, and only then start `providerd`. Normal startup deliberately does not create `placements.db`. The script is intentionally one-shot and refuses to overwrite generated configuration or existing authority. All settings are overridable via environment variables — see the script header for the full list. Requires `manifestd`, `jq`, `curl`, `openssl`, and `findmnt` (from util-linux) on `PATH` plus a running local chain.
 
 ## Configuration
 
@@ -168,14 +172,13 @@ All required fields are validated at startup. The daemon will fail to start with
 | `provider_address` | Provider management address |
 | `keyring_dir` | Directory containing keyring |
 | `key_name` | Key name for signing transactions |
-| `backends` | At least one backend must be configured (multiple backends may share `skus` for load-based routing) |
-| `callback_base_url` | URL where backends send callbacks (must be absolute http/https URL) |
-| `callback_secret` | Shared secret for HMAC callback authentication (minimum 32 characters) |
-| `placement_store_db_path` | Writable path for the durable lease-to-backend placement database |
+| `backends` | At least one backend must be configured (multiple backends may share `skus` for load-based routing); production requires a distinct `hmac_secret` on every entry |
+| `callback_base_url` | URL where backends send callbacks (absolute HTTP(S); HTTPS is required in production mode) |
+| `placement_store_db_path` | Critical provider-bound lease-to-backend authority. It must be an existing prepared database at startup and is not hot-swappable |
 
 ### Backend Configuration
 
-Backends are services that handle the actual resource provisioning. Each backend URL must be an absolute URL with `http://` or `https://` scheme.
+Backends are services that handle the actual resource provisioning. Backend and callback URLs must be absolute HTTP(S) URLs. Provider `production_mode: true` requires HTTPS in both directions and verifies backend peers using the configured private CA (or system roots); bundled backends must also enable production mode so callback peer verification cannot be disabled. HTTP is development-only because request HMAC does not authenticate backend responses and callback HMAC does not provide transport confidentiality.
 
 Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing (use `default: true` for fallback). When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.
 
@@ -185,6 +188,8 @@ backends:
   # then Fred routes each provision to the least-loaded one.
   - name: docker-1
     url: "http://10.0.0.1:9001"
+    # Must equal docker-1's own callback_secret; never reuse on another backend.
+    hmac_secret: "docker-1-unique-32-byte-minimum-secret"
     skus:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
@@ -192,12 +197,13 @@ backends:
 
   - name: docker-2
     url: "http://10.0.0.2:9001"
+    # Must equal docker-2's own callback_secret.
+    hmac_secret: "docker-2-unique-32-byte-minimum-secret"
     skus:
       - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
       - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
 
 callback_base_url: "http://fred.provider.example.com:8080"
-callback_secret: "your-32-character-or-longer-secret-here"
 
 # Required. Records durable attempts and confirmed ownership so reads,
 # reconciliation, restore, and deprovision reach the right backend.
@@ -209,20 +215,44 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | Field | Description | Default |
 |-------|-------------|---------|
 | `name` | Stable, case-sensitive durable backend identity; must be non-blank and unique | (required) |
-| `url` | Absolute `http://` or `https://` URL with a host | (required) |
+| `url` | Absolute `http://` or `https://` origin with a usable ASCII hostname (punycode for IDNs); an explicit port must be 1–65535 | (required) |
+| `hmac_secret` | Bidirectional HMAC key for this backend; set the backend process's `callback_secret` to the same value. Production requires at least 32 bytes and pairwise uniqueness. | (required in production) |
 | `skus` | Exact list of on-chain SKU UUIDs this backend serves | `[]` |
 | `default` | Use as fallback when no SKU match | `false` |
 | `timeout` | HTTP request timeout for calls to this backend | `30s` |
 
 **Validation rules:**
-- Backend names must be non-blank after trimming and exactly unique (comparison is case-sensitive)
+- Backend names must be valid printable UTF-8 with no leading/trailing
+  whitespace and exactly unique (comparison is case-sensitive)
 - Treat a backend name as an immutable storage identity: removing or renaming it
-  while a durable placement refers to it is rejected, and after it is safely
-  drained and retired it can never be reused for the same or different storage
-- Backend URLs must be absolute `http://` or `https://` URLs with a host
-- `callback_base_url` must be an absolute `http://` or `https://` URL
-- Trailing slashes on `callback_base_url` are automatically stripped
-- `callback_canonical_path_prefix`, when set, must start with `/` and must not end with `/`
+  while a durable placement refers to it is rejected. A drained name may leave
+  the active topology and later return only for the same storage identity;
+  replacement storage must use a new unique name. Removal also requires the
+  latest complete, topology-bound raw provision and retention inventories to
+  prove that backend empty; silence is not a drain proof
+- Backend URLs must be absolute `http://` or `https://` origins with a
+  non-empty, non-dot ASCII hostname (use punycode for internationalized
+  names), no path/query/fragment/user info, and any
+  explicit port in the range 1–65535. Empty `?` and `#` markers are rejected
+  rather than silently normalized away; production mode requires peer-verified
+  `https://` (a configured private CA is supported)
+- `callback_base_url` must be an absolute `http://` or `https://` URL without
+  user info, a fragment, malformed query syntax, or reserved `operation_id` /
+  `lifecycle_id` query keys. Its authority follows the same hostname and port
+  rules as backend origins. Its path must contain no internal
+  empty/dot/parent segments, backslashes, or percent-encoded separators
+- Trailing path slashes on `callback_base_url` are automatically stripped;
+  its path escaping is canonicalized. Unrelated query bytes are preserved for
+  callback HMAC signing, so spaces, non-ASCII bytes, and other unsafe raw bytes
+  must be percent-encoded before configuration
+- `callback_canonical_path_prefix` must exactly equal the normalized escaped
+  path of `callback_base_url` (both are empty for a root/direct URL). This
+  fail-fast check prevents a path-stripping proxy configuration from making
+  every HMAC callback fail at runtime
+- Complete callback destinations are accepted and persisted only when their
+  canonical path ends in `/callbacks/provision`; dot segments, encoded path
+  separators, fragments, user info, empty query markers, and unstable raw
+  query bytes fail closed
 
 ### Full Configuration Reference
 
@@ -254,21 +284,32 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | `cors_origins` | Allowed CORS origins for browser clients. `["*"]` allows all; `[]` disables CORS. | `["*"]` |
 | `backends` | List of backend configurations | (required) |
 | `callback_base_url` | Base URL for backend callbacks | (required) |
-| `callback_secret` | HMAC secret for callback authentication (min 32 chars) | (required) |
-| `callback_canonical_path_prefix` | Path prefix prepended to inbound callback URIs before HMAC verification. Set this when fred is behind a path-stripping reverse proxy (e.g., Traefik `stripPrefix` mapping `/api/fred/*` → `/*`); must match the prefix the proxy strips. Leave empty for direct-call deployments. See [SECURITY.md](SECURITY.md) and [docs/security-callback-auth.md](docs/security-callback-auth.md). | `""` |
+| `callback_secret` | Legacy fleet-wide HMAC key accepted only outside production; do not combine with `backends[].hmac_secret` | `""` |
+| `callback_canonical_path_prefix` | Path prefix prepended to inbound callback URIs before HMAC verification. It must exactly equal the normalized escaped path in `callback_base_url` and the prefix stripped by the trusted proxy (e.g., `/api/fred`). Both values are empty for a root/direct URL. See [SECURITY.md](SECURITY.md) and [docs/security-callback-auth.md](docs/security-callback-auth.md). | `""` |
 | `reconciliation_interval` | How often to run reconciliation | `5m` |
 | `token_tracker_db_path` | Path to bbolt database for token replay protection | (optional; required if `production_mode`) |
 | `payload_store_db_path` | Path to bbolt database for payload storage | (optional) |
-| `placement_store_db_path` | Path to the durable lease→backend placement database used for write-ahead placement, routing, restore, and restart recovery | (required) |
+| `placement_store_db_path` | Path to the critical provider-bound durable lease→backend placement authority used for write-ahead placement, routing, restore, and restart recovery. Normal startup opens only an existing prepared, unsymlinked, single-link regular file with exact mode `0600` and never creates or migrates it. Never replace, unlink, rename, or restore the path while `providerd` is running | (required) |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 > **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
 
+Bundled backends also require a one-shot storage-lineage initialization before
+their first normal start. For a genuinely new empty Docker backend, run
+`docker-backend -config docker-backend.yaml -initialize-storage-identity new`;
+the k3s scaffold uses the corresponding `k3s-backend` command. Normal startup is
+verification-only and will not create or repair markers or authoritative
+journals. Existing v0.13 Docker storage instead uses the stopped-and-drained
+`adopt` cutover in [Deployment](DEPLOYMENT.md#upgrading-from-v0130).
+
 Bundled Docker and k3s backends require a positive `callback_max_age` (default
-`24h`). Strict per-lease FIFO keeps an undeliverable exact or legacy callback at
-the head, so a finite maximum age is the safety boundary that eventually permits
-newer observations to proceed. Zero or negative values are rejected at startup;
-do not use them to request unbounded callback retention.
+`24h`). The age applies to legacy callbacks and typed lifecycle observations;
+exact operation and maintenance completions never expire because they may be the
+only evidence that can settle Fred's durable write-ahead attempt or an exact
+replacement. Operation/maintenance intents and Docker close intents likewise do
+not age out. Strict per-lease FIFO means an undeliverable exact completion remains
+a permanent ordering barrier until it is delivered or repaired. Zero or negative
+values are rejected at startup.
 
 ### Advanced Configuration
 
@@ -306,14 +347,21 @@ The callback route has a separate two-minute application budget because a
 terminal result may include chain settlement. It extends the connection write
 deadline for that request only; `http_write_timeout` and the generic 30-second
 request middleware continue to govern the other HTTP routes. Bundled backends
-give the complete inline delivery chain an additional 15 seconds. A fresh first
+give the complete delivery retry chain an additional 15 seconds. A fresh first
 attempt therefore normally leaves time for providerd to return its retryable
 503 after the application budget expires. Quick retries and their 0/1s/5s
 backoffs share that one two-minute-fifteen-second deadline rather than resetting
 it; after an earlier failure consumes part of the budget, a later attempt may
 reach the sender's remaining deadline before providerd's per-request timer.
-Either result keeps the durable FIFO head for the 30-second replay loop instead
-of holding the same lease for another full application budget.
+Either result keeps the durable FIFO head for a later replay instead of holding
+the same lease for another full application budget. Bundled backends commit
+operation, maintenance, and lifecycle callback facts before sending a
+non-blocking wake to their tracked replay loop. Only that loop performs HTTP, so
+the retry chain never extends a lease actor, API handler, or startup-recovery
+critical section. A slow callback can occupy one replay worker and its per-lease
+FIFO lock, without stalling another lease or backend node. This callback budget
+is deliberately independent of providerd's `backends[].timeout`, which governs
+Fred-to-backend requests.
 
 ### TLS Configuration
 
@@ -338,7 +386,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 # Or use environment variables
 ./build/providerd
 
-# Print version (providerd, docker-backend, and k3s-backend support --version)
+# Print version (providerd, backend binaries, and placement tools support --version)
 ./build/providerd --version
 ./build/docker-backend --version
 ./build/k3s-backend --version
@@ -370,7 +418,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
 | `GET` | `/health` | None | Liveness. Probes chain, backends and DBs, but **no verdict ever makes it 503** — poll this from a load balancer |
-| `GET` | `/readyz` | None | Deep readiness. Same body; 503 when a local bbolt store is unreadable or no durable inventory baseline matches the configured backend topology. **Not** for load balancers |
+| `GET` | `/readyz` | None | Deep readiness. Same body; 503 when local bbolt authority is unreadable/withdrawn or no durable inventory baseline matches the configured backend topology. **Not** for load balancers |
 | `GET` | `/metrics` | None | Prometheus metrics |
 | `GET` | `/workloads?lease_uuid=<u1>&lease_uuid=<u2>...` | None | Bulk workload metadata lookup by lease UUID (1..MaxLookupUUIDs). Used by the manifest-admin SPA. |
 | `POST` | `/callbacks/provision` | HMAC-SHA256 | Backend → Fred callback (5-min replay window) |
@@ -392,26 +440,59 @@ same body. They differ only in how the verdict maps onto the status code:
 |---|---|---|---|
 | `healthy` | Every configured probe passed | 200 | 200 |
 | `degraded` | A remote, shared dependency is impaired (chain, or one or more backends). Existing workloads keep serving and exact callbacks plus safely evidenced reconciliation work continue. After inventory bootstrap, the reconciler may place genuinely new recordless `PENDING` work only on backends that answered both inventories; work pinned to a silent owner, `ACTIVE` recordless work, unresolved attempts, and conflicts remain deferred. A chain outage halts reconciliation and lease-resolving calls. Both conditions still accept backend callbacks | 200 | 200 |
-| `unhealthy` | A local, process-owned bbolt store is unreadable, or no durable inventory baseline matches the configured backend topology | 200 | 503 |
+| `unhealthy` | A local, process-owned bbolt store is unreadable, placement authority was permanently withdrawn after a path/inode or outcome-unknown commit failure, or no durable inventory baseline matches the configured backend topology | 200 | 503 |
 
 `checks.placement_inventory` reports a durable baseline bound to the exact set of
 configured backend storage identities. A complete `/provisions` plus
 `/retentions` projection establishes it; it survives process restarts and
-transient incomplete sweeps while that topology is unchanged. A new placement
-database or topology change requires another complete projection.
+transient incomplete sweeps while that topology is unchanged. A topology
+membership change requires identity-bearing responses from the complete
+proposed fleet and another complete projection; one temporarily down node does
+not revoke an already-established unchanged-topology baseline.
 
-`fred_reconciler_sweep_complete` describes only whether the **last** sweep heard
-both inventories from every configured backend; it is not a fleet-wide admission
-gate. With a valid baseline, a partial sweep issues a typed scope containing only
-the backends that answered both inventories. That scope can authorize genuinely
-recordless `PENDING` work on those nodes. It cannot move or retry work tied to a
-silent owner, clear an attempt or conflict from silence, or authorize recordless
-`ACTIVE` recovery.
+`fred_reconciler_sweep_complete` is 0 while a sweep is in progress or after an
+incomplete/error sweep, and becomes 1 only after the most recently completed
+full-fleet inventory was durably projected. It is not a fleet-wide admission
+gate. With a valid baseline, a partial sweep issues a typed scope containing
+only the backends that answered both inventories. That scope can authorize
+genuinely recordless `PENDING` work on those nodes. It cannot move or retry work
+tied to a silent owner, clear an attempt or conflict from silence, or authorize
+recordless `ACTIVE` recovery.
 
 Tenant event dispatch has no per-sweep inventory witness. It instead requires
 the durable topology baseline, live-routes by backend stats within that topology,
 and durably records the exact attempted backend before making the call. A later
 ambiguous result remains pinned regardless of an empty inventory response.
+
+The placement database is bound to the exact configured `provider_uuid` and is
+backup-critical, not a derived inventory cache. Restore it after loss. Only a
+genuinely new provider with zero total chain lease history can create its first
+authority, using the explicit
+[`placement-preflight -initialize-fresh`](DEPLOYMENT.md#initializing-a-genuinely-fresh-placement-authority)
+workflow after an all-state chain query proves no lease history, an independently
+supplied exact backend roster matches configuration, and every configured
+backend returns complete, identity-consistent empty inventories. Fresh
+initialization is never recovery for a lost placement database. The printed
+operator acknowledgement includes the target parent's physical device/inode;
+the initializer rejects a rename/recreation between print and initialize and
+publishes descriptor-relatively with `renameat2(RENAME_NOREPLACE)`.
+
+It is also bound at runtime to the exact regular-file inode opened at
+`placement_store_db_path`. Never copy over, unlink, rename, rotate, or restore
+that pathname while `providerd` is running. A mismatch or outcome-unknown bbolt
+commit permanently withdraws authority from that process; putting the old name
+back does not heal it. Preserve the evidence and follow the
+[runtime-authority runbook](OPERATIONS.md#placement-runtime-authority-was-withdrawn).
+Live backups must use atomic filesystem snapshots, and restores happen only
+while stopped.
+
+The mutating offline placement tools likewise bind the mandatory backup
+parent's physical identity before remote proof, publish with descriptor-relative
+no-replace rename, and retain the exact published inode through mutation and the
+final verdict. Re-attestation also binds its SHA-256 bytes, exact length, `0600`
+mode, and single-link status. Treat `BACKUP PUBLISHED`, `PREPARED:`/`COMMITTED:`, and
+`OUTCOME UNKNOWN` as distinct evidence-preservation outcomes; see the
+[deployment procedure](DEPLOYMENT.md#upgrades).
 
 `/health` is a **liveness** contract: no dependency verdict makes it 503, because
 providerd runs as the single server of its load-balancer pool and the backends'
@@ -770,14 +851,18 @@ lifecycle work sharing either lease is rejected before dispatch. The source
 reservation is process-local and lasts only through the synchronous backend call;
 the target attempt is durable and is later settled only by its exact operation ID.
 
-Backend acceptance (including a contract-conforming `already_provisioned`
-response trusted under the configured backend transport) confirms the target,
-while a contract-conforming synchronous domain refusal clears it. A
+Backend acceptance confirms the target, while a contract-conforming synchronous
+domain refusal clears it. A bare `already_provisioned` response does not prove
+which callback generation the backend persisted, so Fred retains the new target
+attempt until upgraded inventory reports that exact typed generation or its
+authenticated callback arrives. A
 timeout, transport error,
 panic, generic 5xx, malformed error envelope, or unvalidated 503 is ambiguous: Fred
 releases the short-lived source reservation but retains the target attempt because
 the backend may have accepted the request. An immediate retry of that target will
-normally return 409. A positive report from the attempted backend can confirm it;
+normally return 409. A positive report confirms it only when the backend also
+reports the exact paired typed lifecycle generation; an older typed or legacy
+generation remains current while the newer attempt stays recoverable;
 a positive report from another backend creates a durable conflict containing
 every candidate. Inventory silence never disproves or clears an ambiguous
 attempt because the original request could commit after the list response.
@@ -786,6 +871,21 @@ operator proof and repair. Backend response bodies are not HMAC-authenticated:
 their codes establish protocol conformance under the deployment's transport
 trust, not cryptographic authorship. Use TLS or an equivalently trusted network
 between Fred and its configured backends when an on-path attacker is in scope.
+
+On the Docker backend, the source retention row remains a durable finalizer for
+the destination after adoption. While it exists, Provision and Restore of that
+destination are rejected. A pre-commit failure hands the source back only after
+teardown/re-quarantine, source-quota proof, and exact
+failed-operation settlement; an accepted worker failure may therefore stay
+`restoring` until the actor's Failed callback is durable. Conversely, an exact
+active destination Release is proof the restore committed even if containers
+later fail or disappear. With zero survivors, recovery keeps that Release,
+reconstructs a conservative Failed destination plus its capacity, and retains
+the source finalizer as tenant/provider identity rather than rolling data back.
+Once the exact restore intent settles, a plain, identity-preserving Restart may
+repair it; Update and custom-domain redeploys remain fenced until that Restart
+reaches Ready and reconciliation consumes the finalizer. Close instead hands it
+off to a complete durable close intent before teardown.
 
 **Response:** `202 Accepted`
 ```json
@@ -878,11 +978,16 @@ Opens a WebSocket connection for real-time lease status updates. Events are push
 **Behavior:**
 - Events are delivered as WebSocket JSON frames
 - Events are best-effort notifications, not a globally ordered state log. An
-  exact operation-ID callback is ignored after its operation ends or is
-  replaced, so it cannot publish stale status. Bundled backends serialize each
-  lease's durable callback queue: exact completions remain FIFO, lifecycle
-  observations are latest-only, and synchronous provider application preserves
-  that relative order. Other event sources and custom/v0.13 backends do not
+  exact operation-ID callback remains recoverable after a provider restart only
+  while the same durable placement Attempt or confirmed lifecycle generation
+  exists; a nonmatching or replaced ID is ignored, so it cannot publish stale
+  status. Bundled backends serialize each
+  lease's durable callback queue: exact provision/restore and maintenance
+  completions remain FIFO, autonomous lifecycle observations are latest-only,
+  and synchronous provider application preserves that relative order. A bundled
+  Docker backend also returns retryable `409 Conflict` for a newer maintenance
+  command while that lease's prior exact maintenance completion is still
+  queued; successful delivery reopens only that lease. Other event sources and custom/v0.13 backends do not
   carry a global sequence; use the REST status endpoints for current state.
 - The server sends WebSocket ping frames every 30 seconds; the client must respond with pong within 40 seconds or the connection is closed
 - Slow clients that fall behind have events dropped — use the REST endpoints (`/status`, `/releases`) to catch up
@@ -917,6 +1022,7 @@ request URI, including its query. Requires HMAC-SHA256 authentication via the
   "lease_uuid": "...",
   "status": "success",
   "error": "",
+  "backend_storage_id": "canonical-uuidv4-for-this-backend-storage",
   "backend": "optional-sender-label",
   "retained": false
 }
@@ -941,7 +1047,7 @@ Status must be one of `"success"`, `"failed"`, or `"deprovisioned"` (the third i
   retry with backoff
 
 Callback application has a dedicated two-minute deadline. Bundled backends give
-the complete inline delivery chain two minutes fifteen seconds, so a fresh first
+the complete delivery retry chain two minutes fifteen seconds, so a fresh first
 attempt normally leaves response time after the provider's application timer
 returns 503. Quick retries and backoff consume that same deadline; a later
 attempt may instead be canceled when the sender's remaining budget expires.
@@ -950,13 +1056,65 @@ timeout, or lost response is not delivery success. When the shared budget
 expires, bundled backends defer to their 30-second durable replay loop instead
 of holding that lease's FIFO lock for consecutive application budgets.
 
-For a rolling upgrade from v0.13.0, upgrade and restart every backend before
-providerd. New backends accept the old operationless callback shape and persist
-its tokenless lifecycle route; the new provider then migrates the corresponding
-confirmed placement as legacy. The reverse order is not lifecycle-compatible:
+The v0.13.0 upgrade is a stopped cutover, not a rolling upgrade. Drain every old
+callback outbox, stop providerd and all backends, install the upgraded binaries
+without starting them, and run each Docker backend's mandatory read-only
+`-preflight-storage-identity-adoption` proof before taking the cutover backup or
+sealing storage identity. Then rotate to unique per-backend keys and restart
+every upgraded backend before the new providerd. Stack-form v0.13 Docker
+workloads stay in place; older service-name-less cohorts incur bounded
+per-lease downtime while startup stops/renames the original generation and
+recreates its `app` service through Compose. New backends recover the old operationless callback shape already
+embedded in migrated workloads, preserve its tokenless lifecycle route, and
+report a non-secret `legacy` generation in internal inventory. Mandatory offline
+preparation migrates the corresponding owner as legacy before the new provider
+opens it. A pre-identity callback row prevents current callback-store startup;
+it is not carried across the cutover. An absent or rebuilt placement database is
+never a recovery path for those workloads. The reverse binary order is not
+lifecycle-compatible:
 an old backend ignores `lifecycle_callback_url` and reuses the expired
 operation-scoped URL for later observations, which the new provider safely
 ignores.
+
+The seal covers more than the substrate marker. Docker always binds
+`callbacks.db`, `releases.db`, and `retention.db` to the same storage UUID and
+to distinct store kinds; `retention.db` remains required when
+`retain_on_close: false`. K3s binds `callbacks.db` and `releases.db`.
+Every authoritative database must be an unsymlinked, single-link regular file
+with exact mode `0600`; initialization and normal startup reject an insecure
+restore, and runtime re-attestation withdraws the whole backend lineage on
+path/inode, link-count, or permission drift.
+Initialization accepts only an all-absent fresh set or a complete, valid,
+stopped and drained v0.13 set, records that choice in a crash-resumable pending
+anchor, and never completes a mixed set. Before evidence inspection it binds the
+physical parent of both markers and every authoritative journal; subsequent I/O
+is descriptor-relative, so a parent rename, unmount, or same-path recreation
+cannot redirect initialization. Normal startup is verification-only: it will
+not create, rebind, or repair any authoritative store. A missing, foreign,
+cross-kind, or replaced file fails closed, including during periodic cleanup.
+The first terminal journal/substrate failure is sticky backend-wide: every
+sibling journal and callback delivery refuses with that cause until restart.
+`diagnostics.db` is not authority and may be recreated while stopped. Its
+generic opener still refuses symlinks, hard links, non-regular files, and modes
+other than exact `0600`, but it is not storage-UUID-bound or continuously
+re-attested. Back up and restore the marker pair, complete authoritative-store
+set, and substrate together; a
+matching complete snapshot retains the same lineage, so fence the original
+before starting its restored copy. The preflight's only successful stdout is
+`ready_for_v0_13_storage_identity_adoption`; it fails closed on unresolved
+v0.13 restore/deprovision crash windows instead of inventing missing authority.
+If it reports `ErrV013OrphanRollbackRemnant`, preserve its sorted
+`immutable_container_ids`; mutable names are never cleanup authority. The
+separate read-only terminal-orphan mode of `placement-preflight`, invoked with
+`-prove-terminal-orphan <lease-uuid>` and `-expected-backend <name>`, must
+positively prove that the same lease is present and terminal in that same
+provider's complete height-pinned snapshot and absent from a pristine stopped
+v0.13 placement database. Require its printed provider UUID to equal the Docker
+diagnostic. That verdict is necessary but not sufficient: follow the exact-ID
+inspection/removal procedure, then rerun both proofs and require the Docker
+adoption preflight itself to pass before backing up or sealing.
+See [Deployment](DEPLOYMENT.md#upgrading-from-v0130) for the complete cutover,
+repair, and rollback procedure.
 
 **Idempotency:**
 If a callback is received for a lease that has already been processed (no longer in-flight),
@@ -1041,7 +1199,7 @@ Start provisioning a resource (async).
 **Fields:**
 - `items` - Array of lease items with SKU and quantity. All items belong to the same provider.
 - `callback_url` - Exact operation-completion URL; preserve it byte-for-byte and use it only for this provision result.
-- `lifecycle_callback_url` - Typed URL for later restart/update completion, autonomous failure, and deprovision observations.
+- `lifecycle_callback_url` - Typed URL for exact restart/update/custom-domain completion plus autonomous failure and deprovision observations. Bundled backends keep maintenance completion non-coalescible even though it uses this lifecycle route.
 - `payload` - Optional base64-encoded deployment payload (only present if lease has meta_hash)
 - `payload_hash` - Optional hex-encoded SHA-256 hash of payload (only present with payload)
 
@@ -1145,12 +1303,19 @@ List all provisions (for reconciliation).
     {
       "lease_uuid": "...",
       "status": "ready",
+      "lifecycle_generation": {"kind": "typed", "id": "550e8400-e29b-41d4-a716-446655440000"},
       "created_at": "2024-01-15T10:30:00Z"
     }
   ],
   "continue": "..."
 }
 ```
+
+`lifecycle_generation` is an internal reconciliation field, not part of tenant
+lease responses. Bundled backends derive it from the exact callback pair they
+persisted and report only `unknown`, tokenless `legacy`, canonical `typed` plus
+its UUID, or `unusable`; they never expose either callback URL. Older and
+third-party backends may omit it, which providerd treats as `unknown`.
 
 ### POST /restart
 
@@ -1274,9 +1439,12 @@ Get release (deployment) history for a lease.
 
 **Response:** `404 Not Found` if not provisioned.
 
-## Running E2E Tests with Mock Backend
+## Local Fred Development with the Mock Backend
 
-The mock backend allows you to test fred's provisioning flow without a real backend. It supports concurrent provisions with per-lease callback routing.
+The mock backend can stand in for a compute backend while testing Fred against
+a real local chain. It supports concurrent provisions with per-lease callback
+routing, but it is not itself an end-to-end harness and direct calls to its
+mutation endpoints bypass Fred's placement and chain invariants.
 
 **Note:** The mock backend ignores the SKU field entirely - all provisions create identical fake resources regardless of SKU. Connection details are deterministically generated from the lease UUID. For implementing a real backend that interprets SKUs, see [BACKEND_GUIDE.md](BACKEND_GUIDE.md).
 
@@ -1286,12 +1454,23 @@ The mock backend allows you to test fred's provisioning flow without a real back
 # Build mock-backend
 make build-mock
 
-# Run with required callback secret
-MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" ./build/mock-backend
+# Run with a persisted development storage identity and callback secret.
+# Generate the UUID once and keep it with this mock deployment's configuration.
+install -d -m 700 .fred-dev
+mock_storage_id_file="$PWD/.fred-dev/mock-storage-id"
+if [[ ! -e "$mock_storage_id_file" ]]; then
+  (umask 077; set -o noclobber; uuidgen --random | tr '[:upper:]' '[:lower:]' > "$mock_storage_id_file")
+fi
+MOCK_BACKEND_STORAGE_ID="$(<"$mock_storage_id_file")" \
+MOCK_BACKEND_NAME=mock \
+MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" \
+./build/mock-backend
 
-# Or with custom settings
-MOCK_BACKEND_ADDR=:9001 \
+# Or with custom loopback settings. MOCK_BACKEND_NAME must exactly match the
+# corresponding providerd backends[].name.
+MOCK_BACKEND_ADDR=127.0.0.1:9001 \
 MOCK_BACKEND_NAME=test-backend \
+MOCK_BACKEND_STORAGE_ID="$(<"$mock_storage_id_file")" \
 MOCK_BACKEND_DELAY=2s \
 MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" \
 ./build/mock-backend
@@ -1301,19 +1480,29 @@ MOCK_BACKEND_CALLBACK_SECRET="test-secret-at-least-32-characters-long" \
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MOCK_BACKEND_ADDR` | Listen address | `:9000` |
+| `MOCK_BACKEND_ADDR` | Listen address; explicitly choosing a non-loopback address exposes the development server to that network | `127.0.0.1:9000` |
 | `MOCK_BACKEND_NAME` | Backend name (in responses) | `mock-backend` |
+| `MOCK_BACKEND_STORAGE_ID` | Persisted canonical UUIDv4 identifying this mock deployment's in-memory storage lineage | (required) |
 | `MOCK_BACKEND_DELAY` | Simulated provisioning delay | `0s` |
 | `MOCK_BACKEND_TLS_SKIP_VERIFY` | Skip TLS verification for callbacks (use `true` for self-signed certs) | `false` |
-| `MOCK_BACKEND_CALLBACK_SECRET` | HMAC secret for signing callbacks (required, min 32 chars) | (required) |
+| `MOCK_BACKEND_CALLBACK_SECRET` | Per-backend HMAC secret for authenticating inbound provider requests and signing callbacks; must match the providerd backend entry (required, min 32 bytes) | (required) |
 | `MOCK_BACKEND_CLIENT_TIMEOUT` | HTTP client timeout for outbound callbacks | `10s` |
 | `MOCK_BACKEND_READ_TIMEOUT` | HTTP server read timeout | `15s` |
 | `MOCK_BACKEND_WRITE_TIMEOUT` | HTTP server write timeout | `15s` |
 | `MOCK_BACKEND_IDLE_TIMEOUT` | HTTP server idle timeout | `60s` |
 
-**Note:** The mock backend stores callback URLs per lease UUID, so concurrent provisions with different callback URLs are handled correctly without race conditions.
+**Important:** the mock backend stores resources only in process memory. Do not
+restart it while Fred has live placements: a stable storage UUID cannot prove
+continuity for state the process discarded. Stop Fred first and create a fresh
+development provider/placement authority (or use a new backend name and storage
+UUID) after such a reset. Reusing the same UUID is safe only while the mock is
+empty.
 
-**Security Warning:** The mock backend accepts arbitrary `callback_url` values and issues HTTP requests to them, which is an SSRF risk if exposed to untrusted networks. Only run the mock backend on trusted interfaces (e.g., localhost) for local testing. Do not expose it to the internet or untrusted users.
+**Security Warning:** Contract routes require the configured HMAC, and the server
+binds to loopback by default. The mock still accepts callback destinations from
+authenticated requests and performs outbound HTTP, keeps authority only in
+memory, and is not production-hardened. Do not bind it to an untrusted network;
+rotate the development secret if it is disclosed.
 
 ### 2. Configure Fred
 
@@ -1321,13 +1510,13 @@ Create a config file that points to the mock backend:
 
 ```yaml
 # config-test.yaml
-provider_uuid: "01234567-89ab-cdef-0123-456789abcdef"
-provider_address: "manifest1test..."
+provider_uuid: "550e8400-e29b-41d4-a716-446655440000"
+provider_address: "manifest1replace-with-registered-address"
 keyring_backend: "test"
-keyring_dir: "/tmp/test-keyring"
-key_name: "test"
+keyring_dir: "/absolute/path/to/manifest-home"
+key_name: "replace-with-provider-key-name"
 
-chain_id: "test-chain"
+chain_id: "replace-with-local-chain-id"
 grpc_endpoint: "localhost:9090"
 websocket_url: "ws://localhost:26657/websocket"
 
@@ -1338,92 +1527,66 @@ backends:
     url: "http://localhost:9000"
     timeout: 30s
     default: true
+    hmac_secret: "test-secret-at-least-32-characters-long"
 
 callback_base_url: "http://localhost:8080"
-callback_secret: "test-secret-at-least-32-characters-long"
-placement_store_db_path: "/tmp/fred-test-placements.db"
+placement_store_db_path: "/absolute/path/to/fred/.fred-dev/placements.db"
 ```
 
-### 3. Run Fred
+Every identity and endpoint above is deployment-specific. Use the UUID and
+address of the same newly registered provider, its signer keyring/name, the
+actual local chain ID and endpoints, and this checkout's physical absolute
+path. Replace the provider UUID again in the exact confirmation below. The
+provider must have zero lease history, the parent directory must exist, and the
+placement database itself must not already exist. Keep that exact physical
+parent directory in place: its device/inode is included in the printed
+confirmation and re-attested before descriptor-relative publication.
+
+### 3. Initialize the Fresh Placement Authority
+
+Keep `providerd` stopped and tenant/chain lease-mutation ingress fenced. Leave
+the empty mock backend running so its inventory endpoints answer, with no
+in-flight mutation or callback delivery. Then run:
+
+```bash
+fresh_confirmation="$(./build/placement-preflight \
+  -config config-test.yaml \
+  -print-fresh-confirmation \
+  -expected-backends '["mock"]')"
+
+./build/placement-preflight \
+  -config config-test.yaml \
+  -initialize-fresh \
+  -expected-backends '["mock"]' \
+  -confirm-insecure-chain 'I ACCEPT UNAUTHENTICATED CHAIN EVIDENCE FOR LOCAL DEVELOPMENT' \
+  -confirm-quiesced "$fresh_confirmation"
+```
+
+Start Fred only if the final output line begins with
+`INITIALIZED_FOR_CUTOVER:`. This local plaintext-chain attestation is never
+appropriate for a production deployment.
+
+### 4. Run Fred
 
 ```bash
 ./build/providerd -c config-test.yaml
 ```
 
-### 4. Test the Flow
+### 5. Test the Flow
 
-**Check mock backend health:**
+Check the mock backend health without mutating it:
+
 ```bash
 curl http://localhost:9000/health
 ```
 
-**Simulate a provision request (directly to mock backend):**
-```bash
-curl -X POST http://localhost:9000/provision \
-  -H "Content-Type: application/json" \
-  -d '{
-    "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
-    "tenant": "manifest1abc",
-    "provider_uuid": "01234567-89ab-cdef-0123-456789abcdef",
-    "items": [{"sku": "mock-resource", "quantity": 1}],
-    "callback_url": "http://localhost:8080/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
-    "lifecycle_callback_url": "http://localhost:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
-  }'
-```
-
-**Check provisioned resources:**
-```bash
-curl http://localhost:9000/provisions
-```
-
-**Get lease info:**
-```bash
-curl http://localhost:9000/info/550e8400-e29b-41d4-a716-446655440000
-```
-
-**Deprovision:**
-```bash
-curl -X POST http://localhost:9000/deprovision \
-  -H "Content-Type: application/json" \
-  -d '{"lease_uuid": "550e8400-e29b-41d4-a716-446655440000"}'
-```
-
-### 5. Using Docker Compose (Optional)
-
-Create a `docker-compose.yaml` for integrated testing:
-
-```yaml
-version: '3.8'
-
-services:
-  mock-backend:
-    # Build once on the host first: make build-mock
-    image: alpine:3.21
-    command: ["/app/mock-backend"]
-    environment:
-      - MOCK_BACKEND_ADDR=:9000
-      - MOCK_BACKEND_DELAY=1s
-      - MOCK_BACKEND_CALLBACK_SECRET=shared-secret-at-least-32-characters
-    volumes:
-      - "./build/mock-backend:/app/mock-backend:ro"
-    ports:
-      - "9000:9000"
-
-  fred:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: providerd
-    environment:
-      - PROVIDER_PROVIDER_UUID=01234567-89ab-cdef-0123-456789abcdef
-      - PROVIDER_API_LISTEN_ADDR=:8080
-      - PROVIDER_CALLBACK_BASE_URL=http://fred:8080
-      - PROVIDER_CALLBACK_SECRET=shared-secret-at-least-32-characters
-    ports:
-      - "8080:8080"
-    depends_on:
-      - mock-backend
-```
+For a real Fred flow, create a `PENDING` lease on the local chain for this exact
+provider and one of its registered SKUs, then use Fred's tenant endpoints with
+a valid ADR-036 token. Fred will write the placement attempt before dispatching
+to the mock and will settle it from the signed callback. Do not simulate this
+by posting directly to `/provision`; that creates foreign inventory outside
+Fred's authority. The repository's integration harnesses are the repeatable
+automated E2E path.
 
 ## Project Structure
 
@@ -1433,6 +1596,8 @@ cmd/
 ├── mock-backend/       # Mock backend for testing
 ├── docker-backend/     # Docker container backend
 ├── k3s-backend/        # K3s container backend
+├── placement-preflight/ # Offline placement inspector, v0.13 preparer, and fresh initializer
+├── placement-repair/    # Offline placement inspector and exact repair tool
 ├── lease-token/        # Mints ADR-036 tenant bearer tokens for lease endpoints
 └── loadtest/           # Load testing tool (not built by `make all`; `go build ./cmd/loadtest`)
 
@@ -1463,8 +1628,7 @@ internal/
 │   ├── reconcile_inventory.go # Read-only chain/backend inventory collection
 │   ├── reconcile_plan.go # Pure evidence-to-action decision table
 │   ├── reconcile_projection.go # Atomic durable inventory projection
-│   ├── tracker.go      # Temporary compatibility adapter over operation.Registry
-│   ├── inflight.go     # Legacy tracker delegation kept for compatibility tests
+│   ├── inflight.go     # Manager status/drain facade over operation.Registry
 │   ├── handlers.go     # Shared transport helpers and lease item extraction
 │   ├── ack_batcher.go  # Batches lease acknowledgments
 │   ├── timeout_checker.go # Detects callback timeouts
@@ -1487,7 +1651,7 @@ Fred uses **level-triggered reconciliation** to ensure consistency between chain
 
 ### How It Works
 
-Instead of replaying missed events (edge-triggered), reconciliation queries current state. Before reading provisions, the reconciler calls `RefreshState` on each backend to ensure in-memory state is synchronized with the actual infrastructure (e.g., Docker container status).
+Instead of replaying missed events (edge-triggered), reconciliation queries current state. Before reading provisions, the reconciler calls `RefreshState` on each backend. That call synchronizes an in-process backend; the standard HTTP client deliberately implements it as a no-op because a remote backend owns its own projection. In the normal separate-process deployment, Docker substrate/WAL recovery runs at docker-backend startup and on its own `reconcile_interval` (default `5m`), independently of providerd's `reconciliation_interval`.
 
 ```
 Chain State (leases)     Backend State (provisions)
@@ -1495,7 +1659,8 @@ Chain State (leases)     Backend State (provisions)
         └──────────┬───────────────┘
                    │
                    ▼
-         RefreshState (each backend)
+         RefreshState interface call
+       (remote HTTP backends: no-op)
                    │
                    ▼
             Reconciler compares
@@ -1533,11 +1698,12 @@ Chain State (leases)     Backend State (provisions)
 | CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
 | Not found | Provisioned | Orphan: deprovision |
 | PENDING/ACTIVE | Placement conflict/unusable, or unresolved attempt | **Defer — no action this sweep** |
+| PENDING/ACTIVE | Positive membership from a rejected inventory endpoint (`untrusted_positive`) | **Durably quarantine — do not treat the rejected payload as ownership or its removal as absence** |
 | PENDING/ACTIVE | Positive report disagrees with confirmed placement | **Defer — no action this sweep** |
 | PENDING/ACTIVE | Confirmed owner is not configured | **Defer and emit an operator-visible lease error** |
 | PENDING/ACTIVE | Owning backend did not answer | **Defer — no action this sweep** |
 
-For live (`PENDING`/`ACTIVE`) chain leases, the four placement-safety rows take
+For live (`PENDING`/`ACTIVE`) chain leases, the placement-safety rows take
 precedence over every normal state row. A positive backend report is not
 sufficient when the durable record remains unusable, still has an unresolved
 attempt, or names a different confirmed owner.
@@ -1566,6 +1732,16 @@ absence never clears an attempt or conflict. Incomplete sweeps report
 `fred_reconciler_runs_total{outcome="degraded"}`; that gauge is an observation,
 not a global write-authority switch.
 
+If Fred rejects an endpoint because provision/retention membership contradicts,
+its two inventory identities are missing or inconsistent, or its identity
+conflicts with a durable storage pin, the payload cannot establish an owner.
+Its raw positive lease membership is nevertheless persisted across restart as
+`untrusted_positive` quarantine. A sole candidate of that exact kind can
+self-resolve only when a later complete, identity-valid inventory reports the
+same lease from the same backend. Partial inventory, silence, a different or
+second reporter, unknown ownership, and ordinary conflicts remain quarantined
+for explicit operator repair.
+
 The three passes that **delete durable state** — orphan deprovision, payload
 cleanup, placement pruning — keep running on a degraded sweep, scoped to what
 that sweep can positively account for:
@@ -1588,7 +1764,7 @@ such case keeps the state and increments
 
 - **Tenant Authentication**: ADR-036 secp256k1 signatures with 30-second token expiry and low-S normalization
 - **Replay Protection**: Persistent token tracking (bbolt) with fail-closed semantics on mutating endpoints
-- **Callback Authentication**: HMAC-SHA256 with timestamp-based replay protection (5-minute window)
+- **Callback Authentication**: Per-backend HMAC-SHA256 keys; timestamps bound same-endpoint replay to a 5-minute window, while method/URI binding prevents cross-endpoint replay
 - **Rate Limiting**: Dual-layer token bucket — one per-IP limiter shared across all routes (10 RPS) and a per-tenant limiter (5 RPS); behind a proxy, set `trusted_proxies` so it keys on the real client IP
 - **Container Hardening**: Drop all capabilities, no-new-privileges, read-only rootfs, PID limits, network isolation
 - **Input Validation**: UUID format checks, URL scheme/host validation, manifest parsing, image allowlisting

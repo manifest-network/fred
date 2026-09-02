@@ -2,8 +2,10 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // TestDoDeprovision_ContainerlessLease_PurgesStrandedReleaseHistory proves ENG-410's
@@ -36,6 +39,169 @@ func TestDoDeprovision_ContainerlessLease_PurgesStrandedReleaseHistory(t *testin
 	assert.Empty(t, releases, "containerless deprovision must purge stranded release history (ENG-410)")
 }
 
+// A legacy-to-stack migration deliberately keeps the renamed `-prev` containers
+// for a short rollback window. A lease can close during that window. Compose Down
+// owns only the replacement stack, so Deprovision must synchronously remove every
+// rollback container while the durable migration topology still exists, and must
+// retain that topology when any removal is uncertain so the retry remains exact.
+func TestDoDeprovision_DuringLegacyMigrationGraceConsumesRollbackCohort(t *testing.T) {
+	const (
+		leaseUUID    = "11111111-1111-4111-8111-111111111111"
+		providerUUID = "22222222-2222-4222-8222-222222222222"
+	)
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "app"}}
+
+	for _, tc := range []struct {
+		name              string
+		removeErr         error
+		wantErr           bool
+		wantReleaseRemain bool
+	}{
+		{name: "success purges release after exact cleanup"},
+		{
+			name:              "uncertain cleanup preserves release for retry",
+			removeErr:         errors.New("docker unavailable"),
+			wantErr:           true,
+			wantReleaseRemain: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var removed []string
+			mock := &mockDockerClient{
+				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+					return []ContainerInfo{
+						{
+							ContainerID: "prev-id-0", Name: "fred-" + leaseUUID + "-app-0-prev",
+							LeaseUUID: leaseUUID, Tenant: "t1", ProviderUUID: providerUUID,
+							BackendName: "docker", SKU: "docker-micro", InstanceIndex: 0,
+							Image: "busybox", CallbackURL: "https://fred.example/callbacks/provision",
+							Status: "exited",
+						},
+						{
+							ContainerID: "prev-id-1", Name: "fred-" + leaseUUID + "-app-1-prev",
+							LeaseUUID: leaseUUID, Tenant: "t1", ProviderUUID: providerUUID,
+							BackendName: "docker", SKU: "docker-micro", InstanceIndex: 1,
+							Image: "busybox", CallbackURL: "https://fred.example/callbacks/provision",
+							Status: "exited",
+						},
+					}, nil
+				},
+				RemoveContainerFn: func(_ context.Context, id string) error {
+					removed = append(removed, id)
+					if id == "prev-id-0" {
+						return tc.removeErr
+					}
+					return nil
+				},
+			}
+			b := newBackendForProvisionTest(t, mock, map[string]*provision{
+				leaseUUID: {ProvisionState: leasesm.ProvisionState{
+					LeaseUUID: leaseUUID, Tenant: "t1", ProviderUUID: providerUUID,
+					Status: backend.ProvisionStatusReady, Items: items, Quantity: 2,
+				}},
+			})
+			resourceProfiles := testResourceProfiles(t, items)
+			b.provisions[leaseUUID].ResourceProfiles = resourceProfiles
+			releases := attachReleaseStore(t, b)
+			require.NoError(t, releases.Append(leaseUUID, shared.Release{
+				Manifest:         []byte(`{"image":"busybox"}`),
+				Items:            items,
+				ResourceProfiles: resourceProfiles,
+				Status:           "active",
+				CreatedAt:        time.Now(),
+				LegacyMigration:  true,
+			}))
+			// Model a successful restart/update inside the grace window. The
+			// migration row is now superseded, but it is still the sole exact
+			// authority for the rollback containers.
+			require.NoError(t, releases.Append(leaseUUID, shared.Release{
+				Manifest:         []byte(`{"image":"busybox:updated"}`),
+				Items:            items,
+				ResourceProfiles: resourceProfiles,
+				Status:           "deploying",
+				CreatedAt:        time.Now(),
+			}))
+			require.NoError(t, releases.ActivateLatest(leaseUUID))
+
+			err := b.doDeprovision(context.Background(), leaseUUID)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, []string{
+				"prev-id-0",
+				"prev-id-1",
+			}, removed, "cleanup must remove the re-attested immutable rollback IDs")
+
+			got, listErr := releases.List(leaseUUID)
+			require.NoError(t, listErr)
+			if tc.wantReleaseRemain {
+				require.Len(t, got, 2, "failed cleanup must retain its exact retry authority")
+				assert.True(t, got[0].LegacyMigration)
+				assert.Equal(t, items, got[0].Items)
+				assert.Equal(t, "active", got[1].Status)
+				return
+			}
+			assert.Empty(t, got, "release may be purged only after every rollback container is gone")
+			_, stillTracked := b.provisions[leaseUUID]
+			assert.False(t, stillTracked)
+		})
+	}
+}
+
+func TestDoDeprovision_ReleaseDeleteFailureRemainsRetryable(t *testing.T) {
+	const leaseUUID = "u1"
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-1", ProviderUUID: "provider-1",
+			Status: backend.ProvisionStatusReady, Items: items, Quantity: 1,
+		}},
+	})
+	b.provisions[leaseUUID].ResourceProfiles = testResourceProfiles(t, items)
+
+	dbPath := filepath.Join(t.TempDir(), "releases.db")
+	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	b.releaseStore = releases
+	require.NoError(t, releases.Append(leaseUUID, shared.Release{
+		Manifest: []byte(`{"image":"busybox"}`), Items: items,
+		ResourceProfiles: testResourceProfiles(t, items),
+		Status:           "active", CreatedAt: time.Now(),
+	}))
+
+	closeStoreOnDestroy := true
+	b.volumes = &mockVolumeManager{DestroyFn: func(context.Context, string) error {
+		if closeStoreOnDestroy {
+			closeStoreOnDestroy = false
+			return releases.Close()
+		}
+		return nil
+	}}
+
+	err = b.doDeprovision(context.Background(), leaseUUID)
+	require.ErrorContains(t, err, "retire release history")
+	prov, exists := b.provisions[leaseUUID]
+	require.True(t, exists, "failed release retirement must preserve an in-memory retry owner")
+	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+
+	reopened, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	b.releaseStore = reopened
+	stored, err := reopened.List(leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, stored, 1, "the failed transaction must leave exact release authority intact")
+
+	require.NoError(t, b.doDeprovision(context.Background(), leaseUUID))
+	_, exists = b.provisions[leaseUUID]
+	assert.False(t, exists)
+	stored, err = reopened.List(leaseUUID)
+	require.NoError(t, err)
+	assert.Empty(t, stored)
+}
+
 // TestDeprovisionGiveUp_WritesReapingTombstone verifies a give-up (max volume
 // cleanup attempts) writes a reaping tombstone so the footprint keeps counting + the
 // sweep auto-retries, instead of a silent uncounted leak. ENG-376 site 3.
@@ -46,37 +212,69 @@ func TestDoDeprovision_ContainerlessLease_PurgesStrandedReleaseHistory(t *testin
 // every pass (ENG-676). Asserting the projection rather than the name list is also
 // strictly closer to the property ENG-376 exists to protect.
 func TestDeprovisionGiveUp_WritesReapingTombstone(t *testing.T) {
+	const (
+		leaseUUID    = "11111111-1111-4111-8111-111111111111"
+		providerUUID = "22222222-2222-4222-8222-222222222222"
+	)
 	leakBefore := testutil.ToFloat64(retentionLeakedTotal)
-	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
+	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"u1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "u1", Tenant: "t1", Status: backend.ProvisionStatusReady, Quantity: 1,
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "t1", ProviderUUID: providerUUID,
+			Status: backend.ProvisionStatusReady, Quantity: 1,
 			Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+				"app": {Image: "nginx:latest"},
+			}},
 		}, VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1}, // next failure → give up
 	})
 	withMicroSKU(b, 1024)
 	rs := attachRetentionStore(t, b) // RetainOnClose stays false → non-retain destroy arm
+	claim, found, err := b.acquireCloseIntent(
+		context.Background(),
+		leaseUUID,
+		true,
+		"t1",
+		providerUUID,
+		b.provisions[leaseUUID].Items,
+		b.provisions[leaseUUID].StackManifest,
+		"",
+		"",
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	for range maxVolumeCleanupAttempts - 1 {
+		claim, err = b.callbackStore.IncrementCloseCleanupAttempts(claim)
+		require.NoError(t, err)
+	}
 
 	b.volumes = &mockVolumeManager{
-		ListFn:    func() ([]string, error) { return []string{"fred-u1-app-0"}, nil },
+		ListFn: func() ([]string, error) {
+			return []string{canonicalVolumeName(leaseUUID, "app", 0)}, nil
+		},
 		DestroyFn: func(_ context.Context, _ string) error { return errors.New("EBUSY") },
 	}
 
 	// The give-up branch returns nil to the actor (it abandons to manual cleanup and
 	// fires a failed callback), so do not assert on Deprovision's return value here —
 	// the load-bearing assertions are the tombstone + the leak counter below.
-	_ = b.Deprovision(context.Background(), "u1")
+	_ = b.Deprovision(context.Background(), leaseUUID)
 
 	// Poll for the reaping tombstone.
 	var got *shared.RetentionEntry
 	require.Eventually(t, func() bool {
-		g, e := rs.Get("u1")
+		g, e := rs.Get(leaseUUID)
 		if e != nil || g == nil {
 			return false
 		}
 		got = g
 		return true
-	}, 5*time.Second, 20*time.Millisecond, "reaping tombstone for u1 must be written at give-up")
+	}, 5*time.Second, 20*time.Millisecond, "reaping tombstone must be written at give-up")
 
 	assert.Equal(t, shared.RetentionStatusReaping, got.Status)
 	assert.Equal(t,
@@ -599,35 +797,59 @@ func TestDoDeprovision_ComposeDownFails_RemovesDiscoveredContainersWhenRecordIsE
 // their backend to a single known profile via withMicroSKU — can resolve its
 // footprint. A SKU the profile map does not carry silently sizes the record at 0 MB,
 // which would make a "the bytes stay counted" assertion pass vacuously.
-func seedRestoringInto(t *testing.T, rs *shared.RetentionStore, orig, newLease string) string {
+func seedRestoringInto(
+	t *testing.T,
+	rs *shared.RetentionStore,
+	orig, newLease string,
+	destinationItems []backend.LeaseItem,
+) string {
 	t.Helper()
 	retained := retainedName(canonicalVolumeName(orig, "app", 0))
 	require.NoError(t, rs.Put(shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
-		NewLeaseUUID:        newLease,
 		Tenant:              "tenant-a",
-		Status:              shared.RetentionStatusRestoring,
-		Generation:          3,
-		Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+		ProviderUUID:        "provider-a",
+		Status:              shared.RetentionStatusActive,
+		Items:               slices.Clone(destinationItems),
+		ResourceProfiles:    testResourceProfiles(t, destinationItems),
+		StackManifest:       restoreStackManifest(),
 		RetainedVolumeNames: []string{retained},
+		CreatedAt:           time.Now(),
 	}))
+	operationID, callbackURL, lifecycleURL := restoreDestinationAuthority(t)
+	_, err := rs.ClaimForRestoreWithAuthority(
+		orig,
+		newLease,
+		0,
+		destinationItems,
+		testResourceProfiles(t, destinationItems),
+		operationID,
+		callbackURL,
+		lifecycleURL,
+	)
+	require.NoError(t, err)
 	return retainedToNewCanonical(retained, orig, newLease)
 }
 
-func TestDoDeprovision_RetainPath_SkipsVolumesClaimedByRestoringRecord(t *testing.T) {
+func TestDoDeprovision_BlocksUncommittedRestoreBeforeRetainMutation(t *testing.T) {
 	const lease = "u2"
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}}
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
 			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 2,
-			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+			Items: items,
 		}},
 	})
 	b.cfg.RetainOnClose = true
 	rs := attachRetentionStore(t, b)
-	claimedVol := seedRestoringInto(t, rs, "u1", lease)
+	attachReleaseStore(t, b)
+	claimedVol := seedRestoringInto(t, rs, "u1", lease, items)
 
 	var renames [][2]string
 	b.volumes = &mockVolumeManager{
@@ -645,14 +867,9 @@ func TestDoDeprovision_RetainPath_SkipsVolumesClaimedByRestoringRecord(t *testin
 		},
 	}
 
-	require.NoError(t, b.doDeprovision(context.Background(), lease))
-
-	assert.Equal(t, [][2]string{{
-		canonicalVolumeName(lease, "app", 1),
-		retainedName(canonicalVolumeName(lease, "app", 1)),
-	}}, renames,
-		"only the closing lease's OWN volume may be retained; re-retaining the adopted one "+
-			"under u2 leaves u1's record pointing at names that no longer exist (ENG-647)")
+	err := b.ensureCommittedRestoreDestinationForClose(lease)
+	require.ErrorContains(t, err, "has not durably committed ownership")
+	assert.Empty(t, renames, "an uncommitted restore must be rejected before any volume mutation")
 
 	orig, err := rs.Get("u1")
 	require.NoError(t, err)
@@ -662,23 +879,23 @@ func TestDoDeprovision_RetainPath_SkipsVolumesClaimedByRestoringRecord(t *testin
 		"and must still name the data reconcileRestoring will re-quarantine")
 }
 
-// TestDoDeprovision_NonRetainPath_DoesNotDestroyVolumesClaimedByRestoringRecord is the
-// data-loss pin: the destroy arm names volumes by convention (canonicalVolumeName),
-// so without the guard it deletes the adopted data outright and unrecoverably.
-func TestDoDeprovision_NonRetainPath_DoesNotDestroyVolumesClaimedByRestoringRecord(t *testing.T) {
+// The non-retain path has the same pre-mutation ownership gate.
+func TestDoDeprovision_BlocksUncommittedRestoreBeforeDestroyMutation(t *testing.T) {
 	const lease = "u2"
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}}
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
 			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 2,
-			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}},
+			Items: items,
 		}},
 	})
 	// RetainOnClose stays false — the pure destroy path.
 	rs := attachRetentionStore(t, b)
-	claimedVol := seedRestoringInto(t, rs, "u1", lease)
+	attachReleaseStore(t, b)
+	claimedVol := seedRestoringInto(t, rs, "u1", lease, items)
 
 	var destroyed []string
 	b.volumes = &mockVolumeManager{
@@ -688,11 +905,9 @@ func TestDoDeprovision_NonRetainPath_DoesNotDestroyVolumesClaimedByRestoringReco
 		},
 	}
 
-	require.NoError(t, b.doDeprovision(context.Background(), lease))
-
-	assert.Equal(t, []string{canonicalVolumeName(lease, "app", 1)}, destroyed,
-		"the volume claimed by u1's in-flight restore must NOT be destroyed — that is "+
-			"unrecoverable loss of the data u1's record exists to protect (ENG-647)")
+	err := b.ensureCommittedRestoreDestinationForClose(lease)
+	require.ErrorContains(t, err, "has not durably committed ownership")
+	assert.Empty(t, destroyed, "an uncommitted restore must be rejected before any destroy")
 	assert.NotContains(t, destroyed, claimedVol)
 }
 
@@ -706,7 +921,7 @@ func TestDoDeprovision_RestoringClaimLookupFails_DoesNotDestroy(t *testing.T) {
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusFailed, Quantity: 1,
 			Items: []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
 		}},
 	})
@@ -746,14 +961,16 @@ func claimedCloseBackend(t *testing.T, retainOnClose bool) (*Backend, *shared.Re
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusFailed, Quantity: 1,
 			Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
 		}},
 	})
 	withMicroSKU(b, 512)
 	b.cfg.RetainOnClose = retainOnClose
 	rs := attachRetentionStore(t, b)
-	claimedVol := seedRestoringInto(t, rs, "u1", lease)
+	attachReleaseStore(t, b)
+	items := b.provisions[lease].Items
+	claimedVol := seedRestoringInto(t, rs, "u1", lease, items)
 
 	// The restore's live allocation — the only thing counting the adopted bytes.
 	require.NoError(t, b.pool.TryAllocate(lease+"-app-0", "docker-micro", "tenant-a"))
@@ -773,7 +990,7 @@ func TestDoDeprovision_NonRetainPath_KeepsAllocationReservedForClaimedVolume(t *
 		return nil
 	}}
 
-	require.NoError(t, b.doDeprovision(context.Background(), "u2"))
+	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose("u2"), "has not durably committed ownership")
 
 	assert.NotContains(t, destroyed, claimedVol, "the claimed volume must survive the close")
 	assert.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB,
@@ -794,32 +1011,187 @@ func TestDoDeprovision_RetainPath_KeepsAllocationReservedForClaimedVolume(t *tes
 		},
 	}
 
-	require.NoError(t, b.doDeprovision(context.Background(), "u2"))
+	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose("u2"), "has not durably committed ownership")
 
 	assert.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB,
 		"same on the retain arm: the claimed volume is excluded from THIS lease's retained record, "+
 			"so nothing else counts it (ENG-647)")
 }
 
-// TestDoDeprovision_ClaimedVolumeAllocation_ReleasedByRestoreRollback proves the
-// reservation is a HAND-OFF, not a leak: once reconcileRestoring completes the
-// rollback the volume is back under the original record, the retained projection
-// counts it, and only then is the live allocation released.
-func TestDoDeprovision_ClaimedVolumeAllocation_ReleasedByRestoreRollback(t *testing.T) {
-	b, rs, _ := claimedCloseBackend(t, false)
+// An exact active Release is the durable proof that restore ownership transferred.
+// When the source finalizer still lingers, public close admission must first publish
+// its complete close journal and then hand that finalizer off before the actor mutates
+// containers or volumes.
+func TestDeprovision_ReadyRestoreDestinationFinalizesSourceBeforeClose(t *testing.T) {
+	const orig = "0192f1a0-1111-4abc-8def-000000000501"
+	const destination = "0192f1a0-2222-4abc-8def-000000000502"
+	const providerUUID = "22222222-2222-4222-8222-222222222222"
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
+	stack := restoreStackManifest()
+	profiles := testResourceProfiles(t, items)
+	operationID, callbackURL, lifecycleURL := restoreDestinationAuthority(t)
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		destination: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: destination, Tenant: "tenant-a", ProviderUUID: providerUUID,
+			Status: backend.ProvisionStatusReady, Quantity: 1, Items: items, StackManifest: stack,
+			CallbackURL: callbackURL, LifecycleCallbackURL: lifecycleURL,
+		}},
+	})
+	bindTestStorageIdentity(t, b, mock)
+	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: b.cfg.CallbackDBPath})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, callbacks.Close()) })
+	b.callbackStore = callbacks
+	b.operationIntents = callbacks
+	b.provisions[destination].ResourceProfiles = profiles
+	b.cfg.RetainOnClose = true
+	rs := attachRetentionStore(t, b)
+	releases := attachReleaseStore(t, b)
+	manifestBytes, err := json.Marshal(stack)
+	require.NoError(t, err)
+	runtimeAuthority, err := shared.NewReleaseRuntimeAuthority(
+		operationID, "tenant-a", providerUUID, callbackURL, lifecycleURL,
+	)
+	require.NoError(t, err)
+	require.NoError(t, releases.Append(destination, shared.Release{
+		Manifest: manifestBytes, Image: "stack", OperationID: operationID,
+		Items: items, ResourceProfiles: profiles, RuntimeAuthority: &runtimeAuthority,
+		Status: "active", CreatedAt: time.Now(),
+	}))
+	retainedSource := retainedName(canonicalVolumeName(orig, "app", 0))
+	canonicalDestination := canonicalVolumeName(destination, "app", 0)
+	restored := shared.RetentionEntry{
+		OriginalLeaseUUID: orig, NewLeaseUUID: destination,
+		Tenant: "tenant-a", ProviderUUID: providerUUID,
+		Status: shared.RetentionStatusRestoring, Generation: 3,
+		Items: items, StackManifest: stack,
+		DestinationItems: items, DestinationResourceProfiles: profiles,
+		DestinationOperationID: operationID,
+		DestinationCallbackURL: callbackURL, DestinationLifecycleCallbackURL: lifecycleURL,
+		RetainedVolumeNames: []string{retainedSource}, CreatedAt: time.Now(),
+	}
+	putRestoringRetention(t, rs, restored)
+
+	var renames [][2]string
 	b.volumes = &mockVolumeManager{
-		DestroyFn:      func(_ context.Context, _ string) error { return nil },
-		RenameVolumeFn: func(_, _ string) error { return nil },
+		ListFn: func() ([]string, error) { return []string{canonicalDestination}, nil },
+		RenameVolumeFn: func(oldName, newName string) error {
+			renames = append(renames, [2]string{oldName, newName})
+			return nil
+		},
+		DestroyFn: func(_ context.Context, name string) error {
+			t.Fatalf("destination retain-on-close policy must not destroy %q", name)
+			return nil
+		},
 	}
 
-	require.NoError(t, b.doDeprovision(context.Background(), "u2"))
+	require.NoError(t, b.Deprovision(context.Background(), destination))
+
+	source, err := rs.Get(orig)
+	require.NoError(t, err)
+	assert.Nil(t, source, "successful restore ownership must not resurrect under the source lease")
+	destinationRecord, err := rs.Get(destination)
+	require.NoError(t, err)
+	require.NotNil(t, destinationRecord, "the destination's retain-on-close policy must own the bytes")
+	assert.Equal(t, shared.RetentionStatusActive, destinationRecord.Status)
+	assert.Equal(t, "tenant-a", destinationRecord.Tenant)
+	assert.Equal(t, [][2]string{{canonicalDestination, retainedName(canonicalDestination)}}, renames)
+}
+
+// If the exact Release proof cannot be read, close must fail before the actor status,
+// close journal, containers, or volumes are touched.
+func TestDeprovision_ReadyRestoreDestinationFailsClosedWhenCommitProofUnreadable(t *testing.T) {
+	const orig = "0192f1a0-1111-4abc-8def-000000000511"
+	const destination = "0192f1a0-2222-4abc-8def-000000000512"
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
+	stack := restoreStackManifest()
+	profiles := testResourceProfiles(t, items)
+	operationID, callbackURL, lifecycleURL := restoreDestinationAuthority(t)
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
+		destination: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: destination, Tenant: "tenant-a", ProviderUUID: "provider-a",
+			Status: backend.ProvisionStatusReady, Quantity: 1, Items: items, StackManifest: stack,
+			CallbackURL: callbackURL, LifecycleCallbackURL: lifecycleURL,
+		}},
+	})
+	b.provisions[destination].ResourceProfiles = profiles
+	rs := attachRetentionStore(t, b)
+	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "closed-releases.db"),
+	})
+	require.NoError(t, err)
+	require.NoError(t, releaseStore.Close())
+	b.releaseStore = releaseStore
+	putRestoringRetention(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID: orig, NewLeaseUUID: destination,
+		Tenant: "tenant-a", ProviderUUID: "provider-a",
+		Status: shared.RetentionStatusRestoring, Generation: 3,
+		Items: items, StackManifest: stack,
+		DestinationItems: items, DestinationResourceProfiles: profiles,
+		DestinationOperationID: operationID,
+		DestinationCallbackURL: callbackURL, DestinationLifecycleCallbackURL: lifecycleURL,
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(orig, "app", 0))},
+		CreatedAt:           time.Now(),
+	})
+
+	volumeTouched := false
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) {
+			volumeTouched = true
+			return nil, nil
+		},
+		RenameVolumeFn: func(_, _ string) error { volumeTouched = true; return nil },
+		DestroyFn:      func(context.Context, string) error { volumeTouched = true; return nil },
+	}
+
+	err = b.Deprovision(context.Background(), destination)
+	require.ErrorContains(t, err, "has not durably committed ownership")
+	assert.False(t, volumeTouched, "failed ownership finalization must precede every volume mutation")
+
+	b.provisionsMu.RLock()
+	status := b.provisions[destination].Status
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ProvisionStatusReady, status,
+		"failed preflight must not admit the actor's Ready -> Deprovisioning transition")
+	source, getErr := rs.Get(orig)
+	require.NoError(t, getErr)
+	require.NotNil(t, source)
+	assert.Equal(t, shared.RetentionStatusRestoring, source.Status)
+}
+
+// A close racing an uncommitted restore is refused. The subsequent restore
+// rollback hands the live reservation to retained accounting without a gap.
+func TestDoDeprovision_ClaimedVolumeAllocation_ReleasedByRestoreRollback(t *testing.T) {
+	b, rs, claimedVol := claimedCloseBackend(t, false)
+	var destroyed []string
+	b.volumes = &mockVolumeManager{
+		DestroyFn: func(_ context.Context, name string) error {
+			destroyed = append(destroyed, name)
+			return nil
+		},
+		RenameVolumeFn: func(_, _ string) error { return nil },
+		UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
+	}
+
+	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose("u2"), "has not durably committed ownership")
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "close holds the reservation")
+	assert.NotContains(t, destroyed, claimedVol,
+		"an uncommitted destination close must preserve bytes owned by its source finalizer")
 
 	// The restore rollback now runs (boot or retention sweep) and finishes the job.
 	entry, err := rs.Get("u1")
 	require.NoError(t, err)
 	require.NotNil(t, entry)
-	b.reconcileRestoring(context.Background(), *entry)
+	b.provisionsMu.RLock()
+	require.Equal(t, backend.ProvisionStatusFailed, b.provisions["u2"].Status)
+	b.provisionsMu.RUnlock()
+	require.False(t, b.leaseActorProcessingOrQueued("u2"))
+	require.NoError(t, b.reconcileRestoring(context.Background(), *entry))
 
 	reverted, err := rs.Get("u1")
 	require.NoError(t, err)
@@ -836,14 +1208,21 @@ func TestDoDeprovision_ClaimedVolumeAllocation_ReleasedByRestoreRollback(t *test
 // reservation is held because of the claimed volume, not because the close stopped
 // releasing. Without this the tests above would pass against a release that never runs.
 func TestDoDeprovision_NoClaimedVolume_StillReleasesAllocation(t *testing.T) {
-	const lease = "u2"
+	const lease = "22222222-2222-4222-8222-222222222222"
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(_ context.Context, _ string) error { return nil },
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
 	}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 1,
+			LeaseUUID: lease, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+			Status: backend.ProvisionStatusReady, Quantity: 1,
 			Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+				"app": {Image: "nginx:latest"},
+			}},
 		}},
 	})
 	withMicroSKU(b, 512)
@@ -858,71 +1237,39 @@ func TestDoDeprovision_NoClaimedVolume_StillReleasesAllocation(t *testing.T) {
 	assert.Zero(t, b.pool.Stats().AllocationCount)
 }
 
-// TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord closes the delayed
-// half of the data-loss hole (ENG-647, PR #217 review).
-//
-// The close's volume branches refuse to destroy a volume an in-flight restore adopted
-// into this lease's namespace — but a give-up after maxVolumeCleanupAttempts writes a
-// REAPING tombstone, and a tombstone is a scheduled destroy: destroyReapingVolumes
-// RemoveAll's every name it carries. recordGiveUpLeak collects by prefix
-// (fred-{lease}-*), which matches the adopted volume exactly, so without this the
-// guard merely deferred the destruction by one sweep — and made it look accounted-for
-// on the way.
-//
-// The guard is no longer at write time. The tombstone records the footprint's SIZE and
-// names no volumes at all (ENG-676), so there is no name list left to leak an adopted
-// volume into; the finalizer derives its destroy set and refuses the adopted name against
-// the owner table. That makes this an END-TO-END assertion rather than an assertion about
-// an intermediate list: give up, then run the finalizer, and check what is actually
-// destroyed. It is the stronger form of the same property — the old version could have
-// passed while the volume still died at the next sweep.
-func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T) {
+// An uncommitted restore cannot enter the close give-up path at all. This is
+// stronger than filtering adopted names out of a tombstone after teardown failed.
+func TestDeprovision_UncommittedRestoreCannotEnterGiveUp(t *testing.T) {
 	const lease = "u2"
+	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "app"}}
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		lease: {ProvisionState: leasesm.ProvisionState{
 			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusReady, Quantity: 2,
-			Items: []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "app"}},
+			Items: items,
 		}, VolumeCleanupAttempts: maxVolumeCleanupAttempts - 1}, // next failure → give up
 	})
 	withMicroSKU(b, 512)
 	rs := attachRetentionStore(t, b)
-	claimedVol := seedRestoringInto(t, rs, "u1", lease) // fred-u2-app-0 IS u1's adopted data
+	claimedVol := seedRestoringInto(t, rs, "u1", lease, items) // fred-u2-app-0 IS u1's adopted data
 	ownVol := canonicalVolumeName(lease, "app", 1)
 
-	destroyFails := true // EBUSY drives the retry → give-up arm; relaxed for the sweep below
 	var destroyed []string
 	b.volumes = &mockVolumeManager{
 		ListFn: func() ([]string, error) { return []string{claimedVol, ownVol}, nil },
 		DestroyFn: func(_ context.Context, id string) error {
-			if id == claimedVol {
-				t.Errorf("must never destroy the claimed volume %q — it is another lease's retained data", id)
-				return nil
-			}
-			if destroyFails {
-				return errors.New("EBUSY")
-			}
 			destroyed = append(destroyed, id)
-			return nil
+			return errors.New("EBUSY")
 		},
 	}
 
-	_ = b.doDeprovision(context.Background(), lease) // give-up returns nil by contract
+	err := b.ensureCommittedRestoreDestinationForClose(lease)
+	require.ErrorContains(t, err, "has not durably committed ownership")
 
 	tomb, err := rs.Get(lease)
 	require.NoError(t, err)
-	require.NotNil(t, tomb, "the give-up must still record this lease's abandoned footprint")
-	assert.Equal(t, shared.RetentionStatusReaping, tomb.Status)
-	assert.Empty(t, tomb.RetainedVolumeNames, "the record carries no destroy plan (ENG-676)")
-
-	// Now run the finalizer, which is where the guard actually lives. The adopted volume is
-	// in this lease's namespace and would be swept up by the prefix scan, so only the owner
-	// table stands between it and a RemoveAll.
-	destroyFails = false
-	require.False(t, b.destroyReapingVolumes(context.Background(), b.newManagedVolumeIndex(), lease),
-		"a refused name means the record is kept for retry")
-	assert.Equal(t, []string{ownVol}, destroyed,
-		"this lease's own leak is reclaimed; the volume an in-flight restore adopted is not (ENG-647)")
+	assert.Nil(t, tomb, "close refusal must not manufacture a reaping tombstone")
+	assert.Empty(t, destroyed, "close refusal must precede all volume cleanup")
 
 	// And the original record is untouched, so its restore is still possible.
 	orig, err := rs.Get("u1")
@@ -931,48 +1278,33 @@ func TestDeprovisionGiveUp_ExcludesVolumesClaimedByRestoringRecord(t *testing.T)
 	assert.Equal(t, shared.RetentionStatusRestoring, orig.Status)
 }
 
-// TestDoDeprovision_ClaimedVolume_AccountingAcrossRecoveryAndSweep is a
-// CHARACTERIZATION test: it walks the three real events that follow a close which
-// left a restore-claimed volume behind, and pins what the accounting does at each —
-// including a KNOWN GAP that is deliberately not closed in this PR.
-//
-// The gap: holding the reservation (see the tests above) is only durable while the
-// lease is still tracked. The close deletes the provision, and recoverState's
-// pool-authoritative rebuild preserves a key only for a lease still in b.provisions
-// (ENG-567), so the next reconcile tick drops it — default reconcile_interval 5m,
-// against an exposure that lasts until the retention sweep re-quarantines the volume,
-// default retention_reap_interval 1h. Between those the bytes are on disk and counted
-// by nobody, and admission can over-commit against them.
-//
-// This is pinned rather than described so the window is visible in the suite and a
-// future durable fix has to update this test deliberately instead of silently
-// changing an unobserved behaviour. See the ENG-647 follow-up.
+// The restore finalizer is durable sizing authority across refresh. A blocked
+// close cannot create the former uncounted window before rollback completes.
 func TestDoDeprovision_ClaimedVolume_AccountingAcrossRecoveryAndSweep(t *testing.T) {
 	b, rs, claimedVol := claimedCloseBackend(t, false)
 	b.volumes = &mockVolumeManager{
 		DestroyFn:      func(_ context.Context, _ string) error { return nil },
 		RenameVolumeFn: func(_, _ string) error { return nil },
 		ListFn:         func() ([]string, error) { return []string{claimedVol}, nil },
+		UsageFn:        func(context.Context, string) (int64, error) { return 0, nil },
 	}
 
 	// (1) The close: the reservation is held, because the bytes are still on disk and
 	// a restoring record is counted by neither projection.
-	require.NoError(t, b.doDeprovision(context.Background(), "u2"))
+	require.ErrorContains(t, b.ensureCommittedRestoreDestinationForClose("u2"), "has not durably committed ownership")
 	assert.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "close holds the reservation")
 	assert.Zero(t, b.pool.Stats().RetainedDiskMB)
 
-	// (2) The next reconcile tick. recoverState rebuilds the pool from live containers
-	// plus the keys of still-tracked leases; this lease was deleted by the close, so
-	// its key is dropped even though its volume is still on disk. THIS IS THE KNOWN GAP.
-	b.docker = &mockDockerClient{
-		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
-	}
+	// (2) The next reconcile tick reconstructs the exact reservation from the
+	// restoring finalizer even when Docker reports no destination survivors.
+	dockerMock, ok := b.docker.(*mockDockerClient)
+	require.True(t, ok)
+	dockerMock.ListManagedContainersFn = func(_ context.Context) ([]ContainerInfo, error) { return nil, nil }
 	require.NoError(t, b.recoverState(context.Background()))
-	assert.Zero(t, b.pool.Stats().AllocatedDiskMB,
-		"KNOWN GAP (ENG-647 follow-up): the rebuild is ownership-keyed, so an untracked "+
-			"lease's reservation is dropped while its volume is still on disk")
+	assert.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB,
+		"the restore finalizer must keep adopted bytes reserved across refresh")
 	assert.Zero(t, b.pool.Stats().RetainedDiskMB,
-		"and the restoring record still counts nowhere — this is the over-admission window")
+		"the same bytes must not also be counted as retained")
 
 	// (3) The retention sweep — the real end of the window. It re-quarantines the
 	// volume, reverts the record, and the bytes become retained-counted again.

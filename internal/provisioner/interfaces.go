@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
@@ -45,6 +46,17 @@ type PlacementView interface {
 // Compile-time check for the concrete durable store.
 var _ PlacementView = (*placement.Store)(nil)
 
+// PlacementProviderAuthority proves that a placement authority belongs to the
+// exact provider whose chain lifecycle a runtime will drive. Keeping this as a
+// narrow port lets independently constructed Manager and Reconciler instances
+// reject a cross-provider authority mix before they can derive absence,
+// ownership, or backend-mutation permission from the wrong database.
+type PlacementProviderAuthority interface {
+	VerifyProviderUUID(string) error
+}
+
+var _ PlacementProviderAuthority = (*placement.Store)(nil)
+
 // ProvisionOperations is the process-local lifecycle authority needed by the
 // event-driven provision coordinator. Its opaque capabilities keep the
 // prepare/call/settle transitions exact while allowing callers and tests to
@@ -76,13 +88,36 @@ type ReconcilerOperations interface {
 	Lookup(string) (operation.Record, bool)
 	CountsByBackend() map[string]int
 	TryInitiateClaimed(operation.LeaseClaim, operation.TrackSpec) operation.InitiationResult
+	RecoverClaimed(operation.LeaseClaim, operation.OperationID, operation.TrackSpec) operation.RecoveryResult
 	BeginCall(operation.Initiation) bool
 	Activate(operation.Initiation) operation.InitiationCompletion
 	AbortInitiation(operation.Initiation) operation.InitiationCompletion
 }
 
+// RestoreOperations is the process-local lifecycle authority exposed to the
+// restore application service. It deliberately omits reconciliation,
+// callback, timeout, observation, and shutdown transitions.
+type RestoreOperations interface {
+	TryClaimLeaseNow(string) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
+	TryInitiateClaimed(operation.LeaseClaim, operation.TrackSpec) operation.InitiationResult
+	BindBackend(operation.Initiation, string) bool
+	BeginCall(operation.Initiation) bool
+	Activate(operation.Initiation) operation.InitiationCompletion
+	AbortInitiation(operation.Initiation) operation.InitiationCompletion
+}
+
+// MaintenanceClaims is the exact per-lease exclusion authority needed by
+// restart and update handlers. It cannot start or settle lifecycle operations.
+type MaintenanceClaims interface {
+	TryClaimLeaseNow(string) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
+}
+
 var _ ProvisionOperations = (*operation.Registry)(nil)
 var _ ReconcilerOperations = (*operation.Registry)(nil)
+var _ RestoreOperations = (*operation.Registry)(nil)
+var _ MaintenanceClaims = (*operation.Registry)(nil)
 
 // ProvisionPlacement is the exact placement capability needed to initiate a
 // provision. It cannot project inventory, change readiness, settle callbacks,
@@ -91,8 +126,8 @@ type ProvisionPlacement interface {
 	PlacementView
 	CurrentAdmissionBaseline() placement.AdmissionBaseline
 	ScopeAdmission(placement.AdmissionBaseline, []string) (placement.AdmissionScope, error)
-	BeginNewAttempt(placement.AdmissionScope, string, string, operation.OperationID) (placement.AttemptToken, bool, error)
-	BeginOwnedAttempt(placement.AdmissionBaseline, placement.RecordRevision, string, operation.OperationID) (placement.AttemptToken, bool, error)
+	BeginNewAttempt(placement.AdmissionScope, string, string, operation.OperationID, placement.PayloadFingerprint, placement.BackendRequestSnapshot, placement.CallbackPair) (placement.AttemptToken, bool, error)
+	BeginOwnedAttempt(placement.AdmissionBaseline, placement.RecordRevision, string, operation.OperationID, placement.PayloadFingerprint, placement.BackendRequestSnapshot, placement.CallbackPair) (placement.AttemptToken, bool, error)
 	ConfirmAttempt(placement.AttemptToken) (bool, error)
 	RefuseAttempt(placement.AttemptToken) (bool, error)
 }
@@ -102,16 +137,22 @@ type ProvisionPlacement interface {
 // excluding callback settlement by operation identity.
 type ReconcilerPlacement interface {
 	PlacementView
-	ConfigureBackendTopology([]string) error
+	PlacementProviderAuthority
+	VerifyBackendTopology([]string) error
+	ExpectedBackendStorageIdentity(string) (backendidentity.ID, bool)
 	CurrentAdmissionBaseline() placement.AdmissionBaseline
 	ScopeAdmission(placement.AdmissionBaseline, []string) (placement.AdmissionScope, error)
 	BeginInventorySession() placement.InventoryFence
 	EndInventorySession(placement.InventoryFence)
 	ProjectInventory(placement.InventoryFence, placement.InventoryProjection) (placement.ProjectionResult, error)
-	BeginNewAttempt(placement.AdmissionScope, string, string, operation.OperationID) (placement.AttemptToken, bool, error)
-	BeginOwnedAttempt(placement.AdmissionBaseline, placement.RecordRevision, string, operation.OperationID) (placement.AttemptToken, bool, error)
+	BeginNewAttempt(placement.AdmissionScope, string, string, operation.OperationID, placement.PayloadFingerprint, placement.BackendRequestSnapshot, placement.CallbackPair) (placement.AttemptToken, bool, error)
+	BeginOwnedAttempt(placement.AdmissionBaseline, placement.RecordRevision, string, operation.OperationID, placement.PayloadFingerprint, placement.BackendRequestSnapshot, placement.CallbackPair) (placement.AttemptToken, bool, error)
 	ConfirmAttempt(placement.AttemptToken) (bool, error)
 	RefuseAttempt(placement.AttemptToken) (bool, error)
+	ClaimAttempt(string, operation.OperationID) (placement.AttemptClaim, bool, error)
+	ReleaseAttemptClaim(placement.AttemptClaim) bool
+	ConfirmClaimedAttempt(placement.AttemptClaim) (bool, error)
+	RefuseClaimedAttempt(placement.AttemptClaim) (bool, error)
 	DeleteRecord(placement.RecordRevision) (bool, error)
 }
 
@@ -122,8 +163,7 @@ type PlacementAuthorityStore interface {
 	ProvisionPlacement
 	ReconcilerPlacement
 	CallbackLifecycleAuthority
-	ConfirmOperation(leaseUUID, backendName string, operationID operation.OperationID) (bool, error)
-	RefuseOperation(leaseUUID, backendName string, operationID operation.OperationID) (bool, error)
+	CallbackPlacement
 }
 
 var _ ProvisionPlacement = (*placement.Store)(nil)

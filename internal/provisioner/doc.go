@@ -15,15 +15,16 @@
 // The operation.Registry is the only process-local source of lifecycle operation
 // state. It issues typed OperationID values and opaque initiation, lease, token,
 // and settlement capabilities, enforcing Preparing -> Calling -> Active ordering
-// without exposing raw identifiers as mutation authority. The legacy
-// InFlightTracker surface is a temporary compatibility adapter over Registry and
-// does not own duplicate lifecycle state.
+// without exposing raw identifiers as mutation authority. Manager owns this
+// registry directly; lifecycle consumers receive narrow capability ports.
 //
 // The placement store is the durable authority for write-ahead attempts,
 // confirmed owners, conflict quarantine, and inventory revisions. Consumer ports
 // deliberately expose only the transitions each service is permitted to make.
-// A process-local capability and a durable operation-scoped record must agree
-// before an external result can settle a lifecycle operation.
+// During the originating process, settlement joins the process-local capability
+// with the durable operation-scoped record. After a restart, the exact durable
+// operation identity is independently sufficient to reacquire a lease claim and
+// finish settlement; volatile registry loss must not discard causal evidence.
 //
 // # Event Topics
 //
@@ -77,14 +78,34 @@
 //
 //	Chain: PENDING lease exists
 //	Placement: unresolved backend attempt exists
-//	Backend: attempted backend reports the lease
+//	Backend: attempted backend reports the lease and exact paired generation
 //	Action: confirm ownership, then continue settlement
 //
+// When positive inventory or a callback has not settled the attempt, a later
+// sweep reconstructs the exact operation ID and request and redelivers only to
+// the pinned attempted backend. Acceptance or idempotent recognition promotes
+// it; a contract-conforming refusal clears it; every ambiguous response retains
+// it for another sweep. The attempt itself binds the typed kind, exact callback
+// pair, immutable tenant/provider/ordered item snapshot, and provision payload
+// fingerprint or restore source, so callback-base, CustomDomain, and payload
+// updates across a restart cannot silently rewrite the request. Missing
+// payload bytes defer rather than downgrading the call or terminating the lease.
+// A positively terminal target follows a separate claimed path: every exact
+// attempted/confirmed backend is deprovisioned, and only all-success promotes
+// conservative closed-lease affinity; ambiguity retains the attempt.
+//
+// An older observed generation preserves both its current authority and the
+// newer durable attempt. A callback after Registry loss may reacquire the lease
+// and settle through that exact attempt; inventory never invents its ID. A nil
+// chain point-read is not terminal proof: callback settlement stays retryable
+// and preserves the operation, attempt, and payload until the chain positively
+// reports a supported live or terminal state.
 // A positive report from another backend is unioned with every existing owner
 // and attempt into durable conflict quarantine. Complete or partial inventory
 // silence never clears an ambiguous attempt or conflict: an old request can
-// commit after the list response. Only a contract-conforming synchronous
+// commit after the list response. Exact same-operation redelivery, the exact
+// callback, matching paired-generation inventory, a contract-conforming
 // refusal trusted under the configured backend transport, or explicit operator
-// proof, may clear it. This makes timeout, panic, transport failure, generic
+// proof may settle an attempt. This makes timeout, panic, transport failure, generic
 // 5xx, callback loss, and restart conservative by construction.
 package provisioner

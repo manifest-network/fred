@@ -60,14 +60,14 @@ func TestSanitizeVolumePath(t *testing.T) {
 func TestBuildStatefulVolumeBinds(t *testing.T) {
 	t.Run("empty volumes returns empty map", func(t *testing.T) {
 		dir := t.TempDir()
-		binds, err := buildStatefulVolumeBinds(dir, nil, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, nil, 0, 0)
 		require.NoError(t, err)
 		assert.Empty(t, binds)
 	})
 
 	t.Run("single volume path", func(t *testing.T) {
 		dir := t.TempDir()
-		binds, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
 		require.NoError(t, err)
 		require.Len(t, binds, 1)
 		expected := filepath.Join(dir, "data")
@@ -78,7 +78,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 
 	t.Run("multiple volume paths", func(t *testing.T) {
 		dir := t.TempDir()
-		binds, err := buildStatefulVolumeBinds(dir, []string{"/data", "/var/lib/postgresql/data"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data", "/var/lib/postgresql/data"}, 0, 0)
 		require.NoError(t, err)
 		assert.Len(t, binds, 2)
 		assert.Equal(t, "/data", binds[filepath.Join(dir, "data")])
@@ -90,7 +90,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 
 	t.Run("unsupported volume path returns error", func(t *testing.T) {
 		dir := t.TempDir()
-		_, err := buildStatefulVolumeBinds(dir, []string{".."}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{".."}, 0, 0)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported VOLUME path")
 		assert.Contains(t, err.Error(), "..")
@@ -99,14 +99,14 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 	t.Run("unsupported path among valid paths returns error and stops", func(t *testing.T) {
 		dir := t.TempDir()
 		// "/" sanitizes to "" which is unsupported
-		_, err := buildStatefulVolumeBinds(dir, []string{"/data", "/"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data", "/"}, 0, 0)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported VOLUME path")
 	})
 
 	t.Run("uid gid zero skips chown", func(t *testing.T) {
 		dir := t.TempDir()
-		binds, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
 		require.NoError(t, err)
 		assert.Len(t, binds, 1)
 		// Just verify it succeeds without chown — no permission error
@@ -120,14 +120,14 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.Chmod(roDir, 0o500))
 		t.Cleanup(func() { os.Chmod(roDir, 0o700) })
 
-		_, err := buildStatefulVolumeBinds(roDir, []string{"/data"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), roDir, []string{"/data"}, 0, 0)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "volume subdir")
 	})
 
 	t.Run("subdirectory permissions are 0700", func(t *testing.T) {
 		dir := t.TempDir()
-		_, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
 		require.NoError(t, err)
 
 		info, err := os.Stat(filepath.Join(dir, "data"))
@@ -152,7 +152,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.Symlink(outside, filepath.Join(dir, "data")))
 
 		// Deploy 2 declares VOLUME /data.
-		_, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
 		require.Error(t, err, "must refuse to resolve a VOLUME path through a symlink that escapes the volume root")
 	})
 
@@ -163,7 +163,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.Symlink(outside, filepath.Join(dir, "esc")))
 
 		// Deploy 2 declares VOLUME /esc/pwned, which would traverse the symlink.
-		_, err := buildStatefulVolumeBinds(dir, []string{"/esc/pwned"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/esc/pwned"}, 0, 0)
 		require.Error(t, err, "must refuse to create a VOLUME subdir through an escaping symlink")
 		// The escape target must not be written to.
 		assert.NoDirExists(t, filepath.Join(outside, "pwned"), "MkdirAll must not have followed the symlink out of the volume root")
@@ -194,7 +194,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		// Deploy 2 declares VOLUME /data/x. Nothing upstream stops it: sanitizeVolumePath
 		// sees no ".." in the *string*, and update preflight never inspects the image's
 		// VOLUME set or on-disk state.
-		binds, err := buildStatefulVolumeBinds(dir, []string{"/data/x"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, 0, 0)
 		require.Error(t, err, "a leaf symlink that stays INSIDE the volume root must be rejected")
 		assert.Empty(t, binds, "no bind may be emitted once the leaf is refused")
 	})
@@ -204,7 +204,7 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, "data", "y"), 0o700))
 		require.NoError(t, os.Symlink("y", filepath.Join(dir, "data", "x")))
 
-		binds, err := buildStatefulVolumeBinds(dir, []string{"/data/x"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, 0, 0)
 		require.Error(t, err, "a leaf symlink is unsafe as a bind Source wherever it points")
 		assert.Empty(t, binds, "no bind may be emitted once the leaf is refused")
 	})
@@ -223,13 +223,13 @@ func TestBuildStatefulVolumeBinds(t *testing.T) {
 		require.NoError(t, os.Symlink("..", filepath.Join(dir, "data", "x")))
 
 		// The image that declares the poisoned leaf is refused...
-		_, err := buildStatefulVolumeBinds(dir, []string{"/data/x"}, 0, 0)
+		_, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data/x"}, 0, 0)
 		require.Error(t, err)
 
 		// ...but the same volume still serves an image declaring only /data. That is the
 		// tenant's own way out: /data comes back mounted read-write, so its container can
 		// delete the link without an operator.
-		binds, err := buildStatefulVolumeBinds(dir, []string{"/data"}, 0, 0)
+		binds, err := buildStatefulVolumeBindsContext(context.Background(), dir, []string{"/data"}, 0, 0)
 		require.NoError(t, err, "a planted leaf must not wedge the rest of the volume")
 		assert.Equal(t, "/data", binds[filepath.Join(dir, "data")])
 		assertNoSymlinkBindSources(t, binds)
@@ -444,7 +444,7 @@ func TestCleanupOrphanedVolumes_ListFailure(t *testing.T) {
 		stopCtx:    stopCtx,
 		stopCancel: stopCancel,
 	}
-	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+	b.callbackSender = shared.MustNewEphemeralCallbackSender(shared.CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
@@ -724,14 +724,14 @@ func TestAtomicRenameVolumeDir_Idempotent(t *testing.T) {
 	require.NoError(t, os.MkdirAll(oldPath, 0o755))
 
 	// First call: rename succeeds.
-	require.NoError(t, atomicRenameVolumeDir(oldPath, newPath))
+	require.NoError(t, atomicRenameVolumeDir(context.Background(), oldPath, newPath))
 	_, err := os.Stat(newPath)
 	require.NoError(t, err, "new path should exist after rename")
 	_, err = os.Stat(oldPath)
 	require.True(t, os.IsNotExist(err), "old path should be gone after rename")
 
 	// Second call: old gone, new exists — idempotent no-op.
-	require.NoError(t, atomicRenameVolumeDir(oldPath, newPath))
+	require.NoError(t, atomicRenameVolumeDir(context.Background(), oldPath, newPath))
 }
 
 func TestAtomicRenameVolumeDir_BothExistFails(t *testing.T) {
@@ -741,14 +741,14 @@ func TestAtomicRenameVolumeDir_BothExistFails(t *testing.T) {
 	require.NoError(t, os.MkdirAll(oldPath, 0o755))
 	require.NoError(t, os.MkdirAll(newPath, 0o755))
 
-	err := atomicRenameVolumeDir(oldPath, newPath)
+	err := atomicRenameVolumeDir(context.Background(), oldPath, newPath)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "manual intervention required")
 }
 
 func TestAtomicRenameVolumeDir_NeitherExistsFails(t *testing.T) {
 	root := t.TempDir()
-	err := atomicRenameVolumeDir(filepath.Join(root, "a"), filepath.Join(root, "b"))
+	err := atomicRenameVolumeDir(context.Background(), filepath.Join(root, "a"), filepath.Join(root, "b"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither")
 }
@@ -776,7 +776,7 @@ func TestXFSVolumeManager_RenameVolume_UpdatesProjectIDMap(t *testing.T) {
 	mgr.trackProjectID(oldName, projID)
 	mgr.mu.Unlock()
 
-	require.NoError(t, mgr.RenameVolume(oldName, newName))
+	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
 
 	mgr.mu.Lock()
 	gotID, ok := mgr.volumeToID[newName]
@@ -791,7 +791,7 @@ func TestXFSVolumeManager_RenameVolume_UpdatesProjectIDMap(t *testing.T) {
 	assert.Equal(t, newName, gotName, "activeIDs[projID] should point at newName")
 
 	// Second invocation: idempotent — old path gone, new path exists.
-	require.NoError(t, mgr.RenameVolume(oldName, newName))
+	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
 }
 
 func TestBtrfsVolumeManager_RenameVolume_Idempotent(t *testing.T) {
@@ -802,8 +802,8 @@ func TestBtrfsVolumeManager_RenameVolume_Idempotent(t *testing.T) {
 	const newName = "fred-lease-1-app-0"
 	require.NoError(t, os.MkdirAll(filepath.Join(root, oldName), 0o755))
 
-	require.NoError(t, mgr.RenameVolume(oldName, newName))
-	require.NoError(t, mgr.RenameVolume(oldName, newName)) // idempotent
+	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
+	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName)) // idempotent
 
 	_, err := os.Stat(filepath.Join(root, newName))
 	require.NoError(t, err)
@@ -835,7 +835,7 @@ func TestXFSVolumeManager_RenameVolume_FailureLeavesMapUnchanged(t *testing.T) {
 	mgr.trackProjectID(oldName, projID)
 	mgr.mu.Unlock()
 
-	err := mgr.RenameVolume(oldName, newName)
+	err := mgr.RenameVolume(context.Background(), oldName, newName)
 	require.Error(t, err, "rename of both-exist must fail")
 
 	// Maps must be unchanged: oldName still tracked, newName not.

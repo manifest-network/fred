@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -41,19 +40,16 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.RetainOnClose = true
-		// Isolate the retention DB. testBackendWithRealDocker points the other
-		// DBs at its own tmpDir but does NOT set RetentionDBPath; the default is
-		// "retention.db" relative to cwd, which would pollute across tests.
-		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		// Disable the background reaper so it doesn't race the test assertions.
 		cfg.RetentionMaxAge = 0 // 0 = reaping disabled
 		cfg.RetentionReapInterval = 0
 	})
 
 	ctx := context.Background()
-	origLease := fmt.Sprintf("retain-restore-orig-%d", time.Now().UnixNano())
+	origLease := newIntegrationLeaseUUID()
 
 	// ── STEP 1: Provision a stateful lease ────────────────────────────────
 	//
@@ -69,7 +65,7 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    origLease,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -148,13 +144,13 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	require.NotEmpty(t, info.Items, "retained provision must carry the restore-shape Items")
 
 	// ── STEP 5: Restore into a new lease ──────────────────────────────────
-	newLease := fmt.Sprintf("retain-restore-new-%d", time.Now().UnixNano())
+	newLease := newIntegrationLeaseUUID()
 
 	err = b.Restore(ctx, backend.RestoreRequest{
 		LeaseUUID:     newLease,
 		FromLeaseUUID: origLease,
 		Tenant:        "test-tenant",
-		ProviderUUID:  "test-provider",
+		ProviderUUID:  testProviderUUID,
 		// Items shape must match the retained set: ServiceName="app", Quantity=1.
 		Items:       []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
 		CallbackURL: callbackServer.URL,
@@ -214,15 +210,15 @@ func TestIntegration_Docker_RetainGraceReap(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.RetainOnClose = true
-		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		cfg.RetentionMaxAge = graceMaxAge
 		cfg.RetentionReapInterval = reapInterval
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("retain-reap-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// Provision a stateful lease.
 	appManifest := manifest.Manifest{
@@ -235,7 +231,7 @@ func TestIntegration_Docker_RetainGraceReap(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,

@@ -60,3 +60,41 @@ func invokeBackendProvision(
 	}()
 	return backendClient.Provision(ctx, request)
 }
+
+func invokeBackendRestore(
+	ctx context.Context,
+	backendClient backend.Backend,
+	request backend.RestoreRequest,
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error("backend Restore panicked",
+				"lease_uuid", request.LeaseUUID,
+				"backend", backendClient.Name(),
+				"panic", recovered,
+				"stack", string(debug.Stack()),
+			)
+			err = fmt.Errorf("backend Restore panicked: %v", recovered)
+		}
+	}()
+	return backendClient.Restore(ctx, request)
+}
+
+func invokeBackendDeprovision(
+	ctx context.Context,
+	backendClient backend.Backend,
+	leaseUUID string,
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error("backend Deprovision panicked",
+				"lease_uuid", leaseUUID,
+				"backend", backendClient.Name(),
+				"panic", recovered,
+				"stack", string(debug.Stack()),
+			)
+			err = fmt.Errorf("backend Deprovision panicked: %v", recovered)
+		}
+	}()
+	return backendClient.Deprovision(ctx, leaseUUID)
+}

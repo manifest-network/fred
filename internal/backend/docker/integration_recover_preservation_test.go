@@ -5,7 +5,6 @@ package docker
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -49,7 +48,7 @@ import (
 // this test locks in against the real pool + real Docker daemon.
 func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *testing.T) {
 	mountPath := setupBtrfsLoopback(t)
-	leaseUUID := fmt.Sprintf("recover-preserve-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small" // stateful: DiskMB=1024 (defaultTestSKUProfiles)
 
@@ -58,6 +57,7 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		// Manual recoverState control only — no background reconcile loop and
@@ -78,7 +78,7 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       tenant,
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: sku, Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,

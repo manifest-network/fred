@@ -30,8 +30,12 @@
 // without replay protection. Since token lifetime is short (30 seconds), clients
 // can safely retry with a fresh token.
 //
-// Backend callbacks use HMAC-SHA256 authentication with a shared secret
-// configured via callback_secret.
+// Backend callbacks use HMAC-SHA256 authentication. Production selects a
+// distinct per-backend key by the callback's HMAC-covered immutable storage
+// identity; providerd maps it from backends[].hmac_secret and the corresponding
+// backend maps the same value from callback_secret. A fleet-wide top-level
+// callback_secret remains available only as a non-production compatibility
+// mode.
 //
 // # Rate Limiting
 //

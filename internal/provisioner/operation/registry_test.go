@@ -1,6 +1,7 @@
 package operation
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -18,7 +19,7 @@ import (
 )
 
 func newTestRegistry() *Registry {
-	return newRegistry(11, 100, 200)
+	return newRegistry(100, 200)
 }
 
 func testTrackSpec(leaseUUID string) TrackSpec {
@@ -33,20 +34,42 @@ func testTrackSpec(leaseUUID string) TrackSpec {
 	}
 }
 
-func requireStarted(t *testing.T, registry *Registry, spec TrackSpec) Token {
+// tryInitiateForTest follows the same claim-before-initiation protocol as every
+// production caller while preserving the compact result assertions in this
+// package's Registry unit tests.
+func tryInitiateForTest(registry *Registry, spec TrackSpec) InitiationResult {
+	claimResult := registry.TryClaimLeaseNow(spec.LeaseUUID)
+	if !claimResult.Acquired() {
+		if claimResult.Outcome() == LeaseClaimBusy {
+			return InitiationResult{outcome: TrackBusy}
+		}
+		return InitiationResult{outcome: TrackInvalid}
+	}
+	claim := claimResult.Claim()
+	defer registry.ReleaseLease(claim)
+	return registry.TryInitiateClaimed(claim, spec)
+}
+
+func requireStarted(t *testing.T, registry *Registry, spec TrackSpec) operationToken {
 	t.Helper()
-	result := registry.TryTrack(spec)
-	require.Equal(t, TrackStarted, result.Outcome())
-	require.True(t, result.Started())
-	require.True(t, result.Token().Valid())
-	return result.Token()
+	initiation := requireInitiated(t, registry, spec)
+	require.True(t, registry.BeginCall(initiation))
+	require.Equal(t, InitiationActivated, registry.Activate(initiation))
+	return initiation.token
+}
+
+func requireSettled(t *testing.T, registry *Registry, token operationToken) {
+	t.Helper()
+	result := registry.TryClaimCallback(token.leaseUUID, token.operationID())
+	require.True(t, result.Claimed())
+	require.True(t, registry.FinishSettlement(result.Claim()))
 }
 
 func TestRegistryZeroResultsAreConservative(t *testing.T) {
-	var track TrackResult
-	assert.Equal(t, TrackInvalid, track.Outcome())
-	assert.False(t, track.Started())
-	assert.False(t, track.Token().Valid())
+	var recovery RecoveryResult
+	assert.Equal(t, RecoveryInvalid, recovery)
+	assert.False(t, recovery.Recovered())
+	assert.Equal(t, "invalid", recovery.String())
 
 	var initiation InitiationResult
 	assert.Equal(t, TrackInvalid, initiation.Outcome())
@@ -74,9 +97,32 @@ func TestRegistryZeroResultsAreConservative(t *testing.T) {
 	assert.Empty(t, (Record{}).RoutingSKU())
 }
 
+func TestKindDurableEncodingIsClosedAndStrict(t *testing.T) {
+	for _, test := range []struct {
+		kind Kind
+		wire string
+	}{
+		{kind: KindProvision, wire: "provision"},
+		{kind: KindRestore, wire: "restore"},
+	} {
+		assert.True(t, test.kind.Valid())
+		assert.Equal(t, test.wire, test.kind.String())
+		parsed, err := ParseKind(test.wire)
+		require.NoError(t, err)
+		assert.Equal(t, test.kind, parsed)
+	}
+	for _, wire := range []string{"", "Provision", "restore ", "restart", "invalid"} {
+		parsed, err := ParseKind(wire)
+		require.ErrorIs(t, err, ErrInvalidKind)
+		assert.Equal(t, KindInvalid, parsed)
+	}
+	assert.False(t, KindInvalid.Valid())
+	assert.False(t, Kind(255).Valid())
+}
+
 func requireInitiated(t *testing.T, registry *Registry, spec TrackSpec) Initiation {
 	t.Helper()
-	result := registry.TryInitiate(spec)
+	result := tryInitiateForTest(registry, spec)
 	require.Equal(t, TrackStarted, result.Outcome())
 	require.True(t, result.Started())
 	require.True(t, result.Capability().Valid())
@@ -120,7 +166,7 @@ func TestRegistryInitiationPhasesGateLifecycleActors(t *testing.T) {
 
 func TestRegistryBindBackendIsExactPreparingAndOneShot(t *testing.T) {
 	registry := newTestRegistry()
-	foreign := newRegistry(12, 100, 200)
+	foreign := newRegistry(100, 200)
 	spec := testTrackSpec("lease-restore")
 	spec.Backend = ""
 	initiation := requireInitiated(t, registry, spec)
@@ -175,7 +221,7 @@ func TestRegistryInlineCallbackRetainsCallBarrierUntilInitiatorReturns(t *testin
 
 func TestRegistryAbortInitiationIsExactAndPhaseAware(t *testing.T) {
 	registry := newTestRegistry()
-	foreign := newRegistry(12, 100, 200)
+	foreign := newRegistry(100, 200)
 	preparing := requireInitiated(t, registry, testTrackSpec("lease-preparing"))
 	foreignInitiation := requireInitiated(t, foreign, testTrackSpec("lease-preparing"))
 
@@ -212,19 +258,17 @@ func TestRegistrySnapshotIsExplicitlyValidAtRevisionZero(t *testing.T) {
 	assert.Zero(t, snapshot.revision)
 	assert.True(t, NewRegistry().Snapshot().Valid())
 	assert.True(t, NewRegistryWithCountObserver(nil).Snapshot().Valid())
-	assert.True(t, newRegistry(0, 0, 0).Snapshot().Valid())
+	assert.True(t, newRegistry(0, 0).Snapshot().Valid())
 }
 
-func TestRegistryTryTrackRecordsDetachedOperation(t *testing.T) {
+func TestRegistryActiveOperationSnapshotsAreDetached(t *testing.T) {
 	registry := newTestRegistry()
 	startedAt := time.Now().Add(-time.Minute).Round(0)
 	spec := testTrackSpec("lease-1")
 	spec.StartedAt = startedAt
 
-	result := registry.TryTrack(spec)
-	require.True(t, result.Started())
-	assert.Equal(t, TrackStarted, result.Outcome())
-	id := result.Token().ID()
+	token := requireStarted(t, registry, spec)
+	id := token.operationID()
 	assert.Equal(t, deterministicOperationID(101), id)
 
 	// The registry owns a clone, not the caller's mutable slice.
@@ -252,10 +296,10 @@ func TestRegistryTryTrackRecordsDetachedOperation(t *testing.T) {
 	assert.Equal(t, 1, registry.Count())
 }
 
-func TestRegistryTryTrackDefaultsStartTimeAndRejectsInvalidOrBusy(t *testing.T) {
+func TestRegistryTryInitiateDefaultsStartTimeAndRejectsInvalidOrBusy(t *testing.T) {
 	registry := newTestRegistry()
 
-	invalid := registry.TryTrack(TrackSpec{})
+	invalid := tryInitiateForTest(registry, TrackSpec{})
 	assert.Equal(t, TrackInvalid, invalid.Outcome())
 	assert.False(t, invalid.Started())
 
@@ -267,13 +311,13 @@ func TestRegistryTryTrackDefaultsStartTimeAndRejectsInvalidOrBusy(t *testing.T) 
 	assert.False(t, record.StartedAt.Before(before))
 	assert.False(t, record.StartedAt.After(after))
 
-	busy := registry.TryTrack(testTrackSpec("lease-1"))
+	busy := tryInitiateForTest(registry, testTrackSpec("lease-1"))
 	assert.Equal(t, TrackBusy, busy.Outcome())
 	assert.False(t, busy.Started())
-	assert.False(t, busy.Token().Valid())
+	assert.False(t, busy.Capability().Valid())
 }
 
-func TestRegistryTryTrackConcurrentHasSingleWinner(t *testing.T) {
+func TestRegistryTryInitiateConcurrentHasSingleWinner(t *testing.T) {
 	registry := newTestRegistry()
 	const workers = 100
 	var started atomic.Int32
@@ -285,7 +329,7 @@ func TestRegistryTryTrackConcurrentHasSingleWinner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if registry.TryTrack(testTrackSpec("lease-1")).Started() {
+			if tryInitiateForTest(registry, testTrackSpec("lease-1")).Started() {
 				started.Add(1)
 			}
 		}()
@@ -343,7 +387,7 @@ func TestRegistryConcurrentSettlementHasSingleWinner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			result := registry.TryClaimCallback("lease-1", token.ID())
+			result := registry.TryClaimCallback("lease-1", token.operationID())
 			if result.Claimed() {
 				acquired.Add(1)
 				winnerMu.Lock()
@@ -361,73 +405,120 @@ func TestRegistryConcurrentSettlementHasSingleWinner(t *testing.T) {
 	assert.Zero(t, registry.Count())
 }
 
-func TestRegistryDeterministicTestIDsRemainUniqueAcrossSequenceWrap(t *testing.T) {
-	registry := newRegistry(11, math.MaxUint64-1, 200)
+func TestRegistryDeterministicTestIDsFailClosedAtSequenceExhaustion(t *testing.T) {
+	registry := newRegistry(math.MaxUint64-1, 200)
 	first := requireStarted(t, registry, testTrackSpec("lease-1"))
-	second := requireStarted(t, registry, testTrackSpec("lease-2"))
+	assert.Equal(t, deterministicOperationID(math.MaxUint64), first.operationID())
+	requireSettled(t, registry, first)
 
-	assert.Equal(t, deterministicOperationID(math.MaxUint64), first.ID())
-	assert.Equal(t, deterministicOperationID(1), second.ID())
-	assert.NotEqual(t, first.ID(), second.ID())
+	for _, leaseUUID := range []string{"lease-2", "lease-3"} {
+		result := tryInitiateForTest(registry, testTrackSpec(leaseUUID))
+		assert.Equal(t, TrackInvalid, result.Outcome())
+		assert.False(t, result.Started())
+	}
+	assert.Equal(t, uint64(math.MaxUint64), registry.nextOperationID,
+		"exhaustion must never wrap or reuse the deterministic sequence")
+	assert.Zero(t, registry.Count())
 }
 
-func TestRegistryProductionOperationIDsAreIndependentUUIDv4Values(t *testing.T) {
+func TestRegistryProductionOperationIDsHaveCanonicalUUIDv4WireShape(t *testing.T) {
 	registry := NewRegistry()
-	const operations = 64
-	ids := make(map[OperationID]struct{}, operations)
-	for index := range operations {
+	for index := range 8 {
 		spec := testTrackSpec(fmt.Sprintf("lease-%d", index))
 		spec.Backend = fmt.Sprintf("backend-%d", index%2)
 		token := requireStarted(t, registry, spec)
-		parsed, err := uuid.Parse(token.ID().String())
+		parsed, err := uuid.Parse(token.operationID().String())
 		require.NoError(t, err)
 		assert.Equal(t, uuid.Version(4), parsed.Version())
-		assert.Equal(t, token.ID().String(), parsed.String(), "wire form must be canonical")
-		_, duplicate := ids[token.ID()]
-		assert.False(t, duplicate, "independent operation IDs must not collide")
-		ids[token.ID()] = struct{}{}
+		assert.Equal(t, token.operationID().String(), parsed.String(), "wire form must be canonical")
 	}
-	assert.Len(t, ids, operations)
 }
 
-func TestRegistryOperationIDAllocationRejectsReuseAndFailsClosed(t *testing.T) {
-	t.Run("collision fails without installing or consuming another candidate", func(t *testing.T) {
-		registry := newTestRegistry()
-		candidates := []OperationID{
-			deterministicOperationID(501),
-			deterministicOperationID(501),
-			deterministicOperationID(777),
-		}
-		registry.operationIDSource = func() (OperationID, error) {
-			candidate := candidates[0]
-			candidates = candidates[1:]
-			return candidate, nil
-		}
+func TestRegistryRecoverClaimedInstallsExactActiveOperation(t *testing.T) {
+	registry := newRegistry(0, 0)
+	claimResult := registry.TryClaimLeaseNow("lease-1")
+	require.True(t, claimResult.Acquired())
+	claim := claimResult.Claim()
+	id := deterministicOperationID(909)
+	spec := TrackSpec{
+		LeaseUUID: "lease-1",
+		Tenant:    "tenant-1",
+		Items:     []backend.LeaseItem{{SKU: "sku-1", Quantity: 2}},
+		Backend:   "backend-a",
+		StartedAt: time.Unix(123, 0),
+		Kind:      KindRestore,
+	}
 
-		first := requireStarted(t, registry, testTrackSpec("lease-a"))
-		require.True(t, registry.Abort(first))
-		second := registry.TryTrack(testTrackSpec("lease-b"))
+	recovered := registry.RecoverClaimed(claim, id, spec)
+	require.True(t, recovered.Recovered())
+	assert.Equal(t, RecoveryInstalled, recovered)
+	assert.Equal(t, RecoveryBusy, registry.RecoverClaimed(claim, id, spec),
+		"the held lease claim must not replace the operation it just recovered")
+	record, exists := registry.Lookup("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, id, record.ID)
+	assert.Equal(t, PhaseActive, record.Phase)
+	assert.Equal(t, KindRestore, record.Kind)
+	assert.Equal(t, spec.Backend, record.Backend)
+	assert.Equal(t, spec.Tenant, record.Tenant)
+	assert.Equal(t, spec.Items, record.Items)
+	assert.True(t, registry.ReleaseLease(claim),
+		"the caller retains exclusion until durable promotion has completed")
 
-		assert.Equal(t, deterministicOperationID(501), first.ID())
-		assert.Equal(t, TrackInvalid, second.Outcome())
-		assert.False(t, second.Started())
-		assert.Len(t, candidates, 1, "collision must not be hidden by retrying the source")
-		assert.Len(t, registry.issuedOperationIDs, 1)
-		assert.Zero(t, registry.Count())
-	})
+	callback := registry.TryClaimCallback("lease-1", id)
+	require.True(t, callback.Claimed())
+	assert.True(t, registry.FinishSettlement(callback.Claim()))
+}
 
+func TestRegistryRecoverClaimedFailsClosed(t *testing.T) {
+	registry := newRegistry(0, 0)
+	claimResult := registry.TryClaimLeaseNow("lease-1")
+	require.True(t, claimResult.Acquired())
+	claim := claimResult.Claim()
+	validID := deterministicOperationID(910)
+	validSpec := TrackSpec{
+		LeaseUUID: "lease-1",
+		Tenant:    "tenant-1",
+		Backend:   "backend-a",
+		Kind:      KindProvision,
+	}
+
+	tests := []struct {
+		name  string
+		claim LeaseClaim
+		id    OperationID
+		spec  TrackSpec
+	}{
+		{name: "zero claim", id: validID, spec: validSpec},
+		{name: "zero ID", claim: claim, spec: validSpec},
+		{name: "empty tenant", claim: claim, id: validID, spec: TrackSpec{
+			LeaseUUID: "lease-1", Backend: "backend-a", Kind: KindProvision,
+		}},
+		{name: "empty backend", claim: claim, id: validID, spec: TrackSpec{
+			LeaseUUID: "lease-1", Tenant: "tenant-1", Kind: KindProvision,
+		}},
+		{name: "different lease", claim: claim, id: validID, spec: TrackSpec{
+			LeaseUUID: "lease-2", Tenant: "tenant-1", Backend: "backend-a", Kind: KindProvision,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, RecoveryInvalid,
+				registry.RecoverClaimed(test.claim, test.id, test.spec))
+		})
+	}
+	assert.False(t, registry.Contains("lease-1"))
+	assert.True(t, registry.ReleaseLease(claim))
+}
+
+func TestRegistryOperationIDAllocationFailsClosed(t *testing.T) {
 	t.Run("entropy error installs no operation", func(t *testing.T) {
 		registry := newTestRegistry()
 		registry.operationIDSource = func() (OperationID, error) {
 			return OperationID{}, errors.New("entropy unavailable")
 		}
 
-		tracked := registry.TryTrack(testTrackSpec("lease-a"))
-		assert.Equal(t, TrackInvalid, tracked.Outcome())
-		assert.False(t, tracked.Started())
-		assert.Zero(t, registry.Count())
-
-		initiated := registry.TryInitiate(testTrackSpec("lease-b"))
+		initiated := tryInitiateForTest(registry, testTrackSpec("lease-a"))
 		assert.Equal(t, TrackInvalid, initiated.Outcome())
 		assert.False(t, initiated.Started())
 		assert.Zero(t, registry.Count())
@@ -439,7 +530,7 @@ func TestRegistryOperationIDAllocationRejectsReuseAndFailsClosed(t *testing.T) {
 			return OperationID{}, nil
 		}
 
-		result := registry.TryTrack(testTrackSpec("lease-a"))
+		result := tryInitiateForTest(registry, testTrackSpec("lease-a"))
 		assert.Equal(t, TrackInvalid, result.Outcome())
 		assert.False(t, result.Started())
 		assert.Zero(t, registry.Count())
@@ -448,7 +539,7 @@ func TestRegistryOperationIDAllocationRejectsReuseAndFailsClosed(t *testing.T) {
 
 func TestRegistryLeaseClaimFencesSnapshotAndRequiresExactCapability(t *testing.T) {
 	registry := newTestRegistry()
-	foreign := newRegistry(12, 100, 200)
+	foreign := newRegistry(100, 200)
 	snapshot := registry.Snapshot()
 
 	invalidLease := registry.TryClaimLease("", snapshot)
@@ -464,16 +555,16 @@ func TestRegistryLeaseClaimFencesSnapshotAndRequiresExactCapability(t *testing.T
 
 	busy := registry.TryClaimLease("lease-1", snapshot)
 	assert.Equal(t, LeaseClaimBusy, busy.Outcome())
-	assert.Equal(t, TrackBusy, registry.TryTrack(testTrackSpec("lease-1")).Outcome())
+	assert.Equal(t, TrackBusy, tryInitiateForTest(registry, testTrackSpec("lease-1")).Outcome())
 
 	wrongLeaseSpec := testTrackSpec("lease-2")
-	assert.Equal(t, TrackInvalid, registry.TryTrackClaimed(claim, wrongLeaseSpec).Outcome())
-	assert.Equal(t, TrackInvalid, foreign.TryTrackClaimed(claim, testTrackSpec("lease-1")).Outcome())
+	assert.Equal(t, TrackInvalid, registry.TryInitiateClaimed(claim, wrongLeaseSpec).Outcome())
+	assert.Equal(t, TrackInvalid, foreign.TryInitiateClaimed(claim, testTrackSpec("lease-1")).Outcome())
 
-	tracked := registry.TryTrackClaimed(claim, testTrackSpec("lease-1"))
+	tracked := registry.TryInitiateClaimed(claim, testTrackSpec("lease-1"))
 	require.True(t, tracked.Started())
 	assert.Equal(t, TrackBusy,
-		registry.TryTrackClaimed(claim, testTrackSpec("lease-1")).Outcome())
+		registry.TryInitiateClaimed(claim, testTrackSpec("lease-1")).Outcome())
 	assert.True(t, registry.ReleaseLease(claim))
 	assert.False(t, registry.ReleaseLease(claim))
 	assert.False(t, registry.ReleaseLease(foreign.TryClaimLeaseNow("foreign").Claim()))
@@ -530,12 +621,12 @@ func TestRegistrySnapshotFencesCompletedAndStraddlingActions(t *testing.T) {
 func TestRegistrySnapshotPrunesOnlyMutationsOlderThanPriorBoundary(t *testing.T) {
 	registry := newTestRegistry()
 	first := requireStarted(t, registry, testTrackSpec("lease-1"))
-	require.True(t, registry.Abort(first))
+	requireSettled(t, registry, first)
 	firstBoundary := registry.Snapshot()
 	assert.Contains(t, registry.lastMutation, "lease-1")
 
 	second := requireStarted(t, registry, testTrackSpec("lease-2"))
-	require.True(t, registry.Abort(second))
+	requireSettled(t, registry, second)
 	secondBoundary := registry.Snapshot()
 	assert.NotContains(t, registry.lastMutation, "lease-1")
 	assert.Contains(t, registry.lastMutation, "lease-2")
@@ -568,48 +659,27 @@ func TestRegistryEquivalentSnapshotAtSameRevisionRemainsConsumable(t *testing.T)
 	assert.True(t, registry.ReleaseLease(claim.Claim()))
 }
 
-func TestRegistryAbortRequiresExactUnclaimedToken(t *testing.T) {
-	registry := newTestRegistry()
-	foreign := newRegistry(12, 100, 200)
-	first := requireStarted(t, registry, testTrackSpec("lease-1"))
-
-	assert.False(t, registry.Abort(Token{}))
-	foreignToken := requireStarted(t, foreign, testTrackSpec("lease-1"))
-	assert.False(t, registry.Abort(foreignToken))
-
-	settlement := registry.TryClaimCallback("lease-1", first.ID())
-	require.True(t, settlement.Claimed())
-	assert.False(t, registry.Abort(first), "a settlement claim owns terminal cleanup")
-	require.True(t, registry.ReleaseSettlement(settlement.Claim()))
-	require.True(t, registry.Abort(first))
-
-	second := requireStarted(t, registry, testTrackSpec("lease-1"))
-	assert.NotEqual(t, first, second)
-	assert.False(t, registry.Abort(first), "a stale token must not remove its replacement")
-	assert.True(t, registry.Contains("lease-1"))
-}
-
 func TestRegistrySettlementOutcomesAndRecordState(t *testing.T) {
 	registry := newTestRegistry()
 	token := requireStarted(t, registry, testTrackSpec("lease-1"))
 	otherID := deterministicOperationID(999)
 
 	assert.Equal(t, SettlementInvalid,
-		registry.TryClaimCallback("", token.ID()).Outcome())
+		registry.TryClaimCallback("", token.operationID()).Outcome())
 	assert.Equal(t, SettlementInvalid,
 		registry.TryClaimCallback("lease-1", OperationID{}).Outcome())
 	assert.Equal(t, SettlementNotFound,
-		registry.TryClaimCallback("missing", token.ID()).Outcome())
+		registry.TryClaimCallback("missing", token.operationID()).Outcome())
 	assert.Equal(t, SettlementOperationMismatch,
 		registry.TryClaimCallback("lease-1", otherID).Outcome())
 
-	result := registry.TryClaimCallback("lease-1", token.ID())
+	result := registry.TryClaimCallback("lease-1", token.operationID())
 	require.True(t, result.Claimed())
 	assert.Equal(t, SettlementClaimed, result.Outcome())
 	assert.Equal(t, SettlementTerminal, result.Record().Settlement)
 	assert.True(t, result.Claim().Valid())
 
-	busy := registry.TryClaimDeprovision("lease-1", token.ID())
+	busy := registry.TryClaimDeprovision("lease-1", token.operationID())
 	assert.Equal(t, SettlementBusy, busy.Outcome())
 	assert.False(t, busy.Claimed())
 
@@ -628,11 +698,11 @@ func TestRegistrySettlementClaimNoncePreventsReleaseAndFinishABA(t *testing.T) {
 	registry := newTestRegistry()
 	token := requireStarted(t, registry, testTrackSpec("lease-1"))
 
-	first := registry.TryClaimCallback("lease-1", token.ID())
+	first := registry.TryClaimCallback("lease-1", token.operationID())
 	require.True(t, first.Claimed())
 	require.True(t, registry.ReleaseSettlement(first.Claim()))
 
-	second := registry.TryClaimDeprovision("lease-1", token.ID())
+	second := registry.TryClaimDeprovision("lease-1", token.operationID())
 	require.True(t, second.Claimed())
 	assert.Equal(t, SettlementDeprovision, second.Record().Settlement)
 	assert.NotEqual(t, first.Claim(), second.Claim())
@@ -645,10 +715,10 @@ func TestRegistrySettlementClaimNoncePreventsReleaseAndFinishABA(t *testing.T) {
 
 func TestRegistrySettlementRejectsForeignClaim(t *testing.T) {
 	registry := newTestRegistry()
-	foreign := newRegistry(12, 100, 200)
+	foreign := newRegistry(100, 200)
 	requireStarted(t, registry, testTrackSpec("lease-1"))
 	foreignToken := requireStarted(t, foreign, testTrackSpec("lease-1"))
-	foreignClaim := foreign.TryClaimCallback("lease-1", foreignToken.ID())
+	foreignClaim := foreign.TryClaimCallback("lease-1", foreignToken.operationID())
 	require.True(t, foreignClaim.Claimed())
 
 	assert.False(t, registry.ReleaseSettlement(foreignClaim.Claim()))
@@ -685,17 +755,17 @@ func TestRegistryObserverSnapshotsAreDetached(t *testing.T) {
 
 func TestRegistryCountObserverSeesTypedMutationsInOrder(t *testing.T) {
 	var observed []int
-	registry := newRegistryWithObserver(11, 100, 200, func(count int) {
+	registry := newRegistryWithObserver(100, 200, func(count int) {
 		observed = append(observed, count)
 	})
 
 	first := requireStarted(t, registry, testTrackSpec("lease-1"))
 	second := requireStarted(t, registry, testTrackSpec("lease-2"))
-	assert.False(t, registry.TryTrack(testTrackSpec("lease-2")).Started())
-	require.True(t, registry.Abort(first))
-	require.True(t, registry.Abort(second))
+	assert.False(t, tryInitiateForTest(registry, testTrackSpec("lease-2")).Started())
+	requireSettled(t, registry, first)
+	requireSettled(t, registry, second)
 	replacement := requireStarted(t, registry, testTrackSpec("lease-2"))
-	require.True(t, registry.Abort(replacement))
+	requireSettled(t, registry, replacement)
 
 	assert.Equal(t, []int{1, 2, 1, 0, 1, 0}, observed)
 }
@@ -719,8 +789,120 @@ func TestRegistryTimedOutReturnsDetachedRecords(t *testing.T) {
 	assert.Equal(t, 2, registry.Count())
 }
 
+func TestRegistryWaitForDrain(t *testing.T) {
+	t.Run("already empty", func(t *testing.T) {
+		registry := newTestRegistry()
+		assert.Zero(t, registry.WaitForDrain(context.Background(), time.Second))
+	})
+
+	t.Run("exact operation removal wakes waiter", func(t *testing.T) {
+		registry := newTestRegistry()
+		tracked := requireStarted(t, registry, testTrackSpec("lease-1"))
+		result := make(chan int, 1)
+		go func() {
+			result <- registry.WaitForDrain(context.Background(), time.Second)
+		}()
+
+		requireSettled(t, registry, tracked)
+		assert.Zero(t, <-result)
+	})
+
+	t.Run("context and timeout return current count", func(t *testing.T) {
+		registry := newTestRegistry()
+		tracked := requireStarted(t, registry, testTrackSpec("lease-1"))
+		t.Cleanup(func() { requireSettled(t, registry, tracked) })
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		assert.Equal(t, 1, registry.WaitForDrain(ctx, time.Second))
+		assert.Equal(t, 1, registry.WaitForDrain(context.Background(), 0))
+	})
+}
+
+func TestRegistryBeginDrainRejectsOrdinaryWorkAndWaitsForHeldActions(t *testing.T) {
+	registry := newTestRegistry()
+	tracked := requireStarted(t, registry, testTrackSpec("lease-operation"))
+	held := registry.TryClaimLeaseNow("lease-action")
+	require.True(t, held.Acquired())
+	assert.Equal(t, 2, registry.PendingWorkCount())
+
+	registry.BeginDrain()
+	registry.BeginDrain()
+
+	assert.Equal(t, TrackInvalid, tryInitiateForTest(registry, testTrackSpec("lease-new")).Outcome())
+	assert.Equal(t, LeaseClaimInvalid, registry.TryClaimLeaseNow("lease-new").Outcome())
+	snapshot := registry.Snapshot()
+	assert.Equal(t, LeaseClaimInvalid, registry.TryClaimLease("lease-new", snapshot).Outcome())
+	assert.Equal(t, TrackInvalid,
+		registry.TryInitiateClaimed(held.Claim(), testTrackSpec("lease-action")).Outcome(),
+		"a claim acquired before shutdown must not start a new backend operation after the barrier")
+
+	recovery := registry.TryClaimCallbackRecoveryLease("lease-recovery")
+	require.True(t, recovery.Acquired(),
+		"authenticated durable callback recovery remains admitted during drain")
+	assert.Equal(t, 3, registry.PendingWorkCount())
+
+	settlement := registry.TryClaimCallback("lease-operation", tracked.operationID())
+	require.True(t, settlement.Claimed(), "existing operations must remain settleable")
+	require.True(t, registry.FinishSettlement(settlement.Claim()))
+	assert.Equal(t, 2, registry.WaitForDrain(context.Background(), 0),
+		"held ordinary and recovery claims are both shutdown work")
+
+	drained := make(chan int, 1)
+	go func() {
+		drained <- registry.WaitForDrain(context.Background(), time.Second)
+	}()
+	require.True(t, registry.ReleaseLease(held.Claim()))
+	select {
+	case result := <-drained:
+		t.Fatalf("drain returned with callback recovery still active: %d", result)
+	case <-time.After(10 * time.Millisecond):
+	}
+	require.True(t, registry.ReleaseLease(recovery.Claim()))
+	assert.Zero(t, <-drained)
+	assert.Zero(t, registry.PendingWorkCount())
+}
+
+func TestRegistryWaitForDrainCountsLeaseClaimWithoutOperation(t *testing.T) {
+	registry := newTestRegistry()
+	claim := registry.TryClaimLeaseNow("lease-action")
+	require.True(t, claim.Acquired())
+	registry.BeginDrain()
+
+	assert.Equal(t, 1, registry.WaitForDrain(context.Background(), 0))
+	require.True(t, registry.ReleaseLease(claim.Claim()))
+	assert.Zero(t, registry.WaitForDrain(context.Background(), time.Second))
+}
+
+func TestRegistryDrainSignalRearmsForNextOperationGeneration(t *testing.T) {
+	registry := newTestRegistry()
+	first := requireStarted(t, registry, testTrackSpec("lease-first"))
+	firstSignal := registry.drained
+	select {
+	case <-firstSignal:
+		t.Fatal("a live operation must hold an open drain signal")
+	default:
+	}
+	requireSettled(t, registry, first)
+	select {
+	case <-firstSignal:
+	default:
+		t.Fatal("removing the final operation must close its drain signal")
+	}
+
+	second := requireStarted(t, registry, testTrackSpec("lease-second"))
+	secondSignal := registry.drained
+	assert.NotEqual(t, firstSignal, secondSignal)
+	select {
+	case <-secondSignal:
+		t.Fatal("a new operation generation must receive a fresh open signal")
+	default:
+	}
+	requireSettled(t, registry, second)
+}
+
 func TestRegistryClaimNonceAndMutationRevisionSkipZeroOnWrap(t *testing.T) {
-	registry := newRegistry(11, 100, math.MaxUint64)
+	registry := newRegistry(100, math.MaxUint64)
 	claim := registry.TryClaimLeaseNow("lease-1")
 	require.True(t, claim.Acquired())
 	assert.Equal(t, uint64(1), claim.Claim().nonce)

@@ -8,16 +8,16 @@ import (
 )
 
 func TestCapabilityZeroValuesAreInvalid(t *testing.T) {
-	assert.Equal(t, registryIdentity{}, newRegistryIdentity(0))
+	assert.False(t, (registryIdentity{}).valid())
 	assert.False(t, (TrackerSnapshot{}).Valid())
-	assert.False(t, (Token{}).Valid())
-	assert.False(t, (Token{}).ID().Valid())
+	assert.False(t, (operationToken{}).valid())
+	assert.False(t, (operationToken{}).operationID().Valid())
 	assert.False(t, (LeaseClaim{}).Valid())
 	assert.False(t, (SettlementClaim{}).Valid())
 }
 
 func TestTrackerSnapshotRequiresExplicitRegistryIdentity(t *testing.T) {
-	registry := newRegistryIdentity(11)
+	registry := newRegistryIdentity()
 
 	initial := newTrackerSnapshot(registry, 0)
 	assert.True(t, initial.Valid(), "revision zero is valid only when explicitly issued")
@@ -31,13 +31,13 @@ func TestTrackerSnapshotRequiresExplicitRegistryIdentity(t *testing.T) {
 	assert.False(t, invalid.Valid())
 }
 
-func TestTokenRequiresCompleteIssuanceSpec(t *testing.T) {
-	registry := newRegistryIdentity(11)
+func TestOperationTokenRequiresCompleteIssuanceSpec(t *testing.T) {
+	registry := newRegistryIdentity()
 	id := deterministicOperationID(42)
 
-	token := newToken(registry, "lease-1", id)
-	require.True(t, token.Valid())
-	assert.Equal(t, id, token.ID())
+	token := newOperationToken(registry, "lease-1", id)
+	require.True(t, token.valid())
+	assert.Equal(t, id, token.operationID())
 
 	tests := []struct {
 		name     string
@@ -51,15 +51,15 @@ func TestTokenRequiresCompleteIssuanceSpec(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := newToken(tt.registry, tt.lease, tt.id)
-			assert.False(t, got.Valid())
-			assert.False(t, got.ID().Valid())
+			got := newOperationToken(tt.registry, tt.lease, tt.id)
+			assert.False(t, got.valid())
+			assert.False(t, got.operationID().Valid())
 		})
 	}
 }
 
 func TestLeaseClaimRequiresRegistryLeaseAndNonce(t *testing.T) {
-	registry := newRegistryIdentity(11)
+	registry := newRegistryIdentity()
 
 	claim := newLeaseClaim(registry, "lease-1", 9)
 	assert.True(t, claim.Valid())
@@ -82,8 +82,8 @@ func TestLeaseClaimRequiresRegistryLeaseAndNonce(t *testing.T) {
 }
 
 func TestSettlementClaimRequiresTokenNonceAndPurpose(t *testing.T) {
-	registry := newRegistryIdentity(11)
-	token := newToken(registry, "lease-1", deterministicOperationID(42))
+	registry := newRegistryIdentity()
+	token := newOperationToken(registry, "lease-1", deterministicOperationID(42))
 
 	for _, kind := range []SettlementKind{
 		SettlementTerminal,
@@ -95,11 +95,11 @@ func TestSettlementClaimRequiresTokenNonceAndPurpose(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		token Token
+		token operationToken
 		nonce uint64
 		kind  SettlementKind
 	}{
-		{name: "invalid token", token: Token{}, nonce: 9, kind: SettlementTerminal},
+		{name: "invalid token", token: operationToken{}, nonce: 9, kind: SettlementTerminal},
 		{name: "zero nonce", token: token, nonce: 0, kind: SettlementTerminal},
 		{name: "unclaimed kind", token: token, nonce: 9, kind: SettlementUnclaimed},
 		{name: "unknown kind", token: token, nonce: 9, kind: SettlementKind(255)},
@@ -112,13 +112,13 @@ func TestSettlementClaimRequiresTokenNonceAndPurpose(t *testing.T) {
 }
 
 func TestCapabilitiesAreBoundToRegistryAndNonce(t *testing.T) {
-	registryA := newRegistryIdentity(1)
-	registryB := newRegistryIdentity(2)
+	registryA := newRegistryIdentity()
+	registryB := newRegistryIdentity()
 	id := deterministicOperationID(42)
 
-	tokenA := newToken(registryA, "lease-1", id)
-	tokenB := newToken(registryB, "lease-1", id)
-	assert.NotEqual(t, tokenA, tokenB)
+	tokenA := newOperationToken(registryA, "lease-1", id)
+	tokenB := newOperationToken(registryB, "lease-1", id)
+	assert.True(t, tokenA != tokenB, "capability comparison uses private pointer identity")
 
 	leaseClaimA := newLeaseClaim(registryA, "lease-1", 1)
 	leaseClaimB := newLeaseClaim(registryA, "lease-1", 2)
@@ -134,14 +134,14 @@ func TestCapabilitiesAreBoundToRegistryAndNonce(t *testing.T) {
 }
 
 func TestCapabilitiesAreComparable(t *testing.T) {
-	registry := newRegistryIdentity(1)
+	registry := newRegistryIdentity()
 	snapshot := newTrackerSnapshot(registry, 0)
-	token := newToken(registry, "lease-1", deterministicOperationID(1))
+	token := newOperationToken(registry, "lease-1", deterministicOperationID(1))
 	leaseClaim := newLeaseClaim(registry, "lease-1", 1)
 	settlementClaim := newSettlementClaim(token, 1, SettlementTerminal)
 
 	assert.Contains(t, map[TrackerSnapshot]struct{}{snapshot: {}}, snapshot)
-	assert.Contains(t, map[Token]struct{}{token: {}}, token)
+	assert.Contains(t, map[operationToken]struct{}{token: {}}, token)
 	assert.Contains(t, map[LeaseClaim]struct{}{leaseClaim: {}}, leaseClaim)
 	assert.Contains(t, map[SettlementClaim]struct{}{settlementClaim: {}}, settlementClaim)
 }

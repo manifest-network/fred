@@ -27,6 +27,7 @@ func newBackendWithRetention(t *testing.T) (*Backend, *shared.RetentionStore) {
 
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
 	b.retentionStore = rs
+	attachReleaseStore(t, b)
 	return b, rs
 }
 
@@ -92,7 +93,7 @@ func TestGetProvision_Retained_Restoring(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	entry := retentionEntryFixture("lease-r", "tenant-a", time.Now())
 	entry.Status = shared.RetentionStatusRestoring
-	require.NoError(t, rs.Put(entry))
+	putRestoringRetention(t, rs, entry)
 
 	info, err := b.GetProvision(context.Background(), "lease-r")
 	require.NoError(t, err)

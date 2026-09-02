@@ -41,6 +41,11 @@ const (
 	evProvisionErrored
 	evDiagGathered
 	evContainersRemoved
+	// evCohortDiverged is a recovery-authored, substrate-agnostic signal that
+	// observed instances no longer match the durable desired release. It is
+	// separate from evContainerDied so no fake instance identity or inspection
+	// result is needed to reach the fail-closed state.
+	evCohortDiverged
 	// evReplaceCompleted / evReplaceRecovered / evReplaceFailed represent
 	// the outcome of a Restart or Update operation. Three events cover the
 	// four observable outcomes (success, rollback-restored, rollback-failed,
@@ -57,6 +62,13 @@ const (
 	evReplaceCompleted
 	evReplaceRecovered
 	evReplaceFailed
+	// Recovery-only equivalents are reachable solely through the opaque
+	// MaintenanceRecovered message constructors. Keeping distinct triggers
+	// prevents an old worker terminal message from correcting a later state.
+	evMaintenanceRecoveredSuccess
+	evMaintenanceRecoveredFailureReady
+	evMaintenanceRecoveredFailureFailed
+	evMaintenanceRecoveredSuccessRuntimeFailed
 )
 
 func (e leaseEvent) String() string {
@@ -81,12 +93,22 @@ func (e leaseEvent) String() string {
 		return "DiagGathered"
 	case evContainersRemoved:
 		return "ContainersRemoved"
+	case evCohortDiverged:
+		return "CohortDiverged"
 	case evReplaceCompleted:
 		return "ReplaceCompleted"
 	case evReplaceRecovered:
 		return "ReplaceRecovered"
 	case evReplaceFailed:
 		return "ReplaceFailed"
+	case evMaintenanceRecoveredSuccess:
+		return "MaintenanceRecoveredSuccess"
+	case evMaintenanceRecoveredFailureReady:
+		return "MaintenanceRecoveredFailureReady"
+	case evMaintenanceRecoveredFailureFailed:
+		return "MaintenanceRecoveredFailureFailed"
+	case evMaintenanceRecoveredSuccessRuntimeFailed:
+		return "MaintenanceRecoveredSuccessRuntimeFailed"
 	}
 	return fmt.Sprintf("leaseEvent(%d)", int(e))
 }
@@ -132,9 +154,12 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// or the operator initiated a Restart or Update.
 	sm.Configure(backend.ProvisionStatusReady).
 		Permit(evContainerDied, backend.ProvisionStatusFailing, lsm.guardContainerActuallyDied).
+		Permit(evCohortDiverged, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		Permit(evRestartRequested, backend.ProvisionStatusRestarting).
-		Permit(evUpdateRequested, backend.ProvisionStatusUpdating)
+		Permit(evUpdateRequested, backend.ProvisionStatusUpdating).
+		Permit(evMaintenanceRecoveredFailureFailed, backend.ProvisionStatusFailed).
+		Permit(evMaintenanceRecoveredSuccessRuntimeFailed, backend.ProvisionStatusFailed)
 
 	// Failing: transitional. The async diag goroutine is running. Either
 	// DiagGathered arrives (→ Failed, emit terminal callback) or a
@@ -168,7 +193,10 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		OnEntryFrom(evDiagGathered, lsm.onEnterFailedFromDiag).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		Ignore(evContainerDied).
-		Ignore(evDiagGathered)
+		Ignore(evCohortDiverged).
+		Ignore(evDiagGathered).
+		Permit(evMaintenanceRecoveredSuccess, backend.ProvisionStatusReady).
+		Permit(evMaintenanceRecoveredFailureReady, backend.ProvisionStatusReady)
 
 	// Deprovisioning: work runs in actor.handleDeprovision after Fire returns.
 	// Ignore die events and any stale DiagGathered from a canceled-too-late
@@ -241,6 +269,10 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
+		Permit(evMaintenanceRecoveredSuccess, backend.ProvisionStatusReady).
+		Permit(evMaintenanceRecoveredFailureReady, backend.ProvisionStatusReady).
+		Permit(evMaintenanceRecoveredFailureFailed, backend.ProvisionStatusFailed).
+		Permit(evMaintenanceRecoveredSuccessRuntimeFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied)
@@ -249,6 +281,10 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 		Permit(evReplaceCompleted, backend.ProvisionStatusReady).
 		Permit(evReplaceRecovered, backend.ProvisionStatusReady).
 		Permit(evReplaceFailed, backend.ProvisionStatusFailed).
+		Permit(evMaintenanceRecoveredSuccess, backend.ProvisionStatusReady).
+		Permit(evMaintenanceRecoveredFailureReady, backend.ProvisionStatusReady).
+		Permit(evMaintenanceRecoveredFailureFailed, backend.ProvisionStatusFailed).
+		Permit(evMaintenanceRecoveredSuccessRuntimeFailed, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
 		OnExit(lsm.onExitProvisioning).
 		Ignore(evContainerDied)
@@ -260,13 +296,18 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	sm.Configure(backend.ProvisionStatusReady).
 		OnEntryFrom(evProvisionCompleted, lsm.onEnterReadyFromProvision).
 		OnEntryFrom(evReplaceCompleted, lsm.onEnterReadyFromReplaceCompleted).
-		OnEntryFrom(evReplaceRecovered, lsm.onEnterReadyFromReplaceRecovered)
+		OnEntryFrom(evReplaceRecovered, lsm.onEnterReadyFromReplaceRecovered).
+		OnEntryFrom(evMaintenanceRecoveredSuccess, lsm.onEnterReadyFromMaintenanceRecoverySuccess).
+		OnEntryFrom(evMaintenanceRecoveredFailureReady, lsm.onEnterReadyFromMaintenanceRecoveryFailure)
 
 	// Failed entry actions: emit Failed from a Provision error or Replace
 	// failure. Permit(ProvisionRequested) for re-provision retries.
 	sm.Configure(backend.ProvisionStatusFailed).
 		OnEntryFrom(evProvisionErrored, lsm.onEnterFailedFromProvision).
+		OnEntryFrom(evCohortDiverged, lsm.onEnterFailedFromCohortDivergence).
 		OnEntryFrom(evReplaceFailed, lsm.onEnterFailedFromReplace).
+		OnEntryFrom(evMaintenanceRecoveredFailureFailed, lsm.onEnterFailedFromMaintenanceRecoveryFailure).
+		OnEntryFrom(evMaintenanceRecoveredSuccessRuntimeFailed, lsm.onEnterFailedFromMaintenanceRuntimeFailure).
 		Permit(evProvisionRequested, backend.ProvisionStatusProvisioning)
 
 	// Deprovisioning ignores stale provision/replace-completion events that
@@ -439,21 +480,23 @@ func (lsm *leaseSM) onEnterUpdating(ctx context.Context, args ...any) error {
 	return lsm.applyReplaceEntry(args, backend.ProvisionStatusUpdating)
 }
 
-// applyReplaceEntry flips Status to the requested replace state. A provision or
-// restore operation installs its exact-completion/lifecycle callback pair in the
-// same UpdateFn critical section. Restart and update are lifecycle operations;
-// their caller supplies a pair whose identity was validated against the current
-// authority, allowing a callback-base move without rotating the capability. No
-// metric/log side effect belongs inside the closure, per the
-// LeaseProvisionStore idempotence contract.
+// applyReplaceEntry flips Status to the requested replace state. A restore
+// operation installs its exact-completion/lifecycle callback pair immediately
+// because no prior destination runtime exists. Restart/update keep their
+// validated pair pending on the actor until successful substrate + Release
+// commit; rollback therefore reads and re-emits the old committed pair. No
+// metric/log side effect belongs inside the closure, per the LeaseProvisionStore
+// idempotence contract.
 func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus) error {
 	var callbackURL, lifecycleCallbackURL string
 	callbackKind := replaceCallbackOperation
+	var maintenance shared.MaintenanceIntentClaim
 	if len(args) > 0 {
 		if a, ok := args[0].(replaceEntryArgs); ok {
 			callbackURL = a.CallbackURL
 			lifecycleCallbackURL = a.LifecycleCallbackURL
 			callbackKind = a.CallbackKind
+			maintenance = a.Maintenance
 		}
 	}
 	// Capture whether the lease was active (Status==Ready) BEFORE overwriting
@@ -466,27 +509,179 @@ func (lsm *leaseSM) applyReplaceEntry(args []any, status backend.ProvisionStatus
 	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
 		wasActive = p.Status == backend.ProvisionStatusReady
 		p.Status = status
-		if callbackURL != "" {
+		if callbackKind == replaceCallbackOperation && callbackURL != "" {
 			p.CallbackURL = callbackURL
 		}
-		if lifecycleCallbackURL != "" {
+		if callbackKind == replaceCallbackOperation && lifecycleCallbackURL != "" {
 			p.LifecycleCallbackURL = lifecycleCallbackURL
 		}
 	})
 	lsm.actor.replaceWasActive = wasActive
 	lsm.actor.replaceCallbackKind = callbackKind
+	lsm.actor.pendingReplaceCallbackURL = callbackURL
+	lsm.actor.pendingReplaceLifecycleCallbackURL = lifecycleCallbackURL
+	lsm.actor.pendingMaintenance = maintenance
 	return nil
 }
 
 func (lsm *leaseSM) replaceCompletionCallbackURL(p *ProvisionState) string {
 	if lsm.actor.replaceCallbackKind == replaceCallbackLifecycle {
-		return p.LifecycleCallbackURL
+		return lsm.actor.pendingReplaceLifecycleCallbackURL
 	}
 	return p.CallbackURL
 }
 
+func (lsm *leaseSM) clearPendingReplaceRoute() {
+	lsm.actor.pendingReplaceCallbackURL = ""
+	lsm.actor.pendingReplaceLifecycleCallbackURL = ""
+	lsm.actor.pendingMaintenance = shared.MaintenanceIntentClaim{}
+}
+
+// maintenanceRecoveryFailureArgs carries one exact Release projection and its
+// terminal failure surface through a dedicated recovery-only transition.
+// Ordinary replacement entry actions are intentionally not reused: they own
+// non-idempotent gauges, diagnostics and callbacks that WAL retries must never
+// replay.
+type maintenanceRecoveryFailureArgs struct {
+	projection ReplaceSuccessResult
+	failure    ReplaceFailureInfo
+}
+
+func (lsm *leaseSM) applyMaintenanceRecoveredProjection(
+	result ReplaceSuccessResult,
+	status backend.ProvisionStatus,
+) error {
+	applied := lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+		if result.OnSuccess != nil {
+			result.OnSuccess(p)
+		}
+		p.ContainerIDs = result.ContainerIDs
+		if result.ServiceContainers != nil {
+			p.ServiceContainers = result.ServiceContainers
+		}
+		p.Status = status
+		if result.applyRecoveredRuntimeAuthority {
+			p.CallbackURL = result.recoveredCallbackURL
+			p.LifecycleCallbackURL = result.recoveredLifecycleCallbackURL
+		}
+	})
+	if !applied {
+		return errors.New("maintenance recovery provision no longer exists")
+	}
+	return nil
+}
+
+// applyMaintenanceRecoveredSuccess refreshes an actor from the exact committed
+// target without replaying entry-action side effects. It is also used when the
+// FSM already reached Ready but its ProvisionStore entry is stale because an
+// earlier entry action panicked.
+func (lsm *leaseSM) applyMaintenanceRecoveredSuccess(result ReplaceSuccessResult) error {
+	if err := lsm.applyMaintenanceRecoveredProjection(result, backend.ProvisionStatusReady); err != nil {
+		return err
+	}
+	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+		p.LastError = ""
+		p.Reason = ""
+		p.Message = ""
+	})
+	return nil
+}
+
+func (lsm *leaseSM) applyMaintenanceRecoveredFailure(
+	projection ReplaceSuccessResult,
+	info ReplaceFailureInfo,
+	status backend.ProvisionStatus,
+) error {
+	if err := lsm.applyMaintenanceRecoveredProjection(projection, status); err != nil {
+		return err
+	}
+	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+		p.LastError = info.LastError
+		p.Reason = info.Reason
+		p.Message = info.CallbackErr
+	})
+	return nil
+}
+
+func (lsm *leaseSM) applyMaintenanceRecoveredRuntimeFailure(
+	projection ReplaceSuccessResult,
+	info ReplaceFailureInfo,
+) error {
+	return lsm.applyMaintenanceRecoveredFailure(
+		projection, info, backend.ProvisionStatusFailed,
+	)
+}
+
+func (lsm *leaseSM) onEnterReadyFromMaintenanceRecoverySuccess(
+	_ context.Context,
+	args ...any,
+) error {
+	if len(args) != 1 {
+		return errors.New("maintenance recovery success requires its exact projection")
+	}
+	projection, ok := args[0].(ReplaceSuccessResult)
+	if !ok {
+		return errors.New("maintenance recovery success has invalid projection")
+	}
+	return lsm.applyMaintenanceRecoveredSuccess(projection)
+}
+
+func (lsm *leaseSM) onEnterReadyFromMaintenanceRecoveryFailure(
+	_ context.Context,
+	args ...any,
+) error {
+	return lsm.applyMaintenanceRecoveryFailureArgs(
+		args, backend.ProvisionStatusReady,
+	)
+}
+
+func (lsm *leaseSM) onEnterFailedFromMaintenanceRecoveryFailure(
+	_ context.Context,
+	args ...any,
+) error {
+	return lsm.applyMaintenanceRecoveryFailureArgs(
+		args, backend.ProvisionStatusFailed,
+	)
+}
+
+func (lsm *leaseSM) onEnterFailedFromMaintenanceRuntimeFailure(
+	_ context.Context,
+	args ...any,
+) error {
+	if len(args) != 1 {
+		return errors.New("maintenance runtime failure requires its exact projection")
+	}
+	recovery, ok := args[0].(maintenanceRecoveryFailureArgs)
+	if !ok {
+		return errors.New("maintenance runtime failure has invalid projection")
+	}
+	return lsm.applyMaintenanceRecoveredRuntimeFailure(
+		recovery.projection, recovery.failure,
+	)
+}
+
+func (lsm *leaseSM) applyMaintenanceRecoveryFailureArgs(
+	args []any,
+	status backend.ProvisionStatus,
+) error {
+	if len(args) != 1 {
+		return errors.New("maintenance recovery failure requires its exact projection")
+	}
+	recovery, ok := args[0].(maintenanceRecoveryFailureArgs)
+	if !ok {
+		return errors.New("maintenance recovery failure has invalid projection")
+	}
+	return lsm.applyMaintenanceRecoveredFailure(
+		recovery.projection, recovery.failure, status,
+	)
+}
+
 func (lsm *leaseSM) sendReplaceCompletionCallback(callbackURL string, status backend.CallbackStatus, errMsg string) {
 	if lsm.actor.replaceCallbackKind == replaceCallbackLifecycle {
+		if lsm.actor.pendingMaintenance.Valid() && lsm.actor.cfg.SendMaintenanceCallbackFn != nil {
+			lsm.actor.cfg.SendMaintenanceCallbackFn(lsm.actor.pendingMaintenance, status, errMsg)
+			return
+		}
 		lsm.actor.cfg.SendLifecycleCallbackFn(lsm.actor.leaseUUID, callbackURL, status, errMsg)
 		return
 	}
@@ -513,8 +708,7 @@ func (lsm *leaseSM) onExitFailing(ctx context.Context, args ...any) error {
 		lsm.actor.diagCancel()
 		lsm.actor.diagCancel = nil
 	}
-	lsm.actor.waitForWorkers()
-	return nil
+	return lsm.actor.waitForWorkers()
 }
 
 // onExitProvisioning is the analog for Provision/Restart/Update. Same
@@ -528,8 +722,7 @@ func (lsm *leaseSM) onExitProvisioning(ctx context.Context, args ...any) error {
 		lsm.actor.workCancel()
 		lsm.actor.workCancel = nil
 	}
-	lsm.actor.waitForWorkers()
-	return nil
+	return lsm.actor.waitForWorkers()
 }
 
 // workExitWaitTimeout bounds how long Provisioning/Restarting/Updating.OnExit
@@ -636,6 +829,13 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		// it is healthy again. ProvisionState persists across transitions.
 		p.Reason = ""
 		p.Message = ""
+		if result.suppressMaintenanceSettlement {
+			p.CallbackURL = result.recoveredCallbackURL
+			p.LifecycleCallbackURL = result.recoveredLifecycleCallbackURL
+		} else if lsm.actor.replaceCallbackKind == replaceCallbackLifecycle {
+			p.CallbackURL = lsm.actor.pendingReplaceCallbackURL
+			p.LifecycleCallbackURL = lsm.actor.pendingReplaceLifecycleCallbackURL
+		}
 		if result.OnSuccess != nil {
 			result.OnSuccess(p)
 		}
@@ -651,7 +851,10 @@ func (lsm *leaseSM) onEnterReadyFromReplaceCompleted(ctx context.Context, args .
 		cfg.Metrics.ActiveProvisionsInc()
 	}
 
-	lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusSuccess, "")
+	if !result.suppressMaintenanceSettlement {
+		lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusSuccess, "")
+	}
+	lsm.clearPendingReplaceRoute()
 	return nil
 }
 
@@ -710,7 +913,10 @@ func (lsm *leaseSM) onEnterReadyFromReplaceRecovered(ctx context.Context, args .
 		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.Logs)
 	}
 
-	lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
+	if !info.PreserveMaintenance {
+		lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
+		lsm.clearPendingReplaceRoute()
+	}
 	return nil
 }
 
@@ -757,7 +963,10 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 		cfg.PersistDiagnosticsWithLogsFn(diagSnap, info.Logs)
 	}
 
-	lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
+	if !info.PreserveMaintenance {
+		lsm.sendReplaceCompletionCallback(callbackURL, backend.CallbackStatusFailed, info.CallbackErr)
+		lsm.clearPendingReplaceRoute()
+	}
 	return nil
 }
 
@@ -879,6 +1088,55 @@ func (lsm *leaseSM) onEnterFailedFromDiag(ctx context.Context, args ...any) erro
 	return nil
 }
 
+// onEnterFailedFromCohortDivergence is the fail-closed recovery path for a
+// Ready lease whose observed instances do not match its durable desired
+// release. It intentionally does not route through the container-death flow:
+// no particular instance is necessarily dead, and fabricating one would make
+// the inspector guard and diagnostics misleading. The callback text is fixed
+// here, rather than carried by CohortDivergedMsg, so substrate observations
+// can never become tenant-visible text by accident.
+func (lsm *leaseSM) onEnterFailedFromCohortDivergence(ctx context.Context, args ...any) error {
+	cfg := &lsm.actor.cfg
+	leaseUUID := lsm.actor.leaseUUID
+
+	var callbackURL string
+	var failCount int
+	var diagSnap shared.DiagnosticEntry
+	var diagInstanceIDs []string
+	var diagKeys map[string]string
+	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
+		p.Status = backend.ProvisionStatusFailed
+		p.FailCount++
+		p.LastError = errMsgCohortDiverged
+		p.Reason = backend.ReasonInternal
+		p.Message = errMsgCohortDiverged
+		callbackURL = p.LifecycleCallbackURL
+		failCount = p.FailCount
+		diagSnap = DiagnosticSnapshot(p)
+		diagInstanceIDs = append([]string(nil), p.ContainerIDs...)
+		diagKeys = ContainerLogKeys(p)
+	})
+	if !applied {
+		return nil
+	}
+
+	cfg.Metrics.ActiveProvisionsDec()
+	if diagSnap.LeaseUUID != "" {
+		cfg.PersistDiagnosticsFn(diagSnap, diagInstanceIDs, diagKeys)
+	}
+	cfg.SendLifecycleCallbackFn(
+		leaseUUID,
+		callbackURL,
+		backend.CallbackStatusFailed,
+		errMsgCohortDiverged,
+	)
+	cfg.Logger.Warn("recovered workload cohort diverges from durable release",
+		"lease_uuid", leaseUUID,
+		"fail_count", failCount,
+	)
+	return nil
+}
+
 // diagResult carries gather output from the async goroutine into the Failed
 // entry action via Fire args.
 //
@@ -938,6 +1196,7 @@ type replaceEntryArgs struct {
 	CallbackURL          string
 	LifecycleCallbackURL string
 	CallbackKind         replaceCallbackKind
+	Maintenance          shared.MaintenanceIntentClaim
 }
 
 // ReplaceSuccessResult carries doReplaceContainers / doReplaceStackContainers
@@ -950,6 +1209,13 @@ type ReplaceSuccessResult struct {
 	ContainerIDs      []string
 	ServiceContainers map[string][]string // non-nil for stack
 	OnSuccess         func(*ProvisionState)
+	// suppressMaintenanceSettlement is set only by the typed recovery
+	// constructor after an exact terminal Release is observed. Recovery owns
+	// the later intent -> outbox transaction and must not enqueue a duplicate.
+	suppressMaintenanceSettlement  bool
+	applyRecoveredRuntimeAuthority bool
+	recoveredCallbackURL           string
+	recoveredLifecycleCallbackURL  string
 }
 
 // ReplaceFailureInfo carries doReplace* failure data. Used by both
@@ -970,6 +1236,9 @@ type ReplaceFailureInfo struct {
 	// them gone and record an empty entry. For stacks, keys are
 	// "serviceName/instanceIndex"; for single-container, raw indices.
 	Logs map[string]string
+	// PreserveMaintenance suppresses callback settlement when the exact
+	// release terminal write was ambiguous. Periodic recovery owns resolution.
+	PreserveMaintenance bool
 }
 
 // ReplaceResult is doReplace*'s return value bundling everything the
@@ -1030,7 +1299,7 @@ func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 	// the recover overrides terminalMsg on panic, the normal path
 	// sets it on completion. ctx-cancel is special: we suppress the
 	// send entirely (the Deprovisioning.Ignore path handles that case).
-	var terminalMsg LeaseMessage
+	var terminalMsg workerTerminalMessage
 	var event = "diag_gathered"
 	var suppress bool
 	defer func() {
@@ -1099,6 +1368,15 @@ func (a *LeaseActor) gatherDiagAsync(ctx context.Context, containerID string, in
 // callback-error-sanitization invariant. Both names refer to the same
 // constant so drift is structurally impossible.
 const errMsgContainerExited = "container exited unexpectedly"
+
+// errMsgCohortDiverged is the fixed, tenant-safe lifecycle callback and
+// provision Message used when recovery proves that the observed workload no
+// longer matches its durable desired release.
+const errMsgCohortDiverged = "running workload cohort does not match its durable release"
+
+// ErrMsgCohortDiverged exposes the canonical callback text to substrate tests
+// and read-model adapters without allowing callers to author alternate text.
+const ErrMsgCohortDiverged = errMsgCohortDiverged
 
 // ErrMsgContainerExited is the exported view of errMsgContainerExited for
 // substrate adapters that emit failure callbacks outside the SM's own

@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -44,7 +43,7 @@ func isFlatPayload(data []byte) bool {
 // (make([]string, 0, totalQuantity)) to ~16 GB — an OOM reachable before any admission
 // control. Real leases are a handful of containers; 1024 is far above any single node's
 // real capacity (such a lease would fail admission anyway). (ENG-503)
-const maxLeaseQuantity = 1024
+const maxLeaseQuantity = backend.MaxOperationQuantity
 
 // Provision starts async provisioning of containers.
 // For multi-unit leases (quantity > 1), multiple containers are created.
@@ -55,23 +54,34 @@ const maxLeaseQuantity = 1024
 // with an appropriate HTTP status. Only truly asynchronous failures (image pull,
 // container create/start) are communicated via callback.
 func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) error {
-	totalQuantity := req.TotalQuantity()
-
+	if err := b.requireMutationAdmission(ctx, "provision"); err != nil {
+		return fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	defer unlockCommand()
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
+		req.CallbackURL, req.LifecycleCallbackURL,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
+	req.LifecycleCallbackURL = lifecycleCallbackURL
+	if exactRetry, err := b.probeOperationIntent(req.LeaseUUID, req.CallbackURL); err != nil {
+		return err
+	} else if exactRetry {
+		return nil
+	}
+	if err := b.ensureRestoreDestinationUnowned(req.LeaseUUID); err != nil {
+		return err
+	}
 	// Bound the chain-supplied quantity BEFORE the reservation's ContainerIDs allocation
 	// below. item.Quantity is a uint64→int cast at ingest, so a negative value signals an
 	// overflowed cast; a total above maxLeaseQuantity would drive an unbounded pre-admission
 	// allocation (~16 GB at the chain's 1e9 billing cap) or, if negative, panic the make().
 	// Rejected synchronously as a validation error, before any state is reserved. (ENG-503)
-	for i, item := range req.Items {
-		if item.Quantity < 0 || item.Quantity > maxLeaseQuantity {
-			// Name the offending item (index/SKU/service — all tenant-supplied, so safe to
-			// echo) so a multi-item lease rejection is actionable client-side.
-			return fmt.Errorf("%w: item %d (SKU %q, service %q) quantity %d out of range [0, %d]",
-				backend.ErrValidation, i, item.SKU, item.ServiceName, item.Quantity, maxLeaseQuantity)
-		}
-	}
-	if totalQuantity < 0 || totalQuantity > maxLeaseQuantity {
-		return fmt.Errorf("%w: total quantity %d out of range [0, %d]", backend.ErrValidation, totalQuantity, maxLeaseQuantity)
+	totalQuantity, err := backend.ValidateOperationQuantities(req.Items)
+	if err != nil {
+		return err
 	}
 
 	// Boundary normalization: auto-tag a single unnamed item with the default
@@ -87,13 +97,6 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	if err := backend.NormalizeProvisionRequest(&req); err != nil {
 		return err
 	}
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
-		req.CallbackURL, req.LifecycleCallbackURL,
-	)
-	if err != nil {
-		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
-	}
-	req.LifecycleCallbackURL = lifecycleCallbackURL
 
 	logger := b.logger.With(
 		"lease_uuid", req.LeaseUUID,
@@ -101,6 +104,94 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		"items", len(req.Items),
 		"total_quantity", totalQuantity,
 	)
+
+	// Complete every pure validation before creating the durable acceptance
+	// record. The intent is still committed before reservation cleanup, pool
+	// allocation, Docker, volume, or actor side effects.
+	profiles := make(map[string]SKUProfile)
+	for _, item := range req.Items {
+		if _, ok := profiles[item.SKU]; ok {
+			continue
+		}
+		profile, err := b.cfg.GetSKUProfile(item.SKU)
+		if err != nil {
+			return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+		}
+		profiles[item.SKU] = profile
+	}
+	resourceProfiles, err := b.snapshotResourceProfiles(req.Items, profiles)
+	if err != nil {
+		return fmt.Errorf("%w: snapshot resource profiles: %w", backend.ErrValidation, err)
+	}
+	resourcesBySKU, err := resourceSnapshotMap(req.Items, resourceProfiles)
+	if err != nil {
+		return fmt.Errorf("%w: validate resource profiles: %w", backend.ErrValidation, err)
+	}
+	stackManifest, err := manifest.ParsePayload(req.Payload)
+	if err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
+	}
+	if isFlatPayload(req.Payload) {
+		logger.Warn("manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack",
+			"lease_uuid", req.LeaseUUID)
+	}
+	if err := manifest.ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
+	}
+	if err := validateComposeServiceNames(req.Items); err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
+	}
+	if err := manifest.ValidateNoFixedHostPorts(stackManifest); err != nil {
+		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
+	}
+	var healthCheckServices []string
+	for svcName, svc := range stackManifest.Services {
+		if err := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); err != nil {
+			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, err)
+		}
+		if svc.HasActiveHealthCheck() {
+			healthCheckServices = append(healthCheckServices, svcName)
+		}
+	}
+	slices.Sort(healthCheckServices)
+	// Decide the exact label-level custom domains before the write-ahead
+	// acceptance barrier. Desired items remain immutable operation input, while
+	// effective items record DNS-deferred empty domains for exact crash recovery.
+	desiredItems := slices.Clone(req.Items)
+	b.deferUnreadyCustomDomains(ctx, req.Items, req.LeaseUUID, logger)
+	effectiveItems := slices.Clone(req.Items)
+
+	intent, proceed, err := b.beginOperationIntent(
+		shared.OperationIntentProvision,
+		req.LeaseUUID,
+		req.CallbackURL,
+		req.LifecycleCallbackURL,
+		req.Tenant,
+		req.ProviderUUID,
+		desiredItems,
+		resourceProfiles,
+		effectiveItems,
+		healthCheckServices,
+		req.Payload,
+		"",
+		0,
+	)
+	if err != nil {
+		return err
+	}
+	if !proceed {
+		// An exact request retry was already durably accepted or its completion
+		// is pending delivery. Returning success is idempotent; starting another
+		// worker would duplicate the substrate mutation.
+		return nil
+	}
+	if err := b.checkOperationReleaseCapacity(*intent); err != nil {
+		return b.refuseOperationIntent(intent, fmt.Errorf(
+			"%w: reserve provision success release: %w",
+			backend.ErrInsufficientResources,
+			err,
+		))
+	}
 
 	// Atomically check-and-reserve the provision slot (fixes TOCTOU race).
 	// Allow re-provisioning if the existing provision has failed (e.g., container
@@ -124,7 +215,8 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	if existing, exists := b.provisions[req.LeaseUUID]; exists {
 		if existing.Status != backend.ProvisionStatusFailed {
 			b.provisionsMu.Unlock()
-			return fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID)
+			return b.refuseOperationIntent(intent,
+				fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID))
 		}
 		// Capture data needed for cleanup, then release lock before Docker API calls.
 		prevFailCount = existing.FailCount
@@ -152,12 +244,14 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			CallbackURL:          req.CallbackURL,
 			LifecycleCallbackURL: req.LifecycleCallbackURL,
 			Items:                slices.Clone(req.Items), // the ownership claim; see above
+			ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 			ContainerIDs:         make([]string, 0, totalQuantity),
 			StackManifest:        nil, // set by enrichReserved
 			ServiceContainers:    nil,
 		},
 		// VolumeCleanupAttempts: 0 by struct-zero — structural reset of the
 		// per-lease counter is the whole point of the wrapper.
+		resourceProfiles:      shared.CloneSKUResourceSnapshot(resourceProfiles),
 		volumeCleanupAttempts: 0,
 	}.materialize()
 	b.provisionsMu.Unlock()
@@ -181,7 +275,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		// across re-provisions. Volumes are reused via idempotent Create in
 		// doProvision, and only destroyed on explicit deprovision.
 		for _, cid := range oldContainerIDs {
-			if err := b.docker.RemoveContainer(ctx, cid); err != nil {
+			if err := b.mutationAdapter().removeContainer(ctx, cid); err != nil {
 				logger.Warn("failed to remove old container during re-provision",
 					"container_id", leasesm.ShortID(cid), "error", err)
 			}
@@ -189,54 +283,6 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		logger.Info("replacing failed provision",
 			"fail_count", prevFailCount,
 		)
-	}
-
-	// Validate all SKUs upfront and build profile map.
-	// On failure, remove the reservation and return error synchronously.
-	profiles := make(map[string]SKUProfile)
-	for _, item := range req.Items {
-		if _, ok := profiles[item.SKU]; ok {
-			continue // Already validated
-		}
-		profile, err := b.cfg.GetSKUProfile(item.SKU)
-		if err != nil {
-			b.removeProvision(req.LeaseUUID)
-			return fmt.Errorf("%w: %w", backend.ErrValidation, err)
-		}
-		profiles[item.SKU] = profile
-	}
-
-	// Parse payload. ParsePayload always returns a *StackManifest;
-	// legacy flat payloads are auto-wrapped under DefaultServiceName.
-	stackManifest, err := manifest.ParsePayload(req.Payload)
-	if err != nil {
-		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
-	}
-	if isFlatPayload(req.Payload) {
-		logger.Warn("manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack",
-			"lease_uuid", req.LeaseUUID)
-	}
-
-	// Validate the manifest against the (now-normalized) lease items and
-	// every service's image against the registry allowlist. After Task 3
-	// these run unconditionally — there is no legacy single-service arm.
-	if err := manifest.ValidateStackAgainstItems(stackManifest, req.Items); err != nil {
-		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
-	}
-	// Reject tenant-pinned fixed host ports (ENG-605): forcing dynamic
-	// assignment removes host-port squatting and cross-lease collision DoS.
-	// Admission-only — never runs on recover, so stored manifests stay valid.
-	if err := manifest.ValidateNoFixedHostPorts(stackManifest); err != nil {
-		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: %w", backend.ErrInvalidManifest, err)
-	}
-	for svcName, svc := range stackManifest.Services {
-		if err := shared.ValidateImage(svc.Image, b.cfg.AllowedRegistries); err != nil {
-			b.removeProvision(req.LeaseUUID)
-			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svcName, err)
-		}
 	}
 
 	// Allocation IDs are always service-aware now:
@@ -247,12 +293,13 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	for _, item := range req.Items {
 		for i := range item.Quantity {
 			instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if err := b.pool.TryAllocate(instanceID, item.SKU, req.Tenant); err != nil {
+			if err := b.pool.TryAllocateResolved(instanceID, req.Tenant, resourcesBySKU[item.SKU]); err != nil {
 				for _, id := range allocatedIDs {
 					b.pool.Release(id)
 				}
 				b.removeProvision(req.LeaseUUID)
-				return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err)
+				return b.refuseOperationIntent(intent,
+					fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err))
 			}
 			allocatedIDs = append(allocatedIDs, instanceID)
 		}
@@ -276,7 +323,15 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
 	work := func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
-		return b.doProvision(provCtx, req, stackManifest, profiles, logger)
+		return b.doProvisionWithOperationID(
+			provCtx,
+			req,
+			stackManifest,
+			resourceProfiles,
+			intent.OperationID(),
+			intent.CreatedAt(),
+			logger,
+		)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.ProvisionRequestedMsg{
@@ -289,16 +344,12 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			b.pool.Release(id)
 		}
 		b.removeProvision(req.LeaseUUID)
-		return routeErr
+		return b.refuseOperationIntent(intent, routeErr)
 	}
-	// Wait for the actor to fire evProvisionRequested on its SM. If the
-	// SM rejects (shouldn't happen given the synchronous validation
-	// above, but defensive), roll back the provision entry and surface.
-	// ackOrAbort handles the race where ctx/stopCtx cancel at the same
-	// instant as the actor's ack — it checks ack one more time before
-	// giving up, so we don't roll back while the actor is already
-	// committing (which would otherwise leave worker-created containers
-	// orphaned with no provision entry).
+	// Wait for the actor to fire evProvisionRequested on its SM. Only an
+	// explicit rejection proves no worker exists and authorizes rollback. Once
+	// enqueued, cancellation is an unknown outcome: preserve the intent,
+	// reservation, and allocation for worker completion or startup recovery.
 	//
 	// Pool allocations MUST be released on rollback (mirroring the
 	// mid-allocation failure paths above). doProvision's failure defer
@@ -307,15 +358,22 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// these allocations would otherwise leak — a subsequent retry would
 	// then find the per-instance IDs still allocated in the pool and
 	// fail TryAllocate with "already allocated", wedging the lease.
-	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
+	acceptance, err := b.awaitAsyncAcceptance(ctx, ack)
+	switch acceptance {
+	case asyncAcceptanceAccepted:
+		return nil
+	case asyncAcceptanceUnknown:
+		return fmt.Errorf("provision acceptance is unknown; durable recovery retained: %s", err.Error())
+	case asyncAcceptanceRejected:
 		provCancel()
 		for _, id := range allocatedIDs {
 			b.pool.Release(id)
 		}
 		b.removeProvision(req.LeaseUUID)
-		return err
+		return b.refuseOperationIntent(intent, err)
+	default:
+		return fmt.Errorf("invalid provision acceptance state %d", acceptance)
 	}
-	return nil
 }
 
 // volumeOwnerEntry caches the detected UID/GID for an image's VOLUME directories.
@@ -336,7 +394,7 @@ func (b *Backend) detectVolumeOwnerCached(ctx context.Context, imageID, imageNam
 		}
 	}
 
-	detectedUID, detectedGID, err := b.docker.DetectVolumeOwner(ctx, imageName, volumePaths)
+	detectedUID, detectedGID, err := b.mutationAdapter().detectVolumeOwner(ctx, imageName, volumePaths)
 	if err != nil {
 		b.logger.Warn("failed to detect volume owner, defaulting to root (not cached)",
 			"image", imageName, "error", err)
@@ -358,7 +416,7 @@ func (b *Backend) detectWritablePathsCached(ctx context.Context, imageID, imageN
 		}
 	}
 
-	paths, err := b.docker.DetectWritablePaths(ctx, imageName, uid, candidateWritableParents)
+	paths, err := b.mutationAdapter().detectWritablePaths(ctx, imageName, uid, candidateWritableParents)
 	if err != nil {
 		b.logger.Warn("failed to detect writable paths, skipping (not cached)",
 			"image", imageName, "error", err)
@@ -392,7 +450,7 @@ func (b *Backend) inspectImageForSetup(ctx context.Context, image string, manife
 	result := &imageSetup{Volumes: volumes}
 
 	if manifestUser != "" || imageInfo.User != "" {
-		uid, gid, resolveErr := b.docker.ResolveImageUser(ctx, image, manifestUser)
+		uid, gid, resolveErr := b.mutationAdapter().resolveImageUser(ctx, image, manifestUser)
 		if resolveErr != nil {
 			return nil, fmt.Errorf("image user resolution failed: %w", resolveErr)
 		}
@@ -456,7 +514,7 @@ func filterSubpaths(candidates, parents []string) []string {
 // buildStatefulVolumeBinds creates subdirectories for each image VOLUME path
 // under hostPath and returns bind mount mappings. Returns an error if any
 // VOLUME path cannot be sanitized (unsupported path format).
-func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
+func buildStatefulVolumeBindsContext(ctx context.Context, hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
 	binds := make(map[string]string, len(imageVolumes))
 	if len(imageVolumes) == 0 {
 		return binds, nil
@@ -482,6 +540,9 @@ func buildStatefulVolumeBinds(hostPath string, imageVolumes []string, uid, gid i
 	defer func() { _ = root.Close() }()
 
 	for _, volPath := range imageVolumes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sanitized := sanitizeVolumePath(volPath)
 		if sanitized == "" {
 			return nil, fmt.Errorf("image declares unsupported VOLUME path %q", volPath)
@@ -567,11 +628,15 @@ func (b *Backend) setupWritablePathBinds(ctx context.Context, image string, writ
 	wpDir := filepath.Join(hostVolumePath, writablePathSubdir)
 	// Remove stale content from prior extractions so files deleted
 	// in a newer image don't persist.
-	if err := os.RemoveAll(wpDir); err != nil {
+	if err := b.mutationAdapter().removePath(ctx, wpDir); err != nil {
 		b.logger.Warn("failed to clean up old writable path content, extraction may contain stale files",
 			"path", wpDir, "error", err)
 	}
-	failures := b.docker.ExtractImageContent(ctx, image, writablePaths, wpDir, maxBytes, maxEntries)
+	failures, authErr := b.mutationAdapter().extractImageContent(ctx, image, writablePaths, wpDir, maxBytes, maxEntries)
+	if authErr != nil {
+		b.logger.Warn("failed to authorize writable path extraction", "error", authErr)
+		return nil
+	}
 
 	// The bind Source below is mounted read-write into the container and Docker
 	// resolves it host-side. Docker's CopyFromContainer does NOT follow a
@@ -637,17 +702,22 @@ func (b *Backend) setupVolBinds(
 	ctx context.Context,
 	leaseUUID string,
 	items []backend.LeaseItem,
-	profiles map[string]SKUProfile,
+	resourceProfiles []shared.SKUResourceSnapshot,
 	imageSetups map[string]*imageSetup,
 	services map[string]*manifest.Manifest,
 	logger *slog.Logger,
 ) (map[string]map[int]serviceVolBinds, []string, error) {
+	resourcesBySKU, err := resourceSnapshotMap(items, resourceProfiles)
+	if err != nil {
+		return nil, nil, fmt.Errorf("validate volume resource profiles: %w", err)
+	}
 	volBinds := make(map[string]map[int]serviceVolBinds)
 	var createdVolumeIDs []string
 
 	for _, item := range items {
 		svcName := item.ServiceName
-		profile := profiles[item.SKU]
+		resources := resourcesBySKU[item.SKU]
+		profile := resources.Profile()
 		imgSetup := imageSetups[svcName]
 
 		for i := range item.Quantity {
@@ -658,7 +728,7 @@ func (b *Backend) setupVolBinds(
 				volumeID := canonicalVolumeName(leaseUUID, svcName, i)
 				sizeMB := profile.DiskMB
 				if sizeMB <= 0 {
-					sizeMB = int64(b.cfg.GetTmpfsSizeMB())
+					sizeMB = resources.ScratchDiskMB
 				}
 				hostPath, volCreated, volErr := b.createManagedVolume(ctx, volumeID, sizeMB)
 				if volErr != nil {
@@ -674,7 +744,7 @@ func (b *Backend) setupVolBinds(
 				binds := serviceVolBinds{}
 				if needsStatefulVolume {
 					var buildErr error
-					binds.StatefulBinds, buildErr = buildStatefulVolumeBinds(hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
+					binds.StatefulBinds, buildErr = b.mutationAdapter().prepareStatefulVolumeBinds(ctx, hostPath, imgSetup.Volumes, imgSetup.VolumeUID, imgSetup.VolumeGID)
 					if buildErr != nil {
 						return nil, createdVolumeIDs, fmt.Errorf("volume setup failed (service %s, instance %d): %w", svcName, i, buildErr)
 					}
@@ -777,7 +847,35 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 //
 // Returns the (callbackErr, result, logs, err) contract; stack-specific result
 // fields are stackManifest + serviceContainers.
-func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, profiles map[string]SKUProfile, logger *slog.Logger) (callbackErrRet string, reasonRet backend.Reason, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
+func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, resourceProfiles []shared.SKUResourceSnapshot, logger *slog.Logger) (callbackErrRet string, reasonRet backend.Reason, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
+	return b.doProvisionWithOperationID(ctx, req, stack, resourceProfiles, "", time.Now(), logger)
+}
+
+func (b *Backend) doProvisionWithOperationID(
+	ctx context.Context,
+	req backend.ProvisionRequest,
+	stack *manifest.StackManifest,
+	resourceProfiles []shared.SKUResourceSnapshot,
+	operationID shared.OperationID,
+	releaseCreatedAt time.Time,
+	logger *slog.Logger,
+) (callbackErrRet string, reasonRet backend.Reason, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
+	runtimeAuthority, authorityErr := releaseRuntimeAuthorityForOperation(
+		operationID,
+		req.Tenant,
+		req.ProviderUUID,
+		req.CallbackURL,
+		req.LifecycleCallbackURL,
+	)
+	if authorityErr != nil {
+		return "validate runtime authority", backend.ReasonInternal, leasesm.ProvisionSuccessResult{}, nil,
+			fmt.Errorf("validate provision runtime authority: %w", authorityErr)
+	}
+	profiles, profileErr := resourceProfileMap(req.Items, resourceProfiles)
+	if profileErr != nil {
+		return "validate resource profiles", backend.ReasonInternal, leasesm.ProvisionSuccessResult{}, nil,
+			fmt.Errorf("validate provision resource profiles: %w", profileErr)
+	}
 	var containerIDs []string
 	var createdVolumeIDs []string
 	var err error
@@ -845,18 +943,34 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 			return
 		}
 
-		provisionsTotal.WithLabelValues("success").Inc()
-
 		if b.releaseStore != nil {
-			if relErr := b.releaseStore.Append(req.LeaseUUID, shared.Release{
-				Manifest:  req.Payload,
-				Image:     "stack",
-				Status:    "active",
-				CreatedAt: time.Now(),
+			if relErr := b.releaseStore.AppendActive(req.LeaseUUID, shared.Release{
+				Manifest:         req.Payload,
+				Image:            "stack",
+				OperationID:      operationID,
+				Items:            slices.Clone(req.Items),
+				ResourceProfiles: shared.CloneSKUResourceSnapshot(resourceProfiles),
+				RuntimeAuthority: runtimeAuthority,
+				Status:           "active",
+				CreatedAt:        releaseCreatedAt,
 			}); relErr != nil {
-				b.logger.Warn("failed to record initial release", "lease", req.LeaseUUID, "error", relErr)
+				// Compose succeeded, so ordinary failure cleanup would destroy a
+				// possibly-complete cohort while the exact operation intent is the
+				// only durable causal evidence. Latch the Backend and return an
+				// ambiguous result without changing local err: the defer must retain
+				// containers, volumes, and pool reservations for cold-start recovery.
+				provisionsTotal.WithLabelValues("failure").Inc()
+				callbackErrRet = leasesm.ErrMsgInternal
+				reasonRet = backend.ReasonInternal
+				errRet = b.latchAmbiguousOperationOutcome("record successful provision release", relErr)
+				logger.Error("successful provision release could not be recorded; preserving substrate and operation intent for restart recovery",
+					"lease_uuid", req.LeaseUUID, "error", errRet)
+				updateResourceMetrics(b.pool.Stats())
+				return
 			}
 		}
+
+		provisionsTotal.WithLabelValues("success").Inc()
 
 		if b.diagnosticsStore != nil {
 			if delErr := b.diagnosticsStore.Delete(req.LeaseUUID); delErr != nil {
@@ -888,7 +1002,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		}
 		logger.Info("pulling image", "service", svcName, "image", svc.Image)
 		pullStart := time.Now()
-		if err = b.docker.PullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); err != nil {
+		if err = b.mutationAdapter().pullImage(ctx, svc.Image, b.cfg.ImagePullTimeout); err != nil {
 			logger.Error("failed to pull image", "service", svcName, "error", err)
 			err = fmt.Errorf("image pull failed for service %s: %w", svcName, err)
 			callbackErr = backend.MsgImagePullFailed
@@ -934,7 +1048,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	b.provisionsMu.RUnlock()
 
 	var volBinds map[string]map[int]serviceVolBinds
-	volBinds, createdVolumeIDs, err = b.setupVolBinds(ctx, req.LeaseUUID, req.Items, profiles, imageSetups, stack.Services, logger)
+	volBinds, createdVolumeIDs, err = b.setupVolBinds(ctx, req.LeaseUUID, req.Items, resourceProfiles, imageSetups, stack.Services, logger)
 	if err != nil {
 		callbackErr = "volume creation failed"
 		return
@@ -965,7 +1079,7 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	})
 
 	logger.Info("compose up", "project", projectName, "services", len(project.Services))
-	if upErr := b.compose.Up(ctx, project, composeUpOpts{}); upErr != nil {
+	if upErr := b.mutationAdapter().composeUp(ctx, project, composeUpOpts{}); upErr != nil {
 		err = fmt.Errorf("compose up failed: %w", upErr)
 		callbackErr = "container creation failed"
 		return
@@ -979,7 +1093,18 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 		return
 	}
 
-	containerIDs, serviceContainers = mapComposeContainers(containers, req.Items)
+	var mapErr error
+	containerIDs, serviceContainers, mapErr = mapComposeContainers(containers, req.Items)
+	if mapErr != nil {
+		err = fmt.Errorf("map compose ps cohort: %w", mapErr)
+		callbackErr = "container creation failed"
+		return
+	}
+	if !exactServiceContainerCohort(req.Items, containerIDs, serviceContainers) {
+		err = errors.New("compose ps returned an incomplete or duplicate provision cohort")
+		callbackErr = "container creation failed"
+		return
+	}
 
 	// Verify startup per-service so each service uses its own health check config.
 	for svcName, svcCIDs := range serviceContainers {
@@ -994,14 +1119,14 @@ func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest,
 	return
 }
 
-// mapComposeContainers maps Compose PS output to containerIDs and serviceContainers.
-// For fanned-out services (web-0, web-1), it strips the instance suffix to recover
-// the original service name.
-func mapComposeContainers(containers []composeContainerSummary, items []backend.LeaseItem) ([]string, map[string][]string) {
-	// Build a set of base service names for fan-out detection.
-	svcQuantities := make(map[string]int, len(items))
-	for _, item := range items {
-		svcQuantities[item.ServiceName] = item.Quantity
+// mapComposeContainers maps Compose PS output to containerIDs and logical
+// service names using the exact keys produced by composeServiceName. Prefix
+// parsing is deliberately forbidden: a valid service named "web-01" is not an
+// instance of a scaled "web" service.
+func mapComposeContainers(containers []composeContainerSummary, items []backend.LeaseItem) ([]string, map[string][]string, error) {
+	logicalNames, err := composeServiceLogicalNames(items)
+	if err != nil {
+		return nil, nil, fmt.Errorf("derive Compose service keys: %w", err)
 	}
 
 	var containerIDs []string
@@ -1009,23 +1134,16 @@ func mapComposeContainers(containers []composeContainerSummary, items []backend.
 
 	for _, c := range containers {
 		containerIDs = append(containerIDs, c.ID)
-		// Recover original service name from Compose service name.
-		// Fan-out: "web-0" → "web", single: "web" → "web".
-		// We verify the suffix is a valid integer to avoid prefix collisions
-		// (e.g., "web-extra" must not match "web" with qty>1).
-		baseName := c.Service
-		for svcName, qty := range svcQuantities {
-			if qty > 1 && strings.HasPrefix(c.Service, svcName+"-") {
-				suffix := strings.TrimPrefix(c.Service, svcName+"-")
-				if _, parseErr := strconv.Atoi(suffix); parseErr == nil {
-					baseName = svcName
-					break
-				}
-			}
+		logicalName, exists := logicalNames[c.Service]
+		if !exists {
+			return containerIDs, serviceContainers, fmt.Errorf(
+				"compose ps returned unknown service key %q",
+				c.Service,
+			)
 		}
-		serviceContainers[baseName] = append(serviceContainers[baseName], c.ID)
+		serviceContainers[logicalName] = append(serviceContainers[logicalName], c.ID)
 	}
-	return containerIDs, serviceContainers
+	return containerIDs, serviceContainers, nil
 }
 
 // healthPollInterval is the interval between health check polls during startup verification.

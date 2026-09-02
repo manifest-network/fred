@@ -2,6 +2,7 @@ package shared
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -126,6 +127,63 @@ func TestDiagnosticsStore_Persistence(t *testing.T) {
 func TestDiagnosticsStore_EmptyPath(t *testing.T) {
 	_, err := NewDiagnosticsStore(DiagnosticsStoreConfig{})
 	assert.Error(t, err)
+}
+
+func TestDiagnosticsStoreRejectsInsecureExistingDatabaseBeforeSchemaWrite(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		weaken func(string) error
+		want   string
+	}{
+		{
+			name: "overly permissive mode",
+			weaken: func(path string) error {
+				return os.Chmod(path, 0o644)
+			},
+			want: "exact mode 0600",
+		},
+		{
+			name: "additional hard link",
+			weaken: func(path string) error {
+				return os.Link(path, path+".linked")
+			},
+			want: "exactly one hard link",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "diagnostics.db")
+			store, err := NewDiagnosticsStore(DiagnosticsStoreConfig{DBPath: dbPath})
+			require.NoError(t, err)
+			require.NoError(t, store.Close())
+			before, err := os.ReadFile(dbPath)
+			require.NoError(t, err)
+			require.NoError(t, test.weaken(dbPath))
+
+			reopened, err := NewDiagnosticsStore(DiagnosticsStoreConfig{DBPath: dbPath})
+			require.Error(t, err)
+			assert.Nil(t, reopened)
+			assert.ErrorContains(t, err, test.want)
+			after, readErr := os.ReadFile(dbPath)
+			require.NoError(t, readErr)
+			assert.Equal(t, before, after, "rejected database must not receive a schema write")
+		})
+	}
+}
+
+func TestDiagnosticsStoreRejectsSymlinkWithoutTouchingTarget(t *testing.T) {
+	dir := t.TempDir()
+	victimPath := filepath.Join(dir, "empty-victim")
+	dbPath := filepath.Join(dir, "diagnostics.db")
+	require.NoError(t, os.WriteFile(victimPath, nil, 0o600))
+	require.NoError(t, os.Symlink(victimPath, dbPath))
+
+	store, err := NewDiagnosticsStore(DiagnosticsStoreConfig{DBPath: dbPath})
+	require.Error(t, err)
+	assert.Nil(t, store)
+	assert.ErrorContains(t, err, "not a regular file")
+	victim, readErr := os.ReadFile(victimPath)
+	require.NoError(t, readErr)
+	assert.Empty(t, victim, "bbolt must not initialize pages through a symlinked final component")
 }
 
 func TestDiagnosticsStore_Healthy(t *testing.T) {

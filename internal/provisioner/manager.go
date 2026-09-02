@@ -28,8 +28,8 @@ const poisonTopic = "events.poison"
 
 var errCallbackRuntimeUnavailable = errors.New("backend callback runtime is not accepting callbacks")
 
-// Manager is the typed production runtime. Legacy tracker forwarding needed by
-// older package tests is compiled only into the test binary.
+// Manager is the typed production runtime and owns the single process-local
+// operation registry shared through narrow consumer capability ports.
 var _ ReconcilerRuntime = (*Manager)(nil)
 
 // Manager handles the provisioning lifecycle. Chain and payload events use
@@ -70,10 +70,9 @@ type Manager struct {
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
 
-	// Track in-flight provisions (ephemeral - recovered via reconciliation)
-	tracker InFlightTracker
-	// operations is the single typed registry owned by this manager. tracker is
-	// only its temporary compatibility adapter; it holds no duplicate state.
+	// operations is the single process-local lifecycle registry owned by this
+	// manager. Durable attempts and backend inventory recover its ephemeral state
+	// after restart.
 	operations *operation.Registry
 
 	// Orchestrator for provisioning coordination
@@ -114,7 +113,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	if router == nil {
 		return nil, errors.New("backend router is required")
 	}
-	if chainClient == nil {
+	if util.IsNilInterface(chainClient) {
 		return nil, errors.New("chain client is required")
 	}
 	if cfg.ProviderUUID == "" {
@@ -123,17 +122,22 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	if cfg.CallbackBaseURL == "" {
 		return nil, errors.New("callback base URL is required")
 	}
+	if _, err := parseCallbackBaseURL(cfg.CallbackBaseURL); err != nil {
+		return nil, err
+	}
 	if isNilPlacementAuthorityStore(cfg.PlacementStore) {
 		return nil, ErrPlacementStoreUnavailable
 	}
-	// Manager is an independently constructible event-driven runtime; it cannot
-	// rely on a Reconciler being created later to establish this safety boundary.
-	// NewReconciler intentionally repeats the idempotent validation for its own
-	// standalone construction path.
-	if err := cfg.PlacementStore.ConfigureBackendTopology(
+	if err := cfg.PlacementStore.VerifyProviderUUID(cfg.ProviderUUID); err != nil {
+		return nil, fmt.Errorf("verify placement provider authority: %w", err)
+	}
+	// Manager is an independently constructible event-driven runtime. It may
+	// verify the provider- and identity-bearing topology committed by the
+	// composition root, but must never mutate either from configuration alone.
+	if err := cfg.PlacementStore.VerifyBackendTopology(
 		backendTopologyNames(router),
 	); err != nil {
-		return nil, fmt.Errorf("configure placement backend topology: %w", err)
+		return nil, fmt.Errorf("verify placement backend topology: %w", err)
 	}
 
 	// Apply defaults for callback timeout using cmp.Or
@@ -187,8 +191,9 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	// opened only after that launch, and the reconciler's first ack is gated
 	// behind <-Running() in cmd/providerd/main.go.
 
-	tracker := NewInFlightTracker()
-	operations := tracker.Operations()
+	operations := operation.NewRegistryWithCountObserver(func(count int) {
+		metrics.InFlightProvisions.Set(float64(count))
+	})
 	orchestrator, err := NewProvisionOrchestrator(
 		cfg.ProviderUUID, cfg.CallbackBaseURL, router, operations, cfg.PlacementStore,
 		provisionStartEventSinkFunc(func(leaseUUID string) {
@@ -220,6 +225,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		Chain:              chainClient,
 		Acknowledger:       ackBatcher,
 		Placement:          cfg.PlacementStore,
+		StorageIdentities:  cfg.PlacementStore,
 		LifecycleAuthority: cfg.PlacementStore,
 		Payloads:           cfg.PayloadStore,
 		Events:             callbackEvents,
@@ -257,7 +263,6 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		payloadStore:         cfg.PayloadStore,
 		placementStore:       cfg.PlacementStore,
 		ackBatcher:           ackBatcher,
-		tracker:              tracker,
 		operations:           operations,
 		orchestrator:         orchestrator,
 		timeoutChecker:       timeoutChecker,
@@ -428,6 +433,12 @@ func (m *Manager) AckBatcher() Acknowledger {
 
 // Close shuts down the provision manager.
 func (m *Manager) Close() error {
+	// Close may be called directly by tests or by a composition root that did
+	// not perform the graceful WaitForDrain sequence. Establish the same
+	// irreversible ordinary-work admission barrier defensively before closing
+	// any of the settlement paths below.
+	m.BeginDrain()
+
 	// Reject new callback requests before draining either execution path. Direct
 	// callbacks are not owned by Watermill, so the router alone cannot account
 	// for them during shutdown.

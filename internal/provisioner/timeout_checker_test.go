@@ -26,7 +26,7 @@ func (m *mockRejecter) RejectLeases(ctx context.Context, uuids []string, reason 
 	return m.rejectFn(ctx, uuids, reason)
 }
 
-func newTimeoutCheckerForTest(tracker *DefaultInFlightTracker, rejecter LeaseRejecter, timeout time.Duration) *TimeoutChecker {
+func newTimeoutCheckerForTest(tracker *testOperationRegistry, rejecter LeaseRejecter, timeout time.Duration) *TimeoutChecker {
 	return NewTimeoutChecker(TimeoutCheckerConfig{
 		Operations:    tracker.Operations(),
 		Rejecter:      rejecter,
@@ -91,7 +91,7 @@ func TestTimeoutOperationLabel(t *testing.T) {
 }
 
 func TestCheckOnce_NoTimeouts(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	// Track a recent provision (not timed out).
 	tracker.TrackInFlight("lease-1", "tenant-1", []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend")
 
@@ -109,7 +109,7 @@ func TestCheckOnce_NoTimeouts(t *testing.T) {
 }
 
 func TestCheckOnce_SingleTimeout_RejectsAndUntracks(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	// Simulate a provision that started 20 minutes ago.
 	tracker.TrackInFlightWithStartTime("lease-old", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
@@ -133,7 +133,7 @@ func TestCheckOnce_SingleTimeout_RejectsAndUntracks(t *testing.T) {
 }
 
 func TestCheckOnce_ClaimPreventsReplacementDuringReject(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	tracker.TrackInFlightWithStartTime("lease-old", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-a",
 		time.Now().Add(-20*time.Minute))
@@ -168,7 +168,7 @@ func TestCheckOnce_ClaimPreventsReplacementDuringReject(t *testing.T) {
 }
 
 func TestCheckOnce_AlreadyClaimedGenerationIsSkipped(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	tracker.TrackInFlightWithStartTime("lease-old", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-a",
 		time.Now().Add(-20*time.Minute))
@@ -195,7 +195,7 @@ func TestCheckOnce_AlreadyClaimedGenerationIsSkipped(t *testing.T) {
 }
 
 func TestCheckOnce_ConcurrentSweepsRejectGenerationOnce(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	tracker.TrackInFlightWithStartTime("lease-old", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "backend-a",
 		time.Now().Add(-20*time.Minute))
@@ -241,7 +241,7 @@ func TestCheckOnce_ConcurrentSweepsRejectGenerationOnce(t *testing.T) {
 }
 
 func TestCheckOnce_RejectFailure_KeepsInFlight(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	tracker.TrackInFlightWithStartTime("lease-stuck", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
 		time.Now().Add(-20*time.Minute))
@@ -277,7 +277,7 @@ func TestCheckOnce_RejectFailure_KeepsInFlight(t *testing.T) {
 // untrack the lease and hand it back to the reconciler, which owns the ACTIVE-lease
 // re-provision / FailCount / close path.
 func TestCheckOnce_ActiveReprovisionNotPending_UntracksAndHandsBack(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	tracker.TrackInFlightWithStartTime("lease-active", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
 		time.Now().Add(-20*time.Minute))
@@ -302,7 +302,7 @@ func TestCheckOnce_ActiveReprovisionNotPending_UntracksAndHandsBack(t *testing.T
 // that no longer exists on chain is untracked rather than retried forever. Like
 // ErrLeaseNotPending, ErrLeaseNotFound is terminal for RejectLeases.
 func TestCheckOnce_LeaseNotFound_Untracks(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	tracker.TrackInFlightWithStartTime("lease-gone", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
 		time.Now().Add(-20*time.Minute))
@@ -321,7 +321,7 @@ func TestCheckOnce_LeaseNotFound_Untracks(t *testing.T) {
 }
 
 func TestCheckOnce_ContextCanceled_StopsEarly(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	// Add two timed-out provisions.
 	tracker.TrackInFlightWithStartTime("lease-a", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
@@ -350,7 +350,7 @@ func TestCheckOnce_ContextCanceled_StopsEarly(t *testing.T) {
 }
 
 func TestCheckOnce_MultipleTimeouts_PartialFailure(t *testing.T) {
-	tracker := NewInFlightTracker()
+	tracker := newTestOperationRegistry()
 	tracker.TrackInFlightWithStartTime("lease-ok", "tenant-1",
 		[]backend.LeaseItem{{SKU: "sku-1", Quantity: 1}}, "test-backend",
 		time.Now().Add(-20*time.Minute))

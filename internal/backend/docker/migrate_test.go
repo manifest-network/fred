@@ -3,15 +3,21 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // TestResolveMigratedBindSource pins the ENG-539 hardening on the legacy→stack
@@ -74,14 +80,26 @@ func TestResolveMigratedBindSource(t *testing.T) {
 // green.
 func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 	b, fakeDocker, fakeVolumeBackend, fakeRelStore := newMigrationTestBackend(t)
+	profile := b.cfg.SKUProfiles["docker-micro"]
+	profile.DiskMB = 0
+	b.cfg.SKUProfiles["docker-micro"] = profile
+	b.cfg.ContainerTmpfsSizeMB = 73
+	b.cfg.Ingress = IngressConfig{
+		Enabled:        true,
+		WildcardDomain: "provider.example",
+		Entrypoint:     "websecure",
+	}
 
 	fakeDocker.containers = []ContainerInfo{{
 		ContainerID:   "legacy-cid",
 		LeaseUUID:     "lease-1",
 		Tenant:        "tenant-a",
+		ProviderUUID:  "provider-a",
 		SKU:           "docker-micro",
+		CustomDomain:  "legacy.example",
+		FailCount:     3,
 		Image:         "nginx:1.25",
-		CallbackURL:   "https://fred.example/callback?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
+		CallbackURL:   "https://fred.example/callbacks/provision?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
 		InstanceIndex: 0,
 		// ServiceName empty: legacy
 	}}
@@ -90,7 +108,9 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 		Target: "/data",
 		Type:   "bind",
 	}}
-	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.releases["lease-1"] = []byte(
+		`{"image":"nginx:1.25","ports":{"80/tcp":{}}}`,
+	)
 	fakeRelStore.Seed(t) // flush the test-side releases map into the backing store
 
 	if err := b.recoverState(context.Background()); err != nil {
@@ -107,16 +127,197 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 	require.Contains(t, fakeDocker.lastComposeProject.Services, "app")
 	labels := fakeDocker.lastComposeProject.Services["app"].Labels
 	assert.Equal(t,
-		"https://fred.example/callback?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
+		"https://fred.example/callbacks/provision?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
 		labels[LabelCallbackURL],
 	)
 	assert.Equal(t,
-		"https://fred.example/callback?trace=keep&lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+		"https://fred.example/callbacks/provision?trace=keep&lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
 		labels[LabelLifecycleCallbackURL],
 		"legacy migration must persist the derived observation-only callback route")
+	assert.Equal(t, "provider-a", labels[LabelProviderUUID])
+	assert.Equal(t, b.cfg.Name, labels[LabelBackendName])
+	assert.Equal(t, "3", labels[LabelFailCount])
+	assert.Equal(t, "legacy.example", labels[LabelCustomDomain])
 	if !fakeRelStore.hasWrappedRelease("lease-1") {
 		t.Fatalf("release store missing wrapped entry")
 	}
+	latest, err := fakeRelStore.Store.LatestActive("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, latest)
+	require.Equal(t, []backend.LeaseItem{{
+		SKU: "docker-micro", Quantity: 1, ServiceName: "app", CustomDomain: "legacy.example",
+	}}, latest.Items, "migration must durably record the exact desired cohort")
+	require.Equal(t, []shared.SKUResourceSnapshot{{
+		SKU: "docker-micro", CPUCores: 0.25, MemoryMB: 256, ScratchDiskMB: 73,
+	}}, latest.ResourceProfiles,
+		"the one-time v0.13 migration must freeze diskless scratch authority")
+}
+
+func TestResolveLegacyMigrationCallbackURLs(t *testing.T) {
+	const (
+		operationID  = "550e8400-e29b-41d4-a716-446655440000"
+		operationURL = "https://fred.example/callbacks/provision?trace=one%20two&operation_id=" + operationID + "&path=%2Fdata"
+		lifecycleURL = "https://fred.example/callbacks/provision?trace=one%20two&lifecycle_id=" + operationID + "&path=%2Fdata"
+	)
+
+	t.Run("derives missing legacy lifecycle route without rewriting operation URL", func(t *testing.T) {
+		gotOperation, gotLifecycle, err := resolveLegacyMigrationCallbackURLs([]legacyMigrationInstance{{
+			LegacyContainer: ContainerInfo{InstanceIndex: 0, CallbackURL: operationURL},
+		}})
+		require.NoError(t, err)
+		assert.Equal(t, operationURL, gotOperation)
+		assert.Equal(t, lifecycleURL, gotLifecycle)
+	})
+
+	t.Run("keeps a v0.13 operationless route tokenless", func(t *testing.T) {
+		const legacyURL = "https://fred.example/callbacks/provision?trace=keep"
+		gotOperation, gotLifecycle, err := resolveLegacyMigrationCallbackURLs([]legacyMigrationInstance{{
+			LegacyContainer: ContainerInfo{InstanceIndex: 0, CallbackURL: legacyURL},
+		}})
+		require.NoError(t, err)
+		assert.Equal(t, legacyURL, gotOperation)
+		assert.Equal(t, legacyURL, gotLifecycle)
+	})
+
+	t.Run("preserves a valid explicit lifecycle route and accepts mixed old labels", func(t *testing.T) {
+		gotOperation, gotLifecycle, err := resolveLegacyMigrationCallbackURLs([]legacyMigrationInstance{
+			{LegacyContainer: ContainerInfo{
+				InstanceIndex:        0,
+				CallbackURL:          operationURL,
+				LifecycleCallbackURL: lifecycleURL,
+			}},
+			{LegacyContainer: ContainerInfo{
+				InstanceIndex: 1,
+				CallbackURL:   operationURL,
+			}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, operationURL, gotOperation)
+		assert.Equal(t, lifecycleURL, gotLifecycle)
+	})
+
+	t.Run("rejects mismatched sibling completion authority", func(t *testing.T) {
+		_, _, err := resolveLegacyMigrationCallbackURLs([]legacyMigrationInstance{
+			{LegacyContainer: ContainerInfo{InstanceIndex: 0, CallbackURL: operationURL}},
+			{LegacyContainer: ContainerInfo{
+				InstanceIndex: 1,
+				CallbackURL:   "https://other.example/callbacks/provision?operation_id=" + operationID,
+			}},
+		})
+		require.ErrorContains(t, err, "callback_url differs")
+	})
+
+	t.Run("rejects an unrelated explicit lifecycle route", func(t *testing.T) {
+		_, _, err := resolveLegacyMigrationCallbackURLs([]legacyMigrationInstance{{
+			LegacyContainer: ContainerInfo{
+				InstanceIndex:        0,
+				CallbackURL:          operationURL,
+				LifecycleCallbackURL: "https://attacker.example/callbacks/provision?lifecycle_id=" + operationID,
+			},
+		}})
+		require.ErrorContains(t, err, "lifecycle URL must exactly match")
+	})
+}
+
+func TestRecoverState_MigrationRejectsInvalidCallbackPairBeforeMutation(t *testing.T) {
+	b, fakeDocker, fakeVolumeBackend, fakeRelStore := newMigrationTestBackend(t)
+	const operationID = "550e8400-e29b-41d4-a716-446655440000"
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID:          "legacy-cid",
+		LeaseUUID:            "lease-1",
+		Tenant:               "tenant-a",
+		SKU:                  "docker-micro",
+		CallbackURL:          "https://fred.example/callbacks/provision?operation_id=" + operationID,
+		LifecycleCallbackURL: "https://attacker.example/callbacks/provision?lifecycle_id=" + operationID,
+		InstanceIndex:        0,
+	}}
+	fakeDocker.mounts["legacy-cid"] = []ContainerMount{{
+		Source: "/var/lib/fred/volumes/fred-lease-1-0/data",
+		Target: "/data",
+		Type:   "bind",
+	}}
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
+
+	err := b.recoverState(context.Background())
+	require.ErrorContains(t, err, "resolve legacy callback routes")
+	assert.Empty(t, fakeVolumeBackend.renames,
+		"callback authority must be validated before any durable volume rename")
+	assert.Nil(t, fakeDocker.lastComposeProject,
+		"invalid callback authority must be rejected before Compose mutation")
+}
+
+func TestRecoverState_MigrationRefusesStopErrorWhileContainerStillRunning(t *testing.T) {
+	b, fakeDocker, fakeVolumes, fakeRelStore := newMigrationTestBackend(t)
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID:   "legacy-cid",
+		Name:          "fred-lease-1-0",
+		LeaseUUID:     "lease-1",
+		Tenant:        "tenant-a",
+		ProviderUUID:  "provider-a",
+		SKU:           "docker-micro",
+		Image:         "nginx:1.25",
+		CallbackURL:   "https://fred.example/callbacks/provision",
+		InstanceIndex: 0,
+		Status:        "running",
+	}}
+	fakeDocker.mounts["legacy-cid"] = []ContainerMount{{
+		Source: "/var/lib/fred/volumes/fred-lease-1-0/data",
+		Target: "/data",
+		Type:   "bind",
+	}}
+	fakeDocker.stopContainer = func(_ context.Context, containerID string, _ time.Duration) error {
+		assert.Equal(t, "legacy-cid", containerID)
+		return errors.New("transient Docker stop failure")
+	}
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
+
+	err := b.recoverState(context.Background())
+	require.ErrorContains(t, err, "remains in non-quiescent state")
+	assert.Empty(t, fakeVolumes.renames,
+		"a failed Stop followed by a still-running exact-ID inspect must block volume movement")
+	assert.Nil(t, fakeDocker.lastComposeProject,
+		"a still-running legacy container must block its replacement generation")
+}
+
+func TestRecoverState_MigrationRefusesRunningPrevRetry(t *testing.T) {
+	b, fakeDocker, fakeVolumes, fakeRelStore := newMigrationTestBackend(t)
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID:   "legacy-prev-cid",
+		Name:          "fred-lease-1-app-0-prev",
+		LeaseUUID:     "lease-1",
+		Tenant:        "tenant-a",
+		ProviderUUID:  "provider-a",
+		SKU:           "docker-micro",
+		Image:         "nginx:1.25",
+		CallbackURL:   "https://fred.example/callbacks/provision",
+		InstanceIndex: 0,
+		Status:        "running",
+	}}
+	fakeDocker.mounts["legacy-prev-cid"] = []ContainerMount{{
+		Source: "/var/lib/fred/volumes/fred-lease-1-0/data",
+		Target: "/data",
+		Type:   "bind",
+	}}
+	stopCalls := 0
+	fakeDocker.stopContainer = func(_ context.Context, containerID string, _ time.Duration) error {
+		stopCalls++
+		assert.Equal(t, "legacy-prev-cid", containerID)
+		// A nil Docker response is still not proof. Keep the inspect state
+		// running to model a stale/incorrect daemon acknowledgement.
+		return nil
+	}
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
+
+	err := b.recoverState(context.Background())
+	require.ErrorContains(t, err, "remains in non-quiescent state")
+	assert.Equal(t, 1, stopCalls, "an already-named -prev retry must still issue Stop")
+	assert.Empty(t, fakeVolumes.renames,
+		"a running -prev retry must not advance to volume movement")
+	assert.Nil(t, fakeDocker.lastComposeProject,
+		"a running -prev retry must not create the replacement cohort")
 }
 
 // TestRecoverState_MigrationFailure_AbortsStartup: fred must refuse to start
@@ -140,6 +341,40 @@ func TestRecoverState_MigrationFailure_AbortsStartup(t *testing.T) {
 	if !strings.Contains(err.Error(), "lease-1") {
 		t.Fatalf("expected error to identify lease, got: %v", err)
 	}
+}
+
+func TestRecoverState_BoundsWholeLegacyMigration(t *testing.T) {
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
+	b.cfg.ProvisionTimeout = 20 * time.Millisecond
+	b.cfg.MigrationReadyTimeout = 10 * time.Millisecond
+	b.compose = &mockComposeExecutor{UpFn: func(
+		ctx context.Context,
+		_ *composetypes.Project,
+		_ composeUpOpts,
+	) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID:   "legacy-cid",
+		Name:          "fred-lease-1-0",
+		LeaseUUID:     "lease-1",
+		Tenant:        "tenant-a",
+		ProviderUUID:  "provider-a",
+		SKU:           "docker-micro",
+		Image:         "nginx:1.25",
+		CallbackURL:   "https://fred.example/callbacks/provision",
+		InstanceIndex: 0,
+	}}
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
+
+	started := time.Now()
+	err := b.recoverState(context.Background())
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(started), time.Second,
+		"a stalled migration mutation must not wedge startup for process lifetime")
 }
 
 // TestPlanLegacyMigration_RejectsMultiServiceStack: a legacy-labeled
@@ -186,15 +421,71 @@ func TestPlanLegacyMigration_RejectsWrongServiceName(t *testing.T) {
 	assert.Contains(t, err.Error(), "lease-1")
 }
 
-// TestRecoverState_SkipsPrevRemnants: a managed container with a "-prev"
-// suffix on its name is a transient migration rollback artifact — left
-// behind when fred is interrupted between the rename step and the
-// post-grace cleanup, or when recoverState runs while the grace timer
-// is still pending. The main recovery loop must skip it; otherwise the
-// legacy-single-item branch fires (the container has no service_name)
-// and inflates prov.Quantity / appends a spurious LeaseItem.
+func TestPlanLegacyMigration_RejectsSparseInstanceIndexes(t *testing.T) {
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
+	for _, index := range []int{1, 2} {
+		fakeDocker.containers = append(fakeDocker.containers, ContainerInfo{
+			ContainerID:   fmt.Sprintf("legacy-cid-%d", index),
+			Name:          fmt.Sprintf("fred-lease-1-%d", index),
+			LeaseUUID:     "lease-1",
+			Tenant:        "tenant-a",
+			ProviderUUID:  "provider-a",
+			SKU:           "docker-micro",
+			Image:         "nginx:1.25",
+			InstanceIndex: index,
+		})
+	}
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
+
+	err := b.recoverState(context.Background())
+	require.ErrorContains(t, err, "non-contiguous instance indexes")
+	assert.Contains(t, err.Error(), "missing 0")
+	assert.Nil(t, fakeDocker.lastComposeProject,
+		"sparse topology must fail before any migration mutation")
+}
+
+func TestPlanLegacyMigration_RejectsDivergentCustomDomains(t *testing.T) {
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
+	for index, customDomain := range []string{"legacy.example", "other.example"} {
+		fakeDocker.containers = append(fakeDocker.containers, ContainerInfo{
+			ContainerID:   fmt.Sprintf("legacy-cid-%d", index),
+			Name:          fmt.Sprintf("fred-lease-1-%d", index),
+			LeaseUUID:     "lease-1",
+			Tenant:        "tenant-a",
+			ProviderUUID:  "provider-a",
+			SKU:           "docker-micro",
+			CustomDomain:  customDomain,
+			Image:         "nginx:1.25",
+			InstanceIndex: index,
+		})
+	}
+	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
+	fakeRelStore.Seed(t)
+
+	err := b.recoverState(context.Background())
+	require.ErrorContains(t, err, "divergent lease, tenant, provider, SKU, or custom-domain identity")
+	assert.Nil(t, fakeDocker.lastComposeProject,
+		"ambiguous domain authority must fail before any migration mutation")
+}
+
+// TestRecoverState_SkipsPrevRemnants proves both halves of resumability: the
+// migration pre-pass consumes a "-prev" rollback artifact and idempotently
+// reconverges/persists the stack, while the main recovery projection still
+// excludes that artifact so it cannot inflate Quantity or append an unnamed
+// LeaseItem during the inspection grace window.
 func TestRecoverState_SkipsPrevRemnants(t *testing.T) {
-	b, fakeDocker, _, _ := newMigrationTestBackend(t)
+	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
+	releaseItems := []backend.LeaseItem{{
+		SKU: "docker-micro", Quantity: 1, ServiceName: "app",
+	}}
+	require.NoError(t, fakeRelStore.Store.Append("lease-1", shared.Release{
+		Manifest:         []byte(`{"image":"nginx:1.25"}`),
+		Items:            releaseItems,
+		ResourceProfiles: testResourceProfiles(t, releaseItems),
+		Status:           "active",
+		CreatedAt:        time.Now(),
+	}))
 	fakeDocker.containers = []ContainerInfo{
 		{
 			// A healthy migrated container — the normal stack-form shape.
@@ -203,8 +494,11 @@ func TestRecoverState_SkipsPrevRemnants(t *testing.T) {
 			LeaseUUID:     "lease-1",
 			Tenant:        "tenant-a",
 			SKU:           "docker-micro",
+			ProviderUUID:  "provider-a",
 			ServiceName:   "app",
 			InstanceIndex: 0,
+			Image:         "nginx:1.25",
+			CallbackURL:   "https://fred.example/callbacks/provision",
 			Status:        "running",
 		},
 		{
@@ -216,8 +510,11 @@ func TestRecoverState_SkipsPrevRemnants(t *testing.T) {
 			Name:          "fred-lease-1-app-0-prev",
 			LeaseUUID:     "lease-1",
 			Tenant:        "tenant-a",
+			ProviderUUID:  "provider-a",
 			SKU:           "docker-micro",
 			InstanceIndex: 0,
+			Image:         "nginx:1.25",
+			CallbackURL:   "https://fred.example/callbacks/provision",
 			Status:        "exited",
 		},
 	}
@@ -230,6 +527,77 @@ func TestRecoverState_SkipsPrevRemnants(t *testing.T) {
 	require.Len(t, prov.Items, 1, "exactly one LeaseItem for the stack-form service")
 	assert.Equal(t, "app", prov.Items[0].ServiceName)
 	assert.NotContains(t, prov.ContainerIDs, "prev-cid", "ContainerIDs must not include the -prev remnant")
+}
+
+// A migration release is committed before rollback-window cleanup begins. If
+// cleanup removes only one of several `-prev` containers and the process then
+// restarts, the surviving subset must never be mistaken for desired topology:
+// doing so would run Compose at the smaller quantity and downscale a healthy
+// tenant workload. Exact release Items make the remnants cleanup-only.
+func TestRecoverState_DurableMigrationPartialCleanupDoesNotReinferTopology(t *testing.T) {
+	b, fakeDocker, fakeVolumes, fakeRelStore := newMigrationTestBackend(t)
+	b.cfg.MigrationGracePeriod = 20 * time.Millisecond
+	releaseItems := []backend.LeaseItem{{
+		SKU: "docker-micro", Quantity: 2, ServiceName: "app",
+	}}
+	require.NoError(t, fakeRelStore.Store.Append("lease-1", shared.Release{
+		Manifest:         []byte(`{"image":"nginx:1.25"}`),
+		Items:            releaseItems,
+		ResourceProfiles: testResourceProfiles(t, releaseItems),
+		Status:           "active",
+		CreatedAt:        time.Now(),
+	}))
+
+	for index := range 2 {
+		fakeDocker.containers = append(fakeDocker.containers, ContainerInfo{
+			ContainerID:   fmt.Sprintf("app-cid-%d", index),
+			Name:          fmt.Sprintf("fred-lease-1-app-%d", index),
+			LeaseUUID:     "lease-1",
+			Tenant:        "tenant-a",
+			ProviderUUID:  "provider-a",
+			SKU:           "docker-micro",
+			ServiceName:   "app",
+			InstanceIndex: index,
+			Image:         "nginx:1.25",
+			Status:        "running",
+		})
+	}
+	// Index 0's rollback container was already removed before the crash; only
+	// index 1 remains.
+	fakeDocker.containers = append(fakeDocker.containers, ContainerInfo{
+		ContainerID:   "prev-cid-1",
+		Name:          "fred-lease-1-app-1-prev",
+		LeaseUUID:     "lease-1",
+		Tenant:        "tenant-a",
+		ProviderUUID:  "provider-a",
+		SKU:           "docker-micro",
+		InstanceIndex: 1,
+		Image:         "nginx:1.25",
+		Status:        "exited",
+	})
+
+	var mu sync.Mutex
+	var removed []string
+	fakeDocker.removeContainer = func(_ context.Context, containerID string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		removed = append(removed, containerID)
+		return nil
+	}
+
+	require.NoError(t, b.recoverState(context.Background()))
+	assert.Nil(t, fakeDocker.lastComposeProject,
+		"durably committed rollback remnants must not trigger Compose Up")
+	assert.Empty(t, fakeVolumes.renames,
+		"durably committed rollback remnants must not trigger volume migration")
+	require.NotNil(t, b.provisions["lease-1"])
+	assert.Equal(t, 2, b.provisions["lease-1"].Quantity)
+	assert.Equal(t, releaseItems, b.provisions["lease-1"].Items)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Equal(removed, []string{"prev-cid-1"})
+	}, time.Second, 10*time.Millisecond)
 }
 
 // TestExecuteLegacyMigration_EnsuresTenantNetwork: when network
@@ -257,6 +625,7 @@ func TestExecuteLegacyMigration_EnsuresTenantNetwork(t *testing.T) {
 		Tenant:        "tenant-a",
 		SKU:           "docker-micro",
 		Image:         "nginx:1.25",
+		CallbackURL:   "https://fred.example/callbacks/provision",
 		InstanceIndex: 0,
 	}}
 	fakeDocker.mounts["legacy-cid"] = []ContainerMount{{
@@ -291,9 +660,9 @@ func TestExecuteLegacyMigration_PrevCleanupSurvivesCallerContextCancel(t *testin
 
 	var mu sync.Mutex
 	var removed []string
-	fakeDocker.removeContainer = func(_ context.Context, name string) error {
+	fakeDocker.removeContainer = func(_ context.Context, containerID string) error {
 		mu.Lock()
-		removed = append(removed, name)
+		removed = append(removed, containerID)
 		mu.Unlock()
 		return nil
 	}
@@ -305,6 +674,7 @@ func TestExecuteLegacyMigration_PrevCleanupSurvivesCallerContextCancel(t *testin
 		Tenant:        "tenant-a",
 		SKU:           "docker-micro",
 		Image:         "nginx:1.25",
+		CallbackURL:   "https://fred.example/callbacks/provision",
 		InstanceIndex: 0,
 	}}
 	fakeDocker.mounts["legacy-cid"] = []ContainerMount{{
@@ -328,14 +698,79 @@ func TestExecuteLegacyMigration_PrevCleanupSurvivesCallerContextCancel(t *testin
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		for _, name := range removed {
-			if strings.HasSuffix(name, "-prev") {
+		for _, containerID := range removed {
+			if containerID == "legacy-cid" {
 				return true
 			}
 		}
 		return false
 	}, 3*time.Second, 20*time.Millisecond,
 		"migration -prev cleanup must survive caller-context cancellation (got removals: leaked -prev container)")
+}
+
+func TestScheduleLegacyPrevCleanup_RemovesImmutableContainerID(t *testing.T) {
+	b, fakeDocker, _, _ := newMigrationTestBackend(t)
+	b.cfg.MigrationGracePeriod = 10 * time.Millisecond
+
+	removed := make(chan string, 1)
+	fakeDocker.removeContainer = func(_ context.Context, containerID string) error {
+		removed <- containerID
+		return nil
+	}
+	b.scheduleLegacyPrevCleanup([]legacyRollbackCleanupTarget{{
+		ContainerID: "immutable-old-id",
+		Name:        "fred-lease-1-app-0-prev",
+	}}, b.logger)
+
+	select {
+	case got := <-removed:
+		assert.Equal(t, "immutable-old-id", got,
+			"a replacement that reuses the delayed name must never be targeted")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for rollback cleanup")
+	}
+}
+
+func TestRemoveCommittedLegacyRollbackRemnants_DoesNotDeleteReusedName(t *testing.T) {
+	b, fakeDocker, _, releases := newMigrationTestBackend(t)
+	const leaseUUID = "lease-1"
+	items := []backend.LeaseItem{{
+		SKU: "docker-micro", Quantity: 1, ServiceName: "app",
+	}}
+	releaseProfiles := testResourceProfiles(t, items)
+	require.NoError(t, releases.Store.Append(leaseUUID, shared.Release{
+		Manifest:         []byte(`{"services":{"app":{"image":"busybox"}}}`),
+		Image:            "stack",
+		Items:            items,
+		ResourceProfiles: releaseProfiles,
+		Status:           "active",
+		CreatedAt:        time.Now(),
+		LegacyMigration:  true,
+	}))
+
+	// The original rollback remnant has already been removed. A later, unrelated
+	// managed container acquired the reusable Docker name but carries a different
+	// lease identity. Cleanup must inventory and re-attest the labels, then leave
+	// this replacement untouched rather than deleting by name.
+	fakeDocker.containers = []ContainerInfo{{
+		ContainerID:   "replacement-id",
+		Name:          "fred-" + leaseUUID + "-app-0-prev",
+		LeaseUUID:     "different-lease",
+		BackendName:   b.Name(),
+		ServiceName:   "",
+		InstanceIndex: 0,
+		Status:        "exited",
+	}}
+	var removed []string
+	fakeDocker.removeContainer = func(_ context.Context, containerID string) error {
+		removed = append(removed, containerID)
+		return nil
+	}
+
+	require.NoError(t, b.removeCommittedLegacyRollbackRemnants(
+		context.Background(), leaseUUID, b.logger,
+	))
+	assert.Empty(t, removed, "a replacement that only reuses the old name is not migration authority")
 }
 
 // TestFilterManagedMounts_SeparatorBoundary verifies that the prefix

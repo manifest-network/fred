@@ -2,12 +2,292 @@ package shared
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNewResourcePool_RejectsInvalidConstructionBoundaries(t *testing.T) {
+	resolver := func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 1}, nil
+	}
+	tests := []struct {
+		name        string
+		totalCPU    float64
+		totalMemory int64
+		totalDisk   int64
+		quota       *TenantQuotaConfig
+		wantPanic   string
+	}{
+		{name: "NaN total CPU", totalCPU: math.NaN(), totalMemory: 1, totalDisk: 1, wantPanic: "shared.NewResourcePool: total CPU must be finite"},
+		{name: "infinite total CPU", totalCPU: math.Inf(1), totalMemory: 1, totalDisk: 1, wantPanic: "shared.NewResourcePool: total CPU must be finite"},
+		{name: "zero total CPU", totalCPU: 0, totalMemory: 1, totalDisk: 1, wantPanic: "shared.NewResourcePool: total CPU must be positive"},
+		{name: "negative total CPU", totalCPU: -1, totalMemory: 1, totalDisk: 1, wantPanic: "shared.NewResourcePool: total CPU must be positive"},
+		{name: "zero total memory", totalCPU: 1, totalMemory: 0, totalDisk: 1, wantPanic: "shared.NewResourcePool: total memory must be positive"},
+		{name: "negative total disk", totalCPU: 1, totalMemory: 1, totalDisk: -1, wantPanic: "shared.NewResourcePool: total disk must be positive"},
+		{
+			name:        "NaN tenant CPU quota",
+			totalCPU:    1,
+			totalMemory: 1,
+			totalDisk:   1,
+			quota:       &TenantQuotaConfig{MaxCPUCores: math.NaN(), MaxMemoryMB: 1, MaxDiskMB: 1},
+			wantPanic:   "shared.NewResourcePool: invalid tenant quota: max_cpu_cores must be finite",
+		},
+		{
+			name:        "invalid tenant memory quota",
+			totalCPU:    1,
+			totalMemory: 1,
+			totalDisk:   1,
+			quota:       &TenantQuotaConfig{MaxCPUCores: 1, MaxMemoryMB: 0, MaxDiskMB: 1},
+			wantPanic:   "shared.NewResourcePool: invalid tenant quota: max_memory_mb must be positive",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.PanicsWithValue(t, tt.wantPanic, func() {
+				NewResourcePool(tt.totalCPU, tt.totalMemory, tt.totalDisk, resolver, tt.quota)
+			})
+		})
+	}
+}
+
+func TestNewResourcePool_CopiesTenantQuota(t *testing.T) {
+	quota := &TenantQuotaConfig{MaxCPUCores: 1, MaxMemoryMB: 2, MaxDiskMB: 2}
+	pool := NewResourcePool(10, 10, 10, func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 1}, nil
+	}, quota)
+
+	// Mutation of caller-owned configuration after construction must not disable
+	// the live pool's quota gate.
+	quota.MaxCPUCores = math.NaN()
+	require.NoError(t, pool.TryAllocate("lease-1", "sku", "tenant-a"))
+	require.ErrorContains(t, pool.TryAllocate("lease-2", "sku", "tenant-a"), "CPU quota exceeded")
+}
+
+func TestResourcePool_ReleasePublishesExactEmptyStateDespiteFloatRoundoff(t *testing.T) {
+	profiles := map[string]SKUProfile{
+		"first":  {CPUCores: 0.762, MemoryMB: 1, DiskMB: 1},
+		"second": {CPUCores: 0.973, MemoryMB: 1, DiskMB: 1},
+	}
+	quota := &TenantQuotaConfig{MaxCPUCores: 2, MaxMemoryMB: 2, MaxDiskMB: 2}
+	pool := NewResourcePool(2, 2, 2, func(sku string) (SKUProfile, error) {
+		return profiles[sku], nil
+	}, quota)
+
+	require.NoError(t, pool.TryAllocate("first", "first", "tenant-a"))
+	require.NoError(t, pool.TryAllocate("second", "second", "tenant-a"))
+	// Releasing in the opposite order from admission makes ordinary float64
+	// subtraction end slightly below zero for these two valid profiles.
+	pool.Release("second")
+	pool.Release("first")
+
+	stats := pool.Stats()
+	assert.Zero(t, stats.AllocatedCPU)
+	assert.Zero(t, stats.AllocatedMemoryMB)
+	assert.Zero(t, stats.AllocatedDiskMB)
+	assert.Zero(t, stats.AllocationCount)
+	assert.Zero(t, pool.TenantStats("tenant-a").AllocatedCPU)
+	require.NoError(t, pool.TryAllocate("replacement", "first", "tenant-a"),
+		"floating-point release round-off must not fail-close an empty pool forever")
+}
+
+func TestResourcePool_RejectsNonFiniteResolverProfileWithoutPoisoningAccounting(t *testing.T) {
+	paths := []struct {
+		name     string
+		allocate func(*ResourcePool) error
+	}{
+		{
+			name: "fresh allocation",
+			allocate: func(pool *ResourcePool) error {
+				return pool.TryAllocate("lease-1", "bad", "tenant-a")
+			},
+		},
+		{
+			name: "restore adoption",
+			allocate: func(pool *ResourcePool) error {
+				return pool.TryAllocateAdoptAll(
+					[]AdoptInstance{{ID: "lease-1-app-0", SKU: "bad"}},
+					"tenant-a",
+					0,
+				)
+			},
+		},
+	}
+	values := []struct {
+		name string
+		cpu  float64
+	}{
+		{name: "NaN", cpu: math.NaN()},
+		{name: "positive infinity", cpu: math.Inf(1)},
+		{name: "negative infinity", cpu: math.Inf(-1)},
+	}
+
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			for _, value := range values {
+				t.Run(value.name, func(t *testing.T) {
+					pool := NewResourcePool(8, 8192, 8192, func(string) (SKUProfile, error) {
+						return SKUProfile{CPUCores: value.cpu, MemoryMB: 512, DiskMB: 1024}, nil
+					}, nil)
+
+					err := path.allocate(pool)
+					require.ErrorContains(t, err, "cpu_cores must be finite")
+					stats := pool.Stats()
+					assert.Zero(t, stats.AllocationCount)
+					assert.Zero(t, stats.AllocatedCPU)
+					assert.False(t, math.IsNaN(stats.AllocatedCPU),
+						"a rejected profile must not poison subsequent comparisons")
+				})
+			}
+		})
+	}
+}
+
+func TestResourcePool_AdmissionArithmeticDoesNotOverflow(t *testing.T) {
+	t.Run("CPU headroom", func(t *testing.T) {
+		pool := NewResourcePool(math.MaxFloat64, math.MaxInt64, math.MaxInt64, func(sku string) (SKUProfile, error) {
+			if sku == "fills" {
+				return SKUProfile{CPUCores: math.MaxFloat64, MemoryMB: 1, DiskMB: 1}, nil
+			}
+			return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 1}, nil
+		}, nil)
+		require.NoError(t, pool.TryAllocate("lease-1", "fills", "tenant-a"))
+		require.ErrorContains(t, pool.TryAllocate("lease-2", "extra", "tenant-a"), "insufficient CPU")
+		assert.Equal(t, 1, pool.Stats().AllocationCount)
+	})
+
+	t.Run("memory headroom", func(t *testing.T) {
+		pool := NewResourcePool(10, math.MaxInt64, math.MaxInt64, func(sku string) (SKUProfile, error) {
+			if sku == "fills" {
+				return SKUProfile{CPUCores: 1, MemoryMB: math.MaxInt64 - 5, DiskMB: 1}, nil
+			}
+			return SKUProfile{CPUCores: 1, MemoryMB: 10, DiskMB: 1}, nil
+		}, nil)
+		require.NoError(t, pool.TryAllocate("lease-1", "fills", "tenant-a"))
+		require.ErrorContains(t, pool.TryAllocate("lease-2", "extra", "tenant-a"), "insufficient memory")
+		assert.Equal(t, 1, pool.Stats().AllocationCount)
+	})
+
+	t.Run("disk headroom with retained projection", func(t *testing.T) {
+		pool := NewResourcePool(10, 10, math.MaxInt64, func(string) (SKUProfile, error) {
+			return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 10}, nil
+		}, nil)
+		require.NoError(t, pool.SetRetainedDisk(math.MaxInt64-5))
+		err := pool.TryAllocate("lease-1", "sku", "tenant-a")
+		require.ErrorContains(t, err, "insufficient disk")
+		assert.ErrorContains(t, err, "have 5 MB available")
+		assert.Zero(t, pool.Stats().AllocationCount)
+	})
+
+	t.Run("restore aggregate", func(t *testing.T) {
+		pool := NewResourcePool(10, math.MaxInt64, math.MaxInt64, func(string) (SKUProfile, error) {
+			return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: math.MaxInt64}, nil
+		}, nil)
+		err := pool.TryAllocateAdoptAll([]AdoptInstance{{ID: "a", SKU: "sku"}, {ID: "b", SKU: "sku"}}, "tenant-a", 0)
+		require.ErrorContains(t, err, "restore disk requirement exceeds supported range")
+		assert.Zero(t, pool.Stats().AllocationCount)
+	})
+
+	t.Run("restore live accounting", func(t *testing.T) {
+		pool := NewResourcePool(10, 10, math.MaxInt64, func(sku string) (SKUProfile, error) {
+			if sku == "live" {
+				return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: math.MaxInt64 - 5}, nil
+			}
+			return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 10}, nil
+		}, nil)
+		require.NoError(t, pool.TryAllocate("live", "live", "tenant-a"))
+		require.NoError(t, pool.SetRetainedDisk(10))
+
+		err := pool.TryAllocateAdoptAll([]AdoptInstance{{ID: "restore", SKU: "adopt"}}, "tenant-a", 10)
+		require.ErrorContains(t, err, "disk accounting exceeds supported range")
+		assert.Equal(t, 1, pool.Stats().AllocationCount)
+		assert.Nil(t, pool.GetAllocation("restore"))
+	})
+
+	t.Run("negative retained input", func(t *testing.T) {
+		pool := NewResourcePool(10, 10, 10, func(string) (SKUProfile, error) {
+			return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 1}, nil
+		}, nil)
+		err := pool.TryAllocateAdoptAll([]AdoptInstance{{ID: "restore", SKU: "sku"}}, "tenant-a", -1)
+		require.ErrorContains(t, err, "old retained disk must not be negative")
+		assert.Zero(t, pool.Stats().AllocationCount)
+	})
+}
+
+func TestResourcePool_AdoptResolvesEachInstanceExactlyOnce(t *testing.T) {
+	var calls int
+	pool := NewResourcePool(10, 10, 10, func(string) (SKUProfile, error) {
+		calls++
+		if calls == 1 {
+			return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 1}, nil
+		}
+		return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 10}, nil
+	}, nil)
+
+	require.NoError(t, pool.TryAllocateAdoptAll([]AdoptInstance{{ID: "lease-1-app-0", SKU: "sku"}}, "tenant-a", 0))
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, int64(1), pool.Stats().AllocatedDiskMB,
+		"the profile admitted by the aggregate gate must be the profile committed")
+}
+
+func TestResourcePool_ResetRejectsInvalidAggregateAtomically(t *testing.T) {
+	pool := NewResourcePool(10, 10, 10, func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 1}, nil
+	}, nil)
+	require.NoError(t, pool.TryAllocate("existing", "sku", "tenant-a"))
+	wantStats := pool.Stats()
+
+	tests := []struct {
+		name        string
+		allocations []ResourceAllocation
+		wantErr     string
+	}{
+		{
+			name:        "non-finite CPU",
+			allocations: []ResourceAllocation{{LeaseUUID: "bad", CPUCores: math.NaN(), MemoryMB: 1, DiskMB: 1}},
+			wantErr:     `rebuild resource allocations: allocation "bad" CPU must be finite`,
+		},
+		{
+			name: "memory overflow",
+			allocations: []ResourceAllocation{
+				{LeaseUUID: "a", CPUCores: 1, MemoryMB: math.MaxInt64, DiskMB: 1},
+				{LeaseUUID: "b", CPUCores: 1, MemoryMB: 1, DiskMB: 1},
+			},
+			wantErr: "rebuild resource allocations: aggregate memory exceeds supported range",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.EqualError(t, pool.Reset(tt.allocations), tt.wantErr)
+			assert.Equal(t, wantStats, pool.Stats(), "a rejected reset must not publish partial accounting")
+			assert.NotNil(t, pool.GetAllocation("existing"))
+		})
+	}
+}
+
+func TestResourcePool_ResetAcceptsStatelessZeroDiskAllocation(t *testing.T) {
+	pool := NewResourcePool(10, 10, 10, func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 0}, nil
+	}, nil)
+	require.NoError(t, pool.Reset([]ResourceAllocation{
+		{LeaseUUID: "stateless-app-0", Tenant: "tenant-a", SKU: "stateless", CPUCores: 1, MemoryMB: 1, DiskMB: 0},
+	}))
+
+	stats := pool.Stats()
+	assert.Equal(t, 1, stats.AllocationCount)
+	assert.Equal(t, float64(1), stats.AllocatedCPU)
+	assert.Equal(t, int64(1), stats.AllocatedMemoryMB)
+	assert.Zero(t, stats.AllocatedDiskMB)
+	assert.Zero(t, pool.TenantStats("tenant-a").AllocatedDiskMB)
+
+	// Recovery must leave the pool usable for another zero-disk instance rather
+	// than merely accepting the rebuilt snapshot.
+	require.NoError(t, pool.TryAllocate("stateless-app-1", "stateless", "tenant-a"))
+	assert.Equal(t, 2, pool.Stats().AllocationCount)
+}
 
 func TestResourcePool(t *testing.T) {
 	profiles := map[string]SKUProfile{
@@ -90,7 +370,7 @@ func TestResourcePool(t *testing.T) {
 		allocations := []ResourceAllocation{
 			{LeaseUUID: "lease-2", Tenant: "tenant-b", SKU: "large", CPUCores: 4.0, MemoryMB: 4096, DiskMB: 8192},
 		}
-		pool.Reset(allocations)
+		require.NoError(t, pool.Reset(allocations))
 
 		stats := pool.Stats()
 		assert.Equal(t, 1, stats.AllocationCount)
@@ -219,9 +499,9 @@ func TestResourcePool(t *testing.T) {
 		pool.TryAllocate("lease-1", "small", "tenant-a")
 
 		// Reset with allocation for different tenant
-		pool.Reset([]ResourceAllocation{
+		require.NoError(t, pool.Reset([]ResourceAllocation{
 			{LeaseUUID: "lease-2", Tenant: "tenant-b", SKU: "small", CPUCores: 1.0, MemoryMB: 512, DiskMB: 1024},
-		})
+		}))
 
 		// tenant-a should have no usage after reset
 		stats := pool.TenantStats("tenant-a")
@@ -341,9 +621,9 @@ func TestResourcePool(t *testing.T) {
 		pool := NewResourcePool(8.0, 16384, 102400, makeResolver(profiles), nil)
 
 		// Reset with an allocation consuming most of the CPU
-		pool.Reset([]ResourceAllocation{
+		require.NoError(t, pool.Reset([]ResourceAllocation{
 			{LeaseUUID: "existing", Tenant: "tenant-a", SKU: "large", CPUCores: 7.5, MemoryMB: 4096, DiskMB: 8192},
-		})
+		}))
 
 		// New allocation should fail — only 0.5 CPU left, small needs 1.0
 		err := pool.TryAllocate("new-lease", "small", "tenant-a")
@@ -370,7 +650,7 @@ func TestRetainedDiskCountsAgainstPool(t *testing.T) {
 	p := NewResourcePool(8, 8192, 2048, resolver, nil)
 
 	// Reserve 1024 MB as retained (a soft-deleted volume still on disk).
-	p.SetRetainedDisk(1024)
+	require.NoError(t, p.SetRetainedDisk(1024))
 
 	// A 1024 MB live allocation exactly fills the remaining headroom.
 	require.NoError(t, p.TryAllocate("lease-1", "sku", "tenant"))
@@ -385,18 +665,20 @@ func TestRetainedDiskCountsAgainstPool(t *testing.T) {
 func TestStatsIncludesRetainedDisk(t *testing.T) {
 	resolver := func(string) (SKUProfile, error) { return SKUProfile{}, nil }
 	p := NewResourcePool(8, 8192, 4096, resolver, nil)
-	p.SetRetainedDisk(1500)
+	require.NoError(t, p.SetRetainedDisk(1500))
 
 	s := p.Stats()
 	assert.Equal(t, int64(1500), s.RetainedDiskMB)
 	assert.Equal(t, int64(4096-1500), s.AvailableDiskMB())
 }
 
-func TestSetRetainedDiskClampsNegative(t *testing.T) {
+func TestSetRetainedDiskRejectsNegativeAndPreservesProjection(t *testing.T) {
 	resolver := func(string) (SKUProfile, error) { return SKUProfile{}, nil }
 	p := NewResourcePool(8, 8192, 4096, resolver, nil)
-	p.SetRetainedDisk(-500)
-	assert.Equal(t, int64(0), p.Stats().RetainedDiskMB, "negative retained disk must clamp to 0 (never over-admit)")
+	require.NoError(t, p.SetRetainedDisk(500))
+	require.ErrorContains(t, p.SetRetainedDisk(-500), "must be non-negative")
+	assert.Equal(t, int64(500), p.Stats().RetainedDiskMB,
+		"invalid recovery data must not erase the last authoritative projection")
 }
 
 func TestResetPreservesRetainedDisk(t *testing.T) {
@@ -404,11 +686,11 @@ func TestResetPreservesRetainedDisk(t *testing.T) {
 		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
 	}
 	p := NewResourcePool(8, 8192, 4096, resolver, nil)
-	p.SetRetainedDisk(1024)
+	require.NoError(t, p.SetRetainedDisk(1024))
 	// Reset rebuilds live allocations; it must NOT clobber the retained projection
 	// (the backend re-pushes it via refreshRetentionAccounting after recover, but
 	// Reset itself owns only live state).
-	p.Reset([]ResourceAllocation{{LeaseUUID: "l1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}})
+	require.NoError(t, p.Reset([]ResourceAllocation{{LeaseUUID: "l1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}))
 	assert.Equal(t, int64(1024), p.Stats().RetainedDiskMB)
 }
 
@@ -423,11 +705,11 @@ func TestResetPreserving_NilKeepEqualsReset(t *testing.T) {
 
 	a := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
 	require.NoError(t, a.TryAllocate("stale-0", "sku", "t9")) // prior state that must be cleared
-	a.Reset(list)
+	require.NoError(t, a.Reset(list))
 
 	b := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
 	require.NoError(t, b.TryAllocate("stale-0", "sku", "t9"))
-	b.ResetPreserving(list, nil)
+	require.NoError(t, b.ResetPreserving(list, nil))
 
 	assert.Equal(t, a.Stats(), b.Stats(), "nil keep must behave identically to Reset")
 	assert.Nil(t, b.GetAllocation("stale-0"), "nil keep preserves nothing")
@@ -440,10 +722,10 @@ func TestResetPreserving_RetainsMarkedEntryAbsentFromNewList(t *testing.T) {
 	// Rebuild from a snapshot that OMITS the in-flight lease (no container yet),
 	// but mark it to keep — mirroring recoverState dropping an in-flight lease
 	// from the container-derived list.
-	p.ResetPreserving(
+	require.NoError(t, p.ResetPreserving(
 		[]ResourceAllocation{{LeaseUUID: "ready-app-0", Tenant: "t2", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
 		func(key string) bool { return key == "inflight-app-0" },
-	)
+	))
 
 	s := p.Stats()
 	assert.Equal(t, 2, s.AllocationCount, "both the rebuilt Ready lease and the preserved in-flight lease")
@@ -460,10 +742,10 @@ func TestResetPreserving_PreservedWinsOverSameKeyInList_NoDoubleCount(t *testing
 
 	// The same key appears BOTH in the rebuild list and is marked to keep. It must
 	// be counted exactly once (the preserved entry wins).
-	p.ResetPreserving(
+	require.NoError(t, p.ResetPreserving(
 		[]ResourceAllocation{{LeaseUUID: "dup-app-0", Tenant: "t1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
 		func(key string) bool { return key == "dup-app-0" },
-	)
+	))
 
 	s := p.Stats()
 	assert.Equal(t, 1, s.AllocationCount, "same key must not double-count")
@@ -478,7 +760,7 @@ func TestResetPreserving_DropsUnmarkedEntryAbsentFromNewList(t *testing.T) {
 
 	// keep matches nothing and the stale entry is absent from the new list → dropped
 	// (a Failed/Ready lease whose containers are gone must not be over-preserved).
-	p.ResetPreserving(nil, func(key string) bool { return false })
+	require.NoError(t, p.ResetPreserving(nil, func(key string) bool { return false }))
 
 	s := p.Stats()
 	assert.Equal(t, 0, s.AllocationCount, "unmarked entry absent from the rebuild list is dropped")
@@ -496,10 +778,61 @@ func TestTryAllocate_AvailableNeverNegativeInError(t *testing.T) {
 		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 100}, nil
 	}
 	p := NewResourcePool(8, 8192, 1000, resolver, nil)
-	p.SetRetainedDisk(2000) // retained alone exceeds total (e.g. after a total_disk_mb shrink)
+	require.NoError(t, p.SetRetainedDisk(2000)) // retained alone exceeds total (e.g. after a total_disk_mb shrink)
 	err := p.TryAllocate("l1", "sku", "t1")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "have 0 MB available", "available must clamp to 0, never negative")
+}
+
+func TestTryAllocateResolved_UsesPinnedProfileWithoutConsultingResolver(t *testing.T) {
+	resolverCalls := 0
+	p := NewResourcePool(8, 8192, 8192, func(string) (SKUProfile, error) {
+		resolverCalls++
+		return SKUProfile{}, fmt.Errorf("mutable resolver must not be consulted")
+	}, nil)
+	pinned := SKUResourceSnapshot{
+		SKU: "removed-sku", CPUCores: 1.25, MemoryMB: 768, ScratchDiskMB: 1536,
+	}
+
+	require.NoError(t, p.TryAllocateResolved("lease-1", "tenant-a", pinned))
+	assert.Zero(t, resolverCalls)
+	assert.Equal(t, &ResourceAllocation{
+		LeaseUUID: "lease-1",
+		Tenant:    "tenant-a",
+		SKU:       "removed-sku",
+		CPUCores:  1.25,
+		MemoryMB:  768,
+		DiskMB:    1536,
+	}, p.GetAllocation("lease-1"))
+}
+
+func TestTryAllocateAdoptAllResolved_UsesPinnedProfilesAndRollsBackAtomically(t *testing.T) {
+	resolverCalls := 0
+	newPool := func(cpu float64) *ResourcePool {
+		return NewResourcePool(cpu, 8192, 4096, func(string) (SKUProfile, error) {
+			resolverCalls++
+			return SKUProfile{}, fmt.Errorf("mutable resolver must not be consulted")
+		}, nil)
+	}
+	instances := []ResolvedAdoptInstance{
+		{ID: "restore-0", Resources: SKUResourceSnapshot{SKU: "removed-sku", CPUCores: 1, MemoryMB: 256, ScratchDiskMB: 1024}},
+		{ID: "restore-1", Resources: SKUResourceSnapshot{SKU: "removed-sku", CPUCores: 1, MemoryMB: 256, ScratchDiskMB: 1024}},
+	}
+
+	p := newPool(8)
+	require.NoError(t, p.TryAllocateAdoptAllResolved(instances, "tenant-a", 2048))
+	assert.Zero(t, resolverCalls)
+	assert.Equal(t, 2, p.Stats().AllocationCount)
+	assert.Equal(t, int64(2048), p.Stats().AllocatedDiskMB)
+
+	p = newPool(1.5)
+	require.ErrorContains(t,
+		p.TryAllocateAdoptAllResolved(instances, "tenant-a", 2048),
+		"insufficient CPU",
+	)
+	assert.Zero(t, resolverCalls)
+	assert.Equal(t, 0, p.Stats().AllocationCount,
+		"a later pinned-profile failure must roll back the entire batch")
 }
 
 func TestTryAllocateAdoptAll_SkipsPerInstanceDiskGate(t *testing.T) {
@@ -507,7 +840,7 @@ func TestTryAllocateAdoptAll_SkipsPerInstanceDiskGate(t *testing.T) {
 		return SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 200}, nil
 	}
 	p := NewResourcePool(8, 8192, 1000, resolver, nil)
-	p.SetRetainedDisk(900) // 900 retained (other leases) + a fresh 200 would be 1100 > 1000
+	require.NoError(t, p.SetRetainedDisk(900)) // 900 retained (other leases) + a fresh 200 would be 1100 > 1000
 
 	// A normal provision is correctly denied (would over-commit disk).
 	require.Error(t, p.TryAllocate("fresh", "sku", "t1"))
@@ -541,7 +874,7 @@ func TestTryAllocateAdoptAll_GatesAggregateDelta(t *testing.T) {
 	// old) in the projection. Two instances → the pool computes new = 2×2048 = 4096.
 	newPool := func() *ResourcePool {
 		p := NewResourcePool(8, 8192, 4096, resolver, nil)
-		p.SetRetainedDisk(2048)
+		require.NoError(t, p.SetRetainedDisk(2048))
 		return p
 	}
 	two := []AdoptInstance{{ID: "r-0", SKU: "sku"}, {ID: "r-1", SKU: "sku"}}
@@ -586,7 +919,7 @@ func TestTryAllocateAdoptAll_AtomicNoOverCommit(t *testing.T) {
 		return SKUProfile{}, fmt.Errorf("unknown sku %q", sku)
 	}
 	p := NewResourcePool(8, 8192, 4096, resolver, nil)
-	p.SetRetainedDisk(2048) // the lease under restore, old footprint
+	require.NoError(t, p.SetRetainedDisk(2048)) // the lease under restore, old footprint
 
 	// A fresh provision consumes 1024 of the headroom the restore would need.
 	require.NoError(t, p.TryAllocate("intruder", "filler", "t2"))
@@ -628,7 +961,7 @@ func TestTryAllocateAdoptAll_ConcurrentNoOverCommit(t *testing.T) {
 		return SKUProfile{CPUCores: 0.001, MemoryMB: 1, DiskMB: 256}, nil
 	}
 	p := NewResourcePool(1000, 1_000_000, 4096, resolver, nil)
-	p.SetRetainedDisk(1024) // static footprint of other (non-restoring) leases
+	require.NoError(t, p.SetRetainedDisk(1024)) // static footprint of other (non-restoring) leases
 
 	violation := make(chan string, 1)
 	flag := func() {

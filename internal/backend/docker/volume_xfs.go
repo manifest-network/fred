@@ -70,6 +70,10 @@ type xfsVolumeManager struct {
 	volumeToID map[string]uint32 // volumeID → projectID (reverse index)
 }
 
+func (x *xfsVolumeManager) PinIdentityRoot() error { return x.rootWatch.pin(x.dataPath) }
+
+func (x *xfsVolumeManager) VerifyIdentityRoot() error { return x.rootWatch.verify(x.dataPath) }
+
 // assignProjectID returns a collision-free XFS project ID for volumeID.
 // It uses CRC32 as the initial candidate and probes (increments) on
 // collision. The caller must NOT hold x.mu.
@@ -422,7 +426,7 @@ func (x *xfsVolumeManager) Destroy(ctx context.Context, id string) error {
 		// deadline elapsed must not skip this cleanup (mirrors the provision-failure
 		// teardown, which uses a fresh context). Skipping it would leave the entry
 		// leaked with the directory already gone — unrecoverable on retry.
-		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		clearCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		clearCmd := xfsLimitClearCmd(projID)
 		if out, err := exec.CommandContext(clearCtx, "xfs_quota", xfsQuotaArgs(clearCmd, x.mountPoint)...).CombinedOutput(); err != nil {
@@ -461,10 +465,10 @@ func (x *xfsVolumeManager) List() ([]string, error) {
 // rename, so no xfs_quota reapplication is needed. The maps are updated
 // atomically under x.mu after a successful os.Rename so a concurrent
 // Create on the new name cannot observe an inconsistent state.
-func (x *xfsVolumeManager) RenameVolume(oldName, newName string) error {
+func (x *xfsVolumeManager) RenameVolume(ctx context.Context, oldName, newName string) error {
 	oldPath := filepath.Join(x.dataPath, oldName)
 	newPath := filepath.Join(x.dataPath, newName)
-	if err := atomicRenameVolumeDir(oldPath, newPath); err != nil {
+	if err := atomicRenameVolumeDir(ctx, oldPath, newPath); err != nil {
 		return err
 	}
 

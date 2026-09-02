@@ -19,7 +19,7 @@ import (
 // being restored into newLease, so on disk it currently wears fred-{newLease}-web-0.
 func restoringInto(t *testing.T, rs *shared.RetentionStore, orig, newLease string) {
 	t.Helper()
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	putRestoringRetention(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		NewLeaseUUID:        newLease,
 		Tenant:              "tenant-a",
@@ -27,7 +27,7 @@ func restoringInto(t *testing.T, rs *shared.RetentionStore, orig, newLease strin
 		Generation:          3,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "web"}},
 		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(orig, "web", 0))},
-	}))
+	})
 }
 
 // TestVolumeClaims_AdoptedNameIsOwnedByTheOriginalLease is the load-bearing assertion of
@@ -432,7 +432,10 @@ func chokePointFixture(t *testing.T, retainOnClose bool) (b *Backend, rs *shared
 	withMicroSKU(b, 512)
 	b.cfg.RetainOnClose = retainOnClose
 	rs = attachRetentionStore(t, b)
-	require.Equal(t, chokePointAdopted, seedRestoringInto(t, rs, "u1", lease),
+	require.Equal(t, chokePointAdopted, seedRestoringInto(
+		t, rs, "u1", lease,
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "app"}},
+	),
 		"precondition: the restore adopts u1's data under u2's canonical name")
 
 	destroyed, renamed = &[]string{}, &[][2]string{}
@@ -493,24 +496,22 @@ func TestDestroyChokePoint_InFlightRestoreDataIsUnreachableByAnyPath(t *testing.
 		wantReaped string
 	}{
 		{
-			name:          "close, non-retain destroy arm",
+			name:          "uncommitted close, non-retain",
 			retainOnClose: false,
 			drive:         func(t *testing.T, b *Backend) { _ = b.doDeprovision(context.Background(), "u2") },
-			wantReaped:    chokePointOwn,
 		},
 		{
-			name:          "close, retain arm",
+			name:          "uncommitted close, retain",
 			retainOnClose: true,
 			drive:         func(t *testing.T, b *Backend) { _ = b.doDeprovision(context.Background(), "u2") },
 		},
 		{
-			name:          "close, refuse-to-retain (disk cap breached)",
+			name:          "uncommitted close, retention cap breached",
 			retainOnClose: true,
 			setup: func(_ *testing.T, b *Backend, _ *shared.RetentionStore) {
 				b.cfg.MaxRetainedDiskMB = 1 // any stateful lease breaches
 			},
-			drive:      func(t *testing.T, b *Backend) { _ = b.doDeprovision(context.Background(), "u2") },
-			wantReaped: chokePointOwn,
+			drive: func(t *testing.T, b *Backend) { _ = b.doDeprovision(context.Background(), "u2") },
 		},
 		{
 			name: "startup orphan reaper",

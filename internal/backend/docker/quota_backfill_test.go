@@ -39,15 +39,25 @@ func TestReconcileVolumeQuotas_ReAppliesActiveAndRetained(t *testing.T) {
 		"ephemeral": {CPUCores: 1, MemoryMB: 512, DiskMB: 0},
 	}
 
-	// Active lease: 2 stateful, 1 ephemeral (on disk → writable-path volume), and
-	// 1 unknown-SKU item (on disk → must be skipped).
-	b.provisions["laa"] = &provision{ProvisionState: leasesm.ProvisionState{
-		LeaseUUID: "laa",
-		Items: []backend.LeaseItem{
-			{SKU: "stateful", Quantity: 2, ServiceName: "web"},
-			{SKU: "ephemeral", Quantity: 1, ServiceName: "cache"},
-			{SKU: "ghost", Quantity: 1, ServiceName: "unknown"}, // unknown SKU → skip
+	// Active lease: 2 stateful and 1 ephemeral (on disk → writable-path
+	// volume), all sized from the immutable authority captured at admission.
+	liveItems := []backend.LeaseItem{
+		{SKU: "stateful", Quantity: 2, ServiceName: "web"},
+		{SKU: "ephemeral", Quantity: 1, ServiceName: "cache"},
+	}
+	b.provisions["laa"] = &provision{
+		ProvisionState: leasesm.ProvisionState{LeaseUUID: "laa", Items: liveItems},
+		ResourceProfiles: []shared.SKUResourceSnapshot{
+			{SKU: "ephemeral", CPUCores: 1, MemoryMB: 512, ScratchDiskMB: tmpfsMB},
+			{SKU: "stateful", CPUCores: 1, MemoryMB: 512, DiskMB: 100},
 		},
+	}
+	// A genuinely legacy lease whose SKU can no longer be resolved is skipped as
+	// one indivisible authority unit. Applying a partial/current snapshot would
+	// silently reprice only part of a live lease.
+	b.provisions["ldd"] = &provision{ProvisionState: leasesm.ProvisionState{
+		LeaseUUID: "ldd",
+		Items:     []backend.LeaseItem{{SKU: "ghost", Quantity: 1, ServiceName: "unknown"}},
 	}}
 
 	// Retained active: db-0 is retained; sidecar-0's derived name is NOT in
@@ -64,20 +74,25 @@ func TestReconcileVolumeQuotas_ReAppliesActiveAndRetained(t *testing.T) {
 		CreatedAt:           time.Now(),
 	}))
 	// Restoring → skip entirely.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	restoringProfiles := []shared.SKUResourceSnapshot{{
+		SKU: "stateful2", CPUCores: 1, MemoryMB: 512, DiskMB: 250,
+	}}
+	putRestoringRetention(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID: "lcc", Tenant: "t1", ProviderUUID: "p1",
-		Items:               []backend.LeaseItem{{SKU: "stateful2", Quantity: 1, ServiceName: "db"}},
-		RetainedVolumeNames: []string{"fred-retained-lcc-db-0"},
-		Status:              shared.RetentionStatusRestoring,
-		CreatedAt:           time.Now(),
-	}))
+		Items:                       []backend.LeaseItem{{SKU: "stateful2", Quantity: 1, ServiceName: "db"}},
+		ResourceProfiles:            restoringProfiles,
+		DestinationResourceProfiles: restoringProfiles,
+		RetainedVolumeNames:         []string{"fred-retained-lcc-db-0"},
+		Status:                      shared.RetentionStatusRestoring,
+		CreatedAt:                   time.Now(),
+	})
 
 	// On disk. Every to-be-skipped volume is present so the SKIP is proven by the
 	// filter, not by absence: unknown-0 (unknown SKU), lbb-sidecar-0 (not in
 	// RetainedVolumeNames), lcc-db-0 (restoring). web-1 is deliberately ABSENT to
 	// pin the existence gate.
 	onDisk := []string{
-		"fred-laa-web-0", "fred-laa-cache-0", "fred-laa-unknown-0",
+		"fred-laa-web-0", "fred-laa-cache-0", "fred-ldd-unknown-0",
 		"fred-retained-lbb-db-0", "fred-retained-lbb-sidecar-0", "fred-retained-lcc-db-0",
 	}
 
@@ -143,6 +158,90 @@ func TestReconcileVolumeQuotas_EnsureQuotaFailureIsBestEffort(t *testing.T) {
 		"the successful volume increments outcome=applied")
 	assert.Equal(t, failedBefore+1, testutil.ToFloat64(volumeQuotaBackfillTotal.WithLabelValues("failed")),
 		"the failed volume increments outcome=failed")
+}
+
+func TestReconcileVolumeQuotas_UsesPinnedProfilesAfterConfigDrift(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured map[string]SKUProfile
+	}{
+		{
+			name: "profiles resized",
+			configured: map[string]SKUProfile{
+				"live":     {CPUCores: 8, MemoryMB: 8192, DiskMB: 900},
+				"retained": {CPUCores: 8, MemoryMB: 8192, DiskMB: 800},
+			},
+		},
+		{name: "profiles removed", configured: map[string]SKUProfile{}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b, rs := newBackendWithRetention(t)
+			b.cfg.VolumeDataPath = "/data/fred/volumes"
+			b.cfg.ContainerTmpfsSizeMB = 999
+			b.cfg.SKUProfiles = tc.configured
+			liveItems := []backend.LeaseItem{
+				{SKU: "live", Quantity: 1, ServiceName: "app"},
+				{SKU: "live-scratch", Quantity: 1, ServiceName: "cache"},
+			}
+			liveProfiles := []shared.SKUResourceSnapshot{
+				{SKU: "live", CPUCores: 1, MemoryMB: 512, DiskMB: 100},
+				{SKU: "live-scratch", CPUCores: 0.25, MemoryMB: 128, ScratchDiskMB: 64},
+			}
+			b.provisions["live-lease"] = &provision{
+				ProvisionState:   leasesm.ProvisionState{Items: liveItems},
+				ResourceProfiles: liveProfiles,
+			}
+
+			retainedItems := []backend.LeaseItem{
+				{SKU: "retained", Quantity: 1, ServiceName: "db"},
+				{SKU: "retained-scratch", Quantity: 1, ServiceName: "sidecar"},
+			}
+			retainedProfiles := []shared.SKUResourceSnapshot{
+				{SKU: "retained", CPUCores: 2, MemoryMB: 1024, DiskMB: 250},
+				{SKU: "retained-scratch", CPUCores: 0.25, MemoryMB: 128, ScratchDiskMB: 72},
+			}
+			require.NoError(t, rs.Put(shared.RetentionEntry{
+				OriginalLeaseUUID: "retained-lease",
+				Tenant:            "tenant-a",
+				ProviderUUID:      "provider-a",
+				Items:             retainedItems,
+				ResourceProfiles:  retainedProfiles,
+				RetainedVolumeNames: []string{
+					"fred-retained-retained-lease-db-0",
+					"fred-retained-retained-lease-sidecar-0",
+				},
+				Status:    shared.RetentionStatusActive,
+				CreatedAt: time.Now(),
+			}))
+
+			got := map[string]int64{}
+			b.volumes = &mockVolumeManager{
+				ListFn: func() ([]string, error) {
+					return []string{
+						"fred-live-lease-app-0",
+						"fred-live-lease-cache-0",
+						"fred-retained-retained-lease-db-0",
+						"fred-retained-retained-lease-sidecar-0",
+					}, nil
+				},
+				EnsureQuotaFn: func(_ context.Context, id string, sizeMB int64) error {
+					got[id] = sizeMB
+					return nil
+				},
+			}
+
+			b.reconcileVolumeQuotas(context.Background())
+
+			assert.Equal(t, map[string]int64{
+				"fred-live-lease-app-0":                  100,
+				"fred-live-lease-cache-0":                64,
+				"fred-retained-retained-lease-db-0":      250,
+				"fred-retained-retained-lease-sidecar-0": 72,
+			}, got)
+		})
+	}
 }
 
 // TestReconcileVolumeQuotas_NoopWhenNoVolumeDataPath verifies the backfill is a

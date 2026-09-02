@@ -434,7 +434,7 @@ func (o *volumeOp) destroyOne(ctx context.Context, sink volumeDestroyer, name st
 		// the stripe would only block an unrelated volume's create for the length of
 		// this RemoveAll, and this is the bulk path (evictOldest can pass 32 records'
 		// worth of retained names through a single close).
-		return volumeClaim{}, false, sink.Destroy(ctx, name)
+		return volumeClaim{}, false, o.b.mutationAdapter().destroyVolume(ctx, sink, name)
 	}
 	mu := o.b.volumeNameMu(name)
 	mu.Lock()
@@ -442,7 +442,7 @@ func (o *volumeOp) destroyOne(ctx context.Context, sink volumeDestroyer, name st
 	if claim, claimed := o.b.liveClaim(name); claimed && !claimPermits(claim, o.owner) {
 		return claim, true, nil
 	}
-	return volumeClaim{}, false, sink.Destroy(ctx, name)
+	return volumeClaim{}, false, o.b.mutationAdapter().destroyVolume(ctx, sink, name)
 }
 
 // refuse records one name left alone because ownership said no: the report bucket, the

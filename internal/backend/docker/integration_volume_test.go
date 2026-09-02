@@ -184,11 +184,12 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-lifecycle-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// Redis declares VOLUME /data
 	appManifest := manifest.Manifest{
@@ -202,7 +203,7 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -329,6 +330,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		// testBackendWithRealDocker parks the reconciler at 1h; step 3 needs it to
 		// observe the killed container and move the lease to Failed.
@@ -336,7 +338,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-symlink-leaf-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "redis:7", // declares VOLUME /data
@@ -348,7 +350,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	provisionReq := backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -453,12 +455,13 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.ReconcileInterval = 2 * time.Second // fast reconciler for re-provision
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-persist-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{
 		Image:   "redis:7",
@@ -471,7 +474,7 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -510,7 +513,7 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -567,7 +570,7 @@ func TestIntegration_Docker_EphemeralVolumeOverrideTmpfs(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("ephemeral-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// Redis declares VOLUME /data
 	appManifest := manifest.Manifest{
@@ -580,7 +583,7 @@ func TestIntegration_Docker_EphemeralVolumeOverrideTmpfs(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-ephemeral", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -616,11 +619,12 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-multi-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// redis:7 declares VOLUME /data
 	appManifest := manifest.Manifest{
@@ -634,7 +638,7 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -708,16 +712,20 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 	cfg.ProvisionTimeout = 2 * time.Minute
 	cfg.NetworkIsolation = ptrBool(false)
 	cfg.VolumeDataPath = mountPath
+	cfg.VolumeMountPath = mountPath
 	cfg.VolumeFilesystem = "btrfs"
 	tmpDir := t.TempDir()
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db")
+	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
 
 	logger := slog.Default()
+	ctx := context.Background()
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
 	b1, err := New(cfg, logger)
 	require.NoError(t, err)
 
-	ctx := context.Background()
 	err = b1.Start(ctx)
 	require.NoError(t, err)
 	b1Stopped := false
@@ -735,7 +743,7 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 		_ = dockerCli.Close()
 	})
 
-	leaseUUID := fmt.Sprintf("orphan-vol-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// redis:7 declares VOLUME /data → triggers btrfs subvolume creation
 	appManifest := manifest.Manifest{
@@ -748,7 +756,7 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 	err = b1.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -831,7 +839,7 @@ func TestIntegration_Docker_BtrfsRenameVolume_PreservesSubvolID(t *testing.T) {
 	require.NotEmpty(t, originalID, "must extract subvol id before rename")
 
 	// Rename via the manager.
-	require.NoError(t, mgr.RenameVolume(oldName, newName))
+	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
 
 	// New path exists, old path is gone.
 	newPath := filepath.Join(mountPath, newName)
@@ -878,6 +886,7 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		// Custom SKU with a tiny 5MB disk quota
 		cfg.SKUProfiles = map[string]SKUProfile{
@@ -890,7 +899,7 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-quota-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// redis:7 declares VOLUME /data → bind-mounted to 5MB btrfs subvolume.
 	// Using "sleep" as command so redis-server doesn't start and consume space.
@@ -904,7 +913,7 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-tiny", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -1545,8 +1554,8 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
-	const origLease = "l-ret"
-	retName := retainedName(canonicalVolumeName(origLease, "db", 0)) // fred-retained-l-ret-db-0
+	origLease := newIntegrationLeaseUUID()
+	retName := retainedName(canonicalVolumeName(origLease, "db", 0))
 	dir := filepath.Join(dataPath, retName)
 	require.NoError(t, os.MkdirAll(dir, 0700))
 	require.NoError(t, writeProjectIDFile(dir, 556001))
@@ -1559,7 +1568,7 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	require.NoError(t, rs.Put(shared.RetentionEntry{
 		OriginalLeaseUUID:   origLease,
 		Tenant:              "t1",
-		ProviderUUID:        "p1",
+		ProviderUUID:        testProviderUUID,
 		Items:               []backend.LeaseItem{{SKU: "ret-sku", Quantity: 1, ServiceName: "db"}},
 		RetainedVolumeNames: []string{retName},
 		Status:              shared.RetentionStatusActive,
@@ -1717,7 +1726,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 
 	// (a) 5 MiB data fits 20 MiB medium: gate passes, quota lowered, write beyond fails.
 	t.Run("fits_medium", func(t *testing.T) {
-		const origLease = "int-btrfs-fits"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1727,7 +1736,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		// 5 MiB — fits 20 MiB medium
 		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1741,9 +1750,9 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		require.NoError(t, err, "5 MiB data fits 20 MiB medium: checkDemoteFit must pass")
 
 		// Simulate adoptRetainedVolumes: rename to a new lease's canonical name.
-		const newLease = "int-btrfs-fits-new"
+		newLease := newIntegrationLeaseUUID()
 		newCanon := canonicalVolumeName(newLease, "app", 0)
-		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		require.NoError(t, mgr.RenameVolume(context.Background(), retained, newCanon))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap lowers the btrfs qgroup limit to 20 MiB.
@@ -1759,7 +1768,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 
 	// (b) 25 MiB data exceeds 20 MiB medium: gate returns ErrDemoteDataExceedsTier.
 	t.Run("exceeds_medium", func(t *testing.T) {
-		const origLease = "int-btrfs-exceeds"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1772,7 +1781,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
 		require.NoError(t, werr, "writing 25 MiB to 100 MiB-quota volume must succeed; dd output: %s", out)
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1790,7 +1799,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 	// (c) promote: Create at large from a medium-capped volume raises the cap so
 	//     writes beyond medium now succeed.
 	t.Run("promote_raises_cap", func(t *testing.T) {
-		const origLease = "int-btrfs-promote"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 
 		// Start at medium cap (20 MiB).
@@ -1842,7 +1851,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 	// (a) fits: gate passes, XFS bhard lowered, write beyond medium fails.
 	t.Run("fits_medium", func(t *testing.T) {
-		const origLease = "int-xfs-fits"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1851,7 +1860,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1864,9 +1873,9 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 			mediumProfiles, b.logger)
 		require.NoError(t, err, "5 MiB data fits 20 MiB medium: checkDemoteFit must pass")
 
-		const newLease = "int-xfs-fits-new"
+		newLease := newIntegrationLeaseUUID()
 		newCanon := canonicalVolumeName(newLease, "app", 0)
-		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		require.NoError(t, mgr.RenameVolume(context.Background(), retained, newCanon))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap updates the XFS project bhard limit to 20 MiB.
@@ -1881,7 +1890,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 	// (b) exceeds: gate refuses.
 	t.Run("exceeds_medium", func(t *testing.T) {
-		const origLease = "int-xfs-exceeds"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1893,7 +1902,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
 		require.NoError(t, werr, "25 MiB must fit 100 MiB XFS quota; dd output: %s", out)
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1911,7 +1920,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 	// (c) promote: Create at large from a medium-capped project raises the XFS
 	//     project bhard so writes beyond the medium cap now succeed.
 	t.Run("promote_raises_cap", func(t *testing.T) {
-		const origLease = "int-xfs-promote"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 
 		// Start at medium cap (20 MiB).
@@ -1968,7 +1977,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 	//     medium succeeds because referenced (~5 MiB) < refquota (20 MiB).
 	//     Write beyond medium then fails — confirming refquota is the enforcer.
 	t.Run("fits_medium_refquota_succeeds", func(t *testing.T) {
-		const origLease = "int-zfs-fits"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1977,7 +1986,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 
 		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 5)
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1990,9 +1999,9 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 			mediumProfiles, b.logger)
 		require.NoError(t, err, "5 MiB fits 20 MiB medium: gate must pass")
 
-		const newLease = "int-zfs-fits-new"
+		newLease := newIntegrationLeaseUUID()
 		newCanon := canonicalVolumeName(newLease, "app", 0)
-		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		require.NoError(t, mgr.RenameVolume(context.Background(), retained, newCanon))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap issues `zfs set refquota=20M <dataset>`.
@@ -2057,7 +2066,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 	//     `zfs set refquota < referenced` error that ZFS would return if we
 	//     proceeded directly to Create at medium cap.
 	t.Run("exceeds_medium_gate_refuses", func(t *testing.T) {
-		const origLease = "int-zfs-exceeds"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -2069,7 +2078,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		// (ZFS compression=on default would elide zero-filled data as holes).
 		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 25)
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{

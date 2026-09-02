@@ -1,12 +1,14 @@
 package docker
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
@@ -71,8 +74,8 @@ func leaseVolumePrefix(leaseUUID string) string {
 // failed, or the still-canonical volume would be reaped). reconcileRetentions'
 // active arm tolerates the error because cleanupOrphanedVolumes independently
 // protects retention-record canonicals.
-func (b *Backend) renameIfPresent(oldName, newName string) error {
-	if err := b.volumes.RenameVolume(oldName, newName); err != nil {
+func (b *Backend) renameIfPresent(ctx context.Context, oldName, newName string) error {
+	if err := b.mutationAdapter().renameVolume(ctx, oldName, newName); err != nil {
 		b.logger.Warn("reconcile rename skipped", "old", oldName, "new", newName, "error", err)
 		return err
 	}
@@ -91,6 +94,7 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var reconcileErrs []error
 	// One enumeration for the whole boot walk; the reaping arm below is its only user, and
 	// it is resolved lazily so a store with no reaping records pays nothing.
 	//
@@ -113,31 +117,157 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 			// independently protects this record's canonical from the reaper.
 			for _, retained := range e.RetainedVolumeNames {
 				canonical := canonicalFromRetained(retained)
-				if rerr := b.renameIfPresent(canonical, retained); rerr != nil {
+				if rerr := b.renameIfPresent(ctx, canonical, retained); rerr != nil {
 					b.logger.Warn("reconcile: re-quarantine of active canonical failed (cleanup protection covers it)",
 						"lease_uuid", e.OriginalLeaseUUID, "canonical", canonical, "error", rerr)
+					reconcileErrs = append(reconcileErrs, fmt.Errorf(
+						"re-quarantine active retention %q volume %q: %w",
+						e.OriginalLeaseUUID, canonical, rerr,
+					))
 				}
 			}
 		case shared.RetentionStatusRestoring:
-			b.reconcileRestoring(ctx, e)
+			if rerr := b.reconcileRestoring(ctx, e); rerr != nil {
+				reconcileErrs = append(reconcileErrs, rerr)
+			}
 		case shared.RetentionStatusReaping:
 			// Finalizer retry at boot: re-attempt destroy of any record stranded
 			// reaping by a prior crash/destroy-failure; delete it when confirmed gone.
 			b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID)
 		}
 	}
-	return nil
+	return errors.Join(reconcileErrs...)
 }
 
 // reconcileRestoring finalizes or rolls back an interrupted/failed restore,
 // conservatively (defers to an in-flight restore; generation-CAS rollback).
-func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntry) {
+func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntry) error {
+	return b.reconcileRestoringWithAuthority(ctx, e)
+}
+
+// ensureRestoreDestinationUnowned rejects a new lease generation while a
+// restoring source finalizer still owns the destination's canonical volume
+// namespace. Provision and Restore use this stricter guard: even a committed
+// destination remains an existing lease and must not be replaced through a new
+// creation path.
+func (b *Backend) ensureRestoreDestinationUnowned(destinationLease string) error {
+	if b.retentionStore == nil {
+		return nil
+	}
+	source, err := b.retentionStore.RestoringSourceByDestination(destinationLease)
+	if err != nil {
+		return fmt.Errorf("read restore destination ownership: %w", err)
+	}
+	if source != nil {
+		return fmt.Errorf(
+			"%w: destination lease %q remains owned by a pending restore finalizer",
+			backend.ErrInvalidState, destinationLease,
+		)
+	}
+	return nil
+}
+
+// ensureRestoreDestinationRestartAvailable admits an identity-preserving
+// Restart only
+// after the exact active Release proves destination ownership committed and the
+// restore operation intent is settled. The source finalizer intentionally stays
+// durable while a committed destination is Failed/absent: it carries identity
+// across repeated restarts, but must not permanently prevent repair. Update and
+// custom-domain changes are intentionally excluded because they create a newer
+// topology that the still-original finalizer cannot durably identify after a
+// crash; callers must first complete a plain Restart so Ready finalization can
+// consume the row.
+func (b *Backend) ensureRestoreDestinationRestartAvailable(destinationLease string) error {
+	if b.retentionStore == nil {
+		return nil
+	}
+	source, err := b.retentionStore.RestoringSourceByDestination(destinationLease)
+	if err != nil {
+		return fmt.Errorf("read restore destination ownership: %w", err)
+	}
+	if source == nil {
+		return nil
+	}
+	committed, err := b.restoreDestinationCommitted(*source)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: validate committed restore destination %q: %w",
+			backend.ErrInvalidState, destinationLease, err,
+		)
+	}
+	if !committed {
+		return fmt.Errorf(
+			"%w: destination lease %q remains owned by an uncommitted restore finalizer",
+			backend.ErrInvalidState, destinationLease,
+		)
+	}
+	intent, err := b.currentRestoreIntent(*source)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: read restore operation settlement for %q: %w",
+			backend.ErrInvalidState, destinationLease, err,
+		)
+	}
+	if intent != nil {
+		return fmt.Errorf(
+			"%w: destination lease %q restore operation is not settled",
+			backend.ErrInvalidState, destinationLease,
+		)
+	}
+	return nil
+}
+
+func (b *Backend) reconcileRestoringWithAuthority(
+	ctx context.Context,
+	e shared.RetentionEntry,
+) error {
+	if e.Status != shared.RetentionStatusRestoring ||
+		e.OriginalLeaseUUID == "" ||
+		e.NewLeaseUUID == "" ||
+		e.OriginalLeaseUUID == e.NewLeaseUUID ||
+		e.Generation <= 0 {
+		return fmt.Errorf(
+			"invalid restoring authority: source=%q destination=%q status=%q generation=%d",
+			e.OriginalLeaseUUID, e.NewLeaseUUID, e.Status, e.Generation,
+		)
+	}
+	// The entire decision and mutation are one per-destination critical section,
+	// not just the Ready finalizer. In particular, a sweep that snapshots Failed
+	// must not tear down/re-quarantine outside the fence while Restart makes the
+	// same destination Ready: that stale rollback could move a live volume after
+	// success ownership was finalized. CommandFence is a ref-counted keyed
+	// registry, so a slow Docker teardown blocks only this exact lease.
+	unlockCommand := b.commandFence.Lock(e.NewLeaseUUID)
+	defer unlockCommand()
+
+	// The row passed by reconcileRetentions came from a batch snapshot taken
+	// before this per-destination fence. Re-establish exact durable authority
+	// before any release write, teardown, rename, callback settlement, or source
+	// handback. A worker or an earlier sweep may already have consumed it while
+	// this goroutine waited for the command fence.
+	current, err := b.retentionStore.Get(e.OriginalLeaseUUID)
+	if err != nil {
+		return fmt.Errorf("re-read restore source finalizer %q: %w", e.OriginalLeaseUUID, err)
+	}
+	if current == nil || current.Status != shared.RetentionStatusRestoring ||
+		current.NewLeaseUUID != e.NewLeaseUUID || current.Generation != e.Generation {
+		return nil
+	}
+	e = *current
+
+	intent, err := b.currentRestoreIntent(e)
+	if err != nil {
+		return fmt.Errorf("read exact restore intent for destination %q: %w", e.NewLeaseUUID, err)
+	}
+
 	b.provisionsMu.RLock()
 	p, live := b.provisions[e.NewLeaseUUID]
 	var status backend.ProvisionStatus
 	var recordedIDs []string
+	var liveItems []backend.LeaseItem
 	if live {
 		status = p.Status
+		liveItems = slices.Clone(p.Items)
 		// Snapshot (not alias) under the lock, mirroring doDeprovision. Usually EMPTY
 		// here — Restore reserves the provision with no ContainerIDs and only the
 		// success paths fill them in — which is precisely why the teardown below
@@ -147,40 +277,65 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 		recordedIDs = slices.Clone(p.ContainerIDs)
 	}
 	b.provisionsMu.RUnlock()
+	// Restore terminal handlers publish Ready/Failed before synchronously
+	// persisting their callback. Check actor activity only after both the journal
+	// and provision snapshots: false now proves that a handler which published
+	// either terminal status has finished its callback attempt. InboxDepth also
+	// covers an accepted message that has been enqueued but not started yet.
+	if b.leaseActorProcessingOrQueued(e.NewLeaseUUID) {
+		return nil
+	}
 
 	if live && status == backend.ProvisionStatusReady {
-		// Restore finished. Finalize through the SAME gate as doRestore: (re-)record the
-		// new lease's active release, and drop the retention record ONLY once that release
-		// is durable. A bare Delete here would drop the finalizer for a restore whose
-		// release Append failed (no release + no record → reapable), re-opening ENG-523;
-		// routing through finalizeRestoredLease makes this sweep the retry path instead.
-		//
-		// Re-record from the LIVE provision's CURRENT manifest, not the retention record's
-		// frozen (pre-close) one: a tenant Update may have landed after the restore (its own
-		// best-effort release write may also have failed), so recording e.StackManifest here
-		// could persist a stale release that recoverState later redeploys, silently reverting
-		// the update. p.StackManifest tracks the running deployment (restart_update.go). (M-01)
-		if p.StackManifest != nil {
-			e.StackManifest = p.StackManifest
+		// A Ready projection is exact live ownership evidence. Commit (or verify)
+		// its active Release, settle an operation whose actor-side callback
+		// persistence failed, and only then consume the source finalizer. If either
+		// write fails, the finalizer remains a level-triggered retry owner.
+		if err := b.ensureRestoredReleaseStrict(e.NewLeaseUUID, &e, liveItems); err != nil {
+			return fmt.Errorf("finalize Ready restore destination %q: %w", e.NewLeaseUUID, err)
 		}
-		b.finalizeRestoredLease(e.NewLeaseUUID, &e, b.logger)
-		return
+		if intent != nil {
+			if _, err := b.callbackStore.ResolveOperationIntent(
+				*intent, backend.CallbackStatusSuccess, "",
+			); err != nil {
+				return fmt.Errorf("settle committed restore intent for %q: %w", e.NewLeaseUUID, err)
+			}
+		}
+		if err := b.deleteRestoreFinalizerStrict(e.NewLeaseUUID, &e); err != nil {
+			return fmt.Errorf("delete committed restore finalizer for %q: %w", e.NewLeaseUUID, err)
+		}
+		return nil
 	}
 	if live && status != backend.ProvisionStatusFailed {
-		// A live provision in ANY non-Failed state must NOT be torn down:
-		//   - Provisioning/Restarting: a restore genuinely in flight — doRestore's
-		//     terminal defer owns the record; re-quarantining the just-adopted
-		//     volumes would spuriously fail the restore. (A PERIODIC sweep landing
-		//     in the Provisioning sub-window must not treat it as orphaned.)
-		//   - Updating/Deprovisioning: a running new lease whose restore record
-		//     merely lingered past a failed terminal Delete — tearing it down would
-		//     stop a healthy lease mid-operation and yank its volumes (ENG-512).
-		// Only an ABSENT or Failed provision signals a restore that crashed, which
-		// the orphaned arm below (correctly) rolls back. At STARTUP recoverState
-		// rebuilds provisions from live containers and yields only Ready/Failed, so
-		// a mid-flight crash still reaches the orphaned arm.
-		return
+		// A non-terminal projection may have a worker in the gap after writing its
+		// Release but before enqueueing the actor's terminal message. The actor can
+		// be momentarily idle in that gap, so status—not Release existence—is the
+		// authoritative defer signal.
+		return nil
 	}
+
+	committed, err := b.restoreDestinationCommitted(e)
+	if err != nil {
+		return fmt.Errorf("validate restore commit for destination %q: %w", e.NewLeaseUUID, err)
+	}
+	if committed {
+		// The active Release is the write-ahead commit marker. Containers may have
+		// failed or disappeared after that commit; that is a destination runtime
+		// failure, never authority to hand the adopted bytes back to the source.
+		// Keep the source finalizer while the destination is non-Ready because it is
+		// the durable tenant/provider identity needed to reconstruct Failed safely
+		// across repeated restarts. A successful Restart/Update (or Close) later
+		// consumes it through finalizeRestoredLeaseStrict.
+		if intent != nil {
+			if _, err := b.callbackStore.ResolveOperationIntent(
+				*intent, backend.CallbackStatusSuccess, "",
+			); err != nil {
+				return fmt.Errorf("settle committed restore intent for %q: %w", e.NewLeaseUUID, err)
+			}
+		}
+		return nil
+	}
+
 	// Orphaned (crash/failed): tear down any orphaned project, re-quarantine the
 	// adopted volumes back to the retained namespace, then CAS the record to active.
 	//
@@ -202,14 +357,14 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	// is not reapable (ListExpired/MarkReapingIfExpired both require ACTIVE) and
 	// cleanupOrphanedVolumes protects its canonicals. It is NOT time-bounded, though —
 	// that same expiry exemption means the tenant cannot re-request the restore
-	// (ClaimForRestore refuses a restoring record) until a sweep gets a clean teardown,
+	// (ClaimForRestoreWithAuthority refuses a restoring record) until a sweep gets a clean teardown,
 	// so a sustained failure here is an operator signal, not a self-healing state.
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 	if _, derr := b.teardownLeaseContainers(ctx, e.NewLeaseUUID, recordedIDs, stopTimeout,
 		teardownOpRestoreReconcile, b.logger.With("lease_uuid", e.NewLeaseUUID)); derr != nil {
 		b.logger.Warn("reconcile: teardown failed; leaving record restoring for the next sweep",
 			"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID, "error", derr)
-		return
+		return fmt.Errorf("reconcile restoring retention %q teardown: %w", e.OriginalLeaseUUID, derr)
 	}
 	// Re-quarantine each adopted volume. A REAL rename failure (not a benign
 	// no-op) means the volume may still be canonical-named: we must NOT advance
@@ -220,36 +375,263 @@ func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntr
 	failed := false
 	for _, retained := range e.RetainedVolumeNames {
 		newCanonical := retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)
-		if rerr := b.renameIfPresent(newCanonical, retained); rerr != nil {
+		if rerr := b.renameIfPresent(ctx, newCanonical, retained); rerr != nil {
 			failed = true
 		}
 	}
 	if failed {
 		b.logger.Warn("reconcile: re-quarantine rename failed; leaving record restoring for next startup",
 			"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID)
-		return
+		return fmt.Errorf("reconcile restoring retention %q: re-quarantine remains incomplete",
+			e.OriginalLeaseUUID)
 	}
-	if ok, err := b.retentionStore.RevertToActive(e.OriginalLeaseUUID, e.Generation); err != nil {
-		b.logger.Error("reconcile: revert restoring->active failed", "lease_uuid", e.OriginalLeaseUUID, "error", err)
-	} else if ok {
-		// Re-count retained BEFORE releasing the new lease's live allocation so the
-		// footprint is continuously counted (transient double-count = over-deny = safe),
-		// mirroring rollbackRestoreAdoption's success arm. Without this, the new-lease
-		// live pool allocation lingered after removeProvision (map delete only), leaving
-		// retained F + live F = 2F in steady state (ENG-360 Fix #1).
-		b.refreshRetentionAccounting()
-		// Derive and release the new lease's live allocation ids using the same
-		// {newLease}-{svc}-{idx} scheme Restore() builds for TryAllocateAdoptAll.
-		var liveIDs []string
-		for _, item := range e.Items {
-			for i := range item.Quantity {
-				liveIDs = append(liveIDs, fmt.Sprintf("%s-%s-%d", e.NewLeaseUUID, item.ServiceName, i))
-			}
+	// Restore's Create path applies the destination tier's quota to each adopted
+	// volume. A failed promotion therefore leaves a larger physical quota than
+	// the immutable source record accounts for. Restore the exact source quota
+	// before handing authority back to that record; if usage no longer fits, or
+	// either measurement/application is uncertain, keep both the restoring
+	// finalizer and the live reservation. That is over-counted but cannot admit
+	// unaccounted bytes.
+	resourceProfiles, err := b.restoreRetainedVolumeQuotas(ctx, &e)
+	if err != nil {
+		b.logger.Error("reconcile: unable to restore source volume quotas; leaving record restoring",
+			"lease_uuid", e.OriginalLeaseUUID,
+			"new_lease_uuid", e.NewLeaseUUID,
+			"error", err,
+		)
+		return fmt.Errorf("reconcile restoring retention %q quotas: %w", e.OriginalLeaseUUID, err)
+	}
+	// Once teardown, re-quarantine, and source-quota proof are complete, this
+	// destination can no longer succeed. Settle its exact failed operation before
+	// handing the durable row back to Active. A callback-store failure therefore
+	// leaves Restoring + the live reservation as a level-triggered retry vehicle;
+	// moving this after the CAS would strand an Existing intent until restart.
+	if err := b.settleRolledBackRestoreIntent(e, intent); err != nil {
+		return fmt.Errorf("settle rolled-back restore intent for %q: %w", e.NewLeaseUUID, err)
+	}
+	// Derive the destination allocation ids using the same
+	// {newLease}-{svc}-{idx} scheme Restore used for TryAllocateAdoptAll.
+	var liveIDs []string
+	for _, item := range e.Items {
+		for i := range item.Quantity {
+			liveIDs = append(liveIDs, fmt.Sprintf("%s-%s-%d", e.NewLeaseUUID, item.ServiceName, i))
 		}
-		releaseAll(b.pool, liveIDs)
-		updateResourceMetrics(b.pool.Stats())
-		b.removeProvision(e.NewLeaseUUID)
 	}
+	ok, err := b.revertRestoreSourceWithAccounting(&e, e.NewLeaseUUID, resourceProfiles, liveIDs)
+	if err != nil {
+		b.logger.Error("reconcile: revert restoring->active failed", "lease_uuid", e.OriginalLeaseUUID, "error", err)
+		return fmt.Errorf("reconcile restoring retention %q finalizer: %w", e.OriginalLeaseUUID, err)
+	}
+	if ok {
+		b.removeProvision(e.NewLeaseUUID)
+		return nil
+	}
+	return fmt.Errorf("reconcile restoring retention %q lost generation %d authority",
+		e.OriginalLeaseUUID, e.Generation)
+}
+
+// settleRolledBackRestoreIntent retries failure settlement when a prior
+// pre-acceptance Resolve failed. Its caller has already proved teardown,
+// re-quarantine, and source quotas, so the operation is definitively failed and
+// no worker can later publish the destination Ready. It runs before the source
+// handback CAS so a callback-store failure leaves the Restoring row available
+// for the next level-triggered sweep. An absent matching fence is the common
+// no-op path.
+func (b *Backend) settleRolledBackRestoreIntent(
+	e shared.RetentionEntry,
+	intent *shared.OperationIntentClaim,
+) error {
+	if intent == nil {
+		return nil
+	}
+	if b.callbackStore == nil {
+		return errors.New("callback store is required to settle rolled-back restore intent")
+	}
+	if intent.SourceGeneration() != e.Generation {
+		return fmt.Errorf(
+			"pending restore intent generation %d differs from rolled-back source generation %d",
+			intent.SourceGeneration(), e.Generation,
+		)
+	}
+	if _, err := b.callbackStore.ResolveOperationIntent(
+		*intent, backend.CallbackStatusFailed, interruptedOperationFailure,
+	); err != nil {
+		return fmt.Errorf("resolve interrupted restore intent: %w", err)
+	}
+	return nil
+}
+
+func (b *Backend) leaseActorProcessingOrQueued(leaseUUID string) bool {
+	b.actorsMu.Lock()
+	defer b.actorsMu.Unlock()
+	actor, exists := b.actors[leaseUUID]
+	return exists && (actor.CurrentMessageStart() != 0 || actor.InboxDepth() != 0)
+}
+
+// currentRestoreIntent re-reads operation authority while the caller holds the
+// destination command fence. Batch snapshots are not admissible here: a restore
+// can create or settle its intent while a retention sweep waits for that fence.
+// Any claim that touches only one side (or a different generation) is conflicting
+// durable authority and therefore fails closed.
+func (b *Backend) currentRestoreIntent(e shared.RetentionEntry) (*shared.OperationIntentClaim, error) {
+	if b.callbackStore == nil {
+		return nil, nil
+	}
+	claims, err := b.callbackStore.ListOperationIntents()
+	if err != nil {
+		return nil, err
+	}
+	var exact *shared.OperationIntentClaim
+	for i := range claims {
+		claim := claims[i]
+		touchesSource := claim.SourceLeaseUUID() == e.OriginalLeaseUUID
+		touchesDestination := claim.LeaseUUID() == e.NewLeaseUUID
+		if !touchesSource && !touchesDestination {
+			continue
+		}
+		if claim.Kind() != shared.OperationIntentRestore ||
+			!touchesSource || !touchesDestination ||
+			claim.SourceGeneration() != e.Generation {
+			return nil, fmt.Errorf(
+				"%s intent for lease %q conflicts with source %q destination %q generation %d",
+				claim.Kind(), claim.LeaseUUID(), e.OriginalLeaseUUID, e.NewLeaseUUID, e.Generation,
+			)
+		}
+		if exact != nil {
+			return nil, fmt.Errorf("multiple operation intents own restore destination %q", e.NewLeaseUUID)
+		}
+		if err := b.validateRestoreIntentAuthority(claim, e); err != nil {
+			return nil, err
+		}
+		exact = &claim
+	}
+	return exact, nil
+}
+
+func (b *Backend) validateRestoreIntentAuthority(
+	claim shared.OperationIntentClaim,
+	e shared.RetentionEntry,
+) error {
+	if claim.Backend() != b.Name() || claim.BackendStorageID() != b.storageIdentity {
+		return fmt.Errorf(
+			"restore intent belongs to backend %q storage %s, not backend %q storage %s",
+			claim.Backend(), claim.BackendStorageID(), b.Name(), b.storageIdentity,
+		)
+	}
+	if claim.Tenant() != e.Tenant || claim.ProviderUUID() != e.ProviderUUID {
+		return errors.New("restore intent tenant/provider differs from source finalizer authority")
+	}
+	if !slices.Equal(claim.Items(), e.DestinationItems) ||
+		!slices.Equal(claim.EffectiveItems(), e.DestinationItems) ||
+		!slices.Equal(claim.ResourceProfiles(), e.DestinationResourceProfiles) {
+		return errors.New("restore intent topology or resource profiles differ from source finalizer authority")
+	}
+	if e.DestinationCallbackURL != "" || e.DestinationLifecycleCallbackURL != "" {
+		if claim.CallbackURL() != e.DestinationCallbackURL ||
+			claim.LifecycleCallbackURL() != e.DestinationLifecycleCallbackURL {
+			return errors.New("restore intent callback pair differs from source finalizer authority")
+		}
+	}
+	if e.DestinationOperationID != "" && claim.OperationID() != e.DestinationOperationID {
+		return errors.New("restore intent operation ID differs from source finalizer authority")
+	}
+	if e.StackManifest == nil {
+		return errors.New("restore source finalizer has no destination manifest")
+	}
+	manifestBytes, err := json.Marshal(e.StackManifest)
+	if err != nil {
+		return fmt.Errorf("marshal restore source finalizer manifest: %w", err)
+	}
+	if !bytes.Equal(claim.Manifest(), manifestBytes) {
+		return errors.New("restore intent manifest differs from source finalizer authority")
+	}
+	expectedHealthServices := make([]string, 0, len(e.StackManifest.Services))
+	for service, serviceManifest := range e.StackManifest.Services {
+		if serviceManifest != nil && serviceManifest.HasActiveHealthCheck() {
+			expectedHealthServices = append(expectedHealthServices, service)
+		}
+	}
+	slices.Sort(expectedHealthServices)
+	if !slices.Equal(claim.HealthCheckServices(), expectedHealthServices) {
+		return errors.New("restore intent health-check authority differs from source finalizer manifest")
+	}
+	return nil
+}
+
+// restoreDestinationCommitted reports whether the exact destination generation
+// was durably committed before its source finalizer could be consumed. A
+// mismatching active Release is not absence: it is conflicting ownership and
+// must fail closed rather than authorizing rollback of possibly-live bytes.
+func (b *Backend) restoreDestinationCommitted(e shared.RetentionEntry) (bool, error) {
+	if b.releaseStore == nil {
+		return false, errors.New("release store is required")
+	}
+	active, err := b.releaseStore.LatestActive(e.NewLeaseUUID)
+	if err != nil {
+		return false, fmt.Errorf("read active destination release: %w", err)
+	}
+	if active == nil {
+		return false, nil
+	}
+	matches, err := restoreReleaseMatchesAuthority(active, e)
+	if err != nil {
+		return false, err
+	}
+	if !matches {
+		return false, errors.New("active destination release differs from restore finalizer authority")
+	}
+	return true, nil
+}
+
+func restoreReleaseMatchesAuthority(
+	active *shared.Release,
+	e shared.RetentionEntry,
+) (bool, error) {
+	if active == nil {
+		return false, nil
+	}
+	if e.StackManifest == nil {
+		return false, errors.New("restore source finalizer has no destination manifest")
+	}
+	manifestBytes, err := json.Marshal(e.StackManifest)
+	if err != nil {
+		return false, fmt.Errorf("marshal restore destination manifest: %w", err)
+	}
+	switch {
+	case e.DestinationOperationID == "":
+		if active.OperationID != "" || active.RuntimeAuthority != nil {
+			return false, errors.New("legacy restore finalizer cannot own a typed destination release")
+		}
+	case !e.DestinationOperationID.Valid() || !active.OperationID.Valid() ||
+		active.OperationID != e.DestinationOperationID || active.RuntimeAuthority == nil:
+		return false, errors.New("active destination runtime authority has no exact valid restore operation ID")
+	case !releaseRuntimeAuthorityMatchesRetention(active.RuntimeAuthority, e):
+		return false, errors.New("active destination runtime authority differs from restore finalizer")
+	}
+	return bytes.Equal(active.Manifest, manifestBytes) &&
+		slices.Equal(active.Items, e.DestinationItems) &&
+		slices.Equal(active.ResourceProfiles, e.DestinationResourceProfiles), nil
+}
+
+func releaseRuntimeAuthorityMatchesRetention(
+	authority *shared.ReleaseRuntimeAuthority,
+	e shared.RetentionEntry,
+) bool {
+	if authority == nil ||
+		authority.OperationID() != e.DestinationOperationID ||
+		authority.Tenant() != e.Tenant ||
+		authority.ProviderUUID() != e.ProviderUUID {
+		return false
+	}
+	resolvedCallbackURL, resolvedLifecycleCallbackURL, err :=
+		backend.ResolveMaintenanceCallbackURLs(
+			e.DestinationCallbackURL,
+			e.DestinationLifecycleCallbackURL,
+			authority.LifecycleCallbackURL(),
+		)
+	return err == nil &&
+		resolvedCallbackURL == authority.CallbackURL() &&
+		resolvedLifecycleCallbackURL == authority.LifecycleCallbackURL()
 }
 
 // maxRetentionEvictionsPerClose is the per-pass batch rail: a cap reduction
@@ -892,6 +1274,9 @@ func (b *Backend) retryReapingRecords(ctx context.Context) error {
 // information and can never add a destroy. That is the same direction the rest of this
 // file takes: destroy only on a positive fact, never on an error or an empty list.
 func (b *Backend) runRetentionSweep(ctx context.Context) error {
+	if err := b.requireStorageIdentity(ctx); err != nil {
+		return fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
 	var errs []error
 	if _, err := b.reapExpiredRetentions(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("reap expired: %w", err))
@@ -909,7 +1294,11 @@ func (b *Backend) runRetentionSweep(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("list restoring: %w", err))
 		} else {
 			for _, e := range recs {
-				b.reconcileRestoring(ctx, e)
+				// A per-record failure deliberately parks the finalizer for the
+				// next sweep and remains a logged operational delay. Startup uses
+				// reconcileRetentions and propagates the same error when a durable
+				// restore intent needs exact classification.
+				_ = b.reconcileRestoring(ctx, e)
 			}
 		}
 		// ENG-370: prune orphaned records BEFORE ENG-360's accounting refresh so the
@@ -975,15 +1364,6 @@ func (b *Backend) startRetentionReaper() {
 // Restore as a first-class backend operation (ENG-325, Task 7b)
 // ---------------------------------------------------------------------------
 
-// totalQuantity sums the per-item quantities of a lease item set.
-func totalQuantity(items []backend.LeaseItem) int {
-	total := 0
-	for _, item := range items {
-		total += item.Quantity
-	}
-	return total
-}
-
 // itemsShapeMatch reports nil iff a and b carry identical service-name →
 // summed-quantity maps. A restore's new-lease items must match the retained
 // set's shape exactly (the volumes are addressed by serviceName×instanceIndex),
@@ -1015,7 +1395,7 @@ func itemsShapeMatch(a, b []backend.LeaseItem) error {
 // untouched — no rollback. The retained volumes are from a closed lease with
 // no running container, so the footprint is static (no TOCTOU on size); a
 // concurrent reaper flipping the record active→reaping is handled by the
-// later atomic ClaimForRestore (loser → ErrNotRestorable). Do NOT cache the
+// later atomic ClaimForRestoreWithAuthority (loser → ErrNotRestorable). Do NOT cache the
 // Usage result or move this gate after the claim.
 //
 // For each service: a clear promote/same-tier (new ≥ old, both resolvable)
@@ -1026,9 +1406,46 @@ func itemsShapeMatch(a, b []backend.LeaseItem) error {
 // (DiskMB=0) tier with retained data is refused.
 func (b *Backend) checkDemoteFit(ctx context.Context, rec *shared.RetentionEntry,
 	newItems []backend.LeaseItem, newProfiles map[string]SKUProfile, logger *slog.Logger) error {
+	resourceProfiles, err := b.snapshotResourceProfiles(newItems, newProfiles)
+	if err != nil {
+		return fmt.Errorf("%w: snapshot restore resource profiles: %w", backend.ErrValidation, err)
+	}
+	return b.checkDemoteFitWithResourceProfiles(ctx, rec, newItems, resourceProfiles, logger)
+}
+
+func (b *Backend) checkDemoteFitWithResourceProfiles(
+	ctx context.Context,
+	rec *shared.RetentionEntry,
+	newItems []backend.LeaseItem,
+	newResourceProfiles []shared.SKUResourceSnapshot,
+	logger *slog.Logger,
+) error {
 	retained := make(map[string]struct{}, len(rec.RetainedVolumeNames))
 	for _, n := range rec.RetainedVolumeNames {
 		retained[n] = struct{}{}
+	}
+	newResources, err := resourceSnapshotMap(newItems, newResourceProfiles)
+	if err != nil {
+		return fmt.Errorf("%w: invalid restore resource authority: %w", backend.ErrValidation, err)
+	}
+
+	var oldResourceProfiles []shared.SKUResourceSnapshot
+	if len(rec.ResourceProfiles) > 0 {
+		oldResourceProfiles = rec.ResourceProfiles
+	} else {
+		// True v0.13 rows have no immutable authority. Resolve once for this
+		// read-only gate. A failed restore's rollback freezes the same source
+		// authority before handing the retention row back; a successful restore
+		// deletes the source finalizer. An unavailable old SKU remains unknown and
+		// therefore takes the conservative measurement/refusal path below.
+		oldResourceProfiles, _ = b.resolveResourceProfiles(rec.Items)
+	}
+	oldResources := make(map[string]shared.SKUResourceSnapshot)
+	if len(oldResourceProfiles) > 0 {
+		oldResources, err = resourceSnapshotMap(rec.Items, oldResourceProfiles)
+		if err != nil {
+			return fmt.Errorf("%w: invalid retained resource authority: %w", backend.ErrInvalidState, err)
+		}
 	}
 	oldSKU := make(map[string]string, len(rec.Items))
 	for _, it := range rec.Items {
@@ -1036,14 +1453,31 @@ func (b *Backend) checkDemoteFit(ctx context.Context, rec *shared.RetentionEntry
 	}
 	backendKind := b.volumes.Kind()
 	for _, it := range newItems {
-		np, ok := newProfiles[it.SKU]
+		newResourcesForSKU, ok := newResources[it.SKU]
 		if !ok {
 			return fmt.Errorf("%w: unknown SKU %q", backend.ErrValidation, it.SKU)
 		}
-		newDiskMB := np.DiskMB
-		// Promote/same-tier optimization: skip measurement when the new cap is
-		// not smaller than the (resolvable) old cap.
-		if op, oerr := b.cfg.GetSKUProfile(oldSKU[it.ServiceName]); oerr == nil && newDiskMB >= op.DiskMB {
+		newDiskMB, diskErr := newResourcesForSKU.EffectiveDiskMB()
+		if diskErr != nil {
+			return fmt.Errorf("%w: invalid resource authority for SKU %q: %w",
+				backend.ErrValidation, it.SKU, diskErr)
+		}
+		// Promote/same-tier optimization: compare against the immutable profile
+		// captured when the source became retained. Legacy records without a
+		// snapshot fall back to the current configuration; an unresolved legacy
+		// SKU conservatively takes the measurement path.
+		oldResourcesForSKU, oldProfileOK := oldResources[oldSKU[it.ServiceName]]
+		oldDiskMB := int64(0)
+		if oldProfileOK {
+			oldDiskMB, diskErr = oldResourcesForSKU.EffectiveDiskMB()
+			if diskErr != nil {
+				return fmt.Errorf("%w: invalid retained resource authority for service %q: %w",
+					backend.ErrInvalidState, it.ServiceName, diskErr)
+			}
+		}
+		durableSourceToScratch := oldResourcesForSKU.DiskMB > 0 &&
+			newResourcesForSKU.DiskMB == 0
+		if oldProfileOK && !durableSourceToScratch && newDiskMB >= oldDiskMB {
 			continue
 		}
 		for i := range it.Quantity {
@@ -1051,7 +1485,14 @@ func (b *Backend) checkDemoteFit(ctx context.Context, rec *shared.RetentionEntry
 			if _, isStateful := retained[name]; !isStateful {
 				continue // stateless instance: no retained volume to check
 			}
-			if newDiskMB <= 0 {
+			// Scratch is intentionally non-stateful: a durable source volume cannot
+			// be restored into a diskless destination even if its ephemeral allowance
+			// happens to be numerically large enough. Exact retained scratch, however,
+			// may restore to another scratch row and is measured against the new pinned
+			// allowance just like any other physical quota.
+			destinationIsScratch := newResourcesForSKU.DiskMB == 0
+			sourceMayBeDurable := !oldProfileOK || oldResourcesForSKU.DiskMB > 0
+			if newDiskMB <= 0 || (destinationIsScratch && sourceMayBeDurable) {
 				restoreDemoteRefusedTotal.WithLabelValues(backendKind, "ephemeral_tier").Inc()
 				return fmt.Errorf("%w: service %q: cannot restore stateful data into an ephemeral (disk_mb=0) tier",
 					backend.ErrDemoteDataExceedsTier, it.ServiceName)
@@ -1071,6 +1512,10 @@ func (b *Backend) checkDemoteFit(ctx context.Context, rec *shared.RetentionEntry
 					"service", it.ServiceName, "volume", name, "reason", reason, "error", uerr)
 				return fmt.Errorf("%w: service %q: unable to verify retained data fits the requested tier",
 					backend.ErrDemoteDataExceedsTier, it.ServiceName)
+			}
+			if newDiskMB > math.MaxInt64/bytesPerMiB {
+				return fmt.Errorf("%w: service %q: disk_mb cap overflows byte accounting",
+					backend.ErrValidation, it.ServiceName)
 			}
 			capBytes := newDiskMB * bytesPerMiB
 			if usage > capBytes {
@@ -1098,12 +1543,11 @@ func releaseAll(pool *shared.ResourcePool, ids []string) {
 // soft-delete), NOT a Items×Quantity re-derivation: a stateless service (no
 // managed volume) has no retained name, so deriving from Items would attempt a
 // rename of a volume that never existed and fail the whole restore. Returns the
-// first error; the caller fully rolls back on failure. RenameVolume is
-// synchronous, so no context is threaded.
-func (b *Backend) adoptRetainedVolumes(newLease string, rec *shared.RetentionEntry) error {
+// first error; the caller fully rolls back on failure.
+func (b *Backend) adoptRetainedVolumes(ctx context.Context, newLease string, rec *shared.RetentionEntry) error {
 	for _, retained := range rec.RetainedVolumeNames {
 		newCanonical := retainedToNewCanonical(retained, rec.OriginalLeaseUUID, newLease)
-		if err := b.volumes.RenameVolume(retained, newCanonical); err != nil {
+		if err := b.mutationAdapter().renameVolume(ctx, retained, newCanonical); err != nil {
 			return fmt.Errorf("adopt volume %s -> %s: %w", retained, newCanonical, err)
 		}
 	}
@@ -1128,6 +1572,11 @@ func (b *Backend) adoptRetainedVolumes(newLease string, rec *shared.RetentionEnt
 // not-retained, not-restorable) are returned to the caller; asynchronous outcomes
 // flow via the lease callback.
 func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error {
+	if err := b.requireMutationAdmission(ctx, "restore"); err != nil {
+		return fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	defer unlockCommand()
 	logger := b.logger.With("lease_uuid", req.LeaseUUID, "from_lease", req.FromLeaseUUID, "tenant", req.Tenant)
 	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
 		req.CallbackURL, req.LifecycleCallbackURL,
@@ -1136,6 +1585,14 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
 	req.LifecycleCallbackURL = lifecycleCallbackURL
+	if exactRetry, err := b.probeOperationIntent(req.LeaseUUID, req.CallbackURL); err != nil {
+		return err
+	} else if exactRetry {
+		return nil
+	}
+	if err := b.ensureRestoreDestinationUnowned(req.LeaseUUID); err != nil {
+		return err
+	}
 
 	if b.retentionStore == nil {
 		return backend.ErrNotRetained
@@ -1153,6 +1610,14 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		}
 		return backend.ErrNotRetained
 	}
+	// Exact retries were handled by the durable intent probe above. Every new
+	// admission must start from Active; predicting a generation for an existing
+	// Restoring/Reaping row creates a second operation intent that can never own
+	// the source CAS and can wedge both retries. Reject before normalization,
+	// projection reservation, or intent creation so this path is side-effect free.
+	if rec.Status != shared.RetentionStatusActive {
+		return fmt.Errorf("%w: retained source status is %q", backend.ErrInvalidState, rec.Status)
+	}
 	// Boundary normalization (same contract as Provision/Update): a legacy
 	// single-service lease arrives with ServiceName="" from the chain, but the
 	// retained record's Items were normalized to defaultServiceName ("app") at
@@ -1163,8 +1628,15 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: req.Items}); err != nil {
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
+	restoreQuantity, err := backend.ValidateOperationQuantities(req.Items)
+	if err != nil {
+		return err
+	}
 	if err := itemsShapeMatch(rec.Items, req.Items); err != nil {
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
+	if err := validateComposeServiceNames(req.Items); err != nil {
+		return fmt.Errorf("%w: retained topology cannot form an injective Compose project: %w", backend.ErrValidation, err)
 	}
 	// Defensive provider cross-check: the reservation uses rec.ProviderUUID, but a
 	// retained record for a different provider should never be restorable here.
@@ -1191,9 +1663,17 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		}
 		profiles[item.SKU] = p
 	}
+	resourceProfiles, err := b.snapshotResourceProfiles(req.Items, profiles)
+	if err != nil {
+		return fmt.Errorf("%w: snapshot restore resource profiles: %w", backend.ErrValidation, err)
+	}
+	resourcesBySKU, err := resourceSnapshotMap(req.Items, resourceProfiles)
+	if err != nil {
+		return fmt.Errorf("%w: validate restore resource profiles: %w", backend.ErrValidation, err)
+	}
 	// Demote fit-gate (read-only; BEFORE any side effect — reserve/pool/claim/
 	// adopt). A refusal leaves the retained record and volumes untouched.
-	if err := b.checkDemoteFit(ctx, rec, req.Items, profiles, logger); err != nil {
+	if err := b.checkDemoteFitWithResourceProfiles(ctx, rec, req.Items, resourceProfiles, logger); err != nil {
 		return err
 	}
 	for svc, m := range rec.StackManifest.Services {
@@ -1207,13 +1687,56 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			return fmt.Errorf("%w: service %s: %w", backend.ErrValidation, svc, ierr)
 		}
 	}
+	var healthCheckServices []string
+	for service, serviceManifest := range rec.StackManifest.Services {
+		if serviceManifest.HasActiveHealthCheck() {
+			healthCheckServices = append(healthCheckServices, service)
+		}
+	}
+	slices.Sort(healthCheckServices)
+	restoreManifestPayload, err := json.Marshal(rec.StackManifest)
+	if err != nil {
+		return fmt.Errorf("marshal restore manifest for durable intent: %w", err)
+	}
+	intent, proceed, err := b.beginOperationIntent(
+		shared.OperationIntentRestore,
+		req.LeaseUUID,
+		req.CallbackURL,
+		req.LifecycleCallbackURL,
+		rec.Tenant,
+		rec.ProviderUUID,
+		req.Items,
+		resourceProfiles,
+		req.Items,
+		healthCheckServices,
+		restoreManifestPayload,
+		req.FromLeaseUUID,
+		rec.Generation+1,
+	)
+	if err != nil {
+		return err
+	}
+	if !proceed {
+		return nil
+	}
+	if intent == nil {
+		return errors.New("created restore operation intent returned no claim")
+	}
+	if err := b.checkOperationReleaseCapacity(*intent); err != nil {
+		return b.refuseOperationIntent(intent, fmt.Errorf(
+			"%w: reserve restore success release: %w",
+			backend.ErrInsufficientResources,
+			err,
+		))
+	}
 
 	// (b) Reserve the new-lease entry at Status=Provisioning. (7a permits
 	// evRestoreRequested from Provisioning.) Reject if already provisioned.
 	b.provisionsMu.Lock()
 	if _, exists := b.provisions[req.LeaseUUID]; exists {
 		b.provisionsMu.Unlock()
-		return fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID)
+		return b.refuseOperationIntent(intent,
+			fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID))
 	}
 	b.provisions[req.LeaseUUID] = recoveredProvision{ //exhaustruct:enforce
 		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
@@ -1222,7 +1745,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			ProviderUUID:         rec.ProviderUUID,
 			SKU:                  req.Items[0].SKU,
 			Status:               backend.ProvisionStatusProvisioning,
-			Quantity:             totalQuantity(req.Items),
+			Quantity:             restoreQuantity,
 			CreatedAt:            time.Now(),
 			FailCount:            0,
 			LastError:            "",
@@ -1231,10 +1754,12 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			CallbackURL:          req.CallbackURL,
 			LifecycleCallbackURL: req.LifecycleCallbackURL,
 			Items:                slices.Clone(req.Items),
+			ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 			ContainerIDs:         make([]string, 0),
 			StackManifest:        rec.StackManifest,
 			ServiceContainers:    nil,
 		},
+		resourceProfiles:      shared.CloneSKUResourceSnapshot(resourceProfiles),
 		volumeCleanupAttempts: 0,
 	}.materialize()
 	b.provisionsMu.Unlock()
@@ -1245,34 +1770,41 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// already-committed retained footprint — while CPU/mem/tenant are gated per
 	// instance. TryAllocateAdoptAll does the whole reservation under a single pool
 	// lock: the gate is EXACT (no per-volume double-count of the retained bytes
-	// still in the projection until ClaimForRestore), ATOMIC (no concurrent
+	// still in the projection until ClaimForRestoreWithAuthority), ATOMIC (no concurrent
 	// provision/restore can slip disk in between the check and the reservations),
 	// and CONSISTENT (the pool computes the new total from its own resolver, so it
 	// cannot under-gate against the reservation). A fitting multi-volume promote is
 	// admitted and the pool cannot be over-committed (ENG-545).
 	//
-	// We pass only the OLD retained footprint. The retained record can reference a
-	// SKU whose profile was later removed; leaseDiskMB counts that as 0, which
-	// undercounts oldDiskMB and makes the delta LARGER — strictly more conservative,
-	// never an over-admission. Warn for operator visibility, mirroring
-	// computeRetainedDiskMB.
-	oldDiskMB, oldUnresolved := b.leaseDiskMB(rec.Items)
+	// We pass only the OLD retained footprint. New records carry an immutable
+	// profile snapshot, so a later SKU removal/resize cannot reprice already-held
+	// bytes. Legacy records fall back to the current config; an unresolved legacy
+	// SKU contributes zero, making the promote delta larger (over-deny, never
+	// over-admit).
+	oldDiskMB, oldUnresolved, oldDiskErr := b.retentionEntryDiskMB(*rec)
+	if oldDiskErr != nil {
+		b.removeProvision(req.LeaseUUID)
+		return b.refuseOperationIntent(intent, fmt.Errorf(
+			"%w: retained resource footprint is invalid: %w", backend.ErrInvalidState, oldDiskErr,
+		))
+	}
 	if len(oldUnresolved) > 0 {
 		logger.Warn("restore disk gate: retained record references unresolved SKU profile(s); retained footprint undercounted, admission is more conservative",
 			"retained_unresolved_skus", oldUnresolved)
 	}
-	adoptInstances := make([]shared.AdoptInstance, 0, totalQuantity(req.Items))
+	adoptInstances := make([]shared.ResolvedAdoptInstance, 0, restoreQuantity)
 	for _, item := range req.Items {
 		for i := range item.Quantity {
-			adoptInstances = append(adoptInstances, shared.AdoptInstance{
-				ID:  fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i),
-				SKU: item.SKU,
+			adoptInstances = append(adoptInstances, shared.ResolvedAdoptInstance{
+				ID:        fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i),
+				Resources: resourcesBySKU[item.SKU],
 			})
 		}
 	}
-	if aerr := b.pool.TryAllocateAdoptAll(adoptInstances, rec.Tenant, oldDiskMB); aerr != nil {
+	if aerr := b.pool.TryAllocateAdoptAllResolved(adoptInstances, rec.Tenant, oldDiskMB); aerr != nil {
 		b.removeProvision(req.LeaseUUID)
-		return fmt.Errorf("%w: %w", backend.ErrInsufficientResources, aerr)
+		return b.refuseOperationIntent(intent,
+			fmt.Errorf("%w: %w", backend.ErrInsufficientResources, aerr))
 	}
 	allocatedIDs := make([]string, len(adoptInstances))
 	for i, in := range adoptInstances {
@@ -1285,18 +1817,28 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 
 	// (d) ATOMIC claim active->restoring (closes the prelude-vs-reaper race).
 	// Nothing renamed yet.
-	claimed, err := b.retentionStore.ClaimForRestore(req.FromLeaseUUID, req.LeaseUUID, b.cfg.RetentionMaxAge)
+	claimed, err := b.retentionStore.ClaimForRestoreWithAuthorityAt(
+		req.FromLeaseUUID,
+		req.LeaseUUID,
+		b.cfg.RetentionMaxAge,
+		req.Items,
+		resourceProfiles,
+		intent.OperationID(),
+		req.CallbackURL,
+		req.LifecycleCallbackURL,
+		intent.CreatedAt(),
+	)
 	if err != nil {
 		releaseAll(b.pool, allocatedIDs)
 		updateResourceMetrics(b.pool.Stats())
 		b.removeProvision(req.LeaseUUID)
 		switch {
 		case errors.Is(err, shared.ErrNoRetention):
-			return backend.ErrNotRetained
+			return b.refuseOperationIntent(intent, backend.ErrNotRetained)
 		case errors.Is(err, shared.ErrNotRestorable):
-			return fmt.Errorf("%w: %w", backend.ErrInvalidState, err)
+			return b.refuseOperationIntent(intent, fmt.Errorf("%w: %w", backend.ErrInvalidState, err))
 		default:
-			return fmt.Errorf("claim retention: %w", err)
+			return b.refuseOperationIntent(intent, fmt.Errorf("claim retention: %w", err))
 		}
 	}
 
@@ -1312,9 +1854,16 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// so it must be measured here, in the synchronous prelude, to rule the
 	// rename in/out as a contributor to restore latency.
 	adoptStart := time.Now()
-	if err := b.adoptRetainedVolumes(req.LeaseUUID, claimed); err != nil {
-		b.rollbackRestoreAdoption(ctx, req.LeaseUUID, allocatedIDs, claimed, true, logger)
-		return fmt.Errorf("adopt retained volumes: %w", err)
+	if err := b.adoptRetainedVolumes(ctx, req.LeaseUUID, claimed); err != nil {
+		return b.rollbackUnacceptedRestoreAdoption(
+			ctx,
+			req.LeaseUUID,
+			allocatedIDs,
+			claimed,
+			*intent,
+			fmt.Errorf("adopt retained volumes: %w", err),
+			logger,
+		)
 	}
 	replacePhaseDurationSeconds.WithLabelValues("restore", phaseAdopt).Observe(time.Since(adoptStart).Seconds())
 
@@ -1322,7 +1871,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// success/failure/panic.
 	opCtx, opCancel := b.shutdownAwareContext()
 	work := func() leasesm.ReplaceResult {
-		return b.doRestore(opCtx, req.LeaseUUID, claimed, req.Items, profiles, allocatedIDs, logger)
+		return b.doRestore(opCtx, req.LeaseUUID, claimed, req.Items, resourceProfiles, logger)
 	}
 	ack := make(chan error, 1)
 	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestoreRequestedMsg{
@@ -1335,19 +1884,26 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		opCancel()
 		// Worker never ran; no actor transition will flip Status — drop the
 		// reservation (dropProvision=true).
-		b.rollbackRestoreAdoption(ctx, req.LeaseUUID, allocatedIDs, claimed, true, logger)
-		return routeErr
+		return b.rollbackUnacceptedRestoreAdoption(
+			ctx, req.LeaseUUID, allocatedIDs, claimed, *intent, routeErr, logger,
+		)
 	}
-	if accepted, err := b.ackOrAbort(ctx, ack); !accepted {
+	acceptance, err := b.awaitAsyncAcceptance(ctx, ack)
+	switch acceptance {
+	case asyncAcceptanceAccepted:
+		return nil
+	case asyncAcceptanceUnknown:
+		return fmt.Errorf("restore acceptance is unknown; durable recovery retained: %s", err.Error())
+	case asyncAcceptanceRejected:
 		opCancel()
-		// ackOrAbort returned !accepted: the actor rejected the message (it never
-		// fired evRestoreRequested) OR we abandoned on cancellation without the
-		// actor committing — either way no terminal transition owns this
-		// provision, so drop the reservation (dropProvision=true).
-		b.rollbackRestoreAdoption(ctx, req.LeaseUUID, allocatedIDs, claimed, true, logger)
-		return err
+		// An explicit actor rejection proves it never fired evRestoreRequested,
+		// so no terminal transition owns the reservation.
+		return b.rollbackUnacceptedRestoreAdoption(
+			ctx, req.LeaseUUID, allocatedIDs, claimed, *intent, err, logger,
+		)
+	default:
+		return fmt.Errorf("invalid restore acceptance state %d", acceptance)
 	}
-	return nil
 }
 
 // doRestore is the restore worker (runs on the lease actor's replace-worker
@@ -1357,20 +1913,20 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 // Its terminal defer is the SOLE owner of the success/failure/panic outcome for
 // the retention record:
 //   - success (resultRet.Err==nil): delete the retained record (data adopted).
-//   - failure (resultRet.Err!=nil): roll back the adoption (re-quarantine the
-//     volumes, revert the record to active).
+//   - failure (resultRet.Err!=nil): physically roll back the adoption and leave
+//     the source Restoring until the actor durably records its Failed callback;
+//     the retention sweep then completes the source-authority handback.
 //   - panic: a panic leaves resultRet.Err==nil; force the failure path so we
 //     never delete the record while the lease is not Ready. Convert panic→Failed.
 //
-// In BOTH the failure and panic cases the rollback does NOT drop the provision
-// (dropProvision=false): doRestore returns an errored ReplaceResult, so the actor
-// will fire evReplaceFailed and onEnterFailedFromReplace flips Status=Failed and
-// emits the failure callback — which reads CallbackURL from the still-present
-// provision. The lease then settles as a Failed entry, exactly like a failed
-// restart/update. (Dropping it here would race that transition and silently lose
-// the callback; the periodic reaper / a subsequent op reconciles the entry.)
+// In BOTH failure cases the preparation does not drop the provision or live
+// allocation: doRestore returns an errored ReplaceResult, so the actor fires
+// evReplaceFailed, reads CallbackURL from that projection, and persists the
+// operation completion. The same Failed projection is fenced from maintenance
+// by the Restoring row until reconciliation settles any surviving intent and
+// hands capacity back make-before-break.
 func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.RetentionEntry,
-	newItems []backend.LeaseItem, profiles map[string]SKUProfile, allocatedIDs []string, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
+	newItems []backend.LeaseItem, resourceProfiles []shared.SKUResourceSnapshot, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
 	restoreStart := time.Now()
 	defer func() {
 		// N2: a panic leaves resultRet.Err==nil; force the failure path so we never
@@ -1381,7 +1937,7 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			// rollbackRestoreAdoption can't bypass the increment (the success branch
 			// likewise counts before its fallible Delete).
 			restoresTotal.WithLabelValues("failure").Inc()
-			b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
+			b.prepareAcceptedRestoreAdoptionRollback(ctx, leaseUUID, rec, logger)
 			// Mirror spawnReplaceWorker's own panic recovery (lease_actor.go) and the
 			// normal doReplace* failure shape: populate top-level CallbackErr AND
 			// Failure.{Operation,CallbackErr,LastError} so the actor's evReplaceFailed
@@ -1411,17 +1967,17 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 			// Record the new lease's active release, then finalize the restore. The
 			// restoring retention record is the adopted volume's finalizer, so it is
 			// dropped only once the release is durably recorded (ENG-523).
-			b.finalizeRestoredLease(leaseUUID, rec, logger)
+			b.finalizeRestoredLease(leaseUUID, rec, newItems, logger)
 			b.refreshRetentionAccounting()
 			return
 		}
 		// Count the outcome before the fallible rollback (see the panic branch).
 		restoresTotal.WithLabelValues("failure").Inc()
-		b.rollbackRestoreAdoption(ctx, leaseUUID, allocatedIDs, rec, false, logger)
+		b.prepareAcceptedRestoreAdoptionRollback(ctx, leaseUUID, rec, logger)
 	}()
 	return b.doReplaceContainers(ctx, replaceContainersOp{
-		LeaseUUID: leaseUUID, Stack: rec.StackManifest, Items: newItems, Profiles: profiles,
-		OldContainerIDs: nil, ServiceContainers: nil, Operation: "restore", NoComposeRollback: true, Logger: logger,
+		LeaseUUID: leaseUUID, Stack: rec.StackManifest, Items: newItems, ResourceProfiles: resourceProfiles,
+		Operation: "restore", NoComposeRollback: true, Logger: logger,
 		OnSuccess: func(p *leasesm.ProvisionState) { p.StackManifest = rec.StackManifest },
 	})
 }
@@ -1450,51 +2006,469 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 // a running lease down (Ready->Delete; every other live state defers), so a stale
 // restoring record can no longer re-quarantine a healthy lease's volumes — which is
 // what previously forced the unconditional Delete here. (ENG-433 / ENG-523)
-func (b *Backend) finalizeRestoredLease(leaseUUID string, rec *shared.RetentionEntry, logger *slog.Logger) {
-	releaseRecorded := false
-	if b.releaseStore != nil {
-		// Idempotent: reconcileRestoring re-invokes this as the retry path, so skip a
-		// duplicate Append when the release is already durable (e.g. doRestore's Append
-		// succeeded but its subsequent record Delete failed).
-		if existing, lerr := b.releaseStore.LatestActive(leaseUUID); lerr == nil && existing != nil {
-			releaseRecorded = true
-		} else if manifestBytes, marshalErr := json.Marshal(rec.StackManifest); marshalErr != nil {
-			logger.Warn("restore ok but failed to marshal manifest for release record", "lease_uuid", leaseUUID, "error", marshalErr)
-		} else if relErr := b.releaseStore.Append(leaseUUID, shared.Release{
-			Manifest:  manifestBytes,
-			Image:     "stack",
-			Status:    "active",
-			CreatedAt: time.Now(),
-		}); relErr != nil {
-			logger.Warn("restore ok but failed to record release history", "lease_uuid", leaseUUID, "error", relErr)
-		} else {
-			releaseRecorded = true
-		}
-	}
-	if !releaseRecorded {
+func (b *Backend) finalizeRestoredLease(
+	leaseUUID string,
+	rec *shared.RetentionEntry,
+	effectiveItems []backend.LeaseItem,
+	logger *slog.Logger,
+) {
+	if err := b.ensureRestoredReleaseStrict(leaseUUID, rec, effectiveItems); err != nil {
 		// Keep the finalizer: the adopted volume stays protected until a later
 		// reconcileRestoring sweep or an Update durably records the release and drops the
 		// record. Tradeoff while it lingers (only under a sustained release-store outage):
 		// the ORIGINAL lease UUID reports Retained (info.go maps restoring→retained) even
 		// though the restore is done, and a Restore-retry from the original is rejected
-		// (ClaimForRestore needs Active). Both self-heal once the store recovers and the
-		// record is dropped; restoreFinalizerPendingTotal makes the lingering state
-		// observable (a sustained rate = failing release store).
+		// (ClaimForRestoreWithAuthority needs Active). Both self-heal once the store recovers and the
+		// record is dropped; restoreFinalizerPendingTotal makes each initial kept-
+		// pending event observable. Reconciliation retries do not re-increment it.
 		restoreFinalizerPendingTotal.Inc()
-		logger.Warn("restore ok but release not durably recorded; keeping retention record as the adopted volume's finalizer (ENG-523)",
-			"lease_uuid", leaseUUID, "original_lease_uuid", rec.OriginalLeaseUUID)
-		return
-	}
-	if delErr := b.retentionStore.Delete(rec.OriginalLeaseUUID); delErr != nil {
-		logger.Warn("restore ok but failed to delete retention record", "error", delErr)
+		logger.Warn("restore ok but destination Release is not durable; keeping retention record as the adopted volume's finalizer (ENG-523)",
+			"lease_uuid", leaseUUID, "original_lease_uuid", rec.OriginalLeaseUUID, "error", err)
 	}
 }
 
-// rollbackRestoreAdoption is the idempotent compensating teardown for an adopted
-// restore. N1: compose.Down the new project FIRST (stop containers on the
-// bind-mounted volumes) BEFORE renaming volumes back — otherwise a still-running
-// container holds the volume's bind mount open. It then re-quarantines each
-// adopted volume to the retained namespace, and CAS-reverts the record to active.
+// finalizeRestoredLeaseStrict is the exact, idempotent commit used when a
+// caller must know whether ownership transferred before it may continue (for
+// example, close admission). nil means both the destination release and source
+// finalizer deletion are durable. Any error leaves the source record in place,
+// so callers can fail closed without guessing which lease owns the bytes.
+func (b *Backend) finalizeRestoredLeaseStrict(
+	leaseUUID string,
+	rec *shared.RetentionEntry,
+	effectiveItems []backend.LeaseItem,
+) error {
+	if err := b.ensureRestoredReleaseStrict(leaseUUID, rec, effectiveItems); err != nil {
+		return err
+	}
+	return b.deleteRestoreFinalizerStrict(leaseUUID, rec)
+}
+
+// ensureRestoredReleaseStrict durably commits destination ownership without
+// consuming the source finalizer. Callback settlement paths use this first,
+// settle the exact operation second, and only then delete the finalizer; every
+// crash boundary therefore leaves a level-triggered retry owner.
+func (b *Backend) ensureRestoredReleaseStrict(
+	leaseUUID string,
+	rec *shared.RetentionEntry,
+	effectiveItems []backend.LeaseItem,
+) error {
+	if rec == nil {
+		return fmt.Errorf("restore source finalizer is required")
+	}
+	if leaseUUID == "" || rec.OriginalLeaseUUID == "" {
+		return fmt.Errorf("restore source and destination lease UUIDs are required")
+	}
+	if rec.Status != shared.RetentionStatusRestoring || rec.NewLeaseUUID != leaseUUID {
+		return fmt.Errorf(
+			"restore source finalizer does not own destination %q (status=%q new_lease_uuid=%q)",
+			leaseUUID, rec.Status, rec.NewLeaseUUID,
+		)
+	}
+	if rec.OriginalLeaseUUID == leaseUUID {
+		return fmt.Errorf("restore source and destination lease UUIDs must differ")
+	}
+	if rec.Generation <= 0 {
+		return fmt.Errorf("restore source finalizer generation must be positive")
+	}
+	if rec.StackManifest == nil {
+		return fmt.Errorf("restored manifest is required")
+	}
+	if _, err := backend.ValidateOperationQuantities(rec.Items); err != nil {
+		return fmt.Errorf("validate restore source items: %w", err)
+	}
+	if _, err := backend.ValidateOperationQuantities(effectiveItems); err != nil {
+		return fmt.Errorf("validate restored effective items: %w", err)
+	}
+	if len(rec.DestinationItems) > 0 || len(rec.DestinationResourceProfiles) > 0 {
+		if _, err := backend.ValidateOperationQuantities(rec.DestinationItems); err != nil {
+			return fmt.Errorf("validate restore destination authority items: %w", err)
+		}
+		if err := itemsShapeMatch(rec.Items, rec.DestinationItems); err != nil {
+			return fmt.Errorf("validate restored item shape: %w", err)
+		}
+		if err := validateDockerResourceProfiles(
+			rec.DestinationItems,
+			rec.DestinationResourceProfiles,
+		); err != nil {
+			return fmt.Errorf("validate restore destination authority resource profiles: %w", err)
+		}
+		if err := manifest.ValidateStackAgainstItems(rec.StackManifest, rec.DestinationItems); err != nil {
+			return fmt.Errorf("validate restored manifest topology: %w", err)
+		}
+	}
+	if b.releaseStore == nil {
+		return fmt.Errorf("release store is required")
+	}
+	if b.retentionStore == nil {
+		return fmt.Errorf("retention store is required")
+	}
+	b.provisionsMu.RLock()
+	provision, exists := b.provisions[leaseUUID]
+	if !exists || !slices.Equal(provision.Items, effectiveItems) {
+		b.provisionsMu.RUnlock()
+		return fmt.Errorf("restored live provision does not match finalizer items")
+	}
+	if provision.Tenant != rec.Tenant || provision.ProviderUUID != rec.ProviderUUID {
+		b.provisionsMu.RUnlock()
+		return fmt.Errorf(
+			"restored live provision identity does not match finalizer tenant/provider",
+		)
+	}
+	if provision.StackManifest == nil {
+		b.provisionsMu.RUnlock()
+		return fmt.Errorf("restored live provision manifest is required")
+	}
+	liveItems := slices.Clone(provision.Items)
+	liveManifestBytes, marshalLiveErr := json.Marshal(provision.StackManifest)
+	liveManifest := provision.StackManifest
+	liveResourceProfiles := shared.CloneSKUResourceSnapshot(provision.ResourceProfiles)
+	b.provisionsMu.RUnlock()
+	if marshalLiveErr != nil {
+		return fmt.Errorf("marshal restored live provision manifest: %w", marshalLiveErr)
+	}
+	if err := itemsShapeMatch(rec.Items, liveItems); err != nil {
+		return fmt.Errorf("validate restored live item shape: %w", err)
+	}
+	if err := manifest.ValidateStackAgainstItems(liveManifest, liveItems); err != nil {
+		return fmt.Errorf("validate restored live manifest topology: %w", err)
+	}
+	if err := validateDockerResourceProfiles(liveItems, liveResourceProfiles); err != nil {
+		return fmt.Errorf("validate restored resource profiles: %w", err)
+	}
+
+	// A newer successful maintenance operation may already have durably published
+	// the live generation while this restore finalizer lingered. That exact active
+	// Release is sufficient ownership authority. Otherwise append only from the
+	// destination snapshot atomically bound into the source retention claim —
+	// never from live state or mutable SKU configuration. This is the crash-safe
+	// bridge when the restore succeeded, its first Release append failed, and the
+	// operation intent has already been consumed.
+	existing, err := b.releaseStore.LatestActive(leaseUUID)
+	if err != nil {
+		return fmt.Errorf("read restored active release: %w", err)
+	}
+	existingOwnsLive := existing != nil &&
+		existing.OperationID == rec.DestinationOperationID &&
+		bytes.Equal(existing.Manifest, liveManifestBytes) &&
+		slices.Equal(existing.Items, liveItems) &&
+		slices.Equal(existing.ResourceProfiles, liveResourceProfiles) &&
+		((rec.DestinationOperationID == "" && existing.RuntimeAuthority == nil) ||
+			(rec.DestinationOperationID.Valid() && existing.RuntimeAuthority != nil &&
+				existing.OperationID == rec.DestinationOperationID &&
+				releaseRuntimeAuthorityMatchesRetention(existing.RuntimeAuthority, *rec)))
+	if !existingOwnsLive {
+		authorityItems := slices.Clone(rec.DestinationItems)
+		authorityProfiles := shared.CloneSKUResourceSnapshot(rec.DestinationResourceProfiles)
+		if len(authorityItems) == 0 || len(authorityProfiles) == 0 {
+			return fmt.Errorf("restore source finalizer has no exact destination authority and no active release owns the live generation")
+		}
+		if _, err := backend.ValidateOperationQuantities(authorityItems); err != nil {
+			return fmt.Errorf("validate restore destination authority items: %w", err)
+		}
+		if err := itemsShapeMatch(rec.Items, authorityItems); err != nil {
+			return fmt.Errorf("validate restore destination authority shape: %w", err)
+		}
+		if err := validateDockerResourceProfiles(authorityItems, authorityProfiles); err != nil {
+			return fmt.Errorf("validate restore destination authority resource profiles: %w", err)
+		}
+		if err := manifest.ValidateStackAgainstItems(rec.StackManifest, authorityItems); err != nil {
+			return fmt.Errorf("validate restore destination authority manifest topology: %w", err)
+		}
+		authorityManifestBytes, marshalErr := json.Marshal(rec.StackManifest)
+		if marshalErr != nil {
+			return fmt.Errorf("marshal restore destination authority manifest: %w", marshalErr)
+		}
+		if !slices.Equal(effectiveItems, authorityItems) || !slices.Equal(liveItems, authorityItems) {
+			return fmt.Errorf("restored live provision items do not match durable destination authority")
+		}
+		if !slices.Equal(liveResourceProfiles, authorityProfiles) {
+			return fmt.Errorf("restored live provision resource profiles do not match durable destination authority")
+		}
+		if !bytes.Equal(liveManifestBytes, authorityManifestBytes) {
+			return fmt.Errorf("restored live provision manifest does not match durable destination authority")
+		}
+		runtimeAuthority, authorityErr := releaseRuntimeAuthorityForOperation(
+			rec.DestinationOperationID,
+			rec.Tenant,
+			rec.ProviderUUID,
+			rec.DestinationCallbackURL,
+			rec.DestinationLifecycleCallbackURL,
+		)
+		if authorityErr != nil {
+			return fmt.Errorf("construct restore destination runtime authority: %w", authorityErr)
+		}
+		if err := b.releaseStore.AppendActive(leaseUUID, shared.Release{
+			Manifest:         authorityManifestBytes,
+			Image:            "stack",
+			OperationID:      rec.DestinationOperationID,
+			Items:            authorityItems,
+			ResourceProfiles: authorityProfiles,
+			RuntimeAuthority: runtimeAuthority,
+			Status:           "active",
+			CreatedAt:        rec.RestoringSince,
+		}); err != nil {
+			return fmt.Errorf("record restored active release: %w", err)
+		}
+	}
+	return nil
+}
+
+func (b *Backend) deleteRestoreFinalizerStrict(
+	leaseUUID string,
+	rec *shared.RetentionEntry,
+) error {
+	if rec == nil {
+		return fmt.Errorf("restore source finalizer is required")
+	}
+	deleted, err := b.retentionStore.DeleteIfRestoring(
+		rec.OriginalLeaseUUID,
+		leaseUUID,
+		rec.Generation,
+	)
+	if err != nil {
+		return fmt.Errorf("delete restore source finalizer: %w", err)
+	}
+	if !deleted {
+		// Another idempotent finalizer may have won after the exact active
+		// release became durable. Absence is therefore success; any surviving
+		// record is a changed authority that this stale snapshot must not consume.
+		current, readErr := b.retentionStore.Get(rec.OriginalLeaseUUID)
+		if readErr != nil {
+			return fmt.Errorf("verify restore source finalizer after lost delete authority: %w", readErr)
+		}
+		if current != nil {
+			return fmt.Errorf(
+				"restore source finalizer changed before delete (status=%q new_lease_uuid=%q generation=%d)",
+				current.Status, current.NewLeaseUUID, current.Generation,
+			)
+		}
+	}
+	return nil
+}
+
+type retainedQuotaTarget struct {
+	name   string
+	diskMB int64
+}
+
+// restoreRetainedVolumeQuotas restores the exact pre-restore quota on every
+// adopted volume after it has been re-quarantined and before the source
+// retention record becomes Active again.
+//
+// A promote restore raises the physical quota through volumeManager.Create.
+// Merely renaming the volume back does not undo that change on btrfs, XFS, or
+// ZFS. RevertToActiveWithResourceProfiles would then publish the smaller immutable source footprint
+// while the filesystem still permits growth to the larger destination cap.
+// This helper closes that under-accounting window by requiring three proofs:
+// the durable snapshot maps every retained volume to one exact old cap, current
+// usage fits that cap, and the volume manager successfully reapplies it. The
+// caller must leave the record Restoring and its live allocation counted on any
+// error.
+func (b *Backend) restoreRetainedVolumeQuotas(
+	ctx context.Context,
+	rec *shared.RetentionEntry,
+) ([]shared.SKUResourceSnapshot, error) {
+	if rec == nil {
+		return nil, errors.New("restore source retention record is required")
+	}
+	if _, err := backend.ValidateOperationQuantities(rec.Items); err != nil {
+		return nil, fmt.Errorf("validate restore source quantities: %w", err)
+	}
+
+	// New records already carry immutable authority. For a pre-snapshot row,
+	// resolve the currently configured source SKUs once and return that canonical
+	// snapshot to the caller. The caller applies these exact caps and commits this
+	// same value in its generation CAS; a crash before the CAS leaves Restoring
+	// and live-counted, while a successful CAS makes physical and durable truth
+	// observable atomically. An unavailable legacy SKU fails closed.
+	resourceProfiles := shared.CloneSKUResourceSnapshot(rec.ResourceProfiles)
+	if len(resourceProfiles) == 0 {
+		var err error
+		resourceProfiles, err = b.resolveResourceProfiles(rec.Items)
+		if err != nil {
+			return nil, fmt.Errorf("resolve legacy restore source resource profiles: %w", err)
+		}
+	}
+	if err := validateDockerResourceProfiles(rec.Items, resourceProfiles); err != nil {
+		return nil, fmt.Errorf("validate restore source resource profiles: %w", err)
+	}
+	if len(rec.RetainedVolumeNames) == 0 {
+		return resourceProfiles, nil
+	}
+
+	// RetainedVolumeNames is authoritative for which stateful instances actually
+	// survived close. Derive the allowed names from Items only to bind each of
+	// those names to its immutable SKU profile; never invent volumes for stateless
+	// instances or writable-path-only reclamation gaps.
+	unmatched := make(map[string]struct{}, len(rec.RetainedVolumeNames))
+	for _, name := range rec.RetainedVolumeNames {
+		if name == "" {
+			return nil, errors.New("restore source contains an empty retained volume name")
+		}
+		if _, duplicate := unmatched[name]; duplicate {
+			return nil, fmt.Errorf("restore source contains duplicate retained volume %q", name)
+		}
+		unmatched[name] = struct{}{}
+	}
+
+	targets := make([]retainedQuotaTarget, 0, len(unmatched))
+	for _, item := range rec.Items {
+		resources, ok := shared.LookupSKUResourceSnapshotRow(resourceProfiles, item.SKU)
+		if !ok {
+			// Validation proved exact coverage. Keep this guard adjacent to the
+			// authority-consuming code so a future validator change fails closed.
+			return nil, fmt.Errorf("restore source resource profiles omit SKU %q", item.SKU)
+		}
+		for i := range item.Quantity {
+			name := retainedName(canonicalVolumeName(rec.OriginalLeaseUUID, item.ServiceName, i))
+			if _, retained := unmatched[name]; !retained {
+				continue
+			}
+			diskMB, diskErr := resources.EffectiveDiskMB()
+			if diskErr != nil {
+				return nil, fmt.Errorf("retained volume %q has invalid resource authority: %w", name, diskErr)
+			}
+			if diskMB <= 0 {
+				return nil, fmt.Errorf("retained volume %q maps to SKU %q with no durable or scratch disk authority",
+					name, item.SKU)
+			}
+			if diskMB > math.MaxInt64/bytesPerMiB {
+				return nil, fmt.Errorf("retained volume %q old disk_mb cap overflows byte accounting", name)
+			}
+			targets = append(targets, retainedQuotaTarget{name: name, diskMB: diskMB})
+			delete(unmatched, name)
+		}
+	}
+	if len(unmatched) > 0 {
+		names := make([]string, 0, len(unmatched))
+		for name := range unmatched {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		return nil, fmt.Errorf("restore source retained volumes do not match its immutable item topology: %v", names)
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].name < targets[j].name })
+
+	// Measure the complete set before changing any quota. The volumes are frozen:
+	// teardown completed before re-quarantine, so no tenant writer can race this
+	// fit proof. A partial EnsureQuota failure is still safe and retryable, but
+	// avoiding avoidable partial updates makes operator recovery clearer.
+	for _, target := range targets {
+		usage, err := b.volumes.Usage(ctx, target.name)
+		if err != nil {
+			b.logger.Warn("restore rollback cannot verify retained volume usage",
+				"lease_uuid", rec.OriginalLeaseUUID,
+				"volume", target.name,
+				"volume_backend", b.volumes.Kind(),
+				"error", err,
+			)
+			return nil, fmt.Errorf("cannot verify usage for retained volume %q", target.name)
+		}
+		capBytes := target.diskMB * bytesPerMiB
+		if usage < 0 {
+			return nil, fmt.Errorf("retained volume %q reported invalid negative usage", target.name)
+		}
+		if usage > capBytes {
+			b.logger.Error("restore rollback data exceeds immutable source quota",
+				"lease_uuid", rec.OriginalLeaseUUID,
+				"volume", target.name,
+				"used_bytes", usage,
+				"source_disk_mb", target.diskMB,
+				"source_cap_bytes", capBytes,
+			)
+			return nil, fmt.Errorf("retained volume %q usage exceeds its immutable source quota", target.name)
+		}
+	}
+
+	for _, target := range targets {
+		if err := b.mutationAdapter().ensureVolumeQuota(ctx, target.name, target.diskMB); err != nil {
+			b.logger.Error("restore rollback cannot apply immutable source quota",
+				"lease_uuid", rec.OriginalLeaseUUID,
+				"volume", target.name,
+				"volume_backend", b.volumes.Kind(),
+				"source_disk_mb", target.diskMB,
+				"error", err,
+			)
+			return nil, fmt.Errorf("cannot restore immutable source quota for retained volume %q", target.name)
+		}
+	}
+	return resourceProfiles, nil
+}
+
+// revertRestoreSourceWithAccounting is the make-before-break commit from a
+// destination live reservation back to retained source ownership. It
+// pessimistically adds the exact source footprint to the pool before the store
+// CAS, while serialized with every projection refresh. Once the CAS succeeds,
+// a failed full refresh is harmless: the conservative pre-addition already
+// covers these bytes, so the destination allocations can be released and any
+// later refresh/restart converges to the durable Active row.
+func (b *Backend) revertRestoreSourceWithAccounting(
+	rec *shared.RetentionEntry,
+	newLeaseUUID string,
+	resourceProfiles []shared.SKUResourceSnapshot,
+	allocatedIDs []string,
+) (bool, error) {
+	if rec == nil {
+		return false, errors.New("restore source retention record is required")
+	}
+	exact := *rec
+	exact.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
+	handoffMB, unresolved, err := b.retentionEntryDiskMB(exact)
+	if err != nil {
+		return false, fmt.Errorf("size restore rollback accounting handoff: %w", err)
+	}
+	if len(unresolved) > 0 {
+		return false, fmt.Errorf("restore rollback accounting has unresolved SKUs: %v", unresolved)
+	}
+
+	b.retentionAccountingMu.Lock()
+	defer b.retentionAccountingMu.Unlock()
+	previousRetainedMB := b.pool.Stats().RetainedDiskMB
+	conservativeRetainedMB, err := addLeaseDiskMB(previousRetainedMB, handoffMB, 1)
+	if err != nil {
+		return false, fmt.Errorf("reserve restore rollback retained accounting: %w", err)
+	}
+	if err := b.pool.SetRetainedDisk(conservativeRetainedMB); err != nil {
+		return false, fmt.Errorf("reserve restore rollback retained accounting: %w", err)
+	}
+
+	ok, commitErr := b.retentionStore.RevertToActiveWithResourceProfiles(
+		rec.OriginalLeaseUUID, newLeaseUUID, rec.Generation, resourceProfiles,
+	)
+	if commitErr != nil || !ok {
+		// The durable owner did not change, so undo only our conservative add.
+		// No projection writer can interleave while retentionAccountingMu is held.
+		if rollbackErr := b.pool.SetRetainedDisk(previousRetainedMB); rollbackErr != nil {
+			commitErr = errors.Join(commitErr, fmt.Errorf(
+				"restore prior retained accounting after failed ownership CAS: %w", rollbackErr,
+			))
+		}
+		return ok, commitErr
+	}
+
+	if refreshErr := b.refreshRetentionAccountingCheckedLocked(); refreshErr != nil {
+		b.logger.Warn("restore rollback retained projection refresh failed; conservative direct handoff remains counted",
+			"lease_uuid", rec.OriginalLeaseUUID,
+			"new_lease_uuid", newLeaseUUID,
+			"retained_disk_mb", conservativeRetainedMB,
+			"error", refreshErr,
+		)
+	}
+	// The durable Active row and either the checked projection or the conservative
+	// pre-addition now count the source bytes. Releasing live allocations cannot
+	// create an under-count, even when the store became unreadable after its CAS.
+	releaseAll(b.pool, allocatedIDs)
+	updateResourceMetrics(b.pool.Stats())
+	return true, nil
+}
+
+// prepareRestoreAdoptionRollback is the physical half of the idempotent
+// compensation for an adopted restore. N1: compose.Down the new project FIRST
+// (stop containers on the bind-mounted volumes) BEFORE renaming volumes back —
+// otherwise a still-running container holds the volume's bind mount open. It
+// then re-quarantines each adopted volume and proves/reapplies the source quota.
+// It never changes durable source ownership or releases the live allocation;
+// the accepted and unaccepted wrappers choose the correct settlement owner.
 //
 // dropProvision controls the new-lease reservation:
 //   - true  (synchronous paths: adopt failure, route failure, ack abort): no
@@ -1507,20 +2481,18 @@ func (b *Backend) finalizeRestoredLease(leaseUUID string, rec *shared.RetentionE
 // A REAL re-quarantine rename failure (not a benign no-op) means an adopted
 // volume may still be canonical-named under the new lease, so the on-disk state
 // no longer matches the record. Mirroring reconcileRestoring, we then LEAVE the
-// record restoring (do NOT RevertToActive, do NOT removeProvision) and return:
+// record restoring (do NOT RevertToActiveWithResourceProfiles, do NOT removeProvision) and return:
 // the next reconcile sweep retries the re-quarantine safely, and meanwhile the
 // provision's expected-set entry (cleanupOrphanedVolumes' restoring arm) protects
 // the canonical volume from the orphan reaper. Reverting here would make that
 // still-live data eligible for cleanup/reaping.
 //
-// Make-before-break (ENG-376 site 4): when RevertToActive returns a STORE ERROR
-// the revert did NOT commit. The live allocation is KEPT counted (no releaseAll)
-// so the footprint is never under-counted. reconcileRestoring's orphaned arm will
-// resume the revert (via removeProvision when dropProvision=true) and release the
-// same liveIDs. For the !ok (generation changed) and success arms the prior
-// release behavior is preserved.
-func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
-	allocatedIDs []string, rec *shared.RetentionEntry, dropProvision bool, logger *slog.Logger) {
+// Make-before-break (ENG-376 site 4): every failure leaves the live allocation
+// counted. reconcileRestoring's orphaned arm resumes preparation and performs
+// the exact retained-accounting handoff only after journal settlement succeeds.
+func (b *Backend) prepareRestoreAdoptionRollback(ctx context.Context, leaseUUID string,
+	rec *shared.RetentionEntry, dropProvision bool, logger *slog.Logger,
+) ([]shared.SKUResourceSnapshot, bool) {
 	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
 	b.provisionsMu.RLock()
 	var recordedIDs []string
@@ -1557,12 +2529,12 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 		// way that lease ever becomes clean again.
 		logger.Warn("restore rollback: teardown failed; leaving record restoring for the reconcile sweep",
 			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID, "error", derr)
-		return
+		return nil, false
 	}
 	failed := false
 	for _, retained := range rec.RetainedVolumeNames {
 		newCanonical := retainedToNewCanonical(retained, rec.OriginalLeaseUUID, leaseUUID)
-		if rerr := b.renameIfPresent(newCanonical, retained); rerr != nil {
+		if rerr := b.renameIfPresent(ctx, newCanonical, retained); rerr != nil {
 			failed = true
 		}
 	}
@@ -1575,16 +2547,52 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 		// allocation is reclaimed when it is deprovisioned / on recover.
 		logger.Warn("restore rollback: re-quarantine rename failed; leaving record restoring + live counted for reconcile sweep",
 			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID)
-		return
+		if dropProvision {
+			// The actor rejected (or was never reached), so Provisioning has no
+			// legitimate writer left. Remove this Backend-owned reservation marker;
+			// the restoring record protects both canonical and retained names, and
+			// its exact destination authority lets recovery preserve accounting.
+			b.removeProvision(leaseUUID)
+		}
+		return nil, false
 	}
-	// Re-quarantine succeeded. Make-before-break: only release the live allocation
-	// AFTER the destination owner (the active record) durably commits. A store ERROR
-	// means the revert did NOT commit, so we KEEP live counted (F stays counted as
-	// live — no under-count) and let reconcileRestoring resume the revert and release
-	// the same liveIDs. We still removeProvision for dropProvision=true so reconcile's
-	// orphaned arm (live=false) runs — a lingering Provisioning provision would make
-	// reconcileRestoring defer forever.
-	ok, rerr := b.retentionStore.RevertToActive(rec.OriginalLeaseUUID, rec.Generation)
+	resourceProfiles, quotaErr := b.restoreRetainedVolumeQuotas(ctx, rec)
+	if quotaErr != nil {
+		// The names are safely back in the retained namespace, but publishing the
+		// source record would under-account a promoted quota. Preserve the live
+		// reservation. A synchronous prelude has no actor transition coming, so
+		// remove only its in-memory Provisioning guard to let the periodic restoring
+		// reconciler retry this exact quota proof; the pool allocation remains held
+		// until that retry durably reactivates the source.
+		logger.Error("restore rollback: unable to restore source volume quotas; leaving record restoring + live counted",
+			"lease_uuid", rec.OriginalLeaseUUID,
+			"new_lease_uuid", leaseUUID,
+			"error", quotaErr,
+		)
+		if dropProvision {
+			b.removeProvision(leaseUUID)
+		}
+		return nil, false
+	}
+	return resourceProfiles, true
+}
+
+// completeRestoreAdoptionRollback performs the make-before-break ownership
+// handback after prepareRestoreAdoptionRollback proved that no destination
+// container or promoted quota remains. Callers that own a pre-actor restore
+// must durably settle its failed operation before entering this function.
+func (b *Backend) completeRestoreAdoptionRollback(
+	leaseUUID string,
+	allocatedIDs []string,
+	rec *shared.RetentionEntry,
+	resourceProfiles []shared.SKUResourceSnapshot,
+	dropProvision bool,
+	logger *slog.Logger,
+) bool {
+	// Re-quarantine succeeded. The helper pre-counts the exact retained footprint,
+	// commits source authority, and only then releases live allocations while
+	// serialized with projection refreshes.
+	ok, rerr := b.revertRestoreSourceWithAccounting(rec, leaseUUID, resourceProfiles, allocatedIDs)
 	if rerr != nil {
 		retentionLeakedTotal.Inc()
 		logger.Error("restore rollback: revert record failed; keeping live allocation counted until reconcile resumes the revert",
@@ -1592,18 +2600,79 @@ func (b *Backend) rollbackRestoreAdoption(ctx context.Context, leaseUUID string,
 		if dropProvision {
 			b.removeProvision(leaseUUID)
 		}
-		return
+		return false
 	}
 	if !ok {
-		// Generation changed: the record was reverted/re-claimed elsewhere (now active
-		// or owned by a new restore). It is counted there, so RELEASE live to avoid a
-		// 2F double-count — matching the prior behavior for this benign case.
-		logger.Warn("restore rollback: record generation changed; reaper will reconcile", "lease_uuid", rec.OriginalLeaseUUID)
+		// Lost authority is not proof that the replacement owner is already reflected
+		// in the pool. Keep the live term rather than risk an under-count; recovery
+		// rebuilds it from current durable ownership.
+		logger.Warn("restore rollback: record generation changed; preserving live accounting for recovery",
+			"lease_uuid", rec.OriginalLeaseUUID)
+		if dropProvision {
+			b.removeProvision(leaseUUID)
+		}
+		return false
 	}
-	b.refreshRetentionAccounting() // retained += F (record now active, if ok)
-	releaseAll(b.pool, allocatedIDs)
-	updateResourceMetrics(b.pool.Stats())
 	if dropProvision {
 		b.removeProvision(leaseUUID)
 	}
+	return true
+}
+
+// prepareAcceptedRestoreAdoptionRollback performs physical and quota rollback
+// for a restore whose worker crossed the actor acceptance boundary. It
+// deliberately does not hand the source back to Active or release the live
+// allocation: the actor has not yet durably settled its Failed callback. Its
+// Failed transition leaves the provision projection in place, after which the
+// level-triggered retention sweep settles any surviving intent and performs the
+// exact make-before-break handback. This keeps the Restoring row as retry
+// authority if callback persistence fails.
+func (b *Backend) prepareAcceptedRestoreAdoptionRollback(
+	ctx context.Context,
+	leaseUUID string,
+	rec *shared.RetentionEntry,
+	logger *slog.Logger,
+) {
+	_, _ = b.prepareRestoreAdoptionRollback(
+		ctx, leaseUUID, rec, false, logger,
+	)
+}
+
+// rollbackUnacceptedRestoreAdoption compensates a synchronous Restore failure
+// for which no actor worker can publish Ready. It intentionally settles the
+// exact failed operation after physical/quota cleanup but before the source
+// handback CAS. If settlement fails, the Restoring record and live allocation
+// remain a level-triggered retry owner; only the dead Provisioning projection is
+// removed so the periodic reconciler can enter its orphaned rollback arm.
+func (b *Backend) rollbackUnacceptedRestoreAdoption(
+	ctx context.Context,
+	leaseUUID string,
+	allocatedIDs []string,
+	rec *shared.RetentionEntry,
+	intent shared.OperationIntentClaim,
+	cause error,
+	logger *slog.Logger,
+) error {
+	if cause == nil {
+		return errors.New("unaccepted restore rollback requires a failure cause")
+	}
+	if intent.Kind() != shared.OperationIntentRestore {
+		return fmt.Errorf("unaccepted restore rollback received %s intent", intent.Kind())
+	}
+	resourceProfiles, prepared := b.prepareRestoreAdoptionRollback(
+		ctx, leaseUUID, rec, true, logger,
+	)
+	if !prepared {
+		return fmt.Errorf("restore failed; durable source cleanup remains pending: %w", cause)
+	}
+	if err := b.settleUnacceptedRestoreIntent(intent); err != nil {
+		b.removeProvision(leaseUUID)
+		return fmt.Errorf("restore failed; durable operation settlement remains pending: %s: %w", cause.Error(), err)
+	}
+	if !b.completeRestoreAdoptionRollback(
+		leaseUUID, allocatedIDs, rec, resourceProfiles, true, logger,
+	) {
+		return fmt.Errorf("restore failed; durable source handback remains pending: %w", cause)
+	}
+	return cause
 }

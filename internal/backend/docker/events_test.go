@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,7 +21,7 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 
 	var callbackPayload backend.CallbackPayload
 	var callbackReceived atomic.Bool
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&callbackPayload)
 		callbackReceived.Store(true)
 		w.WriteHeader(http.StatusOK)

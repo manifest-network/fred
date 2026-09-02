@@ -33,6 +33,7 @@ import (
 	"github.com/docker/go-connections/nat"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -48,6 +49,7 @@ const (
 	LabelFailCount            = "fred.fail_count"
 	LabelCallbackURL          = "fred.callback_url"
 	LabelLifecycleCallbackURL = "fred.lifecycle_callback_url"
+	LabelMaintenanceID        = "fred.maintenance_id"
 	LabelBackendName          = "fred.backend_name"
 	LabelServiceName          = "fred.service_name"
 	LabelFQDN                 = "fred.fqdn"
@@ -57,6 +59,7 @@ const (
 // DaemonSecurityInfo contains Docker daemon capabilities relevant to
 // container hardening validation.
 type DaemonSecurityInfo struct {
+	SystemID          string
 	StorageDriver     string
 	BackingFilesystem string
 	SecurityOptions   []string
@@ -70,12 +73,14 @@ type ContainerInfo struct {
 	LeaseUUID            string
 	Tenant               string
 	ProviderUUID         string
+	BackendName          string
 	SKU                  string
 	ServiceName          string // Stack service name (empty for single-container leases)
 	InstanceIndex        int
 	FailCount            int
 	CallbackURL          string
 	LifecycleCallbackURL string
+	MaintenanceID        shared.MaintenanceID
 	Image                string
 	Status               string
 	Health               HealthStatus // Health check status (HealthStatusHealthy, HealthStatusUnhealthy, HealthStatusStarting, or HealthStatusNone)
@@ -173,6 +178,7 @@ func (d *DockerClient) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, erro
 	}
 
 	return DaemonSecurityInfo{
+		SystemID:          info.ID,
 		StorageDriver:     info.Driver,
 		BackingFilesystem: backingFS,
 		SecurityOptions:   info.SecurityOptions,
@@ -308,11 +314,10 @@ func (d *DockerClient) readFileFromImage(ctx context.Context, imageName, path st
 		return nil, fmt.Errorf("failed to create temp container: %w", err)
 	}
 	defer func() {
-		// Use a fresh timeout, not the caller ctx: if the caller's ctx is
-		// canceled/timed-out by the time this runs, the removal would no-op and
-		// leak the temp container + its anonymous volume — the exact failure this
-		// reap targets. Matches the other image-introspection helpers (ENG-372).
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Keep cleanup under the authorized mutation lifetime. A canceled backend
+		// must never issue a late removal against a replacement daemon; startup
+		// recovery reaps a temp container left by an operation timeout (ENG-372).
+		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true})
 	}()
@@ -337,7 +342,7 @@ func (d *DockerClient) DetectVolumeOwner(ctx context.Context, imageName string, 
 		return 0, 0, fmt.Errorf("failed to create temp container for volume owner detection: %w", err)
 	}
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
 	}()
@@ -409,7 +414,7 @@ func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName string
 		return nil, fmt.Errorf("failed to create temp container for writable path detection: %w", err)
 	}
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
 	}()
@@ -479,6 +484,13 @@ func (d *DockerClient) DetectWritablePaths(ctx context.Context, imageName string
 // MkdirAll outside destDir (os.Root refuses to traverse a symlinked component that
 // escapes the root). See ENG-543.
 func writablePathExtractDir(destDir, sanitized string) (string, error) {
+	return writablePathExtractDirContext(context.Background(), destDir, sanitized)
+}
+
+func writablePathExtractDirContext(ctx context.Context, destDir, sanitized string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return "", err
 	}
@@ -523,7 +535,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 		return failures
 	}
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		_ = d.client.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{RemoveVolumes: true}) // reap image VOLUME anon volumes (ENG-372)
 	}()
@@ -547,7 +559,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 		// "neo4j/conf/neo4j.conf". Extract to destDir/var/lib/ so content
 		// ends up at destDir/var/lib/neo4j/conf/neo4j.conf.
 		sanitized := sanitizeVolumePath(path)
-		extractDir, mkErr := writablePathExtractDir(destDir, sanitized)
+		extractDir, mkErr := writablePathExtractDirContext(ctx, destDir, sanitized)
 		if mkErr != nil {
 			_ = rc.Close()
 			if failures == nil {
@@ -562,7 +574,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 		// volume-wide inode gate is the caller's XFS ihard quota. On a filesystem without
 		// an inode quota (btrfs/zfs) this backstop therefore bounds entries at
 		// maxDetectedWritablePaths x maxEntries, not maxEntries alone. See ENG-548.
-		written, skippedSymlinks, extractErr := sanitizeAndExtractTar(rc, extractDir, remainingBytes, maxEntries)
+		written, skippedSymlinks, extractErr := sanitizeAndExtractTarContext(ctx, rc, extractDir, remainingBytes, maxEntries)
 		_ = rc.Close()
 		if extractErr != nil {
 			if failures == nil {
@@ -603,6 +615,13 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName string
 // descriptions of such out-of-scope symlinks (e.g., "name -> target") for
 // caller-side debug logging. See ENG-430.
 func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries int64) (int64, []string, error) {
+	return sanitizeAndExtractTarContext(context.Background(), src, destDir, maxBytes, maxEntries)
+}
+
+func sanitizeAndExtractTarContext(ctx context.Context, src io.Reader, destDir string, maxBytes, maxEntries int64) (int64, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
 	// destDir must already exist — the caller (ExtractImageContent) creates it
 	// before calling. os.OpenRoot opens it as a confinement root for every
 	// extraction op below; it returns a clear error if destDir is missing.
@@ -618,6 +637,9 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 	var outOfScope []string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return totalBytes, outOfScope, err
+		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -688,7 +710,7 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 			if fErr != nil {
 				return totalBytes, outOfScope, fmt.Errorf("create %s: %w", name, fErr)
 			}
-			n, copyErr := io.Copy(f, tr)
+			n, copyErr := io.Copy(f, contextReader{ctx: ctx, reader: tr})
 			closeErr := f.Close()
 			if copyErr != nil {
 				return totalBytes, outOfScope, fmt.Errorf("write %s: %w", name, copyErr)
@@ -729,6 +751,18 @@ func sanitizeAndExtractTar(src io.Reader, destDir string, maxBytes, maxEntries i
 		}
 	}
 	return totalBytes, outOfScope, nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }
 
 // symlinkTargetEscapes reports whether a symlink at name (relative to the
@@ -923,6 +957,10 @@ type CreateContainerParams struct {
 	// an expired operation capability as the lifecycle route.
 	LifecycleCallbackURL string
 
+	// MaintenanceID is empty for provision/restore and identifies the exact
+	// restart/update generation for replacement containers.
+	MaintenanceID shared.MaintenanceID
+
 	// Hardening parameters
 	HostBindIP     string
 	ReadonlyRootfs bool
@@ -1021,6 +1059,7 @@ func (d *DockerClient) CreateContainer(ctx context.Context, params CreateContain
 		LabelFailCount:            strconv.Itoa(params.FailCount),
 		LabelCallbackURL:          params.CallbackURL,
 		LabelLifecycleCallbackURL: params.LifecycleCallbackURL,
+		LabelMaintenanceID:        params.MaintenanceID.String(),
 		LabelBackendName:          params.BackendName,
 	}
 	if params.ServiceName != "" {
@@ -1605,10 +1644,12 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		LeaseUUID:            resp.Config.Labels[LabelLeaseUUID],
 		Tenant:               resp.Config.Labels[LabelTenant],
 		ProviderUUID:         resp.Config.Labels[LabelProviderUUID],
+		BackendName:          resp.Config.Labels[LabelBackendName],
 		SKU:                  resp.Config.Labels[LabelSKU],
 		ServiceName:          resp.Config.Labels[LabelServiceName],
 		CallbackURL:          resp.Config.Labels[LabelCallbackURL],
 		LifecycleCallbackURL: resp.Config.Labels[LabelLifecycleCallbackURL],
+		MaintenanceID:        shared.MaintenanceID(resp.Config.Labels[LabelMaintenanceID]),
 		Image:                resp.Config.Image,
 		Status:               resp.State.Status,
 		Health:               health,
@@ -1649,10 +1690,30 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 // ListManagedContainers returns all containers managed by Fred.
 // When backendName is set, only containers belonging to this backend are returned.
 func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerInfo, error) {
+	return d.listManagedContainers(ctx, false)
+}
+
+// ListManagedContainersStrict is the identity-initialization variant. It
+// refuses a managed container with malformed Fred labels rather than silently
+// dropping it from the storage-lineage proof.
+func (d *DockerClient) ListManagedContainersStrict(ctx context.Context) ([]ContainerInfo, error) {
+	return d.listManagedContainers(ctx, true)
+}
+
+func (d *DockerClient) listManagedContainers(
+	ctx context.Context,
+	strict bool,
+) ([]ContainerInfo, error) {
 	f := filters.NewArgs(
 		filters.Arg("label", LabelManaged+"=true"),
 	)
-	if d.backendName != "" {
+	// Ordinary recovery may scope the daemon-side query to this configured
+	// backend. Identity initialization must not: it is proving exclusive
+	// ownership of the physical daemon/root lineage, so every Fred-managed
+	// container must be observed and then classified locally. Filtering here
+	// would let an absent, malformed, or foreign backend_name label disappear
+	// from a supposedly empty/new substrate proof.
+	if d.backendName != "" && !strict {
 		f.Add("label", LabelBackendName+"="+d.backendName)
 	}
 	containers, err := d.client.ContainerList(ctx, container.ListOptions{
@@ -1665,8 +1726,16 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 
 	var result []ContainerInfo
 	for _, c := range containers {
+		if strict {
+			if err := validateStrictManagedContainerLabels(c.ID, d.backendName, c.Labels); err != nil {
+				return nil, err
+			}
+		}
 		meta, err := parseLabelMeta(c.Labels)
 		if err != nil {
+			if strict {
+				return nil, fmt.Errorf("managed container %s has malformed Fred labels: %w", c.ID, err)
+			}
 			// Skip containers with malformed Fred labels — these can't be
 			// reliably tracked for resource accounting.
 			slog.Warn("skipping managed container with malformed labels",
@@ -1687,10 +1756,12 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 			LeaseUUID:            c.Labels[LabelLeaseUUID],
 			Tenant:               c.Labels[LabelTenant],
 			ProviderUUID:         c.Labels[LabelProviderUUID],
+			BackendName:          c.Labels[LabelBackendName],
 			SKU:                  c.Labels[LabelSKU],
 			ServiceName:          c.Labels[LabelServiceName],
 			CallbackURL:          c.Labels[LabelCallbackURL],
 			LifecycleCallbackURL: c.Labels[LabelLifecycleCallbackURL],
+			MaintenanceID:        shared.MaintenanceID(c.Labels[LabelMaintenanceID]),
 			Image:                c.Image,
 			Status:               c.State,
 			InstanceIndex:        meta.InstanceIndex,
@@ -1725,6 +1796,80 @@ func (d *DockerClient) ListManagedContainers(ctx context.Context) ([]ContainerIn
 	}
 
 	return result, nil
+}
+
+func validateStrictManagedContainerLabels(containerID, backendName string, labels map[string]string) error {
+	if backendName == "" {
+		return errors.New("strict managed-container inventory requires a configured backend name")
+	}
+	if labels[LabelManaged] != "true" {
+		return fmt.Errorf("managed container %s is missing the exact managed label", containerID)
+	}
+	// v0.13's legacy migration writer accidentally omitted the backend,
+	// provider, and callback fields from the stack generation it created. The
+	// strict inventory must surface those containers to the cross-journal cohort
+	// verifier rather than dropping or rejecting them one at a time: only a
+	// complete exact `-prev` rollback cohort plus the matching active release can
+	// supply the missing authority. This narrow label shape grants no authority
+	// by itself; every unexplained or stack-only instance is rejected by
+	// verifyStorageIdentityInitializationEvidence.
+	v013MigrationStack := isV013MigrationGeneratedStackLabels(labels)
+	if got := labels[LabelBackendName]; got != backendName && !v013MigrationStack {
+		return fmt.Errorf(
+			"managed container %s belongs to backend %q, expected exact backend %q",
+			containerID, got, backendName,
+		)
+	}
+	if leaseUUID := labels[LabelLeaseUUID]; !backend.IsCanonicalLeaseUUID(leaseUUID) {
+		return fmt.Errorf("managed container %s has invalid lease identity %q", containerID, leaseUUID)
+	}
+	for _, required := range []struct {
+		label       string
+		description string
+	}{
+		{LabelTenant, "tenant"},
+		{LabelSKU, "SKU"},
+		{LabelInstanceIndex, "instance index"},
+	} {
+		if labels[required.label] == "" {
+			return fmt.Errorf("managed container %s has an empty %s label", containerID, required.description)
+		}
+	}
+	if v013MigrationStack {
+		return nil
+	}
+	for _, required := range []struct {
+		label       string
+		description string
+	}{
+		{LabelProviderUUID, "provider"},
+		{LabelCallbackURL, "operation callback"},
+	} {
+		if labels[required.label] == "" {
+			return fmt.Errorf("managed container %s has an empty %s label", containerID, required.description)
+		}
+	}
+	if _, err := backend.ResolveLifecycleCallbackURL(
+		labels[LabelCallbackURL], labels[LabelLifecycleCallbackURL],
+	); err != nil {
+		return fmt.Errorf("managed container %s has invalid callback identity: %w", containerID, err)
+	}
+	if maintenanceID := shared.MaintenanceID(labels[LabelMaintenanceID]); maintenanceID != "" && !maintenanceID.Valid() {
+		return fmt.Errorf("managed container %s has invalid maintenance ID %q", containerID, maintenanceID)
+	}
+	return nil
+}
+
+// isV013MigrationGeneratedStackLabels recognizes the exact authority omission
+// in v0.13's executeLegacyMigration buildComposeProject call. All four fields
+// were omitted together; accepting a partial omission would turn corruption or
+// a hand-edited label set into compatibility authority.
+func isV013MigrationGeneratedStackLabels(labels map[string]string) bool {
+	return labels[LabelServiceName] == manifest.DefaultServiceName &&
+		labels[LabelBackendName] == "" &&
+		labels[LabelProviderUUID] == "" &&
+		labels[LabelCallbackURL] == "" &&
+		labels[LabelLifecycleCallbackURL] == ""
 }
 
 // TenantNetworkName returns a deterministic network name for a tenant address.
@@ -1875,7 +2020,7 @@ func (b *Backend) ensureTenantNetwork(ctx context.Context, tenant string) (strin
 	mu := b.tenantNetworkMu(tenant)
 	mu.Lock()
 	defer mu.Unlock()
-	return b.docker.EnsureTenantNetwork(ctx, tenant)
+	return b.mutationAdapter().ensureTenantNetwork(ctx, tenant)
 }
 
 // releaseTenantNetwork removes the tenant network iff no other lease in
@@ -1896,7 +2041,7 @@ func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error
 	}
 	b.provisionsMu.RUnlock()
 
-	return b.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+	return b.mutationAdapter().removeTenantNetworkIfEmpty(ctx, tenant)
 }
 
 // HealthStatus represents the health check status of a Docker container.

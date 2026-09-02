@@ -170,16 +170,15 @@ var (
 	}, []string{"stage"})
 
 	// LifecycleEventSinkPanicsTotal counts panics recovered from best-effort
-	// lifecycle event sinks immediately before a backend provision or restore
-	// call. Event delivery is observational and must never prevent the durable
-	// operation from reaching the backend after it has entered the Calling
-	// phase. The event label is selected exclusively from the constants below,
-	// keeping cardinality bounded.
+	// lifecycle event sinks. Event delivery is observational and must never
+	// prevent backend dispatch or make an already-settled durable callback look
+	// retryable to its sender. The event label is selected exclusively from the
+	// constants below, keeping cardinality bounded.
 	LifecycleEventSinkPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "lifecycle_event_sink_panics_total",
-		Help:      "Panics recovered from best-effort lifecycle event sinks before backend dispatch, by event",
+		Help:      "Panics recovered from best-effort lifecycle event sinks, by event",
 	}, []string{"event"})
 
 	// The fred_background_* panic counters live in the `background`
@@ -498,7 +497,8 @@ var (
 var (
 	// HealthCheckHealthy tracks the result of each non-backend dependency probe
 	// run by the health handler (1 = healthy, 0 = unhealthy). Labels: check —
-	// one of chain, token_tracker, placement_store, payload_store.
+	// one of chain, token_tracker, placement_store, placement_inventory,
+	// payload_store.
 	//
 	// Backends are deliberately absent: they already have BackendHealthy, which
 	// carries a per-backend label this gauge cannot express.
@@ -832,6 +832,7 @@ const (
 	LifecycleEventProvisionStarting = "provision_starting"
 	LifecycleEventRestoreRestarting = "restore_restarting"
 	LifecycleEventRestoreRefused    = "restore_refused"
+	LifecycleEventCallback          = "callback"
 )
 
 // Lifecycle callback constants are the complete bounded vocabularies for

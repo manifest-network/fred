@@ -7,6 +7,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/leaseitems"
 )
 
 // maxRejectReasonLen is the maximum byte length for on-chain lease rejection
@@ -86,19 +87,7 @@ func ExtractRoutingSKU(lease *billingtypes.Lease) string {
 
 // ExtractLeaseItems converts chain lease items to backend lease items.
 func ExtractLeaseItems(lease *billingtypes.Lease) []backend.LeaseItem {
-	if lease == nil || len(lease.Items) == 0 {
-		return nil
-	}
-	items := make([]backend.LeaseItem, len(lease.Items))
-	for i, item := range lease.Items {
-		items[i] = backend.LeaseItem{
-			SKU:          item.SkuUuid,
-			Quantity:     int(item.Quantity),
-			ServiceName:  item.ServiceName,
-			CustomDomain: item.CustomDomain,
-		}
-	}
-	return items
+	return leaseitems.FromLease(lease)
 }
 
 // TotalLeaseQuantity returns the total quantity across all lease items.

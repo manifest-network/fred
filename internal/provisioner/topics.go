@@ -8,6 +8,7 @@ import (
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
+	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
@@ -64,16 +65,18 @@ const (
 )
 
 // CallbackPath is the path suffix for backend provision callbacks.
-const CallbackPath = "/callbacks/provision"
+const CallbackPath = callbackurl.ProvisionPath
 
 // CallbackOperationIDParam carries the initiating operation's identity in the
 // callback URL. Callback HMACs cover RequestURI, so the value
 // cannot be changed independently of the signed backend request.
 const CallbackOperationIDParam = operation.QueryParameter
 
-// BuildCallbackURL constructs the full callback URL from a base URL.
-func BuildCallbackURL(baseURL string) string {
-	return baseURL + CallbackPath
+// BuildCallbackURL constructs a validated tokenless callback URL for an
+// explicitly migrated legacy lifecycle. It shares the typed builder's URL
+// handling so an unrelated base query cannot swallow the callback path.
+func BuildCallbackURL(baseURL string) (string, error) {
+	return buildCallbackURL(baseURL, "", "")
 }
 
 // BuildCallbackURLForOperation binds a callback to a validated operation ID.
@@ -103,24 +106,20 @@ func BuildCallbackURLForLifecycle(baseURL string, lifecycleID lifecycle.ID) (str
 // re-encoding unrelated fields. The exact raw query is covered by callback
 // HMACs, so normalization here would create an avoidable second wire form.
 func buildCallbackURLWithCapability(baseURL, parameter, value string) (string, error) {
-	callbackURL, err := url.Parse(baseURL)
-	if err != nil {
-		return "", fmt.Errorf("parse callback base URL: %w", err)
-	}
-	query, err := url.ParseQuery(callbackURL.RawQuery)
-	if err != nil {
-		return "", fmt.Errorf("parse callback base query: %w", err)
-	}
-	if _, exists := query[operation.QueryParameter]; exists {
-		return "", fmt.Errorf("callback base URL must not contain %s", operation.QueryParameter)
-	}
-	if _, exists := query[lifecycle.QueryParameter]; exists {
-		return "", fmt.Errorf("callback base URL must not contain %s", lifecycle.QueryParameter)
-	}
+	return buildCallbackURL(baseURL, parameter, value)
+}
 
-	callbackURL.Path += CallbackPath
-	if callbackURL.RawPath != "" {
-		callbackURL.RawPath += CallbackPath
+func buildCallbackURL(baseURL, parameter, value string) (string, error) {
+	base, err := parseCallbackBaseURL(baseURL)
+	if err != nil {
+		return "", err
+	}
+	callbackURL, err := base.ProvisionURL()
+	if err != nil {
+		return "", fmt.Errorf("append callback provision path: %w", err)
+	}
+	if parameter == "" {
+		return callbackURL.String(), nil
 	}
 	capability := url.QueryEscape(parameter) + "=" + url.QueryEscape(value)
 	if callbackURL.RawQuery == "" {
@@ -129,6 +128,18 @@ func buildCallbackURLWithCapability(baseURL, parameter, value string) (string, e
 		callbackURL.RawQuery += "&" + capability
 	}
 	return callbackURL.String(), nil
+}
+
+// parseCallbackBaseURL proves the static portion from which typed callback
+// destinations are derived. Reject components that HTTP never transmits or
+// that could carry ambient/conflicting authority before an operation is
+// admitted; callers then only need to append one validated typed selector.
+func parseCallbackBaseURL(baseURL string) (callbackurl.Base, error) {
+	base, err := callbackurl.ParseBase(baseURL)
+	if err != nil {
+		return callbackurl.Base{}, fmt.Errorf("callback base URL %w", err)
+	}
+	return base, nil
 }
 
 // ChainClient defines the chain operations needed by the provisioner.

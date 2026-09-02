@@ -18,10 +18,14 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/k3s"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
-const testSecret = "test-secret-that-is-at-least-32-chars!"
+const (
+	testSecret           = "test-secret-that-is-at-least-32-chars!"
+	handlerTestLeaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+)
 
 // --- HMAC sanity ----------------------------------------------------------
 
@@ -78,6 +82,19 @@ func newMockHandler(mb *mockBackend) http.Handler {
 	return s.Handler()
 }
 
+func TestNewIdentityBoundServerRejectsTypedNilBackend(t *testing.T) {
+	storageID, err := backendidentity.Parse("b0ca6d70-ea78-4b4e-a94b-7ca5c4bdbbe6")
+	require.NoError(t, err)
+	var typedNil *k3s.Backend
+
+	server, err := NewIdentityBoundServer(
+		typedNil, testSecret, slog.Default(), k3s.DefaultMaxRequestBodySize, storageID,
+	)
+
+	require.EqualError(t, err, "backend is required")
+	assert.Nil(t, server)
+}
+
 // signedPostRequest creates a POST request with a valid HMAC signature.
 func signedPostRequest(path, body string) *http.Request {
 	b := []byte(body)
@@ -91,6 +108,27 @@ func signedGetRequest(path string) *http.Request {
 	req := httptest.NewRequest("GET", path, nil)
 	req.Header.Set(hmacauth.SignatureHeader, hmacauth.Sign(testSecret, req.Method, req.URL.RequestURI(), nil))
 	return req
+}
+
+func TestMutatingHandlersRejectNoncanonicalLeaseUUIDBeforeDispatch(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{"provision", "/provision", `{"lease_uuid":"lease-1","callback_url":"http://localhost/callbacks/provision","items":[{"sku":"k3s-micro","quantity":1}]}`},
+		{"deprovision", "/deprovision", `{"lease_uuid":"lease-1"}`},
+		{"restart", "/restart", `{"lease_uuid":"lease-1","callback_url":"http://localhost/callbacks/provision"}`},
+		{"update", "/update", `{"lease_uuid":"lease-1","callback_url":"http://localhost/callbacks/provision","payload":"e30="}`},
+		{"reconcile custom domain", "/reconcile_custom_domain", `{"lease_uuid":"lease-1"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			newTestHandler().ServeHTTP(response, signedPostRequest(test.path, test.body))
+			assert.Equal(t, http.StatusBadRequest, response.Code)
+			assert.Contains(t, response.Body.String(), "canonical non-nil UUID")
+		})
+	}
 }
 
 // --- mockBackend ---------------------------------------------------------
@@ -251,7 +289,7 @@ func (m *mockBackend) Stats() shared.ResourceStats {
 
 func TestProvision_RequiresAuth(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb","items":[{"sku":"k3s-micro","quantity":1}]}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"http://localhost/callbacks/provision","items":[{"sku":"k3s-micro","quantity":1}]}`
 
 	t.Run("missing signature returns 401", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/provision", strings.NewReader(body))
@@ -280,7 +318,7 @@ func TestProvision_RequiresAuth(t *testing.T) {
 
 func TestDeprovision_RequiresAuth(t *testing.T) {
 	handler := newTestHandler()
-	req := httptest.NewRequest("POST", "/deprovision", strings.NewReader(`{"lease_uuid":"lease-1"}`))
+	req := httptest.NewRequest("POST", "/deprovision", strings.NewReader(`{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000"}`))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
@@ -350,7 +388,7 @@ func TestListProvisions_RequiresAuth(t *testing.T) {
 
 func TestRestart_RequiresAuth(t *testing.T) {
 	handler := newTestHandler()
-	req := httptest.NewRequest("POST", "/restart", strings.NewReader(`{"lease_uuid":"lease-1","callback_url":"http://localhost/cb"}`))
+	req := httptest.NewRequest("POST", "/restart", strings.NewReader(`{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"http://localhost/callbacks/provision"}`))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
@@ -367,7 +405,7 @@ func TestUpdate_RequiresAuth(t *testing.T) {
 
 func TestReconcileCustomDomain_RequiresAuth(t *testing.T) {
 	handler := newTestHandler()
-	req := httptest.NewRequest("POST", "/reconcile_custom_domain", strings.NewReader(`{"lease_uuid":"lease-1"}`))
+	req := httptest.NewRequest("POST", "/reconcile_custom_domain", strings.NewReader(`{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000"}`))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
@@ -456,7 +494,7 @@ func TestGetLogs_TailDefault(t *testing.T) {
 
 func TestRestart_MissingLeaseUUID(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"callback_url":"http://localhost/cb"}`
+	body := `{"callback_url":"http://localhost/callbacks/provision"}`
 	req := signedPostRequest("/restart", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -466,7 +504,7 @@ func TestRestart_MissingLeaseUUID(t *testing.T) {
 
 func TestRestart_MissingCallbackURL(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"lease-1"}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000"}`
 	req := signedPostRequest("/restart", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -476,7 +514,7 @@ func TestRestart_MissingCallbackURL(t *testing.T) {
 
 func TestRestart_InvalidCallbackURL(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"lease-1","callback_url":"ftp://invalid/cb"}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"ftp://invalid/callbacks/provision"}`
 	req := signedPostRequest("/restart", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -486,7 +524,7 @@ func TestRestart_InvalidCallbackURL(t *testing.T) {
 
 func TestRestart_PassesValidation(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb"}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"http://localhost/callbacks/provision"}`
 	req := signedPostRequest("/restart", body)
 	w := httptest.NewRecorder()
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
@@ -494,7 +532,7 @@ func TestRestart_PassesValidation(t *testing.T) {
 
 func TestUpdate_MissingLeaseUUID(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"callback_url":"http://localhost/cb","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+	body := `{"callback_url":"http://localhost/callbacks/provision","payload":"eyJpbWFnZSI6Im5naW54In0="}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -504,7 +542,7 @@ func TestUpdate_MissingLeaseUUID(t *testing.T) {
 
 func TestUpdate_MissingCallbackURL(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"lease-1","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","payload":"eyJpbWFnZSI6Im5naW54In0="}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -514,7 +552,7 @@ func TestUpdate_MissingCallbackURL(t *testing.T) {
 
 func TestUpdate_MissingPayload(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb"}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"http://localhost/callbacks/provision"}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -524,7 +562,7 @@ func TestUpdate_MissingPayload(t *testing.T) {
 
 func TestUpdate_InvalidCallbackURL(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"lease-1","callback_url":"ftp://invalid","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"ftp://invalid","payload":"eyJpbWFnZSI6Im5naW54In0="}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -534,7 +572,7 @@ func TestUpdate_InvalidCallbackURL(t *testing.T) {
 
 func TestUpdate_PassesValidation(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"http://localhost/callbacks/provision","payload":"eyJpbWFnZSI6Im5naW54In0="}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
@@ -563,12 +601,12 @@ func TestReconcileCustomDomain_InvalidJSON(t *testing.T) {
 // --- Handler logic via mockBackend ---------------------------------------
 
 func TestHandleProvision(t *testing.T) {
-	validBody := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb","items":[{"sku":"k3s-micro","quantity":1}]}`
+	validBody := fmt.Sprintf(`{"lease_uuid":%q,"callback_url":"http://localhost/callbacks/provision","items":[{"sku":"k3s-micro","quantity":1}]}`, handlerTestLeaseUUID)
 
 	t.Run("success returns 202", func(t *testing.T) {
 		mb := &mockBackend{
 			ProvisionFunc: func(_ context.Context, req backend.ProvisionRequest) error {
-				assert.Equal(t, "lease-1", req.LeaseUUID)
+				assert.Equal(t, handlerTestLeaseUUID, req.LeaseUUID)
 				return nil
 			},
 		}
@@ -578,7 +616,7 @@ func TestHandleProvision(t *testing.T) {
 		assert.Equal(t, http.StatusAccepted, w.Code)
 		var resp backend.ProvisionResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-		assert.Equal(t, "lease-1", resp.ProvisionID)
+		assert.Equal(t, handlerTestLeaseUUID, resp.ProvisionID)
 	})
 
 	t.Run("ErrAlreadyProvisioned returns 409", func(t *testing.T) {
@@ -668,12 +706,12 @@ func TestHandleProvision(t *testing.T) {
 }
 
 func TestHandleDeprovision(t *testing.T) {
-	validBody := `{"lease_uuid":"lease-1"}`
+	validBody := fmt.Sprintf(`{"lease_uuid":%q}`, handlerTestLeaseUUID)
 
 	t.Run("success returns 200", func(t *testing.T) {
 		mb := &mockBackend{
 			DeprovisionFunc: func(_ context.Context, leaseUUID string) error {
-				assert.Equal(t, "lease-1", leaseUUID)
+				assert.Equal(t, handlerTestLeaseUUID, leaseUUID)
 				return nil
 			},
 		}
@@ -1036,12 +1074,12 @@ func TestHandleListProvisions_Filtered(t *testing.T) {
 }
 
 func TestHandleRestart(t *testing.T) {
-	validBody := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb"}`
+	validBody := fmt.Sprintf(`{"lease_uuid":%q,"callback_url":"http://localhost/callbacks/provision"}`, handlerTestLeaseUUID)
 
 	t.Run("success returns 202", func(t *testing.T) {
 		mb := &mockBackend{
 			RestartFunc: func(_ context.Context, req backend.RestartRequest) error {
-				assert.Equal(t, "lease-1", req.LeaseUUID)
+				assert.Equal(t, handlerTestLeaseUUID, req.LeaseUUID)
 				return nil
 			},
 		}
@@ -1093,12 +1131,12 @@ func TestHandleRestart(t *testing.T) {
 }
 
 func TestHandleUpdate(t *testing.T) {
-	validBody := `{"lease_uuid":"lease-1","callback_url":"http://localhost/cb","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+	validBody := fmt.Sprintf(`{"lease_uuid":%q,"callback_url":"http://localhost/callbacks/provision","payload":"eyJpbWFnZSI6Im5naW54In0="}`, handlerTestLeaseUUID)
 
 	t.Run("success returns 202", func(t *testing.T) {
 		mb := &mockBackend{
 			UpdateFunc: func(_ context.Context, req backend.UpdateRequest) error {
-				assert.Equal(t, "lease-1", req.LeaseUUID)
+				assert.Equal(t, handlerTestLeaseUUID, req.LeaseUUID)
 				return nil
 			},
 		}
@@ -1199,7 +1237,7 @@ func TestReconcileCustomDomain_DispatchesToBackendAndReturns204(t *testing.T) {
 		},
 	}
 
-	body := `{"lease_uuid":"lease-1","items":[{"sku":"k3s-small","quantity":1,"service_name":"web","custom_domain":"foo.example.com"}]}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","items":[{"sku":"k3s-small","quantity":1,"service_name":"web","custom_domain":"foo.example.com"}]}`
 	req := signedPostRequest("/reconcile_custom_domain", body)
 	w := httptest.NewRecorder()
 
@@ -1207,7 +1245,7 @@ func TestReconcileCustomDomain_DispatchesToBackendAndReturns204(t *testing.T) {
 
 	assert.Equal(t, http.StatusNoContent, w.Code)
 	assert.Equal(t, 1, invocationCount)
-	assert.Equal(t, "lease-1", seenLeaseUUID)
+	assert.Equal(t, handlerTestLeaseUUID, seenLeaseUUID)
 	require.Len(t, seenItems, 1)
 	assert.Equal(t, "web", seenItems[0].ServiceName)
 	assert.Equal(t, "foo.example.com", seenItems[0].CustomDomain)
@@ -1219,7 +1257,7 @@ func TestReconcileCustomDomain_BackendErrorReturns500(t *testing.T) {
 			return assert.AnError
 		},
 	}
-	req := signedPostRequest("/reconcile_custom_domain", `{"lease_uuid":"lease-1"}`)
+	req := signedPostRequest("/reconcile_custom_domain", `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000"}`)
 	w := httptest.NewRecorder()
 	newMockHandler(mb).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
@@ -1234,7 +1272,7 @@ func TestReconcileCustomDomain_NotProvisionedReturns404(t *testing.T) {
 			return backend.ErrNotProvisioned
 		},
 	}
-	req := signedPostRequest("/reconcile_custom_domain", `{"lease_uuid":"lease-1"}`)
+	req := signedPostRequest("/reconcile_custom_domain", `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000"}`)
 	w := httptest.NewRecorder()
 	newMockHandler(mb).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusNotFound, w.Code)
@@ -1247,7 +1285,7 @@ func TestReconcileCustomDomain_InvalidStateReturns409(t *testing.T) {
 			return backend.ErrInvalidState
 		},
 	}
-	req := signedPostRequest("/reconcile_custom_domain", `{"lease_uuid":"lease-1"}`)
+	req := signedPostRequest("/reconcile_custom_domain", `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000"}`)
 	w := httptest.NewRecorder()
 	newMockHandler(mb).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusConflict, w.Code)
@@ -1398,38 +1436,38 @@ func TestValidateCallbackURL(t *testing.T) {
 		wantErr string
 	}{
 		// Valid URLs
-		{name: "valid https", url: "https://example.com/callback", wantErr: ""},
-		{name: "valid http", url: "http://example.com/callback", wantErr: ""},
-		{name: "valid with port", url: "https://example.com:8443/callback", wantErr: ""},
-		{name: "valid public IP", url: "https://203.0.113.50/callback", wantErr: ""},
+		{name: "valid https", url: "https://example.com/callbacks/provision", wantErr: ""},
+		{name: "valid http", url: "http://example.com/callbacks/provision", wantErr: ""},
+		{name: "valid with port", url: "https://example.com:8443/callbacks/provision", wantErr: ""},
+		{name: "valid public IP", url: "https://203.0.113.50/callbacks/provision", wantErr: ""},
 
 		// Localhost is allowed (callback URL comes from trusted Fred)
-		{name: "localhost", url: "http://localhost/callback", wantErr: ""},
-		{name: "localhost https", url: "https://localhost:8080/callback", wantErr: ""},
-		{name: "127.0.0.1", url: "http://127.0.0.1/callback", wantErr: ""},
-		{name: "::1", url: "http://[::1]/callback", wantErr: ""},
+		{name: "localhost", url: "http://localhost/callbacks/provision", wantErr: ""},
+		{name: "localhost https", url: "https://localhost:8080/callbacks/provision", wantErr: ""},
+		{name: "127.0.0.1", url: "http://127.0.0.1/callbacks/provision", wantErr: ""},
+		{name: "::1", url: "http://[::1]/callbacks/provision", wantErr: ""},
 
 		// Private networks (backends often run on private networks)
-		{name: "private 10.x", url: "http://10.0.0.1/callback", wantErr: ""},
-		{name: "private 172.16.x", url: "http://172.16.0.1/callback", wantErr: ""},
-		{name: "private 192.168.x", url: "http://192.168.1.1/callback", wantErr: ""},
+		{name: "private 10.x", url: "http://10.0.0.1/callbacks/provision", wantErr: ""},
+		{name: "private 172.16.x", url: "http://172.16.0.1/callbacks/provision", wantErr: ""},
+		{name: "private 192.168.x", url: "http://192.168.1.1/callbacks/provision", wantErr: ""},
 
 		// Invalid schemes
 		{name: "file scheme", url: "file:///etc/passwd", wantErr: "scheme must be http or https"},
 		{name: "ftp scheme", url: "ftp://example.com/file", wantErr: "scheme must be http or https"},
-		{name: "no scheme", url: "example.com/callback", wantErr: "scheme must be http or https"},
+		{name: "no scheme", url: "example.com/callbacks/provision", wantErr: "scheme must be http or https"},
 
 		// Cloud metadata endpoints blocked (SSRF risk)
-		{name: "AWS metadata", url: "http://169.254.169.254/latest/meta-data/", wantErr: "link-local addresses are not allowed"},
-		{name: "link-local", url: "http://169.254.1.1/callback", wantErr: "link-local addresses are not allowed"},
+		{name: "AWS metadata", url: "http://169.254.169.254/latest/meta-data/callbacks/provision", wantErr: "link-local addresses are not allowed"},
+		{name: "link-local", url: "http://169.254.1.1/callbacks/provision", wantErr: "link-local addresses are not allowed"},
 
 		// Trailing-dot normalization (commit 859bfc3). Without the strip in
 		// validateCallbackURL, net.ParseIP returns nil for "169.254.169.254."
 		// and the link-local block is skipped despite resolving to the same
 		// metadata IP. Public hosts must still validate cleanly with a
 		// trailing dot — FQDN form is legal DNS syntax.
-		{name: "trailing-dot AWS metadata blocked", url: "http://169.254.169.254./callback", wantErr: "link-local addresses are not allowed"},
-		{name: "trailing-dot public host allowed", url: "http://example.com./callback", wantErr: ""},
+		{name: "trailing-dot AWS metadata blocked", url: "http://169.254.169.254./callbacks/provision", wantErr: "link-local addresses are not allowed"},
+		{name: "trailing-dot public host allowed", url: "http://example.com./callbacks/provision", wantErr: ""},
 
 		// IPv6 zone-suffix stripping (commit 483f9bd). RFC 6874 zone-scoped
 		// IPv6 literals embed the interface as "%<zone>" (URL-encoded as
@@ -1437,16 +1475,27 @@ func TestValidateCallbackURL(t *testing.T) {
 		// net.ParseIP rejects; net.Dialer would still dial it on
 		// Linux/BSD. Stripping the "%"-suffix before ParseIP exposes the
 		// link-local class so the guard fires.
-		{name: "ipv6 zone-suffix link-local blocked", url: "http://[fe80::1%25eth0]/callback", wantErr: "link-local addresses are not allowed"},
+		{name: "ipv6 zone-suffix link-local blocked", url: "http://[fe80::1%25eth0]/callbacks/provision", wantErr: "link-local addresses are not allowed"},
 
 		// Unspecified addresses (commit 859bfc3). 0.0.0.0 / :: resolve to
 		// "any interface" on the target host — never a legitimate callback
 		// destination.
-		{name: "unspecified IPv4 0.0.0.0", url: "http://0.0.0.0/callback", wantErr: "unspecified addresses are not allowed"},
-		{name: "unspecified IPv6 ::", url: "http://[::]/callback", wantErr: "unspecified addresses are not allowed"},
+		{name: "unspecified IPv4 0.0.0.0", url: "http://0.0.0.0/callbacks/provision", wantErr: "unspecified addresses are not allowed"},
+		{name: "unspecified IPv6 ::", url: "http://[::]/callbacks/provision", wantErr: "unspecified addresses are not allowed"},
 
 		// Malformed
-		{name: "empty host", url: "http:///callback", wantErr: "host is required"},
+		{name: "empty host", url: "http:///callbacks/provision", wantErr: "must have a host"},
+		{name: "port-only host", url: "https://:443/callbacks/provision", wantErr: "non-empty, non-dot hostname"},
+		{name: "dot-only host", url: "https://./callbacks/provision", wantErr: "non-empty, non-dot hostname"},
+		{name: "empty explicit port", url: "https://example.com:/callbacks/provision", wantErr: "port must be between 1 and 65535"},
+		{name: "zero port", url: "https://example.com:0/callbacks/provision", wantErr: "port must be between 1 and 65535"},
+		{name: "oversized port", url: "https://example.com:65536/callbacks/provision", wantErr: "port must be between 1 and 65535"},
+		{name: "userinfo", url: "https://user@example.com/callbacks/provision", wantErr: "user info"},
+		{name: "empty fragment marker", url: "https://example.com/callbacks/provision#", wantErr: "fragment"},
+		{name: "empty query marker", url: "https://example.com/callbacks/provision?", wantErr: "empty query marker"},
+		{name: "dot path segment", url: "https://example.com/api/../callbacks/provision", wantErr: "dot, parent"},
+		{name: "encoded path separator", url: "https://example.com/api%2Fcallback", wantErr: "canonical percent-encoding"},
+		{name: "raw query space", url: "https://example.com/callbacks/provision?trace=a b", wantErr: "unescaped byte"},
 	}
 
 	for _, tt := range tests {
@@ -1474,7 +1523,7 @@ func TestValidateCallbackURL(t *testing.T) {
 func TestHMACMiddleware_RejectsCrossEndpointReplay(t *testing.T) {
 	handler := newTestHandler()
 
-	body := []byte(`{"lease_uuid":"lease-replay-1","callback_url":"http://localhost/cb","items":[{"sku":"k3s-micro","quantity":1}]}`)
+	body := []byte(`{"lease_uuid":"lease-replay-1","callback_url":"http://localhost/callbacks/provision","items":[{"sku":"k3s-micro","quantity":1}]}`)
 
 	srcReq := httptest.NewRequest("POST", "/provision", bytes.NewReader(body))
 	srcSig := hmacauth.Sign(testSecret, srcReq.Method, srcReq.URL.RequestURI(), body)
@@ -1521,7 +1570,7 @@ func TestHMACMiddleware_RejectsCrossMethodReplay(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	body := []byte(`{"lease_uuid":"lease-replay-2","callback_url":"http://localhost/cb","items":[{"sku":"k3s-micro","quantity":1}]}`)
+	body := []byte(`{"lease_uuid":"lease-replay-2","callback_url":"http://localhost/callbacks/provision","items":[{"sku":"k3s-micro","quantity":1}]}`)
 
 	srcReq := httptest.NewRequest("POST", "/provision", bytes.NewReader(body))
 	srcSig := hmacauth.Sign(testSecret, srcReq.Method, srcReq.URL.RequestURI(), body)

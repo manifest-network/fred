@@ -23,6 +23,10 @@ type btrfsVolumeManager struct {
 	rootWatch volumeRootWatch
 }
 
+func (b *btrfsVolumeManager) PinIdentityRoot() error { return b.rootWatch.pin(b.dataPath) }
+
+func (b *btrfsVolumeManager) VerifyIdentityRoot() error { return b.rootWatch.verify(b.dataPath) }
+
 func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
 	subvolPath := filepath.Join(b.dataPath, id)
 	quota := fmt.Sprintf("%dm", sizeMB)
@@ -51,7 +55,7 @@ func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64
 		// because the caller's context may already be canceled (which could
 		// have caused the quota failure), and this volume ID won't be in
 		// createdVolumeIDs so the caller's cleanup loop won't cover it.
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cleanupCancel()
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "btrfs", "subvolume", "delete", subvolPath).CombinedOutput(); cleanupErr != nil {
 			b.logger.Warn("failed to cleanup subvolume after quota failure", "path", subvolPath, "error", cleanupErr, "output", string(cleanupOut))
@@ -112,10 +116,10 @@ func (b *btrfsVolumeManager) List() ([]string, error) {
 // purposes — the underlying subvolume identity (subvol-id), data, and
 // qgroup attachment are preserved across the rename. No btrfs CLI call
 // is needed.
-func (b *btrfsVolumeManager) RenameVolume(oldName, newName string) error {
+func (b *btrfsVolumeManager) RenameVolume(ctx context.Context, oldName, newName string) error {
 	oldPath := filepath.Join(b.dataPath, oldName)
 	newPath := filepath.Join(b.dataPath, newName)
-	return atomicRenameVolumeDir(oldPath, newPath)
+	return atomicRenameVolumeDir(ctx, oldPath, newPath)
 }
 
 // HostPath returns the absolute path of the subvolume under the

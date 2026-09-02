@@ -21,7 +21,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sony/gobreaker"
 
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/httpurl"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // Backend defines the interface for interacting with a provisioning backend.
@@ -118,6 +122,14 @@ type Backend interface {
 
 	// Name returns the backend's configured name.
 	Name() string
+}
+
+// IdentityInventoryBackend exposes the physical storage identity observed on
+// each complete inventory endpoint. Reconciliation requires this stronger
+// interface before it can establish or reuse a placement admission baseline.
+type IdentityInventoryBackend interface {
+	ListProvisionsWithIdentity(context.Context) ([]ProvisionInfo, backendidentity.ID, error)
+	ListRetentionsWithIdentity(context.Context) ([]RetainedLease, backendidentity.ID, error)
 }
 
 // LeaseItem represents a single SKU with its quantity in a lease.
@@ -258,6 +270,27 @@ type LeaseService struct {
 	Instances []LeaseInstance `json:"instances,omitempty"`
 }
 
+// LifecycleGenerationKind classifies the callback authority a backend has
+// durably paired with one live provision. The observation carries no URL or
+// other bearer material; a typed observation exposes only the UUID that Fred
+// originally supplied as both operation_id and lifecycle_id.
+type LifecycleGenerationKind string
+
+const (
+	LifecycleGenerationUnknown  LifecycleGenerationKind = "unknown"
+	LifecycleGenerationLegacy   LifecycleGenerationKind = "legacy"
+	LifecycleGenerationTyped    LifecycleGenerationKind = "typed"
+	LifecycleGenerationUnusable LifecycleGenerationKind = "unusable"
+)
+
+// LifecycleGenerationObservation is an internal backend-inventory fact. A nil
+// *LifecycleGenerationObservation on ProvisionInfo is equivalent to Unknown
+// and preserves compatibility with older and third-party backends.
+type LifecycleGenerationObservation struct {
+	Kind LifecycleGenerationKind `json:"kind"`
+	ID   string                  `json:"id,omitempty"`
+}
+
 // ProvisionInfo describes a single provisioned resource.
 type ProvisionInfo struct {
 	LeaseUUID    string          `json:"lease_uuid"`
@@ -285,6 +318,13 @@ type ProvisionInfo struct {
 	// API responses (LeaseStatusResponse/LeaseProvisionResponse), which would
 	// leak one tenant's address to another.
 	Tenant string `json:"tenant,omitempty"`
+
+	// LifecycleGeneration reports only the class and, for current typed
+	// callbacks, canonical UUID of the callback pair persisted by the backend.
+	// It is consumed by providerd reconciliation and MUST NOT be copied into a
+	// tenant-facing response. Nil means that the backend did not report this
+	// upgraded internal observation.
+	LifecycleGeneration *LifecycleGenerationObservation `json:"lifecycle_generation,omitempty"`
 
 	// Partition is the retained record's optional sub-tenant grouping key
 	// (retention partitioning). Unlike Tenant above, it MAY be copied into
@@ -315,9 +355,15 @@ type ListProvisionsResponse struct {
 // RetainedLease identifies a lease whose data this backend currently retains
 // (soft-deleted, awaiting restore or grace-reap). The reconciler consumes this
 // to keep placement affinity for retained leases so a restore routes to the
-// backend holding the source data (ENG-333).
+// backend holding the source data (ENG-333). ProviderUUID and Tenant are
+// optional for wire compatibility with older/third-party backends; when
+// present they are trusted-internal inventory evidence, never tenant-facing
+// response fields. Offline repair treats missing identity as routing-only and
+// rejects contradictory nonempty identity.
 type RetainedLease struct {
-	LeaseUUID string `json:"lease_uuid"`
+	LeaseUUID    string `json:"lease_uuid"`
+	ProviderUUID string `json:"provider_uuid,omitempty"`
+	Tenant       string `json:"tenant,omitempty"`
 }
 
 // ListRetentionsResponse is the response from the GET /retentions endpoint.
@@ -337,7 +383,7 @@ const (
 	DefaultCallbackApplicationTimeout = 2 * time.Minute
 
 	// DefaultCallbackDeliveryTimeout is the bundled backend sender's total
-	// inline HTTP delivery budget. It remains strictly greater than
+	// HTTP delivery retry budget. It remains strictly greater than
 	// DefaultCallbackApplicationTimeout so a fresh first attempt normally gives
 	// Fred time to serialize a retryable response after its application timeout.
 	// Quick retries share whatever remains of this budget, so a later attempt may
@@ -350,6 +396,10 @@ type CallbackPayload struct {
 	LeaseUUID string         `json:"lease_uuid"`
 	Status    CallbackStatus `json:"status"` // "success", "failed", or "deprovisioned"
 	Error     string         `json:"error,omitempty"`
+	// BackendStorageID binds the observation to the backend storage lineage
+	// that produced it. Upgraded senders persist this value with new outbox
+	// entries and include it in the HMAC-covered body on every delivery.
+	BackendStorageID string `json:"backend_storage_id,omitempty"`
 	// Backend is optional sender metadata retained for bounded metrics on
 	// callbacks that have no current operation. It is not lifecycle authority:
 	// the exact HMAC-authenticated operation URL or durable lifecycle capability
@@ -406,19 +456,19 @@ var (
 // derivation keeps upgraded backends compatible with v0.13 and rolling
 // deployments whose request shape contains only callback_url.
 func ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL string) (string, error) {
-	parsed, err := url.Parse(callbackURL)
+	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
 	if err != nil {
-		return "", fmt.Errorf("%w: parse callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
-	}
-	if err := validateCallbackRawQuery(parsed.RawQuery, ErrInvalidLifecycleCallbackURL); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: validate callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
 	}
 
-	parsed.RawQuery, err = deriveLifecycleCallbackQuery(parsed.RawQuery)
+	rawQuery, err := deriveLifecycleCallbackQuery(endpoint.RawQuery())
 	if err != nil {
 		return "", err
 	}
-	derived := parsed.String()
+	derived, err := endpoint.WithRawQuery(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("%w: derive lifecycle callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
 	if lifecycleCallbackURL == "" {
 		return derived, nil
 	}
@@ -427,6 +477,31 @@ func ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL string) (stri
 			ErrInvalidLifecycleCallbackURL)
 	}
 	return lifecycleCallbackURL, nil
+}
+
+// ObserveLifecycleGeneration classifies an exact callback pair already stored
+// by a backend without returning either URL. Missing halves are Unknown so
+// upgraded Fred remains compatible with records written by older backends.
+// Present but malformed, mixed-authority, or non-matching pairs are Unusable
+// and must quarantine lifecycle callbacks for that lease.
+func ObserveLifecycleGeneration(
+	callbackURL, lifecycleCallbackURL string,
+) LifecycleGenerationObservation {
+	if callbackURL == "" || lifecycleCallbackURL == "" {
+		return LifecycleGenerationObservation{Kind: LifecycleGenerationUnknown}
+	}
+	resolved, err := ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL)
+	if err != nil || resolved != lifecycleCallbackURL {
+		return LifecycleGenerationObservation{Kind: LifecycleGenerationUnusable}
+	}
+	id, typed, err := lifecycleCallbackIdentity(lifecycleCallbackURL)
+	if err != nil {
+		return LifecycleGenerationObservation{Kind: LifecycleGenerationUnusable}
+	}
+	if !typed {
+		return LifecycleGenerationObservation{Kind: LifecycleGenerationLegacy}
+	}
+	return LifecycleGenerationObservation{Kind: LifecycleGenerationTyped, ID: id}
 }
 
 // ResolveMaintenanceCallbackURLs validates a trusted maintenance request
@@ -461,6 +536,9 @@ func ResolveMaintenanceCallbackURLs(
 
 	if requestedLifecycleURL == "" {
 		requestedLifecycleURL = currentLifecycleURL
+	}
+	if requestedLifecycleURL == "" {
+		return "", "", nil
 	}
 	if err := ValidateLifecycleCallbackURL(requestedLifecycleURL); err != nil {
 		return "", "", fmt.Errorf("validate requested lifecycle callback: %w", err)
@@ -501,11 +579,11 @@ func ResolveMaintenanceCallbackURLs(
 }
 
 func lifecycleCallbackIdentity(callbackURL string) (string, bool, error) {
-	parsed, err := url.Parse(callbackURL)
+	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
 	if err != nil {
-		return "", false, fmt.Errorf("%w: parse lifecycle callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
+		return "", false, fmt.Errorf("%w: validate lifecycle callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
 	}
-	for _, part := range strings.Split(parsed.RawQuery, "&") {
+	for _, part := range strings.Split(endpoint.RawQuery(), "&") {
 		rawKey, rawValue, _ := strings.Cut(part, "=")
 		key, decodeErr := url.QueryUnescape(rawKey)
 		if decodeErr != nil {
@@ -523,18 +601,19 @@ func lifecycleCallbackIdentity(callbackURL string) (string, bool, error) {
 }
 
 func resolveOperationCallbackURL(lifecycleCallbackURL string) (string, error) {
-	parsed, err := url.Parse(lifecycleCallbackURL)
+	endpoint, err := callbackurl.ParseEndpoint(lifecycleCallbackURL)
 	if err != nil {
-		return "", fmt.Errorf("%w: parse lifecycle callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
+		return "", fmt.Errorf("%w: validate lifecycle callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
 	}
-	if err := validateCallbackRawQuery(parsed.RawQuery, ErrInvalidLifecycleCallbackURL); err != nil {
-		return "", err
-	}
-	parsed.RawQuery, err = deriveOperationCallbackQuery(parsed.RawQuery)
+	rawQuery, err := deriveOperationCallbackQuery(endpoint.RawQuery())
 	if err != nil {
 		return "", err
 	}
-	return parsed.String(), nil
+	result, err := endpoint.WithRawQuery(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("%w: derive operation callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
+	}
+	return result, nil
 }
 
 // ValidateOperationCallbackURL validates an exact requested-operation route.
@@ -543,16 +622,13 @@ func resolveOperationCallbackURL(lifecycleCallbackURL string) (string, error) {
 // rolling-upgrade window. Duplicate, mixed, or malformed authority is always
 // rejected.
 func ValidateOperationCallbackURL(callbackURL string) error {
-	parsed, err := url.Parse(callbackURL)
+	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
 	if err != nil {
-		return fmt.Errorf("%w: parse operation callback URL: %w", ErrInvalidOperationCallbackURL, err)
-	}
-	if err := validateCallbackRawQuery(parsed.RawQuery, ErrInvalidOperationCallbackURL); err != nil {
-		return err
+		return fmt.Errorf("%w: validate operation callback endpoint: %w", ErrInvalidOperationCallbackURL, err)
 	}
 
 	operationSeen := false
-	for _, part := range strings.Split(parsed.RawQuery, "&") {
+	for _, part := range strings.Split(endpoint.RawQuery(), "&") {
 		rawKey, rawValue, _ := strings.Cut(part, "=")
 		key, decodeErr := url.QueryUnescape(rawKey)
 		if decodeErr != nil {
@@ -585,16 +661,13 @@ func ValidateOperationCallbackURL(callbackURL string) error {
 // rolling-upgrade window. Duplicate, mixed, or malformed authority is always
 // rejected.
 func ValidateLifecycleCallbackURL(callbackURL string) error {
-	parsed, err := url.Parse(callbackURL)
+	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
 	if err != nil {
-		return fmt.Errorf("%w: parse lifecycle callback URL: %w", ErrInvalidLifecycleCallbackURL, err)
-	}
-	if err := validateCallbackRawQuery(parsed.RawQuery, ErrInvalidLifecycleCallbackURL); err != nil {
-		return err
+		return fmt.Errorf("%w: validate lifecycle callback endpoint: %w", ErrInvalidLifecycleCallbackURL, err)
 	}
 
 	lifecycleSeen := false
-	for _, part := range strings.Split(parsed.RawQuery, "&") {
+	for _, part := range strings.Split(endpoint.RawQuery(), "&") {
 		rawKey, rawValue, _ := strings.Cut(part, "=")
 		key, decodeErr := url.QueryUnescape(rawKey)
 		if decodeErr != nil {
@@ -621,101 +694,72 @@ func ValidateLifecycleCallbackURL(callbackURL string) error {
 	return nil
 }
 
-// validateCallbackRawQuery keeps backend callback acceptance aligned with
-// Fred's ingress parser. url.URL.Query silently drops malformed fields, while
-// url.ParseQuery reports invalid escapes and semicolon separators. Validate
-// without re-encoding so a valid HMAC-covered RequestURI remains byte-for-byte
-// unchanged through derivation and durable persistence.
-func validateCallbackRawQuery(rawQuery string, invalidURL error) error {
-	if _, err := url.ParseQuery(rawQuery); err != nil {
-		return fmt.Errorf("%w: malformed callback query: %w", invalidURL, err)
-	}
-	return nil
-}
-
 func deriveLifecycleCallbackQuery(rawQuery string) (string, error) {
-	if rawQuery == "" {
-		return "", nil
-	}
-
-	parts := strings.Split(rawQuery, "&")
-	rewritten := append([]string(nil), parts...)
-	operationIndex := -1
-	operationID := ""
-	for index, part := range parts {
-		rawKey, rawValue, _ := strings.Cut(part, "=")
-		key, err := url.QueryUnescape(rawKey)
-		if err != nil {
-			return "", fmt.Errorf("%w: decode callback query key: %w", ErrInvalidLifecycleCallbackURL, err)
-		}
-
-		switch key {
-		case CallbackLifecycleIDQueryParameter:
-			return "", fmt.Errorf("%w: callback_url must not contain %s",
-				ErrInvalidLifecycleCallbackURL, CallbackLifecycleIDQueryParameter)
-		case CallbackOperationIDQueryParameter:
-			if operationIndex >= 0 {
-				return "", fmt.Errorf("%w: %s must occur exactly once",
-					ErrInvalidLifecycleCallbackURL, CallbackOperationIDQueryParameter)
-			}
-			parsedID, parseErr := parseCanonicalCallbackQueryID(
-				rawValue, CallbackOperationIDQueryParameter, ErrInvalidLifecycleCallbackURL,
-			)
-			if parseErr != nil {
-				return "", parseErr
-			}
-			operationIndex = index
-			operationID = parsedID
-		}
-	}
-
-	if operationIndex < 0 {
-		return rawQuery, nil
-	}
-	rewritten[operationIndex] = CallbackLifecycleIDQueryParameter + "=" + operationID
-	return strings.Join(rewritten, "&"), nil
+	return rewriteCallbackIdentityQuery(
+		rawQuery,
+		CallbackOperationIDQueryParameter,
+		CallbackLifecycleIDQueryParameter,
+		"callback_url",
+		"callback query key",
+	)
 }
 
 func deriveOperationCallbackQuery(rawQuery string) (string, error) {
+	return rewriteCallbackIdentityQuery(
+		rawQuery,
+		CallbackLifecycleIDQueryParameter,
+		CallbackOperationIDQueryParameter,
+		"lifecycle URL",
+		"lifecycle callback query key",
+	)
+}
+
+// rewriteCallbackIdentityQuery swaps one typed callback identity for another
+// without parsing and re-encoding unrelated query fields. Callback request
+// signatures cover the exact RequestURI, so preserving every other byte is a
+// protocol requirement rather than an optimization.
+func rewriteCallbackIdentityQuery(
+	rawQuery, sourceParameter, targetParameter, sourceDescription, keyDescription string,
+) (string, error) {
 	if rawQuery == "" {
 		return "", nil
 	}
 
 	parts := strings.Split(rawQuery, "&")
 	rewritten := append([]string(nil), parts...)
-	lifecycleIndex := -1
-	lifecycleID := ""
+	sourceIndex := -1
+	sourceID := ""
 	for index, part := range parts {
 		rawKey, rawValue, _ := strings.Cut(part, "=")
 		key, err := url.QueryUnescape(rawKey)
 		if err != nil {
-			return "", fmt.Errorf("%w: decode lifecycle callback query key: %w", ErrInvalidLifecycleCallbackURL, err)
+			return "", fmt.Errorf("%w: decode %s: %w", ErrInvalidLifecycleCallbackURL, keyDescription, err)
 		}
 
 		switch key {
-		case CallbackOperationIDQueryParameter:
-			return "", fmt.Errorf("%w: lifecycle URL must not contain %s",
-				ErrInvalidLifecycleCallbackURL, CallbackOperationIDQueryParameter)
-		case CallbackLifecycleIDQueryParameter:
-			if lifecycleIndex >= 0 {
+		case targetParameter:
+			return "", fmt.Errorf("%w: %s must not contain %s",
+				ErrInvalidLifecycleCallbackURL, sourceDescription, targetParameter)
+		case sourceParameter:
+			if sourceIndex >= 0 {
 				return "", fmt.Errorf("%w: %s must occur exactly once",
-					ErrInvalidLifecycleCallbackURL, CallbackLifecycleIDQueryParameter)
+					ErrInvalidLifecycleCallbackURL, sourceParameter)
 			}
 			parsedID, parseErr := parseCanonicalCallbackQueryID(
-				rawValue, CallbackLifecycleIDQueryParameter, ErrInvalidLifecycleCallbackURL,
+				rawValue, sourceParameter, ErrInvalidLifecycleCallbackURL,
 			)
 			if parseErr != nil {
 				return "", parseErr
 			}
-			lifecycleIndex = index
-			lifecycleID = parsedID
+			sourceIndex = index
+			sourceID = parsedID
 		}
 	}
 
-	if lifecycleIndex < 0 {
+	if sourceIndex < 0 {
 		return rawQuery, nil
 	}
-	rewritten[lifecycleIndex] = CallbackOperationIDQueryParameter + "=" + lifecycleID
+	rewritten[sourceIndex] = targetParameter + "=" + sourceID
 	return strings.Join(rewritten, "&"), nil
 }
 
@@ -988,6 +1032,66 @@ var ErrResponseTooLarge = errors.New("response body too large")
 // ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
 
+var (
+	// ErrBackendStorageIdentityUnbound means the production client has no
+	// durable expected identity and therefore refuses non-bootstrap requests.
+	ErrBackendStorageIdentityUnbound = errors.New("backend storage identity is not bound")
+	// ErrBackendStorageIdentityMissing means an upgraded backend response did
+	// not carry the required identity header.
+	ErrBackendStorageIdentityMissing = errors.New("backend response omitted storage identity")
+	// ErrBackendStorageIdentityMismatch means a response or request path names
+	// storage other than the identity pinned for the configured backend name.
+	ErrBackendStorageIdentityMismatch = errors.New("backend storage identity mismatch")
+	// ErrBackendUpgradeRequired proves an upgraded-only side-effect path was not
+	// dispatched: an older backend returned its route-level 404 without an
+	// identity header. Callers may refuse the exact write-ahead attempt.
+	ErrBackendUpgradeRequired = errors.New("backend must be upgraded before side effects are enabled")
+)
+
+// backendStorageIdentityMissingResponseError retains the response class that
+// accompanied a missing identity header. ErrBackendStorageIdentityMissing
+// remains the public fail-closed sentinel; callers may use the narrow helper
+// below to distinguish an unhealthy endpoint from a successful response that
+// failed to attest its identity.
+type backendStorageIdentityMissingResponseError struct {
+	backend    string
+	statusCode int
+	mode       requestIdentityMode
+}
+
+func (err *backendStorageIdentityMissingResponseError) Error() string {
+	return fmt.Sprintf(
+		"%s: backend %q returned status %d",
+		ErrBackendStorageIdentityMissing,
+		err.backend,
+		err.statusCode,
+	)
+}
+
+func (*backendStorageIdentityMissingResponseError) Unwrap() error {
+	return ErrBackendStorageIdentityMissing
+}
+
+// IsBackendStorageIdentityMissingServerError reports whether an
+// identity-bound observation received an HTTP 5xx response with no
+// storage-identity header at all. Observation-only health probes may treat that
+// as transient endpoint unavailability: explicitly empty, duplicate, or
+// malformed headers remain contradictions, and side-effect responses always
+// return false because this classification cannot prove refusal.
+func IsBackendStorageIdentityMissingServerError(err error) bool {
+	var responseErr *backendStorageIdentityMissingResponseError
+	return errors.As(err, &responseErr) &&
+		responseErr.mode == requestIdentityRead &&
+		responseErr.statusCode >= http.StatusInternalServerError &&
+		responseErr.statusCode <= 599
+}
+
+// BackendStorageIdentityResolver supplies the durable identity pinned by the
+// placement store. Implementations must be safe for concurrent calls.
+type BackendStorageIdentityResolver interface {
+	ExpectedBackendStorageIdentity(string) (backendidentity.ID, bool)
+}
+
 // isCircuitBreakerError checks if the error is a circuit breaker error
 // (either open state or too many requests in half-open state).
 func isCircuitBreakerError(err error) bool {
@@ -1001,6 +1105,7 @@ type HTTPClient struct {
 	secret     string
 	httpClient *http.Client
 	cb         *gobreaker.CircuitBreaker
+	identity   BackendStorageIdentityResolver
 
 	// Response body size limits
 	maxInfoBytes             int64
@@ -1020,6 +1125,21 @@ type HTTPClient struct {
 	malformedErrorBodyTotal *prometheus.CounterVec
 }
 
+type requestIdentityMode uint8
+
+const (
+	requestIdentityRead requestIdentityMode = iota + 1
+	requestIdentityBootstrap
+	requestIdentitySideEffect
+)
+
+type requestIdentityContext struct {
+	expected backendidentity.ID
+	mode     requestIdentityMode
+}
+
+type requestIdentityContextKey struct{}
+
 // MaxLookupUUIDs caps the number of lease UUIDs accepted by a single
 // LookupProvisions call (and the matching server-side filter on
 // GET /provisions?lease_uuid=...). Shared across the HTTP client, the
@@ -1034,9 +1154,20 @@ const (
 	DefaultMaxProvisionsBytes       int64 = 8 << 20  // 8 MiB — list of all provisions
 	DefaultMaxLookupProvisionsBytes int64 = 8 << 20  // 8 MiB — filtered provisions lookup; matches MaxProvisionsBytes because stack leases carry unbounded ServiceImages
 	DefaultMaxLogsBytes             int64 = 16 << 20 // 16 MiB — container logs can be large
-	DefaultMaxReleasesBytes         int64 = 8 << 20  // 8 MiB — release history with manifests
-	DefaultMaxStatsBytes            int64 = 1 << 20  // 1 MiB — load stats snapshot (small JSON)
-	DefaultMaxRetentionsBytes       int64 = 1 << 20  // 1 MiB — bounds a single /retentions PAGE (not the whole list) since pagination
+	// MaxStoredReleaseHistoryBytes is the encoded per-lease history contract
+	// enforced by the authoritative release journal. Keep this in the parent
+	// backend package so both the HTTP boundary and the shared store use one
+	// compile-time value without an import cycle.
+	MaxStoredReleaseHistoryBytes = 32 << 20
+	// MaxProjectedReleasesResponseBytes includes bounded projection headroom.
+	// A legacy failed row may omit Reason on disk but gain ReasonUnknown at the
+	// backend read boundary, so a valid response is not necessarily byte-smaller
+	// than its stored history. Forty-eight MiB safely covers the worst valid
+	// status-only history while retaining a finite response-body guard.
+	MaxProjectedReleasesResponseBytes       = 48 << 20
+	DefaultMaxReleasesBytes           int64 = MaxProjectedReleasesResponseBytes
+	DefaultMaxStatsBytes              int64 = 1 << 20 // 1 MiB — load stats snapshot (small JSON)
+	DefaultMaxRetentionsBytes         int64 = 1 << 20 // 1 MiB — bounds a single /retentions PAGE (not the whole list) since pagination
 
 	// DefaultProvisionsPageLimit is the page size the client requests on
 	// GET /provisions. The server coerces a larger value down to MaxPageLimit.
@@ -1082,7 +1213,7 @@ type HTTPClientConfig struct {
 	MaxProvisionsBytes       int64 // ListProvisions response limit (default: 8 MiB)
 	MaxLookupProvisionsBytes int64 // LookupProvisions response limit (default: 8 MiB)
 	MaxLogsBytes             int64 // GetLogs response limit (default: 16 MiB)
-	MaxReleasesBytes         int64 // GetReleases response limit (default: 8 MiB)
+	MaxReleasesBytes         int64 // GetReleases response limit (default: 48 MiB projected response)
 	MaxStatsBytes            int64 // GetLoadStats response limit (default: 1 MiB)
 	MaxRetentionsBytes       int64 // /retentions per-page response limit (default: 1 MiB)
 	ProvisionsPageLimit      int   // /provisions page size requested by the client (default: 1000)
@@ -1111,8 +1242,11 @@ func positiveOr(v, fallback int64) int64 {
 	return fallback
 }
 
-// NewHTTPClient creates a new HTTP backend client.
-func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
+// newHTTPClient constructs the transport implementation without attaching a
+// durable storage-identity resolver. Keep it private: the resulting method set
+// includes every backend side effect, so returning it to bootstrap inventory
+// code would make mutation authority available by accident.
+func newHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 	// Apply defaults using cmp.Or (returns first non-zero value)
 	timeout := cmp.Or(cfg.Timeout, 30*time.Second)
 	maxIdleConns := cmp.Or(cfg.MaxIdleConns, 100)
@@ -1130,7 +1264,7 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 	}
 	if cfg.TLSClientConfig != nil {
 		transport.TLSClientConfig = cfg.TLSClientConfig
-		// The hop stays HTTP/1.1 over TLS (it is plaintext HTTP/1.1 today).
+		// The hop stays HTTP/1.1 over TLS when custom TLS configuration is used.
 		// A custom TLSClientConfig disables Go's automatic HTTP/2; we
 		// deliberately do NOT set ForceAttemptHTTP2 — these are low-volume
 		// JSON request/response calls and h2 with a custom TLS config carries
@@ -1180,7 +1314,9 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 				errors.Is(err, ErrInvalidState) ||
 				errors.Is(err, ErrNotRetained) ||
 				errors.Is(err, ErrDemoteDataExceedsTier) ||
-				errors.Is(err, ErrRestoreRefused)
+				errors.Is(err, ErrRestoreRefused) ||
+				errors.Is(err, ErrBackendStorageIdentityUnbound) ||
+				errors.Is(err, ErrBackendUpgradeRequired)
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			slog.Warn("circuit breaker state change",
@@ -1213,6 +1349,12 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		httpClient: &http.Client{
 			Timeout:   timeout,
 			Transport: transport,
+			// HMAC and storage authority are bound to the original RequestURI.
+			// Following a redirect could replay a POST body onto an unsigned legacy
+			// path or another host, so every backend redirect is returned untouched.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		cb:                       cb,
 		maxInfoBytes:             positiveOr(cfg.MaxInfoBytes, DefaultMaxInfoBytes),
@@ -1229,6 +1371,188 @@ func NewHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		requestsTotal:            cfg.RequestsTotal,
 		malformedErrorBodyTotal:  cfg.MalformedErrorBodyTotal,
 	}
+}
+
+// BootstrapInventoryClient is the complete read-only inventory capability
+// required while a stopped/prepared placement database has not yet supplied a
+// backend storage identity. Its method set deliberately excludes every backend
+// mutation.
+type BootstrapInventoryClient interface {
+	Name() string
+	ListProvisionsWithIdentity(context.Context) ([]ProvisionInfo, backendidentity.ID, error)
+	ListRetentionsWithIdentity(context.Context) ([]RetainedLease, backendidentity.ID, error)
+}
+
+// bootstrapInventoryClient uses composition rather than embedding so neither
+// the concrete HTTPClient nor its side-effect methods leak through the narrow
+// bootstrap capability.
+type bootstrapInventoryClient struct {
+	client *HTTPClient
+}
+
+var _ BootstrapInventoryClient = bootstrapInventoryClient{}
+
+// NewBootstrapInventoryClient constructs the only unbound production client.
+// It can collect identity-bearing inventory but cannot express a mutation.
+func NewBootstrapInventoryClient(cfg HTTPClientConfig) BootstrapInventoryClient {
+	return bootstrapInventoryClient{client: newHTTPClient(cfg)}
+}
+
+func (c bootstrapInventoryClient) Name() string {
+	return c.client.Name()
+}
+
+func (c bootstrapInventoryClient) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]ProvisionInfo, backendidentity.ID, error) {
+	return c.client.ListProvisionsWithIdentity(ctx)
+}
+
+func (c bootstrapInventoryClient) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]RetainedLease, backendidentity.ID, error) {
+	return c.client.ListRetentionsWithIdentity(ctx)
+}
+
+// NewIdentityBoundHTTPClient creates the production client. It refuses every
+// non-inventory request until the placement store has pinned this configured
+// name to an immutable backend storage identity. Side effects use upgraded-only
+// identity paths, so an old/reverted backend returns 404 before decoding or
+// executing the request rather than merely ignoring a new query parameter. A
+// strong HMAC secret is part of construction, so this mutation-capable client
+// cannot silently degrade to the unsigned compatibility behavior of the
+// read-only bootstrap transport.
+func NewIdentityBoundHTTPClient(
+	cfg HTTPClientConfig,
+	resolver BackendStorageIdentityResolver,
+) (*HTTPClient, error) {
+	if util.IsNilInterface(resolver) {
+		return nil, errors.New("backend storage identity resolver is required")
+	}
+	if cfg.Timeout < 0 {
+		return nil, errors.New("identity-bound backend timeout must not be negative")
+	}
+	if len(cfg.Secret) < hmacauth.MinSecretLength {
+		return nil, fmt.Errorf(
+			"identity-bound backend HMAC secret must be at least %d bytes, got %d",
+			hmacauth.MinSecretLength,
+			len(cfg.Secret),
+		)
+	}
+	normalizedOrigin, err := httpurl.NormalizeOrigin(cfg.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("identity-bound backend base URL: %w", err)
+	}
+	cfg.BaseURL = normalizedOrigin
+	client := newHTTPClient(cfg)
+	client.identity = resolver
+	return client, nil
+}
+
+func (c *HTTPClient) prepareRequest(
+	req *http.Request,
+	body []byte,
+	mode requestIdentityMode,
+) error {
+	if c.identity == nil {
+		c.signRequest(req, body)
+		return nil
+	}
+	expected, bound := c.identity.ExpectedBackendStorageIdentity(c.name)
+	if !bound || !expected.Valid() {
+		if mode != requestIdentityBootstrap {
+			return fmt.Errorf("%w: %q", ErrBackendStorageIdentityUnbound, c.name)
+		}
+		expected = backendidentity.ID{}
+	}
+	if mode == requestIdentitySideEffect {
+		path, err := backendidentity.BoundPath(expected, req.URL.Path)
+		if err != nil {
+			return fmt.Errorf("bind backend side-effect path: %w", err)
+		}
+		req.URL.Path = path
+		req.URL.RawPath = ""
+	}
+	if expected.Valid() {
+		query := req.URL.Query()
+		query.Set(backendidentity.QueryParameter, expected.String())
+		req.URL.RawQuery = query.Encode()
+	}
+	ctx := context.WithValue(req.Context(), requestIdentityContextKey{}, requestIdentityContext{
+		expected: expected,
+		mode:     mode,
+	})
+	*req = *req.WithContext(ctx)
+	c.signRequest(req, body)
+	return nil
+}
+
+func (c *HTTPClient) do(req *http.Request) (*http.Response, error) {
+	resp, err := c.httpClient.Do(req)
+	if err != nil || c.identity == nil {
+		return resp, err
+	}
+	identityContext, ok := req.Context().Value(requestIdentityContextKey{}).(requestIdentityContext)
+	if !ok {
+		if resp != nil {
+			discardAndCloseResponse(resp)
+		}
+		return nil, errors.New("identity-bound backend request was not prepared")
+	}
+	values := resp.Header.Values(backendidentity.ResponseHeader)
+	if len(values) == 0 {
+		if identityContext.mode == requestIdentitySideEffect &&
+			resp.StatusCode == http.StatusNotFound {
+			discardAndCloseResponse(resp)
+			return nil, fmt.Errorf("%w: %q", ErrBackendUpgradeRequired, c.name)
+		}
+		missingErr := &backendStorageIdentityMissingResponseError{
+			backend:    c.name,
+			statusCode: resp.StatusCode,
+			mode:       identityContext.mode,
+		}
+		discardAndCloseResponse(resp)
+		return nil, missingErr
+	}
+	if len(values) != 1 || values[0] == "" {
+		discardAndCloseResponse(resp)
+		return nil, fmt.Errorf(
+			"%w: backend %q returned an empty or duplicate identity header",
+			ErrBackendStorageIdentityMissing,
+			c.name,
+		)
+	}
+	observed, parseErr := backendidentity.Parse(values[0])
+	if parseErr != nil {
+		discardAndCloseResponse(resp)
+		return nil, fmt.Errorf("%w: backend %q returned %q: %w",
+			ErrBackendStorageIdentityMismatch, c.name, values[0], parseErr)
+	}
+	if identityContext.expected.Valid() && observed != identityContext.expected {
+		discardAndCloseResponse(resp)
+		return nil, fmt.Errorf("%w: backend %q returned %s, expected %s",
+			ErrBackendStorageIdentityMismatch, c.name, observed, identityContext.expected)
+	}
+	return resp, nil
+}
+
+func discardAndCloseResponse(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+}
+
+func responseStorageIdentity(resp *http.Response) (backendidentity.ID, error) {
+	if resp == nil {
+		return backendidentity.ID{}, ErrBackendStorageIdentityMissing
+	}
+	values := resp.Header.Values(backendidentity.ResponseHeader)
+	if len(values) != 1 {
+		return backendidentity.ID{}, ErrBackendStorageIdentityMissing
+	}
+	return backendidentity.Parse(values[0])
 }
 
 // Name returns the backend's configured name.
@@ -1446,7 +1770,9 @@ func (c *HTTPClient) noteMalformedErrorBody(body []byte, operation, why string) 
 }
 
 // signRequest adds an HMAC-SHA256 signature header to the request.
-// If no secret is configured, this is a no-op (backwards compatible).
+// If no secret is configured, this is a no-op for the deliberately narrow
+// read-only bootstrap client. NewIdentityBoundHTTPClient rejects that state, so
+// mutation-capable production clients cannot reach this compatibility branch.
 func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
 	if c.secret == "" {
 		return
@@ -1466,9 +1792,11 @@ func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxByt
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
-		c.signRequest(httpReq, nil)
+		if err := c.prepareRequest(httpReq, nil, requestIdentityRead); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("%s request failed: %w", metric, err)
 		}
@@ -1517,9 +1845,11 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("provision request failed: %w", err)
 		}
@@ -1575,9 +1905,11 @@ func (c *HTTPClient) Deprovision(ctx context.Context, leaseUUID string) (err err
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("deprovision request failed: %w", err)
 		}
@@ -1635,21 +1967,70 @@ func walkKeysetPages[T any](ctx context.Context, op string, fetchPage func(ctx c
 // returns an error rather than a partial set (complete-or-error) so the
 // reconciler never acts on incomplete data.
 func (c *HTTPClient) ListProvisions(ctx context.Context) (_ []ProvisionInfo, err error) {
+	provisions, _, err := c.listProvisionsWithIdentity(ctx, c.identity != nil)
+	return provisions, err
+}
+
+// ListProvisionsWithIdentity returns a complete provision inventory plus the
+// one storage identity carried consistently by every page.
+func (c *HTTPClient) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]ProvisionInfo, backendidentity.ID, error) {
+	return c.listProvisionsWithIdentity(ctx, true)
+}
+
+func (c *HTTPClient) listProvisionsWithIdentity(
+	ctx context.Context,
+	requireIdentity bool,
+) (_ []ProvisionInfo, observed backendidentity.ID, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics("list_provisions", start, err) }()
 
-	return walkKeysetPages(ctx, "list provisions", func(ctx context.Context, cont string) ([]ProvisionInfo, string, error) {
-		resp, ferr := c.fetchProvisionsPage(ctx, cont)
+	provisions, err := walkKeysetPages(ctx, "list provisions", func(ctx context.Context, cont string) ([]ProvisionInfo, string, error) {
+		resp, pageID, ferr := c.fetchProvisionsPage(ctx, cont, requireIdentity)
 		if ferr != nil {
 			return nil, "", ferr
 		}
+		if pageID.Valid() {
+			if observed.Valid() && observed != pageID {
+				return nil, "", fmt.Errorf(
+					"%w: provisions pages changed from %s to %s",
+					ErrBackendStorageIdentityMismatch, observed, pageID,
+				)
+			}
+			observed = pageID
+		}
+		if resp.Provisions == nil {
+			return nil, "", errors.New("list provisions response must contain a non-null provisions array")
+		}
 		return resp.Provisions, resp.Continue, nil
 	})
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	if err := validateInventoryLeaseUUIDs("provisions", len(provisions), func(index int) string {
+		return provisions[index].LeaseUUID
+	}); err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	if requireIdentity && !observed.Valid() {
+		return nil, backendidentity.ID{}, ErrBackendStorageIdentityMissing
+	}
+	return provisions, observed, nil
+}
+
+type provisionInventoryPage struct {
+	response ListProvisionsResponse
+	identity backendidentity.ID
 }
 
 // fetchProvisionsPage fetches one keyset page. continueToken == "" requests the
 // first page. The per-page body is bounded by maxProvisionsBytes (fail-closed).
-func (c *HTTPClient) fetchProvisionsPage(ctx context.Context, continueToken string) (ListProvisionsResponse, error) {
+func (c *HTTPClient) fetchProvisionsPage(
+	ctx context.Context,
+	continueToken string,
+	requireIdentity bool,
+) (ListProvisionsResponse, backendidentity.ID, error) {
 	q := url.Values{}
 	q.Set("limit", strconv.Itoa(c.provisionsPageLimit))
 	if continueToken != "" {
@@ -1662,9 +2043,11 @@ func (c *HTTPClient) fetchProvisionsPage(ctx context.Context, continueToken stri
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
-		c.signRequest(httpReq, nil)
+		if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("list provisions request failed: %w", err)
 		}
@@ -1673,25 +2056,32 @@ func (c *HTTPClient) fetchProvisionsPage(ctx context.Context, continueToken stri
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("list provisions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
+		var storageID backendidentity.ID
+		if requireIdentity {
+			storageID, err = responseStorageIdentity(resp)
+			if err != nil {
+				return nil, fmt.Errorf("list provisions response identity: %w", err)
+			}
+		}
 
 		var provResult ListProvisionsResponse
 		if err := decodeJSONLimited(resp.Body, c.maxProvisionsBytes, &provResult); err != nil {
 			return nil, fmt.Errorf("decode provisions response: %w", err)
 		}
-		return provResult, nil
+		return provisionInventoryPage{response: provResult, identity: storageID}, nil
 	})
 
 	if isCircuitBreakerError(cbErr) {
-		return ListProvisionsResponse{}, ErrCircuitOpen
+		return ListProvisionsResponse{}, backendidentity.ID{}, ErrCircuitOpen
 	}
 	if cbErr != nil {
-		return ListProvisionsResponse{}, cbErr
+		return ListProvisionsResponse{}, backendidentity.ID{}, cbErr
 	}
-	pr, ok := result.(ListProvisionsResponse)
+	page, ok := result.(provisionInventoryPage)
 	if !ok {
-		return ListProvisionsResponse{}, fmt.Errorf("list provisions: unexpected result type %T", result)
+		return ListProvisionsResponse{}, backendidentity.ID{}, fmt.Errorf("list provisions: unexpected result type %T", result)
 	}
-	return pr, nil
+	return page.response, page.identity, nil
 }
 
 // GetProvision retrieves status information for a single provision.
@@ -1759,9 +2149,11 @@ func (c *HTTPClient) Restart(ctx context.Context, req RestartRequest) (err error
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("restart request failed: %w", err)
 		}
@@ -1801,9 +2193,11 @@ func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) (err error) 
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("update request failed: %w", err)
 		}
@@ -1845,9 +2239,11 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("restore request failed: %w", err)
 		}
@@ -1964,9 +2360,11 @@ func (c *HTTPClient) ReconcileCustomDomain(ctx context.Context, leaseUUID string
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		c.signRequest(httpReq, body)
+		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("reconcile_custom_domain request failed: %w", err)
 		}
@@ -2002,21 +2400,96 @@ func (c *HTTPClient) GetLoadStats(ctx context.Context) (*LoadStats, error) {
 // an error rather than a partial set (complete-or-error) so the reconciler never
 // acts on incomplete retention data.
 func (c *HTTPClient) ListRetentions(ctx context.Context) (_ []RetainedLease, err error) {
+	retentions, _, err := c.listRetentionsWithIdentity(ctx, c.identity != nil)
+	return retentions, err
+}
+
+// ListRetentionsWithIdentity returns a complete retention inventory plus the
+// one storage identity carried consistently by every page.
+func (c *HTTPClient) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]RetainedLease, backendidentity.ID, error) {
+	return c.listRetentionsWithIdentity(ctx, true)
+}
+
+func (c *HTTPClient) listRetentionsWithIdentity(
+	ctx context.Context,
+	requireIdentity bool,
+) (_ []RetainedLease, observed backendidentity.ID, err error) {
 	start := time.Now()
 	defer func() { c.recordMetrics("list_retentions", start, err) }()
 
-	return walkKeysetPages(ctx, "list retentions", func(ctx context.Context, cont string) ([]RetainedLease, string, error) {
-		resp, ferr := c.fetchRetentionsPage(ctx, cont)
+	retentions, err := walkKeysetPages(ctx, "list retentions", func(ctx context.Context, cont string) ([]RetainedLease, string, error) {
+		resp, pageID, ferr := c.fetchRetentionsPage(ctx, cont, requireIdentity)
 		if ferr != nil {
 			return nil, "", ferr
 		}
+		if pageID.Valid() {
+			if observed.Valid() && observed != pageID {
+				return nil, "", fmt.Errorf(
+					"%w: retention pages changed from %s to %s",
+					ErrBackendStorageIdentityMismatch, observed, pageID,
+				)
+			}
+			observed = pageID
+		}
+		if resp.Retentions == nil {
+			return nil, "", errors.New("list retentions response must contain a non-null retentions array")
+		}
 		return resp.Retentions, resp.Continue, nil
 	})
+	if err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	if err := validateInventoryLeaseUUIDs("retentions", len(retentions), func(index int) string {
+		return retentions[index].LeaseUUID
+	}); err != nil {
+		return nil, backendidentity.ID{}, err
+	}
+	if requireIdentity && !observed.Valid() {
+		return nil, backendidentity.ID{}, ErrBackendStorageIdentityMissing
+	}
+	return retentions, observed, nil
+}
+
+type retentionInventoryPage struct {
+	response ListRetentionsResponse
+	identity backendidentity.ID
+}
+
+// validateInventoryLeaseUUIDs validates the fully reassembled endpoint rather
+// than individual pages so a backend cannot evade duplicate detection by
+// splitting the same lease across page boundaries. A malformed inventory is an
+// endpoint failure: callers receive no partial slice, and reconciliation marks
+// that backend unanswered instead of projecting or baselining the evidence.
+func validateInventoryLeaseUUIDs(
+	kind string,
+	length int,
+	leaseUUIDAt func(int) string,
+) error {
+	seen := make(map[string]struct{}, length)
+	for index := range length {
+		leaseUUID := leaseUUIDAt(index)
+		if !IsCanonicalLeaseUUID(leaseUUID) {
+			return fmt.Errorf("list %s: backend returned non-canonical lease UUID %q at index %d",
+				kind, leaseUUID, index)
+		}
+		if _, duplicate := seen[leaseUUID]; duplicate {
+			return fmt.Errorf("list %s: backend returned duplicate lease UUID %q",
+				kind, leaseUUID)
+		}
+		seen[leaseUUID] = struct{}{}
+	}
+	return nil
 }
 
 // fetchRetentionsPage fetches one keyset page. continueToken == "" requests the
 // first page. The per-page body is bounded by maxRetentionsBytes (fail-closed).
-func (c *HTTPClient) fetchRetentionsPage(ctx context.Context, continueToken string) (ListRetentionsResponse, error) {
+func (c *HTTPClient) fetchRetentionsPage(
+	ctx context.Context,
+	continueToken string,
+	requireIdentity bool,
+) (ListRetentionsResponse, backendidentity.ID, error) {
 	q := url.Values{}
 	q.Set("limit", strconv.Itoa(c.retentionsPageLimit))
 	if continueToken != "" {
@@ -2029,9 +2502,11 @@ func (c *HTTPClient) fetchRetentionsPage(ctx context.Context, continueToken stri
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
-		c.signRequest(httpReq, nil)
+		if err := c.prepareRequest(httpReq, nil, requestIdentityBootstrap); err != nil {
+			return nil, err
+		}
 
-		resp, err := c.httpClient.Do(httpReq)
+		resp, err := c.do(httpReq)
 		if err != nil {
 			return nil, fmt.Errorf("list retentions request failed: %w", err)
 		}
@@ -2040,25 +2515,32 @@ func (c *HTTPClient) fetchRetentionsPage(ctx context.Context, continueToken stri
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("list retentions failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
 		}
+		var storageID backendidentity.ID
+		if requireIdentity {
+			storageID, err = responseStorageIdentity(resp)
+			if err != nil {
+				return nil, fmt.Errorf("list retentions response identity: %w", err)
+			}
+		}
 
 		var retResult ListRetentionsResponse
 		if err := decodeJSONLimited(resp.Body, c.maxRetentionsBytes, &retResult); err != nil {
 			return nil, fmt.Errorf("decode retentions response: %w", err)
 		}
-		return retResult, nil
+		return retentionInventoryPage{response: retResult, identity: storageID}, nil
 	})
 
 	if isCircuitBreakerError(cbErr) {
-		return ListRetentionsResponse{}, ErrCircuitOpen
+		return ListRetentionsResponse{}, backendidentity.ID{}, ErrCircuitOpen
 	}
 	if cbErr != nil {
-		return ListRetentionsResponse{}, cbErr
+		return ListRetentionsResponse{}, backendidentity.ID{}, cbErr
 	}
-	rr, ok := result.(ListRetentionsResponse)
+	page, ok := result.(retentionInventoryPage)
 	if !ok {
-		return ListRetentionsResponse{}, fmt.Errorf("list retentions: unexpected result type %T", result)
+		return ListRetentionsResponse{}, backendidentity.ID{}, fmt.Errorf("list retentions: unexpected result type %T", result)
 	}
-	return rr, nil
+	return page.response, page.identity, nil
 }
 
 // Health checks if the backend is reachable and healthy.
@@ -2070,7 +2552,10 @@ func (c *HTTPClient) Health(ctx context.Context) error {
 		return fmt.Errorf("create health request: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(httpReq)
+	if err := c.prepareRequest(httpReq, nil, requestIdentityRead); err != nil {
+		return err
+	}
+	resp, err := c.do(httpReq)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}

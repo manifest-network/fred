@@ -104,47 +104,43 @@ func (b *Backend) routeToLeaseBlocking(ctx context.Context, leaseUUID string, ms
 // rarely fills); long enough to avoid hot-spinning a contended actor.
 const routeToLeaseRetryInterval = 10 * time.Millisecond
 
-// ackOrAbort waits for the actor's ack on a caller-facing request
-// (Provision / Restart / Update). Returns (true, nil) if the actor
-// acked success, (false, err) if the actor rejected or if we abandoned.
-//
-// Race fix: Go's select picks pseudo-randomly when multiple arms are
-// ready. A naive `select { case err := <-ack: ... case <-ctx.Done():
-// rollback ... }` can take the cancellation arm even though the actor
-// already acked — resulting in a rollback while the actor proceeds to
-// spawn a worker against the rolled-back state. Here we do a final
-// non-blocking read of ack after observing cancellation; if the actor
-// already committed, we honor its decision and skip the rollback.
-//
-// The caller is responsible for any compensating action (e.g.
-// removeProvision on the Provision path) when accepted=false. The
-// Restart/Update paths have nothing to compensate post-ENG-230 — they
-// no longer write prov.Status/CallbackURL before the ack — so they just
-// cancel the op context and return the error.
-func (b *Backend) ackOrAbort(ctx context.Context, ack <-chan error) (accepted bool, err error) {
+type asyncAcceptance uint8
+
+const (
+	asyncAcceptanceAccepted asyncAcceptance = iota + 1
+	asyncAcceptanceRejected
+	asyncAcceptanceUnknown
+)
+
+// awaitAsyncAcceptance classifies actor admission for a durable asynchronous
+// operation. Once a message is enqueued, caller cancellation cannot prove that
+// the actor did not accept and spawn its worker immediately after our final
+// channel read. That
+// arm is therefore Unknown: callers retain the write-ahead intent and all
+// reservations for startup recovery. Only an explicit actor error authorizes
+// rollback and intent cancellation.
+func (b *Backend) awaitAsyncAcceptance(ctx context.Context, ack <-chan error) (asyncAcceptance, error) {
 	select {
 	case ackErr := <-ack:
 		if ackErr != nil {
-			return false, ackErr
+			return asyncAcceptanceRejected, ackErr
 		}
-		return true, nil
+		return asyncAcceptanceAccepted, nil
 	case <-ctx.Done():
 	case <-b.stopCtx.Done():
 	}
-	// Cancellation fired. Final non-blocking check: if the actor acked
-	// at the same instant, honor its decision instead of rolling back.
 	select {
 	case ackErr := <-ack:
 		if ackErr != nil {
-			return false, ackErr
+			return asyncAcceptanceRejected, ackErr
 		}
-		return true, nil
+		return asyncAcceptanceAccepted, nil
 	default:
 	}
 	if ctx.Err() != nil {
-		return false, ctx.Err()
+		return asyncAcceptanceUnknown, ctx.Err()
 	}
-	return false, fmt.Errorf("backend shutting down")
+	return asyncAcceptanceUnknown, fmt.Errorf("backend shutting down")
 }
 
 // waitForReply waits for an actor's reply channel on a caller-facing
@@ -155,12 +151,12 @@ func (b *Backend) ackOrAbort(ctx context.Context, ack <-chan error) (accepted bo
 // is unsafe because Go's select is pseudo-randomized when multiple
 // arms are ready, so a caller ctx cancel racing the actor's committed
 // outcome can return ctx.Err() for an operation that fully succeeded.
-// (Same race class as ackOrAbort handles for Provision/Restart/Update.)
+// (The final non-blocking read is the same race treatment used by
+// awaitAsyncAcceptance for durable asynchronous commands.)
 //
-// Semantics differ from ackOrAbort: here the actor's reply IS the
-// outcome of the work (it runs synchronously inside the handler), so
-// there's no "accepted vs err" distinction — callers get the outcome
-// or a cancellation error.
+// Here the actor's reply IS the outcome of the work (it runs synchronously
+// inside the handler), so there is no "accepted vs err" distinction: callers
+// get the outcome or a cancellation error.
 func (b *Backend) waitForReply(ctx context.Context, reply <-chan error) error {
 	select {
 	case err := <-reply:
@@ -228,6 +224,40 @@ func (b *Backend) sampleActorMetrics() {
 	}
 }
 
+// sampleCloseIntentMetrics projects the non-expiring close journal into two
+// low-cardinality gauges. A read failure preserves the last known values: zeroing
+// them would falsely report that destructive work completed. The callback-store
+// error counter and health check carry the read failure itself.
+func (b *Backend) sampleCloseIntentMetrics(now time.Time) {
+	if b.callbackStore == nil {
+		pendingCloseIntents.Set(0)
+		oldestCloseIntentAgeSeconds.Set(0)
+		return
+	}
+	claims, err := b.callbackStore.ListCloseIntents()
+	if err != nil {
+		callbackStoreErrorsTotal.Inc()
+		return
+	}
+
+	pendingCloseIntents.Set(float64(len(claims)))
+	if len(claims) == 0 {
+		oldestCloseIntentAgeSeconds.Set(0)
+		return
+	}
+	oldest := claims[0].CreatedAt()
+	for _, claim := range claims[1:] {
+		if claim.CreatedAt().Before(oldest) {
+			oldest = claim.CreatedAt()
+		}
+	}
+	age := now.Sub(oldest)
+	if age < 0 {
+		age = 0
+	}
+	oldestCloseIntentAgeSeconds.Set(age.Seconds())
+}
+
 // actorMetricsSampleLoop runs sampleActorMetrics on a ticker until the
 // backend shuts down. Spawned once from Start() via b.wg.Go.
 func (b *Backend) actorMetricsSampleLoop() {
@@ -239,6 +269,7 @@ func (b *Backend) actorMetricsSampleLoop() {
 			return
 		case <-ticker.C:
 			b.sampleActorMetrics()
+			b.sampleCloseIntentMetrics(time.Now())
 		}
 	}
 }

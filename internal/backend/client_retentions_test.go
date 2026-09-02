@@ -40,7 +40,7 @@ func pagingRetentionServer(t *testing.T, all []RetainedLease, calls *int) *httpt
 // validates as a UUID — so IDs in these end-to-end tests must be real UUIDs
 // (zero-padded so lexical == numeric order).
 func retUUID(i int) string {
-	return fmt.Sprintf("%08d-0000-0000-0000-000000000000", i)
+	return fmt.Sprintf("%08d-0000-0000-0000-000000000000", i+1)
 }
 
 func manyRetentions(n int) []RetainedLease {
@@ -57,7 +57,7 @@ func TestHTTPClient_ListRetentions_ReassemblesAllPages(t *testing.T) {
 	server := pagingRetentionServer(t, all, &calls)
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
 	got, err := c.ListRetentions(context.Background())
 	require.NoError(t, err)
 	require.Len(t, got, 2500)
@@ -79,7 +79,7 @@ func TestHTTPClient_ListRetentions_LargeInventoryStaysUnderPerPageCap(t *testing
 	server := pagingRetentionServer(t, all, nil)
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, MaxRetentionsBytes: 128 << 10}) // 128 KiB per page
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL, MaxRetentionsBytes: 128 << 10}) // 128 KiB per page
 	got, err := c.ListRetentions(context.Background())
 	require.NoError(t, err, "paginated fetch keeps every page under the byte cap")
 	assert.Len(t, got, 10000)
@@ -94,7 +94,7 @@ func TestHTTPClient_ListRetentions_20kInventoryUnderDefaultCap(t *testing.T) {
 	server := pagingRetentionServer(t, all, nil)
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL}) // default 1 MiB per-page cap
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL}) // default 1 MiB per-page cap
 	got, err := c.ListRetentions(context.Background())
 	require.NoError(t, err, "20k retained leases fetch without ErrResponseTooLarge once paginated")
 	assert.Len(t, got, 20000)
@@ -105,7 +105,7 @@ func TestHTTPClient_ListRetentions_SmallPageLimit(t *testing.T) {
 	server := pagingRetentionServer(t, all, nil)
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, RetentionsPageLimit: 10})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL, RetentionsPageLimit: 10})
 	got, err := c.ListRetentions(context.Background())
 	require.NoError(t, err)
 	assert.Len(t, got, 25)
@@ -121,7 +121,7 @@ func TestHTTPClient_ListRetentions_NonAdvancingContinueErrors(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
 	_, err := c.ListRetentions(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "non-advancing")
@@ -131,23 +131,78 @@ func TestHTTPClient_ListRetentions_BackCompatSinglePageNoContinue(t *testing.T) 
 	// Old server: ignores limit/continue, returns full list, no continue field.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"retentions":[{"lease_uuid":"lease-a"},{"lease_uuid":"lease-b"}]}`))
+		_, _ = w.Write([]byte(`{"retentions":[{"lease_uuid":"018f47a2-8b1c-7def-8123-456789abcdef"},{"lease_uuid":"018f47a2-8b1c-7def-8123-456789abcdee"}]}`))
 	}))
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
 	got, err := c.ListRetentions(context.Background())
 	require.NoError(t, err)
 	assert.Len(t, got, 2, "no continue field => stop after one page")
 }
 
+func TestHTTPClient_ListRetentionsRejectsMalformedOrDuplicateLeaseIdentity(t *testing.T) {
+	tests := []struct {
+		name       string
+		retentions []RetainedLease
+		want       string
+	}{
+		{
+			name:       "non-canonical",
+			retentions: []RetainedLease{{LeaseUUID: "not-a-canonical-uuid"}},
+			want:       "non-canonical lease UUID",
+		},
+		{
+			name: "duplicate",
+			retentions: []RetainedLease{
+				{LeaseUUID: retUUID(1)},
+				{LeaseUUID: retUUID(1)},
+			},
+			want: "duplicate lease UUID",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(ListRetentionsResponse{Retentions: test.retentions})
+			}))
+			defer server.Close()
+
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+			got, err := client.ListRetentions(t.Context())
+			require.ErrorContains(t, err, test.want)
+			assert.Nil(t, got, "malformed inventory must never return a partial projection input")
+		})
+	}
+}
+
+func TestHTTPClient_ListRetentions_RejectsMissingOrNullArray(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing": `{}`,
+		"null":    `{"retentions":null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+			_, err := client.ListRetentions(context.Background())
+			require.ErrorContains(t, err, "non-null retentions array")
+		})
+	}
+}
+
 func TestNewHTTPClient_RetentionsPageLimitDefault(t *testing.T) {
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com"})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: "http://example.com"})
 	assert.Equal(t, DefaultRetentionsPageLimit, c.retentionsPageLimit, "zero config falls back to default")
 
-	c2 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", RetentionsPageLimit: 250})
+	c2 := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", RetentionsPageLimit: 250})
 	assert.Equal(t, 250, c2.retentionsPageLimit, "explicit config is honored")
 
-	c3 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", RetentionsPageLimit: -5})
+	c3 := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", RetentionsPageLimit: -5})
 	assert.Equal(t, DefaultRetentionsPageLimit, c3.retentionsPageLimit, "negative config falls back to default")
 }

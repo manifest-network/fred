@@ -10,8 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 )
 
 func legacyMaintenanceLifecycleStore(
@@ -41,14 +43,52 @@ func legacyMaintenanceLifecycleStore(
 	}))
 	require.NoError(t, db.Close())
 
-	store, err := placement.NewStore(dbPath)
+	preparer, err := placement.OpenLegacyUpgradePreparer(dbPath)
+	require.NoError(t, err)
+	chainProof, err := placementstore.LegacyUpgradeChainProof(
+		placementstore.ProviderUUID, leaseUUID,
+	)
+	require.NoError(t, err)
+	backupPath := dbPath + ".v013.backup"
+	backupTarget, err := placement.BindExactBackupTarget(backupPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, backupTarget.Close()) })
+	inventories := map[string]placement.BackendInventory{
+		backendName: {
+			StorageIdentity:        testAPIBackendStorageID(backendName),
+			Provisions:             []string{leaseUUID},
+			ProvisionProviderUUIDs: map[string]string{leaseUUID: ""},
+			ProvisionItems: map[string][]backend.LeaseItem{
+				leaseUUID: {{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
+			},
+			Retentions: []string{},
+		},
+	}
+	capability, err := preparer.AuthorizePreparation(
+		t.Context(), placementstore.ProviderUUID, []string{backendName}, inventories,
+		chainProof, backupTarget, placement.LegacyPreparationDrainAttestation,
+	)
+	require.NoError(t, err)
+	_, err = preparer.PrepareContext(
+		t.Context(),
+		placementstore.ProviderUUID,
+		[]string{backendName},
+		inventories,
+		chainProof,
+		capability,
+	)
+	require.NoError(t, err)
+	require.NoError(t, preparer.Close())
+	store, err := placement.OpenStore(dbPath, placementstore.ProviderUUID)
+	require.NoError(t, err)
+	require.Equal(t, placement.LifecycleVerdictLegacy,
+		store.CurrentLifecycle(leaseUUID).Verdict(),
+		"the prepared v0.13 authority must survive its first online open",
+	)
+	require.NoError(t, store.Close())
+	store, err = placement.OpenStore(dbPath, placementstore.ProviderUUID)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	require.NoError(t, store.ConfigureBackendTopology([]string{backendName}))
-	fence := store.BeginInventorySession()
-	_, err = store.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
-	store.EndInventorySession(fence)
-	require.NoError(t, err)
 	return store
 }
 
@@ -57,12 +97,16 @@ func typedMaintenanceLifecycleStore(
 	leaseUUID, backendName string,
 ) (*placement.Store, operation.OperationID) {
 	t.Helper()
-	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	store, err := placementstore.NewStore(filepath.Join(t.TempDir(), "placements.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	require.NoError(t, store.ConfigureBackendTopology([]string{backendName}))
+	configureAPIPlacementTopology(t, store, []string{backendName})
 	fence := store.BeginInventorySession()
-	_, err = store.ProjectInventory(fence, placement.InventoryProjection{Complete: true})
+	_, err = store.ProjectInventory(fence, placement.InventoryProjection{
+		Complete:                 true,
+		BackendStorageIdentities: testAPIBackendStorageIDs(backendName),
+		EmptyBackends:            []string{backendName},
+	})
 	store.EndInventorySession(fence)
 	require.NoError(t, err)
 
@@ -74,6 +118,8 @@ func typedMaintenanceLifecycleStore(
 	require.NoError(t, err)
 	attempt, begun, err := store.BeginNewAttempt(
 		scope, leaseUUID, backendName, operationID,
+		placement.PayloadFingerprint{}, testAPIBackendRequestSnapshot(t),
+		testAPICallbackPair(t, operationID),
 	)
 	require.NoError(t, err)
 	require.True(t, begun)
@@ -123,7 +169,7 @@ func TestHandlers_MaintenanceCallbackURLRejectsMissingAuthority(t *testing.T) {
 
 func TestHandlers_MaintenanceCallbackURLKeepsMigratedLeaseLegacy(t *testing.T) {
 	const (
-		leaseUUID   = "legacy-lease"
+		leaseUUID   = "018f47a2-8b1c-7def-8123-456789abcdef"
 		backendName = "backend-a"
 		baseURL     = "https://fred.example/base"
 	)
@@ -157,19 +203,20 @@ func TestHandlers_MaintenanceCallbackURLRejectsTeardownOnlyCapability(t *testing
 	})
 
 	t.Run("legacy", func(t *testing.T) {
-		store := legacyMaintenanceLifecycleStore(t, "legacy", "backend-a")
-		current := store.Lookup("legacy")
+		const leaseUUID = "018f47a2-8b1c-7def-8123-456789abcdef"
+		store := legacyMaintenanceLifecycleStore(t, leaseUUID, "backend-a")
+		current := store.Lookup(leaseUUID)
 		deleted, err := store.DeleteRecord(current.RecordRevision())
 		require.NoError(t, err)
 		require.True(t, deleted)
 		require.Equal(t, placement.LifecycleVerdictTeardownOnly,
-			store.CurrentLifecycle("legacy").Verdict())
+			store.CurrentLifecycle(leaseUUID).Verdict())
 
 		handlers := &Handlers{
 			callbackBaseURL:    "https://fred.example/base",
 			lifecycleCallbacks: store,
 		}
-		_, err = handlers.maintenanceCallbackURL("legacy", "backend-a")
+		_, err = handlers.maintenanceCallbackURL(leaseUUID, "backend-a")
 		assert.Error(t, err, "legacy teardown authority must not be reissued")
 	})
 }

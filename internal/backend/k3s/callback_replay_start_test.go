@@ -35,22 +35,29 @@ func TestBackend_Start_PendingCallbackReplayDoesNotWaitForDelivery(t *testing.T)
 	cfg.CallbackDBPath = filepath.Join(dir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(dir, "diagnostics.db")
 	cfg.ReleasesDBPath = filepath.Join(dir, "releases.db")
-	b, err := New(cfg, slog.Default())
+	b, err := newBackendWithTestIdentity(cfg, slog.Default())
 	require.NoError(t, err)
-	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+	bindK3sTestStorageIdentity(t, b)
+	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
 		Store:           b.callbackStore,
 		HTTPClient:      client,
+		Secret:          string(cfg.CallbackSecret),
+		StorageIdentity: b.storageIdentity,
+		BeforeDelivery:  b.VerifyStorageIdentity,
+		BeforeReplay:    b.VerifyStorageIdentity,
 		Logger:          slog.Default(),
 		StopCtx:         b.stopCtx,
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: 2 * time.Second,
 	})
 	_, err = b.callbackStore.StoreEntry(shared.CallbackEntry{
-		LeaseUUID:    "lease-start-replay",
-		CallbackURL:  "https://fred.example/callback",
-		DeliveryKind: shared.CallbackDeliveryKindLifecycle,
-		Status:       backend.CallbackStatusFailed,
-		CreatedAt:    time.Now(),
+		LeaseUUID:        "550e8400-e29b-41d4-a716-446655440000",
+		CallbackURL:      "https://fred.example/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+		DeliveryKind:     shared.CallbackDeliveryKindLifecycle,
+		Success:          false,
+		Status:           backend.CallbackStatusFailed,
+		BackendStorageID: b.storageIdentity.String(),
+		CreatedAt:        time.Now(),
 	})
 	require.NoError(t, err)
 

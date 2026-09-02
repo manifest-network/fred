@@ -166,3 +166,38 @@ func TestHandleProvisionCallback_RejectsMalformedRawCapabilityQuery(t *testing.T
 	assertErrorBody(t, recorder, "callback query is malformed")
 	assert.False(t, publisher.called)
 }
+
+func TestHandleProvisionCallback_RejectsStatusAuthorityMismatchBeforePublication(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		requestURI string
+		body       string
+		wantError  string
+	}{
+		{
+			name:       "operation capability cannot carry teardown observation",
+			requestURI: "/callbacks/provision?operation_id=" + canonicalTestLifecycleID,
+			body:       `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"deprovisioned"}`,
+			wantError:  "deprovisioned status requires lifecycle or legacy callback authority",
+		},
+		{
+			name:       "retained requires terminal teardown",
+			requestURI: "/callbacks/provision?lifecycle_id=" + canonicalTestLifecycleID,
+			body:       `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"failed","retained":true}`,
+			wantError:  "retained requires deprovisioned status",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+			publisher := &capturingCallbackPublisher{}
+			server := &Server{callbackPublisher: publisher, callbackAuthenticator: auth}
+			recorder := httptest.NewRecorder()
+			server.handleProvisionCallback(recorder,
+				signedLifecycleCallbackRequest(t, auth, test.requestURI, test.body))
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			assertErrorBody(t, recorder, test.wantError)
+			assert.False(t, publisher.called)
+		})
+	}
+}

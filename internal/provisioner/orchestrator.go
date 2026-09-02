@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/util"
 )
@@ -45,13 +47,16 @@ func classifyProvisionOutcome(err error) provisionOutcome {
 	case errors.Is(err, backend.ErrAlreadyProvisioned):
 		// HTTPClient maps every 409 response to this sentinel without validating a
 		// declared machine-readable error code. An intermediary-generated 409
-		// therefore cannot prove that the selected backend owns the lease. Keep the durable
-		// Attempt until matching positive inventory confirms it or an operator
-		// supplies a remote cancellation/refusal proof.
+		// therefore cannot prove that the selected backend owns the lease. Keep the
+		// durable Attempt until its exact callback or an upgraded inventory report
+		// carries the same paired typed generation, or an operator supplies remote
+		// cancellation/refusal proof.
 		return provisionOutcomeAmbiguous
 	case errors.Is(err, backend.ErrValidation),
 		errors.Is(err, backend.ErrCapacityRefused),
-		errors.Is(err, backend.ErrCircuitOpen):
+		errors.Is(err, backend.ErrCircuitOpen),
+		errors.Is(err, backend.ErrBackendStorageIdentityUnbound),
+		errors.Is(err, backend.ErrBackendUpgradeRequired):
 		// Validation and coded capacity errors carry contract-conforming verdicts
 		// trusted under the configured backend transport, while an open circuit means
 		// the request was never sent. The base ErrInsufficientResources is not
@@ -119,6 +124,18 @@ func NewProvisionOrchestrator(
 	placementStore ProvisionPlacement,
 	startEvents ProvisionStartEventSink,
 ) (*ProvisionOrchestrator, error) {
+	if providerUUID == "" {
+		return nil, errors.New("provider UUID is required")
+	}
+	if callbackBaseURL == "" {
+		return nil, errors.New("callback base URL is required")
+	}
+	if _, err := parseCallbackBaseURL(callbackBaseURL); err != nil {
+		return nil, err
+	}
+	if util.IsNilInterface(router) {
+		return nil, errors.New("backend router is required")
+	}
 	if util.IsNilInterface(operations) {
 		return nil, errors.New("operation registry is required")
 	}
@@ -144,7 +161,7 @@ func isNilPlacementAuthorityStore(store PlacementAuthorityStore) bool {
 }
 
 // rememberedDeprovisionCandidates returns process-local positive candidates
-// retained from a failed close after its provisioning tracker entry was
+// retained from a failed close after its operation-registry entry was
 // released. They do not participate in load balancing, callback timeouts, or
 // provision admission, but let later close/orphan retries remain fail-closed.
 func (o *ProvisionOrchestrator) rememberedDeprovisionCandidates(leaseUUID string) []string {
@@ -234,6 +251,12 @@ func (o *ProvisionOrchestrator) startProvisioning(
 ) error {
 	if !claim.Valid() {
 		return fmt.Errorf("%w: invalid lease initiation claim", ErrProvisioningFailed)
+	}
+	if len(lease.MetaHash) != 0 && opts.Payload == nil {
+		return fmt.Errorf(
+			"%w: %w: payload-bearing lease %s has no request bytes",
+			ErrProvisioningFailed, errPayloadNotAvailable, lease.Uuid,
+		)
 	}
 	// Extract lease items and primary SKU for routing
 	items := ExtractLeaseItems(lease)
@@ -325,6 +348,13 @@ func (o *ProvisionOrchestrator) startProvisioning(
 		abortOperation("lifecycle callback URL construction failed")
 		return fmt.Errorf("%w: build lifecycle callback URL: %w", ErrProvisioningFailed, err)
 	}
+	callbackPair, err := placement.NewCallbackPair(
+		initiation.ID(), callbackURL, lifecycleCallbackURL,
+	)
+	if err != nil {
+		abortOperation("callback destination binding failed")
+		return fmt.Errorf("%w: bind callback destinations: %w", ErrProvisioningFailed, err)
+	}
 
 	// Build provision request
 	req := backend.ProvisionRequest{
@@ -336,9 +366,31 @@ func (o *ProvisionOrchestrator) startProvisioning(
 		LifecycleCallbackURL: lifecycleCallbackURL,
 		Payload:              opts.Payload,
 	}
-	// Only include PayloadHash when we have the actual payload
-	if opts.Payload != nil && opts.PayloadHash != "" {
-		req.PayloadHash = opts.PayloadHash
+	attemptPayloadFingerprint := placement.PayloadFingerprint{}
+	// Bind the durable attempt to the bytes actually dispatched. The event's
+	// hash is checked rather than trusted, and payload-bearing requests always
+	// carry a canonical SHA-256 even if a non-production caller omitted it.
+	if opts.Payload != nil {
+		hash := payload.ComputeHash(opts.Payload)
+		exactHash := hex.EncodeToString(hash)
+		if opts.PayloadHash != "" && opts.PayloadHash != exactHash {
+			abortOperation("payload hash differs from payload bytes")
+			return fmt.Errorf("%w: %w: payload hash differs from payload bytes",
+				ErrProvisioningFailed, backend.ErrValidation)
+		}
+		req.PayloadHash = exactHash
+		attemptPayloadFingerprint, err = placement.NewPayloadFingerprint(hash)
+		if err != nil {
+			abortOperation("payload fingerprint construction failed")
+			return fmt.Errorf("%w: bind payload fingerprint: %w", ErrProvisioningFailed, err)
+		}
+	}
+	requestSnapshot, err := placement.NewBackendRequestSnapshot(
+		req.Tenant, req.ProviderUUID, req.Items,
+	)
+	if err != nil {
+		abortOperation("backend request snapshot construction failed")
+		return fmt.Errorf("%w: bind exact backend request: %w", ErrProvisioningFailed, err)
 	}
 
 	// Persist intent BEFORE the external call under the durable topology
@@ -353,10 +405,12 @@ func (o *ProvisionOrchestrator) startProvisioning(
 	case placement.StateAbsent:
 		attemptToken, attemptSet, err = o.placementStore.BeginNewAttempt(
 			recordlessScope, lease.Uuid, backendClient.Name(), initiation.ID(),
+			attemptPayloadFingerprint, requestSnapshot, callbackPair,
 		)
 	case placement.StateConfirmed:
 		attemptToken, attemptSet, err = o.placementStore.BeginOwnedAttempt(
 			baseline, placementRecord.RecordRevision(), backendClient.Name(), initiation.ID(),
+			attemptPayloadFingerprint, requestSnapshot, callbackPair,
 		)
 	case placement.StateAttempting:
 		err = placement.ErrAttemptConflict
@@ -459,19 +513,21 @@ func (o *ProvisionOrchestrator) startProvisioning(
 	case provisionOutcomeDefinitiveFailure:
 		_, settleErr = o.placementStore.RefuseAttempt(attemptToken)
 	case provisionOutcomeAmbiguous:
-		// Preserve the typed durable attempt. Matching positive inventory may
-		// confirm it; silence cannot prove the remote effect will never commit.
+		// Preserve the typed durable attempt. Its exact callback or an upgraded
+		// inventory report carrying the same paired typed generation may confirm it;
+		// silence cannot prove the remote effect will never commit.
 	default:
 		settleErr = fmt.Errorf("unknown provision outcome %d", outcome)
 	}
 	if settleErr != nil {
 		// The write-ahead Attempt remains the conservative truth on a failed
 		// settlement. The backend has already answered, so retrying the external
-		// call here would be less safe than leaving it for callback, matching
-		// positive inventory, or operator repair.
+		// call here would be less safe than leaving it for the exact callback, an
+		// exact paired-generation inventory observation, or operator repair.
 		slog.Warn("failed to settle provision placement",
 			"lease_uuid", lease.Uuid,
 			"backend", backendClient.Name(),
+			"operation_id", initiation.ID(),
 			"outcome", outcome,
 			"error", settleErr,
 		)
@@ -485,6 +541,7 @@ func (o *ProvisionOrchestrator) startProvisioning(
 			"sku", sku,
 			"total_quantity", totalQuantity,
 			"backend", backendClient.Name(),
+			"operation_id", initiation.ID(),
 			"outcome", outcome,
 			"error", provisionErr,
 		)
@@ -579,7 +636,8 @@ func routeForProvisionHonoringPlacementAmong(
 }
 
 // Deprovision tears down a lease's backend resources. The backend is resolved
-// POSITIVELY — from the placement record, then the in-flight tracker. It never
+// POSITIVELY — from the placement record, then the active operation registry
+// record. It never
 // guesses a default backend from the SKU: in a multi-backend pool a SKU is not
 // pinned to one backend, so a guessed deprovision is a phantom no-op that
 // reports success while stranding the real volume on another backend (ENG-335).
@@ -650,7 +708,7 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 	}
 
 	// Every positively named backend is a possible holder. Backend and Attempt
-	// are independent facts, and the claimed in-flight entry may predate either;
+	// are independent facts, and the claimed registry operation may predate either;
 	// deprovision all distinct candidates rather than allowing one to overwrite
 	// another.
 	candidateNames := make([]string, 0, 3)
@@ -698,7 +756,7 @@ func (o *ProvisionOrchestrator) Deprovision(ctx context.Context, leaseUUID strin
 	}
 	finishWithError := func(deprovisionErr error, retryCandidates []string) error {
 		// Once this invocation has captured every positive candidate, the ordinary
-		// provisioning tracker must not survive a poisoned close message: it feeds
+		// active registry operation must not survive a poisoned close message: it feeds
 		// load balancing and callback timeouts. Retain only candidates whose teardown
 		// failed or could not be attempted; successful candidates are retired at the
 		// call site. Observation-only lifecycle callbacks do not retire this state,

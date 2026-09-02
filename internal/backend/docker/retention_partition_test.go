@@ -69,7 +69,7 @@ func TestNew_PopulatesPartitionSource(t *testing.T) {
 		"agg": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 50000, MaxPartitions: 64},
 	}
 
-	b, err := New(cfg, slog.Default())
+	b, err := newBackendWithTestIdentity(cfg, slog.Default())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = b.Stop() })
 

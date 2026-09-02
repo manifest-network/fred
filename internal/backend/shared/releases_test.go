@@ -1,8 +1,11 @@
 package shared
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -41,7 +44,7 @@ func TestReleaseStore(t *testing.T) {
 		err := store.Append("lease-1", Release{
 			Manifest:  []byte(`{"image":"nginx:2.0"}`),
 			Image:     "nginx:2.0",
-			Status:    "active",
+			Status:    "deploying",
 			CreatedAt: time.Now(),
 		})
 		require.NoError(t, err)
@@ -151,7 +154,7 @@ func TestReleaseStore_ActivateLatest(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 
-	// Create 3 releases: v1 active, v2 active, v3 deploying
+	// Create 3 releases: v1 active, v2 superseded, v3 deploying.
 	require.NoError(t, store.Append("lease-1", Release{
 		Image:     "nginx:1.0",
 		Status:    "active",
@@ -159,7 +162,7 @@ func TestReleaseStore_ActivateLatest(t *testing.T) {
 	}))
 	require.NoError(t, store.Append("lease-1", Release{
 		Image:     "nginx:2.0",
-		Status:    "active",
+		Status:    "superseded",
 		CreatedAt: time.Now(),
 	}))
 	require.NoError(t, store.Append("lease-1", Release{
@@ -275,20 +278,21 @@ func TestReleaseStore_LatestActive(t *testing.T) {
 		assert.Nil(t, rel)
 	})
 
-	t.Run("returns most recent active when multiple exist", func(t *testing.T) {
+	t.Run("rejects a second active release without changing the first", func(t *testing.T) {
 		require.NoError(t, store.Append("lease-3", Release{
 			Image:  "app:1.0",
 			Status: "active",
 		}))
-		require.NoError(t, store.Append("lease-3", Release{
+		err := store.Append("lease-3", Release{
 			Image:  "app:2.0",
 			Status: "active",
-		}))
+		})
+		require.ErrorContains(t, err, "active records")
 
 		rel, err := store.LatestActive("lease-3")
 		require.NoError(t, err)
 		require.NotNil(t, rel)
-		assert.Equal(t, "app:2.0", rel.Image)
+		assert.Equal(t, "app:1.0", rel.Image)
 	})
 }
 
@@ -331,6 +335,102 @@ func TestReleaseStore_Healthy(t *testing.T) {
 
 	err = store.Healthy()
 	require.NoError(t, err)
+}
+
+func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "runtime_streaming_releases.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+
+	for _, leaseUUID := range []string{
+		"00000000-0000-4000-8000-000000000001",
+		"00000000-0000-4000-8000-000000000002",
+	} {
+		require.NoError(t, store.AppendActive(leaseUUID, Release{
+			Manifest:  []byte{},
+			Status:    "active",
+			CreatedAt: time.Now(),
+		}))
+	}
+
+	// Runtime open/health validates every record independently and therefore
+	// remains healthy when legitimate aggregate growth exceeds an offline
+	// collection budget.
+	require.NoError(t, store.Healthy())
+
+	t.Run("stopped row ceiling", func(t *testing.T) {
+		err := store.view(func(tx *bolt.Tx) error {
+			budget := newAuthoritativeInspectionBudget(authoritativeInspectionLimits{
+				maxRows:        1,
+				maxRecordBytes: 1 << 20,
+				maxTotalBytes:  1 << 20,
+			})
+			_, inspectErr := inspectReleaseBucketWithObserver(
+				tx, nil, nil, nil, false, budget.observe,
+			)
+			return inspectErr
+		})
+		require.ErrorContains(t, err, "1-record cutover ceiling")
+		require.ErrorContains(t, err, "matching predecessor")
+	})
+
+	t.Run("stopped byte ceiling", func(t *testing.T) {
+		err := store.view(func(tx *bolt.Tx) error {
+			budget := newAuthoritativeInspectionBudget(authoritativeInspectionLimits{
+				maxRows:        10,
+				maxRecordBytes: 1 << 20,
+				maxTotalBytes:  1,
+			})
+			_, inspectErr := inspectReleaseBucketWithObserver(
+				tx, nil, nil, nil, false, budget.observe,
+			)
+			return inspectErr
+		})
+		require.ErrorContains(t, err, "1-byte logical cutover ceiling")
+		require.ErrorContains(t, err, "matching predecessor")
+	})
+}
+
+func TestReleaseProjectionResponseCeilingCoversWorstLegacyExpansion(t *testing.T) {
+	stored := Release{
+		Version:  1,
+		Manifest: []byte{},
+		Status:   "failed",
+	}
+	require.NoError(t, validateStoredRelease(stored))
+
+	storedElement, err := json.Marshal(stored)
+	require.NoError(t, err)
+	projectedElement, err := json.Marshal(backend.ReleaseInfo{
+		Version:   stored.Version,
+		Image:     stored.Image,
+		Status:    stored.Status,
+		CreatedAt: stored.CreatedAt,
+		Reason:    backend.ReasonUnknown,
+		Message:   stored.Message,
+		Manifest:  stored.Manifest,
+	})
+	require.NoError(t, err)
+	require.Greater(t, len(projectedElement), len(storedElement))
+
+	// This is the smallest valid failed legacy row: one-digit version, empty
+	// image, empty non-nil manifest, and zero timestamp. Every additional array
+	// element costs at least its encoded length plus one comma. The only
+	// read-boundary expansion is the synthesized ReasonUnknown field.
+	perEntryStoredBytes := int64(len(storedElement) + 1)
+	maxEntries := (int64(backend.MaxStoredReleaseHistoryBytes) - 1) / perEntryStoredBytes
+	perEntryExpansion := int64(len(projectedElement) - len(storedElement))
+	worstProjectedBytes := int64(backend.MaxStoredReleaseHistoryBytes) +
+		maxEntries*perEntryExpansion
+
+	require.Greater(t, worstProjectedBytes, int64(backend.MaxStoredReleaseHistoryBytes))
+	require.LessOrEqual(
+		t,
+		worstProjectedBytes,
+		int64(backend.MaxProjectedReleasesResponseBytes),
+	)
 }
 
 func TestReleaseStore_CloseIdempotent(t *testing.T) {
@@ -564,6 +664,48 @@ func TestReleaseStore_RemoveOlderThan_KeepsOldActiveWhenNewestIsFailed(t *testin
 	assert.Equal(t, 3, latest.Version, "next version is max(2)+1=3, never a reused 2")
 }
 
+// A restart/update can supersede the migration release before its background
+// rollback-window cleanup fires. The old row is then the only durable fact that
+// names the exact `-prev` cohort, so TTL pruning must retain it alongside the
+// current active release and the index-latest version holder.
+func TestReleaseStore_RemoveOlderThan_KeepsSupersededMigrationAuthority(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "keep_migration_authority.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer store.Close()
+
+	old := time.Now().Add(-100 * 24 * time.Hour)
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}}
+	resourceProfiles := []SKUResourceSnapshot{{
+		SKU: "docker-small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+	}}
+	manifestAuthority := []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`)
+	require.NoError(t, store.Append("lease-1", Release{
+		Image: "migrated", Manifest: manifestAuthority, Items: items,
+		ResourceProfiles: resourceProfiles, LegacyMigration: true,
+		Status: "superseded", CreatedAt: old,
+	}))
+	require.NoError(t, store.Append("lease-1", Release{
+		Image: "current", Manifest: manifestAuthority, Items: items,
+		ResourceProfiles: resourceProfiles, Status: "active", CreatedAt: old,
+	}))
+	require.NoError(t, store.Append("lease-1", Release{
+		Image: "failed-candidate", Manifest: manifestAuthority, Items: items,
+		ResourceProfiles: resourceProfiles, Status: "failed", CreatedAt: old,
+	}))
+
+	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 0, removed,
+		"migration authority, current active release, and index-latest version must all survive")
+
+	releases, err := store.List("lease-1")
+	require.NoError(t, err)
+	require.Len(t, releases, 3)
+	assert.True(t, releases[0].LegacyMigration)
+	assert.Equal(t, items, releases[0].Items)
+}
+
 // TestReleaseStore_RemoveOlderThan_AppendAfterPruneNoVersionReuse is the end-to-end
 // coupling capstone: prune actually removes entries, then Append must still issue a
 // fresh version (proves Change 1 + Change 2 together).
@@ -587,9 +729,9 @@ func TestReleaseStore_RemoveOlderThan_AppendAfterPruneNoVersionReuse(t *testing.
 	assert.Equal(t, 4, latest.Version, "after pruning to [v3], next version is max(3)+1=4, not len-derived 2")
 }
 
-// TestReleaseStore_RemoveOlderThan_EmptyValueRemoved guards the len(releases)==0 path:
-// a null/[] value must be removed like a corrupt key, never panic the sweep.
-func TestReleaseStore_RemoveOlderThan_EmptyValueRemoved(t *testing.T) {
+// Empty release history is ambiguous authority, not disposable history. The
+// reaper must preserve its bytes and fail closed so an operator can repair it.
+func TestReleaseStore_RemoveOlderThan_EmptyValueFailsClosed(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "empty_value.db")
 	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
@@ -600,12 +742,14 @@ func TestReleaseStore_RemoveOlderThan_EmptyValueRemoved(t *testing.T) {
 	}))
 
 	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 1, removed, "an empty value is removed like a corrupt key")
+	require.ErrorContains(t, err, "release history is empty")
+	assert.Equal(t, 0, removed)
 
-	releases, err := store.List("empty-lease")
+	_, err = store.List("empty-lease")
+	require.ErrorContains(t, err, "release history is empty")
+	keys, err := store.LeaseUUIDs()
 	require.NoError(t, err)
-	assert.Nil(t, releases)
+	assert.Contains(t, keys, "empty-lease")
 }
 
 // TestReleaseStore_RemoveOlderThan_PrunesOldTailKeepsFreshActive exercises the age
@@ -632,10 +776,9 @@ func TestReleaseStore_RemoveOlderThan_PrunesOldTailKeepsFreshActive(t *testing.T
 	assert.Equal(t, "v2", releases[0].Image)
 }
 
-// TestReleaseStore_RemoveOlderThan_CorruptValueRemoved is a regression-lock (green
-// before and after the fix) for the unparseable-value branch: a corrupt value is
-// removed whole-key.
-func TestReleaseStore_RemoveOlderThan_CorruptValueRemoved(t *testing.T) {
+// A corrupt exact release must never be erased by TTL cleanup: doing so would
+// let recovery infer a smaller desired cohort from partial survivors.
+func TestReleaseStore_RemoveOlderThan_CorruptValueFailsClosed(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "corrupt_reap.db")
 	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
@@ -646,12 +789,14 @@ func TestReleaseStore_RemoveOlderThan_CorruptValueRemoved(t *testing.T) {
 	}))
 
 	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 1, removed, "an unparseable value is removed whole-key")
+	require.ErrorContains(t, err, "corrupted release history")
+	assert.Equal(t, 0, removed)
 
-	releases, err := store.List("corrupt-lease")
+	_, err = store.List("corrupt-lease")
+	require.Error(t, err, "the original corrupt bytes must remain visible")
+	keys, err := store.LeaseUUIDs()
 	require.NoError(t, err)
-	assert.Nil(t, releases)
+	assert.Contains(t, keys, "corrupt-lease")
 }
 
 // TestReleaseStore_RemoveOlderThan_KeepsLoneOldNonActive covers the keepActive == -1
@@ -679,4 +824,766 @@ func TestReleaseStore_RemoveOlderThan_KeepsLoneOldNonActive(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, releases, 1, "a non-corrupt key is never emptied")
 	assert.Equal(t, "failed", releases[0].Status)
+}
+
+func TestReleaseStore_RecordMigrationBackfillsDesiredItemsIdempotently(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "migration_releases.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+
+	manifest := []byte(`{"image":"nginx:1.25"}`)
+	require.NoError(t, store.Append("lease-1", Release{
+		Manifest: manifest, Image: "nginx:1.25", Status: "active", CreatedAt: time.Now(),
+	}))
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}}
+	profiles, err := BuildSKUResourceSnapshot(items, func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordMigration("lease-1", manifest, items, profiles))
+	require.NoError(t, store.RecordMigration("lease-1", manifest, items, profiles))
+
+	releases, err := store.List("lease-1")
+	require.NoError(t, err)
+	require.Len(t, releases, 1, "backfill and exact replay must not inflate release history")
+	assert.Equal(t, items, releases[0].Items)
+	assert.True(t, releases[0].LegacyMigration)
+
+	items[0].Quantity = 9
+	assert.Equal(t, 2, releases[0].Items[0].Quantity, "stored desired topology must not alias caller memory")
+}
+
+func TestReleaseStore_RecordMigrationRejectsDivergentDesiredItems(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "migration_divergence.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+
+	manifest := []byte(`{"image":"nginx:1.25"}`)
+	firstItems := []backend.LeaseItem{{
+		SKU: "docker-small", Quantity: 1, ServiceName: "app",
+	}}
+	firstProfiles, err := BuildSKUResourceSnapshot(firstItems, func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.RecordMigration("lease-1", manifest, firstItems, firstProfiles))
+	secondItems := []backend.LeaseItem{{
+		SKU: "docker-small", Quantity: 2, ServiceName: "app",
+	}}
+	err = store.RecordMigration("lease-1", manifest, secondItems, firstProfiles)
+	require.ErrorContains(t, err, "divergent desired items")
+}
+
+func TestReleaseStore_BackfillLegacyActiveAuthorityFreezesMultiSKUProfile(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "legacy_authority.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+
+	legacy := Release{
+		Manifest: []byte(`{"services":{"web":{"image":"nginx:1.25"},"db":{"image":"postgres:16"}}}`),
+		Image:    "stack", Status: "active", CreatedAt: time.Now().UTC(),
+	}
+	require.NoError(t, store.Append("lease-1", legacy))
+	stored, err := store.LatestActive("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	items := []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 2, ServiceName: "web", CustomDomain: "web.example"},
+		{SKU: "docker-large", Quantity: 1, ServiceName: "db"},
+	}
+	profiles, err := BuildSKUResourceSnapshot(items, func(sku string) (SKUProfile, error) {
+		switch sku {
+		case "docker-small":
+			return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+		case "docker-large":
+			return SKUProfile{CPUCores: 4, MemoryMB: 4096, DiskMB: 8192}, nil
+		default:
+			return SKUProfile{}, errors.New("unexpected SKU")
+		}
+	})
+	require.NoError(t, err)
+	err = store.BackfillLegacyActiveAuthority("lease-1", *stored, items, profiles, 0)
+	require.ErrorContains(t, err, "authority class is invalid")
+	require.NoError(t, store.BackfillLegacyActiveAuthority(
+		"lease-1", *stored, items, profiles, LegacyActiveAuthorityWorkload,
+	))
+	require.NoError(t, store.BackfillLegacyActiveAuthority(
+		"lease-1", *stored, items, profiles, LegacyActiveAuthorityWorkload,
+	),
+		"an exact retry after an uncertain commit must be idempotent")
+
+	backfilled, err := store.LatestActive("lease-1")
+	require.NoError(t, err)
+	require.NotNil(t, backfilled)
+	assert.Equal(t, items, backfilled.Items)
+	assert.Equal(t, profiles, backfilled.ResourceProfiles)
+	items[0].Quantity = 9
+	profiles[0].MemoryMB = 1
+	assert.Equal(t, 2, backfilled.Items[0].Quantity)
+	small, found := LookupSKUResourceSnapshotRow(backfilled.ResourceProfiles, "docker-small")
+	require.True(t, found)
+	assert.Equal(t, int64(512), small.MemoryMB)
+
+	changedFence := *stored
+	changedFence.Image = "manually-rewritten"
+	err = store.BackfillLegacyActiveAuthority(
+		"lease-1", changedFence, backfilled.Items, backfilled.ResourceProfiles,
+		LegacyActiveAuthorityWorkload,
+	)
+	require.ErrorContains(t, err, "changed before legacy authority backfill")
+}
+
+func TestReleaseStore_DeleteCloseHistory_ExactAndIdempotent(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "close_fence.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+
+	const leaseUUID = "lease-close"
+	require.NoError(t, store.Append(leaseUUID, Release{
+		Manifest: []byte(`{"services":{"app":{"image":"nginx:1.0"}}}`),
+		Image:    "nginx:1.0", Status: "active", CreatedAt: time.Now(),
+	}))
+	require.NoError(t, store.Append(leaseUUID, Release{
+		Manifest: []byte(`{"services":{"app":{"image":"nginx:2.0"}}}`),
+		Image:    "nginx:2.0", Status: "deploying", CreatedAt: time.Now(),
+	}))
+	releases, err := store.List(leaseUUID)
+	require.NoError(t, err)
+	selected := releaseForCloseFence(releases)
+	require.NotNil(t, selected)
+	encoded, err := json.Marshal(selected)
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+
+	require.NoError(t, store.DeleteCloseHistory(leaseUUID, selected.Version, digest),
+		"a close may retire its exact active history, including a preempted pending tail")
+	require.NoError(t, store.DeleteCloseHistory(leaseUUID, selected.Version, digest),
+		"replay after the delete commit must be idempotent")
+	releases, err = store.List(leaseUUID)
+	require.NoError(t, err)
+	assert.Nil(t, releases)
+}
+
+func TestReleaseStore_DeleteCloseHistory_RejectsChangedOrUnexpectedHistory(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "close_fence_conflict.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+
+	const leaseUUID = "lease-close"
+	require.NoError(t, store.Append(leaseUUID, Release{
+		Image: "nginx:1.0", Status: "active", CreatedAt: time.Now(),
+	}))
+	releases, err := store.List(leaseUUID)
+	require.NoError(t, err)
+	encoded, err := json.Marshal(releaseForCloseFence(releases))
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+
+	require.NoError(t, store.UpdateLatestStatus(
+		leaseUUID, "failed", backend.ReasonUpdateFailed, "changed after close admission",
+	))
+	err = store.DeleteCloseHistory(leaseUUID, releases[0].Version, digest)
+	require.ErrorContains(t, err, "changed after close admission")
+	remaining, err := store.List(leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, remaining, 1, "a mismatched fence must preserve the evidence")
+
+	const unexpectedLease = "lease-unexpected"
+	require.NoError(t, store.Append(unexpectedLease, Release{
+		Image: "nginx:1.0", Status: "active", CreatedAt: time.Now(),
+	}))
+	err = store.DeleteCloseHistory(unexpectedLease, 0, [sha256.Size]byte{})
+	require.ErrorContains(t, err, "appeared after close admission")
+	remaining, err = store.List(unexpectedLease)
+	require.NoError(t, err)
+	require.Len(t, remaining, 1)
+}
+
+func putRawReleaseHistory(t *testing.T, store *ReleaseStore, leaseUUID string, releases []Release) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(releases)
+	require.NoError(t, err)
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(releasesBucketName).Put([]byte(leaseUUID), encoded)
+	}))
+	return encoded
+}
+
+func rawReleaseHistory(t *testing.T, store *ReleaseStore, leaseUUID string) []byte {
+	t.Helper()
+	var encoded []byte
+	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
+		encoded = append(encoded, tx.Bucket(releasesBucketName).Get([]byte(leaseUUID))...)
+		return nil
+	}))
+	return encoded
+}
+
+func TestReleaseStore_CorruptAuthorityFailsEveryDecodeMutationClosed(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "corrupt_authority.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	const leaseUUID = "lease-corrupt"
+	items := []backend.LeaseItem{{SKU: "small", Quantity: 1, ServiceName: "app"}}
+	profiles := []SKUResourceSnapshot{{
+		SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+	}}
+	corrupt := Release{
+		Version:          1,
+		Manifest:         []byte(`{"services":{"app":{"image":"nginx:1.0"}}}`),
+		Image:            "nginx:1.0",
+		OperationID:      "not-a-canonical-uuid-v4",
+		Items:            items,
+		ResourceProfiles: profiles,
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}
+	wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{corrupt})
+	selected, err := json.Marshal(corrupt)
+	require.NoError(t, err)
+	digest := sha256.Sum256(selected)
+
+	assertInvalid := func(name string, err error) {
+		t.Helper()
+		require.ErrorContains(t, err, "operation ID", name)
+		assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID), name)
+	}
+	_, err = store.List(leaseUUID)
+	assertInvalid("List", err)
+	assertInvalid("Append", store.Append(leaseUUID, Release{
+		Image: "nginx:2.0", Status: "deploying", CreatedAt: time.Now(),
+	}))
+	assertInvalid("BackfillActiveResourceProfiles", store.BackfillActiveResourceProfiles(
+		leaseUUID, 1, items, profiles,
+	))
+	assertInvalid("UpdateLatestStatus", store.UpdateLatestStatus(
+		leaseUUID, "failed", backend.ReasonUpdateFailed, "failed",
+	))
+	assertInvalid("ActivateLatest", store.ActivateLatest(leaseUUID))
+	assertInvalid("RecordMigration", store.RecordMigration(
+		leaseUUID, corrupt.Manifest, items, profiles,
+	))
+	assertInvalid("DeleteCloseHistory", store.DeleteCloseHistory(leaseUUID, 1, digest))
+	_, err = store.RemoveOlderThan(time.Minute)
+	assertInvalid("RemoveOlderThan", err)
+}
+
+func TestReleaseStore_ListRejectsCorruptItemsAndResourceProfiles(t *testing.T) {
+	tests := map[string]Release{
+		"invalid quantity": {
+			Version: 1,
+			Items:   []backend.LeaseItem{{SKU: "small", Quantity: 0, ServiceName: "app"}},
+		},
+		"profiles without items": {
+			Version: 1,
+			ResourceProfiles: []SKUResourceSnapshot{{
+				SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+			}},
+		},
+		"profile coverage mismatch": {
+			Version: 1,
+			Items:   []backend.LeaseItem{{SKU: "small", Quantity: 1, ServiceName: "app"}},
+			ResourceProfiles: []SKUResourceSnapshot{{
+				SKU: "large", CPUCores: 2, MemoryMB: 1024, DiskMB: 2048,
+			}},
+		},
+	}
+	for name, corrupt := range tests {
+		t.Run(name, func(t *testing.T) {
+			store, err := NewReleaseStore(ReleaseStoreConfig{
+				DBPath: filepath.Join(t.TempDir(), "corrupt_resources.db"),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = store.Close() })
+			putRawReleaseHistory(t, store, "lease-corrupt", []Release{corrupt})
+
+			_, err = store.List("lease-corrupt")
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestReleaseStore_RejectsInvalidManifestAuthorityBeforePersisting(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest []byte
+		wantErr  string
+	}{
+		{
+			name:     "malformed",
+			manifest: []byte(`{"services":`),
+			wantErr:  "release manifest",
+		},
+		{
+			name:     "topology mismatch",
+			manifest: []byte(`{"services":{"worker":{"image":"example.invalid/worker:1"}}}`),
+			wantErr:  "release manifest topology",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := NewReleaseStore(ReleaseStoreConfig{
+				DBPath: filepath.Join(t.TempDir(), "releases.db"),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+			const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+			err = store.AppendActive(leaseUUID, Release{
+				Manifest: test.manifest,
+				Items: []backend.LeaseItem{{
+					SKU: "small", Quantity: 1, ServiceName: "app",
+				}},
+				ResourceProfiles: []SKUResourceSnapshot{{
+					SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+				}},
+				CreatedAt: time.Now(),
+			})
+			require.ErrorContains(t, err, test.wantErr)
+
+			releases, listErr := store.List(leaseUUID)
+			require.NoError(t, listErr)
+			assert.Empty(t, releases, "invalid recovery authority must not be persisted")
+		})
+	}
+}
+
+func TestReleaseStore_HealthAndRecoveryRejectPersistedManifestAuthority(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest []byte
+		wantErr  string
+	}{
+		{
+			name:     "malformed",
+			manifest: []byte(`{"services":`),
+			wantErr:  "release manifest",
+		},
+		{
+			name:     "topology mismatch",
+			manifest: []byte(`{"services":{"worker":{"image":"example.invalid/worker:1"}}}`),
+			wantErr:  "release manifest topology",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := NewReleaseStore(ReleaseStoreConfig{
+				DBPath: filepath.Join(t.TempDir(), "releases.db"),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+			const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+			corrupt := Release{
+				Version:  1,
+				Manifest: test.manifest,
+				Items: []backend.LeaseItem{{
+					SKU: "small", Quantity: 1, ServiceName: "app",
+				}},
+				ResourceProfiles: []SKUResourceSnapshot{{
+					SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+				}},
+				Status:    "active",
+				CreatedAt: time.Now(),
+			}
+			wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{corrupt})
+
+			_, err = store.List(leaseUUID)
+			require.ErrorContains(t, err, test.wantErr)
+			require.ErrorContains(t, store.Healthy(), test.wantErr)
+			assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID),
+				"invalid recovery authority must remain quarantined")
+		})
+	}
+}
+
+func TestReleaseStore_AppendRejectsNonCanonicalOperationID(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "invalid_operation_id.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	err = store.Append("lease", Release{
+		OperationID: "11111111-1111-4111-8111-11111111111A",
+		Status:      "active",
+		CreatedAt:   time.Now(),
+	})
+	require.ErrorContains(t, err, "canonical UUIDv4")
+}
+
+func TestReleaseStore_AssignsVersionBeforeValidationAndRollsBackDuplicateActive(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "release_invariants.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	const leaseUUID = "lease-1"
+	require.NoError(t, store.Append(leaseUUID, Release{
+		Version: 0, Status: "active", CreatedAt: time.Now(),
+	}))
+	releases, err := store.List(leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, releases, 1)
+	assert.Equal(t, 1, releases[0].Version)
+
+	wantRaw := rawReleaseHistory(t, store, leaseUUID)
+	err = store.Append(leaseUUID, Release{
+		Version: 0, Status: "active", CreatedAt: time.Now(),
+	})
+	require.ErrorContains(t, err, "active records")
+	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
+
+	require.NoError(t, store.Append(leaseUUID, Release{
+		Version: 0, Status: "deploying", CreatedAt: time.Now(),
+	}))
+	wantRaw = rawReleaseHistory(t, store, leaseUUID)
+	err = store.UpdateLatestStatus(leaseUUID, "active", "", "")
+	require.ErrorContains(t, err, "active records")
+	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
+
+	releases, err = store.List(leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, releases, 2)
+	assert.Equal(t, []int{1, 2}, []int{releases[0].Version, releases[1].Version})
+	assert.Equal(t, []string{"active", "deploying"}, []string{releases[0].Status, releases[1].Status})
+}
+
+func TestReleaseStore_AppendActiveAtomicallySupersedesAndAssignsVersion(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "append_active.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	const leaseUUID = "lease-1"
+	require.NoError(t, store.Append(leaseUUID, Release{
+		Status: "active", CreatedAt: time.Now(),
+	}))
+	require.NoError(t, store.AppendActive(leaseUUID, Release{
+		CreatedAt: time.Now(),
+	}))
+
+	releases, err := store.List(leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, releases, 2)
+	assert.Equal(t, []int{1, 2}, []int{releases[0].Version, releases[1].Version})
+	assert.Equal(t, []string{"superseded", "active"},
+		[]string{releases[0].Status, releases[1].Status})
+}
+
+func TestReleaseStore_AppendActiveCapacityCompactsDeterministically(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "append_active_capacity.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	store.maxAge = 24 * time.Hour
+
+	const leaseUUID = "lease-capacity"
+	now := time.Now()
+	seed := []Release{
+		{Version: 1, Image: "expired", Status: "superseded", CreatedAt: now.Add(-48 * time.Hour), Error: "expired-history"},
+		{Version: 2, Image: "oldest-fresh", Status: "superseded", CreatedAt: now.Add(-3 * time.Hour), Error: "fresh-history"},
+		{Version: 3, Image: "newer-fresh", Status: "superseded", CreatedAt: now.Add(-2 * time.Hour), Error: "fresh-history"},
+		{Version: 4, Image: "migration", Status: "superseded", CreatedAt: now.Add(-time.Hour), LegacyMigration: true},
+		{Version: 5, Image: "old-active", Status: "active", CreatedAt: now.Add(-30 * time.Minute)},
+	}
+	raw := putRawReleaseHistory(t, store, leaseUUID, seed)
+	candidate := Release{Image: "new-active", Status: "active", CreatedAt: now}
+	full, _, err := planAppendedReleaseHistory(
+		raw,
+		leaseUUID,
+		candidate,
+		true,
+		now.Add(-24*time.Hour),
+		1<<20,
+	)
+	require.NoError(t, err)
+	require.Len(t, full, 6)
+	// Force exactly two removals. The expired v1 must go before the oldest
+	// still-fresh v2; newer v3 and the now-superseded v5 remain audit history.
+	want := []Release{full[2], full[3], full[4], full[5]}
+	wantBytes, err := json.Marshal(want)
+	require.NoError(t, err)
+
+	require.NoError(t, store.appendWithinLimit(leaseUUID, candidate, true, len(wantBytes)))
+	assert.Equal(t, wantBytes, rawReleaseHistory(t, store, leaseUUID))
+	got, err := store.List(leaseUUID)
+	require.NoError(t, err)
+	require.Len(t, got, 4)
+	assert.Equal(t, []int{3, 4, 5, 6}, []int{
+		got[0].Version, got[1].Version, got[2].Version, got[3].Version,
+	})
+	assert.True(t, got[1].LegacyMigration, "latest migration cleanup authority must survive")
+	assert.Equal(t, "active", got[3].Status)
+
+	// The retained index-latest v6 holds the pre-prune maximum, so the next
+	// append issues v7 rather than reusing a deleted version.
+	require.NoError(t, store.appendWithinLimit(
+		leaseUUID,
+		Release{Image: "after-compaction", Status: "failed", CreatedAt: now.Add(time.Minute)},
+		false,
+		1<<20,
+	))
+	latest, err := store.Latest(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, latest)
+	assert.Equal(t, 7, latest.Version)
+}
+
+func TestReleaseStore_AppendActiveCapacityErrorRollsBackByteIdentically(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "append_active_capacity_rollback.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	const leaseUUID = "lease-capacity-rollback"
+	now := time.Now()
+	wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{
+		{Version: 1, Image: "migration", Status: "superseded", CreatedAt: now.Add(-time.Hour), LegacyMigration: true, Error: "protected-migration-authority"},
+		{Version: 2, Image: "old-active", Status: "active", CreatedAt: now},
+	})
+	candidate := Release{Image: "new-active", Status: "active", CreatedAt: now.Add(time.Minute)}
+	full, _, err := planAppendedReleaseHistory(
+		wantRaw,
+		leaseUUID,
+		candidate,
+		true,
+		time.Time{},
+		1<<20,
+	)
+	require.NoError(t, err)
+	protected := []Release{full[0], full[2]}
+	protectedBytes, err := json.Marshal(protected)
+	require.NoError(t, err)
+
+	err = store.appendWithinLimit(leaseUUID, candidate, true, len(protectedBytes)-1)
+	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
+	var capacityErr *ReleaseHistoryCapacityError
+	require.ErrorAs(t, err, &capacityErr)
+	assert.Equal(t, len(protectedBytes)-1, capacityErr.LimitBytes)
+	assert.Equal(t, len(protectedBytes), capacityErr.RequiredBytes)
+	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
+}
+
+func TestReleaseStore_AppendActiveCapacityProofConvergesAfterColdReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "append_active_capacity_cold_reopen.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+
+	const leaseUUID = "lease-capacity-cold-reopen"
+	now := time.Now()
+	seedRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{
+		{Version: 1, Image: "discardable", Status: "superseded", CreatedAt: now.Add(-2 * time.Hour)},
+		{Version: 2, Image: "migration", Status: "superseded", CreatedAt: now.Add(-time.Hour), LegacyMigration: true},
+		{Version: 3, Image: "old-active", Status: "active", CreatedAt: now.Add(-time.Minute)},
+	})
+	candidate := Release{Image: "recovered-active", Status: "active", CreatedAt: now}
+	full, _, err := planAppendedReleaseHistory(
+		seedRaw,
+		leaseUUID,
+		candidate,
+		true,
+		time.Time{},
+		1<<20,
+	)
+	require.NoError(t, err)
+	// Only the most-recent migration and new active row are load-bearing after
+	// the success boundary. Use their exact encoded size as a tiny injected
+	// ceiling so both disposable rows must be compacted.
+	want := []Release{full[1], full[3]}
+	wantRaw, err := json.Marshal(want)
+	require.NoError(t, err)
+
+	require.NoError(t, store.checkAppendCapacityWithinLimit(
+		leaseUUID,
+		candidate,
+		true,
+		len(wantRaw),
+	))
+	assert.Equal(t, seedRaw, rawReleaseHistory(t, store, leaseUUID),
+		"pre-admission proof must remain read-only")
+	require.NoError(t, store.Close())
+
+	store, err = NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	require.NoError(t, store.appendWithinLimit(leaseUUID, candidate, true, len(wantRaw)))
+	require.NoError(t, store.Close())
+
+	store, err = NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
+	latest, err := store.LatestActive(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, latest)
+	assert.Equal(t, 4, latest.Version,
+		"cold recovery must preserve version monotonicity while compacting")
+}
+
+func TestReleaseStore_DeployingAppendReservesActivationAndFailureCapacity(t *testing.T) {
+	t.Run("activation_refused_before_append_when_only_migration_is_protected", func(t *testing.T) {
+		store, err := NewReleaseStore(ReleaseStoreConfig{
+			DBPath: filepath.Join(t.TempDir(), "activation_preflight.db"),
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+		const leaseUUID = "lease-activation"
+		now := time.Now()
+		wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{{
+			Version: 1, Image: "migration", Status: "active", CreatedAt: now, LegacyMigration: true,
+		}})
+		candidate := Release{Image: "deploying", Status: "deploying", CreatedAt: now.Add(time.Minute)}
+		currentShape, _, err := planAppendedReleaseHistory(
+			wantRaw,
+			leaseUUID,
+			candidate,
+			false,
+			time.Time{},
+			1<<20,
+		)
+		require.NoError(t, err)
+		currentBytes, err := json.Marshal(currentShape)
+		require.NoError(t, err)
+
+		err = store.appendWithinLimit(leaseUUID, candidate, false, len(currentBytes))
+		require.ErrorIs(t, err, ErrReleaseHistoryCapacity,
+			"the one-byte-larger terminal activation must be refused before Compose")
+		assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
+	})
+
+	t.Run("failed_status_drops_optional_metadata_instead_of_losing_terminal_state", func(t *testing.T) {
+		store, err := NewReleaseStore(ReleaseStoreConfig{
+			DBPath: filepath.Join(t.TempDir(), "failed_status_capacity.db"),
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+		const leaseUUID = "lease-failed-status"
+		now := time.Now()
+		raw := putRawReleaseHistory(t, store, leaseUUID, []Release{
+			{Version: 1, Image: "migration", Status: "active", CreatedAt: now, LegacyMigration: true},
+			{Version: 2, Image: "candidate", Status: "deploying", CreatedAt: now.Add(time.Minute)},
+		})
+		require.NoError(t, store.updateLatestStatusWithinLimit(
+			leaseUUID,
+			"failed",
+			backend.ReasonUpdateFailed,
+			"optional detail that cannot fit",
+			len(raw),
+		))
+		got, err := store.List(leaseUUID)
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+		assert.Equal(t, "failed", got[1].Status)
+		assert.Empty(t, got[1].Reason)
+		assert.Empty(t, got[1].Message)
+	})
+}
+
+func TestReleaseStoreInspection_ProvesLegacyBackfillCapacityBeforeMutation(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	manifestBytes := []byte(`{"image":"example.invalid/app:1"}`)
+	items := []backend.LeaseItem{{SKU: "small", Quantity: 1, ServiceName: "app"}}
+	profiles := []SKUResourceSnapshot{{SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
+	now := time.Now()
+	expected := Release{
+		Version: 2, Manifest: manifestBytes, Image: "example.invalid/app:1",
+		Status: "active", CreatedAt: now,
+	}
+	candidate := cloneRelease(expected)
+	candidate.Items = slices.Clone(items)
+	candidate.ResourceProfiles = CloneSKUResourceSnapshot(profiles)
+	candidate.LegacyMigration = true
+	candidateBytes, err := json.Marshal([]Release{candidate})
+	require.NoError(t, err)
+
+	dbPath := filepath.Join(t.TempDir(), "legacy_backfill_capacity.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	putRawReleaseHistory(t, store, leaseUUID, []Release{
+		{Version: 1, Image: "discardable", Status: "superseded", CreatedAt: now.Add(-time.Hour), Error: "historical detail"},
+		expected,
+	})
+	require.NoError(t, store.Close())
+
+	inspection, err := InspectReleaseStoreReadOnly(dbPath)
+	require.NoError(t, err)
+	require.NoError(t, inspection.checkLegacyActiveAuthorityCapacityWithinLimit(
+		leaseUUID,
+		expected,
+		items,
+		profiles,
+		LegacyActiveAuthorityMigration,
+		len(candidateBytes),
+	))
+
+	store, err = NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.backfillLegacyActiveAuthorityWithinLimit(
+		leaseUUID,
+		expected,
+		items,
+		profiles,
+		LegacyActiveAuthorityMigration,
+		len(candidateBytes),
+	))
+	assert.Equal(t, candidateBytes, rawReleaseHistory(t, store, leaseUUID))
+}
+
+func TestReleaseStoreInspection_RejectsIrreducibleProfileBackfillAtomically(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440001"
+	items := []backend.LeaseItem{{SKU: "small", Quantity: 1, ServiceName: "app"}}
+	profiles := []SKUResourceSnapshot{{SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
+	expected := Release{
+		Version:  1,
+		Manifest: []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`),
+		Image:    "stack", Items: items, Status: "active", CreatedAt: time.Now(),
+	}
+	dbPath := filepath.Join(t.TempDir(), "profile_backfill_capacity.db")
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{expected})
+	require.NoError(t, store.Close())
+
+	inspection, err := InspectReleaseStoreReadOnly(dbPath)
+	require.NoError(t, err)
+	err = inspection.checkActiveResourceProfilesCapacityWithinLimit(
+		leaseUUID,
+		expected,
+		profiles,
+		len(wantRaw),
+	)
+	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
+
+	store, err = NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	err = store.backfillActiveResourceProfilesWithinLimit(
+		leaseUUID,
+		expected.Version,
+		expected.Items,
+		profiles,
+		len(wantRaw),
+	)
+	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
+	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
 }

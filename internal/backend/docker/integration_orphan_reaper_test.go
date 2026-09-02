@@ -46,6 +46,7 @@ func TestIntegration_Docker_OrphanReaper_KeepsLiveLeaseWithRemovedContainers(t *
 	cfg.ProvisionTimeout = 3 * time.Minute
 	cfg.NetworkIsolation = ptrBool(false)
 	cfg.VolumeDataPath = mountPath
+	cfg.VolumeMountPath = mountPath
 	cfg.VolumeFilesystem = "btrfs"
 	// All stores under one tmpDir so they persist across the b -> b2 restart
 	// (the active release must survive so the reaper can see it).
@@ -55,10 +56,11 @@ func TestIntegration_Docker_OrphanReaper_KeepsLiveLeaseWithRemovedContainers(t *
 	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
 
 	logger := slog.Default()
+	ctx := context.Background()
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
 	b, err := New(cfg, logger)
 	require.NoError(t, err)
 
-	ctx := context.Background()
 	require.NoError(t, b.Start(ctx))
 
 	docker, err := NewDockerClient("", "")
@@ -82,7 +84,7 @@ func TestIntegration_Docker_OrphanReaper_KeepsLiveLeaseWithRemovedContainers(t *
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,

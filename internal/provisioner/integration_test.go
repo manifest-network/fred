@@ -120,9 +120,10 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 
 	// Step 3: Publish success callback.
 	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
-		LeaseUUID:   leaseUUID,
-		Status:      backend.CallbackStatusSuccess,
-		OperationID: mustInFlightOperationID(t, manager, leaseUUID),
+		LeaseUUID:        leaseUUID,
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 
@@ -188,10 +189,11 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 
 	// Publish failure callback.
 	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
-		LeaseUUID:   leaseUUID,
-		Status:      backend.CallbackStatusFailed,
-		Error:       "container crashed",
-		OperationID: mustInFlightOperationID(t, manager, leaseUUID),
+		LeaseUUID:        leaseUUID,
+		Status:           backend.CallbackStatusFailed,
+		Error:            "container crashed",
+		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 
@@ -264,9 +266,10 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond)
 
 	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
-		LeaseUUID:   leaseUUID,
-		Status:      backend.CallbackStatusSuccess,
-		OperationID: mustInFlightOperationID(t, manager, leaseUUID),
+		LeaseUUID:        leaseUUID,
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 

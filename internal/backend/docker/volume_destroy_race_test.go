@@ -265,9 +265,15 @@ func TestProvision_ReservationPublishesTheOwnershipClaim(t *testing.T) {
 	})
 	withMicroSKU(b, 512)
 
-	// An unknown SKU fails validation just after the window, so the test needs no
-	// compose/callback scaffolding to reach and leave the reservation.
-	req := newProvisionRequest(lease, "tenant-a", "docker-nope", 1, validManifestJSON("nginx:latest"))
+	// Pure request validation now deliberately runs before the old failed
+	// provision is replaced, so the prior claim remains published throughout
+	// validation. Force the first post-reservation allocation to fail instead;
+	// that still enters and leaves the ownership window without needing
+	// compose/callback scaffolding.
+	for _, allocationID := range []string{"exhaust-0", "exhaust-1", "exhaust-2", "exhaust-3"} {
+		require.NoError(t, b.pool.TryAllocate(allocationID, "docker-large", "other-tenant"))
+	}
+	req := newProvisionRequest(lease, "tenant-a", "docker-micro", 1, validManifestJSON("nginx:latest"))
 	provisionErr := make(chan error, 1)
 	go func() { provisionErr <- b.Provision(context.Background(), req) }()
 
@@ -288,7 +294,7 @@ func TestProvision_ReservationPublishesTheOwnershipClaim(t *testing.T) {
 		"the published Items must be a copy: NormalizeProvisionRequest mutates the caller's slice in place")
 
 	close(release)
-	require.ErrorIs(t, <-provisionErr, backend.ErrValidation)
+	require.ErrorIs(t, <-provisionErr, backend.ErrInsufficientResources)
 
 	// And the claim goes away with the rolled-back reservation, so a failed admission
 	// does not leave a phantom owner protecting a genuinely orphaned volume.

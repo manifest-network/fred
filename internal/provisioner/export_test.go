@@ -6,12 +6,39 @@ package provisioner
 // whose only caller is a test (ENG-354).
 
 import (
-	"time"
-
 	"github.com/ThreeDotsLabs/watermill/message"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/util"
 )
+
+var defaultCallbackTestStorageIdentity = func() backendidentity.ID {
+	id, err := backendidentity.Parse("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
+	if err != nil {
+		panic(err)
+	}
+	return id
+}()
+
+type callbackTestStorageIdentityAuthority struct{}
+
+func (callbackTestStorageIdentityAuthority) ExpectedBackendStorageIdentity(
+	string,
+) (backendidentity.ID, bool) {
+	return defaultCallbackTestStorageIdentity, true
+}
+
+// newCallbackServiceForTest permits deliberately partial protocol fixtures.
+// Production binaries can call only NewCallbackService, whose composition is
+// safe by construction. Partial test fixtures receive a concrete, valid
+// storage-identity authority; they do not toggle production verification.
+func newCallbackServiceForTest(cfg CallbackServiceConfig) (*CallbackService, error) {
+	if util.IsNilInterface(cfg.StorageIdentities) {
+		cfg.StorageIdentities = callbackTestStorageIdentityAuthority{}
+	}
+	return newCallbackService(cfg)
+}
 
 // HandleBackendCallback preserves the old message-shaped test surface without
 // carrying a production method whose only callers are tests. Production HTTP
@@ -22,6 +49,9 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 	callback, ok := unmarshalMessagePayload[backend.CallbackPayload](msg, TopicBackendCallback)
 	if !ok {
 		return nil
+	}
+	if callback.BackendStorageID == "" {
+		callback.BackendStorageID = defaultCallbackTestStorageIdentity.String()
 	}
 	return h.handleBackendCallbackPayload(msg.Context(), callback)
 }
@@ -41,7 +71,7 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 // so a fresh set per call would silently drop it between handler
 // invocations in a test that spans more than one.
 func handlersOf(m *Manager) *HandlerSet {
-	callbacks, err := NewCallbackService(CallbackServiceConfig{
+	callbacks, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations:         m.operations,
 		Chain:              m.chainClient,
 		Acknowledger:       m.ackBatcher,
@@ -69,12 +99,4 @@ func handlersOf(m *Manager) *HandlerSet {
 		Publisher:       m.publisher,
 		Callbacks:       callbacks,
 	})
-}
-
-// TrackInFlightWithStartTime records an in-flight provision with a
-// caller-supplied start time so timeout tests can simulate a provision
-// that began in the past. Production always stamps time.Now() via
-// TryTrackInFlightWithOperationID.
-func (t *DefaultInFlightTracker) TrackInFlightWithStartTime(leaseUUID, tenant string, items []backend.LeaseItem, backendName string, startTime time.Time) {
-	t.replaceForLegacy(leaseUUID, tenant, items, backendName, startTime)
 }

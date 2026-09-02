@@ -15,10 +15,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 )
 
 // testHandlerDeps preserves concise fixture construction while production
@@ -30,7 +32,7 @@ type testHandlerDeps struct {
 	Orchestrator       *ProvisionOrchestrator
 	EventOperations    EventOperations
 	Operations         CallbackOperations
-	Tracker            InFlightTracker
+	Tracker            *testOperationRegistry
 	Acknowledger       Acknowledger
 	PayloadStore       *payload.Store
 	Publisher          message.Publisher
@@ -85,7 +87,7 @@ func composeTestHandlerSet(t testing.TB, deps testHandlerDeps) *HandlerSet {
 
 	eventOperations := deps.EventOperations
 	callbackOperations := deps.Operations
-	if provider, ok := deps.Tracker.(testOperationRegistryProvider); ok {
+	if provider := deps.Tracker; provider != nil {
 		if eventOperations == nil {
 			eventOperations = provider.Operations()
 		}
@@ -137,7 +139,7 @@ func composeTestHandlerSet(t testing.TB, deps testHandlerDeps) *HandlerSet {
 			)
 		}
 		var err error
-		callbacks, err = NewCallbackService(CallbackServiceConfig{
+		callbacks, err = newCallbackServiceForTest(CallbackServiceConfig{
 			Operations:          callbackOperations,
 			Chain:               deps.ChainClient,
 			Acknowledger:        deps.Acknowledger,
@@ -211,7 +213,7 @@ func testCallbackPlacement(t testing.TB, orchestrator *ProvisionOrchestrator) Ca
 // directly so missing and typed-nil authorities are never papered over.
 func newTestPlacementAuthority(t testing.TB) *placement.Store {
 	t.Helper()
-	store, err := placement.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	store, err := placementstore.NewStore(filepath.Join(t.TempDir(), "placements.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	return store
@@ -225,12 +227,59 @@ func projectTestPlacementInventory(
 ) placement.ProjectionResult {
 	t.Helper()
 	require.NotEmpty(t, backendNames, "typed placement projection requires an explicit topology")
-	require.NoError(t, store.ConfigureBackendTopology(backendNames))
+	configureTestPlacementTopology(t, store, backendNames)
+	if projection.Complete && projection.BackendStorageIdentities == nil {
+		projection.BackendStorageIdentities = make(map[string]backendidentity.ID, len(backendNames))
+		for _, backendName := range backendNames {
+			projection.BackendStorageIdentities[backendName] = testBackendStorageID(backendName)
+		}
+	}
+	if projection.Complete && projection.EmptyBackends == nil {
+		nonempty := make(map[string]struct{})
+		for _, backendName := range projection.Placements {
+			nonempty[backendName] = struct{}{}
+		}
+		for _, backendNames := range projection.Conflicts {
+			for _, backendName := range backendNames {
+				nonempty[backendName] = struct{}{}
+			}
+		}
+		projection.EmptyBackends = make([]string, 0, len(backendNames))
+		for _, backendName := range backendNames {
+			if _, present := nonempty[backendName]; !present {
+				projection.EmptyBackends = append(projection.EmptyBackends, backendName)
+			}
+		}
+	}
 	fence := store.BeginInventorySession()
 	defer store.EndInventorySession(fence)
 	result, err := store.ProjectInventory(fence, projection)
 	require.NoError(t, err)
 	return result
+}
+
+type testTopologyConfigurator interface {
+	ConfigureBackendTopologyWithStorageIdentities(
+		[]string,
+		map[string]backendidentity.ID,
+	) error
+}
+
+func configureTestPlacementTopology(
+	t testing.TB,
+	store ReconcilerPlacement,
+	backendNames []string,
+) {
+	t.Helper()
+	configurator, ok := store.(testTopologyConfigurator)
+	require.True(t, ok, "test placement authority must expose identity-bearing topology setup")
+	identities := make(map[string]backendidentity.ID, len(backendNames))
+	for _, backendName := range backendNames {
+		identities[backendName] = testBackendStorageID(backendName)
+	}
+	require.NoError(t, configurator.ConfigureBackendTopologyWithStorageIdentities(
+		backendNames, identities,
+	))
 }
 
 func armTestPlacementTopology(
@@ -243,18 +292,103 @@ func armTestPlacementTopology(
 	require.True(t, store.CurrentAdmissionBaseline().Valid())
 }
 
+func testPlacementCallbackPair(
+	t testing.TB,
+	id operation.OperationID,
+) placement.CallbackPair {
+	t.Helper()
+	pair, err := makeTestPlacementCallbackPair(id)
+	require.NoError(t, err)
+	return pair
+}
+
+func makeTestPlacementCallbackPair(
+	id operation.OperationID,
+) (placement.CallbackPair, error) {
+	callbackURL, err := BuildCallbackURLForOperation(
+		"https://provider.test/callback", id,
+	)
+	if err != nil {
+		return placement.CallbackPair{}, err
+	}
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	if err != nil {
+		return placement.CallbackPair{}, err
+	}
+	pair, err := placement.NewCallbackPair(id, callbackURL, lifecycleCallbackURL)
+	if err != nil {
+		return placement.CallbackPair{}, err
+	}
+	return pair, nil
+
+}
+
+func mustTestPlacementCallbackPair(id operation.OperationID) placement.CallbackPair {
+	pair, err := makeTestPlacementCallbackPair(id)
+	if err != nil {
+		panic(err)
+	}
+	return pair
+}
+
+func testBackendRequestSnapshot(t testing.TB) placement.BackendRequestSnapshot {
+	t.Helper()
+	return mustTestBackendRequestSnapshot()
+}
+
+func mustTestBackendRequestSnapshot() placement.BackendRequestSnapshot {
+	snapshot, err := placement.NewBackendRequestSnapshot(
+		"tenant-test", "provider-test",
+		[]backend.LeaseItem{{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
+	)
+	if err != nil {
+		panic(err)
+	}
+	return snapshot
+}
+
 func beginTestNewPlacementAttempt(
 	t testing.TB,
 	store PlacementAuthorityStore,
 	leaseUUID, backendName string,
 	operationID operation.OperationID,
 ) placement.AttemptToken {
+	return beginTestNewPlacementAttemptWithFingerprint(
+		t, store, leaseUUID, backendName, operationID, placement.PayloadFingerprint{},
+	)
+}
+
+func beginTestNewPlacementAttemptWithFingerprint(
+	t testing.TB,
+	store PlacementAuthorityStore,
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+	fingerprint placement.PayloadFingerprint,
+) placement.AttemptToken {
+	return beginTestNewPlacementAttemptWithSnapshot(
+		t, store, leaseUUID, backendName, operationID, fingerprint,
+		testBackendRequestSnapshot(t),
+	)
+}
+
+func beginTestNewPlacementAttemptWithSnapshot(
+	t testing.TB,
+	store PlacementAuthorityStore,
+	leaseUUID, backendName string,
+	operationID operation.OperationID,
+	fingerprint placement.PayloadFingerprint,
+	requestSnapshot placement.BackendRequestSnapshot,
+) placement.AttemptToken {
 	t.Helper()
 	baseline := store.CurrentAdmissionBaseline()
 	require.True(t, baseline.Valid(), "test placement admission must be armed before beginning an attempt")
 	scope, err := store.ScopeAdmission(baseline, []string{backendName})
 	require.NoError(t, err)
-	token, applied, err := store.BeginNewAttempt(scope, leaseUUID, backendName, operationID)
+	token, applied, err := store.BeginNewAttempt(
+		scope, leaseUUID, backendName, operationID, fingerprint,
+		requestSnapshot,
+		testPlacementCallbackPair(t, operationID),
+	)
 	require.NoError(t, err)
 	require.True(t, applied)
 	require.True(t, token.Valid())
@@ -288,19 +422,29 @@ func seedTestTypedConfirmedPlacements(
 	armTestPlacementTopology(t, store, backendNames)
 	operations := operation.NewRegistry()
 	for leaseUUID, backendName := range placements {
-		tracked := operations.TryTrack(operation.TrackSpec{
+		claimResult := operations.TryClaimLeaseNow(leaseUUID)
+		require.True(t, claimResult.Acquired())
+		claim := claimResult.Claim()
+		tracked := operations.TryInitiateClaimed(claim, operation.TrackSpec{
 			LeaseUUID: leaseUUID,
+			Tenant:    "tenant-a",
 			Backend:   backendName,
 			Kind:      operation.KindProvision,
 		})
 		require.True(t, tracked.Started())
+		initiation := tracked.Capability()
+		require.True(t, operations.BeginCall(initiation))
+		require.Equal(t, operation.InitiationActivated, operations.Activate(initiation))
+		require.True(t, operations.ReleaseLease(claim))
 		attempt := beginTestNewPlacementAttempt(
-			t, store, leaseUUID, backendName, tracked.Token().ID(),
+			t, store, leaseUUID, backendName, initiation.ID(),
 		)
 		confirmed, err := store.ConfirmAttempt(attempt)
 		require.NoError(t, err)
 		require.True(t, confirmed)
-		require.True(t, operations.Abort(tracked.Token()))
+		settlement := operations.TryClaimCallback(leaseUUID, initiation.ID())
+		require.True(t, settlement.Claimed())
+		require.True(t, operations.FinishSettlement(settlement.Claim()))
 	}
 }
 
@@ -342,6 +486,17 @@ func newTestManager(
 	if cfg.PlacementStore == nil {
 		cfg.PlacementStore = newTestPlacementAuthority(t)
 	}
+	backendNames := backendTopologyNames(router)
+	if len(backendNames) > 0 {
+		configureTestPlacementTopology(t, cfg.PlacementStore, backendNames)
+	}
+	// Most historical unit fixtures use short semantic provider labels. Bind the
+	// test aggregate explicitly at the constructor boundary while production
+	// tests that exercise the real Store call NewManager directly.
+	cfg.PlacementStore = &testProviderBoundPlacementAuthority{
+		PlacementAuthorityStore: cfg.PlacementStore,
+		providerUUID:            cfg.ProviderUUID,
+	}
 	manager, err := NewManager(cfg, router, chainClient)
 	if err != nil {
 		return nil, err
@@ -380,17 +535,16 @@ func newTestProvisionOrchestrator(
 	t testing.TB,
 	providerUUID, callbackBaseURL string,
 	router BackendRouter,
-	tracker InFlightTracker,
+	tracker *testOperationRegistry,
 	store any,
 ) *ProvisionOrchestrator {
 	t.Helper()
-	provider, ok := tracker.(testOperationRegistryProvider)
-	require.True(t, ok, "test tracker must expose its typed operation registry")
-	require.NotNil(t, provider.Operations())
+	require.NotNil(t, tracker)
+	require.NotNil(t, tracker.Operations())
 
 	authority := testPlacementAuthority(t, store, router)
 	orch, err := NewProvisionOrchestrator(
-		providerUUID, callbackBaseURL, router, provider.Operations(), authority,
+		providerUUID, callbackBaseURL, router, tracker.Operations(), authority,
 		&testProvisionStartSink{},
 	)
 	require.NoError(t, err)
@@ -517,15 +671,36 @@ func (a *testReconcilerPlacementAdapter) seedRawPlacements() error {
 	if err != nil {
 		return err
 	}
+	callbackURL, err := BuildCallbackURLForOperation("https://provider.test/callback", id)
+	if err != nil {
+		return err
+	}
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	if err != nil {
+		return err
+	}
+	callbackPair, err := placement.NewCallbackPair(id, callbackURL, lifecycleCallbackURL)
+	if err != nil {
+		return err
+	}
+	requestSnapshot, err := placement.NewBackendRequestSnapshot(
+		"tenant-test", "provider-test",
+		[]backend.LeaseItem{{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
+	)
+	if err != nil {
+		return err
+	}
 	for leaseUUID, current := range attempts {
 		var applied bool
 		if current.Backend == "" {
 			_, applied, err = a.authority.BeginNewAttempt(
 				scope, leaseUUID, current.Attempt, id,
+				placement.PayloadFingerprint{}, requestSnapshot, callbackPair,
 			)
 		} else {
 			_, applied, err = a.authority.BeginOwnedAttempt(
 				baseline, a.authority.Lookup(leaseUUID).RecordRevision(), current.Attempt, id,
+				placement.PayloadFingerprint{}, requestSnapshot, callbackPair,
 			)
 		}
 		if err != nil {
@@ -631,7 +806,12 @@ func (a *testReconcilerPlacementAdapter) ProjectInventory(
 	}
 
 	result, err := a.authority.ProjectInventory(fence, placement.InventoryProjection{
-		Complete: input.Complete, Placements: placements, Conflicts: conflicts,
+		Complete:                 input.Complete,
+		BackendStorageIdentities: maps.Clone(input.BackendStorageIdentities),
+		EmptyBackends:            slices.Clone(input.EmptyBackends),
+		Placements:               placements,
+		Lifecycles:               maps.Clone(input.Lifecycles),
+		Conflicts:                conflicts,
 	})
 	if result.Fenced == nil {
 		result.Fenced = make(map[string]struct{}, len(fencedConflicts)+len(fencedPlacements))
@@ -680,6 +860,70 @@ type testPlacementAuthorityAdapter struct {
 	attempts map[placement.AttemptToken]testAttemptIdentity
 }
 
+func (a *testPlacementAuthorityAdapter) VerifyProviderUUID(providerUUID string) error {
+	return a.authority.VerifyProviderUUID(providerUUID)
+}
+
+type testProviderBoundPlacementAuthority struct {
+	PlacementAuthorityStore
+	providerUUID string
+}
+
+func (authority *testProviderBoundPlacementAuthority) VerifyProviderUUID(providerUUID string) error {
+	if authority == nil || authority.PlacementAuthorityStore == nil ||
+		providerUUID == "" || providerUUID != authority.providerUUID {
+		return placement.ErrProviderAuthorityMismatch
+	}
+	return nil
+}
+
+func (authority *testProviderBoundPlacementAuthority) ConfigureBackendTopologyWithStorageIdentities(
+	backendNames []string,
+	storageIDs map[string]backendidentity.ID,
+) error {
+	configurator, ok := authority.PlacementAuthorityStore.(testTopologyConfigurator)
+	if !ok {
+		return errors.New("embedded test placement authority cannot configure topology")
+	}
+	return configurator.ConfigureBackendTopologyWithStorageIdentities(backendNames, storageIDs)
+}
+
+type testProviderBoundReconcilerPlacement struct {
+	ReconcilerPlacement
+	providerUUID string
+}
+
+func (authority *testProviderBoundReconcilerPlacement) VerifyProviderUUID(providerUUID string) error {
+	if authority == nil || authority.ReconcilerPlacement == nil ||
+		providerUUID == "" || providerUUID != authority.providerUUID {
+		return placement.ErrProviderAuthorityMismatch
+	}
+	return nil
+}
+
+func (authority *testProviderBoundReconcilerPlacement) ConfigureBackendTopologyWithStorageIdentities(
+	backendNames []string,
+	storageIDs map[string]backendidentity.ID,
+) error {
+	configurator, ok := authority.ReconcilerPlacement.(testTopologyConfigurator)
+	if !ok {
+		return errors.New("embedded test placement authority cannot configure topology")
+	}
+	return configurator.ConfigureBackendTopologyWithStorageIdentities(backendNames, storageIDs)
+}
+
+// constructorPlacementAuthoritySpy uses the real provider-bound store while
+// recording whether construction advanced to topology validation.
+type constructorPlacementAuthoritySpy struct {
+	PlacementAuthorityStore
+	topologyChecks int
+}
+
+func (authority *constructorPlacementAuthoritySpy) VerifyBackendTopology(names []string) error {
+	authority.topologyChecks++
+	return authority.PlacementAuthorityStore.VerifyBackendTopology(names)
+}
+
 type testAttemptIdentity struct {
 	leaseUUID   string
 	backendName string
@@ -711,12 +955,25 @@ func (a *testPlacementAuthorityAdapter) EndInventorySession(fence placement.Inve
 	a.authority.EndInventorySession(fence)
 }
 
-func (a *testPlacementAuthorityAdapter) ConfigureBackendTopology(names []string) error {
-	return a.authority.ConfigureBackendTopology(names)
+func (a *testPlacementAuthorityAdapter) VerifyBackendTopology(names []string) error {
+	return a.authority.VerifyBackendTopology(names)
+}
+
+func (a *testPlacementAuthorityAdapter) ConfigureBackendTopologyWithStorageIdentities(
+	names []string,
+	identities map[string]backendidentity.ID,
+) error {
+	return a.authority.ConfigureBackendTopologyWithStorageIdentities(names, identities)
 }
 
 func (a *testPlacementAuthorityAdapter) CurrentAdmissionBaseline() placement.AdmissionBaseline {
 	return a.authority.CurrentAdmissionBaseline()
+}
+
+func (a *testPlacementAuthorityAdapter) ExpectedBackendStorageIdentity(
+	backendName string,
+) (backendidentity.ID, bool) {
+	return a.authority.ExpectedBackendStorageIdentity(backendName)
 }
 
 func (a *testPlacementAuthorityAdapter) ScopeAdmission(
@@ -746,12 +1003,15 @@ func (a *testPlacementAuthorityAdapter) BeginNewAttempt(
 	scope placement.AdmissionScope,
 	leaseUUID, backendName string,
 	id operation.OperationID,
+	payloadFingerprint placement.PayloadFingerprint,
+	requestSnapshot placement.BackendRequestSnapshot,
+	callbackPair placement.CallbackPair,
 ) (placement.AttemptToken, bool, error) {
 	if _, err := a.SetAttempting(leaseUUID, backendName); err != nil {
 		return placement.AttemptToken{}, false, err
 	}
 	token, applied, err := a.authority.BeginNewAttempt(
-		scope, leaseUUID, backendName, id,
+		scope, leaseUUID, backendName, id, payloadFingerprint, requestSnapshot, callbackPair,
 	)
 	if err != nil || !applied {
 		_ = a.ClearAttempt(leaseUUID, backendName)
@@ -768,6 +1028,9 @@ func (a *testPlacementAuthorityAdapter) BeginOwnedAttempt(
 	revision placement.RecordRevision,
 	backendName string,
 	id operation.OperationID,
+	payloadFingerprint placement.PayloadFingerprint,
+	requestSnapshot placement.BackendRequestSnapshot,
+	callbackPair placement.CallbackPair,
 ) (placement.AttemptToken, bool, error) {
 	// Legacy mock snapshots cannot mint RecordRevision. Mirror their exact raw
 	// owner CAS first, then bind the typed attempt to the adapter's private
@@ -795,6 +1058,7 @@ func (a *testPlacementAuthorityAdapter) BeginOwnedAttempt(
 	}
 	token, applied, err := a.authority.BeginOwnedAttempt(
 		baseline, internal.RecordRevision(), backendName, id,
+		payloadFingerprint, requestSnapshot, callbackPair,
 	)
 	if err != nil || !applied {
 		_ = a.ClearAttempt(leaseUUID, backendName)
@@ -881,6 +1145,31 @@ func (a *testPlacementAuthorityAdapter) RefuseOperation(
 		return false, err
 	}
 	return true, nil
+}
+
+func (a *testPlacementAuthorityAdapter) ClaimAttempt(
+	leaseUUID string,
+	id operation.OperationID,
+) (placement.AttemptClaim, bool, error) {
+	return a.authority.ClaimAttempt(leaseUUID, id)
+}
+
+func (a *testPlacementAuthorityAdapter) ReleaseAttemptClaim(
+	claim placement.AttemptClaim,
+) bool {
+	return a.authority.ReleaseAttemptClaim(claim)
+}
+
+func (a *testPlacementAuthorityAdapter) ConfirmClaimedAttempt(
+	claim placement.AttemptClaim,
+) (bool, error) {
+	return a.authority.ConfirmClaimedAttempt(claim)
+}
+
+func (a *testPlacementAuthorityAdapter) RefuseClaimedAttempt(
+	claim placement.AttemptClaim,
+) (bool, error) {
+	return a.authority.RefuseClaimedAttempt(claim)
 }
 
 func (a *testPlacementAuthorityAdapter) AuthorizeLifecycle(

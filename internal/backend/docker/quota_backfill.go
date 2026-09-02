@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
@@ -9,8 +10,10 @@ import (
 // reconcileVolumeQuotas re-applies each existing managed volume's quota (for
 // xfs: project-tag + block (bhard) and inode (ihard) limits) at startup, so
 // leases provisioned while the daemon lacked CAP_SYS_ADMIN (ENG-454) get
-// their disk_mb enforced without a re-provision or data move. It is
-// idempotent and best-effort per volume: a single volume's failure (e.g. a
+// their immutable effective quota enforced without a re-provision or data
+// move. Effective quota is durable DiskMB or, for a physically present
+// diskless writable-path volume, its mutually exclusive pinned ScratchDiskMB.
+// It is idempotent and best-effort per volume: a single volume's failure (e.g. a
 // concurrent deprovision) is logged and skipped, never fatal.
 //
 // It enumerates the volumes that SHOULD carry a quota — active lease instances
@@ -43,10 +46,23 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 	// calls below (mirrors cleanupOrphanedVolumes).
 	b.provisionsMu.RLock()
 	for leaseUUID, prov := range b.provisions {
+		resourceProfiles := prov.ResourceProfiles
+		var resolveErr error
+		if len(resourceProfiles) == 0 {
+			// Explicit v0.13 compatibility only. Normal startup recovery freezes
+			// this value into the active Release before quota reconciliation.
+			resourceProfiles, resolveErr = b.resolveResourceProfiles(prov.Items)
+		}
+		resourcesBySKU, profileErr := resourceSnapshotMap(prov.Items, resourceProfiles)
+		if resolveErr != nil || profileErr != nil {
+			b.logger.Warn("quota backfill: live lease has invalid resource authority; skipping",
+				"lease_uuid", leaseUUID, "error", errors.Join(resolveErr, profileErr))
+			continue
+		}
 		for _, item := range prov.Items {
-			profile, perr := b.cfg.GetSKUProfile(item.SKU)
-			if perr != nil {
-				continue // unknown SKU: nothing we can size
+			resources, ok := resourcesBySKU[item.SKU]
+			if !ok {
+				continue // validated snapshots make this unreachable
 			}
 			// Mirror provision.go's sizing: a stateful item is capped at its
 			// disk_mb; an ephemeral (disk_mb=0) item with an image writable-path
@@ -54,9 +70,9 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 			// must be re-capped too (else a pre-CAP writable volume grows
 			// unbounded). Items with no on-disk volume are dropped by the
 			// existence gate below.
-			sizeMB := profile.DiskMB
-			if sizeMB <= 0 {
-				sizeMB = int64(b.cfg.GetTmpfsSizeMB())
+			sizeMB, sizeErr := resources.EffectiveDiskMB()
+			if sizeErr != nil {
+				continue // resourceSnapshotMap already validated; defensive only
 			}
 			if sizeMB <= 0 {
 				continue
@@ -79,19 +95,37 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 				if e.Status != shared.RetentionStatusActive {
 					continue
 				}
+				resourceProfiles := e.ResourceProfiles
+				var resolveErr error
+				if len(resourceProfiles) == 0 {
+					resourceProfiles, resolveErr = b.resolveResourceProfiles(e.Items)
+				}
+				resourcesBySKU, profileErr := resourceSnapshotMap(e.Items, resourceProfiles)
+				if resolveErr != nil || profileErr != nil {
+					b.logger.Warn("quota backfill: retention has invalid resource authority; skipping",
+						"lease_uuid", e.OriginalLeaseUUID, "error", errors.Join(resolveErr, profileErr))
+					continue
+				}
 				retainedSet := make(map[string]struct{}, len(e.RetainedVolumeNames))
 				for _, n := range e.RetainedVolumeNames {
 					retainedSet[n] = struct{}{}
 				}
 				for _, item := range e.Items {
-					profile, perr := b.cfg.GetSKUProfile(item.SKU)
-					if perr != nil || profile.DiskMB <= 0 {
+					resources, ok := resourcesBySKU[item.SKU]
+					if !ok {
+						continue
+					}
+					sizeMB, sizeErr := resources.EffectiveDiskMB()
+					if sizeErr != nil || sizeMB <= 0 {
 						continue
 					}
 					for i := range item.Quantity {
 						name := retainedName(canonicalVolumeName(e.OriginalLeaseUUID, item.ServiceName, i))
 						if _, ok := retainedSet[name]; ok {
-							want[name] = profile.DiskMB
+							// Scratch remains non-retainable policy-wise, but a
+							// conservatively retained exact name still occupies host disk
+							// and must keep its original quota until it is destroyed.
+							want[name] = sizeMB
 						}
 					}
 				}
@@ -105,7 +139,7 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 			absent++ // expected but not on disk (stateless instance, or already gone)
 			continue
 		}
-		if cerr := b.volumes.EnsureQuota(ctx, name, sizeMB); cerr != nil {
+		if cerr := b.mutationAdapter().ensureVolumeQuota(ctx, name, sizeMB); cerr != nil {
 			failed++
 			volumeQuotaBackfillTotal.WithLabelValues("failed").Inc()
 			b.logger.Warn("quota backfill: failed to re-apply quota",

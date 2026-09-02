@@ -13,11 +13,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
@@ -31,6 +33,20 @@ const testCallbackDeliveryTimeout = 5 * time.Second
 // testCallbackSecret is the HMAC secret the fake Fred receiver uses to
 // verify inbound callbacks. 32 chars to satisfy Config.Validate's floor.
 const testCallbackSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+// testK3sProviderUUID is a canonical provider identity for fixtures that pass
+// through the real durable operation-intent journal. Tests that seed only an
+// in-memory provision may still use memorable strings when identity is not the
+// behavior under test.
+const testK3sProviderUUID = "bc19c267-ddbd-47c8-84ca-c944b9a9c74f"
+
+func TestBackendConstructionRejectsMissingDependencies(t *testing.T) {
+	_, err := newBackend(context.Background(), Config{}, nil, testK3sStorageIdentity{})
+	require.ErrorContains(t, err, "logger")
+
+	_, err = newBackend(context.Background(), Config{}, slog.Default(), nil)
+	require.ErrorContains(t, err, "identity resolver")
+}
 
 // newBackendForTest constructs a Backend with t.TempDir-backed bbolt
 // stores, a zero-backoff callback sender, and an HTTP client targeting
@@ -54,8 +70,9 @@ func newBackendForTest(t *testing.T, fredURL string) *Backend {
 	cfg.ReleasesDBPath = filepath.Join(dir, "releases.db")
 	cfg.CallbackSecret = config.Secret(testCallbackSecret)
 
-	b, err := New(cfg, slog.Default())
+	b, err := newBackendWithTestIdentity(cfg, slog.Default())
 	require.NoError(t, err)
+	bindK3sTestStorageIdentity(t, b)
 
 	rebuildCallbackSender(b)
 	t.Cleanup(func() { _ = b.Stop() })
@@ -69,15 +86,25 @@ func newBackendForTest(t *testing.T, fredURL string) *Backend {
 // read would be test scaffolding in a production struct (ENG-765).
 func rebuildCallbackSender(b *Backend) {
 	httpClient := &http.Client{}
-	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
 		Store:           b.callbackStore,
 		HTTPClient:      httpClient,
 		Secret:          string(b.cfg.CallbackSecret),
+		StorageIdentity: b.storageIdentity,
+		BeforeDelivery:  b.VerifyStorageIdentity,
+		BeforeReplay:    b.VerifyStorageIdentity,
 		Logger:          b.logger,
 		StopCtx:         b.stopCtx,
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: testCallbackDeliveryTimeout,
 	})
+}
+
+// startK3sCallbackReplayForTest opts a fixture into the same tracked delivery
+// lifecycle production Start uses. Most state-only tests deliberately leave
+// replay stopped so they can inspect the durable outbox without racing HTTP.
+func startK3sCallbackReplayForTest(b *Backend) {
+	b.wg.Go(b.callbackSender.RunReplayLoop)
 }
 
 // startFakeFred returns an httptest.Server that plays Fred for callback
@@ -127,14 +154,22 @@ func awaitCallback(t *testing.T, ch <-chan backend.CallbackPayload) backend.Call
 	}
 }
 
-// newProvisionRequest is a convenience constructor for tests.
-func newProvisionRequest(leaseUUID, callbackURL string) backend.ProvisionRequest {
+func testProvisionCallbackURL(baseURL string) string {
+	return baseURL + callbackurl.ProvisionPath
+}
+
+// newProvisionRequest is a convenience constructor for tests. Callers supply
+// a fake Fred base URL; the helper builds the same canonical callback endpoint
+// that providerd supplies in production.
+func newProvisionRequest(leaseUUID, callbackBaseURL string) backend.ProvisionRequest {
 	return backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "manifest1test",
-		ProviderUUID: "prov-1",
+		ProviderUUID: testK3sProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}},
-		CallbackURL:  callbackURL,
+		Payload:      []byte(`{"image":"example.invalid/app:1"}`),
+		CallbackURL: testProvisionCallbackURL(callbackBaseURL) +
+			"?operation_id=" + uuid.NewString(),
 	}
 }
 
@@ -155,6 +190,33 @@ func newTestProvision(b *Backend, leaseUUID, callbackURL string) *provision {
 		ctx:          ctx,
 		cancel:       cancel,
 	}
+}
+
+func seedK3sProvisionIntentForTest(
+	t *testing.T, b *Backend, leaseUUID, callbackBaseURL string,
+) string {
+	t.Helper()
+	bindK3sTestStorageIdentity(t, b)
+	callbackURL := testProvisionCallbackURL(callbackBaseURL) +
+		"?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	require.NoError(t, err)
+	items := []backend.LeaseItem{{SKU: "k3s-small", ServiceName: "app", Quantity: 1}}
+	_, err = b.callbackStore.BeginOperationIntent(shared.OperationIntentSpec{
+		Kind:                 shared.OperationIntentProvision,
+		LeaseUUID:            leaseUUID,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleURL,
+		Backend:              b.cfg.Name,
+		BackendStorageID:     b.storageIdentity,
+		Tenant:               "manifest1test",
+		ProviderUUID:         testK3sProviderUUID,
+		Items:                items,
+		ResourceProfiles:     testK3sResourceProfiles(t, b, items),
+		Manifest:             []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`),
+	})
+	require.NoError(t, err)
+	return callbackURL
 }
 
 // --- Backend lifecycle ----------------------------------------------------
@@ -218,6 +280,7 @@ func TestNewCallbackHTTPClient(t *testing.T) {
 func TestBackend_Start_Succeeds(t *testing.T) {
 	fred, _ := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	bindK3sTestStorageIdentity(t, b)
 	require.NoError(t, b.Start(context.Background()))
 }
 
@@ -244,19 +307,19 @@ func TestProvision_RejectsInvalidRequests(t *testing.T) {
 	}{
 		{
 			name:    "empty lease_uuid",
-			req:     backend.ProvisionRequest{CallbackURL: fred.URL, Items: []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}}},
+			req:     backend.ProvisionRequest{CallbackURL: testProvisionCallbackURL(fred.URL), Items: []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}}},
 			wantMsg: "lease_uuid is required",
 		},
 		{
 			name:    "empty callback_url",
-			req:     backend.ProvisionRequest{LeaseUUID: "lease-1", Items: []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}}},
+			req:     backend.ProvisionRequest{LeaseUUID: "550e8400-e29b-41d4-a716-446655440000", Items: []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}}},
 			wantMsg: "callback_url is required",
 		},
 		{
 			name: "lifecycle authority in operation callback_url",
 			req: backend.ProvisionRequest{
-				LeaseUUID:   "lease-1",
-				CallbackURL: fred.URL + "?lifecycle_id=" + callbackID,
+				LeaseUUID:   "550e8400-e29b-41d4-a716-446655440000",
+				CallbackURL: testProvisionCallbackURL(fred.URL) + "?lifecycle_id=" + callbackID,
 				Items:       []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}},
 			},
 			wantMsg: "invalid lifecycle callback URL",
@@ -264,16 +327,16 @@ func TestProvision_RejectsInvalidRequests(t *testing.T) {
 		{
 			name: "mismatched explicit lifecycle callback_url",
 			req: backend.ProvisionRequest{
-				LeaseUUID:            "lease-1",
-				CallbackURL:          fred.URL + "?operation_id=" + callbackID,
-				LifecycleCallbackURL: fred.URL + "?lifecycle_id=" + otherID,
+				LeaseUUID:            "550e8400-e29b-41d4-a716-446655440000",
+				CallbackURL:          testProvisionCallbackURL(fred.URL) + "?operation_id=" + callbackID,
+				LifecycleCallbackURL: testProvisionCallbackURL(fred.URL) + "?lifecycle_id=" + otherID,
 				Items:                []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}},
 			},
 			wantMsg: "invalid lifecycle callback URL",
 		},
 		{
 			name:    "empty items",
-			req:     backend.ProvisionRequest{LeaseUUID: "lease-1", CallbackURL: fred.URL},
+			req:     backend.ProvisionRequest{LeaseUUID: "550e8400-e29b-41d4-a716-446655440000", CallbackURL: testProvisionCallbackURL(fred.URL)},
 			wantMsg: "items is required",
 		},
 	}
@@ -288,6 +351,49 @@ func TestProvision_RejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestProvisionPersistsAndReportsLifecycleGeneration(t *testing.T) {
+	const id = "550e8400-e29b-41d4-a716-446655440000"
+	b := newBackendForTest(t, "")
+	operationURL := "https://fred.example" + callbackurl.ProvisionPath + "?operation_id=" + id
+	lifecycleURL := "https://fred.example" + callbackurl.ProvisionPath + "?lifecycle_id=" + id
+
+	require.NoError(t, b.Provision(t.Context(), backend.ProvisionRequest{
+		LeaseUUID:            id,
+		Tenant:               "tenant-1",
+		ProviderUUID:         testK3sProviderUUID,
+		CallbackURL:          operationURL,
+		LifecycleCallbackURL: lifecycleURL,
+		Items:                []backend.LeaseItem{{SKU: "k3s-small", Quantity: 1}},
+		Payload:              []byte(`{"image":"example.invalid/app:1"}`),
+	}))
+
+	b.provisionsMu.RLock()
+	stored := b.provisions[id]
+	require.NotNil(t, stored)
+	assert.Equal(t, operationURL, stored.CallbackURL)
+	assert.Equal(t, lifecycleURL, stored.LifecycleCallbackURL)
+	b.provisionsMu.RUnlock()
+
+	info, err := b.GetProvision(t.Context(), id)
+	require.NoError(t, err)
+	assert.Equal(t, &backend.LifecycleGenerationObservation{
+		Kind: backend.LifecycleGenerationTyped,
+		ID:   id,
+	}, info.LifecycleGeneration)
+}
+
+func TestProvisionToInfoMissingCallbackHalfIsUnknown(t *testing.T) {
+	info := provisionToInfo(&provision{
+		LeaseUUID:   "legacy-record",
+		Tenant:      "tenant-a",
+		CallbackURL: "https://fred.example/callbacks/provision",
+	})
+	assert.Equal(t, "tenant-a", info.Tenant)
+	assert.Equal(t, &backend.LifecycleGenerationObservation{
+		Kind: backend.LifecycleGenerationUnknown,
+	}, info.LifecycleGeneration)
+}
+
 func TestProvision_RejectsActiveDuplicate(t *testing.T) {
 	// Duplicate Provision on a lease whose entry is in a non-failed status
 	// (Provisioning, or — once ENG-134+ ships real lifecycle — Ready/
@@ -299,12 +405,13 @@ func TestProvision_RejectsActiveDuplicate(t *testing.T) {
 	// quickly and would defeat the in-progress check non-deterministically.
 	fred, _ := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 
 	b.provisionsMu.Lock()
-	b.provisions["lease-active"] = newTestProvision(b, "lease-active", fred.URL)
+	b.provisions[leaseUUID] = newTestProvision(b, leaseUUID, testProvisionCallbackURL(fred.URL))
 	b.provisionsMu.Unlock()
 
-	err := b.Provision(context.Background(), newProvisionRequest("lease-active", fred.URL))
+	err := b.Provision(context.Background(), newProvisionRequest(leaseUUID, fred.URL))
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned)
 }
@@ -322,20 +429,27 @@ func TestProvision_AllowsRetryAfterFailure(t *testing.T) {
 	// duplicated).
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
+	require.Eventually(t, func() bool {
+		pending, pendingErr := b.callbackStore.ListPending()
+		intents, intentErr := b.callbackStore.ListOperationIntents()
+		return pendingErr == nil && intentErr == nil && len(pending) == 0 && len(intents) == 0
+	}, time.Second, time.Millisecond,
+		"the first synchronous 2xx must precisely remove its completion before a new generation")
 
-	info, err := b.GetProvision(context.Background(), "lease-1")
+	info, err := b.GetProvision(context.Background(), "550e8400-e29b-41d4-a716-446655440000")
 	require.NoError(t, err)
 	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	require.Equal(t, 1, info.FailCount)
 
 	// Retry. Should succeed and inherit the prior FailCount.
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
 
-	info, err = b.GetProvision(context.Background(), "lease-1")
+	info, err = b.GetProvision(context.Background(), "550e8400-e29b-41d4-a716-446655440000")
 	require.NoError(t, err)
 	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	assert.Equal(t, 2, info.FailCount,
@@ -357,11 +471,12 @@ func TestProvision_HappyPath_PostsFailedCallback(t *testing.T) {
 	// callback's signature is invalid the test fails there.
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 
 	p := awaitCallback(t, ch)
-	assert.Equal(t, "lease-1", p.LeaseUUID)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", p.LeaseUUID)
 	assert.Equal(t, backend.CallbackStatusFailed, p.Status)
 	assert.Equal(t, "not implemented", p.Error)
 	assert.Equal(t, "k3s", p.Backend)
@@ -374,68 +489,71 @@ func TestDeprovision_Idempotent_NonexistentLease(t *testing.T) {
 	b := newBackendForTest(t, fred.URL)
 	// Two consecutive deprovisions on a lease that was never provisioned.
 	// Both must return nil per BACKEND_GUIDE.md's idempotency contract.
-	require.NoError(t, b.Deprovision(context.Background(), "ghost"))
-	require.NoError(t, b.Deprovision(context.Background(), "ghost"))
+	const missingLease = "550e8400-e29b-41d4-a716-446655440000"
+	require.NoError(t, b.Deprovision(context.Background(), missingLease))
+	require.NoError(t, b.Deprovision(context.Background(), missingLease))
 }
 
 func TestDeprovision_RemovesFromMap_AfterProvision(t *testing.T) {
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
 
 	list, err := b.ListProvisions(context.Background())
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	assert.Equal(t, "lease-1", list[0].LeaseUUID)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", list[0].LeaseUUID)
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	require.NoError(t, b.Deprovision(context.Background(), "550e8400-e29b-41d4-a716-446655440000"))
 
 	list, err = b.ListProvisions(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, list)
 }
 
-// TestDeprovision_RemovesPendingCallback pins the regression guard for
-// Copilot id 3237313147. shared.CallbackSender persists every callback
-// to bbolt BEFORE delivery and Removes only on success. Pre-fix,
-// Deprovision deleted the in-memory record but left the bbolt entry,
-// so a failed-delivery → Deprovision → restart sequence would let
-// ReplayPendingCallbacks fire a stale status=failed for a torn-down
-// lease. Asserts that Deprovision now clears the pending entry too.
-func TestDeprovision_RemovesPendingCallback(t *testing.T) {
+// An exact operation completion is causal evidence for Fred's durable
+// write-ahead placement Attempt. Deprovision must not erase it merely because
+// the backend's in-memory lease record is already gone.
+func TestDeprovision_PreservesPendingExactCallback(t *testing.T) {
 	fred, _ := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 
-	// Seed the callback store directly to simulate "callback persisted,
-	// delivery hasn't succeeded yet". Bypasses Provision so the goroutine-
-	// timing path stays out of the test.
-	entry := shared.CallbackEntry{
-		LeaseUUID:    "lease-1",
-		CallbackURL:  fred.URL + "/callbacks/provision",
-		DeliveryKind: shared.CallbackDeliveryKindOperation,
-		Status:       backend.CallbackStatusFailed,
-		Backend:      b.cfg.Name,
-		Error:        "not implemented",
-		CreatedAt:    time.Now(),
-	}
-	require.NoError(t, b.callbackStore.Store(entry))
+	// Resolve a real write-ahead intent to simulate "exact callback persisted,
+	// delivery hasn't succeeded yet". Bypasses Provision so goroutine timing
+	// stays out of the test without manufacturing causal evidence directly.
+	callbackURL := seedK3sProvisionIntentForTest(t, b, leaseUUID, fred.URL)
+	intents, err := b.callbackStore.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	entry, err := b.callbackStore.ResolveOperationIntent(
+		intents[0], backend.CallbackStatusFailed, "not implemented",
+	)
+	require.NoError(t, err)
+	require.Equal(t, callbackURL, entry.CallbackURL)
 
 	pending, err := b.callbackStore.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "precondition: callback store has the seeded entry")
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 
 	pending, err = b.callbackStore.ListPending()
 	require.NoError(t, err)
-	assert.Empty(t, pending, "Deprovision must drop the pending callback so ReplayPendingCallbacks won't fire a stale status=failed")
+	require.Len(t, pending, 1)
+	assert.Equal(t, entry.LeaseUUID, pending[0].LeaseUUID)
+	assert.Equal(t, shared.CallbackDeliveryKindOperation, pending[0].DeliveryKind)
 }
 
-func TestDeprovision_SerializesWithInFlightCallbackDelivery(t *testing.T) {
+func TestDeprovision_DoesNotWaitForInFlightCallbackDelivery(t *testing.T) {
 	callbackStarted := make(chan struct{})
 	releaseCallback := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCallback) }) }
+	defer release()
 	var once sync.Once
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		once.Do(func() {
@@ -446,8 +564,9 @@ func TestDeprovision_SerializesWithInFlightCallbackDelivery(t *testing.T) {
 	}))
 	t.Cleanup(callbackServer.Close)
 	b := newBackendForTest(t, callbackServer.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", callbackServer.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", callbackServer.URL)))
 	select {
 	case <-callbackStarted:
 	case <-time.After(time.Second):
@@ -455,28 +574,26 @@ func TestDeprovision_SerializesWithInFlightCallbackDelivery(t *testing.T) {
 	}
 
 	deprovisionDone := make(chan error, 1)
-	go func() { deprovisionDone <- b.Deprovision(context.Background(), "lease-1") }()
-	select {
-	case err := <-deprovisionDone:
-		t.Fatalf("deprovision bypassed the callback sender's in-flight lease lock: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	close(releaseCallback)
+	go func() { deprovisionDone <- b.Deprovision(context.Background(), "550e8400-e29b-41d4-a716-446655440000") }()
 	select {
 	case err := <-deprovisionDone:
 		require.NoError(t, err)
 	case <-time.After(time.Second):
-		t.Fatal("deprovision did not finish after callback delivery released")
+		t.Fatal("deprovision waited for unrelated callback HTTP delivery")
 	}
 
 	pending, err := b.callbackStore.ListPending()
 	require.NoError(t, err)
-	assert.Empty(t, pending,
-		"sender-owned cancellation must remove the failed in-flight callback after its drain releases")
+	require.Len(t, pending, 1,
+		"deprovision must preserve the original completion without manufacturing a duplicate")
+	for _, entry := range pending {
+		assert.Equal(t, shared.CallbackDeliveryKindOperation, entry.DeliveryKind)
+		assert.Equal(t, backend.CallbackStatusFailed, entry.Status)
+	}
 	provisions, err := b.ListProvisions(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, provisions)
+	release()
 }
 
 // --- GetProvision contract (architect's required test set) ---------------
@@ -484,14 +601,15 @@ func TestDeprovision_SerializesWithInFlightCallbackDelivery(t *testing.T) {
 func TestGetProvision_FromMap_AfterStubFailure(t *testing.T) {
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch) // signals goroutine has flipped state + fired callback
 
-	info, err := b.GetProvision(context.Background(), "lease-1")
+	info, err := b.GetProvision(context.Background(), "550e8400-e29b-41d4-a716-446655440000")
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	assert.Equal(t, "lease-1", info.LeaseUUID)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", info.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	// ENG-508: the map path surfaces the curated tenant-safe failure signal
 	// (Reason/Message); the verbose operator LastError is no longer on the wire.
@@ -506,19 +624,20 @@ func TestGetProvision_FromMap_AfterStubFailure(t *testing.T) {
 func TestGetProvision_FromDiagnostics_AfterDeprovision(t *testing.T) {
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	require.NoError(t, b.Deprovision(context.Background(), "550e8400-e29b-41d4-a716-446655440000"))
 
 	// Diagnostics survive Deprovision (cfg.DiagnosticsMaxAge handles
 	// eventual cleanup) so post-teardown queries can still surface the
 	// failure cause.
-	info, err := b.GetProvision(context.Background(), "lease-1")
+	info, err := b.GetProvision(context.Background(), "550e8400-e29b-41d4-a716-446655440000")
 	require.NoError(t, err)
 	require.NotNil(t, info)
-	assert.Equal(t, "lease-1", info.LeaseUUID)
-	assert.Equal(t, "prov-1", info.ProviderUUID)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", info.LeaseUUID)
+	assert.Equal(t, testK3sProviderUUID, info.ProviderUUID)
 	// Fallback synthesizes Status=Failed because shared.DiagnosticEntry
 	// is failure-only by construction (only the runStubProvisioner failure
 	// path calls diagnosticsStore.Store).
@@ -556,18 +675,19 @@ func TestGetProvision_MapAndDiagnostics_AgreeOnWire(t *testing.T) {
 	// scope for ENG-133.
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
 
-	mapInfo, err := b.GetProvision(context.Background(), "lease-1")
+	mapInfo, err := b.GetProvision(context.Background(), "550e8400-e29b-41d4-a716-446655440000")
 	require.NoError(t, err)
 	mapJSON, err := json.Marshal(mapInfo)
 	require.NoError(t, err)
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-1"))
+	require.NoError(t, b.Deprovision(context.Background(), "550e8400-e29b-41d4-a716-446655440000"))
 
-	diagInfo, err := b.GetProvision(context.Background(), "lease-1")
+	diagInfo, err := b.GetProvision(context.Background(), "550e8400-e29b-41d4-a716-446655440000")
 	require.NoError(t, err)
 	diagJSON, err := json.Marshal(diagInfo)
 	require.NoError(t, err)
@@ -598,34 +718,36 @@ func TestListProvisions_EmptyReturnsEmptyNotNil(t *testing.T) {
 func TestListProvisions_ReflectsProvisions(t *testing.T) {
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-2", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("6ba7b811-9dad-41d1-80b4-00c04fd430c8", fred.URL)))
 	_ = awaitCallback(t, ch)
 
 	list, err := b.ListProvisions(context.Background())
 	require.NoError(t, err)
 	require.Len(t, list, 2)
 	uuids := []string{list[0].LeaseUUID, list[1].LeaseUUID}
-	assert.ElementsMatch(t, []string{"lease-1", "lease-2"}, uuids)
+	assert.ElementsMatch(t, []string{"550e8400-e29b-41d4-a716-446655440000", "6ba7b811-9dad-41d1-80b4-00c04fd430c8"}, uuids)
 }
 
 func TestLookupProvisions_FiltersToRequested(t *testing.T) {
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-2", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("6ba7b811-9dad-41d1-80b4-00c04fd430c8", fred.URL)))
 	_ = awaitCallback(t, ch)
 
 	// "lease-3" is not provisioned — silently omitted from the result per
 	// the handler's "200 with empty slice vs 404" contract.
-	list, err := b.LookupProvisions(context.Background(), []string{"lease-1", "lease-3"})
+	list, err := b.LookupProvisions(context.Background(), []string{"550e8400-e29b-41d4-a716-446655440000", "lease-3"})
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	assert.Equal(t, "lease-1", list[0].LeaseUUID)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", list[0].LeaseUUID)
 }
 
 // --- Sentinel-error stubs ------------------------------------------------
@@ -640,26 +762,26 @@ func TestStubMethods_ReturnErrNotProvisioned(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("GetInfo", func(t *testing.T) {
-		info, err := b.GetInfo(ctx, "lease-1")
+		info, err := b.GetInfo(ctx, "550e8400-e29b-41d4-a716-446655440000")
 		assert.Nil(t, info)
 		assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 	})
 
 	t.Run("GetLogs", func(t *testing.T) {
-		logs, err := b.GetLogs(ctx, "lease-1", 100)
+		logs, err := b.GetLogs(ctx, "550e8400-e29b-41d4-a716-446655440000", 100)
 		assert.Nil(t, logs)
 		assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 	})
 
 	t.Run("Restart", func(t *testing.T) {
-		err := b.Restart(ctx, backend.RestartRequest{LeaseUUID: "lease-1", CallbackURL: fred.URL})
+		err := b.Restart(ctx, backend.RestartRequest{LeaseUUID: "550e8400-e29b-41d4-a716-446655440000", CallbackURL: testProvisionCallbackURL(fred.URL)})
 		assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 	})
 
 	t.Run("Update", func(t *testing.T) {
 		err := b.Update(ctx, backend.UpdateRequest{
-			LeaseUUID:   "lease-1",
-			CallbackURL: fred.URL,
+			LeaseUUID:   "550e8400-e29b-41d4-a716-446655440000",
+			CallbackURL: testProvisionCallbackURL(fred.URL),
 			Payload:     []byte("eyJpbWFnZSI6Im5naW54In0="),
 		})
 		assert.ErrorIs(t, err, backend.ErrNotProvisioned)
@@ -672,7 +794,7 @@ func TestStubMethods_ReturnErrNotProvisioned(t *testing.T) {
 	// assertion.
 
 	t.Run("GetReleases", func(t *testing.T) {
-		releases, err := b.GetReleases(ctx, "lease-1")
+		releases, err := b.GetReleases(ctx, "550e8400-e29b-41d4-a716-446655440000")
 		assert.Nil(t, releases)
 		assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 	})
@@ -695,10 +817,11 @@ func TestRunStubProvisioner_SuppressesCallbackAfterDeprovision(t *testing.T) {
 	// We seed an entry directly into the map, delete it (simulating the
 	// fast Deprovision), then invoke runStubProvisioner synchronously so
 	// the test is deterministic instead of racing the Go scheduler.
-	fred, callbacks := startFakeFred(t)
-	b := newBackendForTest(t, fred.URL)
+	b := newBackendForTest(t, "")
 
-	p := newTestProvision(b, "lease-deleted", fred.URL)
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	callbackURL := seedK3sProvisionIntentForTest(t, b, leaseUUID, "https://fred.example")
+	p := newTestProvision(b, leaseUUID, callbackURL)
 	b.provisionsMu.Lock()
 	b.provisions[p.LeaseUUID] = p
 	b.provisionsMu.Unlock()
@@ -722,13 +845,12 @@ func TestRunStubProvisioner_SuppressesCallbackAfterDeprovision(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusProvisioning, p.Status,
 		"a worker that no longer owns the record must not flip its status")
 
-	// Assert no callback was sent.
-	select {
-	case got := <-callbacks:
-		t.Fatalf("expected no callback after deprovision, got: %+v", got)
-	case <-time.After(200 * time.Millisecond):
-		// Expected: callback channel stays empty.
-	}
+	pending, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, p.CallbackURL, pending[0].CallbackURL)
+	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
+	assert.Equal(t, "provision canceled by deprovision", pending[0].Error)
 
 	// Assert no diagnostic was persisted either.
 	diag, err := b.diagnosticsStore.Get(p.LeaseUUID)
@@ -750,10 +872,11 @@ func TestRunStubProvisioner_SuppressesCallbackAfterDeprovision(t *testing.T) {
 // expressed by WHERE Deprovision is called, which is what the hook
 // fields used to simulate.
 func TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic(t *testing.T) {
-	fred, callbacks := startFakeFred(t)
-	b := newBackendForTest(t, fred.URL)
+	b := newBackendForTest(t, "")
 
-	p := newTestProvision(b, "lease-1", fred.URL)
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	callbackURL := seedK3sProvisionIntentForTest(t, b, leaseUUID, "https://fred.example")
+	p := newTestProvision(b, leaseUUID, callbackURL)
 	b.provisionsMu.Lock()
 	b.provisions[p.LeaseUUID] = p
 	b.provisionsMu.Unlock()
@@ -774,17 +897,19 @@ func TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic(t *testin
 		"checkpoint 1 must report the lease as canceled")
 	b.sendStubFailureCallback(f)
 
-	// Neither side effect should have occurred.
+	// The canceled worker must not persist diagnostics or emit its stale
+	// not-implemented callback. Deprovision persists one exact cancellation
+	// outcome for replay so Fred can refuse the durable attempt.
 	diag, err := b.diagnosticsStore.Get(p.LeaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, diag,
 		"diagnostic must not be persisted when ctx is canceled before the diagnostic write")
 
-	select {
-	case got := <-callbacks:
-		t.Fatalf("expected no callback after ctx cancel pre-diagnostic, got: %+v", got)
-	case <-time.After(200 * time.Millisecond):
-	}
+	pending, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, p.CallbackURL, pending[0].CallbackURL)
+	assert.Equal(t, "provision canceled by deprovision", pending[0].Error)
 }
 
 // TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback
@@ -803,10 +928,11 @@ func TestRunStubProvisioner_SuppressesCallback_PostUnlockPreDiagnostic(t *testin
 // order and places the real Deprovision at the interleaving point under
 // test, so no test-only hook field is needed (ENG-765).
 func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *testing.T) {
-	fred, callbacks := startFakeFred(t)
-	b := newBackendForTest(t, fred.URL)
+	b := newBackendForTest(t, "")
 
-	p := newTestProvision(b, "lease-1", fred.URL)
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	callbackURL := seedK3sProvisionIntentForTest(t, b, leaseUUID, "https://fred.example")
+	p := newTestProvision(b, leaseUUID, callbackURL)
 	b.provisionsMu.Lock()
 	b.provisions[p.LeaseUUID] = p
 	b.provisionsMu.Unlock()
@@ -833,17 +959,14 @@ func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *test
 	require.NotNil(t, diag, "diagnostic written before ctx cancel must survive")
 	assert.Equal(t, stubProvisionerErrMsg, diag.Error)
 
-	// The callback was guarded by ctx.Err() at checkpoint 2, so
-	// SendOperationCallback must have been skipped — no bbolt persist, no HTTP POST.
-	select {
-	case got := <-callbacks:
-		t.Fatalf("expected no callback after ctx cancel pre-callback, got: %+v", got)
-	case <-time.After(200 * time.Millisecond):
-	}
+	// The worker callback was guarded by ctx.Err() at checkpoint 2. Deprovision
+	// leaves the single exact cancellation outcome queued for durable replay.
 	pending, err := b.callbackStore.ListPending()
 	require.NoError(t, err)
-	assert.Empty(t, pending,
-		"callbackStore must not contain a persisted entry for the canceled lease")
+	require.Len(t, pending, 1,
+		"callbackStore must contain only the exact cancellation for the canceled lease")
+	assert.Equal(t, p.CallbackURL, pending[0].CallbackURL)
+	assert.Equal(t, "provision canceled by deprovision", pending[0].Error)
 }
 
 // TestRunStubProvisioner_PersistsDiagnosticBeforeCallback pins the ORDER
@@ -880,7 +1003,7 @@ func TestRunStubProvisioner_SuppressesCallback_PostDiagnosticPreCallback(t *test
 // server goroutine exists, which orders that write ahead of any handler
 // read without a mutex.
 func TestRunStubProvisioner_PersistsDiagnosticBeforeCallback(t *testing.T) {
-	const leaseUUID = "lease-order"
+	const leaseUUID = "123e4567-e89b-42d3-a456-426614174000"
 
 	var b *Backend
 	diagSeen := make(chan bool, 1)
@@ -896,6 +1019,7 @@ func TestRunStubProvisioner_PersistsDiagnosticBeforeCallback(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	b = newBackendForTest(t, "")
+	startK3sCallbackReplayForTest(b)
 	srv.Start()
 
 	require.NoError(t, b.Provision(context.Background(), newProvisionRequest(leaseUUID, srv.URL)))
@@ -922,6 +1046,7 @@ func TestReconcileCustomDomain_NoOpForUnhandledLease(t *testing.T) {
 	// doesn't see 404 on every tick per active lease.
 	fred, callbacks := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 	ctx := context.Background()
 	items := []backend.LeaseItem{
 		{SKU: "k3s-small", Quantity: 1, ServiceName: "web", CustomDomain: "foo.example.com"},
@@ -932,9 +1057,9 @@ func TestReconcileCustomDomain_NoOpForUnhandledLease(t *testing.T) {
 	assert.NoError(t, err, "ReconcileCustomDomain must no-op (nil) for unhandled leases")
 
 	// Lease present (provisioned, then flipped to failed by the stub).
-	require.NoError(t, b.Provision(ctx, newProvisionRequest("lease-rcd", fred.URL)))
+	require.NoError(t, b.Provision(ctx, newProvisionRequest("9c858901-8a57-4791-81fe-4c455b099bc9", fred.URL)))
 	_ = awaitCallback(t, callbacks)
-	err = b.ReconcileCustomDomain(ctx, "lease-rcd", items)
+	err = b.ReconcileCustomDomain(ctx, "9c858901-8a57-4791-81fe-4c455b099bc9", items)
 	assert.NoError(t, err, "ReconcileCustomDomain must no-op (nil) even for present leases while ingress is disabled")
 }
 
@@ -966,7 +1091,7 @@ func TestGetProvision_NoRace_UnderConcurrentProvision(t *testing.T) {
 	// Task #19 Fix 2 regression guard. The pre-fix GetProvision dropped
 	// the RLock before reading p.Status / p.FailCount / p.LastError —
 	// which runStubProvisioner mutates under the write lock. This test
-	// hammers the same lease UUID from a Provision writer and a
+	// hammers each lease from the worker's claimStubFailure writer and a
 	// GetProvision reader concurrently, with NO channel-sync between
 	// the pair (intentional: T7b's existing GetProvision tests use
 	// awaitCallback's channel-sync happens-before, which masks the race
@@ -979,54 +1104,57 @@ func TestGetProvision_NoRace_UnderConcurrentProvision(t *testing.T) {
 	// triggering the race window pre-fix while keeping wall clock under
 	// 3s post-fix.
 
-	// Drain-only Fred handler: outbound callbacks from runStubProvisioner
-	// must not block on a buffered channel. HMAC verification isn't
-	// relevant to the race fix (the race is in-process map access, not
-	// callback delivery), so we skip it here to keep the test focused.
-	fred := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(fred.Close)
-
-	b := newBackendForTest(t, fred.URL)
+	// Exercise the actual worker's map-mutation phase directly. Provision now
+	// commits a durable operation intent, whose serialized bbolt writes and
+	// storage-identity checks are unrelated to the provisionsMu race this test
+	// pins. Seeding the in-memory records keeps the regression focused and avoids
+	// turning a lock-race test into a journal-throughput benchmark.
+	b := newBackendForTest(t, "")
 
 	const N = 50
+	provisions := make([]*provision, 0, N)
+	b.provisionsMu.Lock()
+	for i := range N {
+		leaseUUID := fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1)
+		p := newTestProvision(
+			b,
+			leaseUUID,
+			"https://fred.example"+callbackurl.ProvisionPath+"?operation_id="+leaseUUID,
+		)
+		b.provisions[leaseUUID] = p
+		provisions = append(provisions, p)
+	}
+	b.provisionsMu.Unlock()
+
 	var wg sync.WaitGroup
 	wg.Add(2 * N)
 
-	for i := 0; i < N; i++ {
-		uuid := fmt.Sprintf("lease-race-%d", i)
-
-		go func(uuid string) {
+	for _, p := range provisions {
+		go func(p *provision) {
 			defer wg.Done()
-			_ = b.Provision(context.Background(), newProvisionRequest(uuid, fred.URL))
-		}(uuid)
+			_, _ = b.claimStubFailure(p)
+		}(p)
 
-		go func(uuid string) {
+		go func(leaseUUID string) {
 			defer wg.Done()
 			// Tight loop until deadline. Each iteration potentially
 			// observes a different snapshot of the writer's state —
 			// pre-fix, any iteration could trip the race detector.
 			deadline := time.Now().Add(2 * time.Second)
 			for time.Now().Before(deadline) {
-				_, _ = b.GetProvision(context.Background(), uuid)
+				_, _ = b.GetProvision(context.Background(), leaseUUID)
 			}
-		}(uuid)
+		}(p.LeaseUUID)
 	}
 
 	wg.Wait()
 
-	// Sanity check: by the time wg.Wait returns, the writer goroutine
-	// for lease-race-0 has at least called Provision, which inserts the
-	// in-memory entry. GetProvision should surface it (whether the stub
-	// goroutine has finished mutating or not — both states are valid map
-	// hits). Doesn't verify the race fix itself (that's the race
-	// detector's job); just ensures the test setup actually exercised
-	// the contended code path and didn't no-op.
-	info, err := b.GetProvision(context.Background(), "lease-race-0")
+	// Sanity check: the worker-side writer actually transitioned the record.
+	// The race detector remains the assertion for synchronized field access.
+	info, err := b.GetProvision(context.Background(), "00000000-0000-4000-8000-000000000001")
 	require.NoError(t, err)
 	require.NotNil(t, info)
+	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 }
 
 func TestListProvisions_PopulatesFailCount(t *testing.T) {
@@ -1039,8 +1167,9 @@ func TestListProvisions_PopulatesFailCount(t *testing.T) {
 	// wire shape.
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
 
 	list, err := b.ListProvisions(context.Background())
@@ -1057,11 +1186,12 @@ func TestLookupProvisions_PopulatesFailCount(t *testing.T) {
 	// post-fix it carries FailCount: p.FailCount.
 	fred, ch := startFakeFred(t)
 	b := newBackendForTest(t, fred.URL)
+	startK3sCallbackReplayForTest(b)
 
-	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("lease-1", fred.URL)))
+	require.NoError(t, b.Provision(context.Background(), newProvisionRequest("550e8400-e29b-41d4-a716-446655440000", fred.URL)))
 	_ = awaitCallback(t, ch)
 
-	list, err := b.LookupProvisions(context.Background(), []string{"lease-1"})
+	list, err := b.LookupProvisions(context.Background(), []string{"550e8400-e29b-41d4-a716-446655440000"})
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assert.Equal(t, 1, list[0].FailCount,

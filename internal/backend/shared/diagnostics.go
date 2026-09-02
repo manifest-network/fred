@@ -25,7 +25,12 @@ type DiagnosticEntry struct {
 	Message   string            `json:"message,omitempty"`
 	Logs      map[string]string `json:"logs,omitempty"`
 	FailCount int               `json:"fail_count"`
-	CreatedAt time.Time         `json:"created_at"`
+	// LifecycleGeneration is a non-secret projection of the callback pair that
+	// owned this failure. New backends persist it so an in-memory failure and
+	// its post-teardown diagnostics fallback present the same inventory
+	// authority. Older rows omit it and remain readable as unknown.
+	LifecycleGeneration *backend.LifecycleGenerationObservation `json:"lifecycle_generation,omitempty"`
+	CreatedAt           time.Time                               `json:"created_at"`
 }
 
 // DiagnosticsStore persists failure diagnostics in bbolt so they survive

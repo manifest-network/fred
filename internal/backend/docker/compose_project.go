@@ -12,6 +12,7 @@ import (
 	composeapi "github.com/docker/compose/v5/pkg/api"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -22,6 +23,7 @@ type composeProjectParams struct {
 	ProviderUUID         string
 	CallbackURL          string
 	LifecycleCallbackURL string
+	MaintenanceID        shared.MaintenanceID
 	BackendName          string
 	FailCount            int
 	Stack                *manifest.StackManifest
@@ -53,10 +55,7 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 		imgSetup := params.ImageSetups[svcName]
 
 		for i := range item.Quantity {
-			composeSvcName := svcName
-			if item.Quantity > 1 {
-				composeSvcName = fmt.Sprintf("%s-%d", svcName, i)
-			}
+			composeSvcName := composeServiceName(item, i)
 
 			svcConfig := buildComposeServiceConfig(composeServiceParams{
 				LeaseUUID:            params.LeaseUUID,
@@ -64,6 +63,7 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 				ProviderUUID:         params.ProviderUUID,
 				CallbackURL:          params.CallbackURL,
 				LifecycleCallbackURL: params.LifecycleCallbackURL,
+				MaintenanceID:        params.MaintenanceID,
 				BackendName:          params.BackendName,
 				FailCount:            params.FailCount,
 				ServiceName:          svcName,
@@ -225,6 +225,7 @@ type composeServiceParams struct {
 	ProviderUUID         string
 	CallbackURL          string
 	LifecycleCallbackURL string
+	MaintenanceID        shared.MaintenanceID
 	BackendName          string
 	FailCount            int
 	ServiceName          string
@@ -394,6 +395,7 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 		LabelFailCount:            strconv.Itoa(p.FailCount),
 		LabelCallbackURL:          p.CallbackURL,
 		LabelLifecycleCallbackURL: p.LifecycleCallbackURL,
+		LabelMaintenanceID:        p.MaintenanceID.String(),
 		LabelBackendName:          p.BackendName,
 		LabelServiceName:          p.ServiceName,
 	}

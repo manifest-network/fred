@@ -136,6 +136,27 @@ func TestEventBroker_DispatchWithOrderedStartRefusalDoesNotInventStart(t *testin
 	assert.Empty(t, broker.transitions, "refused gates must be retired")
 }
 
+func TestEventBroker_DispatchWithOrderedSettlementKeepsAcceptedStartOnLocalFailure(t *testing.T) {
+	broker := NewEventBroker()
+	events, err := broker.Subscribe("lease-1")
+	require.NoError(t, err)
+	wantErr := errors.New("durable settlement failed")
+
+	accepted, err := broker.DispatchWithOrderedSettlement(
+		testEvent("lease-1", backend.ProvisionStatusUpdating),
+		func() (bool, error) {
+			broker.Publish(testEvent("lease-1", backend.ProvisionStatusReady))
+			return true, wantErr
+		},
+	)
+
+	require.True(t, accepted)
+	require.ErrorIs(t, err, wantErr)
+	assert.Equal(t, backend.ProvisionStatusUpdating, requireBrokerEvent(t, events).Status)
+	assert.Equal(t, backend.ProvisionStatusReady, requireBrokerEvent(t, events).Status)
+	assert.Empty(t, broker.transitions)
+}
+
 func TestEventBroker_DispatchWithOrderedStartSerializesOnlySameLease(t *testing.T) {
 	broker := NewEventBroker()
 	leaseOneEvents, err := broker.Subscribe("lease-1")

@@ -20,6 +20,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/leaseitems"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/util"
@@ -70,7 +71,8 @@ func (result Result) Detail() string { return result.detail }
 func (result Result) Cause() error { return result.cause }
 
 // Command contains authenticated restore identities, never a trusted lease
-// snapshot. Service re-reads TargetLeaseUUID under exact source and target
+// snapshot. Service authorizes SourceLeaseUUID before acquiring any exclusive
+// capability, then re-reads TargetLeaseUUID under exact source and target
 // lifecycle claims before deriving backend request data.
 type Command struct {
 	TargetLeaseUUID string
@@ -78,15 +80,15 @@ type Command struct {
 	SourceLeaseUUID string
 }
 
-// TargetLeaseReader is the authoritative chain read used after both lifecycle
-// claims are held.
-type TargetLeaseReader interface {
+// LeaseReader supplies authoritative chain ownership and target-state reads.
+type LeaseReader interface {
 	GetLease(context.Context, string) (*billingtypes.Lease, error)
 }
 
 // RestoreBackend is the smallest backend surface the service consumes.
 type RestoreBackend interface {
 	Name() string
+	GetProvision(ctx context.Context, leaseUUID string) (*backend.ProvisionInfo, error)
 	Restore(ctx context.Context, request backend.RestoreRequest) error
 }
 
@@ -123,11 +125,15 @@ type OperationRegistry interface {
 // opaque claim owns source exclusion only across synchronous dispatch; the
 // durable target attempt survives it.
 type RestoreAuthority interface {
+	Lookup(leaseUUID string) placement.Placement
 	CurrentAdmissionBaseline() placement.AdmissionBaseline
-	BeginRestore(
+	BeginAuthorizedRestore(
 		baseline placement.AdmissionBaseline,
-		sourceLeaseUUID, targetLeaseUUID string,
+		sourceRevision placement.RecordRevision,
+		targetLeaseUUID string,
 		operationID operation.OperationID,
+		requestSnapshot placement.BackendRequestSnapshot,
+		callbackPair placement.CallbackPair,
 	) (placement.RestoreClaim, error)
 	ConfirmRestore(placement.RestoreClaim) (bool, error)
 	RefuseRestore(placement.RestoreClaim) (bool, error)
@@ -154,7 +160,7 @@ var (
 type Config struct {
 	ProviderUUID string
 	CallbackURL  CallbackURLBuilder
-	Targets      TargetLeaseReader
+	Leases       LeaseReader
 	Backends     BackendResolver
 	Operations   OperationRegistry
 	Authority    RestoreAuthority
@@ -166,7 +172,7 @@ type Config struct {
 type Service struct {
 	providerUUID string
 	callbackURL  CallbackURLBuilder
-	targets      TargetLeaseReader
+	leases       LeaseReader
 	backends     BackendResolver
 	operations   OperationRegistry
 	authority    RestoreAuthority
@@ -182,8 +188,8 @@ func NewService(config Config) (*Service, error) {
 		return nil, errors.New("restore provider UUID is required")
 	case config.CallbackURL == nil:
 		return nil, errors.New("restore callback URL builder is required")
-	case util.IsNilInterface(config.Targets):
-		return nil, errors.New("restore target lease reader is required")
+	case util.IsNilInterface(config.Leases):
+		return nil, errors.New("restore lease reader is required")
 	case util.IsNilInterface(config.Backends):
 		return nil, errors.New("restore backend resolver is required")
 	case util.IsNilInterface(config.Operations):
@@ -203,7 +209,7 @@ func NewService(config Config) (*Service, error) {
 	return &Service{
 		providerUUID: config.ProviderUUID,
 		callbackURL:  config.CallbackURL,
-		targets:      config.Targets,
+		leases:       config.Leases,
 		backends:     config.Backends,
 		operations:   config.Operations,
 		authority:    config.Authority,
@@ -219,6 +225,10 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	if result, ok := service.validateCommand(command); !ok {
 		return result
 	}
+	sourceAuthorization, result, ok := service.authorizeSource(ctx, command)
+	if !ok {
+		return result
+	}
 
 	claims, result, ok := service.claimLeases(command)
 	if !ok {
@@ -230,7 +240,7 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	if !ok {
 		return result
 	}
-	items := extractLeaseItems(targetLease)
+	items := leaseitems.FromLease(targetLease)
 	initiated := service.operations.TryInitiateClaimed(claims.target, operation.TrackSpec{
 		LeaseUUID: command.TargetLeaseUUID,
 		Tenant:    command.Tenant,
@@ -248,10 +258,42 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		}
 	}
 	initiation := initiated.Capability()
+	abortBeforePlacement := func(cause error) Result {
+		completion := service.operations.AbortInitiation(initiation)
+		if completion != operation.InitiationAborted &&
+			completion != operation.InitiationFinished {
+			slog.Error("failed to abort restore initiation before placement admission",
+				"lease_uuid", command.TargetLeaseUUID,
+				"completion", completion,
+			)
+		}
+		return Result{Outcome: OutcomeServiceUnavailable, cause: cause}
+	}
+	callbackURL, err := service.callbackURL(initiation.ID())
+	if err != nil {
+		return abortBeforePlacement(fmt.Errorf("build restore callback URL: %w", err))
+	}
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	if err != nil {
+		return abortBeforePlacement(fmt.Errorf("build restore lifecycle callback URL: %w", err))
+	}
+	callbackPair, err := placement.NewCallbackPair(
+		initiation.ID(), callbackURL, lifecycleCallbackURL,
+	)
+	if err != nil {
+		return abortBeforePlacement(fmt.Errorf("bind restore callback destinations: %w", err))
+	}
+	requestSnapshot, err := placement.NewBackendRequestSnapshot(
+		targetLease.Tenant, service.providerUUID, items,
+	)
+	if err != nil {
+		return abortBeforePlacement(fmt.Errorf("bind exact restore backend request: %w", err))
+	}
 
 	baseline := service.authority.CurrentAdmissionBaseline()
-	restoreClaim, err := service.authority.BeginRestore(
-		baseline, command.SourceLeaseUUID, command.TargetLeaseUUID, initiation.ID(),
+	restoreClaim, err := service.authority.BeginAuthorizedRestore(
+		baseline, sourceAuthorization.revision, command.TargetLeaseUUID, initiation.ID(),
+		requestSnapshot, callbackPair,
 	)
 	if err != nil || !restoreClaim.Valid() || restoreClaim.Backend() == "" {
 		service.operations.AbortInitiation(initiation)
@@ -282,14 +324,6 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	backendClient := service.backends.ResolveRestoreBackend(backendName)
 	if util.IsNilInterface(backendClient) || backendClient.Name() != backendName {
 		return cleanupPreDispatch(fmt.Errorf("restore backend %q is unavailable", backendName))
-	}
-	callbackURL, err := service.callbackURL(initiation.ID())
-	if err != nil {
-		return cleanupPreDispatch(fmt.Errorf("build restore callback URL: %w", err))
-	}
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	if err != nil {
-		return cleanupPreDispatch(fmt.Errorf("build restore lifecycle callback URL: %w", err))
 	}
 	if !service.operations.BeginCall(initiation) {
 		return cleanupPreDispatch(errors.New("restore operation did not enter calling phase"))
@@ -323,7 +357,7 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	if callErr == nil {
 		completion := service.operations.Activate(initiation)
 		if callbackCompleted(completion) {
-			service.abandonRestore(command, backendName, restoreClaim,
+			service.abandonRestore(command, backendName, initiation.ID(), restoreClaim,
 				"inline callback settled accepted restore")
 			return service.accepted(command, backendName)
 		}
@@ -344,7 +378,7 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	if callbackCompleted(completion) {
 		// An authenticated exact callback is stronger evidence than a later return
 		// from the same synchronous call, including a panic recovered as an error.
-		service.abandonRestore(command, backendName, restoreClaim,
+		service.abandonRestore(command, backendName, initiation.ID(), restoreClaim,
 			"inline callback superseded synchronous restore error")
 		return service.accepted(command, backendName)
 	}
@@ -360,9 +394,11 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	result.BackendName = backendName
 	switch {
 	case errors.Is(callErr, backend.ErrAlreadyProvisioned):
-		service.settleRestore("confirm already-provisioned restore", command, backendName, func() (bool, error) {
-			return service.authority.ConfirmRestore(restoreClaim)
-		})
+		// A duplicate response proves only that some generation already exists.
+		// Keep the exact new attempt for a matching callback or upgraded backend
+		// inventory observation; never mint authority for it from a bare 409.
+		service.abandonRestore(command, backendName, initiation.ID(), restoreClaim,
+			"already-provisioned restore outcome awaits exact generation evidence")
 	case definitelyRefused(callErr):
 		service.settleRestore("refuse synchronous restore", command, backendName, func() (bool, error) {
 			return service.authority.RefuseRestore(restoreClaim)
@@ -375,7 +411,7 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 				Timestamp: service.now(),
 			})
 	default:
-		service.abandonRestore(command, backendName, restoreClaim,
+		service.abandonRestore(command, backendName, initiation.ID(), restoreClaim,
 			"ambiguous synchronous restore outcome")
 	}
 	return result
@@ -441,11 +477,108 @@ func (service *Service) releaseLeaseClaims(command Command, claims leaseClaims) 
 	}
 }
 
+// authorizeSource performs only immutable ownership authorization. It runs
+// before claimLeases so an authenticated tenant cannot take an exclusive
+// process-local capability on a source UUID it does not own. The backend's
+// retained record remains authoritative for whether restorable data exists.
+type sourceAuthorization struct {
+	revision placement.RecordRevision
+	backend  string
+}
+
+func (service *Service) authorizeSource(
+	ctx context.Context,
+	command Command,
+) (sourceAuthorization, Result, bool) {
+	lease, err := service.leases.GetLease(ctx, command.SourceLeaseUUID)
+	if err == nil && lease != nil {
+		if lease.Uuid != command.SourceLeaseUUID {
+			return sourceAuthorization{}, Result{
+				Outcome: OutcomeSourceUnavailable,
+				cause:   errors.New("restore source chain read returned a different lease"),
+			}, false
+		}
+		if lease.Tenant != command.Tenant || lease.ProviderUuid != service.providerUUID {
+			// Collapse ownership mismatch into the same tenant-facing result as an
+			// absent source so this authorization check does not become an existence
+			// oracle for another tenant's lease.
+			return sourceAuthorization{}, Result{
+				Outcome: OutcomeSourceNotFound,
+				cause:   errors.New("restore source lease is not owned by the authenticated tenant and provider"),
+			}, false
+		}
+		return service.authorizeSourcePlacement(command.SourceLeaseUUID)
+	}
+	if err != nil && !errors.Is(err, billingtypes.ErrLeaseNotFound) {
+		return sourceAuthorization{}, Result{
+			Outcome: OutcomeSourceUnavailable,
+			cause:   fmt.Errorf("read restore source lease: %w", err),
+		}, false
+	}
+
+	// The chain may prune a closed source before its retention window expires.
+	// Select the backend only from the exact durable placement, then authorize
+	// against that backend's read-only retained record before taking any Registry
+	// claim. Backend-side Restore still repeats this ownership check under its
+	// own mutation lock.
+	authorization, result, ok := service.authorizeSourcePlacement(command.SourceLeaseUUID)
+	if !ok {
+		return sourceAuthorization{}, result, false
+	}
+	backendName := authorization.backend
+	backendClient := service.backends.ResolveRestoreBackend(backendName)
+	if util.IsNilInterface(backendClient) || backendClient.Name() != backendName {
+		return sourceAuthorization{}, Result{
+			Outcome: OutcomeSourceUnavailable,
+			cause:   fmt.Errorf("restore source backend %q is unavailable", backendName),
+		}, false
+	}
+	info, infoErr := backendClient.GetProvision(ctx, command.SourceLeaseUUID)
+	if infoErr != nil {
+		if errors.Is(infoErr, backend.ErrNotProvisioned) {
+			return sourceAuthorization{}, Result{Outcome: OutcomeSourceNotFound}, false
+		}
+		return sourceAuthorization{}, Result{
+			Outcome: OutcomeSourceUnavailable,
+			cause:   fmt.Errorf("read retained restore source: %w", infoErr),
+		}, false
+	}
+	if info == nil || info.LeaseUUID != command.SourceLeaseUUID || info.Tenant == "" ||
+		info.Tenant != command.Tenant ||
+		(info.ProviderUUID != "" && info.ProviderUUID != service.providerUUID) {
+		return sourceAuthorization{}, Result{Outcome: OutcomeSourceNotFound}, false
+	}
+	if info.Status != backend.ProvisionStatusRetained {
+		return sourceAuthorization{}, Result{Outcome: OutcomeNotRetained}, false
+	}
+	return authorization, Result{}, true
+}
+
+func (service *Service) authorizeSourcePlacement(
+	leaseUUID string,
+) (sourceAuthorization, Result, bool) {
+	source := service.authority.Lookup(leaseUUID)
+	if source.State() == placement.StateAbsent {
+		return sourceAuthorization{}, Result{Outcome: OutcomeSourceNotFound}, false
+	}
+	if source.State() != placement.StateConfirmed || source.Backend == "" ||
+		source.Attempt != "" || !source.RecordRevision().Valid() {
+		return sourceAuthorization{}, Result{
+			Outcome: OutcomeSourceUnavailable,
+			cause:   placement.ErrRestoreSourceUnavailable,
+		}, false
+	}
+	return sourceAuthorization{
+		revision: source.RecordRevision(),
+		backend:  source.Backend,
+	}, Result{}, true
+}
+
 func (service *Service) readTarget(
 	ctx context.Context,
 	command Command,
 ) (*billingtypes.Lease, Result, bool) {
-	lease, err := service.targets.GetLease(ctx, command.TargetLeaseUUID)
+	lease, err := service.leases.GetLease(ctx, command.TargetLeaseUUID)
 	if err != nil {
 		return nil, Result{
 			Outcome: OutcomeServiceUnavailable,
@@ -504,6 +637,7 @@ func (service *Service) accepted(command Command, backendName string) Result {
 func (service *Service) abandonRestore(
 	command Command,
 	backendName string,
+	operationID operation.OperationID,
 	claim placement.RestoreClaim,
 	reason string,
 ) {
@@ -511,6 +645,7 @@ func (service *Service) abandonRestore(
 		"lease_uuid", command.TargetLeaseUUID,
 		"from_lease_uuid", command.SourceLeaseUUID,
 		"backend", backendName,
+		"operation_id", operationID,
 	)
 	service.settleRestore("abandon restore dispatch", command, backendName, func() (bool, error) {
 		return service.authority.AbandonRestore(claim)
@@ -600,6 +735,9 @@ func classifyBackendError(err error) Result {
 		result.Outcome = OutcomeInsufficientResources
 	case errors.Is(err, backend.ErrCircuitOpen):
 		result.Outcome = OutcomeBackendUnavailable
+	case errors.Is(err, backend.ErrBackendUpgradeRequired),
+		errors.Is(err, backend.ErrBackendStorageIdentityUnbound):
+		result.Outcome = OutcomeBackendUnavailable
 	case errors.Is(err, backend.ErrDemoteDataExceedsTier):
 		result.Outcome = OutcomeTierTooSmall
 	case errors.Is(err, backend.ErrValidation):
@@ -624,21 +762,7 @@ func definitelyRefused(err error) bool {
 		errors.Is(err, backend.ErrCapacityRefused) ||
 		errors.Is(err, backend.ErrDemoteDataExceedsTier) ||
 		errors.Is(err, backend.ErrValidation) ||
-		errors.Is(err, backend.ErrRestoreRefused)
-}
-
-func extractLeaseItems(lease *billingtypes.Lease) []backend.LeaseItem {
-	if lease == nil || len(lease.Items) == 0 {
-		return nil
-	}
-	items := make([]backend.LeaseItem, len(lease.Items))
-	for index, item := range lease.Items {
-		items[index] = backend.LeaseItem{
-			SKU:          item.SkuUuid,
-			Quantity:     int(item.Quantity),
-			ServiceName:  item.ServiceName,
-			CustomDomain: item.CustomDomain,
-		}
-	}
-	return items
+		errors.Is(err, backend.ErrRestoreRefused) ||
+		errors.Is(err, backend.ErrBackendStorageIdentityUnbound) ||
+		errors.Is(err, backend.ErrBackendUpgradeRequired)
 }

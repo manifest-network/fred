@@ -1,11 +1,14 @@
 package docker
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // Deprovision is the public shim: it routes the request through the lease's
@@ -21,11 +25,143 @@ import (
 // Failing.OnExit cancels the in-flight diag goroutine — the structural
 // suppression of stale Failed callbacks.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
+	if err := b.requireMutationAdmission(ctx, "deprovision"); err != nil {
+		return fmt.Errorf("backend storage identity verification failed: %w", err)
+	}
+	unlockCommand := b.commandFence.Lock(leaseUUID)
+	defer unlockCommand()
+	if err := b.ensureCommittedRestoreDestinationForClose(leaseUUID); err != nil {
+		return err
+	}
 	reply := make(chan error, 1)
 	if err := b.routeToLeaseBlocking(ctx, leaseUUID, leasesm.DeprovisionMsg{Ctx: ctx, Reply: reply}); err != nil {
 		return err
 	}
 	return b.waitForReply(ctx, reply)
+}
+
+// handoffCommittedRestoreToClose consumes a lingering restore finalizer only
+// after the close intent has durably copied destination identity, topology,
+// callbacks, and release fence. This ordering makes a crash on either side safe:
+// before the handoff the restore finalizer owns recovery; afterwards the close
+// journal owns teardown and can resume without any container survivor.
+func (b *Backend) handoffCommittedRestoreToClose(
+	leaseUUID string,
+	closeClaim shared.CloseIntentClaim,
+	hasCloseIntent bool,
+) error {
+	if b.retentionStore == nil {
+		return nil
+	}
+	source, err := b.retentionStore.RestoringSourceByDestination(leaseUUID)
+	if err != nil {
+		return fmt.Errorf("read restore ownership before close admission: %w", err)
+	}
+	if source == nil {
+		return nil
+	}
+	if !hasCloseIntent || closeClaim.CleanupOnly() {
+		return fmt.Errorf("close of restored destination %q requires a full durable close intent", leaseUUID)
+	}
+	if closeClaim.Backend() != b.Name() || closeClaim.BackendStorageID() != b.storageIdentity ||
+		closeClaim.Tenant() != source.Tenant || closeClaim.ProviderUUID() != source.ProviderUUID ||
+		!slices.Equal(closeClaim.Items(), source.DestinationItems) ||
+		!slices.Equal(closeClaim.ResourceProfiles(), source.DestinationResourceProfiles) {
+		return fmt.Errorf(
+			"close intent authority differs from restore finalizer for destination %q",
+			leaseUUID,
+		)
+	}
+	if source.StackManifest == nil {
+		return fmt.Errorf("restore finalizer for destination %q has no manifest", leaseUUID)
+	}
+	manifestBytes, err := json.Marshal(source.StackManifest)
+	if err != nil {
+		return fmt.Errorf("marshal restore finalizer manifest: %w", err)
+	}
+	if !bytes.Equal(closeClaim.Manifest(), manifestBytes) {
+		return fmt.Errorf("close intent manifest differs from restore finalizer for destination %q", leaseUUID)
+	}
+	if source.DestinationCallbackURL != "" || source.DestinationLifecycleCallbackURL != "" {
+		resolvedCallbackURL, resolvedLifecycleCallbackURL, resolveErr :=
+			backend.ResolveMaintenanceCallbackURLs(
+				source.DestinationCallbackURL,
+				source.DestinationLifecycleCallbackURL,
+				closeClaim.LifecycleCallbackURL(),
+			)
+		if resolveErr != nil ||
+			resolvedCallbackURL != closeClaim.CallbackURL() ||
+			resolvedLifecycleCallbackURL != closeClaim.LifecycleCallbackURL() {
+			return fmt.Errorf("close intent callback pair differs from restore finalizer for destination %q", leaseUUID)
+		}
+	}
+	committed, err := b.restoreDestinationCommitted(*source)
+	if err != nil {
+		return fmt.Errorf("validate restore commit before close handoff: %w", err)
+	}
+	if !committed {
+		return fmt.Errorf("restore destination %q is not durably committed", leaseUUID)
+	}
+	if err := b.deleteRestoreFinalizerStrict(leaseUUID, source); err != nil {
+		return fmt.Errorf("handoff restore finalizer to close intent: %w", err)
+	}
+	return nil
+}
+
+// ensureCommittedRestoreDestinationForClose is the pre-journal close gate. It
+// prevents BeginCloseIntent from preempting an uncommitted restore and creating
+// two incompatible durable owners. Once this succeeds, a crash after close
+// admission is safe because the exact active Release already owns destination
+// bytes and the close claim can take over the finalizer on recovery.
+func (b *Backend) ensureCommittedRestoreDestinationForClose(leaseUUID string) error {
+	if b.retentionStore == nil {
+		return nil
+	}
+	source, err := b.retentionStore.RestoringSourceByDestination(leaseUUID)
+	if err != nil {
+		return fmt.Errorf("read restore ownership before close admission: %w", err)
+	}
+	if source == nil {
+		return nil
+	}
+	committed, err := b.restoreDestinationCommitted(*source)
+	if err != nil || !committed {
+		return fmt.Errorf(
+			"%w: restore destination %q has not durably committed ownership",
+			backend.ErrInvalidState, leaseUUID,
+		)
+	}
+	if _, err := b.currentRestoreIntent(*source); err != nil {
+		return fmt.Errorf(
+			"%w: restore destination %q has conflicting operation authority: %w",
+			backend.ErrInvalidState, leaseUUID, err,
+		)
+	}
+	b.provisionsMu.RLock()
+	projection := b.provisions[leaseUUID]
+	b.provisionsMu.RUnlock()
+	if projection == nil {
+		return fmt.Errorf(
+			"%w: restore destination %q has no live projection for close callback authority",
+			backend.ErrInvalidState,
+			leaseUUID,
+		)
+	}
+	resolvedCallbackURL, resolvedLifecycleCallbackURL, resolveErr :=
+		backend.ResolveMaintenanceCallbackURLs(
+			source.DestinationCallbackURL,
+			source.DestinationLifecycleCallbackURL,
+			projection.LifecycleCallbackURL,
+		)
+	if resolveErr != nil ||
+		resolvedCallbackURL != projection.CallbackURL ||
+		resolvedLifecycleCallbackURL != projection.LifecycleCallbackURL {
+		return fmt.Errorf(
+			"%w: restore destination %q live callback authority differs from its committed lineage",
+			backend.ErrInvalidState, leaseUUID,
+		)
+	}
+	return nil
 }
 
 // handleDeprovision (lease-actor message handler) moved to
@@ -56,6 +192,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		wasReady             bool
 		containerIDs         []string
 		items                []backend.LeaseItem
+		resourceProfiles     []shared.SKUResourceSnapshot
 		tenant               string
 		callbackURL          string
 		lifecycleCallbackURL string
@@ -79,22 +216,116 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		providerUUID = p.ProviderUUID
 		stackManifest = p.StackManifest
 	})
+	if err := b.settleCommittedOperationBeforeClose(leaseUUID); err != nil {
+		return err
+	}
+	if err := b.settleMaintenanceBeforeClose(leaseUUID); err != nil {
+		return err
+	}
+	closeClaim, hasCloseIntent, closeErr := b.acquireCloseIntent(
+		ctx,
+		leaseUUID,
+		exists,
+		tenant,
+		providerUUID,
+		items,
+		stackManifest,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
+	if closeErr != nil {
+		return closeErr
+	}
+	if hasCloseIntent && closeClaim.CleanupOnly() == exists {
+		return fmt.Errorf(
+			"durable close intent projection mismatch: cleanup_only=%t projection_exists=%t",
+			closeClaim.CleanupOnly(), exists,
+		)
+	}
+	if err := b.handoffCommittedRestoreToClose(leaseUUID, closeClaim, hasCloseIntent); err != nil {
+		return err
+	}
+	if hasCloseIntent && !closeClaim.CleanupOnly() {
+		// Recovery and retries consume the immutable admission snapshot, never
+		// mutable labels or a partially-updated in-memory projection.
+		tenant = closeClaim.Tenant()
+		providerUUID = closeClaim.ProviderUUID()
+		items = closeClaim.Items()
+		resourceProfiles = closeClaim.ResourceProfiles()
+		callbackURL = closeClaim.CallbackURL()
+		lifecycleCallbackURL = closeClaim.LifecycleCallbackURL()
+		if payload := closeClaim.Manifest(); len(payload) > 0 {
+			stack, err := manifest.ParsePayload(payload)
+			if err != nil {
+				return fmt.Errorf("parse durable close manifest: %w", err)
+			}
+			stackManifest = stack
+		}
+	}
+	retireReleaseHistory := func() error {
+		if hasCloseIntent {
+			return b.purgeCloseReleaseHistory(closeClaim)
+		}
+		return b.purgeReleaseHistory(leaseUUID)
+	}
+	// A close can preempt Provision/Restore after its durable intent commit but
+	// before the worker publishes the in-memory provision reservation. Settle
+	// that exact operation even when no projection exists yet. This must precede
+	// the idempotent-absence return as well as every lifecycle observation below;
+	// otherwise a live-process intent can remain wedged until a restart.
+	if b.callbackStore != nil && !hasCloseIntent {
+		if _, err := b.callbackStore.FailOperationIntentIfPresent(
+			leaseUUID, "operation preempted by deprovision",
+		); err != nil {
+			return fmt.Errorf("persist preempted operation completion before deprovision: %w", err)
+		}
+	}
 	if !exists {
-		// Already deprovisioned (no live container / in-flight op for this lease).
-		// Still purge any stranded releases.db history before returning: a lease whose
-		// container was already gone at on-chain close reaches doDeprovision via the
-		// lease_closed event but short-circuits here ~400 lines before the terminal
-		// releaseStore.Delete, leaving a stale "active" record that audit-lease-status
-		// flags until the 90-day RemoveOlderThan TTL. (ENG-410)
-		b.purgeReleaseHistory(leaseUUID, logger)
+		// A missing in-memory projection is not proof that the substrate is empty.
+		// Production's cleanup-only journal owns a bounded release snapshot and must
+		// consume any stale containers and canonical volumes before retiring that
+		// authority. The callback-store-less fallback retains the historical
+		// release/rollback-only behavior used by isolated tests.
+		var rollbackErr error
+		if hasCloseIntent {
+			closeClaim, rollbackErr = b.cleanupCloseWithoutProjection(ctx, closeClaim, logger)
+		} else {
+			rollbackErr = b.removeCommittedLegacyRollbackRemnants(ctx, leaseUUID, logger)
+		}
+		if rollbackErr != nil {
+			return fmt.Errorf("complete unprojected close cleanup before release purge: %w", rollbackErr)
+		}
+		if hasCloseIntent {
+			if err := b.resolveCloseIntent(
+				closeClaim,
+				backend.CallbackStatusDeprovisioned,
+				"",
+				false,
+				func() error {
+					if err := retireReleaseHistory(); err != nil {
+						return fmt.Errorf("retire release history after containerless deprovision: %w", err)
+					}
+					return nil
+				},
+				func() { b.releaseLeaseAllocations(leaseUUID, closeClaim.Items()) },
+			); err != nil {
+				return err
+			}
+		} else if err := retireReleaseHistory(); err != nil {
+			return fmt.Errorf("retire release history after containerless deprovision: %w", err)
+		}
 		return nil
 	}
-	resolvedLifecycleCallbackURL, resolveErr := backend.ResolveLifecycleCallbackURL(
-		callbackURL, lifecycleCallbackURL,
-	)
-	if resolveErr != nil {
-		logger.Error("cannot derive lifecycle callback URL; suppressing observational callback", "error", resolveErr)
-		resolvedLifecycleCallbackURL = ""
+	resolvedLifecycleCallbackURL := lifecycleCallbackURL
+	if !hasCloseIntent {
+		var resolveErr error
+		resolvedLifecycleCallbackURL, resolveErr = backend.ResolveLifecycleCallbackURL(
+			callbackURL, lifecycleCallbackURL,
+		)
+		if resolveErr != nil {
+			logger.Error("cannot derive lifecycle callback URL; suppressing observational callback", "error", resolveErr)
+			resolvedLifecycleCallbackURL = ""
+		}
 	}
 	// Decrement activeProvisions on the Ready→Deprovisioning transition so the
 	// gauge stays accurate even if Deprovision later fails partially.
@@ -117,27 +348,29 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		teardownOpDeprovision, logger)
 	if teardownErr != nil {
 		errs = append(errs, teardownErr)
+	} else if cleanupErr := func() error {
+		if hasCloseIntent {
+			return b.removeCloseRollbackTargets(ctx, closeClaim, logger)
+		}
+		return b.removeCommittedLegacyRollbackRemnants(ctx, leaseUUID, logger)
+	}(); cleanupErr != nil {
+		errs = append(errs, fmt.Errorf("remove legacy rollback containers before release purge: %w", cleanupErr))
 	}
 
 	// releaseLive releases all pool allocations for this lease and updates
-	// resource metrics. On the non-retain path it is called AFTER all volumes
-	// are destroyed without error (mirroring the refuse-to-retain arm); on the
-	// retain path it is deferred until after refreshRetentionAccounting counts
-	// the retained record, so the footprint is never momentarily uncounted while
-	// the renamed volume persists on disk (no over-admit gap).
+	// resource metrics. Successful durable closes call it inside their terminal
+	// snapshot transaction; retain error paths use the deferred hand-off below.
 	releaseLive := func() {
-		for _, item := range items {
-			for i := range item.Quantity {
-				b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
-			}
-		}
-		updateResourceMetrics(b.pool.Stats())
+		b.releaseLeaseAllocations(leaseUUID, items)
 	}
-	retaining := b.cfg.RetainOnClose && b.retentionStore != nil
-	// Non-retain release happens AFTER successful volume destroy (see the
-	// else branch below). A teardown that only partially succeeds (container
-	// or volume error) keeps resources counted for the retry rather than
-	// freeing them while stuck containers still run or volumes remain on disk.
+	retainRequested := b.cfg.RetainOnClose
+	if hasCloseIntent {
+		retainRequested = closeClaim.RetainOnClose()
+	}
+	retaining := retainRequested && b.retentionStore != nil
+	// A teardown that only partially succeeds keeps resources counted for the
+	// retry rather than freeing them while stuck containers still run or volumes
+	// remain on disk.
 	//
 	// Retaining close: keep the live allocation counted until the retained
 	// record is recorded+refreshed (or the volumes are destroyed) — see the
@@ -160,7 +393,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// thing counting them is this closing lease's live allocation. Releasing it would
 	// leave a real footprint counted by nobody and let admission over-commit against
 	// it. reconcileRestoring takes the reservation over: its orphaned arm
-	// re-quarantines the volume, RevertToActive makes the record active (so the
+	// re-quarantines the volume, RevertToActiveWithResourceProfiles makes the record active (so the
 	// retained projection counts it again), and only THEN does it releaseAll the same
 	// {lease}-{svc}-{idx} ids — re-counted before released, never a gap. pool.Release
 	// is idempotent, so the hand-off is safe even though both paths name the same ids.
@@ -176,12 +409,15 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// projection cannot change on a non-retain close — skip the O(#retained) bbolt
 	// List() scan entirely on that (hot) path. releaseLiveOnRetainPath is only ever
 	// set inside the retain branch, and non-retain releases live inline after a
-	// successful destroy, so nothing is missed by returning early here.
+	// successful terminal settlement, so nothing is missed by returning early here.
+	retentionTerminalHandoffDone := false
 	defer func() {
-		if !retaining {
+		if !retaining || retentionTerminalHandoffDone || hasCloseIntent {
 			return
 		}
-		b.refreshRetentionAccounting()
+		if err := b.refreshRetentionAccountingChecked(); err != nil {
+			return
+		}
 		if releaseLiveOnRetainPath && !claimedLeftBehind {
 			releaseLive()
 		}
@@ -220,15 +456,21 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 	// fixed without the other, which is how this used to go wrong.
 	op := b.volumeOp(leaseUUID, logger)
 	switch {
-	case b.cfg.RetainOnClose && b.retentionStore != nil:
+	case retaining:
 		// Enumerate the lease's ACTUAL managed volumes (ground truth — no SKU guess).
 		all, listErr := b.volumes.List()
 		if listErr != nil {
 			volumeErrs = append(volumeErrs, fmt.Errorf("list volumes for retention: %w", listErr))
 		}
+		// Keep the same inventory as a set for the zero-canonical retry proof below.
+		// Re-listing after the partition/retention checks would introduce a second
+		// point-in-time view and could turn a concurrent disappearance into a false
+		// retained-success callback.
+		allSet := make(map[string]struct{}, len(all))
 		prefixed := make([]string, 0, len(all))
 		prefix := leaseVolumePrefix(leaseUUID)
 		for _, id := range all {
+			allSet[id] = struct{}{}
 			if strings.HasPrefix(id, prefix) { // excludes fred-retained-* and other leases
 				prefixed = append(prefixed, id)
 			}
@@ -326,13 +568,40 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		switch {
 		case len(retainCanonical) == 0:
 			// No durable (declared-VOLUME) data remains to retain: the lease was
-			// stateless, its volumes were already renamed on a prior attempt, or
-			// they were all writable-path-only and just reclaimed above. Release
-			// live only when nothing errored — a List error or a failed wp-only
-			// destroy leaves bytes on disk, so keep live counted (flag stays false)
-			// and let the retry re-attempt.
+			// stateless, its volumes were already renamed on a prior attempt, or they
+			// were all writable-path-only and just reclaimed above. An ACTIVE record
+			// disambiguates the crash-after-rename case, but it is only proof when it
+			// belongs to this lease and every recorded retained volume was present in
+			// the authoritative inventory above. Anything less keeps the close journal
+			// unresolved: otherwise a retry could publish retained:false despite durable
+			// retained data, or retained:true for missing/corrupt data.
 			if len(volumeErrs) == 0 {
-				releaseLiveOnRetainPath = true
+				record, err := b.retentionStore.Get(leaseUUID)
+				switch {
+				case err != nil:
+					volumeErrs = append(volumeErrs, fmt.Errorf("read retention record after zero-canonical close: %w", err))
+				case record == nil:
+					// Preserve the existing stateless / writable-path-only /
+					// refuse-to-retain behavior: no record means there is no
+					// durable retained result to report.
+					releaseLiveOnRetainPath = true
+				default:
+					if proofErr := validateCompletedRetention(
+						leaseUUID,
+						tenant,
+						providerUUID,
+						items,
+						resourceProfiles,
+						record,
+						allSet,
+					); proofErr != nil {
+						volumeErrs = append(volumeErrs, proofErr)
+					} else {
+						volumesRetained = true
+						releaseLiveOnRetainPath = true
+						logger.Info("confirmed prior soft-delete completion", "retained", len(record.RetainedVolumeNames))
+					}
+				}
 			}
 		default:
 			// Hydrate a nil StackManifest from the release store BEFORE anything
@@ -409,7 +678,9 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}
 
-			if scope, refuse := b.shouldRefuseRetention(leaseUUID, tenant, partition, durableItems, budget); refuse {
+			if scope, refuse := b.shouldRefuseRetentionWithResourceProfiles(
+				leaseUUID, tenant, partition, durableItems, resourceProfiles, budget,
+			); refuse {
 				rep := b.destroyOnRefuseToRetain(ctx, op, retainCanonical, leaseUUID, tenant, partition, scope, logger)
 				if err := rep.err(); err != nil {
 					volumeErrs = append(volumeErrs, err)
@@ -451,7 +722,8 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// RetainedVolumeNames is narrowed to the durable volumes actually retained.
 			base := shared.RetentionEntry{
 				OriginalLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
-				Items: items, StackManifest: stackManifest, CallbackURL: callbackURL,
+				Items: items, ResourceProfiles: shared.CloneSKUResourceSnapshot(resourceProfiles),
+				StackManifest: stackManifest, CallbackURL: callbackURL,
 				RetainedVolumeNames: retained, Status: shared.RetentionStatusActive,
 				Partition: partition,
 				CreatedAt: time.Now(), Generation: 0,
@@ -473,7 +745,7 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 				// Only the STILL-canonical volumes need renaming; the already-retained
 				// ones (from a prior attempt) are done.
 				for _, c := range retainCanonical {
-					if err := b.volumes.RenameVolume(c, retainedName(c)); err != nil {
+					if err := b.mutationAdapter().renameVolume(ctx, c, retainedName(c)); err != nil {
 						logger.Error("failed to retain volume", "volume", c, "error", err)
 						volumeErrs = append(volumeErrs, fmt.Errorf("retain volume %s: %w", c, err))
 					}
@@ -505,40 +777,63 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			volumeErrs = append(volumeErrs, err)
 		}
 		claimedLeftBehind = claimedLeftBehind || len(rep.Claimed) > 0
-		if len(volumeErrs) == 0 && !claimedLeftBehind {
-			// All volumes destroyed — bytes are gone, so release the live allocation
-			// now. Releasing only on success (not before the loop) keeps the footprint
-			// counted while a failed Destroy leaves bytes on disk and the lease is kept
-			// Failed for retry, preventing an over-admit/ENOSPC window. Symmetric with
-			// the retain arms (releaseLiveOnRetainPath set only when
-			// len(volumeErrs) == 0).
-			//
-			// A skipped claimed volume is not an error but leaves bytes on disk just the
-			// same, so it holds the reservation for the same reason (ENG-647).
-			releaseLive()
-		}
 	}
 
 	if len(volumeErrs) > 0 {
-		// ENG-285: VolumeCleanupAttempts is a docker-private wrapper field (not
-		// on ProvisionState, unreachable through the substrate-agnostic UpdateFn
-		// seam), so its increment stays a short direct provisionsMu span. The
-		// ProvisionState writes that follow (ContainerIDs/Status/LastError) route
-		// through the actor's single-writer store seam. Splitting the former
-		// atomic read-modify-write into these two critical sections is safe
-		// because recoverState's Deprovisioning preserve-case (recover.go,
-		// ENG-193) keeps the in-flight entry by pointer across its wholesale map
-		// swap — both sections operate on the same *provision, so the increment
-		// is never lost to a rebuilt-fresh struct.
+		joinedVolumeErr := errors.Join(volumeErrs...)
+		authorityErr := b.terminalStorageAuthorityError()
+		if authorityErr != nil ||
+			errors.Is(joinedVolumeErr, backendidentity.ErrIdentityDrift) ||
+			errors.Is(joinedVolumeErr, backendidentity.ErrMutationOutcomeAmbiguous) {
+			// A failed storage attestation after a raw mutation means neither success
+			// nor failure is known. Retry exhaustion is not evidence: consuming the
+			// close/release finalizers here would make a process-local timeout or mount
+			// drift indistinguishable from completed cleanup. Preserve the durable
+			// attempt budget unchanged for a freshly-attested process to classify.
+			cause := errors.Join(joinedVolumeErr, authorityErr)
+			var diagSnap shared.DiagnosticEntry
+			b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+				p.ContainerIDs = nil
+				p.Status = backend.ProvisionStatusFailed
+				p.LastError = fmt.Sprintf("volume cleanup storage outcome is ambiguous: %s", cause)
+				p.Reason = backend.ReasonCleanupFailed
+				p.Message = backend.MsgCleanupFailed
+				diagSnap = leasesm.DiagnosticSnapshot(p)
+			})
+			logger.Error("volume cleanup storage authority unresolved; preserving close finalizers",
+				"error", cause)
+			b.persistDiagnostics(diagSnap, nil)
+			return fmt.Errorf("volume cleanup storage authority unresolved: %w", cause)
+		}
+
+		// Production persists this counter in the close journal before deciding
+		// whether to give up, so a crash cannot reset the retry budget. The
+		// docker-private field remains a live-process mirror and the fallback for
+		// isolated tests whose ephemeral backend has no durable callback store.
 		var attempts int
 		var entryExists bool
-		b.provisionsMu.Lock()
-		if p, ok := b.provisions[leaseUUID]; ok {
-			p.VolumeCleanupAttempts++
-			attempts = p.VolumeCleanupAttempts
-			entryExists = true
+		if hasCloseIntent {
+			refreshed, err := b.callbackStore.IncrementCloseCleanupAttempts(closeClaim)
+			if err != nil {
+				return fmt.Errorf("persist close cleanup attempt: %w", err)
+			}
+			closeClaim = refreshed
+			attempts = refreshed.CleanupAttempts()
+			b.provisionsMu.Lock()
+			if p, ok := b.provisions[leaseUUID]; ok {
+				p.VolumeCleanupAttempts = attempts
+				entryExists = true
+			}
+			b.provisionsMu.Unlock()
+		} else {
+			b.provisionsMu.Lock()
+			if p, ok := b.provisions[leaseUUID]; ok {
+				p.VolumeCleanupAttempts++
+				attempts = p.VolumeCleanupAttempts
+				entryExists = true
+			}
+			b.provisionsMu.Unlock()
 		}
-		b.provisionsMu.Unlock()
 		if !entryExists {
 			// Defensive: the entry existed at the initial Deprovisioning mark
 			// (else doDeprovision returned early at the !exists guard) and the
@@ -553,25 +848,34 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// Too many failed attempts — give up and remove the provision.
 			// The leaked volumes require manual cleanup by the operator.
 			//
-			// Persist the abandoned footprint as a reaping tombstone BEFORE releasing
-			// live, so the bytes hand off live→reaping with no uncounted gap (ENG-376).
+			// Persist the abandoned footprint as a reaping tombstone BEFORE terminal
+			// settlement releases live, so the bytes hand off live→reaping with no
+			// uncounted gap (ENG-376).
 			// The write is unconditional now: the record states the footprint's SIZE and
 			// authorizes no destroy, so it no longer depends on an ownership table that a
 			// degraded store cannot resolve — which is what used to make this hand-off
 			// silently drop the accounting altogether (ENG-676).
-			b.recordGiveUpLeak(leaseUUID, tenant, providerUUID, items, logger)
-			// Release live UNCONDITIONALLY here: the provision is about to be
-			// deleted and `return nil`, so no retry can ever run to free it.
-			// On the retain path the flag is still false, so without this the
-			// live allocation would leak forever and — if a record was written —
-			// double-count the footprint as both live and retained (2F), wedging
-			// any later restore. On the non-retain path, live was not freed
-			// before the destroy loop (it is only freed when all destroys succeed);
-			// a destroy failure that reaches give-up means the volume is abandoned
-			// for manual cleanup and the provision is deleted — this call performs
-			// the real release. pool.Release is idempotent on an absent/already-
-			// released id, so this is always safe.
-			releaseLive()
+			accountingErr := b.recordGiveUpLeak(
+				leaseUUID, tenant, providerUUID, items, resourceProfiles, logger,
+			)
+			if accountingErr != nil && hasCloseIntent {
+				b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+					p.ContainerIDs = nil
+					p.Status = backend.ProvisionStatusFailed
+					p.LastError = fmt.Sprintf("cannot establish counted give-up footprint: %v", accountingErr)
+					p.Reason = backend.ReasonCleanupFailed
+					p.Message = backend.MsgCleanupFailed
+					diagSnap = leasesm.DiagnosticSnapshot(p)
+				})
+				b.persistDiagnostics(diagSnap, nil)
+				return fmt.Errorf("record counted give-up footprint: %w", accountingErr)
+			}
+			if accountingErr != nil {
+				// Callback-store-less backends exist only in narrow unit seams. Preserve
+				// their historical best-effort terminal behavior without weakening the
+				// durable production close path above.
+				logger.Warn("give-up footprint has no durable accounting owner", "error", accountingErr)
+			}
 			b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
 				p.ContainerIDs = nil // containers are gone
 				p.LastError = fmt.Sprintf("volume cleanup failed after %d attempts: %s",
@@ -584,14 +888,43 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			// from the tenant-facing Message) by lease_uuid (ENG-508).
 			logger.Warn("provision failed (verbose detail retained operator-side)",
 				"lease_uuid", leaseUUID, "reason", backend.ReasonVolumeCleanupExhausted, "detail", errors.Join(volumeErrs...))
-			b.provisionStore.Delete(leaseUUID)
-
 			// Persist diagnostics before losing the provision so operators
 			// can see the final error via the diagnostics API.
 			b.persistDiagnostics(diagSnap, nil)
 
-			// Perform the same cleanup as the normal success path.
-			b.purgeReleaseHistory(leaseUUID, logger)
+			if hasCloseIntent {
+				if err := b.resolveCloseIntent(
+					closeClaim,
+					backend.CallbackStatusFailed,
+					"volume cleanup exhausted",
+					false,
+					func() error {
+						if err := b.refreshRetentionAccountingChecked(); err != nil {
+							return fmt.Errorf("refresh counted give-up footprint: %w", err)
+						}
+						if err := retireReleaseHistory(); err != nil {
+							return fmt.Errorf("retire release history after volume-cleanup give-up: %w", err)
+						}
+						return nil
+					},
+					func() {
+						// The tombstone/active record is the new footprint owner. Refresh
+						// and complete live hand-off in the same recovery snapshot as the
+						// durable settlement and volatile projection deletion.
+						b.provisionStore.Delete(leaseUUID)
+						releaseLive()
+						retentionTerminalHandoffDone = retaining
+					},
+				); err != nil {
+					return err
+				}
+			} else {
+				if err := retireReleaseHistory(); err != nil {
+					return fmt.Errorf("retire release history after volume-cleanup give-up: %w", err)
+				}
+				b.provisionStore.Delete(leaseUUID)
+				releaseLive()
+			}
 			if b.cfg.IsNetworkIsolation() {
 				if err := b.releaseTenantNetwork(ctx, tenant); err != nil {
 					logger.Warn("failed to remove tenant network", "tenant", tenant, "error", err)
@@ -605,7 +938,9 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 			)
 
 			// Volume leak: operator must clean up manually. Not a retain-success.
-			b.sendLifecycleCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted", false)
+			if !hasCloseIntent {
+				b.sendLifecycleCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusFailed, "volume cleanup exhausted", false)
+			}
 			return nil
 		}
 
@@ -628,13 +963,65 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 		return fmt.Errorf("volume cleanup failed: %w", errors.Join(volumeErrs...))
 	}
 
-	// Clean up release history
-	b.purgeReleaseHistory(leaseUUID, logger)
-
-	// All containers and volumes removed — delete via the store seam. The map
-	// entry is the *provision wrapper, so GC drops the docker-private
-	// VolumeCleanupAttempts alongside ProvisionState when the entry goes.
-	b.provisionStore.Delete(leaseUUID)
+	if hasCloseIntent {
+		if err := b.resolveCloseIntent(
+			closeClaim,
+			backend.CallbackStatusDeprovisioned,
+			"",
+			volumesRetained,
+			func() error {
+				if retaining {
+					if err := b.refreshRetentionAccountingChecked(); err != nil {
+						return fmt.Errorf("refresh retained close accounting: %w", err)
+					}
+				}
+				if err := retireReleaseHistory(); err != nil {
+					return fmt.Errorf("retire release history after deprovision: %w", err)
+				}
+				return nil
+			},
+			func() {
+				b.provisionStore.Delete(leaseUUID)
+				switch {
+				case retaining:
+					if releaseLiveOnRetainPath && !claimedLeftBehind {
+						releaseLive()
+					}
+					retentionTerminalHandoffDone = true
+				case !claimedLeftBehind:
+					releaseLive()
+				}
+			},
+		); err != nil {
+			var diagSnap shared.DiagnosticEntry
+			b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+				p.Status = backend.ProvisionStatusFailed
+				p.LastError = fmt.Sprintf("close finalization failed: %v", err)
+				p.Reason = backend.ReasonCleanupFailed
+				p.Message = backend.MsgCleanupFailed
+				diagSnap = leasesm.DiagnosticSnapshot(p)
+			})
+			b.persistDiagnostics(diagSnap, nil)
+			return err
+		}
+	} else {
+		if err := retireReleaseHistory(); err != nil {
+			var diagSnap shared.DiagnosticEntry
+			b.provisionStore.UpdateFn(leaseUUID, func(p *leasesm.ProvisionState) {
+				p.Status = backend.ProvisionStatusFailed
+				p.LastError = fmt.Sprintf("close finalization failed: %v", err)
+				p.Reason = backend.ReasonCleanupFailed
+				p.Message = backend.MsgCleanupFailed
+				diagSnap = leasesm.DiagnosticSnapshot(p)
+			})
+			b.persistDiagnostics(diagSnap, nil)
+			return fmt.Errorf("retire release history after deprovision: %w", err)
+		}
+		b.provisionStore.Delete(leaseUUID)
+		if !retaining && !claimedLeftBehind {
+			releaseLive()
+		}
+	}
 
 	// Clean up tenant network if isolation is enabled. releaseTenantNetwork
 	// scans b.provisions under a per-tenant mutex and skips removal if any
@@ -652,32 +1039,131 @@ func (b *Backend) doDeprovision(ctx context.Context, leaseUUID string) error {
 
 	// Terminal success: carry the best-effort retained flag (true only when all
 	// volumes were soft-deleted into the retained namespace without error).
-	b.sendLifecycleCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
+	if !hasCloseIntent {
+		b.sendLifecycleCallbackWithURL(leaseUUID, resolvedLifecycleCallbackURL, backend.CallbackStatusDeprovisioned, "", volumesRetained)
+	}
 	return nil
 }
 
-// purgeReleaseHistory best-effort deletes a lease's releases.db history. It is a
-// no-op when no release store is configured or the key is already absent. Shared by
+func (b *Backend) releaseLeaseAllocations(leaseUUID string, items []backend.LeaseItem) {
+	for _, item := range items {
+		for i := range item.Quantity {
+			b.pool.Release(fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, i))
+		}
+	}
+	updateResourceMetrics(b.pool.Stats())
+}
+
+// validateCompletedRetention proves that a zero-canonical-volume retain retry
+// is the terminal half of an earlier successful soft-delete. The retention row
+// is durable intent; the volume inventory is physical completion evidence. A
+// caller may report retained=true only when both agree exactly enough to prove
+// that every volume promised by the row still exists under this lease's
+// retained namespace.
+func validateCompletedRetention(
+	leaseUUID string,
+	tenant string,
+	providerUUID string,
+	items []backend.LeaseItem,
+	resourceProfiles []shared.SKUResourceSnapshot,
+	record *shared.RetentionEntry,
+	physicalVolumes map[string]struct{},
+) error {
+	if record == nil {
+		return errors.New("retention completion proof requires a record")
+	}
+	if record.OriginalLeaseUUID != leaseUUID {
+		return fmt.Errorf(
+			"retention record identity mismatch after zero-canonical close: got %q, want %q",
+			record.OriginalLeaseUUID,
+			leaseUUID,
+		)
+	}
+	if record.Status != shared.RetentionStatusActive {
+		return fmt.Errorf(
+			"retention record for %s is not active after zero-canonical close: %q",
+			leaseUUID,
+			record.Status,
+		)
+	}
+	if len(record.RetainedVolumeNames) == 0 {
+		return fmt.Errorf("active retention record for %s has no retained volume names", leaseUUID)
+	}
+
+	expectedPrefix := retainedVolumePrefix + leaseUUID + "-"
+	for _, name := range record.RetainedVolumeNames {
+		if !strings.HasPrefix(name, expectedPrefix) || len(name) == len(expectedPrefix) {
+			return fmt.Errorf(
+				"active retention record for %s has malformed or foreign volume name %q",
+				leaseUUID,
+				name,
+			)
+		}
+		if _, exists := physicalVolumes[name]; !exists {
+			return fmt.Errorf(
+				"active retention record for %s references missing retained volume %q",
+				leaseUUID,
+				name,
+			)
+		}
+	}
+	if record.Tenant != tenant || record.ProviderUUID != providerUUID {
+		return fmt.Errorf("active retention record for %s has divergent lease identity", leaseUUID)
+	}
+	if !slices.Equal(record.Items, items) {
+		return fmt.Errorf("active retention record for %s has divergent items", leaseUUID)
+	}
+	if !slices.Equal(record.ResourceProfiles, resourceProfiles) {
+		return fmt.Errorf("active retention record for %s has divergent resource snapshot", leaseUUID)
+	}
+	return nil
+}
+
+// purgeReleaseHistory deletes a lease's releases.db history as a required
+// deprovision finalizer. It is a no-op when no release store is configured or the
+// key is already absent. Shared by
 // doDeprovision's terminal-success, give-up, and already-deprovisioned (!exists) paths
 // so "delete this lease's release history" has one implementation. The !exists path is
 // what lets a deprovision RPC for an already-containerless lease (e.g. a lease_closed
 // event delivered after the container was gone) still purge its stale "active" record
 // instead of stranding it until the 90-day RemoveOlderThan TTL. (ENG-410)
-func (b *Backend) purgeReleaseHistory(leaseUUID string, logger *slog.Logger) {
+func (b *Backend) purgeReleaseHistory(leaseUUID string) error {
 	if b.releaseStore == nil {
-		return
+		return nil
 	}
 	if err := b.releaseStore.Delete(leaseUUID); err != nil {
-		logger.Warn("failed to delete release history", "error", err)
+		return fmt.Errorf("delete release history: %w", err)
 	}
+	return nil
+}
+
+// purgeCloseReleaseHistory consumes the release fence captured by the durable
+// close capability. The bbolt transaction is idempotent after deletion but
+// refuses to erase a history whose selected release changed after admission.
+func (b *Backend) purgeCloseReleaseHistory(claim shared.CloseIntentClaim) error {
+	if b.releaseStore == nil {
+		if claim.ActiveReleaseVersion() != 0 {
+			return fmt.Errorf("durable close has a release fence but no release store")
+		}
+		return nil
+	}
+	if err := b.releaseStore.DeleteCloseHistory(
+		claim.LeaseUUID(),
+		claim.ActiveReleaseVersion(),
+		claim.ActiveReleaseDigest(),
+	); err != nil {
+		return fmt.Errorf("delete release history under close fence: %w", err)
+	}
+	return nil
 }
 
 // recordGiveUpLeak handles a deprovision give-up's abandoned on-disk footprint. When a
 // retention store is configured it writes a reaping tombstone recording the SIZE of that
 // footprint, so it keeps counting in the admission projection and the retention sweep
 // auto-retries the destroy — turning a permanent manual-only leak into a self-healing one.
-// PutReaping is idempotent and refuses to clobber an active/restoring record, so a
-// footprint an existing record already counts is left untouched. (ENG-376)
+// PutReaping is idempotent and refuses to clobber an active/restoring record. The
+// refusal is accepted only after an exact re-read proves an ACTIVE row already
+// counts this footprint; RESTORING is not part of the retained-disk projection.
 //
 // It records a FACT, never a plan (ENG-676). The give-up releases the lease's pool
 // allocation and deletes its provision, so this record is the only thing left counting the
@@ -688,25 +1174,28 @@ func (b *Backend) purgeReleaseHistory(leaseUUID string, logger *slog.Logger) {
 // Give-up tombstones deliberately carry Partition "" (the default bucket): they are
 // reaping-from-birth — never eviction-ordered, never restorable, never counted by any
 // L2 term — and this is the maximally-degraded path (degraded ⇒ default bucket).
-func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items []backend.LeaseItem, logger *slog.Logger) {
+func (b *Backend) recordGiveUpLeak(
+	leaseUUID string,
+	tenant string,
+	providerUUID string,
+	items []backend.LeaseItem,
+	resourceProfiles []shared.SKUResourceSnapshot,
+	logger *slog.Logger,
+) error {
 	retentionLeakedTotal.Inc()
 	if b.retentionStore == nil {
-		return // no projection to correct; metric + the give-up log are the record
+		return errors.New("give-up footprint requires a retention store")
 	}
 	// Items is the whole point of this record and the only field the projection reads:
 	// computeReapingDiskMB sums leaseDiskMB(e.Items) over reaping records and
 	// refreshRetentionAccounting folds that into SetRetainedDisk. It is the FULL lease item
 	// set, not a subset — the give-up abandons the whole footprint.
 	//
-	// Note what this does and does not buy while the store is DEGRADED. The projection is
-	// recomputed by scanning the store, so a store that cannot be enumerated cannot absorb
-	// this record either: the refresh below keeps its last value, the caller releases the
-	// live reservation, and the bytes are counted by neither pool term until the store is
-	// repaired. What the durable record changes is that the repair is sufficient — the next
-	// readable refresh picks it up with no operator action — where before there was nothing
-	// to recount from and the loss was permanent. (Releasing live across a failed refresh is
-	// a property of every live→retained hand-off, including the ordinary retain-path close,
-	// not something this path invents; tracked separately.)
+	// The caller refreshes the retained projection inside the close-snapshot terminal
+	// critical section. A failed write or refresh is non-terminal: the durable close,
+	// release authority, volatile projection, and live allocation all remain. That
+	// overlap is deliberate; give-up must never turn an unreadable retention store into
+	// an uncounted on-disk footprint.
 	//
 	// RetainedVolumeNames is deliberately EMPTY, and that is the fix (ENG-676). This used
 	// to enumerate the lease's volumes and partition them through the ownership table so
@@ -719,26 +1208,61 @@ func (b *Backend) recordGiveUpLeak(leaseUUID, tenant, providerUUID string, items
 	// every pass (destroyReapingVolumes), so there is nothing to compute here and nothing
 	// that can fail to be computed.
 	//
-	// PutReaping is idempotent and refuses to clobber an active/restoring record, so a
-	// footprint an existing record already counts is left untouched. (ENG-376)
+	// PutReaping is idempotent and refuses to clobber active/restoring records. A
+	// refusal still requires the exact counted-row proof below. (ENG-376)
 	//
-	// If PutReaping itself fails, the store is unwritable and there is no durable place to
-	// put the fact — retentionLeakedTotal above plus the MANUAL CLEANUP log are then the
-	// only record, which is the one residual this design accepts.
 	rec := shared.RetentionEntry{
 		OriginalLeaseUUID: leaseUUID,
 		Tenant:            tenant,
 		ProviderUUID:      providerUUID,
 		Items:             items,
+		ResourceProfiles:  shared.CloneSKUResourceSnapshot(resourceProfiles),
 		Status:            shared.RetentionStatusReaping,
 		CreatedAt:         time.Now(),
 	}
-	if ok, err := b.retentionStore.PutReaping(rec); err != nil {
-		logger.Error("give-up leak: failed to record reaping tombstone; footprint UNTRACKED until manual cleanup", "lease_uuid", leaseUUID, "error", err)
-	} else if !ok {
-		logger.Info("give-up leak: an active/restoring record already counts this footprint; no tombstone written", "lease_uuid", leaseUUID)
+	ok, err := b.retentionStore.PutReaping(rec)
+	if err != nil {
+		logger.Error("give-up leak: failed to record reaping tombstone; preserving live close authority", "lease_uuid", leaseUUID, "error", err)
+		return fmt.Errorf("write reaping tombstone: %w", err)
 	}
-	// Reflect the new tombstone immediately (the deferred refresh only runs on the
-	// retain path; a non-retain give-up would otherwise wait for the next sweep).
-	b.refreshRetentionAccounting()
+	if ok {
+		return nil
+	}
+
+	// PutReaping returns false for both ACTIVE and RESTORING rows. Only ACTIVE is
+	// included in the admission projection; RESTORING deliberately is not, so it
+	// cannot take over the live reservation. Re-read and validate the exact row
+	// instead of treating every refusal as accounting evidence.
+	existing, err := b.retentionStore.Get(leaseUUID)
+	if err != nil {
+		return fmt.Errorf("read existing give-up accounting record: %w", err)
+	}
+	if existing == nil {
+		return errors.New("reaping tombstone refused without an existing accounting record")
+	}
+	if existing.OriginalLeaseUUID != leaseUUID {
+		return fmt.Errorf(
+			"existing give-up accounting record belongs to lease %q, want %q",
+			existing.OriginalLeaseUUID,
+			leaseUUID,
+		)
+	}
+	if existing.Status != shared.RetentionStatusActive &&
+		existing.Status != shared.RetentionStatusReaping {
+		return fmt.Errorf("existing give-up record is not counted: status %q", existing.Status)
+	}
+	if len(existing.Items) == 0 || !slices.Equal(existing.Items, items) {
+		return errors.New("existing give-up accounting record has divergent or empty items")
+	}
+	if len(resourceProfiles) > 0 && !slices.Equal(existing.ResourceProfiles, resourceProfiles) {
+		return errors.New("existing give-up accounting record has divergent or missing resource snapshot")
+	}
+	if existing.Tenant != tenant || existing.ProviderUUID != providerUUID {
+		return errors.New("existing give-up accounting record has divergent lease identity")
+	}
+	logger.Info("give-up leak: an existing counted record owns the footprint; no tombstone written",
+		"lease_uuid", leaseUUID,
+		"status", existing.Status,
+	)
+	return nil
 }

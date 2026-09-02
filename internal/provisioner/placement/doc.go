@@ -14,8 +14,10 @@
 // A confirmed `lease_uuid → backend_name` record routes reads and retained-data
 // restore to the machine that owns the workload. Before provision or restore
 // can contact a backend, an attempt carrying the same typed operation identity
-// as its callback URL is written durably. An ambiguous synchronous result keeps
-// that evidence so no retry can silently choose a second backend.
+// as its callback URL and an immutable snapshot of tenant, provider, and exact
+// ordered backend items is written durably. An ambiguous synchronous result
+// keeps that evidence so no retry can silently choose a second backend or
+// rebuild a different request from later mutable chain state.
 //
 // # Concurrency
 //
@@ -27,8 +29,9 @@
 // # Recovery
 //
 // Backend names are immutable storage identities. The Store durably records both
-// the current topology and every retired name, so removing a referenced identity
-// is rejected and a retired identity can never be reused for replacement storage.
+// the current topology and every historically adopted name, so removing a
+// referenced identity is rejected. A temporarily absent name may return only as
+// the same storage identity; replacement storage must receive a new name.
 //
 // The first complete `/provisions` and `/retentions` projection establishes an
 // AdmissionBaseline bound to the current topology. It survives Store reopen and
@@ -38,8 +41,11 @@
 // only a genuinely recordless PENDING reconciliation may use that scope.
 //
 // ProjectInventory applies positive observations at a causal fence. An exact
-// positive confirms its attempted owner; a contradictory positive is unioned
-// with all owners and attempts into durable conflict quarantine. Inventory
+// positive confirms its attempted owner only when an active upgraded backend
+// reports the same paired typed lifecycle generation. Older/unknown generations
+// preserve the attempt; retention-only evidence carries no lifecycle authority.
+// A contradictory positive is unioned with all owners and attempts into durable
+// conflict quarantine. Inventory
 // silence, complete or partial, never clears an attempt or conflict because an
 // old request may commit after the list response.
 //

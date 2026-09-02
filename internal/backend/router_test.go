@@ -229,17 +229,29 @@ func TestRouter_NilBackend(t *testing.T) {
 	}
 }
 
-func TestRouter_RejectsEmptyAndDuplicateBackendNames(t *testing.T) {
-	t.Run("empty name", func(t *testing.T) {
-		unnamed := routerNamedBackend{
-			Backend: NewMockBackend(MockBackendConfig{Name: "delegate"}),
-		}
-		_, err := NewRouter(RouterConfig{Backends: []BackendEntry{
-			{Backend: unnamed},
-		}})
+func TestRouter_RejectsInvalidAndDuplicateBackendNames(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{name: "", want: "backend name is required"},
+		{name: " backend-a", want: "leading or trailing whitespace"},
+		{name: "backend-a\nPASS: forged", want: "non-printable character U+000A"},
+		{name: "backend-a\u200B", want: "non-printable character U+200B"},
+	} {
+		t.Run(fmt.Sprintf("invalid %q", test.name), func(t *testing.T) {
+			invalid := routerNamedBackend{
+				Backend: NewMockBackend(MockBackendConfig{Name: "delegate"}),
+				name:    test.name,
+			}
+			_, err := NewRouter(RouterConfig{Backends: []BackendEntry{
+				{Backend: invalid},
+			}})
 
-		require.EqualError(t, err, "backend at index 0 has an empty name")
-	})
+			require.ErrorContains(t, err, "backend at index 0 has invalid name")
+			require.ErrorContains(t, err, test.want)
+		})
+	}
 
 	t.Run("duplicate name", func(t *testing.T) {
 		_, err := NewRouter(RouterConfig{Backends: []BackendEntry{
@@ -292,138 +304,6 @@ func TestRouter_RouteAll_RejectsDuplicateRegistration(t *testing.T) {
 		},
 	})
 	require.EqualError(t, err, `duplicate backend name "shared"`)
-}
-
-func TestRouter_RouteRoundRobin_Distribution(t *testing.T) {
-	backendA := NewMockBackend(MockBackendConfig{Name: "backend-a"})
-	backendB := NewMockBackend(MockBackendConfig{Name: "backend-b"})
-	backendC := NewMockBackend(MockBackendConfig{Name: "backend-c"})
-
-	router, err := NewRouter(RouterConfig{
-		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
-			{Backend: backendB, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
-			{Backend: backendC, Match: MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
-		},
-	})
-	require.NoError(t, err)
-
-	// Round-robin across two GPU backends
-	counts := map[string]int{}
-	for range 100 {
-		b := router.RouteRoundRobin("gpu-a100")
-		counts[b.Name()]++
-	}
-
-	assert.Equal(t, 50, counts["backend-a"])
-	assert.Equal(t, 50, counts["backend-b"])
-}
-
-func TestRouter_RouteRoundRobin_SingleMatch(t *testing.T) {
-	backendA := NewMockBackend(MockBackendConfig{Name: "solo"})
-
-	router, err := NewRouter(RouterConfig{
-		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}, IsDefault: true},
-		},
-	})
-	require.NoError(t, err)
-
-	// Single match always returns the same backend
-	for range 10 {
-		b := router.RouteRoundRobin("gpu-a100")
-		assert.Equal(t, "solo", b.Name())
-	}
-}
-
-func TestRouter_RouteRoundRobin_NoMatch_FallsBackToDefault(t *testing.T) {
-	backendA := NewMockBackend(MockBackendConfig{Name: "gpu-backend"})
-	defaultBackend := NewMockBackend(MockBackendConfig{Name: "default"})
-
-	router, err := NewRouter(RouterConfig{
-		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
-			{Backend: defaultBackend, IsDefault: true},
-		},
-	})
-	require.NoError(t, err)
-
-	// Repeated calls with unmatched SKU always return default (no divide-by-zero)
-	for range 10 {
-		b := router.RouteRoundRobin("unknown-sku")
-		assert.Equal(t, "default", b.Name())
-	}
-}
-
-func TestRouter_RouteRoundRobin_InterleavedSKUs(t *testing.T) {
-	gpuA := NewMockBackend(MockBackendConfig{Name: "gpu-a"})
-	gpuB := NewMockBackend(MockBackendConfig{Name: "gpu-b"})
-	k8s := NewMockBackend(MockBackendConfig{Name: "k8s"})
-
-	router, err := NewRouter(RouterConfig{
-		Backends: []BackendEntry{
-			{Backend: gpuA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
-			{Backend: gpuB, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
-			{Backend: k8s, Match: MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
-		},
-	})
-	require.NoError(t, err)
-
-	// The global counter is shared across SKU groups. Interleaving calls
-	// for different SKUs advances the counter for all groups, so the
-	// per-group distribution is not perfectly even.
-	gpuCounts := map[string]int{}
-	for range 100 {
-		b := router.RouteRoundRobin("gpu-a100")
-		gpuCounts[b.Name()]++
-
-		// Interleave a single-backend SKU — advances the shared counter
-		k := router.RouteRoundRobin("k8s-small")
-		assert.Equal(t, "k8s", k.Name())
-	}
-
-	// Both GPU backends must be hit, but the distribution is uneven
-	// because the k8s calls consume every other counter tick.
-	assert.Greater(t, gpuCounts["gpu-a"], 0)
-	assert.Greater(t, gpuCounts["gpu-b"], 0)
-	assert.Equal(t, 100, gpuCounts["gpu-a"]+gpuCounts["gpu-b"])
-}
-
-func TestRouter_RouteRoundRobin_ExactSKUs(t *testing.T) {
-	// Simulates production: 3 backends with the same exact SKU UUIDs.
-	// All backends match every SKU UUID, so round-robin distributes evenly.
-	skus := []string{
-		"a1b2c3d4-e5f6-7890-abcd-1234567890ab",
-		"b2c3d4e5-f6a7-8901-bcde-2345678901bc",
-	}
-
-	backendA := NewMockBackend(MockBackendConfig{Name: "docker-1"})
-	backendB := NewMockBackend(MockBackendConfig{Name: "docker-2"})
-	backendC := NewMockBackend(MockBackendConfig{Name: "docker-3"})
-
-	router, err := NewRouter(RouterConfig{
-		Backends: []BackendEntry{
-			{Backend: backendA, Match: MatchCriteria{SKUs: skus}, IsDefault: true},
-			{Backend: backendB, Match: MatchCriteria{SKUs: skus}},
-			{Backend: backendC, Match: MatchCriteria{SKUs: skus}},
-		},
-	})
-	require.NoError(t, err)
-
-	// Round-robin across all 3 backends for a known SKU UUID
-	counts := map[string]int{}
-	for range 300 {
-		b := router.RouteRoundRobin("a1b2c3d4-e5f6-7890-abcd-1234567890ab")
-		counts[b.Name()]++
-	}
-
-	assert.Equal(t, 100, counts["docker-1"])
-	assert.Equal(t, 100, counts["docker-2"])
-	assert.Equal(t, 100, counts["docker-3"])
-
-	// Unknown SKU falls back to default
-	b := router.RouteRoundRobin("unknown-uuid")
-	assert.Equal(t, "docker-1", b.Name())
 }
 
 // unhealthyMockBackend is a mock backend that returns an error on Health check.

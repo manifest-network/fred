@@ -26,6 +26,7 @@ import (
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
@@ -58,6 +59,14 @@ type PlacementLookup interface {
 // inbound callback remains inside the provisioner callback service.
 type LifecycleCallbackAuthority interface {
 	CurrentLifecycle(leaseUUID string) placement.LifecycleAuthorization
+}
+
+// MaintenanceClaims serializes restart/update effects with provisioning,
+// restore, deprovision, and reconciliation. The opaque claim is held through
+// accepted local settlement (including payload persistence for /update).
+type MaintenanceClaims interface {
+	TryClaimLeaseNow(string) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
 }
 
 // PlacementBootstrap reports whether this process has completed at least one
@@ -116,6 +125,7 @@ type Handlers struct {
 	statusChecker      StatusChecker
 	placementLookup    PlacementLookup
 	lifecycleCallbacks LifecycleCallbackAuthority
+	maintenanceClaims  MaintenanceClaims
 	placementBootstrap PlacementBootstrap
 	restoreService     RestoreService
 	payloadPersister   PayloadPersister
@@ -137,6 +147,7 @@ type HandlersConfig struct {
 	StatusChecker      StatusChecker              // optional but required for the /status endpoint
 	PlacementLookup    PlacementLookup            // optional — used for routing reads to the correct backend
 	LifecycleCallbacks LifecycleCallbackAuthority // required for restart/update; legacy owners are explicit store verdicts
+	MaintenanceClaims  MaintenanceClaims          // required for restart/update serialization with reconciliation
 	RestoreService     RestoreService             // required by /restore; owns typed operation and placement capabilities
 	PayloadPersister   PayloadPersister           // REQUIRED for /update — without it an update cannot be made durable (ENG-619)
 	PayloadStoreHealth PayloadStoreHealth         // optional — health probe for the payload store's bbolt DB
@@ -166,6 +177,10 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 			lifecycleCallbacks = authority
 		}
 	}
+	maintenanceClaims := cfg.MaintenanceClaims
+	if util.IsNilInterface(maintenanceClaims) {
+		maintenanceClaims = nil
+	}
 	return &Handlers{
 		client:             cfg.Client,
 		backendRouter:      cfg.BackendRouter,
@@ -173,6 +188,7 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		statusChecker:      cfg.StatusChecker,
 		placementLookup:    cfg.PlacementLookup,
 		lifecycleCallbacks: lifecycleCallbacks,
+		maintenanceClaims:  maintenanceClaims,
 		placementBootstrap: placementBootstrap,
 		restoreService:     restoreService,
 		payloadPersister:   cfg.PayloadPersister,
@@ -223,7 +239,11 @@ func (h *Handlers) maintenanceCallbackURL(
 				authorization.Backend(), backendName,
 			)
 		}
-		return provisioner.BuildCallbackURL(h.callbackBaseURL), nil
+		callbackURL, err := provisioner.BuildCallbackURL(h.callbackBaseURL)
+		if err != nil {
+			return "", fmt.Errorf("build legacy lifecycle callback URL: %w", err)
+		}
+		return callbackURL, nil
 	case placement.LifecycleVerdictInvalid,
 		placement.LifecycleVerdictMissing,
 		placement.LifecycleVerdictStale,
@@ -251,16 +271,128 @@ func (h *Handlers) maintenanceCallbackURL(
 func (h *Handlers) dispatchWithOrderedStart(
 	leaseUUID string,
 	status backend.ProvisionStatus,
-	dispatch func() error,
-) error {
+	dispatch func() (accepted bool, err error),
+) (bool, error) {
 	if h.eventBroker == nil {
 		return dispatch()
 	}
-	return h.eventBroker.DispatchWithOrderedStart(backend.LeaseStatusEvent{
+	return h.eventBroker.DispatchWithOrderedSettlement(backend.LeaseStatusEvent{
 		LeaseUUID: leaseUUID,
 		Status:    status,
 		Timestamp: time.Now(),
 	}, dispatch)
+}
+
+func (h *Handlers) claimMaintenanceLease(
+	w http.ResponseWriter,
+	leaseUUID string,
+) (operation.LeaseClaim, bool) {
+	if h.maintenanceClaims == nil {
+		slog.Error("maintenance rejected: lifecycle claim authority unavailable",
+			"lease_uuid", leaseUUID,
+		)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return operation.LeaseClaim{}, false
+	}
+	result := h.maintenanceClaims.TryClaimLeaseNow(leaseUUID)
+	if result.Acquired() {
+		return result.Claim(), true
+	}
+	if result.Outcome() == operation.LeaseClaimBusy {
+		writeError(w, "lease is already undergoing a lifecycle operation", http.StatusConflict)
+		return operation.LeaseClaim{}, false
+	}
+	slog.Error("maintenance rejected: failed to claim lease lifecycle",
+		"lease_uuid", leaseUUID,
+		"outcome", result.Outcome(),
+	)
+	writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+	return operation.LeaseClaim{}, false
+}
+
+func (h *Handlers) releaseMaintenanceLease(leaseUUID string, claim operation.LeaseClaim) {
+	if !h.maintenanceClaims.ReleaseLease(claim) {
+		slog.Error("failed to release maintenance lifecycle claim", "lease_uuid", leaseUUID)
+	}
+}
+
+const maintenanceChainConfirmationTimeout = 10 * time.Second
+
+// confirmMaintenanceLease closes the authentication-to-dispatch race for
+// restart and update. Authentication's ACTIVE lookup happens before the local
+// lifecycle claim; once that claim is held, re-read the unfiltered exact lease
+// so a close, rejection, expiry, ownership change, or inconsistent response
+// cannot be followed by a backend mutation based on the stale authentication
+// snapshot.
+func (h *Handlers) confirmMaintenanceLease(
+	w http.ResponseWriter,
+	ctx context.Context,
+	leaseUUID, tenant string,
+) (*billingtypes.Lease, bool) {
+	confirmCtx, cancel := context.WithTimeout(ctx, maintenanceChainConfirmationTimeout)
+	defer cancel()
+	lease, err := h.client.GetLease(confirmCtx, leaseUUID)
+	if err != nil {
+		slog.Warn("maintenance rejected: exact lease confirmation unavailable",
+			"error", err, "lease_uuid", leaseUUID)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return nil, false
+	}
+	if lease == nil {
+		writeError(w, errMsgLeaseNotFound, http.StatusNotFound)
+		return nil, false
+	}
+	if lease.Uuid != leaseUUID {
+		slog.Error("maintenance rejected: exact lease query returned another lease",
+			"requested_lease_uuid", leaseUUID, "returned_lease_uuid", lease.Uuid)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return nil, false
+	}
+	if lease.Tenant != tenant || lease.ProviderUuid != h.providerUUID {
+		slog.Warn("maintenance rejected: exact lease authority changed",
+			"lease_uuid", leaseUUID,
+			"token_tenant", tenant,
+			"lease_tenant", lease.Tenant,
+			"lease_provider_uuid", lease.ProviderUuid,
+			"our_provider_uuid", h.providerUUID,
+		)
+		writeError(w, errMsgForbidden, http.StatusForbidden)
+		return nil, false
+	}
+	if lease.State != billingtypes.LEASE_STATE_ACTIVE {
+		writeError(w, "lease is no longer active", http.StatusConflict)
+		return nil, false
+	}
+	return lease, true
+}
+
+func (h *Handlers) resolveMaintenanceBackend(
+	w http.ResponseWriter,
+	leaseUUID string,
+	lease *billingtypes.Lease,
+) (backend.Backend, bool) {
+	if h.backendRouter == nil {
+		slog.Error("backend router not configured")
+		writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+		return nil, false
+	}
+	sku := provisioner.ExtractRoutingSKU(lease)
+	resolved := h.resolveBackend(leaseUUID, sku)
+	if resolved == nil {
+		slog.Error("no backend available", "sku", sku, "lease_uuid", leaseUUID)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return nil, false
+	}
+	return resolved, true
+}
+
+func (h *Handlers) requireMaintenanceRouter(w http.ResponseWriter) bool {
+	if h.backendRouter != nil {
+		return true
+	}
+	slog.Error("backend router not configured")
+	writeError(w, errMsgServiceNotConfigured, http.StatusServiceUnavailable)
+	return false
 }
 
 // AuthenticatedRequest contains the result of a successful authentication.
@@ -1154,10 +1286,27 @@ type LeaseReleasesResponse struct {
 
 // RestartLease handles POST /v1/leases/{lease_uuid}/restart
 func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
-	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, true, true)
+	auth, leaseUUID, ok := h.authenticateLease(w, r, true, true)
 	if !ok {
 		return
 	}
+	if !h.requireMaintenanceRouter(w) {
+		return
+	}
+	claim, ok := h.claimMaintenanceLease(w, leaseUUID)
+	if !ok {
+		return
+	}
+	defer h.releaseMaintenanceLease(leaseUUID, claim)
+	exactLease, ok := h.confirmMaintenanceLease(w, r.Context(), leaseUUID, auth.Token.Tenant)
+	if !ok {
+		return
+	}
+	backendClient, ok := h.resolveMaintenanceBackend(w, leaseUUID, exactLease)
+	if !ok {
+		return
+	}
+
 	callbackURL, err := h.maintenanceCallbackURL(leaseUUID, backendClient.Name())
 	if err != nil {
 		slog.Error("restart rejected: lifecycle callback authority unavailable",
@@ -1169,14 +1318,15 @@ func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.dispatchWithOrderedStart(
+	_, err = h.dispatchWithOrderedStart(
 		leaseUUID,
 		backend.ProvisionStatusRestarting,
-		func() error {
-			return backendClient.Restart(r.Context(), backend.RestartRequest{
+		func() (bool, error) {
+			err := backendClient.Restart(r.Context(), backend.RestartRequest{
 				LeaseUUID:   leaseUUID,
 				CallbackURL: callbackURL,
 			})
+			return err == nil, err
 		},
 	)
 	if err != nil {
@@ -1308,8 +1458,11 @@ func (h *Handlers) writeRestoreResult(
 
 // UpdateLease handles POST /v1/leases/{lease_uuid}/update
 func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
-	auth, leaseUUID, backendClient, ok := h.authenticateAndResolve(w, r, true, true)
+	auth, leaseUUID, ok := h.authenticateLease(w, r, true, true)
 	if !ok {
+		return
+	}
+	if !h.requireMaintenanceRouter(w) {
 		return
 	}
 
@@ -1325,17 +1478,6 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "payload is required", http.StatusBadRequest)
 		return
 	}
-	callbackURL, err := h.maintenanceCallbackURL(leaseUUID, backendClient.Name())
-	if err != nil {
-		slog.Error("update rejected: lifecycle callback authority unavailable",
-			"error", err,
-			"lease_uuid", leaseUUID,
-			"backend", backendClient.Name(),
-		)
-		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
-		return
-	}
-
 	// Refuse before touching the backend rather than after. An update we cannot
 	// persist is one the next reprovision silently undoes (ENG-619), so a lease
 	// left running a manifest fred has no durable record of is strictly worse
@@ -1347,25 +1489,72 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
+	claim, ok := h.claimMaintenanceLease(w, leaseUUID)
+	if !ok {
+		return
+	}
+	defer h.releaseMaintenanceLease(leaseUUID, claim)
+	exactLease, ok := h.confirmMaintenanceLease(w, r.Context(), leaseUUID, auth.Token.Tenant)
+	if !ok {
+		return
+	}
+	backendClient, ok := h.resolveMaintenanceBackend(w, leaseUUID, exactLease)
+	if !ok {
+		return
+	}
+
+	// Resolve lifecycle authority only after taking the exclusive lease claim.
+	// Otherwise an operation that finishes between this read and the claim can
+	// rotate the lifecycle generation, leaving the accepted update with a stale
+	// callback URL that Fred will correctly discard.
+	callbackURL, err := h.maintenanceCallbackURL(leaseUUID, backendClient.Name())
+	if err != nil {
+		slog.Error("update rejected: lifecycle callback authority unavailable",
+			"error", err,
+			"lease_uuid", leaseUUID,
+			"backend", backendClient.Name(),
+		)
+		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return
+	}
 
 	// payload_hash has always been part of the documented /update request
 	// (README, BACKEND_GUIDE) but was never populated, so a third-party backend
 	// implementing the contract received a payload it could not check. Send the
 	// hash of the payload actually being sent — the same value the store records
 	// and the reprovision path later verifies against.
-	err = h.dispatchWithOrderedStart(
+	accepted, err := h.dispatchWithOrderedStart(
 		leaseUUID,
 		backend.ProvisionStatusUpdating,
-		func() error {
-			return backendClient.Update(r.Context(), backend.UpdateRequest{
+		func() (bool, error) {
+			err := backendClient.Update(r.Context(), backend.UpdateRequest{
 				LeaseUUID:   leaseUUID,
 				CallbackURL: callbackURL,
 				Payload:     updateReq.Payload,
 				PayloadHash: hex.EncodeToString(payload.ComputeHash(updateReq.Payload)),
 			})
+			if err != nil {
+				return false, err
+			}
+			return true, h.payloadPersister.OverwritePayload(leaseUUID, updateReq.Payload)
 		},
 	)
 	if err != nil {
+		if accepted {
+			// The backend accepted the update, so the ordered start remains true
+			// even though durable settlement failed. Holding both the event gate
+			// and lifecycle claim through this write prevents another update or
+			// reconciliation pass from overtaking it.
+			slog.Error("lease updated on backend but payload persistence failed — reprovision would revert this lease",
+				"error", err,
+				"lease_uuid", leaseUUID,
+				"tenant", auth.Token.Tenant,
+				"backend", backendClient.Name(),
+			)
+			metrics.PayloadPersistFailuresTotal.WithLabelValues("update").Inc()
+			writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+			return
+		}
 		if errors.Is(err, backend.ErrNotProvisioned) {
 			writeError(w, "lease not yet provisioned", http.StatusNotFound)
 			return
@@ -1386,34 +1575,6 @@ func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("failed to update lease", "error", err, "lease_uuid", leaseUUID)
-		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
-		return
-	}
-
-	// Persist the new payload now that the backend has accepted it.
-	//
-	// After, not before: a payload the backend synchronously rejected must never
-	// reach the store, or the next reprovision would replay a manifest that was
-	// never deployed. The cost of that ordering is a crash window between the
-	// two — which reverts to the pre-ENG-619 behavior for that one lease and is
-	// repaired by the tenant retrying, rather than by fred serving a manifest
-	// nothing ever validated.
-	//
-	// The reconciler verifies a stored payload against the hash recorded here,
-	// not against the lease's create-time on-chain MetaHash, which an update
-	// legitimately diverges from. Until ENG-643 lands the on-chain commitment
-	// still names the create-time manifest; see doStartProvisioning.
-	if err := h.payloadPersister.OverwritePayload(leaseUUID, updateReq.Payload); err != nil {
-		// The backend is now running the new manifest but nothing durable
-		// records it. Answering 202 here is precisely the silent-revert bug, so
-		// report the failure: a retry re-applies and re-persists.
-		slog.Error("lease updated on backend but payload persistence failed — reprovision would revert this lease",
-			"error", err,
-			"lease_uuid", leaseUUID,
-			"tenant", auth.Token.Tenant,
-			"backend", backendClient.Name(),
-		)
-		metrics.PayloadPersistFailuresTotal.WithLabelValues("update").Inc()
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
 		return
 	}
@@ -1489,9 +1650,10 @@ const (
 	// more backends) is impaired. What survives depends on which:
 	//
 	//   - A backend down: existing leases on healthy backends still serve, and
-	//     positively evidenced acknowledgement/cleanup may continue. Every new
-	//     provision, re-provision, and restore backend effect is withheld
-	//     fleet-wide until complete inventory is projected again.
+	//     positively evidenced acknowledgement/cleanup may continue. A prior
+	//     complete topology baseline still permits recordless PENDING leases to
+	//     target backends whose provision and retention inventories both answered;
+	//     work pinned to the silent backend remains deferred lease-locally.
 	//   - The chain down: considerably less. Every tenant endpoint that resolves
 	//     a lease fails, and reconciliation halts outright — RunOnce returns as
 	//     soon as GetPendingLeases or GetActiveLeasesByProvider errors, because
@@ -1584,7 +1746,7 @@ func (h *Handlers) evaluateHealth(ctx context.Context) HealthResponse {
 	// Tracked separately because they map to different verdicts. Collapsing
 	// them back into one boolean reinstates ENG-522.
 	remoteImpaired := false // the chain or a backend — shared, off-box
-	localImpaired := false  // a bbolt store — this process's own disk
+	localImpaired := false  // a process-owned store or admission-readiness invariant
 
 	// record folds one probe into the response: gauge, sanitized client-facing
 	// result, and the matching impairment tier. Raw errors are logged but never

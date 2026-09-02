@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,16 +19,15 @@ import (
 
 	"github.com/manifest-network/fred/internal/api"
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
-	"github.com/manifest-network/fred/internal/provisioner/placement"
 	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
 	"github.com/manifest-network/fred/internal/scheduler"
-	"github.com/manifest-network/fred/internal/tlsconfig"
 	"github.com/manifest-network/fred/internal/watcher"
 )
 
@@ -134,13 +132,48 @@ func run(cmd *cobra.Command, args []string) error {
 		"log_level", cfg.LogLevel,
 	)
 
-	// Create context with cancellation
+	// Install signal cancellation before any backend I/O. The placement topology
+	// probe may legitimately wait on a down node for its bounded startup budget;
+	// SIGINT/SIGTERM must interrupt that wait instead of being observed only after
+	// every startup phase completes. Runtime components use a separate context so
+	// graceful shutdown can keep callback ingress alive while draining operations.
+	startupCtx, stopStartupSignals := signal.NotifyContext(
+		context.Background(), syscall.SIGINT, syscall.SIGTERM,
+	)
+	defer stopStartupSignals()
+
+	// Create the independently controlled runtime context.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Set up signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// Validate the local placement authority and exact backend storage topology
+	// before signer construction can derive keys or any startup path can query or
+	// write the chain. The returned clients remain identity-bound at every later
+	// read and side-effect boundary.
+	placementStore, backendEntries, err := preparePlacementBackends(startupCtx, cfg)
+	if err != nil {
+		if startupCtx.Err() != nil {
+			slog.Info("provider startup canceled by shutdown signal")
+			return nil
+		}
+		return err
+	}
+	defer placementStore.Close()
+	var (
+		callbackKeyring      map[backendidentity.ID]string
+		legacyCallbackSecret string
+	)
+	if cfg.CallbackSecret != "" {
+		// Config validation permits this compatibility mode only outside
+		// production. Production providerd always constructs the identity-keyed
+		// verifier below.
+		legacyCallbackSecret = string(cfg.CallbackSecret)
+	} else {
+		callbackKeyring, err = callbackHMACSecrets(cfg, placementStore)
+		if err != nil {
+			return fmt.Errorf("build backend callback HMAC keyring: %w", err)
+		}
+	}
 
 	// Initialize signer pool (derives sub-keys on first boot if mnemonic available)
 	signerPool, err := chain.NewSignerPool(chain.SignerPoolConfig{
@@ -286,51 +319,6 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	slog.Info("event subscriber initialized", "url", cfg.WebSocketURL)
 
-	// Initialize backends
-	slog.Info("initializing provisioner with backends", "count", len(cfg.Backends))
-
-	var backendEntries []backend.BackendEntry
-	for _, bcfg := range cfg.Backends {
-		// Build the per-backend TLS config at the composition root so file-I/O
-		// errors fail startup here (config.Validate has already checked field
-		// pairing and the production_mode skip-verify rule). Left nil when no
-		// TLS fields are set, so plaintext http:// backends are unaffected.
-		var tlsClientConfig *tls.Config
-		if bcfg.TLSCAFile != "" || bcfg.TLSClientCertFile != "" || bcfg.TLSClientKeyFile != "" || bcfg.TLSSkipVerify {
-			tlsClientConfig, err = tlsconfig.ClientConfig(bcfg.TLSCAFile, bcfg.TLSSkipVerify, bcfg.TLSClientCertFile, bcfg.TLSClientKeyFile)
-			if err != nil {
-				return fmt.Errorf("backend %q: build TLS client config: %w", bcfg.Name, err)
-			}
-		}
-
-		client := backend.NewHTTPClient(backend.HTTPClientConfig{
-			Name:                    bcfg.Name,
-			BaseURL:                 bcfg.URL,
-			Timeout:                 bcfg.Timeout,
-			Secret:                  string(cfg.CallbackSecret),
-			TLSClientConfig:         tlsClientConfig,
-			RequestDuration:         metrics.BackendRequestDuration,
-			RequestsTotal:           metrics.BackendRequestsTotal,
-			CircuitBreakerState:     metrics.BackendCircuitBreakerState,
-			MalformedErrorBodyTotal: metrics.BackendMalformedErrorBodyTotal,
-		})
-
-		backendEntries = append(backendEntries, backend.BackendEntry{
-			Backend: client,
-			Match: backend.MatchCriteria{
-				SKUs: bcfg.SKUs,
-			},
-			IsDefault: bcfg.IsDefault,
-		})
-
-		slog.Info("configured backend",
-			"name", bcfg.Name,
-			"url", bcfg.URL,
-			"skus", bcfg.SKUs,
-			"default", bcfg.IsDefault,
-		)
-	}
-
 	// Create backend router
 	backendRouter, err := backend.NewRouter(backend.RouterConfig{
 		Backends:          backendEntries,
@@ -356,15 +344,6 @@ func run(cmd *cobra.Command, args []string) error {
 		slog.Warn("payload store disabled (no payload_store_db_path configured)")
 	}
 
-	// Durable placement is mandatory: all supported deployments use multiple
-	// backends, so there is no safe match-routing fallback after provisioning.
-	placementStore, err := placement.NewStore(cfg.PlacementStoreDBPath)
-	if err != nil {
-		return fmt.Errorf("failed to create placement store: %w", err)
-	}
-	defer placementStore.Close()
-	slog.Info("placement store enabled", "db_path", cfg.PlacementStoreDBPath)
-
 	// Create event broker for real-time lease event delivery
 	eventBroker := api.NewEventBroker()
 
@@ -389,11 +368,11 @@ func run(cmd *cobra.Command, args []string) error {
 		CallbackURL: func(operationID operation.OperationID) (string, error) {
 			return provisioner.BuildCallbackURLForOperation(cfg.CallbackBaseURL, operationID)
 		},
-		Targets: chainClient,
+		Leases: chainClient,
 		Backends: restoreapp.BackendResolverFunc(func(name string) restoreapp.RestoreBackend {
 			return backendRouter.GetBackendByName(name)
 		}),
-		Operations: provisionMgr.Operations(),
+		Operations: provisionMgr.RestoreOperations(),
 		Authority:  placementStore,
 		Events:     eventBroker,
 	})
@@ -406,7 +385,6 @@ func run(cmd *cobra.Command, args []string) error {
 
 	slog.Info("provisioner initialized",
 		"backends", len(cfg.Backends),
-		"callback_url", cfg.CallbackBaseURL,
 	)
 
 	// Initialize watcher for cross-provider events only
@@ -453,7 +431,8 @@ func run(cmd *cobra.Command, args []string) error {
 		IdleTimeout:                 cfg.HTTPIdleTimeout,
 		ShutdownTimeout:             cfg.ShutdownTimeout,
 		MaxRequestBodySize:          cfg.MaxRequestBodySize,
-		CallbackSecret:              string(cfg.CallbackSecret),
+		CallbackSecret:              legacyCallbackSecret,
+		CallbackHMACSecrets:         callbackKeyring,
 		CallbackCanonicalPathPrefix: cfg.CallbackCanonicalPathPrefix,
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
@@ -467,6 +446,7 @@ func run(cmd *cobra.Command, args []string) error {
 		StatusChecker:      provisionMgr,
 		PlacementLookup:    placementStore,
 		LifecycleCallbacks: placementStore,
+		MaintenanceClaims:  provisionMgr.MaintenanceClaims(),
 		RestoreService:     restoreService,
 		EventBroker:        eventBroker,
 	})
@@ -633,8 +613,8 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Wait for shutdown signal or error
 	select {
-	case sig := <-sigChan:
-		slog.Info("received shutdown signal", "signal", sig)
+	case <-startupCtx.Done():
+		slog.Info("received shutdown signal")
 	case err := <-errChan:
 		slog.Error("component error", "error", err)
 	}
@@ -648,7 +628,12 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Wait for in-flight provisions to drain BEFORE shutting down the API server.
 	// Backends send completion callbacks via HTTP, so the API server must remain
-	// running to receive them during the drain period.
+	// running to receive them during the drain period. Close ordinary lifecycle
+	// admission first so a tenant request, chain event, or reconciliation action
+	// cannot start new backend work after the drain observes zero. Authenticated
+	// callbacks retain their dedicated settlement/recovery path until HTTP
+	// shutdown closes the ingress boundary.
+	provisionMgr.BeginDrain()
 	drainTimeout := cfg.ShutdownTimeout / 2
 	remaining := provisionMgr.WaitForDrain(shutdownCtx, drainTimeout)
 	if remaining > 0 {

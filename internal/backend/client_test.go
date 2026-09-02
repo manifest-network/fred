@@ -46,7 +46,7 @@ func TestHTTPClient_Provision(t *testing.T) {
 	defer server.Close()
 
 	// Create client
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -58,24 +58,24 @@ func TestHTTPClient_Provision(t *testing.T) {
 		Tenant:               "tenant-1",
 		ProviderUUID:         "provider-1",
 		Items:                []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
-		CallbackURL:          "http://fred/callback?operation_id=550e8400-e29b-41d4-a716-446655440000",
-		LifecycleCallbackURL: "http://fred/callback",
+		CallbackURL:          "http://fred/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+		LifecycleCallbackURL: "http://fred/callbacks/provision",
 	})
 
 	require.NoError(t, err)
 
 	assert.Equal(t, "lease-uuid-1", receivedReq.LeaseUUID)
 	assert.Equal(t, "gpu-a100", receivedReq.RoutingSKU())
-	assert.Equal(t, "http://fred/callback?operation_id=550e8400-e29b-41d4-a716-446655440000", receivedReq.CallbackURL)
-	assert.Equal(t, "http://fred/callback", receivedReq.LifecycleCallbackURL)
+	assert.Equal(t, "http://fred/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000", receivedReq.CallbackURL)
+	assert.Equal(t, "http://fred/callbacks/provision", receivedReq.LifecycleCallbackURL)
 }
 
 func TestResolveLifecycleCallbackURL(t *testing.T) {
 	const operationID = "550e8400-e29b-41d4-a716-446655440000"
 	completion := "https://fred.example/callbacks/provision?z=last&operation_id=" + operationID +
-		"&tenant=a%2Fb&&a=first#fragment"
+		"&tenant=a%2Fb&&a=first"
 	want := "https://fred.example/callbacks/provision?z=last&lifecycle_id=" + operationID +
-		"&tenant=a%2Fb&&a=first#fragment"
+		"&tenant=a%2Fb&&a=first"
 
 	derived, err := ResolveLifecycleCallbackURL(completion, "")
 	require.NoError(t, err)
@@ -88,7 +88,7 @@ func TestResolveLifecycleCallbackURL(t *testing.T) {
 }
 
 func TestResolveLifecycleCallbackURLKeepsLegacyOperationlessURLTokenless(t *testing.T) {
-	legacy := "https://fred.example/callbacks/provision?tenant=a%2Fb&&trace=keep#fragment"
+	legacy := "https://fred.example/callbacks/provision?tenant=a%2Fb&&trace=keep"
 
 	derived, err := ResolveLifecycleCallbackURL(legacy, "")
 	require.NoError(t, err)
@@ -108,19 +108,19 @@ func TestResolveLifecycleCallbackURLRejectsAmbiguousOrInvalidAuthority(t *testin
 		name       string
 		completion string
 	}{
-		{name: "duplicate operation IDs", completion: "https://fred.example/callback?operation_id=" + canonical + "&operation_id=" + other},
-		{name: "encoded duplicate operation key", completion: "https://fred.example/callback?operation_id=" + canonical + "&operation%5Fid=" + other},
-		{name: "both authority kinds", completion: "https://fred.example/callback?operation_id=" + canonical + "&lifecycle_id=" + canonical},
-		{name: "preexisting lifecycle ID", completion: "https://fred.example/callback?lifecycle_id=" + canonical},
-		{name: "duplicate lifecycle IDs", completion: "https://fred.example/callback?lifecycle_id=" + canonical + "&lifecycle%5Fid=" + other},
-		{name: "empty operation ID", completion: "https://fred.example/callback?operation_id="},
-		{name: "missing operation value", completion: "https://fred.example/callback?operation_id"},
-		{name: "malformed operation ID", completion: "https://fred.example/callback?operation_id=not-a-uuid"},
-		{name: "uppercase operation ID", completion: "https://fred.example/callback?operation_id=" + strings.ToUpper(canonical)},
-		{name: "non-v4 operation ID", completion: "https://fred.example/callback?operation_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
-		{name: "malformed encoded query key", completion: "https://fred.example/callback?operation%ZZid=" + canonical},
-		{name: "malformed unrelated query value", completion: "https://fred.example/callback?trace=%ZZ&operation_id=" + canonical},
-		{name: "semicolon in unrelated query value", completion: "https://fred.example/callback?trace=x;y&operation_id=" + canonical},
+		{name: "duplicate operation IDs", completion: "https://fred.example/callbacks/provision?operation_id=" + canonical + "&operation_id=" + other},
+		{name: "encoded duplicate operation key", completion: "https://fred.example/callbacks/provision?operation_id=" + canonical + "&operation%5Fid=" + other},
+		{name: "both authority kinds", completion: "https://fred.example/callbacks/provision?operation_id=" + canonical + "&lifecycle_id=" + canonical},
+		{name: "preexisting lifecycle ID", completion: "https://fred.example/callbacks/provision?lifecycle_id=" + canonical},
+		{name: "duplicate lifecycle IDs", completion: "https://fred.example/callbacks/provision?lifecycle_id=" + canonical + "&lifecycle%5Fid=" + other},
+		{name: "empty operation ID", completion: "https://fred.example/callbacks/provision?operation_id="},
+		{name: "missing operation value", completion: "https://fred.example/callbacks/provision?operation_id"},
+		{name: "malformed operation ID", completion: "https://fred.example/callbacks/provision?operation_id=not-a-uuid"},
+		{name: "uppercase operation ID", completion: "https://fred.example/callbacks/provision?operation_id=" + strings.ToUpper(canonical)},
+		{name: "non-v4 operation ID", completion: "https://fred.example/callbacks/provision?operation_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{name: "malformed encoded query key", completion: "https://fred.example/callbacks/provision?operation%ZZid=" + canonical},
+		{name: "malformed unrelated query value", completion: "https://fred.example/callbacks/provision?trace=%ZZ&operation_id=" + canonical},
+		{name: "semicolon in unrelated query value", completion: "https://fred.example/callbacks/provision?trace=x;y&operation_id=" + canonical},
 	}
 
 	for _, test := range tests {
@@ -153,15 +153,103 @@ func TestResolveLifecycleCallbackURLRejectsMismatchedExplicitURL(t *testing.T) {
 	}
 }
 
+func TestObserveLifecycleGeneration(t *testing.T) {
+	const (
+		firstID  = "550e8400-e29b-41d4-a716-446655440000"
+		secondID = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+		baseURL  = "https://fred.example/callbacks/provision?trace=keep"
+	)
+	tests := []struct {
+		name      string
+		operation string
+		lifecycle string
+		want      LifecycleGenerationObservation
+	}{
+		{
+			name: "missing pair is unknown",
+			want: LifecycleGenerationObservation{Kind: LifecycleGenerationUnknown},
+		},
+		{
+			name:      "old record missing lifecycle half is unknown",
+			operation: baseURL + "&operation_id=" + firstID,
+			want:      LifecycleGenerationObservation{Kind: LifecycleGenerationUnknown},
+		},
+		{
+			name:      "tokenless exact pair is legacy",
+			operation: baseURL,
+			lifecycle: baseURL,
+			want:      LifecycleGenerationObservation{Kind: LifecycleGenerationLegacy},
+		},
+		{
+			name:      "canonical exact pair reports only typed ID",
+			operation: baseURL + "&operation_id=" + firstID,
+			lifecycle: baseURL + "&lifecycle_id=" + firstID,
+			want: LifecycleGenerationObservation{
+				Kind: LifecycleGenerationTyped,
+				ID:   firstID,
+			},
+		},
+		{
+			name:      "different typed IDs are unusable",
+			operation: baseURL + "&operation_id=" + firstID,
+			lifecycle: baseURL + "&lifecycle_id=" + secondID,
+			want:      LifecycleGenerationObservation{Kind: LifecycleGenerationUnusable},
+		},
+		{
+			name:      "typed operation paired with legacy lifecycle is unusable",
+			operation: baseURL + "&operation_id=" + firstID,
+			lifecycle: baseURL,
+			want:      LifecycleGenerationObservation{Kind: LifecycleGenerationUnusable},
+		},
+		{
+			name:      "malformed canonical identity is unusable",
+			operation: baseURL + "&operation_id=not-a-uuid",
+			lifecycle: baseURL + "&lifecycle_id=not-a-uuid",
+			want:      LifecycleGenerationObservation{Kind: LifecycleGenerationUnusable},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want,
+				ObserveLifecycleGeneration(test.operation, test.lifecycle))
+		})
+	}
+}
+
+func TestProvisionInfoLifecycleGenerationBackwardWireCompatibility(t *testing.T) {
+	legacyWire := []byte(`{"lease_uuid":"lease-1","status":"ready"}`)
+	var old ProvisionInfo
+	require.NoError(t, json.Unmarshal(legacyWire, &old))
+	assert.Nil(t, old.LifecycleGeneration,
+		"a response from an old backend must decode as an absent/unknown observation")
+
+	encodedOld, err := json.Marshal(old)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encodedOld), "lifecycle_generation")
+
+	want := &LifecycleGenerationObservation{
+		Kind: LifecycleGenerationTyped,
+		ID:   "550e8400-e29b-41d4-a716-446655440000",
+	}
+	encodedNew, err := json.Marshal(ProvisionInfo{
+		LeaseUUID: "lease-1", LifecycleGeneration: want,
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, string(encodedNew), "callback_url")
+	var roundTrip ProvisionInfo
+	require.NoError(t, json.Unmarshal(encodedNew, &roundTrip))
+	assert.Equal(t, want, roundTrip.LifecycleGeneration)
+}
+
 func TestResolveMaintenanceCallbackURLs(t *testing.T) {
 	const (
 		currentID = "550e8400-e29b-41d4-a716-446655440000"
 		otherID   = "123e4567-e89b-42d3-a456-426614174000"
 	)
-	oldOperation := "https://old.example/callback?trace=keep&operation_id=" + currentID
-	oldLifecycle := "https://old.example/callback?trace=keep&lifecycle_id=" + currentID
-	newOperation := "https://new.example/v2/callback?tenant=a%2Fb&operation_id=" + currentID + "#fragment"
-	newLifecycle := "https://new.example/v2/callback?tenant=a%2Fb&lifecycle_id=" + currentID + "#fragment"
+	oldOperation := "https://old.example/callbacks/provision?trace=keep&operation_id=" + currentID
+	oldLifecycle := "https://old.example/callbacks/provision?trace=keep&lifecycle_id=" + currentID
+	newOperation := "https://new.example/v2/callbacks/provision?tenant=a%2Fb&operation_id=" + currentID
+	newLifecycle := "https://new.example/v2/callbacks/provision?tenant=a%2Fb&lifecycle_id=" + currentID
 
 	tests := []struct {
 		name             string
@@ -196,11 +284,11 @@ func TestResolveMaintenanceCallbackURLs(t *testing.T) {
 		},
 		{
 			name:             "legacy pair moves base tokenlessly",
-			callbackURL:      "https://old.example/callback?trace=keep",
-			lifecycleURL:     "https://old.example/callback?trace=keep",
-			requestedURL:     "https://new.example/callback?trace=new",
-			wantOperationURL: "https://new.example/callback?trace=new",
-			wantLifecycleURL: "https://new.example/callback?trace=new",
+			callbackURL:      "https://old.example/callbacks/provision?trace=keep",
+			lifecycleURL:     "https://old.example/callbacks/provision?trace=keep",
+			requestedURL:     "https://new.example/callbacks/provision?trace=new",
+			wantOperationURL: "https://new.example/callbacks/provision?trace=new",
+			wantLifecycleURL: "https://new.example/callbacks/provision?trace=new",
 		},
 		{
 			name:             "trusted typed request initializes oldest record",
@@ -216,7 +304,7 @@ func TestResolveMaintenanceCallbackURLs(t *testing.T) {
 		{
 			name:         "mismatched persisted pair fails closed",
 			callbackURL:  oldOperation,
-			lifecycleURL: "https://other.example/callback?trace=keep&lifecycle_id=" + currentID,
+			lifecycleURL: "https://other.example/callbacks/provision?trace=keep&lifecycle_id=" + currentID,
 			requestedURL: newLifecycle,
 			wantErr:      true,
 		},
@@ -224,20 +312,20 @@ func TestResolveMaintenanceCallbackURLs(t *testing.T) {
 			name:         "typed request cannot rotate identity",
 			callbackURL:  oldOperation,
 			lifecycleURL: oldLifecycle,
-			requestedURL: "https://new.example/callback?lifecycle_id=" + otherID,
+			requestedURL: "https://new.example/callbacks/provision?lifecycle_id=" + otherID,
 			wantErr:      true,
 		},
 		{
 			name:         "typed route cannot downgrade",
 			callbackURL:  oldOperation,
 			lifecycleURL: oldLifecycle,
-			requestedURL: "https://new.example/callback",
+			requestedURL: "https://new.example/callbacks/provision",
 			wantErr:      true,
 		},
 		{
 			name:         "legacy route cannot acquire unrelated typed authority",
-			callbackURL:  "https://old.example/callback",
-			lifecycleURL: "https://old.example/callback",
+			callbackURL:  "https://old.example/callbacks/provision",
+			lifecycleURL: "https://old.example/callbacks/provision",
 			requestedURL: newLifecycle,
 			wantErr:      true,
 		},
@@ -252,12 +340,12 @@ func TestResolveMaintenanceCallbackURLs(t *testing.T) {
 			name:         "malformed requested unrelated query fails closed",
 			callbackURL:  oldOperation,
 			lifecycleURL: oldLifecycle,
-			requestedURL: "https://new.example/callback?trace=%ZZ&lifecycle_id=" + currentID,
+			requestedURL: "https://new.example/callbacks/provision?trace=%ZZ&lifecycle_id=" + currentID,
 			wantErr:      true,
 		},
 		{
 			name:         "malformed persisted unrelated query fails closed",
-			callbackURL:  "https://old.example/callback?trace=x;y&operation_id=" + currentID,
+			callbackURL:  "https://old.example/callbacks/provision?trace=x;y&operation_id=" + currentID,
 			lifecycleURL: oldLifecycle,
 			requestedURL: newLifecycle,
 			wantErr:      true,
@@ -284,10 +372,11 @@ func TestValidateLifecycleCallbackURL(t *testing.T) {
 	const canonical = "550e8400-e29b-41d4-a716-446655440000"
 
 	for _, callbackURL := range []string{
-		"https://fred.example/callback",
-		"https://fred.example/callback?trace=keep&tenant=a%2Fb",
-		"https://fred.example/callback?trace=keep&lifecycle_id=" + canonical,
-		"https://fred.example/callback?lifecycle%5Fid=" + canonical + "&trace=keep",
+		"https://fred.example/callbacks/provision",
+		"https://fred.example/callbacks/provision?trace=keep&tenant=a%2Fb",
+		"https://fred.example/callbacks/provision?trace=%ff",
+		"https://fred.example/callbacks/provision?trace=keep&lifecycle_id=" + canonical,
+		"https://fred.example/callbacks/provision?lifecycle%5Fid=" + canonical + "&trace=keep",
 	} {
 		t.Run("accept "+callbackURL, func(t *testing.T) {
 			require.NoError(t, ValidateLifecycleCallbackURL(callbackURL))
@@ -298,18 +387,30 @@ func TestValidateLifecycleCallbackURL(t *testing.T) {
 		name        string
 		callbackURL string
 	}{
-		{name: "operation authority", callbackURL: "https://fred.example/callback?operation_id=" + canonical},
-		{name: "both authority kinds", callbackURL: "https://fred.example/callback?operation_id=" + canonical + "&lifecycle_id=" + canonical},
-		{name: "duplicate lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id=" + canonical + "&lifecycle_id=" + canonical},
-		{name: "encoded duplicate lifecycle key", callbackURL: "https://fred.example/callback?lifecycle_id=" + canonical + "&lifecycle%5Fid=" + canonical},
-		{name: "empty lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id="},
-		{name: "missing lifecycle value", callbackURL: "https://fred.example/callback?lifecycle_id"},
-		{name: "malformed lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id=not-a-uuid"},
-		{name: "uppercase lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id=" + strings.ToUpper(canonical)},
-		{name: "non-v4 lifecycle ID", callbackURL: "https://fred.example/callback?lifecycle_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
-		{name: "malformed encoded query key", callbackURL: "https://fred.example/callback?lifecycle%ZZid=" + canonical},
-		{name: "malformed unrelated query value", callbackURL: "https://fred.example/callback?trace=%ZZ&lifecycle_id=" + canonical},
-		{name: "semicolon in unrelated query value", callbackURL: "https://fred.example/callback?trace=x;y&lifecycle_id=" + canonical},
+		{name: "operation authority", callbackURL: "https://fred.example/callbacks/provision?operation_id=" + canonical},
+		{name: "both authority kinds", callbackURL: "https://fred.example/callbacks/provision?operation_id=" + canonical + "&lifecycle_id=" + canonical},
+		{name: "duplicate lifecycle ID", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id=" + canonical + "&lifecycle_id=" + canonical},
+		{name: "encoded duplicate lifecycle key", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id=" + canonical + "&lifecycle%5Fid=" + canonical},
+		{name: "empty lifecycle ID", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id="},
+		{name: "missing lifecycle value", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id"},
+		{name: "malformed lifecycle ID", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id=not-a-uuid"},
+		{name: "uppercase lifecycle ID", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id=" + strings.ToUpper(canonical)},
+		{name: "non-v4 lifecycle ID", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{name: "malformed encoded query key", callbackURL: "https://fred.example/callbacks/provision?lifecycle%ZZid=" + canonical},
+		{name: "malformed unrelated query value", callbackURL: "https://fred.example/callbacks/provision?trace=%ZZ&lifecycle_id=" + canonical},
+		{name: "semicolon in unrelated query value", callbackURL: "https://fred.example/callbacks/provision?trace=x;y&lifecycle_id=" + canonical},
+		{name: "raw space in unrelated query value", callbackURL: "https://fred.example/callbacks/provision?trace=a b&lifecycle_id=" + canonical},
+		{name: "raw backslash in unrelated query value", callbackURL: `https://fred.example/callbacks/provision?trace=a\b&lifecycle_id=` + canonical},
+		{name: "raw non-UTF-8 in unrelated query value", callbackURL: "https://fred.example/callbacks/provision?trace=" + string([]byte{0xff}) + "&lifecycle_id=" + canonical},
+		{name: "relative destination", callbackURL: "/callbacks/provision?lifecycle_id=" + canonical},
+		{name: "userinfo", callbackURL: "https://user@fred.example/callbacks/provision?lifecycle_id=" + canonical},
+		{name: "port-only authority", callbackURL: "https://:443/callbacks/provision?lifecycle_id=" + canonical},
+		{name: "invalid port", callbackURL: "https://fred.example:65536/callbacks/provision?lifecycle_id=" + canonical},
+		{name: "empty fragment marker", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id=" + canonical + "#"},
+		{name: "empty query marker", callbackURL: "https://fred.example/callbacks/provision?"},
+		{name: "dot path segment", callbackURL: "https://fred.example/api/../callbacks/provision?lifecycle_id=" + canonical},
+		{name: "encoded path separator", callbackURL: "https://fred.example/api%2Fcallback?lifecycle_id=" + canonical},
+		{name: "noncanonical path escape", callbackURL: "https://fred.example/%63allback?lifecycle_id=" + canonical},
 	}
 	for _, test := range invalid {
 		t.Run("reject "+test.name, func(t *testing.T) {
@@ -323,10 +424,11 @@ func TestValidateOperationCallbackURL(t *testing.T) {
 	const canonical = "550e8400-e29b-41d4-a716-446655440000"
 
 	for _, callbackURL := range []string{
-		"https://fred.example/callback",
-		"https://fred.example/callback?trace=keep&tenant=a%2Fb",
-		"https://fred.example/callback?trace=keep&operation_id=" + canonical,
-		"https://fred.example/callback?operation%5Fid=" + canonical + "&trace=keep",
+		"https://fred.example/callbacks/provision",
+		"https://fred.example/callbacks/provision?trace=keep&tenant=a%2Fb",
+		"https://fred.example/callbacks/provision?trace=%ff",
+		"https://fred.example/callbacks/provision?trace=keep&operation_id=" + canonical,
+		"https://fred.example/callbacks/provision?operation%5Fid=" + canonical + "&trace=keep",
 	} {
 		t.Run("accept "+callbackURL, func(t *testing.T) {
 			require.NoError(t, ValidateOperationCallbackURL(callbackURL))
@@ -337,18 +439,30 @@ func TestValidateOperationCallbackURL(t *testing.T) {
 		name        string
 		callbackURL string
 	}{
-		{name: "lifecycle authority", callbackURL: "https://fred.example/callback?lifecycle_id=" + canonical},
-		{name: "both authority kinds", callbackURL: "https://fred.example/callback?operation_id=" + canonical + "&lifecycle_id=" + canonical},
-		{name: "duplicate operation ID", callbackURL: "https://fred.example/callback?operation_id=" + canonical + "&operation_id=" + canonical},
-		{name: "encoded duplicate operation key", callbackURL: "https://fred.example/callback?operation_id=" + canonical + "&operation%5Fid=" + canonical},
-		{name: "empty operation ID", callbackURL: "https://fred.example/callback?operation_id="},
-		{name: "missing operation value", callbackURL: "https://fred.example/callback?operation_id"},
-		{name: "malformed operation ID", callbackURL: "https://fred.example/callback?operation_id=not-a-uuid"},
-		{name: "uppercase operation ID", callbackURL: "https://fred.example/callback?operation_id=" + strings.ToUpper(canonical)},
-		{name: "non-v4 operation ID", callbackURL: "https://fred.example/callback?operation_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
-		{name: "malformed encoded query key", callbackURL: "https://fred.example/callback?operation%ZZid=" + canonical},
-		{name: "malformed unrelated query value", callbackURL: "https://fred.example/callback?trace=%ZZ&operation_id=" + canonical},
-		{name: "semicolon in unrelated query value", callbackURL: "https://fred.example/callback?trace=x;y&operation_id=" + canonical},
+		{name: "lifecycle authority", callbackURL: "https://fred.example/callbacks/provision?lifecycle_id=" + canonical},
+		{name: "both authority kinds", callbackURL: "https://fred.example/callbacks/provision?operation_id=" + canonical + "&lifecycle_id=" + canonical},
+		{name: "duplicate operation ID", callbackURL: "https://fred.example/callbacks/provision?operation_id=" + canonical + "&operation_id=" + canonical},
+		{name: "encoded duplicate operation key", callbackURL: "https://fred.example/callbacks/provision?operation_id=" + canonical + "&operation%5Fid=" + canonical},
+		{name: "empty operation ID", callbackURL: "https://fred.example/callbacks/provision?operation_id="},
+		{name: "missing operation value", callbackURL: "https://fred.example/callbacks/provision?operation_id"},
+		{name: "malformed operation ID", callbackURL: "https://fred.example/callbacks/provision?operation_id=not-a-uuid"},
+		{name: "uppercase operation ID", callbackURL: "https://fred.example/callbacks/provision?operation_id=" + strings.ToUpper(canonical)},
+		{name: "non-v4 operation ID", callbackURL: "https://fred.example/callbacks/provision?operation_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{name: "malformed encoded query key", callbackURL: "https://fred.example/callbacks/provision?operation%ZZid=" + canonical},
+		{name: "malformed unrelated query value", callbackURL: "https://fred.example/callbacks/provision?trace=%ZZ&operation_id=" + canonical},
+		{name: "semicolon in unrelated query value", callbackURL: "https://fred.example/callbacks/provision?trace=x;y&operation_id=" + canonical},
+		{name: "raw space in unrelated query value", callbackURL: "https://fred.example/callbacks/provision?trace=a b&operation_id=" + canonical},
+		{name: "raw backslash in unrelated query value", callbackURL: `https://fred.example/callbacks/provision?trace=a\b&operation_id=` + canonical},
+		{name: "raw non-UTF-8 in unrelated query value", callbackURL: "https://fred.example/callbacks/provision?trace=" + string([]byte{0xff}) + "&operation_id=" + canonical},
+		{name: "relative destination", callbackURL: "/callbacks/provision?operation_id=" + canonical},
+		{name: "userinfo", callbackURL: "https://user@fred.example/callbacks/provision?operation_id=" + canonical},
+		{name: "port-only authority", callbackURL: "https://:443/callbacks/provision?operation_id=" + canonical},
+		{name: "invalid port", callbackURL: "https://fred.example:65536/callbacks/provision?operation_id=" + canonical},
+		{name: "empty fragment marker", callbackURL: "https://fred.example/callbacks/provision?operation_id=" + canonical + "#"},
+		{name: "empty query marker", callbackURL: "https://fred.example/callbacks/provision?"},
+		{name: "dot path segment", callbackURL: "https://fred.example/api/../callbacks/provision?operation_id=" + canonical},
+		{name: "encoded path separator", callbackURL: "https://fred.example/api%2Fcallback?operation_id=" + canonical},
+		{name: "noncanonical path escape", callbackURL: "https://fred.example/%63allback?operation_id=" + canonical},
 	}
 	for _, test := range invalid {
 		t.Run("reject "+test.name, func(t *testing.T) {
@@ -371,7 +485,7 @@ func TestHTTPClient_Provision_ValidationError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-validation",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -382,7 +496,7 @@ func TestHTTPClient_Provision_ValidationError(t *testing.T) {
 		Tenant:       "tenant-1",
 		ProviderUUID: "provider-1",
 		Items:        []LeaseItem{{SKU: "invalid-sku", Quantity: 1}},
-		CallbackURL:  "http://fred/callback",
+		CallbackURL:  "http://fred/callbacks/provision",
 	})
 
 	assert.ErrorIs(t, err, ErrValidation)
@@ -441,7 +555,7 @@ func TestHTTPClient_Provision_ValidationErrorCodes(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewHTTPClient(HTTPClientConfig{
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{
 				Name:    "test-codes",
 				BaseURL: server.URL,
 				Timeout: 5 * time.Second,
@@ -491,7 +605,7 @@ func TestHTTPClient_CapacityResponseRequiresCodedEnvelopeForRefusalProof(t *test
 				}))
 				defer server.Close()
 
-				client := NewHTTPClient(HTTPClientConfig{
+				client := newUnboundHTTPClientForTest(HTTPClientConfig{
 					Name: operationName + "-capacity-proof", BaseURL: server.URL, Timeout: time.Second,
 				})
 				var err error
@@ -547,7 +661,7 @@ func TestHTTPClient_MalformedErrorBody_IsNeverForwarded(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewHTTPClient(HTTPClientConfig{
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{
 				Name:    "test-malformed-400",
 				BaseURL: server.URL,
 				Timeout: 5 * time.Second,
@@ -593,7 +707,7 @@ func TestHTTPClient_ForeignJSONErrorBodyIsMalformed(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewHTTPClient(HTTPClientConfig{
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{
 				Name: "foreign-json", BaseURL: server.URL, Timeout: 5 * time.Second,
 			})
 			err := client.Provision(context.Background(), ProvisionRequest{LeaseUUID: "test"})
@@ -665,7 +779,7 @@ func TestHTTPClientRestore_UnreadableBodyIsNotBareStatus(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewHTTPClient(HTTPClientConfig{
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{
 				Name: "unreadable-body", BaseURL: server.URL, Timeout: 5 * time.Second,
 			})
 			err := client.Restore(context.Background(), RestoreRequest{
@@ -696,7 +810,7 @@ func TestHTTPClient_MalformedErrorBody_CountedAndLogged(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:                    "be-1",
 		BaseURL:                 server.URL,
 		Timeout:                 5 * time.Second,
@@ -784,7 +898,7 @@ func TestHTTPClient_Provision_ValidationError_DoesNotTripCircuitBreaker(t *testi
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-validation-cb",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -822,7 +936,7 @@ func TestHTTPClient_GetInfo(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test",
 		BaseURL: server.URL,
 	})
@@ -853,7 +967,7 @@ func TestHTTPClient_Deprovision(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test",
 		BaseURL: server.URL,
 	})
@@ -873,14 +987,14 @@ func TestHTTPClient_ListProvisions(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"provisions": []ProvisionInfo{
-				{LeaseUUID: "uuid-1", Status: ProvisionStatusReady},
-				{LeaseUUID: "uuid-2", Status: ProvisionStatusProvisioning},
+				{LeaseUUID: "018f47a2-8b1c-7def-8123-456789abcdef", Status: ProvisionStatusReady},
+				{LeaseUUID: "018f47a2-8b1c-7def-8123-456789abcdee", Status: ProvisionStatusProvisioning},
 			},
 		})
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test",
 		BaseURL: server.URL,
 	})
@@ -891,7 +1005,7 @@ func TestHTTPClient_ListProvisions(t *testing.T) {
 }
 
 func TestHTTPClient_Name(t *testing.T) {
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "my-backend",
 		BaseURL: "http://example.com",
 	})
@@ -908,7 +1022,7 @@ func TestHTTPClient_CircuitBreaker(t *testing.T) {
 	defer server.Close()
 
 	// Configure circuit breaker to trip after 3 failures with a short timeout
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-cb",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -956,7 +1070,7 @@ func TestHTTPClient_CircuitBreaker_Recovery(t *testing.T) {
 	defer server.Close()
 
 	// Configure circuit breaker to trip after 2 failures
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-cb-recovery",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -1002,7 +1116,7 @@ func TestHTTPClient_Health_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-health",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1018,7 +1132,7 @@ func TestHTTPClient_Health_Unhealthy(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-health-unhealthy",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1030,7 +1144,7 @@ func TestHTTPClient_Health_Unhealthy(t *testing.T) {
 }
 
 func TestHTTPClient_Health_ConnectionError(t *testing.T) {
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-health-conn-err",
 		BaseURL: "http://localhost:59999", // Unlikely to be in use
 		Timeout: 100 * time.Millisecond,
@@ -1047,7 +1161,7 @@ func TestHTTPClient_Health_ContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-health-ctx",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1073,7 +1187,7 @@ func TestHTTPClient_CircuitBreaker_NotProvisioned_DoesNotTrip(t *testing.T) {
 	defer server.Close()
 
 	// Configure circuit breaker to trip after 3 failures
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-cb-404",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -1113,7 +1227,7 @@ func TestHTTPClient_CircuitBreaker_404sResetFailureCount(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-cb-mixed",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -1142,7 +1256,7 @@ func TestHTTPClient_CircuitBreaker_ConsecutiveFailuresTrip(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-cb-consecutive",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -1180,7 +1294,7 @@ func TestHTTPClient_Provision_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1192,7 +1306,7 @@ func TestHTTPClient_Provision_WithHMAC(t *testing.T) {
 		Tenant:       "tenant-1",
 		ProviderUUID: "provider-1",
 		Items:        []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
-		CallbackURL:  "http://fred/callback",
+		CallbackURL:  "http://fred/callbacks/provision",
 	})
 	require.NoError(t, err)
 
@@ -1217,7 +1331,7 @@ func TestHTTPClient_Deprovision_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac-deprov",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1241,7 +1355,7 @@ func TestHTTPClient_Provision_NoHMAC_NoHeader(t *testing.T) {
 	defer server.Close()
 
 	// No Secret configured
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-no-hmac",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1252,7 +1366,7 @@ func TestHTTPClient_Provision_NoHMAC_NoHeader(t *testing.T) {
 		Tenant:       "tenant-1",
 		ProviderUUID: "provider-1",
 		Items:        []LeaseItem{{SKU: "gpu-a100", Quantity: 1}},
-		CallbackURL:  "http://fred/callback",
+		CallbackURL:  "http://fred/callbacks/provision",
 	})
 	require.NoError(t, err)
 
@@ -1272,7 +1386,7 @@ func TestHTTPClient_GetInfo_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac-getinfo",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1304,7 +1418,7 @@ func TestHTTPClient_ListProvisions_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac-listprov",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1333,7 +1447,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: server.URL})
 		got, err := client.LookupProvisions(context.Background(), []string{"uuid-1", "uuid-2"})
 		require.NoError(t, err)
 		require.Len(t, got, 1)
@@ -1342,7 +1456,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 	})
 
 	t.Run("rejects empty input", func(t *testing.T) {
-		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: "http://example.com"})
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: "http://example.com"})
 		_, err := client.LookupProvisions(context.Background(), nil)
 		assert.Error(t, err)
 		_, err = client.LookupProvisions(context.Background(), []string{})
@@ -1350,7 +1464,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 	})
 
 	t.Run("rejects over cap", func(t *testing.T) {
-		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: "http://example.com"})
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: "http://example.com"})
 		tooMany := make([]string, MaxLookupUUIDs+1)
 		for i := range tooMany {
 			tooMany[i] = "uuid"
@@ -1365,7 +1479,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: server.URL})
 		got, err := client.LookupProvisions(context.Background(), []string{"uuid-1"})
 		require.NoError(t, err)
 		assert.Nil(t, got)
@@ -1377,7 +1491,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: server.URL})
 		_, err := client.LookupProvisions(context.Background(), []string{"uuid-1"})
 		assert.Error(t, err)
 	})
@@ -1395,7 +1509,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name: "test-hmac-lookup", BaseURL: server.URL, Timeout: 5 * time.Second, Secret: secret,
 		})
 
@@ -1415,7 +1529,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: server.URL})
 		_, err := client.LookupProvisions(context.Background(), []string{"uuid-3", "uuid-1", "uuid-2"})
 		require.NoError(t, err)
 		_, err = client.LookupProvisions(context.Background(), []string{"uuid-1", "uuid-3", "uuid-2"})
@@ -1433,7 +1547,7 @@ func TestHTTPClient_LookupProvisions(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: server.URL})
 		input := []string{"uuid-3", "uuid-1", "uuid-2"}
 		original := append([]string(nil), input...)
 		_, err := client.LookupProvisions(context.Background(), input)
@@ -1452,7 +1566,7 @@ func TestHTTPClient_GetInfo_NoHMAC_NoHeader(t *testing.T) {
 	defer server.Close()
 
 	// No Secret configured
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-no-hmac-getinfo",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1479,7 +1593,7 @@ func TestHTTPClient_Restart(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-restart",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1487,11 +1601,11 @@ func TestHTTPClient_Restart(t *testing.T) {
 
 	err := client.Restart(context.Background(), RestartRequest{
 		LeaseUUID:   "lease-restart-1",
-		CallbackURL: "http://fred/callback",
+		CallbackURL: "http://fred/callbacks/provision",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "lease-restart-1", receivedReq.LeaseUUID)
-	assert.Equal(t, "http://fred/callback", receivedReq.CallbackURL)
+	assert.Equal(t, "http://fred/callbacks/provision", receivedReq.CallbackURL)
 }
 
 func TestHTTPClient_Restart_NotProvisioned(t *testing.T) {
@@ -1500,7 +1614,7 @@ func TestHTTPClient_Restart_NotProvisioned(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-restart-404",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1516,7 +1630,7 @@ func TestHTTPClient_Restart_InvalidState(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-restart-409",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1532,7 +1646,7 @@ func TestHTTPClient_Restart_ServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-restart-500",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1559,7 +1673,7 @@ func TestHTTPClient_Restart_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac-restart",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1568,7 +1682,7 @@ func TestHTTPClient_Restart_WithHMAC(t *testing.T) {
 
 	err := client.Restart(context.Background(), RestartRequest{
 		LeaseUUID:   "lease-hmac-restart",
-		CallbackURL: "http://fred/callback",
+		CallbackURL: "http://fred/callbacks/provision",
 	})
 	require.NoError(t, err)
 
@@ -1592,7 +1706,7 @@ func TestHTTPClient_ReconcileCustomDomain(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-reconcile",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1620,7 +1734,7 @@ func TestHTTPClient_ReconcileCustomDomain_AcceptsAccepted(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-reconcile-202",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1639,7 +1753,7 @@ func TestHTTPClient_ReconcileCustomDomain_NotProvisioned(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-reconcile-404",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1657,7 +1771,7 @@ func TestHTTPClient_ReconcileCustomDomain_InvalidState(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-reconcile-409",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1673,7 +1787,7 @@ func TestHTTPClient_ReconcileCustomDomain_ServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-reconcile-500",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1700,7 +1814,7 @@ func TestHTTPClient_ReconcileCustomDomain_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac-reconcile",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1730,7 +1844,7 @@ func TestHTTPClient_Update(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-update",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1738,7 +1852,7 @@ func TestHTTPClient_Update(t *testing.T) {
 
 	err := client.Update(context.Background(), UpdateRequest{
 		LeaseUUID:   "lease-update-1",
-		CallbackURL: "http://fred/callback",
+		CallbackURL: "http://fred/callbacks/provision",
 		Payload:     []byte("base64-manifest"),
 		PayloadHash: "sha256-hash",
 	})
@@ -1753,7 +1867,7 @@ func TestHTTPClient_Update_NotProvisioned(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-update-404",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1769,7 +1883,7 @@ func TestHTTPClient_Update_InvalidState(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-update-409",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1790,7 +1904,7 @@ func TestHTTPClient_Update_ValidationError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-update-400",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1807,7 +1921,7 @@ func TestHTTPClient_Update_ServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-update-500",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1834,7 +1948,7 @@ func TestHTTPClient_Update_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac-update",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1843,7 +1957,7 @@ func TestHTTPClient_Update_WithHMAC(t *testing.T) {
 
 	err := client.Update(context.Background(), UpdateRequest{
 		LeaseUUID:   "lease-hmac-update",
-		CallbackURL: "http://fred/callback",
+		CallbackURL: "http://fred/callbacks/provision",
 		Payload:     []byte("manifest-data"),
 	})
 	require.NoError(t, err)
@@ -1871,7 +1985,7 @@ func TestHTTPClient_GetReleases(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-releases",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1888,13 +2002,51 @@ func TestHTTPClient_GetReleases(t *testing.T) {
 	assert.Equal(t, "active", releases[1].Status)
 }
 
+func TestHTTPClient_GetReleases_DefaultLimitExceedsLegacyEightMiBCliff(t *testing.T) {
+	manifest := bytes.Repeat([]byte{'x'}, 900_000)
+	want := make([]ReleaseInfo, 7)
+	for i := range want {
+		want[i] = ReleaseInfo{
+			Version:   i + 1,
+			Image:     "example.invalid/workload:latest",
+			Status:    "superseded",
+			CreatedAt: time.Unix(int64(i+1), 0).UTC(),
+			Manifest:  manifest,
+		}
+	}
+	body, err := json.Marshal(want)
+	require.NoError(t, err)
+	// Backend handlers use json.Encoder, whose trailing newline is part of the
+	// response-body ceiling even though it is not part of the stored history.
+	body = append(body, '\n')
+	require.Greater(t, int64(len(body)), int64(8<<20))
+	require.LessOrEqual(t, int64(len(body)), DefaultMaxReleasesBytes)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
+		Name:    "test-default-release-history-limit",
+		BaseURL: server.URL,
+		Timeout: 5 * time.Second,
+	})
+
+	got, err := client.GetReleases(context.Background(), "lease-large-history")
+	require.NoError(t, err)
+	require.Len(t, got, len(want))
+	require.Equal(t, manifest, got[len(got)-1].Manifest)
+}
+
 func TestHTTPClient_GetReleases_NotProvisioned(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-releases-404",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1910,7 +2062,7 @@ func TestHTTPClient_GetReleases_ServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-releases-500",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1928,7 +2080,7 @@ func TestHTTPClient_GetReleases_EmptyList(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-releases-empty",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -1952,7 +2104,7 @@ func TestHTTPClient_GetReleases_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac-releases",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -2024,7 +2176,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:         "test-size-info",
 			BaseURL:      server.URL,
 			Timeout:      5 * time.Second,
@@ -2045,7 +2197,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:              "test-size-provision",
 			BaseURL:           server.URL,
 			Timeout:           5 * time.Second,
@@ -2065,7 +2217,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:               "test-size-provisions",
 			BaseURL:            server.URL,
 			Timeout:            5 * time.Second,
@@ -2085,7 +2237,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:                     "test-size-lookup",
 			BaseURL:                  server.URL,
 			Timeout:                  5 * time.Second,
@@ -2105,7 +2257,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:         "test-size-logs",
 			BaseURL:      server.URL,
 			Timeout:      5 * time.Second,
@@ -2125,7 +2277,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:             "test-size-releases",
 			BaseURL:          server.URL,
 			Timeout:          5 * time.Second,
@@ -2143,7 +2295,7 @@ func TestHTTPClient_ResponseSizeLimits(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:         "test-size-ok",
 			BaseURL:      server.URL,
 			Timeout:      5 * time.Second,
@@ -2165,7 +2317,7 @@ func TestPositiveOr(t *testing.T) {
 }
 
 func TestNewHTTPClient_NegativeLimitsNormalized(t *testing.T) {
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:               "test-negative-limits",
 		BaseURL:            "http://example.com",
 		MaxInfoBytes:       -1,
@@ -2184,7 +2336,7 @@ func TestNewHTTPClient_NegativeLimitsNormalized(t *testing.T) {
 
 func TestRecordMetrics_NilCollectors(t *testing.T) {
 	t.Run("both nil — no panic", func(t *testing.T) {
-		client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: "http://localhost"})
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: "http://localhost"})
 		assert.NotPanics(t, func() {
 			client.recordMetrics("provision", time.Now(), nil)
 			client.recordMetrics("deprovision", time.Now(), assert.AnError)
@@ -2197,7 +2349,7 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 			Help: "test",
 		}, []string{"backend", "operation", "status"})
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:            "test",
 			BaseURL:         "http://localhost",
 			RequestDuration: hist,
@@ -2215,7 +2367,7 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 			Help: "test",
 		}, []string{"backend", "operation", "status"})
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:          "test",
 			BaseURL:       "http://localhost",
 			RequestsTotal: counter,
@@ -2236,7 +2388,7 @@ func TestRecordMetrics_NilCollectors(t *testing.T) {
 			Help: "test",
 		}, []string{"backend", "operation", "status"})
 
-		client := NewHTTPClient(HTTPClientConfig{
+		client := newUnboundHTTPClientForTest(HTTPClientConfig{
 			Name:            "test",
 			BaseURL:         "http://localhost",
 			RequestDuration: hist,
@@ -2362,7 +2514,7 @@ func TestNormalizeProvisionRequest_AcceptsSingleNamedItem(t *testing.T) {
 
 func TestNewHTTPClient_AppliesTLSClientConfig(t *testing.T) {
 	sentinel := &tls.Config{MinVersion: tls.VersionTLS13}
-	c := NewHTTPClient(HTTPClientConfig{
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "tls-backend",
 		BaseURL:         "https://backend.example:9001",
 		TLSClientConfig: sentinel,
@@ -2373,7 +2525,7 @@ func TestNewHTTPClient_AppliesTLSClientConfig(t *testing.T) {
 }
 
 func TestNewHTTPClient_NoTLSConfig_LeavesTransportDefault(t *testing.T) {
-	c := NewHTTPClient(HTTPClientConfig{Name: "plain", BaseURL: "http://backend:9001"})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "plain", BaseURL: "http://backend:9001"})
 	tr, ok := c.httpClient.Transport.(*http.Transport)
 	require.True(t, ok)
 	require.Nil(t, tr.TLSClientConfig)
@@ -2387,7 +2539,7 @@ func TestHTTPClient_GetLoadStats(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: server.URL})
 
 	stats, err := client.GetLoadStats(context.Background())
 	require.NoError(t, err)
@@ -2490,7 +2642,7 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewHTTPClient(HTTPClientConfig{
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{
 				Name:    "test-restore-status",
 				BaseURL: server.URL,
 				Timeout: 5 * time.Second,
@@ -2500,7 +2652,7 @@ func TestHTTPClientRestore_StatusMapping(t *testing.T) {
 				LeaseUUID:     "new-lease-1",
 				FromLeaseUUID: "old-lease-1",
 				Tenant:        "tenant-1",
-				CallbackURL:   "http://fred/callback",
+				CallbackURL:   "http://fred/callbacks/provision",
 			})
 
 			if tt.wantNil {
@@ -2564,7 +2716,7 @@ func TestHTTPClientRestore_ValidationCodeRoundTrips(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewHTTPClient(HTTPClientConfig{
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{
 				Name:    "test-restore-validation-code",
 				BaseURL: server.URL,
 				Timeout: 5 * time.Second,
@@ -2574,7 +2726,7 @@ func TestHTTPClientRestore_ValidationCodeRoundTrips(t *testing.T) {
 				LeaseUUID:     "new-lease-1",
 				FromLeaseUUID: "old-lease-1",
 				Tenant:        "tenant-1",
-				CallbackURL:   "http://fred/callback",
+				CallbackURL:   "http://fred/callbacks/provision",
 			})
 
 			assert.ErrorIs(t, err, tt.wantSentinel)
@@ -2590,7 +2742,7 @@ func TestHTTPClientRestore_500TripsBreaker(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-restore-500-cb",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -2602,7 +2754,7 @@ func TestHTTPClientRestore_500TripsBreaker(t *testing.T) {
 		LeaseUUID:     "new-lease-1",
 		FromLeaseUUID: "old-lease-1",
 		Tenant:        "t",
-		CallbackURL:   "http://fred/callback",
+		CallbackURL:   "http://fred/callbacks/provision",
 	}
 
 	// First 3 calls should reach the server
@@ -2630,7 +2782,7 @@ func TestHTTPClientRestore_422DoesNotTripBreaker(t *testing.T) {
 
 	// Set a low threshold to make any tripping obvious.
 	const threshold = 3
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-restore-422-cb",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -2641,7 +2793,7 @@ func TestHTTPClientRestore_422DoesNotTripBreaker(t *testing.T) {
 		LeaseUUID:     "new-lease-1",
 		FromLeaseUUID: "old-lease-1",
 		Tenant:        "t",
-		CallbackURL:   "http://fred/callback",
+		CallbackURL:   "http://fred/callbacks/provision",
 	}
 
 	// Make more requests than the threshold — circuit must stay closed.
@@ -2672,7 +2824,7 @@ func TestHTTPClientRestore_DemoteExceedsTier_DoesNotTripBreaker(t *testing.T) {
 
 	// Set a low threshold to make any tripping obvious.
 	const threshold = 3
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:            "test-restore-demote-cb",
 		BaseURL:         server.URL,
 		Timeout:         5 * time.Second,
@@ -2683,7 +2835,7 @@ func TestHTTPClientRestore_DemoteExceedsTier_DoesNotTripBreaker(t *testing.T) {
 		LeaseUUID:     "new-lease-1",
 		FromLeaseUUID: "old-lease-1",
 		Tenant:        "t",
-		CallbackURL:   "http://fred/callback",
+		CallbackURL:   "http://fred/callbacks/provision",
 	}
 
 	// Make more requests than the threshold — circuit must stay closed.
@@ -2714,7 +2866,7 @@ func TestHTTPClientRestore_WithHMAC(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name:    "test-hmac-restore",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -2725,8 +2877,8 @@ func TestHTTPClientRestore_WithHMAC(t *testing.T) {
 		LeaseUUID:            "new-lease-hmac",
 		FromLeaseUUID:        "old-lease-hmac",
 		Tenant:               "tenant-1",
-		CallbackURL:          "http://fred/callback?operation_id=550e8400-e29b-41d4-a716-446655440000",
-		LifecycleCallbackURL: "http://fred/callback",
+		CallbackURL:          "http://fred/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+		LifecycleCallbackURL: "http://fred/callbacks/provision",
 	})
 	require.NoError(t, err)
 
@@ -2735,25 +2887,25 @@ func TestHTTPClientRestore_WithHMAC(t *testing.T) {
 	assert.NoError(t, err, "HMAC signature should verify successfully")
 	var receivedReq RestoreRequest
 	require.NoError(t, json.Unmarshal(capturedBody, &receivedReq))
-	assert.Equal(t, "http://fred/callback?operation_id=550e8400-e29b-41d4-a716-446655440000", receivedReq.CallbackURL)
-	assert.Equal(t, "http://fred/callback", receivedReq.LifecycleCallbackURL)
+	assert.Equal(t, "http://fred/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000", receivedReq.CallbackURL)
+	assert.Equal(t, "http://fred/callbacks/provision", receivedReq.LifecycleCallbackURL)
 }
 
 func TestHTTPClient_ListRetentions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/retentions", r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"retentions":[{"lease_uuid":"lease-a"},{"lease_uuid":"lease-b"}]}`))
+		_, _ = w.Write([]byte(`{"retentions":[{"lease_uuid":"018f47a2-8b1c-7def-8123-456789abcdef"},{"lease_uuid":"018f47a2-8b1c-7def-8123-456789abcdee"}]}`))
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: server.URL})
 
 	got, err := client.ListRetentions(context.Background())
 	require.NoError(t, err)
 	require.Len(t, got, 2)
-	assert.Equal(t, "lease-a", got[0].LeaseUUID)
-	assert.Equal(t, "lease-b", got[1].LeaseUUID)
+	assert.Equal(t, "018f47a2-8b1c-7def-8123-456789abcdef", got[0].LeaseUUID)
+	assert.Equal(t, "018f47a2-8b1c-7def-8123-456789abcdee", got[1].LeaseUUID)
 }
 
 func TestHTTPClient_ListRetentions_Empty(t *testing.T) {
@@ -2762,20 +2914,20 @@ func TestHTTPClient_ListRetentions_Empty(t *testing.T) {
 		_, _ = w.Write([]byte(`{"retentions":[]}`))
 	}))
 	defer server.Close()
-	client := NewHTTPClient(HTTPClientConfig{Name: "test", BaseURL: server.URL})
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "test", BaseURL: server.URL})
 	got, err := client.ListRetentions(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }
 
 func TestNewHTTPClient_ProvisionsPageLimitDefault(t *testing.T) {
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com"})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: "http://example.com"})
 	assert.Equal(t, DefaultProvisionsPageLimit, c.provisionsPageLimit, "zero config falls back to default")
 
-	c2 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: 250})
+	c2 := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: 250})
 	assert.Equal(t, 250, c2.provisionsPageLimit, "explicit config is honored")
 
-	c3 := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: -5})
+	c3 := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: "http://example.com", ProvisionsPageLimit: -5})
 	assert.Equal(t, DefaultProvisionsPageLimit, c3.provisionsPageLimit, "negative config falls back to default (never sent as limit=-5)")
 }
 
@@ -2783,11 +2935,30 @@ func TestHTTPClient_ListProvisions_EmptyIsNonNil(t *testing.T) {
 	server := pagingProvisionServer(t, nil) // empty backend
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
 	got, err := c.ListProvisions(context.Background())
 	require.NoError(t, err)
 	assert.NotNil(t, got, "empty backend must yield a non-nil [] (preserves the pre-pagination contract)")
 	assert.Empty(t, got)
+}
+
+func TestHTTPClient_ListProvisions_RejectsMissingOrNullArray(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing": `{}`,
+		"null":    `{"provisions":null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+			_, err := client.ListProvisions(context.Background())
+			require.ErrorContains(t, err, "non-null provisions array")
+		})
+	}
 }
 
 // pagingProvisionServer serves /provisions using the real PaginateProvisions
@@ -2815,7 +2986,7 @@ func pagingProvisionServer(t *testing.T, all []ProvisionInfo) *httptest.Server {
 // ParsePageParams validates as a UUID — so the IDs in these
 // end-to-end tests must be real UUIDs (zero-padded so lexical == numeric order).
 func provUUID(i int) string {
-	return fmt.Sprintf("%08d-0000-0000-0000-000000000000", i)
+	return fmt.Sprintf("%08d-0000-0000-0000-000000000000", i+1)
 }
 
 func manyProvisions(n int) []ProvisionInfo {
@@ -2831,7 +3002,7 @@ func TestHTTPClient_ListProvisions_ReassemblesAllPages(t *testing.T) {
 	server := pagingProvisionServer(t, all)
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
 	got, err := c.ListProvisions(context.Background())
 	require.NoError(t, err)
 	require.Len(t, got, 2500)
@@ -2849,7 +3020,7 @@ func TestHTTPClient_ListProvisions_SmallPageLimit(t *testing.T) {
 	server := pagingProvisionServer(t, all)
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
 	got, err := c.ListProvisions(context.Background())
 	require.NoError(t, err)
 	assert.Len(t, got, 25)
@@ -2866,7 +3037,7 @@ func TestHTTPClient_ListProvisions_NonAdvancingContinueErrors(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
 	_, err := c.ListProvisions(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "non-advancing")
@@ -2884,7 +3055,7 @@ func TestHTTPClient_ListProvisions_PerPageTooLargeErrors(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, MaxProvisionsBytes: 64 << 10}) // 64 KiB per page
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL, MaxProvisionsBytes: 64 << 10}) // 64 KiB per page
 	_, err := c.ListProvisions(context.Background())
 	require.Error(t, err, "an oversized page errors (fail-closed), not silent truncation")
 }
@@ -2894,12 +3065,12 @@ func TestHTTPClient_ListProvisions_BackCompatSinglePageNoContinue(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"provisions": []ProvisionInfo{{LeaseUUID: "a"}, {LeaseUUID: "b"}},
+			"provisions": []ProvisionInfo{{LeaseUUID: provUUID(0)}, {LeaseUUID: provUUID(1)}},
 		})
 	}))
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
 	got, err := c.ListProvisions(context.Background())
 	require.NoError(t, err)
 	assert.Len(t, got, 2, "no continue field => stop after one page")
@@ -2913,18 +3084,54 @@ func TestHTTPClient_ListProvisions_ContinuesOnShortNonFinalPage(t *testing.T) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
 		if calls == 1 {
-			_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{{LeaseUUID: "a"}}, Continue: "a"})
+			_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{{LeaseUUID: provUUID(0)}}, Continue: provUUID(0)})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{{LeaseUUID: "b"}}, Continue: ""})
+		_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: []ProvisionInfo{{LeaseUUID: provUUID(1)}}, Continue: ""})
 	}))
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
 	got, err := c.ListProvisions(context.Background())
 	require.NoError(t, err)
 	require.Len(t, got, 2)
-	assert.Equal(t, []string{"a", "b"}, []string{got[0].LeaseUUID, got[1].LeaseUUID})
+	assert.Equal(t, []string{provUUID(0), provUUID(1)}, []string{got[0].LeaseUUID, got[1].LeaseUUID})
+}
+
+func TestHTTPClient_ListProvisionsRejectsMalformedOrDuplicateLeaseIdentity(t *testing.T) {
+	tests := []struct {
+		name       string
+		provisions []ProvisionInfo
+		want       string
+	}{
+		{
+			name:       "non-canonical",
+			provisions: []ProvisionInfo{{LeaseUUID: "not-a-canonical-uuid"}},
+			want:       "non-canonical lease UUID",
+		},
+		{
+			name: "duplicate",
+			provisions: []ProvisionInfo{
+				{LeaseUUID: provUUID(1)},
+				{LeaseUUID: provUUID(1)},
+			},
+			want: "duplicate lease UUID",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(ListProvisionsResponse{Provisions: test.provisions})
+			}))
+			defer server.Close()
+
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL})
+			got, err := client.ListProvisions(t.Context())
+			require.ErrorContains(t, err, test.want)
+			assert.Nil(t, got, "malformed inventory must never return a partial projection input")
+		})
+	}
 }
 
 // Producer that errors on the 2nd page exercises complete-or-error end to end.
@@ -2944,7 +3151,7 @@ func TestHTTPClient_ListProvisions_PageErrorAborts(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
 	_, err := c.ListProvisions(context.Background())
 	require.Error(t, err, "a failed page aborts the whole fetch (complete-or-error)")
 }
@@ -2976,7 +3183,7 @@ func TestHTTPClient_ListProvisions_ToleratesMidFetchDeletion(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewHTTPClient(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
+	c := newUnboundHTTPClientForTest(HTTPClientConfig{Name: "t", BaseURL: server.URL, ProvisionsPageLimit: 10})
 	got, err := c.ListProvisions(context.Background())
 	require.NoError(t, err)
 
@@ -3014,7 +3221,7 @@ func TestHTTPClientRestore_UnrecognizedCodeRelaysBackendMessage(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewHTTPClient(HTTPClientConfig{
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{
 				Name: "relay", BaseURL: server.URL, Timeout: 5 * time.Second,
 			})
 			err := client.Restore(context.Background(), RestoreRequest{
@@ -3048,7 +3255,7 @@ func TestHTTPClientRestore_UnrecognizedCodeIsNotAMalformedBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name: "be-1", BaseURL: server.URL, Timeout: 5 * time.Second,
 		MalformedErrorBodyTotal: counter,
 	})
@@ -3092,7 +3299,7 @@ func TestHTTPClientRestore_UnrecognizedCodeDoesNotTripBreaker(t *testing.T) {
 	defer server.Close()
 
 	const threshold = 3
-	client := NewHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name: "skew", BaseURL: server.URL, Timeout: 5 * time.Second, CBFailureThresh: threshold,
 	})
 

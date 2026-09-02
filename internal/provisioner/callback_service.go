@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
@@ -20,14 +22,19 @@ import (
 const retainedLeaseNotice = "your lease data was retained and can be restored within the grace window: create a fresh PENDING lease of matching shape, then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID"
 
 var (
-	errCallbackSettlementClaimTimeout  = errors.New("timed out waiting for callback settlement claim")
-	errCallbackOperationsUnavailable   = errors.New("backend callback operation registry is unavailable")
-	errCallbackChainUnavailable        = errors.New("backend callback chain client is unavailable")
-	errCallbackAcknowledgerUnavailable = errors.New("backend callback acknowledger is unavailable")
-	errCallbackPlacementUnavailable    = errors.New("backend callback placement authority is unavailable")
-	errCallbackLifecycleUnavailable    = errors.New("backend callback lifecycle authority is unavailable")
-	errCallbackSettlementLost          = errors.New("backend callback lost its operation settlement claim")
-	errInvalidCallbackCommand          = errors.New("backend callback command was not constructed by NewCallbackCommand")
+	errCallbackSettlementClaimTimeout     = errors.New("timed out waiting for callback settlement claim")
+	errCallbackOperationsUnavailable      = errors.New("backend callback operation registry is unavailable")
+	errCallbackChainUnavailable           = errors.New("backend callback chain client is unavailable")
+	errCallbackAcknowledgerUnavailable    = errors.New("backend callback acknowledger is unavailable")
+	errCallbackPlacementUnavailable       = errors.New("backend callback placement authority is unavailable")
+	errCallbackLifecycleUnavailable       = errors.New("backend callback lifecycle authority is unavailable")
+	errCallbackSettlementLost             = errors.New("backend callback lost its operation settlement claim")
+	errCallbackRecoveryLeaseBusy          = errors.New("backend callback recovery lease is busy")
+	errCallbackStorageIdentityUnavailable = errors.New("backend callback storage identity authority is unavailable")
+	errCallbackStorageIdentityMissing     = errors.New("backend callback storage identity is required")
+	errCallbackStorageIdentityMismatch    = errors.New("backend callback storage identity does not match placement authority")
+	errCallbackStorageIdentityUnbound     = errors.New("backend callback storage identity is not durably bound")
+	errInvalidCallbackCommand             = errors.New("backend callback command was not constructed by NewCallbackCommand")
 )
 
 type callbackLeaseClass uint8
@@ -40,13 +47,14 @@ const (
 )
 
 // classifyCallbackLease interprets an exact lease read for callback
-// settlement. Absence is terminal for the process-local operation: there is no
-// chain lease left for this callback to mutate. Unknown enum values remain
-// retryable so a provider built against an older chain cannot guess that a new
-// state is safe to settle.
+// settlement. A nil result is unknown rather than terminal: x/billing retains
+// terminal leases, so absence can mean an RPC node is behind, reset, or pointed
+// at the wrong chain. Only a positively observed terminal state may retire
+// durable operation/payload evidence. Unknown enum values likewise remain
+// retryable so an older provider cannot guess that a new state is safe.
 func classifyCallbackLease(lease *billingtypes.Lease) callbackLeaseClass {
 	if lease == nil {
-		return callbackLeaseTerminal
+		return callbackLeaseUnknown
 	}
 
 	switch lease.State {
@@ -98,6 +106,7 @@ type CallbackCommand struct {
 	retained    bool
 	operationID operation.OperationID
 	lifecycleID lifecycle.ID
+	storageID   backendidentity.ID
 	selector    callbackSelectorKind
 	valid       bool
 }
@@ -119,6 +128,19 @@ const (
 // the HTTP boundary rejects every explicitly present malformed value before
 // this constructor is called.
 func NewCallbackCommand(callback backend.CallbackPayload) (CallbackCommand, error) {
+	if callback.LeaseUUID == "" {
+		return CallbackCommand{}, errors.New("callback lease UUID is required")
+	}
+	switch callback.Status {
+	case backend.CallbackStatusSuccess,
+		backend.CallbackStatusFailed,
+		backend.CallbackStatusDeprovisioned:
+	default:
+		return CallbackCommand{}, fmt.Errorf("invalid callback status %q", callback.Status)
+	}
+	if callback.Retained && callback.Status != backend.CallbackStatusDeprovisioned {
+		return CallbackCommand{}, errors.New("callback retained flag requires deprovisioned status")
+	}
 	command := CallbackCommand{
 		leaseUUID:   callback.LeaseUUID,
 		status:      callback.Status,
@@ -127,6 +149,13 @@ func NewCallbackCommand(callback backend.CallbackPayload) (CallbackCommand, erro
 		retained:    callback.Retained,
 		selector:    callbackSelectorLegacy,
 		valid:       true,
+	}
+	if callback.BackendStorageID != "" {
+		storageID, err := backendidentity.Parse(callback.BackendStorageID)
+		if err != nil {
+			return CallbackCommand{}, fmt.Errorf("parse callback backend storage identity: %w", err)
+		}
+		command.storageID = storageID
 	}
 	if callback.OperationID != "" && callback.LifecycleID != "" {
 		return CallbackCommand{}, errors.New("callback carries both operation and lifecycle authority")
@@ -138,6 +167,11 @@ func NewCallbackCommand(callback backend.CallbackPayload) (CallbackCommand, erro
 		id, err := operation.ParseID(callback.OperationID)
 		if err != nil {
 			return CallbackCommand{}, fmt.Errorf("parse callback operation ID: %w", err)
+		}
+		if callback.Status == backend.CallbackStatusDeprovisioned {
+			return CallbackCommand{}, errors.New(
+				"deprovisioned callback requires lifecycle or legacy authority",
+			)
 		}
 		command.operationID = id
 		command.selector = callbackSelectorOperation
@@ -161,6 +195,8 @@ type CallbackOperations interface {
 	TryClaimCallback(string, operation.OperationID) operation.SettlementResult
 	ReleaseSettlement(operation.SettlementClaim) bool
 	FinishSettlement(operation.SettlementClaim) bool
+	TryClaimCallbackRecoveryLease(string) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
 }
 
 // CallbackChain is the chain read/write surface used by failure settlement.
@@ -170,12 +206,29 @@ type CallbackChain interface {
 }
 
 // CallbackPlacement is the durable placement surface used at callback time.
-// Both methods require the exact typed operation identity persisted before the
-// backend call, so a delayed same-backend callback cannot settle a newer
-// attempt.
+// The operation methods settle callbacks whose process-local registry record
+// is still present. ClaimAttempt is the restart/ambiguous-outcome recovery
+// boundary: it derives the backend from the exact durable attempt or promoted
+// lifecycle generation and returns an exclusive revision-bound capability that
+// fences inventory until chain and placement settlement complete. Recovery
+// callers acquire the Registry lease capability first; every provisioning,
+// restore, reconciliation, and deprovision competitor uses that same global
+// Registry-before-placement order.
 type CallbackPlacement interface {
 	ConfirmOperation(string, string, operation.OperationID) (bool, error)
 	RefuseOperation(string, string, operation.OperationID) (bool, error)
+	ClaimAttempt(string, operation.OperationID) (placement.AttemptClaim, bool, error)
+	ReleaseAttemptClaim(placement.AttemptClaim) bool
+	ConfirmClaimedAttempt(placement.AttemptClaim) (bool, error)
+	RefuseClaimedAttempt(placement.AttemptClaim) (bool, error)
+}
+
+// CallbackStorageIdentityAuthority resolves the immutable physical-storage
+// lineage pinned to an active backend name. Callback body metadata is never
+// allowed to select the name; it can only prove it came from the lineage
+// already selected by an exact operation or lifecycle capability.
+type CallbackStorageIdentityAuthority interface {
+	ExpectedBackendStorageIdentity(string) (backendidentity.ID, bool)
 }
 
 // CallbackLifecycleAuthority is the durable, revocable authority for
@@ -228,15 +281,16 @@ func (observe callbackDeprovisionObserverFunc) ObserveCallbackDeprovisioned(
 	observe(leaseUUID, backendName)
 }
 
-// CallbackServiceConfig wires the callback application service. Operations is
-// mandatory. Other capabilities are checked at the first path that needs them,
-// which permits status-only callbacks during partial startup and keeps missing
-// mutation authority fail-closed.
+// CallbackServiceConfig wires the callback application service. Operations,
+// Chain, Acknowledger, Placement, StorageIdentities, and LifecycleAuthority are
+// mandatory: a production service cannot be constructed without every durable
+// or security authority needed by one arm of the tagged callback protocol.
 type CallbackServiceConfig struct {
 	Operations          CallbackOperations
 	Chain               CallbackChain
 	Acknowledger        Acknowledger
 	Placement           CallbackPlacement
+	StorageIdentities   CallbackStorageIdentityAuthority
 	LifecycleAuthority  CallbackLifecycleAuthority
 	Payloads            CallbackPayloadStore
 	Events              CallbackEventSink
@@ -253,6 +307,7 @@ type CallbackService struct {
 	chain               CallbackChain
 	acknowledger        Acknowledger
 	placement           CallbackPlacement
+	storageIdentities   CallbackStorageIdentityAuthority
 	lifecycleAuthority  CallbackLifecycleAuthority
 	payloads            CallbackPayloadStore
 	events              CallbackEventSink
@@ -262,12 +317,32 @@ type CallbackService struct {
 	claimMaxWait        time.Duration
 }
 
-// NewCallbackService constructs a callback application service. The operation
-// registry is mandatory even though an authorized lifecycle observation need
-// not have an in-flight operation: one composed service owns both sides of the
-// tagged callback union, and exact settlement can never fall back to lease-only
-// or body-supplied identity.
+// NewCallbackService constructs the fully composed production callback
+// application. One service owns both arms of the tagged callback union, and it
+// cannot fall back to lease-only, body-supplied, or unauthenticated identity.
 func NewCallbackService(cfg CallbackServiceConfig) (*CallbackService, error) {
+	if util.IsNilInterface(cfg.Operations) {
+		return nil, errCallbackOperationsUnavailable
+	}
+	if util.IsNilInterface(cfg.Chain) {
+		return nil, errCallbackChainUnavailable
+	}
+	if util.IsNilInterface(cfg.Acknowledger) {
+		return nil, errCallbackAcknowledgerUnavailable
+	}
+	if util.IsNilInterface(cfg.Placement) {
+		return nil, errCallbackPlacementUnavailable
+	}
+	if util.IsNilInterface(cfg.StorageIdentities) {
+		return nil, errCallbackStorageIdentityUnavailable
+	}
+	if util.IsNilInterface(cfg.LifecycleAuthority) {
+		return nil, errCallbackLifecycleUnavailable
+	}
+	return newCallbackService(cfg)
+}
+
+func newCallbackService(cfg CallbackServiceConfig) (*CallbackService, error) {
 	if util.IsNilInterface(cfg.Operations) {
 		return nil, errCallbackOperationsUnavailable
 	}
@@ -279,6 +354,9 @@ func NewCallbackService(cfg CallbackServiceConfig) (*CallbackService, error) {
 	}
 	if util.IsNilInterface(cfg.Placement) {
 		cfg.Placement = nil
+	}
+	if util.IsNilInterface(cfg.StorageIdentities) {
+		cfg.StorageIdentities = nil
 	}
 	if util.IsNilInterface(cfg.LifecycleAuthority) {
 		cfg.LifecycleAuthority = nil
@@ -308,6 +386,7 @@ func NewCallbackService(cfg CallbackServiceConfig) (*CallbackService, error) {
 		chain:               cfg.Chain,
 		acknowledger:        cfg.Acknowledger,
 		placement:           cfg.Placement,
+		storageIdentities:   cfg.StorageIdentities,
 		lifecycleAuthority:  cfg.LifecycleAuthority,
 		payloads:            cfg.Payloads,
 		events:              cfg.Events,
@@ -333,6 +412,14 @@ func (service *CallbackService) HandleCallback(ctx context.Context, command Call
 		if callback.selector == callbackSelectorLegacy {
 			return service.observeAuthorizedLifecycle(callback)
 		}
+		if service.placement == nil {
+			return errCallbackPlacementUnavailable
+		}
+		handled, err := service.settleDurableAttempt(ctx, callback)
+		if handled || err != nil {
+			service.recordNonInFlightCallbackReceived(callback)
+			return err
+		}
 		service.observeNonInFlightOperation(callback)
 		return nil
 	}
@@ -350,10 +437,12 @@ func (service *CallbackService) HandleCallback(ctx context.Context, command Call
 		)
 		return nil
 	}
+	if err := service.verifyStorageIdentity(callback, record.Backend); err != nil {
+		return err
+	}
 
 	if record.Settlement == operation.SettlementDeprovision {
-		service.observeDeprovisionOwned(callback, record)
-		return nil
+		return service.handleDeprovisionOwned(callback, record)
 	}
 
 	result, observed, deprovisionOwned, err := service.waitForSettlementClaim(ctx, record)
@@ -361,8 +450,7 @@ func (service *CallbackService) HandleCallback(ctx context.Context, command Call
 		return fmt.Errorf("wait to settle callback for lease %s: %w", callback.leaseUUID, err)
 	}
 	if deprovisionOwned {
-		service.observeDeprovisionOwned(callback, observed)
-		return nil
+		return service.handleDeprovisionOwned(callback, observed)
 	}
 	if !result.Claimed() {
 		// The exact operation completed or was replaced while the callback waited.
@@ -486,6 +574,7 @@ func (service *CallbackService) settleClaimed(
 			).Observe(time.Since(record.StartedAt).Seconds())
 		}
 	}
+	var retryableSuccessPlacementErr error
 	finish := func() error {
 		if !service.operations.FinishSettlement(claim) {
 			return fmt.Errorf("%w for lease %s operation %s",
@@ -495,6 +584,17 @@ func (service *CallbackService) settleClaimed(
 		return nil
 	}
 	completeSuccess := func(publishReady bool) error {
+		// A positive backend result is authoritative enough to acknowledge the
+		// lease, but the callback must remain retryable until its exact durable
+		// placement generation is also recorded. Finishing the volatile
+		// operation here would let a 2xx response delete the backend's only
+		// replayable evidence after a transient placement-store failure.
+		if retryableSuccessPlacementErr != nil {
+			return fmt.Errorf(
+				"persist acknowledged placement for lease %s operation %s: %w",
+				record.LeaseUUID, record.ID, retryableSuccessPlacementErr,
+			)
+		}
 		if err := finish(); err != nil {
 			return err
 		}
@@ -533,6 +633,8 @@ func (service *CallbackService) settleClaimed(
 			permanentVerdict := placementErr == nil || isPermanentPlacementVerdict(placementErr)
 			if permanentVerdict {
 				metrics.CallbackPlacementSemanticConflictsTotal.Inc()
+			} else {
+				retryableSuccessPlacementErr = placementErr
 			}
 			slog.Error("failed to confirm placement from authenticated success callback; continuing chain acknowledgement",
 				"lease_uuid", callback.leaseUUID,
@@ -652,12 +754,20 @@ func (service *CallbackService) settleClaimed(
 				callback.leaseUUID, record.Backend, record.ID,
 			)
 			if placementErr != nil {
+				permanentVerdict := isPermanentPlacementVerdict(placementErr)
 				slog.Warn("failed to clean up terminal lease placement operation",
 					"lease_uuid", callback.leaseUUID,
 					"backend", record.Backend,
 					"operation_id", record.ID,
+					"permanent_semantic_verdict", permanentVerdict,
 					"error", placementErr,
 				)
+				if !permanentVerdict {
+					return fmt.Errorf(
+						"refuse placement operation for terminal lease %s: %w",
+						callback.leaseUUID, placementErr,
+					)
+				}
 			} else if !applied {
 				slog.Info("terminal failure callback did not match a durable placement attempt; preserving placement",
 					"lease_uuid", callback.leaseUUID,
@@ -777,10 +887,243 @@ func (service *CallbackService) settleClaimed(
 	return nil
 }
 
+// settleDurableAttempt recovers a provision/restore callback whose ephemeral
+// operation record is gone but whose exact write-ahead operation identity is
+// still durable. The Registry lease claim is acquired first, matching the
+// global order used by provision, restore, reconciliation, and deprovision;
+// the store claim follows and both are held until chain and placement settle.
+// Inventory projection sees the store claim and fences the lease, so a failure
+// callback cannot reject the chain concurrently with positive inventory.
+//
+// Chain settlement intentionally precedes consuming unresolved authority. If
+// a chain RPC or placement write fails, or the process exits between them, the
+// backend's durable outbox can retry against the still-current generation.
+// Chain acknowledge/reject operations are idempotent and terminal errors are
+// verified with an exact lease read before the placement claim is consumed.
+func (service *CallbackService) settleDurableAttempt(
+	ctx context.Context,
+	callback CallbackCommand,
+) (handled bool, err error) {
+	if callback.selector != callbackSelectorOperation {
+		return false, nil
+	}
+	switch callback.status {
+	case backend.CallbackStatusSuccess, backend.CallbackStatusFailed:
+		// Only definitive provision/restore outcomes may consume durable authority.
+	default:
+		return false, nil
+	}
+	leaseClaimResult := service.operations.TryClaimCallbackRecoveryLease(callback.leaseUUID)
+	if !leaseClaimResult.Acquired() {
+		return true, fmt.Errorf("%w for lease %s (outcome %d)",
+			errCallbackRecoveryLeaseBusy, callback.leaseUUID, leaseClaimResult.Outcome())
+	}
+	leaseClaim := leaseClaimResult.Claim()
+	defer func() {
+		if service.operations.ReleaseLease(leaseClaim) {
+			return
+		}
+		releaseErr := fmt.Errorf("%w: release recovered lease capability for %s",
+			errCallbackSettlementLost, callback.leaseUUID)
+		if err == nil {
+			err = releaseErr
+		} else {
+			err = errors.Join(err, releaseErr)
+		}
+	}()
+
+	claim, claimed, claimErr := service.placement.ClaimAttempt(
+		callback.leaseUUID, callback.operationID,
+	)
+	if claimErr != nil {
+		return true, fmt.Errorf("claim durable callback attempt for lease %s: %w",
+			callback.leaseUUID, claimErr)
+	}
+	if !claimed {
+		return false, nil
+	}
+
+	finished := false
+	defer func() {
+		if !finished {
+			service.placement.ReleaseAttemptClaim(claim)
+		}
+	}()
+	callback.backendName = claim.Backend()
+	if err := service.verifyStorageIdentity(callback, callback.backendName); err != nil {
+		return true, err
+	}
+	finish := func(success bool) error {
+		var (
+			applied  bool
+			applyErr error
+		)
+		if success {
+			applied, applyErr = service.placement.ConfirmClaimedAttempt(claim)
+		} else {
+			applied, applyErr = service.placement.RefuseClaimedAttempt(claim)
+		}
+		if applyErr != nil {
+			return applyErr
+		}
+		if !applied {
+			return fmt.Errorf("%w for lease %s operation %s",
+				errCallbackSettlementLost, callback.leaseUUID, callback.operationID)
+		}
+		finished = true
+		return nil
+	}
+	completeFailure := func(reason string, publish bool, deletePayload bool) error {
+		if deletePayload && service.payloads != nil {
+			service.payloads.Delete(callback.leaseUUID)
+		}
+		if err := finish(false); err != nil {
+			return fmt.Errorf("refuse recovered placement attempt for lease %s: %w",
+				callback.leaseUUID, err)
+		}
+		if publish {
+			service.publish(callback.leaseUUID, backend.ProvisionStatusFailed, reason)
+		}
+		return nil
+	}
+
+	slog.Info("recovering backend callback from durable placement generation",
+		"lease_uuid", callback.leaseUUID,
+		"backend", callback.backendName,
+		"operation_id", callback.operationID,
+		"status", callback.status,
+	)
+	switch callback.status {
+	case backend.CallbackStatusSuccess:
+		if service.acknowledger == nil {
+			return true, errCallbackAcknowledgerUnavailable
+		}
+		_, _, acknowledgeErr := service.acknowledger.Acknowledge(ctx, callback.leaseUUID)
+		publishReady := true
+		if acknowledgeErr != nil {
+			if !isTerminalAcknowledgeError(acknowledgeErr) {
+				return true, fmt.Errorf("%w: lease %s: %w",
+					ErrAcknowledgeFailed, callback.leaseUUID, acknowledgeErr)
+			}
+			if service.chain == nil {
+				return true, errCallbackChainUnavailable
+			}
+			lease, leaseErr := service.chain.GetLease(ctx, callback.leaseUUID)
+			if leaseErr != nil {
+				return true, fmt.Errorf(
+					"%w: verify terminal acknowledgement for recovered lease %s after %w: %w",
+					ErrAcknowledgeFailed, callback.leaseUUID, acknowledgeErr, leaseErr,
+				)
+			}
+			switch classifyCallbackLease(lease) {
+			case callbackLeaseActive:
+				// The acknowledgement already landed.
+			case callbackLeaseTerminal:
+				// Preserve positive backend ownership for terminal cleanup without
+				// publishing a stale Ready observation.
+				publishReady = false
+			case callbackLeasePending, callbackLeaseUnknown:
+				return true, fmt.Errorf(
+					"%w: recovered lease %s is %s after terminal acknowledgement error: %w",
+					ErrAcknowledgeFailed, callback.leaseUUID,
+					callbackLeaseState(lease), acknowledgeErr,
+				)
+			}
+		}
+		if err := finish(true); err != nil {
+			return true, fmt.Errorf("confirm recovered placement attempt for lease %s: %w",
+				callback.leaseUUID, err)
+		}
+		if publishReady {
+			service.publish(callback.leaseUUID, backend.ProvisionStatusReady, "")
+		}
+		return true, nil
+
+	case backend.CallbackStatusFailed:
+		if service.chain == nil {
+			return true, errCallbackChainUnavailable
+		}
+		reason := callback.failure
+		if reason == "" {
+			reason = "provisioning failed"
+		}
+		lease, leaseErr := service.chain.GetLease(ctx, callback.leaseUUID)
+		if leaseErr != nil {
+			return true, fmt.Errorf("failed to fetch recovered lease %s: %w",
+				callback.leaseUUID, leaseErr)
+		}
+		switch classifyCallbackLease(lease) {
+		case callbackLeaseActive:
+			if claim.HasSameBackendOwner() {
+				// ACTIVE chain state plus positive store-owned backend evidence is
+				// stronger than a delayed failure. Consume only an unresolved
+				// marker; never reject, publish Failed, or demote the live owner.
+				if err := finish(false); err != nil {
+					return true, fmt.Errorf(
+						"retire stale recovered failure for lease %s: %w",
+						callback.leaseUUID, err,
+					)
+				}
+				slog.Info("ignored recovered failure for active positively confirmed owner",
+					"lease_uuid", callback.leaseUUID,
+					"backend", callback.backendName,
+					"operation_id", callback.operationID,
+				)
+				return true, nil
+			}
+			return true, completeFailure(reason, true, false)
+		case callbackLeaseTerminal:
+			return true, completeFailure(
+				reason, terminalLeaseRepresentsFailure(lease), true,
+			)
+		case callbackLeaseUnknown:
+			return true, fmt.Errorf("recovered lease %s has unknown state %s after failure callback",
+				callback.leaseUUID, callbackLeaseState(lease))
+		case callbackLeasePending:
+			// Only a positively observed PENDING lease may be rejected below.
+		}
+
+		_, _, rejectErr := service.chain.RejectLeases(
+			ctx, []string{callback.leaseUUID}, truncateRejectReason(reason),
+		)
+		if rejectErr != nil {
+			if !isTerminalAcknowledgeError(rejectErr) {
+				return true, fmt.Errorf("failed to reject recovered lease %s: %w",
+					callback.leaseUUID, rejectErr)
+			}
+			currentLease, currentLeaseErr := service.chain.GetLease(ctx, callback.leaseUUID)
+			if currentLeaseErr != nil {
+				return true, fmt.Errorf(
+					"failed to verify terminal reject verdict for recovered lease %s after %w: %w",
+					callback.leaseUUID, rejectErr, currentLeaseErr,
+				)
+			}
+			switch classifyCallbackLease(currentLease) {
+			case callbackLeaseActive:
+				return true, completeFailure(reason, true, false)
+			case callbackLeaseTerminal:
+				return true, completeFailure(
+					reason, terminalLeaseRepresentsFailure(currentLease), true,
+				)
+			case callbackLeasePending, callbackLeaseUnknown:
+				return true, fmt.Errorf(
+					"failed to reject recovered lease %s: chain still reports state %s after terminal verdict: %w",
+					callback.leaseUUID, callbackLeaseState(currentLease), rejectErr,
+				)
+			}
+		}
+		return true, completeFailure(reason, true, true)
+
+	default:
+		return false, nil
+	}
+}
+
 func (service *CallbackService) observeNonInFlightOperation(callback CallbackCommand) {
 	service.recordNonInFlightCallbackReceived(callback)
-	// An operation-scoped callback is authority only while its exact operation
-	// is present. Once gone, it is indistinguishable from a delayed older result.
+	// No exact process-local operation, unresolved durable attempt, or current
+	// confirmed lifecycle generation matches this callback. Its ID is therefore
+	// stale rather than lease-scoped mutation authority.
 	slog.Warn("ignoring callback for an operation that is no longer current",
 		"lease_uuid", callback.leaseUUID,
 		"backend", callback.backendName,
@@ -798,8 +1141,11 @@ func (service *CallbackService) recordNonInFlightCallbackReceived(
 	callback CallbackCommand,
 ) string {
 	backendLabel := sanitizeCallbackBackend(service.backends, callback.backendName)
-	statusLabel := sanitizeCallbackStatus(callback.status)
-	if backendLabel == labelBackendInvalid || statusLabel == labelStatusOther {
+	// CallbackCommand is the safe construction boundary: its unexported status
+	// field can contain only the three closed protocol values, so no defensive
+	// catch-all Prometheus series is reachable here.
+	statusLabel := string(callback.status)
+	if backendLabel == labelBackendInvalid {
 		slog.Warn("sanitized callback label to bounded value",
 			"lease_uuid", callback.leaseUUID,
 			"received_backend", callback.backendName,
@@ -860,6 +1206,10 @@ func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackComm
 		}
 		callback.backendName = authorization.Backend()
 	case placement.LifecycleVerdictRetired:
+		callback.backendName = authorization.Backend()
+		if err := service.verifyStorageIdentity(callback, callback.backendName); err != nil {
+			return err
+		}
 		slog.Info("ignoring duplicate callback for retired lifecycle capability",
 			"lease_uuid", callback.leaseUUID,
 			"backend", authorization.Backend(),
@@ -881,6 +1231,9 @@ func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackComm
 		return nil
 	default:
 		return fmt.Errorf("unknown lifecycle authorization verdict %d", authorization.Verdict())
+	}
+	if err := service.verifyStorageIdentity(callback, callback.backendName); err != nil {
+		return err
 	}
 
 	// Consume terminal teardown authority before publishing its best-effort
@@ -929,6 +1282,29 @@ func (service *CallbackService) observeAuthorizedLifecycle(callback CallbackComm
 	return nil
 }
 
+func (service *CallbackService) verifyStorageIdentity(
+	callback CallbackCommand,
+	backendName string,
+) error {
+	if service.storageIdentities == nil {
+		return errCallbackStorageIdentityUnavailable
+	}
+	if !callback.storageID.Valid() {
+		return fmt.Errorf("%w for lease %s backend %s",
+			errCallbackStorageIdentityMissing, callback.leaseUUID, backendName)
+	}
+	expected, bound := service.storageIdentities.ExpectedBackendStorageIdentity(backendName)
+	if !bound || !expected.Valid() {
+		return fmt.Errorf("%w for backend %s", errCallbackStorageIdentityUnbound, backendName)
+	}
+	if callback.storageID != expected {
+		return fmt.Errorf("%w for lease %s backend %s: got %s, expected %s",
+			errCallbackStorageIdentityMismatch, callback.leaseUUID, backendName,
+			callback.storageID, expected)
+	}
+	return nil
+}
+
 // observeLifecycle owns only subscriber-visible status. It never claims an
 // operation or mutates placement/chain state.
 func (service *CallbackService) observeLifecycle(callback CallbackCommand) bool {
@@ -973,10 +1349,51 @@ func lifecycleCallbackVerdictLabel(verdict placement.LifecycleVerdict) string {
 	}
 }
 
-func (service *CallbackService) observeDeprovisionOwned(
+// handleDeprovisionOwned consumes exact placement evidence without touching
+// chain state while close owns the process-local operation. Returning 2xx
+// without this durable mutation would let the backend delete its only exact
+// completion while Deprovision later removes the volatile Registry record,
+// leaving an Attempt that absence is intentionally forbidden to clear.
+//
+// Legacy callbacks remain observation-only: their tokenless URL does not carry
+// the exact operation capability required to mutate durable placement.
+func (service *CallbackService) handleDeprovisionOwned(
 	callback CallbackCommand,
 	record operation.Record,
-) {
+) error {
+	if callback.selector == callbackSelectorOperation {
+		if service.placement == nil {
+			return errCallbackPlacementUnavailable
+		}
+		var (
+			applied bool
+			err     error
+		)
+		switch callback.status {
+		case backend.CallbackStatusSuccess:
+			applied, err = service.placement.ConfirmOperation(
+				callback.leaseUUID, record.Backend, record.ID,
+			)
+		case backend.CallbackStatusFailed:
+			applied, err = service.placement.RefuseOperation(
+				callback.leaseUUID, record.Backend, record.ID,
+			)
+		default:
+			return fmt.Errorf("invalid exact callback status %q during deprovision", callback.status)
+		}
+		if err != nil {
+			return fmt.Errorf("settle deprovision-owned placement attempt for lease %s: %w",
+				callback.leaseUUID, err)
+		}
+		slog.Info("settled exact placement evidence while deprovision owns operation",
+			"lease_uuid", callback.leaseUUID,
+			"backend", record.Backend,
+			"operation_id", record.ID,
+			"status", callback.status,
+			"applied", applied,
+		)
+	}
+
 	switch callback.status {
 	case backend.CallbackStatusDeprovisioned:
 		service.forgetDeprovisionCandidate(callback.leaseUUID, record.Backend)
@@ -1000,6 +1417,7 @@ func (service *CallbackService) observeDeprovisionOwned(
 		"status", callback.status,
 		"retained", callback.retained,
 	)
+	return nil
 }
 
 func (service *CallbackService) publish(
@@ -1007,9 +1425,24 @@ func (service *CallbackService) publish(
 	status backend.ProvisionStatus,
 	errMsg string,
 ) {
-	if service.events != nil {
-		service.events.PublishCallbackLeaseEvent(leaseUUID, status, errMsg)
+	if service.events == nil {
+		return
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
+				metrics.LifecycleEventCallback,
+			).Inc()
+			slog.Error("callback lifecycle event sink panicked; preserving terminal callback settlement",
+				"lease_uuid", leaseUUID,
+				"status", status,
+				"event", metrics.LifecycleEventCallback,
+				"panic", recovered,
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	service.events.PublishCallbackLeaseEvent(leaseUUID, status, errMsg)
 }
 
 func (service *CallbackService) forgetDeprovisionCandidate(leaseUUID, backendName string) {

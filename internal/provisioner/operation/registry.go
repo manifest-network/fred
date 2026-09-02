@@ -1,10 +1,12 @@
 package operation
 
 import (
-	"crypto/rand"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"maps"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -22,6 +24,41 @@ const (
 	KindProvision
 	KindRestore
 )
+
+// ErrInvalidKind reports an unknown or missing durable operation kind.
+var ErrInvalidKind = errors.New("invalid operation kind")
+
+// Valid reports whether kind authorizes one of the supported asynchronous
+// operation protocols. The zero value is deliberately invalid.
+func (kind Kind) Valid() bool { return kind.valid() }
+
+// String returns the stable durable and diagnostic representation of kind.
+// Invalid values never collapse to a supported kind.
+func (kind Kind) String() string {
+	switch kind {
+	case KindProvision:
+		return "provision"
+	case KindRestore:
+		return "restore"
+	case KindInvalid:
+		return "invalid"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseKind parses the exact stable representation written to durable stores.
+// Empty, alternate-case, and unknown values fail closed.
+func ParseKind(value string) (Kind, error) {
+	switch value {
+	case KindProvision.String():
+		return KindProvision, nil
+	case KindRestore.String():
+		return KindRestore, nil
+	default:
+		return KindInvalid, ErrInvalidKind
+	}
+}
 
 func (kind Kind) valid() bool {
 	switch kind {
@@ -92,14 +129,35 @@ const (
 	TrackInvalid TrackOutcome = iota
 	TrackStarted
 	TrackBusy
-	TrackSnapshotStale
 )
 
-// TrackResult contains a start outcome and, only when Started returns true, the
-// capability that owns the tracked operation.
-type TrackResult struct {
-	token   Token
-	outcome TrackOutcome
+// RecoveryResult is the exhaustive result of installing an exact durable
+// operation under a lease claim. It returns no general-purpose operation
+// capability: recovery creates an active operation whose only valid next
+// transitions are the existing typed settlement APIs.
+type RecoveryResult uint8
+
+const (
+	RecoveryInvalid RecoveryResult = iota
+	RecoveryInstalled
+	RecoveryBusy
+)
+
+// Recovered reports whether the exact durable operation was installed.
+func (result RecoveryResult) Recovered() bool { return result == RecoveryInstalled }
+
+// String returns a stable diagnostic name for the recovery outcome.
+func (result RecoveryResult) String() string {
+	switch result {
+	case RecoveryInvalid:
+		return "invalid"
+	case RecoveryInstalled:
+		return "installed"
+	case RecoveryBusy:
+		return "busy"
+	default:
+		return "unknown"
+	}
 }
 
 // Phase describes where a typed operation is relative to its synchronous
@@ -159,25 +217,6 @@ const (
 	InitiationSettling
 	InitiationFinished
 )
-
-// Outcome returns the reason tracking did or did not start.
-func (result TrackResult) Outcome() TrackOutcome {
-	return result.outcome
-}
-
-// Started reports whether the operation was registered.
-func (result TrackResult) Started() bool {
-	return result.outcome == TrackStarted && result.token.Valid()
-}
-
-// Token returns the operation capability on success and an invalid token for
-// every non-started outcome.
-func (result TrackResult) Token() Token {
-	if !result.Started() {
-		return Token{}
-	}
-	return result.token
-}
 
 // LeaseClaimOutcome is the exhaustive result of attempting to claim a lease.
 // The invalid zero value is conservative and does not authorize work.
@@ -264,7 +303,7 @@ func (result SettlementResult) Claim() SettlementClaim {
 
 type trackedOperation struct {
 	record           Record
-	token            Token
+	token            operationToken
 	initiation       Initiation
 	claim            SettlementClaim
 	terminalFinished bool
@@ -276,7 +315,6 @@ type Registry struct {
 	operations           map[string]trackedOperation
 	leaseClaims          map[string]LeaseClaim
 	lastMutation         map[string]uint64
-	issuedOperationIDs   map[OperationID]struct{}
 	countObserver        func(int)
 	operationIDSource    func() (OperationID, error)
 	identity             registryIdentity
@@ -284,86 +322,69 @@ type Registry struct {
 	nextClaimNonce       uint64
 	mutationRevision     uint64
 	lastSnapshotRevision uint64
+	drained              chan struct{}
+	draining             bool
 	mu                   sync.RWMutex
 }
 
-// NewRegistry constructs an empty operation registry with process-unique ID
-// and capability seeds.
+// NewRegistry constructs an empty operation registry with an unforgeable,
+// process-local capability identity.
 func NewRegistry() *Registry {
-	return newRandomRegistryWithObserver(
-		randomNonZeroUint64(), randomNonZeroUint64(), nil,
-	)
+	return newRandomRegistryWithObserver(nil)
 }
 
 // NewRegistryWithCountObserver constructs a registry that synchronously calls
 // observer after each operation-count mutation. The observer must not call back
 // into the registry. This hook keeps metrics outside the coordination package
-// while ensuring typed and compatibility callers observe the same count.
+// while ensuring every typed lifecycle path reports the same count.
 func NewRegistryWithCountObserver(observer func(int)) *Registry {
-	return newRandomRegistryWithObserver(
-		randomNonZeroUint64(), randomNonZeroUint64(), observer,
-	)
+	return newRandomRegistryWithObserver(observer)
 }
 
-func newRandomRegistryWithObserver(
-	identity, claimSeed uint64,
-	observer func(int),
-) *Registry {
-	registry := newRegistryBase(identity, claimSeed, observer)
+func newRandomRegistryWithObserver(observer func(int)) *Registry {
+	registry := newRegistryBase(0, observer)
 	registry.operationIDSource = randomOperationID
 	return registry
 }
 
-func newRegistry(identity, operationSeed, claimSeed uint64) *Registry {
-	return newRegistryWithObserver(identity, operationSeed, claimSeed, nil)
+func newRegistry(operationSeed, claimSeed uint64) *Registry {
+	return newRegistryWithObserver(operationSeed, claimSeed, nil)
 }
 
 func newRegistryWithObserver(
-	identity, operationSeed, claimSeed uint64,
+	operationSeed, claimSeed uint64,
 	observer func(int),
 ) *Registry {
-	registry := newRegistryBase(identity, claimSeed, observer)
+	registry := newRegistryBase(claimSeed, observer)
 	registry.nextOperationID = operationSeed
 	// Deterministic allocation exists only for package tests. Production
 	// constructors install randomOperationID above so an ID observed by one
 	// backend reveals nothing about another backend's current or future ID.
 	registry.operationIDSource = func() (OperationID, error) {
-		registry.nextOperationID++
-		if registry.nextOperationID == 0 {
-			registry.nextOperationID++
+		if registry.nextOperationID == math.MaxUint64 {
+			return OperationID{}, errOperationIDSequenceExhausted
 		}
+		registry.nextOperationID++
 		return deterministicOperationID(registry.nextOperationID), nil
 	}
 	return registry
 }
 
 func newRegistryBase(
-	identity, claimSeed uint64,
+	claimSeed uint64,
 	observer func(int),
 ) *Registry {
-	if identity == 0 {
-		identity = 1
-	}
+	drained := make(chan struct{})
+	close(drained)
 	return &Registry{
-		operations:         make(map[string]trackedOperation),
-		leaseClaims:        make(map[string]LeaseClaim),
-		lastMutation:       make(map[string]uint64),
-		issuedOperationIDs: make(map[OperationID]struct{}),
-		countObserver:      observer,
-		identity:           newRegistryIdentity(identity),
-		nextClaimNonce:     claimSeed,
+		operations:     make(map[string]trackedOperation),
+		leaseClaims:    make(map[string]LeaseClaim),
+		lastMutation:   make(map[string]uint64),
+		countObserver:  observer,
+		identity:       newRegistryIdentity(),
+		nextClaimNonce: claimSeed,
+		drained:        drained,
 	}
-}
-
-func randomOperationID() (OperationID, error) {
-	value, err := uuid.NewRandom()
-	if err != nil {
-		// Operation identity is a wire capability shared across mutually
-		// untrusted backends. A predictable fallback would turn RNG failure into
-		// cross-backend callback authority, so allocation fails closed.
-		return OperationID{}, err
-	}
-	return newOperationID(value), nil
 }
 
 // deterministicOperationID is used only by package-private deterministic test
@@ -379,83 +400,44 @@ func deterministicOperationID(sequence uint64) OperationID {
 	return newOperationID(value)
 }
 
-func randomNonZeroUint64() uint64 {
-	var raw [8]byte
-	if _, err := rand.Read(raw[:]); err == nil {
-		if value := binary.BigEndian.Uint64(raw[:]); value != 0 {
-			return value
-		}
-	}
-	value := uint64(time.Now().UnixNano())
-	if value == 0 {
-		return 1
-	}
-	return value
-}
-
-// TryTrack atomically starts tracking spec when neither an operation nor a
-// lease claim already owns its lease.
-func (registry *Registry) TryTrack(spec TrackSpec) TrackResult {
-	if !spec.Valid() {
-		return TrackResult{outcome: TrackInvalid}
-	}
-
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	if _, claimed := registry.leaseClaims[spec.LeaseUUID]; claimed {
-		return TrackResult{outcome: TrackBusy}
-	}
-	if _, exists := registry.operations[spec.LeaseUUID]; exists {
-		return TrackResult{outcome: TrackBusy}
-	}
-	return registry.trackLocked(spec)
-}
-
-// TryTrackClaimed starts tracking under the exact lease capability returned by
-// TryClaimLease or TryClaimLeaseNow. A claim from another registry, a stale
-// claim, or a spec for another lease is invalid.
-func (registry *Registry) TryTrackClaimed(claim LeaseClaim, spec TrackSpec) TrackResult {
-	if !spec.Valid() || !claim.Valid() || claim.leaseUUID != spec.LeaseUUID {
-		return TrackResult{outcome: TrackInvalid}
+// RecoverClaimed installs one exact durable operation identity as active under
+// an already-held lease claim. It is intentionally distinct from ordinary
+// initiation:
+// callers cannot allocate a replacement ID, recover without the same
+// process-local exclusion used by ordinary lifecycle work, or install an
+// operation without its exact backend and tenant metadata.
+//
+// This is the only production path that accepts an externally persisted
+// OperationID. The ID has already crossed a strict durable decoder; this method
+// nevertheless revalidates it so the invalid zero value can never authorize
+// callback settlement.
+func (registry *Registry) RecoverClaimed(
+	claim LeaseClaim,
+	id OperationID,
+	spec TrackSpec,
+) RecoveryResult {
+	if !spec.Valid() || spec.Backend == "" || spec.Tenant == "" || !id.Valid() ||
+		!claim.Valid() || claim.leaseUUID != spec.LeaseUUID {
+		return RecoveryInvalid
 	}
 
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
+	if registry.draining {
+		return RecoveryInvalid
+	}
 	if claim.registry != registry.identity || registry.leaseClaims[spec.LeaseUUID] != claim {
-		return TrackResult{outcome: TrackInvalid}
+		return RecoveryInvalid
 	}
 	if _, exists := registry.operations[spec.LeaseUUID]; exists {
-		return TrackResult{outcome: TrackBusy}
+		return RecoveryBusy
 	}
-	return registry.trackLocked(spec)
-}
-
-func (registry *Registry) trackLocked(spec TrackSpec) TrackResult {
-	token := registry.installLocked(spec, PhaseActive, Initiation{})
-	if !token.Valid() {
-		return TrackResult{outcome: TrackInvalid}
+	token := newOperationToken(registry.identity, spec.LeaseUUID, id)
+	if !token.valid() {
+		return RecoveryInvalid
 	}
-	return TrackResult{token: token, outcome: TrackStarted}
-}
-
-// TryInitiate registers spec in the preparing phase when neither an operation
-// nor a lease claim owns the lease. Production backend-call paths use this
-// instead of TryTrack so close, timeout, and callback actors can distinguish
-// local preparation from accepted asynchronous work.
-func (registry *Registry) TryInitiate(spec TrackSpec) InitiationResult {
-	if !spec.Valid() {
-		return InitiationResult{outcome: TrackInvalid}
-	}
-
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	if _, claimed := registry.leaseClaims[spec.LeaseUUID]; claimed {
-		return InitiationResult{outcome: TrackBusy}
-	}
-	if _, exists := registry.operations[spec.LeaseUUID]; exists {
-		return InitiationResult{outcome: TrackBusy}
-	}
-	return registry.initiateLocked(spec)
+	registry.installRecordLocked(spec, token, PhaseActive, Initiation{})
+	return RecoveryInstalled
 }
 
 // TryInitiateClaimed registers a preparing operation under the exact lease
@@ -470,6 +452,9 @@ func (registry *Registry) TryInitiateClaimed(
 
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
+	if registry.draining {
+		return InitiationResult{outcome: TrackInvalid}
+	}
 	if claim.registry != registry.identity || registry.leaseClaims[spec.LeaseUUID] != claim {
 		return InitiationResult{outcome: TrackInvalid}
 	}
@@ -487,32 +472,19 @@ func (registry *Registry) initiateLocked(spec TrackSpec) InitiationResult {
 	if !id.Valid() {
 		return InitiationResult{outcome: TrackInvalid}
 	}
-	token := newToken(registry.identity, spec.LeaseUUID, id)
+	token := newOperationToken(registry.identity, spec.LeaseUUID, id)
 	initiation := newInitiation(token)
 	registry.installRecordLocked(spec, token, PhasePreparing, initiation)
 	return InitiationResult{initiation: initiation, outcome: TrackStarted}
 }
 
-func (registry *Registry) installLocked(
-	spec TrackSpec,
-	phase Phase,
-	initiation Initiation,
-) Token {
-	id := registry.allocateOperationIDLocked()
-	if !id.Valid() {
-		return Token{}
-	}
-	token := newToken(registry.identity, spec.LeaseUUID, id)
-	registry.installRecordLocked(spec, token, phase, initiation)
-	return token
-}
-
 func (registry *Registry) installRecordLocked(
 	spec TrackSpec,
-	token Token,
+	token operationToken,
 	phase Phase,
 	initiation Initiation,
 ) {
+	registry.armDrainSignalLocked()
 	startedAt := spec.StartedAt
 	if startedAt.IsZero() {
 		startedAt = time.Now()
@@ -522,7 +494,7 @@ func (registry *Registry) installRecordLocked(
 		Tenant:     spec.Tenant,
 		Items:      slices.Clone(spec.Items),
 		Backend:    spec.Backend,
-		ID:         token.ID(),
+		ID:         token.operationID(),
 		StartedAt:  startedAt,
 		Kind:       spec.Kind,
 		Phase:      phase,
@@ -539,9 +511,10 @@ func (registry *Registry) installRecordLocked(
 
 // BindBackend binds the exact preparing initiation to the authoritative
 // backend discovered after the operation was registered. Restore uses this to
-// avoid trusting a pre-claim source lookup: the operation begins with no
-// backend, placement.BeginRestore atomically selects the source owner, and only
-// this initiation capability can bind that owner before the call starts.
+// avoid trusting caller-supplied routing: the operation begins with no backend,
+// placement.BeginAuthorizedRestore atomically selects the exact pre-authorized
+// source revision, and only this initiation capability can bind that owner
+// before the call starts.
 //
 // Binding is one-shot. Invalid, foreign, stale, already-bound, claimed, or
 // non-preparing operations return false without mutation.
@@ -677,6 +650,9 @@ func (registry *Registry) TryClaimLease(leaseUUID string, snapshot TrackerSnapsh
 
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
+	if registry.draining {
+		return LeaseClaimResult{outcome: LeaseClaimInvalid}
+	}
 	// Snapshot tombstones older than the prior boundary may already have been
 	// compacted. Consequently, a boundary remains consumable only while it is
 	// the registry's latest causal boundary. A second Snapshot at the same
@@ -692,6 +668,24 @@ func (registry *Registry) TryClaimLease(leaseUUID string, snapshot TrackerSnapsh
 // a mutation so an older reconciliation snapshot remains fenced even if the
 // claim is acquired and released between its inventory and action phases.
 func (registry *Registry) TryClaimLeaseNow(leaseUUID string) LeaseClaimResult {
+	if leaseUUID == "" {
+		return LeaseClaimResult{outcome: LeaseClaimInvalid}
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if registry.draining {
+		return LeaseClaimResult{outcome: LeaseClaimInvalid}
+	}
+	return registry.tryClaimLeaseLocked(leaseUUID, 0, true)
+}
+
+// TryClaimCallbackRecoveryLease acquires the same exclusive lease-action
+// capability as TryClaimLeaseNow, but remains available after BeginDrain.
+// Only authenticated durable callback recovery should depend on this method:
+// shutdown closes every ordinary operation entry point while allowing backend
+// outbox deliveries to finish authority already persisted before the drain.
+func (registry *Registry) TryClaimCallbackRecoveryLease(leaseUUID string) LeaseClaimResult {
 	if leaseUUID == "" {
 		return LeaseClaimResult{outcome: LeaseClaimInvalid}
 	}
@@ -717,6 +711,7 @@ func (registry *Registry) tryClaimLeaseLocked(
 	}
 
 	claim := newLeaseClaim(registry.identity, leaseUUID, registry.allocateClaimNonceLocked())
+	registry.armDrainSignalLocked()
 	registry.leaseClaims[leaseUUID] = claim
 	if markAcquisition {
 		registry.markMutationLocked(leaseUUID)
@@ -737,23 +732,18 @@ func (registry *Registry) ReleaseLease(claim LeaseClaim) bool {
 	}
 	delete(registry.leaseClaims, claim.leaseUUID)
 	registry.markMutationLocked(claim.leaseUUID)
+	registry.closeDrainSignalIfIdleLocked()
 	return true
 }
 
-// Abort removes only token's still-unclaimed operation.
-func (registry *Registry) Abort(token Token) bool {
-	if !token.Valid() || token.registry != registry.identity {
-		return false
-	}
-
+// BeginDrain irreversibly closes ordinary operation and lease-action
+// admission. Existing operations and claims remain valid and may settle;
+// authenticated durable callback recovery uses its dedicated claim method.
+// Calling BeginDrain more than once is harmless.
+func (registry *Registry) BeginDrain() {
 	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	tracked, exists := registry.operations[token.leaseUUID]
-	if !exists || tracked.token != token || tracked.claim.Valid() {
-		return false
-	}
-	registry.removeOperationLocked(token.leaseUUID)
-	return true
+	registry.draining = true
+	registry.mu.Unlock()
 }
 
 // TryClaimCallback acquires terminal callback ownership for the exact
@@ -911,6 +901,66 @@ func (registry *Registry) Count() int {
 	return len(registry.operations)
 }
 
+// WaitForDrain waits until no operation or lease-action claim remains, ctx is
+// canceled, or timeout elapses, and returns the exact remaining work count.
+// Call BeginDrain first when a stable terminal result is required; authenticated
+// callback-recovery claims deliberately remain admissible while the callback
+// HTTP endpoint is live and are included whenever they are already present.
+func (registry *Registry) WaitForDrain(ctx context.Context, timeout time.Duration) int {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		return registry.PendingWorkCount()
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		registry.mu.RLock()
+		remaining := registry.pendingWorkCountLocked()
+		drained := registry.drained
+		registry.mu.RUnlock()
+		if remaining == 0 {
+			return 0
+		}
+
+		select {
+		case <-ctx.Done():
+			return registry.PendingWorkCount()
+		case <-timer.C:
+			return registry.PendingWorkCount()
+		case <-drained:
+			// Re-read under the lock: a new operation may have started after a
+			// prior generation drained but before this waiter resumed.
+		}
+	}
+}
+
+// PendingWorkCount returns the number of operations plus exclusive lease
+// actions that shutdown must allow to finish. It intentionally differs from
+// Count, whose public/metric contract remains operation-only.
+func (registry *Registry) PendingWorkCount() int {
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	return registry.pendingWorkCountLocked()
+}
+
+// PendingLeaseUUIDs returns the detached union of operation and lease-claim
+// identities for shutdown diagnostics.
+func (registry *Registry) PendingLeaseUUIDs() []string {
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	leases := make(map[string]struct{}, len(registry.operations)+len(registry.leaseClaims))
+	for leaseUUID := range registry.operations {
+		leases[leaseUUID] = struct{}{}
+	}
+	for leaseUUID := range registry.leaseClaims {
+		leases[leaseUUID] = struct{}{}
+	}
+	return slices.Collect(maps.Keys(leases))
+}
+
 // CountsByBackend returns a detached snapshot of operation counts per backend.
 func (registry *Registry) CountsByBackend() map[string]int {
 	registry.mu.RLock()
@@ -947,19 +997,14 @@ func (registry *Registry) allocateOperationIDLocked() OperationID {
 	if registry.operationIDSource == nil {
 		return OperationID{}
 	}
-	// A collision with any ID issued by this process is an ABA risk: a delayed
-	// signed callback could otherwise match an unrelated replacement operation.
-	// Remember issued IDs for the process lifetime. Any source error, invalid
-	// value, or collision fails the operation immediately; retrying could hide a
-	// broken or adversarial entropy source.
+	// The production source delegates every allocation to crypto/rand-backed
+	// uuid.NewRandom. UUIDv4 is intentionally probabilistic and needs no
+	// process-lifetime issued-ID history. Any source error or invalid value fails
+	// this operation immediately; a predictable fallback is never installed.
 	candidate, err := registry.operationIDSource()
 	if err != nil || !candidate.Valid() {
 		return OperationID{}
 	}
-	if _, exists := registry.issuedOperationIDs[candidate]; exists {
-		return OperationID{}
-	}
-	registry.issuedOperationIDs[candidate] = struct{}{}
 	return candidate
 }
 
@@ -981,8 +1026,28 @@ func (registry *Registry) markMutationLocked(leaseUUID string) {
 
 func (registry *Registry) removeOperationLocked(leaseUUID string) {
 	delete(registry.operations, leaseUUID)
+	registry.closeDrainSignalIfIdleLocked()
 	registry.markMutationLocked(leaseUUID)
 	registry.notifyCountLocked()
+}
+
+// Caller holds registry.mu.
+func (registry *Registry) pendingWorkCountLocked() int {
+	return len(registry.operations) + len(registry.leaseClaims)
+}
+
+// Caller holds registry.mu. Call before inserting the first work item.
+func (registry *Registry) armDrainSignalLocked() {
+	if registry.pendingWorkCountLocked() == 0 {
+		registry.drained = make(chan struct{})
+	}
+}
+
+// Caller holds registry.mu. Call after removing one work item.
+func (registry *Registry) closeDrainSignalIfIdleLocked() {
+	if registry.pendingWorkCountLocked() == 0 {
+		close(registry.drained)
+	}
 }
 
 func (registry *Registry) notifyCountLocked() {

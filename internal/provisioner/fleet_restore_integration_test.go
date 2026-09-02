@@ -32,7 +32,10 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 		sourceLease = "lease-retained-source"
 		targetLease = "lease-restore-target"
 	)
+	sourceLeaseUUID := fleetLeaseUUID(sourceLease)
+	targetLeaseUUID := fleetLeaseUUID(targetLease)
 	owner := f.backendAt(2)
+	f.addLease(sourceLease, billingtypes.LEASE_STATE_CLOSED, "sku-restore")
 	owner.seedRetention(sourceLease)
 	require.NoError(t, f.sweep(), "complete inventory should establish restore affinity")
 	f.assertPlacementPinned(sourceLease, owner.name)
@@ -44,7 +47,7 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 
 	operations := f.tracker.Operations()
 	events := &fleetRestoreEventRecorder{}
-	callbacks, err := NewCallbackService(CallbackServiceConfig{
+	callbacks, err := newCallbackServiceForTest(CallbackServiceConfig{
 		Operations: operations,
 		Chain:      f.chain,
 		Acknowledger: fleetRestoreAcknowledgerFunc(func(
@@ -74,10 +77,11 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 			return fmt.Errorf("restore callback URL has no operation ID")
 		}
 		command, commandErr := NewCallbackCommand(backend.CallbackPayload{
-			LeaseUUID:   request.LeaseUUID,
-			Status:      backend.CallbackStatusSuccess,
-			Backend:     owner.name,
-			OperationID: operationID.String(),
+			LeaseUUID:        request.LeaseUUID,
+			Status:           backend.CallbackStatusSuccess,
+			Backend:          owner.name,
+			OperationID:      operationID.String(),
+			BackendStorageID: defaultCallbackTestStorageIdentity.String(),
 		})
 		if commandErr != nil {
 			return fmt.Errorf("build exact callback command: %w", commandErr)
@@ -93,7 +97,7 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 		CallbackURL: func(id operation.OperationID) (string, error) {
 			return BuildCallbackURLForOperation("http://fred.invalid", id)
 		},
-		Targets:    f.chain,
+		Leases:     f.chain,
 		Backends:   restoreapp.BackendResolverFunc(f.resolveRestoreBackend),
 		Operations: operations,
 		Authority:  f.placement,
@@ -102,9 +106,9 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 	require.NoError(t, err)
 
 	result := service.Execute(t.Context(), restoreapp.Command{
-		TargetLeaseUUID: targetLease,
+		TargetLeaseUUID: targetLeaseUUID,
 		Tenant:          "tenant-1",
-		SourceLeaseUUID: sourceLease,
+		SourceLeaseUUID: sourceLeaseUUID,
 	})
 	require.True(t, result.Accepted(), "restore failed: %v", result.Cause())
 	require.Equal(t, owner.name, result.BackendName)
@@ -119,30 +123,30 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 	}
 	request, ok := owner.restoreRequest(targetLease)
 	require.True(t, ok)
-	require.Equal(t, sourceLease, request.FromLeaseUUID)
-	require.Equal(t, targetLease, request.LeaseUUID)
+	require.Equal(t, sourceLeaseUUID, request.FromLeaseUUID)
+	require.Equal(t, targetLeaseUUID, request.LeaseUUID)
 	require.Equal(t, f.providerUUID, request.ProviderUUID)
 	require.Equal(t, "tenant-1", request.Tenant)
 
-	require.Equal(t, placement.StateConfirmed, f.placement.Lookup(targetLease).State())
+	require.Equal(t, placement.StateConfirmed, f.placement.Lookup(targetLeaseUUID).State())
 	f.assertPlacementPinned(targetLease, owner.name)
 	f.assertPlacementPinned(sourceLease, owner.name)
-	require.False(t, operations.Contains(targetLease),
+	require.False(t, operations.Contains(targetLeaseUUID),
 		"the inline exact callback must finish the process-local operation")
 	acked, _, _ := f.chainCalls()
-	require.Contains(t, acked, targetLease)
+	require.Contains(t, acked, targetLeaseUUID)
 	require.Equal(t,
 		[]backend.ProvisionStatus{
 			backend.ProvisionStatusRestarting,
 			backend.ProvisionStatusReady,
 		},
-		events.statuses(targetLease),
+		events.statuses(targetLeaseUUID),
 		"the pre-call event must precede an inline terminal callback",
 	)
 
 	// Both lifecycle claims must be released even though the callback completed
 	// during the backend call. Reacquiring them is a black-box leak check.
-	for _, leaseUUID := range []string{sourceLease, targetLease} {
+	for _, leaseUUID := range []string{sourceLeaseUUID, targetLeaseUUID} {
 		claim := operations.TryClaimLeaseNow(leaseUUID)
 		require.Truef(t, claim.Acquired(), "lifecycle claim leaked for %s", leaseUUID)
 		require.True(t, operations.ReleaseLease(claim.Claim()))

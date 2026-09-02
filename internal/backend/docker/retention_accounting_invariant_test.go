@@ -155,7 +155,13 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 		{
 			name: "reconcileRestoring_orphanedRevert",
 			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
-				b.volumes = newVols() // RenameVolume succeeds → re-quarantine works
+				b.volumes = &mockVolumeManager{
+					// A rollback may publish the source as Active only after it has
+					// re-established and verified the retained quota authority.
+					// Model a present, empty retained volume rather than relying on
+					// fakeVolumeBackend's intentionally unsupported Usage method.
+					UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
+				}
 				const origLease, newLease = "orig-r", "new-r"
 				entry := shared.RetentionEntry{
 					OriginalLeaseUUID:   origLease,
@@ -166,7 +172,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 					Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
 					RetainedVolumeNames: []string{"fred-retained-orig-r-web-0"},
 				}
-				require.NoError(t, rs.Put(entry))
+				entry = *putRestoringRetention(t, rs, entry)
 				// New-lease live allocation (no live provision → orphaned arm reverts it).
 				require.NoError(t, b.pool.TryAllocate(newLease+"-web-0", "docker-micro", "t1"))
 				require.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB, "pre: record restoring → not counted")
@@ -180,7 +186,9 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 		{
 			name: "rollbackRestoreAdoption",
 			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
-				b.volumes = newVols() // RenameVolume succeeds → record reverts to active
+				b.volumes = &mockVolumeManager{
+					UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
+				}
 				const origLease, newLease = "orig-rb", "new-rb"
 				rec := shared.RetentionEntry{
 					OriginalLeaseUUID:   origLease,
@@ -191,7 +199,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 					Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
 					RetainedVolumeNames: []string{"fred-retained-orig-rb-web-0"},
 				}
-				require.NoError(t, rs.Put(rec))
+				rec = *putRestoringRetention(t, rs, rec)
 				allocID := newLease + "-web-0"
 				require.NoError(t, b.pool.TryAllocate(allocID, "docker-micro", "t1"))
 
@@ -250,7 +258,9 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				// lease's (canonical) volumes; nothing RETAINED is mutated.
 				budget := retentionBudget{DiskCapMB: 1024}
 				incoming := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}}
-				scope, refuse := b.shouldRefuseRetention("incoming", "agg", "", incoming, budget)
+				scope, refuse := b.shouldRefuseRetentionWithResourceProfiles(
+					"incoming", "agg", "", incoming, nil, budget,
+				)
 				require.True(t, refuse)
 				require.Equal(t, refuseScopeTenant, scope)
 				rep := b.destroyOnRefuseToRetain(context.Background(), b.volumeOp("incoming", slog.Default()),
@@ -273,7 +283,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				putActivePart(t, rs, "held-2", "agg", "", time.Now().Add(-time.Hour))
 				// A restore of held-1 is in flight into the incoming lease, so
 				// fred-incoming-app-0 is held-1's data wearing the incoming lease's name.
-				require.NoError(t, rs.Put(shared.RetentionEntry{
+				putRestoringRetention(t, rs, shared.RetentionEntry{
 					OriginalLeaseUUID:   "held-1",
 					Tenant:              "agg",
 					NewLeaseUUID:        "incoming",
@@ -281,7 +291,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 					Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
 					RetainedVolumeNames: []string{retainedName(canonicalVolumeName("held-1", "app", 0))},
 					CreatedAt:           time.Now().Add(-2 * time.Hour),
-				}))
+				})
 				b.refreshRetentionAccounting()
 
 				rep := b.destroyOnRefuseToRetain(context.Background(), b.volumeOp("incoming", slog.Default()),
@@ -341,7 +351,7 @@ func TestRetentionAccountingInvariant_AfterDeprovisionRetainClose(t *testing.T) 
 			LeaseUUID: "lease-close", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}}},
 		}},

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/provisioner/callbackid"
 )
 
 // QueryParameter is the callback query parameter carrying an OperationID.
@@ -16,6 +17,8 @@ import (
 const QueryParameter = backend.CallbackOperationIDQueryParameter
 
 var (
+	errOperationIDSequenceExhausted = errors.New("operation ID sequence exhausted")
+
 	// ErrInvalidID reports a non-canonical or non-v4 operation identity.
 	ErrInvalidID = errors.New("operation ID must be a canonical UUIDv4")
 
@@ -35,7 +38,7 @@ var (
 //
 // Operation IDs are comparable and safe to use as map keys.
 type OperationID struct {
-	value uuid.UUID
+	value callbackid.UUIDv4
 }
 
 var _ encoding.TextMarshaler = OperationID{}
@@ -45,35 +48,27 @@ var _ fmt.Stringer = OperationID{}
 // used by callback URLs and durable placement intent. Alternative UUID forms,
 // uppercase text, non-v4 UUIDs, and the nil UUID are rejected.
 func ParseID(text string) (OperationID, error) {
-	parsed, err := uuid.Parse(text)
-	if err != nil || parsed.String() != text || parsed.Version() != uuid.Version(4) ||
-		parsed.Variant() != uuid.RFC4122 {
-		return OperationID{}, fmt.Errorf("%w: %q", ErrInvalidID, text)
+	parsed, err := callbackid.Parse(text, ErrInvalidID)
+	if err != nil {
+		return OperationID{}, err
 	}
-	return newOperationID(parsed), nil
+	return OperationID{value: parsed}, nil
 }
 
 // Valid reports whether id contains a canonical UUIDv4 operation identity.
 func (id OperationID) Valid() bool {
-	return id.value != uuid.Nil && id.value.Version() == uuid.Version(4) &&
-		id.value.Variant() == uuid.RFC4122
+	return id.value.Valid()
 }
 
 // String returns the canonical operation identity for structured logging. The
 // zero value is rendered as an explicit marker rather than the nil UUID.
 func (id OperationID) String() string {
-	if !id.Valid() {
-		return "invalid"
-	}
 	return id.value.String()
 }
 
 // MarshalText returns the canonical lowercase, hyphenated UUIDv4 wire value.
 func (id OperationID) MarshalText() ([]byte, error) {
-	if !id.Valid() {
-		return nil, ErrInvalidID
-	}
-	return []byte(id.value.String()), nil
+	return id.value.MarshalText(ErrInvalidID)
 }
 
 // ParseQuery parses the optional callback operation ID. The boolean reports
@@ -81,42 +76,36 @@ func (id OperationID) MarshalText() ([]byte, error) {
 // callbacks emitted by v0.13 backends. A present parameter must have exactly
 // one canonical UUIDv4 value.
 func ParseQuery(values url.Values) (id OperationID, present bool, err error) {
-	raw, present := values[QueryParameter]
-	if !present {
-		return OperationID{}, false, nil
-	}
-	if len(raw) != 1 {
-		return OperationID{}, true, ErrAmbiguousQuery
-	}
-
-	id, err = ParseID(raw[0])
-	if err != nil {
-		return OperationID{}, true, fmt.Errorf("%s: %w", QueryParameter, err)
-	}
-	return id, true, nil
+	return callbackid.ParseQuery(values, QueryParameter, ErrAmbiguousQuery, ParseID)
 }
 
 // SetQuery writes id using its canonical UUID representation. Existing values
 // for QueryParameter are replaced; unrelated values are retained. The
 // destination is not mutated on error.
 func SetQuery(values url.Values, id OperationID) error {
-	if values == nil {
-		return ErrNilQuery
-	}
-	text, err := id.MarshalText()
-	if err != nil {
-		return err
-	}
-	values.Set(QueryParameter, string(text))
-	return nil
+	return callbackid.SetQuery(values, QueryParameter, ErrNilQuery, id.MarshalText)
 }
 
 // newOperationID is deliberately package-private. Registry allocation and the
 // validated wire parser are the only paths that may mint an OperationID.
 func newOperationID(value uuid.UUID) OperationID {
+	return newOperationIDValue(callbackid.FromUUID(value))
+}
+
+func newOperationIDValue(value callbackid.UUIDv4) OperationID {
 	id := OperationID{value: value}
 	if !id.Valid() {
 		return OperationID{}
 	}
 	return id
+}
+
+func randomOperationID() (OperationID, error) {
+	value, err := uuid.NewRandom()
+	if err != nil {
+		// Operation identities are cross-process callback capabilities. Entropy
+		// failure must abort allocation; there is no predictable fallback.
+		return OperationID{}, err
+	}
+	return newOperationID(value), nil
 }

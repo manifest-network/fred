@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -12,6 +13,14 @@ import (
 
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
+
+func TestStoreExportsOnlyRevisionBoundRestoreAdmission(t *testing.T) {
+	storeType := reflect.TypeOf((*Store)(nil))
+	_, unchecked := storeType.MethodByName("BeginRestore")
+	assert.False(t, unchecked, "unchecked tenant-unaware restore admission must remain package-private")
+	_, authorized := storeType.MethodByName("BeginAuthorizedRestore")
+	assert.True(t, authorized, "production restore admission must require an exact source revision")
+}
 
 func newRestoreTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -23,7 +32,7 @@ func newRestoreTestStore(t *testing.T) *Store {
 
 func TestStore_InventoryBootstrappedIsDurableAndTopologyBound(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	s, err := NewStore(dbPath)
+	s, err := newStoreForTest(dbPath)
 	require.NoError(t, err)
 	assert.False(t, s.InventoryBootstrapped())
 
@@ -37,7 +46,7 @@ func TestStore_InventoryBootstrappedIsDurableAndTopologyBound(t *testing.T) {
 		"a partial inventory session must not erase the durable baseline")
 
 	require.NoError(t, s.Close())
-	reopened, err := NewStore(dbPath)
+	reopened, err := newStoreForTest(dbPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
 	assert.True(t, reopened.InventoryBootstrapped(),
@@ -49,7 +58,9 @@ func TestStore_BeginRestoreValidatesAuthorityAndSource(t *testing.T) {
 
 	notReady := newTestStore(t)
 	requireConfirmedPlacement(t, notReady, "source", "backend-a")
-	claim, err := notReady.BeginRestore(notReady.CurrentAdmissionBaseline(), "source", "target", opID)
+	claim, err := beginTestRestore(
+		t, notReady, notReady.CurrentAdmissionBaseline(), "source", "target", opID,
+	)
 	require.ErrorIs(t, err, ErrInvalidAdmissionBaseline)
 	assert.False(t, claim.Valid())
 	assert.Equal(t, StateAbsent, notReady.Lookup("target").State())
@@ -124,7 +135,9 @@ func TestStore_BeginRestoreValidatesAuthorityAndSource(t *testing.T) {
 			if tt.prepare != nil {
 				tt.prepare(t, s)
 			}
-			claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), tt.source, tt.target, tt.opID)
+			claim, err := beginTestRestore(
+				t, s, s.CurrentAdmissionBaseline(), tt.source, tt.target, tt.opID,
+			)
 			require.ErrorIs(t, err, tt.wantErr)
 			assert.False(t, claim.Valid())
 			if tt.target != "" && tt.target != "source" {
@@ -140,13 +153,14 @@ func TestStore_BeginRestoreAcceptsMigratedV013Source(t *testing.T) {
 	writeRawRecords(t, dbPath, map[string][]byte{
 		"source": []byte(`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`),
 	})
-	s, err := NewStore(dbPath)
+	s, err := newStore(dbPath, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
 	require.True(t, s.Lookup("source").RecordRevision().Valid())
 
-	claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7010"))
+	opID := requireOperationID(t, "7010")
+	claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 	require.NoError(t, err)
 	assert.True(t, claim.Valid())
 	assert.Equal(t, "backend-a", claim.Backend())
@@ -192,8 +206,9 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 			beforeTarget := s.Lookup("target")
 			beforeRevision := testRevision(s)
 
-			claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(),
-				"source", "target", requireOperationID(t, "7052"),
+			opID := requireOperationID(t, "7052")
+			claim, err := beginTestRestore(
+				t, s, s.CurrentAdmissionBaseline(), "source", "target", opID,
 			)
 			require.ErrorIs(t, err, ErrRestoreTargetUnavailable)
 			assert.False(t, claim.Valid())
@@ -207,7 +222,7 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 
 	t.Run("unusable", func(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "placements.db")
-		configured, err := NewStore(dbPath)
+		configured, err := newStoreForTest(dbPath)
 		require.NoError(t, err)
 		requireConfirmedPlacement(t, configured, "source", "backend-a")
 		requireAdmissionBaseline(t, configured, "backend-a", "backend-b")
@@ -216,7 +231,7 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 		writeRawRecords(t, dbPath, map[string][]byte{
 			"target": []byte(`{"set_at":"2026-08-25T15:00:00Z","revision":41}`),
 		})
-		s, err := NewStore(dbPath)
+		s, err := newStoreForTest(dbPath)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = s.Close() })
 		beforeSource := s.Lookup("source")
@@ -224,8 +239,9 @@ func TestStore_BeginRestoreRequiresTrulyAbsentTarget(t *testing.T) {
 		require.Equal(t, StateUnusable, beforeTarget.State())
 		beforeRevision := testRevision(s)
 
-		claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(),
-			"source", "target", requireOperationID(t, "7053"),
+		opID := requireOperationID(t, "7053")
+		claim, err := beginTestRestore(
+			t, s, s.CurrentAdmissionBaseline(), "source", "target", opID,
 		)
 		require.ErrorIs(t, err, ErrRestoreTargetUnavailable)
 		assert.False(t, claim.Valid())
@@ -270,7 +286,9 @@ func TestStore_RestoreSettlementLifecycle(t *testing.T) {
 			s := newRestoreTestStore(t)
 			opID, err := testOperationID(uint64(7100 + i))
 			require.NoError(t, err)
-			claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", opID)
+			claim, err := beginTestRestore(
+				t, s, s.CurrentAdmissionBaseline(), "source", "target", opID,
+			)
 			require.NoError(t, err)
 			require.True(t, claim.Valid())
 			assert.Equal(t, "backend-a", claim.Backend())
@@ -300,6 +318,46 @@ func TestStore_RestoreSettlementLifecycle(t *testing.T) {
 	}
 }
 
+func TestStore_RestoreSettlementDefersToExactAttemptClaim(t *testing.T) {
+	tests := []struct {
+		name   string
+		settle func(*Store, RestoreClaim) (bool, error)
+	}{
+		{name: "confirm", settle: (*Store).ConfirmRestore},
+		{name: "refuse", settle: (*Store).RefuseRestore},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := newRestoreTestStore(t)
+			operationID, err := testOperationID(uint64(7150 + index))
+			require.NoError(t, err)
+			restoreClaim, err := beginTestRestore(
+				t, s, s.CurrentAdmissionBaseline(), "source", "target", operationID,
+			)
+			require.NoError(t, err)
+
+			recoveryClaim, claimed, err := s.ClaimAttempt("target", operationID)
+			require.NoError(t, err)
+			require.True(t, claimed)
+			before := s.Lookup("target")
+
+			consumed, err := test.settle(s, restoreClaim)
+			require.ErrorIs(t, err, ErrAttemptClaimed)
+			assert.True(t, consumed, "the synchronous source reservation is still consumed")
+			assert.Equal(t, before, s.Lookup("target"),
+				"restore settlement cannot cross an exact callback recovery claim")
+			assert.Empty(t, s.restoreClaims)
+
+			confirmed, err := s.ConfirmClaimedAttempt(recoveryClaim)
+			require.NoError(t, err)
+			require.True(t, confirmed)
+			assert.Equal(t, StateConfirmed, s.Lookup("target").State())
+			assert.Equal(t, "backend-a", s.Lookup("target").Backend)
+		})
+	}
+}
+
 func TestStore_RestoreClaimIsZeroForeignAndNonceSafe(t *testing.T) {
 	s := newRestoreTestStore(t)
 	other := newRestoreTestStore(t)
@@ -316,7 +374,8 @@ func TestStore_RestoreClaimIsZeroForeignAndNonceSafe(t *testing.T) {
 		assert.False(t, consumed)
 	}
 
-	claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7201"))
+	opID := requireOperationID(t, "7201")
+	claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 	require.NoError(t, err)
 	consumed, err := other.AbandonRestore(claim)
 	require.ErrorIs(t, err, ErrInvalidRestoreClaim)
@@ -359,7 +418,9 @@ func TestStore_BeginRestoreExclusivelyClaimsSourceConcurrently(t *testing.T) {
 				outcomes <- outcome{err: err}
 				return
 			}
-			claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", fmt.Sprintf("target-%d", i), opID)
+			claim, err := beginTestRestore(
+				t, s, s.CurrentAdmissionBaseline(), "source", fmt.Sprintf("target-%d", i), opID,
+			)
 			outcomes <- outcome{claim: claim, err: err}
 		}(i)
 	}
@@ -388,7 +449,8 @@ func TestStore_BeginRestoreTargetAttemptIsAtomicWithSourceClaim(t *testing.T) {
 	t.Run("revision exhaustion", func(t *testing.T) {
 		s := newRestoreTestStore(t)
 		s.revision = math.MaxUint64
-		claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7401"))
+		opID := requireOperationID(t, "7401")
+		claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 		require.ErrorContains(t, err, "placement revision exhausted")
 		assert.False(t, claim.Valid())
 		assert.Empty(t, s.restoreClaims)
@@ -399,7 +461,8 @@ func TestStore_BeginRestoreTargetAttemptIsAtomicWithSourceClaim(t *testing.T) {
 	t.Run("nonce exhaustion", func(t *testing.T) {
 		s := newRestoreTestStore(t)
 		s.restoreNonce = math.MaxUint64
-		claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7402"))
+		opID := requireOperationID(t, "7402")
+		claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 		require.ErrorContains(t, err, "restore nonce exhausted")
 		assert.False(t, claim.Valid())
 		assert.Empty(t, s.restoreClaims)
@@ -409,8 +472,12 @@ func TestStore_BeginRestoreTargetAttemptIsAtomicWithSourceClaim(t *testing.T) {
 	t.Run("durable write failure", func(t *testing.T) {
 		s := newRestoreTestStore(t)
 		beforeRevision := testRevision(s)
-		require.NoError(t, s.Close())
-		claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7403"))
+		// Close only bbolt to inject a definitely pre-commit write failure while
+		// leaving the Store lifecycle open. Store.Close itself withdraws cached
+		// authority by design and is tested separately.
+		require.NoError(t, s.db.Close())
+		opID := requireOperationID(t, "7403")
+		claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 		require.Error(t, err)
 		assert.False(t, claim.Valid())
 		assert.Empty(t, s.restoreClaims)
@@ -423,12 +490,15 @@ func TestStore_BeginRestoreTargetAttemptIsAtomicWithSourceClaim(t *testing.T) {
 func TestStore_RestoreClaimFencesTypedSourceMutations(t *testing.T) {
 	s := newRestoreTestStore(t)
 	sourceRevision := s.Lookup("source").RecordRevision()
-	claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7501"))
+	opID := requireOperationID(t, "7501")
+	claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 	require.NoError(t, err)
 
 	token, applied, err := s.BeginOwnedAttempt(
 		s.CurrentAdmissionBaseline(), sourceRevision, "backend-a", requireOperationID(t, "7502"),
-	)
+		PayloadFingerprint{}, testBackendRequestSnapshot(t),
+		testCallbackPair(requireOperationID(t, "7502")))
+
 	require.ErrorIs(t, err, ErrRestoreSourceClaimed)
 	assert.False(t, applied)
 	assert.False(t, token.Valid())
@@ -479,7 +549,9 @@ func TestStore_ProjectInventoryFencesRestoreSourceOwnerAndConflictMutation(t *te
 			s := newRestoreTestStore(t)
 			opID, err := testOperationID(uint64(7600 + i))
 			require.NoError(t, err)
-			claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", opID)
+			claim, err := beginTestRestore(
+				t, s, s.CurrentAdmissionBaseline(), "source", "target", opID,
+			)
 			require.NoError(t, err)
 			fence := s.BeginInventorySession()
 			defer s.EndInventorySession(fence)
@@ -525,7 +597,9 @@ func TestStore_RestoreSettlementToleratesFastExactCallback(t *testing.T) {
 				s := newRestoreTestStore(t)
 				opID, err := testOperationID(uint64(7700 + i*10 + j))
 				require.NoError(t, err)
-				claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", opID)
+				claim, err := beginTestRestore(
+					t, s, s.CurrentAdmissionBaseline(), "source", "target", opID,
+				)
 				require.NoError(t, err)
 				applied, err := callback.apply(s, "target", "backend-a", opID)
 				require.NoError(t, err)
@@ -546,7 +620,8 @@ func TestStore_RestoreSettlementToleratesFastExactCallback(t *testing.T) {
 
 func TestStore_RestoreSettlementReleasesSourceClaimOnTargetWriteFailure(t *testing.T) {
 	s := newRestoreTestStore(t)
-	claim, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source", "target", requireOperationID(t, "7801"))
+	opID := requireOperationID(t, "7801")
+	claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 
@@ -562,10 +637,16 @@ func TestStore_BeginRestoreRefusesLeaseAlreadyClaimedAsAnotherSource(t *testing.
 	requireConfirmedPlacement(t, s, "source-a", "backend-a")
 	requireConfirmedPlacement(t, s, "source-b", "backend-a")
 	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
-	first, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source-a", "target-a", requireOperationID(t, "7901"))
+	firstID := requireOperationID(t, "7901")
+	first, err := beginTestRestore(
+		t, s, s.CurrentAdmissionBaseline(), "source-a", "target-a", firstID,
+	)
 	require.NoError(t, err)
 
-	second, err := s.BeginRestore(s.CurrentAdmissionBaseline(), "source-b", "source-a", requireOperationID(t, "7902"))
+	secondID := requireOperationID(t, "7902")
+	second, err := beginTestRestore(
+		t, s, s.CurrentAdmissionBaseline(), "source-b", "source-a", secondID,
+	)
 	require.ErrorIs(t, err, ErrRestoreSourceClaimed)
 	assert.False(t, second.Valid())
 	assert.Equal(t, StateConfirmed, s.Lookup("source-a").State())

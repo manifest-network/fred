@@ -1,22 +1,25 @@
 package operation
 
+// registryMarker is deliberately non-zero-sized. Go permits pointers to
+// distinct zero-sized variables to compare equal, which would weaken the
+// process-local capability boundary.
+type registryMarker struct{ issued byte }
+
 // registryIdentity distinguishes capabilities issued by different in-process
-// registries. A registry generates one non-zero identity at construction time.
-// Keeping the type and constructor private prevents callers from minting
+// registries. Pointer identity is unique by construction for the lifetime of
+// each registry and needs neither randomness nor a collision-prone fallback.
+// Keeping the marker and constructor private prevents callers from minting
 // capabilities outside the registry.
 type registryIdentity struct {
-	value uint64
+	marker *registryMarker
 }
 
-func newRegistryIdentity(value uint64) registryIdentity {
-	if value == 0 {
-		return registryIdentity{}
-	}
-	return registryIdentity{value: value}
+func newRegistryIdentity() registryIdentity {
+	return registryIdentity{marker: &registryMarker{issued: 1}}
 }
 
 func (id registryIdentity) valid() bool {
-	return id.value != 0
+	return id.marker != nil
 }
 
 // TrackerSnapshot is a causal boundary issued by an operation registry. A
@@ -41,35 +44,30 @@ func newTrackerSnapshot(registry registryIdentity, revision uint64) TrackerSnaps
 	return TrackerSnapshot{registry: registry, revision: revision}
 }
 
-// Token is the capability returned when a registry starts tracking an
-// operation. It binds the operation identity to both its lease and the issuing
-// registry, so conditional cleanup cannot accidentally target another lease or
-// another registry. The zero value is invalid.
-type Token struct {
+// operationToken is the registry-private identity shared by its public,
+// purpose-specific initiation and settlement capabilities. Keeping this token
+// private prevents callers from bypassing the phase-aware transition APIs.
+type operationToken struct {
 	registry  registryIdentity
 	leaseUUID string
 	id        OperationID
 }
 
-// Valid reports whether token was issued for a non-empty lease and valid
-// operation identity.
-func (token Token) Valid() bool {
+func (token operationToken) valid() bool {
 	return token.registry.valid() && token.leaseUUID != "" && token.id.Valid()
 }
 
-// ID returns the operation identity carried to the backend wire. An invalid
-// token returns an invalid OperationID.
-func (token Token) ID() OperationID {
-	if !token.Valid() {
+func (token operationToken) operationID() OperationID {
+	if !token.valid() {
 		return OperationID{}
 	}
 	return token.id
 }
 
-func newToken(registry registryIdentity, leaseUUID string, id OperationID) Token {
-	token := Token{registry: registry, leaseUUID: leaseUUID, id: id}
-	if !token.Valid() {
-		return Token{}
+func newOperationToken(registry registryIdentity, leaseUUID string, id OperationID) operationToken {
+	token := operationToken{registry: registry, leaseUUID: leaseUUID, id: id}
+	if !token.valid() {
+		return operationToken{}
 	}
 	return token
 }
@@ -77,15 +75,15 @@ func newToken(registry registryIdentity, leaseUUID string, id OperationID) Token
 // Initiation is the exclusive capability to advance one newly registered
 // backend operation from local preparation through the synchronous call
 // boundary. It deliberately exposes only the wire identity: callers cannot
-// obtain the underlying Token and bypass phase-aware completion with Abort.
+// obtain the underlying registry token and bypass phase-aware completion.
 // The zero value is invalid.
 type Initiation struct {
-	token Token
+	token operationToken
 }
 
 // Valid reports whether this capability was issued for a tracked operation.
 func (initiation Initiation) Valid() bool {
-	return initiation.token.Valid()
+	return initiation.token.valid()
 }
 
 // ID returns the operation identity carried in the callback URL and durable
@@ -94,10 +92,10 @@ func (initiation Initiation) ID() OperationID {
 	if !initiation.Valid() {
 		return OperationID{}
 	}
-	return initiation.token.ID()
+	return initiation.token.operationID()
 }
 
-func newInitiation(token Token) Initiation {
+func newInitiation(token operationToken) Initiation {
 	initiation := Initiation{token: token}
 	if !initiation.Valid() {
 		return Initiation{}
@@ -156,17 +154,17 @@ func (kind SettlementKind) validClaimKind() bool {
 // released and subsequently reacquired for the same operation. The zero value
 // is invalid.
 type SettlementClaim struct {
-	token Token
+	token operationToken
 	nonce uint64
 	kind  SettlementKind
 }
 
 // Valid reports whether claim was explicitly issued by a registry.
 func (claim SettlementClaim) Valid() bool {
-	return claim.token.Valid() && claim.nonce != 0 && claim.kind.validClaimKind()
+	return claim.token.valid() && claim.nonce != 0 && claim.kind.validClaimKind()
 }
 
-func newSettlementClaim(token Token, nonce uint64, kind SettlementKind) SettlementClaim {
+func newSettlementClaim(token operationToken, nonce uint64, kind SettlementKind) SettlementClaim {
 	claim := SettlementClaim{token: token, nonce: nonce, kind: kind}
 	if !claim.Valid() {
 		return SettlementClaim{}

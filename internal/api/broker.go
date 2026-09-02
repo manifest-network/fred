@@ -183,6 +183,23 @@ func (b *EventBroker) DispatchWithOrderedStart(
 	start backend.LeaseStatusEvent,
 	dispatch func() error,
 ) error {
+	_, err := b.DispatchWithOrderedSettlement(start, func() (bool, error) {
+		err := dispatch()
+		return err == nil, err
+	})
+	return err
+}
+
+// DispatchWithOrderedSettlement extends DispatchWithOrderedStart across local
+// settlement that must follow backend acceptance. accepted is independent of
+// err: callers return accepted=true when the backend effect started even if a
+// later durable write failed. The start event is then still truthful, while the
+// gate remains active until settlement finishes and queued callbacks cannot be
+// reordered ahead of it.
+func (b *EventBroker) DispatchWithOrderedSettlement(
+	start backend.LeaseStatusEvent,
+	dispatch func() (accepted bool, err error),
+) (bool, error) {
 	transition := b.acquireTransition(start.LeaseUUID)
 	transition.dispatch.Lock()
 	accepted := false
@@ -212,9 +229,8 @@ func (b *EventBroker) DispatchWithOrderedStart(
 	transition.active = true
 	b.transitionMu.Unlock()
 
-	err := dispatch()
-	accepted = err == nil
-	return err
+	accepted, err := dispatch()
+	return accepted, err
 }
 
 func (b *EventBroker) acquireTransition(leaseUUID string) *eventTransition {

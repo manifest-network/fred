@@ -3,6 +3,7 @@ package docker
 import (
 	"slices"
 
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
@@ -26,6 +27,7 @@ import (
 // //exhaustruct:enforce to get the same protection.
 type recoveredProvision struct {
 	leasesm.ProvisionState
+	resourceProfiles      []shared.SKUResourceSnapshot
 	volumeCleanupAttempts int
 }
 
@@ -35,6 +37,7 @@ type recoveredProvision struct {
 func (rec recoveredProvision) materialize() *provision {
 	return &provision{ //exhaustruct:enforce
 		ProvisionState:        rec.ProvisionState,
+		ResourceProfiles:      shared.CloneSKUResourceSnapshot(rec.resourceProfiles),
 		VolumeCleanupAttempts: rec.volumeCleanupAttempts,
 	}
 }
@@ -50,6 +53,7 @@ func (rec recoveredProvision) materialize() *provision {
 func recoveredFromProvision(p *provision) recoveredProvision {
 	rec := recoveredProvision{ //exhaustruct:enforce
 		ProvisionState:        p.ProvisionState,
+		resourceProfiles:      shared.CloneSKUResourceSnapshot(p.ResourceProfiles),
 		volumeCleanupAttempts: p.VolumeCleanupAttempts,
 	}
 	rec.Items = slices.Clone(p.Items)

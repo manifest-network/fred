@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,7 +36,7 @@ func TestCrossLeaseParallelism(t *testing.T) {
 	const diagDelay = 200 * time.Millisecond
 
 	var callbacksReceived atomic.Int32
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callbacksReceived.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))

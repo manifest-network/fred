@@ -26,7 +26,7 @@ import (
 // blocking on a done channel.
 func TestLeaseActor_DirectDispatch(t *testing.T) {
 	var callbackHit atomic.Bool
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callbackHit.Store(true)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -83,7 +83,7 @@ func TestConcurrentDeprovisionAndContainerDeath_ExactlyOneCallback(t *testing.T)
 	var failedSeen atomic.Bool
 	var deprovisionedSeen atomic.Bool
 
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload backend.CallbackPayload
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		callbackCount.Add(1)
@@ -317,7 +317,7 @@ func TestLeaseActor_StatusMatchesSMState(t *testing.T) {
 	}
 
 	var callbackReceived atomic.Int32
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callbackReceived.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -784,68 +784,6 @@ func TestHandleContainerDeath_ShutdownDoesNotHang(t *testing.T) {
 // to synthesize a deprovisionMsg directly and drive the actor, making
 // the handler panic and asserting the reply channel receives an error.
 
-// TestAckOrAbort_HonorsAckEvenWhenCtxCanceled pins the ctx-vs-ack race
-// fix. Go's select picks pseudo-randomly when multiple arms are ready,
-// so a naive select on {ack, ctx.Done, stopCtx.Done} can take the
-// cancellation arm even though the actor has acked — leading the caller
-// to roll back while the actor proceeds.
-//
-// We can't deterministically schedule the race in a unit test, but we
-// can verify the post-cancel non-blocking ack read: pre-cancel the ctx
-// AND pre-ack, then call ackOrAbort and assert it returns (true, nil)
-// instead of ctx.Err.
-func TestAckOrAbort_HonorsAckEvenWhenCtxCanceled(t *testing.T) {
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	defer b.stopCancel()
-
-	t.Run("ack_success_beats_ctx_cancel", func(t *testing.T) {
-		ack := make(chan error, 1)
-		ack <- nil // actor "acked" success
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel() // caller "gave up"
-
-		accepted, err := b.ackOrAbort(ctx, ack)
-		assert.True(t, accepted, "ackOrAbort must honor pre-queued ack even when ctx is already canceled")
-		assert.NoError(t, err)
-	})
-
-	t.Run("ack_error_beats_ctx_cancel", func(t *testing.T) {
-		ack := make(chan error, 1)
-		synthErr := fmt.Errorf("synthetic ack error")
-		ack <- synthErr
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		accepted, err := b.ackOrAbort(ctx, ack)
-		assert.False(t, accepted)
-		assert.ErrorIs(t, err, synthErr,
-			"ackOrAbort must surface actor-rejected error, not ctx.Err")
-	})
-
-	t.Run("no_ack_ctx_canceled", func(t *testing.T) {
-		ack := make(chan error, 1)
-		// no pre-ack
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		accepted, err := b.ackOrAbort(ctx, ack)
-		assert.False(t, accepted)
-		assert.ErrorIs(t, err, context.Canceled,
-			"with no ack and canceled ctx, ackOrAbort must return ctx.Err")
-	})
-
-	t.Run("no_ack_stop_ctx", func(t *testing.T) {
-		ack := make(chan error, 1)
-		ctx := context.Background() // caller ctx fine
-		b.stopCancel()              // backend shutting down
-
-		accepted, err := b.ackOrAbort(ctx, ack)
-		assert.False(t, accepted)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "backend shutting down")
-	})
-}
-
 // TestConcurrentProvisionDeprovision_Stress is an adversarial concurrency
 // test that hammers Backend.Provision and Backend.Deprovision on a small
 // pool of lease UUIDs with many goroutines. Together with -race, this
@@ -978,8 +916,8 @@ func TestConcurrentProvisionDeprovision_Stress(t *testing.T) {
 // TestDeprovision_HonorsLateReplyAfterCtxCancel pins bug_003: when the
 // actor acks success at the same instant as the caller's ctx cancels,
 // Go's select can take the cancellation arm and return ctx.Err() even
-// though doDeprovision already fully committed. Mirroring ackOrAbort's
-// pattern, the shim now does a non-blocking re-read of reply after
+// though doDeprovision already fully committed. The shim therefore does a
+// non-blocking re-read of reply after
 // cancellation so the actor's authoritative outcome wins.
 func TestDeprovision_HonorsLateReplyAfterCtxCancel(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
@@ -1020,8 +958,8 @@ func TestDeprovision_HonorsLateReplyAfterCtxCancel(t *testing.T) {
 
 // TestProvision_ReleasesPoolOnRouteFailure pins bug_001: when
 // Backend.Provision's handoff to the actor fails (routeToLeaseBlocking
-// errors out OR ackOrAbort rejects), the pool allocations made during
-// the preamble must be released, or they leak with no owning provision
+// errors out or durable admission is explicitly rejected), the pool allocations
+// made during the preamble must be released, or they leak with no owning provision
 // entry. A retry on the same lease would then fail TryAllocate with
 // "already allocated" and the lease becomes unrecoverable until
 // backend restart.

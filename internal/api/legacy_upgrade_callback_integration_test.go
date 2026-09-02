@@ -17,18 +17,21 @@ import (
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager composes the real
 // first-upgrade boundary. legacyMaintenanceLifecycleStore writes the v0.13
-// revision-zero JSON directly to disk before placement.NewStore first opens it;
-// the migrated capability must then authorize the old tokenless callback URL
-// through HMAC HTTP ingress and Manager's synchronous callback application.
+// revision-zero JSON directly to disk, runs explicit offline preparation, and
+// reopens the resulting authority through two online process generations. The
+// migrated capability must authorize the old tokenless callback URL through
+// HMAC HTTP ingress and Manager's synchronous callback application, reject a
+// stale typed identity, and retire terminal authority exactly once.
 func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 	const backendName = "backend-a"
 	leaseUUID := testutil.ValidUUID1
-	providerUUID := testutil.ValidUUID2
+	providerUUID := placementstore.ProviderUUID
 
 	placements := legacyMaintenanceLifecycleStore(t, leaseUUID, backendName)
 	require.Equal(t, placement.LifecycleVerdictLegacy,
@@ -90,31 +93,80 @@ func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 	httpServer := httptest.NewServer(http.HandlerFunc(callbackAPI.handleProvisionCallback))
 	t.Cleanup(httpServer.Close)
 
-	body, err := json.Marshal(backend.CallbackPayload{
-		LeaseUUID: leaseUUID,
-		Status:    backend.CallbackStatusSuccess,
-	})
-	require.NoError(t, err)
-	request, err := http.NewRequestWithContext(
-		context.Background(), http.MethodPost,
-		httpServer.URL+testCallbackURI, bytes.NewReader(body),
-	)
-	require.NoError(t, err)
+	send := func(requestURI string, payload backend.CallbackPayload) {
+		t.Helper()
+		payload.LeaseUUID = leaseUUID
+		payload.BackendStorageID = testAPIBackendStorageID(backendName).String()
+		body, marshalErr := json.Marshal(payload)
+		require.NoError(t, marshalErr)
+		request, requestErr := http.NewRequestWithContext(
+			context.Background(), http.MethodPost,
+			httpServer.URL+requestURI, bytes.NewReader(body),
+		)
+		require.NoError(t, requestErr)
+		request.Header.Set(CallbackSignatureHeader,
+			auth.ComputeSignature(request.Method, request.URL.RequestURI(), body),
+		)
+		response, requestErr := http.DefaultClient.Do(request)
+		require.NoError(t, requestErr)
+		assert.Equal(t, http.StatusOK, response.StatusCode)
+		require.NoError(t, response.Body.Close())
+	}
+	requireEvent := func(status backend.ProvisionStatus) backend.LeaseStatusEvent {
+		t.Helper()
+		select {
+		case event := <-leaseEvents:
+			assert.Equal(t, leaseUUID, event.LeaseUUID)
+			assert.Equal(t, status, event.Status)
+			return event
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for migrated legacy %s event", status)
+			return backend.LeaseStatusEvent{}
+		}
+	}
+	requireNoEvent := func(reason string) {
+		t.Helper()
+		select {
+		case event := <-leaseEvents:
+			t.Fatalf("%s: unexpected callback event: %+v", reason, event)
+		default:
+		}
+	}
+
+	// A typed callback cannot upgrade or replace the explicitly tokenless v0.13
+	// authority, even when its signature and storage identity are otherwise valid.
+	send(testCallbackURI+"?lifecycle_id=123e4567-e89b-42d3-a456-426614174099",
+		backend.CallbackPayload{Status: backend.CallbackStatusSuccess})
+	requireNoEvent("stale typed callback against migrated tokenless authority")
+	require.Equal(t, placement.LifecycleVerdictLegacy,
+		placements.CurrentLifecycle(leaseUUID).Verdict())
+
 	// Deliberately sign and send the bare v0.13 URI: no operation_id or
 	// lifecycle_id query parameter exists to manufacture typed authority.
-	request.Header.Set(CallbackSignatureHeader,
-		auth.ComputeSignature(request.Method, request.URL.RequestURI(), body),
-	)
-	response, err := http.DefaultClient.Do(request)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, response.Body.Close()) })
-	assert.Equal(t, http.StatusOK, response.StatusCode)
+	send(testCallbackURI, backend.CallbackPayload{Status: backend.CallbackStatusSuccess})
+	assert.Empty(t, requireEvent(backend.ProvisionStatusReady).Error)
 
-	select {
-	case event := <-leaseEvents:
-		assert.Equal(t, leaseUUID, event.LeaseUUID)
-		assert.Equal(t, backend.ProvisionStatusReady, event.Status)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for migrated legacy callback event")
-	}
+	send(testCallbackURI, backend.CallbackPayload{
+		Status: backend.CallbackStatusFailed,
+		Error:  "container exited after upgrade",
+	})
+	assert.Equal(t, "container exited after upgrade",
+		requireEvent(backend.ProvisionStatusFailed).Error)
+
+	send(testCallbackURI, backend.CallbackPayload{
+		Status:   backend.CallbackStatusDeprovisioned,
+		Retained: true,
+	})
+	assert.Contains(t, requireEvent(backend.ProvisionStatusRetained).Error, "lease data was retained")
+	require.True(t, placements.CurrentLifecycle(leaseUUID).Retired(),
+		"the authenticated backend's terminal callback must consume legacy teardown authority")
+
+	// A persisted v0.13 sender may redeliver after losing the 2xx response. The
+	// retired tokenless capability acknowledges that duplicate without publishing
+	// a second terminal event or recreating authority.
+	send(testCallbackURI, backend.CallbackPayload{
+		Status:   backend.CallbackStatusDeprovisioned,
+		Retained: true,
+	})
+	requireNoEvent("duplicate tokenless callback after terminal retirement")
 }

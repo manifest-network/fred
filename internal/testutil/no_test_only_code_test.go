@@ -115,6 +115,7 @@ var testOnlyDocPhrases = []string{
 var testSupportPackages = []string{
 	"internal/testutil",
 	"internal/chain/chaintest",
+	"internal/testsupport/backendclient",
 }
 
 // exemptDecls are individual production declarations the scan skips,

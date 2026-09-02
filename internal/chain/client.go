@@ -167,31 +167,9 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("signer pool is required")
 	}
-	dialOpts := []grpc.DialOption{
-		// Keepalive must respect the server's enforcement policy.
-		// Cosmos SDK / gRPC defaults: MinTime=5m, PermitWithoutStream=false.
-		// Pinging more aggressively triggers GOAWAY ENHANCE_YOUR_CALM.
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                5 * time.Minute,
-			Timeout:             10 * time.Second,
-			PermitWithoutStream: false,
-		}),
-	}
-
-	if cfg.TLSEnabled {
-		tlsConfig, err := buildTLSConfig(cfg.TLSCAFile, cfg.TLSSkipVerify)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build TLS config: %w", err)
-		}
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
-		slog.Info("gRPC TLS enabled", "ca_file", cfg.TLSCAFile, "skip_verify", cfg.TLSSkipVerify)
-	} else {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	}
-
-	conn, err := grpc.NewClient(cfg.Endpoint, dialOpts...)
+	conn, err := dialGRPC(cfg.Endpoint, cfg.TLSEnabled, cfg.TLSCAFile, cfg.TLSSkipVerify)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to gRPC endpoint: %w", err)
+		return nil, err
 	}
 
 	// Apply defaults using cmp.Or (returns first non-zero value)
@@ -214,6 +192,40 @@ func NewClient(cfg ClientConfig, pool *SignerPool) (*Client, error) {
 		withdrawLimit:   uint64(withdrawLimit),
 		now:             time.Now,
 	}, nil
+}
+
+// dialGRPC is the shared transport constructor for transactional and
+// query-only chain clients. Keeping signer construction out of this boundary
+// lets offline safety tools inspect chain state without opening a keyring or
+// exposing any transaction capability.
+func dialGRPC(endpoint string, tlsEnabled bool, tlsCAFile string, tlsSkipVerify bool) (*grpc.ClientConn, error) {
+	dialOpts := []grpc.DialOption{
+		// Keepalive must respect the server's enforcement policy.
+		// Cosmos SDK / gRPC defaults: MinTime=5m, PermitWithoutStream=false.
+		// Pinging more aggressively triggers GOAWAY ENHANCE_YOUR_CALM.
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                5 * time.Minute,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
+	}
+
+	if tlsEnabled {
+		tlsConfig, err := buildTLSConfig(tlsCAFile, tlsSkipVerify)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build TLS config: %w", err)
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+		slog.Info("gRPC TLS enabled", "ca_file", tlsCAFile, "skip_verify", tlsSkipVerify)
+	} else {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	conn, err := grpc.NewClient(endpoint, dialOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to gRPC endpoint: %w", err)
+	}
+	return conn, nil
 }
 
 // buildTLSConfig creates a TLS configuration for gRPC.

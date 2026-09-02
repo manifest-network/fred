@@ -2,13 +2,16 @@ package k3s
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"strings"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backendname"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 // Type aliases for readability within the k3s package. The underlying
@@ -147,10 +150,10 @@ type Config struct {
 	// and would refuse to open a name already held by the sibling process).
 	CallbackDBPath string `yaml:"callback_db_path"`
 
-	// CallbackMaxAge is the maximum age of a persisted callback entry.
-	// Entries older than this are removed by the callback store's background cleanup.
-	// It must be positive so an undeliverable FIFO head cannot block newer
-	// callbacks forever. Defaults to 24h.
+	// CallbackMaxAge is the maximum age of a legacy callback or typed lifecycle
+	// observation. Exact operation completions never expire because they may be
+	// the only evidence that settles Fred's durable placement attempt. It must be
+	// positive. Defaults to 24h.
 	CallbackMaxAge time.Duration `yaml:"callback_max_age"`
 
 	// DiagnosticsDBPath is the path to the bbolt database for persisting failure diagnostics.
@@ -252,8 +255,8 @@ func DefaultConfig() Config {
 // hardening / volume / network-isolation knobs). The Ingress placeholder
 // is still validated and rejects Enabled=true.
 func (c *Config) Validate() error {
-	if c.Name == "" {
-		return fmt.Errorf("name is required")
+	if err := backendname.Validate(c.Name); err != nil {
+		return fmt.Errorf("name: %w", err)
 	}
 
 	// A non-positive cap (unset in YAML, or 0) falls back to the default rather
@@ -266,6 +269,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("listen_addr is required")
 	}
 
+	if math.IsNaN(c.TotalCPUCores) || math.IsInf(c.TotalCPUCores, 0) {
+		return fmt.Errorf("total_cpu_cores must be finite")
+	}
 	if c.TotalCPUCores <= 0 {
 		return fmt.Errorf("total_cpu_cores must be positive")
 	}
@@ -317,8 +323,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("callback_secret is required")
 	}
 
-	if len(c.CallbackSecret) < 32 {
-		return fmt.Errorf("callback_secret must be at least 32 characters")
+	if len(c.CallbackSecret) < hmacauth.MinSecretLength {
+		return fmt.Errorf("callback_secret must be at least %d characters", hmacauth.MinSecretLength)
 	}
 
 	if c.HostAddress == "" {

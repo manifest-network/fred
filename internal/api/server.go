@@ -5,7 +5,6 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +19,7 @@ import (
 	"github.com/rs/cors"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
@@ -55,6 +55,14 @@ type CallbackPublisher interface {
 	PublishCallback(ctx context.Context, callback backend.CallbackPayload) error
 }
 
+// callbackRequestAuthenticator returns the exact DTO it authenticated. The
+// production implementation selects a per-storage-lineage key from the bounded
+// body; keeping decode inside this boundary prevents authentication and
+// application from interpreting duplicate JSON differently.
+type callbackRequestAuthenticator interface {
+	VerifyCallbackRequest(*http.Request) (backend.CallbackPayload, error)
+}
+
 // StatusChecker provides status information about provisioning.
 // Typically implemented by the provisioner.Manager.
 type StatusChecker interface {
@@ -78,7 +86,7 @@ type Server struct {
 	rateLimiter           *RateLimiter
 	tenantRateLimiter     *TenantRateLimiter
 	callbackPublisher     CallbackPublisher
-	callbackAuthenticator *CallbackAuthenticator
+	callbackAuthenticator callbackRequestAuthenticator
 	statusChecker         StatusChecker
 }
 
@@ -102,10 +110,11 @@ type ServerConfig struct {
 	CallbackApplicationTimeout  time.Duration // Timeout for terminal callback application (default: backend.DefaultCallbackApplicationTimeout)
 	ShutdownTimeout             time.Duration // Timeout for graceful shutdown (default: 30s)
 	MaxRequestBodySize          int64
-	CallbackSecret              string // HMAC secret for callback authentication
-	CallbackCanonicalPathPrefix string // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
-	TokenTrackerDBPath          string // Path to token tracker database (enables replay protection)
-	CallbackBaseURL             string // Base URL for backend callbacks (used by restart/update)
+	CallbackSecret              string                        // Non-production legacy single HMAC secret for isolated embeddings.
+	CallbackHMACSecrets         map[backendidentity.ID]string // Production callback keys indexed by immutable backend storage identity.
+	CallbackCanonicalPathPrefix string                        // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
+	TokenTrackerDBPath          string                        // Path to token tracker database (enables replay protection)
+	CallbackBaseURL             string                        // Base URL for backend callbacks (used by restart/update)
 }
 
 // ServerDeps holds the runtime dependencies for the API server.
@@ -120,6 +129,7 @@ type ServerDeps struct {
 	StatusChecker      StatusChecker
 	PlacementLookup    PlacementLookup            // Required by providerd; nil is supported only by isolated/test API embeddings.
 	LifecycleCallbacks LifecycleCallbackAuthority // Required by providerd for typed restart/update callback routes.
+	MaintenanceClaims  MaintenanceClaims          // Required by providerd for restart/update lifecycle exclusion.
 	RestoreService     RestoreService             // Required by /restore; missing service returns 503.
 	EventBroker        *EventBroker               // Optional — if nil, the events endpoint returns 501.
 }
@@ -168,6 +178,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		StatusChecker:      statusChecker,
 		PlacementLookup:    placementLookup,
 		LifecycleCallbacks: deps.LifecycleCallbacks,
+		MaintenanceClaims:  deps.MaintenanceClaims,
 		RestoreService:     deps.RestoreService,
 		PayloadPersister:   deps.PayloadPersister,
 		PayloadStoreHealth: deps.PayloadStoreHealth,
@@ -200,15 +211,26 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 	requestTimeout := cmp.Or(max(cfg.RequestTimeout, 0), defaultRequestTimeout)
 	shutdownTimeout := cmp.Or(max(cfg.ShutdownTimeout, 0), defaultShutdownTimeout)
 
-	// Create callback authenticator if secret is provided
-	var callbackAuth *CallbackAuthenticator
-	if cfg.CallbackSecret != "" {
+	// Production uses a storage-lineage keyring. The single-key constructor stays
+	// available for isolated non-production embeddings, but accepting both would
+	// create an ambiguous authentication policy.
+	var callbackAuth callbackRequestAuthenticator
+	if cfg.CallbackSecret != "" && len(cfg.CallbackHMACSecrets) != 0 {
+		return nil, fmt.Errorf("callback HMAC keyring cannot be combined with legacy callback secret")
+	}
+	if len(cfg.CallbackHMACSecrets) != 0 {
+		keyring, err := NewCallbackKeyringAuthenticator(cfg.CallbackHMACSecrets)
+		if err != nil {
+			return nil, fmt.Errorf("create callback HMAC keyring: %w", err)
+		}
+		callbackAuth = keyring.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
+	} else if cfg.CallbackSecret != "" {
 		var err error
-		callbackAuth, err = NewCallbackAuthenticator(cfg.CallbackSecret)
+		legacyAuth, err := NewCallbackAuthenticator(cfg.CallbackSecret)
 		if err != nil {
 			return nil, fmt.Errorf("create callback authenticator: %w", err)
 		}
-		callbackAuth = callbackAuth.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
+		callbackAuth = legacyAuth.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
 	}
 
 	// Create payload handler if publisher is provided
@@ -355,20 +377,21 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	body, err := s.callbackAuthenticator.VerifyRequest(r)
+	callback, err := s.callbackAuthenticator.VerifyCallbackRequest(r)
 	if err != nil {
+		if errors.Is(err, errInvalidCallbackPayload) {
+			slog.Warn("invalid callback payload",
+				"error", err,
+				"remote_addr", r.RemoteAddr,
+			)
+			writeError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
 		slog.Warn("callback authentication failed",
 			"error", err,
 			"remote_addr", r.RemoteAddr,
 		)
 		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
-		return
-	}
-
-	var callback backend.CallbackPayload
-	if err := json.Unmarshal(body, &callback); err != nil {
-		slog.Warn("invalid callback payload", "error", err)
-		writeError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
@@ -422,13 +445,19 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		writeError(w, "status must be 'success', 'failed', or 'deprovisioned'", http.StatusBadRequest)
 		return
 	}
-
-	// Note: we intentionally do NOT short-circuit non-in-flight callbacks here.
-	// Restart/update operations don't register in the in-flight tracker (the lease
-	// is already ACTIVE), so their completion callbacks arrive with IsInFlight==false.
-	// The synchronous callback application handles both cases correctly:
-	// in-flight callbacks trigger chain acknowledgement, while non-in-flight callbacks
-	// publish the status event for WebSocket clients.
+	if present && callback.Status == backend.CallbackStatusDeprovisioned {
+		writeError(w, "deprovisioned status requires lifecycle or legacy callback authority", http.StatusBadRequest)
+		return
+	}
+	if callback.Retained && callback.Status != backend.CallbackStatusDeprovisioned {
+		writeError(w, "retained requires deprovisioned status", http.StatusBadRequest)
+		return
+	}
+	// Do not short-circuit callbacks that have no active operation-registry entry.
+	// Restart and update use lifecycle authority for an already-active lease, so
+	// their completion callbacks legitimately have no provision/restore operation.
+	// The synchronous callback application selects settlement from the typed
+	// callback authority instead of treating registry membership as authority.
 
 	slog.Info("received provision callback",
 		"lease_uuid", callback.LeaseUUID,

@@ -6,14 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sync"
+	"syscall"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/fsidentity"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/metrics/background"
+	"github.com/manifest-network/fred/internal/provisioner/storeauthority"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -51,6 +56,21 @@ var (
 	// never outlive its hash or vice versa. A payload written by an older build
 	// simply has no entry here; readers fall back to the on-chain MetaHash.
 	payloadHashBucketName = []byte("payload_hashes")
+
+	// ErrStoreAuthorityUnavailable is sticky for one Store lifetime. It means the
+	// configured pathname can no longer be proved to name the private, single-link
+	// regular file opened by this process.
+	ErrStoreAuthorityUnavailable = errors.New("payload store authority is unavailable")
+
+	// ErrStoreAuthorityPathChanged identifies permission, link-count, pathname,
+	// or physical-parent drift at the payload database.
+	ErrStoreAuthorityPathChanged = errors.New("payload store pathname changed")
+
+	// ErrStoreMutationOutcomeUnknown means bbolt returned an error from Commit.
+	// Database pages or a meta page may already be durable, so the process must
+	// withdraw this Store's authority instead of retrying as though the batch
+	// definitely rolled back.
+	ErrStoreMutationOutcomeUnknown = errors.New("payload store mutation outcome is unknown")
 )
 
 // writeOpType represents the type of write operation.
@@ -93,6 +113,11 @@ type writeResult struct {
 type Store struct {
 	db *bolt.DB
 
+	authorityDirectory *fsidentity.Directory
+	authorityEntry     fsidentity.Entry
+	authorityInfo      os.FileInfo
+	authorityGate      *storeauthority.Gate
+
 	// Write batching
 	writeCh       chan writeOp
 	batchSize     int
@@ -124,11 +149,60 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 	batchSize := cmp.Or(max(cfg.BatchSize, 0), DefaultBatchSize)
 	flushInterval := cmp.Or(max(cfg.FlushInterval, 0), DefaultFlushInterval)
 
-	db, err := bolt.Open(cfg.DBPath, 0600, &bolt.Options{
+	canonicalPath, directory, entry, existingInfo, exists, err := bindPayloadStorePath(cfg.DBPath)
+	if err != nil {
+		return nil, err
+	}
+	closeDirectory := true
+	defer func() {
+		if closeDirectory {
+			_ = directory.Close()
+		}
+	}()
+
+	var openedInfo os.FileInfo
+	db, err := bolt.Open(canonicalPath, 0o600, &bolt.Options{
 		Timeout: 5 * time.Second,
+		OpenFile: func(requested string, flag int, mode os.FileMode) (*os.File, error) {
+			if requested != canonicalPath {
+				return nil, errors.New("bbolt requested an unexpected payload database path")
+			}
+			if exists {
+				flag &^= os.O_CREATE
+			} else {
+				flag |= os.O_CREATE | os.O_EXCL
+			}
+			file, openErr := entry.OpenFile(flag, mode)
+			if openErr != nil {
+				return nil, openErr
+			}
+			info, statErr := file.Stat()
+			if statErr != nil {
+				_ = file.Close()
+				return nil, fmt.Errorf("stat opened payload database: %w", statErr)
+			}
+			if validationErr := validatePayloadStoreFile(canonicalPath, info); validationErr != nil {
+				_ = file.Close()
+				return nil, validationErr
+			}
+			if existingInfo != nil && !os.SameFile(existingInfo, info) {
+				_ = file.Close()
+				return nil, errors.New("payload database changed between validation and open")
+			}
+			if openedInfo != nil && !os.SameFile(openedInfo, info) {
+				_ = file.Close()
+				return nil, errors.New("bbolt reopened a different payload database inode")
+			}
+			openedInfo = info
+			return file, nil
+		},
 	})
 	if err != nil {
 		return nil, err
+	}
+	if openedInfo == nil {
+		_ = db.Close()
+		return nil, errors.New("bbolt did not open the payload database")
 	}
 
 	// Create buckets if they don't exist
@@ -151,18 +225,57 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 		_ = db.Close() // Best effort cleanup on init failure
 		return nil, err
 	}
+	if err := verifyPayloadStoreBinding(directory, entry, openedInfo); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// bbolt synchronizes file pages, not the directory entry which names the
+	// inode. Sync on every construction, including a retry after an earlier
+	// constructor failed, so NewStore never publishes an entry whose durability
+	// depends on whether this invocation happened to create it.
+	if err := directory.Sync(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sync payload database parent: %w", err)
+	}
+	if err := verifyPayloadStoreBinding(directory, entry, openedInfo); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("re-attest payload database after parent sync: %w", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Store{
-		db:            db,
-		writeCh:       make(chan writeOp, writeChannelSize),
-		batchSize:     batchSize,
-		flushInterval: flushInterval,
-		ctx:           ctx,
-		cancel:        cancel,
-		wg:            &sync.WaitGroup{},
-		closeOnce:     &sync.Once{},
+	authorityGate, err := storeauthority.New(
+		func(err error) bool {
+			return errors.Is(err, ErrStoreAuthorityUnavailable) ||
+				errors.Is(err, ErrStoreMutationOutcomeUnknown)
+		},
+		func(error) { cancel() },
+	)
+	if err != nil {
+		cancel()
+		_ = db.Close()
+		return nil, fmt.Errorf("construct payload store authority gate: %w", err)
 	}
+	s := &Store{
+		db:                 db,
+		authorityDirectory: directory,
+		authorityEntry:     entry,
+		authorityInfo:      openedInfo,
+		authorityGate:      authorityGate,
+		writeCh:            make(chan writeOp, writeChannelSize),
+		batchSize:          batchSize,
+		flushInterval:      flushInterval,
+		ctx:                ctx,
+		cancel:             cancel,
+		wg:                 &sync.WaitGroup{},
+		closeOnce:          &sync.Once{},
+	}
+	initialCount, err := s.count()
+	if err != nil {
+		cancel()
+		_ = db.Close()
+		return nil, fmt.Errorf("count initialized payloads: %w", err)
+	}
+	closeDirectory = false
 
 	// Start the batching writer goroutine (using WaitGroup.Go for Go 1.25+).
 	// Wrap with recover so a panic in writerLoop (e.g., bbolt returning
@@ -186,17 +299,268 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 		s.writerLoop(ctx)
 	})
 
-	// Initialize the stored count metric based on current database state
-	metrics.PayloadStoredCount.Set(float64(s.Count()))
+	// Initialize the stored count metric based on the pre-publication snapshot.
+	metrics.PayloadStoredCount.Set(float64(initialCount))
 
 	slog.Info("payload store initialized",
 		"db_path", cfg.DBPath,
 		"batch_size", batchSize,
 		"flush_interval", flushInterval,
-		"initial_count", s.Count(),
+		"initial_count", initialCount,
 	)
 
 	return s, nil
+}
+
+func bindPayloadStorePath(
+	path string,
+) (
+	canonicalPath string,
+	directory *fsidentity.Directory,
+	entry fsidentity.Entry,
+	existingInfo os.FileInfo,
+	exists bool,
+	resultErr error,
+) {
+	absolute, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", nil, fsidentity.Entry{}, nil, false,
+			fmt.Errorf("resolve payload database path: %w", err)
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", nil, fsidentity.Entry{}, nil, false,
+			fmt.Errorf("resolve payload database parent: %w", err)
+	}
+	parent, err = filepath.Abs(parent)
+	if err != nil {
+		return "", nil, fsidentity.Entry{}, nil, false,
+			fmt.Errorf("resolve absolute payload database parent: %w", err)
+	}
+	parent = filepath.Clean(parent)
+	directory, err = fsidentity.OpenDirectory(parent)
+	if err != nil {
+		return "", nil, fsidentity.Entry{}, nil, false,
+			fmt.Errorf("bind payload database parent: %w", err)
+	}
+	closeOnError := func(cause error) error {
+		if closeErr := directory.Close(); closeErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("close payload database parent: %w", closeErr))
+		}
+		return cause
+	}
+	entry, err = directory.Entry(filepath.Base(absolute))
+	if err != nil {
+		return "", nil, fsidentity.Entry{}, nil, false,
+			closeOnError(fmt.Errorf("bind payload database entry: %w", err))
+	}
+	canonicalPath = entry.DisplayPath()
+	existingInfo, err = entry.Lstat()
+	switch {
+	case err == nil:
+		if err := validatePayloadStoreFile(canonicalPath, existingInfo); err != nil {
+			return "", nil, fsidentity.Entry{}, nil, false, closeOnError(err)
+		}
+		exists = true
+	case errors.Is(err, os.ErrNotExist):
+		existingInfo = nil
+		exists = false
+	case err != nil:
+		return "", nil, fsidentity.Entry{}, nil, false,
+			closeOnError(fmt.Errorf("stat payload database: %w", err))
+	}
+	if err := directory.VerifyPath(); err != nil {
+		return "", nil, fsidentity.Entry{}, nil, false,
+			closeOnError(fmt.Errorf("verify payload database parent: %w", err))
+	}
+	return canonicalPath, directory, entry, existingInfo, exists, nil
+}
+
+func validatePayloadStoreFile(path string, info os.FileInfo) error {
+	if info == nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("payload database %q is not a regular file", path)
+	}
+	if info.Mode() != 0o600 {
+		return fmt.Errorf("payload database %q must have exact mode 0600", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Nlink != 1 {
+		return fmt.Errorf("payload database %q must have exactly one hard link", path)
+	}
+	return nil
+}
+
+func verifyPayloadStoreBinding(
+	directory *fsidentity.Directory,
+	entry fsidentity.Entry,
+	expected os.FileInfo,
+) error {
+	if directory == nil || !entry.Valid() || expected == nil {
+		return errors.New("payload database authority is not bound")
+	}
+	if err := directory.VerifyPath(); err != nil {
+		return fmt.Errorf("payload database parent changed: %w", err)
+	}
+	current, err := entry.Lstat()
+	if err != nil {
+		return fmt.Errorf("stat payload database authority: %w", err)
+	}
+	if err := validatePayloadStoreFile(entry.DisplayPath(), current); err != nil {
+		return err
+	}
+	if !os.SameFile(expected, current) {
+		return errors.New("payload database path no longer names the opened inode")
+	}
+	return directory.VerifyPath()
+}
+
+func (s *Store) authorityFailure() error {
+	if s == nil || s.authorityGate == nil || !s.authorityGate.Valid() {
+		return ErrStoreAuthorityUnavailable
+	}
+	return s.authorityGate.Error()
+}
+
+func (s *Store) latchAuthorityFailure(cause error) error {
+	if cause == nil {
+		cause = errors.New("unknown payload database authority failure")
+	}
+	if s == nil || s.authorityGate == nil || !s.authorityGate.Valid() {
+		return fmt.Errorf("%w: %w", ErrStoreAuthorityUnavailable, cause)
+	}
+	return s.authorityGate.Withdraw(payloadAuthorityPathFailure(cause))
+}
+
+func payloadAuthorityPathFailure(cause error) error {
+	return fmt.Errorf("%w: %w: %w",
+		ErrStoreAuthorityUnavailable, ErrStoreAuthorityPathChanged, cause)
+}
+
+func payloadCommitOutcomeUnknown(cause error) error {
+	return fmt.Errorf("%w: %w: %w",
+		ErrStoreAuthorityUnavailable, ErrStoreMutationOutcomeUnknown, cause)
+}
+
+func (s *Store) probeAuthority() error {
+	if s == nil {
+		return errors.New("payload store is nil")
+	}
+	return verifyPayloadStoreBinding(
+		s.authorityDirectory,
+		s.authorityEntry,
+		s.authorityInfo,
+	)
+}
+
+func (s *Store) reattestAuthority() error {
+	if err := s.authorityFailure(); err != nil {
+		return err
+	}
+	if err := s.probeAuthority(); err != nil {
+		return s.latchAuthorityFailure(err)
+	}
+	return s.authorityFailure()
+}
+
+// terminalError preserves a sticky authority-withdrawal classification when
+// the same failure also canceled the writer context. Ordinary shutdown reports
+// the context error; a recovered mutation-boundary panic is latched first.
+func (s *Store) terminalError() error {
+	if err := s.authorityFailure(); err != nil {
+		return err
+	}
+	return s.ctx.Err()
+}
+
+func (s *Store) view(fn func(*bolt.Tx) error) error {
+	if s == nil || fn == nil {
+		return errors.New("payload store and read transaction are required")
+	}
+	if err := s.reattestAuthority(); err != nil {
+		return err
+	}
+	viewErr := s.db.View(fn)
+	authorityErr := s.reattestAuthority()
+	return errors.Join(viewErr, authorityErr)
+}
+
+func (s *Store) update(fn func(*bolt.Tx) error) error {
+	if s == nil || fn == nil {
+		return errors.New("payload store and write transaction are required")
+	}
+	if s.authorityGate == nil || !s.authorityGate.Valid() {
+		return ErrStoreAuthorityUnavailable
+	}
+	return s.authorityGate.Run(func() error {
+		if err := s.probeAuthority(); err != nil {
+			return payloadAuthorityPathFailure(err)
+		}
+		updateErr := updatePayloadWithExplicitOutcome(s.db, fn)
+		if errors.Is(updateErr, ErrStoreMutationOutcomeUnknown) {
+			updateErr = payloadCommitOutcomeUnknown(updateErr)
+		}
+		postcheckErr := s.probeAuthority()
+		if postcheckErr != nil {
+			postcheckErr = payloadAuthorityPathFailure(postcheckErr)
+		}
+		return errors.Join(updateErr, postcheckErr)
+	})
+}
+
+type payloadWriteTransaction interface {
+	Commit() error
+	Rollback() error
+}
+
+// finishPayloadWriteTransaction distinguishes a definitely uncommitted
+// mutation-function rejection from an outcome-unknown bbolt Commit error.
+func finishPayloadWriteTransaction(
+	tx payloadWriteTransaction,
+	mutate func() error,
+) error {
+	if tx == nil {
+		return errors.New("payload write transaction is required")
+	}
+	if mutate == nil {
+		return errors.New("payload mutation is required")
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			_ = tx.Rollback()
+		}
+	}()
+	if err := mutate(); err != nil {
+		rollbackErr := tx.Rollback()
+		finished = true
+		if rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("roll back rejected payload mutation: %w", rollbackErr))
+		}
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		// Commit may have made pages durable before returning its error. Rollback is
+		// only a defensive writer-lock release; it cannot make the outcome definite.
+		_ = tx.Rollback()
+		finished = true
+		return fmt.Errorf("%w: %w", ErrStoreMutationOutcomeUnknown, err)
+	}
+	finished = true
+	return nil
+}
+
+func updatePayloadWithExplicitOutcome(
+	db *bolt.DB,
+	mutate func(*bolt.Tx) error,
+) error {
+	if db == nil {
+		return errors.New("payload database is not open")
+	}
+	tx, err := db.Begin(true)
+	if err != nil {
+		return err
+	}
+	return finishPayloadWriteTransaction(tx, func() error { return mutate(tx) })
 }
 
 // Store stores a payload for a lease.
@@ -274,7 +638,7 @@ func (s *Store) Put(leaseUUID string, payload []byte) error {
 	select {
 	case s.writeCh <- op:
 	case <-s.ctx.Done():
-		return fmt.Errorf("payload store closed, cannot put payload for %s: %w", leaseUUID, s.ctx.Err())
+		return fmt.Errorf("payload store closed, cannot put payload for %s: %w", leaseUUID, s.terminalError())
 	}
 
 	select {
@@ -289,7 +653,7 @@ func (s *Store) Put(leaseUUID string, payload []byte) error {
 		}
 		return nil
 	case <-s.ctx.Done():
-		return fmt.Errorf("payload store closed during put for %s: %w", leaseUUID, s.ctx.Err())
+		return fmt.Errorf("payload store closed during put for %s: %w", leaseUUID, s.terminalError())
 	}
 }
 
@@ -320,7 +684,7 @@ func (s *Store) GetWithHash(leaseUUID string) ([]byte, []byte, error) {
 	key := []byte(leaseUUID)
 	var payload, hash []byte
 
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		if data := tx.Bucket(payloadBucketName).Get(key); data != nil {
 			// Make a copy since bbolt data is only valid within the transaction
 			payload = make([]byte, len(data))
@@ -356,7 +720,7 @@ func (s *Store) Get(leaseUUID string) ([]byte, error) {
 	key := []byte(leaseUUID)
 	var payload []byte
 
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket(payloadBucketName)
 		data := b.Get(key)
 		if data != nil {
@@ -420,7 +784,7 @@ func (s *Store) Has(leaseUUID string) (bool, error) {
 	key := []byte(leaseUUID)
 	var exists bool
 
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket(payloadBucketName)
 		exists = b.Get(key) != nil
 		return nil
@@ -471,20 +835,31 @@ func (s *Store) Delete(leaseUUID string) {
 
 // Count returns the number of stored payloads.
 func (s *Store) Count() int {
+	count, err := s.count()
+	if err != nil {
+		slog.Error("failed to count payloads", "error", err)
+		return 0
+	}
+	return count
+}
+
+// count preserves a read or authority failure for constructor callers, which
+// must not publish a Store whose initial database state cannot be proved safe.
+// Count is the compatibility wrapper for callers that cannot return an error.
+func (s *Store) count() (int, error) {
 	var count int
 
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket(payloadBucketName)
 		count = b.Stats().KeyN
 		return nil
 	})
 
 	if err != nil {
-		slog.Error("failed to count payloads", "error", err)
-		return 0
+		return 0, err
 	}
 
-	return count
+	return count, nil
 }
 
 // List returns all lease UUIDs that have stored payloads.
@@ -492,7 +867,7 @@ func (s *Store) Count() int {
 func (s *Store) List() []string {
 	var leaseUUIDs []string
 
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket(payloadBucketName)
 		c := b.Cursor()
 		for k, _ := c.First(); k != nil; k, _ = c.Next() {
@@ -511,7 +886,7 @@ func (s *Store) List() []string {
 
 // Healthy checks if the bbolt database is accessible and both buckets exist.
 func (s *Store) Healthy() error {
-	return s.db.View(func(tx *bolt.Tx) error {
+	return s.view(func(tx *bolt.Tx) error {
 		if tx.Bucket(payloadBucketName) == nil {
 			return errors.New("payload bucket missing")
 		}
@@ -536,7 +911,12 @@ func (s *Store) Close() error {
 		// Wait for all goroutines to finish (writer will flush pending ops)
 		s.wg.Wait()
 
-		s.closeErr = s.db.Close()
+		dbErr := s.db.Close()
+		var directoryErr error
+		if s.authorityDirectory != nil {
+			directoryErr = s.authorityDirectory.Close()
+		}
+		s.closeErr = errors.Join(dbErr, directoryErr)
 	})
 	return s.closeErr
 }
@@ -563,7 +943,7 @@ func (s *Store) writerLoop(ctx context.Context) {
 		// Individual operation errors are recorded per-result but don't cause
 		// transaction rollback - each lease's payload is independent, so one
 		// failed operation shouldn't block unrelated operations in the batch.
-		err := s.db.Update(func(tx *bolt.Tx) error {
+		err := s.update(func(tx *bolt.Tx) error {
 			payloadBucket := tx.Bucket(payloadBucketName)
 			metaBucket := tx.Bucket(payloadMetaBucketName)
 			hashBucket := tx.Bucket(payloadHashBucketName)

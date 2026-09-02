@@ -32,8 +32,11 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
+	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 	"github.com/manifest-network/fred/internal/testutil"
 )
+
+const testCallbackBaseURL = "https://fred.example"
 
 type restoreServiceFunc func(context.Context, restoreapp.Command) restoreapp.Result
 
@@ -183,7 +186,7 @@ func TestHealthCheck_BackendUnhealthy(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -241,7 +244,7 @@ func TestHealthCheck_AllHealthy(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "healthy-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -422,7 +425,9 @@ func TestHealthCheck_UnconfiguredChecksAreAbsent(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 
 	assert.Equal(t, "healthy", response.Status)
-	for _, key := range []string{"chain", "token_tracker", "placement_store", "payload_store"} {
+	for _, key := range []string{
+		"chain", "token_tracker", "placement_store", "placement_inventory", "payload_store",
+	} {
 		assert.NotContains(t, response.Checks, key,
 			"%s is not configured and must be omitted, not reported as passing", key)
 	}
@@ -469,7 +474,9 @@ func TestHealthCheck_PayloadStoreProbed(t *testing.T) {
 // Asserts both polarities in one test so the ordering of other tests touching
 // these global collectors cannot make it pass vacuously.
 func TestHealthCheck_RecordsCheckGauges(t *testing.T) {
-	checkNames := []string{"chain", "token_tracker", "placement_store", "payload_store"}
+	checkNames := []string{
+		"chain", "token_tracker", "placement_store", "placement_inventory", "payload_store",
+	}
 
 	probe := func(t *testing.T, healthy bool) {
 		t.Helper()
@@ -494,12 +501,17 @@ func TestHealthCheck_RecordsCheckGauges(t *testing.T) {
 			return unhealthyStore()
 		}
 
+		bootstrap := &mockBootstrapPlacementLookup{
+			mockPlacementLookup: mockPlacementLookup{healthyFunc: result},
+			bootstrapped:        healthy,
+		}
 		h := &Handlers{
 			client: &mockChainClient{
 				pingFunc: func(ctx context.Context) error { return result() },
 			},
 			tokenTracker:       &mockTokenTracker{healthyFunc: result},
-			placementLookup:    &mockPlacementLookup{healthyFunc: result},
+			placementLookup:    bootstrap,
+			placementBootstrap: bootstrap,
 			payloadStoreHealth: &mockPayloadStoreHealth{healthyFunc: result},
 			providerUUID:       testutil.ValidUUID1,
 			bech32Prefix:       "manifest",
@@ -545,7 +557,7 @@ func TestHealthCheck_KeepsProbingBackends(t *testing.T) {
 
 	router, err := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{
-			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+			Backend: newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 				Name:    "gauge-backend",
 				BaseURL: backendServer.URL,
 				Timeout: 5 * time.Second,
@@ -617,7 +629,7 @@ func TestServer_HealthNeverReturns503ThroughTheStack(t *testing.T) {
 
 	router, err := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{
-			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+			Backend: newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 				Name: "hung-backend",
 				// Deliberately LONGER than healthProbeBudget: the budget, not
 				// the client timeout, must be what bounds this.
@@ -714,7 +726,7 @@ func TestHealthCheck_HungBackendStillServes(t *testing.T) {
 
 	router, err := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{
-			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+			Backend: newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 				Name:    "hung-backend",
 				BaseURL: backendServer.URL,
 				Timeout: 200 * time.Millisecond,
@@ -758,7 +770,7 @@ func TestReadyz_RemoteDegradationStays200(t *testing.T) {
 
 	router, err := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{
-			Backend: backend.NewHTTPClient(backend.HTTPClientConfig{
+			Backend: newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 				Name:    "down-backend",
 				BaseURL: backendServer.URL,
 				Timeout: 5 * time.Second,
@@ -1010,6 +1022,13 @@ func (m *mockChainClient) GetLease(ctx context.Context, leaseUUID string) (*bill
 	if m.getLeaseFunc != nil {
 		return m.getLeaseFunc(ctx, leaseUUID)
 	}
+	// Most maintenance tests historically supplied only the ACTIVE query used by
+	// request authentication. Model an ordinary chain client by letting the exact
+	// lookup observe that same lease unless a test supplies a distinct exact-read
+	// result (for example an ACTIVE->CLOSED boundary regression).
+	if m.getActiveLeaseFunc != nil {
+		return m.getActiveLeaseFunc(ctx, leaseUUID)
+	}
 	return nil, nil
 }
 
@@ -1090,7 +1109,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		defer backendServer.Close()
 
 		// Create real backend client and router
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -1136,7 +1155,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -1193,7 +1212,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -1250,7 +1269,7 @@ func TestGetLeaseConnection_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -1731,7 +1750,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -1804,7 +1823,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -1869,7 +1888,7 @@ func TestGetLeaseConnection_TokenReplayProtection(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -2246,7 +2265,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -2307,7 +2326,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -2398,7 +2417,7 @@ func TestGetLeaseStatus(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -2647,7 +2666,7 @@ func TestTokenTracker_FailClosed(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -2864,7 +2883,7 @@ func TestGetLeaseStatus_RedactsVerboseError_SurfacesReasonMessage(t *testing.T) 
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -2938,7 +2957,7 @@ func TestGetLeaseStatus_FailedEmptyReason_DefaultsUnknown(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -3003,7 +3022,7 @@ func TestGetLeaseProvision(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3058,10 +3077,10 @@ func TestGetLeaseProvision(t *testing.T) {
 		}))
 		defer routedServer.Close()
 
-		placedBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		placedBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name: "placed-drained", BaseURL: placedServer.URL, Timeout: 5 * time.Second,
 		})
-		routedBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		routedBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name: "sku-routed", BaseURL: routedServer.URL, Timeout: 5 * time.Second,
 		})
 		router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
@@ -3156,7 +3175,7 @@ func TestGetLeaseProvision(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3217,7 +3236,7 @@ func TestGetLeaseProvision(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3256,7 +3275,7 @@ func TestGetLeaseProvision(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3379,7 +3398,7 @@ func TestGetLeaseProvision(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3447,7 +3466,7 @@ func TestGetLeaseLogs(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3493,7 +3512,7 @@ func TestGetLeaseLogs(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3536,7 +3555,7 @@ func TestGetLeaseLogs(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3566,7 +3585,7 @@ func TestGetLeaseLogs(t *testing.T) {
 	})
 
 	t.Run("tail_invalid_returns_400", func(t *testing.T) {
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: "http://unused",
 			Timeout: 5 * time.Second,
@@ -3612,7 +3631,7 @@ func TestGetLeaseLogs(t *testing.T) {
 	})
 
 	t.Run("tail_exceeds_max_returns_400", func(t *testing.T) {
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: "http://unused",
 			Timeout: 5 * time.Second,
@@ -3670,7 +3689,7 @@ func TestGetLeaseLogs(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3709,7 +3728,7 @@ func TestGetLeaseLogs(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3795,7 +3814,7 @@ func TestGetLeaseLogs(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3883,7 +3902,7 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3899,7 +3918,9 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		h := &Handlers{
 			client:             chainClient,
 			backendRouter:      router,
+			callbackBaseURL:    testCallbackBaseURL,
 			lifecycleCallbacks: lifecycleCallbacks,
+			maintenanceClaims:  operation.NewRegistry(),
 			providerUUID:       providerUUID,
 			bech32Prefix:       "manifest",
 		}
@@ -3929,7 +3950,7 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3945,7 +3966,9 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		h := &Handlers{
 			client:             chainClient,
 			backendRouter:      router,
+			callbackBaseURL:    testCallbackBaseURL,
 			lifecycleCallbacks: lifecycleCallbacks,
+			maintenanceClaims:  operation.NewRegistry(),
 			providerUUID:       providerUUID,
 			bech32Prefix:       "manifest",
 		}
@@ -3975,7 +3998,7 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -3991,7 +4014,9 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		h := &Handlers{
 			client:             chainClient,
 			backendRouter:      router,
+			callbackBaseURL:    testCallbackBaseURL,
 			lifecycleCallbacks: lifecycleCallbacks,
+			maintenanceClaims:  operation.NewRegistry(),
 			providerUUID:       providerUUID,
 			bech32Prefix:       "manifest",
 		}
@@ -4021,7 +4046,7 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4037,7 +4062,9 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		h := &Handlers{
 			client:             chainClient,
 			backendRouter:      router,
+			callbackBaseURL:    testCallbackBaseURL,
 			lifecycleCallbacks: lifecycleCallbacks,
+			maintenanceClaims:  operation.NewRegistry(),
 			providerUUID:       providerUUID,
 			bech32Prefix:       "manifest",
 		}
@@ -4056,6 +4083,94 @@ func TestRestartLease_BackendIntegration(t *testing.T) {
 		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
 		assert.Equal(t, "restarting", response["status"])
 	})
+}
+
+func TestMaintenanceEndpointsRefuseWhileDurableOperationNeedsRedelivery(t *testing.T) {
+	keyPair := testutil.NewTestKeyPair("pending-redelivery-maintenance")
+	leaseUUID := testutil.ValidUUID1
+	providerUUID := testutil.ValidUUID2
+	const backendName = "test-backend"
+
+	chainClient := &mockChainClient{
+		getActiveLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
+			if uuid != leaseUUID {
+				return nil, nil
+			}
+			return &billingtypes.Lease{
+				Uuid: leaseUUID, Tenant: keyPair.Address, ProviderUuid: providerUUID,
+				State: billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
+	}
+	store, _ := typedMaintenanceLifecycleStore(t, leaseUUID, backendName)
+	pendingID, err := operation.ParseID("b7287b89-5166-46ce-83a8-80aa388b881c")
+	require.NoError(t, err)
+	_, begun, err := store.BeginOwnedAttempt(
+		store.CurrentAdmissionBaseline(), store.Lookup(leaseUUID).RecordRevision(),
+		backendName, pendingID, placement.PayloadFingerprint{},
+		testAPIBackendRequestSnapshot(t),
+		testAPICallbackPair(t, pendingID),
+	)
+	require.NoError(t, err)
+	require.True(t, begun)
+	require.Equal(t, placement.LifecycleVerdictTeardownOnly,
+		store.CurrentLifecycle(leaseUUID).Verdict())
+
+	var backendCalls atomic.Int32
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backendCalls.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(backendServer.Close)
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
+		Name: backendName, BaseURL: backendServer.URL, Timeout: time.Second,
+	})
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{{
+		Backend: backendClient, IsDefault: true,
+	}}})
+	require.NoError(t, err)
+	persister := &mockPayloadPersister{}
+	handlers := &Handlers{
+		client:             chainClient,
+		backendRouter:      router,
+		callbackBaseURL:    testCallbackBaseURL,
+		placementLookup:    store,
+		lifecycleCallbacks: store,
+		maintenanceClaims:  operation.NewRegistry(),
+		providerUUID:       providerUUID,
+		bech32Prefix:       "manifest",
+		payloadPersister:   persister,
+	}
+
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "restart", path: "restart"},
+		{name: "update", path: "update", body: `{"payload":"dGVzdA=="}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost, "/v1/leases/"+leaseUUID+"/"+test.path,
+				strings.NewReader(test.body),
+			)
+			request.Header.Set("Authorization", "Bearer "+
+				testutil.CreateTestToken(keyPair, leaseUUID, time.Now()))
+			request.SetPathValue("lease_uuid", leaseUUID)
+			response := httptest.NewRecorder()
+			if test.path == "restart" {
+				handlers.RestartLease(response, request)
+			} else {
+				handlers.UpdateLease(response, request)
+			}
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+			assert.Zero(t, backendCalls.Load(),
+				"maintenance must not reach the backend while exact redelivery is pending")
+			assert.Empty(t, persister.calls,
+				"update must not replace the payload used to reconstruct exact redelivery")
+		})
+	}
 }
 
 // TestUpdateLease_BackendIntegration tests the backend integration path
@@ -4095,7 +4210,7 @@ func updateTestBackend(t *testing.T, status int, body string) (*backend.Router, 
 	}))
 	t.Cleanup(server.Close)
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -4135,7 +4250,9 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		return &Handlers{
 			client:             chainClient,
 			backendRouter:      router,
+			callbackBaseURL:    testCallbackBaseURL,
 			lifecycleCallbacks: lifecycleCallbacks,
+			maintenanceClaims:  operation.NewRegistry(),
 			providerUUID:       providerUUID,
 			bech32Prefix:       "manifest",
 			payloadPersister:   persister,
@@ -4167,7 +4284,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4204,7 +4321,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4244,7 +4361,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4285,7 +4402,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4328,7 +4445,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4365,7 +4482,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4406,7 +4523,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4537,7 +4654,7 @@ func TestUpdateLease_BackendIntegration(t *testing.T) {
 		}))
 		defer server.Close()
 
-		client := backend.NewHTTPClient(backend.HTTPClientConfig{
+		client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name: "test-backend", BaseURL: server.URL, Timeout: 5 * time.Second,
 		})
 		router, err := backend.NewRouter(backend.RouterConfig{
@@ -4617,7 +4734,7 @@ func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4662,7 +4779,7 @@ func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4722,7 +4839,7 @@ func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4778,7 +4895,7 @@ func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
 		}))
 		defer backendServer.Close()
 
-		backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "test-backend",
 			BaseURL: backendServer.URL,
 			Timeout: 5 * time.Second,
@@ -4920,12 +5037,12 @@ func TestResolveBackend_PlacementRouting(t *testing.T) {
 		}))
 		defer defaultServer.Close()
 
-		placedBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		placedBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "placed-backend",
 			BaseURL: placedServer.URL,
 			Timeout: 5 * time.Second,
 		})
-		defaultBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		defaultBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "default-backend",
 			BaseURL: defaultServer.URL,
 			Timeout: 5 * time.Second,
@@ -4994,7 +5111,7 @@ func TestResolveBackend_PlacementRouting(t *testing.T) {
 		}))
 		defer defaultServer.Close()
 
-		defaultBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		defaultBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "default-backend",
 			BaseURL: defaultServer.URL,
 			Timeout: 5 * time.Second,
@@ -5049,7 +5166,7 @@ func TestResolveBackend_PlacementRouting(t *testing.T) {
 		}))
 		defer defaultServer.Close()
 
-		defaultBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		defaultBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "default-backend",
 			BaseURL: defaultServer.URL,
 			Timeout: 5 * time.Second,
@@ -5100,7 +5217,7 @@ func TestResolveBackend_PlacementRouting(t *testing.T) {
 		}))
 		defer defaultServer.Close()
 
-		defaultBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+		defaultBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 			Name:    "default-backend",
 			BaseURL: defaultServer.URL,
 			Timeout: 5 * time.Second,
@@ -5300,7 +5417,7 @@ func TestGetWorkloads_NonStackImageRoundTrip(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
@@ -5346,7 +5463,7 @@ func TestGetWorkloads_StackImageRoundTrip(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
@@ -5403,7 +5520,7 @@ func TestGetWorkloads_DedupesRepeatedLeaseUUIDs(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
@@ -5445,10 +5562,10 @@ func TestGetWorkloads_FanOutAcrossBackends(t *testing.T) {
 	})
 	defer srv2.Close()
 
-	client1 := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client1 := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "backend-1", BaseURL: srv1.URL, Timeout: 5 * time.Second,
 	})
-	client2 := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client2 := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "backend-2", BaseURL: srv2.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{
@@ -5484,10 +5601,10 @@ func TestGetWorkloads_BackendErrorWarning(t *testing.T) {
 	failingSrv := newFailingServer(t)
 	defer failingSrv.Close()
 
-	healthyClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	healthyClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "healthy-backend", BaseURL: healthySrv.URL, Timeout: 5 * time.Second,
 	})
-	failingClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	failingClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "failing-backend", BaseURL: failingSrv.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{
@@ -5519,7 +5636,7 @@ func TestGetWorkloads_UnknownLeasesOmitted(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
@@ -5538,7 +5655,7 @@ func TestGetWorkloads_AllUnknownReturnsEmptyMap(t *testing.T) {
 	srv := newFilteredProvisionServer(t, nil)
 	defer srv.Close()
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
@@ -5562,10 +5679,10 @@ func TestGetWorkloads_AllBackendsFail(t *testing.T) {
 	failingSrv2 := newFailingServer(t)
 	defer failingSrv2.Close()
 
-	client1 := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client1 := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "backend-1", BaseURL: failingSrv1.URL, Timeout: 5 * time.Second,
 	})
-	client2 := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client2 := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "backend-2", BaseURL: failingSrv2.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{
@@ -5596,7 +5713,7 @@ func TestGetWorkloads_StackNilServiceImages(t *testing.T) {
 	})
 	defer srv.Close()
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "test-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
@@ -5705,7 +5822,7 @@ func TestGetWorkloads_ContextCancelled(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "slow-backend", BaseURL: srv.URL, Timeout: 5 * time.Second,
 	})
 	h := newWorkloadsHandler(t, []backend.BackendEntry{{Backend: client, IsDefault: true}})
@@ -5736,13 +5853,58 @@ func TestGetWorkloads_ContextCancelled(t *testing.T) {
 // path) so the handler can't accidentally confuse the two.
 const fromLeaseUUID = "fedcba98-7654-3210-fedc-ba9876543210"
 
+// restoreTestLeaseReader supplies the terminal source-chain record that the
+// older handler tests did not need to model. Explicit records from the wrapped
+// reader win, so authorization tests can still model cross-tenant ownership.
+type restoreTestLeaseReader struct {
+	restoreapp.LeaseReader
+	placements   PlacementLookup
+	providerUUID string
+	tenant       string
+}
+
+func (reader restoreTestLeaseReader) GetLease(
+	ctx context.Context,
+	leaseUUID string,
+) (*billingtypes.Lease, error) {
+	lease, err := reader.LeaseReader.GetLease(ctx, leaseUUID)
+	if err != nil {
+		return lease, err
+	}
+	if lease != nil {
+		if len(lease.Items) != 0 {
+			return lease, nil
+		}
+		// The restore service persists an exact replay snapshot before dispatch.
+		// Older handler fixtures predated that boundary and modeled only lease
+		// ownership/state, so give those otherwise-valid targets one valid item.
+		clone := *lease
+		clone.Items = []billingtypes.LeaseItem{{
+			SkuUuid: "test-sku", Quantity: 1, ServiceName: "app",
+		}}
+		return &clone, nil
+	}
+	if reader.placements == nil {
+		return nil, nil
+	}
+	if reader.placements.Lookup(leaseUUID).State() != placement.StateConfirmed {
+		return nil, nil
+	}
+	return &billingtypes.Lease{
+		Uuid:         leaseUUID,
+		Tenant:       reader.tenant,
+		ProviderUuid: reader.providerUUID,
+		State:        billingtypes.LEASE_STATE_CLOSED,
+	}, nil
+}
+
 func newRestoreAuthorityForTest(
 	t *testing.T,
 	sourcePlacements PlacementLookup,
 	router *backend.Router,
 ) *placement.Store {
 	t.Helper()
-	store, err := placement.NewStore(filepath.Join(t.TempDir(), "restore-placements.db"))
+	store, err := placementstore.NewStore(filepath.Join(t.TempDir(), "restore-placements.db"))
 	require.NoError(t, err)
 	backendNames := make([]string, 0, len(router.Backends()))
 	for _, backendClient := range router.Backends() {
@@ -5761,11 +5923,13 @@ func newRestoreAuthorityForTest(
 			}
 		}
 	}
-	require.NoError(t, store.ConfigureBackendTopology(backendNames))
+	configureAPIPlacementTopology(t, store, backendNames)
 	fence := store.BeginInventorySession()
 	_, err = store.ProjectInventory(fence, placement.InventoryProjection{
-		Complete:   true,
-		Placements: placements,
+		Complete:                 true,
+		Placements:               placements,
+		BackendStorageIdentities: testAPIBackendStorageIDs(backendNames...),
+		EmptyBackends:            testAPIEmptyBackends(backendNames, placements),
 	})
 	require.NoError(t, err)
 	store.EndInventorySession(fence)
@@ -5775,22 +5939,28 @@ func newRestoreAuthorityForTest(
 
 func newRestoreServiceForTest(
 	t *testing.T,
-	providerUUID string,
-	targets restoreapp.TargetLeaseReader,
+	providerUUID, tenant string,
+	leases restoreapp.LeaseReader,
 	router *backend.Router,
 	sourcePlacements PlacementLookup,
 	events restoreapp.EventSink,
 ) RestoreService {
 	t.Helper()
-	if sourcePlacements == nil || targets == nil || router == nil {
+	if sourcePlacements == nil || leases == nil || router == nil {
 		return nil
+	}
+	leases = restoreTestLeaseReader{
+		LeaseReader:  leases,
+		placements:   sourcePlacements,
+		providerUUID: providerUUID,
+		tenant:       tenant,
 	}
 	service, err := restoreapp.NewService(restoreapp.Config{
 		ProviderUUID: providerUUID,
 		CallbackURL: func(operationID operation.OperationID) (string, error) {
 			return provisioner.BuildCallbackURLForOperation("https://fred.example.test", operationID)
 		},
-		Targets: targets,
+		Leases: leases,
 		Backends: restoreapp.BackendResolverFunc(func(name string) restoreapp.RestoreBackend {
 			return router.GetBackendByName(name)
 		}),
@@ -5840,7 +6010,7 @@ func TestRestoreLease_ForwardsAnd202(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -5865,7 +6035,7 @@ func TestRestoreLease_ForwardsAnd202(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -5928,7 +6098,7 @@ func TestRestoreLease_RejectsNonPendingLease(t *testing.T) {
 			}))
 			defer backendServer.Close()
 
-			backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 				Name:    "test-backend",
 				BaseURL: backendServer.URL,
 				Timeout: 5 * time.Second,
@@ -5986,7 +6156,7 @@ func TestRestoreLease_RereadRejectsTargetThatBecameTerminal(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer backendServer.Close()
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "test-backend", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
 	})
 	router, err := backend.NewRouter(backend.RouterConfig{
@@ -6004,7 +6174,7 @@ func TestRestoreLease_RereadRejectsTargetThatBecameTerminal(t *testing.T) {
 		BackendRouter:   router,
 		PlacementLookup: sourcePlacements,
 		RestoreService: newRestoreServiceForTest(
-			t, providerUUID, chainClient, router, sourcePlacements, nil,
+			t, providerUUID, kp.Address, chainClient, router, sourcePlacements, nil,
 		),
 		ProviderUUID: providerUUID,
 		Bech32Prefix: "manifest",
@@ -6055,7 +6225,7 @@ func TestRestoreLease_NoRetention404(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6080,7 +6250,7 @@ func TestRestoreLease_NoRetention404(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6134,7 +6304,7 @@ func TestRestoreLease_InsufficientResources503(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6159,7 +6329,7 @@ func TestRestoreLease_InsufficientResources503(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6218,7 +6388,7 @@ func TestRestoreLease_PendingLeaseAuthenticates(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6243,7 +6413,7 @@ func TestRestoreLease_PendingLeaseAuthenticates(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6289,7 +6459,7 @@ func TestRestoreLease_MalformedFromLease400(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6356,7 +6526,7 @@ func TestRestoreLease_MissingFromLease400(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6443,12 +6613,12 @@ func TestRestoreLease_RoutesToSourcePlacementBackend(t *testing.T) {
 	}))
 	defer otherServer.Close()
 
-	srcBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+	srcBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "backend-src",
 		BaseURL: srcServer.URL,
 		Timeout: 5 * time.Second,
 	})
-	otherBackend := backend.NewHTTPClient(backend.HTTPClientConfig{
+	otherBackend := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "backend-other",
 		BaseURL: otherServer.URL,
 		Timeout: 5 * time.Second,
@@ -6480,7 +6650,7 @@ func TestRestoreLease_RoutesToSourcePlacementBackend(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6526,7 +6696,7 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6545,7 +6715,7 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6601,7 +6771,7 @@ func TestRestoreLease_UnresolvableSourcePlacement_Returns503(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6620,7 +6790,7 @@ func TestRestoreLease_UnresolvableSourcePlacement_Returns503(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6671,7 +6841,7 @@ func TestRestoreLease_PlacementDisabled_Returns503(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6812,7 +6982,7 @@ func TestRestoreLease_RejectsNonOwnedTarget(t *testing.T) {
 			}))
 			defer backendServer.Close()
 
-			backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 				Name:    "test-backend",
 				BaseURL: backendServer.URL,
 				Timeout: 5 * time.Second,
@@ -6843,15 +7013,11 @@ func TestRestoreLease_RejectsNonOwnedTarget(t *testing.T) {
 	}
 }
 
-// TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource verifies PROPERTY 2b
-// plumbing at the restore route: the handler forwards the ADR-036 SIGNER's tenant
-// (auth.Token.Tenant) to the backend — never a body- or path-derived value — and
-// surfaces the backend's ErrNotRetained as an indistinguishable 404. This is what
-// makes the backend's source-ownership gate (rec.Tenant != req.Tenant) effective:
-// the caller owns the fresh TARGET lease but supplies another tenant's retained
-// from_lease_uuid; the backend (here simulated with 422) sees the signer's tenant
-// and rejects, and the caller cannot tell cross-tenant from not-found.
-func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
+// TestRestoreLease_RejectsCrossTenantSourceBeforeBackend verifies that source
+// ownership is authorized before the restore service acquires lifecycle claims
+// or contacts the backend. The tenant-facing result remains indistinguishable
+// from an absent retained source.
+func TestRestoreLease_RejectsCrossTenantSourceBeforeBackend(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
 	leaseUUID := testutil.ValidUUID1
 	providerUUID := testutil.ValidUUID2
@@ -6859,36 +7025,34 @@ func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
 	// The caller legitimately owns the fresh PENDING target lease.
 	chainClient := &mockChainClient{
 		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid == leaseUUID {
+			switch uuid {
+			case leaseUUID:
 				return &billingtypes.Lease{
 					Uuid:         leaseUUID,
 					Tenant:       kp.Address,
 					ProviderUuid: providerUUID,
 					State:        billingtypes.LEASE_STATE_PENDING,
 				}, nil
+			case fromLeaseUUID:
+				return &billingtypes.Lease{
+					Uuid:         fromLeaseUUID,
+					Tenant:       "another-tenant",
+					ProviderUuid: providerUUID,
+					State:        billingtypes.LEASE_STATE_CLOSED,
+				}, nil
 			}
 			return nil, nil
 		},
 	}
 
-	var receivedBody []byte
+	var backendCalls atomic.Int32
 	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/restore" && r.Method == "POST" {
-			var err error
-			receivedBody, err = io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("read body: %v", err)
-			}
-			// Simulate the docker backend's cross-tenant rejection
-			// (rec.Tenant(other) != req.Tenant(signer) -> ErrNotRetained).
-			w.WriteHeader(http.StatusUnprocessableEntity)
-			return
-		}
-		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		backendCalls.Add(1)
+		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -6911,7 +7075,7 @@ func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -6931,16 +7095,7 @@ func TestRestoreLease_ForwardsSignerTenantOnCrossTenantSource(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
 	assert.Equal(t, "no retained data found for that lease", errResp.Error)
 
-	// The handler must have forwarded the SIGNER's tenant — the value the backend
-	// gate compares against the retained record — not the body's from_lease_uuid
-	// or any caller-supplied field. (RestoreRequest carries no tenant field for the
-	// caller to set; this pins that RestoreLease sets the backend request's Tenant
-	// from the authenticated token, i.e. Tenant: auth.Token.Tenant.)
-	require.NotNil(t, receivedBody, "backend should have received a request body")
-	var backendReq map[string]any
-	require.NoError(t, json.Unmarshal(receivedBody, &backendReq))
-	assert.Equal(t, kp.Address, backendReq["tenant"], "handler must forward the ADR-036 signer's tenant to the backend")
-	assert.Equal(t, fromLeaseUUID, backendReq["from_lease_uuid"], "handler must forward the requested source lease")
+	assert.Zero(t, backendCalls.Load(), "unauthorized source must be rejected before backend dispatch")
 }
 
 // TestRestoreLease_DemoteExceedsTier422 verifies that a backend 422 with
@@ -6979,7 +7134,7 @@ func TestRestoreLease_DemoteExceedsTier422(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "test-backend-demote",
 		BaseURL: backendServer.URL,
 		Timeout: 5 * time.Second,
@@ -7002,7 +7157,7 @@ func TestRestoreLease_DemoteExceedsTier422(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}
@@ -7075,7 +7230,7 @@ func TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 			}))
 			defer backendServer.Close()
 
-			backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 				Name:    "test-backend-malformed",
 				BaseURL: backendServer.URL,
 				Timeout: 5 * time.Second,
@@ -7098,7 +7253,7 @@ func TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 				client:          chainClient,
 				backendRouter:   router,
 				placementLookup: placement,
-				restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+				restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 				providerUUID:    providerUUID,
 				bech32Prefix:    "manifest",
 			}
@@ -7142,7 +7297,7 @@ func detailErrorFromBackend(t *testing.T, detail string) error {
 	}))
 	t.Cleanup(server.Close)
 
-	client := backend.NewHTTPClient(backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    "detail-src",
 		BaseURL: server.URL,
 		Timeout: 5 * time.Second,
@@ -7258,7 +7413,7 @@ func TestRestoreLease_422KeepsLoadtestContract(t *testing.T) {
 			}))
 			defer backendServer.Close()
 
-			backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+			backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 				Name: "loadtest-contract", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
 			})
 			router, rerr := backend.NewRouter(backend.RouterConfig{
@@ -7276,7 +7431,7 @@ func TestRestoreLease_422KeepsLoadtestContract(t *testing.T) {
 				client:          chainClient,
 				backendRouter:   router,
 				placementLookup: placement,
-				restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+				restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 				providerUUID:    providerUUID,
 				bech32Prefix:    "manifest",
 			}
@@ -7353,7 +7508,9 @@ func TestUpdateLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 			h := &Handlers{
 				client:             chainClient,
 				backendRouter:      router,
+				callbackBaseURL:    testCallbackBaseURL,
 				lifecycleCallbacks: lifecycleCallbacks,
+				maintenanceClaims:  operation.NewRegistry(),
 				providerUUID:       providerUUID,
 				bech32Prefix:       "manifest",
 				payloadPersister:   persister,
@@ -7422,7 +7579,7 @@ func TestRestoreLease_UnrecognizedBackendCodeRelays422(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	backendClient := backend.NewHTTPClient(backend.HTTPClientConfig{
+	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name: "unknown-code", BaseURL: backendServer.URL, Timeout: 5 * time.Second,
 	})
 	router, err := backend.NewRouter(backend.RouterConfig{
@@ -7440,7 +7597,7 @@ func TestRestoreLease_UnrecognizedBackendCodeRelays422(t *testing.T) {
 		client:          chainClient,
 		backendRouter:   router,
 		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, chainClient, router, placement, nil),
+		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
 		providerUUID:    providerUUID,
 		bech32Prefix:    "manifest",
 	}

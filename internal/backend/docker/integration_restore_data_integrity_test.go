@@ -76,6 +76,7 @@ func retainRestoreBackend(t *testing.T, mountPath string) *Backend {
 	return testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.RetainOnClose = true
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
@@ -105,7 +106,7 @@ func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
 	b := retainRestoreBackend(t, mountPath)
 
 	ctx := context.Background()
-	origLease := fmt.Sprintf("retain-di-orig-%d", time.Now().UnixNano())
+	origLease := newIntegrationLeaseUUID()
 
 	const topContent = "top-exact-ALPHA"           // no trailing newline → exact-byte assertable
 	const nestedContent = "deep-nested-BRAVO-1234" // distinct, nested under /data/nested/dir
@@ -117,7 +118,7 @@ func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    origLease,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -141,12 +142,12 @@ func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
 	require.True(t, cb.Retained, "real btrfs retain must set the ground-truth Retained flag")
 
 	// Restore into a new lease.
-	newLease := fmt.Sprintf("retain-di-new-%d", time.Now().UnixNano())
+	newLease := newIntegrationLeaseUUID()
 	require.NoError(t, b.Restore(ctx, backend.RestoreRequest{
 		LeaseUUID:     newLease,
 		FromLeaseUUID: origLease,
 		Tenant:        "test-tenant",
-		ProviderUUID:  "test-provider",
+		ProviderUUID:  testProviderUUID,
 		Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
 		CallbackURL:   callbackServer.URL,
 	}))
@@ -191,7 +192,7 @@ func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
 	b := retainRestoreBackend(t, mountPath)
 
 	ctx := context.Background()
-	origLease := fmt.Sprintf("retain-multi-orig-%d", time.Now().UnixNano())
+	origLease := newIntegrationLeaseUUID()
 
 	appManifest := manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}}
 	payload, err := json.Marshal(appManifest)
@@ -200,7 +201,7 @@ func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    origLease,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -228,12 +229,12 @@ func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
 	require.Len(t, rec.RetainedVolumeNames, 2, "both instance volumes must be retained")
 
 	// Restore Quantity=2 into a new lease.
-	newLease := fmt.Sprintf("retain-multi-new-%d", time.Now().UnixNano())
+	newLease := newIntegrationLeaseUUID()
 	require.NoError(t, b.Restore(ctx, backend.RestoreRequest{
 		LeaseUUID:     newLease,
 		FromLeaseUUID: origLease,
 		Tenant:        "test-tenant",
-		ProviderUUID:  "test-provider",
+		ProviderUUID:  testProviderUUID,
 		Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
 		CallbackURL:   callbackServer.URL,
 	}))
@@ -302,7 +303,7 @@ func TestIntegration_Docker_BtrfsRenameVolume_PreservesNestedMetadata(t *testing
 	require.NotEmpty(t, originalID)
 
 	// Rename via the manager (the restore adopt primitive).
-	require.NoError(t, mgr.RenameVolume(oldName, newName))
+	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
 	newPath := filepath.Join(mountPath, newName)
 	_, err = os.Stat(oldPath)
 	require.True(t, errors.Is(err, fs.ErrNotExist), "old path must be gone after rename")
@@ -376,7 +377,7 @@ func TestIntegration_Docker_RetainRestore_OwnershipBoundary(t *testing.T) {
 	require.Equal(t, uint32(priorUID), ownerUID(t, nestedFile), "precondition: nested file owned by prior uid")
 
 	// Re-deploy ownership step with a DRIFTED resolved owner.
-	binds, err := buildStatefulVolumeBinds(hostPath, []string{"/data"}, driftUID, driftGID)
+	binds, err := buildStatefulVolumeBindsContext(context.Background(), hostPath, []string{"/data"}, driftUID, driftGID)
 	require.NoError(t, err)
 	require.Equal(t, "/data", binds[dataDir], "the VOLUME subdir must be bound to /data")
 
@@ -426,7 +427,7 @@ func TestIntegration_Docker_Close_WritablePathOnly_Reclaimed(t *testing.T) {
 	b.cfg.ContainerReadonlyRootfs = ptrBool(true)
 
 	ctx := context.Background()
-	origLease := fmt.Sprintf("retain-wp-orig-%d", time.Now().UnixNano())
+	origLease := newIntegrationLeaseUUID()
 
 	const wpPath = "/var/lib/grafana" // grafana writable path (NOT a declared VOLUME)
 	const sentinelName = "tenant-wrote-this.txt"
@@ -439,7 +440,7 @@ func TestIntegration_Docker_Close_WritablePathOnly_Reclaimed(t *testing.T) {
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    origLease,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,

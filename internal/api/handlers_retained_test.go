@@ -80,7 +80,7 @@ func erroringBackendServer(t *testing.T) *httptest.Server {
 
 func httpBackend(t *testing.T, name, url string) backend.Backend {
 	t.Helper()
-	return backend.NewHTTPClient(backend.HTTPClientConfig{
+	return newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
 		Name:    name,
 		BaseURL: url,
 		Timeout: 5 * time.Second,

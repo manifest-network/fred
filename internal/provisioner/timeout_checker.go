@@ -12,8 +12,8 @@ import (
 
 // TimeoutOperations is the lifecycle authority needed by TimeoutChecker. The
 // checker deliberately depends on this narrow capability surface instead of
-// the legacy tracker API, so a timeout can only release or finish the exact
-// operation claim it acquired.
+// the registry's complete mutation surface, so a timeout can only release or
+// finish the exact operation claim it acquired.
 type TimeoutOperations interface {
 	TimedOut(time.Duration) []operation.Record
 	TryClaimTimeout(string, operation.OperationID) operation.SettlementResult
@@ -72,7 +72,7 @@ func (c *TimeoutChecker) Start(ctx context.Context) {
 	}
 }
 
-// CheckOnce performs one sweep of the in-flight tracker: every provision
+// CheckOnce performs one sweep of the operation registry: every provision
 // older than the callback timeout is rejected on-chain, and untracked
 // only once that rejection has either succeeded or become impossible.
 // This is the body of Start's ticker loop, run on every tick.

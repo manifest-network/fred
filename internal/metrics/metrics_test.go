@@ -332,7 +332,9 @@ func TestCounterVecLabels(t *testing.T) {
 		APIRequestsTotal.WithLabelValues("GET", "/health", "200")
 	})
 	assert.NotPanics(t, func() {
-		for _, check := range []string{"chain", "token_tracker", "placement_store", "payload_store"} {
+		for _, check := range []string{
+			"chain", "token_tracker", "placement_store", "placement_inventory", "payload_store",
+		} {
 			HealthCheckHealthy.WithLabelValues(check)
 		}
 	})

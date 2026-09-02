@@ -24,6 +24,10 @@
 # Enforces:
 #   - grpc_tls_skip_verify must be false when grpc_tls_enabled is true
 #   - token_tracker_db_path must be configured (replay protection)
+#   - callback_base_url must use HTTPS; every backend URL must use HTTPS with
+#     certificate verification (enable production_mode on bundled backends too)
+#   - every backend must have a unique hmac_secret; the fleet-wide top-level
+#     callback_secret compatibility setting is rejected
 #   - callback_base_url and backend URLs must not use loopback, link-local,
 #     or unspecified addresses (SSRF protection)
 #
@@ -245,8 +249,9 @@ tenant_rate_limit_burst: 10
 # name is a case-sensitive durable placement identity. It must be non-blank and
 # exactly unique, and must not change while placements or retained data refer to
 # it. Removing or renaming a referenced identity is rejected; it does not migrate
-# data. Once a drained name is removed, placement metadata retires it forever.
-# Never reuse it for the same or different storage; give a replacement a new name.
+# data. A fully drained name may leave and later rejoin only when it still denotes
+# the same persistent storage. Never bind replacement storage to a historical
+# name; give the replacement a new globally unique name.
 #
 # ROUTING:
 #   Leases are routed to backends using the skus field — an exact list of
@@ -277,6 +282,8 @@ backends:
   # Default backend - receives all leases that don't match other backends
   - name: mock
     url: "http://localhost:9000"    # Backend API base URL
+    # Must equal this backend process's callback_secret. Never reuse across nodes.
+    hmac_secret: "mock-backend-secret-change-me-0123456789"
     timeout: 30s                     # Request timeout for backend API calls
     default: true                    # Optional fallback marker (at most one)
 
@@ -294,6 +301,7 @@ backends:
   #
   # - name: docker-1
   #   url: "http://10.0.0.1:9000"
+  #   hmac_secret: "docker-1-unique-secret-change-me-0123456789"
   #   skus:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
   #     - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
@@ -301,12 +309,14 @@ backends:
   #
   # - name: docker-2
   #   url: "http://10.0.0.2:9000"
+  #   hmac_secret: "docker-2-unique-secret-change-me-0123456789"
   #   skus:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
   #     - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
   #
   # - name: docker-3
   #   url: "http://10.0.0.3:9000"
+  #   hmac_secret: "docker-3-unique-secret-change-me-0123456789"
   #   skus:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
   #     - "b2c3d4e5-f6a7-8901-bcde-2345678901bc"
@@ -322,24 +332,29 @@ backends:
   #
   # - name: docker-1
   #   url: "http://10.0.0.1:9001"
+  #   hmac_secret: "docker-1-unique-secret-change-me-0123456789"
   #   skus:
   #     - "a1b2c3d4-e5f6-7890-abcd-1234567890ab"
   #
   # - name: k3s-1
   #   url: "http://10.0.0.1:9002"
+  #   hmac_secret: "k3s-1-unique-secret-change-me-0123456789"
   #   skus:
   #     - "c3d4e5f6-a7b8-9012-cdef-3456789012cd"
 
   # ---------------------------------------------------------------------------
   # TLS / mTLS to a backend (ENG-103)
   # ---------------------------------------------------------------------------
-  # When a backend listens on HTTPS, use https:// in url and point tls_ca_file
+  # production_mode requires peer-verified https:// for every backend; tls_ca_file
+  # may point at the private CA that issued the backend certificate.
+  # When a backend listens on HTTPS, point tls_ca_file
   # at the private CA that signed the backend's server certificate (omit it to
   # use the system root CAs). For mutual TLS, also supply a client certificate
   # and key that the backend's tls_client_ca_file trusts.
   #
   # - name: docker-1
   #   url: "https://10.0.0.1:9001"
+  #   hmac_secret: "docker-1-unique-secret-change-me-0123456789"
   #   tls_ca_file: "/etc/fred/providerd/tls/backend-ca.pem"
   #   # mTLS (optional): present a client certificate to the backend
   #   tls_client_cert_file: "/etc/fred/providerd/tls/client.pem"
@@ -354,15 +369,25 @@ backends:
 # Backends call back to fred to report provisioning results.
 
 # URL that backends will call to report provisioning status.
-# Must be reachable from all your backends. Include protocol (http/https).
-# Format: "http(s)://host:port" - the /callbacks/provision path is added automatically.
+# Must be reachable from all your backends. Include protocol (http/https);
+# production_mode requires https://; bundled backends in production mode verify
+# its certificate and reject callback_insecure_skip_verify.
+# User info, fragments, malformed or request-target-unstable raw queries,
+# operation_id/lifecycle_id query keys, non-ASCII or unusable hostnames/ports,
+# non-canonical path segments, backslashes, and encoded path separators are
+# rejected. Percent-encode spaces/non-ASCII query bytes. Other path/query
+# bytes are preserved, and the
+# /callbacks/provision path plus one typed identity are added automatically.
 callback_base_url: "http://localhost:8080"
 
-# Shared secret for HMAC-SHA256 authentication of callback requests.
-# Backends sign their callbacks with this secret; fred verifies the signature.
-# SECURITY: Use a strong random value. Generate with: openssl rand -hex 32
-# Must be at least 32 characters. Must match the secret configured in your backends.
-callback_secret: "your-secret-key-at-least-32-characters-long"
+# HMAC keys live on each backends[] entry. Set each backend process's existing
+# callback_secret to that entry's hmac_secret. Generate a different key for
+# every backend with `openssl rand -hex 32`.
+#
+# Legacy non-production-only fallback: one fleet-wide key may be configured
+# instead of all backends[].hmac_secret values. Production rejects this mode,
+# and mixed or partial configurations are always rejected.
+# callback_secret: "legacy-development-key-at-least-32-bytes"
 
 # Path prefix prepended to inbound callback URIs before HMAC verification.
 # Set this when fred sits behind a path-stripping reverse proxy (e.g., Traefik
@@ -370,7 +395,9 @@ callback_secret: "your-secret-key-at-least-32-characters-long"
 # prefix the proxy strips so signer (backend, full external URL) and verifier
 # (fred, post-strip URL) agree on the canonical URI.
 # Leave empty for direct-call deployments.
-# Validation: when set, must start with "/" and must not end with "/".
+# Validation: must exactly equal callback_base_url's normalized escaped path
+# (both empty for a root/direct URL); when set, it starts with "/" and does not
+# end with "/".
 # See docs/security-callback-auth.md.
 # callback_canonical_path_prefix: "/api/fred"
 
@@ -458,7 +485,9 @@ bech32_prefix: "manifest"
 # SECURITY: Always enable in production to prevent token replay attacks.
 #
 # The database file is created automatically. Ensure the directory exists
-# and fred has write permissions.
+# and fred has write permissions. A newly created file uses mode 0600; unlike
+# placement and payload authority below, this short-lived replay cache is not
+# path/inode identity-bound or continuously re-attested.
 token_tracker_db_path: "/var/lib/fred/tokens.db"
 
 # =============================================================================
@@ -473,8 +502,10 @@ token_tracker_db_path: "/var/lib/fred/tokens.db"
 # If not set, the payload upload endpoint rejects all uploads.
 # Tenants creating leases with meta_hash won't be able to upload their manifests.
 #
-# The database file is created automatically. Ensure the directory exists
-# and fred has write permissions.
+# The database file is created automatically with mode 0600. An existing path
+# must be an unsymlinked, single-link regular file with exact mode 0600. Fred
+# opens/creates it descriptor-relatively without following the final component
+# and re-attests its parent, path, inode, mode, and link count while running.
 payload_store_db_path: "/var/lib/fred/payloads.db"
 
 # =============================================================================
@@ -497,8 +528,12 @@ payload_store_db_path: "/var/lib/fred/payloads.db"
 # inventories; owned work, recordless ACTIVE recovery, attempts, and conflicts
 # remain deferred. Inventory silence never clears an attempt or conflict.
 #
-# The database file is created automatically. Ensure the directory exists
-# and fred has write permissions.
+# Normal startup opens only an existing, non-empty, prepared database and never
+# creates or initializes this authority file. Prepare it with the documented
+# placement-preflight workflow while providerd is stopped. It must be an
+# unsymlinked, single-link regular file with exact mode 0600; providerd binds and
+# re-attests that exact path/inode while running. Ensure fred can write the file
+# and its parent directory.
 placement_store_db_path: "/var/lib/fred/placements.db"
 
 # =============================================================================

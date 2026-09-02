@@ -57,5 +57,5 @@ func (b *Backend) createManagedVolume(ctx context.Context, volumeID string, size
 	mu := b.volumeNameMu(volumeID)
 	mu.Lock()
 	defer mu.Unlock()
-	return b.volumes.Create(ctx, volumeID, sizeMB)
+	return b.mutationAdapter().createVolume(ctx, volumeID, sizeMB)
 }

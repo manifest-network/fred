@@ -44,7 +44,26 @@ Backends authenticate callbacks to Fred using HMAC-SHA256 with a four-field cano
 
 **Signed canonical string:** `<timestamp>\n<METHOD>\n<canonical-URI>\n<hex(sha256(body))>` — binding all four fields prevents timestamp substitution AND cross-endpoint replay (a captured `POST /callbacks/provision` signature cannot be replayed against any other endpoint or method).
 
-**Path-stripping reverse proxies.** Because the canonical string includes the request URI, deployments where a reverse proxy rewrites the inbound path (e.g., Traefik `stripPrefix` middleware mapping `/api/fred/*` → fred's bare `/*`) would otherwise see a verifier/signer URI mismatch: backends sign the full external URL while fred receives the stripped URL post-proxy. The static `callback_canonical_path_prefix` config field tells fred's verifier what prefix to prepend to `r.URL.RequestURI()` before computing the canonical string, so signer and verifier agree. The value is **static config**, not derived from request headers (e.g., `X-Forwarded-Prefix`) — this rules out spoofing as a failure mode and leaves "config is correct" as the only invariant to maintain. The prefix must be sourced from the same configuration variable that defines the proxy's strip rule; drift between the two breaks every callback. The TLS-posture context that makes the underlying ENG-191 URI binding load-bearing is documented in the `### Security` (TLS) section of the companion `manifest-deploy` operations repository's `CLAUDE.md` (a separate repo, not part of this one). See [docs/security-callback-auth.md](docs/security-callback-auth.md) for the full threat-model rationale.
+**Path-stripping reverse proxies.** Because the canonical string includes the request URI, deployments where a reverse proxy rewrites the inbound path (e.g., Traefik `stripPrefix` middleware mapping `/api/fred/*` → fred's bare `/*`) would otherwise see a verifier/signer URI mismatch: backends sign the full external URL while fred receives the stripped URL post-proxy. The static `callback_canonical_path_prefix` config field tells fred's verifier what prefix to prepend to `r.URL.RequestURI()` before computing the canonical string, so signer and verifier agree. The value is **static config**, not derived from request headers (e.g., `X-Forwarded-Prefix`) — this rules out spoofing as a failure mode and leaves "config is correct" as the only invariant to maintain. The callback-base path, canonical prefix, and proxy strip rule must be sourced from the same deployment variable; Fred additionally rejects startup unless the first two normalize to identical escaped bytes. Drift breaks every callback. The TLS-posture context that makes the underlying ENG-191 URI binding load-bearing is documented in the `### Security` (TLS) section of the companion `manifest-deploy` operations repository's `CLAUDE.md` (a separate repo, not part of this one). See [docs/security-callback-auth.md](docs/security-callback-auth.md) for the full threat-model rationale.
+
+**Backend trust boundary.** Production assigns each configured backend a
+distinct `backends[].hmac_secret`. The same key is configured as that backend
+process's `callback_secret`, authenticating both directions of only that
+provider/backend channel. Fred binds the configured name to the backend's
+immutable storage UUID during placement startup; callback bodies carry that
+UUID inside the HMAC-covered payload, and Fred uses it to select the exact
+verification key. The UUID is an untrusted selector until verification
+succeeds, then callback application checks it again against durable operation
+or lifecycle authority.
+
+A compromised backend therefore cannot sign a callback for another backend's
+storage UUID or authenticate a provider command sent to another backend. A
+single bidirectional key does let a compromised backend forge the provider side
+of its *own* channel, but that adds no storage authority: the process already
+controls that substrate. Direction-separated keys would matter only if those
+two principals within one backend trust boundary must be isolated. The
+top-level fleet-wide `callback_secret` remains a non-production compatibility
+mode and is rejected when `production_mode: true`.
 
 | Parameter | Value |
 |-----------|-------|
@@ -122,7 +141,14 @@ Used tokens are tracked in a persistent bbolt database keyed by the normalized s
 
 ### Callback Replay (Backend -> Fred)
 
-Callback timestamps older than 5 minutes are rejected. Combined with HMAC binding the timestamp to the body, this prevents both replay and timestamp substitution.
+Callback timestamps older than 5 minutes are rejected, so an identical signed
+request can be replayed only within the configured freshness window. The
+protocol intentionally has no callback nonce cache because durable backend
+delivery retries the exact request after ambiguous network outcomes. Method and
+complete-URI binding prevent moving a captured signature to another endpoint,
+resource, or operation; body and timestamp binding prevent payload or timestamp
+substitution. Typed operation/lifecycle settlement and idempotent application
+remain the defense against duplicate delivery within the freshness window.
 
 ## Input Validation
 
@@ -132,9 +158,26 @@ All lease UUIDs are validated with `google/uuid.Parse` before use. Invalid UUIDs
 
 ### URL Validation
 
-All configured URLs (callback_base_url, backend URLs) are validated at startup:
-- Must be absolute `http://` or `https://` URLs with a host
-- Trailing slashes stripped from callback_base_url
+All configured URLs (`callback_base_url`, backend URLs) are validated at startup:
+- Must be absolute `http://` or `https://` URLs with a non-empty, non-dot ASCII
+  hostname (internationalized names use their punycode form); explicit ports
+  must be in the range 1–65535
+- Backend URLs must be origins: no user info, path, query, or fragment. Raw
+  empty `?` and `#` markers are rejected instead of being silently discarded
+- `callback_base_url` rejects user info, fragments, opaque URLs, malformed
+  query syntax, preexisting `operation_id` or `lifecycle_id` selectors,
+  non-canonical dot/empty path segments, backslashes, and percent-encoded path
+  separators whose interpretation can differ across proxies
+- Trailing path slashes are stripped from `callback_base_url` without
+  re-encoding its other query values. Raw query bytes unsafe in an HTTP request
+  target (including spaces and non-ASCII bytes) must be percent-encoded
+- `callback_canonical_path_prefix` must equal the normalized escaped base path
+  byte-for-byte, so a signer/verifier path mismatch fails at startup
+
+Complete callback destinations are revalidated before backend acceptance,
+durable persistence, replay, and placement decode. Their path must end in
+`/callbacks/provision`, and authority, path, fragment, and raw-query ambiguity
+fails closed rather than being deferred to `net/http` or a reverse proxy.
 
 In production mode, additional SSRF checks block:
 - Loopback addresses (`127.0.0.0/8`, `::1`, `::ffff:127.0.0.1`)
@@ -143,6 +186,90 @@ In production mode, additional SSRF checks block:
 - `localhost` hostname (case-insensitive, including FQDN `localhost.`)
 
 Private IPs (RFC 1918) are intentionally allowed since backends commonly run on private networks. DNS resolution is not performed — hostnames resolving to blocked addresses are not caught. Use network-level controls for defense in depth.
+
+**Durable callback outbox trust boundary.** A bundled backend's callback
+database and its configuration are trusted local state owned by the same
+backend OS identity. Current outbox rows are validated fail-closed before any
+egress, but validation does not make a host-controlled DNS name trustworthy.
+Restrict backend callback egress at the network layer to the intended Fred
+endpoint(s), and protect both the backend configuration and callback database
+with the same filesystem/host controls. Every authoritative backend journal
+(callback operation/maintenance/close intents and outbox, release, and retention) must be a single-link
+regular file opened without following the final path component and with exact
+mode `0600`; initialization and ordinary startup reject group- or world-readable
+restores and later permission drift. The diagnostics database grants no
+lifecycle authority and is not continuously re-attested, but its open/create
+path still rejects symlinks, hard links, non-regular files, and modes other than
+exact `0600`.
+
+**Provider-local database trust boundary.** The placement and optional payload
+databases contain provider, tenant, lifecycle, routing, and manifest data. Each
+must be an unsymlinked, single-link regular file with exact mode `0600`.
+`providerd` creates a new payload database with those properties and rejects an
+insecure existing payload or placement database before use. While running, both
+stores re-attest the retained inode, link count, and mode at every database
+transaction boundary. Pathname, permission, or hard-link drift—and physical
+parent drift for the descriptor-relative payload store—is process-sticky and
+fails later access closed.
+
+The token replay database is a separate short-lived cache. bbolt creates a
+missing file with mode `0600`, but Fred does not treat an existing token cache as
+provider/lineage authority and does not continuously bind its pathname, inode,
+mode, or link count. Configure its parent as trusted local state and replace or
+restore it only while `providerd` is stopped.
+
+### Backend storage-lineage boundary
+
+Fred durably pins every configured backend name to one canonical UUIDv4 storage
+identity. Identity-bearing inventory responses must agree on that UUID across
+all pages and both `/provisions` and `/retentions`. Once pinned, reads include
+the HMAC-covered `backend_storage_id` query, and all side effects use only
+`/_fred/storage/{uuid}/...`; upgraded backends validate that path before body
+decode or mutation. The client never follows redirects. A trusted proxy must
+not internally rewrite that upgraded-only namespace onto a legacy mutating
+route, because an internal rewrite is not an HTTP redirect Fred can reject.
+
+`X-Fred-Backend-Storage-ID` is not cryptographic proof by itself. Request HMAC
+authenticates Fred to a backend; it does not sign the backend's response.
+Production deployments rely on peer-verified HTTPS using the configured
+private CA or system roots, optionally mTLS, to authenticate response headers,
+inventory, and refusal verdicts. Storage identity detects accidental
+same-name replacement under that authenticated transport boundary; it is not a
+defense against an intermediary that can forge the backend's authenticated
+response. A header on a cheap pre-dispatch error identifies only the process's
+sealed ID; it is not positive inventory/effect evidence. A backend that confirms
+runtime lineage drift deletes the header and returns `503`.
+
+The Docker backend also re-attests lineage after every raw Compose, Docker,
+volume-manager, and tenant-path mutation. A postcheck failure makes both a
+successful return and a transport error causally ambiguous: the backend latches
+that state for its process lifetime, cancels further substrate work, suppresses
+callback settlement, and preserves the operation/maintenance intent or retention finalizer
+for strict restart recovery. This conservative check detects a replacement
+during a daemon/filesystem call; it cannot make an external daemon or CLI
+mutation atomic with the marker proof. Local path operations may eventually be
+anchored to a pinned directory descriptor, while Docker/ZFS/btrfs require a
+substrate-native generation/CAS primitive to close that residual window.
+
+Bundled backends retain old HMAC-authenticated, identity-unbound mutation paths
+as a bounded v0.13 compatibility surface, but the supported upgrade never sends
+traffic through them. Drain pending work, stop the old provider and all
+backends, fence the old host, rotate to unique per-backend credentials, seal
+storage identity, and only then start the upgraded fleet. A stale provider that
+still has a valid current HMAC and mTLS credential could invoke an old path, so
+revoke the old credentials and do not expose those paths through a proxy. The
+identity-bound namespace is the only mutation path selected by the upgraded
+provider.
+
+The reverse hop carries the same identity in the HMAC-covered callback JSON.
+New outbox rows capture it immutably when the completion is enqueued, and replay
+must preserve that captured value. Fred compares it with the durable pin before
+settling chain or placement authority. Copying an outbox to replacement storage
+therefore cannot make old completion evidence belong to the replacement.
+Marker pairs, backend control databases, and their substrate are trusted
+durable state: protect and back them up together. A full snapshot clone retains
+the same identity by design, so operators must fence the old clone before the
+restored one starts.
 
 ### Request Body Limits
 
@@ -227,7 +354,17 @@ Optional TLS for the gRPC connection to the chain. Supports custom CA file. `grp
 
 ### TLS (providerd → backend, ENG-103)
 
-Optional TLS, including mutual TLS, on the providerd → backend HTTP transport. TLS is opt-in: when no TLS fields are configured the hop serves plaintext HTTP (the default). When enabled, both sides pin TLS 1.3 as the minimum version (`internal/tlsconfig/tlsconfig.go:37,61`). Certificates are loaded once at startup; rotation requires a restart (tracked in ENG-294).
+TLS, including optional mutual TLS, protects both backend HTTP hops. Plaintext is supported only outside production mode. Provider `production_mode: true` requires every backend URL and `callback_base_url` to use HTTPS and verifies backend peers against the configured private CA or system roots; bundled-backend production mode independently forbids disabling callback peer verification. A self-signed private CA is a valid trust anchor—the leaf chain and hostname/IP SAN are still verified. Both settings are required for the full production invariant: request HMAC does not authenticate the backend's response identity, inventory, or refusal verdict, while callback HMAC does not provide confidentiality for causal tokens. When TLS is enabled, both sides pin TLS 1.3 as the minimum version (`internal/tlsconfig/tlsconfig.go:37,61`). Certificates are loaded once at startup; rotation requires a restart (tracked in ENG-294).
+
+The reference deployment uses different verified chains in each direction:
+providerd verifies backend IP-SAN certificates against an internal private CA
+and authenticates with mTLS; backend callback clients verify the public
+certificate terminated by Traefik for `callback_base_url` through system roots.
+The backend's `callback_insecure_skip_verify: false` is the setting that performs
+that client verification. Its separate `production_mode: true` is a
+configuration guard—it refuses a future `true` value for the skip flag—but it
+does not create verification on another process's behalf. Providerd production
+mode likewise cannot substitute for enabling the backend process's guard.
 
 **Server side (docker-backend YAML, `internal/backend/docker/config.go:65-81`):**
 
@@ -303,11 +440,15 @@ Network isolation places each tenant's containers in a dedicated Docker bridge n
 
 | Secret | Minimum Length | Constant-Time | Logged |
 |--------|---------------|---------------|--------|
-| `callback_secret` | 32 bytes | Yes (`hmac.Equal`) | Never |
+| `backends[].hmac_secret` (providerd) / that backend's `callback_secret` | 32 bytes; unique per backend | Yes (`hmac.Equal`) | Never |
 | Payload `meta_hash` | 64 hex chars | Yes (`subtle.ConstantTimeCompare`) | Never |
 | ADR-036 signatures | N/A | secp256k1 library verify | Signature logged in debug (public data) |
 
-**Secret rotation:** The callback secret is static per deployment. Rotation requires coordinated restart of Fred and all backends with the new secret. See [DEPLOYMENT.md § Secret rotation](DEPLOYMENT.md#secret-rotation) for the procedure.
+**Secret rotation:** Each backend key is static for that provider/backend
+channel. Rotate one channel with a coordinated stopped restart so queued
+callbacks and provider commands never cross a mixed-key interval. See
+[DEPLOYMENT.md § Secret rotation](DEPLOYMENT.md#secret-rotation) for the
+procedure.
 
 ## Production Mode
 
@@ -316,7 +457,9 @@ When `production_mode: true`, Fred enforces security requirements at startup:
 | Check | Rationale |
 |-------|-----------|
 | `token_tracker_db_path` required | Replay protection must be enabled |
+| Every backend has a distinct `backends[].hmac_secret`; top-level `callback_secret` rejected | A compromised backend must not authenticate another backend's commands or callbacks |
 | `grpc_tls_skip_verify` blocked (when TLS enabled) | Prevent MITM on chain connection |
+| Every `backends[].url` uses `https://` | Authenticate storage-identity observations, inventory, and synchronous backend verdicts |
 | `backends[].tls_skip_verify` blocked | Prevent MITM on the providerd → backend connection |
 | SSRF checks on all URLs | Block loopback, link-local, unspecified addresses |
 
@@ -328,7 +471,7 @@ The daemon refuses to start if any check fails.
 
 1. **SSRF checks are IP-literal only.** Hostnames resolving to blocked addresses (e.g., a DNS record pointing `evil.com` to `127.0.0.1`) are not caught. DNS resolution is intentionally skipped to avoid TOCTOU race conditions. Use network-level controls (firewall rules, egress policies) for defense in depth.
 
-2. **Release history includes raw manifests.** The `GET /releases` response includes the full manifest payload. If tenants put secrets in environment variables, those persist in the release store and are returned on read. This is tenant-visible-to-tenant-only (properly authenticated), but tenants should be aware that manifest contents are stored.
+2. **Release history contains secrets and causal capabilities.** The `GET /releases` response includes the full manifest payload. If tenants put secrets in environment variables, those persist in the release store and are returned on read. Typed active releases also retain the operation/lifecycle callback destinations needed for non-expiring runtime recovery. Keep `releases.db`, stopped-process copies, and backups private with the matching callback/retention journals; do not expose raw records in tickets or logs. The API remains tenant-visible-to-tenant-only when properly authenticated.
 
 3. **Per-tenant rate limiting adds ECDSA cost to every request.** Tokens are fully validated (secp256k1 signature verification) before bucket consumption, which adds CPU overhead per request. This is the correct trade-off: the previous design (skipping verification) allowed attackers to burn a victim's quota with forged tokens.
 
