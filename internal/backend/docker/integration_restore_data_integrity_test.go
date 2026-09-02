@@ -114,14 +114,16 @@ func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
 	appManifest := manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	provisionCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    origLease,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            origLease,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          provisionCallbacks.operationURL,
+		LifecycleCallbackURL: provisionCallbacks.lifecycleURL,
+		Payload:              payload,
 	}))
 	cb := waitForCallback(t, callbackCh, origLease, 3*time.Minute)
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
@@ -143,13 +145,15 @@ func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
 
 	// Restore into a new lease.
 	newLease := newIntegrationLeaseUUID()
+	restoreCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	require.NoError(t, b.Restore(ctx, backend.RestoreRequest{
-		LeaseUUID:     newLease,
-		FromLeaseUUID: origLease,
-		Tenant:        "test-tenant",
-		ProviderUUID:  testProviderUUID,
-		Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		CallbackURL:   callbackServer.URL,
+		LeaseUUID:            newLease,
+		FromLeaseUUID:        origLease,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL:          restoreCallbacks.operationURL,
+		LifecycleCallbackURL: restoreCallbacks.lifecycleURL,
 	}))
 	cb = waitForCallback(t, callbackCh, newLease, 3*time.Minute)
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status, "restore must succeed; error: %s", cb.Error)
@@ -197,14 +201,16 @@ func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
 	appManifest := manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	provisionCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    origLease,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            origLease,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
+		CallbackURL:          provisionCallbacks.operationURL,
+		LifecycleCallbackURL: provisionCallbacks.lifecycleURL,
+		Payload:              payload,
 	}))
 	cb := waitForCallback(t, callbackCh, origLease, 3*time.Minute)
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
@@ -230,13 +236,15 @@ func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
 
 	// Restore Quantity=2 into a new lease.
 	newLease := newIntegrationLeaseUUID()
+	restoreCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	require.NoError(t, b.Restore(ctx, backend.RestoreRequest{
-		LeaseUUID:     newLease,
-		FromLeaseUUID: origLease,
-		Tenant:        "test-tenant",
-		ProviderUUID:  testProviderUUID,
-		Items:         []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
-		CallbackURL:   callbackServer.URL,
+		LeaseUUID:            newLease,
+		FromLeaseUUID:        origLease,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL:          restoreCallbacks.operationURL,
+		LifecycleCallbackURL: restoreCallbacks.lifecycleURL,
 	}))
 	cb = waitForCallback(t, callbackCh, newLease, 3*time.Minute)
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status, "multi-instance restore must succeed; error: %s", cb.Error)
@@ -266,8 +274,10 @@ func TestIntegration_Docker_BtrfsRenameVolume_PreservesNestedMetadata(t *testing
 	mountPath := setupBtrfsLoopback(t)
 	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
 
-	const oldName = "fred-meta-legacy-app-0"
-	const newName = "fred-meta-new-app-0"
+	const oldLeaseUUID = "550e8400-e29b-41d4-a716-446655440110"
+	const newLeaseUUID = "550e8400-e29b-41d4-a716-446655440111"
+	oldName := canonicalVolumeName(oldLeaseUUID, "app", 0)
+	newName := canonicalVolumeName(newLeaseUUID, "app", 0)
 	const (
 		wantUID  = 4242
 		wantGID  = 4243

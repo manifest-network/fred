@@ -11,12 +11,33 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
+
+type volumeCleanupContextKey struct{}
+
+func TestNewVolumeCleanupContextOutlivesCanceledRequest(t *testing.T) {
+	parent, cancelParent := context.WithCancel(
+		context.WithValue(t.Context(), volumeCleanupContextKey{}, "trace-value"),
+	)
+	cleanupCtx, cancelCleanup := newVolumeCleanupContext(parent)
+	defer cancelCleanup()
+
+	cancelParent()
+	require.Error(t, parent.Err())
+	require.NoError(t, cleanupCtx.Err(), "compensation must survive request cancellation")
+	assert.Equal(t, "trace-value", cleanupCtx.Value(volumeCleanupContextKey{}))
+	deadline, ok := cleanupCtx.Deadline()
+	require.True(t, ok, "compensation must remain bounded")
+	remaining := time.Until(deadline)
+	assert.Positive(t, remaining)
+	assert.LessOrEqual(t, remaining, volumeCleanupTimeout)
+}
 
 func TestSanitizeVolumePath(t *testing.T) {
 	tests := []struct {
@@ -622,8 +643,8 @@ func TestXFSValidatePopulatesActiveIDs(t *testing.T) {
 	mgr := newTestXFSManager(t)
 
 	// Create fake volume directories with marker files.
-	vol1 := "fred-vol-1"
-	vol2 := "fred-vol-2"
+	vol1 := "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	vol2 := "fred-550e8400-e29b-41d4-a716-446655440000-app-1"
 	var projID1 uint32 = 100
 	var projID2 uint32 = 200
 
@@ -634,20 +655,9 @@ func TestXFSValidatePopulatesActiveIDs(t *testing.T) {
 	require.NoError(t, writeProjectIDFile(dir1, projID1))
 	require.NoError(t, writeProjectIDFile(dir2, projID2))
 
-	// Simulate the scan portion of Validate (can't call Validate directly
-	// because it requires xfs_quota).
-	ids, err := mgr.List()
-	require.NoError(t, err)
-	assert.Len(t, ids, 2)
-
-	mgr.mu.Lock()
-	for _, vid := range ids {
-		dirPath := filepath.Join(mgr.dataPath, vid)
-		projID, err := readProjectIDFile(dirPath)
-		require.NoError(t, err)
-		mgr.trackProjectID(vid, projID)
-	}
-	mgr.mu.Unlock()
+	// Exercise the production scan directly (Validate itself also probes the
+	// host's xfs_quota binary and capabilities, which this unit test does not).
+	require.NoError(t, mgr.loadProjectIDs())
 
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
@@ -662,54 +672,44 @@ func TestXFSValidateErrorsOnMissingMarker(t *testing.T) {
 	mgr := newTestXFSManager(t)
 
 	// Volume directory without a marker file should cause an error.
-	dir := filepath.Join(mgr.dataPath, "fred-vol-nomarker")
+	dir := filepath.Join(mgr.dataPath, "fred-550e8400-e29b-41d4-a716-446655440000-app-0")
 	require.NoError(t, os.MkdirAll(dir, 0755))
 
-	ids, err := mgr.List()
-	require.NoError(t, err)
-	require.Len(t, ids, 1)
-
-	dirPath := filepath.Join(mgr.dataPath, ids[0])
-	_, err = readProjectIDFile(dirPath)
+	err := mgr.loadProjectIDs()
 	require.Error(t, err)
+	assert.ErrorContains(t, err, "read project ID marker")
 }
 
 func TestXFSValidateErrorsOnDuplicateProjectID(t *testing.T) {
 	mgr := newTestXFSManager(t)
 
 	// Two volumes with the same project ID in their marker files.
-	dir1 := filepath.Join(mgr.dataPath, "fred-vol-dup1")
-	dir2 := filepath.Join(mgr.dataPath, "fred-vol-dup2")
+	dir1 := filepath.Join(mgr.dataPath, "fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	dir2 := filepath.Join(mgr.dataPath, "fred-550e8400-e29b-41d4-a716-446655440000-app-1")
 	require.NoError(t, os.MkdirAll(dir1, 0755))
 	require.NoError(t, os.MkdirAll(dir2, 0755))
 	require.NoError(t, writeProjectIDFile(dir1, 42))
 	require.NoError(t, writeProjectIDFile(dir2, 42))
 
-	ids, err := mgr.List()
-	require.NoError(t, err)
-
-	// Simulate the Validate scan loop — should detect the duplicate.
-	mgr.mu.Lock()
-	var scanErr error
-	for _, vid := range ids {
-		dirPath := filepath.Join(mgr.dataPath, vid)
-		projID, err := readProjectIDFile(dirPath)
-		require.NoError(t, err)
-		if existing, ok := mgr.activeIDs[projID]; ok && existing != vid {
-			scanErr = fmt.Errorf("duplicate project ID %d: volumes %s and %s", projID, existing, vid)
-			break
-		}
-		mgr.trackProjectID(vid, projID)
-	}
-	mgr.mu.Unlock()
-
+	scanErr := mgr.loadProjectIDs()
 	require.Error(t, scanErr)
 	assert.Contains(t, scanErr.Error(), "duplicate project ID")
 }
 
+func TestXFSLoadProjectIDsRejectsMalformedManagedEntry(t *testing.T) {
+	mgr := newTestXFSManager(t)
+	dir := filepath.Join(mgr.dataPath, "fred-not-a-canonical-managed-volume")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	require.NoError(t, writeProjectIDFile(dir, 42))
+
+	err := mgr.loadProjectIDs()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "validate managed volume name")
+}
+
 // --- RenameVolume tests (Task 10) ------------------------------------------
 //
-// These tests exercise the shared atomicRenameVolumeDir helper and the
+// These tests exercise the shared descriptor-relative renameAtStorageRoot helper and the
 // per-backend RenameVolume wrappers. They avoid filesystem-specific
 // tooling (xfs_quota, btrfs CLI, zfs CLI) by operating on plain
 // directories under t.TempDir() — the rename semantics are identical
@@ -717,38 +717,50 @@ func TestXFSValidateErrorsOnDuplicateProjectID(t *testing.T) {
 // shells out to the `zfs` binary and is integration-test territory; it's
 // not covered by this unit suite.
 
-func TestAtomicRenameVolumeDir_Idempotent(t *testing.T) {
+func TestRenameAtStorageRoot_Idempotent(t *testing.T) {
 	root := t.TempDir()
-	oldPath := filepath.Join(root, "fred-lease-1-0")
-	newPath := filepath.Join(root, "fred-lease-1-app-0")
+	oldName, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-0")
+	require.NoError(t, err)
+	newName, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.NoError(t, err)
+	oldPath := oldName.hostPath(root)
+	newPath := newName.hostPath(root)
 	require.NoError(t, os.MkdirAll(oldPath, 0o755))
 
 	// First call: rename succeeds.
-	require.NoError(t, atomicRenameVolumeDir(context.Background(), oldPath, newPath))
-	_, err := os.Stat(newPath)
+	require.NoError(t, renameAtStorageRoot(context.Background(), root, oldName, newName))
+	_, err = os.Stat(newPath)
 	require.NoError(t, err, "new path should exist after rename")
 	_, err = os.Stat(oldPath)
 	require.True(t, os.IsNotExist(err), "old path should be gone after rename")
 
 	// Second call: old gone, new exists — idempotent no-op.
-	require.NoError(t, atomicRenameVolumeDir(context.Background(), oldPath, newPath))
+	require.NoError(t, renameAtStorageRoot(context.Background(), root, oldName, newName))
 }
 
-func TestAtomicRenameVolumeDir_BothExistFails(t *testing.T) {
+func TestRenameAtStorageRoot_BothExistFails(t *testing.T) {
 	root := t.TempDir()
-	oldPath := filepath.Join(root, "a")
-	newPath := filepath.Join(root, "b")
+	oldName, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-0")
+	require.NoError(t, err)
+	newName, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.NoError(t, err)
+	oldPath := oldName.hostPath(root)
+	newPath := newName.hostPath(root)
 	require.NoError(t, os.MkdirAll(oldPath, 0o755))
 	require.NoError(t, os.MkdirAll(newPath, 0o755))
 
-	err := atomicRenameVolumeDir(context.Background(), oldPath, newPath)
+	err = renameAtStorageRoot(context.Background(), root, oldName, newName)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "manual intervention required")
 }
 
-func TestAtomicRenameVolumeDir_NeitherExistsFails(t *testing.T) {
+func TestRenameAtStorageRoot_NeitherExistsFails(t *testing.T) {
 	root := t.TempDir()
-	err := atomicRenameVolumeDir(context.Background(), filepath.Join(root, "a"), filepath.Join(root, "b"))
+	oldName, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-0")
+	require.NoError(t, err)
+	newName, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.NoError(t, err)
+	err = renameAtStorageRoot(context.Background(), root, oldName, newName)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither")
 }
@@ -767,14 +779,15 @@ func TestXFSVolumeManager_RenameVolume_UpdatesProjectIDMap(t *testing.T) {
 		volumeToID: make(map[string]uint32),
 	}
 
-	const oldName = "fred-lease-1-0"
-	const newName = "fred-lease-1-app-0"
+	const oldName = "fred-550e8400-e29b-41d4-a716-446655440000-0"
+	const newName = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	const projID = uint32(42)
 	require.NoError(t, os.MkdirAll(filepath.Join(root, oldName), 0o755))
 	require.NoError(t, writeProjectIDFile(filepath.Join(root, oldName), projID))
 	mgr.mu.Lock()
-	mgr.trackProjectID(oldName, projID)
+	registerErr := mgr.registerProjectIDLocked(oldName, projID)
 	mgr.mu.Unlock()
+	require.NoError(t, registerErr)
 
 	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
 
@@ -796,10 +809,20 @@ func TestXFSVolumeManager_RenameVolume_UpdatesProjectIDMap(t *testing.T) {
 
 func TestBtrfsVolumeManager_RenameVolume_Idempotent(t *testing.T) {
 	root := t.TempDir()
+	binDir := t.TempDir()
+	fakeBtrfs := filepath.Join(binDir, "btrfs")
+	require.NoError(t, os.WriteFile(fakeBtrfs, []byte(`#!/bin/sh
+if [ "$1 $2" = "subvolume show" ]; then
+  printf '%s\n' 'Subvolume ID: 256'
+  exit 0
+fi
+exit 97
+`), 0o700))
+	t.Setenv("PATH", binDir)
 	mgr := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
 
-	const oldName = "fred-lease-1-0"
-	const newName = "fred-lease-1-app-0"
+	const oldName = "fred-550e8400-e29b-41d4-a716-446655440000-0"
+	const newName = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	require.NoError(t, os.MkdirAll(filepath.Join(root, oldName), 0o755))
 
 	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
@@ -809,8 +832,144 @@ func TestBtrfsVolumeManager_RenameVolume_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestBtrfsVolumeManagerAttestsExactSubvolume(t *testing.T) {
+	root := t.TempDir()
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "btrfs.log")
+	fakeBtrfs := filepath.Join(binDir, "btrfs")
+	require.NoError(t, os.WriteFile(fakeBtrfs, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$FRED_TEST_BTRFS_LOG"
+printf '%s\n' 'Subvolume ID: 512'
+`), 0o700))
+	t.Setenv("PATH", binDir)
+	t.Setenv("FRED_TEST_BTRFS_LOG", logPath)
+
+	name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+	require.NoError(t, os.Mkdir(filepath.Join(root, name), 0o700))
+	managedName, err := parseManagedVolumeName(name)
+	require.NoError(t, err)
+	mgr := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
+
+	require.NoError(t, mgr.AttestManagedVolume(t.Context(), managedName))
+	commands, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Equal(t, "subvolume show "+filepath.Join(root, name)+"\n", string(commands))
+}
+
+func TestBtrfsVolumeManager_DestroyPlainDirectoryIsNotIdempotent(t *testing.T) {
+	root := t.TempDir()
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	path := filepath.Join(root, name)
+	require.NoError(t, os.Mkdir(path, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(path, "tenant-data"), []byte("keep"), 0o600))
+
+	binDir := t.TempDir()
+	fakeBtrfs := filepath.Join(binDir, "btrfs")
+	require.NoError(t, os.WriteFile(fakeBtrfs, []byte("#!/bin/sh\necho 'ERROR: not a btrfs subvolume' >&2\nexit 1\n"), 0o700))
+	t.Setenv("PATH", binDir)
+
+	mgr := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
+	err := mgr.Destroy(context.Background(), name)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "not a btrfs subvolume")
+	assert.FileExists(t, filepath.Join(path, "tenant-data"), "failed deletion must retain the bytes and accounting evidence")
+}
+
+func TestFilesystemVolumeManagers_RejectTraversalAtEveryPathBoundary(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	invalid := "fred-550e8400-e29b-41d4-a716-446655440000-app-0/../../victim"
+	valid := "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{"xfs create", func() error {
+			_, _, err := (&xfsVolumeManager{dataPath: root}).Create(context.Background(), invalid, 1)
+			return err
+		}},
+		{"xfs quota", func() error { return (&xfsVolumeManager{dataPath: root}).EnsureQuota(context.Background(), invalid, 1) }},
+		{"xfs destroy", func() error { return (&xfsVolumeManager{dataPath: root}).Destroy(context.Background(), invalid) }},
+		{"xfs rename old", func() error {
+			return (&xfsVolumeManager{dataPath: root}).RenameVolume(context.Background(), invalid, valid)
+		}},
+		{"xfs rename new", func() error {
+			return (&xfsVolumeManager{dataPath: root}).RenameVolume(context.Background(), valid, invalid)
+		}},
+		{"xfs usage", func() error {
+			_, err := (&xfsVolumeManager{dataPath: root}).Usage(context.Background(), invalid)
+			return err
+		}},
+		{"btrfs create", func() error {
+			_, _, err := (&btrfsVolumeManager{dataPath: root}).Create(context.Background(), invalid, 1)
+			return err
+		}},
+		{"btrfs quota", func() error {
+			return (&btrfsVolumeManager{dataPath: root}).EnsureQuota(context.Background(), invalid, 1)
+		}},
+		{"btrfs destroy", func() error { return (&btrfsVolumeManager{dataPath: root}).Destroy(context.Background(), invalid) }},
+		{"btrfs rename old", func() error {
+			return (&btrfsVolumeManager{dataPath: root}).RenameVolume(context.Background(), invalid, valid)
+		}},
+		{"btrfs rename new", func() error {
+			return (&btrfsVolumeManager{dataPath: root}).RenameVolume(context.Background(), valid, invalid)
+		}},
+		{"btrfs usage", func() error {
+			_, err := (&btrfsVolumeManager{dataPath: root}).Usage(context.Background(), invalid)
+			return err
+		}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			require.Error(t, test.run())
+		})
+	}
+
+	for _, got := range []string{
+		(&xfsVolumeManager{dataPath: root}).HostPath(invalid),
+		(&btrfsVolumeManager{dataPath: root}).HostPath(invalid),
+	} {
+		relative, err := filepath.Rel(root, got)
+		require.NoError(t, err)
+		assert.True(t, filepath.IsLocal(relative))
+		assert.Contains(t, filepath.Base(got), ".fred-rejected-volume-")
+	}
+}
+
+func TestVolumeManagers_DestroyRejectsManagedNameSymlink(t *testing.T) {
+	t.Parallel()
+
+	for _, filesystem := range []string{"xfs", "btrfs"} {
+		filesystem := filesystem
+		t.Run(filesystem, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			outside := t.TempDir()
+			victim := filepath.Join(outside, "tenant-data")
+			require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+			const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+			require.NoError(t, os.Symlink(outside, filepath.Join(root, name)))
+
+			var err error
+			switch filesystem {
+			case "xfs":
+				err = (&xfsVolumeManager{dataPath: root}).Destroy(context.Background(), name)
+			case "btrfs":
+				err = (&btrfsVolumeManager{dataPath: root}).Destroy(context.Background(), name)
+			}
+			require.Error(t, err)
+			assert.FileExists(t, victim)
+			assert.FileExists(t, filepath.Join(root, name), "the symlink itself must not be consumed as successful volume deletion")
+		})
+	}
+}
+
 // TestXFSVolumeManager_RenameVolume_FailureLeavesMapUnchanged covers
-// the failure path of xfs RenameVolume: when atomicRenameVolumeDir
+// the failure path of xfs RenameVolume: when renameAtStorageRoot
 // returns an error (e.g. neither path exists, or both exist), the
 // in-memory volumeToID / activeIDs maps must NOT be modified — a
 // partial map update on a failed rename would desynchronise the
@@ -825,15 +984,16 @@ func TestXFSVolumeManager_RenameVolume_FailureLeavesMapUnchanged(t *testing.T) {
 		volumeToID: make(map[string]uint32),
 	}
 
-	const oldName = "fred-lease-1-0"
-	const newName = "fred-lease-1-app-0"
+	const oldName = "fred-550e8400-e29b-41d4-a716-446655440000-0"
+	const newName = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
 	const projID = uint32(99)
-	// Both directories exist → atomicRenameVolumeDir refuses (manual intervention required).
+	// Both directories exist → renameAtStorageRoot refuses (manual intervention required).
 	require.NoError(t, os.MkdirAll(filepath.Join(root, oldName), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(root, newName), 0o755))
 	mgr.mu.Lock()
-	mgr.trackProjectID(oldName, projID)
+	registerErr := mgr.registerProjectIDLocked(oldName, projID)
 	mgr.mu.Unlock()
+	require.NoError(t, registerErr)
 
 	err := mgr.RenameVolume(context.Background(), oldName, newName)
 	require.Error(t, err, "rename of both-exist must fail")
@@ -855,15 +1015,18 @@ func TestXFSVolumeManager_RenameVolume_FailureLeavesMapUnchanged(t *testing.T) {
 func TestVolumeManager_HostPath(t *testing.T) {
 	t.Run("xfs", func(t *testing.T) {
 		mgr := &xfsVolumeManager{dataPath: "/var/lib/fred/volumes"}
-		assert.Equal(t, "/var/lib/fred/volumes/fred-lease-1-app-0", mgr.HostPath("fred-lease-1-app-0"))
+		name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+		assert.Equal(t, filepath.Join("/var/lib/fred/volumes", name), mgr.HostPath(name))
 	})
 	t.Run("btrfs", func(t *testing.T) {
 		mgr := &btrfsVolumeManager{dataPath: "/var/lib/fred/volumes"}
-		assert.Equal(t, "/var/lib/fred/volumes/fred-lease-1-app-0", mgr.HostPath("fred-lease-1-app-0"))
+		name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+		assert.Equal(t, filepath.Join("/var/lib/fred/volumes", name), mgr.HostPath(name))
 	})
 	t.Run("zfs", func(t *testing.T) {
 		mgr := &zfsVolumeManager{dataPath: "/var/lib/fred/volumes"}
-		assert.Equal(t, "/var/lib/fred/volumes/fred-lease-1-app-0", mgr.HostPath("fred-lease-1-app-0"))
+		name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+		assert.Equal(t, filepath.Join("/var/lib/fred/volumes", name), mgr.HostPath(name))
 	})
 	t.Run("noop returns empty", func(t *testing.T) {
 		mgr := &noopVolumeManager{}

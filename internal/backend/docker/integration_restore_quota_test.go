@@ -23,7 +23,7 @@ import (
 )
 
 // parseXfsReportHardBlocks returns the HARD block-limit column for projID from
-// `xfs_quota report -p -b -N` output. Rows are `#<projid> <used> <soft> <hard>
+// `xfs_quota report -p -b -n -N` output. Rows are `#<projid> <used> <soft> <hard>
 // <warn/grace>` in 1 KiB blocks, so the hard limit is fields[3]. This mirrors
 // the production parseXfsReportUsedBlocks (which reads fields[1]) but lives in
 // the test file to honor the zero-prod-change goal.
@@ -45,13 +45,13 @@ func parseXfsReportHardBlocks(out string, projID uint32) (int64, error) {
 // xfsBhardBytes reads back the enforced hard limit (in bytes) for the volume's
 // XFS project. It resolves the projID from the volume's .fred-project-id marker
 // (guaranteed present after a successful Create) and runs the SAME report flags
-// as production Usage() — `report -p -b -N` (never -h, which scales to strings
+// as production Usage() — `report -p -b -n -N` (never -h, which scales to strings
 // and breaks exact equality).
 func xfsBhardBytes(t *testing.T, mount string, mgr volumeManager, volName string) int64 {
 	t.Helper()
 	projID, err := readProjectIDFile(mgr.HostPath(volName))
 	require.NoError(t, err, "read project-id marker for %s", volName)
-	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -b -N", mount)...).CombinedOutput()
+	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -b -n -N", mount)...).CombinedOutput()
 	require.NoError(t, err, "xfs_quota report -p: %s", out)
 	blocks, err := parseXfsReportHardBlocks(string(out), projID)
 	require.NoError(t, err, "parse hard-limit blocks from: %s", out)
@@ -114,12 +114,13 @@ func newRestoreQuotaBackend(t *testing.T, mgr volumeManager) (*Backend, <-chan b
 	b.compose = happyComposeMock(&mu, &down, nil)
 	rebuildCallbackSender(b, testCallbackClient) // pick up testCallbackSecret so callback HMAC verifies
 	attachRetentionStore(t, b)
+	stopReplay := startRestoreCallbackReplay(t, b)
 	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 100}
 	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 20}
 	server, ch := startCallbackServer(t)
 	// Drain async restore workers before setupXFSLoopback's cleanup unmounts the
 	// loopback. Registered after the mount cleanup, so LIFO runs this first.
-	t.Cleanup(func() { b.stopCancel(); b.wg.Wait() })
+	t.Cleanup(stopReplay)
 	return b, ch, server.URL
 }
 

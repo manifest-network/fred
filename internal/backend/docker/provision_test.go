@@ -79,6 +79,118 @@ func newBackendForProvisionTest(t *testing.T, mock *mockDockerClient, provisions
 	return b
 }
 
+// prepareFailedProvisionReplacement upgrades a compact Failed-provision fixture
+// into the exact predecessor authority that production recovery publishes. A
+// replacement provision is allowed to erase an older cohort only when its live
+// projection, active Release, and Docker labels agree on the tenant, provider,
+// workload shape, and callback generation.
+func prepareFailedProvisionReplacement(
+	t *testing.T,
+	b *Backend,
+	mock *mockDockerClient,
+	leaseUUID, tenant, sku string,
+	payload []byte,
+) {
+	t.Helper()
+
+	prov, ok := b.provisions[leaseUUID]
+	require.True(t, ok, "replacement fixture requires a predecessor projection")
+	require.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	require.Len(t, prov.ContainerIDs, prov.Quantity)
+
+	items := []backend.LeaseItem{{
+		SKU: sku, Quantity: prov.Quantity, ServiceName: manifest.DefaultServiceName,
+	}}
+	profiles := testResourceProfiles(t, items)
+	stack, err := manifest.ParsePayload(payload)
+	require.NoError(t, err)
+
+	const predecessorOperationID = shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	callbackURL := "https://old.example/callbacks/provision?operation_id=" + predecessorOperationID.String()
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	require.NoError(t, err)
+	authority, err := shared.NewReleaseRuntimeAuthority(
+		predecessorOperationID,
+		tenant,
+		nominalDockerProviderUUID,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+
+	prov.Tenant = tenant
+	prov.ProviderUUID = nominalDockerProviderUUID
+	prov.SKU = sku
+	prov.CallbackURL = callbackURL
+	prov.LifecycleCallbackURL = lifecycleCallbackURL
+	prov.Items = items
+	prov.ProvisionState.ResourceProfiles = shared.CloneSKUResourceSnapshot(profiles)
+	prov.ResourceProfiles = shared.CloneSKUResourceSnapshot(profiles)
+	prov.StackManifest = stack
+	prov.ServiceContainers = map[string][]string{
+		manifest.DefaultServiceName: append([]string(nil), prov.ContainerIDs...),
+	}
+
+	containers := make([]ContainerInfo, 0, len(prov.ContainerIDs))
+	for index, containerID := range prov.ContainerIDs {
+		containers = append(containers, ContainerInfo{
+			ContainerID:          containerID,
+			Name:                 fmt.Sprintf("fred-%s-%s-%d", leaseUUID, manifest.DefaultServiceName, index),
+			LeaseUUID:            leaseUUID,
+			Tenant:               tenant,
+			ProviderUUID:         nominalDockerProviderUUID,
+			SKU:                  sku,
+			ServiceName:          manifest.DefaultServiceName,
+			InstanceIndex:        index,
+			Image:                stack.Services[manifest.DefaultServiceName].Image,
+			CallbackURL:          callbackURL,
+			LifecycleCallbackURL: lifecycleCallbackURL,
+			Status:               "exited",
+		})
+	}
+	mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) {
+		return append([]ContainerInfo(nil), containers...), nil
+	}
+	originalInspect := mock.InspectContainerFn
+	mock.InspectContainerFn = func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+		for i := range containers {
+			if containers[i].ContainerID == containerID {
+				copy := containers[i]
+				return &copy, nil
+			}
+		}
+		if originalInspect != nil {
+			return originalInspect(ctx, containerID)
+		}
+		return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+	}
+
+	compose, ok := b.compose.(*mockComposeExecutor)
+	require.True(t, ok, "replacement fixture requires the mock Compose executor")
+	compose.DownFn = func(context.Context, string, time.Duration) error {
+		return errors.New("exercise strict predecessor teardown fallback")
+	}
+
+	journal, ok := b.operationIntents.(noopOperationIntentJournal)
+	require.True(t, ok, "replacement fixture requires the nominal operation journal")
+	b.operationIntents = durableTestOperationIntentJournal{
+		store: journal.store, storageID: b.storageIdentity,
+	}
+	b.callbackStore = journal.store
+
+	releases := attachReleaseStore(t, b)
+	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
+		Manifest:         append([]byte(nil), payload...),
+		Image:            "stack",
+		OperationID:      predecessorOperationID,
+		Items:            append([]backend.LeaseItem(nil), items...),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(profiles),
+		RuntimeAuthority: &authority,
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+}
+
 // nominalReleaseCapacityPlanner keeps broad worker/actor fixtures lightweight
 // when they do not model release history, but dynamically delegates as soon as
 // a test attaches the real store. Production never uses this adapter.
@@ -96,18 +208,19 @@ func (p nominalReleaseCapacityPlanner) CheckAppendActiveCapacity(
 	return p.backend.releaseStore.CheckAppendActiveCapacity(leaseUUID, release)
 }
 
-func (p nominalReleaseCapacityPlanner) CheckRecordMigrationCapacity(
+func (p nominalReleaseCapacityPlanner) CheckRecordLegacyMigrationCapacity(
 	leaseUUID string,
 	manifest []byte,
 	items []backend.LeaseItem,
 	profiles []shared.SKUResourceSnapshot,
+	authority shared.LegacyRuntimeAuthority,
 	createdAt time.Time,
 ) error {
 	if p.backend.releaseStore == nil {
 		return nil
 	}
-	return p.backend.releaseStore.CheckRecordMigrationCapacity(
-		leaseUUID, manifest, items, profiles, createdAt,
+	return p.backend.releaseStore.CheckRecordLegacyMigrationCapacity(
+		leaseUUID, manifest, items, profiles, authority, createdAt,
 	)
 }
 
@@ -437,6 +550,8 @@ func TestProvision_RejectsWhileDeprovisioning(t *testing.T) {
 }
 
 func TestProvision_ReProvisionFailed(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440101"
+	payload := validManifestJSON("nginx:latest")
 	removeCalled := false
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
@@ -452,7 +567,7 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    2,
 			Quantity:     1,
@@ -460,7 +575,8 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 		},
 	})
 	// Pre-allocate a resource for the old provision
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(leaseUUID+"-app-0", "docker-small", "tenant-a")
+	prepareFailedProvisionReplacement(t, b, mock, leaseUUID, "tenant-a", "docker-small", payload)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	callbackReceived := make(chan struct{})
@@ -473,9 +589,11 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	rebuildCallbackSender(b, callbackServer.Client())
+	b.wg.Go(b.callbackSender.RunReplayLoop)
 
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	req.CallbackURL = callbackServer.URL
+	req := newProvisionRequest(leaseUUID, "tenant-a", "docker-small", 1, payload)
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
@@ -484,7 +602,7 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 
 	// New provision should have preserved FailCount
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[leaseUUID]
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, 2, prov.FailCount, "FailCount should be preserved from previous provision")
 
@@ -513,6 +631,8 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 // class of bug. This test asserts that property end-to-end through the
 // Provision API.
 func TestProvision_ReProvision_ClearsVolumeCleanupAttempts(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440101"
+	payload := validManifestJSON("nginx:latest")
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
@@ -532,9 +652,9 @@ func TestProvision_ReProvision_ClearsVolumeCleanupAttempts(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {
+		leaseUUID: {
 			ProvisionState: leasesm.ProvisionState{
-				LeaseUUID:    "lease-1",
+				LeaseUUID:    leaseUUID,
 				Status:       backend.ProvisionStatusFailed,
 				FailCount:    2,
 				Quantity:     1,
@@ -546,7 +666,8 @@ func TestProvision_ReProvision_ClearsVolumeCleanupAttempts(t *testing.T) {
 			VolumeCleanupAttempts: 2,
 		},
 	})
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(leaseUUID+"-app-0", "docker-small", "tenant-a")
+	prepareFailedProvisionReplacement(t, b, mock, leaseUUID, "tenant-a", "docker-small", payload)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	callbackReceived := make(chan struct{})
@@ -559,9 +680,11 @@ func TestProvision_ReProvision_ClearsVolumeCleanupAttempts(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	rebuildCallbackSender(b, callbackServer.Client())
+	b.wg.Go(b.callbackSender.RunReplayLoop)
 
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	req.CallbackURL = callbackServer.URL
+	req := newProvisionRequest(leaseUUID, "tenant-a", "docker-small", 1, payload)
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
@@ -573,7 +696,7 @@ func TestProvision_ReProvision_ClearsVolumeCleanupAttempts(t *testing.T) {
 	// re-provision allocates a fresh *provision so the embedded counter
 	// resets along with every other Docker-private field.
 	b.provisionsMu.RLock()
-	attempts := b.provisions["lease-1"].VolumeCleanupAttempts
+	attempts := b.provisions[leaseUUID].VolumeCleanupAttempts
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, 0, attempts,
 		"re-provision must reset VolumeCleanupAttempts so a subsequent Deprovision starts at 0, not inherit stale state from the old provision")
@@ -990,6 +1113,8 @@ func TestDoProvision_StatefulSKUNoImageVolumes(t *testing.T) {
 }
 
 func TestProvision_ReProvisionKeepsVolumes(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440101"
+	payload := validManifestJSON("nginx:latest")
 	destroyCalled := false
 	vm := &mockVolumeManager{
 		defaultDir: t.TempDir(),
@@ -1023,7 +1148,7 @@ func TestProvision_ReProvisionKeepsVolumes(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    1,
 			Quantity:     1,
@@ -1038,7 +1163,8 @@ func TestProvision_ReProvisionKeepsVolumes(t *testing.T) {
 		},
 	}
 	b.volumes = vm
-	_ = b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(leaseUUID+"-app-0", "docker-small", "tenant-a")
+	prepareFailedProvisionReplacement(t, b, mock, leaseUUID, "tenant-a", "docker-small", payload)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	callbackReceived := make(chan struct{})
@@ -1051,9 +1177,11 @@ func TestProvision_ReProvisionKeepsVolumes(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	rebuildCallbackSender(b, callbackServer.Client())
+	b.wg.Go(b.callbackSender.RunReplayLoop)
 
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	req.CallbackURL = callbackServer.URL
+	req := newProvisionRequest(leaseUUID, "tenant-a", "docker-small", 1, payload)
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
@@ -3331,6 +3459,8 @@ func TestGetLogs_FallbackNoLogs(t *testing.T) {
 }
 
 func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440102"
+	payload := validManifestJSON("docker.io/nginx:latest")
 	// When a re-provision succeeds, the stale diagnostic entry from the
 	// previous failure should be removed from the diagnostics store.
 	dbPath := filepath.Join(t.TempDir(), "diag_clear.db")
@@ -3340,7 +3470,7 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 
 	// Pre-populate a stale diagnostic entry.
 	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
-		LeaseUUID: "lease-reprov",
+		LeaseUUID: leaseUUID,
 		Error:     "old failure",
 		FailCount: 1,
 	}))
@@ -3361,9 +3491,9 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-reprov": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-reprov",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Tenant:       "tenant-a",
-			ProviderUUID: "prov-1",
+			ProviderUUID: nominalDockerProviderUUID,
 			Status:       backend.ProvisionStatusFailed,
 			FailCount:    1,
 			Quantity:     1,
@@ -3378,21 +3508,26 @@ func TestProvision_SuccessClearsStaleDiagnostics(t *testing.T) {
 		},
 	}
 	b.diagnosticsStore = diagStore
-	_ = b.pool.TryAllocate("lease-reprov-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(leaseUUID+"-app-0", "docker-small", "tenant-a")
+	prepareFailedProvisionReplacement(t, b, mock, leaseUUID, "tenant-a", "docker-small", payload)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 	rebuildCallbackSender(b, callbackServer.Client())
+	b.wg.Go(b.callbackSender.RunReplayLoop)
 
-	req := newProvisionRequest("lease-reprov", "tenant-a", "docker-small", 1, validManifestJSON("docker.io/nginx:latest"))
-	req.CallbackURL = callbackServer.URL
+	req := newProvisionRequest(leaseUUID, "tenant-a", "docker-small", 1, payload)
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 	err = b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
 	require.Eventually(t, func() bool { return callbackReceived.Load() }, 5*time.Second, 50*time.Millisecond)
 
 	// Stale diagnostic entry should be removed.
-	entry, err := diagStore.Get("lease-reprov")
+	entry, err := diagStore.Get(leaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, entry, "stale diagnostic entry should be removed on successful re-provision")
+
+	b.stopCancel()
+	b.wg.Wait()
 }
 
 func TestDoProvision_StatefulSKUChownsVolumeSubdirs(t *testing.T) {

@@ -603,7 +603,10 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
-	hostVol := t.TempDir()
+	volumeRoot := t.TempDir()
+	b.cfg.VolumeDataPath = volumeRoot
+	hostVol := filepath.Join(volumeRoot, canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0))
+	require.NoError(t, os.Mkdir(hostVol, 0o700))
 	wpDir := filepath.Join(hostVol, writablePathSubdir)
 
 	// Stale content from a prior extraction / tenant write under the writable path.
@@ -648,7 +651,10 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
-	hostVol := t.TempDir()
+	volumeRoot := t.TempDir()
+	b.cfg.VolumeDataPath = volumeRoot
+	hostVol := filepath.Join(volumeRoot, canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0))
+	require.NoError(t, os.Mkdir(hostVol, 0o700))
 	wpDir := filepath.Join(hostVol, writablePathSubdir)
 	outside := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(outside, "host-secret"), []byte("x"), 0o600))
@@ -679,7 +685,10 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
-	hostVol := t.TempDir()
+	volumeRoot := t.TempDir()
+	b.cfg.VolumeDataPath = volumeRoot
+	hostVol := filepath.Join(volumeRoot, canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0))
+	require.NoError(t, os.Mkdir(hostVol, 0o700))
 	wpDir := filepath.Join(hostVol, writablePathSubdir)
 
 	// Extraction leaves wpDir as a regular FILE, so os.OpenRoot(wpDir) fails with a

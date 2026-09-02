@@ -39,6 +39,12 @@ import (
 
 var version = "dev"
 
+// Storage-identity preflight and initialization attest every managed volume
+// sequentially. Keep the default finite, but large enough for a real fleet;
+// operators with unusually large or slow substrates can override it on the
+// one-shot command line.
+const defaultStorageIdentityOperationTimeout = 10 * time.Minute
+
 func main() {
 	startup, err := parseStartupFlags(os.Args[1:], os.Stdout)
 	if errors.Is(err, flag.ErrHelp) {
@@ -93,7 +99,9 @@ func main() {
 		logger.Info("SKU mapping", "uuid", uuid, "profile", profile)
 	}
 	if startup.preflightStorageIdentityAdoption {
-		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		preflightCtx, preflightCancel := context.WithTimeout(
+			context.Background(), startup.storageIdentityOperationTimeout,
+		)
 		verdict, preflightErr := docker.PreflightStorageIdentityAdoptionForConfig(
 			preflightCtx, cfg, logger,
 		)
@@ -109,7 +117,9 @@ func main() {
 		return
 	}
 	if startup.initializeStorageIdentity != "" {
-		identityCtx, identityCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		identityCtx, identityCancel := context.WithTimeout(
+			context.Background(), startup.storageIdentityOperationTimeout,
+		)
 		identity, initializeErr := docker.InitializeStorageIdentityForConfig(
 			identityCtx, cfg, logger,
 			docker.StorageIdentityInitializationMode(startup.initializeStorageIdentity),
@@ -192,20 +202,28 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal or server error
+	// Wait for an operator signal, listener failure, or a terminal storage
+	// authority withdrawal. The last case must return a non-zero process status:
+	// its typed on-disk recovery evidence is consumed only by a fresh Start.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	// startupErr captures a ListenAndServe failure (port in use, bind refused,
 	// etc.) so the process can exit non-zero after the graceful-shutdown path
 	// runs. Without this, supervisors / k8s liveness probes / CI would see the
 	// "binary that never bound" as a successful run.
-	var startupErr error
-	select {
-	case <-sigCh:
+	trigger := waitForShutdownTrigger(sigCh, serverErr, b.TerminalStorageAuthorityFailure())
+	var (
+		startupErr          = trigger.serverErr
+		storageAuthorityErr = trigger.storageAuthorityErr
+	)
+	switch {
+	case trigger.signaled:
 		logger.Info("shutting down...")
-	case err := <-serverErr:
-		logger.Error("HTTP server error, shutting down", "error", err)
-		startupErr = err
+	case startupErr != nil:
+		logger.Error("HTTP server error, shutting down", "error", startupErr)
+	case storageAuthorityErr != nil:
+		logger.Error("terminal backend storage authority failure; shutting down for recovery",
+			"error", storageAuthorityErr)
 	}
 
 	// Graceful shutdown
@@ -221,15 +239,23 @@ func main() {
 		backendShutdownErr = err
 		logger.Error("backend shutdown error", "error", err)
 	}
+	// If an operator/listener event won the initial select concurrently with a
+	// storage latch, observe the buffered first cause after all backend workers
+	// have drained. A successful Stop proves no later worker can publish one.
+	storageAuthorityErr = takePendingStorageAuthorityFailure(
+		storageAuthorityErr,
+		b.TerminalStorageAuthorityFailure(),
+	)
 
 	// A backend drain timeout deliberately leaves stores and the Docker client
 	// open because a canceled worker may still be using them. Returning from
 	// main is the forced-exit boundary that kills such a worker; report it as a
 	// failure so the supervisor restarts and recovery re-attests substrate state.
-	if exitCode := shutdownExitCode(startupErr, backendShutdownErr); exitCode != 0 {
-		logger.Error("shutdown incomplete; forcing non-zero process exit",
+	if exitCode := shutdownExitCode(startupErr, backendShutdownErr, storageAuthorityErr); exitCode != 0 {
+		logger.Error("backend terminated with a failure; forcing non-zero process exit",
 			"startup_error", startupErr,
 			"backend_error", backendShutdownErr,
+			"storage_authority_error", storageAuthorityErr,
 		)
 		os.Exit(exitCode)
 	}
@@ -237,8 +263,43 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func shutdownExitCode(startupErr, backendShutdownErr error) int {
-	if startupErr != nil || backendShutdownErr != nil {
+type shutdownTrigger struct {
+	signaled            bool
+	serverErr           error
+	storageAuthorityErr error
+}
+
+func waitForShutdownTrigger(
+	signals <-chan os.Signal,
+	serverFailures <-chan error,
+	storageAuthorityFailures <-chan error,
+) shutdownTrigger {
+	select {
+	case <-signals:
+		return shutdownTrigger{signaled: true}
+	case err := <-serverFailures:
+		return shutdownTrigger{serverErr: err}
+	case err := <-storageAuthorityFailures:
+		return shutdownTrigger{storageAuthorityErr: err}
+	}
+}
+
+func takePendingStorageAuthorityFailure(current error, failures <-chan error) error {
+	if current != nil {
+		return current
+	}
+	select {
+	case err, ok := <-failures:
+		if ok {
+			return err
+		}
+	default:
+	}
+	return nil
+}
+
+func shutdownExitCode(startupErr, backendShutdownErr, storageAuthorityErr error) int {
+	if startupErr != nil || backendShutdownErr != nil || storageAuthorityErr != nil {
 		return 1
 	}
 	return 0
@@ -279,6 +340,7 @@ type startupFlags struct {
 	showVersion                      bool
 	initializeStorageIdentity        string
 	preflightStorageIdentityAdoption bool
+	storageIdentityOperationTimeout  time.Duration
 }
 
 func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
@@ -293,8 +355,15 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		"preflight-storage-identity-adoption", false,
 		"one-shot read-only: verify a stopped v0.13 lineage is adoptable and exit",
 	)
+	identityOperationTimeout := fs.Duration(
+		"storage-identity-operation-timeout", defaultStorageIdentityOperationTimeout,
+		"cooperative deadline for context-aware one-shot storage-identity proof work",
+	)
 	if err := fs.Parse(args); err != nil {
 		return startupFlags{}, err
+	}
+	if *identityOperationTimeout <= 0 {
+		return startupFlags{}, errors.New("-storage-identity-operation-timeout must be positive")
 	}
 	if *preflightAdoption && *initializeIdentity != "" {
 		return startupFlags{}, errors.New(
@@ -309,6 +378,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		showVersion:                      *showVer,
 		initializeStorageIdentity:        *initializeIdentity,
 		preflightStorageIdentityAdoption: *preflightAdoption,
+		storageIdentityOperationTimeout:  *identityOperationTimeout,
 	}, nil
 }
 

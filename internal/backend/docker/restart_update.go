@@ -211,8 +211,8 @@ func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackUR
 	if sourceErr != nil {
 		return fmt.Errorf("construct restart source authority: %w", sourceErr)
 	}
-	runtimeAuthority, authorityErr := releaseRuntimeAuthorityForOperation(
-		active.OperationID, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+	runtimeAuthority, legacyRuntimeAuthority, authorityErr := releaseRuntimeAuthoritiesForMaintenance(
+		active, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
 	)
 	if authorityErr != nil {
 		return fmt.Errorf("construct restart release runtime authority: %w", authorityErr)
@@ -226,14 +226,15 @@ func (b *Backend) routeReplaceRestart(ctx context.Context, leaseUUID, callbackUR
 		kind = shared.MaintenanceIntentCustomDomain
 	}
 	maintenance, targetRelease, admitErr := b.admitMaintenance(kind, sourceClaim, shared.Release{
-		Manifest:         manifestBytes,
-		Image:            "stack",
-		OperationID:      active.OperationID,
-		Items:            slices.Clone(items),
-		ResourceProfiles: resourceProfiles,
-		RuntimeAuthority: runtimeAuthority,
-		Status:           "deploying",
-		CreatedAt:        time.Now(),
+		Manifest:               manifestBytes,
+		Image:                  "stack",
+		OperationID:            active.OperationID,
+		Items:                  slices.Clone(items),
+		ResourceProfiles:       resourceProfiles,
+		RuntimeAuthority:       runtimeAuthority,
+		LegacyRuntimeAuthority: legacyRuntimeAuthority,
+		Status:                 "deploying",
+		CreatedAt:              time.Now(),
 	})
 	if admitErr != nil {
 		return admitErr
@@ -331,7 +332,11 @@ type replaceSourceSnapshot struct {
 }
 
 func newReplaceSourceSnapshot(release shared.Release) (replaceSourceSnapshot, error) {
-	if release.Status != "active" || release.RuntimeAuthority == nil {
+	if release.Status != "active" {
+		return replaceSourceSnapshot{}, errors.New("source release lacks active runtime authority")
+	}
+	authority, ok := runtimeIdentityForRelease(&release)
+	if !ok {
 		return replaceSourceSnapshot{}, errors.New("source release lacks active runtime authority")
 	}
 	stack, err := manifest.ParsePayload(release.Manifest)
@@ -349,12 +354,47 @@ func newReplaceSourceSnapshot(release shared.Release) (replaceSourceSnapshot, er
 		Stack:                stack,
 		Items:                slices.Clone(release.Items),
 		ResourceProfiles:     shared.CloneSKUResourceSnapshot(release.ResourceProfiles),
-		Tenant:               release.RuntimeAuthority.Tenant(),
-		ProviderUUID:         release.RuntimeAuthority.ProviderUUID(),
-		CallbackURL:          release.RuntimeAuthority.CallbackURL(),
-		LifecycleCallbackURL: release.RuntimeAuthority.LifecycleCallbackURL(),
+		Tenant:               authority.Tenant(),
+		ProviderUUID:         authority.ProviderUUID(),
+		CallbackURL:          authority.CallbackURL(),
+		LifecycleCallbackURL: authority.LifecycleCallbackURL(),
 		MaintenanceID:        release.MaintenanceID,
 	}, nil
+}
+
+// releaseRuntimeAuthoritiesForMaintenance preserves the active release's
+// authority class. Current generations retain their operation-scoped typed
+// authority; v0.13 generations retain a separately typed tokenless authority.
+// MaintenanceID remains the exact UUIDv4 identity of the replacement WAL in
+// both cases, so supporting a legacy source does not manufacture a provision
+// operation capability that never existed.
+func releaseRuntimeAuthoritiesForMaintenance(
+	active shared.Release,
+	tenant, providerUUID, callbackURL, lifecycleCallbackURL string,
+) (*shared.ReleaseRuntimeAuthority, *shared.LegacyRuntimeAuthority, error) {
+	authority, ok := runtimeIdentityForRelease(&active)
+	if !ok {
+		return nil, nil, errors.New("active release has no durable runtime authority")
+	}
+	if authority.Class() == shared.ReleaseAuthorityLegacy {
+		legacy, err := shared.NewLegacyRuntimeAuthority(
+			tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, &legacy, nil
+	}
+	typed, err := releaseRuntimeAuthorityForOperation(
+		active.OperationID, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if typed == nil {
+		return nil, nil, errors.New("typed active release has no operation lineage")
+	}
+	return typed, nil, nil
 }
 
 // replaceContainersOp describes a stack container replacement operation.
@@ -958,8 +998,8 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 	if sourceErr != nil {
 		return fmt.Errorf("construct update source authority: %w", sourceErr)
 	}
-	runtimeAuthority, authorityErr := releaseRuntimeAuthorityForOperation(
-		active.OperationID, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+	runtimeAuthority, legacyRuntimeAuthority, authorityErr := releaseRuntimeAuthoritiesForMaintenance(
+		active, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
 	)
 	if authorityErr != nil {
 		return fmt.Errorf("construct update release runtime authority: %w", authorityErr)
@@ -968,14 +1008,15 @@ func (b *Backend) Update(ctx context.Context, req backend.UpdateRequest) error {
 		shared.MaintenanceIntentUpdate,
 		sourceClaim,
 		shared.Release{
-			Manifest:         req.Payload,
-			Image:            "stack",
-			OperationID:      active.OperationID,
-			Items:            slices.Clone(items),
-			ResourceProfiles: resourceProfiles,
-			RuntimeAuthority: runtimeAuthority,
-			Status:           "deploying",
-			CreatedAt:        time.Now(),
+			Manifest:               req.Payload,
+			Image:                  "stack",
+			OperationID:            active.OperationID,
+			Items:                  slices.Clone(items),
+			ResourceProfiles:       resourceProfiles,
+			RuntimeAuthority:       runtimeAuthority,
+			LegacyRuntimeAuthority: legacyRuntimeAuthority,
+			Status:                 "deploying",
+			CreatedAt:              time.Now(),
 		},
 	)
 	if admitErr != nil {

@@ -272,6 +272,56 @@ func TestVolumeOp_Destroy_UnreadableClaims_DestroysNothing(t *testing.T) {
 		"counted per volume, so the refusal is visible at the same granularity as the decision")
 }
 
+func TestCleanupOrphanedVolumes_UnreadableClaimsFailReadinessBoundary(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Close())
+	orphan := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{orphan}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("must not destroy %q when the ownership journal is unreadable", id)
+			return nil
+		},
+	}
+
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "resolve orphan volume ownership")
+}
+
+func TestCleanupOrphanedVolumes_UnreadableReleaseFailsReadinessBoundary(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	releases := attachReleaseStore(t, b)
+	require.NoError(t, releases.Close())
+	orphan := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{orphan}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("must not destroy %q when active-release authority is unreadable", id)
+			return nil
+		},
+	}
+
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "read active release for orphan candidate")
+}
+
+func TestCleanupOrphanedVolumes_DestroyFailureFailsReadinessBoundary(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	orphan := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{orphan}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			assert.Equal(t, orphan, id)
+			return assert.AnError
+		},
+	}
+
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "destroy orphaned volumes")
+	require.ErrorIs(t, err, assert.AnError)
+}
+
 // TestVolumeOp_Destroy_ReportsPerNameFailures keeps the three outcomes distinct — a
 // caller that cannot tell "gone" from "failed" from "refused" releases capacity it
 // shouldn't.
@@ -619,8 +669,9 @@ func TestCleanupOrphanedVolumes_UnreadableClaims_CountsTheUndecided(t *testing.T
 	}
 
 	before := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable))
-	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()),
-		"an unreadable store skips the run; it does not fail startup")
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "resolve orphan volume ownership",
+		"an unreadable ownership journal must keep startup unready")
 
 	assert.InDelta(t, before+2,
 		testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable)), 0.0001,

@@ -289,7 +289,8 @@ func validateMaintenanceRecoveryProjection(
 		return result, nil
 	}
 	target := claim.TargetRelease()
-	if target.RuntimeAuthority == nil {
+	authority, ok := target.RuntimeIdentity()
+	if !ok {
 		return ReplaceSuccessResult{}, errors.New("maintenance recovery target has no runtime authority")
 	}
 	stack, err := manifest.ParsePayload(target.Manifest)
@@ -298,7 +299,6 @@ func validateMaintenanceRecoveryProjection(
 	}
 	items := append([]backend.LeaseItem(nil), target.Items...)
 	resourceProfiles := shared.CloneSKUResourceSnapshot(target.ResourceProfiles)
-	authority := target.RuntimeAuthority
 	result.OnSuccess = func(state *ProvisionState) {
 		state.Tenant = authority.Tenant()
 		state.ProviderUUID = authority.ProviderUUID()

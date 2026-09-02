@@ -746,18 +746,21 @@ func TestMaintenanceReleaseRejectsRawMutationBypasses(t *testing.T) {
 			targetRelease.Items,
 			targetRelease.ResourceProfiles,
 		), ErrMaintenanceReleaseClaimRequired)
-		require.ErrorIs(t, releases.CheckRecordMigrationCapacity(
+		authority := testLegacyMigrationAuthority(t)
+		require.ErrorIs(t, releases.CheckRecordLegacyMigrationCapacity(
 			intent.LeaseUUID(),
 			targetRelease.Manifest,
 			targetRelease.Items,
 			targetRelease.ResourceProfiles,
+			authority,
 			time.Now(),
 		), ErrMaintenanceReleaseClaimRequired)
-		require.ErrorIs(t, releases.RecordMigration(
+		require.ErrorIs(t, releases.RecordLegacyMigration(
 			intent.LeaseUUID(),
 			targetRelease.Manifest,
 			targetRelease.Items,
 			targetRelease.ResourceProfiles,
+			authority,
 		), ErrMaintenanceReleaseClaimRequired)
 		require.ErrorIs(t, releases.Delete(intent.LeaseUUID()), ErrMaintenanceReleaseClaimRequired)
 

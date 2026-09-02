@@ -559,7 +559,18 @@ func (f *fakeVolumeBackend) Destroy(_ context.Context, id string) error {
 	return nil
 }
 func (f *fakeVolumeBackend) List() ([]string, error) { return nil, nil }
-func (f *fakeVolumeBackend) Validate() error         { return nil }
+func (f *fakeVolumeBackend) ListForProof(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+func (f *fakeVolumeBackend) Validate() error { return nil }
+func (f *fakeVolumeBackend) AttestManagedVolume(context.Context, managedVolumeName) error {
+	return nil
+}
+func (f *fakeVolumeBackend) RequireNoInterruptedVolumeMutations(context.Context) error { return nil }
+func (f *fakeVolumeBackend) RecoverInterruptedVolumeMutations(context.Context) error   { return nil }
 
 // RenameVolume captures the rename request. Returns nil unconditionally —
 // migration tests assert on the recorded renames slice rather than on a

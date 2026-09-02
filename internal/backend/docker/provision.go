@@ -45,6 +45,49 @@ func isFlatPayload(data []byte) bool {
 // real capacity (such a lease would fail admission anyway). (ENG-503)
 const maxLeaseQuantity = backend.MaxOperationQuantity
 
+func resolvedProvisionAllocations(
+	leaseUUID string,
+	items []backend.LeaseItem,
+	resourceProfiles []shared.SKUResourceSnapshot,
+) ([]string, []shared.ResolvedAdoptInstance, error) {
+	resourcesBySKU, err := resourceSnapshotMap(items, resourceProfiles)
+	if err != nil {
+		return nil, nil, err
+	}
+	total, err := backend.ValidateOperationQuantities(items)
+	if err != nil {
+		return nil, nil, err
+	}
+	ids := make([]string, 0, total)
+	allocations := make([]shared.ResolvedAdoptInstance, 0, total)
+	for _, item := range items {
+		if item.ServiceName == "" {
+			return nil, nil, errors.New("resolved provision allocation requires a service name")
+		}
+		for index := range item.Quantity {
+			id := fmt.Sprintf("%s-%s-%d", leaseUUID, item.ServiceName, index)
+			ids = append(ids, id)
+			allocations = append(allocations, shared.ResolvedAdoptInstance{
+				ID:        id,
+				Resources: resourcesBySKU[item.SKU],
+			})
+		}
+	}
+	return ids, allocations, nil
+}
+
+// replacementProvisionFailureRecovery is an unforgeable-by-callers marker
+// carried only by the Provision admission path after it has torn down a Failed
+// predecessor and published the candidate generation. A candidate can reuse
+// the predecessor's canonical volumes, so ordinary fresh-provision cleanup
+// cannot infer that createdVolumeIDs==0 means no durable bytes remain.
+//
+// On failure the worker retains the candidate intent/reservation and stops the
+// backend. Cold recovery can then use the candidate intent plus the older
+// active Release to rebuild the predecessor without exposing free capacity in
+// the interim.
+type replacementProvisionFailureRecovery struct{}
+
 // Provision starts async provisioning of containers.
 // For multi-unit leases (quantity > 1), multiple containers are created.
 // For multi-SKU leases, containers are created with the appropriate profile for each SKU.
@@ -193,24 +236,12 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		))
 	}
 
-	// Atomically check-and-reserve the provision slot (fixes TOCTOU race).
-	// Allow re-provisioning if the existing provision has failed (e.g., container
-	// crashed and reconciler is retrying). Deprovisioning, Provisioning,
-	// Restarting, Updating, and Ready are all in-flight or live states that
-	// must not be re-provisioned until they reach Failed or are removed.
-	//
-	// The reservation is also this lease's OWNERSHIP CLAIM on its canonical volume
-	// names — snapshotVolumeClaims (volume_destroy.go) derives them from
-	// prov.Items, so an entry whose Items are unset claims nothing. It therefore
-	// carries Items from the start, exactly as Restore's reservation does. Setting
-	// them later would make the re-provision arm below RETRACT a live claim: it
-	// deletes the previous, claim-bearing entry, and the volumes it deliberately
-	// keeps (see "keep volumes" below) would be collectable by any concurrent
-	// destroy until the claim was re-established (ENG-681).
+	// Build the complete candidate reservation before touching the predecessor.
+	// The reservation is also this lease's ownership claim on its canonical
+	// volumes, so every publish carries Items and immutable sizing together.
 	var prevFailCount int
-	var oldContainerIDs []string
-	var oldQuantity int
-	var oldItems []backend.LeaseItem // non-nil for stacks, needed for service-aware release
+	var oldItems []backend.LeaseItem
+	var oldProvision *provision
 	b.provisionsMu.Lock()
 	if existing, exists := b.provisions[req.LeaseUUID]; exists {
 		if existing.Status != backend.ProvisionStatusFailed {
@@ -220,12 +251,10 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		}
 		// Capture data needed for cleanup, then release lock before Docker API calls.
 		prevFailCount = existing.FailCount
-		oldContainerIDs = existing.ContainerIDs
-		oldQuantity = existing.Quantity
-		oldItems = existing.Items
-		delete(b.provisions, req.LeaseUUID)
+		oldItems = slices.Clone(existing.Items)
+		oldProvision = existing
 	}
-	b.provisions[req.LeaseUUID] = recoveredProvision{ //exhaustruct:enforce
+	candidate := recoveredProvision{ //exhaustruct:enforce
 		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
 			LeaseUUID:    req.LeaseUUID,
 			Tenant:       req.Tenant,
@@ -254,55 +283,205 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		resourceProfiles:      shared.CloneSKUResourceSnapshot(resourceProfiles),
 		volumeCleanupAttempts: 0,
 	}.materialize()
-	b.provisionsMu.Unlock()
-
-	// Clean up old failed provision resources outside the lock.
-	if oldQuantity > 0 {
-		if len(oldItems) > 0 {
-			// Stack: release service-aware allocation IDs.
-			for _, item := range oldItems {
-				for i := range item.Quantity {
-					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
-				}
-			}
-		} else {
-			// Non-stack: release index-based allocation IDs.
-			for i := range oldQuantity {
-				b.pool.Release(fmt.Sprintf("%s-%d", req.LeaseUUID, i))
-			}
-		}
-		// Remove old containers but keep volumes — stateful data persists
-		// across re-provisions. Volumes are reused via idempotent Create in
-		// doProvision, and only destroyed on explicit deprovision.
-		for _, cid := range oldContainerIDs {
-			if err := b.mutationAdapter().removeContainer(ctx, cid); err != nil {
-				logger.Warn("failed to remove old container during re-provision",
-					"container_id", leasesm.ShortID(cid), "error", err)
-			}
-		}
-		logger.Info("replacing failed provision",
-			"fail_count", prevFailCount,
-		)
+	if oldProvision == nil {
+		b.provisions[req.LeaseUUID] = candidate
 	}
+	b.provisionsMu.Unlock()
 
 	// Allocation IDs are always service-aware now:
 	// {leaseUUID}-{serviceName}-{instanceIndex}. The legacy {leaseUUID}-{idx}
 	// scheme is gone from the live path; Task 9's recover-time migration
 	// converts on-disk artifacts that still carry it.
-	var allocatedIDs []string
+	allocatedIDs := make([]string, 0, totalQuantity)
+	replacementAllocations := make([]shared.ResolvedAdoptInstance, 0, totalQuantity)
 	for _, item := range req.Items {
 		for i := range item.Quantity {
 			instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			if err := b.pool.TryAllocateResolved(instanceID, req.Tenant, resourcesBySKU[item.SKU]); err != nil {
-				for _, id := range allocatedIDs {
+			allocatedIDs = append(allocatedIDs, instanceID)
+			replacementAllocations = append(replacementAllocations, shared.ResolvedAdoptInstance{
+				ID:        instanceID,
+				Resources: resourcesBySKU[item.SKU],
+			})
+		}
+	}
+
+	var predecessorAllocationIDs []string
+	var predecessorAllocations []shared.ResolvedAdoptInstance
+	if oldProvision != nil {
+		if oldProvision.Tenant != req.Tenant || oldProvision.ProviderUUID != req.ProviderUUID {
+			return b.refuseOperationIntent(intent, fmt.Errorf(
+				"failed provision predecessor belongs to a different tenant or provider",
+			))
+		}
+		var predecessorErr error
+		predecessorAllocationIDs, predecessorAllocations, predecessorErr = resolvedProvisionAllocations(
+			req.LeaseUUID, oldItems, oldProvision.ResourceProfiles,
+		)
+		if predecessorErr != nil {
+			return b.refuseOperationIntent(intent, fmt.Errorf(
+				"rebuild failed provision predecessor allocation: %w", predecessorErr,
+			))
+		}
+		// The predecessor projection and pool reservation remain authoritative while
+		// its exact cohort is torn down. The candidate intent is already durable, so
+		// any incomplete teardown becomes an outcome ambiguity: stop this backend and
+		// let cold recovery validate the surviving subset against the predecessor
+		// active Release before retrying. Volumes are deliberately kept for reuse.
+		inventoryCtx, cancelInventory := b.recoveryDockerReadContext(context.WithoutCancel(ctx))
+		containers, inventoryErr := b.listManagedContainersStrictForRecovery(inventoryCtx)
+		if inventoryErr != nil {
+			cancelInventory()
+			return b.refuseOperationIntent(intent, fmt.Errorf("inspect failed provision predecessor: %w", inventoryErr))
+		}
+		var active *shared.Release
+		if b.releaseStore != nil {
+			var releaseErr error
+			active, releaseErr = b.releaseStore.LatestActive(req.LeaseUUID)
+			if releaseErr != nil {
+				cancelInventory()
+				return b.refuseOperationIntent(intent, fmt.Errorf("read failed provision predecessor release: %w", releaseErr))
+			}
+		}
+		if activeIdentity, hasActiveIdentity := runtimeIdentityForRelease(active); hasActiveIdentity {
+			oldLifecycleURL := oldProvision.LifecycleCallbackURL
+			if activeIdentity.Class() == shared.ReleaseAuthorityLegacy {
+				oldLifecycleURL, err = backend.ResolveLifecycleCallbackURL(
+					oldProvision.CallbackURL, oldProvision.LifecycleCallbackURL,
+				)
+				if err != nil {
+					cancelInventory()
+					return b.refuseOperationIntent(intent, fmt.Errorf(
+						"validate failed provision predecessor callback pair: %w", err,
+					))
+				}
+			}
+			if activeIdentity.Tenant() != req.Tenant ||
+				activeIdentity.ProviderUUID() != req.ProviderUUID ||
+				oldProvision.Tenant != activeIdentity.Tenant() ||
+				oldProvision.ProviderUUID != activeIdentity.ProviderUUID() ||
+				oldProvision.CallbackURL != activeIdentity.CallbackURL() ||
+				oldLifecycleURL != activeIdentity.LifecycleCallbackURL() {
+				cancelInventory()
+				return b.refuseOperationIntent(intent, fmt.Errorf(
+					"active provision predecessor identity differs from the live projection",
+				))
+			}
+		}
+		classification, classifyErr := b.classifyProvisionIntentSubstrate(
+			inventoryCtx, *intent, active, containers,
+		)
+		cancelInventory()
+		if classifyErr != nil {
+			return b.refuseOperationIntent(intent, fmt.Errorf("validate failed provision predecessor: %w", classifyErr))
+		}
+		if classification.hasCurrent {
+			return b.latchAmbiguousOperationOutcome(
+				"validate replacement provision predecessor",
+				errors.New("candidate provision substrate exists before worker admission"),
+			)
+		}
+		if classification.legacyAuthority != nil {
+			if classification.legacyPredecessor == nil || b.releaseStore == nil {
+				return b.latchAmbiguousOperationOutcome(
+					"persist replacement provision predecessor authority",
+					errors.New("legacy predecessor classification has no durable release store fence"),
+				)
+			}
+			if persistErr := b.releaseStore.BackfillLegacyRuntimeAuthority(
+				req.LeaseUUID,
+				*classification.legacyPredecessor,
+				*classification.legacyAuthority,
+			); persistErr != nil {
+				return b.refuseOperationIntent(intent, fmt.Errorf(
+					"persist failed provision predecessor runtime authority: %w", persistErr,
+				))
+			}
+		}
+
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		remaining, teardownErr := b.teardownLeaseContainers(
+			cleanupCtx, req.LeaseUUID, classification.currentIDs, 10*time.Second,
+			teardownOpProvisionCleanup, logger,
+		)
+		cleanupCancel()
+		if teardownErr != nil || len(remaining) != 0 {
+			cleanupErr := teardownErr
+			if cleanupErr == nil {
+				cleanupErr = fmt.Errorf("predecessor teardown left %d container(s)", len(remaining))
+			}
+			return b.latchAmbiguousOperationOutcome("replace failed provision predecessor", cleanupErr)
+		}
+
+		b.provisionsMu.Lock()
+		if b.provisions[req.LeaseUUID] != oldProvision {
+			b.provisionsMu.Unlock()
+			return b.latchAmbiguousOperationOutcome(
+				"publish replacement provision reservation",
+				errors.New("failed predecessor projection changed during teardown"),
+			)
+		}
+		if replaceErr := b.pool.ReplaceResolvedAll(
+			predecessorAllocationIDs, replacementAllocations, req.Tenant,
+		); replaceErr != nil {
+			b.provisionsMu.Unlock()
+			return b.refuseOperationIntent(intent,
+				fmt.Errorf("%w: %w", backend.ErrInsufficientResources, replaceErr))
+		}
+		b.provisions[req.LeaseUUID] = candidate
+		b.provisionsMu.Unlock()
+		logger.Info("replacing failed provision", "fail_count", prevFailCount)
+	} else {
+		for i, allocation := range replacementAllocations {
+			if err := b.pool.TryAllocateResolved(
+				allocation.ID, req.Tenant, allocation.Resources,
+			); err != nil {
+				for _, id := range allocatedIDs[:i] {
 					b.pool.Release(id)
 				}
 				b.removeProvision(req.LeaseUUID)
 				return b.refuseOperationIntent(intent,
 					fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err))
 			}
-			allocatedIDs = append(allocatedIDs, instanceID)
 		}
+	}
+
+	rollbackUnacceptedProvision := func(cause error) error {
+		if oldProvision == nil {
+			for _, id := range allocatedIDs {
+				b.pool.Release(id)
+			}
+			b.removeProvision(req.LeaseUUID)
+			return b.refuseOperationIntent(intent, cause)
+		}
+
+		// The predecessor cohort is already proven absent, but its active Release
+		// still owns the reusable volumes and failed runtime projection. Move pool
+		// accounting and the map back together before settling a candidate that was
+		// explicitly rejected by the actor.
+		predecessor := recoveredFromProvision(oldProvision)
+		predecessor.Status = backend.ProvisionStatusFailed
+		predecessor.ContainerIDs = nil
+		predecessor.ServiceContainers = nil
+		b.provisionsMu.Lock()
+		if b.provisions[req.LeaseUUID] != candidate {
+			b.provisionsMu.Unlock()
+			return b.latchAmbiguousOperationOutcome(
+				"restore predecessor after rejected provision admission",
+				errors.New("candidate provision projection changed before rollback"),
+			)
+		}
+		if replaceErr := b.pool.ReplaceResolvedAll(
+			allocatedIDs, predecessorAllocations, oldProvision.Tenant,
+		); replaceErr != nil {
+			b.provisionsMu.Unlock()
+			return b.latchAmbiguousOperationOutcome(
+				"restore predecessor resource reservation after rejected provision admission",
+				replaceErr,
+			)
+		}
+		b.provisions[req.LeaseUUID] = predecessor.materialize()
+		b.provisionsMu.Unlock()
+		return b.refuseOperationIntent(intent, cause)
 	}
 
 	// Update the reservation with full details now that validation passed. Items
@@ -323,6 +502,10 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
 	work := func() (string, backend.Reason, leasesm.ProvisionSuccessResult, map[string]string, error) {
+		var replacementRecovery *replacementProvisionFailureRecovery
+		if oldProvision != nil {
+			replacementRecovery = &replacementProvisionFailureRecovery{}
+		}
 		return b.doProvisionWithOperationID(
 			provCtx,
 			req,
@@ -330,6 +513,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			resourceProfiles,
 			intent.OperationID(),
 			intent.CreatedAt(),
+			replacementRecovery,
 			logger,
 		)
 	}
@@ -340,24 +524,17 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		Ack:    ack,
 	}); routeErr != nil {
 		provCancel()
-		for _, id := range allocatedIDs {
-			b.pool.Release(id)
-		}
-		b.removeProvision(req.LeaseUUID)
-		return b.refuseOperationIntent(intent, routeErr)
+		return rollbackUnacceptedProvision(routeErr)
 	}
 	// Wait for the actor to fire evProvisionRequested on its SM. Only an
 	// explicit rejection proves no worker exists and authorizes rollback. Once
 	// enqueued, cancellation is an unknown outcome: preserve the intent,
 	// reservation, and allocation for worker completion or startup recovery.
 	//
-	// Pool allocations MUST be released on rollback (mirroring the
-	// mid-allocation failure paths above). doProvision's failure defer
-	// only runs if the worker actually runs; if the actor never accepts
-	// the message (route/ack failure), the worker is never spawned and
-	// these allocations would otherwise leak — a subsequent retry would
-	// then find the per-instance IDs still allocated in the pool and
-	// fail TryAllocate with "already allocated", wedging the lease.
+	// The candidate allocation MUST be rolled back if the worker never starts.
+	// A fresh provision drops it; a re-provision atomically restores the
+	// predecessor allocation and Failed projection because its active Release
+	// and reusable volumes remain authoritative after the old cohort teardown.
 	acceptance, err := b.awaitAsyncAcceptance(ctx, ack)
 	switch acceptance {
 	case asyncAcceptanceAccepted:
@@ -366,11 +543,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		return fmt.Errorf("provision acceptance is unknown; durable recovery retained: %s", err.Error())
 	case asyncAcceptanceRejected:
 		provCancel()
-		for _, id := range allocatedIDs {
-			b.pool.Release(id)
-		}
-		b.removeProvision(req.LeaseUUID)
-		return b.refuseOperationIntent(intent, err)
+		return rollbackUnacceptedProvision(err)
 	default:
 		return fmt.Errorf("invalid provision acceptance state %d", acceptance)
 	}
@@ -848,7 +1021,7 @@ func (b *Backend) deferUnreadyCustomDomains(ctx context.Context, items []backend
 // Returns the (callbackErr, result, logs, err) contract; stack-specific result
 // fields are stackManifest + serviceContainers.
 func (b *Backend) doProvision(ctx context.Context, req backend.ProvisionRequest, stack *manifest.StackManifest, resourceProfiles []shared.SKUResourceSnapshot, logger *slog.Logger) (callbackErrRet string, reasonRet backend.Reason, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
-	return b.doProvisionWithOperationID(ctx, req, stack, resourceProfiles, "", time.Now(), logger)
+	return b.doProvisionWithOperationID(ctx, req, stack, resourceProfiles, "", time.Now(), nil, logger)
 }
 
 func (b *Backend) doProvisionWithOperationID(
@@ -858,6 +1031,7 @@ func (b *Backend) doProvisionWithOperationID(
 	resourceProfiles []shared.SKUResourceSnapshot,
 	operationID shared.OperationID,
 	releaseCreatedAt time.Time,
+	replacementRecovery *replacementProvisionFailureRecovery,
 	logger *slog.Logger,
 ) (callbackErrRet string, reasonRet backend.Reason, resultRet leasesm.ProvisionSuccessResult, logsRet map[string]string, errRet error) {
 	runtimeAuthority, authorityErr := releaseRuntimeAuthorityForOperation(
@@ -894,13 +1068,6 @@ func (b *Backend) doProvisionWithOperationID(
 			logger.Error("stack provision failed", "lease_uuid", req.LeaseUUID, "error", err)
 			provisionsTotal.WithLabelValues("failure").Inc()
 
-			// Release all service-aware allocation IDs.
-			for _, item := range req.Items {
-				for i := range item.Quantity {
-					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
-				}
-			}
-
 			// Capture logs from the failed containers BEFORE removal —
 			// see doProvision's equivalent comment. For stacks we also
 			// pass the service-name map so the persisted keys are
@@ -912,26 +1079,90 @@ func (b *Backend) doProvisionWithOperationID(
 			// than walking containerIDs, which is still nil whenever Up itself failed —
 			// it is only assigned from compose PS AFTER a successful Up, so the recorded
 			// list is empty for exactly the failures that leave containers behind
-			// (ENG-647). Best-effort as before: the provision has already failed and its
-			// pool allocation is released above, and there is no retained data behind a
-			// fresh provision, so a leftover is a resource leak to alert on rather than a
-			// reason to hold the lease.
+			// (ENG-647). A failed teardown is not evidence that the containers stopped
+			// using their bind mounts. Keep the exact operation intent, full resource
+			// reservation, and volume claims in that case; destroying a mounted volume
+			// or returning its capacity to the pool would turn a recoverable cleanup
+			// failure into data loss or over-admission. The backend-lifetime latch also
+			// prevents the actor's terminal event from settling the operation intent.
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cleanupCancel()
-			if _, tdErr := b.teardownLeaseContainers(cleanupCtx, req.LeaseUUID, containerIDs, 10*time.Second,
-				teardownOpProvisionCleanup, logger); tdErr != nil {
-				logger.Warn("failed to cleanup containers after provision error", "error", tdErr)
+			remaining, tdErr := b.teardownLeaseContainers(cleanupCtx, req.LeaseUUID, containerIDs, 10*time.Second,
+				teardownOpProvisionCleanup, logger)
+			if tdErr != nil || len(remaining) != 0 {
+				cleanupErr := tdErr
+				if cleanupErr == nil {
+					cleanupErr = fmt.Errorf("container teardown left %d container(s)", len(remaining))
+				}
+				ambiguousErr := b.latchAmbiguousOperationOutcome(
+					"cleanup failed provision containers", cleanupErr,
+				)
+				logger.Error("failed to cleanup containers after provision error; preserving operation recovery authority",
+					"remaining_containers", len(remaining), "error", ambiguousErr)
+				callbackErrRet = leasesm.ErrMsgInternal
+				reasonRet = backend.ReasonInternal
+				errRet = errors.Join(err, ambiguousErr)
+				updateResourceMetrics(b.pool.Stats())
+				return
 			}
 			// createdVolumeIDs holds only the volumes THIS call brought into existence
 			// (Create reports created=false for a pre-existing directory), so it cannot
 			// name an adopted one — but the ownership check is not optional here either,
 			// because "cannot name" is a property of a caller, and this site had no
-			// check of its own at all (ENG-658). Best-effort as before: the provision has
-			// already failed and its pool allocation is released above, so a refusal or a
-			// failure is a leak to alert on, which cleanupOrphanedVolumes then collects.
-			if rep := b.volumeOp(req.LeaseUUID, logger).destroy(cleanupCtx, destroySiteProvisionCleanup, createdVolumeIDs...); rep.leftOnDisk() {
-				logger.Warn("failed to cleanup volume(s) after error",
-					"destroyed", len(rep.Destroyed), "refused", rep.refused(), "error", rep.err())
+			// check of its own at all (ENG-658). Cleanup must be complete before the
+			// pool allocation can be returned. If even one created volume remains, retain
+			// the intent and reservation so the next process can rebuild the full claim,
+			// settle the failed attempt, then let the ordinary orphan pass reap only names
+			// not protected by an older committed release.
+			rep := b.volumeOp(req.LeaseUUID, logger).destroy(
+				cleanupCtx, destroySiteProvisionCleanup, createdVolumeIDs...,
+			)
+			if rep.leftOnDisk() {
+				cleanupErr := rep.err()
+				if cleanupErr == nil {
+					cleanupErr = fmt.Errorf(
+						"volume cleanup left %d claimed or refused volume(s)",
+						len(rep.Claimed)+len(rep.Unproven),
+					)
+				}
+				ambiguousErr := b.latchAmbiguousOperationOutcome(
+					"cleanup failed provision volumes", cleanupErr,
+				)
+				logger.Error("failed to cleanup volume(s) after provision error; preserving operation recovery authority",
+					"destroyed", len(rep.Destroyed), "refused", rep.refused(), "error", ambiguousErr)
+				callbackErrRet = leasesm.ErrMsgInternal
+				reasonRet = backend.ReasonInternal
+				errRet = errors.Join(err, ambiguousErr)
+				updateResourceMetrics(b.pool.Stats())
+				return
+			}
+			if replacementRecovery != nil {
+				// The candidate may have reused canonical volumes owned by the
+				// predecessor active Release. Absence of candidate-created volumes is
+				// therefore not proof that returning the reservation is safe. Preserve
+				// the exact candidate intent and its conservative full allocation; cold
+				// recovery will settle the failed candidate and atomically rebuild the
+				// predecessor projection/accounting from its durable Release.
+				ambiguousErr := b.latchAmbiguousOperationOutcome(
+					"recover failed replacement provision",
+					errors.New("replacement provision failed after predecessor teardown"),
+				)
+				logger.Error("replacement provision failed; preserving predecessor volume accounting for restart recovery",
+					"error", ambiguousErr)
+				callbackErrRet = leasesm.ErrMsgInternal
+				reasonRet = backend.ReasonInternal
+				errRet = errors.Join(err, ambiguousErr)
+				updateResourceMetrics(b.pool.Stats())
+				return
+			}
+
+			// Containers and every volume created by this attempt are now proven
+			// absent. Only this boundary authorizes returning the reservation; the actor
+			// may then settle the exact failed operation normally.
+			for _, item := range req.Items {
+				for i := range item.Quantity {
+					b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
+				}
 			}
 			callbackErrRet = callbackErr
 			// Reason is authored at the failure site (failReason); ENG-508.

@@ -415,12 +415,24 @@ allows 30 seconds for initial substrate/storage-identity attestation;
 construction deadline explicitly. `Start` uses the
 shorter of its caller context and a 30-second bound for the initial Docker
 identity/connectivity reads, then a backend-lifecycle 30-minute aggregate budget
-for crash convergence. Subsequent startup phases each receive one aggregate
-budget of `max(2m, container_stop_timeout)`, while recovery list/inspect calls,
-the complete cold-start diagnostic scan, and the complete orphan-network scan
-each share a 30-second budget. These are safety bounds, not independent
-per-object timers, so fleet size cannot multiply a wedged daemon call into an
-unbounded startup.
+for crash convergence. Inside it, interrupted-volume recovery and its
+clean-inventory proof each receive a fixed two-minute filesystem-only child
+deadline; container stop grace cannot inflate them. Later startup phases each
+receive one aggregate budget of `max(2m, container_stop_timeout)`. Each recovery
+list/inspect Docker call receives its own 30-second child budget, while the
+complete cold-start diagnostic scan and complete orphan-network scan each share
+one separate 30-second aggregate budget. Per-call recovery bounds can therefore
+accumulate with fleet size, but the 30-minute `Start` parent remains the hard
+aggregate ceiling; one wedged daemon call cannot block indefinitely.
+
+The separate Docker storage-identity preflight and initializer share one
+`-storage-identity-operation-timeout` deadline (default `10m`) across
+context-aware Docker and filesystem-control-plane probes. It is cooperative,
+not a hard wall-clock interrupt for blocking local open, bbolt, or fsync work.
+Deadline expiry makes the command unsuccessful but is not proof of rollback:
+initialization may retain its crash-resumable pending state or finish marker
+publication before a later cancellation check. Operators keep the lineage
+stopped and rerun the same mode against unchanged input.
 
 **Ack batcher ordering:** `Manager.Start` launches the batcher's lanes before opening synchronous callback admission and before `wmRouter.Run` starts chain/payload handlers. The reconciler is the other caller of `Acknowledge()`; its first ack happens in step 4, after the `Running()` gate in step 2. The batcher runs on the manager's own lifecycle context (`m.stopCtx`, rooted at `context.Background()`), *not* on the ctx passed to `Start`. That keeps the lanes' lifetime exactly what it was before ENG-723, when `NewManager` started them on a bare `context.Background()`: `Close()` is what ends them. Direct callbacks have a second manager-owned cancellation context; `Close()` closes admission, cancels admitted application, waits for it to drain, and only then stops the batcher. Constructing a `Manager` starts no goroutines.
 
@@ -451,12 +463,15 @@ unbounded startup.
 ```
 
 That sequence and the configurable `shutdown_timeout` belong to `providerd`.
-Docker-backend has a separate fail-closed boundary: after its fixed 30-second
-HTTP shutdown, it cancels backend work and waits up to a fixed 90 seconds for
-backend-owned goroutines. A drain timeout leaves the Docker client and durable
-stores open so a still-running worker cannot use closed dependencies, returns
-`ErrShutdownDrainTimeout`, and causes the binary to exit non-zero. Its supervisor
-then restarts it through normal substrate and journal recovery.
+Docker-backend has a separate fail-closed boundary. A terminal runtime storage-
+authority withdrawal publishes its first cause to the main loop, which closes
+the listener, allows up to 30 seconds for HTTP shutdown, cancels backend work,
+and waits up to 90 seconds for backend-owned goroutines. It exits status 1 even
+when that drain succeeds so a supervisor must launch a fresh `Start` to recover
+the retained evidence. A drain timeout also exits 1 and leaves the Docker client
+and durable stores open until process death so a still-running worker cannot use
+closed dependencies. A failure during `Start` happens before listener bind and
+exits 1 immediately; there is no running server or worker set to drain.
 
 ## Backend Integration
 
@@ -836,17 +851,35 @@ non-proof retain the exact intent and fail startup closed. The k3s scaffold
 creates no cluster objects, so its only valid operation-intent recovery is the
 deterministic `not implemented` failure.
 
-For Docker, an already-active typed Release is itself an exact operation commit
-proof even when containers are exited or entirely absent. Its immutable nested
-runtime authority binds the same valid operation UUID to tenant, canonical
-provider UUID, and the current operation/lifecycle callback pair; the Release
-also binds the exact manifest, emitted items, and resource profiles. Typed
-lineage and runtime authority must be present together and match, while both are
-absent only for the v0.13 compatibility shape. Recovery therefore settles the
-matching intent as success and rebuilds a conservative Failed projection and
-reservation without appending a new Release. Restart/Update callback moves are
-pending substrate state and become authoritative only when their deploying
+For Docker, an already-active Release with durable runtime authority is itself
+exact recovery evidence even when containers are exited or entirely absent.
+Current releases carry an immutable nested typed authority that binds the same
+valid operation UUID to tenant, canonical provider UUID, and the current
+operation/lifecycle callback pair. A fully inspected callback-bearing v0.13
+cohort instead gets a separately typed `LegacyRuntimeAuthority`: it freezes the
+exact principal and tokenless callback pair without inventing an operation
+capability the old provider never issued. Both forms also bind the exact
+manifest, emitted items, and resource profiles. Invalid, mixed, or partial
+forms are unrepresentable through their constructors and rejected on decode.
+Recovery therefore settles
+a matching current intent as success, or reconstructs either authority class as
+a conservative Failed projection and reservation without appending a new
+Release.
+An active callbackless pre-label cohort cannot be assigned provider callback
+authority safely and is rejected by the mandatory stopped adoption preflight.
+Callbackless historical cleanup/close evidence remains readable, but never
+authorizes zero-survivor recovery or maintenance.
+
+Restart, update, and custom-domain replacement preserve that authority class.
+Their separate UUIDv4 `maintenance_id` remains the exact write-ahead and
+container-cohort identity even for a tokenless v0.13 release. A callback-base
+move is pending substrate state and becomes authoritative only when the target
 Release activates; failure or rollback leaves the prior active route intact.
+The first and every subsequent restart, update, or custom-domain replacement of
+that lineage remains legacy and tokenless; `maintenance_id` is replacement WAL
+and cohort identity, not provider callback authority. Only a later genuine
+provision or restore operation can rotate it to operation-scoped typed callback
+authority.
 
 Callback-store health validates every delivery and intent bucket and the
 invariant that one lease cannot simultaneously own operation, maintenance, and
@@ -907,6 +940,68 @@ additionally requires a stopped backend, a drained legacy callback outbox,
 valid release/retention rows, and substrate evidence that agrees with the active
 releases.
 
+That substrate evidence is concrete rather than name-based. Every managed name
+first becomes one canonical typed component and must then be an actual Btrfs
+subvolume, a real directory on the configured XFS root with a regular no-follow
+nonzero project-ID marker, or the exact depth-one ZFS child mounted at its exact
+managed path. ZFS proof inventory unions child datasets with directory entries,
+so an unmounted or externally mounted child cannot disappear as absence.
+Container evidence separately proves the label-derived volume and exact
+target-derived subtree, rejecting a symlink at any component. XFS startup quota
+reconciliation establishes the live kernel project tag and limits before
+readiness; the marker alone is durable project-ID authority, not proof that a
+previous tagging command completed.
+
+The XFS allocator's ownership domain is the containing filesystem, not the
+managed directory. Project IDs and dquots are filesystem-global, while Fred
+scans only its configured root and allocates from the full nonzero 32-bit
+namespace. Sole project-ID allocation on that mount is therefore a deployment
+invariant: separate Fred roots or a foreign allocator can collide even when
+their paths do not. A dedicated XFS mount is the current construction-safe
+choice. Coordinated disjoint ranges require a follow-up allocator feature; no
+range configuration exists in this release.
+
+XFS therefore creates under a typed, parent-synced hidden stage whose name
+carries the nonzero project ID and final managed name. Only after its marker,
+project tag, and limits are durable does a descriptor-rooted no-replace rename
+publish the bind-ready final name. A stage recovered on normal sealed startup is
+cleanup-only because its requested quota was not persisted. Its parent-synced
+typed name authorizes clearing the encoded dquot and deleting an empty stage or
+one whose sole no-follow regular marker is at most ten bytes; that marker may be
+empty, partial, or zero-filled after a crash. This weaker proof can never
+publish: publication still requires a complete parsed marker equal to the ID in
+the stage name. Runtime post-durability errors attempt exact compensation; the
+external quota clear uses a detached cleanup context capped at 30 seconds and
+by any earlier aggregate parent deadline. Any cleanup failure or outcome
+ambiguity preserves the stage, latches the current backend instance, and
+cancels further substrate work. The daemon closes its listener, drains, and
+exits status 1 so its supervisor launches a fresh `Start`, which must recover
+the retained authority before serving again; a persistent fault crash-loops
+closed. The same process does not retry it. The backend never publishes
+recovered stage evidence.
+
+XFS destruction uses a separate typed, parent-synced authority named
+`.fred-xfs-delete-<project-id>-<managed-volume>`. It is an empty sibling that is
+normalized to project ID zero and synced before the final volume is changed; the
+final name remains in place while its contents are removed. This lets a restart
+recognize the exact deletion even if the tenant volume's marker was already
+unlinked. Recovery re-normalizes and re-attests the authority before touching
+the final tree, requires the final name's absence to be parent-synced, and then
+proves both block and inode usage for the encoded project ID are zero. An
+open-but-unlinked file therefore keeps the operation pending. Only after that
+proof does recovery clear all block and inode limits, remove the delete
+authority, and sync the parent again. Any failure preserves the authority and
+rejects creation of the same final name. A runtime failure takes the graceful
+nonzero latch path; a failure found by `Start` exits 1 before binding a listener.
+The supervisor's fresh `Start` must resume the exact cleanup before readiness.
+
+ZFS instead retains an exact unmounted child and normal sealed startup remounts
+and re-attests it without destruction. Any ambiguous recovery preserves evidence
+and prevents readiness. Read-only preflight and initialization reject both
+create and delete forms rather than mutate the lineage being proved. Btrfs has
+no private stage; its already-published subvolume is classified by operation
+recovery, the fatal quota gate, and orphan cleanup.
+
 Normal startup loads the committed marker pair as a typed verified-storage
 capability, verifies the complete authoritative set before recovery or cleanup,
 and opens each store without file-creation or lineage-repair authority. The open
@@ -937,6 +1032,12 @@ marker pair, all authoritative stores, and the substrate intentionally remains
 the same lineage. Operators must fence the original before starting the restored
 copy and must roll the whole set back together; there is no supported recovery
 that combines individually matching files from different points in time.
+
+The production deployment envelope verified read-only for the ENG-632 cutover
+on 2026-09-02 is `docker-backend` on XFS. Btrfs and ZFS retain automated coverage
+but are not deployed or production-validated, and K3s is the non-functional
+scaffold described below. This point-in-time fact scopes the rollout proof; it
+does not replace the mandatory pre-cutover re-inventory in `DEPLOYMENT.md`.
 
 ### K3s backend (experimental)
 
@@ -1206,8 +1307,8 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_resource_memory_allocated_ratio` | gauge | — | Allocated/total memory |
 | `fred_docker_backend_resource_disk_allocated_ratio` | gauge | — | Allocated/total physical disk. Docker includes durable `disk_mb` plus the pinned scratch allowance for every live diskless instance, even if no managed scratch directory was ultimately needed |
 | `fred_docker_backend_restore_demote_refused_total` | counter | `backend, reason` | Restores refused by the demote fit-gate (`checkDemoteFit`) because the retained data does not fit the requested smaller SKU tier. `reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`. Synchronous-prelude refusals — NOT counted by `restore_total` (worker-scoped); surfaced to the tenant as HTTP 422 — the `demote_exceeds_tier` string discriminator rides only the backend→fred hop (ENG-438) |
-| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota-backfill per-volume re-application (re-tag + re-limit) attempts, `outcome` ∈ `applied`/`failed`; re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision (ENG-454) |
-| `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | XFS project-quota clear failures on volume Destroy; a rising rate means the project-quota table is regrowing (leaked zero-byte entry) and needs one-time manual operator cleanup (ENG-459) |
+| `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota-reconciliation per-volume re-application (re-tag + re-limit) attempts, `outcome` ∈ `applied`/`failed`; re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint binds (ENG-454) |
+| `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | Failed XFS quota-clear commands during interrupted-create compensation or typed deletion; preceding block/inode proof failures are not counted. Typed authority is retained and the current backend instance fail-stops for recovery by a fresh `Start`; only historical already-absent/no-authority leaks need classified one-time manual cleanup (ENG-459/ENG-632) |
 
 **Retention:**
 

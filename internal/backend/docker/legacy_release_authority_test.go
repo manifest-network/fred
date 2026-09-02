@@ -439,6 +439,10 @@ func TestStorageIdentityVolumeEvidenceAcceptsExactRenamedPrevSource(t *testing.T
 	root := t.TempDir()
 	newVolume := canonicalVolumeName(leaseUUID, "app", 0)
 	require.NoError(t, os.MkdirAll(filepath.Join(root, newVolume, "data"), 0o700))
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(root, newVolume, writablePathSubdir, "var", "cache", "app"),
+		0o700,
+	))
 	cfg := DefaultConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.VolumeDataPath = root
@@ -448,6 +452,16 @@ func TestStorageIdentityVolumeEvidenceAcceptsExactRenamedPrevSource(t *testing.T
 		Mounts: []ContainerMount{{
 			Type: "bind", Target: "/data",
 			Source: filepath.Join(root, "fred-"+leaseUUID+"-0", "data"),
+		}, {
+			Type: "bind", Target: "/var/cache/app",
+			Source: filepath.Join(
+				root,
+				"fred-"+leaseUUID+"-0",
+				writablePathSubdir,
+				"var",
+				"cache",
+				"app",
+			),
 		}},
 	}
 

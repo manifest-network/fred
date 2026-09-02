@@ -90,7 +90,7 @@ tenant-declared tmpfs remain memory-backed.
 
 ### Stateful workloads (`disk_mb > 0` SKUs)
 
-The docker-backend places each container's data on a quota-enforced host directory. Three filesystems are implemented, but **`xfs` is the only backend validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. **Use `xfs` for production deployments** (see below). The `btrfs` and `zfs` backends are implemented but **untested and not used in any deployment** — treat them as experimental.
+The docker-backend places each container's data on a quota-enforced host directory. Three filesystems are implemented, but **`xfs` is the only backend validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. **Use `xfs` for production deployments** (see below). The `btrfs` and `zfs` backends have automated coverage but are **not production-validated and not used in any deployment** — treat them as experimental.
 
 #### xfs (good for large fleets)
 
@@ -112,15 +112,40 @@ dnf install -y xfsprogs        # Fedora/RHEL
 
 Each container gets a directory with an xfs project quota.
 
+> **XFS project IDs and their dquots belong to the entire containing
+> filesystem, not to `volume_data_path`.** Fred discovers collisions only among
+> the managed volumes beneath its own configured root and may select any nonzero
+> 32-bit project ID. It must therefore be the sole project-ID allocator on that
+> XFS mount. Two Fred roots, or Fred plus another project-quota manager, cannot
+> safely share the filesystem merely by using different directories: one could
+> reassign, limit, or clear the other's dquot. Prefer a dedicated XFS filesystem
+> for `volume_data_path`. The current manifest-managed production layout places
+> the root beneath a shared `/data` mount and was found to have no second
+> project-ID allocator; keeping that true is an enforceable deployment
+> precondition, not isolation supplied by the directory layout. Before adding
+> any other allocator, move Fred to a dedicated mount or first add and deploy a
+> coordinated, disjoint project-ID range mechanism. Range coordination is a
+> follow-up capability, not something this release provides.
+>
+> **Keep the containing XFS mount and `volume_data_path` fixed for the full
+> docker-backend process lifetime.** Quota reporting and mutation cross the
+> `xfs_quota` boundary by mountpoint/path, while Fred detects lineage changes by
+> descriptor-rooted pre/post attestation. Do not unmount, replace, bind over, or
+> move either path under a running backend. Stop docker-backend first, perform
+> the mount maintenance, then restart it so startup re-attests the complete
+> lineage before serving. Native atomic closure of this external-tool window
+> requires descriptor-native project/quota operations and is a follow-up; sole
+> project-ID allocation on the mount remains a separate requirement.
+>
 > **The docker-backend must run with `CAP_SYS_ADMIN` to enforce XFS project
 > quotas, and additionally with `CAP_FOWNER` for the startup quota backfill
 > (see below).** Setting the block limit (`xfs_quota limit -p`,
 > i.e. `quotactl(Q_XSETQLIM)`) is privileged and needs `CAP_SYS_ADMIN`; the
-> `report` read is not, so a missing capability is invisible until the first
-> stateful provision fails with
-> `xfs_quota: cannot set limits: Operation not permitted`. The backend
-> **fails fast at startup** if it lacks `CAP_SYS_ADMIN` rather than running with
-> silently-unenforced per-volume disk caps. See the systemd section below for how
+> `report` read alone would not expose a missing mutation privilege. Fred
+> therefore checks its effective `CAP_SYS_ADMIN` during startup and refuses to
+> serve before the first stateful provision; without that explicit guard the
+> first `xfs_quota limit -p` would fail with `Operation not permitted`. See the
+> systemd section below for how
 > to grant it. (`xfs_quota` requires a real mount point, but the backend resolves
 > the XFS mount that *contains* `volume_data_path` automatically — so
 > `volume_data_path` may be the mount itself, as above, or a subdirectory of it,
@@ -133,21 +158,21 @@ Each container gets a directory with an xfs project quota.
 > to the tenant — needs only `CAP_SYS_ADMIN`. The startup backfill that heals
 > volumes provisioned before the capability was granted, however, re-tags
 > directories that have already been chown'd to the tenant UID; setting a project
-> ID on an inode the daemon does not own requires `CAP_FOWNER`. By design the
-> daemon does **not** fail fast on a missing `CAP_FOWNER` — a fresh backend with no
-> pre-existing untagged volumes doesn't need it, so the startup guard gates only on
-> `CAP_SYS_ADMIN`. The backfill is best-effort instead: if it can't re-tag a volume
-> it logs `quota backfill: failed to re-apply quota` and increments
-> `volume_quota_backfill_total{outcome="failed"}`, leaving that one volume
-> unenforced. To heal such volumes, grant `CAP_FOWNER` and restart the backend (or
-> re-provision them).
+> ID on an inode the daemon does not own requires `CAP_FOWNER`. A fresh backend
+> with no pre-existing volumes does not need that capability, so the preliminary
+> capability probe gates only on `CAP_SYS_ADMIN`. Existing storage is proved by
+> the startup quota reconciliation itself: it attempts every expected present
+> active or retained volume, logs and counts each failed re-application, and then
+> fails startup/readiness if any inventory, durable-authority, or enforcement
+> error remains. Grant `CAP_FOWNER` and restart the backend; it will not serve
+> while a known tenant volume may remain unenforced.
 
-#### Experimental backends (untested — not for production)
+#### Experimental backends (not production-validated or deployed)
 
 > **Not production-ready.** The `btrfs` and `zfs` backends are implemented but
 > have **no production coverage** — no mainnet/Morpheus backend runs them, and the
-> per-volume inode (`ihard`) exhaustion protection enforced on XFS has no tested
-> equivalent here. They are documented for completeness only; use `xfs` for any
+> per-volume inode (`ihard`) exhaustion protection enforced on XFS has no
+> production-validated equivalent here. They are documented for completeness only; use `xfs` for any
 > production deployment.
 
 #### btrfs (experimental)
@@ -296,16 +321,22 @@ Docker-backend uses fixed, nested safety budgets; they are not YAML tuning
 knobs. The production constructor allows 30 seconds for the initial
 Docker/storage-lineage attestation. `Start` shares at most 30 seconds across its
 initial identity, ping, and capability reads, then uses a backend-lifecycle
-30-minute aggregate budget for crash convergence and legacy migration. Each
-subsequent startup phase receives one aggregate budget of
-`max(2m, container_stop_timeout)`. Recovery Docker list/inspect calls are capped
-at 30 seconds, and cold-start diagnostic collection plus orphan-network cleanup
-each share one such aggregate budget rather than receiving a fresh timeout per
-container/network.
+30-minute aggregate budget for crash convergence and legacy migration. Within
+that overall budget, interrupted-volume recovery and its clean-inventory proof
+each receive a fixed two-minute filesystem-only child deadline; container stop
+grace cannot inflate them. Later startup phases each receive one aggregate
+budget of `max(2m, container_stop_timeout)`. Recovery Docker list/inspect calls
+are capped at 30 seconds, and cold-start diagnostic collection plus
+orphan-network cleanup each share one such aggregate budget rather than
+receiving a fresh timeout per container/network.
 
 Consequently, a wedged Docker API fails startup or defers a best-effort phase
 instead of blocking process lifetime, while a large fleet cannot multiply a
-per-object timeout without bound. An overall recovery deadline is a typed startup
+per-object daemon timeout without bound. These budgets are cooperative around
+local filesystem work: Go cannot forcibly interrupt one blocking kernel call,
+and a very large recursive top-level removal can cross its nominal deadline.
+Recovery checks cancellation between top-level entries and phases and makes no
+further mutations afterward. An overall recovery deadline is a typed startup
 failure: systemd may restart the backend, and the next launch resumes from the
 same operation, maintenance, and close intents and substrate evidence.
 
@@ -404,7 +435,11 @@ from your config (default 30s). Docker-backend has two sequential bounds: a
 fixed 30s HTTP-server shutdown followed by a fixed 90s backend-worker drain.
 Configure its unit comfortably above the combined two minutes so the binary can
 report a typed drain failure and exit non-zero rather than being killed first;
-neither Docker bound is configurable.
+neither Docker bound is configurable. Use `TimeoutStopSec=180s` (or a larger
+site value) and verify the rendered live unit with
+`systemctl show fred-docker-backend -p TimeoutStopUSec` before rollout. The
+common 90-second systemd default is insufficient. The manifest-deploy unit must
+be updated separately before relying on this graceful runtime-latch path.
 
 ---
 
@@ -760,6 +795,17 @@ starts.
 
 ### Upgrading from v0.13.0
 
+**Live-fleet scope for this cutover.** The read-only deployment and manifest
+inventory verified on 2026-09-02 for ENG-632 found the serving production tenant
+fleet on `docker-backend` with XFS, matching
+[Components and topology](#components-and-topology) and the current
+[stateful-filesystem guidance](#stateful-workloads-disk_mb--0-skus).
+K3s remains a non-functional scaffold, and Btrfs/ZFS remain experimental. This
+is a point-in-time rollout fact, not a permanent support or compatibility
+promise: re-inventory the deployments immediately before executing the cutover
+and extend the proof plan if the fleet has changed. Local development
+environments are outside this production cutover gate.
+
 The v0.13 placement database is migrated only by the mandatory offline
 `placement-preflight -prepare` step below. Normal upgraded startup is read-only
 with respect to schema: it refuses an unprepared file rather than performing a
@@ -818,6 +864,21 @@ docker-backend -config /etc/fred/docker-backend.yaml \
   -preflight-storage-identity-adoption
 ```
 
+The preflight and initializer share
+`-storage-identity-operation-timeout` (default `10m`) as one cooperative
+cancellation deadline for context-aware Docker and filesystem-control-plane
+probes. Managed-volume substrate attestation is deliberately sequential, so
+large fleets or slow control planes may need a larger value, for example
+`-storage-identity-operation-timeout 30m`. This is not a hard wall-clock kill:
+blocking local open, bbolt, and fsync operations cannot be forcibly interrupted
+by a Go context. Deadline expiry makes the command unsuccessful at its next
+cancellation boundary, but does not prove rollback or completion. Preflight is
+read-only; initialization may have left a crash-resumable pending state or even
+completed the seal before a later check reports cancellation. Keep the lineage
+stopped and rerun the same initialization mode against unchanged input. Only
+exit status zero plus the exact success verdict authorizes the next cutover
+step.
+
 Require exit status zero and stdout containing only the exact checked verdict
 `ready_for_v0_13_storage_identity_adoption` followed by a newline. All startup
 and failure diagnostics go to stderr, and a short or failed stdout write makes
@@ -856,6 +917,40 @@ cannot be accounted on first upgraded startup. Likewise, a positive v0.13 SKU
 a host volume only when image-volume or writable-path discovery required one. Release
 and container topology prove a legitimate bindless cohort; the reverse
 inventory check still refuses any unexplained managed volume.
+
+The managed-volume check proves more than a directory name. Every inventory
+entry must have the canonical live or retained lease/service/index grammar and
+must be backed by the configured quota substrate: an actual Btrfs subvolume, an
+XFS directory with a regular no-follow nonzero project-ID marker, or the exact
+ZFS child dataset mounted at the exact managed path. ZFS inventory includes
+depth-one child datasets even when they are unmounted or mounted elsewhere, so
+they cannot disappear from the proof with their expected directory. Container
+bind evidence must name the exact volume derived from its labels and the exact
+target-derived subtree (or `_wp` subtree), with no symlinked path component;
+lexically naming one volume while resolving into another is rejected. Repair or
+restore the matching stopped substrate rather than replacing a failed proof
+with a same-named plain directory or marker.
+
+The stopped proof and initialization commands never normalize private
+interrupted-volume-mutation evidence. A name of the form
+`.fred-xfs-stage-<project-id>-<managed-volume>` is an upgraded XFS create stage,
+not a bind-ready volume; both commands reject it without publishing or deleting
+it. Its parent-synced typed name is cleanup authority even if its only regular
+project marker was recovered empty, partially written, or zero-filled (up to
+the writer's ten-byte maximum); that weaker evidence is never publication
+authority. Such a stage cannot have been written by v0.13.0, so seeing one during an
+unsealed cutover means an upgraded process already mutated this root or the
+wrong snapshot was selected. Preserve the full marker/journal/volume evidence
+and restore the matching stopped snapshot; do not rename the stage to its final
+name or remove it to force a verdict. Likewise,
+`.fred-xfs-delete-<project-id>-<managed-volume>` is upgraded deletion authority
+that cannot originate from v0.13.0. Its paired final volume may already be
+markerless or absent, so deleting or editing the empty sibling could erase the
+only safe recovery proof. Preserve the complete snapshot and determine why an
+upgraded process reached this root. An exact ZFS managed child that is unmounted
+is also rejected rather than omitted. Verify its exact child dataset
+and configured mountpoint, then remount it or restore the matching pool snapshot
+before rerunning the proof.
 
 The preflight also rejects an interrupted v0.13 deprovision when the journals
 contain an active release, no managed container cohort, and a semantically
@@ -1074,7 +1169,48 @@ or substrate failure is a backend-lifetime latch: it cancels the backend and is
 returned by every sibling journal and callback-delivery boundary. Replacing a
 file after startup, or receiving an outcome-unknown bbolt `Commit` error,
 therefore fail-stops the whole backend authority rather than allowing another
-journal to continue from a partially trusted lineage.
+journal to continue from a partially trusted lineage. A running docker-backend
+then closes its listener, drains workers, and exits status 1 so its supervisor
+launches a fresh process. That process must pass `Start` recovery before serving;
+an unrepaired persistent fault crash-loops closed.
+
+Normal startup, after exclusively opening the identity-bound journals, resolves
+manager-private interrupted volume mutations before ordinary operation-intent
+recovery.
+An XFS stage carries its exact nonzero project ID and typed final volume name,
+but not the original requested quota, so startup clears its dquot and removes
+only an empty stage or one whose sole entry is a no-follow regular marker of at
+most ten bytes. That marker may be empty, partial, or zero-filled after a crash;
+the synced typed stage name remains cleanup authority, while publication always
+requires the complete marker to parse and equal the encoded project ID. Runtime
+errors after stage durability attempt exact compensation; the external quota
+clear uses a detached cleanup context capped at 30 seconds and by any earlier
+aggregate parent deadline. Any cleanup or outcome ambiguity preserves the stage
+and triggers the backend-wide graceful exit above; the supervisor's fresh
+`Start` must recover it before serving. Startup never promotes recovered debris
+into a tenant volume.
+An exact unmounted ZFS child is remounted and re-attested at its
+configured path without being destroyed. Either recovery preserves its evidence
+and fails startup on an ambiguous or failed mutation. Btrfs has no private stage:
+an interrupted create is an already-published subvolume, which operation
+recovery classifies before fatal quota reconciliation and orphan cleanup. See
+[Interrupted managed-volume mutation at startup](OPERATIONS.md#interrupted-managed-volume-mutation-at-startup)
+before taking any manual action.
+
+An XFS delete authority instead names an already-admitted destructive
+operation. It is an empty, parent-synced sibling normalized to project ID zero.
+Startup re-normalizes and syncs it before resuming in-place removal of the exact
+final volume, then parent-syncs the final name's absence. It requires numeric
+XFS reports to prove both block and inode usage for the encoded project ID are
+zero before clearing all quota limits; an open-but-unlinked tenant file keeps
+usage nonzero and readiness stays closed until the handle is released and
+startup is retried. A failure discovered during `Start` refuses listener bind
+and exits status 1 immediately; a runtime failure closes the listener and drains
+before exiting 1. In either case the supervisor's fresh `Start` must complete
+recovery. The authority is removed
+and the parent synced only after the quota clear succeeds. Never edit or delete
+it manually to make readiness green, and never create its final name while it
+remains.
 
 After configuring every backend key, set the same `K_i` only on that backend's
 matching providerd `backends[].hmac_secret` and remove the provider's top-level
@@ -1378,6 +1514,24 @@ lifecycle observations without replacement; the deliberate service-name-less
 Docker migration recreates its containers while preserving the exact tokenless
 callback pair on the replacement generation. An absent or rebuilt placement
 database is never a recovery path for those workloads.
+
+Before any action may remove the last container in a complete callback-bearing
+v0.13 cohort,
+docker-backend CAS-persists a separately typed `LegacyRuntimeAuthority` on its
+active Release. It freezes the canonical tenant/provider principal, tokenless
+callback pair, exact emitted items, manifest, and resource profiles; it never
+manufactures an operation ID. This makes zero-survivor crash recovery and the
+post-cutover maintenance path safe. The first and every subsequent restart,
+update, or custom-domain replacement stays legacy and tokenless;
+`maintenance_id` is exact replacement journal/cohort/rollback identity, not
+provider callback authority. A callback-base change commits only with the
+replacement Release; failure retains the previous route. The legacy lifecycle
+class rotates to typed only when a later genuine provision or restore supplies
+an operation-scoped callback capability that providerd also persists. A
+active callbackless pre-label cohort cannot be assigned provider callback
+authority safely and is rejected by the mandatory stopped adoption preflight;
+callbackless historical cleanup/close evidence remains readable but never
+authorizes zero-survivor recovery or maintenance.
 
 Do not interpret that installation order as permission to roll the fleet. A
 v0.13.0 backend does not understand `lifecycle_callback_url`; if paired with a

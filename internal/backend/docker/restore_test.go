@@ -801,8 +801,8 @@ func TestEvict_IncrementsEvictedCounterPerRecord(t *testing.T) {
 
 // TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError verifies the
 // fail-safe: when the retention store cannot be read (so the protected-canonical
-// set cannot be built), orphan destruction is skipped entirely — nothing is
-// destroyed — rather than failing open and risking a retained canonical.
+// set cannot be built), orphan destruction is skipped entirely and the error is
+// surfaced so startup cannot report readiness with unresolved ownership.
 func TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForTest(mock, nil)
@@ -826,8 +826,11 @@ func TestCleanupOrphanedVolumes_FailsSafeOnRetentionReadError(t *testing.T) {
 		},
 	}
 
-	// Must NOT error (so Start doesn't crash) and must NOT destroy anything.
-	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+	// The sweep must fail closed: surface the unreadable authority so Start
+	// refuses readiness, while still leaving every candidate untouched.
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "resolve orphan volume ownership")
+	require.ErrorContains(t, err, "database not open")
 }
 
 // TestDeprovision_RetainOff_DestroysAsBefore verifies that when

@@ -321,8 +321,8 @@ func validateMaintenanceAppendInput(source ReleaseClaim, target Release) error {
 	if !target.MaintenanceID.Valid() {
 		return errors.New("maintenance target requires a canonical UUIDv4 maintenance ID")
 	}
-	if !target.OperationID.Valid() {
-		return errors.New("maintenance target requires a typed operation lineage")
+	if _, ok := releaseRuntimeIdentityFor(target); !ok {
+		return errors.New("maintenance target requires durable runtime authority")
 	}
 	if err := validateStoredRelease(target); err != nil {
 		return fmt.Errorf("invalid maintenance release: %w", err)
@@ -362,22 +362,27 @@ func planMaintenanceAppendTx(
 	if err != nil {
 		return nil, Release{}, err
 	}
-	if sourceRelease.RuntimeAuthority == nil || target.RuntimeAuthority == nil {
+	sourceAuthority, sourceOK := releaseRuntimeIdentityFor(sourceRelease)
+	targetAuthority, targetOK := releaseRuntimeIdentityFor(target)
+	if !sourceOK || !targetOK {
 		return nil, Release{}, errors.New("maintenance source and target require runtime authority")
 	}
+	if sourceAuthority.class != targetAuthority.class {
+		return nil, Release{}, errors.New("maintenance target changes runtime authority class")
+	}
 	if target.OperationID != sourceRelease.OperationID ||
-		target.RuntimeAuthority.OperationID() != sourceRelease.RuntimeAuthority.OperationID() {
+		targetAuthority.operationID != sourceAuthority.operationID {
 		return nil, Release{}, errors.New("maintenance target changes operation lineage")
 	}
-	if target.RuntimeAuthority.Tenant() != sourceRelease.RuntimeAuthority.Tenant() {
+	if targetAuthority.tenant != sourceAuthority.tenant {
 		return nil, Release{}, errors.New("maintenance target changes tenant authority")
 	}
-	if target.RuntimeAuthority.ProviderUUID() != sourceRelease.RuntimeAuthority.ProviderUUID() {
+	if targetAuthority.providerUUID != sourceAuthority.providerUUID {
 		return nil, Release{}, errors.New("maintenance target changes provider authority")
 	}
 	// Callback route bases are trusted configuration and may intentionally rotate
-	// during maintenance. NewReleaseRuntimeAuthority has already proven both URL
-	// capabilities carry this same typed operation/lifecycle UUID, so byte-equal
+	// during maintenance. The class-specific constructors have already proven a
+	// coherent typed identity or a wholly tokenless legacy pair, so byte-equal
 	// URLs are neither required nor a stronger identity fence here.
 	if maintenanceReleaseIndex(current, target.MaintenanceID) >= 0 {
 		return nil, Release{}, errors.New("maintenance target ID already exists")

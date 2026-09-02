@@ -120,21 +120,20 @@ var (
 // job (ENG-647). Kept as constants so the call sites, the pre-init, and the tests
 // cannot drift on a typo.
 //
-// The operations split into two kinds, and the distinction is what an alert must key
-// on. BLOCKING operations treat a failed teardown as fatal: the lease stays tracked,
-// its capacity stays reserved, and the teardown is retried, so outcome="failed" there
-// means containers are pinned and fred is holding state open for them. ADVISORY
-// operations discard the error and let state advance anyway, so outcome="failed"
-// there means "a possible leak, or merely an unreachable daemon" — never "fred is
-// waiting". Mixing the two under one label would make the wedge case unqueryable.
+// The operations split into three kinds, and the distinction is what an alert must key
+// on. BLOCKING operations keep the lease tracked and retry. FAIL-STOP recovery retains
+// the provision intent, reservation, and claims, suppresses settlement, and requires a
+// fresh Start. The one ADVISORY prelude lets state advance. Mixing them under one label
+// would make the wedge case unqueryable.
 const (
 	// Blocking.
 	teardownOpRestoreReconcile = "restore_reconcile" // reconcileRestoring's orphaned arm (boot + retention sweep)
 	teardownOpRestoreRollback  = "restore_rollback"  // rollbackRestoreAdoption, worker arm: teardown blocks the rollback
 	teardownOpDeprovision      = "deprovision"       // doDeprovision's close-path teardown
+	// Fail-stop recovery.
+	teardownOpProvisionCleanup = "provision_cleanup" // failed provision retains its WAL and accounting for cold recovery
 	// Advisory.
-	teardownOpRestorePrelude   = "restore_prelude"   // rollbackRestoreAdoption, dropProvision arm: the rollback completes regardless
-	teardownOpProvisionCleanup = "provision_cleanup" // the stack-provision failure defer, best-effort by design
+	teardownOpRestorePrelude = "restore_prelude" // rollbackRestoreAdoption, dropProvision arm: the rollback completes regardless
 
 	teardownOutcomeRecovered = "recovered" // fallback removed every container it found
 	teardownOutcomeFailed    = "failed"    // a container may still be running (removal or discovery failed)
@@ -356,18 +355,18 @@ var (
 		Help:      "Startup quota-backfill per-volume re-application attempts by outcome",
 	}, []string{"outcome"})
 
-	// volumeQuotaClearFailedTotal counts XFS project-quota clear failures during
-	// volume Destroy (ENG-459). Destroy resets a project's bhard limit to 0 so its
-	// quota-table entry drops out of xfs_quota's scans once the directory is gone;
-	// the clear is best-effort (it must not wedge teardown — a leaked limit entry
-	// holds no disk), so a failure is logged and counted here rather than propagated.
-	// The observable backstop, mirroring retentionLeakedTotal: a rising rate means
-	// the project-quota table is regrowing and needs operator cleanup.
+	// volumeQuotaClearFailedTotal counts failed XFS quota-clear commands during
+	// interrupted-create compensation and typed deletion (ENG-459/ENG-632). It
+	// does not count the preceding block/inode usage proofs. Current typed
+	// failures are propagated and retain their durable mutation authority, which
+	// fail-stops this backend process until a fresh Start recovers it. Only an
+	// already-absent historical volume without typed authority can require the
+	// classified manual cleanup described in OPERATIONS.md.
 	volumeQuotaClearFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
 		Name:      "volume_quota_clear_failed_total",
-		Help:      "XFS project-quota clear failures on volume destroy (leaked table entry needs operator cleanup) — see ENG-459",
+		Help:      "Failed XFS quota-clear commands during create compensation or deletion; typed authority is retained for restart recovery — see ENG-459/ENG-632",
 	})
 
 	// volumeBindSymlinkRejectedTotal counts stateful-volume bind sources refused
@@ -855,9 +854,10 @@ var (
 	//     lease tracked and retries rather than advancing state over it. A sustained rate
 	//     is not data loss — it is capacity and anonymous volumes pinned on the host, and
 	//     a daemon that needs a look.
-	//   - ADVISORY (restore_prelude, provision_cleanup): the caller discards the error and
-	//     state advances anyway, so nothing is being held open and nothing will retry. A
-	//     rate here means a possible leak to reap by hand, or — for restore_prelude, whose
+	//   - FAIL-STOP (provision_cleanup): fred retains the exact intent, reservation, and
+	//     claims, suppresses its callback, and requires cold recovery before serving.
+	//   - ADVISORY (restore_prelude): the caller discards the error and state advances,
+	//     so no prelude retry owns it. A rate here may mean a leak to classify, or — because
 	//     callers are entered on caller-context cancellation and then pass that same dead
 	//     context to the teardown — merely a canceled restore request with nothing on the
 	//     host at all.

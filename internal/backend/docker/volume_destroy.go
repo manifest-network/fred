@@ -205,6 +205,17 @@ func (b *Backend) snapshotVolumeClaims() (*volumeClaims, error) {
 // volume name, so answering "does any record claim this name?" needs the whole-store read
 // the op already paid for once. The record transitions that would matter (a restore
 // claiming a name mid-sweep) are CAS'd in bbolt and are a different shape from this race.
+func leaseUUIDFromVolumeName(name string) (string, bool) {
+	if isRetainedVolume(name) {
+		return "", false
+	}
+	managedName, err := parseManagedVolumeName(name)
+	if err != nil {
+		return "", false
+	}
+	return managedVolumeLeaseUUID(managedName), true
+}
+
 func (b *Backend) liveClaim(name string) (volumeClaim, bool) {
 	leaseUUID, ok := leaseUUIDFromVolumeName(name)
 	if !ok {

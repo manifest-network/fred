@@ -149,8 +149,10 @@ height-pinned chain workload before providerd starts.
 
 Each encoded per-lease history is capped at 32 MiB. Before a provision,
 restore, or one-time legacy migration mutates substrate, the backend proves that
-the exact terminal release can fit after deterministic compaction; the final
-write repeats that plan in its bbolt transaction. Compaction always preserves
+the exact terminal release can fit after deterministic compaction. The legacy
+proof includes the complete tokenless runtime authority, and the post-health
+write commits that authority with the manifest, items, and profiles before
+rollback cleanup is scheduled. Compaction always preserves
 the index-latest row, most recent active row, and newest legacy-migration row.
 It removes expired disposable audit entries first, then the oldest fresh
 disposable entries, so capacity pressure may shorten audit history before
@@ -179,6 +181,12 @@ both markers absent. It reports unresolved v0.13 restoring records and exact
 interrupted deprovision shapes rather than synthesizing the operation authority
 those records lack; follow the isolated-v0.13 repair procedure in
 `DEPLOYMENT.md`, then stop, preflight, and back up again.
+Both this preflight and `-initialize-storage-identity {new|adopt}` accept
+`-storage-identity-operation-timeout` (default `10m`). The deadline is shared
+across context-aware Docker and filesystem-control-plane probes but is
+cooperative: a blocking local open, bbolt operation, or fsync cannot be
+interrupted mid-syscall. A timeout is failure, not proof of rollback; keep the
+lineage stopped and rerun the same mode against unchanged input.
 An active legacy release with neither containers nor a retention finalizer is a
 different unresolved-close refusal: never replay deprovision against it, because
 that can purge the release while stranding remaining tenant volumes. Restore a
@@ -244,18 +252,31 @@ blocks the next one. A readable `releases.db`, for example, cannot advance after
 three journals, Docker substrate, and managed volumes as one evidence/backup
 set.
 
-A current typed active Release is also the durable runtime commit record. It
-atomically binds its valid UUIDv4 operation lineage to the exact tenant,
-canonical provider UUID, emitted/effective item topology, pinned resource
-profiles, manifest, and current operation/lifecycle callback pair. The nested
-runtime-authority value is all-or-nothing: an empty operation ID with no runtime
-authority is the supported v0.13 shape, while a typed operation without complete
-matching authority is invalid. Restart and Update treat a requested callback
-base as pending until the replacement is Ready and that Release activates;
-failure and rollback keep the previous active route. Consequently a committed
-typed Release can rebuild a conservative Failed projection and full allocation
-even when no containers survive, without minting a replacement Release or
-guessing authority from mutable configuration.
+`TerminalStorageAuthorityFailure` publishes that first runtime cause to the
+binary's main loop. The listener closes, HTTP and backend workers drain under
+their fixed shutdown bounds, and the process exits status 1 even after a clean
+drain so its supervisor launches a fresh `Start`. A persistent fault therefore
+crash-loops closed. A failure found during `Start` exits 1 before listener bind;
+there is no running server to drain. Library consumers embedding `Backend` must
+also consume `TerminalStorageAuthorityFailure`, stop serving, drain, and replace
+the entire Backend instance; continuing with the latched instance is unsupported.
+
+An active Release is the durable runtime commit record. Current releases carry
+an all-or-nothing typed authority that binds a valid UUIDv4 operation lineage to
+the exact tenant, canonical provider UUID, emitted/effective item topology,
+pinned resource profiles, manifest, and callback pair. A fully inspected
+callback-bearing v0.13 cohort is instead CAS-fenced with a disjoint tokenless
+`LegacyRuntimeAuthority`; the authorityless v0.13 row is accepted only as
+pre-backfill upgrade input and must be frozen before any operation can remove
+its last witness. Restart and Update treat a requested callback base as pending
+until the replacement is Ready and that Release activates; failure and rollback
+keep the previous active route. Either committed authority class can rebuild a
+conservative Failed projection and full allocation with zero survivors, without
+minting a replacement Release or guessing from mutable configuration.
+An active callbackless pre-label cohort cannot be assigned provider callback
+authority safely and is rejected by the mandatory stopped adoption preflight.
+Callbackless historical cleanup/close evidence remains readable, but never
+authorizes zero-survivor recovery or maintenance.
 
 Runtime callback URLs contain causal capabilities. Treat `releases.db` and every
 stopped-process copy or backup as sensitive together with `callbacks.db` and
@@ -373,10 +394,10 @@ is best-effort and skipped, while the conservative pool reservation remains.
 | Filesystem | Mechanism | Requirements | Production status |
 |---|---|---|---|
 | **xfs** | Project quotas | `pquota` mount option, `xfs_quota` binary; daemon `CAP_SYS_ADMIN` | **Validated — use this in production** |
-| **btrfs** | Subvolumes with qgroup quotas | `btrfs quota enable` on the filesystem; daemon `CAP_SYS_ADMIN` | Experimental — untested |
-| **zfs** | Child datasets with quota property | Parent dataset exists, `zfs` binary (exempt from `CAP_SYS_ADMIN` via `zfs allow` delegation) | Experimental — untested |
+| **btrfs** | Subvolumes with qgroup quotas | `btrfs quota enable` on the filesystem; daemon `CAP_SYS_ADMIN` | Experimental — automated tests, not production-validated or deployed |
+| **zfs** | Child datasets with quota property | Parent dataset exists, `zfs` binary (exempt from `CAP_SYS_ADMIN` via `zfs allow` delegation) | Experimental — automated tests, not production-validated or deployed |
 
-> **Production support:** **`xfs` is the only filesystem validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. The **`btrfs`** and **`zfs`** backends are implemented but **not tested and not used in any deployment** — treat them as experimental. In particular, the inode-exhaustion backstops that XFS enforces via kernel project quotas have no equivalent coverage on btrfs/zfs. Use `xfs` for any production deployment.
+> **Production support:** **`xfs` is the only filesystem validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. The **`btrfs`** and **`zfs`** backends have automated coverage but are **not production-validated and not used in any deployment** — treat them as experimental. In particular, the inode-exhaustion backstops that XFS enforces via kernel project quotas have no equivalent production evidence on btrfs/zfs. Use `xfs` for any production deployment.
 
 > **Capability requirement (xfs/btrfs):** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` on an xfs or btrfs backend. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. The startup backfill that re-tags pre-existing tenant-owned volumes additionally needs `CAP_FOWNER`. Grant them ambiently — `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota`/`btrfs` child processes. `zfs` is exempt (`zfs allow` delegation) and `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
 
@@ -420,9 +441,25 @@ When provisioning `redis:latest` on this SKU:
 2. Host directory created: `/var/lib/fred/volumes/fred-<lease>-0/` with 2048 MB quota
 3. Subdirectory `data/` bind-mounted to container `/data`
 4. Redis writes to `/data` — quota enforced by kernel
-5. On deprovision: host directory destroyed, and on XFS the project-quota limit is cleared (`bhard=0 bsoft=0 ihard=0 isoft=0`) so its entry drops out of the quota table
+5. On deprovision: an XFS delete authority is synced first, the host directory
+   is removed in place, block and inode usage are proved zero, and all
+   project-quota limits are cleared (`bhard=0 bsoft=0 ihard=0 isoft=0`) before
+   the authority is removed
 
-> **XFS quota-table hygiene (ENG-459):** on XFS, `Destroy` clears the volume's project-quota block and inode limits (`bhard=0 bsoft=0 ihard=0 isoft=0`) after removing the directory, so the entry leaves the quota table instead of leaking one stale zero-byte entry per provision (an unbounded table slows every `xfs_quota` scan, degrading provisioning latency as leases churn). The clear is best-effort — a failure is logged and bumps `fred_docker_backend_volume_quota_clear_failed_total` rather than wedging teardown. Entries leaked by pre-ENG-459 daemons persist and need a one-time manual operator cleanup.
+> **XFS quota-table hygiene and crash recovery (ENG-459/ENG-632):** before
+> removing any final-volume bytes, `Destroy` creates an empty, project-zero,
+> parent-synced
+> `.fred-xfs-delete-<project-id>-<managed-volume>` sibling. The final name stays
+> in place while deletion progresses. After its absence is synced, Fred proves
+> both block and inode usage are zero, strictly clears all four limits, then
+> removes and syncs the authority. An open-but-unlinked file therefore blocks
+> completion. Any failure retains the authority, fail-stops the current backend
+> instance, and blocks recreation under the same final name. The daemon closes
+> its listener, drains, and exits status 1 so its supervisor launches a fresh
+> `Start`; an unrepaired fault crash-loops closed. Recovery must complete before
+> readiness; this is not a best-effort current-generation cleanup. Entries
+> leaked by pre-ENG-459 daemons
+> without a typed authority still require the one-time manual operator cleanup.
 
 ### SKU Profile Fields
 
@@ -717,7 +754,10 @@ The bounds are nested and aggregate where cardinality matters:
 - `Start` shares the shorter of its caller context and 30 seconds across initial
   identity/connectivity reads, then uses the backend lifecycle context with one
   30-minute overall crash-recovery budget.
-- Subsequent startup phases each use one aggregate
+- Within that overall budget, interrupted-volume recovery and its
+  clean-inventory proof each use a fixed two-minute filesystem-only child
+  deadline; `container_stop_timeout` cannot inflate them.
+- Later startup phases each use one aggregate
   `max(2m, container_stop_timeout)` budget. A longer configured stop grace is
   therefore honored for one container without multiplying that grace per lease.
 - Ordinary recovery Docker list/inspect boundaries are capped at 30 seconds.
@@ -725,8 +765,11 @@ The bounds are nested and aggregate where cardinality matters:
   and orphan-network cleanup shares one across the whole network set.
 
 A timeout fails that recovery boundary closed (and preserves exact operation,
-maintenance, and close authority) instead of wedging startup or a later
-reconciliation pass.
+maintenance, and close authority) instead of wedging a Docker/CLI boundary.
+Local filesystem deadlines are cooperative: one blocking kernel call cannot be
+forcibly interrupted, and a very large recursive top-level removal can cross
+the nominal budget. Recovery checks cancellation between top-level entries and
+phases and makes no further mutations afterward.
 These bounds are independent of the longer `migration_ready_timeout` used to
 observe a legacy replacement becoming ready. They are internal safety bounds,
 not YAML keys; zero-valued internal fields select these production defaults.
@@ -737,7 +780,7 @@ not YAML keys; zero-valued internal fields select these production defaults.
 2. **List managed containers** -- filters by `fred.managed=true` label for the ordinary projection.
 3. **Stabilize close authority** -- the ordinary managed-container inventory and close-intent read run under the same backend-local recovery guard used by live Deprovision. Load every close intent before ordinary callback-label or release-cohort validation. Containers owned by a close are deliberately excluded from those exact-cohort checks because teardown may already have removed some or all siblings; unrelated Provision and Restore commands remain available.
 4. **Resume an unfinished legacy migration** -- a pre-commit original/`-prev` cohort is converged idempotently. Once `RecordMigration` has persisted exact `Items` and resource profiles, remaining `-prev` containers are cleanup-only: recovery validates the complete live Compose cohort first and never infers topology from a partially cleaned rollback set. When exact stopped adoption proved a v0.13 committed-migration cohort whose row omitted those current fields, recovery writes `Items`, profiles, and the migration marker in one transaction so an immediately admitted close captures the rollback containers' immutable IDs before it may retire release history.
-5. **Validate ordinary callback and release cohorts** -- every sibling must carry one coherent callback pair. Typed releases must carry complete matching runtime authority, and their exact `Items` and resource profiles must match the observed service/SKU/index/domain/image set; a mismatch fails the lease closed. With no survivors, that authority reconstructs the exact identity, callback route, topology, and conservative allocation as Failed. A v0.13 stack row without `Items` or runtime authority is derived only from a complete, identity-consistent, dense cohort and exact active manifest, then fenced by the whole-release backfill described above. A pending operation intent owns its own generation transition and resource snapshot and is classified separately during startup.
+5. **Validate ordinary callback and release cohorts** -- every sibling must carry one coherent callback pair. Current releases must carry complete matching typed runtime authority. A complete callback-bearing v0.13 cohort is CAS-fenced with a distinct `LegacyRuntimeAuthority` that freezes its canonical principal and tokenless pair without manufacturing an operation ID; an active callbackless pre-label cohort is rejected by mandatory stopped adoption because provider callback authority cannot be minted safely. Either authority's exact `Items` and resource profiles must match the observed service/SKU/index/domain/image set; a mismatch fails the lease closed. With no survivors, it reconstructs the exact identity, callback route, topology, and conservative allocation as Failed. A still-unbackfilled v0.13 stack row is derived only from a complete, identity-consistent, dense cohort and exact active manifest, then receives the whole-release and legacy-runtime backfills before any operation may erase its last container. The first and every subsequent restart, update, or custom-domain replacement stays legacy/tokenless; its independent UUIDv4 `maintenance_id` is exact replacement WAL/cohort identity, not provider callback authority. Only a later genuine provision or restore rotates callback authority to typed. A pending operation intent owns its own generation transition and resource snapshot and is classified separately during startup.
 6. **Group by lease UUID** -- ordinary containers are grouped into provision records. The highest `FailCount` across containers in a lease is used (handles partial re-provisions).
 7. **Rebuild close owners** -- a full close publishes a conservative `deprovisioning` projection and full resource reservation solely from its immutable journal snapshot, even with zero survivors. Cleanup-only closes reserve their durable topology without publishing a tenant provision.
 8. **Rebuild restore destination authority** -- a source `restoring` finalizer

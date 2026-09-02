@@ -149,6 +149,54 @@ func TestAcquireCloseIntentUsesFencedReleaseTopology(t *testing.T) {
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
+func TestAcquireCloseIntentUsesFencedLegacyRuntimeAuthority(t *testing.T) {
+	dir := t.TempDir()
+	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, nil)
+	seedCloseDeprovisionLease(t, b, stores)
+
+	const callbackURL = "https://fred.example/callbacks/provision?lease_uuid=" + closeDeprovisionLeaseUUID
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	require.NoError(t, err)
+	authority, err := shared.NewLegacyRuntimeAuthority(
+		"tenant-authoritative",
+		closeDeprovisionProviderUUID,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+	active, err := stores.releases.LatestActive(closeDeprovisionLeaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	require.NoError(t, stores.releases.BackfillLegacyRuntimeAuthority(
+		closeDeprovisionLeaseUUID, *active, authority,
+	))
+	stack, err := manifest.ParsePayload(active.Manifest)
+	require.NoError(t, err)
+
+	// Model a stale in-memory projection after the durable v0.13 authority was
+	// frozen. Close must fence the principal and callback pair from the Release,
+	// not combine the Release topology with these caller-supplied values.
+	claim, found, err := b.acquireCloseIntent(
+		context.Background(),
+		closeDeprovisionLeaseUUID,
+		true,
+		"tenant-stale",
+		"33333333-3333-4333-8333-333333333333",
+		active.Items,
+		stack,
+		"https://stale.example/callback",
+		"",
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, authority.Tenant(), claim.Tenant())
+	require.Equal(t, authority.ProviderUUID(), claim.ProviderUUID())
+	require.Equal(t, authority.CallbackURL(), claim.CallbackURL())
+	require.Equal(t, authority.LifecycleCallbackURL(), claim.LifecycleCallbackURL())
+
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
 func TestDoDeprovision_UnmarkedExactRollbackUsesSelectedReleaseAuthority(t *testing.T) {
 	dir := t.TempDir()
 	const callbackURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"

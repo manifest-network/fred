@@ -10,6 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // errComposeDown is the canonical "compose gave up part-way" failure. Under compose
@@ -135,6 +137,32 @@ func TestTeardownLeaseContainers_DiscoveryFails_ReturnsError(t *testing.T) {
 	assert.ErrorIs(t, err, errComposeDown, "the originating Down failure stays in the chain")
 	assert.Equal(t, []string{"c-recorded"}, remaining,
 		"report what we know of as possibly-present; an empty list reads as 'nothing left'")
+}
+
+func TestTeardownLeaseContainers_AmbiguousDownNeverFallsBack(t *testing.T) {
+	discoveryCalled := false
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
+			discoveryCalled = true
+			return nil, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	downCause := errors.New("parent directory sync failed")
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		return errors.Join(backendidentity.ErrMutationOutcomeAmbiguous, downCause)
+	}}
+
+	remaining, err := b.teardownLeaseContainers(
+		context.Background(), "lease-1", []string{"recorded"},
+		time.Second, teardownOpProvisionCleanup, slog.Default(),
+	)
+
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	require.ErrorIs(t, err, downCause)
+	assert.Equal(t, []string{"recorded"}, remaining)
+	assert.False(t, discoveryCalled,
+		"an outcome-ambiguous mutation must not query a possibly replaced substrate and downgrade itself to clean")
 }
 
 // TestTeardownLeaseContainers_RemovalFails_ReturnsRemaining pins that a partial

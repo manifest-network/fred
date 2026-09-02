@@ -38,6 +38,8 @@ func newStorageAuthorityLatchTestBackend(t *testing.T) (*Backend, Config) {
 
 	b, err := newBackendWithTestIdentity(cfg, slog.Default())
 	require.NoError(t, err)
+	require.NotNil(t, b.TerminalStorageAuthorityFailure(),
+		"the production constructor must expose terminal authority withdrawal to the daemon")
 	b.operationIntents = b.callbackStore
 	t.Cleanup(func() { _ = b.Stop() })
 	return b, cfg
@@ -105,6 +107,13 @@ func TestSiblingAuthoritativeStoreFailureBlocksCallbackSettlement(t *testing.T) 
 			case <-b.stopCtx.Done():
 			default:
 				t.Fatal("authoritative store failure did not cancel the backend lifetime")
+			}
+			select {
+			case published := <-b.TerminalStorageAuthorityFailure():
+				assert.EqualError(t, published, triggerErr.Error(),
+					"the daemon channel must preserve the exact first terminal cause")
+			default:
+				t.Fatal("authoritative store failure was not published to the daemon")
 			}
 
 			// Direct operation-intent settlement and the CallbackSender must both

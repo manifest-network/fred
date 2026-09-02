@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -826,7 +827,19 @@ func TestReleaseStore_RemoveOlderThan_KeepsLoneOldNonActive(t *testing.T) {
 	assert.Equal(t, "failed", releases[0].Status)
 }
 
-func TestReleaseStore_RecordMigrationBackfillsDesiredItemsIdempotently(t *testing.T) {
+func testLegacyMigrationAuthority(t testing.TB) LegacyRuntimeAuthority {
+	t.Helper()
+	authority, err := NewLegacyRuntimeAuthority(
+		"tenant-a",
+		"22222222-2222-4222-8222-222222222222",
+		"https://fred.example/callbacks/provision",
+		"https://fred.example/callbacks/provision",
+	)
+	require.NoError(t, err)
+	return authority
+}
+
+func TestReleaseStore_RecordLegacyMigrationBackfillsDesiredItemsIdempotently(t *testing.T) {
 	store, err := NewReleaseStore(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "migration_releases.db"),
 	})
@@ -842,20 +855,22 @@ func TestReleaseStore_RecordMigrationBackfillsDesiredItemsIdempotently(t *testin
 		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.RecordMigration("lease-1", manifest, items, profiles))
-	require.NoError(t, store.RecordMigration("lease-1", manifest, items, profiles))
+	authority := testLegacyMigrationAuthority(t)
+	require.NoError(t, store.RecordLegacyMigration("lease-1", manifest, items, profiles, authority))
+	require.NoError(t, store.RecordLegacyMigration("lease-1", manifest, items, profiles, authority))
 
 	releases, err := store.List("lease-1")
 	require.NoError(t, err)
 	require.Len(t, releases, 1, "backfill and exact replay must not inflate release history")
 	assert.Equal(t, items, releases[0].Items)
 	assert.True(t, releases[0].LegacyMigration)
+	assert.Equal(t, &authority, releases[0].LegacyRuntimeAuthority)
 
 	items[0].Quantity = 9
 	assert.Equal(t, 2, releases[0].Items[0].Quantity, "stored desired topology must not alias caller memory")
 }
 
-func TestReleaseStore_RecordMigrationRejectsDivergentDesiredItems(t *testing.T) {
+func TestReleaseStore_RecordLegacyMigrationRejectsDivergentAuthorityAndItems(t *testing.T) {
 	store, err := NewReleaseStore(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "migration_divergence.db"),
 	})
@@ -870,12 +885,83 @@ func TestReleaseStore_RecordMigrationRejectsDivergentDesiredItems(t *testing.T) 
 		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.RecordMigration("lease-1", manifest, firstItems, firstProfiles))
+	authority := testLegacyMigrationAuthority(t)
+	require.NoError(t, store.RecordLegacyMigration("lease-1", manifest, firstItems, firstProfiles, authority))
+	otherAuthority, authorityErr := NewLegacyRuntimeAuthority(
+		authority.Tenant(),
+		authority.ProviderUUID(),
+		"https://other.example/callbacks/provision",
+		"",
+	)
+	require.NoError(t, authorityErr)
+	authorityErr = store.RecordLegacyMigration(
+		"lease-1", manifest, firstItems, firstProfiles, otherAuthority,
+	)
+	require.ErrorContains(t, authorityErr, "divergent legacy runtime authority")
 	secondItems := []backend.LeaseItem{{
 		SKU: "docker-small", Quantity: 2, ServiceName: "app",
 	}}
-	err = store.RecordMigration("lease-1", manifest, secondItems, firstProfiles)
+	err = store.RecordLegacyMigration("lease-1", manifest, secondItems, firstProfiles, authority)
 	require.ErrorContains(t, err, "divergent desired items")
+}
+
+func TestReleaseStore_LegacyMigrationCapacityIncludesRuntimeAuthority(t *testing.T) {
+	const limitBytes = 1024
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
+	profiles, err := BuildSKUResourceSnapshot(items, func(string) (SKUProfile, error) {
+		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+	})
+	require.NoError(t, err)
+	createdAt := time.Unix(1_700_000_000, 0).UTC()
+
+	shortStore, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "short-authority.db"),
+	})
+	require.NoError(t, err)
+	defer shortStore.Close()
+	require.NoError(t, shortStore.recordLegacyMigrationWithinLimit(
+		"lease-short-authority",
+		[]byte(`{"image":"nginx:1.25"}`),
+		items,
+		profiles,
+		testLegacyMigrationAuthority(t),
+		createdAt,
+		limitBytes,
+	), "the same release with a compact callback authority fits the synthetic limit")
+
+	longAuthority, err := NewLegacyRuntimeAuthority(
+		"tenant-a",
+		"22222222-2222-4222-8222-222222222222",
+		"https://fred.example/callbacks/provision?trace="+strings.Repeat("x", 2048),
+		"",
+	)
+	require.NoError(t, err)
+	longStore, err := NewReleaseStore(ReleaseStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "long-authority.db"),
+	})
+	require.NoError(t, err)
+	defer longStore.Close()
+	err = longStore.recordLegacyMigrationWithinLimit(
+		"lease-long-authority",
+		[]byte(`{"image":"nginx:1.25"}`),
+		items,
+		profiles,
+		longAuthority,
+		createdAt,
+		limitBytes,
+	)
+	require.ErrorIs(t, err, ErrReleaseHistoryCapacity,
+		"capacity admission must account for the authority bytes committed after substrate work")
+
+	err = longStore.CheckRecordLegacyMigrationCapacity(
+		"lease-zero-authority",
+		[]byte(`{"image":"nginx:1.25"}`),
+		items,
+		profiles,
+		LegacyRuntimeAuthority{},
+		createdAt,
+	)
+	require.ErrorContains(t, err, "valid legacy runtime authority")
 }
 
 func TestReleaseStore_BackfillLegacyActiveAuthorityFreezesMultiSKUProfile(t *testing.T) {
@@ -1073,8 +1159,8 @@ func TestReleaseStore_CorruptAuthorityFailsEveryDecodeMutationClosed(t *testing.
 		leaseUUID, "failed", backend.ReasonUpdateFailed, "failed",
 	))
 	assertInvalid("ActivateLatest", store.ActivateLatest(leaseUUID))
-	assertInvalid("RecordMigration", store.RecordMigration(
-		leaseUUID, corrupt.Manifest, items, profiles,
+	assertInvalid("RecordLegacyMigration", store.RecordLegacyMigration(
+		leaseUUID, corrupt.Manifest, items, profiles, testLegacyMigrationAuthority(t),
 	))
 	assertInvalid("DeleteCloseHistory", store.DeleteCloseHistory(leaseUUID, 1, digest))
 	_, err = store.RemoveOlderThan(time.Minute)

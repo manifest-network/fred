@@ -92,6 +92,40 @@ func newMaintenanceRecoveryHarnessForKind(
 	t *testing.T,
 	kind shared.MaintenanceIntentKind,
 ) *maintenanceRecoveryHarness {
+	return newMaintenanceRecoveryHarnessForAuthority(t, kind, false)
+}
+
+func newLegacyMaintenanceRecoveryHarnessForKind(
+	t *testing.T,
+	kind shared.MaintenanceIntentKind,
+) *maintenanceRecoveryHarness {
+	return newMaintenanceRecoveryHarnessForAuthority(t, kind, true)
+}
+
+func newLegacyMaintenanceRecoveryHarnessForKindAtCallback(
+	t *testing.T,
+	kind shared.MaintenanceIntentKind,
+	callbackURL string,
+) *maintenanceRecoveryHarness {
+	return newMaintenanceRecoveryHarnessForAuthorityAtCallback(
+		t, kind, true, callbackURL,
+	)
+}
+
+func newMaintenanceRecoveryHarnessForAuthority(
+	t *testing.T,
+	kind shared.MaintenanceIntentKind,
+	legacy bool,
+) *maintenanceRecoveryHarness {
+	return newMaintenanceRecoveryHarnessForAuthorityAtCallback(t, kind, legacy, "")
+}
+
+func newMaintenanceRecoveryHarnessForAuthorityAtCallback(
+	t *testing.T,
+	kind shared.MaintenanceIntentKind,
+	legacy bool,
+	targetCallbackURL string,
+) *maintenanceRecoveryHarness {
 	t.Helper()
 	dir := t.TempDir()
 	inventory := &maintenanceInventory{}
@@ -122,34 +156,48 @@ func newMaintenanceRecoveryHarnessForKind(
 	manifestBytes, err := json.Marshal(stack)
 	require.NoError(t, err)
 	source := shared.Release{
-		Manifest:         manifestBytes,
-		Image:            "stack",
-		OperationID:      operationID,
-		Items:            items,
-		ResourceProfiles: profiles,
-		RuntimeAuthority: mustTestReleaseRuntimeAuthority(
+		Manifest: manifestBytes, Image: "stack", Items: items,
+		ResourceProfiles: profiles, Status: "active", CreatedAt: time.Now(),
+	}
+	if legacy {
+		callbackURL = "https://fred.example/callbacks/provision"
+		lifecycleCallbackURL = callbackURL
+		authority, authorityErr := shared.NewLegacyRuntimeAuthority(
+			"tenant-a", "22222222-2222-4222-8222-222222222222",
+			callbackURL, lifecycleCallbackURL,
+		)
+		require.NoError(t, authorityErr)
+		source.LegacyRuntimeAuthority = &authority
+	} else {
+		source.OperationID = operationID
+		source.RuntimeAuthority = mustTestReleaseRuntimeAuthority(
 			t, operationID, "tenant-a", "22222222-2222-4222-8222-222222222222",
 			callbackURL, lifecycleCallbackURL,
-		),
-		Status:    "active",
-		CreatedAt: time.Now(),
+		)
 	}
 	require.NoError(t, releases.AppendActive(leaseUUID, source))
 	source, sourceClaim, err := releases.ClaimLatestActive(leaseUUID)
 	require.NoError(t, err)
+	target := source
+	target.Version = 0
+	target.Status = "deploying"
+	target.CreatedAt = time.Now()
+	target.Items = slices.Clone(items)
+	target.ResourceProfiles = shared.CloneSKUResourceSnapshot(profiles)
+	if targetCallbackURL != "" {
+		require.True(t, legacy, "only legacy callback rotation is used by this harness")
+		sourceAuthority := mustDockerReleaseRuntimeIdentity(t, source)
+		targetAuthority, authorityErr := shared.NewLegacyRuntimeAuthority(
+			sourceAuthority.Tenant(), sourceAuthority.ProviderUUID(),
+			targetCallbackURL, targetCallbackURL,
+		)
+		require.NoError(t, authorityErr)
+		target.LegacyRuntimeAuthority = &targetAuthority
+	}
 	admission, err := callbacks.BeginMaintenanceIntent(shared.MaintenanceIntentSpec{
-		Kind:          kind,
-		SourceRelease: sourceClaim,
-		TargetRelease: shared.Release{
-			Manifest:         manifestBytes,
-			Image:            "stack",
-			OperationID:      operationID,
-			Items:            slices.Clone(items),
-			ResourceProfiles: shared.CloneSKUResourceSnapshot(profiles),
-			RuntimeAuthority: source.RuntimeAuthority,
-			Status:           "deploying",
-			CreatedAt:        time.Now(),
-		},
+		Kind:             kind,
+		SourceRelease:    sourceClaim,
+		TargetRelease:    target,
 		Backend:          b.Name(),
 		BackendStorageID: b.storageIdentity,
 	})
@@ -210,19 +258,21 @@ func (h *maintenanceRecoveryHarness) reopen() {
 
 func (h *maintenanceRecoveryHarness) containersFor(release shared.Release, count int, status string, health HealthStatus) []ContainerInfo {
 	h.t.Helper()
+	authority, ok := release.RuntimeIdentity()
+	require.True(h.t, ok)
 	containers := make([]ContainerInfo, 0, count)
 	for index := range count {
 		containers = append(containers, ContainerInfo{
 			ContainerID:          release.MaintenanceID.String() + "-container-" + string(rune('a'+index)),
 			LeaseUUID:            h.leaseUUID,
-			Tenant:               release.RuntimeAuthority.Tenant(),
-			ProviderUUID:         release.RuntimeAuthority.ProviderUUID(),
+			Tenant:               authority.Tenant(),
+			ProviderUUID:         authority.ProviderUUID(),
 			BackendName:          h.b.Name(),
 			SKU:                  release.Items[0].SKU,
 			ServiceName:          release.Items[0].ServiceName,
 			InstanceIndex:        index,
-			CallbackURL:          release.RuntimeAuthority.CallbackURL(),
-			LifecycleCallbackURL: release.RuntimeAuthority.LifecycleCallbackURL(),
+			CallbackURL:          authority.CallbackURL(),
+			LifecycleCallbackURL: authority.LifecycleCallbackURL(),
 			MaintenanceID:        release.MaintenanceID,
 			Image:                "docker.io/library/nginx:1.27",
 			Status:               status,
@@ -307,6 +357,87 @@ func TestRecoverMaintenanceIntentAcrossEveryDurableCrashBoundary(t *testing.T) {
 		require.NotNil(t, active)
 		assert.Equal(t, h.intent.MaintenanceID(), active.MaintenanceID)
 	})
+}
+
+func TestRecoverLegacyMaintenanceTargetAcrossColdRestart(t *testing.T) {
+	for _, kind := range []shared.MaintenanceIntentKind{
+		shared.MaintenanceIntentRestart,
+		shared.MaintenanceIntentUpdate,
+		shared.MaintenanceIntentCustomDomain,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			h := newLegacyMaintenanceRecoveryHarnessForKind(t, kind)
+			h.appendTarget(false)
+			h.inventory.containers = h.containersFor(
+				h.targetRelease, 2, "running", HealthStatusNone,
+			)
+			h.reopen()
+
+			require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+			h.assertSettled(backend.CallbackStatusSuccess)
+			active, err := h.releases.LatestActive(h.leaseUUID)
+			require.NoError(t, err)
+			require.NotNil(t, active)
+			assert.Equal(t, h.intent.MaintenanceID(), active.MaintenanceID)
+			assert.Empty(t, active.OperationID)
+			assert.Nil(t, active.RuntimeAuthority)
+			require.NotNil(t, active.LegacyRuntimeAuthority)
+			assert.Equal(t, shared.ReleaseAuthorityLegacy,
+				mustDockerReleaseRuntimeIdentity(t, *active).Class())
+		})
+	}
+}
+
+func TestRecoverLegacyMaintenanceCallbackBaseAcrossColdRestart(t *testing.T) {
+	const movedCallbackURL = "https://moved.example/callbacks/provision"
+	h := newLegacyMaintenanceRecoveryHarnessForKindAtCallback(
+		t, shared.MaintenanceIntentRestart, movedCallbackURL,
+	)
+	h.appendTarget(false)
+	h.inventory.containers = h.containersFor(
+		h.targetRelease, 2, "running", HealthStatusNone,
+	)
+	h.reopen()
+
+	// recoverState is the cold-start path: it settles the durable maintenance
+	// intent before projecting the exact target cohort into memory.
+	require.NoError(t, h.b.recoverState(t.Context()))
+	h.assertSettled(backend.CallbackStatusSuccess)
+
+	pending, err := h.callbacks.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, movedCallbackURL, pending[0].CallbackURL,
+		"cold settlement must notify the callback route persisted by the target intent")
+
+	active, err := h.releases.LatestActive(h.leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	activeAuthority := mustDockerReleaseRuntimeIdentity(t, *active)
+	assert.Equal(t, shared.ReleaseAuthorityLegacy, activeAuthority.Class())
+	assert.Equal(t, movedCallbackURL, activeAuthority.CallbackURL())
+	assert.Equal(t, movedCallbackURL, activeAuthority.LifecycleCallbackURL())
+	assert.Equal(t, h.intent.MaintenanceID(), active.MaintenanceID)
+	assert.Empty(t, active.OperationID)
+	assert.Nil(t, active.RuntimeAuthority)
+
+	h.b.provisionsMu.RLock()
+	projected := h.b.provisions[h.leaseUUID]
+	h.b.provisionsMu.RUnlock()
+	require.NotNil(t, projected)
+	assert.Equal(t, backend.ProvisionStatusReady, projected.Status)
+	assert.Equal(t, movedCallbackURL, projected.CallbackURL)
+	assert.Equal(t, movedCallbackURL, projected.LifecycleCallbackURL)
+}
+
+func mustDockerReleaseRuntimeIdentity(
+	t *testing.T,
+	release shared.Release,
+) shared.ReleaseRuntimeIdentity {
+	t.Helper()
+	authority, ok := release.RuntimeIdentity()
+	require.True(t, ok)
+	return authority
 }
 
 func TestRecoverMaintenancePreservesUpdateImagePullFailurePolicy(t *testing.T) {

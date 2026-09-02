@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +28,31 @@ func TestParseStartupFlagsStorageIdentityAdoptionPreflight(t *testing.T) {
 	assert.Equal(t, "/etc/fred/docker.yaml", startup.configPath)
 	assert.True(t, startup.preflightStorageIdentityAdoption)
 	assert.Empty(t, startup.initializeStorageIdentity)
+	assert.Equal(t, defaultStorageIdentityOperationTimeout, startup.storageIdentityOperationTimeout)
+}
+
+func TestParseStartupFlagsStorageIdentityOperationTimeout(t *testing.T) {
+	startup, err := parseStartupFlags(
+		[]string{
+			"-initialize-storage-identity", "adopt",
+			"-storage-identity-operation-timeout", "45m",
+		},
+		io.Discard,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Minute, startup.storageIdentityOperationTimeout)
+}
+
+func TestParseStartupFlagsRejectsNonPositiveStorageIdentityOperationTimeout(t *testing.T) {
+	for _, timeout := range []string{"0", "-1s"} {
+		t.Run(timeout, func(t *testing.T) {
+			_, err := parseStartupFlags(
+				[]string{"-storage-identity-operation-timeout", timeout},
+				io.Discard,
+			)
+			require.ErrorContains(t, err, "must be positive")
+		})
+	}
 }
 
 func TestParseStartupFlagsRejectsPreflightAndInitializationTogether(t *testing.T) {

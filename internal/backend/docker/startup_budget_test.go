@@ -71,6 +71,78 @@ func TestStartupPhaseBudget_HonorsConfiguredContainerStopGrace(t *testing.T) {
 		"zero values must select both production defaults")
 }
 
+func TestStartupVolumeMutationContextHasFixedFilesystemOnlyCap(t *testing.T) {
+	started := time.Now()
+	ctx, cancel := startupVolumeMutationContext(context.Background())
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	require.True(t, ok)
+	assert.WithinDuration(t, started.Add(defaultStartupVolumeMutationTimeout), deadline, time.Second)
+}
+
+func TestStart_OverallRecoveryBudgetIncludesInterruptedVolumeRecovery(t *testing.T) {
+	entered := make(chan struct{})
+	var observedDeadline time.Time
+	b, _ := newInterruptedVolumeStartBackend(t)
+	b.startupRecoveryTimeout = 25 * time.Millisecond
+	// Neither setting may inflate the filesystem-only recovery budget or let it
+	// escape the aggregate startup deadline.
+	b.startupPhaseTimeout = time.Hour
+	b.cfg.ContainerStopTimeout = time.Hour
+	b.volumes = &mockVolumeManager{
+		RecoverInterruptedVolumeMutationsFn: func(ctx context.Context) error {
+			observedDeadline, _ = ctx.Deadline()
+			close(entered)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	started := time.Now()
+	err := b.Start(context.Background())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "recover interrupted managed-volume mutations")
+	assert.Less(t, time.Since(started), time.Second)
+	select {
+	case <-entered:
+	default:
+		t.Fatal("startup did not reach interrupted-volume recovery")
+	}
+	assert.False(t, observedDeadline.IsZero())
+	assert.Less(t, observedDeadline.Sub(started), time.Second,
+		"interrupted-volume recovery must inherit the aggregate startup deadline")
+}
+
+func TestStart_StopContextCancelsInterruptedVolumeRecovery(t *testing.T) {
+	entered := make(chan struct{})
+	b, _ := newInterruptedVolumeStartBackend(t)
+	b.startupRecoveryTimeout = time.Minute
+	b.volumes = &mockVolumeManager{
+		RecoverInterruptedVolumeMutationsFn: func(ctx context.Context) error {
+			close(entered)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- b.Start(context.Background()) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("startup did not reach interrupted-volume recovery")
+	}
+	b.stopCancel()
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorContains(t, err, "recover interrupted managed-volume mutations")
+	case <-time.After(time.Second):
+		t.Fatal("canceling stopCtx did not unblock interrupted-volume recovery")
+	}
+}
+
 func TestStart_OverallRecoveryBudgetCancelsStalledInventory(t *testing.T) {
 	entered := make(chan struct{})
 	var once sync.Once

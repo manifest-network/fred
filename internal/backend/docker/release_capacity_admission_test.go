@@ -33,11 +33,12 @@ func (p *refusingReleaseHistoryCapacityPlanner) CheckAppendActiveCapacity(
 	return p.capacityError()
 }
 
-func (p *refusingReleaseHistoryCapacityPlanner) CheckRecordMigrationCapacity(
+func (p *refusingReleaseHistoryCapacityPlanner) CheckRecordLegacyMigrationCapacity(
 	string,
 	[]byte,
 	[]backend.LeaseItem,
 	[]shared.SKUResourceSnapshot,
+	shared.LegacyRuntimeAuthority,
 	time.Time,
 ) error {
 	p.migrationCalls++
@@ -179,11 +180,10 @@ func TestLegacyMigrationReleaseCapacityRefusalPrecedesSubstrateMutation(t *testi
 		return nil
 	}
 
-	const operationID = "550e8400-e29b-41d4-a716-446655440000"
 	migration := &legacyMigration{
 		LeaseUUID:    "lease-capacity-migration",
 		Tenant:       "tenant-a",
-		ProviderUUID: "provider-a",
+		ProviderUUID: nominalDockerProviderUUID,
 		SKU:          "docker-micro",
 		Stack: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 			manifest.DefaultServiceName: {Image: "docker.io/library/nginx:1.27"},
@@ -192,8 +192,7 @@ func TestLegacyMigrationReleaseCapacityRefusalPrecedesSubstrateMutation(t *testi
 			LegacyContainer: ContainerInfo{
 				ContainerID:   "legacy-container",
 				InstanceIndex: 0,
-				CallbackURL: "https://fred.example/callbacks/provision?operation_id=" +
-					operationID,
+				CallbackURL:   "https://fred.example/callbacks/provision",
 			},
 			NewContainerName: "fred-lease-capacity-migration-app-0",
 			PrevName:         "fred-lease-capacity-migration-app-0-prev",

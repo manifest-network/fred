@@ -3,6 +3,9 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
@@ -13,8 +16,10 @@ import (
 // their immutable effective quota enforced without a re-provision or data
 // move. Effective quota is durable DiskMB or, for a physically present
 // diskless writable-path volume, its mutually exclusive pinned ScratchDiskMB.
-// It is idempotent and best-effort per volume: a single volume's failure (e.g. a
-// concurrent deprovision) is logged and skipped, never fatal.
+// It is idempotent and attempts every expected, present volume even when one
+// fails. Any inventory, durable-authority, or quota-enforcement failure is
+// returned after the walk so Start cannot report readiness while a tenant
+// volume may be running without its immutable cap.
 //
 // It enumerates the volumes that SHOULD carry a quota — active lease instances
 // (stateful, or ephemeral-with-writable-path) and active-status retained volumes
@@ -24,23 +29,19 @@ import (
 // untagged; unlike Create it never creates a missing volume. It must run after
 // recoverState (so b.provisions is populated) and reconcileRetentions (so the
 // fred-retained- namespace is settled), and before the serving loops.
-func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
+func (b *Backend) reconcileVolumeQuotas(ctx context.Context) error {
 	if b.cfg.VolumeDataPath == "" {
-		return // noop backend: no quota-enforced volumes
+		return nil // noop backend: no quota-enforced volumes
 	}
 
-	existingList, err := b.volumes.List()
+	existing, err := attestManagedVolumeInventory(ctx, b.volumes)
 	if err != nil {
-		b.logger.Warn("quota backfill: cannot list volumes; skipping", "error", err)
-		return
-	}
-	existing := make(map[string]struct{}, len(existingList))
-	for _, n := range existingList {
-		existing[n] = struct{}{}
+		return fmt.Errorf("attest managed volumes for quota reconciliation: %w", err)
 	}
 
 	// name → sizeMB for every volume expected to carry a disk quota.
 	want := make(map[string]int64)
+	var reconcileErrs []error
 
 	// Active leases. Snapshot under RLock; do NOT hold it across the quota exec
 	// calls below (mirrors cleanupOrphanedVolumes).
@@ -55,14 +56,22 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 		}
 		resourcesBySKU, profileErr := resourceSnapshotMap(prov.Items, resourceProfiles)
 		if resolveErr != nil || profileErr != nil {
-			b.logger.Warn("quota backfill: live lease has invalid resource authority; skipping",
-				"lease_uuid", leaseUUID, "error", errors.Join(resolveErr, profileErr))
+			authorityErr := errors.Join(resolveErr, profileErr)
+			b.logger.Error("quota reconciliation: live lease has invalid resource authority",
+				"lease_uuid", leaseUUID, "error", authorityErr)
+			reconcileErrs = append(reconcileErrs, fmt.Errorf(
+				"resolve live lease %q quota authority: %w", leaseUUID, authorityErr,
+			))
 			continue
 		}
 		for _, item := range prov.Items {
 			resources, ok := resourcesBySKU[item.SKU]
 			if !ok {
-				continue // validated snapshots make this unreachable
+				reconcileErrs = append(reconcileErrs, fmt.Errorf(
+					"resolve live lease %q SKU %q quota authority: missing validated resource snapshot",
+					leaseUUID, item.SKU,
+				))
+				continue
 			}
 			// Mirror provision.go's sizing: a stateful item is capped at its
 			// disk_mb; an ephemeral (disk_mb=0) item with an image writable-path
@@ -72,7 +81,10 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 			// existence gate below.
 			sizeMB, sizeErr := resources.EffectiveDiskMB()
 			if sizeErr != nil {
-				continue // resourceSnapshotMap already validated; defensive only
+				reconcileErrs = append(reconcileErrs, fmt.Errorf(
+					"resolve live lease %q SKU %q effective quota: %w", leaseUUID, item.SKU, sizeErr,
+				))
+				continue
 			}
 			if sizeMB <= 0 {
 				continue
@@ -89,7 +101,8 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 	if b.retentionStore != nil {
 		entries, lerr := b.retentionStore.List()
 		if lerr != nil {
-			b.logger.Warn("quota backfill: cannot list retentions; active-lease volumes still processed", "error", lerr)
+			b.logger.Error("quota reconciliation: cannot list retentions; active-lease volumes still processed", "error", lerr)
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("list retained quota authority: %w", lerr))
 		} else {
 			for _, e := range entries {
 				if e.Status != shared.RetentionStatusActive {
@@ -102,8 +115,12 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 				}
 				resourcesBySKU, profileErr := resourceSnapshotMap(e.Items, resourceProfiles)
 				if resolveErr != nil || profileErr != nil {
-					b.logger.Warn("quota backfill: retention has invalid resource authority; skipping",
-						"lease_uuid", e.OriginalLeaseUUID, "error", errors.Join(resolveErr, profileErr))
+					authorityErr := errors.Join(resolveErr, profileErr)
+					b.logger.Error("quota reconciliation: retention has invalid resource authority",
+						"lease_uuid", e.OriginalLeaseUUID, "error", authorityErr)
+					reconcileErrs = append(reconcileErrs, fmt.Errorf(
+						"resolve retained lease %q quota authority: %w", e.OriginalLeaseUUID, authorityErr,
+					))
 					continue
 				}
 				retainedSet := make(map[string]struct{}, len(e.RetainedVolumeNames))
@@ -113,10 +130,21 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 				for _, item := range e.Items {
 					resources, ok := resourcesBySKU[item.SKU]
 					if !ok {
+						reconcileErrs = append(reconcileErrs, fmt.Errorf(
+							"resolve retained lease %q SKU %q quota authority: missing validated resource snapshot",
+							e.OriginalLeaseUUID, item.SKU,
+						))
 						continue
 					}
 					sizeMB, sizeErr := resources.EffectiveDiskMB()
-					if sizeErr != nil || sizeMB <= 0 {
+					if sizeErr != nil {
+						reconcileErrs = append(reconcileErrs, fmt.Errorf(
+							"resolve retained lease %q SKU %q effective quota: %w",
+							e.OriginalLeaseUUID, item.SKU, sizeErr,
+						))
+						continue
+					}
+					if sizeMB <= 0 {
 						continue
 					}
 					for i := range item.Quantity {
@@ -134,7 +162,8 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 	}
 
 	var applied, failed, absent int
-	for name, sizeMB := range want {
+	for _, name := range slices.Sorted(maps.Keys(want)) {
+		sizeMB := want[name]
 		if _, ok := existing[name]; !ok {
 			absent++ // expected but not on disk (stateless instance, or already gone)
 			continue
@@ -144,6 +173,9 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 			volumeQuotaBackfillTotal.WithLabelValues("failed").Inc()
 			b.logger.Warn("quota backfill: failed to re-apply quota",
 				"volume", name, "size_mb", sizeMB, "error", cerr)
+			reconcileErrs = append(reconcileErrs, fmt.Errorf(
+				"enforce %s quota for managed volume %q: %w", b.volumes.Kind(), name, cerr,
+			))
 			continue
 		}
 		applied++
@@ -153,4 +185,5 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) {
 		b.logger.Info("volume quota backfill complete", "backend", b.volumes.Kind(),
 			"applied", applied, "failed", failed, "expected_absent", absent)
 	}
+	return errors.Join(reconcileErrs...)
 }

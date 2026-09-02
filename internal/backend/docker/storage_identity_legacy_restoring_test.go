@@ -252,7 +252,7 @@ func TestIntegrationStorageIdentityAdoptionPreflightRejectsUnexplainedManagedVol
 
 	const source = "77777777-7777-4777-8777-777777777777"
 	alreadyDestroyedVolume := "fred-retained-" + source + "-app-0"
-	unexplainedVolume := "fred-unexplained-managed-volume"
+	unexplainedVolume := canonicalVolumeName("99999999-9999-4999-8999-999999999999", "app", 0)
 	require.NoError(t, os.Mkdir(filepath.Join(cfg.VolumeDataPath, unexplainedVolume), 0o700))
 	legacyRow := []byte(`{"original_lease_uuid":"` + source +
 		`","tenant":"tenant-a","provider_uuid":"33333333-3333-4333-8333-333333333333",` +
@@ -490,6 +490,9 @@ func TestReapingLeaseUUIDFromVolumeName(t *testing.T) {
 		{name: "noncanonical UUID", volumeName: "fred-CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC-app-0"},
 		{name: "prefix collision", volumeName: "fred-" + leaseUUID + "x-app-0"},
 		{name: "retained token is not UUID", volumeName: "fred-retained-not-a-lease-app-0"},
+		{name: "leading-zero index", volumeName: "fred-" + leaseUUID + "-app-01"},
+		{name: "invalid service", volumeName: "fred-" + leaseUUID + "-App-0"},
+		{name: "missing suffix", volumeName: "fred-" + leaseUUID + "-"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			gotUUID, gotOK := reapingLeaseUUIDFromVolumeName(test.volumeName)

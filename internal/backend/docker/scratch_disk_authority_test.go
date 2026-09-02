@@ -118,8 +118,9 @@ func TestRestoreDemoteGateUsesPinnedScratch(t *testing.T) {
 
 func TestStorageIdentityAdoptionExplainsDisklessScratchBind(t *testing.T) {
 	root := t.TempDir()
-	volumeName := "fred-lease-a-app-0"
-	mountSource := filepath.Join(root, volumeName, writablePathSubdir, "var-cache-app")
+	const leaseUUID = "11111111-1111-4111-8111-111111111111"
+	volumeName := canonicalVolumeName(leaseUUID, "app", 0)
+	mountSource := filepath.Join(root, volumeName, writablePathSubdir, "var", "cache", "app")
 	require.NoError(t, os.MkdirAll(mountSource, 0o700))
 	cfg := DefaultConfig()
 	cfg.VolumeDataPath = root
@@ -128,8 +129,11 @@ func TestStorageIdentityAdoptionExplainsDisklessScratchBind(t *testing.T) {
 	}
 
 	evidence, err := storageIdentityContainerVolumeEvidence(cfg, []ContainerInfo{{
-		ContainerID: "container-a",
-		SKU:         "diskless",
+		ContainerID:   "container-a",
+		LeaseUUID:     leaseUUID,
+		SKU:           "diskless",
+		ServiceName:   "app",
+		InstanceIndex: 0,
 		Mounts: []ContainerMount{{
 			Source: mountSource,
 			Target: "/var/cache/app",

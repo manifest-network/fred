@@ -846,6 +846,16 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 // record is dropped only on the positive fact that the footprint is gone.
 func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeIndex, orig string) bool {
 	logger := b.logger.With("lease_uuid", orig)
+	if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
+		// A prior raw mutation retained typed recovery evidence and withdrew this
+		// Backend instance. In particular, do not let a fresh inventory hide an
+		// XFS delete-stage and turn "final name absent" into permission to delete
+		// the reaping record. Startup recovery in a fresh process owns the next
+		// classification.
+		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		logger.Error("reaping: backend storage recovery is pending; keeping the record", "error", authorityErr)
+		return false
+	}
 	// owner "" — a tombstone is a scheduled destroy, not an assertion of ownership, so it
 	// is entitled to exactly the volumes NOTHING claims. That also refuses a name a LIVE
 	// provision holds, which is reachable when a tombstoned lease is later re-provisioned

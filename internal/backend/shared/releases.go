@@ -60,9 +60,10 @@ type Release struct {
 	Manifest []byte `json:"manifest"`
 	Image    string `json:"image"`
 	// MaintenanceID identifies the exact restart/update replacement cohort.
-	// Provision/restore and legacy rows omit it. A maintenance ID is immutable
-	// across deploying, active, failed, and superseded states and is also placed
-	// on every replacement container.
+	// Provision/restore rows omit it; a maintenance generation may carry either
+	// current or v0.13 runtime authority. A maintenance ID is immutable across
+	// deploying, active, failed, and superseded states and is also placed on
+	// every replacement container.
 	MaintenanceID MaintenanceID `json:"maintenance_id,omitempty"`
 	// OperationID is the exact causal token of the provision/restore generation
 	// that first committed this release lineage. Maintenance releases preserve it.
@@ -81,12 +82,20 @@ type Release struct {
 	// recovery snapshots the then-current configuration when migrating those
 	// rows so subsequent restarts and closes cannot reprice a live lease.
 	ResourceProfiles []SKUResourceSnapshot `json:"resource_profiles,omitempty"`
-	// RuntimeAuthority is the non-expiring identity needed to reconstruct a
+	// RuntimeAuthority is the current non-expiring identity needed to reconstruct a
 	// terminal lease projection when an exact committed generation has no
 	// surviving containers. It is a nested all-or-nothing snapshot so JSON cannot
 	// represent a partially-authoritative combination of tenant, provider, and
-	// callback routes. Nil is the explicit v0.13/legacy shape.
+	// callback routes. A v0.13 row uses LegacyRuntimeAuthority instead.
 	RuntimeAuthority *ReleaseRuntimeAuthority `json:"runtime_authority,omitempty"`
+	// LegacyRuntimeAuthority is the separately typed, tokenless identity frozen
+	// from a complete v0.13 cohort. It is never interchangeable with
+	// RuntimeAuthority: legacy rows have no OperationID and cannot be granted a
+	// UUID-scoped capability they never received. Persisting this exact pair is
+	// nevertheless required before removing the last legacy container, because
+	// otherwise a later restart could not reconstruct the active release's
+	// principal, callback route, or resource ownership.
+	LegacyRuntimeAuthority *LegacyRuntimeAuthority `json:"legacy_runtime_authority,omitempty"`
 	// LegacyMigration identifies a release produced by Docker's one-time
 	// legacy-to-Compose migration. It remains durable cleanup authority even when
 	// a later update supersedes this release: Deprovision consumes the original
@@ -117,6 +126,114 @@ type releaseRuntimeAuthorityJSON struct {
 	ProviderUUID         string `json:"provider_uuid"`
 	CallbackURL          string `json:"callback_url"`
 	LifecycleCallbackURL string `json:"lifecycle_callback_url"`
+}
+
+// LegacyRuntimeAuthority is an immutable, tokenless v0.13 runtime identity.
+// Its zero value is invalid and all fields are private so a caller cannot mix a
+// principal from one cohort with callback authority from another.
+type LegacyRuntimeAuthority struct {
+	tenant               string
+	providerUUID         string
+	callbackURL          string
+	lifecycleCallbackURL string
+	valid                bool
+}
+
+type legacyRuntimeAuthorityJSON struct {
+	Tenant               string `json:"tenant"`
+	ProviderUUID         string `json:"provider_uuid"`
+	CallbackURL          string `json:"callback_url"`
+	LifecycleCallbackURL string `json:"lifecycle_callback_url"`
+}
+
+// NewLegacyRuntimeAuthority validates and freezes one coherent tokenless
+// operation/lifecycle callback pair. Typed callback identities are rejected:
+// they belong in ReleaseRuntimeAuthority together with their OperationID.
+func NewLegacyRuntimeAuthority(
+	tenant, providerUUID, callbackURL, lifecycleCallbackURL string,
+) (LegacyRuntimeAuthority, error) {
+	if tenant == "" || providerUUID == "" || callbackURL == "" {
+		return LegacyRuntimeAuthority{}, errors.New("legacy runtime authority must be complete")
+	}
+	if !backend.IsCanonicalLeaseUUID(providerUUID) {
+		return LegacyRuntimeAuthority{}, errors.New("legacy runtime authority provider UUID is not canonical")
+	}
+	resolvedLifecycle, err := backend.ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL)
+	if err != nil {
+		return LegacyRuntimeAuthority{}, fmt.Errorf("legacy runtime authority callback pair: %w", err)
+	}
+	observation := backend.ObserveLifecycleGeneration(callbackURL, resolvedLifecycle)
+	if observation.Kind != backend.LifecycleGenerationLegacy {
+		return LegacyRuntimeAuthority{}, errors.New("legacy runtime authority callback pair is not tokenless")
+	}
+	return LegacyRuntimeAuthority{
+		tenant:               tenant,
+		providerUUID:         providerUUID,
+		callbackURL:          callbackURL,
+		lifecycleCallbackURL: resolvedLifecycle,
+		valid:                true,
+	}, nil
+}
+
+func (authority LegacyRuntimeAuthority) Tenant() string {
+	if !authority.valid {
+		return ""
+	}
+	return authority.tenant
+}
+
+func (authority LegacyRuntimeAuthority) ProviderUUID() string {
+	if !authority.valid {
+		return ""
+	}
+	return authority.providerUUID
+}
+
+func (authority LegacyRuntimeAuthority) CallbackURL() string {
+	if !authority.valid {
+		return ""
+	}
+	return authority.callbackURL
+}
+
+func (authority LegacyRuntimeAuthority) LifecycleCallbackURL() string {
+	if !authority.valid {
+		return ""
+	}
+	return authority.lifecycleCallbackURL
+}
+
+func (authority LegacyRuntimeAuthority) MarshalJSON() ([]byte, error) {
+	if !authority.valid {
+		return nil, errors.New("legacy runtime authority is invalid")
+	}
+	return json.Marshal(legacyRuntimeAuthorityJSON{
+		Tenant:               authority.tenant,
+		ProviderUUID:         authority.providerUUID,
+		CallbackURL:          authority.callbackURL,
+		LifecycleCallbackURL: authority.lifecycleCallbackURL,
+	})
+}
+
+func (authority *LegacyRuntimeAuthority) UnmarshalJSON(data []byte) error {
+	if authority == nil {
+		return errors.New("legacy runtime authority destination is nil")
+	}
+	var wire legacyRuntimeAuthorityJSON
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	parsed, err := NewLegacyRuntimeAuthority(
+		wire.Tenant,
+		wire.ProviderUUID,
+		wire.CallbackURL,
+		wire.LifecycleCallbackURL,
+	)
+	if err != nil {
+		return err
+	}
+	*authority = parsed
+	return nil
 }
 
 // NewReleaseRuntimeAuthority constructs the immutable runtime identity paired
@@ -394,12 +511,36 @@ func (inspection ReleaseStoreInspection) CheckLegacyActiveAuthorityCapacity(
 	resourceProfiles []SKUResourceSnapshot,
 	class LegacyActiveAuthorityClass,
 ) error {
-	return inspection.checkLegacyActiveAuthorityCapacityWithinLimit(
+	return inspection.checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
 		leaseUUID,
 		expected,
 		items,
 		resourceProfiles,
 		class,
+		nil,
+		backend.MaxStoredReleaseHistoryBytes,
+	)
+}
+
+// CheckLegacyActiveAuthorityAndRuntimeCapacity simulates the complete startup
+// upgrade of a stopped v0.13 Release, including the separately typed tokenless
+// runtime identity. This ensures the offline sealing proof cannot pass only for
+// startup to fail when it persists the additional zero-survivor authority.
+func (inspection ReleaseStoreInspection) CheckLegacyActiveAuthorityAndRuntimeCapacity(
+	leaseUUID string,
+	expected Release,
+	items []backend.LeaseItem,
+	resourceProfiles []SKUResourceSnapshot,
+	class LegacyActiveAuthorityClass,
+	authority LegacyRuntimeAuthority,
+) error {
+	return inspection.checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
+		leaseUUID,
+		expected,
+		items,
+		resourceProfiles,
+		class,
+		&authority,
 		backend.MaxStoredReleaseHistoryBytes,
 	)
 }
@@ -410,6 +551,26 @@ func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityCapacityWithi
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
 	class LegacyActiveAuthorityClass,
+	limitBytes int,
+) error {
+	return inspection.checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
+		leaseUUID,
+		expected,
+		items,
+		resourceProfiles,
+		class,
+		nil,
+		limitBytes,
+	)
+}
+
+func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
+	leaseUUID string,
+	expected Release,
+	items []backend.LeaseItem,
+	resourceProfiles []SKUResourceSnapshot,
+	class LegacyActiveAuthorityClass,
+	authority *LegacyRuntimeAuthority,
 	limitBytes int,
 ) error {
 	if expected.Version <= 0 || expected.Status != "active" {
@@ -439,6 +600,12 @@ func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityCapacityWithi
 	candidate.Items = slices.Clone(items)
 	candidate.ResourceProfiles = CloneSKUResourceSnapshot(resourceProfiles)
 	candidate.LegacyMigration = class == LegacyActiveAuthorityMigration
+	if authority != nil {
+		if !authority.valid {
+			return errors.New("legacy runtime authority is invalid")
+		}
+		candidate.LegacyRuntimeAuthority = cloneLegacyRuntimeAuthority(authority)
+	}
 	if err := validateStoredRelease(candidate); err != nil {
 		return fmt.Errorf("project legacy active release authority: %w", err)
 	}
@@ -843,15 +1010,36 @@ func validateStoredRelease(release Release) error {
 	if release.MaintenanceID != "" && !release.MaintenanceID.Valid() {
 		return errors.New("maintenance ID is not a canonical UUIDv4")
 	}
-	if release.MaintenanceID != "" && release.OperationID == "" {
-		return errors.New("maintenance ID requires a typed operation lineage")
+	if release.MaintenanceID != "" && release.OperationID == "" &&
+		release.LegacyRuntimeAuthority == nil {
+		return errors.New("maintenance ID requires durable runtime authority")
 	}
 	typed := release.OperationID != ""
+	if legacy := release.LegacyRuntimeAuthority; legacy != nil {
+		if !legacy.valid {
+			return errors.New("legacy runtime authority is invalid")
+		}
+		validated, err := NewLegacyRuntimeAuthority(
+			legacy.tenant,
+			legacy.providerUUID,
+			legacy.callbackURL,
+			legacy.lifecycleCallbackURL,
+		)
+		if err != nil {
+			return fmt.Errorf("legacy runtime authority: %w", err)
+		}
+		if validated != *legacy {
+			return errors.New("legacy runtime authority is not canonical")
+		}
+	}
 	if release.OperationID == "" {
 		if release.RuntimeAuthority != nil {
 			return errors.New("legacy release cannot carry runtime authority")
 		}
 	} else {
+		if release.LegacyRuntimeAuthority != nil {
+			return errors.New("typed release cannot carry legacy runtime authority")
+		}
 		if !release.OperationID.Valid() {
 			return errors.New("operation ID is not a canonical UUIDv4")
 		}
@@ -866,6 +1054,9 @@ func validateStoredRelease(release Release) error {
 		if typed {
 			return errors.New("typed release requires exact desired items")
 		}
+		if release.LegacyRuntimeAuthority != nil {
+			return errors.New("legacy runtime authority requires exact desired items")
+		}
 		if len(release.ResourceProfiles) > 0 {
 			return errors.New("resource profiles require desired items")
 		}
@@ -878,6 +1069,9 @@ func validateStoredRelease(release Release) error {
 		return err
 	}
 	if len(release.ResourceProfiles) == 0 {
+		if release.LegacyRuntimeAuthority != nil {
+			return errors.New("legacy runtime authority requires exact resource profiles")
+		}
 		if typed {
 			return errors.New("typed release requires exact resource profiles")
 		}
@@ -1150,10 +1344,19 @@ func cloneRelease(release Release) Release {
 	release.Items = slices.Clone(release.Items)
 	release.ResourceProfiles = CloneSKUResourceSnapshot(release.ResourceProfiles)
 	release.RuntimeAuthority = cloneReleaseRuntimeAuthority(release.RuntimeAuthority)
+	release.LegacyRuntimeAuthority = cloneLegacyRuntimeAuthority(release.LegacyRuntimeAuthority)
 	return release
 }
 
 func cloneReleaseRuntimeAuthority(authority *ReleaseRuntimeAuthority) *ReleaseRuntimeAuthority {
+	if authority == nil {
+		return nil
+	}
+	copy := *authority
+	return &copy
+}
+
+func cloneLegacyRuntimeAuthority(authority *LegacyRuntimeAuthority) *LegacyRuntimeAuthority {
 	if authority == nil {
 		return nil
 	}
@@ -1920,6 +2123,91 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 	})
 }
 
+// BackfillLegacyRuntimeAuthority CAS-persists the exact tokenless principal
+// and callback pair observed on a validated v0.13 active cohort. Callers must
+// complete whole-cohort validation before invoking this method. Once durable,
+// the authority permits recovery to materialize the same active Release after
+// its last container has been safely removed during a replacement attempt.
+//
+// This intentionally does not manufacture an OperationID: the two authority
+// classes remain disjoint on disk and in the type system.
+func (s *ReleaseStore) BackfillLegacyRuntimeAuthority(
+	leaseUUID string,
+	expected Release,
+	authority LegacyRuntimeAuthority,
+) error {
+	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
+		return err
+	}
+	if expected.Version <= 0 || expected.Status != "active" {
+		return errors.New("legacy runtime authority fence must name a positive active version")
+	}
+	if expected.OperationID != "" || expected.RuntimeAuthority != nil ||
+		len(expected.Items) == 0 || len(expected.ResourceProfiles) == 0 {
+		return errors.New("legacy runtime authority fence is not a fully backfilled v0.13 release")
+	}
+	if !authority.valid {
+		return errors.New("legacy runtime authority is invalid")
+	}
+	expected = cloneRelease(expected)
+	durableAuthority := authority
+	return s.update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(releasesBucketName)
+		if bucket == nil {
+			return errors.New("releases bucket missing")
+		}
+		data := bucket.Get([]byte(leaseUUID))
+		if data == nil {
+			return fmt.Errorf("release history for %s no longer exists", leaseUUID)
+		}
+		var releases []Release
+		if err := json.Unmarshal(data, &releases); err != nil {
+			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
+		}
+		if err := validateReleaseHistory(releases); err != nil {
+			return fmt.Errorf("invalid release data for %s: %w", leaseUUID, err)
+		}
+		if err := rejectRawMaintenanceHistoryMutation(releases); err != nil {
+			return err
+		}
+		activeIndex := latestActiveReleaseIndex(releases)
+		if activeIndex < 0 {
+			return fmt.Errorf("active release for %s no longer exists", leaseUUID)
+		}
+		active := &releases[activeIndex]
+		if active.Version != expected.Version || active.Status != expected.Status ||
+			!bytes.Equal(active.Manifest, expected.Manifest) || active.Image != expected.Image ||
+			!active.CreatedAt.Equal(expected.CreatedAt) || active.Error != expected.Error ||
+			active.Reason != expected.Reason || active.Message != expected.Message ||
+			active.OperationID != "" || active.RuntimeAuthority != nil ||
+			active.MaintenanceID != expected.MaintenanceID ||
+			active.LegacyMigration != expected.LegacyMigration ||
+			!slices.Equal(active.Items, expected.Items) ||
+			!slices.Equal(active.ResourceProfiles, expected.ResourceProfiles) {
+			return fmt.Errorf("active release for %s changed before legacy runtime authority backfill", leaseUUID)
+		}
+		if active.LegacyRuntimeAuthority != nil {
+			if *active.LegacyRuntimeAuthority == durableAuthority {
+				return nil
+			}
+			return fmt.Errorf("active release for %s has divergent legacy runtime authority", leaseUUID)
+		}
+		active.LegacyRuntimeAuthority = &durableAuthority
+		if err := validateReleaseHistory(releases); err != nil {
+			return fmt.Errorf("invalid legacy runtime authority for %s: %w", leaseUUID, err)
+		}
+		encoded, err := compactAndEncodeReleaseHistory(
+			releases,
+			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
+			backend.MaxStoredReleaseHistoryBytes,
+		)
+		if err != nil {
+			return fmt.Errorf("marshal legacy runtime authority backfill: %w", err)
+		}
+		return bucket.Put([]byte(leaseUUID), encoded)
+	})
+}
+
 // Latest returns the most recent release for a lease. Returns nil, nil when not found.
 func (s *ReleaseStore) Latest(leaseUUID string) (*Release, error) {
 	releases, err := s.List(leaseUUID)
@@ -2106,44 +2394,49 @@ func (s *ReleaseStore) activateLatestWithinLimit(leaseUUID string, limitBytes in
 	})
 }
 
-// RecordMigration appends an "active" release entry for a recover-time
-// migration so the lease's release history captures the wrap-and-rename
-// step. Idempotent: if the most-recent active entry already carries the
-// same wrapped manifest and desired topology, the call is a no-op. An older
-// manifest-only entry is upgraded in place so migration recovery gains an
-// exact cohort invariant without inflating release history.
+// RecordLegacyMigration appends an "active" release entry for a recover-time
+// v0.13 migration so the lease's release history captures the wrap-and-rename
+// step and its tokenless runtime identity in one commit. Idempotent: if the
+// most-recent active entry already carries the same wrapped manifest, desired
+// topology, and authority, the call is a no-op. An older manifest-only entry is
+// upgraded in place so migration recovery gains an exact cohort invariant
+// without inflating release history.
 //
 // Used exclusively by the docker backend's migrate.go (Task 9).
-func (s *ReleaseStore) RecordMigration(
+func (s *ReleaseStore) RecordLegacyMigration(
 	leaseUUID string,
 	manifest []byte,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
+	authority LegacyRuntimeAuthority,
 ) error {
-	return s.RecordMigrationAt(
+	return s.RecordLegacyMigrationAt(
 		leaseUUID,
 		manifest,
 		items,
 		resourceProfiles,
+		authority,
 		time.Now(),
 	)
 }
 
-// CheckRecordMigrationCapacity proves that the exact migration release can be
-// committed after deterministic history compaction. createdAt must be reused by
-// RecordMigrationAt so the proof and the post-substrate write have identical
-// wire size; Docker calls this before stopping or renaming a legacy cohort.
-func (s *ReleaseStore) CheckRecordMigrationCapacity(
+// CheckRecordLegacyMigrationCapacity proves that the exact migration release,
+// including its runtime authority, can be committed after deterministic history
+// compaction. createdAt must be reused by RecordLegacyMigrationAt so the proof
+// and the post-substrate write have identical wire size; Docker calls this
+// before stopping or renaming a legacy cohort.
+func (s *ReleaseStore) CheckRecordLegacyMigrationCapacity(
 	leaseUUID string,
 	manifest []byte,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
+	authority LegacyRuntimeAuthority,
 	createdAt time.Time,
 ) error {
 	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
 		return err
 	}
-	if err := validateMigrationReleaseInput(items, resourceProfiles, createdAt); err != nil {
+	if err := validateLegacyMigrationReleaseInput(items, resourceProfiles, authority, createdAt); err != nil {
 		return err
 	}
 	durableManifest := slices.Clone(manifest)
@@ -2156,6 +2449,7 @@ func (s *ReleaseStore) CheckRecordMigrationCapacity(
 			durableManifest,
 			durableItems,
 			durableProfiles,
+			authority,
 			createdAt,
 			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
 			backend.MaxStoredReleaseHistoryBytes,
@@ -2164,38 +2458,42 @@ func (s *ReleaseStore) CheckRecordMigrationCapacity(
 	})
 }
 
-// RecordMigrationAt is RecordMigration with an explicit admission timestamp.
+// RecordLegacyMigrationAt is RecordLegacyMigration with an explicit admission
+// timestamp.
 // It exists so the pre-side-effect capacity proof and post-Compose durable
 // commit can describe the exact same release bytes.
-func (s *ReleaseStore) RecordMigrationAt(
+func (s *ReleaseStore) RecordLegacyMigrationAt(
 	leaseUUID string,
 	manifest []byte,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
+	authority LegacyRuntimeAuthority,
 	createdAt time.Time,
 ) error {
-	return s.recordMigrationWithinLimit(
+	return s.recordLegacyMigrationWithinLimit(
 		leaseUUID,
 		manifest,
 		items,
 		resourceProfiles,
+		authority,
 		createdAt,
 		backend.MaxStoredReleaseHistoryBytes,
 	)
 }
 
-func (s *ReleaseStore) recordMigrationWithinLimit(
+func (s *ReleaseStore) recordLegacyMigrationWithinLimit(
 	leaseUUID string,
 	manifest []byte,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
+	authority LegacyRuntimeAuthority,
 	createdAt time.Time,
 	limitBytes int,
 ) error {
 	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
 		return err
 	}
-	if err := validateMigrationReleaseInput(items, resourceProfiles, createdAt); err != nil {
+	if err := validateLegacyMigrationReleaseInput(items, resourceProfiles, authority, createdAt); err != nil {
 		return err
 	}
 	durableManifest := slices.Clone(manifest)
@@ -2209,6 +2507,7 @@ func (s *ReleaseStore) recordMigrationWithinLimit(
 			durableManifest,
 			durableItems,
 			durableProfiles,
+			authority,
 			createdAt,
 			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
 			limitBytes,
@@ -2227,9 +2526,10 @@ func (s *ReleaseStore) recordMigrationWithinLimit(
 	})
 }
 
-func validateMigrationReleaseInput(
+func validateLegacyMigrationReleaseInput(
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
+	authority LegacyRuntimeAuthority,
 	createdAt time.Time,
 ) error {
 	if len(items) == 0 {
@@ -2237,6 +2537,9 @@ func validateMigrationReleaseInput(
 	}
 	if err := ValidateSKUResourceSnapshot(items, resourceProfiles); err != nil {
 		return fmt.Errorf("migration release resource profiles: %w", err)
+	}
+	if !authority.valid {
+		return errors.New("migration release requires valid legacy runtime authority")
 	}
 	if createdAt.IsZero() {
 		return errors.New("migration release requires an admission timestamp")
@@ -2250,6 +2553,7 @@ func planMigrationReleaseHistory(
 	manifest []byte,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
+	authority LegacyRuntimeAuthority,
 	createdAt time.Time,
 	cutoff time.Time,
 	limitBytes int,
@@ -2269,6 +2573,12 @@ func planMigrationReleaseHistory(
 
 	latestActive := latestActiveReleaseIndex(releases)
 	if latestActive >= 0 && bytes.Equal(releases[latestActive].Manifest, manifest) {
+		if releases[latestActive].OperationID != "" || releases[latestActive].RuntimeAuthority != nil {
+			return nil, false, fmt.Errorf("active migration release for %s has typed runtime authority", leaseUUID)
+		}
+		if existing := releases[latestActive].LegacyRuntimeAuthority; existing != nil && *existing != authority {
+			return nil, false, fmt.Errorf("active migration release for %s has divergent legacy runtime authority", leaseUUID)
+		}
 		if len(releases[latestActive].Items) != 0 &&
 			!slices.Equal(releases[latestActive].Items, items) {
 			return nil, false, fmt.Errorf("active migration release for %s has divergent desired items", leaseUUID)
@@ -2279,12 +2589,14 @@ func planMigrationReleaseHistory(
 		}
 		if slices.Equal(releases[latestActive].Items, items) &&
 			slices.Equal(releases[latestActive].ResourceProfiles, resourceProfiles) &&
-			releases[latestActive].LegacyMigration {
+			releases[latestActive].LegacyMigration &&
+			releases[latestActive].LegacyRuntimeAuthority != nil {
 			return releases, false, nil
 		}
 		releases[latestActive].Items = slices.Clone(items)
 		releases[latestActive].ResourceProfiles = CloneSKUResourceSnapshot(resourceProfiles)
 		releases[latestActive].LegacyMigration = true
+		releases[latestActive].LegacyRuntimeAuthority = cloneLegacyRuntimeAuthority(&authority)
 	} else {
 		for index := range releases {
 			if releases[index].Status == "active" {
@@ -2292,14 +2604,15 @@ func planMigrationReleaseHistory(
 			}
 		}
 		releases = append(releases, Release{
-			Version:          maxVersion(releases) + 1,
-			Manifest:         slices.Clone(manifest),
-			Image:            "stack",
-			Items:            slices.Clone(items),
-			ResourceProfiles: CloneSKUResourceSnapshot(resourceProfiles),
-			LegacyMigration:  true,
-			Status:           "active",
-			CreatedAt:        createdAt,
+			Version:                maxVersion(releases) + 1,
+			Manifest:               slices.Clone(manifest),
+			Image:                  "stack",
+			Items:                  slices.Clone(items),
+			ResourceProfiles:       CloneSKUResourceSnapshot(resourceProfiles),
+			LegacyRuntimeAuthority: cloneLegacyRuntimeAuthority(&authority),
+			LegacyMigration:        true,
+			Status:                 "active",
+			CreatedAt:              createdAt,
 		})
 	}
 	if err := validateReleaseHistory(releases); err != nil {

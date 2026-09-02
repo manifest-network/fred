@@ -16,11 +16,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 
 	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/fsidentity"
 )
 
 // storageMutationAdapters is deliberately held by Backend instead of passed
@@ -29,6 +32,217 @@ import (
 // retain a raw Docker/Compose/volume mutation method across an actor wait.
 type storageMutationAdapters struct {
 	backend *Backend
+}
+
+// newBackendStorageAuthorityLifetime binds terminal storage withdrawal to both
+// backend-worker cancellation and one daemon-visible failure notification. The
+// first-error channel has capacity one and the hook never blocks: it can run at
+// the end of an identity-bound bbolt commit and must not introduce a dependency
+// on the HTTP server's receive loop.
+func newBackendStorageAuthorityLifetime() (
+	context.Context,
+	context.CancelFunc,
+	<-chan error,
+	*backendidentity.StorageAuthorityGate,
+	error,
+) {
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	terminalFailure := make(chan error, 1)
+	gate, err := backendidentity.NewStorageAuthorityGate(func(cause error) {
+		select {
+		case terminalFailure <- cause:
+		default:
+		}
+		stopCancel()
+	})
+	if err != nil {
+		stopCancel()
+		return nil, nil, nil, nil, err
+	}
+	return stopCtx, stopCancel, terminalFailure, gate, nil
+}
+
+// storagePathComponent is a single, relative filesystem name that has crossed
+// the storage mutation boundary's lexical validation. Keeping it distinct from
+// string prevents a request- or store-derived identifier from being handed to
+// a destructive filesystem primitive without first proving that it cannot
+// carry path traversal syntax.
+type storagePathComponent string
+
+// parseStoragePathComponent validates one filesystem component. The explicit
+// slash and ".." checks are deliberately stricter than filepath.IsLocal: fred's
+// managed storage names never need either spelling, and rejecting both slash
+// forms keeps the token safe if a database is moved between Unix and Windows.
+func parseStoragePathComponent(value string) (storagePathComponent, error) {
+	switch {
+	case value == "":
+		return "", errors.New("storage path component is empty")
+	case value == ".", value == "..":
+		return "", fmt.Errorf("storage path component is reserved: %q", value)
+	case !filepath.IsLocal(value), filepath.IsAbs(value):
+		return "", fmt.Errorf("storage path component is not local: %q", value)
+	case filepath.Clean(value) != value, filepath.Base(value) != value:
+		return "", fmt.Errorf("storage path component is not a single clean name: %q", value)
+	case strings.ContainsAny(value, `/\\`), strings.Contains(value, ".."), strings.ContainsRune(value, 0):
+		return "", fmt.Errorf("storage path component contains reserved path syntax: %q", value)
+	default:
+		return storagePathComponent(value), nil
+	}
+}
+
+func openAttestedManagedVolumeRoot(root *os.Root, volumeID managedVolumeName) (*os.Root, error) {
+	before, err := root.Lstat(volumeID.value())
+	if err != nil {
+		return nil, err
+	}
+	if !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("managed volume entry %q is not a real directory", volumeID.value())
+	}
+	volumeRoot, err := root.OpenRoot(volumeID.value())
+	if err != nil {
+		return nil, err
+	}
+	after, err := volumeRoot.Stat(".")
+	if err != nil {
+		_ = volumeRoot.Close()
+		return nil, err
+	}
+	if !os.SameFile(before, after) {
+		_ = volumeRoot.Close()
+		return nil, fmt.Errorf("managed volume entry %q changed while opening it", volumeID.value())
+	}
+	return volumeRoot, nil
+}
+
+// removeManagedVolumeSubtree performs recursive deletion under an attested
+// managed-volume descriptor. Opening the volume first is load-bearing: rooting
+// one combined "volume/_wp" path at volume_data_path would still permit the
+// volume component to be an in-root symlink to another tenant's volume.
+func removeManagedVolumeSubtree(rootPath string, volumeID managedVolumeName, subtree storagePathComponent) error {
+	validatedSubtree, err := parseStoragePathComponent(string(subtree))
+	if err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return fmt.Errorf("open storage root %q: %w", rootPath, err)
+	}
+	defer func() { _ = root.Close() }()
+	volumeRoot, err := openAttestedManagedVolumeRoot(root, volumeID)
+	if err != nil {
+		return fmt.Errorf("open managed volume %q: %w", volumeID.value(), err)
+	}
+	defer func() { _ = volumeRoot.Close() }()
+	if err := volumeRoot.RemoveAll(string(validatedSubtree)); err != nil {
+		return fmt.Errorf("remove subtree %q from managed volume %q: %w", validatedSubtree, volumeID.value(), err)
+	}
+	return nil
+}
+
+func managedDirectoryExistsAtRoot(root *os.Root, name managedVolumeName) (bool, error) {
+	info, err := root.Lstat(name.value())
+	if err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return false, fmt.Errorf("managed volume entry %q is not a real directory", name.value())
+		}
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+// renameAtStorageRoot atomically renames one exact managed-volume entry under
+// an open root descriptor. Both the source and destination are typed names;
+// Lstat rejects symlinks and non-directory collisions before the rename, while
+// os.Root prevents either lookup from escaping if an ancestor changes.
+//
+// Idempotency semantics:
+//   - neither exists  -> error
+//   - only old exists -> rename
+//   - only new exists -> nil (a previous attempt already renamed it)
+//   - both exist      -> error (never merge or pick a winner)
+func renameAtStorageRoot(ctx context.Context, rootPath string, oldName, newName managedVolumeName) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	root, err := fsidentity.OpenDirectory(rootPath)
+	if err != nil {
+		return fmt.Errorf("open storage root %q: %w", rootPath, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	entryIsRealDirectory := func(name managedVolumeName) (bool, error) {
+		info, statErr := root.Lstat(name.value())
+		if statErr == nil {
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return false, fmt.Errorf("managed volume entry %q is not a real directory", name.value())
+			}
+			return true, nil
+		}
+		if errors.Is(statErr, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, statErr
+	}
+	oldExists, err := entryIsRealDirectory(oldName)
+	if err != nil {
+		return fmt.Errorf("stat old managed volume %q: %w", oldName.value(), err)
+	}
+	newExists, err := entryIsRealDirectory(newName)
+	if err != nil {
+		return fmt.Errorf("stat new managed volume %q: %w", newName.value(), err)
+	}
+	switch {
+	case !oldExists && newExists:
+		return nil
+	case oldExists && newExists:
+		return fmt.Errorf("both old (%s) and new (%s) volume paths exist; manual intervention required",
+			oldName.hostPath(rootPath), newName.hostPath(rootPath))
+	case !oldExists && !newExists:
+		return fmt.Errorf("neither old (%s) nor new (%s) volume path exists",
+			oldName.hostPath(rootPath), newName.hostPath(rootPath))
+	}
+	// The no-replace flag is the mutation-time authority. A stat-then-Rename
+	// sequence can overwrite a destination created after the check (an empty
+	// directory is replaceable on Linux); RENAME_NOREPLACE makes that race fail
+	// closed in the kernel while retaining the same pinned parent descriptor.
+	if err := root.RenameNoReplace(oldName.value(), newName.value()); err != nil {
+		return fmt.Errorf("rename managed volume %q to %q: %w", oldName.value(), newName.value(), err)
+	}
+	return nil
+}
+
+// writablePathVolumeComponent proves that path is exactly
+// {volumeRoot}/{managed-volume}/_wp. It returns only the managed volume token;
+// the eventual deletion path is reconstructed from that token and the fixed
+// _wp component rather than reusing the caller-supplied path.
+func writablePathVolumeComponent(volumeRoot, path string) (managedVolumeName, error) {
+	if volumeRoot == "" || !filepath.IsAbs(volumeRoot) || filepath.Clean(volumeRoot) != volumeRoot {
+		return "", fmt.Errorf("volume root must be a non-empty clean absolute path: %q", volumeRoot)
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", fmt.Errorf("writable-path cleanup target must be a clean absolute path: %q", path)
+	}
+
+	relative, err := filepath.Rel(volumeRoot, path)
+	if err != nil {
+		return "", fmt.Errorf("resolve writable-path cleanup target relative to volume root: %w", err)
+	}
+	if !filepath.IsLocal(relative) || filepath.Clean(relative) != relative {
+		return "", fmt.Errorf("writable-path cleanup target escapes volume root: %q", path)
+	}
+	if filepath.Base(relative) != writablePathSubdir {
+		return "", fmt.Errorf("writable-path cleanup target must end in %q: %q", writablePathSubdir, path)
+	}
+
+	volumeName := filepath.Dir(relative)
+	component, err := parseManagedVolumeName(volumeName)
+	if err != nil {
+		return "", fmt.Errorf("validate writable-path cleanup volume: %w", err)
+	}
+	return component, nil
 }
 
 // mutationAdapter supports the small number of package tests which construct a
@@ -211,6 +425,15 @@ func (m storageMutationAdapters) completeMutation(ctx context.Context, operation
 		postcheckErr = m.backend.latchAmbiguousOperationOutcome(
 			operation+" post-mutation storage verification", postcheckErr,
 		)
+	} else if errors.Is(mutationErr, backendidentity.ErrMutationOutcomeAmbiguous) ||
+		errors.Is(mutationErr, ErrVolumeMutationRecoveryPending) {
+		// A manager can prove that a side effect reached its live name while its
+		// durability acknowledgement remained unknown (for example, XFS rename
+		// succeeded but the parent-directory fsync failed), or retain a durable
+		// cleanup capability after a known-incomplete delete. The identity
+		// postcheck cannot consume either recovery obligation, so preserve the
+		// manager's typed cause and fail-stop exactly as for a failed postcheck.
+		mutationErr = m.backend.latchAmbiguousOperationOutcome(operation, mutationErr)
 	}
 	return errors.Join(mutationErr, postcheckErr)
 }
@@ -348,6 +571,16 @@ func (m storageMutationAdapters) createVolume(ctx context.Context, id string, si
 	return hostPath, created, m.completeMutation(ctx, "create volume", mutationErr)
 }
 
+func (m storageMutationAdapters) recoverInterruptedVolumeMutations(ctx context.Context) error {
+	ctx, done, err := m.authorize(ctx, "recover interrupted volume mutations")
+	if err != nil {
+		return err
+	}
+	defer done()
+	mutationErr := m.backend.volumes.RecoverInterruptedVolumeMutations(ctx)
+	return m.completeMutation(ctx, "recover interrupted volume mutations", mutationErr)
+}
+
 func (m storageMutationAdapters) destroyVolume(ctx context.Context, sink volumeDestroyer, id string) error {
 	ctx, done, err := m.authorize(ctx, "destroy volume")
 	if err != nil {
@@ -390,7 +623,15 @@ func (m storageMutationAdapters) removePath(ctx context.Context, path string) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	mutationErr := os.RemoveAll(path)
+	volume, err := writablePathVolumeComponent(m.backend.cfg.VolumeDataPath, path)
+	if err != nil {
+		return err
+	}
+	wpComponent, err := parseStoragePathComponent(writablePathSubdir)
+	if err != nil {
+		return fmt.Errorf("validate writable-path directory name: %w", err)
+	}
+	mutationErr := removeManagedVolumeSubtree(m.backend.cfg.VolumeDataPath, volume, wpComponent)
 	return m.completeMutation(ctx, "remove tenant path", mutationErr)
 }
 

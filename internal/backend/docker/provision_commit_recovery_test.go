@@ -211,10 +211,15 @@ func TestRecoverCommittedProvisionAfterRestart(t *testing.T) {
 
 func TestRecoverProvisionDoesNotCommitFromAnotherReleaseGeneration(t *testing.T) {
 	for _, tt := range []struct {
-		name        string
-		operationID shared.OperationID
+		name                  string
+		operationID           shared.OperationID
+		expectUnresolvedError string
 	}{
-		{name: "legacy empty operation ID", operationID: ""},
+		{
+			name:                  "legacy empty operation ID",
+			operationID:           "",
+			expectUnresolvedError: "legacy predecessor has no durable runtime authority",
+		},
 		{name: "different operation ID", operationID: "9a72fbc1-38c8-4f31-87f7-f689979b9324"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -248,16 +253,54 @@ func TestRecoverProvisionDoesNotCommitFromAnotherReleaseGeneration(t *testing.T)
 				CreatedAt:        time.Now(),
 			}))
 
+			committed, err := b.operationIntentHasCommittedRelease(admission.Claim)
+			require.NoError(t, err)
+			assert.False(t, committed, "another generation must not commit the pending operation")
+
 			require.NoError(t, b.recoverState(context.Background()))
-			_, err = b.GetProvision(context.Background(), spec.LeaseUUID)
-			require.ErrorIs(t, err, backend.ErrNotProvisioned,
-				"another generation must not manufacture runtime authority")
-			require.NoError(t, b.recoverOperationIntents(context.Background(), nil))
+			candidate, err := b.GetProvision(context.Background(), spec.LeaseUUID)
+			require.NoError(t, err)
+			assert.Equal(t, backend.ProvisionStatusProvisioning, candidate.Status)
+			assert.Equal(t, admission.Claim.EffectiveItems(), candidate.Items)
+			b.provisionsMu.RLock()
+			candidateCallbackURL := b.provisions[spec.LeaseUUID].CallbackURL
+			b.provisionsMu.RUnlock()
+			assert.Equal(t, spec.CallbackURL, candidateCallbackURL,
+				"the temporary cleanup projection must come from the pending intent")
+
+			recoveryErr := b.recoverOperationIntents(context.Background(), nil)
+			if tt.expectUnresolvedError != "" {
+				require.ErrorContains(t, recoveryErr, tt.expectUnresolvedError)
+				intents, listErr := stores.callbacks.ListOperationIntents()
+				require.NoError(t, listErr)
+				require.Len(t, intents, 1,
+					"ambiguous legacy authority must retain the exact operation evidence")
+				pending, listErr := stores.callbacks.ListPending()
+				require.NoError(t, listErr)
+				assert.Empty(t, pending)
+				return
+			}
+			require.NoError(t, recoveryErr)
 			pending, err := stores.callbacks.ListPending()
 			require.NoError(t, err)
 			require.Len(t, pending, 1)
 			assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
 			assert.Equal(t, interruptedOperationFailure, pending[0].Error)
+
+			recovered, err := b.GetProvision(context.Background(), spec.LeaseUUID)
+			require.NoError(t, err)
+			assert.Equal(t, backend.ProvisionStatusFailed, recovered.Status)
+			b.provisionsMu.RLock()
+			recoveredCallbackURL := b.provisions[spec.LeaseUUID].CallbackURL
+			b.provisionsMu.RUnlock()
+			assert.Equal(t, runtimeAuthority.CallbackURL(), recoveredCallbackURL,
+				"failed candidate recovery must restore the older release authority")
+			assert.NotEqual(t, spec.CallbackURL, recoveredCallbackURL)
+			active, err := stores.releases.LatestActive(spec.LeaseUUID)
+			require.NoError(t, err)
+			require.NotNil(t, active)
+			assert.Equal(t, tt.operationID, active.OperationID,
+				"failure settlement must not append a candidate release")
 		})
 	}
 }

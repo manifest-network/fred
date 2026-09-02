@@ -464,9 +464,10 @@ func sortInstancesByIndex(xs []legacyMigrationInstance) {
 //  4. Compose.Up. Creates N stack-form containers in one shot.
 //  5. Wait for ready (verifyStartup, bounded by
 //     b.cfg.MigrationReadyTimeout).
-//  6. RecordMigration on the release store so the next boot sees both the
-//     wrapped manifest and exact desired cohort. This durable commit is a
-//     prerequisite for declaring the migrated substrate authoritative.
+//  6. RecordLegacyMigration on the release store so the next boot sees the
+//     wrapped manifest, exact desired cohort, and tokenless runtime authority
+//     in one commit. This durable commit is a prerequisite for declaring the
+//     migrated substrate authoritative.
 //  7. Schedule tracked background removal of all `-prev` containers after
 //     b.cfg.MigrationGracePeriod — preserves rollback inspection potential
 //     without blocking startup.
@@ -483,14 +484,14 @@ func sortInstancesByIndex(xs []legacyMigrationInstance) {
 //     partially renamed. The planner deliberately includes `-prev` legacy
 //     containers; the next boot skips the completed rename, repeats the
 //     idempotent volume moves, and converges Compose Up.
-//   - **Boundary 3 (after compose.Up, before RecordMigration):** new
+//   - **Boundary 3 (after compose.Up, before RecordLegacyMigration):** new
 //     stack containers exist alongside `-prev` containers. The release
 //     store still has the legacy active entry, so the next boot will
 //     re-plan. The volume renames are already idempotent (the rename
 //     tolerance below skips already-renamed paths). Compose.Up is
 //     idempotent on container name. Resumable, but the operator may
 //     see two generations of containers transiently.
-//   - **Boundary 4 (after RecordMigration, before grace-window removal):**
+//   - **Boundary 4 (after RecordLegacyMigration, before grace-window removal):**
 //     forward progress is durable. A restart rediscovers `-prev`, revalidates
 //     the idempotent migration, and schedules tracked cleanup again.
 func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration, logger *slog.Logger) error {
@@ -507,6 +508,15 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 	legacyCallbackURL, lifecycleCallbackURL, err := resolveLegacyMigrationCallbackURLs(m.Instances)
 	if err != nil {
 		return fmt.Errorf("resolve legacy callback routes: %w", err)
+	}
+	legacyRuntimeAuthority, err := shared.NewLegacyRuntimeAuthority(
+		m.Tenant,
+		m.ProviderUUID,
+		legacyCallbackURL,
+		lifecycleCallbackURL,
+	)
+	if err != nil {
+		return fmt.Errorf("freeze legacy migration runtime authority: %w", err)
 	}
 
 	svc := m.Stack.Services[manifest.DefaultServiceName]
@@ -548,11 +558,12 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 		return fmt.Errorf("marshal wrapped migration manifest: %w", err)
 	}
 	migrationCreatedAt := time.Now()
-	if err := capacityPlanner.CheckRecordMigrationCapacity(
+	if err := capacityPlanner.CheckRecordLegacyMigrationCapacity(
 		m.LeaseUUID,
 		migrationManifest,
 		items,
 		resourceProfiles,
+		legacyRuntimeAuthority,
 		migrationCreatedAt,
 	); err != nil {
 		return fmt.Errorf("reserve migration release capacity: %w", err)
@@ -675,15 +686,17 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 		return fmt.Errorf("wait for ready: %w", err)
 	}
 
-	// 6. Persist the wrapped manifest and exact migrated cohort before removing
-	// any rollback evidence. A persistence failure is not success: keep every
-	// `-prev` container and fail startup so the next boot/operator can recover
-	// from both generations rather than silently accepting an unrecorded cohort.
-	if err := b.releaseStore.RecordMigrationAt(
+	// 6. Persist the wrapped manifest, exact migrated cohort, and the tokenless
+	// runtime authority proven before Stop in one transaction before removing any
+	// rollback evidence. A persistence failure is not success: keep every `-prev`
+	// container and fail startup so the next boot/operator can recover from both
+	// generations rather than silently accepting an unrecorded cohort.
+	if err := b.releaseStore.RecordLegacyMigrationAt(
 		m.LeaseUUID,
 		migrationManifest,
 		items,
 		resourceProfiles,
+		legacyRuntimeAuthority,
 		migrationCreatedAt,
 	); err != nil {
 		return fmt.Errorf("record migration release: %w", err)

@@ -718,6 +718,7 @@ func TestIntegration_Docker_ContainerKilled_Detected(t *testing.T) {
 
 	ctx := context.Background()
 	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -727,12 +728,13 @@ func TestIntegration_Docker_ContainerKilled_Detected(t *testing.T) {
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -774,6 +776,7 @@ func TestIntegration_Docker_MultiContainer_PartialKill(t *testing.T) {
 
 	ctx := context.Background()
 	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -784,12 +787,13 @@ func TestIntegration_Docker_MultiContainer_PartialKill(t *testing.T) {
 
 	// Provision with Quantity: 2
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -950,6 +954,7 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	})
 
 	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -959,12 +964,13 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -1043,6 +1049,7 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	})
 
 	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer1.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
@@ -1052,12 +1059,13 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	require.NoError(t, err)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer1.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2424,15 +2432,17 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// Provision with stateful SKU (docker-small has DiskMB > 0)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2451,7 +2461,7 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	// Restart
 	err = b.Restart(ctx, backend.RestartRequest{
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	})
 	require.NoError(t, err)
 
@@ -2497,15 +2507,17 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	// Provision with stateful SKU (docker-small has DiskMB > 0)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -2531,7 +2543,7 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 
 	err = b.Update(ctx, backend.UpdateRequest{
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)

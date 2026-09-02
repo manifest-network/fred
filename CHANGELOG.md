@@ -194,10 +194,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Deployment and backend guidance now records the read-only ENG-632 fleet
+  inventory as of 2026-09-02: the serving production tenant fleet uses
+  `docker-backend` on XFS. K3s remains a non-functional scaffold, while Btrfs
+  and ZFS have automated coverage but are neither deployed nor
+  production-validated. The mandatory cutover gate therefore targets Docker on
+  XFS and requires re-inventory immediately before rollout; local development
+  is outside that production gate. (ENG-632)
 - Durable callback, operation, and close journals tolerate a backward
   wall-clock correction when their existing rows are read after restart. New
   callback writes still reject timestamps beyond the allowed future-skew
   bound, so clock rollback recovery does not weaken future-time admission.
+- Docker storage-identity preflight and initialization now share the
+  `-storage-identity-operation-timeout` cancellation deadline (default `10m`)
+  across context-aware Docker and filesystem-control-plane probes. The deadline
+  is cooperative, not a hard wall-clock interrupt for blocking local
+  open/bbolt/fsync work. Expiry makes the command unsuccessful but is not proof
+  of rollback: initialization may have left its crash-resumable pending state or
+  completed the seal before a later check observed cancellation. Keep the
+  lineage stopped and rerun the same mode against unchanged input, requiring
+  its exact success verdict. (ENG-632)
 - **Breaking production configuration:** each `backends[]` entry now requires a
   unique `hmac_secret` of at least 32 bytes matching only that backend's
   `callback_secret`; duplicate keys are rejected. The provider's top-level
@@ -361,16 +377,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   lifecycle callback pair. A crash after the Release commit but before callback
   enqueue therefore settles the exact operation as success; exited or zero
   survivors recover as Failed with the complete conservative reservation, and a
-  second restart retains the same lifecycle/close authority. Empty operation ID
-  plus absent authority remains the only accepted v0.13 shape; partial or
-  divergent typed authority fails closed. Restart/Update callback moves stay
+  second restart retains the same lifecycle/close authority. A complete
+  callback-bearing v0.13 cohort is CAS-fenced with a disjoint tokenless
+  `LegacyRuntimeAuthority`; an authorityless v0.13 row is accepted only as
+  pre-backfill upgrade input. Partial, mixed-class, or divergent authority fails
+  closed. Restart/Update callback moves stay
   pending until the replacement succeeds, so preflight failure or rollback keeps
   the prior committed runtime route. (ENG-632)
 - Docker release history now has a 32 MiB encoded per-lease contract. Every
   mutator transactionally preserves the index-latest, most recent active, and
   newest legacy-migration authority while pruning expired disposable audit rows
   before the oldest fresh ones. Provision, restore, and legacy migration prove
-  exact terminal capacity before their first substrate side effect; a protected
+  exact terminal capacity before their first substrate side effect; legacy
+  migration includes its tokenless principal and callback authority in that
+  proof and in the atomic post-health Release commit before rollback cleanup is
+  scheduled. A protected
   history that cannot fit is refused without mutation. Runtime health streams
   the fleet without the stopped cutover's 256 MiB aggregate ceiling, and the
   release client uses a 48 MiB projected-response budget. (ENG-632)
@@ -537,7 +558,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   During the stopped cutover, update and start backends before providerd: new
   backends understand callback state inherited in the old tokenless shape,
   while a v0.13 backend cannot preserve the separate lifecycle route sent by a
-  new provider.
+  new provider. Docker now freezes every complete callback-bearing v0.13 cohort into a distinct
+  zero-value-invalid `LegacyRuntimeAuthority` before any operation may remove
+  its last container. That durable principal, tokenless callback pair, manifest,
+  item topology, and resource snapshot permit zero-survivor recovery and keep
+  the first restart, update, or custom-domain redeploy operational after the
+  cutover. The first and every subsequent restart, update, or custom-domain
+  replacement stays legacy and tokenless; its UUIDv4 `maintenance_id` is exact
+  replacement WAL/cohort identity, not provider callback authority. Only a
+  later genuine provision or restore rotates the lifecycle to typed authority.
+  Active callbackless pre-label cohorts are rejected by mandatory stopped
+  adoption because provider callback authority cannot be minted safely;
+  historical callbackless cleanup/close evidence remains readable but does not
+  authorize zero-survivor recovery or maintenance.
   (ENG-632)
 - The callback JSON `backend` field remains optional metrics-only sender
   metadata for v0.13 compatibility. It need not equal Fred's durable router
@@ -588,18 +621,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `web-0`). Compose PS attribution uses the same exact generated-key map instead
   of numeric-prefix parsing, so valid services such as `web-01` and `web-999`
   cannot be misclassified as scaled `web` instances. (ENG-632)
+- Docker startup quota reconciliation now attempts every expected present live
+  or retained volume and then fails startup/readiness on any inventory,
+  immutable-resource-authority, or quota-enforcement error. A truly fresh XFS
+  root does not need `CAP_FOWNER`, but an existing tree may need it for recursive
+  project-ID re-tagging; the backend no longer serves while a known tenant
+  volume may remain uncapped. (ENG-632)
+- XFS volume creation now prepares a parent-synced, typed hidden stage carrying
+  the nonzero project ID and final managed name, writes and syncs its marker,
+  applies the project tag and limits, and only then publishes the final name with
+  no-replace rename. Startup treats a recovered stage as cleanup-only because
+  the original requested quota is not durable: it clears the dquot and removes
+  only an empty stage or one whose sole no-follow regular marker is at most ten
+  bytes. The marker may be empty, partial, or zero-filled after a crash; the
+  parent-synced typed stage name remains cleanup authority, while publication
+  still requires the complete marker to parse and match that name. Runtime
+  errors after stage durability attempt exact compensation; the external quota
+  clear uses a detached cleanup context capped at 30 seconds and by any earlier
+  aggregate parent deadline. A failed or ambiguous cleanup preserves the stage,
+  withdraws storage authority, gracefully drains a running docker-backend, and
+  exits status 1 so its supervisor runs a fresh `Start` before readiness. A
+  failure discovered by `Start` exits 1 before listener bind. A persistent
+  fault therefore crash-loops closed. An exact unmounted ZFS managed
+  child is likewise preserved and remounted/re-attested on normal sealed
+  startup rather than destroyed. Read-only preflight and storage-identity
+  initialization reject both forms instead of mutating the lineage they are
+  proving; Btrfs's already-published subvolume form converges through operation
+  recovery, the fatal quota gate, and orphan classification.
+  (ENG-632)
+- XFS volume destruction now writes a separate empty, project-zero,
+  parent-synced `.fred-xfs-delete-<project-id>-<managed-volume>` authority before
+  removing any final-volume bytes. A restart can therefore resume the exact
+  deletion after the volume marker is gone. It re-normalizes and syncs the
+  authority, removes the final tree in place, parent-syncs its absence, proves
+  both block and inode usage are zero (including open-but-unlinked files),
+  strictly clears every project-quota limit, and removes the authority last.
+  Failure preserves the authority and blocks same-name creation. A runtime
+  failure gracefully drains and exits status 1; a startup recovery failure
+  exits 1 before listener bind. The supervisor's fresh `Start` must prove
+  completion. Offline preflight and storage initialization reject
+  this upgraded private evidence without mutating it.
+  (ENG-632)
 
 - Docker construction and startup can no longer wait for process lifetime on a
-  wedged daemon. The default `New` path bounds substrate/storage attestation at
+  wedged Docker/CLI boundary. The default `New` path bounds substrate/storage
+  attestation at
   30 seconds (`NewWithContext` uses an explicit caller deadline without adding
   a fallback); `Start` has a
-  30-minute backend-lifecycle recovery budget, each subsequent startup phase
-  shares one `max(2m, container_stop_timeout)` aggregate budget, and recovery
-  Docker reads remain 30-second bounded. Cold-start diagnostics and orphan
-  network cleanup now share one budget across the whole fleet rather than
-  multiplying a timeout per container/network. Exhaustion fails or defers the
-  phase with durable operation, maintenance, and close evidence intact for the
-  next launch.
+  30-minute backend-lifecycle recovery budget. Interrupted-volume recovery and
+  its clean-inventory proof each receive a fixed two-minute filesystem-only
+  child deadline inside that aggregate; later startup phases share one
+  `max(2m, container_stop_timeout)` aggregate budget, and recovery Docker reads
+  remain 30-second bounded. Cold-start diagnostics and orphan network cleanup
+  now share one budget across the whole fleet rather than multiplying a timeout
+  per container/network. Exhaustion fails or defers the phase with durable
+  operation, maintenance, and close evidence intact for the next launch. Local
+  filesystem deadlines are cooperative: one blocking kernel call cannot be
+  forcibly interrupted and a very large recursive removal can cross the
+  nominal budget, but recovery checks cancellation between top-level entries
+  and phases and makes no later mutations.
   (ENG-632)
 - Release-history cleanup now fails closed on corrupt or empty durable values
   instead of deleting them as expired. It also preserves the newest legacy
@@ -745,6 +825,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- XFS project IDs and dquots are filesystem-global even when
+  `volume_data_path` is a subdirectory. Fred allocates across the nonzero 32-bit
+  namespace and detects collisions only in its own managed root, so deployments
+  must make Fred the sole project-ID allocator on the containing XFS mount.
+  Separate directory roots are not isolation. Use a dedicated filesystem, or
+  add a coordinated disjoint-range mechanism before introducing another
+  allocator; this release has no range-coordination knob. The current
+  manifest-managed production layout shares `/data` but has no other observed
+  project-quota allocator, which is an operational precondition to keep enforcing
+  rather than a safety property of that layout. (ENG-632)
+- Managed Docker volume identities are now validated as canonical, single-component
+  typed names before any Btrfs, XFS, or ZFS filesystem, quota, rename, destroy, or
+  dataset operation. Descriptor-rooted cleanup and XFS marker access reject traversal,
+  symlink aliases, cross-volume redirection, and non-directory collisions; invalid input
+  cannot escape through the legacy error-less `HostPath` interface. Storage-identity
+  adoption applies the same grammar, attests every name as an actual Btrfs subvolume,
+  real directory on the configured XFS root with a regular no-follow nonzero
+  project-ID marker, or exact ZFS child dataset mounted at its exact managed path,
+  and proves each retained or mounted volume against its exact lease, service,
+  instance, and namespace before publishing an authority marker. Startup quota
+  reconciliation establishes the XFS kernel project tag and limit before
+  readiness. ZFS proof inventory also includes depth-one child datasets with no
+  expected directory, so an unmounted or externally mounted dataset cannot
+  disappear from preflight evidence; preflight cannot seal state the runtime
+  would later reject. (ENG-632)
 - **docker: a stateful-volume bind source whose leaf is a symlink is now rejected — the
   half of ENG-539 that was never fixed.** ENG-539 confined subdirectory creation to the
   volume root with `os.Root`, and that guard holds: a link that escapes the root, or an

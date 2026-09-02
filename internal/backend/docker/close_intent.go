@@ -87,11 +87,13 @@ func (b *Backend) acquireCloseIntent(
 	if fencedRelease != nil && len(fencedRelease.Items) > 0 {
 		closeItems = slices.Clone(fencedRelease.Items)
 	}
-	if !cleanupOnly && fencedRelease != nil && fencedRelease.RuntimeAuthority != nil {
-		tenant = fencedRelease.RuntimeAuthority.Tenant()
-		providerUUID = fencedRelease.RuntimeAuthority.ProviderUUID()
-		callbackURL = fencedRelease.RuntimeAuthority.CallbackURL()
-		lifecycleCallbackURL = fencedRelease.RuntimeAuthority.LifecycleCallbackURL()
+	if !cleanupOnly {
+		if authority, ok := runtimeIdentityForRelease(fencedRelease); ok {
+			tenant = authority.Tenant()
+			providerUUID = authority.ProviderUUID()
+			callbackURL = authority.CallbackURL()
+			lifecycleCallbackURL = authority.LifecycleCallbackURL()
+		}
 	}
 	if !cleanupOnly && callbackURL != "" {
 		resolved, resolveErr := backend.ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL)
@@ -437,9 +439,9 @@ func (b *Backend) closeLegacyRollbackTargets(
 		(observedTenant != expectedTenant || observedProviderUUID != expectedProviderUUID) {
 		return nil, errors.New("legacy rollback identity differs from the closing lease")
 	}
-	if selected := latestActiveRelease(releases); selected != nil && selected.RuntimeAuthority != nil {
-		if observedTenant != selected.RuntimeAuthority.Tenant() ||
-			observedProviderUUID != selected.RuntimeAuthority.ProviderUUID() {
+	if selected := latestActiveRelease(releases); selected != nil {
+		if authority, ok := runtimeIdentityForRelease(selected); ok &&
+			(observedTenant != authority.Tenant() || observedProviderUUID != authority.ProviderUUID()) {
 			return nil, errors.New("legacy rollback identity differs from active release authority")
 		}
 	}

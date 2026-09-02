@@ -2,6 +2,7 @@ package shared
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"sync"
 )
@@ -117,6 +118,59 @@ func (p *ResourcePool) TryAllocateResolved(
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.tryAllocateProfileLocked(leaseUUID, resources.SKU, tenant, profile, true)
+}
+
+// ReplaceResolvedAll atomically replaces an existing operation's exact
+// allocation keys with a new immutable snapshot. It is the re-provision
+// boundary: predecessor containers are torn down first, then the pool and the
+// provision projection move generations together without exposing phantom
+// free capacity to another tenant. Any validation/capacity failure restores the
+// complete predecessor accounting byte-for-byte.
+func (p *ResourcePool) ReplaceResolvedAll(
+	oldIDs []string,
+	instances []ResolvedAdoptInstance,
+	tenant string,
+) error {
+	profiles := make([]SKUProfile, len(instances))
+	for i, instance := range instances {
+		profile, err := effectiveAllocationProfile(instance.Resources)
+		if err != nil {
+			return fmt.Errorf("replacement allocation %q: %w", instance.ID, err)
+		}
+		profiles[i] = profile
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	allocationsBefore := maps.Clone(p.allocations)
+	tenantUsageBefore := maps.Clone(p.tenantUsage)
+	allocatedCPUBefore := p.allocatedCPU
+	allocatedMemoryBefore := p.allocatedMemory
+	allocatedDiskBefore := p.allocatedDisk
+	rollback := func() {
+		p.allocations = allocationsBefore
+		p.tenantUsage = tenantUsageBefore
+		p.allocatedCPU = allocatedCPUBefore
+		p.allocatedMemory = allocatedMemoryBefore
+		p.allocatedDisk = allocatedDiskBefore
+	}
+
+	for _, id := range oldIDs {
+		p.releaseLocked(id)
+	}
+	for i, instance := range instances {
+		if err := p.tryAllocateProfileLocked(
+			instance.ID,
+			instance.Resources.SKU,
+			tenant,
+			profiles[i],
+			true,
+		); err != nil {
+			rollback()
+			return fmt.Errorf("replacement allocation %q: %w", instance.ID, err)
+		}
+	}
+	return nil
 }
 
 // AdoptInstance identifies one container instance to reserve on the restore/adopt

@@ -11,8 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
@@ -29,6 +27,33 @@ type recoveredInstanceKey struct {
 	service string
 	sku     string
 	index   int
+}
+
+func runtimeIdentityForRelease(release *shared.Release) (shared.ReleaseRuntimeIdentity, bool) {
+	if release == nil {
+		return shared.ReleaseRuntimeIdentity{}, false
+	}
+	return release.RuntimeIdentity()
+}
+
+func containerMatchesReleaseRuntimeIdentity(
+	container ContainerInfo,
+	authority shared.ReleaseRuntimeIdentity,
+) bool {
+	lifecycleCallbackURL := container.LifecycleCallbackURL
+	if authority.Class() == shared.ReleaseAuthorityLegacy {
+		resolved, err := backend.ResolveLifecycleCallbackURL(
+			container.CallbackURL, container.LifecycleCallbackURL,
+		)
+		if err != nil {
+			return false
+		}
+		lifecycleCallbackURL = resolved
+	}
+	return container.Tenant == authority.Tenant() &&
+		container.ProviderUUID == authority.ProviderUUID() &&
+		container.CallbackURL == authority.CallbackURL() &&
+		lifecycleCallbackURL == authority.LifecycleCallbackURL()
 }
 
 // validateRecoveredReleaseCohort proves that the container snapshot contains
@@ -72,11 +97,8 @@ func validateRecoveredReleaseCohort(release *shared.Release, containers []Contai
 		strings.TrimSpace(identity.ProviderUUID) == "" {
 		return fmt.Errorf("container %q has incomplete lease, tenant, or provider identity", identity.ContainerID)
 	}
-	if authority := release.RuntimeAuthority; authority != nil &&
-		(identity.Tenant != authority.Tenant() ||
-			identity.ProviderUUID != authority.ProviderUUID() ||
-			identity.CallbackURL != authority.CallbackURL() ||
-			identity.LifecycleCallbackURL != authority.LifecycleCallbackURL()) {
+	authority, hasRuntimeAuthority := runtimeIdentityForRelease(release)
+	if hasRuntimeAuthority && !containerMatchesReleaseRuntimeIdentity(identity, authority) {
 		return fmt.Errorf("container %q identity differs from durable runtime authority", identity.ContainerID)
 	}
 	for _, container := range containers {
@@ -85,11 +107,7 @@ func validateRecoveredReleaseCohort(release *shared.Release, containers []Contai
 			container.ProviderUUID != identity.ProviderUUID {
 			return fmt.Errorf("container %q has divergent lease, tenant, or provider identity", container.ContainerID)
 		}
-		if authority := release.RuntimeAuthority; authority != nil &&
-			(container.Tenant != authority.Tenant() ||
-				container.ProviderUUID != authority.ProviderUUID() ||
-				container.CallbackURL != authority.CallbackURL() ||
-				container.LifecycleCallbackURL != authority.LifecycleCallbackURL()) {
+		if hasRuntimeAuthority && !containerMatchesReleaseRuntimeIdentity(container, authority) {
 			return fmt.Errorf("container %q identity differs from durable runtime authority", container.ContainerID)
 		}
 		if container.MaintenanceID != release.MaintenanceID {
@@ -378,6 +396,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			return fmt.Errorf("list operation intents before state recovery: %w", listErr)
 		}
 		for _, claim := range operationClaims {
+			if claim.Backend() != b.Name() || claim.BackendStorageID() != b.storageIdentity {
+				return fmt.Errorf(
+					"operation intent for lease %q belongs to backend %q storage %s, not backend %q storage %s",
+					claim.LeaseUUID(), claim.Backend(), claim.BackendStorageID(), b.Name(), b.storageIdentity,
+				)
+			}
+			if profileErr := validateDockerResourceProfiles(claim.Items(), claim.ResourceProfiles()); profileErr != nil {
+				return fmt.Errorf(
+					"operation intent for lease %q has invalid resource authority: %w",
+					claim.LeaseUUID(), profileErr,
+				)
+			}
 			if _, closing := closeIntents[claim.LeaseUUID()]; closing {
 				return fmt.Errorf(
 					"lease %q has simultaneous durable close and operation intents",
@@ -642,6 +672,36 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			}
 			if cohortErr := validateRecoveredReleaseCohort(release, containersByLease[leaseUUID]); cohortErr != nil {
 				cohortIssues[leaseUUID] = cohortErr
+				continue
+			}
+			// A complete v0.13 cohort is the last place its tokenless principal
+			// and callback pair can be proven without inference. Freeze that identity
+			// proactively, before an ordinary runtime failure or later replacement can
+			// remove the last container. Callbackless pre-label cohorts remain on the
+			// older conservative path because no callback authority can be minted.
+			if release.OperationID == "" && release.RuntimeAuthority == nil &&
+				release.LegacyRuntimeAuthority == nil && len(containersByLease[leaseUUID]) > 0 {
+				pair := callbackPairs[leaseUUID]
+				if pair.callbackURL != "" {
+					identity := containersByLease[leaseUUID][0]
+					legacyAuthority, authorityErr := shared.NewLegacyRuntimeAuthority(
+						identity.Tenant,
+						identity.ProviderUUID,
+						pair.callbackURL,
+						pair.lifecycleCallbackURL,
+					)
+					if authorityErr != nil {
+						return fmt.Errorf("freeze v0.13 runtime authority for lease %q: %w",
+							leaseUUID, authorityErr)
+					}
+					if backfillErr := b.releaseStore.BackfillLegacyRuntimeAuthority(
+						leaseUUID, *release, legacyAuthority,
+					); backfillErr != nil {
+						return fmt.Errorf("persist v0.13 runtime authority for lease %q: %w",
+							leaseUUID, backfillErr)
+					}
+					release.LegacyRuntimeAuthority = &legacyAuthority
+				}
 			}
 		}
 	}
@@ -685,6 +745,30 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		var resourceProfiles []shared.SKUResourceSnapshot
 		if claim, pending := operationClaimsByLease[c.LeaseUUID]; pending {
 			resourceProfiles = claim.ResourceProfiles()
+			if claim.Kind() == shared.OperationIntentProvision &&
+				(c.CallbackURL != claim.CallbackURL() ||
+					c.LifecycleCallbackURL != claim.LifecycleCallbackURL()) {
+				// A re-provision writes its candidate intent before tearing down the
+				// predecessor. Size an exact old-generation survivor from the active
+				// Release it still belongs to; the operation classifier later requires
+				// both callback labels and every immutable field to match before it can
+				// authorize teardown.
+				if release := releasesByLease[c.LeaseUUID]; release != nil {
+					if predecessorIdentity, ok := runtimeIdentityForRelease(release); ok &&
+						containerMatchesReleaseRuntimeIdentity(c, predecessorIdentity) {
+						resourceProfiles = release.ResourceProfiles
+					} else if release.OperationID == "" && release.RuntimeAuthority == nil &&
+						release.LegacyRuntimeAuthority == nil {
+						// Transitional v0.13 rows can reach this pass before their
+						// tokenless identity has been frozen. Sizing a visibly
+						// non-candidate survivor from the immutable active Release is
+						// conservative accounting only; the strict intent classifier
+						// still proves principal, callback pair, image, and exact instance
+						// membership before granting teardown authority.
+						resourceProfiles = release.ResourceProfiles
+					}
+				}
+			}
 		} else if release := releasesByLease[c.LeaseUUID]; release != nil {
 			resourceProfiles = release.ResourceProfiles
 		} else if source, pendingFinalize := restoreAuthorityByDestination[c.LeaseUUID]; pendingFinalize {
@@ -872,14 +956,100 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		})
 	}
 
+	// An uncommitted provision intent is the complete cleanup authority for its
+	// write-ahead generation. Container inventory may expose only a prefix of the
+	// requested cohort (or none at all), but publishing that partial shape would
+	// under-count reserved capacity and leave the not-yet-mounted canonical volume
+	// names unclaimed while recovery tears the cohort down. Overlay the immutable
+	// intent snapshot before any cleanup can run. A same-token committed Release is
+	// excluded: it crossed the success boundary and the release-owned path below is
+	// its stronger runtime authority.
+	for _, leaseUUID := range slices.Sorted(maps.Keys(operationClaimsByLease)) {
+		claim := operationClaimsByLease[leaseUUID]
+		if claim.Kind() != shared.OperationIntentProvision {
+			continue
+		}
+		committed, commitErr := operationReleaseMatchesIntent(releasesByLease[leaseUUID], claim)
+		if commitErr != nil {
+			return fmt.Errorf("validate pending provision release for lease %q: %w", leaseUUID, commitErr)
+		}
+		if committed {
+			continue
+		}
+		items := claim.EffectiveItems()
+		quantity, quantityErr := backend.ValidateOperationQuantities(items)
+		if quantityErr != nil {
+			return fmt.Errorf("validate pending provision quantities for lease %q: %w", leaseUUID, quantityErr)
+		}
+		stackManifest, parseErr := manifest.ParsePayload(claim.Manifest())
+		if parseErr != nil {
+			return fmt.Errorf("parse pending provision manifest for lease %q: %w", leaseUUID, parseErr)
+		}
+		resourceProfiles := claim.ResourceProfiles()
+		recovered, exists := building[leaseUUID]
+		if !exists {
+			recovered = &recoveredProvision{ //exhaustruct:enforce
+				ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
+					LeaseUUID:            leaseUUID,
+					Tenant:               claim.Tenant(),
+					ProviderUUID:         claim.ProviderUUID(),
+					SKU:                  items[0].SKU,
+					Status:               backend.ProvisionStatusProvisioning,
+					Quantity:             quantity,
+					CreatedAt:            claim.CreatedAt(),
+					FailCount:            0,
+					LastError:            "",
+					Reason:               "",
+					Message:              "",
+					CallbackURL:          claim.CallbackURL(),
+					LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+					Items:                items,
+					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
+					ContainerIDs:         nil,
+					StackManifest:        stackManifest,
+					ServiceContainers:    nil,
+				},
+				resourceProfiles:      resourceProfiles,
+				volumeCleanupAttempts: 0,
+			}
+			building[leaseUUID] = recovered
+		} else {
+			// Labels identify candidate substrate; the intent alone authorizes the
+			// complete topology, callbacks, and sizing. The strict classifier later
+			// verifies every observed label before any teardown is attempted.
+			recovered.LeaseUUID = leaseUUID
+			recovered.Tenant = claim.Tenant()
+			recovered.ProviderUUID = claim.ProviderUUID()
+			recovered.SKU = items[0].SKU
+			recovered.Quantity = quantity
+			recovered.CreatedAt = claim.CreatedAt()
+			recovered.CallbackURL = claim.CallbackURL()
+			recovered.LifecycleCallbackURL = claim.LifecycleCallbackURL()
+			recovered.Items = items
+			recovered.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
+			recovered.StackManifest = stackManifest
+			recovered.resourceProfiles = resourceProfiles
+		}
+		allocations, allocationErr := recoveredSnapshotAllocations(
+			leaseUUID, claim.Tenant(), items, resourceProfiles,
+		)
+		if allocationErr != nil {
+			return fmt.Errorf("rebuild pending provision allocations for lease %q: %w", leaseUUID, allocationErr)
+		}
+		allocsByLease[leaseUUID] = allocations
+	}
+
 	// A current Release carries an all-or-nothing runtime identity specifically
 	// so recovery remains convergent after its operation intent has settled and a
 	// later restart observes zero survivors. When an operation is pending, only an
 	// exact same-token Release may contribute this authority; an older active
 	// generation must remain outside the candidate operation's recovery boundary.
+	// The legacy identity is separately typed and tokenless, but provides the same
+	// zero-survivor reconstruction for an adopted v0.13 Release.
 	for _, leaseUUID := range slices.Sorted(maps.Keys(releasesByLease)) {
 		release := releasesByLease[leaseUUID]
-		if release == nil || release.RuntimeAuthority == nil {
+		authority, hasRuntimeAuthority := runtimeIdentityForRelease(release)
+		if !hasRuntimeAuthority {
 			continue
 		}
 		if _, restoreOwned := restoreAuthorityByDestination[leaseUUID]; restoreOwned {
@@ -905,7 +1075,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if parseErr != nil {
 			return fmt.Errorf("parse durable runtime manifest for lease %q: %w", leaseUUID, parseErr)
 		}
-		authority := release.RuntimeAuthority
 		recovered, exists := building[leaseUUID]
 		if !exists {
 			recovered = &recoveredProvision{ //exhaustruct:enforce
@@ -1776,58 +1945,42 @@ func (b *Backend) recoverState(ctx context.Context) error {
 // This catches volumes leaked by crashes between volume creation and container creation,
 // or between container removal and volume destruction. Called once at startup after
 // recoverState populates the provision map.
-// leaseHasActiveRelease reports whether the lease that owns volume id
-// (fred-{uuid}-{service}-{idx}) still has an active release record. Used to keep
-// the orphan reaper from destroying a live lease's data when its containers were
-// removed out-of-band (ENG-505). Returns false (i.e. treat as reapable) when
-// there is no release store or the name doesn't carry a parseable lease UUID.
-func (b *Backend) leaseHasActiveRelease(volumeID string) bool {
+// activeReleaseClaimsVolume reports whether the exact canonical name appears in
+// its lease's active release. The name-level check matters after a failed
+// re-provision: the predecessor Release must keep its reusable volumes, but it
+// must not shield fresh candidate-only volumes merely because they share a lease
+// UUID. A legacy active release without item authority remains fail-safe and
+// protects the whole lease namespace until migration supplies exact items.
+func (b *Backend) activeReleaseClaimsVolume(volumeID string) (bool, error) {
 	if b.releaseStore == nil {
-		return false
+		return false, nil
 	}
 	leaseUUID, ok := leaseUUIDFromVolumeName(volumeID)
 	if !ok {
-		return false
+		return false, nil
 	}
 	rel, err := b.releaseStore.LatestActive(leaseUUID)
 	if err != nil {
 		// Fail safe: a transient release-store read error must NOT let the reaper
-		// destroy a volume that may have an active release. Keep it; the next boot
-		// retries. This mirrors the retention-store fail-safe in cleanupOrphaned-
-		// Volumes below (a read failure skips destruction rather than risking it).
+		// destroy a volume that may have an active release. Surface the failure so
+		// startup cannot report readiness with an unclassified quota footprint.
 		b.logger.Warn("cleanupOrphanedVolumes: release-store read failed; keeping volume (fail-safe)", "volume_id", volumeID, "error", err)
-		return true
+		return false, fmt.Errorf("read active release for orphan candidate %q: %w", volumeID, err)
 	}
-	return rel != nil
-}
-
-// leaseUUIDFromVolumeName extracts the lease UUID from a managed volume name of
-// the form fred-{uuid}-{service}-{idx}, where {uuid} is the canonical 36-char
-// form. Returns ("", false) if id does not match that shape.
-func leaseUUIDFromVolumeName(id string) (string, bool) {
-	const prefix = "fred-"
-	rest, ok := strings.CutPrefix(id, prefix)
-	if !ok || len(rest) < 37 || rest[36] != '-' {
-		return "", false
+	if rel == nil {
+		return false, nil
 	}
-	candidate := rest[:36]
-	if _, err := uuid.Parse(candidate); err != nil {
-		return "", false
+	if len(rel.Items) == 0 {
+		return true, nil
 	}
-	// Require the {service}-{idx} suffix so only real managed names match, not a
-	// bare fred-{uuid}- prefix. {service} may contain hyphens; {idx} is the
-	// numeric trailer after the last hyphen.
-	suffix := rest[37:]
-	dash := strings.LastIndexByte(suffix, '-')
-	if dash <= 0 || dash == len(suffix)-1 {
-		return "", false
-	}
-	for i := dash + 1; i < len(suffix); i++ {
-		if suffix[i] < '0' || suffix[i] > '9' {
-			return "", false
+	for _, item := range rel.Items {
+		for index := range item.Quantity {
+			if canonicalVolumeName(leaseUUID, item.ServiceName, index) == volumeID {
+				return true, nil
+			}
 		}
 	}
-	return candidate, true
+	return false, nil
 }
 
 func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
@@ -1881,7 +2034,7 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 		volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable).Add(float64(undecided))
 		b.logger.Error("cleanupOrphanedVolumes: ownership unresolvable; skipping orphan destruction this run (fail-safe)",
 			"undecided_volumes", undecided, "error", err)
-		return nil
+		return fmt.Errorf("resolve orphan volume ownership: %w", err)
 	}
 
 	candidates := make([]string, 0, len(volumeIDs))
@@ -1902,7 +2055,11 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 			// right — only the noise does.
 			continue
 		}
-		if b.leaseHasActiveRelease(id) {
+		hasActiveRelease, releaseErr := b.activeReleaseClaimsVolume(id)
+		if releaseErr != nil {
+			return releaseErr
+		}
+		if hasActiveRelease {
 			// A successfully-provisioned lease keeps an active release until it is
 			// cleanly deprovisioned, so a volume whose lease still has one is not a
 			// create-crash leak — its containers were merely removed out-of-band
@@ -1914,7 +2071,7 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 			// -store read, not a claim, and a record's absence there is meaningful. Fold
 			// it in and a give-up tombstone whose purgeReleaseHistory failed would become
 			// permanently unreapable instead of self-healing.
-			b.logger.Warn("cleanupOrphanedVolumes: lease still has an active release; not reaping its volume", "volume_id", id)
+			b.logger.Warn("cleanupOrphanedVolumes: active release still claims volume; not reaping it", "volume_id", id)
 			continue
 		}
 		candidates = append(candidates, id)
@@ -1927,6 +2084,9 @@ func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
 	if len(rep.Destroyed) > 0 || len(rep.Errs) > 0 || rep.refused() > 0 {
 		b.logger.Info("orphaned volume cleanup complete",
 			"destroyed", len(rep.Destroyed), "failed", len(rep.Errs), "claimed", len(rep.Claimed))
+	}
+	if err := rep.err(); err != nil {
+		return fmt.Errorf("destroy orphaned volumes: %w", err)
 	}
 	return nil
 }

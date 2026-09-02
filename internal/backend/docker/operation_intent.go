@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -146,9 +147,23 @@ func (b *Backend) settleUnacceptedRestoreIntent(claim shared.OperationIntentClai
 }
 
 type recoveredIntentDecision struct {
-	claim  shared.OperationIntentClaim
-	status backend.CallbackStatus
-	errMsg string
+	claim                  shared.OperationIntentClaim
+	status                 backend.CallbackStatus
+	errMsg                 string
+	provisionCleanupIDs    []string
+	provisionAllocationIDs []string
+	legacyPredecessor      *shared.Release
+	legacyAuthority        *shared.LegacyRuntimeAuthority
+}
+
+type operationIntentSubstrate struct {
+	status            backend.CallbackStatus
+	errMsg            string
+	hasCurrent        bool
+	needsTeardown     bool
+	currentIDs        []string
+	legacyPredecessor *shared.Release
+	legacyAuthority   *shared.LegacyRuntimeAuthority
 }
 
 // recoverOperationIntents classifies the durable write-ahead window from
@@ -190,12 +205,33 @@ func (b *Backend) recoverOperationIntents(ctx context.Context, retentionReconcil
 			return fmt.Errorf("%s operation intent for lease %q has invalid resource authority: %w",
 				claim.Kind(), claim.LeaseUUID(), err)
 		}
-		status, errMsg, classifyErr := b.classifyOperationIntent(ctx, claim, containers)
+		classification, classifyErr := b.classifyOperationIntent(ctx, claim, containers)
 		if classifyErr != nil {
 			return fmt.Errorf("%s operation intent for lease %q remains unresolved: %w",
 				claim.Kind(), claim.LeaseUUID(), classifyErr)
 		}
-		decisions = append(decisions, recoveredIntentDecision{claim: claim, status: status, errMsg: errMsg})
+		decision := recoveredIntentDecision{
+			claim:  claim,
+			status: classification.status,
+			errMsg: classification.errMsg,
+		}
+		if claim.Kind() == shared.OperationIntentProvision && classification.needsTeardown {
+			decision.provisionCleanupIDs = slices.Clone(classification.currentIDs)
+		}
+		decision.legacyPredecessor = classification.legacyPredecessor
+		decision.legacyAuthority = classification.legacyAuthority
+		if claim.Kind() == shared.OperationIntentProvision &&
+			classification.status == backend.CallbackStatusFailed {
+			allocationIDs, _, allocationErr := resolvedProvisionAllocations(
+				claim.LeaseUUID(), claim.EffectiveItems(), claim.ResourceProfiles(),
+			)
+			if allocationErr != nil {
+				return fmt.Errorf("resolve failed provision allocation authority for lease %q: %w",
+					claim.LeaseUUID(), allocationErr)
+			}
+			decision.provisionAllocationIDs = allocationIDs
+		}
+		decisions = append(decisions, decision)
 	}
 	// Preflight every success before mutating any release/finalizer or settling
 	// any intent. One missing projection/SKU/corrupt store must preserve the
@@ -208,6 +244,57 @@ func (b *Backend) recoverOperationIntents(ctx context.Context, retentionReconcil
 			}
 		}
 	}
+	// Freeze legacy predecessor identity before removing its last container.
+	// The CAS is durable but non-destructive; a failure leaves every operation
+	// intent and substrate object untouched for a later startup retry.
+	for _, decision := range decisions {
+		if decision.legacyAuthority == nil {
+			continue
+		}
+		if decision.legacyPredecessor == nil {
+			return fmt.Errorf("legacy predecessor authority for lease %q has no release fence",
+				decision.claim.LeaseUUID())
+		}
+		if err := b.releaseStore.BackfillLegacyRuntimeAuthority(
+			decision.claim.LeaseUUID(),
+			*decision.legacyPredecessor,
+			*decision.legacyAuthority,
+		); err != nil {
+			return fmt.Errorf("persist legacy predecessor runtime authority for lease %q: %w",
+				decision.claim.LeaseUUID(), err)
+		}
+	}
+	// A provision that did not cross its exact Release commit boundary may be
+	// classified Failed only after every container carrying this operation's
+	// unguessable callback identity is gone. Keep all operation intents durable
+	// while doing the destructive work: if any teardown is incomplete, the
+	// backend-lifetime latch suppresses actor/callback settlement and a fresh
+	// process retries from the same immutable authority.
+	for _, decision := range decisions {
+		if len(decision.provisionCleanupIDs) == 0 {
+			continue
+		}
+		remaining, teardownErr := b.teardownLeaseContainers(
+			ctx,
+			decision.claim.LeaseUUID(),
+			decision.provisionCleanupIDs,
+			10*time.Second,
+			teardownOpProvisionCleanup,
+			b.logger.With("lease_uuid", decision.claim.LeaseUUID(), "operation", "provision_recovery"),
+		)
+		if teardownErr != nil || len(remaining) != 0 {
+			cleanupErr := teardownErr
+			if cleanupErr == nil {
+				cleanupErr = fmt.Errorf("container teardown left %d container(s)", len(remaining))
+			}
+			return b.latchAmbiguousOperationOutcome(
+				fmt.Sprintf("recover failed provision %q", decision.claim.LeaseUUID()),
+				cleanupErr,
+			)
+		}
+	}
+
+	rebuildAfterSettlement := false
 	for _, decision := range decisions {
 		if decision.status == backend.CallbackStatusSuccess {
 			if err := b.ensureRecoveredOperationSuccess(decision.claim); err != nil {
@@ -220,6 +307,35 @@ func (b *Backend) recoverOperationIntents(ctx context.Context, retentionReconcil
 		); err != nil {
 			return fmt.Errorf("settle recovered %s operation intent for lease %q: %w",
 				decision.claim.Kind(), decision.claim.LeaseUUID(), err)
+		}
+		if decision.claim.Kind() == shared.OperationIntentProvision &&
+			decision.status == backend.CallbackStatusFailed {
+			rebuildAfterSettlement = true
+		}
+	}
+	if rebuildAfterSettlement {
+		// Remove the temporary intent-owned projections and their exact candidate
+		// reservations before rebuilding. Leaving
+		// one as Provisioning would make recoverState preserve it as a live worker
+		// even though its exact failed callback has replaced the intent. Releasing
+		// only the immutable intent keys also prevents ResetPreserving's lease-prefix
+		// guard from carrying candidate-only services into an older Release of the
+		// same lease. recoverState immediately reconstructs that committed Release's
+		// full accounting/volume claim; a genuinely fresh failed attempt instead
+		// loses its claim and becomes eligible for the ordinary startup orphan pass.
+		b.provisionsMu.Lock()
+		for _, decision := range decisions {
+			if decision.claim.Kind() == shared.OperationIntentProvision &&
+				decision.status == backend.CallbackStatusFailed {
+				delete(b.provisions, decision.claim.LeaseUUID())
+				for _, allocationID := range decision.provisionAllocationIDs {
+					b.pool.Release(allocationID)
+				}
+			}
+		}
+		b.provisionsMu.Unlock()
+		if err := b.recoverState(ctx); err != nil {
+			return fmt.Errorf("rebuild state after failed provision recovery: %w", err)
 		}
 	}
 	return nil
@@ -270,7 +386,7 @@ func (b *Backend) preflightOperationIntentRecovery(ctx context.Context) error {
 		if committed {
 			continue
 		}
-		if _, _, _, err := b.classifyOperationIntentSubstrate(ctx, claim, containers); err != nil {
+		if _, err := b.classifyOperationIntentSubstrate(ctx, claim, containers); err != nil {
 			return fmt.Errorf("%s operation intent for lease %q is ambiguous before retention reconciliation: %w",
 				claim.Kind(), claim.LeaseUUID(), err)
 		}
@@ -490,22 +606,289 @@ func (b *Backend) classifyOperationIntent(
 	ctx context.Context,
 	claim shared.OperationIntentClaim,
 	all []ContainerInfo,
-) (backend.CallbackStatus, string, error) {
+) (operationIntentSubstrate, error) {
 	committed, err := b.operationIntentHasCommittedRelease(claim)
 	if err != nil {
-		return "", "", err
+		return operationIntentSubstrate{}, err
 	}
 	if committed {
-		return backend.CallbackStatusSuccess, "", nil
+		return operationIntentSubstrate{status: backend.CallbackStatusSuccess}, nil
 	}
-	status, errMsg, hasCurrent, err := b.classifyOperationIntentSubstrate(ctx, claim, all)
+	var classification operationIntentSubstrate
+	if claim.Kind() == shared.OperationIntentProvision {
+		active, readErr := b.releaseStore.LatestActive(claim.LeaseUUID())
+		if readErr != nil {
+			return operationIntentSubstrate{}, fmt.Errorf("read predecessor active release: %w", readErr)
+		}
+		classification, err = b.classifyProvisionIntentSubstrate(ctx, claim, active, all)
+	} else {
+		classification, err = b.classifyOperationIntentSubstrate(ctx, claim, all)
+	}
 	if err != nil {
-		return "", "", err
+		return operationIntentSubstrate{}, err
 	}
-	if err := b.validateRestoreIntentSource(claim, hasCurrent); err != nil {
-		return "", "", err
+	if err := b.validateRestoreIntentSource(claim, classification.hasCurrent); err != nil {
+		return operationIntentSubstrate{}, err
 	}
-	return status, errMsg, nil
+	return classification, nil
+}
+
+// classifyProvisionIntentSubstrate recognizes the one older generation a
+// provision retry can legitimately interrupt. Provision admission writes the
+// candidate intent before tearing down a Failed predecessor, while the older
+// active Release remains the durable runtime authority until the candidate
+// commits. A crash can therefore leave an exact subset of predecessor
+// containers beside zero or partial candidate containers. Both cohorts are
+// safe to tear down only after every survivor proves one of those two exact
+// authorities; any third/partial identity remains an operator-visible hard
+// contradiction.
+func (b *Backend) classifyProvisionIntentSubstrate(
+	ctx context.Context,
+	claim shared.OperationIntentClaim,
+	predecessor *shared.Release,
+	all []ContainerInfo,
+) (operationIntentSubstrate, error) {
+	predecessorIdentity, hasPredecessorIdentity := runtimeIdentityForRelease(predecessor)
+	if hasPredecessorIdentity &&
+		(predecessorIdentity.Tenant() != claim.Tenant() ||
+			predecessorIdentity.ProviderUUID() != claim.ProviderUUID()) {
+		return operationIntentSubstrate{}, errors.New(
+			"candidate and predecessor active release belong to different tenant or provider",
+		)
+	}
+	current := make([]ContainerInfo, 0)
+	older := make([]ContainerInfo, 0)
+	for _, container := range all {
+		if container.LeaseUUID != claim.LeaseUUID() || strings.HasSuffix(container.Name, "-prev") {
+			continue
+		}
+		currentOperation := container.CallbackURL == claim.CallbackURL()
+		currentLifecycle := container.LifecycleCallbackURL == claim.LifecycleCallbackURL()
+		if currentOperation || currentLifecycle {
+			if !currentOperation || !currentLifecycle {
+				return operationIntentSubstrate{}, fmt.Errorf(
+					"container %q has a partial current callback identity", container.ContainerID,
+				)
+			}
+			current = append(current, container)
+			continue
+		}
+		if hasPredecessorIdentity {
+			olderLifecycleURL := container.LifecycleCallbackURL
+			if predecessorIdentity.Class() == shared.ReleaseAuthorityLegacy {
+				var resolveErr error
+				olderLifecycleURL, resolveErr = backend.ResolveLifecycleCallbackURL(
+					container.CallbackURL, container.LifecycleCallbackURL,
+				)
+				if resolveErr != nil {
+					return operationIntentSubstrate{}, fmt.Errorf(
+						"container %q has an invalid legacy predecessor callback pair: %w",
+						container.ContainerID, resolveErr,
+					)
+				}
+			}
+			olderOperation := container.CallbackURL == predecessorIdentity.CallbackURL()
+			olderLifecycle := olderLifecycleURL == predecessorIdentity.LifecycleCallbackURL()
+			if !olderOperation || !olderLifecycle {
+				return operationIntentSubstrate{}, fmt.Errorf(
+					"container %q does not exactly match the candidate or predecessor callback identity",
+					container.ContainerID,
+				)
+			}
+		} else if predecessor == nil || predecessor.OperationID != "" ||
+			predecessor.RuntimeAuthority != nil || predecessor.LegacyRuntimeAuthority != nil ||
+			len(predecessor.Items) == 0 || len(predecessor.ResourceProfiles) == 0 {
+			return operationIntentSubstrate{}, errors.New(
+				"container substrate with another callback generation exists without exact predecessor authority",
+			)
+		}
+		older = append(older, container)
+	}
+
+	classification, err := b.classifyOperationIntentSubstrate(ctx, claim, current)
+	if err != nil {
+		return operationIntentSubstrate{}, err
+	}
+	if len(older) == 0 {
+		// A complete Ready candidate cohort has enough exact, typed authority to
+		// commit a fresh Release and supersede a stale v0.13 row. It does not
+		// need recovery authority for that predecessor because no failure cleanup
+		// or predecessor reconstruction follows this classification. Every failed
+		// or partial candidate still requires the frozen legacy identity below
+		// before its teardown can erase the last reconstruction witness.
+		if classification.status == backend.CallbackStatusSuccess {
+			return classification, nil
+		}
+		if predecessor != nil && predecessor.OperationID == "" &&
+			predecessor.RuntimeAuthority == nil && predecessor.LegacyRuntimeAuthority == nil {
+			return operationIntentSubstrate{}, errors.New(
+				"legacy predecessor has no durable runtime authority and no surviving cohort to freeze",
+			)
+		}
+		return classification, nil
+	}
+	predecessorIDs, legacyAuthority, err := b.validatePredecessorProvisionSubset(
+		ctx, claim, predecessor, older,
+	)
+	if err != nil {
+		return operationIntentSubstrate{}, err
+	}
+	classification.status = backend.CallbackStatusFailed
+	classification.errMsg = interruptedOperationFailure
+	classification.hasCurrent = len(current) != 0
+	classification.needsTeardown = true
+	classification.currentIDs = append(classification.currentIDs, predecessorIDs...)
+	if legacyAuthority != nil {
+		predecessorCopy := *predecessor
+		classification.legacyPredecessor = &predecessorCopy
+		classification.legacyAuthority = legacyAuthority
+	}
+	return classification, nil
+}
+
+func (b *Backend) validatePredecessorProvisionSubset(
+	ctx context.Context,
+	claim shared.OperationIntentClaim,
+	release *shared.Release,
+	listed []ContainerInfo,
+) ([]string, *shared.LegacyRuntimeAuthority, error) {
+	if release == nil {
+		return nil, nil, errors.New("predecessor active release is absent")
+	}
+	legacy := release.RuntimeAuthority == nil
+	if legacy {
+		if release.OperationID != "" {
+			return nil, nil, errors.New("predecessor active release has partial runtime authority")
+		}
+	} else {
+		if !release.OperationID.Valid() || release.OperationID != release.RuntimeAuthority.OperationID() {
+			return nil, nil, errors.New("predecessor active release has inconsistent operation identity")
+		}
+		if release.RuntimeAuthority.Tenant() != claim.Tenant() ||
+			release.RuntimeAuthority.ProviderUUID() != claim.ProviderUUID() {
+			return nil, nil, errors.New(
+				"candidate and predecessor active release belong to different tenant or provider",
+			)
+		}
+	}
+	if err := validateDockerResourceProfiles(release.Items, release.ResourceProfiles); err != nil {
+		return nil, nil, fmt.Errorf("predecessor active release has invalid resource authority: %w", err)
+	}
+	stack, err := manifest.ParsePayload(release.Manifest)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse predecessor active manifest: %w", err)
+	}
+	type instanceKey struct {
+		service string
+		sku     string
+		index   int
+	}
+	expected := make(map[instanceKey]struct{})
+	domains := make(map[string]string, len(release.Items))
+	for _, item := range release.Items {
+		domains[item.ServiceName] = item.CustomDomain
+		for index := range item.Quantity {
+			key := instanceKey{service: item.ServiceName, sku: item.SKU, index: index}
+			if _, duplicate := expected[key]; duplicate {
+				return nil, nil, fmt.Errorf("predecessor release contains duplicate expected instance %+v", key)
+			}
+			expected[key] = struct{}{}
+		}
+	}
+	seen := make(map[instanceKey]struct{}, len(listed))
+	ids := make([]string, 0, len(listed))
+	authority := release.RuntimeAuthority
+	legacyAuthority := release.LegacyRuntimeAuthority
+	var legacyCallbackURL string
+	var legacyLifecycleCallbackURL string
+	for _, summary := range listed {
+		container, inspectErr := b.inspectContainerForRecovery(ctx, summary.ContainerID)
+		if inspectErr != nil {
+			return nil, nil, fmt.Errorf("inspect predecessor container %q: %w", summary.ContainerID, inspectErr)
+		}
+		if container.LeaseUUID != claim.LeaseUUID() {
+			return nil, nil, fmt.Errorf("predecessor container %q lease identity changed", summary.ContainerID)
+		}
+		if legacy {
+			resolvedLifecycle, resolveErr := backend.ResolveLifecycleCallbackURL(
+				container.CallbackURL, container.LifecycleCallbackURL,
+			)
+			if resolveErr != nil {
+				return nil, nil, fmt.Errorf(
+					"legacy predecessor container %q has an invalid callback pair: %w",
+					summary.ContainerID, resolveErr,
+				)
+			}
+			if legacyAuthority != nil {
+				identity, ok := release.RuntimeIdentity()
+				if !ok {
+					return nil, nil, errors.New("legacy predecessor active release has invalid runtime authority")
+				}
+				if !containerMatchesReleaseRuntimeIdentity(*container, identity) {
+					return nil, nil, fmt.Errorf(
+						"legacy predecessor container %q identity differs from its active release",
+						summary.ContainerID,
+					)
+				}
+			} else if container.Tenant != claim.Tenant() || container.ProviderUUID != claim.ProviderUUID() {
+				return nil, nil, fmt.Errorf(
+					"legacy predecessor container %q belongs to a different tenant or provider",
+					summary.ContainerID,
+				)
+			}
+			if container.CallbackURL == "" {
+				return nil, nil, fmt.Errorf("legacy predecessor container %q has no callback identity", summary.ContainerID)
+			}
+			if container.CallbackURL == claim.CallbackURL() ||
+				resolvedLifecycle == claim.LifecycleCallbackURL() {
+				return nil, nil, fmt.Errorf(
+					"legacy predecessor container %q partially matches the candidate callback identity",
+					summary.ContainerID,
+				)
+			}
+			if legacyCallbackURL == "" {
+				legacyCallbackURL = container.CallbackURL
+				legacyLifecycleCallbackURL = resolvedLifecycle
+			} else if container.CallbackURL != legacyCallbackURL ||
+				resolvedLifecycle != legacyLifecycleCallbackURL {
+				return nil, nil, errors.New("legacy predecessor cohort has mixed callback identities")
+			}
+		} else if container.Tenant != authority.Tenant() ||
+			container.ProviderUUID != authority.ProviderUUID() ||
+			container.CallbackURL != authority.CallbackURL() ||
+			container.LifecycleCallbackURL != authority.LifecycleCallbackURL() {
+			return nil, nil, fmt.Errorf("predecessor container %q identity changed or differs from its active release", summary.ContainerID)
+		}
+		serviceManifest, ok := stack.Services[container.ServiceName]
+		if !ok || serviceManifest == nil || container.Image != serviceManifest.Image {
+			return nil, nil, fmt.Errorf("predecessor container %q image differs from its active release", summary.ContainerID)
+		}
+		if container.CustomDomain != domains[container.ServiceName] {
+			return nil, nil, fmt.Errorf("predecessor container %q custom domain differs from its active release", summary.ContainerID)
+		}
+		key := instanceKey{service: container.ServiceName, sku: container.SKU, index: container.InstanceIndex}
+		if _, ok := expected[key]; !ok {
+			return nil, nil, fmt.Errorf("predecessor container %q is not in the exact released instance set", summary.ContainerID)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return nil, nil, fmt.Errorf("duplicate predecessor container for instance %+v", key)
+		}
+		seen[key] = struct{}{}
+		ids = append(ids, summary.ContainerID)
+	}
+	if legacy && legacyAuthority == nil {
+		frozen, freezeErr := shared.NewLegacyRuntimeAuthority(
+			claim.Tenant(),
+			claim.ProviderUUID(),
+			legacyCallbackURL,
+			legacyLifecycleCallbackURL,
+		)
+		if freezeErr != nil {
+			return nil, nil, fmt.Errorf("freeze legacy predecessor runtime authority: %w", freezeErr)
+		}
+		legacyAuthority = &frozen
+	}
+	return ids, legacyAuthority, nil
 }
 
 // operationIntentHasCommittedRelease recognizes the durable success boundary
@@ -640,7 +1023,7 @@ func (b *Backend) classifyOperationIntentSubstrate(
 	ctx context.Context,
 	claim shared.OperationIntentClaim,
 	all []ContainerInfo,
-) (backend.CallbackStatus, string, bool, error) {
+) (operationIntentSubstrate, error) {
 	var current []ContainerInfo
 	oldCount := 0
 	for _, container := range all {
@@ -653,22 +1036,25 @@ func (b *Backend) classifyOperationIntentSubstrate(
 		case callbackMatches && lifecycleMatches:
 			current = append(current, container)
 		case callbackMatches || lifecycleMatches:
-			return "", "", false, fmt.Errorf("container %q has a partial current callback identity", container.ContainerID)
+			return operationIntentSubstrate{}, fmt.Errorf("container %q has a partial current callback identity", container.ContainerID)
 		default:
 			oldCount++
 		}
 	}
 	if oldCount != 0 {
-		return "", "", false, fmt.Errorf("container substrate with another callback generation exists")
+		return operationIntentSubstrate{}, fmt.Errorf("container substrate with another callback generation exists")
 	}
 	if len(current) == 0 {
 		// No container carries this operation's unguessable callback authority;
 		// therefore this exact operation created no surviving substrate.
-		return backend.CallbackStatusFailed, interruptedOperationFailure, false, nil
+		return operationIntentSubstrate{
+			status: backend.CallbackStatusFailed,
+			errMsg: interruptedOperationFailure,
+		}, nil
 	}
 	stack, err := manifest.ParsePayload(claim.Manifest())
 	if err != nil {
-		return "", "", true, fmt.Errorf("parse durable operation manifest: %w", err)
+		return operationIntentSubstrate{}, fmt.Errorf("parse durable operation manifest: %w", err)
 	}
 
 	type instanceKey struct {
@@ -685,54 +1071,52 @@ func (b *Backend) classifyOperationIntentSubstrate(
 		for index := range item.Quantity {
 			key := instanceKey{service: item.ServiceName, sku: item.SKU, index: index}
 			if _, duplicate := expected[key]; duplicate {
-				return "", "", true, fmt.Errorf("intent contains duplicate expected instance %+v", key)
+				return operationIntentSubstrate{}, fmt.Errorf("intent contains duplicate expected instance %+v", key)
 			}
 			expected[key] = struct{}{}
 		}
 	}
-	if len(current) != len(expected) {
-		return "", "", true, fmt.Errorf("partial substrate: found %d current containers, expected %d",
-			len(current), len(expected))
-	}
 
 	seen := make(map[instanceKey]struct{}, len(current))
+	currentIDs := make([]string, 0, len(current))
 	effectiveDomains := make(map[string]string, len(claim.EffectiveItems()))
 	for _, item := range claim.EffectiveItems() {
 		effectiveDomains[item.ServiceName] = item.CustomDomain
 	}
 	serviceDomains := make(map[string]string, len(effectiveDomains))
-	ready, failed := 0, 0
+	ready, failed, nonterminal := 0, 0, 0
 	for _, listed := range current {
 		container, err := b.inspectContainerForRecovery(ctx, listed.ContainerID)
 		if err != nil {
-			return "", "", true, fmt.Errorf("inspect current container %q: %w", listed.ContainerID, err)
+			return operationIntentSubstrate{}, fmt.Errorf("inspect current container %q: %w", listed.ContainerID, err)
 		}
 		if container.LeaseUUID != claim.LeaseUUID() ||
 			container.Tenant != claim.Tenant() ||
 			container.ProviderUUID != claim.ProviderUUID() ||
 			container.CallbackURL != claim.CallbackURL() ||
 			container.LifecycleCallbackURL != claim.LifecycleCallbackURL() {
-			return "", "", true, fmt.Errorf("container %q identity changed or does not match the intent", listed.ContainerID)
+			return operationIntentSubstrate{}, fmt.Errorf("container %q identity changed or does not match the intent", listed.ContainerID)
 		}
 		serviceManifest, ok := stack.Services[container.ServiceName]
 		if !ok || serviceManifest == nil || container.Image != serviceManifest.Image {
-			return "", "", true, fmt.Errorf("container %q image does not match the durable manifest", listed.ContainerID)
+			return operationIntentSubstrate{}, fmt.Errorf("container %q image does not match the durable manifest", listed.ContainerID)
 		}
 		if domain, exists := serviceDomains[container.ServiceName]; exists && domain != container.CustomDomain {
-			return "", "", true, fmt.Errorf("service %q has inconsistent custom-domain labels", container.ServiceName)
+			return operationIntentSubstrate{}, fmt.Errorf("service %q has inconsistent custom-domain labels", container.ServiceName)
 		}
 		serviceDomains[container.ServiceName] = container.CustomDomain
 		if container.CustomDomain != effectiveDomains[container.ServiceName] {
-			return "", "", true, fmt.Errorf("container %q custom domain does not match durable effective items", listed.ContainerID)
+			return operationIntentSubstrate{}, fmt.Errorf("container %q custom domain does not match durable effective items", listed.ContainerID)
 		}
 		key := instanceKey{service: container.ServiceName, sku: container.SKU, index: container.InstanceIndex}
 		if _, ok := expected[key]; !ok {
-			return "", "", true, fmt.Errorf("container %q is not in the exact expected instance set", listed.ContainerID)
+			return operationIntentSubstrate{}, fmt.Errorf("container %q is not in the exact expected instance set", listed.ContainerID)
 		}
 		if _, duplicate := seen[key]; duplicate {
-			return "", "", true, fmt.Errorf("duplicate container for expected instance %+v", key)
+			return operationIntentSubstrate{}, fmt.Errorf("duplicate container for expected instance %+v", key)
 		}
 		seen[key] = struct{}{}
+		currentIDs = append(currentIDs, listed.ContainerID)
 		switch containerStatusToProvisionStatus(container.Status) {
 		case backend.ProvisionStatusReady:
 			if _, required := healthRequired[container.ServiceName]; required &&
@@ -741,25 +1125,58 @@ func (b *Backend) classifyOperationIntentSubstrate(
 					failed++
 					continue
 				}
-				return "", "", true, fmt.Errorf("container %q has not completed its required health check", listed.ContainerID)
+				nonterminal++
+				continue
 			}
 			ready++
 		case backend.ProvisionStatusFailed:
 			failed++
 		default:
-			return "", "", true, fmt.Errorf("container %q remains in non-terminal state %q", listed.ContainerID, container.Status)
+			nonterminal++
 		}
 	}
 	if len(seen) != len(expected) {
-		return "", "", true, fmt.Errorf("partial substrate instance set")
+		if claim.Kind() != shared.OperationIntentProvision || len(seen) > len(expected) {
+			return operationIntentSubstrate{}, fmt.Errorf(
+				"partial substrate: found %d current containers, expected %d",
+				len(seen), len(expected),
+			)
+		}
+		return operationIntentSubstrate{
+			status:        backend.CallbackStatusFailed,
+			errMsg:        interruptedOperationFailure,
+			hasCurrent:    true,
+			needsTeardown: true,
+			currentIDs:    currentIDs,
+		}, nil
 	}
 	switch {
 	case ready == len(expected):
-		return backend.CallbackStatusSuccess, "", true, nil
+		return operationIntentSubstrate{
+			status:     backend.CallbackStatusSuccess,
+			hasCurrent: true,
+			currentIDs: currentIDs,
+		}, nil
 	case failed == len(expected):
-		return backend.CallbackStatusFailed, interruptedOperationFailure, true, nil
+		return operationIntentSubstrate{
+			status:        backend.CallbackStatusFailed,
+			errMsg:        interruptedOperationFailure,
+			hasCurrent:    true,
+			needsTeardown: claim.Kind() == shared.OperationIntentProvision,
+			currentIDs:    currentIDs,
+		}, nil
+	case claim.Kind() == shared.OperationIntentProvision && ready+failed+nonterminal == len(expected):
+		return operationIntentSubstrate{
+			status:        backend.CallbackStatusFailed,
+			errMsg:        interruptedOperationFailure,
+			hasCurrent:    true,
+			needsTeardown: true,
+			currentIDs:    currentIDs,
+		}, nil
+	case nonterminal != 0:
+		return operationIntentSubstrate{}, fmt.Errorf("container substrate remains non-terminal")
 	default:
-		return "", "", true, fmt.Errorf("mixed ready and failed substrate state")
+		return operationIntentSubstrate{}, fmt.Errorf("mixed ready and failed substrate state")
 	}
 }
 

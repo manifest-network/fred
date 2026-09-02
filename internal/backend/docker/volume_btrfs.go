@@ -2,13 +2,10 @@ package docker
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -28,19 +25,31 @@ func (b *btrfsVolumeManager) PinIdentityRoot() error { return b.rootWatch.pin(b.
 func (b *btrfsVolumeManager) VerifyIdentityRoot() error { return b.rootWatch.verify(b.dataPath) }
 
 func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
-	subvolPath := filepath.Join(b.dataPath, id)
+	volumeID, err := parseManagedVolumeName(id)
+	if err != nil {
+		return "", false, fmt.Errorf("validate btrfs volume ID for create: %w", err)
+	}
+	subvolPath := volumeID.hostPath(b.dataPath)
 	quota := fmt.Sprintf("%dm", sizeMB)
+	root, err := os.OpenRoot(b.dataPath)
+	if err != nil {
+		return "", false, fmt.Errorf("open btrfs volume root %s: %w", b.dataPath, err)
+	}
+	defer func() { _ = root.Close() }()
 
 	// Idempotent: if subvolume already exists, update quota and return.
-	_, statErr := os.Stat(subvolPath)
-	if statErr == nil {
+	exists, statErr := managedDirectoryExistsAtRoot(root, volumeID)
+	if statErr == nil && exists {
+		if err := b.AttestManagedVolume(ctx, volumeID); err != nil {
+			return "", false, fmt.Errorf("attest existing btrfs subvolume %s: %w", subvolPath, err)
+		}
 		if out, err := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", quota, subvolPath).CombinedOutput(); err != nil {
 			return "", false, fmt.Errorf("btrfs qgroup limit %s on existing %s: %w: %s", quota, subvolPath, err, out)
 		}
 		b.logger.Debug("reusing existing btrfs subvolume", "path", subvolPath, "quota_mb", sizeMB)
 		return subvolPath, false, nil
 	}
-	if !errors.Is(statErr, fs.ErrNotExist) {
+	if statErr != nil {
 		return "", false, fmt.Errorf("stat subvolume %s: %w", subvolPath, statErr)
 	}
 
@@ -55,7 +64,7 @@ func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64
 		// because the caller's context may already be canceled (which could
 		// have caused the quota failure), and this volume ID won't be in
 		// createdVolumeIDs so the caller's cleanup loop won't cover it.
-		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 10*time.Second)
+		cleanupCtx, cleanupCancel := newVolumeCleanupContext(ctx)
 		defer cleanupCancel()
 		if cleanupOut, cleanupErr := exec.CommandContext(cleanupCtx, "btrfs", "subvolume", "delete", subvolPath).CombinedOutput(); cleanupErr != nil {
 			b.logger.Warn("failed to cleanup subvolume after quota failure", "path", subvolPath, "error", cleanupErr, "output", string(cleanupOut))
@@ -71,12 +80,25 @@ func (b *btrfsVolumeManager) Create(ctx context.Context, id string, sizeMB int64
 // subvolume's quota is inherent to it, so there is no separate "tag" step).
 // No-op if the subvolume is absent (never creates). See ENG-454.
 func (b *btrfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB int64) error {
-	subvolPath := filepath.Join(b.dataPath, id)
-	if _, err := os.Stat(subvolPath); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
+	volumeID, err := parseManagedVolumeName(id)
+	if err != nil {
+		return fmt.Errorf("validate btrfs volume ID for quota: %w", err)
+	}
+	subvolPath := volumeID.hostPath(b.dataPath)
+	root, err := os.OpenRoot(b.dataPath)
+	if err != nil {
+		return fmt.Errorf("open btrfs volume root %s: %w", b.dataPath, err)
+	}
+	defer func() { _ = root.Close() }()
+	exists, err := managedDirectoryExistsAtRoot(root, volumeID)
+	if err != nil {
 		return fmt.Errorf("stat subvolume %s: %w", subvolPath, err)
+	}
+	if !exists {
+		return nil
+	}
+	if err := b.AttestManagedVolume(ctx, volumeID); err != nil {
+		return fmt.Errorf("attest existing btrfs subvolume %s before quota: %w", subvolPath, err)
 	}
 	quota := fmt.Sprintf("%dm", sizeMB)
 	if out, err := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", quota, subvolPath).CombinedOutput(); err != nil {
@@ -86,7 +108,26 @@ func (b *btrfsVolumeManager) EnsureQuota(ctx context.Context, id string, sizeMB 
 }
 
 func (b *btrfsVolumeManager) Destroy(ctx context.Context, id string) error {
-	subvolPath := filepath.Join(b.dataPath, id)
+	volumeID, err := parseManagedVolumeName(id)
+	if err != nil {
+		return fmt.Errorf("validate btrfs volume ID for destroy: %w", err)
+	}
+	subvolPath := volumeID.hostPath(b.dataPath)
+	root, err := os.OpenRoot(b.dataPath)
+	if err != nil {
+		return fmt.Errorf("open btrfs volume root %s: %w", b.dataPath, err)
+	}
+	defer func() { _ = root.Close() }()
+	exists, err := managedDirectoryExistsAtRoot(root, volumeID)
+	if err != nil {
+		return fmt.Errorf("stat subvolume %s: %w", subvolPath, err)
+	}
+	if !exists {
+		return nil
+	}
+	if err := b.AttestManagedVolume(ctx, volumeID); err != nil {
+		return fmt.Errorf("attest btrfs subvolume %s before destroy: %w", subvolPath, err)
+	}
 
 	out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "delete", subvolPath).CombinedOutput()
 	if err != nil {
@@ -95,8 +136,7 @@ func (b *btrfsVolumeManager) Destroy(ctx context.Context, id string) error {
 		// Match specific error strings rather than exit codes to avoid
 		// swallowing permission, busy, or I/O errors.
 		if strings.Contains(outStr, "cannot find") ||
-			strings.Contains(outStr, "No such file or directory") ||
-			strings.Contains(outStr, "not a btrfs subvolume") {
+			strings.Contains(outStr, "No such file or directory") {
 			b.logger.Debug("btrfs subvolume does not exist (idempotent)", "path", subvolPath)
 			return nil
 		}
@@ -111,15 +151,97 @@ func (b *btrfsVolumeManager) List() ([]string, error) {
 	return b.rootWatch.list(b.dataPath)
 }
 
-// RenameVolume renames a btrfs subvolume root via plain os.Rename. The
-// btrfs kernel module treats a subvolume root as a directory for rename
-// purposes — the underlying subvolume identity (subvol-id), data, and
-// qgroup attachment are preserved across the rename. No btrfs CLI call
-// is needed.
+func (b *btrfsVolumeManager) ListForProof(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return b.rootWatch.listForProof(b.dataPath)
+}
+
+// AttestManagedVolume proves that the exact managed directory is a Btrfs
+// subvolume root. A successful directory stat alone is insufficient: a plain
+// directory would place tenant writes on the parent filesystem without the
+// subvolume qgroup identity the quota boundary depends on.
+func (b *btrfsVolumeManager) AttestManagedVolume(ctx context.Context, name managedVolumeName) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(b.dataPath)
+	if err != nil {
+		return fmt.Errorf("open btrfs volume root %s: %w", b.dataPath, err)
+	}
+	defer func() { _ = root.Close() }()
+	exists, err := managedDirectoryExistsAtRoot(root, name)
+	if err != nil {
+		return fmt.Errorf("stat btrfs volume %s: %w", name.hostPath(b.dataPath), err)
+	}
+	if !exists {
+		return fmt.Errorf("btrfs volume %s does not exist", name.hostPath(b.dataPath))
+	}
+	out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "show", name.hostPath(b.dataPath)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("btrfs subvolume show %s: %w: %s", name.hostPath(b.dataPath), err, out)
+	}
+	if _, err := parseBtrfsSubvolumeID(string(out)); err != nil {
+		return fmt.Errorf("validate btrfs subvolume identity for %s: %w", name.hostPath(b.dataPath), err)
+	}
+	return nil
+}
+
+// Btrfs publishes the subvolume name before applying its qgroup limit, but a
+// crash in that window leaves an ordinary, structurally attested managed
+// subvolume. Durable operation recovery classifies it and the fatal startup
+// quota gate repairs every claimed live/retained volume before readiness;
+// unclaimed subvolumes are collected as orphans. There is no private create
+// namespace to reject or recover here.
+func (b *btrfsVolumeManager) RequireNoInterruptedVolumeMutations(context.Context) error { return nil }
+
+func (b *btrfsVolumeManager) RecoverInterruptedVolumeMutations(context.Context) error { return nil }
+
+// RenameVolume renames a btrfs subvolume root through the descriptor-rooted
+// VFS rename path. The btrfs kernel module treats a subvolume root as a
+// directory for rename purposes — the underlying subvolume identity
+// (subvol-id), data, and qgroup attachment are preserved across the rename.
+// No btrfs CLI call is needed.
 func (b *btrfsVolumeManager) RenameVolume(ctx context.Context, oldName, newName string) error {
-	oldPath := filepath.Join(b.dataPath, oldName)
-	newPath := filepath.Join(b.dataPath, newName)
-	return atomicRenameVolumeDir(ctx, oldPath, newPath)
+	oldVolume, err := parseManagedVolumeName(oldName)
+	if err != nil {
+		return fmt.Errorf("validate old btrfs volume ID for rename: %w", err)
+	}
+	newVolume, err := parseManagedVolumeName(newName)
+	if err != nil {
+		return fmt.Errorf("validate new btrfs volume ID for rename: %w", err)
+	}
+	root, err := os.OpenRoot(b.dataPath)
+	if err != nil {
+		return fmt.Errorf("open btrfs volume root %s: %w", b.dataPath, err)
+	}
+	oldExists, oldStatErr := managedDirectoryExistsAtRoot(root, oldVolume)
+	newExists, newStatErr := managedDirectoryExistsAtRoot(root, newVolume)
+	_ = root.Close()
+	if oldStatErr != nil {
+		return fmt.Errorf("stat old btrfs subvolume %s: %w", oldVolume.hostPath(b.dataPath), oldStatErr)
+	}
+	if newStatErr != nil {
+		return fmt.Errorf("stat new btrfs subvolume %s: %w", newVolume.hostPath(b.dataPath), newStatErr)
+	}
+	if oldExists {
+		if err := b.AttestManagedVolume(ctx, oldVolume); err != nil {
+			return fmt.Errorf("attest old btrfs subvolume before rename: %w", err)
+		}
+	}
+	if newExists {
+		if err := b.AttestManagedVolume(ctx, newVolume); err != nil {
+			return fmt.Errorf("attest new btrfs subvolume before rename: %w", err)
+		}
+	}
+	if err := renameAtStorageRoot(ctx, b.dataPath, oldVolume, newVolume); err != nil {
+		return err
+	}
+	if err := b.AttestManagedVolume(ctx, newVolume); err != nil {
+		return fmt.Errorf("attest renamed btrfs subvolume: %w", err)
+	}
+	return nil
 }
 
 // HostPath returns the absolute path of the subvolume under the
@@ -127,7 +249,11 @@ func (b *btrfsVolumeManager) RenameVolume(ctx context.Context, oldName, newName 
 // this to compute paths for not-yet-renamed or about-to-be-created
 // volumes.
 func (b *btrfsVolumeManager) HostPath(name string) string {
-	return filepath.Join(b.dataPath, name)
+	volumeID, err := parseManagedVolumeName(name)
+	if err != nil {
+		return rejectedManagedVolumeHostPath(b.dataPath, name)
+	}
+	return volumeID.hostPath(b.dataPath)
 }
 
 // Kind identifies the btrfs backend.
@@ -141,7 +267,23 @@ func (b *btrfsVolumeManager) Kind() string { return "btrfs" }
 // not a recount — never a `quota rescan`). rfer != excl is logged
 // (informational), never an error: gating on rfer is correct regardless.
 func (b *btrfsVolumeManager) Usage(ctx context.Context, id string) (int64, error) {
-	subvolPath := filepath.Join(b.dataPath, id)
+	volumeID, err := parseManagedVolumeName(id)
+	if err != nil {
+		return 0, fmt.Errorf("validate btrfs volume ID for usage: %w", err)
+	}
+	subvolPath := volumeID.hostPath(b.dataPath)
+	root, err := os.OpenRoot(b.dataPath)
+	if err != nil {
+		return 0, fmt.Errorf("open btrfs volume root %s: %w", b.dataPath, err)
+	}
+	defer func() { _ = root.Close() }()
+	exists, err := managedDirectoryExistsAtRoot(root, volumeID)
+	if err != nil {
+		return 0, fmt.Errorf("stat subvolume %s: %w", subvolPath, err)
+	}
+	if !exists {
+		return 0, fmt.Errorf("subvolume %s does not exist", subvolPath)
+	}
 	showOut, err := exec.CommandContext(ctx, "btrfs", "subvolume", "show", subvolPath).CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("btrfs subvolume show %s: %w: %s", subvolPath, err, showOut)

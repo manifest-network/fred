@@ -240,6 +240,27 @@ response. A header on a cheap pre-dispatch error identifies only the process's
 sealed ID; it is not positive inventory/effect evidence. A backend that confirms
 runtime lineage drift deletes the header and returns `503`.
 
+Storage-lineage proof does not accept a canonical-looking directory name as
+substrate authority. Every managed name is parsed as one typed path component
+and then proved as an actual Btrfs subvolume, a real directory on the configured
+XFS root with a regular no-follow nonzero project-ID marker, or the exact
+depth-one ZFS child with its exact managed mountpoint. ZFS proof inventory unions
+the directory view with the child-dataset view, so an unmounted or externally
+mounted child cannot disappear as apparent absence. Container bind evidence
+must independently match its label-derived volume and exact target-derived
+subtree, with no symlink in any component. The XFS marker is durable project-ID
+authority; startup separately re-applies the kernel project tag and limits and
+refuses readiness if that enforcement cannot be proved.
+
+XFS project IDs and dquots are scoped to the whole containing filesystem. Fred's
+allocator scans only its own managed root and selects from the full nonzero
+32-bit namespace, so a different Fred root or foreign project-quota manager on
+the same mount could collide and make a later limit or clear affect unrelated
+inodes. The deployment trust boundary therefore requires Fred to be the sole
+project-ID allocator on that mount. A dedicated XFS filesystem provides that
+isolation. Sharing is unsupported until a coordinated disjoint-range mechanism
+is added; separate subdirectories do not provide separate project namespaces.
+
 The Docker backend also re-attests lineage after every raw Compose, Docker,
 volume-manager, and tenant-path mutation. A postcheck failure makes both a
 successful return and a transport error causally ambiguous: the backend latches
@@ -247,9 +268,43 @@ that state for its process lifetime, cancels further substrate work, suppresses
 callback settlement, and preserves the operation/maintenance intent or retention finalizer
 for strict restart recovery. This conservative check detects a replacement
 during a daemon/filesystem call; it cannot make an external daemon or CLI
-mutation atomic with the marker proof. Local path operations may eventually be
-anchored to a pinned directory descriptor, while Docker/ZFS/btrfs require a
-substrate-native generation/CAS primitive to close that residual window.
+mutation atomic with the marker proof. Local recursive deletion and directory
+rename are descriptor-rooted after exact managed-volume-name validation, and
+XFS project-marker access uses attested, no-follow descriptor lookups. External
+Docker, ZFS, btrfs, and xfs_quota operations still require a substrate-native
+generation/CAS primitive to close the residual same-root replacement window.
+
+XFS also withholds the bind-ready final name until a typed hidden stage is
+parent-synced, its project marker is durable, and both project tag and limits
+have succeeded; publication is a descriptor-rooted no-replace rename and
+requires the marker's parsed ID to match the stage name. For cleanup, the synced
+typed name remains authoritative when a crash recovers the sole no-follow
+regular marker as empty, partial, or zero-filled, up to the ten bytes the writer
+could emit. A stage found after restart is cleanup authority only because its
+original quota is not durable, so normal sealed startup clears its dquot and
+removes only that bounded empty-or-single-marker shape, never publishes it.
+Runtime failures after stage durability attempt exact compensation; the
+external quota clear uses a detached cleanup context capped at 30 seconds and by
+any earlier aggregate parent deadline. Any failed or ambiguous cleanup retains
+the stage, latches and stops the current backend instance, and requires a fresh
+`Start` to recover the authority before serving.
+
+Destruction has distinct authority:
+`.fred-xfs-delete-<project-id>-<managed-volume>` is created empty, normalized to
+project ID zero, and parent-synced before the final volume is changed. Recovery
+re-normalizes and re-attests that sibling, deletes only the encoded final tree,
+syncs its absence, and requires numeric block and inode usage for the encoded
+project ID to be zero before clearing its dquot. This detects open-but-unlinked
+files that pathname absence cannot. The sibling is removed and the parent
+synced only after the strict clear; until then it prevents readiness and
+same-name creation. Offline proof refuses the private authority rather than
+turning it into mutation permission.
+
+ZFS retains an exact
+unmounted child after an ambiguous create and normal sealed startup remounts and
+re-attests it rather than destroying it. The stopped preflight and initializer
+reject either form without mutation. Failure or ambiguity preserves the evidence
+and prevents readiness.
 
 Bundled backends retain old HMAC-authenticated, identity-unbound mutation paths
 as a bounded v0.13 compatibility surface, but the supported upgrade never sends
@@ -427,7 +482,7 @@ Every container created by the Docker backend runs with these security measures:
 
 Network isolation places each tenant's containers in a dedicated Docker bridge network. Docker's `DOCKER-ISOLATION` iptables chains drop forwarded traffic between different bridge networks, preventing cross-tenant communication.
 
-**Daemon capabilities vs. container privileges.** The controls above constrain the tenant *container*, which continues to run with `CapDrop: ["ALL"]` — that is unchanged. Enforcing the per-volume disk quota, however, requires the docker-backend *daemon itself* to hold `CAP_SYS_ADMIN` to set the xfs/btrfs block limit — granted via `AmbientCapabilities=CAP_SYS_ADMIN` on the systemd unit, or by running as root. On an xfs or btrfs backend the daemon **fails fast at startup** if it lacks `CAP_SYS_ADMIN`, rather than silently skipping the cap and leaving `disk_mb` unenforced (`internal/backend/docker/capability.go`). zfs is exempt (it uses `zfs allow` delegation, so a cap check would wrongly reject a properly-delegated non-root host); the noop backend is unaffected. The startup backfill that re-tags pre-existing tenant-owned volumes with their project ID additionally needs `CAP_FOWNER` (best-effort — a missing `CAP_FOWNER` does not fail startup). See [DEPLOYMENT.md](DEPLOYMENT.md) — filesystem setup (xfs) and the systemd capabilities note — for the full `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` grant procedure.
+**Daemon capabilities vs. container privileges.** The controls above constrain the tenant *container*, which continues to run with `CapDrop: ["ALL"]` — that is unchanged. Enforcing the per-volume disk quota, however, requires the docker-backend *daemon itself* to hold `CAP_SYS_ADMIN` to set the xfs/btrfs block limit — granted via `AmbientCapabilities=CAP_SYS_ADMIN` on the systemd unit, or by running as root. On an xfs or btrfs backend the daemon **fails fast at startup** if it lacks `CAP_SYS_ADMIN`, rather than silently skipping the cap and leaving `disk_mb` unenforced (`internal/backend/docker/capability.go`). zfs is exempt (it uses `zfs allow` delegation, so a cap check would wrongly reject a properly-delegated non-root host); the noop backend is unaffected. Re-tagging an existing XFS tree may additionally need `CAP_FOWNER` when it contains tenant-owned inodes. A truly fresh root does not need that capability, so the preliminary capability probe checks only `CAP_SYS_ADMIN`; startup quota reconciliation then attempts every expected present live or retained volume and refuses readiness on any inventory, durable-authority, or enforcement error. See [DEPLOYMENT.md](DEPLOYMENT.md) — filesystem setup (xfs) and the systemd capabilities note — for the full `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` grant procedure.
 
 ## Error Handling
 

@@ -626,14 +626,18 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 	status backend.ProvisionStatus,
 	failure *leasesm.ReplaceFailureInfo,
 ) (bool, error) {
-	if release.RuntimeAuthority == nil {
+	authority, ok := runtimeIdentityForRelease(&release)
+	if !ok {
 		return false, errors.New("maintenance projection release has no runtime authority")
 	}
-	authority := release.RuntimeAuthority
-	if release.OperationID != intent.TargetRelease().OperationID ||
-		authority.OperationID() != release.OperationID ||
+	target := intent.TargetRelease()
+	targetAuthority, ok := runtimeIdentityForRelease(&target)
+	if !ok || release.OperationID != target.OperationID ||
+		authority.Class() != targetAuthority.Class() ||
 		authority.Tenant() != intent.Tenant() ||
-		authority.ProviderUUID() != intent.ProviderUUID() {
+		authority.ProviderUUID() != intent.ProviderUUID() ||
+		authority.Tenant() != targetAuthority.Tenant() ||
+		authority.ProviderUUID() != targetAuthority.ProviderUUID() {
 		return false, errors.New("maintenance projection release changes durable runtime identity")
 	}
 	if release.MaintenanceID == intent.MaintenanceID() &&
@@ -925,11 +929,12 @@ func (b *Backend) validateMaintenanceTargetContainer(
 		container.MaintenanceID != intent.MaintenanceID() || container.BackendName != b.Name() {
 		return fmt.Errorf("container %q lacks exact maintenance identity", container.ContainerID)
 	}
-	if target.RuntimeAuthority == nil ||
-		container.Tenant != target.RuntimeAuthority.Tenant() ||
-		container.ProviderUUID != target.RuntimeAuthority.ProviderUUID() ||
-		container.CallbackURL != target.RuntimeAuthority.CallbackURL() ||
-		container.LifecycleCallbackURL != target.RuntimeAuthority.LifecycleCallbackURL() {
+	authority, ok := runtimeIdentityForRelease(&target)
+	if !ok ||
+		container.Tenant != authority.Tenant() ||
+		container.ProviderUUID != authority.ProviderUUID() ||
+		container.CallbackURL != authority.CallbackURL() ||
+		container.LifecycleCallbackURL != authority.LifecycleCallbackURL() {
 		return fmt.Errorf("container %q diverges from target runtime authority", container.ContainerID)
 	}
 	stack, err := manifest.ParsePayload(target.Manifest)

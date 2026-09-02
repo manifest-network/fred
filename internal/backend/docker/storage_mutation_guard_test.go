@@ -20,6 +20,42 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
+func TestBackendStorageAuthorityLifetimePublishesFirstFailureAndCancels(t *testing.T) {
+	t.Parallel()
+
+	stopCtx, stopCancel, failures, gate, err := newBackendStorageAuthorityLifetime()
+	require.NoError(t, err)
+	t.Cleanup(stopCancel)
+	require.NotNil(t, failures)
+	assert.Equal(t, 1, cap(failures), "the durability-boundary hook must never wait for the daemon")
+	b := &Backend{terminalStorageAuthorityFailure: failures}
+	assert.Equal(t, failures, b.TerminalStorageAuthorityFailure())
+
+	first := fmt.Errorf("%w: injected volume cleanup evidence", backendidentity.ErrMutationOutcomeAmbiguous)
+	require.ErrorIs(t, gate.Latch(first), first)
+	select {
+	case got := <-b.TerminalStorageAuthorityFailure():
+		require.ErrorIs(t, got, first)
+	case <-time.After(time.Second):
+		t.Fatal("terminal storage-authority failure was not published")
+	}
+	select {
+	case <-stopCtx.Done():
+	default:
+		t.Fatal("terminal storage-authority failure did not cancel the backend lifetime")
+	}
+
+	second := fmt.Errorf("%w: later independent failure", backendidentity.ErrIdentityDrift)
+	require.ErrorIs(t, gate.Latch(second), first, "the gate must retain its exact first cause")
+	select {
+	case extra := <-b.TerminalStorageAuthorityFailure():
+		t.Fatalf("terminal storage-authority channel published more than once: %v", extra)
+	default:
+	}
+	assert.Nil(t, (*Backend)(nil).TerminalStorageAuthorityFailure())
+	assert.Nil(t, (&Backend{}).TerminalStorageAuthorityFailure())
+}
+
 // TestStorageMutationGuard_ClosesFrontDoorMutationTOCTOU models the exact
 // queueing window the adapter exists for: the request/front-door check passes,
 // the sealed marker disappears while work waits, and only then does the actor
@@ -68,6 +104,156 @@ func TestStorageMutationGuard_ClosesFrontDoorMutationTOCTOU(t *testing.T) {
 	case <-b.stopCtx.Done():
 	default:
 		t.Fatal("permanent identity drift did not cancel the backend lifetime")
+	}
+}
+
+func TestParseStoragePathComponent_RejectsTraversalSyntax(t *testing.T) {
+	t.Parallel()
+
+	valid, err := parseStoragePathComponent("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.NoError(t, err)
+	assert.Equal(t, storagePathComponent("fred-550e8400-e29b-41d4-a716-446655440000-app-0"), valid)
+
+	for _, value := range []string{
+		"",
+		".",
+		"..",
+		"../outside",
+		"fred-volume/../../outside",
+		`fred-volume\..\outside`,
+		"fred..volume",
+		"/absolute",
+		"fred-volume\x00",
+	} {
+		t.Run(fmt.Sprintf("%q", value), func(t *testing.T) {
+			t.Parallel()
+			_, parseErr := parseStoragePathComponent(value)
+			require.Error(t, parseErr)
+		})
+	}
+}
+
+func TestParseManagedVolumeName_RequiresCanonicalIdentity(t *testing.T) {
+	t.Parallel()
+
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	for _, value := range []string{
+		"fred-" + leaseUUID + "-app-0",
+		"fred-" + leaseUUID + "-api-worker-12",
+		"fred-retained-" + leaseUUID + "-app-0",
+		"fred-" + leaseUUID + "-0", // stopped v0.13 upgrade
+		"fred-retained-" + leaseUUID + "-0",
+	} {
+		value := value
+		t.Run("accept_"+value, func(t *testing.T) {
+			t.Parallel()
+			name, err := parseManagedVolumeName(value)
+			require.NoError(t, err)
+			assert.Equal(t, value, name.value())
+		})
+	}
+
+	for _, value := range []string{
+		"other-" + leaseUUID + "-app-0",
+		"fred-550E8400-E29B-41D4-A716-446655440000-app-0",
+		"fred-00000000-0000-0000-0000-000000000000-app-0",
+		"fred-" + leaseUUID,
+		"fred-" + leaseUUID + "-app-01",
+		"fred-" + leaseUUID + "-app--1",
+		"fred-" + leaseUUID + "-App-0",
+		"fred-" + leaseUUID + "-app.example-0",
+		"fred-" + leaseUUID + "-/../../outside-0",
+		`fred-` + leaseUUID + `-app\..\outside-0`,
+	} {
+		value := value
+		t.Run("reject_"+value, func(t *testing.T) {
+			t.Parallel()
+			_, err := parseManagedVolumeName(value)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestRemoveManagedVolumeSubtree_ConfinesRecursiveDeletion(t *testing.T) {
+	t.Parallel()
+
+	volumeRoot := t.TempDir()
+	volumeName, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.NoError(t, err)
+	wpName, err := parseStoragePathComponent(writablePathSubdir)
+	require.NoError(t, err)
+
+	volumePath := volumeName.hostPath(volumeRoot)
+	wpPath := filepath.Join(volumePath, writablePathSubdir)
+	require.NoError(t, os.MkdirAll(wpPath, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(wpPath, "tenant-data"), []byte("x"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(volumePath, "keep"), []byte("x"), 0o600))
+
+	require.NoError(t, removeManagedVolumeSubtree(volumeRoot, volumeName, wpName))
+	assert.NoDirExists(t, wpPath)
+	assert.FileExists(t, filepath.Join(volumePath, "keep"), "only the fixed writable-path subtree may be removed")
+}
+
+func TestRemoveManagedVolumeSubtree_RejectsEscapingSymlink(t *testing.T) {
+	t.Parallel()
+
+	volumeRoot := t.TempDir()
+	outside := t.TempDir()
+	volumeName, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.NoError(t, err)
+	wpName, err := parseStoragePathComponent(writablePathSubdir)
+	require.NoError(t, err)
+
+	outsideWP := filepath.Join(outside, writablePathSubdir)
+	require.NoError(t, os.Mkdir(outsideWP, 0o700))
+	victim := filepath.Join(outsideWP, "victim")
+	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+	require.NoError(t, os.Symlink(outside, volumeName.hostPath(volumeRoot)))
+
+	require.Error(t, removeManagedVolumeSubtree(volumeRoot, volumeName, wpName))
+	assert.FileExists(t, victim, "descriptor-relative deletion must not follow a symlink outside the storage root")
+}
+
+func TestRemoveManagedVolumeSubtree_RejectsCrossVolumeSymlink(t *testing.T) {
+	t.Parallel()
+
+	volumeRoot := t.TempDir()
+	source, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.NoError(t, err)
+	target, err := parseManagedVolumeName("fred-550e8400-e29b-41d4-a716-446655440000-app-1")
+	require.NoError(t, err)
+	wpName, err := parseStoragePathComponent(writablePathSubdir)
+	require.NoError(t, err)
+
+	targetWP := filepath.Join(target.hostPath(volumeRoot), writablePathSubdir)
+	require.NoError(t, os.MkdirAll(targetWP, 0o700))
+	victim := filepath.Join(targetWP, "tenant-data")
+	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+	require.NoError(t, os.Symlink(target.value(), source.hostPath(volumeRoot)))
+
+	require.Error(t, removeManagedVolumeSubtree(volumeRoot, source, wpName))
+	assert.FileExists(t, victim, "one managed volume must never redirect cleanup into another volume")
+}
+
+func TestWritablePathVolumeComponent_RequiresExactManagedSubtree(t *testing.T) {
+	t.Parallel()
+
+	volumeRoot := t.TempDir()
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	validPath := filepath.Join(volumeRoot, name, writablePathSubdir)
+	got, err := writablePathVolumeComponent(volumeRoot, validPath)
+	require.NoError(t, err)
+	assert.Equal(t, managedVolumeName(name), got)
+
+	outside := filepath.Join(filepath.Dir(volumeRoot), "outside", writablePathSubdir)
+	for _, candidate := range []string{
+		outside,
+		filepath.Join(volumeRoot, "unmanaged", writablePathSubdir),
+		filepath.Join(volumeRoot, name, "nested", writablePathSubdir),
+		filepath.Join(volumeRoot, name, "not-writable-path"),
+	} {
+		_, parseErr := writablePathVolumeComponent(volumeRoot, candidate)
+		require.Error(t, parseErr, "candidate %q must be rejected", candidate)
 	}
 }
 
@@ -145,6 +331,104 @@ func TestStorageMutationGuard_PostcheckJoinsMutationAndIdentityErrors(t *testing
 	assert.ErrorIs(t, err, backendidentity.ErrIdentityDrift, "the postcheck cause must remain inspectable")
 	assert.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous,
 		"a failed postcheck must expose the typed ambiguity cause")
+}
+
+func TestStorageMutationGuard_ManagerAmbiguityLatchesBackendAfterSuccessfulPostcheck(t *testing.T) {
+	t.Parallel()
+
+	mutationCause := errors.New("xfs parent directory sync failed")
+	managerErr := fmt.Errorf("%w: %w", backendidentity.ErrMutationOutcomeAmbiguous, mutationCause)
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	storeAuthorityGate, err := backendidentity.NewStorageAuthorityGate(func(error) { stop() })
+	require.NoError(t, err)
+	b := &Backend{
+		volumes: &mockVolumeManager{CreateFn: func(context.Context, string, int64) (string, bool, error) {
+			return "", false, managerErr
+		}},
+		stopCtx: stopCtx, stopCancel: stop,
+		storeAuthorityGate: storeAuthorityGate,
+	}
+	installMutationTestVerifier(t, b, func(context.Context) error { return nil })
+	b.mutations = storageMutationAdapters{backend: b}
+
+	_, _, err = b.mutationAdapter().createVolume(context.Background(),
+		"fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100)
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	require.ErrorIs(t, err, mutationCause)
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+	select {
+	case <-b.stopCtx.Done():
+	default:
+		t.Fatal("typed manager ambiguity did not stop the backend lifetime")
+	}
+}
+
+func TestStorageMutationGuard_VolumeRecoveryPendingLatchesBackendAfterSuccessfulPostcheck(t *testing.T) {
+	t.Parallel()
+
+	mutationCause := errors.New("xfs delete-stage still has open-unlinked inodes")
+	managerErr := fmt.Errorf("%w: %w", ErrVolumeMutationRecoveryPending, mutationCause)
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	storeAuthorityGate, err := backendidentity.NewStorageAuthorityGate(func(error) { stop() })
+	require.NoError(t, err)
+	b := &Backend{
+		volumes: &mockVolumeManager{DestroyFn: func(context.Context, string) error {
+			return managerErr
+		}},
+		stopCtx: stopCtx, stopCancel: stop,
+		storeAuthorityGate: storeAuthorityGate,
+	}
+	installMutationTestVerifier(t, b, func(context.Context) error { return nil })
+	b.mutations = storageMutationAdapters{backend: b}
+
+	sink := b.volumes.(volumeDestroyer)
+	err = b.mutationAdapter().destroyVolume(context.Background(), sink,
+		"fred-550e8400-e29b-41d4-a716-446655440000-app-0")
+	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	require.ErrorIs(t, err, mutationCause)
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), ErrVolumeMutationRecoveryPending)
+	select {
+	case <-b.stopCtx.Done():
+	default:
+		t.Fatal("typed volume recovery obligation did not stop the backend lifetime")
+	}
+}
+
+func TestStorageMutationGuard_ManagerRenameAmbiguityLatchesBackendAfterSuccessfulPostcheck(t *testing.T) {
+	t.Parallel()
+
+	mutationCause := errors.New("xfs rename parent directory sync failed")
+	managerErr := fmt.Errorf("%w: %w", backendidentity.ErrMutationOutcomeAmbiguous, mutationCause)
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	storeAuthorityGate, err := backendidentity.NewStorageAuthorityGate(func(error) { stop() })
+	require.NoError(t, err)
+	b := &Backend{
+		volumes: &mockVolumeManager{RenameVolumeFn: func(string, string) error {
+			return managerErr
+		}},
+		stopCtx: stopCtx, stopCancel: stop,
+		storeAuthorityGate: storeAuthorityGate,
+	}
+	installMutationTestVerifier(t, b, func(context.Context) error { return nil })
+	b.mutations = storageMutationAdapters{backend: b}
+
+	err = b.mutationAdapter().renameVolume(
+		context.Background(),
+		"fred-550e8400-e29b-41d4-a716-446655440000-0",
+		"fred-550e8400-e29b-41d4-a716-446655440000-app-0",
+	)
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	require.ErrorIs(t, err, mutationCause)
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+	select {
+	case <-b.stopCtx.Done():
+	default:
+		t.Fatal("typed XFS rename ambiguity did not stop the backend lifetime")
+	}
 }
 
 func TestStorageMutationGuard_CanceledPostcheckLatchesAmbiguity(t *testing.T) {

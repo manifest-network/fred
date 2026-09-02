@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -111,6 +112,75 @@ func TestNewReleaseRuntimeAuthorityRejectsIncompleteOrDivergentInput(t *testing.
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestLegacyRuntimeAuthorityRequiresCanonicalProviderAndTokenlessCallbacks(t *testing.T) {
+	const (
+		providerUUID = "22222222-2222-4222-8222-222222222222"
+		callbackURL  = "https://fred.example/callbacks/provision?route=v013"
+	)
+	authority, err := NewLegacyRuntimeAuthority("tenant-a", providerUUID, callbackURL, "")
+	require.NoError(t, err)
+	assert.Equal(t, providerUUID, authority.ProviderUUID())
+	assert.Equal(t, callbackURL, authority.CallbackURL())
+	assert.NotEmpty(t, authority.LifecycleCallbackURL())
+
+	for _, tt := range []struct {
+		name, tenant, provider, callback, lifecycle string
+	}{
+		{name: "missing tenant", provider: providerUUID, callback: callbackURL},
+		{name: "missing provider", tenant: "tenant-a", callback: callbackURL},
+		{name: "noncanonical provider", tenant: "tenant-a", provider: "provider-a", callback: callbackURL},
+		{name: "typed callback", tenant: "tenant-a", provider: providerUUID, callback: "https://fred.example/callbacks/provision?operation_id=" + releaseRuntimeAuthorityOperationID.String()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewLegacyRuntimeAuthority(
+				tt.tenant, tt.provider, tt.callback, tt.lifecycle,
+			)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestLegacyRuntimeAuthorityJSONRejectsNoncanonicalProvider(t *testing.T) {
+	var authority LegacyRuntimeAuthority
+	err := json.Unmarshal([]byte(`{
+		"tenant":"tenant-a",
+		"provider_uuid":"provider-a",
+		"callback_url":"https://fred.example/callbacks/provision?route=v013",
+		"lifecycle_callback_url":"https://fred.example/callbacks/provision?route=v013"
+	}`), &authority)
+	require.ErrorContains(t, err, "provider UUID is not canonical")
+	assert.Empty(t, authority.ProviderUUID())
+}
+
+func TestReleaseStoreRejectsInvalidLegacyRuntimeAuthority(t *testing.T) {
+	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	items := []backend.LeaseItem{{SKU: "sku-a", ServiceName: "app", Quantity: 1}}
+	release := Release{
+		Manifest:               []byte(`{"services":{"app":{"image":"nginx:1.27"}}}`),
+		Image:                  "stack",
+		Items:                  items,
+		ResourceProfiles:       []SKUResourceSnapshot{{SKU: "sku-a", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		LegacyRuntimeAuthority: &LegacyRuntimeAuthority{},
+		Status:                 "active",
+		CreatedAt:              time.Now(),
+	}
+
+	err = store.AppendActive("550e8400-e29b-41d4-a716-446655440000", release)
+	require.ErrorContains(t, err, "legacy runtime authority is invalid")
+
+	release.LegacyRuntimeAuthority = &LegacyRuntimeAuthority{
+		tenant:               "tenant-a",
+		providerUUID:         "provider-a",
+		callbackURL:          "https://fred.example/callbacks/provision?route=v013",
+		lifecycleCallbackURL: "https://fred.example/callbacks/provision?route=v013",
+		valid:                true,
+	}
+	err = store.AppendActive("550e8400-e29b-41d4-a716-446655440000", release)
+	require.ErrorContains(t, err, "provider UUID is not canonical")
 }
 
 func TestReleaseHistoryWriteCeilingRollsBackAppend(t *testing.T) {

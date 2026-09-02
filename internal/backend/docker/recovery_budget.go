@@ -24,6 +24,12 @@ const (
 	// generous process-independent budget. Exhaustion is a typed startup failure
 	// and the next launch resumes from durable evidence.
 	defaultStartupRecoveryTimeout = 30 * time.Minute
+	// Interrupted volume mutation recovery runs before Docker/container recovery
+	// and never waits for a container stop grace. Give each of its two phases a
+	// fixed local cap while still deriving it from the aggregate startup context.
+	// Keeping this separate from startupPhaseBudget prevents an unusually large
+	// ContainerStopTimeout from inflating filesystem-only work.
+	defaultStartupVolumeMutationTimeout = 2 * time.Minute
 	// Best-effort fleet sweeps get a smaller aggregate budget. Nested per-call
 	// deadlines are capped by this parent instead of multiplying by object count.
 	defaultStartupPhaseTimeout = 2 * time.Minute
@@ -35,6 +41,10 @@ func (b *Backend) recoveryDockerReadContext(parent context.Context) (context.Con
 
 func (b *Backend) startupRecoveryContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(b.stopCtx, cmp.Or(b.startupRecoveryTimeout, defaultStartupRecoveryTimeout))
+}
+
+func startupVolumeMutationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, defaultStartupVolumeMutationTimeout)
 }
 
 func (b *Backend) startupPhaseContext(parent context.Context) (context.Context, context.CancelFunc) {

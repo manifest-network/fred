@@ -233,6 +233,119 @@ func TestResourcePool_AdoptResolvesEachInstanceExactlyOnce(t *testing.T) {
 		"the profile admitted by the aggregate gate must be the profile committed")
 }
 
+func TestResourcePool_ReplaceResolvedAllPublishesOneAtomicGeneration(t *testing.T) {
+	resolverCalls := 0
+	pool := NewResourcePool(20, 20, 20, func(string) (SKUProfile, error) {
+		resolverCalls++
+		return SKUProfile{}, assert.AnError
+	}, &TenantQuotaConfig{MaxCPUCores: 20, MaxMemoryMB: 20, MaxDiskMB: 20})
+	old := SKUResourceSnapshot{SKU: "old", CPUCores: 2, MemoryMB: 2, DiskMB: 2}
+	unrelated := SKUResourceSnapshot{SKU: "other", CPUCores: 1, MemoryMB: 1, DiskMB: 1}
+	replacement := SKUResourceSnapshot{SKU: "new", CPUCores: 3, MemoryMB: 3, DiskMB: 3}
+	require.NoError(t, pool.TryAllocateResolved("lease-app-0", "tenant-a", old))
+	require.NoError(t, pool.TryAllocateResolved("lease-app-1", "tenant-a", old))
+	require.NoError(t, pool.TryAllocateResolved("other-app-0", "tenant-b", unrelated))
+
+	require.NoError(t, pool.ReplaceResolvedAll(
+		[]string{"lease-app-0", "lease-app-1"},
+		[]ResolvedAdoptInstance{
+			{ID: "lease-next-0", Resources: replacement},
+			{ID: "lease-next-1", Resources: replacement},
+		},
+		"tenant-a",
+	))
+
+	assert.Zero(t, resolverCalls, "replacement must consume only its durable snapshots")
+	assert.Nil(t, pool.GetAllocation("lease-app-0"))
+	assert.Nil(t, pool.GetAllocation("lease-app-1"))
+	assert.Equal(t, &ResourceAllocation{
+		LeaseUUID: "lease-next-0", Tenant: "tenant-a", SKU: "new",
+		CPUCores: 3, MemoryMB: 3, DiskMB: 3,
+	}, pool.GetAllocation("lease-next-0"))
+	assert.NotNil(t, pool.GetAllocation("other-app-0"), "unrelated authority must remain")
+	assert.Equal(t, ResourceStats{
+		TotalCPU: 20, TotalMemoryMB: 20, TotalDiskMB: 20,
+		AllocatedCPU: 7, AllocatedMemoryMB: 7, AllocatedDiskMB: 7,
+		AllocationCount: 3,
+	}, pool.Stats())
+	assert.Equal(t, float64(6), pool.TenantStats("tenant-a").AllocatedCPU)
+	assert.Equal(t, int64(6), pool.TenantStats("tenant-a").AllocatedMemoryMB)
+	assert.Equal(t, int64(6), pool.TenantStats("tenant-a").AllocatedDiskMB)
+}
+
+func TestResourcePool_ReplaceResolvedAllRollsBackExactAccounting(t *testing.T) {
+	tests := []struct {
+		name         string
+		replacements []ResolvedAdoptInstance
+		wantError    string
+	}{
+		{
+			name: "later capacity failure",
+			replacements: []ResolvedAdoptInstance{
+				{ID: "candidate-0", Resources: SKUResourceSnapshot{SKU: "small", CPUCores: 3, MemoryMB: 3, DiskMB: 3}},
+				{ID: "candidate-1", Resources: SKUResourceSnapshot{SKU: "large", CPUCores: 4, MemoryMB: 4, DiskMB: 4}},
+			},
+			wantError: "insufficient CPU",
+		},
+		{
+			name: "duplicate candidate id",
+			replacements: []ResolvedAdoptInstance{
+				{ID: "candidate", Resources: SKUResourceSnapshot{SKU: "small", CPUCores: 1, MemoryMB: 1, DiskMB: 1}},
+				{ID: "candidate", Resources: SKUResourceSnapshot{SKU: "small", CPUCores: 1, MemoryMB: 1, DiskMB: 1}},
+			},
+			wantError: "already has allocated resources",
+		},
+		{
+			name: "candidate collides with unrelated allocation",
+			replacements: []ResolvedAdoptInstance{
+				{ID: "other-app-0", Resources: SKUResourceSnapshot{SKU: "small", CPUCores: 1, MemoryMB: 1, DiskMB: 1}},
+			},
+			wantError: "already has allocated resources",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolverCalls := 0
+			pool := NewResourcePool(10, 10, 10, func(string) (SKUProfile, error) {
+				resolverCalls++
+				return SKUProfile{}, assert.AnError
+			}, &TenantQuotaConfig{MaxCPUCores: 10, MaxMemoryMB: 10, MaxDiskMB: 10})
+			old := SKUResourceSnapshot{SKU: "old", CPUCores: 2, MemoryMB: 2, DiskMB: 2}
+			other := SKUResourceSnapshot{SKU: "other", CPUCores: 4, MemoryMB: 4, DiskMB: 4}
+			require.NoError(t, pool.TryAllocateResolved("lease-app-0", "tenant-a", old))
+			require.NoError(t, pool.TryAllocateResolved("lease-app-1", "tenant-a", old))
+			require.NoError(t, pool.TryAllocateResolved("other-app-0", "tenant-b", other))
+			require.NoError(t, pool.SetRetainedDisk(1))
+			statsBefore := pool.Stats()
+			tenantABefore := pool.TenantStats("tenant-a")
+			tenantBBefore := pool.TenantStats("tenant-b")
+			allocationsBefore := map[string]*ResourceAllocation{
+				"lease-app-0": pool.GetAllocation("lease-app-0"),
+				"lease-app-1": pool.GetAllocation("lease-app-1"),
+				"other-app-0": pool.GetAllocation("other-app-0"),
+			}
+
+			err := pool.ReplaceResolvedAll(
+				[]string{"lease-app-0", "lease-app-1"}, tt.replacements, "tenant-a",
+			)
+			require.ErrorContains(t, err, tt.wantError)
+			assert.Zero(t, resolverCalls, "replacement must consume only its durable snapshots")
+			assert.Equal(t, statsBefore, pool.Stats())
+			assert.Equal(t, tenantABefore, pool.TenantStats("tenant-a"))
+			assert.Equal(t, tenantBBefore, pool.TenantStats("tenant-b"))
+			for id, allocation := range allocationsBefore {
+				assert.Equal(t, allocation, pool.GetAllocation(id), "allocation %s", id)
+			}
+			for _, replacement := range tt.replacements {
+				if _, existed := allocationsBefore[replacement.ID]; !existed {
+					assert.Nil(t, pool.GetAllocation(replacement.ID), "candidate %s leaked", replacement.ID)
+				}
+			}
+		})
+	}
+}
+
 func TestResourcePool_ResetRejectsInvalidAggregateAtomically(t *testing.T) {
 	pool := NewResourcePool(10, 10, 10, func(string) (SKUProfile, error) {
 		return SKUProfile{CPUCores: 1, MemoryMB: 1, DiskMB: 1}, nil

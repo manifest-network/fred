@@ -1077,10 +1077,12 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 
 	// 4. Restore into a NEW lease.
 	newLease := newIntegrationLeaseUUID()
+	restoreCallbacks := newIntegrationCallbackAuthority(t, env.callbackURL)
 	require.NoError(t, env.backend.Restore(ctx, backend.RestoreRequest{
 		LeaseUUID: newLease, FromLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: env.providerUUID,
-		Items:       []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		CallbackURL: env.callbackURL,
+		Items:                []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL:          restoreCallbacks.operationURL,
+		LifecycleCallbackURL: restoreCallbacks.lifecycleURL,
 	}))
 	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, newLease, 3*time.Minute).Status)
 

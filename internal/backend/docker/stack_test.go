@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 const stackMaintenanceLeaseUUID = "11111111-1111-4111-8111-111111111111"
@@ -470,6 +472,7 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 // --- Finding 3: re-provision cleans up old stack allocations ---
 
 func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 	removedContainers := map[string]bool{}
 	var mu sync.Mutex
 	mock := &mockDockerClient{
@@ -481,9 +484,6 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		},
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
 	}
 
@@ -500,14 +500,58 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
 		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
 	}
+	oldPayload := validStackManifestJSON(map[string]string{
+		"web": "nginx:latest",
+		"db":  "postgres:16",
+	})
+	oldProfiles := testResourceProfiles(t, oldItems)
+	oldOperationID := shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	oldCallbackURL := "https://old.example/callbacks/provision?operation_id=" + oldOperationID.String()
+	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
+	require.NoError(t, err)
+	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+		oldOperationID, "tenant-a", nominalDockerProviderUUID, oldCallbackURL, oldLifecycleURL,
+	)
+	require.NoError(t, err)
+	oldContainers := []ContainerInfo{
+		{
+			ContainerID: "old-web-c1", LeaseUUID: leaseUUID, Tenant: "tenant-a",
+			ProviderUUID: nominalDockerProviderUUID, SKU: "docker-small", ServiceName: "web",
+			InstanceIndex: 0, CallbackURL: oldCallbackURL, LifecycleCallbackURL: oldLifecycleURL,
+			Image: "nginx:latest", Status: "running",
+		},
+		{
+			ContainerID: "old-db-c1", LeaseUUID: leaseUUID, Tenant: "tenant-a",
+			ProviderUUID: nominalDockerProviderUUID, SKU: "docker-small", ServiceName: "db",
+			InstanceIndex: 0, CallbackURL: oldCallbackURL, LifecycleCallbackURL: oldLifecycleURL,
+			Image: "postgres:16", Status: "running",
+		},
+	}
+	mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) {
+		return slices.Clone(oldContainers), nil
+	}
+	mock.InspectContainerFn = func(_ context.Context, containerID string) (*ContainerInfo, error) {
+		for _, container := range oldContainers {
+			if container.ContainerID == containerID {
+				copy := container
+				return &copy, nil
+			}
+		}
+		return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:       backend.ProvisionStatusFailed,
-			FailCount:    1,
-			Quantity:     2,
-			ContainerIDs: []string{"old-web-c1", "old-db-c1"},
-			Items:        oldItems,
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
+			Tenant:               "tenant-a",
+			ProviderUUID:         nominalDockerProviderUUID,
+			Status:               backend.ProvisionStatusFailed,
+			FailCount:            1,
+			Quantity:             2,
+			ContainerIDs:         []string{"old-web-c1", "old-db-c1"},
+			CallbackURL:          oldCallbackURL,
+			LifecycleCallbackURL: oldLifecycleURL,
+			Items:                oldItems,
+			ResourceProfiles:     oldProfiles,
 			ServiceContainers: map[string][]string{
 				"web": {"old-web-c1"},
 				"db":  {"old-db-c1"},
@@ -518,13 +562,33 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 					"db":  {Image: "postgres:16"},
 				},
 			}},
+			ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
 		},
 	})
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	nominalIntents := b.operationIntents.(noopOperationIntentJournal)
+	b.operationIntents = durableTestOperationIntentJournal{store: nominalIntents.store, storageID: storageID}
+	b.callbackStore = nominalIntents.store
+	releases := attachReleaseStore(t, b)
+	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
+		Manifest:         oldPayload,
+		Image:            "stack",
+		OperationID:      oldOperationID,
+		Items:            slices.Clone(oldItems),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+		RuntimeAuthority: &oldAuthority,
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+	composeMock.DownFn = func(context.Context, string, time.Duration) error {
+		return errors.New("force strict per-container predecessor teardown")
+	}
 	b.compose = composeMock
 
 	// Pre-allocate old stack resources with service-aware IDs.
-	_ = b.pool.TryAllocate("lease-1-web-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-db-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(leaseUUID+"-web-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(leaseUUID+"-db-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	callbackReceived := make(chan struct{})
@@ -537,6 +601,7 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	rebuildCallbackSender(b, callbackServer.Client())
 
 	newItems := []backend.LeaseItem{
 		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
@@ -547,10 +612,11 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		"db":  "postgres:16",
 	})
 
-	req := newStackProvisionRequest("lease-1", "tenant-a", newItems, payload)
-	req.CallbackURL = callbackServer.URL
+	req := newStackProvisionRequest(leaseUUID, "tenant-a", newItems, payload)
+	const candidateOperationID = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	req.CallbackURL = callbackServer.URL + "?operation_id=" + candidateOperationID.String()
 
-	err := b.Provision(context.Background(), req)
+	err = b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
 	// Old containers should be removed during re-provision cleanup (synchronous phase).
@@ -559,10 +625,15 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 	assert.True(t, removedContainers["old-db-c1"], "old db container should be removed")
 	mu.Unlock()
 
-	<-callbackReceived
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		return b.provisions[leaseUUID] != nil &&
+			b.provisions[leaseUUID].Status == backend.ProvisionStatusReady
+	}, 5*time.Second, time.Millisecond)
 
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[leaseUUID]
 	status := prov.Status
 	newCIDs := prov.ContainerIDs
 	svcContainers := prov.ServiceContainers

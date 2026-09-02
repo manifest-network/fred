@@ -61,14 +61,16 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	provisionCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    origLease,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            origLease,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          provisionCallbacks.operationURL,
+		LifecycleCallbackURL: provisionCallbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -145,6 +147,7 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 
 	// ── STEP 5: Restore into a new lease ──────────────────────────────────
 	newLease := newIntegrationLeaseUUID()
+	restoreCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Restore(ctx, backend.RestoreRequest{
 		LeaseUUID:     newLease,
@@ -152,8 +155,9 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 		Tenant:        "test-tenant",
 		ProviderUUID:  testProviderUUID,
 		// Items shape must match the retained set: ServiceName="app", Quantity=1.
-		Items:       []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		CallbackURL: callbackServer.URL,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL:          restoreCallbacks.operationURL,
+		LifecycleCallbackURL: restoreCallbacks.lifecycleURL,
 	})
 	require.NoError(t, err)
 

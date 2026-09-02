@@ -64,7 +64,8 @@ func (b *Backend) teardownLeaseContainers(ctx context.Context, leaseUUID string,
 	// guarded Down refused to mutate; durable recovery retries on the next valid
 	// backend lifetime.
 	if errors.Is(downErr, context.Canceled) || errors.Is(downErr, context.DeadlineExceeded) ||
-		errors.Is(downErr, backendidentity.ErrIdentityDrift) {
+		errors.Is(downErr, backendidentity.ErrIdentityDrift) ||
+		errors.Is(downErr, backendidentity.ErrMutationOutcomeAmbiguous) {
 		teardownFallbackTotal.WithLabelValues(operation, teardownOutcomeFailed).Inc()
 		return recordedIDs, downErr
 	}

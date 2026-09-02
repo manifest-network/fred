@@ -119,9 +119,10 @@ func TestCleanupOrphanedVolumes_ProtectsLiveLeaseWithActiveRelease(t *testing.T)
 		"a genuine create-crash leak (no active release) is still reaped")
 }
 
-// leaseUUIDFromVolumeName must match ONLY canonical managed names
-// (fred-{uuid}-{service}-{idx}), not a bare fred-{uuid}- prefix, so the reaper
-// can't mistake an unrelated directory for a protected lease volume (ENG-505).
+// leaseUUIDFromVolumeName must match only typed canonical live names (current
+// service-aware or v0.13 migration form), not a bare fred-{uuid}- prefix, so
+// the reaper cannot mistake an unrelated directory for a protected lease
+// volume (ENG-505).
 func TestLeaseUUIDFromVolumeName(t *testing.T) {
 	u := "0192f1a0-1111-7abc-8def-000000000001"
 	cases := []struct {
@@ -131,6 +132,7 @@ func TestLeaseUUIDFromVolumeName(t *testing.T) {
 	}{
 		{"fred-" + u + "-app-0", u, true},
 		{"fred-" + u + "-web-1-0", u, true}, // hyphenated service name
+		{"fred-" + u + "-0", u, true},       // canonical v0.13 migration name
 		{"fred-" + u + "-", "", false},      // missing service + idx
 		{"fred-" + u + "-foo", "", false},   // missing numeric idx
 		{"fred-" + u + "-app-x", "", false}, // non-numeric idx

@@ -27,13 +27,16 @@ import (
 // methods default to sensible no-ops (not panics) since most tests don't care
 // about volumes. Tests that need to observe volume calls set the Fn fields.
 type mockVolumeManager struct {
-	CreateFn       func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
-	EnsureQuotaFn  func(ctx context.Context, id string, sizeMB int64) error
-	DestroyFn      func(ctx context.Context, id string) error
-	ListFn         func() ([]string, error)
-	ValidateFn     func() error
-	RenameVolumeFn func(oldName, newName string) error
-	UsageFn        func(ctx context.Context, id string) (int64, error)
+	CreateFn                              func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
+	EnsureQuotaFn                         func(ctx context.Context, id string, sizeMB int64) error
+	DestroyFn                             func(ctx context.Context, id string) error
+	ListFn                                func() ([]string, error)
+	AttestManagedVolumeFn                 func(context.Context, managedVolumeName) error
+	RequireNoInterruptedVolumeMutationsFn func(context.Context) error
+	RecoverInterruptedVolumeMutationsFn   func(context.Context) error
+	ValidateFn                            func() error
+	RenameVolumeFn                        func(oldName, newName string) error
+	UsageFn                               func(ctx context.Context, id string) (int64, error)
 
 	// defaultDir is returned by Create when CreateFn is nil.
 	// Set this to t.TempDir() in tests that need real paths.
@@ -66,6 +69,34 @@ func (m *mockVolumeManager) List() ([]string, error) {
 		return m.ListFn()
 	}
 	return nil, nil
+}
+
+func (m *mockVolumeManager) ListForProof(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return m.List()
+}
+
+func (m *mockVolumeManager) AttestManagedVolume(ctx context.Context, name managedVolumeName) error {
+	if m.AttestManagedVolumeFn != nil {
+		return m.AttestManagedVolumeFn(ctx, name)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) RequireNoInterruptedVolumeMutations(ctx context.Context) error {
+	if m.RequireNoInterruptedVolumeMutationsFn != nil {
+		return m.RequireNoInterruptedVolumeMutationsFn(ctx)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) RecoverInterruptedVolumeMutations(ctx context.Context) error {
+	if m.RecoverInterruptedVolumeMutationsFn != nil {
+		return m.RecoverInterruptedVolumeMutationsFn(ctx)
+	}
+	return nil
 }
 
 func (m *mockVolumeManager) Validate() error {
@@ -1328,7 +1359,7 @@ func TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest(t *testing.
 			return []ContainerInfo{
 				{
 					ContainerID: "c1", LeaseUUID: leaseUUID, Tenant: "t",
-					ProviderUUID: "provider-a", SKU: "docker-small", ServiceName: "app",
+					ProviderUUID: nominalDockerProviderUUID, SKU: "docker-small", ServiceName: "app",
 					Image: "nginx:1.25", Status: "running",
 					CallbackURL: "http://cb/callbacks/provision",
 				},

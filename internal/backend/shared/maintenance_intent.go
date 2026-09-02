@@ -130,28 +130,32 @@ func (c MaintenanceIntentClaim) TargetReleaseClaim() (MaintenanceReleaseClaim, b
 	}, true
 }
 func (c MaintenanceIntentClaim) Tenant() string {
-	if c.entry.TargetRelease.RuntimeAuthority == nil {
+	authority, ok := releaseRuntimeIdentityFor(c.entry.TargetRelease)
+	if !ok {
 		return ""
 	}
-	return c.entry.TargetRelease.RuntimeAuthority.Tenant()
+	return authority.tenant
 }
 func (c MaintenanceIntentClaim) ProviderUUID() string {
-	if c.entry.TargetRelease.RuntimeAuthority == nil {
+	authority, ok := releaseRuntimeIdentityFor(c.entry.TargetRelease)
+	if !ok {
 		return ""
 	}
-	return c.entry.TargetRelease.RuntimeAuthority.ProviderUUID()
+	return authority.providerUUID
 }
 func (c MaintenanceIntentClaim) CallbackURL() string {
-	if c.entry.TargetRelease.RuntimeAuthority == nil {
+	authority, ok := releaseRuntimeIdentityFor(c.entry.TargetRelease)
+	if !ok {
 		return ""
 	}
-	return c.entry.TargetRelease.RuntimeAuthority.CallbackURL()
+	return authority.callbackURL
 }
 func (c MaintenanceIntentClaim) LifecycleCallbackURL() string {
-	if c.entry.TargetRelease.RuntimeAuthority == nil {
+	authority, ok := releaseRuntimeIdentityFor(c.entry.TargetRelease)
+	if !ok {
 		return ""
 	}
-	return c.entry.TargetRelease.RuntimeAuthority.LifecycleCallbackURL()
+	return authority.lifecycleCallbackURL
 }
 
 type maintenanceIntentEntry struct {
@@ -639,10 +643,11 @@ func callbackEntryForMaintenanceIntent(
 	status backend.CallbackStatus,
 	errMsg string,
 ) CallbackEntry {
+	authority, _ := releaseRuntimeIdentityFor(intent.TargetRelease)
 	return CallbackEntry{
 		DeliveryID:       deliveryID,
 		LeaseUUID:        intent.LeaseUUID,
-		CallbackURL:      intent.TargetRelease.RuntimeAuthority.LifecycleCallbackURL(),
+		CallbackURL:      authority.lifecycleCallbackURL,
 		DeliveryKind:     CallbackDeliveryKindMaintenance,
 		Success:          status != backend.CallbackStatusFailed,
 		Status:           status,
@@ -673,8 +678,8 @@ func validateMaintenanceIntentSpec(spec MaintenanceIntentSpec) error {
 	if spec.TargetRelease.Version != 0 || spec.TargetRelease.Status != "deploying" {
 		return errors.New("maintenance target must be a version-zero deploying template")
 	}
-	if !spec.TargetRelease.OperationID.Valid() || spec.TargetRelease.RuntimeAuthority == nil {
-		return errors.New("maintenance target requires typed runtime authority")
+	if _, ok := releaseRuntimeIdentityFor(spec.TargetRelease); !ok {
+		return errors.New("maintenance target requires durable runtime authority")
 	}
 	if err := validateStoredCallbackCreatedAt(spec.TargetRelease.CreatedAt); err != nil {
 		return fmt.Errorf("maintenance target: %w", err)

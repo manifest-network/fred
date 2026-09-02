@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // TestResolveMigratedBindSource pins the ENG-539 hardening on the legacy→stack
@@ -94,12 +96,12 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 		ContainerID:   "legacy-cid",
 		LeaseUUID:     "lease-1",
 		Tenant:        "tenant-a",
-		ProviderUUID:  "provider-a",
+		ProviderUUID:  nominalDockerProviderUUID,
 		SKU:           "docker-micro",
 		CustomDomain:  "legacy.example",
 		FailCount:     3,
 		Image:         "nginx:1.25",
-		CallbackURL:   "https://fred.example/callbacks/provision?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
+		CallbackURL:   "https://fred.example/callbacks/provision?trace=keep",
 		InstanceIndex: 0,
 		// ServiceName empty: legacy
 	}}
@@ -127,14 +129,14 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 	require.Contains(t, fakeDocker.lastComposeProject.Services, "app")
 	labels := fakeDocker.lastComposeProject.Services["app"].Labels
 	assert.Equal(t,
-		"https://fred.example/callbacks/provision?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
+		"https://fred.example/callbacks/provision?trace=keep",
 		labels[LabelCallbackURL],
 	)
 	assert.Equal(t,
-		"https://fred.example/callbacks/provision?trace=keep&lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+		"https://fred.example/callbacks/provision?trace=keep",
 		labels[LabelLifecycleCallbackURL],
-		"legacy migration must persist the derived observation-only callback route")
-	assert.Equal(t, "provider-a", labels[LabelProviderUUID])
+		"v0.13 migration must preserve its tokenless observation route")
+	assert.Equal(t, nominalDockerProviderUUID, labels[LabelProviderUUID])
 	assert.Equal(t, b.cfg.Name, labels[LabelBackendName])
 	assert.Equal(t, "3", labels[LabelFailCount])
 	assert.Equal(t, "legacy.example", labels[LabelCustomDomain])
@@ -151,6 +153,68 @@ func TestRecoverState_MigratesLegacyContainer(t *testing.T) {
 		SKU: "docker-micro", CPUCores: 0.25, MemoryMB: 256, ScratchDiskMB: 73,
 	}}, latest.ResourceProfiles,
 		"the one-time v0.13 migration must freeze diskless scratch authority")
+	require.NotNil(t, latest.LegacyRuntimeAuthority)
+	assert.Equal(t, nominalDockerProviderUUID, latest.LegacyRuntimeAuthority.ProviderUUID())
+	assert.Equal(t, "https://fred.example/callbacks/provision?trace=keep",
+		latest.LegacyRuntimeAuthority.CallbackURL())
+}
+
+func TestExecuteLegacyMigrationAtomicallyPersistsRuntimeAuthority(t *testing.T) {
+	b, fakeDocker, _, _ := newMigrationTestBackend(t)
+	dbPath := filepath.Join(t.TempDir(), "atomic-migration-releases.db")
+	store, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	b.releaseStore = store
+
+	const (
+		leaseUUID   = "33333333-3333-4333-8333-333333333333"
+		callbackURL = "https://fred.example/callbacks/provision?trace=legacy"
+	)
+	legacy := ContainerInfo{
+		ContainerID:   "legacy-atomic-cid",
+		Name:          "fred-33333333-3333-4333-8333-333333333333-0",
+		LeaseUUID:     leaseUUID,
+		Tenant:        "tenant-a",
+		ProviderUUID:  nominalDockerProviderUUID,
+		SKU:           "docker-micro",
+		Image:         "nginx:1.25",
+		CallbackURL:   callbackURL,
+		InstanceIndex: 0,
+	}
+	fakeDocker.containers = []ContainerInfo{legacy}
+	migration := &legacyMigration{
+		LeaseUUID:    leaseUUID,
+		Tenant:       legacy.Tenant,
+		ProviderUUID: legacy.ProviderUUID,
+		SKU:          legacy.SKU,
+		Stack: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+			manifest.DefaultServiceName: {Image: legacy.Image},
+		}},
+		Instances: []legacyMigrationInstance{{
+			LegacyContainer:  legacy,
+			NewContainerName: "fred-33333333-3333-4333-8333-333333333333-app-0",
+			PrevName:         "fred-33333333-3333-4333-8333-333333333333-app-0-prev",
+		}},
+	}
+
+	require.NoError(t, b.executeLegacyMigration(context.Background(), migration, slog.Default()))
+	active, err := store.LatestActive(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	require.NotNil(t, active.LegacyRuntimeAuthority,
+		"the migration commit itself must carry zero-survivor callback authority")
+	assert.Equal(t, callbackURL, active.LegacyRuntimeAuthority.CallbackURL())
+	assert.Equal(t, callbackURL, active.LegacyRuntimeAuthority.LifecycleCallbackURL())
+
+	require.NoError(t, store.Close())
+	reopened, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	defer reopened.Close()
+	active, err = reopened.LatestActive(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	require.NotNil(t, active.LegacyRuntimeAuthority)
+	assert.Equal(t, callbackURL, active.LegacyRuntimeAuthority.CallbackURL())
 }
 
 func TestResolveLegacyMigrationCallbackURLs(t *testing.T) {
@@ -254,7 +318,7 @@ func TestRecoverState_MigrationRefusesStopErrorWhileContainerStillRunning(t *tes
 		Name:          "fred-lease-1-0",
 		LeaseUUID:     "lease-1",
 		Tenant:        "tenant-a",
-		ProviderUUID:  "provider-a",
+		ProviderUUID:  nominalDockerProviderUUID,
 		SKU:           "docker-micro",
 		Image:         "nginx:1.25",
 		CallbackURL:   "https://fred.example/callbacks/provision",
@@ -288,7 +352,7 @@ func TestRecoverState_MigrationRefusesRunningPrevRetry(t *testing.T) {
 		Name:          "fred-lease-1-app-0-prev",
 		LeaseUUID:     "lease-1",
 		Tenant:        "tenant-a",
-		ProviderUUID:  "provider-a",
+		ProviderUUID:  nominalDockerProviderUUID,
 		SKU:           "docker-micro",
 		Image:         "nginx:1.25",
 		CallbackURL:   "https://fred.example/callbacks/provision",
@@ -326,9 +390,14 @@ func TestRecoverState_MigrationRefusesRunningPrevRetry(t *testing.T) {
 func TestRecoverState_MigrationFailure_AbortsStartup(t *testing.T) {
 	b, fakeDocker, _, fakeRelStore := newMigrationTestBackend(t)
 	fakeDocker.containers = []ContainerInfo{{
-		ContainerID: "legacy-cid",
-		LeaseUUID:   "lease-1",
-		SKU:         "docker-micro",
+		ContainerID:   "legacy-cid",
+		LeaseUUID:     "lease-1",
+		Tenant:        "tenant-a",
+		ProviderUUID:  nominalDockerProviderUUID,
+		SKU:           "docker-micro",
+		Image:         "nginx:1.25",
+		CallbackURL:   "https://fred.example/callbacks/provision",
+		InstanceIndex: 0,
 	}}
 	fakeDocker.composeUpErr = errors.New("compose up failed")
 	fakeRelStore.releases["lease-1"] = []byte(`{"image":"nginx:1.25"}`)
@@ -338,6 +407,7 @@ func TestRecoverState_MigrationFailure_AbortsStartup(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected recoverState to fail when migration fails")
 	}
+	require.ErrorContains(t, err, "compose up failed")
 	if !strings.Contains(err.Error(), "lease-1") {
 		t.Fatalf("expected error to identify lease, got: %v", err)
 	}
@@ -360,7 +430,7 @@ func TestRecoverState_BoundsWholeLegacyMigration(t *testing.T) {
 		Name:          "fred-lease-1-0",
 		LeaseUUID:     "lease-1",
 		Tenant:        "tenant-a",
-		ProviderUUID:  "provider-a",
+		ProviderUUID:  nominalDockerProviderUUID,
 		SKU:           "docker-micro",
 		Image:         "nginx:1.25",
 		CallbackURL:   "https://fred.example/callbacks/provision",
@@ -494,7 +564,7 @@ func TestRecoverState_SkipsPrevRemnants(t *testing.T) {
 			LeaseUUID:     "lease-1",
 			Tenant:        "tenant-a",
 			SKU:           "docker-micro",
-			ProviderUUID:  "provider-a",
+			ProviderUUID:  nominalDockerProviderUUID,
 			ServiceName:   "app",
 			InstanceIndex: 0,
 			Image:         "nginx:1.25",
@@ -510,7 +580,7 @@ func TestRecoverState_SkipsPrevRemnants(t *testing.T) {
 			Name:          "fred-lease-1-app-0-prev",
 			LeaseUUID:     "lease-1",
 			Tenant:        "tenant-a",
-			ProviderUUID:  "provider-a",
+			ProviderUUID:  nominalDockerProviderUUID,
 			SKU:           "docker-micro",
 			InstanceIndex: 0,
 			Image:         "nginx:1.25",
@@ -600,6 +670,130 @@ func TestRecoverState_DurableMigrationPartialCleanupDoesNotReinferTopology(t *te
 	}, time.Second, 10*time.Millisecond)
 }
 
+// A crash after RecordLegacyMigration commits but after every target container
+// disappears can leave only the stopped `-prev` rollback cohort. Those remnants
+// are cleanup evidence, never live-runtime or sizing authority: recovery must
+// reconstruct the complete conservative projection from the reopened Release
+// and retain the rollback cohort while the target generation is divergent.
+func TestRecoverState_CommittedLegacyMigrationWithZeroTargetSurvivorsKeepsRollbackRemnants(t *testing.T) {
+	b, fakeDocker, fakeVolumes, _ := newMigrationTestBackend(t)
+	b.cfg.MigrationGracePeriod = 20 * time.Millisecond
+
+	const (
+		leaseUUID    = "550e8400-e29b-41d4-a716-446655440000"
+		tenant       = "tenant-a"
+		providerUUID = nominalDockerProviderUUID
+		callbackURL  = "https://fred.example/callbacks/provision?route=v013"
+	)
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	require.NoError(t, err)
+	authority, err := shared.NewLegacyRuntimeAuthority(
+		tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+	items := []backend.LeaseItem{{
+		SKU: "docker-micro", Quantity: 2, ServiceName: "app",
+	}}
+	profiles := testResourceProfiles(t, items)
+	manifestBytes := []byte(`{"services":{"app":{"image":"nginx:1.25"}}}`)
+	createdAt := time.Now().Add(-time.Hour).UTC()
+
+	// Cross a real bbolt close/reopen boundary so no process-local migration
+	// state can contribute to the recovered projection or allocation.
+	releasePath := filepath.Join(t.TempDir(), "committed-migration-releases.db")
+	writer, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: releasePath})
+	require.NoError(t, err)
+	require.NoError(t, writer.RecordLegacyMigrationAt(
+		leaseUUID, manifestBytes, items, profiles, authority, createdAt,
+	))
+	require.NoError(t, writer.Close())
+	reopened, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: releasePath})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	b.releaseStore = reopened
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+
+	// Both exact rollback containers survived, but the committed target cohort
+	// has zero survivors. A migration replay or grace cleanup here would erase the
+	// only rollback evidence while the current generation is known divergent.
+	for index := range 2 {
+		fakeDocker.containers = append(fakeDocker.containers, ContainerInfo{
+			ContainerID:          fmt.Sprintf("prev-cid-%d", index),
+			Name:                 fmt.Sprintf("fred-%s-app-%d-prev", leaseUUID, index),
+			LeaseUUID:            leaseUUID,
+			Tenant:               tenant,
+			ProviderUUID:         providerUUID,
+			BackendName:          b.Name(),
+			SKU:                  "docker-micro",
+			InstanceIndex:        index,
+			Image:                "nginx:1.25",
+			CallbackURL:          callbackURL,
+			LifecycleCallbackURL: lifecycleCallbackURL,
+			Status:               "exited",
+			CreatedAt:            createdAt,
+		})
+	}
+
+	var mu sync.Mutex
+	var removed []string
+	fakeDocker.removeContainer = func(_ context.Context, containerID string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		removed = append(removed, containerID)
+		return nil
+	}
+
+	require.NoError(t, b.recoverState(t.Context()))
+	assert.Nil(t, fakeDocker.lastComposeProject,
+		"a committed migration must not be replayed from rollback remnants")
+	assert.Empty(t, fakeVolumes.renames,
+		"rollback remnants must not trigger volume migration")
+
+	b.provisionsMu.RLock()
+	recovered := b.provisions[leaseUUID]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, recovered)
+	assert.Equal(t, backend.ProvisionStatusFailed, recovered.Status)
+	assert.Equal(t, tenant, recovered.Tenant)
+	assert.Equal(t, providerUUID, recovered.ProviderUUID)
+	assert.Equal(t, callbackURL, recovered.CallbackURL)
+	assert.Equal(t, lifecycleCallbackURL, recovered.LifecycleCallbackURL)
+	assert.Equal(t, items, recovered.Items)
+	assert.Equal(t, 2, recovered.Quantity)
+	assert.Empty(t, recovered.ContainerIDs,
+		"rollback remnants are not members of the recovered live generation")
+	assert.Equal(t, backend.ReasonInternal, recovered.Reason)
+	assert.Contains(t, recovered.LastError, "found 0 containers, expected 2")
+
+	for index := range 2 {
+		allocation := b.pool.GetAllocation(fmt.Sprintf("%s-app-%d", leaseUUID, index))
+		require.NotNil(t, allocation, "release-owned instance %d must remain fully reserved", index)
+		assert.Equal(t, tenant, allocation.Tenant)
+		assert.Equal(t, profiles[0].CPUCores, allocation.CPUCores)
+		assert.Equal(t, profiles[0].MemoryMB, allocation.MemoryMB)
+		assert.Equal(t, profiles[0].DiskMB, allocation.DiskMB)
+	}
+
+	require.Never(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(removed) != 0
+	}, 5*b.cfg.MigrationGracePeriod, 5*time.Millisecond,
+		"divergent target cohort must retain exact stopped rollback remnants")
+
+	active, err := reopened.LatestActive(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.True(t, active.LegacyMigration)
+	assert.Equal(t, items, active.Items)
+	assert.Equal(t, profiles, active.ResourceProfiles)
+	require.NotNil(t, active.LegacyRuntimeAuthority)
+	assert.Equal(t, authority, *active.LegacyRuntimeAuthority)
+}
+
 // TestExecuteLegacyMigration_EnsuresTenantNetwork: when network
 // isolation is enabled (the production default), the migration
 // executor must call EnsureTenantNetwork before bringing the new
@@ -623,6 +817,7 @@ func TestExecuteLegacyMigration_EnsuresTenantNetwork(t *testing.T) {
 		Name:          "fred-lease-1-0",
 		LeaseUUID:     "lease-1",
 		Tenant:        "tenant-a",
+		ProviderUUID:  nominalDockerProviderUUID,
 		SKU:           "docker-micro",
 		Image:         "nginx:1.25",
 		CallbackURL:   "https://fred.example/callbacks/provision",
@@ -672,6 +867,7 @@ func TestExecuteLegacyMigration_PrevCleanupSurvivesCallerContextCancel(t *testin
 		Name:          "fred-lease-1-0",
 		LeaseUUID:     "lease-1",
 		Tenant:        "tenant-a",
+		ProviderUUID:  nominalDockerProviderUUID,
 		SKU:           "docker-micro",
 		Image:         "nginx:1.25",
 		CallbackURL:   "https://fred.example/callbacks/provision",

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,11 +70,12 @@ type ContainerEvent struct {
 // synthetic limits instead of manufacturing a 32 MiB history.
 type releaseHistoryCapacityPlanner interface {
 	CheckAppendActiveCapacity(string, shared.Release) error
-	CheckRecordMigrationCapacity(
+	CheckRecordLegacyMigrationCapacity(
 		string,
 		[]byte,
 		[]backend.LeaseItem,
 		[]shared.SKUResourceSnapshot,
+		shared.LegacyRuntimeAuthority,
 		time.Time,
 	) error
 }
@@ -100,6 +102,12 @@ type Backend struct {
 	// distinct from identityVerifyMu because a store hook can fire while
 	// VerifyStorageIdentity already holds that mutex.
 	storeAuthorityGate *backendidentity.StorageAuthorityGate
+	// terminalStorageAuthorityFailure publishes the first exact cause that
+	// permanently withdrew this Backend's storage authority. It is buffered so
+	// the gate's failure hook can never block a journal boundary while the daemon
+	// is busy or already shutting down. The channel is deliberately never closed:
+	// a concurrent late latch must not race Stop into a send-on-closed panic.
+	terminalStorageAuthorityFailure <-chan error
 
 	// partitionSource is the parsed cfg.RetentionPartitionSource, resolved once
 	// in New() (a malformed source is a startup failure, never a close-time
@@ -803,7 +811,52 @@ type storageIdentityProofClient interface {
 
 type storageIdentityProofVolumes interface {
 	Validate() error
-	List() ([]string, error)
+	ListForProof(context.Context) ([]string, error)
+	AttestManagedVolume(context.Context, managedVolumeName) error
+	RequireNoInterruptedVolumeMutations(context.Context) error
+}
+
+// attestManagedVolumeInventory returns one exact, duplicate-free inventory
+// only after every name has crossed both proof boundaries: the managed-volume
+// grammar and the concrete manager's read-only substrate attestation. A plain
+// directory named like a volume is therefore never enough to seal or load a
+// storage identity.
+func attestManagedVolumeInventory(
+	ctx context.Context,
+	volumes storageIdentityProofVolumes,
+) (map[string]managedVolumeName, error) {
+	if ctx == nil {
+		return nil, errors.New("managed volume inventory proof context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("attest managed volume inventory: %w", err)
+	}
+	managedVolumes, err := volumes.ListForProof(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate managed volumes: %w", err)
+	}
+	managedSet := make(map[string]managedVolumeName, len(managedVolumes))
+	for _, volumeName := range managedVolumes {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("attest managed volume inventory: %w", err)
+		}
+		managedName, parseErr := parseManagedVolumeName(volumeName)
+		if parseErr != nil {
+			return nil, fmt.Errorf(
+				"managed volume %q name is invalid: %w",
+				volumeName,
+				parseErr,
+			)
+		}
+		if _, duplicate := managedSet[volumeName]; duplicate {
+			return nil, fmt.Errorf("managed volume inventory contains duplicate name %q", volumeName)
+		}
+		if err := volumes.AttestManagedVolume(ctx, managedName); err != nil {
+			return nil, fmt.Errorf("attest managed volume %q: %w", volumeName, err)
+		}
+		managedSet[volumeName] = managedName
+	}
+	return managedSet, nil
 }
 
 func acquireDockerStorageIdentityProof(
@@ -817,6 +870,13 @@ func acquireDockerStorageIdentityProof(
 	}
 	if err := volumes.Validate(); err != nil {
 		return nil, fmt.Errorf("validate volume substrate before lineage proof: %w", err)
+	}
+	// One-shot new/adopt/preflight commands are deliberately read-only until
+	// marker publication. Private mutation debris cannot be silently normalized
+	// into the lineage being measured; the stopped operator must first recover
+	// it with the already-sealed backend or remove it under an explicit runbook.
+	if err := volumes.RequireNoInterruptedVolumeMutations(ctx); err != nil {
+		return nil, fmt.Errorf("interrupted managed-volume mutation blocks lineage proof: %w", err)
 	}
 	if pinner, ok := volumes.(identityRootPinner); ok {
 		if err := pinner.PinIdentityRoot(); err != nil {
@@ -1230,19 +1290,13 @@ func verifyStorageIdentityInitializationEvidence(
 	for index := range retentions {
 		retentionsByLease[retentions[index].OriginalLeaseUUID] = &retentions[index]
 	}
-	managedVolumes, err := volumes.List()
+	managedSet, err := attestManagedVolumeInventory(ctx, volumes)
 	if err != nil {
-		return fmt.Errorf("enumerate managed volumes before storage identity initialization: %w", err)
-	}
-	managedSet := make(map[string]struct{}, len(managedVolumes))
-	for _, volumeName := range managedVolumes {
-		managedSet[volumeName] = struct{}{}
+		return fmt.Errorf("prove managed volume substrate before storage identity initialization: %w", err)
 	}
 	managedVolumeCountsByLease := make(map[string]int)
-	for volumeName := range managedSet {
-		if leaseUUID, managed := reapingLeaseUUIDFromVolumeName(volumeName); managed {
-			managedVolumeCountsByLease[leaseUUID]++
-		}
+	for _, volumeName := range managedSet {
+		managedVolumeCountsByLease[managedVolumeLeaseUUID(volumeName)]++
 	}
 	for _, leaseUUID := range slices.Sorted(maps.Keys(containersByLease)) {
 		cohort := containersByLease[leaseUUID]
@@ -1426,6 +1480,32 @@ func verifyStorageIdentityInitializationEvidence(
 				profileErr,
 			)
 		}
+		var legacyRuntimeAuthority *shared.LegacyRuntimeAuthority
+		if crashClass == v013MigrationCrashNone {
+			callbackURL, lifecycleCallbackURL, callbackErr := resolveLegacyContainerCallbackURLs(cohort)
+			if callbackErr != nil {
+				return fmt.Errorf(
+					"resolve startup runtime authority for active v0.13 release %s: %w",
+					leaseUUID,
+					callbackErr,
+				)
+			}
+			identity := cohort[0]
+			frozen, freezeErr := shared.NewLegacyRuntimeAuthority(
+				identity.Tenant,
+				identity.ProviderUUID,
+				callbackURL,
+				lifecycleCallbackURL,
+			)
+			if freezeErr != nil {
+				return fmt.Errorf(
+					"validate startup runtime authority for active v0.13 release %s: %w",
+					leaseUUID,
+					freezeErr,
+				)
+			}
+			legacyRuntimeAuthority = &frozen
+		}
 		var capacityErr error
 		switch {
 		case len(release.Items) == 0:
@@ -1433,13 +1513,24 @@ func verifyStorageIdentityInitializationEvidence(
 			if crashClass != v013MigrationCrashNone {
 				authorityClass = shared.LegacyActiveAuthorityMigration
 			}
-			capacityErr = releases.CheckLegacyActiveAuthorityCapacity(
-				leaseUUID,
-				release,
-				authorityItems,
-				authorityProfiles,
-				authorityClass,
-			)
+			if legacyRuntimeAuthority != nil {
+				capacityErr = releases.CheckLegacyActiveAuthorityAndRuntimeCapacity(
+					leaseUUID,
+					release,
+					authorityItems,
+					authorityProfiles,
+					authorityClass,
+					*legacyRuntimeAuthority,
+				)
+			} else {
+				capacityErr = releases.CheckLegacyActiveAuthorityCapacity(
+					leaseUUID,
+					release,
+					authorityItems,
+					authorityProfiles,
+					authorityClass,
+				)
+			}
 		case len(release.ResourceProfiles) == 0:
 			capacityErr = releases.CheckActiveResourceProfilesCapacity(
 				leaseUUID,
@@ -1470,7 +1561,22 @@ func verifyStorageIdentityInitializationEvidence(
 		return err
 	}
 
+	reapingLeases := make(map[string]managedVolumeEvidenceAuthority)
 	for _, retention := range retentions {
+		expectedVolumeNames, expectedErr := managedVolumeEvidenceAuthorityForLease(
+			retention.OriginalLeaseUUID,
+			retention.Items,
+		)
+		if expectedErr != nil {
+			return fmt.Errorf(
+				"derive exact managed-volume identities for retention %s: %w",
+				retention.OriginalLeaseUUID,
+				expectedErr,
+			)
+		}
+		if retention.Status == shared.RetentionStatusReaping {
+			reapingLeases[retention.OriginalLeaseUUID] = expectedVolumeNames
+		}
 		if len(retention.ResourceProfiles) == 0 {
 			for _, item := range retention.Items {
 				if _, err := cfg.GetSKUProfile(item.SKU); err != nil {
@@ -1493,11 +1599,25 @@ func verifyStorageIdentityInitializationEvidence(
 					retention.OriginalLeaseUUID, err)
 			}
 		}
+		seenRetentionVolumes := make(map[string]struct{}, len(retention.RetainedVolumeNames))
 		for _, volumeName := range retention.RetainedVolumeNames {
-			if volumeName == "" || filepath.Base(volumeName) != volumeName {
-				return fmt.Errorf("retention %s contains invalid volume name %q",
+			managedName, parseErr := parseManagedVolumeName(volumeName)
+			if parseErr != nil {
+				return fmt.Errorf("retention %s contains invalid managed volume name %q: %w",
+					retention.OriginalLeaseUUID, volumeName, parseErr)
+			}
+			if !expectedVolumeNames.containsRetained(managedName) {
+				return fmt.Errorf(
+					"retention %s volume %q is not an exact retained identity for its source lease items",
+					retention.OriginalLeaseUUID,
+					volumeName,
+				)
+			}
+			if _, duplicate := seenRetentionVolumes[volumeName]; duplicate {
+				return fmt.Errorf("retention %s contains duplicate managed volume name %q",
 					retention.OriginalLeaseUUID, volumeName)
 			}
+			seenRetentionVolumes[volumeName] = struct{}{}
 			volumePath := filepath.Join(cfg.VolumeDataPath, volumeName)
 			if _, statErr := os.Lstat(volumePath); statErr != nil {
 				if retention.Status == shared.RetentionStatusReaping && errors.Is(statErr, os.ErrNotExist) {
@@ -1525,25 +1645,20 @@ func verifyStorageIdentityInitializationEvidence(
 	// retained namespaces belonging to OriginalLeaseUUID. Use that same strict
 	// namespace proof here: it preserves resumable give-up/partial-reap state,
 	// while the reverse cross-check below still rejects every volume outside an
-	// exact reaping lease prefix. Index by UUID and scan the managed inventory
+	// exact reaping lease identity. Index by UUID and scan the managed inventory
 	// once so an operator-controlled 100k-row journal cannot force O(R*V) work.
-	reapingLeases := make(map[string]struct{})
-	for _, retention := range retentions {
-		if retention.Status == shared.RetentionStatusReaping {
-			reapingLeases[retention.OriginalLeaseUUID] = struct{}{}
-		}
-	}
-	for volumeName := range managedSet {
-		leaseUUID, namespaced := reapingLeaseUUIDFromVolumeName(volumeName)
-		if !namespaced {
+	for volumeName, managedName := range managedSet {
+		leaseUUID := managedVolumeLeaseUUID(managedName)
+		expectedVolumeNames, explained := reapingLeases[leaseUUID]
+		if !explained {
 			continue
 		}
-		if _, explained := reapingLeases[leaseUUID]; !explained {
-			continue
-		}
-		if volumeName == "" || filepath.Base(volumeName) != volumeName {
-			return fmt.Errorf("reaping retention %s matched invalid managed volume name %q",
-				leaseUUID, volumeName)
+		if !expectedVolumeNames.containsEither(managedName) {
+			return fmt.Errorf(
+				"reaping retention %s matched managed volume %q outside its exact source item identities",
+				leaseUUID,
+				volumeName,
+			)
 		}
 		volumePath := filepath.Join(cfg.VolumeDataPath, volumeName)
 		if err := requireExistingPathUnderRoot(cfg.VolumeDataPath, volumePath); err != nil {
@@ -1555,12 +1670,12 @@ func verifyStorageIdentityInitializationEvidence(
 
 	switch mode {
 	case StorageIdentityInitializeNew:
-		if len(containers) != 0 || len(retentions) != 0 || len(managedVolumes) != 0 || len(releases.ActiveLeaseUUIDs) != 0 {
+		if len(containers) != 0 || len(retentions) != 0 || len(managedSet) != 0 || len(releases.ActiveLeaseUUIDs) != 0 {
 			return fmt.Errorf("new storage identity requires an empty backend (containers=%d retentions=%d managed_volumes=%d); use adopt for a verified v0.13 lineage",
-				len(containers), len(retentions), len(managedVolumes))
+				len(containers), len(retentions), len(managedSet))
 		}
 	case StorageIdentityInitializeAdopt:
-		if len(containers) == 0 && len(retentions) == 0 && len(managedVolumes) == 0 {
+		if len(containers) == 0 && len(retentions) == 0 && len(managedSet) == 0 {
 			return errors.New(
 				"adopt storage identity found a drained v0.13 callback outbox but no managed " +
 					"containers, retentions, or volumes; rerun with -initialize-storage-identity new " +
@@ -1647,24 +1762,128 @@ func legacyReleaseMatchesInterruptedDeprovisionRetention(
 	return bytes.Equal(releaseJSON, retentionJSON), nil
 }
 
-func reapingLeaseUUIDFromVolumeName(volumeName string) (string, bool) {
-	var suffix string
-	switch {
-	case strings.HasPrefix(volumeName, retainedVolumePrefix):
-		suffix = strings.TrimPrefix(volumeName, retainedVolumePrefix)
-	case strings.HasPrefix(volumeName, volumePrefix):
-		suffix = strings.TrimPrefix(volumeName, volumePrefix)
-	default:
-		return "", false
-	}
-	if len(suffix) < 37 || suffix[36] != '-' {
-		return "", false
-	}
-	leaseUUID := suffix[:36]
+// managedVolumeEvidenceAuthority is the exact volume-name authority one
+// retained lease's item topology can grant. Physical volume presence is
+// legitimately a subset: v0.13 created a host volume only when an image VOLUME
+// or writable-path probe needed one. Keeping quantities as bounds, rather than
+// materializing every possible name, also keeps stopped-store inspection
+// proportional to journal size when a record carries a large valid quantity.
+type managedVolumeEvidenceAuthority struct {
+	leaseUUID         string
+	serviceQuantities map[string]int
+	legacyAppQuantity int
+}
+
+func managedVolumeEvidenceAuthorityForLease(
+	leaseUUID string,
+	items []backend.LeaseItem,
+) (managedVolumeEvidenceAuthority, error) {
 	if !backend.IsCanonicalLeaseUUID(leaseUUID) {
+		return managedVolumeEvidenceAuthority{}, fmt.Errorf("lease UUID %q is not canonical", leaseUUID)
+	}
+	normalized := slices.Clone(items)
+	if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: normalized}); err != nil {
+		return managedVolumeEvidenceAuthority{}, err
+	}
+	if _, err := backend.ValidateOperationQuantities(normalized); err != nil {
+		return managedVolumeEvidenceAuthority{}, err
+	}
+
+	result := managedVolumeEvidenceAuthority{
+		leaseUUID:         leaseUUID,
+		serviceQuantities: make(map[string]int, len(normalized)),
+	}
+	for _, item := range normalized {
+		if !isManagedVolumeServiceName(item.ServiceName) {
+			return managedVolumeEvidenceAuthority{}, fmt.Errorf(
+				"service name %q is outside the managed-volume grammar",
+				item.ServiceName,
+			)
+		}
+		if _, duplicate := result.serviceQuantities[item.ServiceName]; duplicate {
+			return managedVolumeEvidenceAuthority{}, fmt.Errorf(
+				"duplicate service name %q",
+				item.ServiceName,
+			)
+		}
+		result.serviceQuantities[item.ServiceName] = item.Quantity
+	}
+	if len(normalized) == 1 && normalized[0].ServiceName == manifest.DefaultServiceName {
+		// This is the only topology the pre-service on-disk form could
+		// represent. Multi-service names must carry their service explicitly.
+		result.legacyAppQuantity = normalized[0].Quantity
+	}
+	return result, nil
+}
+
+type managedVolumeEvidenceIdentity struct {
+	leaseUUID   string
+	serviceName string
+	instance    int
+	retained    bool
+	legacyV013  bool
+}
+
+// managedVolumeEvidenceIdentityFromName accepts only a parsed token. Its
+// slicing and integer conversion are therefore projections of grammar already
+// proved by parseManagedVolumeName, never a second permissive parser.
+func managedVolumeEvidenceIdentityFromName(name managedVolumeName) managedVolumeEvidenceIdentity {
+	value := name.value()
+	retained := strings.HasPrefix(value, retainedVolumePrefix)
+	remainder := strings.TrimPrefix(value, volumePrefix)
+	if retained {
+		remainder = strings.TrimPrefix(value, retainedVolumePrefix)
+	}
+	leaseUUID, suffix := remainder[:36], remainder[37:]
+	serviceName, indexText := "", suffix
+	legacyV013 := true
+	if dash := strings.LastIndexByte(suffix, '-'); dash >= 0 {
+		serviceName, indexText = suffix[:dash], suffix[dash+1:]
+		legacyV013 = false
+	}
+	instance, _ := strconv.Atoi(indexText)
+	return managedVolumeEvidenceIdentity{
+		leaseUUID:   leaseUUID,
+		serviceName: serviceName,
+		instance:    instance,
+		retained:    retained,
+		legacyV013:  legacyV013,
+	}
+}
+
+func (a managedVolumeEvidenceAuthority) containsRetained(name managedVolumeName) bool {
+	identity := managedVolumeEvidenceIdentityFromName(name)
+	return identity.retained && a.containsIdentity(identity)
+}
+
+func (a managedVolumeEvidenceAuthority) containsEither(name managedVolumeName) bool {
+	return a.containsIdentity(managedVolumeEvidenceIdentityFromName(name))
+}
+
+func (a managedVolumeEvidenceAuthority) containsIdentity(identity managedVolumeEvidenceIdentity) bool {
+	if identity.leaseUUID != a.leaseUUID {
+		return false
+	}
+	if identity.legacyV013 {
+		return identity.instance < a.legacyAppQuantity
+	}
+	quantity, exists := a.serviceQuantities[identity.serviceName]
+	return exists && identity.instance < quantity
+}
+
+// managedVolumeLeaseUUID may accept only a parsed token. parseManagedVolumeName
+// proved the fixed-width canonical UUID and the complete suffix grammar, so this
+// extraction cannot accidentally turn a prefix collision into lease authority.
+func managedVolumeLeaseUUID(volumeName managedVolumeName) string {
+	return managedVolumeEvidenceIdentityFromName(volumeName).leaseUUID
+}
+
+func reapingLeaseUUIDFromVolumeName(volumeName string) (string, bool) {
+	managedName, err := parseManagedVolumeName(volumeName)
+	if err != nil {
 		return "", false
 	}
-	return leaseUUID, true
+	return managedVolumeLeaseUUID(managedName), true
 }
 
 type stoppedV013RollbackCohortProof struct {
@@ -1887,6 +2106,7 @@ func storageIdentityContainerVolumeEvidence(
 					container.ContainerID)
 			}
 			source := mount.Source
+			interruptedMigrationAlternate := false
 			if err := requireExistingPathUnderRoot(cfg.VolumeDataPath, source); err != nil {
 				// v0.13 can stop+rename a legacy container and then rename its
 				// volume parent before crashing. Docker retains the old bind source
@@ -1899,6 +2119,7 @@ func storageIdentityContainerVolumeEvidence(
 						container.ContainerID, source, err)
 				}
 				source = alternate
+				interruptedMigrationAlternate = true
 			}
 			relative, relErr := filepath.Rel(cfg.VolumeDataPath, source)
 			if relErr != nil || relative == "." || relative == ".." ||
@@ -1907,14 +2128,134 @@ func storageIdentityContainerVolumeEvidence(
 					container.ContainerID, source)
 			}
 			volumeName := strings.Split(relative, string(filepath.Separator))[0]
-			if !strings.HasPrefix(volumeName, volumePrefix) {
-				return nil, fmt.Errorf("managed container %s mount %q is not in the managed volume namespace",
-					container.ContainerID, source)
+			managedName, parseErr := parseManagedVolumeName(volumeName)
+			if parseErr != nil {
+				return nil, fmt.Errorf(
+					"managed container %s mount %q has invalid managed volume identity %q: %w",
+					container.ContainerID,
+					source,
+					volumeName,
+					parseErr,
+				)
 			}
-			evidenceVolumes[volumeName] = struct{}{}
+			expectedName := canonicalVolumeName(
+				container.LeaseUUID,
+				container.ServiceName,
+				container.InstanceIndex,
+			)
+			switch {
+			case interruptedMigrationAlternate:
+				expectedName = canonicalVolumeName(
+					container.LeaseUUID,
+					manifest.DefaultServiceName,
+					container.InstanceIndex,
+				)
+			case container.ServiceName == "":
+				expectedName = fmt.Sprintf(
+					"fred-%s-%d",
+					container.LeaseUUID,
+					container.InstanceIndex,
+				)
+			}
+			expectedManagedName, expectedErr := parseManagedVolumeName(expectedName)
+			if expectedErr != nil {
+				return nil, fmt.Errorf(
+					"managed container %s labels do not derive a valid managed volume identity %q: %w",
+					container.ContainerID,
+					expectedName,
+					expectedErr,
+				)
+			}
+			if managedName != expectedManagedName {
+				return nil, fmt.Errorf(
+					"managed container %s mount %q identifies volume %q, expected exact live identity %q from its lease, service, and instance labels",
+					container.ContainerID,
+					source,
+					managedName.value(),
+					expectedManagedName.value(),
+				)
+			}
+			if err := requireManagedVolumeMountSource(
+				cfg.VolumeDataPath,
+				source,
+				managedName,
+				mount.Target,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"managed container %s mount %q does not prove volume %q: %w",
+					container.ContainerID,
+					source,
+					managedName.value(),
+					err,
+				)
+			}
+			evidenceVolumes[managedName.value()] = struct{}{}
 		}
 	}
 	return evidenceVolumes, nil
+}
+
+// requireManagedVolumeMountSource binds Docker's lexical mount declaration to
+// the exact managed-volume directory it claims. Global-root confinement alone
+// is insufficient: volume-A/data can be a symlink to volume-B/data and still
+// resolve below volume_data_path. Adoption must reject that cross-volume
+// redirection, and a source subtree that fred could not have emitted for the
+// declared container target.
+func requireManagedVolumeMountSource(
+	volumeDataPath string,
+	source string,
+	volumeName managedVolumeName,
+	target string,
+) error {
+	volumeRoot := volumeName.hostPath(volumeDataPath)
+	relative, err := filepath.Rel(volumeRoot, source)
+	if err != nil {
+		return fmt.Errorf("derive source subtree below exact managed volume root: %w", err)
+	}
+	if relative == "." || relative == ".." || filepath.IsAbs(relative) ||
+		strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("source subtree %q is outside the exact managed volume root", relative)
+	}
+	targetSubtree := sanitizeVolumePath(target)
+	if targetSubtree == "" {
+		return fmt.Errorf("container target %q has no valid managed-volume subtree", target)
+	}
+	writableSubtree := filepath.Join(writablePathSubdir, targetSubtree)
+	if !managedVolumeMountSubtreeMatches(relative, targetSubtree) {
+		return fmt.Errorf(
+			"source subtree %q does not match target-derived subtree %q or writable-path subtree %q",
+			relative,
+			targetSubtree,
+			writableSubtree,
+		)
+	}
+	storageRoot, err := os.OpenRoot(volumeDataPath)
+	if err != nil {
+		return fmt.Errorf("open configured managed volume root: %w", err)
+	}
+	defer func() { _ = storageRoot.Close() }()
+	exactVolumeRoot, err := openAttestedManagedVolumeRoot(storageRoot, volumeName)
+	if err != nil {
+		return fmt.Errorf("open exact managed volume root: %w", err)
+	}
+	defer func() { _ = exactVolumeRoot.Close() }()
+	var prefix string
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		prefix = filepath.Join(prefix, component)
+		info, statErr := exactVolumeRoot.Lstat(prefix)
+		if statErr != nil {
+			return fmt.Errorf("stat exact source subtree %q: %w", prefix, statErr)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("exact source subtree component %q is not a real directory", prefix)
+		}
+	}
+	return nil
+}
+
+func managedVolumeMountSubtreeMatches(relative, targetSubtree string) bool {
+	return relative == targetSubtree ||
+		relative == filepath.Join(writablePathSubdir, targetSubtree)
 }
 
 func interruptedMigrationMountSource(
@@ -1942,7 +2283,8 @@ func interruptedMigrationMountSource(
 		return "", false
 	}
 	sanitizedTarget := sanitizeVolumePath(mount.Target)
-	if sanitizedTarget == "" || filepath.Join(parts[1:]...) != sanitizedTarget {
+	if sanitizedTarget == "" ||
+		!managedVolumeMountSubtreeMatches(filepath.Join(parts[1:]...), sanitizedTarget) {
 		return "", false
 	}
 	parts[0] = canonicalVolumeName(
@@ -2087,19 +2429,18 @@ func newBackend(
 	}
 
 	httpClient := newCallbackHTTPClient(cfg, logger)
-	stopCtx, stopCancel := context.WithCancel(context.Background())
+	stopCtx, stopCancel, terminalStorageAuthorityFailure, storeAuthorityGate, err :=
+		newBackendStorageAuthorityLifetime()
+	if err != nil {
+		_ = docker.Close()
+		return nil, fmt.Errorf("construct backend storage authority lifetime: %w", err)
+	}
 	constructionComplete := false
 	defer func() {
 		if !constructionComplete {
 			stopCancel()
 		}
 	}()
-	storeAuthorityGate, err := backendidentity.NewStorageAuthorityGate(func(error) { stopCancel() })
-	if err != nil {
-		_ = docker.Close()
-		return nil, fmt.Errorf("construct backend storage authority gate: %w", err)
-	}
-
 	cbStore, err := shared.OpenIdentityBoundCallbackStore(shared.CallbackStoreConfig{
 		DBPath:         cfg.CallbackDBPath,
 		MaxAge:         cfg.CallbackMaxAge,
@@ -2159,27 +2500,28 @@ func newBackend(
 	}
 
 	b := &Backend{
-		cfg:                    cfg,
-		docker:                 docker,
-		compose:                composeSvc,
-		pool:                   pool,
-		volumes:                volumes,
-		logger:                 logger.With("backend", cfg.Name),
-		partitionSource:        partitionSource,
-		provisions:             make(map[string]*provision),
-		actors:                 make(map[string]*leasesm.LeaseActor),
-		callbackStore:          cbStore,
-		operationIntents:       cbStore,
-		diagnosticsStore:       diagStore,
-		releaseStore:           releaseStore,
-		releaseCapacityPlanner: releaseStore,
-		retentionStore:         retentionStore,
-		orphanStreaks:          make(map[string]int),
-		storageIdentity:        storage.ID(),
-		storageAuthority:       storage,
-		storeAuthorityGate:     storeAuthorityGate,
-		stopCtx:                stopCtx,
-		stopCancel:             stopCancel,
+		cfg:                             cfg,
+		docker:                          docker,
+		compose:                         composeSvc,
+		pool:                            pool,
+		volumes:                         volumes,
+		logger:                          logger.With("backend", cfg.Name),
+		partitionSource:                 partitionSource,
+		provisions:                      make(map[string]*provision),
+		actors:                          make(map[string]*leasesm.LeaseActor),
+		callbackStore:                   cbStore,
+		operationIntents:                cbStore,
+		diagnosticsStore:                diagStore,
+		releaseStore:                    releaseStore,
+		releaseCapacityPlanner:          releaseStore,
+		retentionStore:                  retentionStore,
+		orphanStreaks:                   make(map[string]int),
+		storageIdentity:                 storage.ID(),
+		storageAuthority:                storage,
+		storeAuthorityGate:              storeAuthorityGate,
+		terminalStorageAuthorityFailure: terminalStorageAuthorityFailure,
+		stopCtx:                         stopCtx,
+		stopCancel:                      stopCancel,
 		// tenantNetworkStripes is a fixed-size array embedded in Backend;
 		// the zero value is ready to use (N unlocked sync.Mutexes).
 	}
@@ -2271,15 +2613,55 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("volume manager validation failed: %w", err)
 	}
 
+	// Every mutating/convergent startup phase shares one generous but finite
+	// backend-lifecycle budget, including the interrupted-volume recovery that
+	// must run before Docker inventory is safe to inspect. It is deliberately
+	// independent of the caller's short readiness context: main cancels that
+	// context as soon as Start returns, while an idempotent recovery may
+	// legitimately take longer. stopCtx cancellation still ends the whole pass.
+	startupCtx, cancelStartup := b.startupRecoveryContext()
+	defer cancelStartup()
+
+	// Manager-private mutation evidence is structurally safe to inspect but is
+	// not a bind-ready tenant volume. New() has already opened the identity-bound
+	// journals (and therefore won their bbolt writer locks), so this is the first
+	// point at which recovery may mutate it without racing a second backend
+	// process. The recovery operation is deliberately unconditional and
+	// idempotent: treating an arbitrary read error from RequireNoInterruptedVolumeMutations
+	// as a Boolean "work exists" signal would conflate timeout/inventory failure
+	// with typed recovery evidence. Recover before operation intents: an
+	// unpublished XFS stage carries no tenant bytes and must be cleared, while an
+	// exact unmounted ZFS child must be mounted before Docker/inventory recovery
+	// can classify its owner.
+	// These are filesystem/quota-only phases: their local cap must not inherit a
+	// configured container stop grace. Both remain children of startupCtx, so the
+	// documented aggregate startup deadline cannot be reset or exceeded here.
+	recoveryCtx, cancelRecovery := startupVolumeMutationContext(startupCtx)
+	err := b.mutationAdapter().recoverInterruptedVolumeMutations(recoveryCtx)
+	cancelRecovery()
+	if err != nil {
+		return fmt.Errorf("recover interrupted managed-volume mutations: %w", err)
+	}
+	volumeProofCtx, cancelVolumeProof := startupVolumeMutationContext(startupCtx)
+	interruptedErr := b.volumes.RequireNoInterruptedVolumeMutations(volumeProofCtx)
+	var volumeProofErr error
+	if interruptedErr == nil {
+		_, volumeProofErr = attestManagedVolumeInventory(volumeProofCtx, b.volumes)
+	}
+	cancelVolumeProof()
+	if interruptedErr != nil {
+		return fmt.Errorf("interrupted managed-volume mutation remains after recovery: %w", interruptedErr)
+	}
+	if volumeProofErr != nil {
+		return fmt.Errorf("managed volume substrate validation failed: %w", volumeProofErr)
+	}
+
 	// ENG-360: warn loudly if the operator over-sized the disk pool relative to
 	// physical capacity (the invariant the hard-quota-sum model depends on).
 	b.warnIfOverProvisioned()
 
 	// Check daemon capabilities for hardening configuration
 	b.checkDaemonCapabilities(initialCtx)
-
-	startupCtx, cancelStartup := b.startupRecoveryContext()
-	defer cancelStartup()
 
 	// Recover state under a generous but finite backend-lifecycle budget, NOT
 	// the caller's short startup ctx: recoverState can
@@ -2298,7 +2680,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	// tear down, rename, or finalize any source record. Ambiguous partial/mixed
 	// evidence must remain byte-for-byte available for operator recovery.
 	preflightCtx, cancelPreflight := b.startupPhaseContext(startupCtx)
-	err := b.preflightOperationIntentRecovery(preflightCtx)
+	err = b.preflightOperationIntentRecovery(preflightCtx)
 	cancelPreflight()
 	if err != nil {
 		callbackStoreErrorsTotal.Inc()
@@ -2331,14 +2713,20 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Backfill per-volume quotas onto existing volumes. Volumes provisioned
 	// before the daemon held CAP_SYS_ADMIN were created untagged/un-limited;
 	// once the capability is granted, this re-applies enforcement without a
-	// re-provision. Best-effort (never fatal). Runs after reconcileRetentions so
-	// the fred-retained- namespace matches the retention records (ENG-454).
+	// re-provision. Every expected present volume is attempted, then any failures
+	// fail startup/readiness closed: serving while even one known tenant volume
+	// may be uncapped would violate the resource authority recovered above. Runs
+	// after reconcileRetentions so the fred-retained- namespace matches the
+	// retention records (ENG-454).
 	// Uses b.stopCtx like the recovery steps above: a one-time legacy migration
 	// in recoverState can push these startup steps past the caller's short ctx
 	// deadline (ENG-592).
 	quotaCtx, cancelQuotas := b.startupPhaseContext(startupCtx)
-	b.reconcileVolumeQuotas(quotaCtx)
+	err = b.reconcileVolumeQuotas(quotaCtx)
 	cancelQuotas()
+	if err != nil {
+		return fmt.Errorf("reconcile startup volume quotas: %w", err)
+	}
 
 	// Clean up orphaned volumes (created but no matching provision).
 	// Must run after recoverState so the provision map is populated. On
@@ -2537,6 +2925,9 @@ func (b *Backend) loadStorageIdentity(ctx context.Context) error {
 	}
 	if err := b.volumes.Validate(); err != nil {
 		return fmt.Errorf("validate volume substrate before identity initialization: %w", err)
+	}
+	if _, err := attestManagedVolumeInventory(ctx, b.volumes); err != nil {
+		return fmt.Errorf("attest managed volume substrate before identity initialization: %w", err)
 	}
 	if pinner, ok := b.volumes.(identityRootPinner); ok {
 		if err := pinner.PinIdentityRoot(); err != nil {
@@ -2794,6 +3185,19 @@ func (b *Backend) StorageIdentity() backendidentity.ID {
 		return backendidentity.ID{}
 	}
 	return b.storageIdentity
+}
+
+// TerminalStorageAuthorityFailure reports the first backend-lifetime storage
+// failure that requires a fresh process to re-open durable stores and run
+// startup recovery. The receive-only channel yields at most one error and is
+// never closed. A nil channel means this Backend was assembled by an isolated
+// test rather than the production constructor and therefore disables the
+// corresponding select case.
+func (b *Backend) TerminalStorageAuthorityFailure() <-chan error {
+	if b == nil {
+		return nil
+	}
+	return b.terminalStorageAuthorityFailure
 }
 
 // Health checks that the Docker daemon is reachable AND the persistence stores

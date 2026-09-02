@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -164,12 +166,13 @@ func newOperationIntentRecoveryBackend(
 	provisions map[string]*provision,
 ) *Backend {
 	t.Helper()
+	inventory := append([]ContainerInfo(nil), containers...)
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return append([]ContainerInfo(nil), containers...), nil
+			return append([]ContainerInfo(nil), inventory...), nil
 		},
 		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
-			for _, container := range containers {
+			for _, container := range inventory {
 				if container.ContainerID == containerID {
 					copy := container
 					return &copy, nil
@@ -179,6 +182,10 @@ func newOperationIntentRecoveryBackend(
 		},
 	}
 	b := newBackendForTest(mock, provisions)
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		inventory = nil
+		return nil
+	}}
 	b.storageIdentity = storageID
 	b.callbackStore = store
 	b.operationIntents = store
@@ -421,6 +428,624 @@ func TestProvisionReleaseAppendFailureRetainsIntentUntilRestartRecovery(t *testi
 	require.NoError(t, err)
 	require.NotNil(t, active)
 	assert.Equal(t, spec.Items, active.Items)
+}
+
+func TestProvisionVolumeDurabilityAmbiguityRetainsIntentAndStopsBackend(t *testing.T) {
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	callbackStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, callbackStore.Close()) })
+	spec := dockerOperationIntentSpec(t, storageID)
+	admission, err := callbackStore.BeginOperationIntent(spec)
+	require.NoError(t, err)
+
+	mutationCause := errors.New("xfs final-name parent sync failed")
+	mock := &mockDockerClient{
+		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
+		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
+			return &ImageInfo{Volumes: map[string]struct{}{"/data": {}}}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.storageIdentity = storageID
+	b.callbackStore = callbackStore
+	b.operationIntents = callbackStore
+	b.volumes = &mockVolumeManager{CreateFn: func(context.Context, string, int64) (string, bool, error) {
+		return "", false, fmt.Errorf("%w: %w", backendidentity.ErrMutationOutcomeAmbiguous, mutationCause)
+	}}
+	stack, err := manifest.ParsePayload(spec.Manifest)
+	require.NoError(t, err)
+	req := backend.ProvisionRequest{
+		LeaseUUID:            spec.LeaseUUID,
+		CallbackURL:          spec.CallbackURL,
+		LifecycleCallbackURL: spec.LifecycleCallbackURL,
+		Tenant:               spec.Tenant,
+		ProviderUUID:         spec.ProviderUUID,
+		Items:                append([]backend.LeaseItem(nil), spec.Items...),
+		Payload:              append([]byte(nil), spec.Manifest...),
+	}
+
+	_, _, _, _, provisionErr := b.doProvision(
+		context.Background(), req, stack, spec.ResourceProfiles, b.logger,
+	)
+	require.ErrorIs(t, provisionErr, backendidentity.ErrMutationOutcomeAmbiguous)
+	require.ErrorIs(t, provisionErr, mutationCause)
+	select {
+	case <-b.stopCtx.Done():
+	default:
+		t.Fatal("volume durability ambiguity did not stop the backend lifetime")
+	}
+
+	refusalErr := b.refuseOperationIntent(&admission.Claim, provisionErr)
+	require.ErrorIs(t, refusalErr, backendidentity.ErrMutationOutcomeAmbiguous)
+	intents, err := callbackStore.ListOperationIntents()
+	require.NoError(t, err)
+	assert.Len(t, intents, 1, "typed volume ambiguity must preserve the exact operation intent")
+	pending, err := callbackStore.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending, "an ambiguous volume result must not publish a failed callback")
+}
+
+func TestProvisionTeardownFailureRetainsIntentPoolAndVolumesAndStopsBackend(t *testing.T) {
+	const teardownFailure = "docker inventory unavailable during failed provision cleanup"
+	mock := &mockDockerClient{
+		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
+		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
+			return &ImageInfo{ID: "image-1", Volumes: map[string]struct{}{`/data`: {}}}, nil
+		},
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, errors.New(teardownFailure)
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.cfg.ContainerReadonlyRootfs = ptrBool(false)
+	bindTestStorageIdentity(t, b, mock)
+	profile := b.cfg.SKUProfiles["docker-micro"]
+	profile.DiskMB = 512
+	b.cfg.SKUProfiles["docker-micro"] = profile
+	b.compose = &mockComposeExecutor{
+		UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
+			return errors.New("injected compose up failure")
+		},
+		DownFn: func(context.Context, string, time.Duration) error {
+			return errors.New("injected compose down failure")
+		},
+	}
+	var destroyCalls int
+	b.volumes = &mockVolumeManager{
+		defaultDir: t.TempDir(),
+		DestroyFn: func(context.Context, string) error {
+			destroyCalls++
+			return nil
+		},
+	}
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	b.callbackStore = store
+	b.operationIntents = store
+	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
+		Store:           store,
+		HTTPClient:      testCallbackClient,
+		Secret:          durableCallbackTestSecret,
+		Logger:          b.logger,
+		StopCtx:         b.stopCtx,
+		BeforeDelivery:  func(context.Context) error { return b.terminalStorageAuthorityError() },
+		BeforeReplay:    func(context.Context) error { return b.terminalStorageAuthorityError() },
+		StorageIdentity: b.storageIdentity,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: testCallbackDeliveryTimeout,
+	})
+	spec := dockerOperationIntentSpec(t, b.storageIdentity)
+
+	require.NoError(t, b.Provision(context.Background(), backend.ProvisionRequest{
+		LeaseUUID:            spec.LeaseUUID,
+		Tenant:               spec.Tenant,
+		ProviderUUID:         spec.ProviderUUID,
+		Items:                slices.Clone(spec.Items),
+		CallbackURL:          spec.CallbackURL,
+		LifecycleCallbackURL: spec.LifecycleCallbackURL,
+		Payload:              slices.Clone(spec.Manifest),
+	}))
+	select {
+	case <-b.stopCtx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("incomplete failed-provision teardown did not stop the backend")
+	}
+	b.wg.Wait()
+
+	assert.Zero(t, destroyCalls, "managed volumes must remain untouched while a container may still mount them")
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+	allocation := b.pool.GetAllocation(spec.LeaseUUID + "-app-0")
+	require.NotNil(t, allocation, "the full reservation must remain while substrate cleanup is incomplete")
+	b.provisionsMu.RLock()
+	retained := b.provisions[spec.LeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, retained)
+	assert.Equal(t, spec.Items, retained.Items)
+	intents, err := store.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	assert.Equal(t, spec.LeaseUUID, intents[0].LeaseUUID())
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending, "the actor must not erase recovery authority with a failed callback")
+}
+
+func TestProvisionVolumeRecoveryPendingRetainsIntentReservationAndSuppressesCallback(t *testing.T) {
+	mock := &mockDockerClient{
+		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
+		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
+			return &ImageInfo{ID: "image-1", Volumes: map[string]struct{}{`/data`: {}}}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	b.cfg.ContainerReadonlyRootfs = ptrBool(false)
+	bindTestStorageIdentity(t, b, mock)
+	profile := b.cfg.SKUProfiles["docker-micro"]
+	profile.DiskMB = 512
+	b.cfg.SKUProfiles["docker-micro"] = profile
+	b.compose = &mockComposeExecutor{
+		UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
+			return errors.New("injected compose up failure")
+		},
+		DownFn: func(context.Context, string, time.Duration) error { return nil },
+	}
+	volumeRoot := t.TempDir()
+	var destroyCalls int
+	b.volumes = &mockVolumeManager{
+		defaultDir: volumeRoot,
+		CreateFn: func(_ context.Context, id string, _ int64) (string, bool, error) {
+			path := filepath.Join(volumeRoot, id)
+			require.NoError(t, os.MkdirAll(path, 0o755))
+			return path, true, nil
+		},
+		DestroyFn: func(context.Context, string) error {
+			destroyCalls++
+			return fmt.Errorf("injected staged-delete finalization failure: %w", ErrVolumeMutationRecoveryPending)
+		},
+	}
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	b.callbackStore = store
+	b.operationIntents = store
+	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
+		Store:           store,
+		HTTPClient:      testCallbackClient,
+		Secret:          durableCallbackTestSecret,
+		Logger:          b.logger,
+		StopCtx:         b.stopCtx,
+		BeforeDelivery:  func(context.Context) error { return b.terminalStorageAuthorityError() },
+		BeforeReplay:    func(context.Context) error { return b.terminalStorageAuthorityError() },
+		StorageIdentity: b.storageIdentity,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: testCallbackDeliveryTimeout,
+	})
+	spec := dockerOperationIntentSpec(t, b.storageIdentity)
+
+	require.NoError(t, b.Provision(context.Background(), backend.ProvisionRequest{
+		LeaseUUID:            spec.LeaseUUID,
+		Tenant:               spec.Tenant,
+		ProviderUUID:         spec.ProviderUUID,
+		Items:                slices.Clone(spec.Items),
+		CallbackURL:          spec.CallbackURL,
+		LifecycleCallbackURL: spec.LifecycleCallbackURL,
+		Payload:              slices.Clone(spec.Manifest),
+	}))
+	select {
+	case <-b.stopCtx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("volume recovery obligation did not stop the backend")
+	}
+	b.wg.Wait()
+
+	assert.Equal(t, 1, destroyCalls)
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), ErrVolumeMutationRecoveryPending)
+	require.NotNil(t, b.pool.GetAllocation(spec.LeaseUUID+"-app-0"),
+		"capacity must stay reserved until startup consumes the staged-delete recovery record")
+	intents, err := store.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	assert.Equal(t, spec.LeaseUUID, intents[0].LeaseUUID())
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending,
+		"a typed storage-recovery obligation must prevent callback settlement from erasing the WAL")
+}
+
+func TestProvisionRejectsPredecessorPrincipalMismatchBeforeTeardown(t *testing.T) {
+	oldItems := []backend.LeaseItem{{SKU: "docker-micro", ServiceName: "app", Quantity: 1}}
+	oldSpec := shared.OperationIntentSpec{
+		LeaseUUID:            "550e8400-e29b-41d4-a716-446655440000",
+		CallbackURL:          "https://old.example/callbacks/provision",
+		LifecycleCallbackURL: "https://old.example/callbacks/lifecycle",
+		Tenant:               "tenant-b",
+		ProviderUUID:         "33333333-3333-4333-8333-333333333333",
+		Items:                oldItems,
+		ResourceProfiles:     testResourceProfiles(t, oldItems),
+		Manifest:             validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
+	}
+	old := readyIntentProjection(oldSpec)[oldSpec.LeaseUUID]
+	old.Status = backend.ProvisionStatusFailed
+	var downCalls int
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{oldSpec.LeaseUUID: old})
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		downCalls++
+		return nil
+	}}
+
+	req := backend.ProvisionRequest{
+		LeaseUUID:    oldSpec.LeaseUUID,
+		Tenant:       "tenant-a",
+		ProviderUUID: nominalDockerProviderUUID,
+		Items:        []backend.LeaseItem{{SKU: "docker-micro", ServiceName: "app", Quantity: 1}},
+		CallbackURL:  "https://new.example/callbacks/provision",
+		Payload:      validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
+	}
+	err := b.Provision(context.Background(), req)
+	require.ErrorContains(t, err, "different tenant or provider")
+	assert.Zero(t, downCalls, "a caller must not acquire teardown authority across principals")
+	b.provisionsMu.RLock()
+	retained := b.provisions[oldSpec.LeaseUUID]
+	b.provisionsMu.RUnlock()
+	assert.Same(t, old, retained)
+}
+
+func TestRecoverOperationIntentRejectsCrossPrincipalPredecessorBeforeTeardown(t *testing.T) {
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	candidate := dockerOperationIntentSpec(t, storageID)
+	_, err = store.BeginOperationIntent(candidate)
+	require.NoError(t, err)
+
+	oldOperationID := shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	oldCallbackURL := "https://fred.example/callbacks/provision?operation_id=" + oldOperationID.String()
+	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
+	require.NoError(t, err)
+	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+		oldOperationID,
+		"tenant-b",
+		"33333333-3333-4333-8333-333333333333",
+		oldCallbackURL,
+		oldLifecycleURL,
+	)
+	require.NoError(t, err)
+	oldSpec := candidate
+	oldSpec.Tenant = oldAuthority.Tenant()
+	oldSpec.ProviderUUID = oldAuthority.ProviderUUID()
+	oldSpec.CallbackURL = oldCallbackURL
+	oldSpec.LifecycleCallbackURL = oldLifecycleURL
+	oldContainer := dockerIntentContainer(oldSpec, "old-container", oldSpec.Items[0].SKU, 0)
+	b := newOperationIntentRecoveryBackend(t, store, storageID, []ContainerInfo{oldContainer}, nil)
+	var downCalls int
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		downCalls++
+		return nil
+	}}
+	require.NoError(t, b.releaseStore.AppendActive(candidate.LeaseUUID, shared.Release{
+		Manifest:         candidate.Manifest,
+		Image:            "stack",
+		OperationID:      oldOperationID,
+		Items:            slices.Clone(candidate.Items),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(candidate.ResourceProfiles),
+		RuntimeAuthority: &oldAuthority,
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+
+	err = b.recoverOperationIntents(context.Background(), nil)
+	require.ErrorContains(t, err, "different tenant or provider")
+	assert.Zero(t, downCalls, "recovery must reject cross-principal teardown before mutation")
+	intents, listErr := store.ListOperationIntents()
+	require.NoError(t, listErr)
+	assert.Len(t, intents, 1)
+	pending, listErr := store.ListPending()
+	require.NoError(t, listErr)
+	assert.Empty(t, pending)
+}
+
+func TestProvisionRejectedAfterPredecessorTeardownRestoresProjectionAndAccounting(t *testing.T) {
+	var inventory []ContainerInfo
+	var removed []string
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return slices.Clone(inventory), nil
+		},
+		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+			for _, container := range inventory {
+				if container.ContainerID == containerID {
+					copy := container
+					return &copy, nil
+				}
+			}
+			return nil, errors.New("container not found")
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			removed = append(removed, containerID)
+			for index, container := range inventory {
+				if container.ContainerID == containerID {
+					inventory = append(inventory[:index], inventory[index+1:]...)
+					break
+				}
+			}
+			return nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	bindTestStorageIdentity(t, b, mock)
+	b.cfg.SKUProfiles = defaultTestSKUProfiles()
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		return errors.New("force exact fallback removal")
+	}}
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	b.callbackStore = store
+	b.operationIntents = store
+	releases := attachReleaseStore(t, b)
+
+	oldItems := []backend.LeaseItem{{SKU: "docker-micro", ServiceName: "app", Quantity: 2}}
+	oldProfiles := testResourceProfiles(t, oldItems)
+	oldOperationID := shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	oldCallbackURL := "https://fred.example/callbacks/provision?operation_id=" + oldOperationID.String()
+	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
+	require.NoError(t, err)
+	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+		oldOperationID, "tenant-a", nominalDockerProviderUUID, oldCallbackURL, oldLifecycleURL,
+	)
+	require.NoError(t, err)
+	oldManifest := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
+	oldSpec := shared.OperationIntentSpec{
+		LeaseUUID:            durableCallbackTestLeaseUUID,
+		CallbackURL:          oldCallbackURL,
+		LifecycleCallbackURL: oldLifecycleURL,
+		Tenant:               "tenant-a",
+		ProviderUUID:         nominalDockerProviderUUID,
+		Items:                oldItems,
+		ResourceProfiles:     oldProfiles,
+		Manifest:             oldManifest,
+	}
+	inventory = []ContainerInfo{
+		dockerIntentContainer(oldSpec, "actual-predecessor-survivor", oldItems[0].SKU, 1),
+	}
+	old := readyIntentProjection(oldSpec, "stale-projection-container")[oldSpec.LeaseUUID]
+	b.provisionsMu.Lock()
+	b.provisions[oldSpec.LeaseUUID] = old
+	b.provisionsMu.Unlock()
+	// Pin an actor to the prior Ready state, then expose the runtime Failed
+	// projection to Provision. Its explicit rejection exercises the post-teardown
+	// rollback boundary without starting a worker.
+	b.actorFor(oldSpec.LeaseUUID)
+	b.provisionsMu.Lock()
+	old.Status = backend.ProvisionStatusFailed
+	b.provisionsMu.Unlock()
+	oldIDs, oldAllocations, err := resolvedProvisionAllocations(
+		oldSpec.LeaseUUID, oldItems, oldProfiles,
+	)
+	require.NoError(t, err)
+	for _, allocation := range oldAllocations {
+		require.NoError(t, b.pool.TryAllocateResolved(
+			allocation.ID, oldSpec.Tenant, allocation.Resources,
+		))
+	}
+	require.NoError(t, releases.AppendActive(oldSpec.LeaseUUID, shared.Release{
+		Manifest:         oldManifest,
+		Image:            "stack",
+		OperationID:      oldOperationID,
+		Items:            slices.Clone(oldItems),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+		RuntimeAuthority: &oldAuthority,
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+
+	candidate := dockerOperationIntentSpec(t, b.storageIdentity)
+	candidate.Items = []backend.LeaseItem{
+		{SKU: "docker-micro", ServiceName: "app", Quantity: 1},
+		{SKU: "docker-micro", ServiceName: "cache", Quantity: 1},
+	}
+	candidate.Manifest = validStackManifestJSON(map[string]string{
+		"app": "docker.io/library/nginx:1.27", "cache": "docker.io/library/redis:7",
+	})
+	err = b.Provision(context.Background(), backend.ProvisionRequest{
+		LeaseUUID:            candidate.LeaseUUID,
+		Tenant:               candidate.Tenant,
+		ProviderUUID:         candidate.ProviderUUID,
+		Items:                slices.Clone(candidate.Items),
+		CallbackURL:          candidate.CallbackURL,
+		LifecycleCallbackURL: candidate.LifecycleCallbackURL,
+		Payload:              slices.Clone(candidate.Manifest),
+	})
+	require.Error(t, err, "the actor pinned to Ready must reject a provision transition")
+	assert.Equal(t, []string{"actual-predecessor-survivor"}, removed,
+		"teardown must use the fresh classified survivor, never the stale projection ID")
+	b.provisionsMu.RLock()
+	restored := b.provisions[oldSpec.LeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, restored)
+	assert.Equal(t, backend.ProvisionStatusFailed, restored.Status)
+	assert.Equal(t, oldItems, restored.Items)
+	assert.Empty(t, restored.ContainerIDs)
+	for _, allocationID := range oldIDs {
+		assert.NotNil(t, b.pool.GetAllocation(allocationID))
+	}
+	assert.Nil(t, b.pool.GetAllocation(oldSpec.LeaseUUID+"-cache-0"))
+	intents, listErr := store.ListOperationIntents()
+	require.NoError(t, listErr)
+	assert.Empty(t, intents)
+	pending, listErr := store.ListPending()
+	require.NoError(t, listErr)
+	require.Len(t, pending, 1)
+	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
+}
+
+func TestFailedReplacementProvisionRetainsIntentAndAccountingForColdRecovery(t *testing.T) {
+	var inventory []ContainerInfo
+	mock := &mockDockerClient{
+		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
+		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
+			return &ImageInfo{ID: "image-1", Volumes: map[string]struct{}{`/data`: {}}}, nil
+		},
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return slices.Clone(inventory), nil
+		},
+		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+			for _, container := range inventory {
+				if container.ContainerID == containerID {
+					copy := container
+					return &copy, nil
+				}
+			}
+			return nil, errors.New("container not found")
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	bindTestStorageIdentity(t, b, mock)
+	b.cfg.SKUProfiles = defaultTestSKUProfiles()
+	b.cfg.ContainerReadonlyRootfs = ptrBool(false)
+	b.compose = &mockComposeExecutor{
+		DownFn: func(context.Context, string, time.Duration) error {
+			inventory = nil
+			return nil
+		},
+		UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
+			return errors.New("injected replacement compose failure")
+		},
+	}
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	b.callbackStore = store
+	b.operationIntents = store
+	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
+		Store:           store,
+		HTTPClient:      testCallbackClient,
+		Secret:          durableCallbackTestSecret,
+		Logger:          b.logger,
+		StopCtx:         b.stopCtx,
+		BeforeDelivery:  func(context.Context) error { return b.terminalStorageAuthorityError() },
+		BeforeReplay:    func(context.Context) error { return b.terminalStorageAuthorityError() },
+		StorageIdentity: b.storageIdentity,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: testCallbackDeliveryTimeout,
+	})
+	releases := attachReleaseStore(t, b)
+
+	oldItems := []backend.LeaseItem{{SKU: "docker-micro", ServiceName: "app", Quantity: 1}}
+	oldProfiles := testResourceProfiles(t, oldItems)
+	oldOperationID := shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	oldCallbackURL := "https://fred.example/callbacks/provision?operation_id=" + oldOperationID.String()
+	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
+	require.NoError(t, err)
+	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+		oldOperationID, "tenant-a", nominalDockerProviderUUID, oldCallbackURL, oldLifecycleURL,
+	)
+	require.NoError(t, err)
+	manifestPayload := validStackManifestJSON(map[string]string{"app": "docker.io/library/redis:7"})
+	oldSpec := shared.OperationIntentSpec{
+		LeaseUUID:            durableCallbackTestLeaseUUID,
+		CallbackURL:          oldCallbackURL,
+		LifecycleCallbackURL: oldLifecycleURL,
+		Tenant:               "tenant-a",
+		ProviderUUID:         nominalDockerProviderUUID,
+		Items:                oldItems,
+		ResourceProfiles:     oldProfiles,
+		Manifest:             manifestPayload,
+	}
+	inventory = []ContainerInfo{dockerIntentContainer(oldSpec, "old-container", oldItems[0].SKU, 0)}
+	old := readyIntentProjection(oldSpec, "old-container")[oldSpec.LeaseUUID]
+	old.Status = backend.ProvisionStatusFailed
+	b.provisionsMu.Lock()
+	b.provisions[oldSpec.LeaseUUID] = old
+	b.provisionsMu.Unlock()
+	_, oldAllocations, err := resolvedProvisionAllocations(oldSpec.LeaseUUID, oldItems, oldProfiles)
+	require.NoError(t, err)
+	for _, allocation := range oldAllocations {
+		require.NoError(t, b.pool.TryAllocateResolved(allocation.ID, oldSpec.Tenant, allocation.Resources))
+	}
+	require.NoError(t, releases.AppendActive(oldSpec.LeaseUUID, shared.Release{
+		Manifest:         manifestPayload,
+		Image:            "stack",
+		OperationID:      oldOperationID,
+		Items:            slices.Clone(oldItems),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+		RuntimeAuthority: &oldAuthority,
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+	volumeRoot := t.TempDir()
+	volumeName := canonicalVolumeName(oldSpec.LeaseUUID, "app", 0)
+	volumePath := filepath.Join(volumeRoot, volumeName)
+	require.NoError(t, os.MkdirAll(volumePath, 0o755))
+	var destroyCalls int
+	b.volumes = &mockVolumeManager{
+		defaultDir: volumeRoot,
+		CreateFn: func(_ context.Context, id string, _ int64) (string, bool, error) {
+			require.Equal(t, volumeName, id)
+			return volumePath, false, nil
+		},
+		DestroyFn: func(context.Context, string) error {
+			destroyCalls++
+			return nil
+		},
+	}
+
+	candidate := dockerOperationIntentSpec(t, b.storageIdentity)
+	candidate.Items = slices.Clone(oldItems)
+	candidate.Manifest = slices.Clone(manifestPayload)
+	require.NoError(t, b.Provision(context.Background(), backend.ProvisionRequest{
+		LeaseUUID:            candidate.LeaseUUID,
+		Tenant:               candidate.Tenant,
+		ProviderUUID:         candidate.ProviderUUID,
+		Items:                slices.Clone(candidate.Items),
+		CallbackURL:          candidate.CallbackURL,
+		LifecycleCallbackURL: candidate.LifecycleCallbackURL,
+		Payload:              slices.Clone(candidate.Manifest),
+	}))
+	select {
+	case <-b.stopCtx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("failed replacement did not latch the backend for cold recovery")
+	}
+	b.wg.Wait()
+	assert.Zero(t, destroyCalls, "a reused predecessor volume is never candidate-created cleanup")
+	_, statErr := os.Stat(volumePath)
+	require.NoError(t, statErr)
+	assert.NotNil(t, b.pool.GetAllocation(oldSpec.LeaseUUID+"-app-0"),
+		"candidate accounting must remain conservative until cold recovery restores the predecessor")
+	b.provisionsMu.RLock()
+	retained := b.provisions[oldSpec.LeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, retained)
+	assert.Equal(t, candidate.CallbackURL, retained.CallbackURL)
+	intents, listErr := store.ListOperationIntents()
+	require.NoError(t, listErr)
+	require.Len(t, intents, 1)
+	assert.Equal(t, candidate.LeaseUUID, intents[0].LeaseUUID())
+	pending, listErr := store.ListPending()
+	require.NoError(t, listErr)
+	assert.Empty(t, pending, "the stopped backend must not settle through the predecessor route")
 }
 
 func TestRecoverOperationIntent_CrashBeforeMutationSettlesExactFailure(t *testing.T) {
@@ -792,7 +1417,7 @@ func TestRestoreIntentToReservationWindowIsFencedAgainstDeprovision(t *testing.T
 	assert.False(t, exists)
 }
 
-func TestRecoverOperationIntent_PartialSubstrateFailsClosed(t *testing.T) {
+func TestRecoverOperationIntent_PartialProvisionCohortIsTornDownBeforeFailureSettlement(t *testing.T) {
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)
 	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
@@ -806,15 +1431,383 @@ func TestRecoverOperationIntent_PartialSubstrateFailsClosed(t *testing.T) {
 	require.NoError(t, err)
 	container := dockerIntentContainer(spec, "container-1", spec.Items[0].SKU, 0)
 	b := newOperationIntentRecoveryBackend(t, store, storageID, []ContainerInfo{container}, nil)
+	volumes := newVolumeSet(
+		canonicalVolumeName(spec.LeaseUUID, spec.Items[0].ServiceName, 0),
+		canonicalVolumeName(spec.LeaseUUID, spec.Items[0].ServiceName, 1),
+	)
+	b.volumes = volumes.manager()
 
-	err = b.recoverOperationIntents(context.Background(), nil)
-	require.ErrorContains(t, err, "partial substrate")
+	// First-pass state recovery must restore the complete immutable reservation
+	// and both volume claims, even though Docker exposes only one of two expected
+	// containers. That authority remains published throughout teardown.
+	require.NoError(t, b.recoverState(context.Background()))
+	b.provisionsMu.RLock()
+	recovered := b.provisions[spec.LeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, recovered)
+	assert.Equal(t, 2, recovered.Quantity)
+	assert.Equal(t, spec.Items, recovered.Items)
+	assert.NotNil(t, b.pool.GetAllocation(spec.LeaseUUID+"-app-0"))
+	assert.NotNil(t, b.pool.GetAllocation(spec.LeaseUUID+"-app-1"))
+	claims, claimErr := b.snapshotVolumeClaims()
+	require.NoError(t, claimErr)
+	_, claimed0 := claims.owner(canonicalVolumeName(spec.LeaseUUID, "app", 0))
+	_, claimed1 := claims.owner(canonicalVolumeName(spec.LeaseUUID, "app", 1))
+	assert.True(t, claimed0)
+	assert.True(t, claimed1)
+
+	require.NoError(t, b.recoverOperationIntents(context.Background(), nil))
 	intents, listErr := store.ListOperationIntents()
 	require.NoError(t, listErr)
-	assert.Len(t, intents, 1, "ambiguous evidence must retain the durable intent")
+	assert.Empty(t, intents)
 	pending, listErr := store.ListPending()
 	require.NoError(t, listErr)
-	assert.Empty(t, pending)
+	require.Len(t, pending, 1)
+	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
+	_, getErr := b.GetProvision(context.Background(), spec.LeaseUUID)
+	assert.ErrorIs(t, getErr, backend.ErrNotProvisioned)
+	assert.Nil(t, b.pool.GetAllocation(spec.LeaseUUID+"-app-0"))
+	assert.Nil(t, b.pool.GetAllocation(spec.LeaseUUID+"-app-1"))
+
+	// Only after settlement and the internal state rebuild do the fresh volumes
+	// become ordinary orphans. The existing startup pass then removes both.
+	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+	assert.ElementsMatch(t, []string{
+		canonicalVolumeName(spec.LeaseUUID, "app", 0),
+		canonicalVolumeName(spec.LeaseUUID, "app", 1),
+	}, volumes.names())
+}
+
+func TestRecoverOperationIntent_PredecessorSubsetRestoresReleaseAndReapsOnlyCandidateOrphan(t *testing.T) {
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	oldItems := []backend.LeaseItem{{SKU: "docker-micro", ServiceName: "app", Quantity: 2}}
+	oldProfiles := testResourceProfiles(t, oldItems)
+	oldManifest := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
+	const oldOperationID = shared.OperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	oldCallbackURL := "https://fred.example/callbacks/provision?operation_id=" + oldOperationID.String()
+	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
+	require.NoError(t, err)
+	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+		oldOperationID,
+		"tenant-a",
+		"22222222-2222-4222-8222-222222222222",
+		oldCallbackURL,
+		oldLifecycleURL,
+	)
+	require.NoError(t, err)
+
+	candidate := dockerOperationIntentSpec(t, storageID)
+	candidate.Items = []backend.LeaseItem{
+		{SKU: "docker-micro", ServiceName: "app", Quantity: 2},
+		{SKU: "docker-micro", ServiceName: "cache", Quantity: 1},
+	}
+	candidate.ResourceProfiles = testResourceProfiles(t, candidate.Items)
+	candidate.Manifest = validStackManifestJSON(map[string]string{
+		"app":   "docker.io/library/nginx:1.27",
+		"cache": "docker.io/library/redis:7",
+	})
+	_, err = store.BeginOperationIntent(candidate)
+	require.NoError(t, err)
+
+	oldSpec := candidate
+	oldSpec.CallbackURL = oldCallbackURL
+	oldSpec.LifecycleCallbackURL = oldLifecycleURL
+	oldSpec.Items = oldItems
+	oldSpec.EffectiveItems = oldItems
+	oldSpec.ResourceProfiles = oldProfiles
+	oldSpec.Manifest = oldManifest
+	// Model a crash after one of the two predecessor containers was removed.
+	survivor := dockerIntentContainer(oldSpec, "old-container-1", oldItems[0].SKU, 1)
+	b := newOperationIntentRecoveryBackend(t, store, storageID, []ContainerInfo{survivor}, nil)
+	require.NoError(t, b.releaseStore.AppendActive(candidate.LeaseUUID, shared.Release{
+		Manifest:         oldManifest,
+		Image:            "stack",
+		OperationID:      oldOperationID,
+		Items:            oldItems,
+		ResourceProfiles: oldProfiles,
+		RuntimeAuthority: &oldAuthority,
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+	oldVolume0 := canonicalVolumeName(candidate.LeaseUUID, "app", 0)
+	oldVolume1 := canonicalVolumeName(candidate.LeaseUUID, "app", 1)
+	freshCandidateVolume := canonicalVolumeName(candidate.LeaseUUID, "cache", 0)
+	volumes := newVolumeSet(oldVolume0, oldVolume1, freshCandidateVolume)
+	b.volumes = volumes.manager()
+
+	require.NoError(t, b.recoverState(context.Background()))
+	assert.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-0"))
+	assert.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-1"))
+	assert.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-cache-0"),
+		"the complete candidate intent must remain reserved during cleanup")
+
+	require.NoError(t, b.recoverOperationIntents(context.Background(), nil))
+	b.provisionsMu.RLock()
+	recovered := b.provisions[candidate.LeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, recovered)
+	assert.Equal(t, backend.ProvisionStatusFailed, recovered.Status)
+	assert.Equal(t, oldItems, recovered.Items)
+	assert.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-0"))
+	assert.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-1"))
+	assert.Nil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-cache-0"))
+	claims, claimErr := b.snapshotVolumeClaims()
+	require.NoError(t, claimErr)
+	_, old0Claimed := claims.owner(oldVolume0)
+	_, old1Claimed := claims.owner(oldVolume1)
+	_, freshClaimed := claims.owner(freshCandidateVolume)
+	assert.True(t, old0Claimed)
+	assert.True(t, old1Claimed)
+	assert.False(t, freshClaimed)
+
+	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()))
+	assert.Equal(t, []string{freshCandidateVolume}, volumes.names(),
+		"the older release protects only its exact names; the candidate-only volume is reaped")
+}
+
+func TestRecoverOperationIntent_LegacyPredecessorFreezesAuthorityBeforeTeardown(t *testing.T) {
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	candidate := dockerOperationIntentSpec(t, storageID)
+	candidate.Items = []backend.LeaseItem{{
+		SKU: "docker-small", ServiceName: "replacement", Quantity: 1,
+	}}
+	candidate.ResourceProfiles = testResourceProfiles(t, candidate.Items)
+	candidate.Manifest = validStackManifestJSON(map[string]string{
+		"replacement": "docker.io/library/redis:7",
+	})
+	_, err = store.BeginOperationIntent(candidate)
+	require.NoError(t, err)
+
+	oldItems := []backend.LeaseItem{{SKU: "docker-micro", ServiceName: "app", Quantity: 2}}
+	oldProfiles := testResourceProfiles(t, oldItems)
+	oldManifest := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
+	oldSpec := shared.OperationIntentSpec{
+		LeaseUUID:            candidate.LeaseUUID,
+		CallbackURL:          "https://legacy.example/callbacks/provision?route=v013",
+		LifecycleCallbackURL: "", // v0.13 stored only callback_url; recovery derives the pair.
+		Tenant:               candidate.Tenant,
+		ProviderUUID:         candidate.ProviderUUID,
+		Items:                oldItems,
+		ResourceProfiles:     oldProfiles,
+		Manifest:             oldManifest,
+	}
+	// Model a crash after one predecessor instance was removed. The candidate
+	// intentionally uses a different SKU so the first recovery pass must account
+	// this survivor from the active Release before legacy identity is frozen.
+	survivor := dockerIntentContainer(oldSpec, "legacy-old-container-1", oldItems[0].SKU, 1)
+	b := newOperationIntentRecoveryBackend(t, store, storageID, []ContainerInfo{survivor}, nil)
+	require.NoError(t, b.releaseStore.AppendActive(candidate.LeaseUUID, shared.Release{
+		Manifest:         oldManifest,
+		Image:            "stack",
+		Items:            slices.Clone(oldItems),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+
+	require.NoError(t, b.recoverState(context.Background()))
+	require.NoError(t, b.recoverOperationIntents(context.Background(), nil))
+	active, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
+	require.NoError(t, readErr)
+	require.NotNil(t, active)
+	require.NotNil(t, active.LegacyRuntimeAuthority,
+		"legacy identity must commit before teardown removes its last witness")
+	assert.Equal(t, oldSpec.Tenant, active.LegacyRuntimeAuthority.Tenant())
+	assert.Equal(t, oldSpec.ProviderUUID, active.LegacyRuntimeAuthority.ProviderUUID())
+	assert.Equal(t, oldSpec.CallbackURL, active.LegacyRuntimeAuthority.CallbackURL())
+	restoredLifecycle, resolveErr := backend.ResolveLifecycleCallbackURL(oldSpec.CallbackURL, "")
+	require.NoError(t, resolveErr)
+	assert.Equal(t, restoredLifecycle, active.LegacyRuntimeAuthority.LifecycleCallbackURL())
+	b.provisionsMu.RLock()
+	restored := b.provisions[candidate.LeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, restored)
+	assert.Equal(t, backend.ProvisionStatusFailed, restored.Status)
+	assert.Equal(t, oldItems, restored.Items)
+	assert.Equal(t, oldSpec.CallbackURL, restored.CallbackURL)
+	assert.Empty(t, restored.ContainerIDs)
+	assert.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-0"))
+	assert.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-1"))
+	assert.Nil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-replacement-0"))
+
+	// A second zero-survivor rebuild reads only the durable release authority;
+	// no in-memory container identity from the first process may be required.
+	fresh := newBackendForTest(&mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}, nil)
+	fresh.storageIdentity = storageID
+	fresh.callbackStore = store
+	fresh.operationIntents = store
+	fresh.releaseStore = b.releaseStore
+	require.NoError(t, fresh.recoverState(context.Background()))
+	fresh.provisionsMu.RLock()
+	secondRestart := fresh.provisions[candidate.LeaseUUID]
+	fresh.provisionsMu.RUnlock()
+	require.NotNil(t, secondRestart)
+	assert.Equal(t, oldSpec.Tenant, secondRestart.Tenant)
+	assert.Equal(t, oldSpec.ProviderUUID, secondRestart.ProviderUUID)
+	assert.Equal(t, oldSpec.CallbackURL, secondRestart.CallbackURL)
+	assert.Equal(t, oldItems, secondRestart.Items)
+	assert.NotNil(t, fresh.pool.GetAllocation(candidate.LeaseUUID+"-app-0"))
+	assert.NotNil(t, fresh.pool.GetAllocation(candidate.LeaseUUID+"-app-1"))
+}
+
+func TestRecoverState_ProactivelyFreezesCompleteLegacyRuntimeAuthority(t *testing.T) {
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	items := []backend.LeaseItem{{SKU: "docker-micro", ServiceName: "app", Quantity: 1}}
+	profiles := testResourceProfiles(t, items)
+	legacySpec := shared.OperationIntentSpec{
+		LeaseUUID:            durableCallbackTestLeaseUUID,
+		CallbackURL:          "https://legacy.example/callbacks/provision?route=v013",
+		LifecycleCallbackURL: "",
+		Tenant:               "tenant-a",
+		ProviderUUID:         nominalDockerProviderUUID,
+		Items:                items,
+		ResourceProfiles:     profiles,
+		Manifest:             validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
+	}
+	container := dockerIntentContainer(legacySpec, "legacy-container", items[0].SKU, 0)
+	b := newOperationIntentRecoveryBackend(t, store, storageID, []ContainerInfo{container}, nil)
+	require.NoError(t, b.releaseStore.AppendActive(legacySpec.LeaseUUID, shared.Release{
+		Manifest:         legacySpec.Manifest,
+		Image:            "stack",
+		Items:            slices.Clone(items),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(profiles),
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+	require.NoError(t, b.recoverState(context.Background()))
+	active, readErr := b.releaseStore.LatestActive(legacySpec.LeaseUUID)
+	require.NoError(t, readErr)
+	require.NotNil(t, active)
+	require.NotNil(t, active.LegacyRuntimeAuthority)
+	assert.Equal(t, legacySpec.CallbackURL, active.LegacyRuntimeAuthority.CallbackURL())
+
+	for restart := 1; restart <= 2; restart++ {
+		fresh := newBackendForTest(&mockDockerClient{
+			ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
+		}, nil)
+		fresh.storageIdentity = storageID
+		fresh.callbackStore = store
+		fresh.operationIntents = store
+		fresh.releaseStore = b.releaseStore
+		require.NoError(t, fresh.recoverState(context.Background()), "restart %d", restart)
+		fresh.provisionsMu.RLock()
+		recovered := fresh.provisions[legacySpec.LeaseUUID]
+		fresh.provisionsMu.RUnlock()
+		require.NotNil(t, recovered, "restart %d", restart)
+		assert.Equal(t, backend.ProvisionStatusFailed, recovered.Status)
+		assert.Equal(t, legacySpec.Tenant, recovered.Tenant)
+		assert.Equal(t, legacySpec.CallbackURL, recovered.CallbackURL)
+		assert.NotNil(t, fresh.pool.GetAllocation(legacySpec.LeaseUUID+"-app-0"))
+	}
+}
+
+func TestRecoverOperationIntentRejectsAmbiguousLegacyPredecessor(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func([]ContainerInfo) []ContainerInfo
+		want   string
+	}{
+		{
+			name: "mixed callback generation",
+			mutate: func(containers []ContainerInfo) []ContainerInfo {
+				containers[1].CallbackURL = "https://other.example/callbacks/provision"
+				return containers
+			},
+			want: "mixed callback identities",
+		},
+		{
+			name: "foreign principal",
+			mutate: func(containers []ContainerInfo) []ContainerInfo {
+				containers[1].Tenant = "tenant-b"
+				return containers
+			},
+			want: "different tenant or provider",
+		},
+		{
+			name: "out of release instance",
+			mutate: func(containers []ContainerInfo) []ContainerInfo {
+				containers[1].InstanceIndex = 2
+				return containers
+			},
+			want: "not in the exact released instance set",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+			require.NoError(t, err)
+			store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+				DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			candidate := dockerOperationIntentSpec(t, storageID)
+			_, err = store.BeginOperationIntent(candidate)
+			require.NoError(t, err)
+			oldItems := []backend.LeaseItem{{SKU: "docker-micro", ServiceName: "app", Quantity: 2}}
+			oldProfiles := testResourceProfiles(t, oldItems)
+			oldSpec := shared.OperationIntentSpec{
+				LeaseUUID:            candidate.LeaseUUID,
+				CallbackURL:          "https://legacy.example/callbacks/provision",
+				LifecycleCallbackURL: "",
+				Tenant:               candidate.Tenant,
+				ProviderUUID:         candidate.ProviderUUID,
+				Items:                oldItems,
+				ResourceProfiles:     oldProfiles,
+				Manifest:             validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
+			}
+			containers := tc.mutate([]ContainerInfo{
+				dockerIntentContainer(oldSpec, "legacy-0", oldItems[0].SKU, 0),
+				dockerIntentContainer(oldSpec, "legacy-1", oldItems[0].SKU, 1),
+			})
+			b := newOperationIntentRecoveryBackend(t, store, storageID, containers, nil)
+			var downCalls int
+			b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+				downCalls++
+				return nil
+			}}
+			require.NoError(t, b.releaseStore.AppendActive(candidate.LeaseUUID, shared.Release{
+				Manifest:         oldSpec.Manifest,
+				Image:            "stack",
+				Items:            slices.Clone(oldItems),
+				ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+				Status:           "active",
+				CreatedAt:        time.Now().Add(-time.Hour),
+			}))
+
+			err = b.recoverOperationIntents(context.Background(), nil)
+			require.ErrorContains(t, err, tc.want)
+			assert.Zero(t, downCalls)
+			intents, listErr := store.ListOperationIntents()
+			require.NoError(t, listErr)
+			assert.Len(t, intents, 1)
+			active, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
+			require.NoError(t, readErr)
+			require.NotNil(t, active)
+			assert.Nil(t, active.LegacyRuntimeAuthority,
+				"ambiguous evidence must not be promoted into durable teardown authority")
+		})
+	}
 }
 
 func TestRecoverOperationIntent_RestoreWaitsForCleanRetentionReconciliation(t *testing.T) {

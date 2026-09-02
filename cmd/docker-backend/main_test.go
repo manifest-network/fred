@@ -9,8 +9,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -76,20 +78,71 @@ func TestIdentityBoundServerOmitsIdentityWhenRuntimeAttestationIsUnavailable(t *
 
 func TestShutdownExitCode(t *testing.T) {
 	tests := []struct {
-		name        string
-		startupErr  error
-		shutdownErr error
-		want        int
+		name                string
+		startupErr          error
+		shutdownErr         error
+		storageAuthorityErr error
+		want                int
 	}{
 		{name: "clean", want: 0},
 		{name: "listener failed", startupErr: errors.New("listen"), want: 1},
 		{name: "backend did not drain", shutdownErr: docker.ErrShutdownDrainTimeout, want: 1},
+		{name: "storage authority withdrawn", storageAuthorityErr: backendidentity.ErrMutationOutcomeAmbiguous, want: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, shutdownExitCode(tt.startupErr, tt.shutdownErr))
+			assert.Equal(t, tt.want, shutdownExitCode(tt.startupErr, tt.shutdownErr, tt.storageAuthorityErr))
 		})
 	}
+}
+
+func TestWaitForShutdownTrigger(t *testing.T) {
+	t.Parallel()
+
+	t.Run("signal", func(t *testing.T) {
+		signals := make(chan os.Signal, 1)
+		signals <- syscall.SIGTERM
+		got := waitForShutdownTrigger(signals, nil, nil)
+		assert.True(t, got.signaled)
+		assert.NoError(t, got.serverErr)
+		assert.NoError(t, got.storageAuthorityErr)
+	})
+
+	t.Run("listener failure", func(t *testing.T) {
+		want := errors.New("listen failed")
+		failures := make(chan error, 1)
+		failures <- want
+		got := waitForShutdownTrigger(nil, failures, nil)
+		require.ErrorIs(t, got.serverErr, want)
+		assert.False(t, got.signaled)
+		assert.NoError(t, got.storageAuthorityErr)
+	})
+
+	t.Run("storage authority failure", func(t *testing.T) {
+		want := fmt.Errorf("%w: pending xfs recovery", backendidentity.ErrMutationOutcomeAmbiguous)
+		failures := make(chan error, 1)
+		failures <- want
+		got := waitForShutdownTrigger(nil, nil, failures)
+		require.ErrorIs(t, got.storageAuthorityErr, want)
+		assert.False(t, got.signaled)
+		assert.NoError(t, got.serverErr)
+	})
+}
+
+func TestTakePendingStorageAuthorityFailure(t *testing.T) {
+	t.Parallel()
+
+	want := fmt.Errorf("%w: pending xfs recovery", backendidentity.ErrMutationOutcomeAmbiguous)
+	failures := make(chan error, 1)
+	failures <- want
+	require.ErrorIs(t, takePendingStorageAuthorityFailure(nil, failures), want)
+	assert.NoError(t, takePendingStorageAuthorityFailure(nil, nil), "a nil test channel disables the poll")
+
+	current := errors.New("already selected")
+	extra := make(chan error, 1)
+	extra <- want
+	require.ErrorIs(t, takePendingStorageAuthorityFailure(current, extra), current)
+	assert.Len(t, extra, 1, "an already-selected first cause must not be replaced")
 }
 
 func TestVerifySignature(t *testing.T) {

@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // This file covers ENG-681: the owner table is a snapshot, so a destroy authorized by it
@@ -226,26 +228,45 @@ func TestCreateManagedVolume_SerializesAgainstAnInFlightDestroy(t *testing.T) {
 }
 
 // TestProvision_ReservationPublishesTheOwnershipClaim pins that a lease's claim exists for
-// the WHOLE of Provision, not just its tail.
-//
-// snapshotVolumeClaims derives live claims from prov.Items, so a reservation that left
-// Items unset claimed nothing until enrichReserved ran — and on the re-provision arm
-// exercised here it did worse than that: the previous, claim-bearing entry is deleted and
-// replaced in the same critical section, so a live claim was RETRACTED across container
-// removal, SKU validation, manifest parsing and pool allocation. The volumes it protects
-// are deliberately kept across a re-provision, so anything collecting in that window was
-// collecting live tenant data (ENG-681).
-//
-// Parking in RemoveContainer puts the assertion inside that window by construction: it is
-// the re-provision cleanup, which runs after the reservation and before enrichReserved.
+// the WHOLE of Provision, not just its tail. A safe re-provision keeps the predecessor
+// projection authoritative until its exact cohort is proven absent, then atomically
+// publishes the candidate projection and pool generation. Both projections claim the
+// same canonical volume names, so the handoff cannot expose reusable tenant data to an
+// orphan collector (ENG-681).
 func TestProvision_ReservationPublishesTheOwnershipClaim(t *testing.T) {
-	lease := "0192f1a0-4444-7abc-8def-000000000104"
+	const lease = "0192f1a0-4444-7abc-8def-000000000104"
+	const candidateOperationID = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	svc := manifest.DefaultServiceName
+	oldItems := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: svc}}
+	oldProfiles := testResourceProfiles(t, oldItems)
+	oldOperationID := shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	oldCallbackURL := "https://old.example/callbacks/provision?operation_id=" + oldOperationID.String()
+	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
+	require.NoError(t, err)
+	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+		oldOperationID, "tenant-a", nominalDockerProviderUUID, oldCallbackURL, oldLifecycleURL,
+	)
+	require.NoError(t, err)
+	oldManifest := validManifestJSON("nginx:latest")
+	oldContainer := ContainerInfo{
+		ContainerID: "container-1", Name: "fred-" + lease + "-app-0", LeaseUUID: lease,
+		Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+		SKU: "docker-micro", ServiceName: svc, InstanceIndex: 0,
+		Image: "nginx:latest", CallbackURL: oldCallbackURL,
+		LifecycleCallbackURL: oldLifecycleURL, Status: "exited",
+	}
 
 	reached := make(chan struct{})
 	release := make(chan struct{})
 	mock := &mockDockerClient{
-		RemoveContainerFn: func(ctx context.Context, containerID string) error {
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{oldContainer}, nil
+		},
+		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
+			copy := oldContainer
+			return &copy, nil
+		},
+		RemoveContainerFn: func(ctx context.Context, _ string) error {
 			close(reached)
 			select {
 			case <-release:
@@ -254,54 +275,63 @@ func TestProvision_ReservationPublishesTheOwnershipClaim(t *testing.T) {
 			return nil
 		},
 	}
-	// The lease is Failed, so Provision takes the re-provision arm: it deletes this
-	// entry and re-reserves. Its volumes stay on disk by design.
-	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		lease: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: lease, Tenant: "tenant-a", Status: backend.ProvisionStatusFailed, Quantity: 1,
-			ContainerIDs: []string{"container-1"},
-			Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: svc}},
-		}},
-	})
-	withMicroSKU(b, 512)
-
-	// Pure request validation now deliberately runs before the old failed
-	// provision is replaced, so the prior claim remains published throughout
-	// validation. Force the first post-reservation allocation to fail instead;
-	// that still enters and leaves the ownership window without needing
-	// compose/callback scaffolding.
-	for _, allocationID := range []string{"exhaust-0", "exhaust-1", "exhaust-2", "exhaust-3"} {
-		require.NoError(t, b.pool.TryAllocate(allocationID, "docker-large", "other-tenant"))
+	oldProjection := &provision{
+		ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: lease, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+			Status: backend.ProvisionStatusFailed, Quantity: 1,
+			ContainerIDs: []string{oldContainer.ContainerID}, Items: oldItems,
+			ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+			CallbackURL:      oldCallbackURL, LifecycleCallbackURL: oldLifecycleURL,
+		},
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
 	}
-	req := newProvisionRequest(lease, "tenant-a", "docker-micro", 1, validManifestJSON("nginx:latest"))
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{lease: oldProjection})
+	withMicroSKU(b, 512)
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	nominalIntents := b.operationIntents.(noopOperationIntentJournal)
+	b.operationIntents = durableTestOperationIntentJournal{store: nominalIntents.store, storageID: storageID}
+	releases := attachReleaseStore(t, b)
+	require.NoError(t, releases.AppendActive(lease, shared.Release{
+		Manifest: oldManifest, Image: "stack", OperationID: oldOperationID,
+		Items: oldItems, ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+		RuntimeAuthority: &oldAuthority, Status: "active", CreatedAt: time.Now().Add(-time.Hour),
+	}))
+	compose := newNominalProvisionComposeExecutor()
+	compose.DownFn = func(context.Context, string, time.Duration) error {
+		return errors.New("force strict predecessor fallback")
+	}
+	b.compose = compose
+
+	req := newProvisionRequest(lease, "tenant-a", "docker-micro", 1, oldManifest)
+	req.CallbackURL = "https://new.example/callbacks/provision?operation_id=" + candidateOperationID.String()
 	provisionErr := make(chan error, 1)
 	go func() { provisionErr <- b.Provision(context.Background(), req) }()
 
-	<-reached
+	select {
+	case <-reached:
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("re-provision did not enter predecessor teardown")
+	}
 	claims, err := b.snapshotVolumeClaims()
 	require.NoError(t, err)
 	claim, claimed := claims.owner(canonicalVolumeName(lease, svc, 0))
-	assert.True(t, claimed, "the reservation must claim this lease's canonical volumes for the whole of Provision")
+	assert.True(t, claimed)
 	assert.Equal(t, volumeClaim{kind: claimLive, owner: lease}, claim)
-
 	b.provisionsMu.RLock()
 	prov := b.provisions[lease]
-	require.NotNil(t, prov)
-	require.Len(t, prov.Items, 1)
-	aliased := &prov.Items[0] == &req.Items[0]
 	b.provisionsMu.RUnlock()
-	assert.False(t, aliased,
-		"the published Items must be a copy: NormalizeProvisionRequest mutates the caller's slice in place")
+	assert.Same(t, oldProjection, prov,
+		"the predecessor projection remains authoritative until teardown is proven complete")
 
 	close(release)
-	require.ErrorIs(t, <-provisionErr, backend.ErrInsufficientResources)
-
-	// And the claim goes away with the rolled-back reservation, so a failed admission
-	// does not leave a phantom owner protecting a genuinely orphaned volume.
+	require.NoError(t, <-provisionErr)
 	claims, err = b.snapshotVolumeClaims()
 	require.NoError(t, err)
-	_, claimed = claims.owner(canonicalVolumeName(lease, svc, 0))
-	assert.False(t, claimed, "removeProvision must retract the claim it published")
+	claim, claimed = claims.owner(canonicalVolumeName(lease, svc, 0))
+	assert.True(t, claimed, "the candidate must take over the volume claim without a gap")
+	assert.Equal(t, volumeClaim{kind: claimLive, owner: lease}, claim)
 
 	b.stopCancel()
 	b.wg.Wait()
