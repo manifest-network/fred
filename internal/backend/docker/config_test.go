@@ -2,6 +2,7 @@ package docker
 
 import (
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -29,6 +30,7 @@ func validConfig() Config {
 		ContainerStartTimeout:  30_000_000_000,  // 30s
 		ReconcileInterval:      300_000_000_000, // 5m
 		ProvisionTimeout:       600_000_000_000, // 10m
+		CallbackMaxAge:         24 * time.Hour,
 		HostAddress:            "192.168.1.100",
 		CallbackSecret:         config.Secret(strings.Repeat("x", 32)),
 		AllowedRegistries:      []string{"docker.io"},
@@ -38,7 +40,8 @@ func validConfig() Config {
 		SKUProfiles: map[string]SKUProfile{
 			"small": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024},
 		},
-		VolumeDataPath: "/data/volumes",
+		VolumeDataPath:  "/data/volumes",
+		VolumeMountPath: "/data",
 	}
 }
 
@@ -61,6 +64,7 @@ func TestConfig_Validate(t *testing.T) {
 		}
 		cfg.SKUMapping = map[string]string{"sku-uuid-1": "stateless"}
 		cfg.VolumeDataPath = ""
+		cfg.VolumeMountPath = ""
 		require.NoError(t, cfg.Validate())
 	})
 }
@@ -99,7 +103,8 @@ func TestNewCallbackHTTPClient(t *testing.T) {
 	t.Run("verification on by default", func(t *testing.T) {
 		c := newCallbackHTTPClient(validConfig(), slog.Default())
 		require.NotNil(t, c)
-		assert.Equal(t, 30*time.Second, c.Timeout)
+		assert.Zero(t, c.Timeout,
+			"CallbackSender's per-request context must be the sole timeout authority")
 		assert.Nil(t, c.Transport,
 			"default client must use the stdlib transport, which verifies TLS")
 	})
@@ -110,7 +115,8 @@ func TestNewCallbackHTTPClient(t *testing.T) {
 
 		c := newCallbackHTTPClient(cfg, slog.Default())
 		require.NotNil(t, c)
-		assert.Equal(t, 30*time.Second, c.Timeout)
+		assert.Zero(t, c.Timeout,
+			"CallbackSender's per-request context must be the sole timeout authority")
 		tr, ok := c.Transport.(*http.Transport)
 		require.True(t, ok, "transport must be an *http.Transport")
 		require.NotNil(t, tr.TLSClientConfig)
@@ -128,6 +134,11 @@ func TestConfig_Validate_RequiredFields(t *testing.T) {
 			name:    "empty name",
 			mutate:  func(c *Config) { c.Name = "" },
 			wantErr: "name is required",
+		},
+		{
+			name:    "ambiguous name",
+			mutate:  func(c *Config) { c.Name = "backend-a\nPASS: forged" },
+			wantErr: "non-printable character U+000A",
 		},
 		{
 			name:    "empty listen_addr",
@@ -188,6 +199,16 @@ func TestConfig_Validate_PositiveValues(t *testing.T) {
 			wantErr: "total_cpu_cores must be positive",
 		},
 		{
+			name:    "NaN total_cpu_cores",
+			mutate:  func(c *Config) { c.TotalCPUCores = math.NaN() },
+			wantErr: "total_cpu_cores must be finite",
+		},
+		{
+			name:    "infinite total_cpu_cores",
+			mutate:  func(c *Config) { c.TotalCPUCores = math.Inf(1) },
+			wantErr: "total_cpu_cores must be finite",
+		},
+		{
 			name:    "zero total_memory_mb",
 			mutate:  func(c *Config) { c.TotalMemoryMB = 0 },
 			wantErr: "total_memory_mb must be positive",
@@ -226,6 +247,21 @@ func TestConfig_Validate_PositiveValues(t *testing.T) {
 			name:    "zero container_start_timeout",
 			mutate:  func(c *Config) { c.ContainerStartTimeout = 0 },
 			wantErr: "container_start_timeout must be positive",
+		},
+		{
+			name:    "negative container_stop_timeout",
+			mutate:  func(c *Config) { c.ContainerStopTimeout = -1 },
+			wantErr: "container_stop_timeout must be non-negative",
+		},
+		{
+			name:    "negative migration_ready_timeout",
+			mutate:  func(c *Config) { c.MigrationReadyTimeout = -1 },
+			wantErr: "migration_ready_timeout must be non-negative",
+		},
+		{
+			name:    "negative migration_grace_period",
+			mutate:  func(c *Config) { c.MigrationGracePeriod = -1 },
+			wantErr: "migration_grace_period must be non-negative",
 		},
 		{
 			name:    "zero reconcile_interval",
@@ -419,7 +455,12 @@ func TestConfig_Validate_MaxAge(t *testing.T) {
 		{
 			name:    "negative callback_max_age",
 			mutate:  func(c *Config) { c.CallbackMaxAge = -1 },
-			wantErr: "callback_max_age must be non-negative",
+			wantErr: "callback_max_age must be positive",
+		},
+		{
+			name:    "zero callback_max_age",
+			mutate:  func(c *Config) { c.CallbackMaxAge = 0 },
+			wantErr: "callback_max_age must be positive",
 		},
 		{
 			name:    "negative diagnostics_max_age",
@@ -432,8 +473,8 @@ func TestConfig_Validate_MaxAge(t *testing.T) {
 			wantErr: "releases_max_age must be non-negative",
 		},
 		{
-			name:   "zero max ages are valid",
-			mutate: func(c *Config) { c.CallbackMaxAge = 0; c.DiagnosticsMaxAge = 0; c.ReleasesMaxAge = 0 },
+			name:   "zero diagnostics and releases max ages are valid",
+			mutate: func(c *Config) { c.DiagnosticsMaxAge = 0; c.ReleasesMaxAge = 0 },
 		},
 	}
 	for _, tt := range tests {
@@ -459,6 +500,18 @@ func TestConfig_Validate_Volume(t *testing.T) {
 		err := cfg.Validate()
 		require.Error(t, err)
 		assert.ErrorContains(t, err, "volume_data_path is required when any SKU profile has disk_mb > 0")
+	})
+
+	t.Run("diskless managed volumes still require volume_mount_path", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SKUProfiles = map[string]SKUProfile{
+			"stateless": {CPUCores: 0.5, MemoryMB: 512, DiskMB: 0},
+		}
+		cfg.SKUMapping = map[string]string{"sku-uuid-1": "stateless"}
+		cfg.VolumeMountPath = ""
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "volume_mount_path is required whenever volume_data_path is configured")
 	})
 
 	t.Run("volume_data_path with whitespace", func(t *testing.T) {
@@ -626,6 +679,7 @@ func TestConfig_DefaultConfig_Validates(t *testing.T) {
 		"uuid-4": "docker-large",
 	}
 	cfg.VolumeDataPath = "/data/volumes"
+	cfg.VolumeMountPath = "/data"
 	require.NoError(t, cfg.Validate())
 }
 
@@ -931,7 +985,8 @@ func TestValidate_RetentionPartitioning(t *testing.T) {
 		cfg.SKUProfiles = defaultTestSKUProfiles() // largest stateful SKU: docker-large 4096
 		cfg.SKUMapping = map[string]string{"uuid-1": "docker-micro", "uuid-2": "docker-small", "uuid-3": "docker-medium", "uuid-4": "docker-large"}
 		cfg.VolumeDataPath = "/tmp/vols" // stateful SKUs require it
-		cfg.TotalDiskMB = 1_000_000      // must exceed every budget disk figure below
+		cfg.VolumeMountPath = "/tmp"
+		cfg.TotalDiskMB = 1_000_000 // must exceed every budget disk figure below
 		cfg.RetainOnClose = true
 		return cfg
 	}

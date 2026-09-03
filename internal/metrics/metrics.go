@@ -43,6 +43,23 @@ const (
 
 // Provisioning metrics
 var (
+	// PlacementWriteFailuresTotal counts failed writes and failed durable-sync
+	// verification in the placement store. Placement transitions are write-ahead
+	// safety records: when one cannot be persisted or verified, provisioning is
+	// either refused before contacting a backend or left with an unresolved
+	// attempt for a later sweep to resolve. Any increase therefore needs operator
+	// attention (ENG-632).
+	//
+	// Deliberately unlabelled. Backend and lease identifiers belong in the
+	// accompanying log; putting either on a counter would create an unbounded
+	// Prometheus series set.
+	PlacementWriteFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "placement",
+		Name:      "write_failures_total",
+		Help:      "Total failed writes or durable-sync verifications in the placement store",
+	})
+
 	// InFlightProvisions tracks the number of provisions currently in progress.
 	InFlightProvisions = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
@@ -120,11 +137,13 @@ var (
 	})
 
 	// ReconcilerDeferredLeasesTotal counts leases the reconciler skipped because
-	// the sweep could not positively identify which backend owns them — the
-	// per-lease deferral that replaced the fleet-wide abort (ENG-356).
+	// the current sweep did not establish a safe lifecycle decision. Causes
+	// include a silent backend, ambiguous or unresolved placement, and an
+	// operation or placement change that crossed the inventory boundary.
 	//
-	// A sustained non-zero rate while fred_reconciler_sweep_complete is 1 would
-	// be a defect, not expected behavior: on a complete sweep nothing defers.
+	// The lease-local boundary cases can occur even when every backend answered,
+	// so a low rate while fred_reconciler_sweep_complete is 1 is expected during
+	// ordinary lease churn. A sustained rate still warrants investigation.
 	//
 	// Deliberately its own counter rather than a new label value on
 	// reconciler_actions_total: adding a label value there would silently change
@@ -133,7 +152,7 @@ var (
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "reconciler_deferred_leases_total",
-		Help:      "Total leases the reconciler skipped because their owning backend did not report",
+		Help:      "Total leases reconciliation deferred because ownership or lifecycle evidence was unsafe or changed during the sweep",
 	})
 
 	// ReconcilerPanicsTotal counts panics recovered inside reconciler
@@ -141,13 +160,26 @@ var (
 	// recover exists specifically to prevent one bad lease/orphan/backend
 	// from crashing the fred process. Any non-zero value is a latent bug
 	// to fix at its source — not business-as-usual. Label values:
-	// "process_lease", "process_orphan", "fetch_provisions", "fetch_retentions".
+	// "process_lease", "process_orphan", "fetch_provisions", "fetch_retentions",
+	// "check_placement_marker".
 	ReconcilerPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "provisioner",
 		Name:      "reconciler_panics_total",
 		Help:      "Panics recovered in reconciler per-unit goroutines, by stage",
 	}, []string{"stage"})
+
+	// LifecycleEventSinkPanicsTotal counts panics recovered from best-effort
+	// lifecycle event sinks. Event delivery is observational and must never
+	// prevent backend dispatch or make an already-settled durable callback look
+	// retryable to its sender. The event label is selected exclusively from the
+	// constants below, keeping cardinality bounded.
+	LifecycleEventSinkPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "lifecycle_event_sink_panics_total",
+		Help:      "Panics recovered from best-effort lifecycle event sinks, by event",
+	}, []string{"event"})
 
 	// The fred_background_* panic counters live in the `background`
 	// subpackage: they are the only collectors written by more than one fred
@@ -239,18 +271,20 @@ var (
 		Help:      "Per-backend provision-list attempts during reconciliation, by outcome",
 	}, []string{"backend", "outcome"})
 
-	// ReconcilerSweepComplete reports whether the most recent sweep saw every
-	// configured backend (1) or ran degraded (0).
+	// ReconcilerSweepComplete reports current full-fleet mutation authority. It is
+	// set to 0 before every sweep's first external read and returns to 1 only after
+	// complete provision and retention inventory has been projected durably.
 	//
-	// It gates the meaning of every other reconciler metric: on a degraded sweep
-	// the action counters describe only the leases fred could positively place,
-	// so reading them as fleet-wide totals overstates what was skipped. A
+	// It gates the meaning of every other reconciler metric: while 0, the sweep may
+	// be in progress or may have failed a chain read, backend inventory fetch, or
+	// durable projection. Action counters then describe only positively evidenced
+	// work, so reading them as fleet-wide totals overstates what was skipped. A
 	// boolean state gauge rather than an _info metric, since the value changes.
 	ReconcilerSweepComplete = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Subsystem: "reconciler",
 		Name:      "sweep_complete",
-		Help:      "1 if the last reconciliation saw every configured backend, 0 if it ran degraded",
+		Help:      "1 only while a complete full-fleet inventory is durably projected and no newer sweep has invalidated authority; 0 during startup, an in-progress sweep, or any incomplete or failed read or projection",
 	})
 
 	// ReconcilerCleanupSkipsTotal counts destructive cleanup actions the
@@ -275,6 +309,8 @@ var (
 	//   - chain_error: the per-candidate chain re-check failed. Transient.
 	//   - backend_silent: a placement record's own backend did not answer this
 	//     sweep, so its absence from the backend data proves nothing.
+	//   - attempt_pending: an ambiguous remote effect is still possible. Backend
+	//     silence cannot order or cancel that effect, even on a complete sweep.
 	//
 	// A separate metric rather than new label values on actions_total, for the
 	// same reason deferred_leases_total is separate: adding a value there would
@@ -356,13 +392,15 @@ var (
 		Help:      "Total number of backend requests",
 	}, []string{"backend", "operation", "status"})
 
-	// BackendInsufficientResourcesTotal tracks backend capacity rejections.
+	// BackendInsufficientResourcesTotal tracks backend capacity responses by
+	// whether the response satisfied the coded-refusal contract. The verdict set
+	// is closed below so producer drift cannot create unbounded cardinality.
 	BackendInsufficientResourcesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "backend",
 		Name:      "insufficient_resources_total",
-		Help:      "Total number of provisions rejected due to insufficient backend resources",
-	}, []string{"backend"})
+		Help:      "Total number of backend provision or restore capacity responses by contract verdict",
+	}, []string{"backend", "verdict"})
 
 	// BackendMalformedErrorBodyTotal counts client-error responses whose body was
 	// not the declared JSON error envelope, so fred answered the tenant with a
@@ -459,7 +497,8 @@ var (
 var (
 	// HealthCheckHealthy tracks the result of each non-backend dependency probe
 	// run by the health handler (1 = healthy, 0 = unhealthy). Labels: check —
-	// one of chain, token_tracker, placement_store, payload_store.
+	// one of chain, token_tracker, placement_store, placement_inventory,
+	// payload_store.
 	//
 	// Backends are deliberately absent: they already have BackendHealthy, which
 	// carries a per-backend label this gauge cannot express.
@@ -607,13 +646,68 @@ var (
 		Help:      "Total number of provisions that timed out waiting for backend callback",
 	})
 
-	// NonInFlightCallbacksTotal tracks callbacks received for leases not in the in-flight tracker,
-	// labeled by the reporting backend and the callback status.
+	// CallbackSettlementClaimWaitTimeoutsTotal tracks callbacks that hit the
+	// hard bound while another terminal actor held their exact in-flight
+	// generation's settlement claim.
+	CallbackSettlementClaimWaitTimeoutsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "callback_settlement_claim_wait_timeouts_total",
+		Help:      "Total callback waits that timed out while an in-flight settlement claim remained contended",
+	})
+
+	// CallbackPlacementSemanticConflictsTotal counts authenticated success-
+	// callback settlement attempts whose positive backend evidence could not be
+	// merged into the durable placement record because that record contained a
+	// conflicting or otherwise unusable semantic fact. Processing continues
+	// toward chain acknowledgement; a retry can increment this again. The
+	// preserved placement record and accompanying ERROR log require operator
+	// reconciliation.
+	//
+	// Deliberately unlabelled. The log carries the lease, backend, generation and
+	// concrete verdict without turning any of them into an unbounded metric label.
+	CallbackPlacementSemanticConflictsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "callback_placement_semantic_conflicts_total",
+		Help:      "Total success-callback settlement attempts that continued toward chain acknowledgement after a conflicting durable placement verdict",
+	})
+
+	// CallbackDeprovisionOwnedSuccessTotal counts provision-success callbacks
+	// observed while a chain-terminal deprovision invocation owns the exact
+	// generation. The callback cannot acknowledge the now-closing lease, but the
+	// overlap is operationally important and must not be visible only in logs.
+	CallbackDeprovisionOwnedSuccessTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "callback_deprovision_owned_success_total",
+		Help:      "Total provision-success callbacks observed while deprovision owned the exact in-flight generation",
+	})
+
+	// LifecycleCallbackOutcomesTotal classifies every authenticated callback
+	// routed to lifecycle policy exactly once. Summing all outcomes is the
+	// lifecycle-specific received count; outcome separates an applied observation
+	// from an acknowledged stale/retired drop and a retryable application failure.
+	// Verdict and status use closed vocabularies
+	// declared below, so malformed or future values cannot create unbounded
+	// series.
+	LifecycleCallbackOutcomesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "lifecycle_callback_outcomes_total",
+		Help:      "Authenticated lifecycle callbacks by terminal application outcome, authorization verdict, and bounded callback status",
+	}, []string{"outcome", "verdict", "status"})
+
+	// NonInFlightCallbacksTotal retains its original received-at-ingress
+	// semantics for compatibility with existing dashboards. It increments before
+	// lifecycle authorization, including when the callback is then dropped as
+	// stale or retired. LifecycleCallbackOutcomesTotal is the separate policy
+	// result; do not reinterpret this counter as "applied".
 	NonInFlightCallbacksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "non_in_flight_callbacks_total",
-		Help:      "Callbacks received for leases not in the in-flight tracker (restart/update completions, late delivery, or intentional deprovision), labeled by backend and status",
+		Help:      "Callbacks received outside exact in-flight operation settlement (restart/update completions, late delivery, or intentional deprovision), labeled by reporting backend and status",
 	}, []string{"backend", "status"})
 )
 
@@ -710,6 +804,7 @@ const (
 	CleanupSkipChainUnknownState = "chain_unknown_state"
 	CleanupSkipChainError        = "chain_error"
 	CleanupSkipBackendSilent     = "backend_silent"
+	CleanupSkipAttemptPending    = "attempt_pending"
 )
 
 // Operation constants for the `operation` label on provisioning_total /
@@ -719,6 +814,46 @@ const (
 const (
 	OperationProvision = "provision"
 	OperationRestore   = "restore"
+)
+
+// Capacity verdict constants are the complete bounded vocabulary for the
+// verdict label on BackendInsufficientResourcesTotal. CodedRefusal means the
+// configured endpoint returned the declared envelope and machine code; it does
+// not mean the response was cryptographically authenticated. Ambiguous covers
+// legacy/code-less and unknown-code 503 responses.
+const (
+	CapacityVerdictCodedRefusal = "coded_refusal"
+	CapacityVerdictAmbiguous    = "ambiguous"
+)
+
+// Lifecycle event constants are the complete bounded label vocabulary for
+// LifecycleEventSinkPanicsTotal.
+const (
+	LifecycleEventProvisionStarting = "provision_starting"
+	LifecycleEventRestoreRestarting = "restore_restarting"
+	LifecycleEventRestoreRefused    = "restore_refused"
+	LifecycleEventCallback          = "callback"
+)
+
+// Lifecycle callback constants are the complete bounded vocabularies for
+// LifecycleCallbackOutcomesTotal. Retryable means Fred returned a non-2xx and
+// the backend must retain the durable FIFO head; Dropped is a terminal 2xx
+// no-op for stale or otherwise unauthorized observational input.
+const (
+	LifecycleCallbackOutcomeApplied   = "applied"
+	LifecycleCallbackOutcomeDropped   = "dropped"
+	LifecycleCallbackOutcomeRetryable = "retryable"
+
+	LifecycleCallbackVerdictAuthorized   = "authorized"
+	LifecycleCallbackVerdictLegacy       = "legacy"
+	LifecycleCallbackVerdictTeardownOnly = "teardown_only"
+	LifecycleCallbackVerdictRetired      = "retired"
+	LifecycleCallbackVerdictInvalid      = "invalid"
+	LifecycleCallbackVerdictMissing      = "missing"
+	LifecycleCallbackVerdictStale        = "stale"
+	LifecycleCallbackVerdictUnusable     = "unusable"
+	LifecycleCallbackVerdictUnavailable  = "unavailable"
+	LifecycleCallbackVerdictUnknown      = "unknown"
 )
 
 // Action constants for reconciliation

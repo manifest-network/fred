@@ -76,7 +76,7 @@ func TestHandleLeaseCreated_WithMetaHash(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -108,7 +108,7 @@ func TestHandleLeaseCreated_LeaseNotFound(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -137,7 +137,7 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -173,7 +173,7 @@ func TestHandleLeaseClosed_NoPlacement_SweepsAllBackends(t *testing.T) {
 
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -215,7 +215,7 @@ func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {
 	// close no longer fetches the lease from chain for SKU routing).
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -257,7 +257,7 @@ func TestHandleLeaseClosed_AllBackendsFail(t *testing.T) {
 	// Not in-flight, no placement -> sweeps all backends, all fail (ENG-335).
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -287,7 +287,7 @@ func TestHandleLeaseClosed_PayloadCleanup(t *testing.T) {
 	require.NoError(t, err, "NewPayloadStore()")
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -343,7 +343,7 @@ func TestHandlePayloadReceived_HashMismatch(t *testing.T) {
 	require.NoError(t, err, "NewPayloadStore()")
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,

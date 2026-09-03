@@ -19,7 +19,7 @@ import (
 // being restored into newLease, so on disk it currently wears fred-{newLease}-web-0.
 func restoringInto(t *testing.T, rs *shared.RetentionStore, orig, newLease string) {
 	t.Helper()
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	putRestoringRetention(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		NewLeaseUUID:        newLease,
 		Tenant:              "tenant-a",
@@ -27,7 +27,7 @@ func restoringInto(t *testing.T, rs *shared.RetentionStore, orig, newLease strin
 		Generation:          3,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "web"}},
 		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(orig, "web", 0))},
-	}))
+	})
 }
 
 // TestVolumeClaims_AdoptedNameIsOwnedByTheOriginalLease is the load-bearing assertion of
@@ -272,6 +272,56 @@ func TestVolumeOp_Destroy_UnreadableClaims_DestroysNothing(t *testing.T) {
 		"counted per volume, so the refusal is visible at the same granularity as the decision")
 }
 
+func TestCleanupOrphanedVolumes_UnreadableClaimsFailReadinessBoundary(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	rs := attachRetentionStore(t, b)
+	require.NoError(t, rs.Close())
+	orphan := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{orphan}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("must not destroy %q when the ownership journal is unreadable", id)
+			return nil
+		},
+	}
+
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "resolve orphan volume ownership")
+}
+
+func TestCleanupOrphanedVolumes_UnreadableReleaseFailsReadinessBoundary(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	releases := attachReleaseStore(t, b)
+	require.NoError(t, releases.Close())
+	orphan := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{orphan}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			t.Fatalf("must not destroy %q when active-release authority is unreadable", id)
+			return nil
+		},
+	}
+
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "read active release for orphan candidate")
+}
+
+func TestCleanupOrphanedVolumes_DestroyFailureFailsReadinessBoundary(t *testing.T) {
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	orphan := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
+	b.volumes = &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{orphan}, nil },
+		DestroyFn: func(_ context.Context, id string) error {
+			assert.Equal(t, orphan, id)
+			return assert.AnError
+		},
+	}
+
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "destroy orphaned volumes")
+	require.ErrorIs(t, err, assert.AnError)
+}
+
 // TestVolumeOp_Destroy_ReportsPerNameFailures keeps the three outcomes distinct — a
 // caller that cannot tell "gone" from "failed" from "refused" releases capacity it
 // shouldn't.
@@ -432,7 +482,10 @@ func chokePointFixture(t *testing.T, retainOnClose bool) (b *Backend, rs *shared
 	withMicroSKU(b, 512)
 	b.cfg.RetainOnClose = retainOnClose
 	rs = attachRetentionStore(t, b)
-	require.Equal(t, chokePointAdopted, seedRestoringInto(t, rs, "u1", lease),
+	require.Equal(t, chokePointAdopted, seedRestoringInto(
+		t, rs, "u1", lease,
+		[]backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "app"}},
+	),
 		"precondition: the restore adopts u1's data under u2's canonical name")
 
 	destroyed, renamed = &[]string{}, &[][2]string{}
@@ -493,24 +546,22 @@ func TestDestroyChokePoint_InFlightRestoreDataIsUnreachableByAnyPath(t *testing.
 		wantReaped string
 	}{
 		{
-			name:          "close, non-retain destroy arm",
+			name:          "uncommitted close, non-retain",
 			retainOnClose: false,
 			drive:         func(t *testing.T, b *Backend) { _ = b.doDeprovision(context.Background(), "u2") },
-			wantReaped:    chokePointOwn,
 		},
 		{
-			name:          "close, retain arm",
+			name:          "uncommitted close, retain",
 			retainOnClose: true,
 			drive:         func(t *testing.T, b *Backend) { _ = b.doDeprovision(context.Background(), "u2") },
 		},
 		{
-			name:          "close, refuse-to-retain (disk cap breached)",
+			name:          "uncommitted close, retention cap breached",
 			retainOnClose: true,
 			setup: func(_ *testing.T, b *Backend, _ *shared.RetentionStore) {
 				b.cfg.MaxRetainedDiskMB = 1 // any stateful lease breaches
 			},
-			drive:      func(t *testing.T, b *Backend) { _ = b.doDeprovision(context.Background(), "u2") },
-			wantReaped: chokePointOwn,
+			drive: func(t *testing.T, b *Backend) { _ = b.doDeprovision(context.Background(), "u2") },
 		},
 		{
 			name: "startup orphan reaper",
@@ -618,8 +669,9 @@ func TestCleanupOrphanedVolumes_UnreadableClaims_CountsTheUndecided(t *testing.T
 	}
 
 	before := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable))
-	require.NoError(t, b.cleanupOrphanedVolumes(context.Background()),
-		"an unreadable store skips the run; it does not fail startup")
+	err := b.cleanupOrphanedVolumes(context.Background())
+	require.ErrorContains(t, err, "resolve orphan volume ownership",
+		"an unreadable ownership journal must keep startup unready")
 
 	assert.InDelta(t, before+2,
 		testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable)), 0.0001,

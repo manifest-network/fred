@@ -5,6 +5,13 @@
 # IMPORTANT: You must configure sku_mapping to link on-chain SKU UUIDs to
 # local resource profiles. Without this mapping, provisioning will fail with
 # "unknown SKU" errors.
+#
+# FIRST START: normal server startup is verification-only and will not create
+# the storage-identity marker pair or authoritative journals. For a genuinely
+# new, empty backend, run this one-shot command before the first normal start:
+#   docker-backend -config docker-backend.yaml -initialize-storage-identity new
+# Existing v0.13 storage uses the stopped-and-drained `adopt` cutover documented
+# in DEPLOYMENT.md; never use `new` to replace or recover a committed lineage.
 
 # Log verbosity. Valid values: debug, info, warn, error. Default: info.
 # log_level: "info"
@@ -55,7 +62,10 @@ docker_host: "unix:///var/run/docker.sock"
 # =============================================================================
 # RESOURCE POOL
 # =============================================================================
-# Total resources available for provisioning containers.
+# Total resources available for provisioning containers. Disk is physical
+# admission capacity: stateful instances charge durable disk_mb; every
+# disk_mb: 0 instance charges the container_tmpfs_size_mb scratch allowance
+# pinned at admission, even when its image ultimately needs no host scratch.
 
 total_cpu_cores: 8.0
 total_memory_mb: 16384
@@ -134,7 +144,7 @@ sku_profiles:
 # tenant_quota:
 #   max_cpu_cores: 4.0      # Max CPU cores per tenant
 #   max_memory_mb: 8192     # Max memory per tenant (MB)
-#   max_disk_mb: 51200      # Max disk per tenant (MB)
+#   max_disk_mb: 51200      # Max durable + pinned scratch disk per tenant (MB)
 
 # =============================================================================
 # ALLOWED REGISTRIES
@@ -156,7 +166,7 @@ allowed_registries:
 # HMAC secret for signing callbacks to Fred (minimum 32 characters).
 # REQUIRED — docker-backend refuses to start with an empty value.
 # Generate with: openssl rand -hex 32
-# Must match callback_secret configured on the Fred side.
+# Must match this backend's own providerd backends[].hmac_secret.
 callback_secret: ""
 
 # Production mode: tighten startup checks. When true, the backend refuses to
@@ -170,14 +180,25 @@ callback_secret: ""
 # Rejected at startup when production_mode is true.
 # callback_insecure_skip_verify: false
 
-# Path to bbolt database for persisting pending callbacks.
-# Callbacks are stored before delivery to survive restarts.
+# Every bbolt path below is opened without following the final path component
+# and must name a regular file with exactly one hard link and mode 0600. Fresh
+# files are created with 0600. callbacks.db, releases.db, and retention.db are
+# also identity-bound authority and are re-attested while running;
+# diagnostics.db is recreatable and has only the open-time filesystem checks.
+
+# Path to bbolt database for persisting accepted provision/restore intents and
+# pending callbacks. An intent is committed before the first substrate mutation
+# and atomically becomes its callback entry on completion; preserve this file
+# with the matching release/retention journals, storage-identity markers, and
+# containers/volumes across backup and rollback. Normal startup never creates
+# or rebinds a missing authoritative journal.
 # Default: "callbacks.db"
 callback_db_path: "callbacks.db"
 
-# Maximum age of persisted callback entries. Entries older than this are
-# removed by background cleanup (an initial sweep runs at startup, then
-# periodically). Default: 24h.
+# Maximum age of legacy callbacks and typed lifecycle observations. Exact
+# operation completions never expire because they may be the only evidence
+# that settles Fred's durable placement attempt. Cleanup runs at startup and
+# periodically. Must be positive. Default: 24h.
 callback_max_age: 24h
 
 # =============================================================================
@@ -188,7 +209,8 @@ callback_max_age: 24h
 # GET /provisions/{lease_uuid} and GET /logs/{lease_uuid} endpoints fall back
 # to this store when the provision is no longer in memory.
 
-# Path to bbolt database for persisting failure diagnostics.
+# Path to bbolt database for persisting failure diagnostics. This store carries
+# no lifecycle authority and may be recreated if its history is lost.
 # Default: "diagnostics.db"
 diagnostics_db_path: "diagnostics.db"
 
@@ -203,7 +225,8 @@ diagnostics_max_age: 168h
 # GET /releases/{lease_uuid} endpoint returns this history. Releases are
 # persisted to a bbolt database so they survive backend restarts.
 
-# Path to bbolt database for persisting release history.
+# Path to the identity-bound authoritative release database. The file is
+# required even when it is empty; normal startup never recreates a missing one.
 # Default: "releases.db"
 releases_db_path: "releases.db"
 
@@ -222,14 +245,16 @@ releases_max_age: 2160h
 #
 # Limitations:
 #   - Retention is best-effort and capacity-bounded (see max_retained_leases_per_tenant).
-#   - Restore works only on the backend node that holds the retained volumes
-#     (single-backend deployments; multi-node affinity is a future enhancement).
+#   - Restore executes on the backend node that holds the retained volumes;
+#     providerd preserves that source affinity across its multi-backend fleet.
 #   - Retained data is a single copy on local disk — retention is not a backup.
 
 # Enable soft-delete on lease close/expire. Default: false.
 # retain_on_close: false
 
-# Path to bbolt database tracking retained lease records. Default: "retention.db".
+# Path to the identity-bound authoritative retention database. The file is
+# always required, including when retain_on_close is false; policy disables new
+# retention, not the empty authority. Default: "retention.db".
 # retention_db_path: "retention.db"
 
 # How long retained volumes are kept before the grace reaper destroys them.
@@ -321,16 +346,21 @@ host_address: ""
 # Default: 256.
 # container_pids_limit: 256
 
-# Size in MB for tmpfs mounts (/tmp, /run) when readonly rootfs is
-# enabled. Default: 64.
+# Size in MB for tmpfs mounts (/tmp, /run, image VOLUME overrides and tenant
+# tmpfs) and, separately, the quota/pool scratch allowance pinned for every
+# disk_mb: 0 instance. Scratch is non-retainable host disk authority; the tmpfs
+# mounts remain memory-backed. Default: 64.
 # container_tmpfs_size_mb: 64
 
 # =============================================================================
 # VOLUME MANAGEMENT
 # =============================================================================
 # When any SKU profile has disk_mb > 0, you must configure a volume data path.
-# Each container gets a quota-enforced subdirectory on the host. Image VOLUME
-# paths (e.g., /data in redis:latest) are auto-discovered and bind-mounted.
+# Each stateful container gets a quota-enforced subdirectory on the host. On an
+# all-diskless host this path is optional: when configured, auto-detected
+# non-VOLUME writable paths may use a quota-capped scratch directory; when
+# omitted, that seeding is best-effort and skipped. Diskless image VOLUME paths
+# are always tmpfs overrides, never durable binds.
 #
 # The filesystem of the volume_data_path must be btrfs, xfs, or zfs.
 # If volume_filesystem is not set, it is auto-detected.
@@ -354,6 +384,10 @@ host_address: ""
 # The btrfs and zfs backends are implemented but not tested in any deployment;
 # use xfs for production.
 volume_data_path: "/var/lib/fred/volumes"
+# Required whenever volume_data_path is set, including an all-diskless managed-
+# scratch host. This must be the actual mountpoint containing volume_data_path,
+# not merely another directory on the same root FS.
+volume_mount_path: "/var/lib/fred/volumes"
 # volume_filesystem: "xfs"  # optional, auto-detected (xfs is the only production-validated backend)
 
 # Smallest average file size (bytes) a workload may have before the per-volume

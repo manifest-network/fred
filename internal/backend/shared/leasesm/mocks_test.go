@@ -4,12 +4,17 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/workbarrier"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // mockProvisionStore is a real concurrent in-memory implementation of
@@ -28,6 +33,8 @@ type mockProvisionStore struct {
 	mu     sync.Mutex
 	states map[string]*ProvisionState
 }
+
+const testActorLeaseUUID = "11111111-1111-4111-8111-111111111111"
 
 func newMockProvisionStore() *mockProvisionStore {
 	return &mockProvisionStore{states: make(map[string]*ProvisionState)}
@@ -140,6 +147,7 @@ type testActorOpts struct {
 	Logger                       *slog.Logger
 	StopCtx                      context.Context
 	WG                           *sync.WaitGroup
+	WorkerDrainTimeout           time.Duration
 	Inspector                    InstanceInspector
 	Diag                         DiagnosticsGatherer
 	CallbackSender               *shared.CallbackSender
@@ -148,7 +156,9 @@ type testActorOpts struct {
 	OnTerminated                 func(uuid string)
 	PersistDiagnosticsFn         func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
 	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
-	SendCallbackFn               func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	SendOperationCallbackFn      func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	SendLifecycleCallbackFn      func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	SendMaintenanceCallbackFn    func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string)
 	DoDeprovisionFn              func(ctx context.Context, leaseUUID string) error
 }
 
@@ -211,8 +221,14 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 	if opts.PersistDiagnosticsWithLogsFn == nil {
 		opts.PersistDiagnosticsWithLogsFn = func(shared.DiagnosticEntry, map[string]string) {}
 	}
-	if opts.SendCallbackFn == nil {
-		opts.SendCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	if opts.SendOperationCallbackFn == nil {
+		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	}
+	if opts.SendLifecycleCallbackFn == nil {
+		opts.SendLifecycleCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	}
+	if opts.SendMaintenanceCallbackFn == nil {
+		opts.SendMaintenanceCallbackFn = func(shared.MaintenanceIntentClaim, backend.CallbackStatus, string) {}
 	}
 	if opts.DoDeprovisionFn == nil {
 		opts.DoDeprovisionFn = func(context.Context, string) error { return nil }
@@ -224,6 +240,7 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 			Logger:                       opts.Logger,
 			StopCtx:                      opts.StopCtx,
 			WG:                           opts.WG,
+			WorkerDrainTimeout:           opts.WorkerDrainTimeout,
 			Inspector:                    opts.Inspector,
 			Diag:                         opts.Diag,
 			CallbackSender:               opts.CallbackSender,
@@ -232,7 +249,9 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 			OnTerminated:                 opts.OnTerminated,
 			PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
 			PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
-			SendCallbackFn:               opts.SendCallbackFn,
+			SendOperationCallbackFn:      opts.SendOperationCallbackFn,
+			SendLifecycleCallbackFn:      opts.SendLifecycleCallbackFn,
+			SendMaintenanceCallbackFn:    opts.SendMaintenanceCallbackFn,
 			DoDeprovisionFn:              opts.DoDeprovisionFn,
 		}
 	})
@@ -287,8 +306,14 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	if opts.PersistDiagnosticsWithLogsFn == nil {
 		opts.PersistDiagnosticsWithLogsFn = func(shared.DiagnosticEntry, map[string]string) {}
 	}
-	if opts.SendCallbackFn == nil {
-		opts.SendCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	if opts.SendOperationCallbackFn == nil {
+		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	}
+	if opts.SendLifecycleCallbackFn == nil {
+		opts.SendLifecycleCallbackFn = func(string, string, backend.CallbackStatus, string) {}
+	}
+	if opts.SendMaintenanceCallbackFn == nil {
+		opts.SendMaintenanceCallbackFn = func(shared.MaintenanceIntentClaim, backend.CallbackStatus, string) {}
 	}
 	if opts.DoDeprovisionFn == nil {
 		opts.DoDeprovisionFn = func(context.Context, string) error { return nil }
@@ -305,6 +330,7 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		Logger:                       opts.Logger,
 		StopCtx:                      opts.StopCtx,
 		WG:                           opts.WG,
+		WorkerDrainTimeout:           opts.WorkerDrainTimeout,
 		Inspector:                    opts.Inspector,
 		Diag:                         opts.Diag,
 		CallbackSender:               opts.CallbackSender,
@@ -313,7 +339,9 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		OnTerminated:                 opts.OnTerminated,
 		PersistDiagnosticsFn:         opts.PersistDiagnosticsFn,
 		PersistDiagnosticsWithLogsFn: opts.PersistDiagnosticsWithLogsFn,
-		SendCallbackFn:               opts.SendCallbackFn,
+		SendOperationCallbackFn:      opts.SendOperationCallbackFn,
+		SendLifecycleCallbackFn:      opts.SendLifecycleCallbackFn,
+		SendMaintenanceCallbackFn:    opts.SendMaintenanceCallbackFn,
 		DoDeprovisionFn:              opts.DoDeprovisionFn,
 	}
 	a.leaseUUID = a.cfg.LeaseUUID
@@ -324,6 +352,69 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	// manually (e.g., by calling gatherDiagAsync directly on the test
 	// goroutine, or by inspecting the inbox without a draining run loop).
 	return a
+}
+
+func newTestMaintenanceClaim(
+	t *testing.T,
+	leaseUUID string,
+	kind shared.MaintenanceIntentKind,
+) shared.MaintenanceIntentClaim {
+	t.Helper()
+	dir := t.TempDir()
+	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
+		DBPath: filepath.Join(dir, "releases.db"),
+	})
+	require.NoError(t, err)
+	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(dir, "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, callbacks.Close())
+		require.NoError(t, releases.Close())
+	})
+
+	const operationID = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + operationID.String()
+	lifecycleURL := "https://fred.example/callbacks/provision?lifecycle_id=" + operationID.String()
+	authority, err := shared.NewReleaseRuntimeAuthority(
+		operationID,
+		"tenant-a",
+		"22222222-2222-4222-8222-222222222222",
+		callbackURL,
+		lifecycleURL,
+	)
+	require.NoError(t, err)
+	items := []backend.LeaseItem{{SKU: "sku-a", ServiceName: "app", Quantity: 1}}
+	source := shared.Release{
+		Manifest:         []byte(`{"services":{"app":{"image":"nginx:1.27"}}}`),
+		Image:            "stack",
+		OperationID:      operationID,
+		Items:            items,
+		ResourceProfiles: []shared.SKUResourceSnapshot{{SKU: "sku-a", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		RuntimeAuthority: &authority,
+		Status:           "active",
+		CreatedAt:        time.Now(),
+	}
+	require.NoError(t, releases.AppendActive(leaseUUID, source))
+	active, sourceClaim, err := releases.ClaimLatestActive(leaseUUID)
+	require.NoError(t, err)
+	active.Version = 0
+	active.Status = "deploying"
+	active.CreatedAt = time.Now()
+	storageID, err := backendidentity.Parse("550e8400-e29b-41d4-a716-446655440000")
+	require.NoError(t, err)
+	admission, err := callbacks.BeginMaintenanceIntent(shared.MaintenanceIntentSpec{
+		Kind:             kind,
+		SourceRelease:    sourceClaim,
+		TargetRelease:    active,
+		Backend:          "docker-a",
+		BackendStorageID: storageID,
+	})
+	require.NoError(t, err)
+	appendClaim, err := callbacks.StartMaintenanceAppend(admission)
+	require.NoError(t, err)
+	return appendClaim.Intent()
 }
 
 // TestMockProvisionStore_ConcurrentUpdate validates that the mock's

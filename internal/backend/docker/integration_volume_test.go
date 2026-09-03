@@ -28,6 +28,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // setupBtrfsLoopback creates a btrfs filesystem on a loopback file and mounts it.
@@ -184,11 +185,12 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-lifecycle-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// Redis declares VOLUME /data
 	appManifest := manifest.Manifest{
@@ -202,7 +204,7 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -329,6 +331,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		// testBackendWithRealDocker parks the reconciler at 1h; step 3 needs it to
 		// observe the killed container and move the lease to Failed.
@@ -336,7 +339,8 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-symlink-leaf-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	initialCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "redis:7", // declares VOLUME /data
@@ -346,12 +350,13 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	require.NoError(t, err)
 
 	provisionReq := backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          initialCallbacks.operationURL,
+		LifecycleCallbackURL: initialCallbacks.lifecycleURL,
+		Payload:              payload,
 	}
 
 	// 1. Provision normally.
@@ -407,20 +412,19 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	//    and assert before the worker has even run. A fresh channel correlates the
 	//    payload to this attempt by construction rather than by timing.
 	replayServer, replayCh := startCallbackServer(t)
+	replayCallbacks := newIntegrationCallbackAuthority(t, replayServer.URL)
 	replayReq := provisionReq
-	replayReq.CallbackURL = replayServer.URL
+	replayReq.CallbackURL = replayCallbacks.operationURL
+	replayReq.LifecycleCallbackURL = replayCallbacks.lifecycleURL
 	require.NoError(t, b.Provision(ctx, replayReq))
 
-	failTimeout := time.After(3 * time.Minute)
-	var failure backend.CallbackPayload
-	for failure.Status != backend.CallbackStatusFailed {
-		select {
-		case cb := <-replayCh:
-			failure = cb
-		case <-failTimeout:
-			t.Fatal("timeout waiting for the re-provision to fail closed on the symlinked volume leaf")
-		}
+	select {
+	case <-b.stopCtx.Done():
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for the re-provision to fail closed on the symlinked volume leaf")
 	}
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous,
+		"a failed replacement after predecessor teardown must retain its intent for cold recovery")
 
 	// 5. The refusal must be attributable, and must have happened at the guard.
 	assert.Equal(t, float64(1), testutil.ToFloat64(volumeBindSymlinkRejectedTotal)-before,
@@ -443,7 +447,31 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	assert.NotZero(t, linkInfo.Mode()&fs.ModeSymlink,
 		"the planted symlink must still be there: the guard rejects, it never unlinks")
 
-	require.NoError(t, b.Deprovision(ctx, leaseUUID))
+	// The replacement tore down the predecessor before bind validation failed, so
+	// the exact candidate intent cannot be settled in this process. Its terminal
+	// storage-authority latch suppresses callbacks until a fresh process reopens
+	// the journals and classifies the now-quiescent substrate.
+	select {
+	case callback := <-replayCh:
+		t.Fatalf("unexpected callback before cold recovery: %+v", callback)
+	case <-time.After(500 * time.Millisecond):
+	}
+	cfg := b.cfg
+	require.NoError(t, b.Stop())
+	restarted, err := New(cfg, slog.Default())
+	require.NoError(t, err)
+	intents, err := restarted.callbackStore.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "the failed replacement intent must survive the stopped backend")
+	require.NoError(t, restarted.Start(ctx))
+	t.Cleanup(func() { _ = restarted.Stop() })
+	failure := waitForCallback(t, replayCh, leaseUUID, 30*time.Second)
+	require.Equal(t, backend.CallbackStatusFailed, failure.Status)
+	recovered, err := restarted.GetProvision(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, backend.ProvisionStatusFailed, recovered.Status,
+		"cold recovery must restore the predecessor as a close-admissible Failed projection")
+	require.NoError(t, restarted.Deprovision(ctx, leaseUUID))
 }
 
 func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
@@ -453,12 +481,14 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.ReconcileInterval = 2 * time.Second // fast reconciler for re-provision
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-persist-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	initialCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	appManifest := manifest.Manifest{
 		Image:   "redis:7",
@@ -469,12 +499,13 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 
 	// 1. Provision redis
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          initialCallbacks.operationURL,
+		LifecycleCallbackURL: initialCallbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -507,13 +538,15 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	drainCallbacks(callbackCh)
 
 	// 5. Re-provision same lease
+	replacementCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          replacementCallbacks.operationURL,
+		LifecycleCallbackURL: replacementCallbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 
@@ -567,7 +600,7 @@ func TestIntegration_Docker_EphemeralVolumeOverrideTmpfs(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("ephemeral-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// Redis declares VOLUME /data
 	appManifest := manifest.Manifest{
@@ -580,7 +613,7 @@ func TestIntegration_Docker_EphemeralVolumeOverrideTmpfs(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-ephemeral", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -616,11 +649,12 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-multi-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// redis:7 declares VOLUME /data
 	appManifest := manifest.Manifest{
@@ -634,7 +668,7 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 2}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -690,12 +724,14 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	assert.True(t, errors.Is(err, fs.ErrNotExist), "subvolume 1 should be destroyed after deprovision, got err: %v", err)
 }
 
-// TestIntegration_Docker_OrphanedVolumeCleanup verifies that orphaned volumes
-// (created but no matching provision) are destroyed when a new backend starts.
-// This simulates a crash between container removal and volume destruction.
+// TestIntegration_Docker_OrphanedVolumeCleanup verifies that an unclaimed
+// managed volume is destroyed when a new backend starts. It seeds the durable
+// state left after a failed provisioning rollback could not remove its volume:
+// no live projection, operation intent, active release, retention record, or
+// container names the bytes. Interrupted-operation recovery is covered
+// separately; this test starts at the orphan collector's ownership boundary.
 func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 	mountPath := setupBtrfsLoopback(t)
-	callbackServer, callbackCh := startCallbackServer(t)
 
 	// Build config manually to control backend lifecycle (like ColdStartRecovery tests)
 	cfg := DefaultConfig()
@@ -708,16 +744,20 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 	cfg.ProvisionTimeout = 2 * time.Minute
 	cfg.NetworkIsolation = ptrBool(false)
 	cfg.VolumeDataPath = mountPath
+	cfg.VolumeMountPath = mountPath
 	cfg.VolumeFilesystem = "btrfs"
 	tmpDir := t.TempDir()
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
+	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db")
+	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
 
 	logger := slog.Default()
+	ctx := context.Background()
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
 	b1, err := New(cfg, logger)
 	require.NoError(t, err)
 
-	ctx := context.Background()
 	err = b1.Start(ctx)
 	require.NoError(t, err)
 	b1Stopped := false
@@ -727,62 +767,24 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 		}
 	})
 
-	dockerCli, err := NewDockerClient("", "")
+	leaseUUID := newIntegrationLeaseUUID()
+	volumeID := canonicalVolumeName(leaseUUID, manifest.DefaultServiceName, 0)
+	diskMB := cfg.SKUProfiles["docker-small"].DiskMB
+	subvolPath, created, err := b1.createManagedVolume(ctx, volumeID, diskMB)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		cleanupTestContainers(t, dockerCli, cfg.Name)
-		cleanupTestNetworks(t, dockerCli, cfg.Name)
-		_ = dockerCli.Close()
-	})
-
-	leaseUUID := fmt.Sprintf("orphan-vol-%d", time.Now().UnixNano())
-
-	// redis:7 declares VOLUME /data → triggers btrfs subvolume creation
-	appManifest := manifest.Manifest{
-		Image:   "redis:7",
-		Command: []string{"sleep", "3600"},
-	}
-	payload, err := json.Marshal(appManifest)
-	require.NoError(t, err)
-
-	err = b1.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
-	})
-	require.NoError(t, err)
-
-	select {
-	case cb := <-callbackCh:
-		require.Equal(t, backend.CallbackStatusSuccess, cb.Status)
-	case <-time.After(3 * time.Minute):
-		t.Fatal("timeout waiting for provision callback")
-	}
-
-	// Verify subvolume exists
-	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
-	subvolPath := filepath.Join(mountPath, volumeID)
+	require.True(t, created, "fixture must create a fresh managed subvolume")
+	require.Equal(t, filepath.Join(mountPath, volumeID), subvolPath)
 	_, err = os.Stat(subvolPath)
-	require.NoError(t, err, "subvolume should exist after provision")
+	require.NoError(t, err, "orphan fixture must exist before restart")
 
 	// Stop the first backend
 	err = b1.Stop()
 	require.NoError(t, err)
 	b1Stopped = true
 
-	// Force-remove the container (simulates crash that removes container but
-	// leaves the volume orphaned on disk)
-	provContainers := inspectProvisionContainers(t, leaseUUID)
-	require.Len(t, provContainers, 1)
-	err = dockerCli.client.ContainerRemove(ctx, provContainers[0].ID, container.RemoveOptions{Force: true})
-	require.NoError(t, err)
-
-	// Volume should still exist on disk after container removal
+	// Stopping the first process leaves only the deliberately unclaimed volume.
 	_, err = os.Stat(subvolPath)
-	require.NoError(t, err, "volume should survive container removal")
+	require.NoError(t, err, "orphan fixture must survive until the next startup")
 
 	// Start a new backend with the same config.
 	// Start() calls recoverState (no containers found) then cleanupOrphanedVolumes
@@ -797,6 +799,188 @@ func TestIntegration_Docker_OrphanedVolumeCleanup(t *testing.T) {
 	_, statErr := os.Stat(subvolPath)
 	assert.True(t, errors.Is(statErr, fs.ErrNotExist),
 		"orphaned volume should be destroyed after backend restart, got err: %v", statErr)
+}
+
+// provisionRollbackLeakVolumeManager injects the two failures needed to drive
+// the complete orphan-recovery boundary with a real quota substrate. Create
+// delegates to the production manager, then plants a symlink at redis' /data
+// bind leaf so the descriptor-rooted bind preparation deterministically fails
+// after the subvolume exists. Destroy refuses the first process' compensating
+// rollback, leaving the unclaimed bytes for a cold-start backend to collect.
+//
+// The identity-root methods are forwarded explicitly because replacing
+// Backend.volumes with a wrapper must not weaken per-mutation storage identity
+// verification in the test.
+type provisionRollbackLeakVolumeManager struct {
+	volumeManager
+	pinner       identityRootPinner
+	created      chan string
+	resumeCreate chan struct{}
+}
+
+func (m *provisionRollbackLeakVolumeManager) PinIdentityRoot() error {
+	return m.pinner.PinIdentityRoot()
+}
+
+func (m *provisionRollbackLeakVolumeManager) VerifyIdentityRoot() error {
+	return m.pinner.VerifyIdentityRoot()
+}
+
+func (m *provisionRollbackLeakVolumeManager) Create(
+	ctx context.Context,
+	id string,
+	sizeMB int64,
+) (string, bool, error) {
+	hostPath, created, err := m.volumeManager.Create(ctx, id, sizeMB)
+	if err != nil || !created {
+		return hostPath, created, err
+	}
+	if err := os.Mkdir(filepath.Join(hostPath, "trap"), 0o700); err != nil {
+		return hostPath, created, fmt.Errorf("create deterministic bind trap: %w", err)
+	}
+	if err := os.Symlink("trap", filepath.Join(hostPath, "data")); err != nil {
+		return hostPath, created, fmt.Errorf("plant deterministic bind trap: %w", err)
+	}
+	select {
+	case m.created <- hostPath:
+	default:
+	}
+	select {
+	case <-m.resumeCreate:
+		return hostPath, created, nil
+	case <-ctx.Done():
+		return hostPath, created, ctx.Err()
+	}
+}
+
+func (*provisionRollbackLeakVolumeManager) Destroy(context.Context, string) error {
+	return syscall.EBUSY
+}
+
+// TestIntegration_Docker_ProvisionRollbackLeakIsReapedAfterRestart composes
+// the complete crash-recovery argument instead of seeding an orphan directly:
+// durable operation admission -> real Btrfs subvolume -> downstream failure ->
+// failed compensation -> backend fail-stop with the intent still durable ->
+// process rebuild -> exact failure settlement -> cold-start orphan collection.
+// A regression in any boundary either settles before cleanup authority is safe,
+// loses resource accounting, or leaves the subvolume permanently stranded.
+func TestIntegration_Docker_ProvisionRollbackLeakIsReapedAfterRestart(t *testing.T) {
+	mountPath := setupBtrfsLoopback(t)
+	callbackServer, callbackCh := startCallbackServer(t)
+
+	storeDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
+	cfg.Name = fmt.Sprintf("test-provision-orphan-%d", time.Now().UnixNano())
+	cfg.CallbackSecret = testCallbackSecret
+	cfg.HostAddress = "127.0.0.1"
+	cfg.StartupVerifyDuration = time.Second
+	cfg.ReconcileInterval = time.Hour
+	cfg.ProvisionTimeout = 2 * time.Minute
+	cfg.NetworkIsolation = ptrBool(false)
+	cfg.VolumeDataPath = mountPath
+	cfg.VolumeMountPath = mountPath
+	cfg.VolumeFilesystem = "btrfs"
+	cfg.CallbackDBPath = filepath.Join(storeDir, "callbacks.db")
+	cfg.DiagnosticsDBPath = filepath.Join(storeDir, "diagnostics.db")
+	cfg.ReleasesDBPath = filepath.Join(storeDir, "releases.db")
+	cfg.RetentionDBPath = filepath.Join(storeDir, "retention.db")
+
+	ctx := context.Background()
+	logger := slog.Default()
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
+	b1, err := New(cfg, logger)
+	require.NoError(t, err)
+	require.NoError(t, b1.Start(ctx))
+	b1Stopped := false
+	t.Cleanup(func() {
+		if !b1Stopped {
+			_ = b1.Stop()
+		}
+	})
+
+	pinner, ok := b1.volumes.(identityRootPinner)
+	require.True(t, ok, "production Btrfs manager must preserve root identity")
+	faults := &provisionRollbackLeakVolumeManager{
+		volumeManager: b1.volumes,
+		pinner:        pinner,
+		created:       make(chan string, 1),
+		resumeCreate:  make(chan struct{}),
+	}
+	b1.volumes = faults
+
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
+	payload, err := json.Marshal(manifest.Manifest{
+		Image:   "redis:7",
+		Command: []string{"sleep", "3600"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, b1.Provision(ctx, backend.ProvisionRequest{
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
+	}))
+
+	var leakedPath string
+	select {
+	case leakedPath = <-faults.created:
+	case <-time.After(2 * time.Minute):
+		t.Fatal("timed out waiting for real managed-volume creation")
+	}
+	_, err = os.Stat(leakedPath)
+	require.NoError(t, err, "real subvolume must exist before downstream failure")
+	intents, err := b1.callbackStore.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "provision must durably precede volume creation")
+	require.Equal(t, leaseUUID, intents[0].LeaseUUID())
+	require.Equal(t, shared.OperationIntentProvision, intents[0].Kind())
+	close(faults.resumeCreate)
+
+	select {
+	case <-b1.stopCtx.Done():
+	case <-time.After(2 * time.Minute):
+		t.Fatal("failed volume compensation did not stop the backend")
+	}
+	_, err = b1.callbackStore.ListOperationIntents()
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous,
+		"the terminal backend must refuse journal reads until a fresh process reopens them")
+	require.ErrorIs(t, b1.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+	_, err = b1.callbackStore.ListPending()
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	assert.NotNil(t, b1.pool.GetAllocation(leaseUUID+"-app-0"),
+		"capacity must remain reserved while the leaked volume is still claimed")
+	select {
+	case callback := <-callbackCh:
+		t.Fatalf("unexpected callback before restart recovery: %+v", callback)
+	case <-time.After(500 * time.Millisecond):
+	}
+	_, err = os.Stat(leakedPath)
+	require.NoError(t, err, "injected EBUSY must preserve the failed rollback's subvolume")
+
+	require.NoError(t, b1.Stop())
+	b1Stopped = true
+	b2, err := New(cfg, logger)
+	require.NoError(t, err)
+	remaining, err := b2.callbackStore.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, remaining, 1,
+		"cleanup failure must preserve the exact operation intent for cold recovery")
+	require.NoError(t, b2.Start(ctx))
+	t.Cleanup(func() { _ = b2.Stop() })
+	callback := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
+	require.Equal(t, backend.CallbackStatusFailed, callback.Status)
+	remaining, err = b2.callbackStore.ListOperationIntents()
+	require.NoError(t, err)
+	assert.Empty(t, remaining, "cold recovery must settle the exact failed operation")
+
+	_, err = os.Stat(leakedPath)
+	assert.ErrorIs(t, err, fs.ErrNotExist,
+		"cold-start ownership recovery must collect the unclaimed provision rollback")
 }
 
 // TestIntegration_Docker_BtrfsRenameVolume_PreservesSubvolID verifies
@@ -818,8 +1002,9 @@ func TestIntegration_Docker_BtrfsRenameVolume_PreservesSubvolID(t *testing.T) {
 
 	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
 
-	const oldName = "fred-rename-legacy-0"
-	const newName = "fred-rename-legacy-app-0"
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440109"
+	oldName := fmt.Sprintf("fred-%s-0", leaseUUID)
+	newName := canonicalVolumeName(leaseUUID, "app", 0)
 
 	// Create a real btrfs subvolume at the legacy path.
 	oldPath := filepath.Join(mountPath, oldName)
@@ -831,7 +1016,7 @@ func TestIntegration_Docker_BtrfsRenameVolume_PreservesSubvolID(t *testing.T) {
 	require.NotEmpty(t, originalID, "must extract subvol id before rename")
 
 	// Rename via the manager.
-	require.NoError(t, mgr.RenameVolume(oldName, newName))
+	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
 
 	// New path exists, old path is gone.
 	newPath := filepath.Join(mountPath, newName)
@@ -878,6 +1063,7 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		// Custom SKU with a tiny 5MB disk quota
 		cfg.SKUProfiles = map[string]SKUProfile{
@@ -890,7 +1076,7 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	leaseUUID := fmt.Sprintf("vol-quota-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 
 	// redis:7 declares VOLUME /data → bind-mounted to 5MB btrfs subvolume.
 	// Using "sleep" as command so redis-server doesn't start and consume space.
@@ -904,7 +1090,7 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
+		ProviderUUID: testProviderUUID,
 		Items:        []backend.LeaseItem{{SKU: "docker-tiny", Quantity: 1}},
 		CallbackURL:  callbackServer.URL,
 		Payload:      payload,
@@ -1084,7 +1270,8 @@ func TestIntegration_Usage_Btrfs(t *testing.T) {
 
 	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
 
-	const volName = "fred-int-usage-btrfs-app-0"
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440100"
+	volName := canonicalVolumeName(leaseUUID, "app", 0)
 	const capMiB = int64(100)
 
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
@@ -1114,7 +1301,8 @@ func TestIntegration_Usage_XFS(t *testing.T) {
 	mgr, err := newVolumeManager(mountDir, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
-	const volName = "fred-int-usage-xfs-app-0"
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440101"
+	volName := canonicalVolumeName(leaseUUID, "app", 0)
 	const capMiB = int64(100)
 
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
@@ -1155,7 +1343,8 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
-	const volName = "fred-int-xfs-subdir-app-0"
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440102"
+	volName := canonicalVolumeName(leaseUUID, "app", 0)
 	const capMiB = int64(20)
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
 	require.NoError(t, err)
@@ -1187,7 +1376,7 @@ func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
 // the inode report (-i) instead of the block report.
 func xfsProjectInodeCount(t *testing.T, mount string, projID uint32) int64 {
 	t.Helper()
-	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -i -N", mount)...).CombinedOutput()
+	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -i -n -N", mount)...).CombinedOutput()
 	require.NoError(t, err, "xfs_quota report -p -i: %s", out)
 	want := strconv.FormatUint(uint64(projID), 10)
 	for _, line := range strings.Split(string(out), "\n") {
@@ -1223,7 +1412,8 @@ func TestIntegration_XFS_InodeQuota_EnforcesEDQUOT(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
-	const volName = "fred-int-xfs-inode-quota-app-0"
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440103"
+	volName := canonicalVolumeName(leaseUUID, "app", 0)
 	const capMiB = int64(100) // generous block quota: only the inode count should bind
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
 	require.NoError(t, err)
@@ -1269,7 +1459,7 @@ func TestIntegration_XFS_InodeQuota_EnforcesEDQUOT(t *testing.T) {
 // foreign) entries in the filesystem-global quota table. `-N` suppresses headers.
 func xfsReportListsProject(t *testing.T, mount string, projID uint32) bool {
 	t.Helper()
-	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -N", mount)...).CombinedOutput()
+	out, err := exec.Command("xfs_quota", xfsQuotaArgs("report -p -n -N", mount)...).CombinedOutput()
 	require.NoError(t, err, "xfs_quota report -p: %s", out)
 	want := strconv.FormatUint(uint64(projID), 10)
 	for _, line := range strings.Split(string(out), "\n") {
@@ -1279,6 +1469,17 @@ func xfsReportListsProject(t *testing.T, mount string, projID uint32) bool {
 		}
 	}
 	return false
+}
+
+func requireXFSProjectEventuallyAbsent(t *testing.T, mount string, projID uint32) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for xfsReportListsProject(t, mount, projID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("project-quota entry %d remained visible after pending inode cleanup", projID)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // TestIntegration_XFS_Destroy_ClearsQuotaEntry is the ENG-459 regression. Since
@@ -1305,10 +1506,11 @@ func TestIntegration_XFS_Destroy_ClearsQuotaEntry(t *testing.T) {
 
 	const n = 8
 	const capMiB = int64(20)
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440104"
 	names := make([]string, n)
 	projIDs := make([]uint32, n)
 	for i := range n {
-		name := fmt.Sprintf("fred-int-eng459-app-%d", i)
+		name := canonicalVolumeName(leaseUUID, "app", i)
 		names[i] = name
 		_, created, err := mgr.Create(ctx, name, capMiB)
 		require.NoError(t, err)
@@ -1332,6 +1534,157 @@ func TestIntegration_XFS_Destroy_ClearsQuotaEntry(t *testing.T) {
 		assert.False(t, xfsReportListsProject(t, mount, projID),
 			"ENG-459: after Destroy, volume %s's project-quota entry (%d) must be gone", names[i], projID)
 	}
+}
+
+// TestIntegration_XFS_InterruptedCreateStageRecoveryClearsQuota is the
+// privileged crash-recovery regression for the private XFS create namespace.
+// It seeds the exact durable state that exists after project tagging and quota
+// setup but before the stage-to-final rename, then constructs a fresh manager
+// as a restarted process would. Startup must discover (and initially refuse to
+// publish past) the stage, and explicit recovery must remove both the directory
+// evidence and its kernel dquot without ever publishing the final volume name.
+func TestIntegration_XFS_InterruptedCreateStageRecoveryClearsQuota(t *testing.T) {
+	mount := setupXFSLoopback(t)
+	dataPath := filepath.Join(mount, "volumes") // subdir of the mount (production layout)
+	require.NoError(t, os.MkdirAll(dataPath, 0700))
+	ctx := context.Background()
+
+	const leaseUUID = "550e8400-e29b-41d4-a716-44665544010a"
+	finalName, err := parseManagedVolumeName(canonicalVolumeName(leaseUUID, "app", 0))
+	require.NoError(t, err)
+	const projID = uint32(424243)
+	stage, err := newXFSStageName(projID, finalName)
+	require.NoError(t, err)
+	stagePath := stage.hostPath(dataPath)
+	finalPath := finalName.hostPath(dataPath)
+
+	// Reproduce Create's durable pre-publication boundary: a parent-synced
+	// typed stage, a synced marker, a project tag, and nonzero block/inode
+	// limits. No final directory is ever created by this fixture.
+	require.NoError(t, os.Mkdir(stagePath, 0700))
+	parent, err := os.Open(dataPath)
+	require.NoError(t, err)
+	require.NoError(t, parent.Sync())
+	require.NoError(t, parent.Close())
+	require.NoError(t, writeProjectIDFile(stagePath, projID))
+	stageDir, err := os.Open(stagePath)
+	require.NoError(t, err)
+	require.NoError(t, stageDir.Sync())
+	require.NoError(t, stageDir.Close())
+
+	setupCmd := xfsProjectSetupCmd(stagePath, projID)
+	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(setupCmd, mount)...).CombinedOutput()
+	require.NoError(t, err, "xfs_quota project setup for interrupted stage: %s", out)
+	limitCmd := xfsLimitCmd(projID, "20m", inodeHardLimit(20, 1024))
+	out, err = exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(limitCmd, mount)...).CombinedOutput()
+	require.NoError(t, err, "xfs_quota limit for interrupted stage: %s", out)
+	require.True(t, xfsReportListsProject(t, mount, projID),
+		"fixture project must have a live dquot before restart recovery")
+	require.NoDirExists(t, finalPath, "fixture must stop before stage publication")
+
+	// A new manager has no process-local stage capability. Validate reconstructs
+	// cleanup-only authority exclusively from the parent-synced on-disk name.
+	restarted, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, restarted.Validate())
+	gateErr := restarted.RequireNoInterruptedVolumeMutations(ctx)
+	require.Error(t, gateErr, "startup must not proceed while interrupted create evidence remains")
+	assert.Contains(t, gateErr.Error(), stage.value())
+
+	require.NoError(t, restarted.RecoverInterruptedVolumeMutations(ctx))
+	require.NoError(t, restarted.RequireNoInterruptedVolumeMutations(ctx),
+		"successful recovery must consume its reconstructed stage authority")
+	require.NoDirExists(t, stagePath, "recovery must remove the private create stage")
+	require.NoDirExists(t, finalPath, "recovery must never publish an interrupted create")
+	// Clearing the limits precedes unlinking the typed stage so crash recovery
+	// never loses its project-ID authority. XFS may retire that last unlinked
+	// inode asynchronously; require eventual dquot disappearance rather than
+	// racing the inodegc worker immediately after recovery returns.
+	requireXFSProjectEventuallyAbsent(t, mount, projID)
+}
+
+// TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode exercises
+// the kernel behavior behind the durable delete protocol. An open descriptor
+// keeps an unlinked project-tagged inode (and its usage) alive. Recovery must
+// normalize a replayed pre-reset tombstone to project 0, remove the namespace,
+// refuse to clear the old dquot while that inode remains, then converge after a
+// process restart once the descriptor is closed.
+func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing.T) {
+	mount := setupXFSLoopback(t)
+	dataPath := filepath.Join(mount, "volumes")
+	require.NoError(t, os.MkdirAll(dataPath, 0o700))
+	ctx := context.Background()
+
+	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
+	const leaseUUID = "550e8400-e29b-41d4-a716-44665544010b"
+	volumeName := canonicalVolumeName(leaseUUID, "app", 0)
+	volumeID, err := parseManagedVolumeName(volumeName)
+	require.NoError(t, err)
+	volumePath, created, err := mgr.Create(ctx, volumeName, 20)
+	require.NoError(t, err)
+	require.True(t, created)
+	projID, err := readProjectIDFile(volumePath)
+	require.NoError(t, err)
+
+	dataFile, err := os.OpenFile(filepath.Join(volumePath, "tenant-data"), os.O_CREATE|os.O_RDWR, 0o600)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dataFile.Close() })
+	require.NoError(t, dataFile.Truncate(1024*1024))
+	require.NoError(t, dataFile.Sync())
+
+	deleteStage, err := newXFSDeleteStageName(projID, volumeID)
+	require.NoError(t, err)
+	deleteStagePath := deleteStage.hostPath(dataPath)
+	require.NoError(t, os.Mkdir(deleteStagePath, 0o700))
+	// Model a power loss after mkdir but before prepare's project-0 reset by
+	// deliberately charging the sibling itself to the retiring project.
+	out, err := exec.CommandContext(ctx, "xfs_quota",
+		xfsQuotaArgs(xfsProjectSetupCmd(deleteStagePath, projID), mount)...).CombinedOutput()
+	require.NoError(t, err, "tag pre-reset delete-stage fixture: %s", out)
+	parent, err := os.Open(dataPath)
+	require.NoError(t, err)
+	require.NoError(t, parent.Sync())
+	require.NoError(t, parent.Close())
+
+	// Reproduce marker-first partial RemoveAll while tenant data and its open FD
+	// remain. Only the typed sibling carries the collision-probed project ID.
+	require.NoError(t, os.Remove(filepath.Join(volumePath, projectIDFile)))
+	volumeDir, err := os.Open(volumePath)
+	require.NoError(t, err)
+	require.NoError(t, volumeDir.Sync())
+	require.NoError(t, volumeDir.Close())
+
+	restarted, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, restarted.Validate())
+	require.ErrorContains(t, restarted.RequireNoInterruptedVolumeMutations(ctx), deleteStage.value())
+	err = restarted.RecoverInterruptedVolumeMutations(ctx)
+	require.ErrorContains(t, err, "refuse to clear xfs project quota")
+	assert.NoDirExists(t, volumePath, "namespace deletion may finish while the FD remains open")
+	assert.DirExists(t, deleteStagePath, "nonzero kernel usage must retain durable cleanup authority")
+	assert.True(t, xfsReportListsProject(t, mount, projID), "nonzero open-inode usage must retain the dquot")
+
+	// Recovery must have repaired the replayed pre-reset sibling before its zero
+	// proof. Read the typed kernel attribute rather than xfsprogs report prose.
+	deleteStageRoot, err := os.OpenRoot(deleteStagePath)
+	require.NoError(t, err)
+	deleteStageAttr, readAttrErr := (linuxXFSProjectAttributeReader{}).ReadProjectAttributes(deleteStageRoot)
+	closeRootErr := deleteStageRoot.Close()
+	require.NoError(t, readAttrErr)
+	require.NoError(t, closeRootErr)
+	require.NoError(t, validateXFSDefaultProject(deleteStageAttr))
+
+	require.NoError(t, dataFile.Close(), "closing the last reference releases the unlinked project inode")
+	restartedAgain, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, restartedAgain.Validate())
+	require.NoError(t, restartedAgain.RecoverInterruptedVolumeMutations(ctx))
+	require.NoError(t, restartedAgain.RequireNoInterruptedVolumeMutations(ctx))
+	assert.NoDirExists(t, deleteStagePath)
+	assert.False(t, xfsReportListsProject(t, mount, projID),
+		"last-close recovery must clear the dquot and tombstone")
 }
 
 // TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin is the ENG-454 regression.
@@ -1457,7 +1810,8 @@ func TestIntegration_XFS_Backfill_TagsUntaggedVolume(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
-	const volName = "fred-int-backfill-app-0"
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440105"
+	volName := canonicalVolumeName(leaseUUID, "app", 0)
 	const capMiB = int64(20)
 
 	// Simulate a volume created by a pre-ENG-454 daemon: the directory and the
@@ -1505,7 +1859,7 @@ func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
 	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
-	const lease = "l-e2e-backfill"
+	const lease = "550e8400-e29b-41d4-a716-446655440106"
 	volName := canonicalVolumeName(lease, "app", 0)
 	dir := filepath.Join(dataPath, volName)
 	require.NoError(t, os.MkdirAll(dir, 0700))
@@ -1517,7 +1871,7 @@ func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
 	_, uerr := mgr.Usage(ctx, volName)
 	require.Error(t, uerr, "untagged volume must not be measurable before backfill")
 
-	b.reconcileVolumeQuotas(ctx)
+	require.NoError(t, b.reconcileVolumeQuotas(ctx))
 
 	used, err := mgr.Usage(ctx, volName)
 	require.NoError(t, err, "reconcile backfill must make the volume measurable")
@@ -1545,8 +1899,8 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	mgr, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 
-	const origLease = "l-ret"
-	retName := retainedName(canonicalVolumeName(origLease, "db", 0)) // fred-retained-l-ret-db-0
+	origLease := newIntegrationLeaseUUID()
+	retName := retainedName(canonicalVolumeName(origLease, "db", 0))
 	dir := filepath.Join(dataPath, retName)
 	require.NoError(t, os.MkdirAll(dir, 0700))
 	require.NoError(t, writeProjectIDFile(dir, 556001))
@@ -1559,7 +1913,7 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	require.NoError(t, rs.Put(shared.RetentionEntry{
 		OriginalLeaseUUID:   origLease,
 		Tenant:              "t1",
-		ProviderUUID:        "p1",
+		ProviderUUID:        testProviderUUID,
 		Items:               []backend.LeaseItem{{SKU: "ret-sku", Quantity: 1, ServiceName: "db"}},
 		RetainedVolumeNames: []string{retName},
 		Status:              shared.RetentionStatusActive,
@@ -1569,7 +1923,7 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	_, uerr := mgr.Usage(ctx, retName)
 	require.Error(t, uerr, "untagged retained volume must not be measurable before backfill")
 
-	b.reconcileVolumeQuotas(ctx)
+	require.NoError(t, b.reconcileVolumeQuotas(ctx))
 
 	used, err := mgr.Usage(ctx, retName)
 	require.NoError(t, err, "reconcile must backfill the retained volume")
@@ -1596,14 +1950,14 @@ func TestIntegration_Btrfs_ReconcileBackfill_EndToEnd(t *testing.T) {
 	ctx := context.Background()
 	mgr := &btrfsVolumeManager{dataPath: dataPath, logger: slog.Default()}
 
-	const lease = "l-btrfs-e2e"
+	const lease = "550e8400-e29b-41d4-a716-446655440107"
 	volName := canonicalVolumeName(lease, "app", 0)
 	hostPath, _, err := mgr.Create(ctx, volName, 100) // large initial cap
 	require.NoError(t, err)
 	writeIncompressibleMiB(t, filepath.Join(hostPath, "seed.bin"), 5) // under both caps
 
 	b := backendForReconcileTest(t, mgr, dataPath, lease, "app", "btrfs-small", 20)
-	b.reconcileVolumeQuotas(ctx)
+	require.NoError(t, b.reconcileVolumeQuotas(ctx))
 
 	// The reconcile tightened the qgroup limit to 20 MiB → 30 MiB more is rejected.
 	writeIncompressibleExpectFail(t, filepath.Join(hostPath, "big.bin"), 30)
@@ -1620,14 +1974,14 @@ func TestIntegration_Zfs_ReconcileBackfill_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate()) // resolves parentDataset
 
-	const lease = "l-zfs-e2e"
+	const lease = "550e8400-e29b-41d4-a716-446655440001"
 	volName := canonicalVolumeName(lease, "app", 0)
 	hostPath, _, err := mgr.Create(ctx, volName, 100) // large initial refquota
 	require.NoError(t, err)
 	writeIncompressibleMiB(t, filepath.Join(hostPath, "seed.bin"), 5) // under both caps
 
 	b := backendForReconcileTest(t, mgr, mount, lease, "app", "zfs-small", 20)
-	b.reconcileVolumeQuotas(ctx)
+	require.NoError(t, b.reconcileVolumeQuotas(ctx))
 
 	// The reconcile tightened refquota to 20 MiB → 30 MiB more is rejected.
 	writeIncompressibleExpectFail(t, filepath.Join(hostPath, "big.bin"), 30)
@@ -1646,7 +2000,8 @@ func TestIntegration_Btrfs_SubdirDataPath_Measures(t *testing.T) {
 	ctx := context.Background()
 	mgr := &btrfsVolumeManager{dataPath: dataPath, logger: slog.Default()}
 
-	const volName = "fred-int-btrfs-subdir-app-0"
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440108"
+	volName := canonicalVolumeName(leaseUUID, "app", 0)
 	hostPath, created, err := mgr.Create(ctx, volName, 100)
 	require.NoError(t, err)
 	require.True(t, created)
@@ -1670,7 +2025,7 @@ func TestIntegration_Usage_ZFS(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
 
-	const volName = "fred-int-usage-zfs-app-0"
+	const volName = "fred-550e8400-e29b-41d4-a716-446655440002-app-0"
 	const capMiB = int64(100)
 
 	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
@@ -1717,7 +2072,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 
 	// (a) 5 MiB data fits 20 MiB medium: gate passes, quota lowered, write beyond fails.
 	t.Run("fits_medium", func(t *testing.T) {
-		const origLease = "int-btrfs-fits"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1727,7 +2082,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		// 5 MiB — fits 20 MiB medium
 		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1741,9 +2096,9 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 		require.NoError(t, err, "5 MiB data fits 20 MiB medium: checkDemoteFit must pass")
 
 		// Simulate adoptRetainedVolumes: rename to a new lease's canonical name.
-		const newLease = "int-btrfs-fits-new"
+		newLease := newIntegrationLeaseUUID()
 		newCanon := canonicalVolumeName(newLease, "app", 0)
-		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		require.NoError(t, mgr.RenameVolume(context.Background(), retained, newCanon))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap lowers the btrfs qgroup limit to 20 MiB.
@@ -1759,7 +2114,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 
 	// (b) 25 MiB data exceeds 20 MiB medium: gate returns ErrDemoteDataExceedsTier.
 	t.Run("exceeds_medium", func(t *testing.T) {
-		const origLease = "int-btrfs-exceeds"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1772,7 +2127,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
 		require.NoError(t, werr, "writing 25 MiB to 100 MiB-quota volume must succeed; dd output: %s", out)
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1790,7 +2145,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 	// (c) promote: Create at large from a medium-capped volume raises the cap so
 	//     writes beyond medium now succeed.
 	t.Run("promote_raises_cap", func(t *testing.T) {
-		const origLease = "int-btrfs-promote"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 
 		// Start at medium cap (20 MiB).
@@ -1842,7 +2197,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 	// (a) fits: gate passes, XFS bhard lowered, write beyond medium fails.
 	t.Run("fits_medium", func(t *testing.T) {
-		const origLease = "int-xfs-fits"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1851,7 +2206,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1864,9 +2219,9 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 			mediumProfiles, b.logger)
 		require.NoError(t, err, "5 MiB data fits 20 MiB medium: checkDemoteFit must pass")
 
-		const newLease = "int-xfs-fits-new"
+		newLease := newIntegrationLeaseUUID()
 		newCanon := canonicalVolumeName(newLease, "app", 0)
-		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		require.NoError(t, mgr.RenameVolume(context.Background(), retained, newCanon))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap updates the XFS project bhard limit to 20 MiB.
@@ -1881,7 +2236,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 
 	// (b) exceeds: gate refuses.
 	t.Run("exceeds_medium", func(t *testing.T) {
-		const origLease = "int-xfs-exceeds"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1893,7 +2248,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
 		require.NoError(t, werr, "25 MiB must fit 100 MiB XFS quota; dd output: %s", out)
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1911,7 +2266,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 	// (c) promote: Create at large from a medium-capped project raises the XFS
 	//     project bhard so writes beyond the medium cap now succeed.
 	t.Run("promote_raises_cap", func(t *testing.T) {
-		const origLease = "int-xfs-promote"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 
 		// Start at medium cap (20 MiB).
@@ -1968,7 +2323,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 	//     medium succeeds because referenced (~5 MiB) < refquota (20 MiB).
 	//     Write beyond medium then fails — confirming refquota is the enforcer.
 	t.Run("fits_medium_refquota_succeeds", func(t *testing.T) {
-		const origLease = "int-zfs-fits"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -1977,7 +2332,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 
 		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 5)
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{
@@ -1990,9 +2345,9 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 			mediumProfiles, b.logger)
 		require.NoError(t, err, "5 MiB fits 20 MiB medium: gate must pass")
 
-		const newLease = "int-zfs-fits-new"
+		newLease := newIntegrationLeaseUUID()
 		newCanon := canonicalVolumeName(newLease, "app", 0)
-		require.NoError(t, mgr.RenameVolume(retained, newCanon))
+		require.NoError(t, mgr.RenameVolume(context.Background(), retained, newCanon))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
 
 		// Create at medium cap issues `zfs set refquota=20M <dataset>`.
@@ -2020,7 +2375,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 	//     smaller quota= would otherwise silently bind on promote and cap the lease
 	//     at the old size even after `zfs set refquota=<larger>` succeeds.
 	t.Run("promote_clears_legacy_quota", func(t *testing.T) {
-		const lease = "int-zfs-promote"
+		const lease = "550e8400-e29b-41d4-a716-446655440003"
 		canon := canonicalVolumeName(lease, "app", 0)
 
 		// Create at medium cap — hits the fresh-create path (no legacy quota).
@@ -2057,7 +2412,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 	//     `zfs set refquota < referenced` error that ZFS would return if we
 	//     proceeded directly to Create at medium cap.
 	t.Run("exceeds_medium_gate_refuses", func(t *testing.T) {
-		const origLease = "int-zfs-exceeds"
+		origLease := newIntegrationLeaseUUID()
 		canon := canonicalVolumeName(origLease, "app", 0)
 		retained := retainedName(canon)
 
@@ -2069,7 +2424,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 		// (ZFS compression=on default would elide zero-filled data as holes).
 		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 25)
 
-		require.NoError(t, mgr.RenameVolume(canon, retained))
+		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 		rec := &shared.RetentionEntry{

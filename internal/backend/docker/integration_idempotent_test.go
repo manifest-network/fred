@@ -42,7 +42,7 @@ func baseCreateParams(d *DockerClient, leaseUUID, image string) CreateContainerP
 	return CreateContainerParams{
 		LeaseUUID:     leaseUUID,
 		Tenant:        "test-tenant",
-		ProviderUUID:  "test-provider",
+		ProviderUUID:  testProviderUUID,
 		SKU:           "docker-micro",
 		ServiceName:   manifest.DefaultServiceName,
 		Manifest:      &manifest.Manifest{Image: image, Command: []string{"sleep", "3600"}},
@@ -81,7 +81,7 @@ func TestIntegration_Docker_RemoveContainer_Concurrent(t *testing.T) {
 	// Pull a small image we can create and destroy quickly.
 	require.NoError(t, d.PullImage(ctx, "busybox:latest", 60*time.Second))
 
-	params := baseCreateParams(d, fmt.Sprintf("concurrent-%d", time.Now().UnixNano()), "busybox:latest")
+	params := baseCreateParams(d, newIntegrationLeaseUUID(), "busybox:latest")
 	containerID, err := d.CreateContainer(ctx, params, 30*time.Second)
 	require.NoError(t, err)
 	defer forceRemove(t, d, containerID)
@@ -123,7 +123,7 @@ func TestIntegration_Docker_CreateContainer_AdoptOnReplay(t *testing.T) {
 
 	require.NoError(t, d.PullImage(ctx, "busybox:latest", 60*time.Second))
 
-	params := baseCreateParams(d, fmt.Sprintf("adopt-%d", time.Now().UnixNano()), "busybox:latest")
+	params := baseCreateParams(d, newIntegrationLeaseUUID(), "busybox:latest")
 
 	before := testutil.ToFloat64(idempotentOpsTotal.WithLabelValues("create", "already_exists"))
 
@@ -150,7 +150,7 @@ func TestIntegration_Docker_CreateContainer_RejectsImageMismatch(t *testing.T) {
 	require.NoError(t, d.PullImage(ctx, "busybox:latest", 60*time.Second))
 	require.NoError(t, d.PullImage(ctx, "alpine:latest", 60*time.Second))
 
-	leaseUUID := fmt.Sprintf("mismatch-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	firstParams := baseCreateParams(d, leaseUUID, "busybox:latest")
 	firstID, err := d.CreateContainer(ctx, firstParams, 30*time.Second)
 	require.NoError(t, err)

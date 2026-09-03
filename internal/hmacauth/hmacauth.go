@@ -29,11 +29,13 @@
 // The 1-minute clock-skew tolerance for future timestamps is hardcoded in
 // Verify; use VerifyWithTime to override it.
 //
-// Combined with the method+URI+body binding above, the timestamp check
-// prevents replay, timestamp substitution, and cross-endpoint replay
-// attacks. The canonical-string approach is conceptually similar to
-// AWS SigV4's canonical request, simplified to the fields this codebase
-// needs.
+// The timestamp check bounds replay of the same signed request to maxAge; it
+// does not provide one-time delivery because this protocol intentionally has no
+// nonce cache. Binding method, URI, and body prevents a captured signature from
+// being moved to a different endpoint, resource, method, or payload, while
+// binding the timestamp prevents timestamp substitution. The canonical-string
+// approach is conceptually similar to AWS SigV4's canonical request,
+// simplified to the fields this codebase needs.
 //
 // # Constant-time comparison
 //
@@ -63,6 +65,7 @@
 //   - Fred → backend HTTP requests (internal/backend/client.go)
 //   - docker-backend self-verification middleware (cmd/docker-backend/main.go)
 //   - k3s-backend self-verification middleware (cmd/k3s-backend/server.go)
+//   - mock-backend self-verification middleware (cmd/mock-backend/main.go)
 package hmacauth
 
 import (
@@ -76,8 +79,15 @@ import (
 	"time"
 )
 
-// SignatureHeader is the HTTP header name for HMAC signatures.
-const SignatureHeader = "X-Fred-Signature"
+const (
+	// SignatureHeader is the HTTP header name for HMAC signatures.
+	SignatureHeader = "X-Fred-Signature"
+
+	// MinSecretLength is the minimum HMAC secret length accepted at production
+	// authentication and signing boundaries. Thirty-two bytes retain the full
+	// security strength of HMAC-SHA256.
+	MinSecretLength = 32
+)
 
 // ComputeMAC computes the HMAC-SHA256 over the canonical string
 // "<timestamp>\n<method>\n<uri>\n<hex(sha256(body))>".

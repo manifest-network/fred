@@ -83,7 +83,7 @@ func TestDeprovision_WritablePathOnly_DestroyedNotRetained(t *testing.T) {
 			LeaseUUID: "lease-wp", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "grafana/grafana:11.1.0"}}},
 		}},
@@ -178,7 +178,7 @@ func TestDeprovision_StatefulVolume_RetainedNotDestroyed(t *testing.T) {
 			LeaseUUID: "lease-sf", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
 		}},
@@ -264,7 +264,7 @@ func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testi
 			LeaseUUID: "lease-mx", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			CallbackURL:  server.URL,
+			CallbackURL:  server.URL + "/callbacks/provision",
 			Items:        items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 				"db":   {Image: "redis:7"},
@@ -370,7 +370,7 @@ func TestDeprovision_WritablePathOnly_WithXFSMarker_StillReclaimed(t *testing.T)
 			LeaseUUID: "lease-xfs", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "grafana/grafana:11.1.0"}}},
 		}},
@@ -445,7 +445,7 @@ func TestDeprovision_AmbiguousVolume_RetainedConservatively(t *testing.T) {
 			LeaseUUID: "lease-amb", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
 		}},
@@ -503,14 +503,14 @@ func TestDeprovision_AmbiguousVolume_RetainedConservatively(t *testing.T) {
 func TestBuildStatefulVolumeBinds_RejectsReservedWritablePathName(t *testing.T) {
 	host := t.TempDir()
 
-	_, err := buildStatefulVolumeBinds(host, []string{"/" + writablePathSubdir}, 0, 0)
+	_, err := buildStatefulVolumeBindsContext(context.Background(), host, []string{"/" + writablePathSubdir}, 0, 0)
 	require.Error(t, err, "a VOLUME that sanitizes to the reserved _wp name must be rejected")
 
-	_, err = buildStatefulVolumeBinds(host, []string{"/" + writablePathSubdir + "/data"}, 0, 0)
+	_, err = buildStatefulVolumeBindsContext(context.Background(), host, []string{"/" + writablePathSubdir + "/data"}, 0, 0)
 	require.Error(t, err, "a VOLUME nested under the reserved _wp dir must also be rejected")
 
 	// A normal declared VOLUME is unaffected.
-	binds, err := buildStatefulVolumeBinds(host, []string{"/data"}, 0, 0)
+	binds, err := buildStatefulVolumeBindsContext(context.Background(), host, []string{"/data"}, 0, 0)
 	require.NoError(t, err)
 	require.Len(t, binds, 1)
 }
@@ -541,7 +541,7 @@ func TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained(t *testing.T) {
 			LeaseUUID: "lease-mk", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
 		}},
@@ -603,7 +603,10 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
-	hostVol := t.TempDir()
+	volumeRoot := t.TempDir()
+	b.cfg.VolumeDataPath = volumeRoot
+	hostVol := filepath.Join(volumeRoot, canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0))
+	require.NoError(t, os.Mkdir(hostVol, 0o700))
 	wpDir := filepath.Join(hostVol, writablePathSubdir)
 
 	// Stale content from a prior extraction / tenant write under the writable path.
@@ -648,7 +651,10 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
-	hostVol := t.TempDir()
+	volumeRoot := t.TempDir()
+	b.cfg.VolumeDataPath = volumeRoot
+	hostVol := filepath.Join(volumeRoot, canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0))
+	require.NoError(t, os.Mkdir(hostVol, 0o700))
 	wpDir := filepath.Join(hostVol, writablePathSubdir)
 	outside := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(outside, "host-secret"), []byte("x"), 0o600))
@@ -679,7 +685,10 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{})
 
-	hostVol := t.TempDir()
+	volumeRoot := t.TempDir()
+	b.cfg.VolumeDataPath = volumeRoot
+	hostVol := filepath.Join(volumeRoot, canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0))
+	require.NoError(t, os.Mkdir(hostVol, 0o700))
 	wpDir := filepath.Join(hostVol, writablePathSubdir)
 
 	// Extraction leaves wpDir as a regular FILE, so os.OpenRoot(wpDir) fails with a
@@ -762,7 +771,7 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 			LeaseUUID: "lease-rt", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			CallbackURL:  server.URL,
+			CallbackURL:  server.URL + "/callbacks/provision",
 			Items:        items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 				"db":    {Image: "redis:7"},
@@ -879,7 +888,7 @@ func TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted(t *testing.T)
 			LeaseUUID: "lease-rf", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			CallbackURL:  server.URL,
+			CallbackURL:  server.URL + "/callbacks/provision",
 			Items:        items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 				"db":   {Image: "redis:7"},
@@ -952,7 +961,7 @@ func TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively(t *testing.
 			LeaseUUID: "lease-wpf", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
 		}},
@@ -1032,7 +1041,7 @@ func TestDeprovision_PartialInstanceRetain_CapCheckCountsOnlyRetained(t *testing
 			LeaseUUID: "lease-pi", Tenant: "tenant-a", ProviderUUID: "prov-1",
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL,
+			CallbackURL:   server.URL + "/callbacks/provision",
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"svc": {Image: "redis:7"}}},
 		}},

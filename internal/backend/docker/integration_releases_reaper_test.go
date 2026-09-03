@@ -62,12 +62,14 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	cfg.CallbackDBPath = filepath.Join(tmpDir, "callbacks.db")
 	cfg.DiagnosticsDBPath = filepath.Join(tmpDir, "diagnostics.db")
 	cfg.ReleasesDBPath = filepath.Join(tmpDir, "releases.db") // shared by b and b2
-	for name, p := range cfg.SKUProfiles {                    // no volume FS -> drop DiskMB
+	cfg.RetentionDBPath = filepath.Join(tmpDir, "retention.db")
+	for name, p := range cfg.SKUProfiles { // no volume FS -> drop DiskMB
 		p.DiskMB = 0
 		cfg.SKUProfiles[name] = p
 	}
 
 	// --- Backend #1: provision a real lease (writes the provision-time release). ---
+	initializeFreshIntegrationStorageIdentity(t, ctx, cfg, logger)
 	b, err := New(cfg, logger)
 	require.NoError(t, err)
 	require.NoError(t, b.Start(ctx))
@@ -80,7 +82,8 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 		_ = docker.Close()
 	})
 
-	leaseUUID := fmt.Sprintf("eng440-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 	appManifest := manifest.Manifest{
 		Image:   "busybox:latest",
 		Command: []string{"sleep", "3600"},
@@ -89,12 +92,13 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: "test-provider",
-		Items:        []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	}))
 	cb := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status, "provision must succeed")
@@ -131,7 +135,7 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	// left the recovered StackManifest nil.
 	require.NoError(t, b2.Restart(ctx, backend.RestartRequest{
 		LeaseUUID:   leaseUUID,
-		CallbackURL: callbackServer.URL,
+		CallbackURL: callbacks.lifecycleURL,
 	}), "Restart must not fail with 'no stored manifest' after the reap")
 	cb = waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
 	assert.Equal(t, backend.CallbackStatusSuccess, cb.Status, "restart redeploy must succeed")

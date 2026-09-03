@@ -45,7 +45,7 @@ func TestParseBtrfsQgroupRfer_NotFound(t *testing.T) {
 }
 
 func TestParseXfsReportUsedBlocks(t *testing.T) {
-	// `xfs_quota -x -c "report -p -b -N" <mnt>` rows: <projid> <used> <soft> <hard> <warn/grace>
+	// `xfs_quota -x -c "report -p -b -n -N" <mnt>` rows: <projid> <used> <soft> <hard> <warn/grace>
 	// Used is in 1KiB blocks.
 	out := "#0            0          0          0     00 [--------]\n" +
 		"#1048576   1024          0    2097152     00 [--------]\n"

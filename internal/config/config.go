@@ -6,12 +6,18 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/spf13/viper"
+
+	"github.com/manifest-network/fred/internal/backendname"
+	"github.com/manifest-network/fred/internal/callbackurl"
+	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/httpurl"
 )
 
 // ParseLogLevel converts a string log level to slog.Level.
@@ -129,7 +135,8 @@ type Config struct {
 	// Payload store configuration
 	PayloadStoreDBPath string `mapstructure:"payload_store_db_path"`
 
-	// Placement store configuration (enables round-robin backend routing)
+	// Placement store configuration. This durable authority is required because
+	// providerd always operates against a multi-backend placement pool.
 	PlacementStoreDBPath string `mapstructure:"placement_store_db_path"`
 
 	// Shutdown configuration
@@ -146,6 +153,12 @@ type BackendConfig struct {
 	Timeout   time.Duration `mapstructure:"timeout"`
 	SKUs      []string      `mapstructure:"skus"`
 	IsDefault bool          `mapstructure:"default"`
+	// HMACSecret authenticates both directions of the providerd <-> backend
+	// protocol for this backend only. Production requires one distinct secret per
+	// configured backend so compromising one node cannot mint commands or
+	// callbacks for another node. CallbackSecret remains a non-production legacy
+	// fallback for isolated development and tests.
+	HMACSecret Secret `mapstructure:"hmac_secret"`
 
 	// TLS for the providerd -> backend hop (ENG-103). Empty fields fall back to
 	// Go defaults (system root CAs, no client certificate).
@@ -153,6 +166,28 @@ type BackendConfig struct {
 	TLSSkipVerify     bool   `mapstructure:"tls_skip_verify"`      // DEV ONLY; rejected when production_mode is true
 	TLSClientCertFile string `mapstructure:"tls_client_cert_file"` // client cert for mTLS (set with key)
 	TLSClientKeyFile  string `mapstructure:"tls_client_key_file"`  // client key for mTLS (set with cert)
+}
+
+// ResolveBackendHMACSecret returns the key assigned to one configured backend.
+// A per-backend key always wins. The top-level callback_secret is accepted only
+// as the all-backend legacy mode validated for non-production deployments.
+func (c *Config) ResolveBackendHMACSecret(backendName string) (Secret, error) {
+	if c == nil {
+		return "", fmt.Errorf("provider config is required")
+	}
+	for _, candidate := range c.Backends {
+		if candidate.Name != backendName {
+			continue
+		}
+		if candidate.HMACSecret != "" {
+			return candidate.HMACSecret, nil
+		}
+		if !c.ProductionMode && c.CallbackSecret != "" {
+			return c.CallbackSecret, nil
+		}
+		return "", fmt.Errorf("backend %q has no HMAC secret", backendName)
+	}
+	return "", fmt.Errorf("backend %q is not configured", backendName)
 }
 
 // TLSEnabled returns true if TLS is configured.
@@ -458,8 +493,8 @@ func (c *Config) Validate() error {
 	seenNames := make(map[string]bool)
 
 	for i, b := range c.Backends {
-		if b.Name == "" {
-			return fmt.Errorf("backends[%d].name is required", i)
+		if err := backendname.Validate(b.Name); err != nil {
+			return fmt.Errorf("backends[%d].name: %w", i, err)
 		}
 		if seenNames[b.Name] {
 			return fmt.Errorf("duplicate backend name: %s", b.Name)
@@ -469,9 +504,14 @@ func (c *Config) Validate() error {
 		if b.URL == "" {
 			return fmt.Errorf("backends[%d].url is required", i)
 		}
-		if err := validateHTTPURL(b.URL); err != nil {
+		if b.Timeout < 0 {
+			return fmt.Errorf("backends[%d].timeout must not be negative", i)
+		}
+		backendURL, err := httpurl.NormalizeOrigin(b.URL)
+		if err != nil {
 			return fmt.Errorf("backends[%d].url: %w", i, err)
 		}
+		c.Backends[i].URL = backendURL
 
 		// mTLS client cert and key are set together.
 		if (b.TLSClientCertFile != "") != (b.TLSClientKeyFile != "") {
@@ -506,18 +546,51 @@ func (c *Config) Validate() error {
 	if c.CallbackBaseURL == "" {
 		return fmt.Errorf("callback_base_url is required")
 	}
-	if err := validateHTTPURL(c.CallbackBaseURL); err != nil {
-		return fmt.Errorf("callback_base_url: %w", err)
+	callbackBase, err := callbackurl.ParseBase(c.CallbackBaseURL)
+	if err != nil {
+		return fmt.Errorf("callback_base_url: URL %w", err)
 	}
-	// Normalize: strip trailing slashes to avoid double slashes when joining paths
-	c.CallbackBaseURL = strings.TrimRight(c.CallbackBaseURL, "/")
+	c.CallbackBaseURL = callbackBase.String()
 
-	// callback_secret is required for callback authentication (HMAC)
-	if c.CallbackSecret == "" {
-		return fmt.Errorf("callback_secret is required for callback authentication")
+	// HMAC authentication has exactly two configuration modes. Production uses
+	// one unique key per backend. The top-level callback_secret remains only as an
+	// all-or-nothing compatibility mode for non-production tests and development;
+	// accepting a partial or mixed fleet would silently recreate the cross-backend
+	// trust domain this boundary is intended to remove.
+	perBackendSecrets := 0
+	seenHMACSecrets := make(map[string]int, len(c.Backends))
+	for i, configuredBackend := range c.Backends {
+		if configuredBackend.HMACSecret == "" {
+			continue
+		}
+		perBackendSecrets++
+		if len(configuredBackend.HMACSecret) < hmacauth.MinSecretLength {
+			return fmt.Errorf(
+				"backends[%d].hmac_secret must be at least %d bytes",
+				i, hmacauth.MinSecretLength,
+			)
+		}
+		secret := string(configuredBackend.HMACSecret)
+		if previous, duplicate := seenHMACSecrets[secret]; duplicate {
+			return fmt.Errorf(
+				"backends[%d].hmac_secret duplicates backends[%d].hmac_secret",
+				i, previous,
+			)
+		}
+		seenHMACSecrets[secret] = i
 	}
-	if len(c.CallbackSecret) < 32 {
-		return fmt.Errorf("callback_secret must be at least 32 characters")
+	switch {
+	case perBackendSecrets == 0:
+		if c.CallbackSecret == "" {
+			return fmt.Errorf("callback_secret is required for non-production legacy authentication, or configure hmac_secret on every backend")
+		}
+		if len(c.CallbackSecret) < hmacauth.MinSecretLength {
+			return fmt.Errorf("callback_secret must be at least %d bytes", hmacauth.MinSecretLength)
+		}
+	case c.CallbackSecret != "":
+		return fmt.Errorf("callback_secret cannot be combined with per-backend hmac_secret")
+	case perBackendSecrets != len(c.Backends):
+		return fmt.Errorf("hmac_secret must be configured on every backend; got %d of %d", perBackendSecrets, len(c.Backends))
 	}
 
 	// callback_canonical_path_prefix is optional; empty preserves direct-call behavior.
@@ -530,6 +603,13 @@ func (c *Config) Validate() error {
 		if strings.HasSuffix(c.CallbackCanonicalPathPrefix, "/") {
 			return fmt.Errorf("callback_canonical_path_prefix must not end with \"/\"")
 		}
+	}
+	if c.CallbackCanonicalPathPrefix != callbackBase.EscapedPath() {
+		return fmt.Errorf(
+			"callback_canonical_path_prefix %q must exactly match callback_base_url path %q",
+			c.CallbackCanonicalPathPrefix,
+			callbackBase.EscapedPath(),
+		)
 	}
 
 	// Production mode security enforcement (runs after all basic validation)
@@ -552,11 +632,50 @@ func (c *Config) Validate() error {
 		if err := validateExternalURL(c.CallbackBaseURL); err != nil {
 			return fmt.Errorf("production_mode: callback_base_url: %w", err)
 		}
+		callbackURL, err := url.Parse(c.CallbackBaseURL)
+		if err != nil || callbackURL.Scheme != "https" {
+			// Callback operation/lifecycle tokens and their HMAC are bearer-like
+			// causal authority on this hop. Production must protect both their
+			// integrity and confidentiality in transit, even though the payload is
+			// independently authenticated.
+			return fmt.Errorf(
+				"production_mode: callback_base_url must use https://",
+			)
+		}
 		for i, b := range c.Backends {
 			if err := validateExternalURL(b.URL); err != nil {
 				return fmt.Errorf("production_mode: backends[%d].url: %w", i, err)
 			}
+			backendURL, err := url.Parse(b.URL)
+			if err != nil || backendURL.Scheme != "https" {
+				// Fred authenticates backend-bound requests with HMAC, but backend
+				// response headers and bodies are not independently signed. In
+				// production, certificate-verified HTTPS is therefore part of the
+				// authority boundary for storage-identity observations, inventories,
+				// and synchronous refusal verdicts.
+				return fmt.Errorf(
+					"production_mode: backends[%d].url must use https:// with certificate verification",
+					i,
+				)
+			}
 		}
+		if c.CallbackSecret != "" {
+			return fmt.Errorf("production_mode: callback_secret is a fleet-wide legacy key; configure a unique backends[].hmac_secret for every backend")
+		}
+	}
+
+	// Durable placement is part of the correctness boundary for every
+	// deployment. Without it, a restart or ambiguous backend response could
+	// route the same lease to a different backend.
+	if c.PlacementStoreDBPath == "" {
+		return fmt.Errorf("placement_store_db_path is required for durable multi-backend placement")
+	}
+	if !filepath.IsAbs(c.PlacementStoreDBPath) ||
+		filepath.Clean(c.PlacementStoreDBPath) != c.PlacementStoreDBPath {
+		return fmt.Errorf(
+			"placement_store_db_path must be an absolute, clean path: %q",
+			c.PlacementStoreDBPath,
+		)
 	}
 
 	return nil
@@ -566,21 +685,6 @@ func (c *Config) Validate() error {
 func IsValidUUID(s string) bool {
 	_, err := uuid.Parse(s)
 	return err == nil
-}
-
-// validateHTTPURL checks that a URL is an absolute http/https URL with non-empty host.
-func validateHTTPURL(rawURL string) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("URL must use http:// or https:// scheme, got %q", parsed.Scheme)
-	}
-	if parsed.Host == "" {
-		return fmt.Errorf("URL must have a host")
-	}
-	return nil
 }
 
 // validateExternalURL rejects URLs that point to loopback, link-local, or

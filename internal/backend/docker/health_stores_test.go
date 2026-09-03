@@ -56,6 +56,7 @@ func TestHealth_ProbesEachStore(t *testing.T) {
 			// Only the target store is wired (others nil → skipped), so it is the
 			// first — and only — branch that can fail.
 			b := &Backend{docker: mock}
+			installMutationTestVerifier(t, b, nil)
 			store := tc.wire(t, b)
 
 			require.NoError(t, b.Health(context.Background()), "docker ok + store open → healthy")

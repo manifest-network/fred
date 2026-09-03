@@ -17,34 +17,105 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/util"
+)
+
+const (
+	callbackSettlementClaimPollInterval = 25 * time.Millisecond
+	callbackSettlementClaimMaxWait      = 30 * time.Second
 )
 
 // HandlerDeps contains the dependencies needed by the handler set.
 type HandlerDeps struct {
-	ChainClient   ChainClient
-	Orchestrator  *ProvisionOrchestrator
-	Tracker       InFlightTracker
-	Acknowledger  Acknowledger
-	PayloadStore  *payload.Store
-	Publisher     message.Publisher // For publishing to TopicLeaseEvent (optional)
-	BackendRouter BackendRouter     // Used to allowlist backend names on non-in-flight callback metrics
+	ChainClient     ChainClient
+	Orchestrator    EventProvisioner
+	EventOperations EventOperations
+	PayloadStore    HandlerPayloadStore
+	Publisher       message.Publisher // For publishing to TopicLeaseEvent (optional)
+	Callbacks       CallbackApplication
 }
 
-// HandlerSet contains the Watermill message handlers for the provisioner.
-// It encapsulates all handler methods and their dependencies.
+// EventProvisioner is the application capability consumed by event adapters.
+// Handlers can request provision/deprovision workflows, but cannot reach the
+// orchestrator's placement, routing, or operation-registry dependencies.
+type EventProvisioner interface {
+	StartProvisioningClaimed(
+		context.Context,
+		operation.LeaseClaim,
+		*billingtypes.Lease,
+		ProvisionOpts,
+	) error
+	Deprovision(context.Context, string) error
+}
+
+// HandlerPayloadStore is the lease-payload surface needed by message handlers.
+// Hash verification remains a pure payload-package function; persistence and
+// lifecycle coordination stay behind separate ports.
+type HandlerPayloadStore interface {
+	Get(string) ([]byte, error)
+	Has(string) (bool, error)
+	Delete(string)
+}
+
+// EventOperations is the exact lifecycle capability needed by lease and
+// payload event adapters. It can fence one lease while chain state is re-read,
+// but cannot inspect, start, or settle an operation.
+type EventOperations interface {
+	TryClaimLeaseNow(string) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
+	Contains(string) bool
+}
+
+// HandlerSet contains message adapters for the provisioner. Chain and payload
+// adapters are registered with Watermill; Manager invokes the callback adapter
+// synchronously to preserve backend outbox ordering.
 type HandlerSet struct {
 	deps            HandlerDeps
+	provisioner     EventProvisioner
+	payloads        HandlerPayloadStore
+	callbacks       CallbackApplication
+	eventOperations EventOperations
 	awaitingMu      sync.Mutex
 	awaitingPayload map[string]struct{} // tracks lease UUIDs awaiting payload for gauge accuracy
 }
 
 // NewHandlerSet creates a new HandlerSet with the given dependencies.
 func NewHandlerSet(deps HandlerDeps) *HandlerSet {
-	return &HandlerSet{
+	provisioner := deps.Orchestrator
+	if util.IsNilInterface(provisioner) {
+		provisioner = nil
+	}
+	payloads := deps.PayloadStore
+	if util.IsNilInterface(payloads) {
+		payloads = nil
+	}
+	eventOperations := deps.EventOperations
+	if util.IsNilInterface(eventOperations) {
+		eventOperations = nil
+	}
+	callbacks := deps.Callbacks
+	if util.IsNilInterface(callbacks) {
+		callbacks = nil
+	}
+	// The ports are retained in dedicated narrow fields, not duplicated in the
+	// handler dependency bag. Normalizing typed nils here keeps optional payload
+	// storage safe after changing the dependency from a concrete pointer to an
+	// interface.
+	deps.Orchestrator = nil
+	deps.PayloadStore = nil
+	deps.EventOperations = nil
+	deps.Callbacks = nil
+	handler := &HandlerSet{
 		deps:            deps,
+		provisioner:     provisioner,
+		payloads:        payloads,
+		callbacks:       callbacks,
+		eventOperations: eventOperations,
 		awaitingPayload: make(map[string]struct{}),
 	}
+	return handler
 }
 
 // rejectOnValidationError rejects a lease on chain after a validation error.
@@ -76,8 +147,15 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	if !ok {
 		return nil
 	}
+	claim, proceed, err := h.claimEventLease(event.LeaseUUID)
+	if err != nil || !proceed {
+		return err
+	}
+	defer h.releaseEventLease(claim, event.LeaseUUID)
 
-	// Fetch lease details from chain to get SKU for routing
+	// Re-read chain state while the exact lifecycle claim excludes close and
+	// reconciliation. Delayed create events must never dispatch from an older
+	// PENDING observation after the lease has become terminal.
 	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)
 	if err != nil {
 		slog.Error("failed to fetch lease details",
@@ -90,6 +168,13 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 		slog.Warn("lease not found, skipping",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
+		)
+		return nil
+	}
+	if lease.State != billingtypes.LEASE_STATE_PENDING {
+		slog.Info("ignoring delayed create event for non-pending lease",
+			"lease_uuid", event.LeaseUUID,
+			"state", lease.State.String(),
 		)
 		return nil
 	}
@@ -110,7 +195,7 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	}
 
 	// Start provisioning without payload
-	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{})
+	err = h.provisioner.StartProvisioningClaimed(msg.Context(), claim, lease, ProvisionOpts{})
 	if err != nil {
 		if errors.Is(err, backend.ErrValidation) {
 			return h.rejectOnValidationError(msg.Context(), lease, err)
@@ -118,7 +203,6 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 		return err
 	}
 
-	h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusProvisioning, "")
 	return nil
 }
 
@@ -154,14 +238,14 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 	// This handles the case where a tenant uploaded a payload but canceled the lease
 	// before provisioning started, or any other scenario where payload exists but
 	// the lease is no longer valid.
-	if h.deps.PayloadStore != nil {
-		if exists, err := h.deps.PayloadStore.Has(event.LeaseUUID); err != nil {
+	if h.payloads != nil {
+		if exists, err := h.payloads.Has(event.LeaseUUID); err != nil {
 			slog.Warn("failed to check payload store during lease close",
 				"lease_uuid", event.LeaseUUID,
 				"error", err,
 			)
 		} else if exists {
-			h.deps.PayloadStore.Delete(event.LeaseUUID)
+			h.payloads.Delete(event.LeaseUUID)
 			slog.Info("cleaned up stored payload for closed lease",
 				"lease_uuid", event.LeaseUUID,
 				"tenant", event.Tenant,
@@ -177,225 +261,32 @@ func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error
 	// retention status (GET /status, GET /provision).
 
 	// Delegate to orchestrator for deprovisioning
-	return h.deps.Orchestrator.Deprovision(msg.Context(), event.LeaseUUID)
+	return h.provisioner.Deprovision(msg.Context(), event.LeaseUUID)
 }
 
-// HandleBackendCallback processes callbacks from backends.
-func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
+// HandleBackendCallbackPayload is the synchronous, typed transport adapter
+// used by Manager. It returns only after CallbackService reaches a terminal
+// application result, preserving the backend's per-lease delivery order.
+func (h *HandlerSet) HandleBackendCallbackPayload(
+	ctx context.Context,
+	callback backend.CallbackPayload,
+) (err error) {
 	defer func() { recordWatermillMetrics(TopicBackendCallback, err) }()
+	return h.handleBackendCallbackPayload(ctx, callback)
+}
 
-	callback, ok := unmarshalMessagePayload[backend.CallbackPayload](msg, TopicBackendCallback)
-	if !ok {
-		return nil
+func (h *HandlerSet) handleBackendCallbackPayload(
+	ctx context.Context,
+	callback backend.CallbackPayload,
+) error {
+	command, err := NewCallbackCommand(callback)
+	if err != nil {
+		return fmt.Errorf("decode backend callback operation identity: %w", err)
 	}
-
-	// Check if this lease is in-flight (idempotency check).
-	// Non-in-flight callbacks are expected for restart/update operations, which
-	// don't register in the in-flight tracker (the lease is already ACTIVE).
-	// For these, we still publish the status event so WebSocket clients see
-	// the ready/failed transition, but skip chain operations.
-	provision, exists := h.deps.Tracker.GetInFlight(callback.LeaseUUID)
-	if !exists {
-		backendLabel := h.sanitizeBackendName(callback.Backend)
-		statusLabel := sanitizeCallbackStatus(callback.Status)
-		if backendLabel == labelBackendInvalid || statusLabel == labelStatusOther {
-			slog.Warn("sanitized callback label to bounded value",
-				"lease_uuid", callback.LeaseUUID,
-				"received_backend", callback.Backend,
-				"received_status", callback.Status,
-			)
-		}
-		metrics.NonInFlightCallbacksTotal.WithLabelValues(backendLabel, statusLabel).Inc()
-
-		switch callback.Status {
-		case backend.CallbackStatusSuccess:
-			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
-		case backend.CallbackStatusFailed:
-			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, callback.Error)
-		case backend.CallbackStatusDeprovisioned:
-			// No chain action: the backend tore down a lease that was not
-			// in-flight here. Chain state is unchanged. ENG-329: if the backend
-			// reports it actually retained the data, emit the retained notice on
-			// observed ground truth (best-effort/fire-and-forget — the queryable
-			// retention status is the durable backstop, so there is no marker or
-			// reaper here). A non-retain deprovision emits nothing.
-			if callback.Retained {
-				h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusRetained,
-					"your lease data was retained and can be restored within the grace window: create a fresh PENDING lease of matching shape, then POST /v1/leases/{new_lease_uuid}/restore with from_lease_uuid set to this lease's UUID")
-			}
-		default:
-			slog.Warn("unexpected callback status for non-in-flight lease",
-				"lease_uuid", callback.LeaseUUID,
-				"status", callback.Status,
-			)
-			return nil
-		}
-		slog.Info("published event for non-in-flight callback (restart/update)",
-			"lease_uuid", callback.LeaseUUID,
-			"status", callback.Status,
-		)
-		return nil
+	if h.callbacks == nil {
+		return errCallbackOperationsUnavailable
 	}
-
-	slog.Info("processing backend callback",
-		"lease_uuid", callback.LeaseUUID,
-		"tenant", provision.Tenant,
-		"status", callback.Status,
-		"backend", provision.Backend,
-	)
-
-	// Record provisioning duration if we have the start time. The operation label
-	// (provision|restore) keeps restore latency separable from fresh provisions (ENG-358).
-	operation := provision.Kind.operationLabel()
-	recordDuration := func() {
-		if !provision.StartTime.IsZero() {
-			duration := time.Since(provision.StartTime).Seconds()
-			metrics.ProvisioningDuration.WithLabelValues(provision.Backend, operation).Observe(duration)
-		}
-	}
-
-	switch callback.Status {
-	case backend.CallbackStatusSuccess:
-		// Acknowledge the lease on chain via batcher to avoid sequence mismatch errors
-		acknowledged, txHash, err := h.deps.Acknowledger.Acknowledge(msg.Context(), callback.LeaseUUID)
-		if err != nil {
-			// Check if this is a terminal error (e.g., lease already acknowledged)
-			if isTerminalAcknowledgeError(err) {
-				// Lease is already in a non-PENDING state (likely already ACTIVE).
-				// This can happen if we received a duplicate callback or the reconciler
-				// already acknowledged it. Treat as success - the lease is active.
-				h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
-				recordDuration()
-				metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend, operation).Inc()
-				h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
-				slog.Info("lease already acknowledged, skipping",
-					"lease_uuid", callback.LeaseUUID,
-					"tenant", provision.Tenant,
-				)
-				return nil
-			}
-
-			slog.Error("failed to acknowledge lease",
-				"lease_uuid", callback.LeaseUUID,
-				"tenant", provision.Tenant,
-				"error", err,
-			)
-			// Keep in-flight tracking for retry - Watermill will retry this message
-			return fmt.Errorf("%w: lease %s: %w", ErrAcknowledgeFailed, callback.LeaseUUID, err)
-		}
-
-		// Only remove from in-flight after successful acknowledgment
-		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
-		recordDuration()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeSuccess, provision.Backend, operation).Inc()
-
-		// Payload is intentionally NOT deleted here. The lease is now ACTIVE
-		// but the container could crash later, requiring re-provisioning with
-		// the same manifest. Payload cleanup happens when the lease is closed
-		// (HandleLeaseClosed) or when the PENDING-failure path below rejects
-		// the lease and deletes the payload. ACTIVE re-provision failures
-		// also keep the payload — the reconciler may retry from it.
-
-		h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusReady, "")
-
-		slog.Info("lease acknowledged after provisioning",
-			"lease_uuid", callback.LeaseUUID,
-			"tenant", provision.Tenant,
-			"operation", operation,
-			"acknowledged", acknowledged,
-			"tx_hash", txHash,
-		)
-
-	case backend.CallbackStatusFailed:
-		reason := callback.Error
-		if reason == "" {
-			reason = "provisioning failed"
-		}
-
-		// Check if this is a re-provision of an ACTIVE lease. Rejecting only
-		// applies to PENDING leases. For ACTIVE leases, just untrack and let
-		// the reconciler handle it (it will retry or reject based on FailCount).
-		lease, err := h.deps.ChainClient.GetLease(msg.Context(), callback.LeaseUUID)
-		if err != nil {
-			slog.Error("failed to fetch lease state for failure callback, keeping in-flight",
-				"lease_uuid", callback.LeaseUUID,
-				"error", err,
-			)
-			return fmt.Errorf("failed to fetch lease %s: %w", callback.LeaseUUID, err)
-		}
-		if lease != nil && lease.State == billingtypes.LEASE_STATE_ACTIVE {
-			// Lease is ACTIVE — this was a re-provision attempt. Untrack and
-			// let the reconciler detect the still-failed backend state.
-			h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
-			recordDuration()
-			metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend, operation).Inc()
-
-			h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, reason)
-
-			slog.Warn("re-provision failed for active lease, deferring to reconciler",
-				"lease_uuid", callback.LeaseUUID,
-				"tenant", provision.Tenant,
-				"reason", reason,
-			)
-			return nil
-		}
-
-		// PENDING lease — reject on chain FIRST, before untracking.
-		// This prevents a race where the reconciler sees a PENDING lease that's
-		// not in-flight and tries to provision it again.
-		rejected, txHashes, err := h.deps.ChainClient.RejectLeases(msg.Context(), []string{callback.LeaseUUID}, truncateRejectReason(reason))
-		if err != nil {
-			// Keep in-flight so reconciler doesn't try to re-provision.
-			// The timeout checker or next reconciliation will retry.
-			slog.Error("failed to reject lease after provisioning failure, keeping in-flight",
-				"lease_uuid", callback.LeaseUUID,
-				"tenant", provision.Tenant,
-				"error", err,
-			)
-			// Return error to trigger Watermill retry
-			return fmt.Errorf("failed to reject lease %s: %w", callback.LeaseUUID, err)
-		}
-
-		// Only untrack AFTER successful rejection
-		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
-		recordDuration()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeFailed, provision.Backend, operation).Inc()
-
-		// Clean up payload and placement after successful rejection.
-		// Placement was recorded when the backend accepted the provision
-		// request, but rejected leases don't emit a close event, so
-		// Deprovision (which normally cleans up placement) is never called.
-		if h.deps.PayloadStore != nil {
-			h.deps.PayloadStore.Delete(callback.LeaseUUID)
-		}
-		h.deps.Orchestrator.DeletePlacement(callback.LeaseUUID)
-
-		h.publishLeaseEvent(callback.LeaseUUID, backend.ProvisionStatusFailed, reason)
-
-		slog.Info("lease rejected after provisioning failure",
-			"lease_uuid", callback.LeaseUUID,
-			"tenant", provision.Tenant,
-			"rejected", rejected,
-			"tx_hashes", txHashes,
-			"reason", reason,
-		)
-
-	default:
-		// Unknown status is treated as terminal to prevent leases from being stuck
-		// in the in-flight map indefinitely. The reconciler will pick up the lease
-		// and handle it based on its actual chain/backend state.
-		h.deps.Tracker.UntrackInFlight(callback.LeaseUUID)
-		recordDuration()
-		metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, provision.Backend, operation).Inc()
-
-		slog.Warn("unknown callback status, treating as terminal",
-			"lease_uuid", callback.LeaseUUID,
-			"tenant", provision.Tenant,
-			"status", callback.Status,
-		)
-	}
-
-	return nil
+	return h.callbacks.HandleCallback(ctx, command)
 }
 
 // HandlePayloadReceived processes payload upload events.
@@ -406,7 +297,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	// Guard against nil payloadStore - this shouldn't happen in normal operation
 	// since payload events are only published after successful storage, but
 	// handle it gracefully for robustness.
-	if h.deps.PayloadStore == nil {
+	if h.payloads == nil {
 		slog.Error("payload store not configured, cannot process payload event")
 		return nil // Don't retry - configuration issue
 	}
@@ -427,8 +318,18 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	metrics.LeasesAwaitingPayload.Set(float64(len(h.awaitingPayload)))
 	h.awaitingMu.Unlock()
 
-	// Fetch lease details from chain to get SKU for routing
-	lease, err := h.deps.ChainClient.GetLease(msg.Context(), event.LeaseUUID)
+	claim, proceed, err := h.claimEventLease(event.LeaseUUID)
+	if err != nil || !proceed {
+		return err
+	}
+	defer h.releaseEventLease(claim, event.LeaseUUID)
+
+	// Fetch lease details from chain to get SKU for routing. The subscriber's
+	// context may live for the whole process, so bound this point read: a stalled
+	// RPC must release the lease claim and let Watermill retry.
+	leaseCtx, cancelLease := context.WithTimeout(msg.Context(), chainConfirmTimeout)
+	lease, err := h.deps.ChainClient.GetLease(leaseCtx, event.LeaseUUID)
+	cancelLease()
 	if err != nil {
 		slog.Error("failed to fetch lease details",
 			"lease_uuid", event.LeaseUUID,
@@ -436,25 +337,38 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		)
 		return fmt.Errorf("failed to fetch lease %s: %w", event.LeaseUUID, err)
 	}
-	if lease == nil {
-		slog.Warn("lease not found, cleaning up payload",
+	liveness, reason := classifyLease(lease, nil)
+	switch liveness {
+	case leaseTerminal:
+		slog.Info("payload event observed terminal lease; deleting payload",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
+			"state", leaseState(lease),
 		)
-		h.deps.PayloadStore.Delete(event.LeaseUUID)
+		h.payloads.Delete(event.LeaseUUID)
 		return nil
-	}
-
-	// Verify lease is still pending
-	if lease.State != billingtypes.LEASE_STATE_PENDING {
-		slog.Warn("lease is no longer pending, skipping provisioning",
+	case leaseUnknown:
+		// Absence and unknown/future states are not terminal evidence. A lagging or
+		// reset RPC node must never delete the only manifest needed to provision or
+		// recover a live lease.
+		slog.Warn("payload event cannot confirm lease state; preserving payload for retry",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
-			"state", lease.State.String(),
+			"state", leaseState(lease),
+			"reason", reason,
 		)
-		// Clean up the stored payload
-		h.deps.PayloadStore.Delete(event.LeaseUUID)
-		return nil
+		return fmt.Errorf("cannot confirm payload lease %s state", event.LeaseUUID)
+	case leaseLive:
+		if lease.State == billingtypes.LEASE_STATE_ACTIVE {
+			// A delayed duplicate payload event can arrive after a successful callback.
+			// ACTIVE leases intentionally retain their manifest for crash recovery and
+			// reprovision, so acknowledge the duplicate without touching the payload.
+			slog.Debug("payload event arrived after lease became active; preserving payload",
+				"lease_uuid", event.LeaseUUID,
+				"tenant", event.Tenant,
+			)
+			return nil
+		}
 	}
 
 	// Get the payload from the store WITHOUT removing it yet.
@@ -464,7 +378,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 	// keep the payload so a subsequent re-provision can reuse the same
 	// manifest. This also ensures the payload remains available for retry
 	// if the backend fails or crashes before sending a callback.
-	payloadData, err := h.deps.PayloadStore.Get(event.LeaseUUID)
+	payloadData, err := h.payloads.Get(event.LeaseUUID)
 	if err != nil {
 		slog.Error("failed to read payload from store",
 			"lease_uuid", event.LeaseUUID,
@@ -473,12 +387,18 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		return fmt.Errorf("payload store read error: %w", err)
 	}
 	if payloadData == nil {
-		// This shouldn't happen in normal operation since payload is stored
-		// before publishing the event, but handle it gracefully
-		slog.Warn("payload not found in store, proceeding without payload",
+		// The event may outlive or race the durable payload write. Retrying is
+		// safe; dispatching without bytes is not, because the chain still names a
+		// payload-bearing request and no exact fingerprint could be persisted.
+		h.awaitingMu.Lock()
+		h.awaitingPayload[event.LeaseUUID] = struct{}{}
+		metrics.LeasesAwaitingPayload.Set(float64(len(h.awaitingPayload)))
+		h.awaitingMu.Unlock()
+		slog.Warn("payload not found in store, deferring payload event",
 			"lease_uuid", event.LeaseUUID,
 			"tenant", event.Tenant,
 		)
+		return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, event.LeaseUUID)
 	} else if event.MetaHashHex != "" {
 		// Re-verify payload hash before provisioning to catch any corruption.
 		// The payload was validated on upload, but disk corruption could occur.
@@ -498,33 +418,65 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 				return fmt.Errorf("failed to reject lease %s after payload corruption: %w",
 					event.LeaseUUID, rejectErr)
 			}
-			h.deps.PayloadStore.Delete(event.LeaseUUID)
+			h.payloads.Delete(event.LeaseUUID)
 			h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusFailed, rejectReasonPayloadCorrupted)
 			return nil
 		}
 	}
 
 	// Start provisioning with payload
-	err = h.deps.Orchestrator.StartProvisioning(msg.Context(), lease, ProvisionOpts{
+	err = h.provisioner.StartProvisioningClaimed(msg.Context(), claim, lease, ProvisionOpts{
 		Payload:     payloadData,
 		PayloadHash: event.MetaHashHex,
 	})
 	if err != nil {
 		if errors.Is(err, backend.ErrValidation) {
-			h.deps.PayloadStore.Delete(event.LeaseUUID)
+			h.payloads.Delete(event.LeaseUUID)
 			return h.rejectOnValidationError(msg.Context(), lease, err)
 		}
 		return err
 	}
 
-	h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusProvisioning, "")
 	return nil
+}
+
+func (h *HandlerSet) claimEventLease(leaseUUID string) (operation.LeaseClaim, bool, error) {
+	if h.eventOperations == nil {
+		return operation.LeaseClaim{}, false, errors.New("event lifecycle operation registry is unavailable")
+	}
+	result := h.eventOperations.TryClaimLeaseNow(leaseUUID)
+	if result.Acquired() {
+		return result.Claim(), true, nil
+	}
+	if h.eventOperations.Contains(leaseUUID) {
+		// A duplicate create/payload delivery for the current operation is
+		// idempotent. There is no stale read to retry.
+		return operation.LeaseClaim{}, false, nil
+	}
+	return operation.LeaseClaim{}, false, fmt.Errorf(
+		"lease %s lifecycle claim is busy; retry event", leaseUUID,
+	)
+}
+
+func (h *HandlerSet) releaseEventLease(claim operation.LeaseClaim, leaseUUID string) {
+	if !h.eventOperations.ReleaseLease(claim) {
+		slog.Error("failed to release exact event lifecycle claim", "lease_uuid", leaseUUID)
+	}
 }
 
 // publishLeaseEvent publishes a LeaseStatusEvent to TopicLeaseEvent for real-time delivery.
 // Best-effort: errors are logged but do not affect the handler's return value.
 func (h *HandlerSet) publishLeaseEvent(leaseUUID string, status backend.ProvisionStatus, errMsg string) {
-	if h.deps.Publisher == nil {
+	publishLeaseStatusEvent(h.deps.Publisher, leaseUUID, status, errMsg)
+}
+
+func publishLeaseStatusEvent(
+	publisher message.Publisher,
+	leaseUUID string,
+	status backend.ProvisionStatus,
+	errMsg string,
+) {
+	if publisher == nil {
 		return
 	}
 
@@ -542,7 +494,7 @@ func (h *HandlerSet) publishLeaseEvent(leaseUUID string, status backend.Provisio
 	}
 
 	msg := message.NewMessage(watermill.NewUUID(), data)
-	if err := h.deps.Publisher.Publish(TopicLeaseEvent, msg); err != nil {
+	if err := publisher.Publish(TopicLeaseEvent, msg); err != nil {
 		slog.Warn("failed to publish lease event", "lease_uuid", leaseUUID, "error", err)
 	}
 }
@@ -551,30 +503,4 @@ func (h *HandlerSet) publishLeaseEvent(leaseUUID string, status backend.Provisio
 const (
 	labelBackendUnknown = "unknown"
 	labelBackendInvalid = "invalid"
-	labelStatusOther    = "other"
 )
-
-// Keep in sync with CallbackStatus* constants in internal/backend/client.go.
-func sanitizeCallbackStatus(s backend.CallbackStatus) string {
-	switch s {
-	case backend.CallbackStatusSuccess, backend.CallbackStatusFailed, backend.CallbackStatusDeprovisioned:
-		return string(s)
-	default:
-		return labelStatusOther
-	}
-}
-
-// sanitizeBackendName bounds Prometheus label cardinality by collapsing any
-// name outside the configured router's allowlist to "invalid". Empty values
-// (pre-upgrade backends that don't populate CallbackPayload.Backend) map to
-// "unknown". Returning the raw name was insufficient: a misbehaving sender
-// could emit arbitrarily many distinct regex-valid values.
-func (h *HandlerSet) sanitizeBackendName(name string) string {
-	if name == "" {
-		return labelBackendUnknown
-	}
-	if h.deps.BackendRouter == nil || h.deps.BackendRouter.GetBackendByName(name) == nil {
-		return labelBackendInvalid
-	}
-	return name
-}

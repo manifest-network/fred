@@ -19,6 +19,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/manifest-network/manifest-ledger v0.0.1
 	github.com/moby/moby/client v0.5.0
+	github.com/moby/sys/mountinfo v0.7.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/qmuntal/stateless v1.8.0
@@ -34,6 +35,7 @@ require (
 	golang.org/x/time v0.15.0
 	google.golang.org/grpc v1.82.1
 	gopkg.in/yaml.v3 v3.0.1
+	k8s.io/apimachinery v0.36.0
 	k8s.io/client-go v0.36.0
 )
 
@@ -331,7 +333,6 @@ require (
 	gopkg.in/ini.v1 v1.67.3 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 	k8s.io/api v0.36.0 // indirect
-	k8s.io/apimachinery v0.36.0 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260319004828-5883c5ee87b9 // indirect
 	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5 // indirect

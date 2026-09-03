@@ -146,11 +146,10 @@ type AckBatcher struct {
 	// started is raised by Start before the lanes spawn. Until then nothing
 	// drains lane.requests, so an Acknowledge would land in the buffered
 	// channel and then block on a resultCh no one will ever write — an
-	// unbounded hang on the caller's goroutine, which for the backend-callback
-	// path is a Watermill handler. Manager.Start launches the batcher before
-	// those handlers exist, so this is a guard for the day that ordering
-	// breaks: fail the same retryable way a restarting lane does and let
-	// Watermill redeliver, rather than wedge a handler forever.
+	// unbounded hang on the caller's goroutine. Manager.Start launches the
+	// batcher before opening callback admission, so this is a guard for the day
+	// that ordering breaks: fail the same retryable way a restarting lane does
+	// and let the backend's durable outbox retry rather than wedge HTTP ingress.
 	started atomic.Bool
 }
 

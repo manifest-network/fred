@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,14 +17,39 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 const (
-	testUUID1 = "01234567-89ab-cdef-0123-456789abcdef"
-	testUUID2 = "abcdef01-2345-6789-abcd-ef0123456789"
-	testUUID3 = "12345678-1234-1234-1234-123456789abc"
+	testUUID1         = "01234567-89ab-cdef-0123-456789abcdef"
+	testUUID2         = "abcdef01-2345-6789-abcd-ef0123456789"
+	testUUID3         = "12345678-1234-1234-1234-123456789abc"
+	testStorageID     = "6ba7b811-9dad-41d1-80b4-00c04fd430c8"
+	testBackendSecret = "test-secret-that-is-at-least-32-chars!"
 )
+
+func mustTestStorageID(t testing.TB) backendidentity.ID {
+	t.Helper()
+	id, err := backendidentity.Parse(testStorageID)
+	require.NoError(t, err)
+	return id
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+func signedTestRequest(method, target string, body []byte) *http.Request {
+	request := httptest.NewRequest(method, target, bytes.NewReader(body))
+	request.Header.Set(
+		hmacauth.SignatureHeader,
+		hmacauth.SignRequest(testBackendSecret, request, body),
+	)
+	return request
+}
 
 // newTestServer wires a real MockBackend behind a MockBackendServer for handler
 // testing. Provisions are seeded via the backend's Provision API so they live in
@@ -36,9 +65,228 @@ func newTestServer(t *testing.T, leases []string) *MockBackendServer {
 		}))
 	}
 	return &MockBackendServer{
-		backend:      mb,
-		callbackURLs: make(map[string]string),
+		backend:        mb,
+		callbackSecret: testBackendSecret,
+		name:           "mock",
+		storageID:      mustTestStorageID(t),
+		callbackURLs:   make(map[string]string),
 	}
+}
+
+func TestMockBackend_HandlerBindsResponsesAndSideEffectsToStorageIdentity(t *testing.T) {
+	srv := newTestServer(t, nil)
+	handler := srv.Handler()
+
+	health := httptest.NewRecorder()
+	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))
+	require.Equal(t, http.StatusOK, health.Code)
+	assert.Equal(t, testStorageID, health.Header().Get(backendidentity.ResponseHeader))
+
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	body := []byte(`{"lease_uuid":"` + leaseUUID + `","tenant":"tenant","provider_uuid":"provider","items":[{"sku":"test","quantity":1}],"callback_url":"http://fred.local/callbacks/provision"}`)
+	boundPath, err := backendidentity.BoundPath(srv.storageID, "/provision")
+	require.NoError(t, err)
+	boundPath += "?" + backendidentity.QueryParameter + "=" + testStorageID
+
+	accepted := httptest.NewRecorder()
+	handler.ServeHTTP(accepted, signedTestRequest(http.MethodPost, boundPath, body))
+	require.Equal(t, http.StatusAccepted, accepted.Code, accepted.Body.String())
+	assert.Equal(t, testStorageID, accepted.Header().Get(backendidentity.ResponseHeader))
+	_, err = srv.backend.GetProvision(context.Background(), leaseUUID)
+	require.NoError(t, err)
+
+	const rejectedLease = "86cda7d7-ec70-4377-8a69-12a4a5ef4f46"
+	rejectedBody := bytes.ReplaceAll(body, []byte(leaseUUID), []byte(rejectedLease))
+	wrongPath := "/_fred/storage/550e8400-e29b-41d4-a716-446655440000/provision"
+	rejected := httptest.NewRecorder()
+	handler.ServeHTTP(rejected, signedTestRequest(http.MethodPost, wrongPath, rejectedBody))
+	require.Equal(t, http.StatusNotFound, rejected.Code)
+	_, err = srv.backend.GetProvision(context.Background(), rejectedLease)
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
+func TestMockBackend_HandlerRejectsMismatchedExpectedIdentityBeforeHandler(t *testing.T) {
+	srv := newTestServer(t, nil)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet,
+		"/health?"+backendidentity.QueryParameter+"=550e8400-e29b-41d4-a716-446655440000", nil)
+
+	srv.Handler().ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusConflict, recorder.Code)
+	assert.Equal(t, testStorageID, recorder.Header().Get(backendidentity.ResponseHeader))
+}
+
+func TestMockBackend_HandlerAuthenticatesContractRoutesAndKeepsOperationalRoutesPublic(t *testing.T) {
+	srv := newTestServer(t, nil)
+	handler := srv.Handler()
+	boundProvision, err := backendidentity.BoundPath(srv.storageID, "/provision")
+	require.NoError(t, err)
+	boundDeprovision, err := backendidentity.BoundPath(srv.storageID, "/deprovision")
+	require.NoError(t, err)
+
+	for _, route := range []struct {
+		method string
+		target string
+	}{
+		{http.MethodPost, "/provision"},
+		{http.MethodPost, "/deprovision"},
+		{http.MethodGet, "/info/" + testUUID1},
+		{http.MethodGet, "/logs/" + testUUID1},
+		{http.MethodGet, "/provisions"},
+		{http.MethodGet, "/provisions/" + testUUID1},
+		{http.MethodGet, "/retentions"},
+		{http.MethodPost, boundProvision},
+		{http.MethodPost, boundDeprovision},
+	} {
+		t.Run(route.method+" "+route.target, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(route.method, route.target, nil))
+
+			assert.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+			assert.JSONEq(t, `{"error":"missing signature"}`, response.Body.String())
+		})
+	}
+
+	for _, target := range []string{"/health", "/stats"} {
+		t.Run("public "+target, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+
+			assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		})
+	}
+
+	t.Run("valid signed inventory request", func(t *testing.T) {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, signedTestRequest(http.MethodGet, "/provisions", nil))
+
+		assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	})
+}
+
+func TestMockBackend_HandlerRejectsUnsignedMutationWithoutSideEffect(t *testing.T) {
+	srv := newTestServer(t, nil)
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	body := []byte(`{"lease_uuid":"` + leaseUUID + `","tenant":"tenant","provider_uuid":"provider","items":[{"sku":"test","quantity":1}],"callback_url":"http://fred.local/callbacks/provision"}`)
+
+	response := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/provision", bytes.NewReader(body)))
+
+	require.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+	_, err := srv.backend.GetProvision(context.Background(), leaseUUID)
+	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
+}
+
+func TestMockBackend_HandlerCapsAuthenticatedRequestBodies(t *testing.T) {
+	srv := newTestServer(t, nil)
+	body := bytes.Repeat([]byte{'x'}, int(mockBackendMaxRequestBodySize)+1)
+	request := httptest.NewRequest(http.MethodPost, "/provision", bytes.NewReader(body))
+	request.Header.Set(hmacauth.SignatureHeader, "present-but-invalid")
+	response := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, response.Code, response.Body.String())
+}
+
+func TestMockBackendAddrDefaultsToLoopback(t *testing.T) {
+	t.Setenv("MOCK_BACKEND_ADDR", "")
+	assert.Equal(t, "127.0.0.1:9000", mockBackendAddr())
+
+	t.Setenv("MOCK_BACKEND_ADDR", "[::1]:9001")
+	assert.Equal(t, "[::1]:9001", mockBackendAddr())
+}
+
+func TestMockBackend_ProvisionRejectsUnusableCallbackAuthority(t *testing.T) {
+	t.Parallel()
+
+	for _, callbackURL := range []string{
+		"https://:443/callbacks/provision",
+		"https://./callbacks/provision",
+		"https://fred.example:/callbacks/provision",
+		"https://fred.example:0/callbacks/provision",
+		"https://fred.example:65536/callbacks/provision",
+		"https://user@fred.example/callbacks/provision",
+		"https://fred.example/callbacks/provision#",
+		"https://fred.example/callbacks/provision?",
+		"https://fred.example/api/../callbacks/provision",
+		"https://fred.example/api%2Fcallback",
+		"https://fred.example/callbacks/provision?trace=a b",
+	} {
+		t.Run(callbackURL, func(t *testing.T) {
+			t.Parallel()
+			srv := newTestServer(t, nil)
+			body, err := json.Marshal(backend.ProvisionRequest{
+				LeaseUUID:    testUUID1,
+				Tenant:       "tenant",
+				ProviderUUID: "provider",
+				Items:        []backend.LeaseItem{{SKU: "test", Quantity: 1}},
+				CallbackURL:  callbackURL,
+			})
+			require.NoError(t, err)
+			boundPath, err := backendidentity.BoundPath(srv.storageID, "/provision")
+			require.NoError(t, err)
+			boundPath += "?" + backendidentity.QueryParameter + "=" + testStorageID
+
+			response := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(response, signedTestRequest(http.MethodPost, boundPath, body))
+
+			assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+		})
+	}
+}
+
+func TestMockBackend_CallbackCapabilityNeverEntersLogs(t *testing.T) {
+	const capability = "550e8400-e29b-41d4-a716-446655440000"
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + capability
+
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	srv := &MockBackendServer{
+		name:      "mock",
+		storageID: mustTestStorageID(t),
+		httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("transport failed for %s", request.URL.String())
+		})},
+	}
+	srv.sendCallback(callbackURL, backend.CallbackPayload{
+		LeaseUUID: testUUID1,
+		Status:    backend.CallbackStatusFailed,
+	})
+
+	assert.NotContains(t, output.String(), capability)
+	assert.NotContains(t, output.String(), callbackURL)
+}
+
+func TestMockBackend_CallbackIncludesStorageIdentity(t *testing.T) {
+	var received backend.CallbackPayload
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		defer request.Body.Close()
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&received))
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Body:       io.NopCloser(bytes.NewReader(nil)),
+			Header:     make(http.Header),
+			Request:    request,
+		}, nil
+	})}
+
+	srv := newTestServer(t, nil)
+	srv.httpClient = client
+	srv.callbackSecret = testBackendSecret
+	srv.callbackURLs[testUUID1] = "http://fred.local/callbacks/provision"
+
+	srv.handleCallback(backend.CallbackPayload{
+		LeaseUUID: testUUID1,
+		Status:    backend.CallbackStatusSuccess,
+	})
+
+	assert.Equal(t, testStorageID, received.BackendStorageID)
+	assert.Equal(t, "mock", received.Backend)
 }
 
 func TestMockBackend_HandleListProvisions_Filtered_OK(t *testing.T) {
@@ -260,7 +508,7 @@ func TestMockBackend_HandleStats_ErrorIs500(t *testing.T) {
 // This test is the safety net that locks the two implementations to
 // the same canonical string.
 func TestComputeSignature_VerifiesAgainstHmacauth(t *testing.T) {
-	const secret = "test-secret-that-is-at-least-32-chars!"
+	const secret = testBackendSecret
 	srv := &MockBackendServer{callbackSecret: secret}
 
 	cases := []struct {

@@ -205,6 +205,17 @@ func (b *Backend) snapshotVolumeClaims() (*volumeClaims, error) {
 // volume name, so answering "does any record claim this name?" needs the whole-store read
 // the op already paid for once. The record transitions that would matter (a restore
 // claiming a name mid-sweep) are CAS'd in bbolt and are a different shape from this race.
+func leaseUUIDFromVolumeName(name string) (string, bool) {
+	if isRetainedVolume(name) {
+		return "", false
+	}
+	managedName, err := parseManagedVolumeName(name)
+	if err != nil {
+		return "", false
+	}
+	return managedVolumeLeaseUUID(managedName), true
+}
+
 func (b *Backend) liveClaim(name string) (volumeClaim, bool) {
 	leaseUUID, ok := leaseUUIDFromVolumeName(name)
 	if !ok {
@@ -434,7 +445,7 @@ func (o *volumeOp) destroyOne(ctx context.Context, sink volumeDestroyer, name st
 		// the stripe would only block an unrelated volume's create for the length of
 		// this RemoveAll, and this is the bulk path (evictOldest can pass 32 records'
 		// worth of retained names through a single close).
-		return volumeClaim{}, false, sink.Destroy(ctx, name)
+		return volumeClaim{}, false, o.b.mutationAdapter().destroyVolume(ctx, sink, name)
 	}
 	mu := o.b.volumeNameMu(name)
 	mu.Lock()
@@ -442,7 +453,7 @@ func (o *volumeOp) destroyOne(ctx context.Context, sink volumeDestroyer, name st
 	if claim, claimed := o.b.liveClaim(name); claimed && !claimPermits(claim, o.owner) {
 		return claim, true, nil
 	}
-	return volumeClaim{}, false, sink.Destroy(ctx, name)
+	return volumeClaim{}, false, o.b.mutationAdapter().destroyVolume(ctx, sink, name)
 }
 
 // refuse records one name left alone because ownership said no: the report bucket, the

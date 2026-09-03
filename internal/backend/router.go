@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/manifest-network/fred/internal/backendname"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // Router routes requests to backends based on SKU matching.
@@ -19,7 +22,7 @@ type Router struct {
 	backends       []backendEntry
 	backendsByName map[string]Backend // O(1) lookup by name
 	defaultBackend Backend
-	counter        atomic.Uint64 // round-robin counter for RouteRoundRobin
+	counter        atomic.Uint64 // tie-break and no-stats fallback rotation
 
 	// Optional Prometheus gauge for backend health (nil = skip recording)
 	backendHealthy *prometheus.GaugeVec
@@ -86,8 +89,15 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}
 
 	for i, entry := range cfg.Backends {
-		if entry.Backend == nil {
+		if util.IsNilInterface(entry.Backend) {
 			return nil, fmt.Errorf("backend at index %d is nil", i)
+		}
+		name := entry.Backend.Name()
+		if err := backendname.Validate(name); err != nil {
+			return nil, fmt.Errorf("backend at index %d has invalid name: %w", i, err)
+		}
+		if _, exists := r.backendsByName[name]; exists {
+			return nil, fmt.Errorf("duplicate backend name %q", name)
 		}
 
 		r.backends = append(r.backends, backendEntry{
@@ -95,11 +105,10 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 			match:   entry.Match,
 		})
 
-		// Build name lookup map (first backend with a given name wins)
-		name := entry.Backend.Name()
-		if _, exists := r.backendsByName[name]; !exists {
-			r.backendsByName[name] = entry.Backend
-		}
+		// A backend name is durable placement identity. Ambiguous or empty names
+		// are rejected above instead of silently changing which machine owns a
+		// placement lookup.
+		r.backendsByName[name] = entry.Backend
 
 		if entry.IsDefault {
 			if r.defaultBackend != nil {
@@ -127,35 +136,31 @@ func (r *Router) Route(sku string) Backend {
 	return r.defaultBackend
 }
 
-// RouteAll returns all backends that match the given SKU, deduplicated by name.
+// RouteAll returns all backends that match the given SKU. NewRouter rejects
+// duplicate durable backend names, so every returned backend is already unique.
 // If no backends match, returns nil.
 func (r *Router) RouteAll(sku string) []Backend {
-	seen := make(map[string]bool)
 	var matches []Backend
 	for _, entry := range r.backends {
 		if r.matches(sku, entry.match) {
-			name := entry.backend.Name()
-			if !seen[name] {
-				seen[name] = true
-				matches = append(matches, entry.backend)
-			}
+			matches = append(matches, entry.backend)
 		}
 	}
 	return matches
 }
 
-// RouteRoundRobin distributes requests across all backends matching the SKU
-// using round-robin selection. Falls back to the default backend if no match.
-func (r *Router) RouteRoundRobin(sku string) Backend {
-	matches := r.RouteAll(sku)
-	switch len(matches) {
+// routeRoundRobin selects only from candidates. fallback is used solely when
+// candidates is empty, which lets eligibility-aware callers retain the normal
+// default-backend behavior without widening their candidate set.
+func (r *Router) routeRoundRobin(candidates []Backend, fallback Backend) Backend {
+	switch len(candidates) {
 	case 0:
-		return r.defaultBackend
+		return fallback
 	case 1:
-		return matches[0]
+		return candidates[0]
 	default:
 		idx := r.counter.Add(1) - 1
-		return matches[idx%uint64(len(matches))]
+		return candidates[idx%uint64(len(candidates))]
 	}
 }
 
@@ -189,13 +194,56 @@ const cpuRatioEpsilon = 1e-9
 // A residual herd window remains when concurrent provisions read the same
 // pre-update /stats snapshot and the in-flight tiebreak does not separate them;
 // it is tolerated because the backend's 503 admission gate hard-caps any
-// over-targeted backend and provision QPS is low. The round-robin counter is
-// shared with RouteRoundRobin, so tie rotation is intentionally approximate.
+// over-targeted backend and provision QPS is low. Tie rotation is intentionally
+// approximate because the same counter also drives no-stats fallback routing.
 func (r *Router) RouteForProvision(ctx context.Context, sku string, inFlightByBackend map[string]int) Backend {
-	candidates := r.RouteAll(sku)
+	return r.routeForProvision(ctx, r.RouteAll(sku), r.defaultBackend, inFlightByBackend)
+}
+
+// RouteForProvisionAmong selects a provision backend using the same SKU,
+// default, and load-balancing rules as RouteForProvision, but treats
+// eligibleNames as a hard routing boundary. An empty set, or a set containing
+// neither a matching backend nor the default backend, yields nil.
+//
+// When matching candidates expose no usable load stats, round-robin fallback is
+// restricted to those eligible candidates. The default backend is considered
+// only when no eligible backend matches the SKU, and only when it is itself
+// eligible.
+func (r *Router) RouteForProvisionAmong(
+	ctx context.Context,
+	sku string,
+	eligibleNames map[string]struct{},
+	inFlightByBackend map[string]int,
+) Backend {
+	if len(eligibleNames) == 0 {
+		return nil
+	}
+
+	allCandidates := r.RouteAll(sku)
+	candidates := make([]Backend, 0, len(allCandidates))
+	for _, candidate := range allCandidates {
+		if _, eligible := eligibleNames[candidate.Name()]; eligible {
+			candidates = append(candidates, candidate)
+		}
+	}
+
+	var fallback Backend
+	if _, eligible := eligibleNames[r.defaultBackend.Name()]; eligible {
+		fallback = r.defaultBackend
+	}
+
+	return r.routeForProvision(ctx, candidates, fallback, inFlightByBackend)
+}
+
+func (r *Router) routeForProvision(
+	ctx context.Context,
+	candidates []Backend,
+	fallback Backend,
+	inFlightByBackend map[string]int,
+) Backend {
 	switch len(candidates) {
 	case 0:
-		return r.defaultBackend
+		return fallback
 	case 1:
 		return candidates[0]
 	}
@@ -248,7 +296,7 @@ func (r *Router) RouteForProvision(ctx context.Context, sku string, inFlightByBa
 		if r.routingFallback != nil {
 			r.routingFallback.Inc()
 		}
-		return r.RouteRoundRobin(sku)
+		return r.routeRoundRobin(candidates, fallback)
 	}
 
 	// 1) Lowest CPU ratio.
@@ -296,21 +344,13 @@ func (r *Router) Default() Backend {
 	return r.defaultBackend
 }
 
-// Backends returns all unique backends for operations like reconciliation and health checks.
-// The same backend may be registered multiple times with different SKU lists, but
-// this method returns each backend only once (deduplicated by name).
+// Backends returns the constructor-validated unique backends for operations
+// such as reconciliation and health checks.
 func (r *Router) Backends() []Backend {
-	seen := make(map[string]bool)
-	var backends []Backend
-
+	backends := make([]Backend, 0, len(r.backends))
 	for _, entry := range r.backends {
-		name := entry.backend.Name()
-		if !seen[name] {
-			seen[name] = true
-			backends = append(backends, entry.backend)
-		}
+		backends = append(backends, entry.backend)
 	}
-
 	return backends
 }
 

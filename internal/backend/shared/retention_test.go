@@ -25,6 +25,13 @@ func newTestRetentionStore(t *testing.T) *RetentionStore {
 	return s
 }
 
+func testRestoreCallbackAuthority() (OperationID, string, string) {
+	const id = OperationID("11111111-1111-4111-8111-111111111111")
+	return id,
+		"https://fred.example/callbacks/provision?operation_id=" + id.String(),
+		"https://fred.example/callbacks/provision?lifecycle_id=" + id.String()
+}
+
 // getRaw returns the raw stored bytes for a key (test-only, white-box) so a test
 // can assert a record is byte-identical/untouched after a refused write.
 func (s *RetentionStore) getRaw(orig string) ([]byte, error) {
@@ -50,6 +57,76 @@ func sampleEntry(orig string) RetentionEntry {
 		Generation:          0,
 		CreatedAt:           time.Now(),
 	}
+}
+
+func sampleResourceProfiles() []SKUResourceSnapshot {
+	return []SKUResourceSnapshot{{SKU: "sku-1", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
+}
+
+func testResourceProfilesForItems(items []backend.LeaseItem) []SKUResourceSnapshot {
+	skus := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		skus[item.SKU] = struct{}{}
+	}
+	ordered := make([]string, 0, len(skus))
+	for sku := range skus {
+		ordered = append(ordered, sku)
+	}
+	sort.Strings(ordered)
+	profiles := make([]SKUResourceSnapshot, 0, len(ordered))
+	for _, sku := range ordered {
+		profiles = append(profiles, SKUResourceSnapshot{
+			SKU: sku, CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+		})
+	}
+	return profiles
+}
+
+func claimForRestoreForTest(
+	store *RetentionStore,
+	originalLease, destinationLease string,
+	maxAge time.Duration,
+) (*RetentionEntry, error) {
+	source, err := store.Get(originalLease)
+	if err != nil {
+		return nil, err
+	}
+	items := sampleEntry(originalLease).Items
+	if source != nil {
+		items = source.Items
+	}
+	operationID, callbackURL, lifecycleCallbackURL := testRestoreCallbackAuthority()
+	return store.ClaimForRestoreWithAuthority(
+		originalLease,
+		destinationLease,
+		maxAge,
+		items,
+		testResourceProfilesForItems(items),
+		operationID,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
+}
+
+func revertToActiveForTest(
+	store *RetentionStore,
+	originalLease, destinationLease string,
+	expectGeneration int,
+) (bool, error) {
+	source, err := store.Get(originalLease)
+	if err != nil {
+		return false, err
+	}
+	items := sampleEntry(originalLease).Items
+	if source != nil {
+		items = source.Items
+	}
+	return store.RevertToActiveWithResourceProfiles(
+		originalLease,
+		destinationLease,
+		expectGeneration,
+		testResourceProfilesForItems(items),
+	)
 }
 
 // TestRetentionStore_CRUD covers Put/Get/Delete + idempotent Delete + Get-absent returns nil,nil.
@@ -83,12 +160,13 @@ func TestRetentionStore_CRUD(t *testing.T) {
 	require.NoError(t, s.Delete("lease-1"))
 }
 
-// TestRetentionStore_ClaimForRestore covers the atomic active→restoring transition.
-func TestRetentionStore_ClaimForRestore(t *testing.T) {
+// TestRetentionStore_ClaimForRestoreWithAuthority covers the atomic
+// active→restoring transition with complete destination authority.
+func TestRetentionStore_ClaimForRestoreWithAuthority(t *testing.T) {
 	s := newTestRetentionStore(t)
 
 	// Absent → ErrNoRetention
-	_, err := s.ClaimForRestore("nope", "new-lease-1", 0)
+	_, err := claimForRestoreForTest(s, "nope", "new-lease-1", 0)
 	assert.ErrorIs(t, err, ErrNoRetention)
 
 	// Successful claim: active → restoring
@@ -96,7 +174,7 @@ func TestRetentionStore_ClaimForRestore(t *testing.T) {
 	e.Generation = 0
 	require.NoError(t, s.Put(e))
 
-	claimed, err := s.ClaimForRestore("lease-1", "new-lease-42", 0)
+	claimed, err := claimForRestoreForTest(s, "lease-1", "new-lease-42", 0)
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, RetentionStatusRestoring, claimed.Status)
@@ -111,31 +189,287 @@ func TestRetentionStore_ClaimForRestore(t *testing.T) {
 	assert.Equal(t, 1, got.Generation)
 
 	// Second claim → ErrNotRestorable (already restoring)
-	_, err = s.ClaimForRestore("lease-1", "new-lease-99", 0)
+	_, err = claimForRestoreForTest(s, "lease-1", "new-lease-99", 0)
 	assert.ErrorIs(t, err, ErrNotRestorable)
 
 	// Active but older than maxAge → ErrNoRetention (about to be reaped)
 	old := sampleEntry("lease-old")
 	old.CreatedAt = time.Now().Add(-100 * 24 * time.Hour) // 100 days ago
 	require.NoError(t, s.Put(old))
-	_, err = s.ClaimForRestore("lease-old", "new-lease-x", 90*24*time.Hour)
+	_, err = claimForRestoreForTest(s, "lease-old", "new-lease-x", 90*24*time.Hour)
 	assert.ErrorIs(t, err, ErrNoRetention)
 }
 
-// TestRetentionStore_RevertToActive_CAS verifies generation-CAS transitions.
-func TestRetentionStore_RevertToActive_CAS(t *testing.T) {
+func TestRetentionStore_ClaimForRestoreWithAuthority_PersistsAndClearsAtomically(t *testing.T) {
+	dbPath := t.TempDir() + "/retention.db"
+	store, err := NewRetentionStore(RetentionStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+
+	source := sampleEntry("source")
+	source.Items[0].ServiceName = "app"
+	source.ResourceProfiles = sampleResourceProfiles()
+	require.NoError(t, store.Put(source))
+	destinationItems := []backend.LeaseItem{{
+		SKU: "destination-sku", Quantity: 2, ServiceName: "app",
+	}}
+	destinationProfiles := []SKUResourceSnapshot{{
+		SKU: "destination-sku", CPUCores: 2, MemoryMB: 2048, DiskMB: 4096,
+	}}
+	operationID, callbackURL, lifecycleCallbackURL := testRestoreCallbackAuthority()
+
+	claimed, err := store.ClaimForRestoreWithAuthority(
+		"source", "destination", 0, destinationItems, destinationProfiles,
+		operationID, callbackURL, lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+	require.Equal(t, destinationItems, claimed.DestinationItems)
+	require.Equal(t, destinationProfiles, claimed.DestinationResourceProfiles)
+	// Caller mutation cannot rewrite the opaque durable claim.
+	destinationItems[0].SKU = "mutated"
+	destinationProfiles[0].DiskMB = 1
+	require.NoError(t, store.Close())
+
+	store, err = NewRetentionStore(RetentionStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	reopened, err := store.Get("source")
+	require.NoError(t, err)
+	require.NotNil(t, reopened)
+	assert.Equal(t, "destination-sku", reopened.DestinationItems[0].SKU)
+	assert.Equal(t, int64(4096), reopened.DestinationResourceProfiles[0].DiskMB)
+	assert.Equal(t, operationID, reopened.DestinationOperationID)
+	assert.Equal(t, callbackURL, reopened.DestinationCallbackURL)
+	assert.Equal(t, lifecycleCallbackURL, reopened.DestinationLifecycleCallbackURL)
+
+	ok, err := store.RevertToActiveWithResourceProfiles(
+		"source", "destination", reopened.Generation, source.ResourceProfiles,
+	)
+	require.NoError(t, err)
+	require.True(t, ok)
+	reverted, err := store.Get("source")
+	require.NoError(t, err)
+	require.NotNil(t, reverted)
+	assert.Equal(t, RetentionStatusActive, reverted.Status)
+	assert.Empty(t, reverted.DestinationItems)
+	assert.Empty(t, reverted.DestinationResourceProfiles)
+	assert.Empty(t, reverted.DestinationOperationID)
+	assert.Empty(t, reverted.DestinationCallbackURL)
+	assert.Empty(t, reverted.DestinationLifecycleCallbackURL)
+}
+
+func TestRetentionStore_ClaimForRestoreWithAuthority_RejectsMismatchedShapeWithoutMutation(t *testing.T) {
+	store := newTestRetentionStore(t)
+	source := sampleEntry("source")
+	source.Items[0].ServiceName = "app"
+	require.NoError(t, store.Put(source))
+	operationID, callbackURL, lifecycleCallbackURL := testRestoreCallbackAuthority()
+
+	_, err := store.ClaimForRestoreWithAuthority(
+		"source",
+		"destination",
+		0,
+		[]backend.LeaseItem{{SKU: "destination-sku", Quantity: 2, ServiceName: "other"}},
+		[]SKUResourceSnapshot{{SKU: "destination-sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		operationID, callbackURL, lifecycleCallbackURL,
+	)
+	require.ErrorContains(t, err, "destination shape")
+	stored, getErr := store.Get("source")
+	require.NoError(t, getErr)
+	require.NotNil(t, stored)
+	assert.Equal(t, RetentionStatusActive, stored.Status)
+	assert.Zero(t, stored.Generation)
+	assert.Empty(t, stored.DestinationItems)
+}
+
+func TestRetentionStore_UpdateRestoringDestinationCallbacks_PreservesExactAuthority(t *testing.T) {
+	store := newTestRetentionStore(t)
+	source := sampleEntry("source")
+	source.Items[0].ServiceName = "app"
+	source.ResourceProfiles = sampleResourceProfiles()
+	require.NoError(t, store.Put(source))
+	destinationItems := []backend.LeaseItem{{
+		SKU: "destination-sku", Quantity: 2, ServiceName: "app",
+	}}
+	destinationProfiles := []SKUResourceSnapshot{{
+		SKU: "destination-sku", CPUCores: 2, MemoryMB: 2048, DiskMB: 4096,
+	}}
+	operationID, callbackURL, lifecycleCallbackURL := testRestoreCallbackAuthority()
+	claimed, err := store.ClaimForRestoreWithAuthority(
+		"source", "destination", 0,
+		destinationItems, destinationProfiles,
+		operationID, callbackURL, lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+
+	movedCallbackURL := "https://moved.example/callbacks/provision?operation_id=" + operationID.String()
+	movedLifecycleURL := "https://moved.example/callbacks/provision?lifecycle_id=" + operationID.String()
+	updated, err := store.UpdateRestoringDestinationCallbacks(
+		"source", "destination", claimed.Generation,
+		movedCallbackURL, movedLifecycleURL,
+	)
+	require.NoError(t, err)
+	require.True(t, updated)
+	stored, err := store.Get("source")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, operationID, stored.DestinationOperationID)
+	assert.Equal(t, movedCallbackURL, stored.DestinationCallbackURL)
+	assert.Equal(t, movedLifecycleURL, stored.DestinationLifecycleCallbackURL)
+
+	updated, err = store.UpdateRestoringDestinationCallbacks(
+		"source", "destination", claimed.Generation-1,
+		movedCallbackURL, movedLifecycleURL,
+	)
+	require.NoError(t, err)
+	assert.False(t, updated)
+
+	before, err := store.getRaw("source")
+	require.NoError(t, err)
+	const differentID = OperationID("22222222-2222-4222-8222-222222222222")
+	updated, err = store.UpdateRestoringDestinationCallbacks(
+		"source", "destination", claimed.Generation,
+		"https://other.example/callbacks/provision?operation_id="+differentID.String(),
+		"https://other.example/callbacks/provision?lifecycle_id="+differentID.String(),
+	)
+	require.ErrorContains(t, err, "lifecycle ID does not match")
+	assert.False(t, updated)
+	after, err := store.getRaw("source")
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
+func TestRetentionStore_ClaimForRestoreWithAuthority_RejectsOperationIDCallbackMismatch(t *testing.T) {
+	store := newTestRetentionStore(t)
+	source := sampleEntry("source")
+	source.Items[0].ServiceName = "app"
+	source.ResourceProfiles = sampleResourceProfiles()
+	require.NoError(t, store.Put(source))
+	operationID, _, _ := testRestoreCallbackAuthority()
+	const callbackID = OperationID("22222222-2222-4222-8222-222222222222")
+
+	_, err := store.ClaimForRestoreWithAuthority(
+		"source", "destination", 0,
+		[]backend.LeaseItem{{SKU: "destination-sku", Quantity: 2, ServiceName: "app"}},
+		[]SKUResourceSnapshot{{SKU: "destination-sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
+		operationID,
+		"https://fred.example/callbacks/provision?operation_id="+callbackID.String(),
+		"https://fred.example/callbacks/provision?lifecycle_id="+callbackID.String(),
+	)
+	require.ErrorContains(t, err, "differs from callback authority")
+	stored, getErr := store.Get("source")
+	require.NoError(t, getErr)
+	require.NotNil(t, stored)
+	assert.Equal(t, RetentionStatusActive, stored.Status)
+	assert.Zero(t, stored.Generation)
+}
+
+func TestRetentionStore_RestoringRowsRequireCompleteAuthority(t *testing.T) {
+	const differentID = OperationID("22222222-2222-4222-8222-222222222222")
+	tests := map[string]struct {
+		mutate  func(*RetentionEntry)
+		wantErr string
+	}{
+		"empty source": {
+			mutate:  func(entry *RetentionEntry) { entry.OriginalLeaseUUID = "" },
+			wantErr: "source and destination lease UUIDs",
+		},
+		"empty destination": {
+			mutate:  func(entry *RetentionEntry) { entry.NewLeaseUUID = "" },
+			wantErr: "source and destination lease UUIDs",
+		},
+		"same source and destination": {
+			mutate:  func(entry *RetentionEntry) { entry.NewLeaseUUID = entry.OriginalLeaseUUID },
+			wantErr: "must differ",
+		},
+		"non-positive generation": {
+			mutate:  func(entry *RetentionEntry) { entry.Generation = 0 },
+			wantErr: "generation must be positive",
+		},
+		"missing destination items": {
+			mutate:  func(entry *RetentionEntry) { entry.DestinationItems = nil },
+			wantErr: "exact destination items and resource profiles",
+		},
+		"missing destination profiles": {
+			mutate:  func(entry *RetentionEntry) { entry.DestinationResourceProfiles = nil },
+			wantErr: "exact destination items and resource profiles",
+		},
+		"empty operation ID": {
+			mutate:  func(entry *RetentionEntry) { entry.DestinationOperationID = "" },
+			wantErr: "canonical UUIDv4",
+		},
+		"non-canonical operation ID": {
+			mutate:  func(entry *RetentionEntry) { entry.DestinationOperationID = "NOT-A-UUID" },
+			wantErr: "canonical UUIDv4",
+		},
+		"missing operation callback": {
+			mutate:  func(entry *RetentionEntry) { entry.DestinationCallbackURL = "" },
+			wantErr: "exact operation/lifecycle callback pair",
+		},
+		"missing lifecycle callback": {
+			mutate:  func(entry *RetentionEntry) { entry.DestinationLifecycleCallbackURL = "" },
+			wantErr: "exact operation/lifecycle callback pair",
+		},
+		"callback pair has different identities": {
+			mutate: func(entry *RetentionEntry) {
+				entry.DestinationLifecycleCallbackURL =
+					"https://fred.example/callbacks/provision?lifecycle_id=" + differentID.String()
+			},
+			wantErr: "callback pair",
+		},
+		"operation ID differs from callback": {
+			mutate:  func(entry *RetentionEntry) { entry.DestinationOperationID = differentID },
+			wantErr: "differs from callback authority",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := newTestRetentionStore(t)
+			source := sampleEntry("source")
+			source.ResourceProfiles = sampleResourceProfiles()
+			require.NoError(t, store.Put(source))
+			claimed, err := claimForRestoreForTest(store, "source", "destination", 0)
+			require.NoError(t, err)
+			test.mutate(claimed)
+
+			err = store.Put(*claimed)
+			require.ErrorContains(t, err, test.wantErr)
+		})
+	}
+}
+
+func TestRetentionStore_ReadsRejectIncompleteRestoringAuthority(t *testing.T) {
+	store := newTestRetentionStore(t)
+	source := sampleEntry("source")
+	source.ResourceProfiles = sampleResourceProfiles()
+	require.NoError(t, store.Put(source))
+	claimed, err := claimForRestoreForTest(store, "source", "destination", 0)
+	require.NoError(t, err)
+	claimed.DestinationLifecycleCallbackURL = ""
+	corrupt, err := json.Marshal(claimed)
+	require.NoError(t, err)
+	putRawRecord(t, store, "source", corrupt)
+
+	_, err = store.Get("source")
+	require.ErrorContains(t, err, "exact operation/lifecycle callback pair")
+	_, err = store.List()
+	require.ErrorContains(t, err, "exact operation/lifecycle callback pair")
+}
+
+// TestRetentionStore_RevertToActiveWithResourceProfiles_CAS verifies the exact
+// destination/generation CAS and atomic source-profile publication.
+func TestRetentionStore_RevertToActiveWithResourceProfiles_CAS(t *testing.T) {
 	s := newTestRetentionStore(t)
 
-	// Setup: put a restoring record at Generation=5
+	// Setup: claim a restoring record at Generation=5.
 	e := sampleEntry("lease-cas")
-	e.Status = RetentionStatusRestoring
-	e.Generation = 5
-	e.NewLeaseUUID = "new-lease-x"
-	e.RestoringSince = time.Now()
+	e.Generation = 4
 	require.NoError(t, s.Put(e))
+	claimed, err := claimForRestoreForTest(s, "lease-cas", "new-lease-x", 0)
+	require.NoError(t, err)
+	require.Equal(t, 5, claimed.Generation)
 
 	// Correct generation → true, status=active, Generation bumped to 6
-	ok, err := s.RevertToActive("lease-cas", 5)
+	ok, err := revertToActiveForTest(s, "lease-cas", "new-lease-x", 5)
 	require.NoError(t, err)
 	assert.True(t, ok)
 
@@ -148,12 +482,12 @@ func TestRetentionStore_RevertToActive_CAS(t *testing.T) {
 	assert.True(t, got.RestoringSince.IsZero())
 
 	// Stale generation → false, no error
-	ok, err = s.RevertToActive("lease-cas", 5) // gen is now 6, 5 is stale
+	ok, err = revertToActiveForTest(s, "lease-cas", "new-lease-x", 5) // gen is now 6, 5 is stale
 	require.NoError(t, err)
 	assert.False(t, ok)
 
 	// Absent → false
-	ok, err = s.RevertToActive("nonexistent", 0)
+	ok, err = revertToActiveForTest(s, "nonexistent", "new-lease-x", 0)
 	require.NoError(t, err)
 	assert.False(t, ok)
 
@@ -161,9 +495,106 @@ func TestRetentionStore_RevertToActive_CAS(t *testing.T) {
 	e2 := sampleEntry("lease-active")
 	e2.Generation = 3
 	require.NoError(t, s.Put(e2))
-	ok, err = s.RevertToActive("lease-active", 3)
+	ok, err = revertToActiveForTest(s, "lease-active", "new-lease-x", 3)
 	require.NoError(t, err)
 	assert.False(t, ok, "non-restoring record must not be reverted")
+}
+
+func TestRetentionStore_RevertToActiveWithResourceProfiles_AtomicLegacyBackfill(t *testing.T) {
+	s := newTestRetentionStore(t)
+	legacy := sampleEntry("legacy-source")
+	legacy.Generation = 4
+	legacy.ResourceProfiles = nil
+	require.NoError(t, s.Put(legacy))
+	_, err := claimForRestoreForTest(s, "legacy-source", "destination", 0)
+	require.NoError(t, err)
+
+	profiles := sampleResourceProfiles()
+	ok, err := s.RevertToActiveWithResourceProfiles(
+		"legacy-source", "different-destination", 5, profiles,
+	)
+	require.NoError(t, err)
+	assert.False(t, ok, "a stale destination must not publish sizing authority")
+	unchanged, err := s.Get("legacy-source")
+	require.NoError(t, err)
+	require.NotNil(t, unchanged)
+	assert.Equal(t, RetentionStatusRestoring, unchanged.Status)
+	assert.Empty(t, unchanged.ResourceProfiles)
+
+	ok, err = s.RevertToActiveWithResourceProfiles(
+		"legacy-source", "destination", 5, profiles,
+	)
+	require.NoError(t, err)
+	require.True(t, ok)
+	committed, err := s.Get("legacy-source")
+	require.NoError(t, err)
+	require.NotNil(t, committed)
+	assert.Equal(t, RetentionStatusActive, committed.Status)
+	assert.Equal(t, 6, committed.Generation)
+	assert.Empty(t, committed.NewLeaseUUID)
+	assert.Equal(t, profiles, committed.ResourceProfiles,
+		"activation and the quota authority established by the caller commit together")
+
+	modern := sampleEntry("modern-source")
+	modern.Generation = 8
+	modern.ResourceProfiles = profiles
+	require.NoError(t, s.Put(modern))
+	_, err = claimForRestoreForTest(s, "modern-source", "modern-destination", 0)
+	require.NoError(t, err)
+	mismatched := sampleResourceProfiles()
+	mismatched[0].DiskMB++
+	ok, err = s.RevertToActiveWithResourceProfiles(
+		"modern-source", "modern-destination", 9, mismatched,
+	)
+	require.ErrorContains(t, err, "differ from durable")
+	assert.False(t, ok)
+	unchanged, err = s.Get("modern-source")
+	require.NoError(t, err)
+	require.NotNil(t, unchanged)
+	assert.Equal(t, RetentionStatusRestoring, unchanged.Status)
+	assert.Equal(t, profiles, unchanged.ResourceProfiles,
+		"a stale caller cannot replace immutable sizing authority")
+}
+
+func TestRetentionStore_DeleteIfRestoring_CAS(t *testing.T) {
+	s := newTestRetentionStore(t)
+	e := sampleEntry("lease-source")
+	e.Generation = 4
+	require.NoError(t, s.Put(e))
+	_, err := claimForRestoreForTest(s, "lease-source", "lease-destination", 0)
+	require.NoError(t, err)
+
+	for _, attempt := range []struct {
+		name        string
+		destination string
+		generation  int
+	}{
+		{name: "wrong destination", destination: "other-destination", generation: 5},
+		{name: "stale generation", destination: "lease-destination", generation: 4},
+	} {
+		t.Run(attempt.name, func(t *testing.T) {
+			deleted, err := s.DeleteIfRestoring("lease-source", attempt.destination, attempt.generation)
+			require.NoError(t, err)
+			assert.False(t, deleted)
+			got, getErr := s.Get("lease-source")
+			require.NoError(t, getErr)
+			require.NotNil(t, got, "a stale finalizer snapshot must not consume current authority")
+		})
+	}
+
+	deleted, err := s.DeleteIfRestoring("lease-source", "lease-destination", 5)
+	require.NoError(t, err)
+	require.True(t, deleted)
+	got, err := s.Get("lease-source")
+	require.NoError(t, err)
+	assert.Nil(t, got)
+	restoring, err := s.ListRestoring()
+	require.NoError(t, err)
+	assert.Empty(t, restoring, "the derived status index must be updated with the delete")
+
+	deleted, err = s.DeleteIfRestoring("lease-source", "lease-destination", 5)
+	require.NoError(t, err)
+	assert.False(t, deleted, "absent exact delete is idempotent")
 }
 
 // TestRetentionStore_ListExpired_ActiveOnly verifies restoring+expired records
@@ -180,9 +611,10 @@ func TestRetentionStore_ListExpired_ActiveOnly(t *testing.T) {
 
 	// Restoring + expired (should NOT appear)
 	e2 := sampleEntry("lease-exp-restoring")
-	e2.Status = RetentionStatusRestoring
 	e2.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
 	require.NoError(t, s.Put(e2))
+	_, err := claimForRestoreForTest(s, "lease-exp-restoring", "lease-exp-destination", 0)
+	require.NoError(t, err)
 
 	// Active + fresh (should NOT appear)
 	e3 := sampleEntry("lease-fresh-active")
@@ -257,13 +689,13 @@ func TestRetentionStore_EmptyPath(t *testing.T) {
 func TestRetentionStore_ListRestoring(t *testing.T) {
 	s := newTestRetentionStore(t)
 
-	e1 := sampleEntry("lease-r1")
-	e1.Status = RetentionStatusRestoring
-	require.NoError(t, s.Put(e1))
+	require.NoError(t, s.Put(sampleEntry("lease-r1")))
+	_, err := claimForRestoreForTest(s, "lease-r1", "destination-r1", 0)
+	require.NoError(t, err)
 
-	e2 := sampleEntry("lease-r2")
-	e2.Status = RetentionStatusRestoring
-	require.NoError(t, s.Put(e2))
+	require.NoError(t, s.Put(sampleEntry("lease-r2")))
+	_, err = claimForRestoreForTest(s, "lease-r2", "destination-r2", 0)
+	require.NoError(t, err)
 
 	e3 := sampleEntry("lease-a1")
 	e3.Status = RetentionStatusActive
@@ -348,9 +780,9 @@ func TestListReaping(t *testing.T) {
 	reaping := sampleEntry("reaping-1")
 	reaping.Status = RetentionStatusReaping
 	require.NoError(t, s.Put(reaping))
-	restoring := sampleEntry("restoring-1")
-	restoring.Status = RetentionStatusRestoring
-	require.NoError(t, s.Put(restoring))
+	require.NoError(t, s.Put(sampleEntry("restoring-1")))
+	_, err := claimForRestoreForTest(s, "restoring-1", "restoring-destination", 0)
+	require.NoError(t, err)
 
 	got, err := s.ListReaping()
 	require.NoError(t, err)
@@ -429,6 +861,77 @@ func TestPutReaping_ReLeakPreservesStoredAccounting(t *testing.T) {
 	assert.ElementsMatch(t, []string{"vol-a", "vol-b", "vol-c"}, got.RetainedVolumeNames)
 }
 
+func TestPutReaping_ResourceProfilesAreExactAndRetrySafe(t *testing.T) {
+	t.Run("fresh row validates snapshot", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		base := sampleEntry("reaping-invalid")
+		base.ResourceProfiles = []SKUResourceSnapshot{{
+			SKU: "other", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+		}}
+		ok, err := s.PutReaping(base)
+		require.ErrorContains(t, err, "unreferenced SKU")
+		assert.False(t, ok)
+	})
+
+	t.Run("empty retry preserves stored exact snapshot", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		first := sampleEntry("reaping-preserve")
+		first.ResourceProfiles = sampleResourceProfiles()
+		ok, err := s.PutReaping(first)
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		partial := RetentionEntry{
+			OriginalLeaseUUID:   first.OriginalLeaseUUID,
+			RetainedVolumeNames: []string{"vol-c"},
+		}
+		ok, err = s.PutReaping(partial)
+		require.NoError(t, err)
+		require.True(t, ok)
+		got, err := s.Get(first.OriginalLeaseUUID)
+		require.NoError(t, err)
+		require.Equal(t, sampleResourceProfiles(), got.ResourceProfiles)
+	})
+
+	t.Run("new exact retry upgrades legacy tombstone", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		legacy := sampleEntry("reaping-upgrade")
+		ok, err := s.PutReaping(legacy)
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		retry := sampleEntry(legacy.OriginalLeaseUUID)
+		retry.ResourceProfiles = sampleResourceProfiles()
+		ok, err = s.PutReaping(retry)
+		require.NoError(t, err)
+		require.True(t, ok)
+		got, err := s.Get(legacy.OriginalLeaseUUID)
+		require.NoError(t, err)
+		require.Equal(t, sampleResourceProfiles(), got.ResourceProfiles)
+	})
+
+	t.Run("different exact retry cannot reprice tombstone", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		first := sampleEntry("reaping-divergent")
+		first.ResourceProfiles = sampleResourceProfiles()
+		ok, err := s.PutReaping(first)
+		require.NoError(t, err)
+		require.True(t, ok)
+		before, err := s.getRaw(first.OriginalLeaseUUID)
+		require.NoError(t, err)
+
+		retry := sampleEntry(first.OriginalLeaseUUID)
+		retry.ResourceProfiles = sampleResourceProfiles()
+		retry.ResourceProfiles[0].DiskMB++
+		ok, err = s.PutReaping(retry)
+		require.ErrorContains(t, err, "differs from stored immutable snapshot")
+		assert.False(t, ok)
+		after, readErr := s.getRaw(first.OriginalLeaseUUID)
+		require.NoError(t, readErr)
+		assert.Equal(t, before, after)
+	})
+}
+
 // TestPutActiveMerged_AbsentWritesFresh verifies that PutActiveMerged on an
 // absent key writes the base entry verbatim and returns ok=true.
 func TestPutActiveMerged_AbsentWritesFresh(t *testing.T) {
@@ -500,6 +1003,149 @@ func TestPutActiveMerged_ActiveMergesAndPreservesCreatedAtGen(t *testing.T) {
 	assert.ElementsMatch(t, []string{"a", "b"}, got.RetainedVolumeNames, "names must be the dedup union")
 }
 
+func TestPutActiveMerged_ResourceProfilesPersistUpgradeAndPreserve(t *testing.T) {
+	t.Run("fresh exact row", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		base := sampleEntry("lease-fresh-exact")
+		base.ResourceProfiles = sampleResourceProfiles()
+		ok, err := s.PutActiveMerged(base)
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		// The persisted row owns a copy, not the caller's mutable slice.
+		base.ResourceProfiles[0].DiskMB = 1
+		got, err := s.Get(base.OriginalLeaseUUID)
+		require.NoError(t, err)
+		require.Equal(t, sampleResourceProfiles(), got.ResourceProfiles)
+	})
+
+	t.Run("new exact retry upgrades legacy row", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		legacy := sampleEntry("lease-upgrade")
+		require.Empty(t, legacy.ResourceProfiles)
+		require.NoError(t, s.Put(legacy))
+
+		retry := sampleEntry(legacy.OriginalLeaseUUID)
+		retry.ResourceProfiles = sampleResourceProfiles()
+		ok, err := s.PutActiveMerged(retry)
+		require.NoError(t, err)
+		require.True(t, ok)
+		got, err := s.Get(legacy.OriginalLeaseUUID)
+		require.NoError(t, err)
+		require.Equal(t, sampleResourceProfiles(), got.ResourceProfiles)
+	})
+
+	t.Run("legacy retry preserves stored exact authority", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		stored := sampleEntry("lease-preserve")
+		stored.ResourceProfiles = sampleResourceProfiles()
+		require.NoError(t, s.Put(stored))
+
+		retry := sampleEntry(stored.OriginalLeaseUUID)
+		require.Empty(t, retry.ResourceProfiles)
+		ok, err := s.PutActiveMerged(retry)
+		require.NoError(t, err)
+		require.True(t, ok)
+		got, err := s.Get(stored.OriginalLeaseUUID)
+		require.NoError(t, err)
+		require.Equal(t, sampleResourceProfiles(), got.ResourceProfiles)
+	})
+}
+
+func TestPutActiveMerged_RejectsResourceProfileDivergenceAndMalformedSnapshots(t *testing.T) {
+	t.Run("different exact snapshot cannot reprice stored footprint", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		stored := sampleEntry("lease-divergent")
+		stored.ResourceProfiles = sampleResourceProfiles()
+		require.NoError(t, s.Put(stored))
+		before, err := s.getRaw(stored.OriginalLeaseUUID)
+		require.NoError(t, err)
+
+		retry := sampleEntry(stored.OriginalLeaseUUID)
+		retry.ResourceProfiles = sampleResourceProfiles()
+		retry.ResourceProfiles[0].DiskMB++
+		ok, err := s.PutActiveMerged(retry)
+		require.ErrorContains(t, err, "differs from stored immutable snapshot")
+		assert.False(t, ok)
+		after, readErr := s.getRaw(stored.OriginalLeaseUUID)
+		require.NoError(t, readErr)
+		assert.Equal(t, before, after)
+	})
+
+	t.Run("malformed incoming snapshot is not persisted", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		base := sampleEntry("lease-malformed-incoming")
+		base.ResourceProfiles = []SKUResourceSnapshot{{
+			SKU: "different", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+		}}
+		ok, err := s.PutActiveMerged(base)
+		require.ErrorContains(t, err, "unreferenced SKU")
+		assert.False(t, ok)
+		got, readErr := s.Get(base.OriginalLeaseUUID)
+		require.NoError(t, readErr)
+		assert.Nil(t, got)
+	})
+
+	t.Run("malformed stored snapshot is not overwritten", func(t *testing.T) {
+		s := newTestRetentionStore(t)
+		stored := sampleEntry("lease-malformed-stored")
+		stored.ResourceProfiles = []SKUResourceSnapshot{{
+			SKU: "sku-1", CPUCores: 1, MemoryMB: 0, DiskMB: 1024,
+		}}
+		raw, err := json.Marshal(stored)
+		require.NoError(t, err)
+		require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
+			return tx.Bucket(retentionBucketName).Put([]byte(stored.OriginalLeaseUUID), raw)
+		}))
+		before, err := s.getRaw(stored.OriginalLeaseUUID)
+		require.NoError(t, err)
+
+		retry := sampleEntry(stored.OriginalLeaseUUID)
+		retry.ResourceProfiles = sampleResourceProfiles()
+		ok, err := s.PutActiveMerged(retry)
+		require.ErrorContains(t, err, "stored snapshot")
+		assert.False(t, ok)
+		after, readErr := s.getRaw(stored.OriginalLeaseUUID)
+		require.NoError(t, readErr)
+		assert.Equal(t, before, after)
+	})
+}
+
+func TestRetentionEntry_LegacyJSONOmitsResourceProfiles(t *testing.T) {
+	raw := []byte(`{"original_lease_uuid":"legacy","items":[{"sku":"sku-1","quantity":1}]}`)
+	var entry RetentionEntry
+	require.NoError(t, json.Unmarshal(raw, &entry))
+	assert.Empty(t, entry.ResourceProfiles)
+
+	encoded, err := json.Marshal(entry)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "resource_profiles")
+}
+
+func TestRetentionStorePutAndReadsValidateNonemptyResourceProfiles(t *testing.T) {
+	s := newTestRetentionStore(t)
+	invalidQuantity := sampleEntry("invalid-profile-quantity")
+	invalidQuantity.Items[0].Quantity = 0
+	invalidQuantity.ResourceProfiles = sampleResourceProfiles()
+	require.ErrorContains(t, s.Put(invalidQuantity), "quantity 0 out of range")
+
+	invalid := sampleEntry("invalid-profile")
+	invalid.ResourceProfiles = []SKUResourceSnapshot{{
+		SKU: "sku-1", CPUCores: 1, MemoryMB: 0, DiskMB: 1024,
+	}}
+	require.ErrorContains(t, s.Put(invalid), "memory_mb must be positive")
+
+	raw, err := json.Marshal(invalid)
+	require.NoError(t, err)
+	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte(invalid.OriginalLeaseUUID), raw)
+	}))
+	_, err = s.Get(invalid.OriginalLeaseUUID)
+	require.ErrorContains(t, err, "memory_mb must be positive")
+	_, err = s.List()
+	require.ErrorContains(t, err, "memory_mb must be positive")
+}
+
 // TestPutActiveMerged_ActivePreservesStoredManifestWhenBaseNil guards the
 // soft-delete retry path: a first close attempt may persist a non-nil
 // StackManifest (from the provision or hydrated from the release store), then a
@@ -557,17 +1203,13 @@ func TestPutActiveMerged_ActivePreservesStoredManifestWhenBaseNil(t *testing.T) 
 func TestPutActiveMerged_RestoringRefuses(t *testing.T) {
 	s := newTestRetentionStore(t)
 
-	stored := RetentionEntry{
-		OriginalLeaseUUID:   "lease-1",
-		Tenant:              "tenant-a",
-		Status:              RetentionStatusRestoring,
-		NewLeaseUUID:        "new-lease",
-		RetainedVolumeNames: []string{"a"},
-		Generation:          5,
-		RestoringSince:      time.Now().Round(time.Millisecond),
-		CreatedAt:           time.Now().Add(-time.Hour).Round(time.Millisecond),
-	}
+	stored := sampleEntry("lease-1")
+	stored.RetainedVolumeNames = []string{"a"}
+	stored.Generation = 4
+	stored.CreatedAt = time.Now().Add(-time.Hour).Round(time.Millisecond)
 	require.NoError(t, s.Put(stored))
+	_, err := claimForRestoreForTest(s, "lease-1", "new-lease", 0)
+	require.NoError(t, err)
 
 	before, err := s.getRaw("lease-1")
 	require.NoError(t, err)
@@ -618,7 +1260,7 @@ func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			_, claimErr = s.ClaimForRestore("lease-c", "new", time.Hour)
+			_, claimErr = claimForRestoreForTest(s, "lease-c", "new", time.Hour)
 		}()
 		wg.Wait()
 
@@ -640,14 +1282,15 @@ func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
 	}
 }
 
-// TestStatusAudit_ClaimForRestore_RejectsReaping ensures a reaping record cannot be restored.
-func TestStatusAudit_ClaimForRestore_RejectsReaping(t *testing.T) {
+// TestStatusAudit_ClaimForRestoreWithAuthority_RejectsReaping ensures a reaping
+// record cannot be restored.
+func TestStatusAudit_ClaimForRestoreWithAuthority_RejectsReaping(t *testing.T) {
 	s := newTestRetentionStore(t)
 	r := sampleEntry("lease-r")
 	r.Status = RetentionStatusReaping
 	require.NoError(t, s.Put(r))
-	_, err := s.ClaimForRestore("lease-r", "new", time.Hour)
-	require.Error(t, err, "ClaimForRestore must reject a reaping record")
+	_, err := claimForRestoreForTest(s, "lease-r", "new", time.Hour)
+	require.Error(t, err, "ClaimForRestoreWithAuthority must reject a reaping record")
 }
 
 // TestStatusAudit_ListExpired_ExcludesReaping ensures the reaper never re-marks a reaping record.
@@ -776,11 +1419,13 @@ func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
 	require.True(t, ok)
 	assertIndexConsistent(t, s)
 
-	_, err = s.ClaimForRestore("u1", "newlease", time.Hour) // active -> restoring
+	claimed, err := claimForRestoreForTest(s, "u1", "newlease", time.Hour) // active -> restoring
 	require.NoError(t, err)
 	assertIndexConsistent(t, s)
 
-	swapped, err := s.RevertToActive("u1", 1) // restoring -> active (gen=1 after claim)
+	swapped, err := revertToActiveForTest(
+		s, "u1", "newlease", claimed.Generation,
+	) // restoring -> active
 	require.NoError(t, err)
 	require.True(t, swapped)
 	assertIndexConsistent(t, s)
@@ -879,10 +1524,16 @@ func TestRetentionIndex_ListByIndexEquivalence(t *testing.T) {
 	s := newTestRetentionStore(t)
 	for i, st := range []string{RetentionStatusActive, RetentionStatusRestoring, RetentionStatusReaping, RetentionStatusActive} {
 		e := sampleEntry(fmt.Sprintf("u%d", i))
-		e.Status = st
 		if i == 3 {
 			e.Tenant = "tenant-b"
 		}
+		if st == RetentionStatusRestoring {
+			require.NoError(t, s.Put(e))
+			_, err := claimForRestoreForTest(s, e.OriginalLeaseUUID, "destination-"+e.OriginalLeaseUUID, 0)
+			require.NoError(t, err)
+			continue
+		}
+		e.Status = st
 		require.NoError(t, s.Put(e))
 	}
 	byT, err := s.ListByTenant("tenant-a")
@@ -1006,8 +1657,8 @@ func TestRetentionIndex_ConcurrentReadersWriters(t *testing.T) {
 			default:
 			}
 			id := fmt.Sprintf("u%d", i%50)
-			if _, err := s.ClaimForRestore(id, "n", time.Hour); err == nil {
-				_, _ = s.RevertToActive(id, 1)
+			if claimed, err := claimForRestoreForTest(s, id, "n", time.Hour); err == nil {
+				_, _ = revertToActiveForTest(s, id, "n", claimed.Generation)
 			}
 			_, _, _ = s.MarkReapingIfActive(id)
 		}
@@ -1083,11 +1734,10 @@ func TestRetentionIndex_RebuildKeysOnBucketKey(t *testing.T) {
 	require.Len(t, got, 1, "record must be found via the bucket key, not the empty value UUID")
 }
 
-// TestRetentionIndex_MutatorKeysOnBucketKey pins that indexApply (the runtime maintenance path)
-// keys the index on the bucket KEY too, consistent with scanIndex. A record whose stored value UUID
-// is empty/mismatched must still be correctly re-indexed when a mutator transitions its status —
-// otherwise scanIndex (keyed on the bucket key) and indexApply (keyed on the value field) diverge and
-// the record drifts out of the index until the next ReIndex. (Copilot follow-up regression.)
+// TestRetentionIndex_MutatorKeysOnBucketKey pins that indexApply (the runtime
+// maintenance path) keys the index on the bucket KEY too, consistent with
+// scanIndex. A corrupt empty source identity may no longer enter Restoring
+// through the strong API, but non-restoring transitions must still use the key.
 func TestRetentionIndex_MutatorKeysOnBucketKey(t *testing.T) {
 	s := newTestRetentionStore(t)
 
@@ -1098,16 +1748,16 @@ func TestRetentionIndex_MutatorKeysOnBucketKey(t *testing.T) {
 	}))
 	require.NoError(t, s.ReIndex()) // index keyed on the bucket key "K1"
 
-	// Runtime status transition active -> restoring via a mutator (keyed on orig="K1").
-	// maxAge=0 disables the expiry check (the white-box record has a zero CreatedAt); this test
-	// is about index keying, not grace expiry.
-	_, err := s.ClaimForRestore("K1", "newlease", 0)
+	// Runtime status transition active -> reaping via a mutator keyed on "K1".
+	_, transitioned, err := s.MarkReapingIfActive("K1")
 	require.NoError(t, err)
+	require.True(t, transitioned)
 
-	// The record must move to the restoring partition under "K1" and be found via getAll(Get("K1")).
-	restoring, err := s.ListRestoring()
+	// The record must move to the reaping partition under "K1" and be found via
+	// getAll(Get("K1")).
+	reaping, err := s.ListReaping()
 	require.NoError(t, err)
-	require.Len(t, restoring, 1, "transitioned record must be found via the bucket key, not the empty value UUID")
+	require.Len(t, reaping, 1, "transitioned record must be found via the bucket key, not the empty value UUID")
 	// No stale entry left in the active partition: the index must match a fresh rebuild.
 	assertIndexConsistent(t, s)
 }
@@ -1233,10 +1883,10 @@ func TestPartition_RoundTripsThroughLifecycleMethods(t *testing.T) {
 	e.Partition = "cust-a"
 	require.NoError(t, s.Put(e))
 
-	claimed, err := s.ClaimForRestore("orig-rt", "new-lease", 0)
+	claimed, err := claimForRestoreForTest(s, "orig-rt", "new-lease", 0)
 	require.NoError(t, err)
 	require.Equal(t, "cust-a", claimed.Partition)
-	ok, err := s.RevertToActive("orig-rt", claimed.Generation)
+	ok, err := revertToActiveForTest(s, "orig-rt", "new-lease", claimed.Generation)
 	require.NoError(t, err)
 	require.True(t, ok)
 	got, err := s.Get("orig-rt")

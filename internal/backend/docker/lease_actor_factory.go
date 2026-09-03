@@ -16,7 +16,7 @@ import (
 // run goroutine has already been spawned.
 //
 // Pattern matches PR4's seam-and-closure approach for PersistDiagnosticsFn /
-// SendCallbackFn / PersistDiagnosticsWithLogsFn and PR5b-1's Metrics
+// SendOperationCallbackFn / PersistDiagnosticsWithLogsFn and PR5b-1's Metrics
 // adapter — each substrate-private operation is reached via a closure
 // captured at construction, so the actor never holds a *Backend pointer
 // of its own.
@@ -59,10 +59,39 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 			PersistDiagnosticsWithLogsFn: func(entry shared.DiagnosticEntry, logs map[string]string) {
 				b.persistDiagnosticsWithLogs(entry, logs)
 			},
-			SendCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
-				// The actor SM only drives provision/restart/update callbacks —
-				// never the deprovision retain-success path — so retained=false.
-				b.sendCallbackWithURL(uuid, url, status, errMsg, false)
+			SendOperationCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
+				// Provision/restore operation completions never carry the
+				// deprovision retain-success flag.
+				b.sendOperationCallbackWithURL(uuid, url, status, errMsg)
+			},
+			SendLifecycleCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
+				if url == "" {
+					b.provisionsMu.RLock()
+					var completionURL string
+					if provision, exists := b.provisions[uuid]; exists {
+						completionURL = provision.CallbackURL
+					}
+					b.provisionsMu.RUnlock()
+					resolved, err := backend.ResolveLifecycleCallbackURL(completionURL, "")
+					if err != nil {
+						b.logger.Error("cannot derive lifecycle callback URL; suppressing observational callback",
+							"lease_uuid", uuid, "error", err)
+						return
+					}
+					url = resolved
+				}
+				b.sendLifecycleCallbackWithURL(uuid, url, status, errMsg, false)
+			},
+			SendMaintenanceCallbackFn: func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string) {
+				if b.callbackSender == nil {
+					b.logger.Error("cannot settle maintenance callback without durable sender",
+						"lease_uuid", claim.LeaseUUID())
+					return
+				}
+				if err := b.callbackSender.SendMaintenanceCallback(claim, status, errMsg); err != nil {
+					b.logger.Error("failed to settle maintenance callback; durable intent retained for recovery",
+						"lease_uuid", claim.LeaseUUID(), "maintenance_id", claim.MaintenanceID(), "error", err)
+				}
 			},
 			DoDeprovisionFn: func(ctx context.Context, leaseUUID string) error {
 				return b.doDeprovision(ctx, leaseUUID)

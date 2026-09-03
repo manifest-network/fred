@@ -30,6 +30,10 @@ func TestListRetentionsPage(t *testing.T) {
 		page, next, err := b.ListRetentionsPage(ctx, "", 2)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"a", "b"}, retIDs(page))
+		for _, retained := range page {
+			assert.Equal(t, "prov-1", retained.ProviderUUID)
+			assert.Equal(t, "tenant-a", retained.Tenant)
+		}
 		assert.Equal(t, "b", next)
 	})
 	t.Run("resume strictly after continue", func(t *testing.T) {

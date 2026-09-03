@@ -3,10 +3,14 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -16,9 +20,194 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
+
+const stackMaintenanceLeaseUUID = "11111111-1111-4111-8111-111111111111"
+
+// installStackStrictCohortInventory makes the Docker inventory observed by a
+// stack replacement come from the exact labels emitted by its last successful
+// Compose Up. Restart/update settlement deliberately requires both Compose PS
+// and a strict Docker inventory of the same generation, so returning a generic
+// running container here would make these tests bypass the production safety
+// boundary they are meant to exercise.
+func installStackStrictCohortInventory(
+	t *testing.T,
+	dockerMock *mockDockerClient,
+	composeMock *mockComposeExecutor,
+) {
+	t.Helper()
+	require.Nil(t, dockerMock.ListManagedContainersFn)
+
+	type serviceSnapshot struct {
+		image  string
+		labels map[string]string
+	}
+	type projectSnapshot struct {
+		name     string
+		services map[string]serviceSnapshot
+	}
+	var (
+		mu      sync.Mutex
+		current projectSnapshot
+	)
+	originalUp := composeMock.UpFn
+	composeMock.UpFn = func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+		if originalUp != nil {
+			if err := originalUp(ctx, project, opts); err != nil {
+				return err
+			}
+		}
+		snapshot := projectSnapshot{
+			name:     project.Name,
+			services: make(map[string]serviceSnapshot, len(project.Services)),
+		}
+		for serviceName, service := range project.Services {
+			snapshot.services[serviceName] = serviceSnapshot{
+				image:  service.Image,
+				labels: maps.Clone(service.Labels),
+			}
+		}
+		mu.Lock()
+		current = snapshot
+		mu.Unlock()
+		return nil
+	}
+
+	dockerMock.ListManagedContainersFn = func(ctx context.Context) ([]ContainerInfo, error) {
+		mu.Lock()
+		snapshot := projectSnapshot{
+			name:     current.name,
+			services: maps.Clone(current.services),
+		}
+		mu.Unlock()
+		if snapshot.name == "" {
+			return nil, nil
+		}
+		containers, err := composeMock.PS(ctx, snapshot.name)
+		if err != nil {
+			return nil, err
+		}
+		inventory := make([]ContainerInfo, 0, len(containers))
+		for _, container := range containers {
+			service, ok := snapshot.services[container.Service]
+			if !ok {
+				return nil, fmt.Errorf("compose service %q is absent from the successful project", container.Service)
+			}
+			instanceIndex, err := strconv.Atoi(service.labels[LabelInstanceIndex])
+			if err != nil {
+				return nil, fmt.Errorf("parse %s for service %q: %w", LabelInstanceIndex, container.Service, err)
+			}
+			inventory = append(inventory, ContainerInfo{
+				ContainerID:          container.ID,
+				LeaseUUID:            service.labels[LabelLeaseUUID],
+				Tenant:               service.labels[LabelTenant],
+				ProviderUUID:         service.labels[LabelProviderUUID],
+				BackendName:          service.labels[LabelBackendName],
+				SKU:                  service.labels[LabelSKU],
+				ServiceName:          service.labels[LabelServiceName],
+				CallbackURL:          service.labels[LabelCallbackURL],
+				LifecycleCallbackURL: service.labels[LabelLifecycleCallbackURL],
+				MaintenanceID:        shared.MaintenanceID(service.labels[LabelMaintenanceID]),
+				Image:                service.image,
+				Status:               container.State,
+				Health:               HealthStatus(container.Health),
+				InstanceIndex:        instanceIndex,
+				CustomDomain:         service.labels[LabelCustomDomain],
+			})
+		}
+		return inventory, nil
+	}
+}
+
+// seedStackMaintenanceAuthority attaches the same durable source release,
+// maintenance journal, and callback replay loop required by production. The
+// source authority is exact: callback identity, workload topology, resource
+// sizing, tenant, provider, and canonical lease identity all agree.
+func seedStackMaintenanceAuthority(
+	t *testing.T,
+	b *Backend,
+	leaseUUID string,
+	stack *manifest.StackManifest,
+	items []backend.LeaseItem,
+	operationID shared.OperationID,
+	callbackURL, lifecycleCallbackURL string,
+	client *http.Client,
+) {
+	t.Helper()
+	require.True(t, backend.IsCanonicalLeaseUUID(leaseUUID))
+	require.True(t, operationID.Valid())
+
+	manifestBytes, err := json.Marshal(stack)
+	require.NoError(t, err)
+	profiles := testResourceProfiles(t, items)
+	dir := t.TempDir()
+	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
+		DBPath: filepath.Join(dir, "stack-maintenance-releases.db"),
+	})
+	require.NoError(t, err)
+	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(dir, "stack-maintenance-callbacks.db"),
+	})
+	require.NoError(t, err)
+	b.releaseStore = releases
+	b.callbackStore = callbacks
+	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
+		Manifest:         manifestBytes,
+		Image:            "stack",
+		OperationID:      operationID,
+		Items:            slices.Clone(items),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(profiles),
+		RuntimeAuthority: mustTestReleaseRuntimeAuthority(
+			t, operationID, "tenant-a", nominalDockerProviderUUID,
+			callbackURL, lifecycleCallbackURL,
+		),
+		Status:    "active",
+		CreatedAt: time.Now(),
+	}))
+
+	b.provisionsMu.Lock()
+	provision := b.provisions[leaseUUID]
+	if provision != nil {
+		provision.LeaseUUID = leaseUUID
+		provision.Tenant = "tenant-a"
+		provision.ProviderUUID = nominalDockerProviderUUID
+		provision.CallbackURL = callbackURL
+		provision.LifecycleCallbackURL = lifecycleCallbackURL
+		provision.ResourceProfiles = shared.CloneSKUResourceSnapshot(profiles)
+	}
+	b.provisionsMu.Unlock()
+	require.NotNil(t, provision)
+
+	rebuildCallbackSender(b, client)
+	b.wg.Go(b.callbackSender.RunReplayLoop)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+		require.NoError(t, callbacks.Close())
+		require.NoError(t, releases.Close())
+	})
+}
+
+// awaitStackMaintenanceCallback waits for both the HTTP observation and the
+// sender's precise durable-row removal. Handler receipt alone is too early a
+// shutdown barrier: canceling stopCtx while the client is still consuming the
+// 2xx response correctly leaves the row for replay.
+func awaitStackMaintenanceCallback(t *testing.T, b *Backend, received <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for callback")
+	}
+	require.Eventually(t, func() bool {
+		pending, err := b.callbackStore.ListPending()
+		return err == nil && len(pending) == 0
+	}, 5*time.Second, time.Millisecond, "callback delivery must remove its exact durable row")
+}
 
 // validStackManifestJSON builds a minimal valid stack manifest payload.
 func validStackManifestJSON(services map[string]string) []byte {
@@ -36,9 +225,9 @@ func newStackProvisionRequest(leaseUUID, tenant string, items []backend.LeaseIte
 	return backend.ProvisionRequest{
 		LeaseUUID:    leaseUUID,
 		Tenant:       tenant,
-		ProviderUUID: "prov-1",
+		ProviderUUID: nominalDockerProviderUUID,
 		Items:        items,
-		CallbackURL:  "http://localhost/callback",
+		CallbackURL:  "http://localhost/callbacks/provision",
 		Payload:      payload,
 	}
 }
@@ -152,7 +341,7 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 	})
 
 	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -245,7 +434,7 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 
 	callbackReceived := make(chan struct{})
 	var callbackPayload backend.CallbackPayload
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&callbackPayload)
 		w.WriteHeader(http.StatusOK)
 		select {
@@ -283,6 +472,7 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 // --- Finding 3: re-provision cleans up old stack allocations ---
 
 func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 	removedContainers := map[string]bool{}
 	var mu sync.Mutex
 	mock := &mockDockerClient{
@@ -294,9 +484,6 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		},
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
-		},
-		InspectContainerFn: func(ctx context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 		},
 	}
 
@@ -313,14 +500,58 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
 		{SKU: "docker-small", Quantity: 1, ServiceName: "db"},
 	}
+	oldPayload := validStackManifestJSON(map[string]string{
+		"web": "nginx:latest",
+		"db":  "postgres:16",
+	})
+	oldProfiles := testResourceProfiles(t, oldItems)
+	oldOperationID := shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	oldCallbackURL := "https://old.example/callbacks/provision?operation_id=" + oldOperationID.String()
+	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
+	require.NoError(t, err)
+	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
+		oldOperationID, "tenant-a", nominalDockerProviderUUID, oldCallbackURL, oldLifecycleURL,
+	)
+	require.NoError(t, err)
+	oldContainers := []ContainerInfo{
+		{
+			ContainerID: "old-web-c1", LeaseUUID: leaseUUID, Tenant: "tenant-a",
+			ProviderUUID: nominalDockerProviderUUID, SKU: "docker-small", ServiceName: "web",
+			InstanceIndex: 0, CallbackURL: oldCallbackURL, LifecycleCallbackURL: oldLifecycleURL,
+			Image: "nginx:latest", Status: "running",
+		},
+		{
+			ContainerID: "old-db-c1", LeaseUUID: leaseUUID, Tenant: "tenant-a",
+			ProviderUUID: nominalDockerProviderUUID, SKU: "docker-small", ServiceName: "db",
+			InstanceIndex: 0, CallbackURL: oldCallbackURL, LifecycleCallbackURL: oldLifecycleURL,
+			Image: "postgres:16", Status: "running",
+		},
+	}
+	mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) {
+		return slices.Clone(oldContainers), nil
+	}
+	mock.InspectContainerFn = func(_ context.Context, containerID string) (*ContainerInfo, error) {
+		for _, container := range oldContainers {
+			if container.ContainerID == containerID {
+				copy := container
+				return &copy, nil
+			}
+		}
+		return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Status:       backend.ProvisionStatusFailed,
-			FailCount:    1,
-			Quantity:     2,
-			ContainerIDs: []string{"old-web-c1", "old-db-c1"},
-			Items:        oldItems,
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
+			Tenant:               "tenant-a",
+			ProviderUUID:         nominalDockerProviderUUID,
+			Status:               backend.ProvisionStatusFailed,
+			FailCount:            1,
+			Quantity:             2,
+			ContainerIDs:         []string{"old-web-c1", "old-db-c1"},
+			CallbackURL:          oldCallbackURL,
+			LifecycleCallbackURL: oldLifecycleURL,
+			Items:                oldItems,
+			ResourceProfiles:     oldProfiles,
 			ServiceContainers: map[string][]string{
 				"web": {"old-web-c1"},
 				"db":  {"old-db-c1"},
@@ -331,17 +562,37 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 					"db":  {Image: "postgres:16"},
 				},
 			}},
+			ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
 		},
 	})
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	nominalIntents := b.operationIntents.(noopOperationIntentJournal)
+	b.operationIntents = durableTestOperationIntentJournal{store: nominalIntents.store, storageID: storageID}
+	b.callbackStore = nominalIntents.store
+	releases := attachReleaseStore(t, b)
+	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
+		Manifest:         oldPayload,
+		Image:            "stack",
+		OperationID:      oldOperationID,
+		Items:            slices.Clone(oldItems),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
+		RuntimeAuthority: &oldAuthority,
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	}))
+	composeMock.DownFn = func(context.Context, string, time.Duration) error {
+		return errors.New("force strict per-container predecessor teardown")
+	}
 	b.compose = composeMock
 
 	// Pre-allocate old stack resources with service-aware IDs.
-	_ = b.pool.TryAllocate("lease-1-web-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-db-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(leaseUUID+"-web-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(leaseUUID+"-db-0", "docker-small", "tenant-a")
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -350,6 +601,7 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	rebuildCallbackSender(b, callbackServer.Client())
 
 	newItems := []backend.LeaseItem{
 		{SKU: "docker-small", Quantity: 1, ServiceName: "web"},
@@ -360,10 +612,11 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		"db":  "postgres:16",
 	})
 
-	req := newStackProvisionRequest("lease-1", "tenant-a", newItems, payload)
-	req.CallbackURL = callbackServer.URL
+	req := newStackProvisionRequest(leaseUUID, "tenant-a", newItems, payload)
+	const candidateOperationID = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	req.CallbackURL = callbackServer.URL + "?operation_id=" + candidateOperationID.String()
 
-	err := b.Provision(context.Background(), req)
+	err = b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
 	// Old containers should be removed during re-provision cleanup (synchronous phase).
@@ -372,10 +625,15 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 	assert.True(t, removedContainers["old-db-c1"], "old db container should be removed")
 	mu.Unlock()
 
-	<-callbackReceived
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		return b.provisions[leaseUUID] != nil &&
+			b.provisions[leaseUUID].Status == backend.ProvisionStatusReady
+	}, 5*time.Second, time.Millisecond)
 
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[leaseUUID]
 	status := prov.Status
 	newCIDs := prov.ContainerIDs
 	svcContainers := prov.ServiceContainers
@@ -408,9 +666,9 @@ func TestStackRestart_Success(t *testing.T) {
 	}
 
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: stackMaintenanceLeaseUUID,
 			Tenant:        "tenant-a",
-			ProviderUUID:  "prov-1",
+			ProviderUUID:  nominalDockerProviderUUID,
 			SKU:           "docker-small",
 			Status:        backend.ProvisionStatusReady,
 			StackManifest: stackManifest,
@@ -446,11 +704,14 @@ func TestStackRestart_Success(t *testing.T) {
 			}, nil
 		},
 	}
+	installStackStrictCohortInventory(t, mock, composeMock)
 
 	var callbackPayload backend.CallbackPayload
+	var callbackRequestURI string
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		callbackRequestURI = r.URL.RequestURI()
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -459,23 +720,28 @@ func TestStackRestart_Success(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	const lifecycleID = "550e8400-e29b-41d4-a716-446655440000"
+	oldOperationURL := callbackServer.URL + "/old/callbacks/provision?operation_id=" + lifecycleID
+	oldLifecycleURL := callbackServer.URL + "/old/callbacks/provision?lifecycle_id=" + lifecycleID
+	newOperationURL := callbackServer.URL + "/new/callbacks/provision?operation_id=" + lifecycleID
+	newLifecycleURL := callbackServer.URL + "/new/callbacks/provision?lifecycle_id=" + lifecycleID
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	rebuildCallbackSender(b, callbackServer.Client())
+	seedStackMaintenanceAuthority(
+		t, b, stackMaintenanceLeaseUUID, stackManifest, items,
+		shared.OperationID(lifecycleID), oldOperationURL, oldLifecycleURL,
+		callbackServer.Client(),
+	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID:   "lease-1",
-		CallbackURL: callbackServer.URL,
+		LeaseUUID:   stackMaintenanceLeaseUUID,
+		CallbackURL: newLifecycleURL,
 	})
 	require.NoError(t, err)
 
-	select {
-	case <-callbackReceived:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for callback")
-	}
+	awaitStackMaintenanceCallback(t, b, callbackReceived)
 
 	// Verify Compose Up was called with ForceRecreate for restart.
 	mu.Lock()
@@ -484,17 +750,23 @@ func TestStackRestart_Success(t *testing.T) {
 
 	// Verify callback indicates success.
 	assert.Equal(t, backend.CallbackStatusSuccess, callbackPayload.Status)
+	assert.Equal(t, "/new/callbacks/provision?lifecycle_id="+lifecycleID, callbackRequestURI,
+		"restart completion must use the same lifecycle capability at the current callback base")
 
 	// Verify final state: new containers, ready status.
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackMaintenanceLeaseUUID]
 	status := prov.Status
 	svcContainers := prov.ServiceContainers
+	gotOperationURL := prov.CallbackURL
+	gotLifecycleURL := prov.LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status)
 	assert.Len(t, svcContainers, 2)
 	assert.Len(t, svcContainers["web"], 1)
 	assert.Len(t, svcContainers["db"], 1)
+	assert.Equal(t, newOperationURL, gotOperationURL, "restart must persist the relocated callback pair")
+	assert.Equal(t, newLifecycleURL, gotLifecycleURL, "restart must preserve lifecycle identity")
 
 	b.stopCancel()
 	b.wg.Wait()
@@ -513,9 +785,9 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 	}
 
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: stackMaintenanceLeaseUUID,
 			Tenant:        "tenant-a",
-			ProviderUUID:  "prov-1",
+			ProviderUUID:  nominalDockerProviderUUID,
 			SKU:           "docker-small",
 			Status:        backend.ProvisionStatusReady,
 			StackManifest: stackManifest,
@@ -556,10 +828,11 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 			}, nil
 		},
 	}
+	installStackStrictCohortInventory(t, mock, composeMock)
 
 	var callbackPayload backend.CallbackPayload
 	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&callbackPayload)
 		w.WriteHeader(http.StatusOK)
 		select {
@@ -572,27 +845,29 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	rebuildCallbackSender(b, callbackServer.Client())
+	operationID := shared.OperationID("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
+	operationURL := callbackServer.URL + "?operation_id=" + operationID.String()
+	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + operationID.String()
+	seedStackMaintenanceAuthority(
+		t, b, stackMaintenanceLeaseUUID, stackManifest, items,
+		operationID, operationURL, lifecycleURL, callbackServer.Client(),
+	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID:   "lease-1",
-		CallbackURL: callbackServer.URL,
+		LeaseUUID:   stackMaintenanceLeaseUUID,
+		CallbackURL: lifecycleURL,
 	})
 	require.NoError(t, err)
 
-	select {
-	case <-callbackReceived:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for callback")
-	}
+	awaitStackMaintenanceCallback(t, b, callbackReceived)
 
 	// Even though rollback succeeded, the operation failed — callback should report failure.
 	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
 
 	// After rollback via Compose, provision should be back to Ready.
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackMaintenanceLeaseUUID]
 	status := prov.Status
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status)
@@ -609,6 +884,7 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 // --- Stack Update tests ---
 
 func TestStackUpdate_Success(t *testing.T) {
+	const lifecycleID = "550e8400-e29b-41d4-a716-446655440000"
 	oldStack := &manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:1.24"},
@@ -621,9 +897,9 @@ func TestStackUpdate_Success(t *testing.T) {
 	}
 
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: stackMaintenanceLeaseUUID,
 			Tenant:        "tenant-a",
-			ProviderUUID:  "prov-1",
+			ProviderUUID:  nominalDockerProviderUUID,
 			SKU:           "docker-small",
 			Status:        backend.ProvisionStatusReady,
 			StackManifest: oldStack,
@@ -653,11 +929,14 @@ func TestStackUpdate_Success(t *testing.T) {
 			}, nil
 		},
 	}
+	installStackStrictCohortInventory(t, mock, composeMock)
 
 	var callbackPayload backend.CallbackPayload
+	var callbackRequestURI string
 	callbackReceived := make(chan struct{})
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&callbackPayload)
+		callbackRequestURI = r.URL.RequestURI()
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -666,10 +945,18 @@ func TestStackUpdate_Success(t *testing.T) {
 		}
 	}))
 	defer callbackServer.Close()
+	oldOperationURL := callbackServer.URL + "/old/callbacks/provision?operation_id=" + lifecycleID
+	oldLifecycleURL := callbackServer.URL + "/old/callbacks/provision?lifecycle_id=" + lifecycleID
+	newOperationURL := callbackServer.URL + "/new/callbacks/provision?operation_id=" + lifecycleID
+	newLifecycleURL := callbackServer.URL + "/new/callbacks/provision?lifecycle_id=" + lifecycleID
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	rebuildCallbackSender(b, callbackServer.Client())
+	seedStackMaintenanceAuthority(
+		t, b, stackMaintenanceLeaseUUID, oldStack, items,
+		shared.OperationID(lifecycleID), oldOperationURL, oldLifecycleURL,
+		callbackServer.Client(),
+	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	newPayload := validStackManifestJSON(map[string]string{
@@ -678,26 +965,26 @@ func TestStackUpdate_Success(t *testing.T) {
 	})
 
 	err := b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID:   "lease-1",
-		CallbackURL: callbackServer.URL,
+		LeaseUUID:   stackMaintenanceLeaseUUID,
+		CallbackURL: newLifecycleURL,
 		Payload:     newPayload,
 	})
 	require.NoError(t, err)
 
-	select {
-	case <-callbackReceived:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for callback")
-	}
+	awaitStackMaintenanceCallback(t, b, callbackReceived)
 
 	assert.Equal(t, backend.CallbackStatusSuccess, callbackPayload.Status)
+	assert.Equal(t, "/new/callbacks/provision?lifecycle_id="+lifecycleID, callbackRequestURI,
+		"update completion must use the same lifecycle capability at the current callback base")
 
 	// Verify OnSuccess updated the manifest.StackManifest.
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackMaintenanceLeaseUUID]
 	status := prov.Status
 	updatedManifest := prov.StackManifest
 	svcContainers := prov.ServiceContainers
+	gotOperationURL := prov.CallbackURL
+	gotLifecycleURL := prov.LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 
 	assert.Equal(t, backend.ProvisionStatusReady, status)
@@ -705,6 +992,8 @@ func TestStackUpdate_Success(t *testing.T) {
 	assert.Equal(t, "nginx:1.25", updatedManifest.Services["web"].Image)
 	assert.Equal(t, "postgres:16", updatedManifest.Services["db"].Image)
 	assert.Len(t, svcContainers, 2)
+	assert.Equal(t, newOperationURL, gotOperationURL, "update must persist the relocated callback pair")
+	assert.Equal(t, newLifecycleURL, gotLifecycleURL, "update must preserve lifecycle identity")
 
 	b.stopCancel()
 	b.wg.Wait()
@@ -952,7 +1241,7 @@ func TestStackProvision_ComposeUpFailure(t *testing.T) {
 
 	var callbackPayload backend.CallbackPayload
 	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&callbackPayload)
 		w.WriteHeader(http.StatusOK)
 		select {
@@ -1218,34 +1507,31 @@ func TestRecoverState_StackMultiInstance(t *testing.T) {
 
 // TestStackRestart_PreservesCustomDomainInItems lifts a slice of the
 // CustomDomain-threading coverage from the deleted
-// TestRestart_LegacyPropagatesCustomDomainFromProvItems. The original
-// test exercised CreateContainerParams.CustomDomain end-to-end — that
-// path is gone with the legacy doProvision. End-to-end label-level
-// verification now requires a configured Traefik ingress which is
-// substantial test scaffolding; instead this test pins the narrower
-// (but load-bearing) invariant: a Restart cycle must not lose the
-// CustomDomain off prov.Items. The downstream label-emission is
-// independently covered by ingress_test.go (TraefikCustomDomainLabels,
-// CustomDomainRouterName).
+// TestRestart_LegacyPropagatesCustomDomainFromProvItems. The fixture uses the
+// minimal real ingress path so strict inventory observes the same custom-domain
+// label as Docker. The focused invariant remains that a Restart cycle must not
+// lose the CustomDomain off prov.Items.
 func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
 	const customDomain = "foo.example.com"
-	payload := validStackManifestJSON(map[string]string{
-		manifest.DefaultServiceName: "nginx:latest",
-	})
-	stack, err := manifest.ParsePayload(payload)
-	require.NoError(t, err)
+	stack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+		manifest.DefaultServiceName: {
+			Image: "nginx:latest",
+			Ports: map[string]manifest.PortConfig{"80/tcp": {}},
+		},
+	}}
+	items := []backend.LeaseItem{
+		{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName, CustomDomain: customDomain},
+	}
 
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:    "lease-1",
-			Tenant:       "tenant-a",
-			ProviderUUID: "prov-1",
-			SKU:          "docker-small",
-			Status:       backend.ProvisionStatusReady,
-			Quantity:     1,
-			Items: []backend.LeaseItem{
-				{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName, CustomDomain: customDomain},
-			},
+		stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:         stackMaintenanceLeaseUUID,
+			Tenant:            "tenant-a",
+			ProviderUUID:      nominalDockerProviderUUID,
+			SKU:               "docker-small",
+			Status:            backend.ProvisionStatusReady,
+			Quantity:          1,
+			Items:             items,
 			StackManifest:     stack,
 			ServiceContainers: map[string][]string{manifest.DefaultServiceName: {"old-c1"}},
 			ContainerIDs:      []string{"old-c1"},
@@ -1272,9 +1558,10 @@ func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
 		},
 		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
 	}
+	installStackStrictCohortInventory(t, mock, composeMock)
 
 	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -1286,17 +1573,26 @@ func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	rebuildCallbackSender(b, callbackServer.Client())
+	b.cfg.Ingress = IngressConfig{
+		Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure",
+	}
+	operationID := shared.OperationID("123e4567-e89b-42d3-a456-426614174000")
+	operationURL := callbackServer.URL + "?operation_id=" + operationID.String()
+	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + operationID.String()
+	seedStackMaintenanceAuthority(
+		t, b, stackMaintenanceLeaseUUID, stack, items,
+		operationID, operationURL, lifecycleURL, callbackServer.Client(),
+	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID:   "lease-1",
-		CallbackURL: callbackServer.URL,
+		LeaseUUID:   stackMaintenanceLeaseUUID,
+		CallbackURL: lifecycleURL,
 	}))
-	<-callbackReceived
+	awaitStackMaintenanceCallback(t, b, callbackReceived)
 
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackMaintenanceLeaseUUID]
 	require.NotNil(t, prov)
 	preserved := prov.Items[0].CustomDomain
 	b.provisionsMu.RUnlock()
@@ -1326,10 +1622,10 @@ func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
 	require.NoError(t, err)
 
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:    "lease-1",
+		stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:    stackMaintenanceLeaseUUID,
 			Tenant:       "tenant-a",
-			ProviderUUID: "prov-1",
+			ProviderUUID: nominalDockerProviderUUID,
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     1,
@@ -1366,10 +1662,11 @@ func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
 		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
 		ContainerLogsFn:   func(ctx context.Context, id string, tail int) (string, error) { return "", nil },
 	}
+	installStackStrictCohortInventory(t, mock, composeMock)
 
 	var callbackPayload backend.CallbackPayload
 	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&callbackPayload)
 		w.WriteHeader(http.StatusOK)
 		select {
@@ -1382,31 +1679,54 @@ func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	rebuildCallbackSender(b, callbackServer.Client())
+	operationID := shared.OperationID("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
+	operationURL := callbackServer.URL + "?operation_id=" + operationID.String()
+	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + operationID.String()
+	seedStackMaintenanceAuthority(
+		t, b, stackMaintenanceLeaseUUID, stack, provisions[stackMaintenanceLeaseUUID].Items,
+		operationID, operationURL, lifecycleURL, callbackServer.Client(),
+	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID:   "lease-1",
-		CallbackURL: callbackServer.URL,
+		LeaseUUID:   stackMaintenanceLeaseUUID,
+		CallbackURL: lifecycleURL,
 		Payload:     payload,
 	}))
-	<-callbackReceived
+	require.Eventually(t, func() bool {
+		intent, found, err := b.callbackStore.GetMaintenanceIntent(stackMaintenanceLeaseUUID)
+		if err != nil || !found || b.actorOwnsMaintenance(stackMaintenanceLeaseUUID, intent.MaintenanceID()) {
+			return false
+		}
+		b.provisionsMu.RLock()
+		status := b.provisions[stackMaintenanceLeaseUUID].Status
+		b.provisionsMu.RUnlock()
+		return status == backend.ProvisionStatusFailed
+	}, 5*time.Second, time.Millisecond, "failed replacement must release its exact worker authority")
+	select {
+	case <-callbackReceived:
+		t.Fatal("ambiguous rollback failure must preserve callback settlement for recovery")
+	default:
+	}
+	require.NoError(t, b.recoverMaintenanceIntents(context.Background()))
+	awaitStackMaintenanceCallback(t, b, callbackReceived)
 
 	// Up should be called twice: once for the new generation (fails),
 	// once for the rollback (also fails).
 	assert.GreaterOrEqual(t, upCalls, 2,
 		"compose.Up must be tried for both the update and the rollback before status escalates")
 
-	// Callback reports failure with rollback-failed context.
+	// The durable resolver reports the curated update failure only after it has
+	// classified the ambiguous substrate outcome; the verbose Compose errors stay
+	// in backend logs rather than crossing the tenant callback boundary.
 	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
-	assert.Contains(t, callbackPayload.Error, "rollback failed",
-		"callback error must surface that rollback failed (operator triage signal)")
+	assert.Equal(t, backend.MsgUpdateFailed, callbackPayload.Error)
 
 	// Final status must be Failed — when rollback itself fails, neither
 	// the new nor the old generation is healthy; the lease is genuinely
 	// broken and the operator/tenant needs to know.
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackMaintenanceLeaseUUID]
 	status := prov.Status
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusFailed, status,
@@ -1428,10 +1748,10 @@ func TestStackRestart_RollbackClearsLastError(t *testing.T) {
 	require.NoError(t, err)
 
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:    "lease-1",
+		stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:    stackMaintenanceLeaseUUID,
 			Tenant:       "tenant-a",
-			ProviderUUID: "prov-1",
+			ProviderUUID: nominalDockerProviderUUID,
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			Quantity:     1,
@@ -1473,9 +1793,10 @@ func TestStackRestart_RollbackClearsLastError(t *testing.T) {
 		},
 		RemoveContainerFn: func(ctx context.Context, id string) error { return nil },
 	}
+	installStackStrictCohortInventory(t, mock, composeMock)
 
 	callbackReceived := make(chan struct{})
-	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		select {
 		case <-callbackReceived:
@@ -1487,17 +1808,23 @@ func TestStackRestart_RollbackClearsLastError(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	rebuildCallbackSender(b, callbackServer.Client())
+	operationID := shared.OperationID("123e4567-e89b-42d3-a456-426614174000")
+	operationURL := callbackServer.URL + "?operation_id=" + operationID.String()
+	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + operationID.String()
+	seedStackMaintenanceAuthority(
+		t, b, stackMaintenanceLeaseUUID, stack, provisions[stackMaintenanceLeaseUUID].Items,
+		operationID, operationURL, lifecycleURL, callbackServer.Client(),
+	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
 	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID:   "lease-1",
-		CallbackURL: callbackServer.URL,
+		LeaseUUID:   stackMaintenanceLeaseUUID,
+		CallbackURL: lifecycleURL,
 	}))
-	<-callbackReceived
+	awaitStackMaintenanceCallback(t, b, callbackReceived)
 
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackMaintenanceLeaseUUID]
 	b.provisionsMu.RUnlock()
 
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status,

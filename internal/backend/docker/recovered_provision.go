@@ -1,8 +1,10 @@
 package docker
 
 import (
+	"reflect"
 	"slices"
 
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
@@ -26,6 +28,7 @@ import (
 // //exhaustruct:enforce to get the same protection.
 type recoveredProvision struct {
 	leasesm.ProvisionState
+	resourceProfiles      []shared.SKUResourceSnapshot
 	volumeCleanupAttempts int
 }
 
@@ -35,6 +38,7 @@ type recoveredProvision struct {
 func (rec recoveredProvision) materialize() *provision {
 	return &provision{ //exhaustruct:enforce
 		ProvisionState:        rec.ProvisionState,
+		ResourceProfiles:      shared.CloneSKUResourceSnapshot(rec.resourceProfiles),
 		VolumeCleanupAttempts: rec.volumeCleanupAttempts,
 	}
 }
@@ -50,8 +54,10 @@ func (rec recoveredProvision) materialize() *provision {
 func recoveredFromProvision(p *provision) recoveredProvision {
 	rec := recoveredProvision{ //exhaustruct:enforce
 		ProvisionState:        p.ProvisionState,
+		resourceProfiles:      shared.CloneSKUResourceSnapshot(p.ResourceProfiles),
 		volumeCleanupAttempts: p.VolumeCleanupAttempts,
 	}
+	rec.ResourceProfiles = shared.CloneSKUResourceSnapshot(p.ProvisionState.ResourceProfiles)
 	rec.Items = slices.Clone(p.Items)
 	rec.ContainerIDs = slices.Clone(p.ContainerIDs)
 	if p.ServiceContainers != nil {
@@ -62,6 +68,13 @@ func recoveredFromProvision(p *provision) recoveredProvision {
 		rec.ServiceContainers = sc
 	}
 	return rec
+}
+
+// provisionMatchesRecovered compares a published, lock-protected projection
+// with a previously captured deep snapshot. Pointer identity alone cannot
+// detect the intentional in-place mutations performed by lease actors.
+func provisionMatchesRecovered(p *provision, snapshot recoveredProvision) bool {
+	return p != nil && reflect.DeepEqual(recoveredFromProvision(p), snapshot)
 }
 
 // enrichReserved sets the post-validation workload metadata on a reserved

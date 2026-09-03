@@ -11,7 +11,39 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
+
+const volumeCleanupTimeout = 10 * time.Second
+
+// ErrVolumeMutationRecoveryPending means a volume manager has already made an
+// irreversible mutation decision durable, but could not finish consuming its
+// typed recovery evidence. The mutation adapter fail-stops the live Backend on
+// this class so no later close, restore, or collector can infer completion from
+// a partially removed namespace. A fresh process must run startup recovery.
+var ErrVolumeMutationRecoveryPending = errors.New("volume mutation recovery pending")
+
+// newDetachedBoundedContext lets compensation finish after request
+// cancellation, while still honoring an earlier aggregate phase deadline. A
+// plain context.WithoutCancel followed by WithTimeout would silently extend an
+// already-expired Start budget by the full local timeout on every stage.
+func newDetachedBoundedContext(parent context.Context, maximum time.Duration) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(parent)
+	deadline := time.Now().Add(maximum)
+	if parentDeadline, ok := parent.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	return context.WithDeadline(base, deadline)
+}
+
+// newVolumeCleanupContext gives a compensating cleanup a bounded lifetime that
+// survives request cancellation while preserving tracing and other context
+// values. Callers may use it only after proving this invocation created the
+// unpublished storage object being cleaned up; ambiguous outcomes must retain
+// their evidence for retry instead of guessing through destruction.
+func newVolumeCleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return newDetachedBoundedContext(parent, volumeCleanupTimeout)
+}
 
 // volumeManager manages quota-enforced host directories for container volumes.
 //
@@ -31,7 +63,8 @@ type volumeManager interface {
 
 	// EnsureQuota re-applies the quota (for xfs: project-tag + block (bhard)
 	// and inode (ihard) limits) to an EXISTING volume, so a volume created
-	// before the daemon could set quotas (ENG-454) gets its disk_mb cap
+	// before the daemon could set quotas (ENG-454) gets its immutable effective
+	// cap (durable disk or pinned diskless scratch)
 	// enforced without a re-provision or data move. Unlike Create it NEVER
 	// creates: if the volume is absent it is a no-op (returns nil), so a
 	// concurrently-deprovisioning volume cannot be resurrected. Idempotent.
@@ -41,6 +74,37 @@ type volumeManager interface {
 	// List returns the IDs of all managed volumes in the data directory.
 	// Used for orphan detection at startup.
 	List() ([]string, error)
+
+	// ListForProof returns the complete managed-volume substrate inventory under
+	// a caller-owned deadline. For directory-backed managers this is the same
+	// namespace as List. ZFS additionally inventories child datasets so an
+	// unmounted or externally-mounted dataset cannot disappear from the proof
+	// merely because its expected directory is absent.
+	ListForProof(context.Context) ([]string, error)
+
+	// AttestManagedVolume proves that name is backed by this manager's exact
+	// quota substrate, not merely by a directory with a syntactically valid
+	// managed name. The typed name keeps unvalidated path and dataset strings
+	// out of the proof boundary; the context bounds any filesystem CLI probe.
+	// It is read-only and is used before storage identity publication and
+	// backend startup, as well as before reusing an existing volume.
+	AttestManagedVolume(context.Context, managedVolumeName) error
+
+	// RequireNoInterruptedVolumeMutations is the read-only publication boundary
+	// for first-time storage-lineage initialization and post-recovery startup. It
+	// rejects manager-private mutation evidence (for example an XFS create/delete
+	// stage or an exact but unmounted ZFS child) without repairing or deleting it.
+	// Explicit adoption calls this while the old daemon is stopped, so a proof
+	// command can never mutate the lineage it is measuring.
+	RequireNoInterruptedVolumeMutations(context.Context) error
+
+	// RecoverInterruptedVolumeMutations resolves manager-private mutation evidence
+	// after the identity-bound stores have been opened exclusively but before
+	// ordinary operation-intent recovery. Implementations may only act on strictly
+	// typed substrate evidence and must retain it on an ambiguous or failed
+	// cleanup. The storage mutation adapter surrounds this method with before/after
+	// lineage verification.
+	RecoverInterruptedVolumeMutations(context.Context) error
 
 	// Validate checks filesystem support and permissions, and rebuilds any
 	// internal state (e.g. active project IDs) from on-disk volumes. Called at startup.
@@ -57,7 +121,7 @@ type volumeManager interface {
 	// fred-{leaseUUID}-{idx} volumes into the service-aware
 	// fred-{leaseUUID}-{service}-{idx} naming convention without copying
 	// data.
-	RenameVolume(oldName, newName string) error
+	RenameVolume(ctx context.Context, oldName, newName string) error
 
 	// HostPath returns the absolute on-host path for a managed volume of
 	// the given name. The volume need not yet exist — this lets callers
@@ -80,9 +144,17 @@ type volumeManager interface {
 	Kind() string
 }
 
-// noopVolumeManager is used when no SKUs have disk_mb > 0.
-// Create returns an error (callers must guard with disk_mb > 0 checks);
-// Destroy is a no-op; Validate always succeeds.
+type identityRootPinner interface {
+	PinIdentityRoot() error
+	VerifyIdentityRoot() error
+}
+
+var errVolumeRootIdentityDrift = errors.New("volume root identity drift")
+
+// noopVolumeManager is used when volume_data_path is unset. Create returns an
+// error; stateful SKUs are rejected by config validation and diskless
+// writable-path setup treats the unavailable optional scratch volume as a
+// best-effort seeding failure. Destroy is a no-op; Validate always succeeds.
 type noopVolumeManager struct{}
 
 func (n *noopVolumeManager) Create(_ context.Context, _ string, _ int64) (string, bool, error) {
@@ -103,6 +175,21 @@ func (n *noopVolumeManager) List() ([]string, error) {
 	return nil, nil
 }
 
+func (n *noopVolumeManager) ListForProof(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (n *noopVolumeManager) AttestManagedVolume(_ context.Context, name managedVolumeName) error {
+	return fmt.Errorf("noop volume manager cannot attest managed volume %q", name.value())
+}
+
+func (n *noopVolumeManager) RequireNoInterruptedVolumeMutations(context.Context) error { return nil }
+
+func (n *noopVolumeManager) RecoverInterruptedVolumeMutations(context.Context) error { return nil }
+
 func (n *noopVolumeManager) Validate() error {
 	return nil
 }
@@ -110,7 +197,7 @@ func (n *noopVolumeManager) Validate() error {
 // RenameVolume on the noop manager is a no-op so migrate code paths can
 // run on hosts with no stateful SKUs without a special case. The legacy
 // lease cannot have had a managed volume to begin with.
-func (n *noopVolumeManager) RenameVolume(_, _ string) error {
+func (n *noopVolumeManager) RenameVolume(_ context.Context, _, _ string) error {
 	return nil
 }
 
@@ -207,12 +294,13 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 			return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
 		}
 		return &xfsVolumeManager{
-			dataPath:        dataPath,
-			mountPoint:      mountPoint,
-			logger:          logger,
-			minAvgFileBytes: minAvgFileBytes,
-			activeIDs:       make(map[uint32]string),
-			volumeToID:      make(map[string]uint32),
+			dataPath:          dataPath,
+			mountPoint:        mountPoint,
+			logger:            logger,
+			minAvgFileBytes:   minAvgFileBytes,
+			projectAttributes: linuxXFSProjectAttributeReader{},
+			activeIDs:         make(map[uint32]string),
+			volumeToID:        make(map[string]uint32),
 		}, nil
 	case "zfs":
 		return &zfsVolumeManager{dataPath: dataPath, logger: logger}, nil
@@ -239,37 +327,96 @@ const volumePrefix = "fred-"
 // prunes them, and once the filesystem is mounted again those volumes have no record naming
 // them — so the next boot's orphan sweep destroys retained tenant data. (ENG-687)
 //
-// The baseline is learned rather than configured: the first enumeration that actually finds
-// volumes records the device backing the root, and from then on an EMPTY result must come
-// from that same device or it is treated as uncertainty. That ordering is what makes it
-// safe — a root we have never seen hold anything has nothing to lose, and the transition
-// this guards is precisely "held volumes, then suddenly none".
+// Before a storage lineage is sealed, the watch can learn a provisional baseline: the first
+// enumeration that actually finds volumes records the device backing the root, and from then
+// on an EMPTY result must come from that same device or it is treated as uncertainty. This
+// learned mode remains useful to isolated tests and to read-only initialization evidence.
+// Production startup does not rely on it: loadStorageIdentity pins the root's exact device and
+// inode before loading the persistent marker pair, whose primary marker lives inside this root.
+// A daemon that starts with the mount already absent therefore fails marker loading instead of
+// accepting the empty parent-filesystem stub.
 //
 // Every enumeration pays one stat, not just the empty ones: a populated read is where the
 // baseline is LEARNED, so skipping it there would leave nothing to compare against later.
-// Only the empty result is REJECTED on a mismatch — a populated one re-learns instead,
-// which is also what lets a deliberate remount converge rather than wedge.
-//
-// KNOWN LIMIT, deliberately not papered over: the baseline is process-local, so a daemon that
-// STARTS while the mount is already down has never seen this root hold anything and its first
-// empty enumeration is accepted. The startup filesystem probe covers that only when the parent
-// filesystem differs from the configured one — on a host whose root and data volume are both
-// XFS, both guards pass.
-//
-// Closing it needs a mount identity that survives a restart, which is a different mechanism
-// (a marker file in the root, or persisted identity, plus an upgrade story for roots that
-// predate it) and is tracked separately. The obvious shortcut — refusing to believe an empty
-// root while retention records still name volumes — was tried and rejected: it cannot tell an
+// In provisional learned mode, only an empty mismatch is rejected and a populated read may
+// re-learn. Once production pins the root, both populated and empty mismatches are rejected;
+// a deliberate remount is a storage-lineage change that requires explicit operator handling,
+// never automatic convergence. The tempting shortcut — refusing to believe an empty root
+// while retention records still name volumes — remains wrong: it cannot distinguish an
 // unmount from a genuine reclaim of every volume, so it disables the orphan pruner on exactly
 // the nodes it was built for (pinned by TestRunRetentionSweep_PrunesOrphans).
 type volumeRootWatch struct {
-	mu   sync.Mutex
-	dev  uint64
-	seen bool
+	mu     sync.Mutex
+	dev    uint64
+	ino    uint64
+	seen   bool
+	pinned bool
+}
+
+// pin freezes the filesystem device that carries the identity marker. Once
+// pinned, a populated replacement is rejected just like an empty replacement;
+// runtime code can no longer relearn a different substrate.
+func (w *volumeRootWatch) pin(dataPath string) error {
+	identity, err := statVolumeRootIdentity(dataPath)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.seen && (w.dev != identity.dev || (w.ino != 0 && w.ino != identity.ino)) {
+		return fmt.Errorf("volume data root %s changed before identity pin (device/inode %d/%d, was %d/%d)",
+			dataPath, identity.dev, identity.ino, w.dev, w.ino)
+	}
+	w.dev, w.ino, w.seen, w.pinned = identity.dev, identity.ino, true, true
+	return nil
+}
+
+// verify proves that the configured path still resolves to the exact directory
+// inode pinned before the backend identity was loaded. Device-only comparison
+// misses a same-filesystem rename/replacement, which is enough to redirect all
+// subsequent volume mutations to unrelated bytes.
+func (w *volumeRootWatch) verify(dataPath string) error {
+	identity, err := statVolumeRootIdentity(dataPath)
+	if err != nil {
+		// A configured, pinned root disappearing is not a transient probe
+		// failure. Continuing would redirect subsequent creates/destroys to the
+		// parent filesystem if the path is recreated, so latch the same permanent
+		// drift class as an inode/device replacement.
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: pinned volume data root %s disappeared: %w",
+				errVolumeRootIdentityDrift, dataPath, err)
+		}
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.pinned || !w.seen {
+		return errors.New("volume data root identity is not pinned")
+	}
+	if identity.dev != w.dev || identity.ino != w.ino {
+		return fmt.Errorf("%w: volume data root %s changed identity (device/inode %d/%d, expected %d/%d)",
+			errVolumeRootIdentityDrift,
+			dataPath, identity.dev, identity.ino, w.dev, w.ino)
+	}
+	return nil
 }
 
 // list enumerates dataPath and refuses to report emptiness it cannot vouch for.
 func (w *volumeRootWatch) list(dataPath string) ([]string, error) {
+	return w.listMatching(dataPath, false)
+}
+
+// listForProof inventories every entry in fred's reserved managed namespace,
+// regardless of filesystem type. Runtime List deliberately returns only real
+// directories because its consumers may derive deletion candidates; a lineage
+// proof has the opposite requirement and must surface a canonical-looking
+// symlink, regular file, or malformed fred-* collision so the typed parser and
+// concrete attester can reject it rather than seal an incomplete view.
+func (w *volumeRootWatch) listForProof(dataPath string) ([]string, error) {
+	return w.listMatching(dataPath, true)
+}
+
+func (w *volumeRootWatch) listMatching(dataPath string, includeNonDirectories bool) ([]string, error) {
 	// The lock spans the OBSERVATION as well as the update, not just the update. Two
 	// concurrent readings can otherwise be applied out of order — the older one landing last
 	// and installing a baseline that was already superseded — which is the same
@@ -278,20 +425,27 @@ func (w *volumeRootWatch) list(dataPath string) ([]string, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	ids, dev, err := listVolumeIDsWithDevice(dataPath)
+	ids, identity, err := listVolumeEntriesWithRootIdentity(dataPath, includeNonDirectories)
 	if err != nil {
 		return nil, err
 	}
 	if len(ids) > 0 {
-		// Ground truth, and the only place the baseline is set. Re-learning it on every
-		// populated read also means a deliberate remount onto a different device converges
-		// on the next sweep instead of wedging until restart.
-		w.dev, w.seen = dev, true
+		if w.pinned && (identity.dev != w.dev || identity.ino != w.ino) {
+			return nil, fmt.Errorf("volume data root %s moved to a different identity-bound filesystem "+
+				"(device/inode %d/%d, expected %d/%d)",
+				dataPath, identity.dev, identity.ino, w.dev, w.ino)
+		}
+		// Ground truth, and the only place a provisional, unpinned baseline is set.
+		// Production pins before startup work, so it never re-learns a replacement.
+		if !w.pinned {
+			w.dev, w.ino, w.seen = identity.dev, identity.ino, true
+		}
 		return ids, nil
 	}
-	if w.seen && dev != w.dev {
+	if w.seen && (identity.dev != w.dev || (w.pinned && identity.ino != w.ino)) {
 		return nil, fmt.Errorf("volume data root %s is empty but now lives on a different filesystem "+
-			"(device %d, was %d) — refusing to report it as empty; is it unmounted?", dataPath, dev, w.dev)
+			"(device/inode %d/%d, was %d/%d) — refusing to report it as empty; is it unmounted?",
+			dataPath, identity.dev, identity.ino, w.dev, w.ino)
 	}
 	return ids, nil
 }
@@ -338,63 +492,74 @@ func listVolumeIDs(dataPath string) ([]string, error) {
 // this file already applies elsewhere — keep the question inside the single operation that can
 // answer it — applied one level deeper than it was.
 func listVolumeIDsWithDevice(dataPath string) ([]string, uint64, error) {
+	ids, identity, err := listVolumeIDsWithRootIdentity(dataPath)
+	return ids, identity.dev, err
+}
+
+type volumeRootIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+// statVolumeRootIdentity performs the cheap runtime attestation path: one
+// open+fstat and no directory enumeration. HTTP requests call it frequently,
+// so making identity proof O(number of tenant volumes) would serialize every
+// backend request behind an increasingly expensive global check.
+func statVolumeRootIdentity(dataPath string) (volumeRootIdentity, error) {
+	f, err := os.Open(dataPath) //nolint:gosec // operator-configured root, validated at construction
+	if err != nil {
+		return volumeRootIdentity{}, fmt.Errorf("open volume data directory %s: %w", dataPath, err)
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return volumeRootIdentity{}, fmt.Errorf("stat volume data directory %s: %w", dataPath, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return volumeRootIdentity{}, fmt.Errorf("stat %s: no syscall.Stat_t available on this platform", dataPath)
+	}
+	return volumeRootIdentity{dev: st.Dev, ino: st.Ino}, nil
+}
+
+// listVolumeIDsWithRootIdentity is the stronger identity-bearing primitive
+// used after storage-lineage pinning. The directory inode distinguishes an
+// in-place path replacement on the same filesystem; both values come from the
+// same descriptor used for enumeration.
+func listVolumeIDsWithRootIdentity(dataPath string) ([]string, volumeRootIdentity, error) {
+	return listVolumeEntriesWithRootIdentity(dataPath, false)
+}
+
+func listVolumeEntriesWithRootIdentity(
+	dataPath string,
+	includeNonDirectories bool,
+) ([]string, volumeRootIdentity, error) {
 	f, err := os.Open(dataPath) //nolint:gosec // G304: dataPath is the operator-configured volume_data_path, validated at construction — never tenant-reachable (volume names are appended by callers, not by this open)
 	if err != nil {
-		return nil, 0, fmt.Errorf("open volume data directory %s: %w", dataPath, err)
+		return nil, volumeRootIdentity{}, fmt.Errorf("open volume data directory %s: %w", dataPath, err)
 	}
 	defer func() { _ = f.Close() }()
 
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, 0, fmt.Errorf("stat volume data directory %s: %w", dataPath, err)
+		return nil, volumeRootIdentity{}, fmt.Errorf("stat volume data directory %s: %w", dataPath, err)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
-		return nil, 0, fmt.Errorf("stat %s: no syscall.Stat_t available on this platform", dataPath)
+		return nil, volumeRootIdentity{}, fmt.Errorf("stat %s: no syscall.Stat_t available on this platform", dataPath)
 	}
 
 	entries, err := f.ReadDir(-1)
 	if err != nil {
-		return nil, 0, fmt.Errorf("read volume data directory %s: %w", dataPath, err)
+		return nil, volumeRootIdentity{}, fmt.Errorf("read volume data directory %s: %w", dataPath, err)
 	}
 	var ids []string
 	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), volumePrefix) {
+		if strings.HasPrefix(e.Name(), volumePrefix) && (includeNonDirectories || e.IsDir()) {
 			ids = append(ids, e.Name())
 		}
 	}
-	return ids, st.Dev, nil
-}
-
-// atomicRenameVolumeDir renames oldPath → newPath via os.Rename with
-// idempotency guards. Shared by the xfs and btrfs backends, both of which
-// support os.Rename on their volume roots (xfs: a plain directory; btrfs:
-// a subvolume root, which the kernel renames as a metadata operation
-// without touching the contained data).
-//
-// Idempotency semantics:
-//   - neither exists  → error (caller asked to rename a non-existent volume)
-//   - only old exists → os.Rename
-//   - only new exists → nil (previous run already renamed; retry is safe)
-//   - both exist      → error (operator must reconcile; we won't merge or pick a winner)
-func atomicRenameVolumeDir(oldPath, newPath string) error {
-	oldExists, oldErr := pathExists(oldPath)
-	if oldErr != nil {
-		return fmt.Errorf("stat old volume path %s: %w", oldPath, oldErr)
-	}
-	newExists, newErr := pathExists(newPath)
-	if newErr != nil {
-		return fmt.Errorf("stat new volume path %s: %w", newPath, newErr)
-	}
-	switch {
-	case !oldExists && newExists:
-		return nil // idempotent
-	case oldExists && newExists:
-		return fmt.Errorf("both old (%s) and new (%s) volume paths exist; manual intervention required", oldPath, newPath)
-	case !oldExists && !newExists:
-		return fmt.Errorf("neither old (%s) nor new (%s) volume path exists", oldPath, newPath)
-	}
-	return os.Rename(oldPath, newPath)
+	return ids, volumeRootIdentity{dev: st.Dev, ino: st.Ino}, nil
 }
 
 // pathExists reports whether p exists on the filesystem. Distinct from

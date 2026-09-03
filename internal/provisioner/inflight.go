@@ -2,84 +2,66 @@ package provisioner
 
 import (
 	"context"
+	"log/slog"
 	"time"
-
-	"github.com/manifest-network/fred/internal/backend"
 )
 
-// TrackInFlight delegates to the tracker.
-func (m *Manager) TrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) {
-	m.tracker.TrackInFlight(leaseUUID, tenant, items, backendName)
+// RestoreOperations exposes only the lifecycle authority consumed by the
+// restore application service. The concrete registry and its unrelated
+// callback, timeout, and reconciliation transitions remain encapsulated.
+func (m *Manager) RestoreOperations() RestoreOperations {
+	return m.operations
 }
 
-// TryTrackInFlight delegates to the tracker.
-func (m *Manager) TryTrackInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	return m.tracker.TryTrackInFlight(leaseUUID, tenant, items, backendName)
+// MaintenanceClaims exposes only the per-lease exclusion used by restart and
+// update handlers. A maintenance handler cannot observe or mutate operations.
+func (m *Manager) MaintenanceClaims() MaintenanceClaims {
+	return m.operations
 }
 
-// TryTrackRestoreInFlight delegates to the tracker. It lets the API restore
-// handler register the new lease in-flight (as a restore) so the restore's
-// provision callback is acknowledged inline rather than ~one reconciler interval
-// later (ENG-358).
-func (m *Manager) TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool {
-	return m.tracker.TryTrackRestoreInFlight(leaseUUID, tenant, items, backendName)
+// ReconcilerOperations exposes only the lifecycle authority consumed by the
+// level-triggered reconciler. Its static type prevents the reconciler from
+// reaching unrelated callback or timeout transitions.
+func (m *Manager) ReconcilerOperations() ReconcilerOperations {
+	return m.operations
 }
 
-// UntrackInFlight delegates to the tracker.
-func (m *Manager) UntrackInFlight(leaseUUID string) {
-	m.tracker.UntrackInFlight(leaseUUID)
-}
-
-// IsInFlight delegates to the tracker.
+// IsInFlight reports whether the lifecycle registry owns leaseUUID.
 func (m *Manager) IsInFlight(leaseUUID string) bool {
-	return m.tracker.IsInFlight(leaseUUID)
+	return m.operations.Contains(leaseUUID)
 }
 
-// PopInFlight delegates to the tracker.
-func (m *Manager) PopInFlight(leaseUUID string) (InFlightProvision, bool) {
-	return m.tracker.PopInFlight(leaseUUID)
-}
-
-// GetInFlight delegates to the tracker.
-func (m *Manager) GetInFlight(leaseUUID string) (InFlightProvision, bool) {
-	return m.tracker.GetInFlight(leaseUUID)
-}
-
-// InFlightCount delegates to the tracker.
+// InFlightCount returns the number of process-local lifecycle operations.
 func (m *Manager) InFlightCount() int {
-	return m.tracker.InFlightCount()
+	return m.operations.Count()
 }
 
-// InFlightCountsByBackend delegates to the tracker.
-func (m *Manager) InFlightCountsByBackend() map[string]int {
-	return m.tracker.InFlightCountsByBackend()
-}
-
-// GetInFlightLeases delegates to the tracker.
-func (m *Manager) GetInFlightLeases() []string {
-	return m.tracker.GetInFlightLeases()
-}
-
-// WaitForDrain delegates to the tracker.
+// WaitForDrain waits for process-local lifecycle operations to settle before
+// shutdown and returns the number still present when the wait ends.
 func (m *Manager) WaitForDrain(ctx context.Context, timeout time.Duration) int {
-	return m.tracker.WaitForDrain(ctx, timeout)
+	count := m.operations.PendingWorkCount()
+	if count == 0 {
+		return 0
+	}
+	slog.Info("waiting for lifecycle work to drain", "count", count, "timeout", timeout)
+
+	remaining := m.operations.WaitForDrain(ctx, timeout)
+	if remaining == 0 {
+		slog.Info("all lifecycle work drained successfully")
+		return 0
+	}
+	if ctx != nil && ctx.Err() != nil {
+		slog.Warn("drain interrupted by context cancellation",
+			"remaining", remaining, "leases", m.operations.PendingLeaseUUIDs())
+		return remaining
+	}
+	slog.Warn("drain timeout expired with provisions still in-flight",
+		"remaining", remaining, "leases", m.operations.PendingLeaseUUIDs())
+	return remaining
 }
 
-// GetTimedOutProvisions delegates to the tracker.
-func (m *Manager) GetTimedOutProvisions(timeout time.Duration) []InFlightProvision {
-	return m.tracker.GetTimedOutProvisions(timeout)
+// BeginDrain irreversibly rejects new ordinary lifecycle work while preserving
+// settlement of operations and durable callbacks that were already accepted.
+func (m *Manager) BeginDrain() {
+	m.operations.BeginDrain()
 }
-
-// RecordRestorePlacement delegates to the orchestrator (ENG-333).
-func (m *Manager) RecordRestorePlacement(newLeaseUUID, backendName string) {
-	m.orchestrator.RecordRestorePlacement(newLeaseUUID, backendName)
-}
-
-// Compile-time check that *Manager can serve as the API's restore placement
-// recorder (ENG-333) and restore in-flight tracker (ENG-358). Structural to
-// avoid importing the api package.
-var _ interface {
-	RecordRestorePlacement(newLeaseUUID, backendName string)
-	TryTrackRestoreInFlight(leaseUUID, tenant string, items []backend.LeaseItem, backendName string) bool
-	UntrackInFlight(leaseUUID string)
-} = (*Manager)(nil)

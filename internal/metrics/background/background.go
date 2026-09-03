@@ -3,9 +3,9 @@
 // by every fred binary: providerd for its token-tracker cleanup loop, the docker
 // backend for its callback, diagnostics, releases and retention loops, the k3s
 // backend for callback, diagnostics and releases (it has no retention store —
-// retention is docker-only, ENG-325). GoroutinePanicsTotal is written only by
-// providerd, for its payload-writer, ack-batcher and withdraw goroutines; it
-// lives here anyway, see the rule below.
+// retention is docker-only, ENG-325). GoroutinePanicsTotal is written by
+// providerd for its payload-writer, ack-batcher and withdraw goroutines and by
+// both bundled backends for the shared callback-replay workers.
 //
 // It exists as a package of its own because its parent, internal/metrics, is
 // providerd's. Those collectors are registered on the default registerer at
@@ -26,11 +26,9 @@
 // three binaries at once — ENG-712 with a wider blast radius than the original.
 //
 // Being written by more than one binary is the reason to put a collector here,
-// not a requirement of membership. GoroutinePanicsTotal is providerd-only and
-// still belongs: it is the other half of the fred_background_* family and of one
-// ARCHITECTURE.md table, and being label-bearing it costs the backends nothing.
-// Splitting the family would only invite the ENG-712 import edge back the next
-// time a backend needs a goroutine-panic counter.
+// not a requirement of membership. Both collectors now cross the process
+// boundary; their label-bearing shape still means a healthy process exports no
+// child series.
 //
 // What does NOT belong here: a providerd-only collector unrelated to this family
 // (internal/metrics), and one only a single backend writes (that backend's

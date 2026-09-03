@@ -5,14 +5,18 @@ package docker
 
 import (
 	"fmt"
+	"math"
 	"net"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backendname"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/hmacauth"
 )
 
 // Type aliases for readability within the docker package.
@@ -26,6 +30,7 @@ type TenantQuotaConfig = shared.TenantQuotaConfig
 // instead of an immediately-canceled context or instant `-prev`
 // removal.
 const (
+	defaultContainerStopTimeout  = 30 * time.Second
 	defaultMigrationReadyTimeout = 90 * time.Second
 	defaultMigrationGracePeriod  = time.Minute
 )
@@ -96,7 +101,9 @@ type Config struct {
 	// TotalMemoryMB is the total memory available in MB.
 	TotalMemoryMB int64 `yaml:"total_memory_mb"`
 
-	// TotalDiskMB is the total disk space available in MB.
+	// TotalDiskMB is the physical disk admission pool in MB. Live Docker
+	// instances charge either durable SKU disk or their pinned diskless scratch
+	// allowance; retained/reaping durable footprints share the same pool.
 	TotalDiskMB int64 `yaml:"total_disk_mb"`
 
 	// SKUMapping maps on-chain SKU UUIDs to profile names.
@@ -166,8 +173,10 @@ type Config struct {
 	// Defaults to 256.
 	ContainerPidsLimit *int64 `yaml:"container_pids_limit"`
 
-	// ContainerTmpfsSizeMB sets the tmpfs size in MB for /tmp and /run when
-	// readonly rootfs is enabled. Defaults to 64.
+	// ContainerTmpfsSizeMB sets each memory-tmpfs ceiling and, separately, the
+	// conservative host-disk scratch allowance pinned for every DiskMB==0
+	// instance. Scratch is physical admission authority but is not retainable.
+	// Zero selects the 64 MB default.
 	ContainerTmpfsSizeMB int `yaml:"container_tmpfs_size_mb"`
 
 	// StartupVerifyDuration is how long to wait after starting containers before
@@ -181,10 +190,20 @@ type Config struct {
 	// When set, prevents any single tenant from consuming the entire pool.
 	TenantQuota *TenantQuotaConfig `yaml:"tenant_quota"`
 
-	// VolumeDataPath is the host directory for managed volumes.
-	// Required when any SKU profile has DiskMB > 0.
-	// Each container gets a quota-enforced subdirectory under this path.
+	// VolumeDataPath is the host directory for managed durable and writable-path
+	// scratch volumes. It is required when any SKU profile has DiskMB > 0 and
+	// optional for an all-diskless deployment. A diskless instance gets a
+	// quota-enforced subdirectory only when its image needs writable-path
+	// scaffolding; provisioning remains best-effort when this path is omitted.
 	VolumeDataPath string `yaml:"volume_data_path"`
+
+	// VolumeMountPath is the operator-declared mountpoint containing
+	// VolumeDataPath. It is required whenever managed host volumes are enabled,
+	// including diskless writable-path scratch, and must be an actual mount at
+	// initialization and runtime. This independent deployment fact
+	// prevents an unmounted same-filesystem stub from being sealed as a fresh
+	// storage lineage after whole-data-root loss.
+	VolumeMountPath string `yaml:"volume_mount_path"`
 
 	// VolumeFilesystem specifies the filesystem type for volume quota enforcement.
 	// Supported values: "btrfs", "xfs", "zfs". If empty, auto-detected from VolumeDataPath.
@@ -199,9 +218,10 @@ type Config struct {
 	// Values below 512 are rejected (they would uncap the fix). See ENG-548.
 	MinAvgFileBytes int64 `yaml:"min_avg_file_bytes"`
 
-	// CallbackMaxAge is the maximum age of a persisted callback entry.
-	// Entries older than this are removed by the callback store's background cleanup.
-	// Defaults to 24h.
+	// CallbackMaxAge is the maximum age of a legacy callback or typed lifecycle
+	// observation. Exact operation and maintenance completions never expire
+	// because they may be the only evidence that settles Fred's durable placement
+	// or replacement intent. It must be positive. Defaults to 24h.
 	CallbackMaxAge time.Duration `yaml:"callback_max_age"`
 
 	// DiagnosticsDBPath is the path to the bbolt database for persisting failure diagnostics.
@@ -379,7 +399,8 @@ func (c *Config) GetPidsLimit() *int64 {
 	return &v
 }
 
-// GetTmpfsSizeMB returns the tmpfs size in MB. Defaults to 64.
+// GetTmpfsSizeMB returns the memory-tmpfs ceiling and diskless scratch
+// allowance in MB. A configured zero selects the positive 64 MB default.
 func (c *Config) GetTmpfsSizeMB() int {
 	if c.ContainerTmpfsSizeMB > 0 {
 		return c.ContainerTmpfsSizeMB
@@ -440,7 +461,7 @@ func DefaultConfig() Config {
 		ImagePullTimeout:             5 * time.Minute,
 		ContainerCreateTimeout:       30 * time.Second,
 		ContainerStartTimeout:        30 * time.Second,
-		ContainerStopTimeout:         30 * time.Second,
+		ContainerStopTimeout:         defaultContainerStopTimeout,
 		ReconcileInterval:            5 * time.Minute,
 		ProvisionTimeout:             10 * time.Minute,
 		CallbackDBPath:               "callbacks.db",
@@ -468,8 +489,8 @@ func DefaultConfig() Config {
 
 // Validate checks that the configuration is valid.
 func (c *Config) Validate() error {
-	if c.Name == "" {
-		return fmt.Errorf("name is required")
+	if err := backendname.Validate(c.Name); err != nil {
+		return fmt.Errorf("name: %w", err)
 	}
 
 	// A non-positive cap (unset in YAML, or 0) falls back to the default rather
@@ -498,6 +519,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("docker_host is required")
 	}
 
+	if math.IsNaN(c.TotalCPUCores) || math.IsInf(c.TotalCPUCores, 0) {
+		return fmt.Errorf("total_cpu_cores must be finite")
+	}
 	if c.TotalCPUCores <= 0 {
 		return fmt.Errorf("total_cpu_cores must be positive")
 	}
@@ -549,8 +573,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("callback_secret is required")
 	}
 
-	if len(c.CallbackSecret) < 32 {
-		return fmt.Errorf("callback_secret must be at least 32 characters")
+	if len(c.CallbackSecret) < hmacauth.MinSecretLength {
+		return fmt.Errorf("callback_secret must be at least %d characters", hmacauth.MinSecretLength)
 	}
 
 	if c.HostAddress == "" {
@@ -586,6 +610,23 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("container_start_timeout must be positive")
 	}
 
+	// Zero is the documented default sentinel. Negative durations are not a
+	// useful sentinel: cmp.Or only defaults zero, so allowing one through would
+	// hand Docker an already-expired stop grace period.
+	if c.ContainerStopTimeout < 0 {
+		return fmt.Errorf("container_stop_timeout must be non-negative (zero uses the default)")
+	}
+
+	// Recover-time migration uses zero as its default sentinel as well. Reject
+	// explicit negative values here rather than letting context.WithTimeout
+	// turn a configuration typo into an immediate, repeatedly resumed failure.
+	if c.MigrationReadyTimeout < 0 {
+		return fmt.Errorf("migration_ready_timeout must be non-negative (zero uses the default)")
+	}
+	if c.MigrationGracePeriod < 0 {
+		return fmt.Errorf("migration_grace_period must be non-negative (zero uses the default)")
+	}
+
 	if c.ReconcileInterval <= 0 {
 		return fmt.Errorf("reconcile_interval must be positive")
 	}
@@ -606,8 +647,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("container_tmpfs_size_mb must be >= 0")
 	}
 
-	if c.CallbackMaxAge < 0 {
-		return fmt.Errorf("callback_max_age must be non-negative")
+	if c.CallbackMaxAge <= 0 {
+		return fmt.Errorf("callback_max_age must be positive")
 	}
 
 	if c.DiagnosticsMaxAge < 0 {
@@ -685,8 +726,26 @@ func (c *Config) Validate() error {
 	if c.HasStatefulSKUs() && c.VolumeDataPath == "" {
 		return fmt.Errorf("volume_data_path is required when any SKU profile has disk_mb > 0")
 	}
+	if c.VolumeDataPath != "" && c.VolumeMountPath == "" {
+		return fmt.Errorf("volume_mount_path is required whenever volume_data_path is configured")
+	}
 	if strings.ContainsAny(c.VolumeDataPath, " \t\n") {
 		return fmt.Errorf("volume_data_path must not contain whitespace (got %q)", c.VolumeDataPath)
+	}
+	if strings.ContainsAny(c.VolumeMountPath, " \t\n") {
+		return fmt.Errorf("volume_mount_path must not contain whitespace (got %q)", c.VolumeMountPath)
+	}
+	if c.VolumeMountPath != "" {
+		if !filepath.IsAbs(c.VolumeMountPath) || filepath.Clean(c.VolumeMountPath) != c.VolumeMountPath {
+			return fmt.Errorf("volume_mount_path must be a clean absolute path (got %q)", c.VolumeMountPath)
+		}
+		if !filepath.IsAbs(c.VolumeDataPath) || filepath.Clean(c.VolumeDataPath) != c.VolumeDataPath {
+			return fmt.Errorf("volume_data_path must be a clean absolute path when volume_mount_path is set (got %q)", c.VolumeDataPath)
+		}
+		relative, err := filepath.Rel(c.VolumeMountPath, c.VolumeDataPath)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+			return fmt.Errorf("volume_data_path %q must be inside volume_mount_path %q", c.VolumeDataPath, c.VolumeMountPath)
+		}
 	}
 	if c.VolumeFilesystem != "" {
 		switch c.VolumeFilesystem {

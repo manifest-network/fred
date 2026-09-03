@@ -34,7 +34,7 @@ import (
 var version = "dev"
 
 func main() {
-	configPath, showVersion, err := parseFlags(os.Args[1:], os.Stdout)
+	startup, err := parseStartupFlags(os.Args[1:], os.Stdout)
 	if errors.Is(err, flag.ErrHelp) {
 		// -h/-help: usage already written to stderr; this is a clean exit.
 		os.Exit(0)
@@ -43,9 +43,10 @@ func main() {
 		// flag.ContinueOnError already wrote the error and usage to stderr.
 		os.Exit(2)
 	}
-	if showVersion {
+	if startup.showVersion {
 		os.Exit(0)
 	}
+	configPath := startup.configPath
 
 	// Bootstrap logger for startup messages (before config is loaded).
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -89,15 +90,32 @@ func main() {
 	for uuid, profile := range cfg.SKUMapping {
 		logger.Info("SKU mapping", "uuid", uuid, "profile", profile)
 	}
+	if startup.initializeStorageIdentity != "" {
+		identityCtx, identityCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		identity, initializeErr := k3s.InitializeStorageIdentityForConfig(
+			identityCtx, cfg,
+			k3s.StorageIdentityInitializationMode(startup.initializeStorageIdentity),
+		)
+		identityCancel()
+		if initializeErr != nil {
+			logger.Error("failed to initialize backend storage identity", "error", initializeErr)
+			os.Exit(1)
+		}
+		logger.Info("backend storage identity initialized", "storage_identity", identity)
+		return
+	}
 
-	// Create backend
-	b, err := k3s.New(cfg, logger)
+	// Attest the cluster lineage before opening stores or starting their cleanup
+	// goroutines.
+	identityCtx, identityCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	b, err := k3s.NewWithContext(identityCtx, cfg, logger)
+	identityCancel()
 	if err != nil {
 		logger.Error("failed to create backend", "error", err)
 		os.Exit(1)
 	}
 
-	// Start backend
+	// Start backend only after the marker and cluster UID match.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	if err := b.Start(ctx); err != nil {
 		cancel()
@@ -105,9 +123,13 @@ func main() {
 		os.Exit(1)
 	}
 	cancel()
-
-	// Create server
-	server := NewServer(b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize)
+	server, err := NewIdentityBoundServer(
+		b, string(cfg.CallbackSecret), logger, cfg.MaxRequestBodySize, b.StorageIdentity(),
+	)
+	if err != nil {
+		logger.Error("failed to create identity-bound server", "error", err)
+		os.Exit(1)
+	}
 
 	// Setup HTTP server. ReadHeaderTimeout closes the slow-loris attack
 	// surface (a client that trickles request headers to hold a goroutine
@@ -182,18 +204,36 @@ func main() {
 //
 // Usage and parse errors go to the FlagSet's default output (stderr); -h/-help
 // surfaces as flag.ErrHelp so the caller can exit 0.
-func parseFlags(args []string, out io.Writer) (configPath string, showVersion bool, err error) {
+type startupFlags struct {
+	configPath                string
+	showVersion               bool
+	initializeStorageIdentity string
+}
+
+func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	fs := flag.NewFlagSet("k3s-backend", flag.ContinueOnError)
 	cfgPath := fs.String("config", "config.k3s.yaml", "Path to configuration file")
 	showVer := fs.Bool("version", false, "print version information and exit")
+	initializeIdentity := fs.String(
+		"initialize-storage-identity", "",
+		"one-shot mode (new): seal this backend's current durable storage lineage and exit",
+	)
 	if err := fs.Parse(args); err != nil {
-		return "", false, err
+		return startupFlags{}, err
 	}
 	if *showVer {
 		fmt.Fprintf(out, "k3s-backend version %s\n", version)
-		return "", true, nil
 	}
-	return *cfgPath, false, nil
+	return startupFlags{
+		configPath:                *cfgPath,
+		showVersion:               *showVer,
+		initializeStorageIdentity: *initializeIdentity,
+	}, nil
+}
+
+func parseFlags(args []string, out io.Writer) (configPath string, showVersion bool, err error) {
+	startup, err := parseStartupFlags(args, out)
+	return startup.configPath, startup.showVersion, err
 }
 
 func loadConfig(path string) (k3s.Config, error) {

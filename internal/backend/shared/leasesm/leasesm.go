@@ -4,7 +4,7 @@
 // package; substrate-specific concerns are injected via the interfaces
 // declared here (InstanceInspector, DiagnosticsGatherer,
 // LeaseProvisionStore, SMMetrics) and the closure-bridge fields on
-// LeaseActorConfig (PersistDiagnosticsFn, SendCallbackFn,
+// LeaseActorConfig (PersistDiagnosticsFn, SendOperationCallbackFn,
 // DoDeprovisionFn, OnTerminated). The Docker backend implements those
 // against its DockerClient + provision-record map; future substrates
 // (K3s, etc.) implement them against their own primitives.
@@ -129,20 +129,26 @@ type DiagnosticsGatherer interface {
 // though substrates translate them to substrate-specific shapes
 // (Docker compose-spec, K8s pod spec) at provision time.
 type ProvisionState struct {
-	LeaseUUID    string
-	Tenant       string
-	ProviderUUID string
-	SKU          string
-	Status       backend.ProvisionStatus
-	Quantity     int
-	CreatedAt    time.Time
-	FailCount    int
-	LastError    string
-	Reason       backend.Reason // curated failure-category code (ENG-508), authored at source
-	Message      string         // curated human message (== on-chain CallbackErr)
-	CallbackURL  string
-	Items        []backend.LeaseItem
-	ContainerIDs []string
+	LeaseUUID            string
+	Tenant               string
+	ProviderUUID         string
+	SKU                  string
+	Status               backend.ProvisionStatus
+	Quantity             int
+	CreatedAt            time.Time
+	FailCount            int
+	LastError            string
+	Reason               backend.Reason // curated failure-category code (ENG-508), authored at source
+	Message              string         // curated human message (== on-chain CallbackErr)
+	CallbackURL          string
+	LifecycleCallbackURL string
+	Items                []backend.LeaseItem
+	// ResourceProfiles is the immutable capacity authority paired with Items.
+	// It belongs in the actor-owned projection so a recovered maintenance
+	// target cannot publish new topology while retaining source-generation
+	// resource accounting.
+	ResourceProfiles []shared.SKUResourceSnapshot
+	ContainerIDs     []string
 	// Manifest field deleted in Task 15 — all leases are stack-shaped
 	// post-migration; per-service refs go through StackManifest.Services.
 	StackManifest     *manifest.StackManifest
@@ -189,7 +195,7 @@ type ProvisionState struct {
 //	    callbackURL = p.CallbackURL // capture for post-Unlock use
 //	})
 //	// post-Unlock work uses the captured callbackURL
-//	cfg.SendCallbackFn(uuid, callbackURL, backend.CallbackStatusSuccess, "")
+//	cfg.SendOperationCallbackFn(uuid, callbackURL, backend.CallbackStatusSuccess, "")
 //
 // Pick outer-capture for ALL UpdateFn call sites — mixing capture-style
 // and a hypothetical "UpdateFn returns values" extension is a
@@ -235,9 +241,9 @@ type ProvisionState struct {
 //     Routing this through an actor message is PROHIBITED: the actor is blocked
 //     in waitForWorkers() and cannot dequeue the publish message the worker must
 //     send to release the barrier (actor self-deadlock). Bounded escape: a worker
-//     exceeding workExitWaitTimeout (75s; diagnosticsGatherTimeout 30s is the
-//     inner budget) degrades to a recoverState-reconciled zombie, never to state
-//     corruption.
+//     exceeding WorkerDrainTimeout (75s by default;
+//     diagnosticsGatherTimeout 30s is the inner budget) refuses the state
+//     transition and therefore cannot authorize conflicting teardown.
 //  2. The deprovision volume-retry block (docker backend) keeps ONLY the
 //     docker-private VolumeCleanupAttempts increment in a short direct
 //     provisionsMu span — that counter is not a ProvisionState field, so it
@@ -308,16 +314,21 @@ type SMMetrics interface {
 // preserve their existing "only delete if I'm still the registered
 // actor" semantics by closing over the actor pointer.
 type LeaseActorConfig struct {
-	LeaseUUID      string
-	Logger         *slog.Logger
-	StopCtx        context.Context
-	WG             *sync.WaitGroup
-	Inspector      InstanceInspector
-	Diag           DiagnosticsGatherer
-	CallbackSender *shared.CallbackSender
-	ProvisionStore LeaseProvisionStore
-	OnTerminated   func(leaseUUID string)
-	Metrics        SMMetrics
+	LeaseUUID string
+	Logger    *slog.Logger
+	StopCtx   context.Context
+	WG        *sync.WaitGroup
+	// WorkerDrainTimeout bounds transitions that must cancel and join an
+	// in-flight mutation worker before the destination state is safe to enter.
+	// Zero selects the package default. Tests and future substrates may use a
+	// shorter positive value; production callers should normally leave it zero.
+	WorkerDrainTimeout time.Duration
+	Inspector          InstanceInspector
+	Diag               DiagnosticsGatherer
+	CallbackSender     *shared.CallbackSender
+	ProvisionStore     LeaseProvisionStore
+	OnTerminated       func(leaseUUID string)
+	Metrics            SMMetrics
 
 	// PersistDiagnosticsFn writes a failure diagnostic to the
 	// substrate's diagnostics store, including a fresh fetch of
@@ -334,11 +345,21 @@ type LeaseActorConfig struct {
 	// containers).
 	PersistDiagnosticsWithLogsFn func(entry shared.DiagnosticEntry, logs map[string]string)
 
-	// SendCallbackFn dispatches a callback (success or failure) for
-	// the given lease/URL pair. The substrate adapter handles error
-	// truncation, HMAC signing, retry, and store persistence; the SM
-	// only supplies the inputs.
-	SendCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
+	// SendOperationCallbackFn dispatches an exact requested-operation
+	// completion for the given lease/URL pair. The substrate adapter handles
+	// error truncation, HMAC signing, ordered persistence, and retry.
+	SendOperationCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
+
+	// SendLifecycleCallbackFn dispatches an observation-only callback carrying
+	// either a typed lifecycle capability or a migrated legacy tokenless route.
+	// Keeping it separate from
+	// SendOperationCallbackFn makes it impossible for container death to reuse
+	// an expired provision/restore settlement capability by accident.
+	SendLifecycleCallbackFn func(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string)
+
+	// SendMaintenanceCallbackFn settles an exact durable maintenance claim.
+	// It is distinct from observation delivery so close cannot coalesce it.
+	SendMaintenanceCallbackFn func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string)
 
 	// DoDeprovisionFn dispatches the substrate-specific deprovision
 	// flow for the given lease. Called from handleDeprovision after

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
@@ -113,6 +114,10 @@ func (s *backendProvisionStore) Get(leaseUUID string) (*leasesm.ProvisionState, 
 		return nil, false
 	}
 	snap := p.ProvisionState
+	// ResourceProfiles is temporarily mirrored on Docker's wrapper for
+	// construction compatibility. The actor seam always observes the wrapper's
+	// authoritative value until all literal sites migrate to ProvisionState.
+	snap.ResourceProfiles = shared.CloneSKUResourceSnapshot(p.ResourceProfiles)
 	return &snap, true
 }
 
@@ -130,7 +135,9 @@ func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.Prov
 	if !ok {
 		return false
 	}
+	p.ProvisionState.ResourceProfiles = shared.CloneSKUResourceSnapshot(p.ResourceProfiles)
 	fn(&p.ProvisionState)
+	p.ResourceProfiles = shared.CloneSKUResourceSnapshot(p.ProvisionState.ResourceProfiles)
 	return true
 }
 

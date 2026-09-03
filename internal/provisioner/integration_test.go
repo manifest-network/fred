@@ -29,7 +29,7 @@ func startTestManager(t *testing.T, cfg ManagerConfig, mockBackend *mockManagerB
 	})
 	require.NoError(t, err)
 
-	manager, err := NewManager(cfg, router, mockChain)
+	manager, err := newTestManager(t, cfg, router, mockChain)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -119,9 +119,11 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 	assert.True(t, manager.IsInFlight(leaseUUID))
 
 	// Step 3: Publish success callback.
-	err = manager.PublishCallback(backend.CallbackPayload{
-		LeaseUUID: leaseUUID,
-		Status:    backend.CallbackStatusSuccess,
+	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
+		LeaseUUID:        leaseUUID,
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 
@@ -186,10 +188,12 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 	assert.True(t, manager.IsInFlight(leaseUUID))
 
 	// Publish failure callback.
-	err = manager.PublishCallback(backend.CallbackPayload{
-		LeaseUUID: leaseUUID,
-		Status:    backend.CallbackStatusFailed,
-		Error:     "container crashed",
+	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
+		LeaseUUID:        leaseUUID,
+		Status:           backend.CallbackStatusFailed,
+		Error:            "container crashed",
+		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 
@@ -261,9 +265,11 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 		return len(mockBackend.provisionCalls) > 0
 	}, 5*time.Second, 20*time.Millisecond)
 
-	err = manager.PublishCallback(backend.CallbackPayload{
-		LeaseUUID: leaseUUID,
-		Status:    backend.CallbackStatusSuccess,
+	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
+		LeaseUUID:        leaseUUID,
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
 	})
 	require.NoError(t, err)
 

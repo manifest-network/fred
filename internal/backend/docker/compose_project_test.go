@@ -20,12 +20,13 @@ func testConfig() *Config {
 
 func baseProjectParams() composeProjectParams {
 	return composeProjectParams{
-		LeaseUUID:    "lease-1",
-		Tenant:       "tenant-a",
-		ProviderUUID: "prov-1",
-		CallbackURL:  "http://localhost/callback",
-		BackendName:  "docker",
-		FailCount:    0,
+		LeaseUUID:            "lease-1",
+		Tenant:               "tenant-a",
+		ProviderUUID:         "prov-1",
+		CallbackURL:          "http://localhost/callbacks/provision?operation_id=exact",
+		LifecycleCallbackURL: "http://localhost/callbacks/provision",
+		BackendName:          "docker",
+		FailCount:            0,
 		Stack: &manifest.StackManifest{
 			Services: map[string]*manifest.Manifest{
 				"web": {Image: "nginx:latest"},
@@ -119,7 +120,8 @@ func TestBuildComposeProject_Labels(t *testing.T) {
 	assert.Equal(t, "web", svc.Labels[LabelServiceName])
 	assert.Equal(t, "0", svc.Labels[LabelInstanceIndex])
 	assert.Equal(t, "0", svc.Labels[LabelFailCount])
-	assert.Equal(t, "http://localhost/callback", svc.Labels[LabelCallbackURL])
+	assert.Equal(t, "http://localhost/callbacks/provision?operation_id=exact", svc.Labels[LabelCallbackURL])
+	assert.Equal(t, "http://localhost/callbacks/provision", svc.Labels[LabelLifecycleCallbackURL])
 	assert.Equal(t, "docker", svc.Labels[LabelBackendName])
 	// User labels included.
 	assert.Equal(t, "1.0", svc.Labels["app.version"])

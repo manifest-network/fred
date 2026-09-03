@@ -16,7 +16,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -26,8 +25,11 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/k3s"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/util"
 )
 
 // backendService defines the methods that handlers call on the backend.
@@ -60,6 +62,43 @@ type Server struct {
 	callbackSecret     string
 	logger             *slog.Logger
 	maxRequestBodySize int64
+	storageIdentity    backendidentity.ID
+	identityVerifier   interface{ VerifyStorageIdentity(context.Context) error }
+}
+
+// NewIdentityBoundServer creates the production server that exposes and
+// validates one immutable K3s storage identity.
+func NewIdentityBoundServer(
+	b backendService,
+	callbackSecret string,
+	logger *slog.Logger,
+	maxRequestBodySize int64,
+	storageID backendidentity.ID,
+) (*Server, error) {
+	if util.IsNilInterface(b) {
+		return nil, errors.New("backend is required")
+	}
+	if !storageID.Valid() {
+		return nil, backendidentity.ErrInvalidID
+	}
+	verifier, ok := b.(interface{ VerifyStorageIdentity(context.Context) error })
+	if !ok {
+		return nil, errors.New("backend does not support runtime storage identity verification")
+	}
+	server := NewServer(b, callbackSecret, logger, maxRequestBodySize)
+	server.storageIdentity = storageID
+	server.identityVerifier = verifier
+	return server, nil
+}
+
+func validateMutatingLeaseUUID(value string) error {
+	if value == "" {
+		return errors.New("lease_uuid is required")
+	}
+	if !backend.IsCanonicalLeaseUUID(value) {
+		return errors.New("lease_uuid must be a canonical non-nil UUID")
+	}
+	return nil
 }
 
 // NewServer creates a new HTTP server for the K3s backend. maxRequestBodySize
@@ -82,24 +121,77 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	authMw := hmacAuthMiddleware(s.callbackSecret, s.logger, s.maxRequestBodySize)
-	mux.Handle("POST /provision", authMw(http.HandlerFunc(s.handleProvision)))
-	mux.Handle("POST /deprovision", authMw(http.HandlerFunc(s.handleDeprovision)))
-	mux.Handle("GET /info/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetInfo)))
-	mux.Handle("GET /logs/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetLogs)))
-	mux.Handle("GET /provisions/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetProvision)))
-	mux.Handle("GET /provisions", authMw(http.HandlerFunc(s.handleListProvisions)))
-	mux.Handle("POST /restart", authMw(http.HandlerFunc(s.handleRestart)))
-	mux.Handle("POST /update", authMw(http.HandlerFunc(s.handleUpdate)))
-	mux.Handle("GET /retentions", authMw(http.HandlerFunc(s.handleListRetentions)))
-	mux.Handle("POST /reconcile_custom_domain", authMw(http.HandlerFunc(s.handleReconcileCustomDomain)))
-	mux.Handle("GET /releases/{lease_uuid}", authMw(http.HandlerFunc(s.handleGetReleases)))
+	protected := func(handler http.Handler) http.Handler {
+		if !s.storageIdentity.Valid() {
+			return authMw(handler)
+		}
+		// Authentication is intentionally outside re-attestation: an
+		// unauthenticated caller must not be able to turn every request into a
+		// Kubernetes API call.
+		return authMw(s.verifyStorageIdentity(handler))
+	}
+	mux.Handle("POST /provision", protected(http.HandlerFunc(s.handleProvision)))
+	mux.Handle("POST /deprovision", protected(http.HandlerFunc(s.handleDeprovision)))
+	mux.Handle("GET /info/{lease_uuid}", protected(http.HandlerFunc(s.handleGetInfo)))
+	mux.Handle("GET /logs/{lease_uuid}", protected(http.HandlerFunc(s.handleGetLogs)))
+	mux.Handle("GET /provisions/{lease_uuid}", protected(http.HandlerFunc(s.handleGetProvision)))
+	mux.Handle("GET /provisions", protected(http.HandlerFunc(s.handleListProvisions)))
+	mux.Handle("POST /restart", protected(http.HandlerFunc(s.handleRestart)))
+	mux.Handle("POST /update", protected(http.HandlerFunc(s.handleUpdate)))
+	mux.Handle("GET /retentions", protected(http.HandlerFunc(s.handleListRetentions)))
+	mux.Handle("POST /reconcile_custom_domain", protected(http.HandlerFunc(s.handleReconcileCustomDomain)))
+	mux.Handle("GET /releases/{lease_uuid}", protected(http.HandlerFunc(s.handleGetReleases)))
 
 	// Operational endpoints — no auth required (monitoring, health checks).
-	mux.HandleFunc("GET /health", s.handleHealth)
-	mux.HandleFunc("GET /stats", s.handleStats)
+	if s.storageIdentity.Valid() {
+		mux.Handle("GET /health", s.verifyStorageIdentity(http.HandlerFunc(s.handleHealth)))
+		mux.Handle("GET /stats", s.verifyStorageIdentity(http.HandlerFunc(s.handleStats)))
+	} else {
+		mux.HandleFunc("GET /health", s.handleHealth)
+		mux.HandleFunc("GET /stats", s.handleStats)
+	}
 	mux.Handle("GET /metrics", promhttp.Handler())
 
+	if s.storageIdentity.Valid() {
+		bind := func(handler http.Handler) http.Handler {
+			bound, err := backendidentity.RequireBoundPath(s.storageIdentity, protected(handler))
+			if err != nil {
+				return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, "backend storage identity unavailable", http.StatusServiceUnavailable)
+				})
+			}
+			return bound
+		}
+		prefix := backendidentity.BoundPathPrefix + "{storage_id}"
+		mux.Handle("POST "+prefix+"/provision", bind(http.HandlerFunc(s.handleProvision)))
+		mux.Handle("POST "+prefix+"/deprovision", bind(http.HandlerFunc(s.handleDeprovision)))
+		mux.Handle("POST "+prefix+"/restart", bind(http.HandlerFunc(s.handleRestart)))
+		mux.Handle("POST "+prefix+"/update", bind(http.HandlerFunc(s.handleUpdate)))
+		mux.Handle("POST "+prefix+"/reconcile_custom_domain", bind(http.HandlerFunc(s.handleReconcileCustomDomain)))
+		identityHandler, err := backendidentity.ResponseMiddleware(s.storageIdentity, mux)
+		if err == nil {
+			return identityHandler
+		}
+	}
+
 	return mux
+}
+
+func (s *Server) verifyStorageIdentity(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.identityVerifier == nil {
+			w.Header().Del(backendidentity.ResponseHeader)
+			http.Error(w, "backend storage identity verifier unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := s.identityVerifier.VerifyStorageIdentity(r.Context()); err != nil {
+			s.logger.Error("backend storage identity verification failed", "error", err)
+			w.Header().Del(backendidentity.ResponseHeader)
+			http.Error(w, "backend storage identity verification failed", http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
@@ -109,8 +201,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID(req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.CallbackURL == "" {
@@ -137,7 +229,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, backend.ErrInsufficientResources) {
-			s.errorResponse(w, http.StatusServiceUnavailable, err.Error())
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
@@ -215,8 +309,8 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID(req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -235,8 +329,8 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID(req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.CallbackURL == "" {
@@ -294,8 +388,8 @@ func (s *Server) handleReconcileCustomDomain(w http.ResponseWriter, r *http.Requ
 		s.errorResponse(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID(req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -330,8 +424,8 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.LeaseUUID == "" {
-		s.errorResponse(w, http.StatusBadRequest, "lease_uuid is required")
+	if err := validateMutatingLeaseUUID(req.LeaseUUID); err != nil {
+		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.CallbackURL == "" {
@@ -514,6 +608,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 type ErrorResponse struct {
 	Error          string                 `json:"error"`
 	ValidationCode backend.ValidationCode `json:"validation_code,omitempty"`
+	Code           string                 `json:"code,omitempty"`
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
@@ -534,6 +629,10 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 
 func (s *Server) errorResponse(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, ErrorResponse{Error: message})
+}
+
+func (s *Server) errorResponseWithCode(w http.ResponseWriter, status int, message, code string) {
+	s.writeJSON(w, status, ErrorResponse{Error: message, Code: code})
 }
 
 // validationErrorResponse writes a 400 response with a validation_code field
@@ -564,17 +663,9 @@ const maxTailLines = 10000 // Upper bound for log tail requests
 // callback_base_url configuration. We allow localhost and private IPs here
 // since backends commonly run on private networks alongside Fred.
 func validateCallbackURL(rawURL string) error {
-	parsed, err := url.Parse(rawURL)
+	endpoint, err := callbackurl.ParseEndpoint(rawURL)
 	if err != nil {
-		return fmt.Errorf("malformed URL")
-	}
-
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("scheme must be http or https")
-	}
-
-	if parsed.Host == "" {
-		return fmt.Errorf("host is required")
+		return fmt.Errorf("invalid callback endpoint: %w", err)
 	}
 
 	// Extract hostname (without port) and normalize for SSRF parsing.
@@ -589,7 +680,7 @@ func validateCallbackURL(rawURL string) error {
 	// Go's net.Dialer DOES dial them on Linux/BSD. Stripping the zone
 	// suffix before ParseIP makes the IP-class check see "fe80::1" and
 	// correctly trip IsLinkLocalUnicast.
-	hostname := parsed.Hostname()
+	hostname := endpoint.Hostname()
 	hostname = strings.TrimSuffix(hostname, ".")
 	if i := strings.IndexByte(hostname, '%'); i >= 0 {
 		hostname = hostname[:i]

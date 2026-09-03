@@ -1,6 +1,7 @@
 package k3s
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ func validConfig() Config {
 		TotalMemoryMB:     16384,
 		TotalDiskMB:       102400,
 		ReconcileInterval: 5 * time.Minute,
+		CallbackMaxAge:    24 * time.Hour,
 		HostAddress:       "192.168.1.100",
 		CallbackSecret:    config.Secret(strings.Repeat("x", 32)),
 		AllowedRegistries: []string{"docker.io"},
@@ -93,6 +95,11 @@ func TestConfig_Validate_RequiredFields(t *testing.T) {
 			wantErr: "name is required",
 		},
 		{
+			name:    "ambiguous name",
+			mutate:  func(c *Config) { c.Name = "backend-a\nPASS: forged" },
+			wantErr: "non-printable character U+000A",
+		},
+		{
 			name:    "empty listen_addr",
 			mutate:  func(c *Config) { c.ListenAddr = "" },
 			wantErr: "listen_addr is required",
@@ -144,6 +151,16 @@ func TestConfig_Validate_PositiveValues(t *testing.T) {
 			name:    "negative total_cpu_cores",
 			mutate:  func(c *Config) { c.TotalCPUCores = -1 },
 			wantErr: "total_cpu_cores must be positive",
+		},
+		{
+			name:    "NaN total_cpu_cores",
+			mutate:  func(c *Config) { c.TotalCPUCores = math.NaN() },
+			wantErr: "total_cpu_cores must be finite",
+		},
+		{
+			name:    "infinite total_cpu_cores",
+			mutate:  func(c *Config) { c.TotalCPUCores = math.Inf(1) },
+			wantErr: "total_cpu_cores must be finite",
 		},
 		{
 			name:    "zero total_memory_mb",
@@ -286,7 +303,12 @@ func TestConfig_Validate_MaxAge(t *testing.T) {
 		{
 			name:    "negative callback_max_age",
 			mutate:  func(c *Config) { c.CallbackMaxAge = -1 },
-			wantErr: "callback_max_age must be non-negative",
+			wantErr: "callback_max_age must be positive",
+		},
+		{
+			name:    "zero callback_max_age",
+			mutate:  func(c *Config) { c.CallbackMaxAge = 0 },
+			wantErr: "callback_max_age must be positive",
 		},
 		{
 			name:    "negative diagnostics_max_age",
@@ -299,8 +321,8 @@ func TestConfig_Validate_MaxAge(t *testing.T) {
 			wantErr: "releases_max_age must be non-negative",
 		},
 		{
-			name:   "zero max ages are valid",
-			mutate: func(c *Config) { c.CallbackMaxAge = 0; c.DiagnosticsMaxAge = 0; c.ReleasesMaxAge = 0 },
+			name:   "zero diagnostics and releases max ages are valid",
+			mutate: func(c *Config) { c.DiagnosticsMaxAge = 0; c.ReleasesMaxAge = 0 },
 		},
 	}
 	for _, tt := range tests {

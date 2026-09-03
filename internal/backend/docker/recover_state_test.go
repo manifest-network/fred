@@ -20,19 +20,23 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // mockVolumeManager implements volumeManager for testing. Unlike mockDockerClient,
 // methods default to sensible no-ops (not panics) since most tests don't care
 // about volumes. Tests that need to observe volume calls set the Fn fields.
 type mockVolumeManager struct {
-	CreateFn       func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
-	EnsureQuotaFn  func(ctx context.Context, id string, sizeMB int64) error
-	DestroyFn      func(ctx context.Context, id string) error
-	ListFn         func() ([]string, error)
-	ValidateFn     func() error
-	RenameVolumeFn func(oldName, newName string) error
-	UsageFn        func(ctx context.Context, id string) (int64, error)
+	CreateFn                              func(ctx context.Context, id string, sizeMB int64) (string, bool, error)
+	EnsureQuotaFn                         func(ctx context.Context, id string, sizeMB int64) error
+	DestroyFn                             func(ctx context.Context, id string) error
+	ListFn                                func() ([]string, error)
+	AttestManagedVolumeFn                 func(context.Context, managedVolumeName) error
+	RequireNoInterruptedVolumeMutationsFn func(context.Context) error
+	RecoverInterruptedVolumeMutationsFn   func(context.Context) error
+	ValidateFn                            func() error
+	RenameVolumeFn                        func(oldName, newName string) error
+	UsageFn                               func(ctx context.Context, id string) (int64, error)
 
 	// defaultDir is returned by Create when CreateFn is nil.
 	// Set this to t.TempDir() in tests that need real paths.
@@ -67,6 +71,34 @@ func (m *mockVolumeManager) List() ([]string, error) {
 	return nil, nil
 }
 
+func (m *mockVolumeManager) ListForProof(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return m.List()
+}
+
+func (m *mockVolumeManager) AttestManagedVolume(ctx context.Context, name managedVolumeName) error {
+	if m.AttestManagedVolumeFn != nil {
+		return m.AttestManagedVolumeFn(ctx, name)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) RequireNoInterruptedVolumeMutations(ctx context.Context) error {
+	if m.RequireNoInterruptedVolumeMutationsFn != nil {
+		return m.RequireNoInterruptedVolumeMutationsFn(ctx)
+	}
+	return nil
+}
+
+func (m *mockVolumeManager) RecoverInterruptedVolumeMutations(ctx context.Context) error {
+	if m.RecoverInterruptedVolumeMutationsFn != nil {
+		return m.RecoverInterruptedVolumeMutationsFn(ctx)
+	}
+	return nil
+}
+
 func (m *mockVolumeManager) Validate() error {
 	if m.ValidateFn != nil {
 		return m.ValidateFn()
@@ -77,7 +109,7 @@ func (m *mockVolumeManager) Validate() error {
 // RenameVolume delegates to RenameVolumeFn when set. Tests that don't exercise
 // volume renaming get a no-op default; Task 9 tests and restore tests that need
 // to observe rename calls set RenameVolumeFn.
-func (m *mockVolumeManager) RenameVolume(oldName, newName string) error {
+func (m *mockVolumeManager) RenameVolume(_ context.Context, oldName, newName string) error {
 	if m.RenameVolumeFn != nil {
 		return m.RenameVolumeFn(oldName, newName)
 	}
@@ -227,6 +259,13 @@ func (m *mockDockerClient) ListManagedContainers(ctx context.Context) ([]Contain
 	panic("unexpected call to ListManagedContainers")
 }
 
+func (m *mockDockerClient) ListManagedContainersStrict(ctx context.Context) ([]ContainerInfo, error) {
+	if m.ListManagedContainersFn != nil {
+		return m.ListManagedContainersFn(ctx)
+	}
+	panic("unexpected call to ListManagedContainersStrict")
+}
+
 func (m *mockDockerClient) EnsureTenantNetwork(ctx context.Context, tenant string) (string, error) {
 	if m.EnsureTenantNetworkFn != nil {
 		return m.EnsureTenantNetworkFn(ctx, tenant)
@@ -314,20 +353,34 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	}
 
 	stopCtx, stopCancel := context.WithCancel(context.Background())
+	storageID, err := backendidentity.Parse("550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		panic(err)
+	}
+	storeAuthorityGate, err := backendidentity.NewStorageAuthorityGate(func(error) { stopCancel() })
+	if err != nil {
+		panic(err)
+	}
 
 	b := &Backend{
-		cfg:        cfg,
-		docker:     mock,
-		compose:    &mockComposeExecutor{},
-		pool:       pool,
-		volumes:    &noopVolumeManager{},
-		logger:     slog.Default(),
-		provisions: provs,
-		actors:     make(map[string]*leasesm.LeaseActor),
-		stopCtx:    stopCtx,
-		stopCancel: stopCancel,
+		cfg:                cfg,
+		docker:             mock,
+		compose:            &mockComposeExecutor{},
+		pool:               pool,
+		volumes:            &noopVolumeManager{},
+		logger:             slog.Default(),
+		provisions:         provs,
+		operationIntents:   noopOperationIntentJournal{},
+		actors:             make(map[string]*leasesm.LeaseActor),
+		stopCtx:            stopCtx,
+		stopCancel:         stopCancel,
+		storageIdentity:    storageID,
+		storeAuthorityGate: storeAuthorityGate,
 	}
-	b.callbackSender = shared.NewCallbackSender(shared.CallbackSenderConfig{
+	b.storageVerifier = testDockerRuntimeStorageVerifier{identity: func() backendidentity.ID {
+		return b.storageIdentity
+	}}
+	b.callbackSender = shared.MustNewEphemeralCallbackSender(shared.CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
 		Logger:     b.logger,
 		StopCtx:    b.stopCtx,
@@ -379,6 +432,193 @@ func TestRecoverState_Serialized(t *testing.T) {
 		"recoverState calls should be serialized (max concurrency must be 1)")
 }
 
+func TestRecoverState_BoundsManagedContainerInventory(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	b.recoveryDockerReadTimeout = 10 * time.Millisecond
+
+	started := time.Now()
+	err := b.recoverState(context.Background())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(started), time.Second,
+		"a stalled Docker inventory must not wedge recovery")
+}
+
+func TestRecoverState_BoundsProductionStorageIdentityProbe(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	bindTestStorageIdentity(t, b, mock)
+	mock.DaemonInfoFn = func(ctx context.Context) (DaemonSecurityInfo, error) {
+		<-ctx.Done()
+		return DaemonSecurityInfo{}, ctx.Err()
+	}
+	b.recoveryDockerReadTimeout = 10 * time.Millisecond
+
+	started := time.Now()
+	err := b.recoverState(context.Background())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(started), time.Second,
+		"the production identity recheck must not wedge before bounded inventory begins")
+}
+
+func TestRecoverState_BoundsColdStartDiagnostics(t *testing.T) {
+	for _, phase := range []string{"inspect", "logs"} {
+		t.Run(phase, func(t *testing.T) {
+			mock := &mockDockerClient{
+				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+					return []ContainerInfo{{
+						ContainerID: "dead-1", LeaseUUID: "lease-1", Tenant: "tenant-1",
+						ProviderUUID: "provider-1", SKU: "docker-small", ServiceName: "app",
+						Status: "exited", CreatedAt: time.Now(),
+					}}, nil
+				},
+				InspectContainerFn: func(ctx context.Context, _ string) (*ContainerInfo, error) {
+					if phase == "inspect" {
+						<-ctx.Done()
+						return nil, ctx.Err()
+					}
+					return &ContainerInfo{ContainerID: "dead-1", Status: "exited"}, nil
+				},
+				ContainerLogsFn: func(ctx context.Context, _ string, _ int) (string, error) {
+					<-ctx.Done()
+					return "", ctx.Err()
+				},
+			}
+			b := newBackendForTest(mock, nil)
+			b.recoveryDockerReadTimeout = 10 * time.Millisecond
+
+			started := time.Now()
+			require.NoError(t, b.recoverState(context.Background()))
+			assert.Less(t, time.Since(started), time.Second,
+				"cold-start diagnostics are best-effort and must share a finite budget")
+		})
+	}
+}
+
+func TestRecoverState_PersistedDiagnosticsShareOneAggregateBudget(t *testing.T) {
+	const (
+		leaseA = "lease-a"
+		leaseB = "lease-b"
+	)
+	started := time.Now()
+	var persistenceBudgetRemaining []time.Duration
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{
+				{
+					ContainerID: "dead-a", LeaseUUID: leaseA, Tenant: "tenant-a",
+					ProviderUUID: "provider-a", SKU: "docker-small", ServiceName: "app",
+					Status: "exited", CreatedAt: started,
+				},
+				{
+					ContainerID: "dead-b", LeaseUUID: leaseB, Tenant: "tenant-b",
+					ProviderUUID: "provider-b", SKU: "docker-small", ServiceName: "app",
+					Status: "exited", CreatedAt: started,
+				},
+			}, nil
+		},
+		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+			return &ContainerInfo{ContainerID: id, Status: "exited"}, nil
+		},
+		ContainerLogsFn: func(ctx context.Context, _ string, tail int) (string, error) {
+			if tail == diagnosticLogTail {
+				return "cold-start diagnostic", nil
+			}
+			require.Equal(t, persistedLogTail, tail)
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok, "persisted-log capture must always carry a deadline")
+			remaining := time.Until(deadline)
+			persistenceBudgetRemaining = append(persistenceBudgetRemaining, remaining)
+			if remaining > time.Second {
+				return "", errors.New("persisted-log capture received a fresh per-lease budget")
+			}
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	b.recoveryDockerReadTimeout = 20 * time.Millisecond
+	diagnostics, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "diagnostics.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, diagnostics.Close()) })
+	b.diagnosticsStore = diagnostics
+
+	require.NoError(t, b.recoverState(context.Background()))
+	assert.Less(t, time.Since(started), time.Second,
+		"persisting N failed leases must consume one recovery budget, not N fresh timeouts")
+	require.Len(t, persistenceBudgetRemaining, 1,
+		"once one lease exhausts the shared budget, recovery must issue no later Docker log reads")
+	for _, remaining := range persistenceBudgetRemaining {
+		assert.LessOrEqual(t, remaining, 100*time.Millisecond,
+			"each lease must inherit the one short recovery deadline")
+	}
+	for _, leaseUUID := range []string{leaseA, leaseB} {
+		entry, getErr := diagnostics.Get(leaseUUID)
+		require.NoError(t, getErr)
+		require.NotNil(t, entry, "deadline exhaustion must drop logs, not the diagnostic record")
+	}
+}
+
+func TestRecoverState_BoundsManagedNetworkCleanup(t *testing.T) {
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
+		ListManagedNetworksFn: func(ctx context.Context) ([]networktypes.Inspect, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	b.cfg.NetworkIsolation = ptrBool(true)
+	b.recoveryDockerReadTimeout = 10 * time.Millisecond
+
+	started := time.Now()
+	require.NoError(t, b.recoverState(context.Background()))
+	assert.Less(t, time.Since(started), time.Second,
+		"a stalled Docker network inventory must not wedge recovery")
+}
+
+func TestRecoverState_ManagedNetworkCleanupUsesOneAggregateBudget(t *testing.T) {
+	var removals atomic.Int32
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
+		ListManagedNetworksFn: func(context.Context) ([]networktypes.Inspect, error) {
+			return []networktypes.Inspect{
+				{Name: "fred-tenant-a", Labels: map[string]string{LabelTenant: "tenant-a"}},
+				{Name: "fred-tenant-b", Labels: map[string]string{LabelTenant: "tenant-b"}},
+			}, nil
+		},
+		RemoveTenantNetworkIfEmptyFn: func(ctx context.Context, _ string) error {
+			removals.Add(1)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	b := newBackendForTest(mock, nil)
+	b.cfg.NetworkIsolation = ptrBool(true)
+	b.recoveryDockerReadTimeout = 10 * time.Millisecond
+
+	started := time.Now()
+	require.NoError(t, b.recoverState(context.Background()))
+	assert.Less(t, time.Since(started), time.Second)
+	assert.Equal(t, int32(1), removals.Load(),
+		"one wedged removal must exhaust the phase budget instead of granting every network a fresh timeout")
+}
+
 // Simulated-race tests on the recoverState path are obsolete: recoverState
 // hands Ready→Failed transitions off to the lease's actor via
 // containerDiedMsg, and the SM's Failing.OnExit cancellation is the
@@ -420,18 +660,82 @@ func runRecover(t *testing.T, existing map[string]*provision, containers []Conta
 
 func TestRecoverState_ReadyFromRunningContainers(t *testing.T) {
 	got := runRecover(t, nil, []ContainerInfo{
-		{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running", CallbackURL: "http://cb"},
+		{
+			ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small",
+			ServiceName: "app", Status: "running",
+			CallbackURL:          "http://cb/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+			LifecycleCallbackURL: "http://cb/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+		},
 	})
 	p, ok := got["L1"]
 	require.True(t, ok)
 	assert.Equal(t, backend.ProvisionStatusReady, p.Status)
 	assert.Equal(t, []string{"c1"}, p.ContainerIDs)
 	assert.Equal(t, 1, p.Quantity)
-	assert.Equal(t, "http://cb", p.CallbackURL)
+	assert.Equal(t, "http://cb/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000", p.CallbackURL)
+	assert.Equal(t, "http://cb/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000", p.LifecycleCallbackURL)
 	assert.Equal(t, map[string][]string{"app": {"c1"}}, p.ServiceContainers,
 		"ServiceContainers must be rebuilt from container labels")
 	assert.Equal(t, []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}, p.Items,
 		"Items must be rebuilt from container labels")
+}
+
+func TestRecoverState_DerivesLifecycleCallbackFromLegacyExactLabel(t *testing.T) {
+	got := runRecover(t, nil, []ContainerInfo{{
+		ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small",
+		ServiceName: "app", Status: "running",
+		CallbackURL: "http://cb/callbacks/provision?tenant=a%2Fb&operation_id=550e8400-e29b-41d4-a716-446655440000",
+	}})
+	p, ok := got["L1"]
+	require.True(t, ok)
+	assert.Equal(t,
+		"http://cb/callbacks/provision?tenant=a%2Fb&lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+		p.LifecycleCallbackURL,
+		"containers created before lifecycle labels were added must recover typed observation authority")
+}
+
+func TestRecoverState_RejectsMismatchedLifecycleLabel(t *testing.T) {
+	containers := []ContainerInfo{{
+		ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small",
+		ServiceName: "app", Status: "running",
+		CallbackURL:          "https://fred.example/callbacks/provision?trace=keep&operation_id=550e8400-e29b-41d4-a716-446655440000",
+		LifecycleCallbackURL: "https://unrelated.example/callbacks/provision",
+	}}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return containers, nil },
+	}
+	b := newBackendForTest(mock, nil)
+	err := b.recoverState(context.Background())
+	require.ErrorContains(t, err, "validate recovered callback cohorts")
+	require.ErrorContains(t, err, "invalid callback pair")
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	assert.Empty(t, b.provisions, "invalid persisted authority must be quarantined before state publication")
+}
+
+func TestRecoveredCallbackPairs_RejectSiblingDivergenceIndependentOfListOrder(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	first := ContainerInfo{
+		ContainerID: "container-a", LeaseUUID: leaseUUID, Tenant: "t", SKU: "docker-small",
+		ServiceName: "app", Status: "running",
+		CallbackURL:          "https://fred.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+		LifecycleCallbackURL: "https://fred.example/callbacks/provision?lifecycle_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+	}
+	second := ContainerInfo{
+		ContainerID: "container-b", LeaseUUID: leaseUUID, Tenant: "t", SKU: "docker-small",
+		ServiceName: "app", InstanceIndex: 1, Status: "running",
+		CallbackURL:          "https://fred.example/callbacks/provision?operation_id=6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+		LifecycleCallbackURL: "https://fred.example/callbacks/provision?lifecycle_id=6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+	}
+
+	_, forwardErr := recoveredCallbackPairs([]ContainerInfo{first, second})
+	_, reverseErr := recoveredCallbackPairs([]ContainerInfo{second, first})
+	require.Error(t, forwardErr)
+	require.Error(t, reverseErr)
+	assert.EqualError(t, reverseErr, forwardErr.Error(), "Docker list order must not select callback authority")
+	assert.ErrorContains(t, forwardErr, "callback labels diverge")
+	assert.ErrorContains(t, forwardErr, "container-a")
+	assert.ErrorContains(t, forwardErr, "container-b")
 }
 
 func TestRecoverState_ColdStartFailed_BumpsFailCountAndLastError(t *testing.T) {
@@ -1032,13 +1336,14 @@ func TestRecoverState_ColdStartFailed_EnrichmentSkippedWhenInstanceReplaced(t *t
 // reaper-before-recover ordering) is proven by the integration e2e
 // TestIntegration_Docker_AgeReapedReleaseStillRestartable.
 func TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440002"
 	dbPath := filepath.Join(t.TempDir(), "recover_releases.db")
 	relStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer relStore.Close()
 
 	// One provision-time active release, older than the 90d cutoff.
-	require.NoError(t, relStore.Append("L1", shared.Release{
+	require.NoError(t, relStore.Append(leaseUUID, shared.Release{
 		Manifest:  []byte(`{"image":"nginx:1.25"}`),
 		Image:     "stack",
 		Status:    "active",
@@ -1052,7 +1357,12 @@ func TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest(t *testing.
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
 			return []ContainerInfo{
-				{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "running", CallbackURL: "http://cb"},
+				{
+					ContainerID: "c1", LeaseUUID: leaseUUID, Tenant: "t",
+					ProviderUUID: nominalDockerProviderUUID, SKU: "docker-small", ServiceName: "app",
+					Image: "nginx:1.25", Status: "running",
+					CallbackURL: "http://cb/callbacks/provision",
+				},
 			}, nil
 		},
 	}
@@ -1061,7 +1371,7 @@ func TestRecoverState_AgeReapedActiveRelease_StillRehydratesManifest(t *testing.
 	require.NoError(t, b.recoverState(context.Background()))
 
 	b.provisionsMu.RLock()
-	p := b.provisions["L1"]
+	p := b.provisions[leaseUUID]
 	b.provisionsMu.RUnlock()
 	require.NotNil(t, p)
 	require.NotNil(t, p.StackManifest,

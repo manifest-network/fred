@@ -5,6 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -13,11 +17,491 @@ import (
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 	networktypes "github.com/docker/docker/api/types/network"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/callbackurl"
 )
+
+// nominalDockerProviderUUID is the canonical provider identity used by broad
+// Docker unit fixtures. Durable intent/release stores validate the same UUID
+// shape as production, so a memorable non-UUID placeholder can no longer be
+// used when a test upgrades from an ephemeral seam to the real journal.
+const nominalDockerProviderUUID = "22222222-2222-4222-8222-222222222222"
+
+const asyncTestResultTimeout = 5 * time.Second
+
+// waitForAsyncTestResult keeps concurrency regressions local to the assertion
+// that owns the goroutine. Without a bounded receive, a broken lock handoff can
+// leave the entire docker package waiting for the global `go test` timeout.
+func waitForAsyncTestResult(t *testing.T, results <-chan error, operation string) error {
+	t.Helper()
+	timer := time.NewTimer(asyncTestResultTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-results:
+		return err
+	case <-timer.C:
+		t.Fatalf("timeout waiting for %s", operation)
+		return context.DeadlineExceeded
+	}
+}
+
+func waitForTestSignal(t *testing.T, signal <-chan struct{}, operation string) {
+	t.Helper()
+	timer := time.NewTimer(asyncTestResultTimeout)
+	defer timer.Stop()
+	select {
+	case <-signal:
+	case <-timer.C:
+		t.Fatalf("timeout waiting for %s", operation)
+	}
+}
+
+func testResourceProfiles(t *testing.T, items []backend.LeaseItem) []shared.SKUResourceSnapshot {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.SKUProfiles = defaultTestSKUProfiles()
+	b := &Backend{cfg: cfg}
+	resolved := make(map[string]SKUProfile)
+	for _, item := range items {
+		if _, ok := resolved[item.SKU]; ok {
+			continue
+		}
+		profile, err := cfg.GetSKUProfile(item.SKU)
+		require.NoError(t, err)
+		resolved[item.SKU] = profile
+	}
+	profiles, err := b.snapshotResourceProfiles(items, resolved)
+	require.NoError(t, err)
+	return profiles
+}
+
+func newTestRestoreCallbackAuthority(t *testing.T) (shared.OperationID, string, string) {
+	t.Helper()
+	operationID := shared.OperationID(uuid.NewString())
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + operationID.String()
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	require.NoError(t, err)
+	return operationID, callbackURL, lifecycleCallbackURL
+}
+
+func mustTestReleaseRuntimeAuthority(
+	t *testing.T,
+	operationID shared.OperationID,
+	tenant, providerUUID, callbackURL, lifecycleCallbackURL string,
+) *shared.ReleaseRuntimeAuthority {
+	t.Helper()
+	authority, err := shared.NewReleaseRuntimeAuthority(
+		operationID, tenant, providerUUID, callbackURL, lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+	return &authority
+}
+
+// testOperationCallbackURL upgrades ordinary callback-server URLs used by
+// positive-path tests to the exact operation authority production receives
+// from providerd. Explicit operation identities are preserved so tests that
+// assert a particular token continue to exercise that token.
+func testOperationCallbackURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return raw
+	}
+	if _, exists := query[backend.CallbackOperationIDQueryParameter]; exists {
+		return raw
+	}
+	query.Set(backend.CallbackOperationIDQueryParameter, uuid.NewString())
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+// putRestoringRetention seeds a restore finalizer through the same durable
+// transition used by production. Tests must not manufacture nominal restoring
+// rows with Put: doing so bypasses the destination resource and callback
+// authorities that make recovery safe after a restart.
+func putRestoringRetention(
+	t *testing.T,
+	store *shared.RetentionStore,
+	desired shared.RetentionEntry,
+) *shared.RetentionEntry {
+	t.Helper()
+	require.Equal(t, shared.RetentionStatusRestoring, desired.Status)
+	require.NotEmpty(t, desired.OriginalLeaseUUID)
+
+	if desired.NewLeaseUUID == "" {
+		desired.NewLeaseUUID = desired.OriginalLeaseUUID + "-restore"
+	}
+	if len(desired.Items) == 0 {
+		desired.Items = []backend.LeaseItem{{
+			SKU: "docker-micro", Quantity: 1, ServiceName: "app",
+		}}
+	}
+	if len(desired.ResourceProfiles) == 0 {
+		desired.ResourceProfiles = testResourceProfiles(t, desired.Items)
+	}
+	if desired.StackManifest == nil {
+		desired.StackManifest = restoreStackManifest()
+	}
+	destinationItems := desired.DestinationItems
+	usedSourceItems := len(destinationItems) == 0
+	if len(destinationItems) == 0 {
+		destinationItems = append([]backend.LeaseItem(nil), desired.Items...)
+	}
+	destinationProfiles := desired.DestinationResourceProfiles
+	if len(destinationProfiles) == 0 && usedSourceItems {
+		destinationProfiles = shared.CloneSKUResourceSnapshot(desired.ResourceProfiles)
+	}
+	if len(destinationProfiles) == 0 {
+		destinationProfiles = testResourceProfiles(t, destinationItems)
+	}
+
+	operationID := desired.DestinationOperationID
+	callbackURL := desired.DestinationCallbackURL
+	lifecycleCallbackURL := desired.DestinationLifecycleCallbackURL
+	if operationID == "" && callbackURL == "" && lifecycleCallbackURL == "" {
+		operationID, callbackURL, lifecycleCallbackURL = newTestRestoreCallbackAuthority(t)
+	} else {
+		require.True(t, operationID.Valid(), "fixture operation ID must be a canonical UUIDv4")
+		require.NotEmpty(t, callbackURL)
+		require.NotEmpty(t, lifecycleCallbackURL)
+	}
+
+	active := desired
+	active.Status = shared.RetentionStatusActive
+	active.NewLeaseUUID = ""
+	active.RestoringSince = time.Time{}
+	active.DestinationItems = nil
+	active.DestinationResourceProfiles = nil
+	active.DestinationOperationID = ""
+	active.DestinationCallbackURL = ""
+	active.DestinationLifecycleCallbackURL = ""
+	if desired.Generation > 0 {
+		active.Generation = desired.Generation - 1
+	}
+	require.NoError(t, store.Put(active))
+
+	claimed, err := store.ClaimForRestoreWithAuthority(
+		desired.OriginalLeaseUUID,
+		desired.NewLeaseUUID,
+		0,
+		destinationItems,
+		destinationProfiles,
+		operationID,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+	if !desired.RestoringSince.IsZero() && !desired.RestoringSince.Equal(claimed.RestoringSince) {
+		claimed.RestoringSince = desired.RestoringSince
+		require.NoError(t, store.Put(*claimed))
+	}
+	return claimed
+}
+
+type testDockerStorageIdentity struct{}
+
+// newCallbackTestServer returns an httptest server whose advertised URL is a
+// complete Fred callback endpoint. Mutating URL is test-only metadata;
+// httptest.Server uses its listener for Client and Close.
+func newCallbackTestServer(handler http.Handler) *httptest.Server {
+	server := httptest.NewServer(handler)
+	server.URL += callbackurl.ProvisionPath
+	return server
+}
+
+func (testDockerStorageIdentity) resolve(
+	_ context.Context,
+	cfg Config,
+	_ dockerClient,
+	_ volumeManager,
+) (backendidentity.VerifiedStorage, error) {
+	const substrateID = "test-docker-substrate"
+	markerPath := filepath.Clean(cfg.CallbackDBPath) + ".storage-identity.json"
+	anchorPath := filepath.Clean(cfg.CallbackDBPath) + ".storage-identity-anchor.json"
+	paths, err := bindDockerStorageInitializationPaths(cfg, markerPath, anchorPath)
+	if err != nil {
+		return backendidentity.VerifiedStorage{}, err
+	}
+	defer func() { _ = paths.Close() }()
+	hooks := backendidentity.MarkerPairStoreHooks{
+		Profile: backendidentity.InitializationProfileFresh,
+		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
+			if err := shared.PrepareBoundCallbackStoreStorage(paths.callbacks, storage, profile); err != nil {
+				return err
+			}
+			if err := shared.PrepareBoundReleaseStoreStorage(paths.releases, storage, profile); err != nil {
+				return err
+			}
+			return shared.PrepareBoundRetentionStoreStorage(paths.retention, storage, profile)
+		},
+		Check: func(storage backendidentity.PendingStorage) error {
+			if err := shared.CheckBoundCallbackStoreStorage(paths.callbacks, storage); err != nil {
+				return err
+			}
+			if err := shared.CheckBoundReleaseStoreStorage(paths.releases, storage); err != nil {
+				return err
+			}
+			return shared.CheckBoundRetentionStoreStorage(paths.retention, storage)
+		},
+		Verify: func(storage backendidentity.VerifiedStorage) error {
+			return verifyBoundDockerAuthoritativeStoreSet(paths, storage)
+		},
+	}
+	return paths.markers.InitializeWithStores(cfg.Name, substrateID, hooks)
+}
+
+type testDockerRuntimeStorageVerifier struct {
+	id       backendidentity.ID
+	identity func() backendidentity.ID
+	verify   func(context.Context) error
+}
+
+func (verifier testDockerRuntimeStorageVerifier) StorageIdentity() backendidentity.ID {
+	if verifier.identity != nil {
+		return verifier.identity()
+	}
+	return verifier.id
+}
+func (verifier testDockerRuntimeStorageVerifier) Verify(ctx context.Context) error {
+	if verifier.verify != nil {
+		return verifier.verify(ctx)
+	}
+	return nil
+}
+
+func newBackendWithTestIdentity(cfg Config, logger *slog.Logger) (*Backend, error) {
+	b, err := newBackend(context.Background(), cfg, logger, testDockerStorageIdentity{})
+	if err == nil {
+		b.operationIntents = noopOperationIntentJournal{}
+	}
+	return b, err
+}
+
+// newNominalProvisionComposeExecutor models the successful Compose substrate
+// used by broad provision tests. It derives the PS cohort from the exact
+// service keys emitted by buildComposeProject, rather than returning an empty
+// inventory that now (correctly) fails the exact-cohort safety check.
+func newNominalProvisionComposeExecutor() *mockComposeExecutor {
+	var mu sync.Mutex
+	projects := make(map[string][]composeContainerSummary)
+	return &mockComposeExecutor{
+		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
+			serviceNames := make([]string, 0, len(project.Services))
+			for serviceName := range project.Services {
+				serviceNames = append(serviceNames, serviceName)
+			}
+			sort.Strings(serviceNames)
+			containers := make([]composeContainerSummary, 0, len(serviceNames))
+			for index, serviceName := range serviceNames {
+				containers = append(containers, composeContainerSummary{
+					ID:      fmt.Sprintf("container-%d", index+1),
+					Service: serviceName,
+					State:   "running",
+				})
+			}
+			mu.Lock()
+			projects[project.Name] = containers
+			mu.Unlock()
+			return nil
+		},
+		PSFn: func(_ context.Context, projectName string) ([]composeContainerSummary, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]composeContainerSummary(nil), projects[projectName]...), nil
+		},
+	}
+}
+
+type noopOperationIntentJournal struct {
+	store *shared.CallbackStore
+}
+
+func (noopOperationIntentJournal) ProbeOperationIntent(
+	shared.OperationIntentProbe,
+) (shared.OperationIntentAdmissionDisposition, error) {
+	return shared.OperationIntentAdmissionNone, nil
+}
+
+func (j noopOperationIntentJournal) BeginOperationIntent(
+	spec shared.OperationIntentSpec,
+) (shared.OperationIntentAdmission, error) {
+	if j.store == nil {
+		return shared.OperationIntentAdmission{}, errors.New(
+			"nominal operation-intent fixture has no claim-minting store",
+		)
+	}
+	callbackURL, err := url.Parse(spec.CallbackURL)
+	if err != nil {
+		return shared.OperationIntentAdmission{}, err
+	}
+	callbackQuery, err := url.ParseQuery(callbackURL.RawQuery)
+	if err != nil {
+		return shared.OperationIntentAdmission{}, err
+	}
+	if callbackQuery.Has(backend.CallbackOperationIDQueryParameter) {
+		return shared.OperationIntentAdmission{}, errors.New(
+			"nominal operation-intent fixture cannot replace typed operation authority",
+		)
+	}
+	if spec.LifecycleCallbackURL != "" {
+		lifecycleURL, parseErr := url.Parse(spec.LifecycleCallbackURL)
+		if parseErr != nil {
+			return shared.OperationIntentAdmission{}, parseErr
+		}
+		lifecycleQuery, parseErr := url.ParseQuery(lifecycleURL.RawQuery)
+		if parseErr != nil {
+			return shared.OperationIntentAdmission{}, parseErr
+		}
+		if lifecycleQuery.Has(backend.CallbackLifecycleIDQueryParameter) {
+			return shared.OperationIntentAdmission{}, errors.New(
+				"nominal operation-intent fixture cannot replace typed lifecycle authority",
+			)
+		}
+	}
+
+	// These unit fixtures intentionally use memorable non-UUID identities and
+	// tokenless callback routes. Mint the opaque claim through the real journal
+	// under fresh internal UUID keys, while leaving the request-facing values
+	// untouched. A unique key preserves the old always-created behavior without
+	// manufacturing a claim or weakening production validation.
+	spec.LeaseUUID = uuid.NewString()
+	spec.ProviderUUID = uuid.NewString()
+	if spec.SourceLeaseUUID != "" {
+		spec.SourceLeaseUUID = uuid.NewString()
+	}
+	return j.store.BeginOperationIntent(spec)
+}
+
+func (j noopOperationIntentJournal) ListOperationIntents() ([]shared.OperationIntentClaim, error) {
+	if j.store == nil {
+		return nil, nil
+	}
+	return j.store.ListOperationIntents()
+}
+
+func (noopOperationIntentJournal) ResolveOperationIntent(
+	shared.OperationIntentClaim,
+	backend.CallbackStatus,
+	string,
+) (shared.CallbackEntry, error) {
+	return shared.CallbackEntry{}, nil
+}
+
+// durableTestOperationIntentJournal delegates to the production bbolt store
+// while supplying the physical-storage identity omitted by isolated Backend
+// fixtures. Keeping Backend.storageIdentity invalid intentionally preserves the
+// package-test mutation-admission bypass; the durable journal still constructs
+// and verifies real opaque operation claims.
+type durableTestOperationIntentJournal struct {
+	store     *shared.CallbackStore
+	storageID backendidentity.ID
+}
+
+func (j durableTestOperationIntentJournal) ProbeOperationIntent(
+	probe shared.OperationIntentProbe,
+) (shared.OperationIntentAdmissionDisposition, error) {
+	if !probe.BackendStorageID.Valid() {
+		probe.BackendStorageID = j.storageID
+	}
+	return j.store.ProbeOperationIntent(probe)
+}
+
+func (j durableTestOperationIntentJournal) BeginOperationIntent(
+	spec shared.OperationIntentSpec,
+) (shared.OperationIntentAdmission, error) {
+	if !spec.BackendStorageID.Valid() {
+		spec.BackendStorageID = j.storageID
+	}
+	return j.store.BeginOperationIntent(spec)
+}
+
+func (j durableTestOperationIntentJournal) ListOperationIntents() ([]shared.OperationIntentClaim, error) {
+	return j.store.ListOperationIntents()
+}
+
+func (j durableTestOperationIntentJournal) ResolveOperationIntent(
+	claim shared.OperationIntentClaim,
+	status backend.CallbackStatus,
+	errMsg string,
+) (shared.CallbackEntry, error) {
+	return j.store.ResolveOperationIntent(claim, status, errMsg)
+}
+
+// bindTestStorageIdentity seals a stateless test Backend so Start tests can
+// exercise the phase they name rather than failing at the production-only
+// explicit lineage precondition first.
+func bindTestStorageIdentity(t *testing.T, b *Backend, dockerClient *mockDockerClient) {
+	t.Helper()
+	const daemonID = "test-daemon"
+	dbPath := filepath.Join(t.TempDir(), "callbacks.db")
+	b.cfg.CallbackDBPath = dbPath
+	for name, profile := range b.cfg.SKUProfiles {
+		profile.DiskMB = 0
+		b.cfg.SKUProfiles[name] = profile
+	}
+	dockerClient.DaemonInfoFn = func(context.Context) (DaemonSecurityInfo, error) {
+		return DaemonSecurityInfo{SystemID: daemonID}, nil
+	}
+	id, err := initializeTestMarkerPair(
+		dbPath+".storage-identity.json",
+		dbPath+".storage-identity-anchor.json",
+		b.cfg.Name,
+		daemonID,
+	)
+	require.NoError(t, err)
+	b.storageIdentity = id
+	b.storageVerifier = testDockerRuntimeStorageVerifier{
+		id: id,
+		verify: func(ctx context.Context) error {
+			info, err := dockerClient.DaemonInfo(ctx)
+			if err != nil {
+				return err
+			}
+			return backendidentity.VerifyMarkerPair(
+				dbPath+".storage-identity.json",
+				dbPath+".storage-identity-anchor.json",
+				b.cfg.Name,
+				info.SystemID,
+				id,
+			)
+		},
+	}
+}
+
+func initializeTestMarkerPair(
+	primaryPath, anchorPath, backendName, substrateID string,
+) (backendidentity.ID, error) {
+	pair, err := backendidentity.BindMarkerPair(primaryPath, anchorPath)
+	if err != nil {
+		return backendidentity.ID{}, err
+	}
+	defer func() { _ = pair.Close() }()
+	storage, err := pair.InitializeWithStores(
+		backendName,
+		substrateID,
+		backendidentity.MarkerPairStoreHooks{
+			Profile: backendidentity.InitializationProfileFresh,
+			Prepare: func(backendidentity.PendingStorage, backendidentity.InitializationProfile) error {
+				return nil
+			},
+			Check:  func(backendidentity.PendingStorage) error { return nil },
+			Verify: func(backendidentity.VerifiedStorage) error { return nil },
+		},
+	)
+	if err != nil {
+		return backendidentity.ID{}, err
+	}
+	return storage.ID(), nil
+}
 
 // actorFor resolves the lease actor for leaseUUID, creating and starting
 // one if absent. Test-only: production code uses routeToLease to deliver
@@ -85,10 +569,12 @@ type fakeDocker struct {
 	// RemoveContainer hook. Default (nil) is silent success. Tests that need
 	// to *capture* removals (e.g. the -prev grace-cleanup test) override this.
 	removeContainer func(ctx context.Context, name string) error
+	stopContainer   func(ctx context.Context, containerID string, timeout time.Duration) error
 
 	// Compose side.
 	composeUpErr           error  // returned by composeExecutor.Up if non-nil
 	lastComposeProjectName string // captured project.Name from the most recent Up call
+	lastComposeProject     *composetypes.Project
 }
 
 // fakeVolumeBackend records RenameVolume calls and stubs the rest of the
@@ -113,12 +599,23 @@ func (f *fakeVolumeBackend) Destroy(_ context.Context, id string) error {
 	return nil
 }
 func (f *fakeVolumeBackend) List() ([]string, error) { return nil, nil }
-func (f *fakeVolumeBackend) Validate() error         { return nil }
+func (f *fakeVolumeBackend) ListForProof(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+func (f *fakeVolumeBackend) Validate() error { return nil }
+func (f *fakeVolumeBackend) AttestManagedVolume(context.Context, managedVolumeName) error {
+	return nil
+}
+func (f *fakeVolumeBackend) RequireNoInterruptedVolumeMutations(context.Context) error { return nil }
+func (f *fakeVolumeBackend) RecoverInterruptedVolumeMutations(context.Context) error   { return nil }
 
 // RenameVolume captures the rename request. Returns nil unconditionally —
 // migration tests assert on the recorded renames slice rather than on a
 // returned error.
-func (f *fakeVolumeBackend) RenameVolume(oldName, newName string) error {
+func (f *fakeVolumeBackend) RenameVolume(_ context.Context, oldName, newName string) error {
 	f.renames = append(f.renames, [2]string{oldName, newName})
 	return nil
 }
@@ -220,7 +717,10 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 		// up the test runtime (mockDockerClient.RemoveContainer panics
 		// by default). RenameContainer default already returns nil
 		// silently in the underlying mock.
-		StopContainerFn: func(_ context.Context, _ string, _ time.Duration) error {
+		StopContainerFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			if state.stopContainer != nil {
+				return state.stopContainer(ctx, containerID, timeout)
+			}
 			return nil
 		},
 		RemoveContainerFn: func(ctx context.Context, name string) error {
@@ -258,6 +758,14 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 					if ms, ok := state.mounts[containerID]; ok {
 						c.Mounts = append(c.Mounts, ms...)
 					}
+					// Fixtures that omit Status model the default successful Stop
+					// hook above. Production InspectContainer always returns a Docker
+					// state; expose the corresponding explicit quiescent state to the
+					// migration's post-stop proof without changing the stale list
+					// snapshot used by the broader recoverState fixture.
+					if c.Status == "" {
+						c.Status = "exited"
+					}
 					return &c, nil
 				}
 			}
@@ -271,6 +779,7 @@ func newMigrationTestBackend(t *testing.T) (*Backend, *fakeDocker, *fakeVolumeBa
 				return state.composeUpErr
 			}
 			state.lastComposeProjectName = project.Name
+			state.lastComposeProject = project
 			if state.composeUpErr != nil {
 				return state.composeUpErr
 			}
@@ -389,4 +898,27 @@ func (v *volumeSet) names() []string {
 // manager wires the set into a mockVolumeManager.
 func (v *volumeSet) manager() *mockVolumeManager {
 	return &mockVolumeManager{ListFn: v.list, DestroyFn: v.destroy}
+}
+
+// rollbackRestoreAdoption preserves the former phase-level fixture seam for
+// tests that exercise physical/quota handback independently of operation-intent
+// settlement. Production callers must choose one of the accepted/unaccepted
+// wrappers, which makes the settlement owner explicit.
+func (b *Backend) rollbackRestoreAdoption(
+	ctx context.Context,
+	leaseUUID string,
+	allocatedIDs []string,
+	rec *shared.RetentionEntry,
+	dropProvision bool,
+	logger *slog.Logger,
+) bool {
+	resourceProfiles, prepared := b.prepareRestoreAdoptionRollback(
+		ctx, leaseUUID, rec, dropProvision, logger,
+	)
+	if !prepared {
+		return false
+	}
+	return b.completeRestoreAdoptionRollback(
+		leaseUUID, allocatedIDs, rec, resourceProfiles, dropProvision, logger,
+	)
 }

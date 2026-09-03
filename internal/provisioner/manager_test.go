@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,9 +20,14 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
+	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 )
 
 // hashPayload computes the SHA-256 hash of a payload and returns it as a hex string.
@@ -36,6 +42,14 @@ func testItems(sku string) []backend.LeaseItem {
 		return nil
 	}
 	return []backend.LeaseItem{{SKU: sku, Quantity: 1}}
+}
+
+func mustInFlightOperationID(t *testing.T, manager *Manager, leaseUUID string) string {
+	t.Helper()
+	p, exists := manager.GetInFlight(leaseUUID)
+	require.True(t, exists, "lease %s must be in-flight", leaseUUID)
+	require.True(t, p.OperationID.Valid())
+	return p.OperationID.String()
 }
 
 // mockManagerBackend implements backend.Backend for manager tests.
@@ -128,6 +142,12 @@ func TestNewManager_Validation(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chaintest.MockClient{}
+	validPlacement := newTestPlacementAuthority(t)
+	configureTestPlacementTopology(t, validPlacement, []string{"test"})
+	var typedNilPlacement *placement.Store
+	var typedNilAuthority PlacementAuthorityStore = typedNilPlacement
+	var typedNilChain *chaintest.MockClient
+	var typedNilChainClient ChainClient = typedNilChain
 
 	tests := []struct {
 		name        string
@@ -151,6 +171,13 @@ func TestNewManager_Validation(t *testing.T) {
 			wantErr:     "chain client is required",
 		},
 		{
+			name:        "typed nil chain client",
+			cfg:         ManagerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			router:      router,
+			chainClient: typedNilChainClient,
+			wantErr:     "chain client is required",
+		},
+		{
 			name:        "missing provider UUID",
 			cfg:         ManagerConfig{CallbackBaseURL: "http://localhost"},
 			router:      router,
@@ -165,8 +192,43 @@ func TestNewManager_Validation(t *testing.T) {
 			wantErr:     "callback base URL is required",
 		},
 		{
-			name:        "valid config",
-			cfg:         ManagerConfig{ProviderUUID: "test-uuid", CallbackBaseURL: "http://localhost"},
+			name: "invalid callback URL",
+			cfg: ManagerConfig{
+				ProviderUUID:    "test-uuid",
+				CallbackBaseURL: "http://localhost/callback#not-sent",
+			},
+			router:      router,
+			chainClient: mockChain,
+			wantErr:     "callback base URL must not contain a fragment",
+		},
+		{
+			name: "missing placement authority",
+			cfg: ManagerConfig{
+				ProviderUUID:    "test-uuid",
+				CallbackBaseURL: "http://localhost",
+			},
+			router:      router,
+			chainClient: mockChain,
+			wantErr:     ErrPlacementStoreUnavailable.Error(),
+		},
+		{
+			name: "typed nil placement authority",
+			cfg: ManagerConfig{
+				ProviderUUID:    "test-uuid",
+				CallbackBaseURL: "http://localhost",
+				PlacementStore:  typedNilAuthority,
+			},
+			router:      router,
+			chainClient: mockChain,
+			wantErr:     ErrPlacementStoreUnavailable.Error(),
+		},
+		{
+			name: "valid config",
+			cfg: ManagerConfig{
+				ProviderUUID:    placementstore.ProviderUUID,
+				CallbackBaseURL: "http://localhost",
+				PlacementStore:  validPlacement,
+			},
 			router:      router,
 			chainClient: mockChain,
 			wantErr:     "",
@@ -175,15 +237,144 @@ func TestNewManager_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewManager(tt.cfg, tt.router, tt.chainClient)
+			manager, err := NewManager(tt.cfg, tt.router, tt.chainClient)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
+				require.NotNil(t, manager)
 			} else {
 				require.Error(t, err)
 				assert.Equal(t, tt.wantErr, err.Error())
 			}
 		})
 	}
+}
+
+func TestNewManager_RejectsPlacementAuthorityForDifferentProviderBeforeTopologyUse(t *testing.T) {
+	backendClient := &mockManagerBackend{name: "backend-a"}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{{
+		Backend: backendClient, IsDefault: true,
+	}}})
+	require.NoError(t, err)
+	store := newTestPlacementAuthority(t)
+	configureTestPlacementTopology(t, store, []string{backendClient.Name()})
+	authority := &constructorPlacementAuthoritySpy{PlacementAuthorityStore: store}
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    "e58ed763-928c-4e03-bfac-67a92a99de90",
+		CallbackBaseURL: "http://localhost:8080",
+		PlacementStore:  authority,
+	}, router, &chaintest.MockClient{})
+
+	require.ErrorIs(t, err, placement.ErrProviderAuthorityMismatch)
+	assert.Nil(t, manager)
+	assert.Zero(t, authority.topologyChecks,
+		"wrong-provider construction must stop before consuming topology authority")
+}
+
+func TestNewManager_RejectsUncommittedRouterTopologyWithoutMutatingAuthority(t *testing.T) {
+	backendA := &mockManagerBackend{name: "backend-a"}
+	backendB := &mockManagerBackend{name: "backend-b"}
+	oldRouter, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: backendA, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	currentRouter, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{
+			{Backend: backendB},
+			{Backend: backendA, IsDefault: true},
+		},
+	})
+	require.NoError(t, err)
+
+	store := newTestPlacementAuthority(t)
+	armTestPlacementAdmission(t, store, oldRouter)
+	require.True(t, store.InventoryBootstrapped())
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    placementstore.ProviderUUID,
+		CallbackBaseURL: "http://localhost:8080",
+		PlacementStore:  store,
+	}, currentRouter, &chaintest.MockClient{})
+	require.ErrorIs(t, err, placement.ErrInvalidBackendTopology)
+	assert.Nil(t, manager)
+	assert.True(t, store.InventoryBootstrapped(),
+		"runtime construction must not mutate the previously committed topology")
+	require.NoError(t, store.VerifyBackendTopology([]string{"backend-a"}))
+
+	configureTestPlacementTopology(t, store, []string{"backend-a", "backend-b"})
+	manager, err = NewManager(ManagerConfig{
+		ProviderUUID:    placementstore.ProviderUUID,
+		CallbackBaseURL: "http://localhost:8080",
+		PlacementStore:  store,
+	}, currentRouter, &chaintest.MockClient{})
+	require.NoError(t, err)
+	require.NotNil(t, manager)
+}
+
+func TestNewManager_BackendConfigRevertSurvivesPlacementStoreReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	backends := map[string]*mockManagerBackend{
+		"backend-a": {name: "backend-a"},
+		"backend-b": {name: "backend-b"},
+	}
+
+	startWithTopology := func(names ...string) {
+		t.Helper()
+		entries := make([]backend.BackendEntry, 0, len(names))
+		for index, name := range names {
+			entries = append(entries, backend.BackendEntry{
+				Backend:   backends[name],
+				IsDefault: index == 0,
+			})
+		}
+		router, err := backend.NewRouter(backend.RouterConfig{Backends: entries})
+		require.NoError(t, err)
+		store, err := placementstore.NewStore(dbPath)
+		require.NoError(t, err)
+		configureTestPlacementTopology(t, store, names)
+		manager, err := NewManager(ManagerConfig{
+			ProviderUUID:    placementstore.ProviderUUID,
+			CallbackBaseURL: "http://localhost:8080",
+			PlacementStore:  store,
+		}, router, &chaintest.MockClient{})
+		require.NoError(t, err)
+		require.NotNil(t, manager)
+		armTestPlacementAdmission(t, store, router)
+		require.NoError(t, store.Close())
+	}
+
+	startWithTopology("backend-a", "backend-b")
+	startWithTopology("backend-a")
+	startWithTopology("backend-a", "backend-b")
+}
+
+func TestNewManager_RejectsTopologyThatWouldRemoveDurableOwner(t *testing.T) {
+	store := newTestPlacementAuthority(t)
+	seedTestConfirmedPlacements(t, store, []string{"removed-backend"}, map[string]string{
+		"lease-1": "removed-backend",
+	})
+	remaining := &mockManagerBackend{name: "remaining-backend"}
+	router, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: remaining, IsDefault: true}},
+	})
+	require.NoError(t, err)
+
+	require.ErrorIs(t, store.ConfigureBackendTopologyWithStorageIdentities(
+		[]string{"remaining-backend"},
+		map[string]backendidentity.ID{
+			"remaining-backend": testBackendStorageID("remaining-backend"),
+		},
+	), placement.ErrBackendTopologyInUse)
+
+	manager, err := NewManager(ManagerConfig{
+		ProviderUUID:    placementstore.ProviderUUID,
+		CallbackBaseURL: "http://localhost:8080",
+		PlacementStore:  store,
+	}, router, &chaintest.MockClient{})
+	require.ErrorIs(t, err, placement.ErrInvalidBackendTopology)
+	assert.Nil(t, manager)
+	assert.Equal(t, placement.StateConfirmed, store.Lookup("lease-1").State())
+	assert.Equal(t, "removed-backend", store.Lookup("lease-1").Backend)
 }
 
 func TestManager_InFlightTracking(t *testing.T) {
@@ -193,7 +384,7 @@ func TestManager_InFlightTracking(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -215,6 +406,15 @@ func TestManager_InFlightTracking(t *testing.T) {
 	assert.Equal(t, "tenant-1", provision.Tenant)
 	assert.Equal(t, "sku-1", provision.RoutingSKU())
 	assert.Equal(t, "test-backend", provision.Backend)
+	require.Same(t, manager.operations, manager.RestoreOperations(),
+		"restore must share the manager's one operation registry")
+	require.Same(t, manager.operations, manager.MaintenanceClaims(),
+		"maintenance must share the manager's one operation registry")
+	require.Same(t, manager.operations, manager.ReconcilerOperations(),
+		"the reconciler port must be backed by the manager's one operation registry")
+	typedProvision, exists := manager.operations.Lookup("lease-1")
+	require.True(t, exists)
+	assert.Equal(t, provision.OperationID, typedProvision.ID)
 
 	// Should still be in-flight (GetInFlight doesn't remove)
 	assert.True(t, manager.IsInFlight("lease-1"), "IsInFlight() should be true after GetInFlight")
@@ -237,7 +437,7 @@ func TestManager_TryTrackInFlight(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -274,7 +474,7 @@ func TestManager_TryTrackInFlight_RaceCondition(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -330,7 +530,7 @@ func TestManager_PopInFlight(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -354,7 +554,97 @@ func TestManager_PopInFlight(t *testing.T) {
 
 func TestBuildCallbackURL(t *testing.T) {
 	expected := "http://localhost:8080/callbacks/provision"
-	assert.Equal(t, expected, BuildCallbackURL("http://localhost:8080"))
+	legacyURL, err := BuildCallbackURL("http://localhost:8080")
+	require.NoError(t, err)
+	assert.Equal(t, expected, legacyURL)
+
+	operationID, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174000")
+	require.NoError(t, err)
+	typedURL, err := BuildCallbackURLForOperation("http://localhost:8080", operationID)
+	require.NoError(t, err)
+	assert.Equal(t, expected+"?operation_id=123e4567-e89b-42d3-a456-426614174000", typedURL)
+
+	lifecycleID, err := lifecycle.FromOperationID(operationID)
+	require.NoError(t, err)
+	lifecycleURL, err := BuildCallbackURLForLifecycle("http://localhost:8080", lifecycleID)
+	require.NoError(t, err)
+	assert.Equal(t, expected+"?lifecycle_id=123e4567-e89b-42d3-a456-426614174000", lifecycleURL)
+
+	typedURL, err = BuildCallbackURLForOperation(
+		"http://localhost:8080/root?trace=a%2Fb&&z=last", operationID,
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"http://localhost:8080/root/callbacks/provision?trace=a%2Fb&&z=last&operation_id=123e4567-e89b-42d3-a456-426614174000",
+		typedURL,
+		"typed construction must preserve valid unrelated raw query bytes",
+	)
+
+	lifecycleURL, err = BuildCallbackURLForLifecycle(
+		"http://localhost:8080/root?trace=a%2Fb&&z=last", lifecycleID,
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"http://localhost:8080/root/callbacks/provision?trace=a%2Fb&&z=last&lifecycle_id=123e4567-e89b-42d3-a456-426614174000",
+		lifecycleURL,
+	)
+
+	typedURL, err = BuildCallbackURLForOperation(
+		"http://localhost:8080/root///?trace=ends%2F", operationID,
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"http://localhost:8080/root/callbacks/provision?trace=ends%2F&operation_id=123e4567-e89b-42d3-a456-426614174000",
+		typedURL,
+		"typed construction must canonicalize the path boundary without rewriting the raw query",
+	)
+	legacyURL, err = BuildCallbackURL(
+		"http://localhost:8080/root///?trace=ends%2F",
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"http://localhost:8080/root/callbacks/provision?trace=ends%2F",
+		legacyURL,
+		"legacy construction must place the path before the raw query and normalize trailing separators",
+	)
+
+	for _, malformedBaseURL := range []string{
+		"http://localhost:8080?trace=%ZZ",
+		"http://localhost:8080?trace=x;y",
+		"/relative/callback",
+		"ftp://localhost/callback",
+		"http://operator@localhost/callback",
+		"http://localhost/callback#not-sent",
+		"http://localhost/root/../callback",
+		"http://localhost/root//callback",
+		"http://localhost/root%2Fcallback",
+		"http://localhost/root%00callback",
+		`http://localhost/root\callback`,
+	} {
+		_, err = BuildCallbackURL(malformedBaseURL)
+		require.Error(t, err, "legacy builder must reject malformed base URL %q", malformedBaseURL)
+		_, err = BuildCallbackURLForOperation(malformedBaseURL, operationID)
+		require.Error(t, err, "operation builder must reject malformed base query %q", malformedBaseURL)
+		_, err = BuildCallbackURLForLifecycle(malformedBaseURL, lifecycleID)
+		require.Error(t, err, "lifecycle builder must reject malformed base query %q", malformedBaseURL)
+	}
+
+	for _, authoritativeBaseURL := range []string{
+		"http://localhost:8080?operation_id=123e4567-e89b-42d3-a456-426614174000",
+		"http://localhost:8080?lifecycle%5Fid=123e4567-e89b-42d3-a456-426614174000",
+	} {
+		_, err = BuildCallbackURL(authoritativeBaseURL)
+		require.Error(t, err, "legacy builder must reject authority in base URL %q", authoritativeBaseURL)
+		_, err = BuildCallbackURLForOperation(authoritativeBaseURL, operationID)
+		require.Error(t, err, "operation builder must reject authority in base URL %q", authoritativeBaseURL)
+		_, err = BuildCallbackURLForLifecycle(authoritativeBaseURL, lifecycleID)
+		require.Error(t, err, "lifecycle builder must reject authority in base URL %q", authoritativeBaseURL)
+	}
+
+	_, err = BuildCallbackURLForOperation("http://localhost:8080", operation.OperationID{})
+	require.ErrorIs(t, err, operation.ErrInvalidID)
+	_, err = BuildCallbackURLForLifecycle("http://localhost:8080", lifecycle.ID{})
+	require.ErrorIs(t, err, lifecycle.ErrInvalidID)
 }
 
 func TestManager_HandleLeaseCreated(t *testing.T) {
@@ -370,13 +660,13 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 				ProviderUuid: "provider-1",
 				State:        billingtypes.LEASE_STATE_PENDING,
 				Items: []billingtypes.LeaseItem{
-					{SkuUuid: "sku-1"},
+					{SkuUuid: "sku-1", Quantity: 1},
 				},
 			}, nil
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -402,7 +692,11 @@ func TestManager_HandleLeaseCreated(t *testing.T) {
 	assert.Equal(t, "lease-1", mockBackend.provisionCalls[0].LeaseUUID)
 	assert.Equal(t, "tenant-1", mockBackend.provisionCalls[0].Tenant)
 	assert.Equal(t, "provider-1", mockBackend.provisionCalls[0].ProviderUUID)
-	assert.Equal(t, "http://localhost:8080/callbacks/provision", mockBackend.provisionCalls[0].CallbackURL)
+	inFlight, exists := manager.operations.Lookup("lease-1")
+	require.True(t, exists)
+	wantCallbackURL, err := BuildCallbackURLForOperation("http://localhost:8080", inFlight.ID)
+	require.NoError(t, err)
+	assert.Equal(t, wantCallbackURL, mockBackend.provisionCalls[0].CallbackURL)
 
 	// Verify in-flight tracking
 	assert.True(t, manager.IsInFlight("lease-1"), "lease should be in-flight after handleLeaseCreated")
@@ -421,12 +715,12 @@ func TestManager_HandleLeaseCreated_ProvisionError(t *testing.T) {
 				Tenant:       "tenant-1",
 				ProviderUuid: "provider-1",
 				State:        billingtypes.LEASE_STATE_PENDING,
-				Items:        []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+				Items:        []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 			}, nil
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -456,7 +750,7 @@ func TestManager_HandleLeaseCreated_MalformedMessage(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -482,7 +776,7 @@ func TestManager_HandleLeaseClosed(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -519,7 +813,7 @@ func TestManager_HandleLeaseClosed_DeprovisionError(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -560,7 +854,7 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -570,11 +864,14 @@ func TestManager_HandleBackendCallback_Success(t *testing.T) {
 	startAckBatcherForTest(t, manager)
 
 	// Track the lease first
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -597,21 +894,30 @@ func TestManager_HandleBackendCallback_Failed(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
-	mockChain := &chaintest.MockClient{}
+	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid: "lease-1", State: billingtypes.LEASE_STATE_PENDING,
+			}, nil
+		},
+	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
 	require.NoError(t, err)
 
 	// Track the lease first
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "out of resources",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "out of resources",
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -630,7 +936,7 @@ func TestManager_HandleBackendCallback_UnknownLease(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -671,7 +977,7 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -681,11 +987,14 @@ func TestManager_HandleBackendCallback_AcknowledgeError(t *testing.T) {
 	startAckBatcherForTest(t, manager)
 
 	// Track the lease
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -721,9 +1030,14 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			return 0, nil, terminalErr
 		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid: "lease-1", State: billingtypes.LEASE_STATE_ACTIVE,
+			}, nil
+		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -733,11 +1047,14 @@ func TestManager_HandleBackendCallback_AcknowledgeTerminalError(t *testing.T) {
 	startAckBatcherForTest(t, manager)
 
 	// Track the lease
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -803,29 +1120,32 @@ func TestManager_HandleBackendCallback_UnknownStatus(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
 	require.NoError(t, err)
 
 	// Track the lease
-	manager.TrackInFlight("lease-1", "tenant-1", testItems(""), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems(""), "test",
+	)
 
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    "unknown-status",
+		LeaseUUID:   "lease-1",
+		Status:      "unknown-status",
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	// Should return nil (unknown status is logged, not retried)
+	// A structurally invalid callback is retryable/fail-closed at the typed
+	// application boundary and cannot consume the current operation.
 	err = handlersOf(manager).HandleBackendCallback(msg)
-	assert.NoError(t, err, "should return nil for unknown status")
+	require.ErrorContains(t, err, "invalid callback status")
 
-	// Lease should be removed from in-flight (unknown status is treated as terminal
-	// to prevent leases from being stuck indefinitely)
-	assert.False(t, manager.IsInFlight("lease-1"), "lease should NOT be in-flight after unknown status callback (treated as terminal)")
+	assert.True(t, manager.IsInFlight("lease-1"),
+		"invalid status must not settle the exact in-flight operation")
 }
 
 func TestManager_PublishLeaseEvent(t *testing.T) {
@@ -835,7 +1155,7 @@ func TestManager_PublishLeaseEvent(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -870,14 +1190,14 @@ func TestManager_PublishLeaseEvent(t *testing.T) {
 	}
 }
 
-func TestManager_PublishCallback(t *testing.T) {
+func TestManager_PublishCallbackRequiresRunningRuntime(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -888,8 +1208,8 @@ func TestManager_PublishCallback(t *testing.T) {
 		Status:    backend.CallbackStatusSuccess,
 	}
 
-	err = manager.PublishCallback(callback)
-	assert.NoError(t, err)
+	err = manager.PublishCallback(context.Background(), callback)
+	require.ErrorIs(t, err, errCallbackRuntimeUnavailable)
 }
 
 func TestManager_HandleLeaseExpired(t *testing.T) {
@@ -900,7 +1220,7 @@ func TestManager_HandleLeaseExpired(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -942,7 +1262,7 @@ func TestManager_StartAndClose(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -964,6 +1284,9 @@ func TestManager_StartAndClose(t *testing.T) {
 
 	// Close should stop the router
 	assert.NoError(t, manager.Close())
+	assert.Equal(t, operation.LeaseClaimInvalid,
+		manager.MaintenanceClaims().TryClaimLeaseNow("lease-after-close").Outcome(),
+		"Close must defensively close ordinary lifecycle admission")
 
 	// Cancel context to ensure clean shutdown
 	cancel()
@@ -981,14 +1304,15 @@ func TestManager_StartAndClose(t *testing.T) {
 }
 
 func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
-	// Test the warning log when backend lookup by name fails
+	// A best-effort fleet sweep still runs, but the close delivery must not be
+	// acknowledged as successful while its positively named backend was absent.
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1004,9 +1328,9 @@ func TestManager_HandleLeaseClosed_BackendNameNotFound(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	// Should succeed by falling back to default backend
 	err = handlersOf(manager).HandleLeaseClosed(msg)
-	assert.NoError(t, err, "should fallback to default backend")
+	require.ErrorIs(t, err, ErrDeprovisionFailed)
+	require.ErrorIs(t, err, ErrPlacementUnresolvable)
 
 	// Verify deprovision was called on the default backend
 	mockBackend.mu.Lock()
@@ -1039,7 +1363,7 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1092,6 +1416,9 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: "lease-1", State: billingtypes.LEASE_STATE_PENDING}, nil
+		},
 		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -1101,20 +1428,23 @@ func TestManager_HandleBackendCallback_FailedRejectsLease(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
 	require.NoError(t, err)
 
 	// Track the lease first
-	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems("sku-1"), "test",
+	)
 
 	// Send failed callback with error message
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "out of GPU resources",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "out of GPU resources",
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -1143,6 +1473,9 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
 	})
 	mockChain := &chaintest.MockClient{
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{Uuid: "lease-1", State: billingtypes.LEASE_STATE_PENDING}, nil
+		},
 		RejectLeasesFunc: func(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -1151,20 +1484,23 @@ func TestManager_HandleBackendCallback_FailedDefaultReason(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
 	require.NoError(t, err)
 
 	// Track the lease first
-	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems("sku-1"), "test",
+	)
 
 	// Send failed callback WITHOUT error message
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "", // Empty error
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "", // Empty error
+		OperationID: operationID.String(),
 	}
 	payload, _ := json.Marshal(callback)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
@@ -1228,7 +1564,7 @@ func TestManager_GetInFlightLeases(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1266,7 +1602,7 @@ func TestManager_WaitForDrain_AlreadyEmpty(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1284,7 +1620,7 @@ func TestManager_WaitForDrain_DrainCompletes(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1313,7 +1649,7 @@ func TestManager_WaitForDrain_TimeoutExpires(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1339,7 +1675,7 @@ func TestManager_WaitForDrain_ContextCancelled(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1372,7 +1708,7 @@ func TestManager_InFlightCount(t *testing.T) {
 	})
 	mockChain := &chaintest.MockClient{}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -1451,7 +1787,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 				ProviderUuid: "provider-1",
 				State:        billingtypes.LEASE_STATE_PENDING,
 				Items: []billingtypes.LeaseItem{
-					{SkuUuid: "sku-1"},
+					{SkuUuid: "sku-1", Quantity: 1},
 				},
 				MetaHash: []byte("somehash"),
 			}, nil
@@ -1466,7 +1802,7 @@ func TestManager_HandlePayloadReceived(t *testing.T) {
 	require.NoError(t, err)
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1517,7 +1853,7 @@ func TestManager_HandlePayloadReceived_NoPayloadStore(t *testing.T) {
 	mockChain := &chaintest.MockClient{}
 
 	// Create manager WITHOUT payload store
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    nil, // No payload store
@@ -1555,7 +1891,7 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	})
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1575,7 +1911,7 @@ func TestManager_HandlePayloadReceived_MalformedMessage(t *testing.T) {
 	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls for malformed message")
 }
 
-func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
+func TestManager_HandlePayloadReceived_UnknownLeasePreservesPayload(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -1592,7 +1928,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	})
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1610,14 +1946,15 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	// Should return nil (lease not found, clean up payload)
+	// A nil point-read is not terminal proof. Preserve the only recovery payload
+	// and ask Watermill to retry rather than turning RPC lag into data loss.
 	err = handlersOf(manager).HandlePayloadReceived(msg)
-	assert.NoError(t, err, "should return nil for lease not found")
+	assert.Error(t, err, "unknown chain absence must be retried")
 
-	// Verify payload was cleaned up
+	// Verify payload was preserved.
 	hasP2, errP2 := payloadStore.Has("lease-1")
 	require.NoError(t, errP2)
-	assert.False(t, hasP2, "payload should be deleted when lease not found")
+	assert.True(t, hasP2, "unknown chain absence is not terminal evidence")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
@@ -1625,7 +1962,7 @@ func TestManager_HandlePayloadReceived_LeaseNotFound(t *testing.T) {
 	assert.Empty(t, mockBackend.provisionCalls, "expected 0 provision calls for lease not found")
 }
 
-func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
+func TestManager_HandlePayloadReceived_ActiveLeasePreservesPayload(t *testing.T) {
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -1636,7 +1973,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 				Uuid:   leaseUUID,
 				Tenant: "tenant-1",
 				State:  billingtypes.LEASE_STATE_ACTIVE, // Not PENDING
-				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 			}, nil
 		},
 	}
@@ -1647,7 +1984,7 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	})
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1665,14 +2002,15 @@ func TestManager_HandlePayloadReceived_LeaseNotPending(t *testing.T) {
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	// Should return nil (lease not pending, skip provisioning)
+	// A delayed duplicate event for an ACTIVE lease is acknowledged without
+	// deleting the manifest still needed for reprovision and recovery.
 	err = handlersOf(manager).HandlePayloadReceived(msg)
-	assert.NoError(t, err, "should return nil for non-pending lease")
+	assert.NoError(t, err, "active duplicate payload event should be acknowledged")
 
-	// Verify payload was cleaned up
+	// Verify payload was preserved.
 	hasP3, errP3 := payloadStore.Has("lease-1")
 	require.NoError(t, errP3)
-	assert.False(t, hasP3, "payload should be deleted when lease is not pending")
+	assert.True(t, hasP3, "ACTIVE recovery requires the durable manifest")
 
 	// Verify no provisioning was attempted
 	mockBackend.mu.Lock()
@@ -1698,7 +2036,7 @@ func TestManager_HandlePayloadReceived_ChainError(t *testing.T) {
 	})
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1730,7 +2068,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 				Uuid:   leaseUUID,
 				Tenant: "tenant-1",
 				State:  billingtypes.LEASE_STATE_PENDING,
-				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 			}, nil
 		},
 	}
@@ -1741,7 +2079,7 @@ func TestManager_HandlePayloadReceived_ProvisionError(t *testing.T) {
 	})
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1786,7 +2124,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 				Uuid:   leaseUUID,
 				Tenant: "tenant-1",
 				State:  billingtypes.LEASE_STATE_PENDING,
-				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 			}, nil
 		},
 	}
@@ -1797,7 +2135,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 	})
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1826,6 +2164,7 @@ func TestManager_HandlePayloadReceived_AlreadyInFlight(t *testing.T) {
 }
 
 func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
+	payloadHash := sha256.Sum256([]byte("missing payload"))
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: mockBackend, IsDefault: true}},
@@ -1833,10 +2172,11 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
-				Uuid:   leaseUUID,
-				Tenant: "tenant-1",
-				State:  billingtypes.LEASE_STATE_PENDING,
-				Items:  []billingtypes.LeaseItem{{SkuUuid: "sku-1"}},
+				Uuid:     leaseUUID,
+				Tenant:   "tenant-1",
+				State:    billingtypes.LEASE_STATE_PENDING,
+				MetaHash: payloadHash[:],
+				Items:    []billingtypes.LeaseItem{{SkuUuid: "sku-1", Quantity: 1}},
 			}, nil
 		},
 	}
@@ -1847,7 +2187,7 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	})
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1859,23 +2199,19 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 	event := payload.Event{
 		LeaseUUID:   "lease-1",
 		Tenant:      "tenant-1",
-		MetaHashHex: "abc123",
+		MetaHashHex: hex.EncodeToString(payloadHash[:]),
 	}
 	payload, _ := json.Marshal(event)
 	msg := message.NewMessage(watermill.NewUUID(), payload)
 
-	// Should succeed (proceeds without payload with warning)
+	// The durable message is retried until its payload write becomes visible.
 	err = handlersOf(manager).HandlePayloadReceived(msg)
-	assert.NoError(t, err, "should return nil when payload missing from store")
+	require.ErrorIs(t, err, errPayloadNotAvailable)
 
-	// Verify provisioning was called (with nil payload and no hash)
+	// A payload-bearing chain request can never be downgraded to payloadless.
 	mockBackend.mu.Lock()
 	defer mockBackend.mu.Unlock()
-	require.Len(t, mockBackend.provisionCalls, 1)
-	assert.Nil(t, mockBackend.provisionCalls[0].Payload)
-	// PayloadHash should be empty when payload is missing - backends should never
-	// receive a hash without the corresponding payload data
-	assert.Empty(t, mockBackend.provisionCalls[0].PayloadHash, "PayloadHash should be empty when payload is missing")
+	assert.Empty(t, mockBackend.provisionCalls)
 }
 
 func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
@@ -1906,7 +2242,7 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	})
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -1971,7 +2307,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:         "provider-1",
 		CallbackBaseURL:      "http://localhost:8080",
 		CallbackTimeout:      100 * time.Millisecond, // Short timeout for testing
@@ -1985,7 +2321,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		mu.Unlock()
 
 		// Track a lease with an artificial old start time
-		tracker := manager.tracker.(*DefaultInFlightTracker)
+		tracker := managerTestOperationRegistry(manager)
 		tracker.TrackInFlightWithStartTime("timeout-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
 
 		// Run timeout check
@@ -2033,7 +2369,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		mu.Unlock()
 
 		// Track multiple old leases
-		tracker := manager.tracker.(*DefaultInFlightTracker)
+		tracker := managerTestOperationRegistry(manager)
 		for i := range 5 {
 			leaseID := "cancel-lease-" + string(rune('a'+i))
 			tracker.TrackInFlightWithStartTime(leaseID, "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
@@ -2068,7 +2404,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 			},
 		}
 
-		failManager, err := NewManager(ManagerConfig{
+		failManager, err := newTestManager(t, ManagerConfig{
 			ProviderUUID:         "provider-1",
 			CallbackBaseURL:      "http://localhost:8080",
 			CallbackTimeout:      100 * time.Millisecond,
@@ -2077,7 +2413,7 @@ func TestManager_CheckCallbackTimeouts(t *testing.T) {
 		require.NoError(t, err)
 
 		// Track an old lease
-		tracker := failManager.tracker.(*DefaultInFlightTracker)
+		tracker := managerTestOperationRegistry(failManager)
 		tracker.TrackInFlightWithStartTime("fail-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Hour))
 
 		// Run timeout check - should not panic
@@ -2112,7 +2448,7 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:         "provider-1",
 		CallbackBaseURL:      "http://localhost:8080",
 		CallbackTimeout:      50 * time.Millisecond, // Short for testing
@@ -2127,7 +2463,7 @@ func TestManager_RunTimeoutChecker(t *testing.T) {
 	go manager.timeoutChecker.Start(ctx)
 
 	// Track a lease that will timeout
-	tracker := manager.tracker.(*DefaultInFlightTracker)
+	tracker := managerTestOperationRegistry(manager)
 	tracker.TrackInFlightWithStartTime("auto-timeout-lease", "tenant-1", testItems("test-sku"), "test", time.Now().Add(-1*time.Second))
 
 	// Wait for timeout checker to run
@@ -2187,7 +2523,7 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 	require.NoError(t, err)
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -2230,8 +2566,9 @@ func TestPayloadPersistsUntilCallback(t *testing.T) {
 
 	// Step 3: Simulate successful callback - payload should be deleted now
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusSuccess,
+		OperationID: mustInFlightOperationID(t, manager, "lease-1"),
 	}
 	callbackPayload, _ := json.Marshal(callback)
 	callbackMsg := message.NewMessage(watermill.NewUUID(), callbackPayload)
@@ -2281,7 +2618,7 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 	require.NoError(t, err)
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -2312,9 +2649,10 @@ func TestPayloadDeletedAfterFailedCallback(t *testing.T) {
 
 	// Simulate failed callback
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusFailed,
-		Error:     "unknown SKU",
+		LeaseUUID:   "lease-1",
+		Status:      backend.CallbackStatusFailed,
+		Error:       "unknown SKU",
+		OperationID: mustInFlightOperationID(t, manager, "lease-1"),
 	}
 	callbackPayload, _ := json.Marshal(callback)
 	callbackMsg := message.NewMessage(watermill.NewUUID(), callbackPayload)
@@ -2359,7 +2697,7 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -2408,13 +2746,14 @@ func TestPayloadSurvivesRestartForReconciliation(t *testing.T) {
 	assert.Equal(t, string(testPayload), string(retrievedPayload))
 }
 
-// TestCallbacksRequireRunningRouter is a regression test for the startup race condition
-// where callbacks could arrive before Watermill handlers were subscribed.
-// The fix ensures we wait for manager.Running() before accepting callbacks.
-func TestCallbacksRequireRunningRouter(t *testing.T) {
+// TestCallbacksRequireRunningManager is a regression test for the startup race
+// where the HTTP server can receive a callback before the ack batcher starts.
+// The backend must receive a retryable error before Start and a terminal result
+// only after the synchronous application path is ready.
+func TestCallbacksRequireRunningManager(t *testing.T) {
 	// This test verifies that:
-	// 1. Publishing before Running() results in lost messages
-	// 2. Publishing after Running() ensures messages are processed
+	// 1. Publishing before Start is rejected rather than partially applied.
+	// 2. Publishing after startup returns only after the callback is processed.
 
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -2435,7 +2774,7 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -2444,61 +2783,53 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start manager in background
+	// The callback runtime is deliberately unavailable before Start. In
+	// production the API maps this to 503 so the backend's durable outbox keeps
+	// the delivery pending.
+	earlyOperationID := requireProvisionCallbackOperation(
+		t, manager, "lease-early", "tenant-1", testItems("sku-1"), "test",
+	)
+	require.ErrorIs(t, manager.PublishCallback(context.Background(), backend.CallbackPayload{
+		LeaseUUID:        "lease-early",
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+		OperationID:      earlyOperationID.String(),
+	}), errCallbackRuntimeUnavailable)
+	require.True(t, manager.IsInFlight("lease-early"))
+
+	// Start manager in background.
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- manager.Start(ctx)
 	}()
 
-	// Track a lease that will receive a callback
-	manager.TrackInFlight("lease-early", "tenant-1", testItems("sku-1"), "test")
-
-	// RACE CONDITION SCENARIO: Try to publish callback BEFORE Running()
-	// In production, this is what happened when backends sent callbacks
-	// before Watermill handlers were subscribed.
-	//
-	// Note: We can't reliably test the failure case because it depends on timing.
-	// The Watermill gochannel pubsub may or may not have subscribers yet.
-	// What we CAN test is that after Running(), callbacks always work.
-
-	// Wait for Running() - this is the fix that ensures handlers are subscribed
+	// Running is a convenient observable startup barrier. Callback admission is
+	// opened slightly earlier, immediately after the ack batcher starts.
 	select {
 	case <-manager.Running():
-		// Good - handlers are now subscribed
 	case <-time.After(5 * time.Second):
 		t.Fatal("manager did not start within timeout")
 	}
 
 	// Track another lease for the "after Running()" test
-	manager.TrackInFlight("lease-after", "tenant-1", testItems("sku-1"), "test")
+	afterOperationID := requireProvisionCallbackOperation(
+		t, manager, "lease-after", "tenant-1", testItems("sku-1"), "test",
+	)
 
-	// AFTER Running(): Publish callback - this should always work
+	// After startup, PublishCallback applies synchronously.
 	callback := backend.CallbackPayload{
-		LeaseUUID: "lease-after",
-		Status:    backend.CallbackStatusSuccess,
+		LeaseUUID:        "lease-after",
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+		OperationID:      afterOperationID.String(),
 	}
-
-	// Use the manager's PublishCallback method which publishes to the internal topic
-	require.NoError(t, manager.PublishCallback(callback), "failed to publish callback")
-
-	// Wait for the full handler flow to complete: message → handler → batcher →
-	// chain ack → handler untrack. We poll on the final observable state
-	// (!IsInFlight) rather than an intermediate signal (ackCalled) to avoid
-	// a race where the chain mock has been called but the handler hasn't yet
-	// called UntrackInFlight.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !manager.IsInFlight("lease-after") {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	require.NoError(t, manager.PublishCallback(context.Background(), callback))
 
 	// Verify lease was removed from in-flight (full handler flow completed)
 	assert.False(t, manager.IsInFlight("lease-after"), "lease should not be in-flight after successful callback")
 
 	// If the lease was untracked, the acknowledge must have been called
-	assert.True(t, ackCalled.Load(), "REGRESSION: callback was not processed after Running() - handlers may not be subscribed")
+	assert.True(t, ackCalled.Load(), "callback returned before chain acknowledgment")
 
 	// Clean up
 	cancel()
@@ -2510,16 +2841,13 @@ func TestCallbacksRequireRunningRouter(t *testing.T) {
 	}
 }
 
-// TestManager_Close_NoPanicWithActiveHandler is a regression test for the
-// shutdown ordering bug where Manager.Close() stopped the ack batcher before
-// closing the Watermill router. If a handler was actively calling Acknowledge()
-// during shutdown, the batcher's batchLoop would close b.requests, and the
-// handler (or a Watermill retry of it) would panic with send-on-closed-channel.
-//
-// The fix ensures the Watermill router is closed first (draining all in-progress
-// handlers) before stopping the ack batcher.
-func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
+// TestManager_CloseCancelsAndDrainsActiveCallback verifies that callbacks
+// bypassing Watermill are still owned by Manager's shutdown boundary. Close
+// rejects new admissions, cancels active application, drains it, and only then
+// stops AckBatcher; it must not wait for an unresponsive chain indefinitely.
+func TestManager_CloseCancelsAndDrainsActiveCallback(t *testing.T) {
 	ackReached := make(chan struct{}, 1) // signals AcknowledgeLeases is executing
+	releaseAck := make(chan struct{})
 
 	mockBackend := &mockManagerBackend{name: "test"}
 	router, _ := backend.NewRouter(backend.RouterConfig{
@@ -2537,10 +2865,9 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 			case ackReached <- struct{}{}:
 			default:
 			}
-			// Simulate a slow chain response. Use a select so the call
-			// respects context cancellation (as real chain calls do).
+			// Hold the batch operation until Manager.Close cancels its lifecycle.
 			select {
-			case <-time.After(200 * time.Millisecond):
+			case <-releaseAck:
 				return uint64(len(leaseUUIDs)), []string{"tx-hash"}, nil
 			case <-ctx.Done():
 				return 0, nil, ctx.Err()
@@ -2548,7 +2875,7 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:     "provider-1",
 		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond, // Flush quickly
@@ -2567,13 +2894,20 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 		t.Fatal("manager did not start")
 	}
 
-	// Track lease and publish a success callback. The handler will call
-	// Acknowledge(), which sends to the batcher's request channel.
-	manager.TrackInFlight("lease-1", "tenant-1", testItems("sku-1"), "test")
-	require.NoError(t, manager.PublishCallback(backend.CallbackPayload{
-		LeaseUUID: "lease-1",
-		Status:    backend.CallbackStatusSuccess,
-	}))
+	// Track lease and publish a success callback asynchronously so Close can
+	// overlap the synchronous application call.
+	operationID := requireProvisionCallbackOperation(
+		t, manager, "lease-1", "tenant-1", testItems("sku-1"), "test",
+	)
+	callbackErr := make(chan error, 1)
+	go func() {
+		callbackErr <- manager.PublishCallback(context.Background(), backend.CallbackPayload{
+			LeaseUUID:        "lease-1",
+			Status:           backend.CallbackStatusSuccess,
+			BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
+			OperationID:      operationID.String(),
+		})
+	}()
 
 	// Wait for the handler to reach AcknowledgeLeases inside the batcher.
 	select {
@@ -2582,17 +2916,30 @@ func TestManager_Close_NoPanicWithActiveHandler(t *testing.T) {
 		t.Fatal("handler did not reach AcknowledgeLeases")
 	}
 
-	// Call Close() while the handler is actively using the ack batcher.
-	// Do NOT cancel the context first — this exercises the path where
-	// Close() alone must safely drain handlers before stopping the batcher.
-	//
-	// With the old ordering (batcher stopped before router), the batcher's
-	// context cancellation causes AcknowledgeLeases to return an error,
-	// Watermill retries the handler, and the retried Acknowledge() call
-	// sends to the now-closed b.requests channel, panicking.
-	assert.NotPanics(t, func() {
-		assert.NoError(t, manager.Close())
-	})
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- manager.Close() }()
+
+	require.Eventually(t, func() bool {
+		manager.callbackAdmissionMu.Lock()
+		defer manager.callbackAdmissionMu.Unlock()
+		return manager.callbackClosed
+	}, time.Second, time.Millisecond)
+	require.ErrorIs(t, manager.PublishCallback(context.Background(), backend.CallbackPayload{
+		LeaseUUID: "lease-late",
+		Status:    backend.CallbackStatusFailed,
+	}), errCallbackRuntimeUnavailable)
+	select {
+	case err := <-callbackErr:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel the active callback")
+	}
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close remained blocked after canceling callback application")
+	}
 
 	cancel()
 	select {
@@ -2619,7 +2966,7 @@ func TestManager_PoisonQueue_BreaksInfiniteLoop(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 	}, router, mockChain)
@@ -2677,6 +3024,51 @@ func (s *mockLeaseEventSink) Publish(event backend.LeaseStatusEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = append(s.events, event)
+}
+
+type blockingLeaseEventSink struct {
+	entered chan struct{}
+	release chan struct{}
+	event   backend.LeaseStatusEvent
+}
+
+func (s *blockingLeaseEventSink) Publish(event backend.LeaseStatusEvent) {
+	close(s.entered)
+	<-s.release
+	s.event = event
+}
+
+func TestManager_PublishProvisionStartingAppliesSynchronously(t *testing.T) {
+	sink := &blockingLeaseEventSink{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := &Manager{leaseEventSink: sink}
+	done := make(chan struct{})
+	go func() {
+		manager.PublishProvisionStarting("lease-1")
+		close(done)
+	}()
+
+	select {
+	case <-sink.entered:
+	case <-time.After(time.Second):
+		t.Fatal("provisioning event did not reach the subscriber sink")
+	}
+	select {
+	case <-done:
+		t.Fatal("PublishProvisionStarting returned before the sink applied the event")
+	default:
+	}
+	close(sink.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("PublishProvisionStarting did not return after event application")
+	}
+
+	assert.Equal(t, "lease-1", sink.event.LeaseUUID)
+	assert.Equal(t, backend.ProvisionStatusProvisioning, sink.event.Status)
 }
 
 func TestForwardToEventSink_ForwardsToSink(t *testing.T) {
@@ -2755,7 +3147,7 @@ func TestManager_OverwritePayload_ReplacesStoredPayload(t *testing.T) {
 	require.NoError(t, err)
 	defer payloadStore.Close()
 
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		PayloadStore:    payloadStore,
@@ -2785,7 +3177,7 @@ func TestManager_OverwritePayload_NoStoreReturnsSentinel(t *testing.T) {
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{{Backend: &mockManagerBackend{name: "test"}, IsDefault: true}},
 	})
-	manager, err := NewManager(ManagerConfig{
+	manager, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:    "provider-1",
 		CallbackBaseURL: "http://localhost:8080",
 		// PayloadStore deliberately omitted

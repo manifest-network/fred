@@ -52,13 +52,43 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		provisionsTotal.WithLabelValues("rejected").Inc()
 		return fmt.Errorf("%w: lease_uuid is required", backend.ErrValidation)
 	}
+	unlockCommand := b.commandFence.Lock(req.LeaseUUID)
+	defer unlockCommand()
 	if req.CallbackURL == "" {
 		provisionsTotal.WithLabelValues("rejected").Inc()
 		return fmt.Errorf("%w: callback_url is required", backend.ErrValidation)
 	}
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
+		req.CallbackURL, req.LifecycleCallbackURL,
+	)
+	if err != nil {
+		provisionsTotal.WithLabelValues("rejected").Inc()
+		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
+	}
+	req.LifecycleCallbackURL = lifecycleCallbackURL
+	if exactRetry, probeErr := b.probeProvisionIntent(req); probeErr != nil {
+		provisionsTotal.WithLabelValues("rejected").Inc()
+		return probeErr
+	} else if exactRetry {
+		provisionsTotal.WithLabelValues("accepted").Inc()
+		return nil
+	}
 	if len(req.Items) == 0 {
 		provisionsTotal.WithLabelValues("rejected").Inc()
 		return fmt.Errorf("%w: items is required", backend.ErrValidation)
+	}
+	if err := backend.NormalizeProvisionRequest(&req); err != nil {
+		provisionsTotal.WithLabelValues("rejected").Inc()
+		return err
+	}
+	intent, proceed, err := b.beginProvisionIntent(req)
+	if err != nil {
+		provisionsTotal.WithLabelValues("rejected").Inc()
+		return err
+	}
+	if !proceed {
+		provisionsTotal.WithLabelValues("accepted").Inc()
+		return nil
 	}
 
 	b.provisionsMu.Lock()
@@ -74,7 +104,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		if existing.Status != backend.ProvisionStatusFailed {
 			b.provisionsMu.Unlock()
 			provisionsTotal.WithLabelValues("rejected").Inc()
-			return backend.ErrAlreadyProvisioned
+			return b.refuseProvisionIntent(intent, backend.ErrAlreadyProvisioned)
 		}
 		// Carry forward FailCount across the replacement so the runStubProvisioner
 		// goroutine's increment lands on the cumulative count.
@@ -94,15 +124,16 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// write.
 	ctx, cancel := context.WithCancel(b.stopCtx)
 	p := &provision{
-		LeaseUUID:    req.LeaseUUID,
-		Tenant:       req.Tenant,
-		ProviderUUID: req.ProviderUUID,
-		Status:       backend.ProvisionStatusProvisioning,
-		CallbackURL:  req.CallbackURL,
-		FailCount:    prevFailCount,
-		CreatedAt:    time.Now(),
-		ctx:          ctx,
-		cancel:       cancel,
+		LeaseUUID:            req.LeaseUUID,
+		Tenant:               req.Tenant,
+		ProviderUUID:         req.ProviderUUID,
+		Status:               backend.ProvisionStatusProvisioning,
+		CallbackURL:          req.CallbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		FailCount:            prevFailCount,
+		CreatedAt:            time.Now(),
+		ctx:                  ctx,
+		cancel:               cancel,
 	}
 	b.provisions[req.LeaseUUID] = p
 	// b.wg.Add(1) is called inside the lock-held region (before Unlock)
@@ -150,12 +181,13 @@ func (b *Backend) runStubProvisioner(p *provision) {
 // reference here, and reading its cancellation state is safe by design —
 // that is the whole point of the checkpoints below.
 type stubFailure struct {
-	leaseUUID    string
-	tenant       string
-	providerUUID string
-	callbackURL  string
-	failCount    int
-	leaseCtx     context.Context
+	leaseUUID           string
+	tenant              string
+	providerUUID        string
+	callbackURL         string
+	lifecycleGeneration backend.LifecycleGenerationObservation
+	failCount           int
+	leaseCtx            context.Context
 }
 
 // claimStubFailure takes provisionsMu, marks the lease failed, and returns
@@ -196,7 +228,10 @@ func (b *Backend) claimStubFailure(p *provision) (f stubFailure, ok bool) {
 		tenant:       p.Tenant,
 		providerUUID: p.ProviderUUID,
 		callbackURL:  p.CallbackURL,
-		failCount:    p.FailCount,
+		lifecycleGeneration: backend.ObserveLifecycleGeneration(
+			p.CallbackURL, p.LifecycleCallbackURL,
+		),
+		failCount: p.FailCount,
 		// Capture the lease ctx while still under provisionsMu:
 		// Deprovision will call cancel() inside the same lock before
 		// deleting the map entry, so this read is race-free and the
@@ -233,14 +268,15 @@ func (b *Backend) persistStubDiagnostic(f stubFailure) (canceled bool) {
 	}
 
 	if err := b.diagnosticsStore.Store(shared.DiagnosticEntry{
-		LeaseUUID:    f.leaseUUID,
-		ProviderUUID: f.providerUUID,
-		Tenant:       f.tenant,
-		Error:        stubProvisionerErrMsg,
-		Reason:       backend.ReasonInternal,
-		Message:      stubProvisionerErrMsg,
-		FailCount:    f.failCount,
-		CreatedAt:    time.Now(),
+		LeaseUUID:           f.leaseUUID,
+		ProviderUUID:        f.providerUUID,
+		Tenant:              f.tenant,
+		Error:               stubProvisionerErrMsg,
+		Reason:              backend.ReasonInternal,
+		Message:             stubProvisionerErrMsg,
+		FailCount:           f.failCount,
+		LifecycleGeneration: &f.lifecycleGeneration,
+		CreatedAt:           time.Now(),
 	}); err != nil {
 		// Deliberate fall-through: see the contract above.
 		b.logger.Error("failed to persist failure diagnostic",
@@ -252,7 +288,7 @@ func (b *Backend) persistStubDiagnostic(f stubFailure) (canceled bool) {
 }
 
 // sendStubFailureCallback is checkpoint 2 and the callback send. ENG-189
-// case (c): shared.CallbackSender.SendCallback persists to bbolt BEFORE
+// case (c): shared.CallbackSender.SendOperationCallback persists to bbolt BEFORE
 // delivery, so without this guard a torn-down lease can still have a stale
 // status=failed callback queued for replay.
 //
@@ -276,13 +312,13 @@ func (b *Backend) sendStubFailureCallback(f stubFailure) {
 		return
 	}
 
-	b.callbackSender.SendCallback(
+	b.callbackSender.SendOperationCallbackContext(
+		f.leaseCtx,
 		f.leaseUUID,
 		f.callbackURL,
 		b.cfg.Name,
 		backend.CallbackStatusFailed,
 		stubProvisionerErrMsg,
-		false, // k3s stub never retains
 	)
 }
 
@@ -301,32 +337,18 @@ func (b *Backend) sendStubFailureCallback(f stubFailure) {
 // worker that already released the lock observes cancellation at its
 // next checkpoint and aborts.
 //
-// Residual TOCTOU (accepted scope, ENG-189 plan §7 / R1): cancellation
-// cannot stop an in-flight SendCallback once the worker's checkpoint-2
-// ctx.Err() check has passed. Between that check and SendCallback's
-// bbolt Store + outbound HTTP POST, nothing here can abort the
-// callback — shared.CallbackSender has no per-lease ctx today. The
-// callbackStore.Remove call below clears any pre-existing pending
-// entry (e.g., from a prior failed delivery on the same lease's replay
-// queue); it does NOT cancel an HTTP POST already in flight, and it
-// does NOT prevent a racing worker that passes its ctx.Err() check
-// from re-persisting its own status=failed entry after this Remove
-// runs as a no-op. The window is ns-scale by construction (the
-// worker's last instruction before SendCallback is the ctx.Err()
-// check). Closing it requires reshaping the seam — e.g., a
-// Deprovision-side barrier that waits for any in-flight SendCallback
-// to drain, or pairing a ctx-threaded SendCallback with
-// Store-under-provisionsMu discipline so the persist becomes part of
-// the cancellable critical section. Either approach is deferred to
-// ENG-134+, where the real K8s worker replaces runStubProvisioner and
-// reshapes this seam anyway.
-//
-// TestDeprovision_RemovesPendingCallback pins the replay-queue cleanup
-// regression: a failed delivery persists an entry; Deprovision must
-// clear it so a subsequent restart's ReplayPendingCallbacks does not
-// fire a stale status=failed callback for a torn-down lease.
+// Deprovision must preserve exact operation evidence. Fred's write-ahead
+// placement Attempt can be cleared only by the matching operation callback (or
+// positive generation inventory); deleting a queued completion or merely
+// canceling its worker would leave the lease permanently attempting after the
+// volatile operation Registry record is removed. The teardown therefore
+// atomically replaces only a still-present intent with its exact failure after
+// canceling the worker. An already-durable completion is left untouched, so
+// teardown cannot manufacture a duplicate.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	_ = ctx
+	unlockCommand := b.commandFence.Lock(leaseUUID)
+	defer unlockCommand()
 	b.provisionsMu.Lock()
 	if existing, ok := b.provisions[leaseUUID]; ok {
 		// Cancel before delete + before unlock so any in-flight worker
@@ -334,13 +356,18 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 		existing.cancel()
 		delete(b.provisions, leaseUUID)
 	}
-	if err := b.callbackStore.Remove(leaseUUID); err != nil {
-		b.logger.Error("failed to remove pending callback on deprovision",
-			"lease_uuid", leaseUUID,
-			"error", err,
-		)
-	}
 	b.provisionsMu.Unlock()
+
+	// Settle only an operation that is still unresolved. If the worker already
+	// replaced its intent with a durable completion, absence is a no-op; adding
+	// a generic callback here would create a duplicate exact completion.
+	if b.callbackStore != nil {
+		if _, err := b.callbackStore.FailOperationIntentIfPresent(
+			leaseUUID, "provision canceled by deprovision",
+		); err != nil {
+			return fmt.Errorf("persist preempted provision completion: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -389,17 +416,9 @@ func (b *Backend) GetProvision(ctx context.Context, leaseUUID string) (*backend.
 	// pointlessly.
 	b.provisionsMu.RLock()
 	if p, exists := b.provisions[leaseUUID]; exists {
-		info := &backend.ProvisionInfo{
-			LeaseUUID:    p.LeaseUUID,
-			ProviderUUID: p.ProviderUUID,
-			Status:       p.Status,
-			FailCount:    p.FailCount,
-			Reason:       defaultReason(p.Status, p.Reason),
-			Message:      p.Message,
-			CreatedAt:    p.CreatedAt,
-		}
+		info := provisionToInfo(p)
 		b.provisionsMu.RUnlock()
-		return info, nil
+		return &info, nil
 	}
 	b.provisionsMu.RUnlock()
 
@@ -411,13 +430,15 @@ func (b *Backend) GetProvision(ctx context.Context, leaseUUID string) (*backend.
 		return nil, backend.ErrNotProvisioned
 	}
 	return &backend.ProvisionInfo{
-		LeaseUUID:    diag.LeaseUUID,
-		ProviderUUID: diag.ProviderUUID,
-		Status:       backend.ProvisionStatusFailed,
-		FailCount:    diag.FailCount,
-		Reason:       defaultReason(backend.ProvisionStatusFailed, diag.Reason),
-		Message:      diag.Message,
-		CreatedAt:    diag.CreatedAt,
+		LeaseUUID:           diag.LeaseUUID,
+		ProviderUUID:        diag.ProviderUUID,
+		Tenant:              diag.Tenant,
+		Status:              backend.ProvisionStatusFailed,
+		FailCount:           diag.FailCount,
+		Reason:              defaultReason(backend.ProvisionStatusFailed, diag.Reason),
+		Message:             diag.Message,
+		CreatedAt:           diag.CreatedAt,
+		LifecycleGeneration: diag.LifecycleGeneration,
 	}, nil
 }
 
@@ -430,15 +451,7 @@ func (b *Backend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, 
 	defer b.provisionsMu.RUnlock()
 	out := make([]backend.ProvisionInfo, 0, len(b.provisions))
 	for _, p := range b.provisions {
-		out = append(out, backend.ProvisionInfo{
-			LeaseUUID:    p.LeaseUUID,
-			ProviderUUID: p.ProviderUUID,
-			Status:       p.Status,
-			FailCount:    p.FailCount,
-			Reason:       defaultReason(p.Status, p.Reason),
-			Message:      p.Message,
-			CreatedAt:    p.CreatedAt,
-		})
+		out = append(out, provisionToInfo(p))
 	}
 	return out, nil
 }
@@ -466,18 +479,30 @@ func (b *Backend) LookupProvisions(ctx context.Context, uuids []string) ([]backe
 	out := make([]backend.ProvisionInfo, 0, len(uuids))
 	for _, u := range uuids {
 		if p, ok := b.provisions[u]; ok {
-			out = append(out, backend.ProvisionInfo{
-				LeaseUUID:    p.LeaseUUID,
-				ProviderUUID: p.ProviderUUID,
-				Status:       p.Status,
-				FailCount:    p.FailCount,
-				Reason:       defaultReason(p.Status, p.Reason),
-				Message:      p.Message,
-				CreatedAt:    p.CreatedAt,
-			})
+			out = append(out, provisionToInfo(p))
 		}
 	}
 	return out, nil
+}
+
+// provisionToInfo projects the callback pair as a minimal, non-secret
+// generation observation for providerd inventory reconciliation. The pair
+// itself never leaves the backend process through this type.
+func provisionToInfo(p *provision) backend.ProvisionInfo {
+	lifecycleGeneration := backend.ObserveLifecycleGeneration(
+		p.CallbackURL, p.LifecycleCallbackURL,
+	)
+	return backend.ProvisionInfo{
+		LeaseUUID:           p.LeaseUUID,
+		ProviderUUID:        p.ProviderUUID,
+		Tenant:              p.Tenant,
+		Status:              p.Status,
+		FailCount:           p.FailCount,
+		Reason:              defaultReason(p.Status, p.Reason),
+		Message:             p.Message,
+		CreatedAt:           p.CreatedAt,
+		LifecycleGeneration: &lifecycleGeneration,
+	}
 }
 
 // Restart is a stub for ENG-133. Returns ErrNotProvisioned (mapped to

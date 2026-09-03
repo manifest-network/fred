@@ -11,6 +11,8 @@ COPY . .
 ARG VERSION=dev
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/providerd ./cmd/providerd \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/placement-preflight ./cmd/placement-preflight \
+ && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/placement-repair ./cmd/placement-repair \
  && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/docker-backend ./cmd/docker-backend \
  && CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/k3s-backend ./cmd/k3s-backend
 
@@ -23,6 +25,8 @@ RUN mkdir -p /out/data && chown 65532:65532 /out/data
 FROM gcr.io/distroless/static-debian12 AS providerd
 
 COPY --from=builder /out/providerd /providerd
+COPY --from=builder /out/placement-preflight /placement-preflight
+COPY --from=builder /out/placement-repair /placement-repair
 
 USER nonroot:nonroot
 EXPOSE 8080
@@ -57,7 +61,9 @@ ENTRYPOINT ["/providerd"]
 #      already-copied-and-chowned working copy from step 1 above.
 #
 # Persist /data to retain k3s-callbacks.db, k3s-diagnostics.db, and
-# k3s-releases.db:
+# k3s-releases.db. A genuinely new empty volume must first run this same image
+# once with `-initialize-storage-identity new`; normal startup is
+# verification-only:
 #   docker run --network host -v k3s-db-data:/data \
 #     -v ./config.k3s.yaml:/data/config.k3s.yaml \
 #     -v /tmp/k3s.yaml:/etc/rancher/k3s/k3s.yaml:ro \
@@ -82,7 +88,10 @@ ENTRYPOINT ["/k3s-backend"]
 # --target docker-backend, or --target k3s-backend explicitly.
 #
 # Config must be mounted at runtime. The Docker socket must also be accessible.
-# Persist /data to retain callbacks.db, diagnostics.db, and releases.db:
+# Persist /data to retain callbacks.db, diagnostics.db, releases.db, and the
+# always-required retention.db. A genuinely new empty volume must first run this
+# same image once with `-initialize-storage-identity new`; normal startup is
+# verification-only:
 #   docker run -v db-data:/data \
 #     -v ./docker-backend.yaml:/data/docker-backend.yaml \
 #     -v /var/run/docker.sock:/var/run/docker.sock \
@@ -92,7 +101,8 @@ FROM gcr.io/distroless/static-debian12 AS docker-backend
 
 COPY --from=builder /out/docker-backend /docker-backend
 
-# /data holds persistent state (callbacks.db, diagnostics.db, releases.db).
+# /data holds persistent state (callbacks.db, diagnostics.db, releases.db,
+# retention.db, and the storage-identity marker pair).
 # Declare as a volume so data survives container restarts.
 COPY --from=builder --chown=65532:65532 /out/data /data
 WORKDIR /data

@@ -10,6 +10,9 @@ import (
 
 const (
 	eventChannelBuffer = 16
+	// transitionEventBuffer leaves one subscriber slot for an accepted start
+	// event, so draining a full gate still preserves its newest terminal event.
+	transitionEventBuffer = eventChannelBuffer - 1
 
 	// DefaultMaxSubscriptionsPerLease is the maximum number of concurrent
 	// WebSocket subscriptions allowed per lease UUID.
@@ -33,6 +36,26 @@ type EventBroker struct {
 
 	maxPerLease int
 	maxTotal    int
+
+	// transitionMu protects the short-lived per-lease gates used by
+	// DispatchWithOrderedStart. A backend is allowed to post its asynchronous
+	// completion before its Restart/Update response reaches Fred. While one of
+	// those dispatches is unresolved, Publish appends same-lease callbacks here
+	// instead of blocking the callback response (which could deadlock a remote
+	// backend waiting to return its acceptance response).
+	transitionMu sync.Mutex
+	transitions  map[string]*eventTransition
+}
+
+type eventTransition struct {
+	// dispatch serializes overlapping tenant requests for one lease at the event
+	// boundary. The backend remains the authority that accepts or refuses the
+	// second operation; serialization only makes their subscriber-visible start
+	// and completion windows non-overlapping.
+	dispatch sync.Mutex
+	refs     int
+	active   bool
+	pending  []backend.LeaseStatusEvent
 }
 
 // NewEventBroker creates a new event broker with default subscription limits.
@@ -48,6 +71,7 @@ func NewEventBrokerWithLimits(maxPerLease, maxTotal int) *EventBroker {
 		clients:     make(map[string]map[chan backend.LeaseStatusEvent]struct{}),
 		maxPerLease: maxPerLease,
 		maxTotal:    maxTotal,
+		transitions: make(map[string]*eventTransition),
 	}
 }
 
@@ -120,6 +144,121 @@ func (b *EventBroker) Unsubscribe(leaseUUID string, ch <-chan backend.LeaseStatu
 // Publish sends an event to all clients subscribed to the event's lease UUID.
 // Non-blocking: if a client's channel is full, the event is dropped for that client.
 func (b *EventBroker) Publish(event backend.LeaseStatusEvent) {
+	b.transitionMu.Lock()
+	defer b.transitionMu.Unlock()
+
+	if transition := b.transitions[event.LeaseUUID]; transition != nil && transition.active {
+		if len(transition.pending) < transitionEventBuffer {
+			transition.pending = append(transition.pending, event)
+			return
+		}
+		// Match the broker's best-effort bounded-delivery contract while
+		// retaining the newest observed state. A buggy authenticated backend
+		// cannot grow memory for the duration of a slow dispatch or make gate
+		// drain time unbounded.
+		copy(transition.pending, transition.pending[1:])
+		transition.pending[len(transition.pending)-1] = event
+		slog.Debug("dropped oldest event while maintenance transition was unresolved",
+			"lease_uuid", event.LeaseUUID,
+			"status", event.Status,
+		)
+		return
+	}
+	b.publishDirect(event)
+}
+
+// DispatchWithOrderedStart calls dispatch while holding a nonblocking
+// subscriber-order gate for start.LeaseUUID. If dispatch succeeds, start is
+// delivered before every callback event that arrived during dispatch. If it
+// fails synchronously, no start event is manufactured and any independently
+// valid callback observations are released in their original order.
+//
+// Publish never waits for dispatch: it only appends to the active gate under a
+// short mutex. This matters for a remote backend that posts a callback and waits
+// for Fred's HTTP response before returning its Restart/Update acceptance.
+// Concurrent dispatches for the same lease are serialized; other leases are
+// independent. The registry entry is reference-counted and removed after the
+// last waiter, so tenant churn cannot grow it without bound.
+func (b *EventBroker) DispatchWithOrderedStart(
+	start backend.LeaseStatusEvent,
+	dispatch func() error,
+) error {
+	_, err := b.DispatchWithOrderedSettlement(start, func() (bool, error) {
+		err := dispatch()
+		return err == nil, err
+	})
+	return err
+}
+
+// DispatchWithOrderedSettlement extends DispatchWithOrderedStart across local
+// settlement that must follow backend acceptance. accepted is independent of
+// err: callers return accepted=true when the backend effect started even if a
+// later durable write failed. The start event is then still truthful, while the
+// gate remains active until settlement finishes and queued callbacks cannot be
+// reordered ahead of it.
+func (b *EventBroker) DispatchWithOrderedSettlement(
+	start backend.LeaseStatusEvent,
+	dispatch func() (accepted bool, err error),
+) (bool, error) {
+	transition := b.acquireTransition(start.LeaseUUID)
+	transition.dispatch.Lock()
+	accepted := false
+	defer func() {
+		// Keep transitionMu held across direct fan-out. A concurrent Publish can
+		// therefore neither overtake the accepted start nor slip between queued
+		// callbacks while the gate is being drained. This defer also runs during
+		// panic unwinding: queued independent observations are released, no start
+		// is invented, and the registry cannot remain permanently active.
+		b.transitionMu.Lock()
+		pending := transition.pending
+		transition.pending = nil
+		transition.active = false
+		if accepted {
+			b.publishDirect(start)
+		}
+		for _, event := range pending {
+			b.publishDirect(event)
+		}
+		b.transitionMu.Unlock()
+
+		transition.dispatch.Unlock()
+		b.releaseTransition(start.LeaseUUID, transition)
+	}()
+
+	b.transitionMu.Lock()
+	transition.active = true
+	b.transitionMu.Unlock()
+
+	accepted, err := dispatch()
+	return accepted, err
+}
+
+func (b *EventBroker) acquireTransition(leaseUUID string) *eventTransition {
+	b.transitionMu.Lock()
+	defer b.transitionMu.Unlock()
+
+	transition := b.transitions[leaseUUID]
+	if transition == nil {
+		transition = &eventTransition{}
+		b.transitions[leaseUUID] = transition
+	}
+	transition.refs++
+	return transition
+}
+
+func (b *EventBroker) releaseTransition(leaseUUID string, transition *eventTransition) {
+	b.transitionMu.Lock()
+	defer b.transitionMu.Unlock()
+
+	transition.refs--
+	if transition.refs == 0 && !transition.active {
+		delete(b.transitions, leaseUUID)
+	}
+}
+
+// publishDirect performs the existing nonblocking fan-out. Callers that
+// participate in transition ordering hold transitionMu before entering it.
+func (b *EventBroker) publishDirect(event backend.LeaseStatusEvent) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 

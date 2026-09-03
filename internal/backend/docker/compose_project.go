@@ -12,25 +12,28 @@ import (
 	composeapi "github.com/docker/compose/v5/pkg/api"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // composeProjectParams holds all inputs for building a Compose project.
 type composeProjectParams struct {
-	LeaseUUID    string
-	Tenant       string
-	ProviderUUID string
-	CallbackURL  string
-	BackendName  string
-	FailCount    int
-	Stack        *manifest.StackManifest
-	Items        []backend.LeaseItem
-	Profiles     map[string]SKUProfile
-	ImageSetups  map[string]*imageSetup
-	NetworkName  string                             // pre-created tenant network name (empty if isolation disabled)
-	VolBinds     map[string]map[int]serviceVolBinds // svc → instance → binds
-	Cfg          *Config
-	Ingress      IngressConfig
+	LeaseUUID            string
+	Tenant               string
+	ProviderUUID         string
+	CallbackURL          string
+	LifecycleCallbackURL string
+	MaintenanceID        shared.MaintenanceID
+	BackendName          string
+	FailCount            int
+	Stack                *manifest.StackManifest
+	Items                []backend.LeaseItem
+	Profiles             map[string]SKUProfile
+	ImageSetups          map[string]*imageSetup
+	NetworkName          string                             // pre-created tenant network name (empty if isolation disabled)
+	VolBinds             map[string]map[int]serviceVolBinds // svc → instance → binds
+	Cfg                  *Config
+	Ingress              IngressConfig
 }
 
 // serviceVolBinds holds volume binds for a single service instance.
@@ -52,29 +55,28 @@ func buildComposeProject(params composeProjectParams) *composetypes.Project {
 		imgSetup := params.ImageSetups[svcName]
 
 		for i := range item.Quantity {
-			composeSvcName := svcName
-			if item.Quantity > 1 {
-				composeSvcName = fmt.Sprintf("%s-%d", svcName, i)
-			}
+			composeSvcName := composeServiceName(item, i)
 
 			svcConfig := buildComposeServiceConfig(composeServiceParams{
-				LeaseUUID:    params.LeaseUUID,
-				Tenant:       params.Tenant,
-				ProviderUUID: params.ProviderUUID,
-				CallbackURL:  params.CallbackURL,
-				BackendName:  params.BackendName,
-				FailCount:    params.FailCount,
-				ServiceName:  svcName,
-				Instance:     i,
-				SKU:          item.SKU,
-				Manifest:     svc,
-				Profile:      profile,
-				ImgSetup:     imgSetup,
-				NetworkName:  params.NetworkName,
-				Cfg:          params.Cfg,
-				Ingress:      params.Ingress,
-				Quantity:     item.Quantity,
-				CustomDomain: item.CustomDomain,
+				LeaseUUID:            params.LeaseUUID,
+				Tenant:               params.Tenant,
+				ProviderUUID:         params.ProviderUUID,
+				CallbackURL:          params.CallbackURL,
+				LifecycleCallbackURL: params.LifecycleCallbackURL,
+				MaintenanceID:        params.MaintenanceID,
+				BackendName:          params.BackendName,
+				FailCount:            params.FailCount,
+				ServiceName:          svcName,
+				Instance:             i,
+				SKU:                  item.SKU,
+				Manifest:             svc,
+				Profile:              profile,
+				ImgSetup:             imgSetup,
+				NetworkName:          params.NetworkName,
+				Cfg:                  params.Cfg,
+				Ingress:              params.Ingress,
+				Quantity:             item.Quantity,
+				CustomDomain:         item.CustomDomain,
 			})
 
 			// Apply volume binds if present.
@@ -218,23 +220,25 @@ func applyDependsOn(services composetypes.Services, stack *manifest.StackManifes
 
 // composeServiceParams holds inputs for building a single Compose service config.
 type composeServiceParams struct {
-	LeaseUUID    string
-	Tenant       string
-	ProviderUUID string
-	CallbackURL  string
-	BackendName  string
-	FailCount    int
-	ServiceName  string
-	Instance     int
-	SKU          string
-	Manifest     *manifest.Manifest
-	Profile      SKUProfile
-	ImgSetup     *imageSetup
-	NetworkName  string
-	Cfg          *Config
-	Ingress      IngressConfig
-	Quantity     int
-	CustomDomain string // tenant-supplied FQDN; "" when not set
+	LeaseUUID            string
+	Tenant               string
+	ProviderUUID         string
+	CallbackURL          string
+	LifecycleCallbackURL string
+	MaintenanceID        shared.MaintenanceID
+	BackendName          string
+	FailCount            int
+	ServiceName          string
+	Instance             int
+	SKU                  string
+	Manifest             *manifest.Manifest
+	Profile              SKUProfile
+	ImgSetup             *imageSetup
+	NetworkName          string
+	Cfg                  *Config
+	Ingress              IngressConfig
+	Quantity             int
+	CustomDomain         string // tenant-supplied FQDN; "" when not set
 }
 
 func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfig {
@@ -381,17 +385,19 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 
 	// Labels — all fred.* labels preserved identically to CreateContainer.
 	labels := composetypes.Labels{
-		LabelManaged:       "true",
-		LabelLeaseUUID:     p.LeaseUUID,
-		LabelTenant:        p.Tenant,
-		LabelProviderUUID:  p.ProviderUUID,
-		LabelSKU:           p.SKU,
-		LabelCreatedAt:     time.Now().Format(time.RFC3339),
-		LabelInstanceIndex: strconv.Itoa(p.Instance),
-		LabelFailCount:     strconv.Itoa(p.FailCount),
-		LabelCallbackURL:   p.CallbackURL,
-		LabelBackendName:   p.BackendName,
-		LabelServiceName:   p.ServiceName,
+		LabelManaged:              "true",
+		LabelLeaseUUID:            p.LeaseUUID,
+		LabelTenant:               p.Tenant,
+		LabelProviderUUID:         p.ProviderUUID,
+		LabelSKU:                  p.SKU,
+		LabelCreatedAt:            time.Now().Format(time.RFC3339),
+		LabelInstanceIndex:        strconv.Itoa(p.Instance),
+		LabelFailCount:            strconv.Itoa(p.FailCount),
+		LabelCallbackURL:          p.CallbackURL,
+		LabelLifecycleCallbackURL: p.LifecycleCallbackURL,
+		LabelMaintenanceID:        p.MaintenanceID.String(),
+		LabelBackendName:          p.BackendName,
+		LabelServiceName:          p.ServiceName,
 	}
 	// Add user labels (already validated to not conflict with fred.*).
 	for k, v := range p.Manifest.Labels {

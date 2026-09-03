@@ -191,14 +191,15 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 		}
 		if entry != nil {
 			return &backend.ProvisionInfo{
-				LeaseUUID:    entry.LeaseUUID,
-				ProviderUUID: entry.ProviderUUID,
-				Status:       backend.ProvisionStatusFailed,
-				CreatedAt:    entry.CreatedAt,
-				BackendName:  b.cfg.Name,
-				FailCount:    entry.FailCount,
-				Reason:       defaultReason(backend.ProvisionStatusFailed, entry.Reason),
-				Message:      entry.Message,
+				LeaseUUID:           entry.LeaseUUID,
+				ProviderUUID:        entry.ProviderUUID,
+				Status:              backend.ProvisionStatusFailed,
+				CreatedAt:           entry.CreatedAt,
+				BackendName:         b.cfg.Name,
+				FailCount:           entry.FailCount,
+				Reason:              defaultReason(backend.ProvisionStatusFailed, entry.Reason),
+				Message:             entry.Message,
+				LifecycleGeneration: entry.LifecycleGeneration,
 			}, nil
 		}
 	}
@@ -346,16 +347,20 @@ func defaultReason(status backend.ProvisionStatus, r backend.Reason) backend.Rea
 // service `Image` field was deleted in Task 15 — callers that need a
 // representative image consult ServiceImages or iterate Items.
 func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo {
+	lifecycleGeneration := backend.ObserveLifecycleGeneration(
+		prov.CallbackURL, prov.LifecycleCallbackURL,
+	)
 	info := backend.ProvisionInfo{
-		LeaseUUID:    prov.LeaseUUID,
-		ProviderUUID: prov.ProviderUUID,
-		Status:       prov.Status,
-		CreatedAt:    prov.CreatedAt,
-		BackendName:  backendName,
-		FailCount:    prov.FailCount,
-		Reason:       defaultReason(prov.Status, prov.Reason),
-		Message:      prov.Message,
-		Quantity:     prov.Quantity,
+		LeaseUUID:           prov.LeaseUUID,
+		ProviderUUID:        prov.ProviderUUID,
+		Status:              prov.Status,
+		CreatedAt:           prov.CreatedAt,
+		BackendName:         backendName,
+		FailCount:           prov.FailCount,
+		Reason:              defaultReason(prov.Status, prov.Reason),
+		Message:             prov.Message,
+		Quantity:            prov.Quantity,
+		LifecycleGeneration: &lifecycleGeneration,
 	}
 	// Post-Task-15 every provision carries `prov.Items` (populated at
 	// Provision time by NormalizeProvisionRequest and rehydrated from

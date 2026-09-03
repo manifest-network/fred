@@ -53,6 +53,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -107,11 +108,25 @@ func resolveMigratedBindSource(hostRoot, sanitized string) (string, error) {
 // b.compose.Up runs with RemoveOrphans:true and would destroy
 // already-migrated siblings.
 type legacyMigration struct {
-	LeaseUUID string
-	Tenant    string
-	SKU       string
-	Stack     *manifest.StackManifest
-	Instances []legacyMigrationInstance
+	LeaseUUID    string
+	Tenant       string
+	ProviderUUID string
+	SKU          string
+	CustomDomain string
+	FailCount    int
+	Stack        *manifest.StackManifest
+	Instances    []legacyMigrationInstance
+}
+
+// committedLegacyRollbackCohort carries exact immutable cleanup evidence from
+// migration planning into ordinary recovery. The nonzero authority class is
+// present only when the same whole-cohort classifier used by stopped adoption
+// proved a v0.13 post-RecordMigration generation. Keeping that provenance typed
+// avoids turning the mere presence of a `-prev` name into durable migration
+// authority.
+type committedLegacyRollbackCohort struct {
+	remnants             []ContainerInfo
+	legacyAuthorityClass shared.LegacyActiveAuthorityClass
 }
 
 // legacyMigrationInstance captures the per-container state needed to
@@ -142,31 +157,49 @@ type volRename struct {
 //   - has a fred.lease_uuid label (managed by fred);
 //   - has NO fred.service_name label (the post-Task-3 marker for the
 //     stack-form path);
-//   - the container name doesn't end with "-prev" — Task 9's migration
-//     renames the legacy container to {newname}-prev as a rollback
-//     window before forced removal, and a startup interrupted mid-
-//     window leaves a -prev remnant that must NOT be re-migrated on
-//     the next boot.
+//   - both original names and migration-created "-prev" rollback remnants are
+//     candidates. A rollback-only stop/rename boundary is resumable because
+//     stop/rename and volume rename are idempotent. Mixed rollback/stack crash
+//     generations are classified separately; their mere presence never grants
+//     replay authority.
 func isLegacyContainer(c ContainerInfo) bool {
-	if c.LeaseUUID == "" || c.ServiceName != "" {
-		return false
-	}
-	return !strings.HasSuffix(c.Name, "-prev")
+	return c.LeaseUUID != "" && c.ServiceName == ""
+}
+
+// isLegacyRollbackRemnant identifies only the exact name produced by
+// executeLegacyMigration. A generic "-prev" suffix is not authority to hide a
+// managed container from recovery: labels or names can be corrupted or edited
+// independently, and an unrelated container must fail normal validation rather
+// than being silently treated as rollback evidence.
+func isLegacyRollbackRemnant(c ContainerInfo) bool {
+	return isLegacyContainer(c) && c.Name == fmt.Sprintf(
+		"fred-%s-%s-%d-prev",
+		c.LeaseUUID,
+		manifest.DefaultServiceName,
+		c.InstanceIndex,
+	)
 }
 
 // planLegacyMigrations groups legacy containers by lease and produces
 // one migration plan per lease. Returns a nil-safe empty slice when
 // there are no legacy containers (the common steady-state path on a
 // post-migration fleet).
-func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo) ([]*legacyMigration, error) {
+func (b *Backend) planLegacyMigrations(
+	ctx context.Context,
+	all []ContainerInfo,
+) ([]*legacyMigration, map[string]committedLegacyRollbackCohort, error) {
 	byLease := map[string][]ContainerInfo{}
+	allByLease := map[string][]ContainerInfo{}
 	for _, c := range all {
+		if c.LeaseUUID != "" {
+			allByLease[c.LeaseUUID] = append(allByLease[c.LeaseUUID], c)
+		}
 		if isLegacyContainer(c) {
 			byLease[c.LeaseUUID] = append(byLease[c.LeaseUUID], c)
 		}
 	}
 	if len(byLease) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Sort lease UUIDs so plan ordering is deterministic across restarts
@@ -178,14 +211,77 @@ func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo)
 	sort.Strings(leaseUUIDs)
 
 	plans := make([]*legacyMigration, 0, len(byLease))
+	committedRemnants := make(map[string]committedLegacyRollbackCohort)
 	for _, leaseUUID := range leaseUUIDs {
+		// Once RecordMigration has durably published an exact desired cohort,
+		// any exact `-prev` names are rollback-window remnants, not evidence from
+		// which a new desired topology may be inferred. Cleanup may have removed
+		// only a subset before a crash; re-planning from that subset could
+		// downscale the healthy Compose project. Defer their removal until the
+		// ordinary recovery path has verified the durable cohort below.
+		if b.releaseStore != nil {
+			release, err := b.releaseStore.LatestActive(leaseUUID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("read release store for lease %s: %w", leaseUUID, err)
+			}
+			if release != nil && len(release.Items) > 0 {
+				for _, container := range byLease[leaseUUID] {
+					if !isLegacyRollbackRemnant(container) {
+						return nil, nil, fmt.Errorf(
+							"lease %s has an exact durable release but legacy container %q is not an expected rollback remnant",
+							leaseUUID,
+							container.Name,
+						)
+					}
+				}
+				committedRemnants[leaseUUID] = committedLegacyRollbackCohort{
+					remnants: append([]ContainerInfo(nil), byLease[leaseUUID]...),
+				}
+				continue
+			}
+			if release != nil && release.Image == "stack" {
+				class, _, inspectErr := inspectV013MigrationCrashCohort(
+					release,
+					allByLease[leaseUUID],
+				)
+				if inspectErr != nil {
+					return nil, nil, fmt.Errorf(
+						"inspect v0.13 migration rollback cohort for lease %s: %w",
+						leaseUUID,
+						inspectErr,
+					)
+				}
+				if class == v013MigrationCrashAfterRelease {
+					committedRemnants[leaseUUID] = committedLegacyRollbackCohort{
+						remnants: append([]ContainerInfo(nil), byLease[leaseUUID]...),
+						// This is the only legacy store shape whose exact
+						// whole-cohort proof can safely mint the missing durable
+						// migration marker during authority backfill.
+						legacyAuthorityClass: shared.LegacyActiveAuthorityMigration,
+					}
+					continue
+				}
+				// v0.13's migration-generated stack generation omitted the
+				// backend label, so ordinary recovery may see only a partial
+				// `-prev` cleanup cohort. A stack release proves RecordMigration
+				// committed, but without the full stack inventory or frozen Items
+				// the rollback subset cannot prove desired quantity. Never replay
+				// that subset as a downscaled deployment.
+				return nil, nil, fmt.Errorf(
+					"%w: lease %s has a stack active release without frozen items and rollback remnants, but the complete committed stack cohort is not visible; run the stopped storage-identity adoption preflight and resolve the exact v0.13 migration crash lineage before startup",
+					ErrV013InterruptedMigration,
+					leaseUUID,
+				)
+			}
+		}
+
 		plan, err := b.planLegacyMigrationForLease(ctx, leaseUUID, byLease[leaseUUID])
 		if err != nil {
-			return nil, fmt.Errorf("plan lease %s: %w", leaseUUID, err)
+			return nil, nil, fmt.Errorf("plan lease %s: %w", leaseUUID, err)
 		}
 		plans = append(plans, plan)
 	}
-	return plans, nil
+	return plans, committedRemnants, nil
 }
 
 // planLegacyMigrationForLease builds the per-lease migration plan. The
@@ -193,6 +289,34 @@ func (b *Backend) planLegacyMigrations(ctx context.Context, all []ContainerInfo)
 // store has no active entry, the migration fails loudly. See the
 // package doc for why in-container reconstruction is rejected.
 func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID string, group []ContainerInfo) (*legacyMigration, error) {
+	if len(group) == 0 {
+		return nil, fmt.Errorf("legacy migration group is empty")
+	}
+	identity := group[0]
+	maxFailCount := identity.FailCount
+	instanceIndexes := make(map[int]struct{}, len(group))
+	for _, container := range group {
+		if container.LeaseUUID != leaseUUID || container.Tenant != identity.Tenant ||
+			container.ProviderUUID != identity.ProviderUUID || container.SKU != identity.SKU ||
+			container.CustomDomain != identity.CustomDomain {
+			return nil, fmt.Errorf(
+				"legacy container cohort has divergent lease, tenant, provider, SKU, or custom-domain identity",
+			)
+		}
+		if _, duplicate := instanceIndexes[container.InstanceIndex]; duplicate {
+			return nil, fmt.Errorf("legacy container cohort has duplicate instance index %d", container.InstanceIndex)
+		}
+		instanceIndexes[container.InstanceIndex] = struct{}{}
+		maxFailCount = max(maxFailCount, container.FailCount)
+	}
+	for index := range len(group) {
+		if _, exists := instanceIndexes[index]; !exists {
+			return nil, fmt.Errorf(
+				"legacy container cohort has non-contiguous instance indexes: missing %d in [0,%d)",
+				index, len(group),
+			)
+		}
+	}
 	if b.releaseStore == nil {
 		return nil, fmt.Errorf("no release store configured; cannot read stored manifest for legacy lease %s", leaseUUID)
 	}
@@ -242,7 +366,7 @@ func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID str
 		// array attached.
 		mounts := c.Mounts
 		if mounts == nil {
-			inspected, ierr := b.docker.InspectContainer(ctx, c.ContainerID)
+			inspected, ierr := b.inspectContainerForRecovery(ctx, c.ContainerID)
 			if ierr != nil {
 				return nil, fmt.Errorf("inspect legacy container %s for mounts: %w", c.ContainerID, ierr)
 			}
@@ -270,11 +394,14 @@ func (b *Backend) planLegacyMigrationForLease(ctx context.Context, leaseUUID str
 	sortInstancesByIndex(instances)
 
 	return &legacyMigration{
-		LeaseUUID: leaseUUID,
-		Tenant:    group[0].Tenant,
-		SKU:       group[0].SKU,
-		Stack:     stack,
-		Instances: instances,
+		LeaseUUID:    leaseUUID,
+		Tenant:       identity.Tenant,
+		ProviderUUID: identity.ProviderUUID,
+		SKU:          identity.SKU,
+		CustomDomain: identity.CustomDomain,
+		FailCount:    maxFailCount,
+		Stack:        stack,
+		Instances:    instances,
 	}, nil
 }
 
@@ -337,43 +464,60 @@ func sortInstancesByIndex(xs []legacyMigrationInstance) {
 //  4. Compose.Up. Creates N stack-form containers in one shot.
 //  5. Wait for ready (verifyStartup, bounded by
 //     b.cfg.MigrationReadyTimeout).
-//  6. Schedule background removal of all `-prev` containers after
-//     b.cfg.MigrationGracePeriod — preserves rollback inspection
-//     potential without blocking startup.
-//  7. RecordMigration on the release store so the next boot sees the
-//     wrapped manifest as the active release. Idempotent on
-//     byte-equal payload.
+//  6. RecordLegacyMigration on the release store so the next boot sees the
+//     wrapped manifest, exact desired cohort, and tokenless runtime authority
+//     in one commit. This durable commit is a prerequisite for declaring the
+//     migrated substrate authoritative.
+//  7. Schedule tracked background removal of all `-prev` containers after
+//     b.cfg.MigrationGracePeriod — preserves rollback inspection potential
+//     without blocking startup.
 //
 // Failure semantics: any step error returns immediately. The caller
 // (recoverState) wraps with operator remediation guidance.
 //
-// Idempotency / crash resumability is bounded:
+// Idempotency / crash resumability:
 //   - **Boundary 1 (before Stop+rename-to-prev):** a crash here leaves
 //     legacy containers and legacy-named volumes intact. Next boot
 //     re-runs the migration from scratch — fully resumable.
 //   - **Boundary 2 (after rename-to-prev, before compose.Up):**
-//     containers are stopped & renamed to `<name>-prev`, volumes may
-//     be partially renamed to new naming. The next boot's planner
-//     will not find a fresh legacy container under the original
-//     name (it's `-prev` now) and cannot replan the migration from
-//     state alone — operator intervention required (see CHANGELOG
-//     troubleshooting section). NOT resumable.
-//   - **Boundary 3 (after compose.Up, before RecordMigration):** new
+//     containers are stopped & renamed to `<name>-prev`, and volumes may be
+//     partially renamed. The planner deliberately includes `-prev` legacy
+//     containers; the next boot skips the completed rename, repeats the
+//     idempotent volume moves, and converges Compose Up.
+//   - **Boundary 3 (after compose.Up, before RecordLegacyMigration):** new
 //     stack containers exist alongside `-prev` containers. The release
 //     store still has the legacy active entry, so the next boot will
 //     re-plan. The volume renames are already idempotent (the rename
 //     tolerance below skips already-renamed paths). Compose.Up is
 //     idempotent on container name. Resumable, but the operator may
 //     see two generations of containers transiently.
-//   - **Boundary 4 (after RecordMigration, before grace-window
-//     removal):** terminal state. Background removal of `-prev`
-//     containers is fire-and-forget; if fred restarts inside the
-//     grace window, orphan `-prev` containers linger on disk until
-//     manual cleanup. Forward progress is durable; cleanup is
-//     operator-territory.
+//   - **Boundary 4 (after RecordLegacyMigration, before grace-window removal):**
+//     forward progress is durable. A restart rediscovers `-prev`, revalidates
+//     the idempotent migration, and schedules tracked cleanup again.
 func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration, logger *slog.Logger) error {
 	logger = logger.With("lease_uuid", m.LeaseUUID, "instances", len(m.Instances))
 	logger.Info("legacy migration starting")
+
+	// Validate callback authority before stopping or renaming anything. Preserve
+	// the exact operation-completion route and independently resolve its
+	// observation-only pair. Old containers have no lifecycle label, in which
+	// case resolution derives it by replacing only operation_id; current labels
+	// must already equal that exact derivation. Validate every sibling so
+	// container-list order can never select one route from inconsistent durable
+	// state after destructive migration work has begun.
+	legacyCallbackURL, lifecycleCallbackURL, err := resolveLegacyMigrationCallbackURLs(m.Instances)
+	if err != nil {
+		return fmt.Errorf("resolve legacy callback routes: %w", err)
+	}
+	legacyRuntimeAuthority, err := shared.NewLegacyRuntimeAuthority(
+		m.Tenant,
+		m.ProviderUUID,
+		legacyCallbackURL,
+		lifecycleCallbackURL,
+	)
+	if err != nil {
+		return fmt.Errorf("freeze legacy migration runtime authority: %w", err)
+	}
 
 	svc := m.Stack.Services[manifest.DefaultServiceName]
 	if svc == nil {
@@ -383,18 +527,60 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 	if svc.StopGracePeriod != nil {
 		stopGrace = svc.StopGracePeriod.Duration()
 	}
+	// True v0.13 rows have no persisted resource authority. Freeze the one
+	// compatibility value before the first destructive migration step, then use
+	// this exact snapshot for Compose, accounting, quota recovery, and the
+	// migration Release. A later config resize cannot reprice the migrated lease.
+	profile, err := b.cfg.GetSKUProfile(m.SKU)
+	if err != nil {
+		return fmt.Errorf("load SKU profile %s: %w", m.SKU, err)
+	}
+	quantity := len(m.Instances)
+	items := []backend.LeaseItem{{
+		SKU:          m.SKU,
+		Quantity:     quantity,
+		ServiceName:  manifest.DefaultServiceName,
+		CustomDomain: m.CustomDomain,
+	}}
+	resourceProfiles, err := b.snapshotResourceProfiles(items, map[string]SKUProfile{m.SKU: profile})
+	if err != nil {
+		return fmt.Errorf("snapshot migrated resource profiles: %w", err)
+	}
+	if b.releaseStore == nil {
+		return fmt.Errorf("record migration: release store is required")
+	}
+	capacityPlanner := b.releaseHistoryCapacityPlanner()
+	if capacityPlanner == nil {
+		return fmt.Errorf("record migration: release capacity planner is required")
+	}
+	migrationManifest, err := json.Marshal(m.Stack)
+	if err != nil {
+		return fmt.Errorf("marshal wrapped migration manifest: %w", err)
+	}
+	migrationCreatedAt := time.Now()
+	if err := capacityPlanner.CheckRecordLegacyMigrationCapacity(
+		m.LeaseUUID,
+		migrationManifest,
+		items,
+		resourceProfiles,
+		legacyRuntimeAuthority,
+		migrationCreatedAt,
+	); err != nil {
+		return fmt.Errorf("reserve migration release capacity: %w", err)
+	}
 
-	// 1. Stop + rename every legacy container.
+	// 1. Stop + prove quiescence + rename every legacy container. The proof is
+	// required even for an already-`-prev` retry: a name is not runtime state,
+	// and advancing while the exact old container still has the bind open can
+	// put two generations on the same tenant data.
 	for _, inst := range m.Instances {
-		if err := b.docker.StopContainer(ctx, inst.LegacyContainer.ContainerID, stopGrace); err != nil {
-			// Tolerate already-stopped (the docker SDK returns an error for
-			// a stop on a non-running container). Don't fail the migration
-			// over it — the rename below will surface a real "container
-			// missing" condition if it's serious.
-			logger.Warn("stop legacy container returned error (continuing)",
-				"container_id", inst.LegacyContainer.ContainerID, "error", err)
+		if err := b.stopLegacyContainerForMigration(ctx, inst, stopGrace); err != nil {
+			return err
 		}
-		if err := b.docker.RenameContainer(ctx, inst.LegacyContainer.ContainerID, inst.PrevName); err != nil {
+		if inst.LegacyContainer.Name == inst.PrevName {
+			continue
+		}
+		if err := b.mutationAdapter().renameContainer(ctx, inst.LegacyContainer.ContainerID, inst.PrevName); err != nil {
 			if !isAlreadyNamedErr(err, inst.PrevName) {
 				return fmt.Errorf("rename %s to %s: %w", inst.LegacyContainer.ContainerID, inst.PrevName, err)
 			}
@@ -405,7 +591,7 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 	// (Task 10), so re-runs after a partial migration succeed quietly.
 	for _, inst := range m.Instances {
 		for _, r := range inst.VolRenames {
-			if err := b.volumes.RenameVolume(r.Old, r.New); err != nil {
+			if err := b.mutationAdapter().renameVolume(ctx, r.Old, r.New); err != nil {
 				return fmt.Errorf("rename volume %s→%s (instance idx=%d): %w",
 					r.Old, r.New, inst.LegacyContainer.InstanceIndex, err)
 			}
@@ -416,17 +602,6 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 	// the live provision flow (provision.go:doProvision); the only
 	// migration-specific input is the VolBinds map seeded from the
 	// just-renamed directories.
-	profile, err := b.cfg.GetSKUProfile(m.SKU)
-	if err != nil {
-		return fmt.Errorf("load SKU profile %s: %w", m.SKU, err)
-	}
-	quantity := len(m.Instances)
-	items := []backend.LeaseItem{{
-		SKU:         m.SKU,
-		Quantity:    quantity,
-		ServiceName: manifest.DefaultServiceName,
-	}}
-
 	volBinds := map[string]map[int]serviceVolBinds{
 		manifest.DefaultServiceName: {},
 	}
@@ -467,20 +642,25 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 		}
 		networkName = TenantNetworkName(m.Tenant)
 	}
-
 	project := buildComposeProject(composeProjectParams{
-		LeaseUUID:   m.LeaseUUID,
-		Tenant:      m.Tenant,
-		Stack:       m.Stack,
-		Items:       items,
-		Profiles:    map[string]SKUProfile{m.SKU: profile},
-		NetworkName: networkName,
-		VolBinds:    volBinds,
-		Cfg:         &b.cfg,
+		LeaseUUID:            m.LeaseUUID,
+		Tenant:               m.Tenant,
+		ProviderUUID:         m.ProviderUUID,
+		CallbackURL:          legacyCallbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		BackendName:          b.cfg.Name,
+		FailCount:            m.FailCount,
+		Stack:                m.Stack,
+		Items:                items,
+		Profiles:             map[string]SKUProfile{m.SKU: profile},
+		NetworkName:          networkName,
+		VolBinds:             volBinds,
+		Cfg:                  &b.cfg,
+		Ingress:              b.cfg.Ingress,
 	})
 
 	// 4. Compose Up — brings up all instances at once.
-	if err := b.compose.Up(ctx, project, composeUpOpts{}); err != nil {
+	if err := b.mutationAdapter().composeUp(ctx, project, composeUpOpts{}); err != nil {
 		return fmt.Errorf("compose up: %w", err)
 	}
 
@@ -506,48 +686,263 @@ func (b *Backend) executeLegacyMigration(ctx context.Context, m *legacyMigration
 		return fmt.Errorf("wait for ready: %w", err)
 	}
 
-	// 6. Schedule per-instance `-prev` removal after the operator-
+	// 6. Persist the wrapped manifest, exact migrated cohort, and the tokenless
+	// runtime authority proven before Stop in one transaction before removing any
+	// rollback evidence. A persistence failure is not success: keep every `-prev`
+	// container and fail startup so the next boot/operator can recover from both
+	// generations rather than silently accepting an unrecorded cohort.
+	if err := b.releaseStore.RecordLegacyMigrationAt(
+		m.LeaseUUID,
+		migrationManifest,
+		items,
+		resourceProfiles,
+		legacyRuntimeAuthority,
+		migrationCreatedAt,
+	); err != nil {
+		return fmt.Errorf("record migration release: %w", err)
+	}
+
+	// 7. Schedule per-instance `-prev` removal after the operator-
 	// inspection grace window. Background — must not block startup. This
-	// fire-and-forget cleanup is gated on b.stopCtx, NOT the caller's ctx:
+	// tracked cleanup is gated on b.stopCtx, NOT the caller's ctx:
 	// it must survive the caller returning (main cancels the short startup
 	// context the instant Start returns — keying on ctx would fire Done() at
 	// ~0s and leak every migration's `-prev` containers) while still stopping
 	// on daemon shutdown (ENG-592). Unlike the synchronous ready-wait above,
 	// there is no caller left to honor a deadline once this goroutine detaches.
+	rollbackTargets := make([]legacyRollbackCleanupTarget, 0, len(m.Instances))
 	for _, inst := range m.Instances {
-		inst := inst
-		go func() {
+		rollbackTargets = append(rollbackTargets, legacyRollbackCleanupTarget{
+			ContainerID: inst.LegacyContainer.ContainerID,
+			Name:        inst.PrevName,
+		})
+	}
+	b.scheduleLegacyPrevCleanup(rollbackTargets, logger)
+
+	logger.Info("legacy migration complete")
+	return nil
+}
+
+// stopLegacyContainerForMigration establishes the load-bearing precondition for
+// moving a legacy container's bind-mounted data. Docker Stop can return an
+// error after the daemon accepted the request, and a retry can discover a
+// `-prev` container that is nevertheless running. Neither the return value nor
+// the name alone proves quiescence, so inspect the exact immutable container ID
+// and admit only Docker's explicit non-running states.
+func (b *Backend) stopLegacyContainerForMigration(
+	ctx context.Context,
+	inst legacyMigrationInstance,
+	stopGrace time.Duration,
+) error {
+	containerID := inst.LegacyContainer.ContainerID
+	if containerID == "" {
+		return errors.New("legacy migration container has no immutable ID")
+	}
+	stopErr := b.mutationAdapter().stopContainer(ctx, containerID, stopGrace)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("stop legacy container %s: %w", containerID, errors.Join(stopErr, err))
+	}
+
+	inspected, inspectErr := b.inspectContainerForRecovery(ctx, containerID)
+	if inspectErr != nil {
+		return fmt.Errorf(
+			"prove legacy container %s stopped after stop result: %w",
+			containerID,
+			errors.Join(stopErr, inspectErr),
+		)
+	}
+	if inspected == nil || inspected.ContainerID != containerID {
+		observedID := ""
+		if inspected != nil {
+			observedID = inspected.ContainerID
+		}
+		return fmt.Errorf(
+			"prove legacy container %s stopped: inspect returned immutable ID %q",
+			containerID,
+			observedID,
+		)
+	}
+
+	if isDockerNonRunningStatus(inspected.Status) {
+		// These are Docker's explicit non-running states. A prior Stop error is
+		// now classified as an ambiguous response to a completed stop, not as
+		// permission to guess: the exact postcondition is what authorizes the
+		// volume move.
+		return nil
+	}
+	stateErr := fmt.Errorf(
+		"legacy container %s remains in non-quiescent state %q",
+		containerID,
+		inspected.Status,
+	)
+	return fmt.Errorf("prove legacy container stopped: %w", errors.Join(stopErr, stateErr))
+}
+
+// scheduleLegacyPrevCleanup removes rollback-window containers only after the
+// caller has proved that an exact migration release is durable and its live
+// Compose cohort is valid. It is also used on restart to resume an interrupted
+// partial cleanup without ever re-inferring desired topology from the remaining
+// rollback subset.
+type legacyRollbackCleanupTarget struct {
+	ContainerID string
+	Name        string
+}
+
+func (b *Backend) scheduleLegacyPrevCleanup(targets []legacyRollbackCleanupTarget, logger *slog.Logger) {
+	for _, target := range targets {
+		b.wg.Go(func() {
 			select {
 			case <-time.After(cmp.Or(b.cfg.MigrationGracePeriod, defaultMigrationGracePeriod)):
 			case <-b.stopCtx.Done():
 				return
 			}
-			// Use a fresh context with a short timeout so a wedged
+			// Derive cleanup from the backend lifecycle and re-attest immediately
+			// before the destructive call. A storage/daemon swap during the grace
+			// window must leave the -prev container for operator inspection, not
+			// remove something from the replacement substrate.
 			// docker daemon doesn't keep the goroutine alive forever.
 			// Logged as warning rather than failing the migration —
 			// the data plane is already on the stack-form container;
 			// the -prev leftover is an operator cleanup at worst.
-			rmCtx, rmCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			rmCtx, rmCancel := context.WithTimeout(b.stopCtx, 30*time.Second)
 			defer rmCancel()
-			if err := b.docker.RemoveContainer(rmCtx, inst.PrevName); err != nil {
-				logger.Warn("remove -prev container after grace failed (manual cleanup may be needed)",
-					"name", inst.PrevName, "error", err)
+			if err := b.requireStorageIdentity(rmCtx); err != nil {
+				logger.Warn("suppressing -prev removal after backend identity verification failed",
+					"name", target.Name, "container_id", target.ContainerID, "error", err)
+				return
 			}
-		}()
+			// Docker container IDs are immutable. Removing by the delayed name
+			// could delete an unrelated replacement that acquired it during the
+			// grace window after the original vanished.
+			if err := b.mutationAdapter().removeContainer(rmCtx, target.ContainerID); err != nil {
+				logger.Warn("remove -prev container after grace failed (manual cleanup may be needed)",
+					"name", target.Name, "container_id", target.ContainerID, "error", err)
+			}
+		})
 	}
+}
 
-	// 7. Persist wrapped manifest. RecordMigration is idempotent.
-	if b.releaseStore != nil {
-		data, mErr := json.Marshal(m.Stack)
-		if mErr != nil {
-			logger.Warn("marshal wrapped manifest for release store (migration still complete)", "error", mErr)
-		} else if persistErr := b.releaseStore.RecordMigration(m.LeaseUUID, data); persistErr != nil {
-			logger.Warn("release store RecordMigration failed (migration still complete)", "error", persistErr)
+// removeCommittedLegacyRollbackRemnants synchronously consumes the rollback
+// containers of a durably committed legacy migration before Deprovision deletes
+// the release record that identifies them. The ordinary Compose project does not
+// own these pre-Compose containers, so a successful Compose Down cannot remove
+// them. Leaving cleanup only to the grace-period goroutine creates a crash window:
+// after release-history deletion, the next startup sees `-prev` as an uncommitted
+// legacy cohort and cannot safely reconstruct it.
+func (b *Backend) removeCommittedLegacyRollbackRemnants(
+	ctx context.Context,
+	leaseUUID string,
+	logger *slog.Logger,
+) error {
+	if b.releaseStore == nil {
+		return nil
+	}
+	releases, err := b.releaseStore.List(leaseUUID)
+	if err != nil {
+		return fmt.Errorf("read release history before legacy rollback cleanup: %w", err)
+	}
+	hasMigrationAuthority := false
+	for _, release := range releases {
+		if release.LegacyMigration {
+			hasMigrationAuthority = true
+			break
 		}
 	}
+	if !hasMigrationAuthority {
+		return nil
+	}
 
-	logger.Info("legacy migration complete")
-	return nil
+	// Reuse close admission's exact whole-cohort proof instead of reconstructing
+	// targets from reusable Docker names. The inventory snapshot binds every
+	// rollback remnant to an immutable container ID and validates its stopped
+	// state, backend, release topology, image, and callback cohort before the
+	// first destructive call. An already-removed remnant is ordinary success;
+	// an unrelated container that later acquires its old name is never selected.
+	targets, err := b.closeLegacyRollbackTargets(
+		ctx,
+		leaseUUID,
+		releases,
+		"",
+		"",
+		"",
+		"",
+	)
+	if err != nil {
+		return fmt.Errorf("resolve immutable legacy rollback cleanup targets: %w", err)
+	}
+
+	var cleanupErrs []error
+	for _, target := range targets {
+		if err := b.mutationAdapter().removeContainer(ctx, target.ContainerID); err != nil {
+			logger.Warn("failed to remove committed legacy rollback container",
+				"name", target.Name,
+				"container_id", target.ContainerID,
+				"error", err,
+			)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf(
+				"remove %s (%s): %w",
+				target.Name,
+				target.ContainerID,
+				err,
+			))
+		}
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+func resolveLegacyMigrationCallbackURLs(instances []legacyMigrationInstance) (string, string, error) {
+	if len(instances) == 0 {
+		return "", "", fmt.Errorf("legacy migration has no instances")
+	}
+	containers := make([]ContainerInfo, len(instances))
+	for index := range instances {
+		containers[index] = instances[index].LegacyContainer
+	}
+	return resolveLegacyContainerCallbackURLs(containers)
+}
+
+// resolveLegacyContainerCallbackURLs is the pure callback-authority proof
+// shared by stopped adoption and runtime migration. Keeping one predicate is
+// load-bearing: a cohort that seals successfully must not later fail startup
+// because its individually valid v0.13 siblings disagree about the callback
+// generation migration must persist on the replacement stack.
+func resolveLegacyContainerCallbackURLs(containers []ContainerInfo) (string, string, error) {
+	if len(containers) == 0 {
+		return "", "", errors.New("legacy callback cohort has no containers")
+	}
+	callbackURL := containers[0].CallbackURL
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
+		callbackURL, containers[0].LifecycleCallbackURL,
+	)
+	if err != nil {
+		return "", "", fmt.Errorf("instance %d: %w",
+			containers[0].InstanceIndex, err)
+	}
+	for _, container := range containers[1:] {
+		if container.CallbackURL != callbackURL {
+			return "", "", fmt.Errorf(
+				"instance %d callback_url differs from instance %d",
+				container.InstanceIndex,
+				containers[0].InstanceIndex,
+			)
+		}
+		resolved, resolveErr := backend.ResolveLifecycleCallbackURL(
+			container.CallbackURL,
+			container.LifecycleCallbackURL,
+		)
+		if resolveErr != nil {
+			return "", "", fmt.Errorf("instance %d: %w",
+				container.InstanceIndex, resolveErr)
+		}
+		if resolved != lifecycleCallbackURL {
+			return "", "", fmt.Errorf(
+				"instance %d lifecycle callback route differs from instance %d",
+				container.InstanceIndex,
+				containers[0].InstanceIndex,
+			)
+		}
+	}
+	return callbackURL, lifecycleCallbackURL, nil
 }
 
 // isAlreadyNamedErr reports whether a docker RenameContainer failure
@@ -589,7 +984,7 @@ func namesOf(insts []legacyMigrationInstance) []string {
 // already validated the Up call succeeded, so a missing container
 // means a name mismatch or a race we can't safely paper over.
 func (b *Backend) resolveContainerIDsByName(ctx context.Context, names []string) ([]string, error) {
-	containers, err := b.docker.ListManagedContainers(ctx)
+	containers, err := b.listManagedContainersForRecovery(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list managed containers: %w", err)
 	}

@@ -2,10 +2,12 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -65,7 +67,7 @@ func TestReconcileRestoring_DefersForUpdating(t *testing.T) {
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
 		RetainedVolumeNames: []string{"fred-retained-u1-app-0"},
 	}
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
 
 	b.reconcileRestoring(context.Background(), e)
 
@@ -76,7 +78,7 @@ func TestReconcileRestoring_DefersForUpdating(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Equal(t, shared.RetentionStatusRestoring, entry.Status)
-	assert.Equal(t, 3, entry.Generation, "orphaned arm / RevertToActive must NOT fire")
+	assert.Equal(t, 3, entry.Generation, "orphaned arm / RevertToActiveWithResourceProfiles must NOT fire")
 
 	b.provisionsMu.RLock()
 	_, hasU2 := b.provisions["u2"]
@@ -117,9 +119,10 @@ func TestCleanupOrphanedVolumes_ProtectsLiveLeaseWithActiveRelease(t *testing.T)
 		"a genuine create-crash leak (no active release) is still reaped")
 }
 
-// leaseUUIDFromVolumeName must match ONLY canonical managed names
-// (fred-{uuid}-{service}-{idx}), not a bare fred-{uuid}- prefix, so the reaper
-// can't mistake an unrelated directory for a protected lease volume (ENG-505).
+// leaseUUIDFromVolumeName must match only typed canonical live names (current
+// service-aware or v0.13 migration form), not a bare fred-{uuid}- prefix, so
+// the reaper cannot mistake an unrelated directory for a protected lease
+// volume (ENG-505).
 func TestLeaseUUIDFromVolumeName(t *testing.T) {
 	u := "0192f1a0-1111-7abc-8def-000000000001"
 	cases := []struct {
@@ -129,6 +132,7 @@ func TestLeaseUUIDFromVolumeName(t *testing.T) {
 	}{
 		{"fred-" + u + "-app-0", u, true},
 		{"fred-" + u + "-web-1-0", u, true}, // hyphenated service name
+		{"fred-" + u + "-0", u, true},       // canonical v0.13 migration name
 		{"fred-" + u + "-", "", false},      // missing service + idx
 		{"fred-" + u + "-foo", "", false},   // missing numeric idx
 		{"fred-" + u + "-app-x", "", false}, // non-numeric idx
@@ -148,11 +152,41 @@ func eng523RestoringRecord(orig, newLease string) shared.RetentionEntry {
 		OriginalLeaseUUID:   orig,
 		NewLeaseUUID:        newLease,
 		Tenant:              "tenant-a",
+		ProviderUUID:        "22222222-2222-4222-8222-222222222222",
 		Status:              shared.RetentionStatusRestoring,
 		Generation:          1,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
 		StackManifest:       restoreStackManifest(), // realistic, parseable payload (not a nil "null" marshal)
 		RetainedVolumeNames: []string{"fred-retained-" + orig + "-app-0"},
+	}
+}
+
+func projectReadyRestoredLease(b *Backend, entry shared.RetentionEntry) {
+	b.provisionsMu.Lock()
+	defer b.provisionsMu.Unlock()
+	b.provisions[entry.NewLeaseUUID] = &provision{ //exhaustruct:enforce
+		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
+			LeaseUUID:            entry.NewLeaseUUID,
+			Tenant:               entry.Tenant,
+			ProviderUUID:         entry.ProviderUUID,
+			SKU:                  entry.DestinationItems[0].SKU,
+			Status:               backend.ProvisionStatusReady,
+			Quantity:             entry.DestinationItems[0].Quantity,
+			CreatedAt:            time.Now(),
+			FailCount:            0,
+			LastError:            "",
+			Reason:               "",
+			Message:              "",
+			CallbackURL:          entry.DestinationCallbackURL,
+			LifecycleCallbackURL: entry.DestinationLifecycleCallbackURL,
+			Items:                slices.Clone(entry.DestinationItems),
+			ResourceProfiles:     shared.CloneSKUResourceSnapshot(entry.DestinationResourceProfiles),
+			ContainerIDs:         nil,
+			StackManifest:        entry.StackManifest,
+			ServiceContainers:    nil,
+		},
+		ResourceProfiles:      shared.CloneSKUResourceSnapshot(entry.DestinationResourceProfiles),
+		VolumeCleanupAttempts: 0,
 	}
 }
 
@@ -177,10 +211,11 @@ func TestFinalizeRestoredLease_KeepsFinalizerWhenReleaseAppendFails(t *testing.T
 	b.releaseStore = relStore
 
 	e := eng523RestoringRecord(orig, newLease)
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	projectReadyRestoredLease(b, e)
 
 	before := testutil.ToFloat64(restoreFinalizerPendingTotal)
-	b.finalizeRestoredLease(newLease, &e, slog.Default())
+	b.finalizeRestoredLease(newLease, &e, e.Items, slog.Default())
 
 	got, err := rs.Get(orig)
 	require.NoError(t, err)
@@ -207,7 +242,7 @@ func TestCleanupOrphanedVolumes_ProtectsAdoptedVolumeOfLingeringRestoringRecord(
 	var destroyed []string
 	b := newBackendForTest(&mockDockerClient{}, nil) // no live provisions, no release store
 	rs := attachRetentionStore(t, b)
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	putRestoringRetention(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		NewLeaseUUID:        newLease,
 		Tenant:              "tenant-a",
@@ -215,7 +250,7 @@ func TestCleanupOrphanedVolumes_ProtectsAdoptedVolumeOfLingeringRestoringRecord(
 		Generation:          1,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName}},
 		RetainedVolumeNames: []string{retained},
-	}))
+	})
 	b.volumes = &mockVolumeManager{
 		ListFn:    func() ([]string, error) { return []string{adopted, leak}, nil },
 		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
@@ -244,9 +279,10 @@ func TestFinalizeRestoredLease_DropsFinalizerWhenReleaseRecorded(t *testing.T) {
 	b.releaseStore = relStore
 
 	e := eng523RestoringRecord(orig, newLease)
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	projectReadyRestoredLease(b, e)
 
-	b.finalizeRestoredLease(newLease, &e, slog.Default())
+	require.NoError(t, b.finalizeRestoredLeaseStrict(newLease, &e, e.Items))
 
 	got, err := rs.Get(orig)
 	require.NoError(t, err)
@@ -265,9 +301,15 @@ func TestFinalizeRestoredLease_DropsFinalizerWhenReleaseRecorded(t *testing.T) {
 func TestReconcileRestoring_ReadyButReleaseUnrecordable_KeepsFinalizer(t *testing.T) {
 	orig := "0192f1a0-1111-7abc-8def-000000000008"
 	newLease := "0192f1a0-2222-7abc-8def-000000000009"
+	e := eng523RestoringRecord(orig, newLease)
 
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		newLease: {ProvisionState: leasesm.ProvisionState{LeaseUUID: newLease, Status: backend.ProvisionStatusReady}},
+		newLease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: newLease, Tenant: "tenant-a",
+			ProviderUUID: "22222222-2222-4222-8222-222222222222",
+			Status:       backend.ProvisionStatusReady,
+			Items:        e.Items, StackManifest: e.StackManifest,
+		}},
 	})
 	rs := attachRetentionStore(t, b)
 
@@ -276,8 +318,8 @@ func TestReconcileRestoring_ReadyButReleaseUnrecordable_KeepsFinalizer(t *testin
 	require.NoError(t, relStore.Close()) // Append + LatestActive fail
 	b.releaseStore = relStore
 
-	e := eng523RestoringRecord(orig, newLease)
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	projectReadyRestoredLease(b, e)
 
 	b.reconcileRestoring(context.Background(), e)
 
@@ -293,15 +335,19 @@ func TestReconcileRestoring_ReadyButReleaseUnrecordable_KeepsFinalizer(t *testin
 func TestReconcileRestoring_ReadyRecordsMissingReleaseThenDropsFinalizer(t *testing.T) {
 	orig := "0192f1a0-1111-7abc-8def-00000000000a"
 	newLease := "0192f1a0-2222-7abc-8def-00000000000b"
+	e := eng523RestoringRecord(orig, newLease)
 
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
-		newLease: {ProvisionState: leasesm.ProvisionState{LeaseUUID: newLease, Status: backend.ProvisionStatusReady}},
+		newLease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: newLease, Status: backend.ProvisionStatusReady,
+			Items: e.Items, StackManifest: e.StackManifest,
+		}},
 	})
 	rs := attachRetentionStore(t, b)
 	relStore := attachReleaseStore(t, b) // working, empty: no active release yet (Append had failed)
 
-	e := eng523RestoringRecord(orig, newLease)
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
+	projectReadyRestoredLease(b, e)
 
 	b.reconcileRestoring(context.Background(), e)
 
@@ -324,14 +370,22 @@ func TestFinalizeRestoredLease_IdempotentWhenReleaseAlreadyRecorded(t *testing.T
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	rs := attachRetentionStore(t, b)
 	relStore := attachReleaseStore(t, b)
+	e := eng523RestoringRecord(orig, newLease)
+	e = *putRestoringRetention(t, rs, e)
+	projectReadyRestoredLease(b, e)
+	manifestBytes, err := json.Marshal(e.StackManifest)
+	require.NoError(t, err)
 	require.NoError(t, relStore.Append(newLease, shared.Release{
-		Manifest: []byte(`{"services":{}}`), Image: "stack", Status: "active", CreatedAt: time.Now(),
+		Manifest: manifestBytes, Image: "stack", OperationID: e.DestinationOperationID,
+		Items: slices.Clone(e.DestinationItems), ResourceProfiles: shared.CloneSKUResourceSnapshot(e.DestinationResourceProfiles),
+		RuntimeAuthority: mustTestReleaseRuntimeAuthority(
+			t, e.DestinationOperationID, e.Tenant, e.ProviderUUID,
+			e.DestinationCallbackURL, e.DestinationLifecycleCallbackURL,
+		),
+		Status: "active", CreatedAt: time.Now(),
 	}))
 
-	e := eng523RestoringRecord(orig, newLease)
-	require.NoError(t, rs.Put(e))
-
-	b.finalizeRestoredLease(newLease, &e, slog.Default())
+	require.NoError(t, b.finalizeRestoredLeaseStrict(newLease, &e, e.Items))
 
 	got, err := rs.Get(orig)
 	require.NoError(t, err)
@@ -342,11 +396,10 @@ func TestFinalizeRestoredLease_IdempotentWhenReleaseAlreadyRecorded(t *testing.T
 	assert.Len(t, releases, 1, "must not append a duplicate active release (idempotent)")
 }
 
-// M-01 (PR #174 review): reconcileRestoring's retry must re-record the LIVE provision's
-// CURRENT manifest, not the retention record's frozen (pre-Update) one. Otherwise a
-// sweep landing after a tenant Update (whose own best-effort release write also failed)
-// records a stale release and silently reverts the update on the next restart.
-func TestReconcileRestoring_ReRecordsLiveManifestNotFrozenRecord(t *testing.T) {
+// A live generation that diverges from the restore's durable destination authority
+// must fail closed. Update is now excluded while this finalizer exists, so recovery
+// may never bless mutable live state as if it were the committed restore generation.
+func TestReconcileRestoring_RejectsLiveManifestOutsideDurableAuthority(t *testing.T) {
 	orig := "0192f1a0-1111-7abc-8def-00000000000e"
 	newLease := "0192f1a0-2222-7abc-8def-00000000000f"
 
@@ -355,26 +408,32 @@ func TestReconcileRestoring_ReRecordsLiveManifestNotFrozenRecord(t *testing.T) {
 	updated := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 		manifest.DefaultServiceName: {Image: "redis:7"},
 	}}
+	liveItems := []backend.LeaseItem{{
+		SKU: "docker-large", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+	}}
 	b := newBackendForTest(&mockDockerClient{}, map[string]*provision{
 		newLease: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: newLease, Status: backend.ProvisionStatusReady, StackManifest: updated,
-		}},
+			LeaseUUID: newLease, Tenant: "tenant-a",
+			ProviderUUID:  "22222222-2222-4222-8222-222222222222",
+			Status:        backend.ProvisionStatusReady,
+			StackManifest: updated, Items: liveItems,
+		}, ResourceProfiles: testResourceProfiles(t, liveItems)},
 	})
 	rs := attachRetentionStore(t, b)
 	relStore := attachReleaseStore(t, b)
 
 	e := eng523RestoringRecord(orig, newLease) // e.StackManifest = restoreStackManifest() = nginx:latest (frozen)
-	require.NoError(t, rs.Put(e))
+	e = *putRestoringRetention(t, rs, e)
 
-	b.reconcileRestoring(context.Background(), e)
+	err := b.reconcileRestoring(context.Background(), e)
+	require.ErrorContains(t, err, "do not match durable destination authority")
 
 	rel, err := relStore.LatestActive(newLease)
 	require.NoError(t, err)
-	require.NotNil(t, rel, "reconcileRestoring must record the missing release")
-	assert.Contains(t, string(rel.Manifest), "redis:7",
-		"must record the LIVE (updated) manifest, not the frozen record manifest (M-01)")
-	assert.NotContains(t, string(rel.Manifest), "nginx",
-		"must NOT re-record the retention record's frozen pre-Update manifest (M-01)")
+	assert.Nil(t, rel, "divergent live state must not be published as restore ownership")
+	finalizer, err := rs.Get(orig)
+	require.NoError(t, err)
+	require.NotNil(t, finalizer, "durable restore authority must remain retryable")
 }
 
 // --- ENG-659: the reaping finalizer re-checks ownership at DESTROY time ----------------
@@ -394,7 +453,7 @@ func seedClaimedTombstone(t *testing.T, rs *shared.RetentionStore, orig, newLeas
 	retained := "fred-retained-" + orig + "-app-0"
 	adopted := retainedToNewCanonical(retained, orig, newLease)
 	ownLeak := canonicalVolumeName(newLease, "app", 1)
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	putRestoringRetention(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		NewLeaseUUID:        newLease,
 		Tenant:              "tenant-a",
@@ -402,7 +461,7 @@ func seedClaimedTombstone(t *testing.T, rs *shared.RetentionStore, orig, newLeas
 		Generation:          1,
 		Items:               []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
 		RetainedVolumeNames: []string{retained},
-	}))
+	})
 	require.NoError(t, rs.Put(shared.RetentionEntry{
 		OriginalLeaseUUID:   newLease,
 		Tenant:              "tenant-a",
@@ -612,7 +671,14 @@ func TestDestroyReapingVolumes_ConvergesAfterRestoreRollback(t *testing.T) {
 	// The rollback: reconcileRestoring renames fred-{newLease}-app-0 back into the
 	// retained namespace and CASes the record to active. The claim is gone with it, and so
 	// is the volume — the adopted name no longer exists under this lease.
-	reverted, err := rs.RevertToActive(orig, 1)
+	reverted, err := rs.RevertToActiveWithResourceProfiles(
+		orig,
+		newLease,
+		1,
+		testResourceProfiles(t, []backend.LeaseItem{{
+			SKU: "docker-small", Quantity: 1, ServiceName: "app",
+		}}),
+	)
 	require.NoError(t, err)
 	require.True(t, reverted)
 	vs.mu.Lock()

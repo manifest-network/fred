@@ -17,7 +17,7 @@ import (
 // why it is spelled out here rather than derived (ENG-712).
 //
 // These are Gather() family names; the three histograms each expand into
-// _bucket/_sum/_count in the text exposition, so 21 collectors here are 27
+// _bucket/_sum/_count in the text exposition, so 24 collectors here are 30
 // metric names on the wire.
 var unlabelledMetricNames = []string{
 	"fred_backend_health_probe_panics_total",
@@ -26,6 +26,10 @@ var unlabelledMetricNames = []string{
 	"fred_payload_leases_awaiting",
 	"fred_payload_size_bytes",
 	"fred_payload_stored_count",
+	"fred_placement_write_failures_total",
+	"fred_provisioner_callback_deprovision_owned_success_total",
+	"fred_provisioner_callback_placement_semantic_conflicts_total",
+	"fred_provisioner_callback_settlement_claim_wait_timeouts_total",
 	"fred_provisioner_callback_timeouts_total",
 	"fred_provisioner_in_flight_provisions",
 	"fred_provisioner_reconciler_deferred_leases_total",
@@ -74,6 +78,8 @@ var labelledMetricNames = []string{
 	"fred_provisioner_ack_batcher_lane_restarts_total",
 	"fred_provisioner_provisioning_duration_seconds",
 	"fred_provisioner_provisioning_total",
+	"fred_provisioner_lifecycle_callback_outcomes_total",
+	"fred_provisioner_lifecycle_event_sink_panics_total",
 	"fred_provisioner_reconciler_panics_total",
 	"fred_reconciler_actions_total",
 	"fred_reconciler_backend_fetch_total",
@@ -91,6 +97,7 @@ var labelledMetricNames = []string{
 func allCollectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		// Provisioning
+		PlacementWriteFailuresTotal,
 		InFlightProvisions,
 		ProvisioningTotal,
 		ProvisioningDuration,
@@ -100,6 +107,7 @@ func allCollectors() []prometheus.Collector {
 		ReconcilerInflightSkipsTotal,
 		ReconcilerDeferredLeasesTotal,
 		ReconcilerPanicsTotal,
+		LifecycleEventSinkPanicsTotal,
 		SignerOOGRetriesTotal,
 		GasSimulationTotal,
 		GasSimulated,
@@ -147,7 +155,11 @@ func allCollectors() []prometheus.Collector {
 		MalformedMessagesTotal,
 		ReconciliationConflictsTotal,
 		// Callback
+		CallbackDeprovisionOwnedSuccessTotal,
+		CallbackPlacementSemanticConflictsTotal,
+		CallbackSettlementClaimWaitTimeoutsTotal,
 		CallbackTimeoutsTotal,
+		LifecycleCallbackOutcomesTotal,
 		NonInFlightCallbacksTotal,
 		// Signer pool
 		SignerPoolSize,
@@ -256,6 +268,12 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerPanicsTotal.WithLabelValues("process_orphan")
 		ReconcilerPanicsTotal.WithLabelValues("fetch_provisions")
 		ReconcilerPanicsTotal.WithLabelValues("fetch_retentions")
+		ReconcilerPanicsTotal.WithLabelValues("check_placement_marker")
+	})
+	assert.NotPanics(t, func() {
+		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventProvisionStarting)
+		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRestarting)
+		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRefused)
 	})
 	assert.NotPanics(t, func() {
 		SignerOOGRetriesTotal.WithLabelValues("retried")
@@ -286,7 +304,7 @@ func TestCounterVecLabels(t *testing.T) {
 		for _, pass := range []string{CleanupPassOrphan, CleanupPassPayload, CleanupPassPlacement} {
 			for _, reason := range []string{
 				CleanupSkipChainLive, CleanupSkipChainUnknown, CleanupSkipChainUnknownState,
-				CleanupSkipChainError, CleanupSkipBackendSilent,
+				CleanupSkipChainError, CleanupSkipBackendSilent, CleanupSkipAttemptPending,
 			} {
 				ReconcilerCleanupSkipsTotal.WithLabelValues(pass, reason)
 			}
@@ -314,7 +332,9 @@ func TestCounterVecLabels(t *testing.T) {
 		APIRequestsTotal.WithLabelValues("GET", "/health", "200")
 	})
 	assert.NotPanics(t, func() {
-		for _, check := range []string{"chain", "token_tracker", "placement_store", "payload_store"} {
+		for _, check := range []string{
+			"chain", "token_tracker", "placement_store", "placement_inventory", "payload_store",
+		} {
 			HealthCheckHealthy.WithLabelValues(check)
 		}
 	})
@@ -340,13 +360,19 @@ func TestCounterVecLabels(t *testing.T) {
 		PayloadPersistFailuresTotal.WithLabelValues("update")
 	})
 	assert.NotPanics(t, func() {
-		BackendInsufficientResourcesTotal.WithLabelValues("docker")
+		BackendInsufficientResourcesTotal.WithLabelValues("docker", CapacityVerdictCodedRefusal)
+		BackendInsufficientResourcesTotal.WithLabelValues("docker", CapacityVerdictAmbiguous)
 		BackendMalformedErrorBodyTotal.WithLabelValues("docker", "restore")
 	})
 	assert.NotPanics(t, func() {
 		BackendHealthy.WithLabelValues("docker")
 	})
 	assert.NotPanics(t, func() {
+		LifecycleCallbackOutcomesTotal.WithLabelValues(
+			LifecycleCallbackOutcomeApplied,
+			LifecycleCallbackVerdictAuthorized,
+			"success",
+		)
 		NonInFlightCallbacksTotal.WithLabelValues("docker", "success")
 	})
 	assert.NotPanics(t, func() {
@@ -368,6 +394,38 @@ func TestOutcomeConstants(t *testing.T) {
 	for _, o := range outcomes {
 		assert.False(t, seen[o], "duplicate outcome constant: %s", o)
 		seen[o] = true
+	}
+}
+
+func TestLifecycleCallbackMetricVocabulary(t *testing.T) {
+	outcomes := []string{
+		LifecycleCallbackOutcomeApplied,
+		LifecycleCallbackOutcomeDropped,
+		LifecycleCallbackOutcomeRetryable,
+	}
+	verdicts := []string{
+		LifecycleCallbackVerdictAuthorized,
+		LifecycleCallbackVerdictLegacy,
+		LifecycleCallbackVerdictTeardownOnly,
+		LifecycleCallbackVerdictRetired,
+		LifecycleCallbackVerdictInvalid,
+		LifecycleCallbackVerdictMissing,
+		LifecycleCallbackVerdictStale,
+		LifecycleCallbackVerdictUnusable,
+		LifecycleCallbackVerdictUnavailable,
+		LifecycleCallbackVerdictUnknown,
+	}
+	for name, values := range map[string][]string{
+		"outcome": outcomes,
+		"verdict": verdicts,
+	} {
+		seen := make(map[string]struct{}, len(values))
+		for _, value := range values {
+			assert.NotEmpty(t, value, "%s label must not be empty", name)
+			_, duplicate := seen[value]
+			assert.False(t, duplicate, "duplicate %s label %q", name, value)
+			seen[value] = struct{}{}
+		}
 	}
 }
 

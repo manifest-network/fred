@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -21,10 +20,14 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 )
 
 // integrationAcknowledger wraps a chain client as an Acknowledger for integration tests.
@@ -44,10 +47,36 @@ func (a *integrationAcknowledger) Acknowledge(ctx context.Context, leaseUUID str
 	return n > 0, hash, nil
 }
 
-// testReconcilerTracker adapts InFlightTracker + PayloadStore to satisfy ReconcilerTracker.
+// testReconcilerTracker adapts the shared operation registry and payload store
+// to the reconciler's narrow production runtime port.
 type testReconcilerTracker struct {
-	provisioner.InFlightTracker
-	store *payload.Store
+	operations *operation.Registry
+	store      *payload.Store
+}
+
+// integrationIdentityBackend models the production HTTP client's
+// identity-bearing inventory contract while keeping these tests' direct,
+// in-process Docker transport seam.
+type integrationIdentityBackend struct {
+	*Backend
+}
+
+func (b integrationIdentityBackend) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]backend.ProvisionInfo, backendidentity.ID, error) {
+	provisions, err := b.ListProvisions(ctx)
+	return provisions, b.StorageIdentity(), err
+}
+
+func (b integrationIdentityBackend) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]backend.RetainedLease, backendidentity.ID, error) {
+	retentions, err := b.ListRetentions(ctx)
+	return retentions, b.StorageIdentity(), err
+}
+
+func (t *testReconcilerTracker) ReconcilerOperations() provisioner.ReconcilerOperations {
+	return t.operations
 }
 
 func (t *testReconcilerTracker) HasPayload(leaseUUID string) (bool, error) {
@@ -58,21 +87,95 @@ func (t *testReconcilerTracker) PayloadStore() *payload.Store {
 	return t.store
 }
 
+// finishProvisionCallback settles the typed operation after this integration
+// harness receives a successful backend callback. The test callback server is
+// intentionally not wired through Manager's callback application service, so
+// the harness must perform the same claim-and-finish transition explicitly.
+func (t *testReconcilerTracker) finishProvisionCallback(leaseUUID string) bool {
+	operations := t.operations
+	record, exists := operations.Lookup(leaseUUID)
+	if !exists {
+		return false
+	}
+	claimed := operations.TryClaimCallback(leaseUUID, record.ID)
+	return claimed.Claimed() && operations.FinishSettlement(claimed.Claim())
+}
+
 // reconcilerTestEnv holds all components for a full-stack reconciler integration test.
 type reconcilerTestEnv struct {
-	backend      *Backend
-	reconciler   *provisioner.Reconciler
-	tracker      *testReconcilerTracker
-	chainClient  *chaintest.MockClient
-	callbackCh   <-chan backend.CallbackPayload
-	callbackURL  string
-	providerUUID string
+	backend        *Backend
+	reconciler     *provisioner.Reconciler
+	tracker        *testReconcilerTracker
+	placementStore *placement.Store
+	chainClient    *chaintest.MockClient
+	callbackCh     <-chan backend.CallbackPayload
+	callbackURL    string
+	providerUUID   string
+}
+
+// installExactLeaseLookupFallback makes the integration chain double obey the
+// same list/get contract as the real ledger. Typed reconciliation re-reads a
+// lease under its lifecycle claim immediately before dispatch; returning nil
+// there means "the lease disappeared" and must safely defer the action. Tests
+// that need a different terminal-state answer install their own GetLeaseFunc,
+// which this helper deliberately preserves.
+func installExactLeaseLookupFallback(chainClient *chaintest.MockClient, providerUUID string) {
+	if chainClient.GetLeaseFunc != nil {
+		return
+	}
+	chainClient.GetLeaseFunc = func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
+		pending, err := chainClient.GetPendingLeases(ctx, providerUUID)
+		if err != nil {
+			return nil, err
+		}
+		for i := range pending {
+			if pending[i].Uuid == leaseUUID {
+				lease := pending[i]
+				return &lease, nil
+			}
+		}
+
+		active, err := chainClient.GetActiveLeasesByProvider(ctx, providerUUID)
+		if err != nil {
+			return nil, err
+		}
+		for i := range active {
+			if active[i].Uuid == leaseUUID {
+				lease := active[i]
+				return &lease, nil
+			}
+		}
+		return nil, nil
+	}
+}
+
+// configureEmptyPlacement replaces the test store's removable seed topology
+// with the exact backend identity and complete empty inventory that the
+// production startup path verifies before admitting lifecycle work.
+func configureEmptyPlacement(t *testing.T, store *placement.Store, b *Backend) {
+	t.Helper()
+	require.NoError(t, store.ConfigureBackendTopologyWithStorageIdentities(
+		[]string{b.Name()},
+		map[string]backendidentity.ID{b.Name(): b.StorageIdentity()},
+	))
+	fence := store.BeginInventorySession()
+	_, err := store.ProjectInventory(fence, placement.InventoryProjection{
+		Complete:      true,
+		EmptyBackends: []string{b.Name()},
+		BackendStorageIdentities: map[string]backendidentity.ID{
+			b.Name(): b.StorageIdentity(),
+		},
+	})
+	store.EndInventorySession(fence)
+	require.NoError(t, err)
 }
 
 // testReconcilerSetup creates a full-stack test environment:
 // real docker backend + reconciler + mock chain + tracker + payload store.
 func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraCfg ...func(*Config)) *reconcilerTestEnv {
 	t.Helper()
+	const providerUUID = testProviderUUID
+	installExactLeaseLookupFallback(chainClient, providerUUID)
 
 	callbackServer, callbackCh := startCallbackServer(t)
 
@@ -87,7 +190,9 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 
 	// Create the router wrapping our real docker backend
 	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
+		Backends: []backend.BackendEntry{{
+			Backend: integrationIdentityBackend{Backend: b}, IsDefault: true,
+		}},
 	})
 	require.NoError(t, err)
 
@@ -99,13 +204,16 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 	t.Cleanup(func() { _ = store.Close() })
 
 	// Create in-flight tracker + reconciler tracker adapter
-	inFlight := provisioner.NewInFlightTracker()
 	tracker := &testReconcilerTracker{
-		InFlightTracker: inFlight,
-		store:           store,
+		operations: operation.NewRegistry(),
+		store:      store,
 	}
-
-	providerUUID := "test-provider"
+	placementStore, err := placementstore.NewStoreForProvider(
+		filepath.Join(t.TempDir(), "placements.db"), providerUUID,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = placementStore.Close() })
+	configureEmptyPlacement(t, placementStore, b)
 
 	// Create a simple acknowledger that delegates to chainClient for integration tests
 	integrationAck := &integrationAcknowledger{chainClient: chainClient}
@@ -121,18 +229,19 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 		integrationAck,
 		router,
 		tracker,
-		nil,
+		placementStore,
 	)
 	require.NoError(t, err)
 
 	return &reconcilerTestEnv{
-		backend:      b,
-		reconciler:   reconciler,
-		tracker:      tracker,
-		chainClient:  chainClient,
-		callbackCh:   callbackCh,
-		callbackURL:  callbackServer.URL,
-		providerUUID: providerUUID,
+		backend:        b,
+		reconciler:     reconciler,
+		tracker:        tracker,
+		placementStore: placementStore,
+		chainClient:    chainClient,
+		callbackCh:     callbackCh,
+		callbackURL:    callbackServer.URL,
+		providerUUID:   providerUUID,
 	}
 }
 
@@ -153,7 +262,7 @@ func makeLease(leaseUUID, tenant, providerUUID, sku string, quantity uint64, met
 }
 
 func TestIntegration_Reconciler_ContainerDied_ReProvisions(t *testing.T) {
-	leaseUUID := fmt.Sprintf("recon-reprov-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
@@ -219,7 +328,7 @@ func TestIntegration_Reconciler_ContainerDied_ReProvisions(t *testing.T) {
 	}
 
 	// Untrack in-flight (simulates what the handler would do on callback)
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Transition lease to ACTIVE
 	mu.Lock()
@@ -268,7 +377,7 @@ func TestIntegration_Reconciler_ContainerDied_ReProvisions(t *testing.T) {
 }
 
 func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
-	leaseUUID := fmt.Sprintf("recon-crash-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
@@ -334,7 +443,7 @@ func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for initial provision callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Transition to ACTIVE
 	mu.Lock()
@@ -370,7 +479,7 @@ func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
 			case <-time.After(2 * time.Minute):
 				t.Fatalf("timeout waiting for re-provision %d callback", i)
 			}
-			env.tracker.UntrackInFlight(leaseUUID)
+			require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 		}
 	}
 
@@ -382,7 +491,7 @@ func TestIntegration_Reconciler_CrashLoop_ClosesLease(t *testing.T) {
 }
 
 func TestIntegration_Reconciler_OrphanCleanup(t *testing.T) {
-	leaseUUID := fmt.Sprintf("recon-orphan-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
@@ -455,7 +564,7 @@ func TestIntegration_Reconciler_OrphanCleanup(t *testing.T) {
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Verify container exists
 	containers := inspectProvisionContainers(t, leaseUUID)
@@ -487,7 +596,7 @@ func TestIntegration_Reconciler_OrphanCleanup(t *testing.T) {
 }
 
 func TestIntegration_Reconciler_MultiContainer_PartialKill_Recovers(t *testing.T) {
-	leaseUUID := fmt.Sprintf("recon-multi-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
@@ -548,7 +657,7 @@ func TestIntegration_Reconciler_MultiContainer_PartialKill_Recovers(t *testing.T
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision success callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Verify 2 containers are running
 	containers := inspectProvisionContainers(t, leaseUUID)
@@ -601,7 +710,7 @@ func TestIntegration_Reconciler_MultiContainer_PartialKill_Recovers(t *testing.T
 }
 
 func TestIntegration_Reconciler_PendingReady_Acknowledges(t *testing.T) {
-	leaseUUID := fmt.Sprintf("recon-ack-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
@@ -653,7 +762,7 @@ func TestIntegration_Reconciler_PendingReady_Acknowledges(t *testing.T) {
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// Second RunOnce → chain still returns PENDING but backend has it Ready
 	// → should acknowledge
@@ -687,7 +796,7 @@ func TestIntegration_Reconciler_PendingReady_Acknowledges(t *testing.T) {
 // drives RunOnce on an interval — mirroring the production reconciler, which
 // self-heals on its next tick — instead of betting on a single tick.
 func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) {
-	leaseUUID := fmt.Sprintf("recon-refresh-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
@@ -739,7 +848,9 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	})
 
 	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
+		Backends: []backend.BackendEntry{{
+			Backend: integrationIdentityBackend{Backend: b}, IsDefault: true,
+		}},
 	})
 	require.NoError(t, err)
 
@@ -749,13 +860,19 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
 
-	inFlight := provisioner.NewInFlightTracker()
 	tracker := &testReconcilerTracker{
-		InFlightTracker: inFlight,
-		store:           store,
+		operations: operation.NewRegistry(),
+		store:      store,
 	}
+	providerUUID := testProviderUUID
+	placementStore, err := placementstore.NewStoreForProvider(
+		filepath.Join(t.TempDir(), "placements.db"), providerUUID,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = placementStore.Close() })
+	configureEmptyPlacement(t, placementStore, b)
 
-	providerUUID := "test-provider"
+	installExactLeaseLookupFallback(mockChain, providerUUID)
 	integrationAck2 := &integrationAcknowledger{chainClient: mockChain}
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
@@ -768,7 +885,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 		integrationAck2,
 		router,
 		tracker,
-		nil,
+		placementStore,
 	)
 	require.NoError(t, err)
 
@@ -790,7 +907,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision success callback")
 	}
-	tracker.UntrackInFlight(leaseUUID)
+	require.True(t, tracker.finishProvisionCallback(leaseUUID))
 
 	// 2. Transition lease to ACTIVE
 	mu.Lock()
@@ -861,7 +978,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 
 func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 	mountPath := setupBtrfsLoopback(t)
-	leaseUUID := fmt.Sprintf("recon-retain-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small" // stateful: DiskMB=1024
 
@@ -903,6 +1020,7 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 
 	env := testReconcilerSetup(t, mockChain, func(cfg *Config) {
 		cfg.VolumeDataPath = mountPath
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.RetainOnClose = true
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
@@ -915,7 +1033,7 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 	// 1. Chain-driven provision.
 	require.NoError(t, env.reconciler.RunOnce(ctx))
 	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, leaseUUID, 3*time.Minute).Status)
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	// 2. Sentinel into the managed volume.
 	cid := getContainerID(t, leaseUUID)
@@ -958,13 +1076,19 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 	require.NotEmpty(t, info.Items, "retained provision must carry the restore-shape Items")
 
 	// 4. Restore into a NEW lease.
-	newLease := fmt.Sprintf("recon-restore-new-%d", time.Now().UnixNano())
+	newLease := newIntegrationLeaseUUID()
+	restoreCallbacks := newIntegrationCallbackAuthority(t, env.callbackURL)
 	require.NoError(t, env.backend.Restore(ctx, backend.RestoreRequest{
 		LeaseUUID: newLease, FromLeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: env.providerUUID,
-		Items:       []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: manifest.DefaultServiceName}},
-		CallbackURL: env.callbackURL,
+		Items:                []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL:          restoreCallbacks.operationURL,
+		LifecycleCallbackURL: restoreCallbacks.lifecycleURL,
 	}))
 	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, newLease, 3*time.Minute).Status)
+	// Callback settlement and source-finalizer deletion are separate durable
+	// crash boundaries. Drive the level-triggered retention reconciler explicitly
+	// instead of waiting for the production sweep cadence.
+	finalizeRestoreRetentionForTest(t, env.backend, env.backend.retentionStore, leaseUUID)
 
 	// 5. Sentinel survived; record gone.
 	out := execInContainer(t, getContainerID(t, newLease), []string{"cat", "/data/sentinel.txt"})
@@ -995,12 +1119,21 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 		}
 	})
 	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: b, IsDefault: true}},
+		Backends: []backend.BackendEntry{{
+			Backend: integrationIdentityBackend{Backend: b}, IsDefault: true,
+		}},
 	})
 	require.NoError(t, err)
+	placementStore, err := placementstore.NewStoreForProvider(
+		filepath.Join(t.TempDir(), "manager-placements.db"), testProviderUUID,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, placementStore.Close()) })
+	configureEmptyPlacement(t, placementStore, b)
 	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
-		ProviderUUID:    "test-provider",
+		ProviderUUID:    testProviderUUID,
 		CallbackBaseURL: callbackServer.URL,
+		PlacementStore:  placementStore,
 	}, router, mockChain)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1016,10 +1149,10 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 
 func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
 	mountPath := setupBtrfsLoopback(t)
-	leaseUUID := fmt.Sprintf("mgr-close-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small"
-	const providerUUID = "test-provider"
+	const providerUUID = testProviderUUID
 
 	mockChain := &chaintest.MockClient{
 		GetLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
@@ -1028,6 +1161,7 @@ func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
 	}
 	mgr, b, callbackCh, callbackURL := testManagerSetup(t, mockChain, func(cfg *Config) {
 		cfg.VolumeDataPath = mountPath // REQUIRED: empty would zero docker-small's DiskMB → stateless → nothing to retain
+		cfg.VolumeMountPath = mountPath
 		cfg.VolumeFilesystem = "btrfs"
 		cfg.RetainOnClose = true
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
@@ -1088,7 +1222,7 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 		originalImage = "busybox:latest"
 		updatedImage  = "alpine:latest"
 	)
-	leaseUUID := fmt.Sprintf("recon-update-%d", time.Now().UnixNano())
+	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	sku := "docker-micro"
 
@@ -1154,7 +1288,7 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for provision success callback")
 	}
-	env.tracker.UntrackInFlight(leaseUUID)
+	require.True(t, env.tracker.finishProvisionCallback(leaseUUID))
 
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.NotEmpty(t, containers)
@@ -1166,9 +1300,15 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	require.NoError(t, env.reconciler.RunOnce(ctx))
 
 	// --- tenant /update: exactly what the API handler does, in the same order ---
+	lifecycleAuthorization := env.placementStore.CurrentLifecycle(leaseUUID)
+	require.Equal(t, placement.LifecycleVerdictAuthorized, lifecycleAuthorization.Verdict())
+	maintenanceCallbackURL, err := provisioner.BuildCallbackURLForLifecycle(
+		env.callbackURL, lifecycleAuthorization.ID(),
+	)
+	require.NoError(t, err)
 	require.NoError(t, env.backend.Update(ctx, backend.UpdateRequest{
 		LeaseUUID:   leaseUUID,
-		CallbackURL: env.callbackURL,
+		CallbackURL: maintenanceCallbackURL,
 		Payload:     payloadV2,
 		PayloadHash: hex.EncodeToString(payload.ComputeHash(payloadV2)),
 	}))

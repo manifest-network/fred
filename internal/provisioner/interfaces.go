@@ -2,9 +2,10 @@ package provisioner
 
 import (
 	"context"
-	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
@@ -20,6 +21,11 @@ type BackendRouter interface {
 	// used to spread concurrent provisions; it may be nil.
 	RouteForProvision(ctx context.Context, sku string, inFlightByBackend map[string]int) backend.Backend
 
+	// RouteForProvisionAmong applies the same provision routing policy while
+	// treating eligibleNames as a hard boundary. It returns nil when neither an
+	// eligible SKU match nor the eligible default backend exists.
+	RouteForProvisionAmong(ctx context.Context, sku string, eligibleNames map[string]struct{}, inFlightByBackend map[string]int) backend.Backend
+
 	// GetBackendByName returns a backend by its name. Returns nil if not found.
 	GetBackendByName(name string) backend.Backend
 
@@ -30,22 +36,139 @@ type BackendRouter interface {
 // Compile-time check that backend.Router implements BackendRouter.
 var _ BackendRouter = (*backend.Router)(nil)
 
-// PlacementStore records which backend is serving each lease so that
-// read operations reach the correct backend after provision routing.
-type PlacementStore interface {
-	Get(leaseUUID string) string
-	SetAt(leaseUUID string) (time.Time, bool)
-	Set(leaseUUID, backendName string) error
-	Delete(leaseUUID string)
-	SetBatch(placements map[string]string) error
-	Count() int
-	List() []string
-	Healthy() error
-	Close() error
+// PlacementView is the read-only placement projection shared by routing and
+// lifecycle consumers. Holding a view never authorizes a placement mutation.
+type PlacementView interface {
+	Lookup(leaseUUID string) placement.Placement
+	List() map[string]placement.Placement
 }
 
-// Compile-time check that placement.Store implements PlacementStore.
-var _ PlacementStore = (*placement.Store)(nil)
+// Compile-time check for the concrete durable store.
+var _ PlacementView = (*placement.Store)(nil)
+
+// PlacementProviderAuthority proves that a placement authority belongs to the
+// exact provider whose chain lifecycle a runtime will drive. Keeping this as a
+// narrow port lets independently constructed Manager and Reconciler instances
+// reject a cross-provider authority mix before they can derive absence,
+// ownership, or backend-mutation permission from the wrong database.
+type PlacementProviderAuthority interface {
+	VerifyProviderUUID(string) error
+}
+
+var _ PlacementProviderAuthority = (*placement.Store)(nil)
+
+// ProvisionOperations is the process-local lifecycle authority needed by the
+// event-driven provision coordinator. Its opaque capabilities keep the
+// prepare/call/settle transitions exact while allowing callers and tests to
+// supply the narrow port instead of the Registry implementation.
+type ProvisionOperations interface {
+	CountsByBackend() map[string]int
+	TryInitiateClaimed(operation.LeaseClaim, operation.TrackSpec) operation.InitiationResult
+	BeginCall(operation.Initiation) bool
+	Activate(operation.Initiation) operation.InitiationCompletion
+	AbortInitiation(operation.Initiation) operation.InitiationCompletion
+	Lookup(string) (operation.Record, bool)
+	TryClaimDeprovision(string, operation.OperationID) operation.SettlementResult
+	ReleaseSettlement(operation.SettlementClaim) bool
+	FinishSettlement(operation.SettlementClaim) bool
+	TryClaimLeaseNow(string) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
+}
+
+// ReconcilerOperations is the process-local lifecycle authority needed by the
+// level-triggered reconciler. Snapshot-scoped lease claims and phase-aware
+// initiation are deliberately exposed together because a reconciled backend
+// side effect must hold both halves of that causal boundary.
+type ReconcilerOperations interface {
+	Contains(string) bool
+	Snapshot() operation.TrackerSnapshot
+	LeaseUUIDs() []string
+	TryClaimLease(string, operation.TrackerSnapshot) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
+	Lookup(string) (operation.Record, bool)
+	CountsByBackend() map[string]int
+	TryInitiateClaimed(operation.LeaseClaim, operation.TrackSpec) operation.InitiationResult
+	RecoverClaimed(operation.LeaseClaim, operation.OperationID, operation.TrackSpec) operation.RecoveryResult
+	BeginCall(operation.Initiation) bool
+	Activate(operation.Initiation) operation.InitiationCompletion
+	AbortInitiation(operation.Initiation) operation.InitiationCompletion
+}
+
+// RestoreOperations is the process-local lifecycle authority exposed to the
+// restore application service. It deliberately omits reconciliation,
+// callback, timeout, observation, and shutdown transitions.
+type RestoreOperations interface {
+	TryClaimLeaseNow(string) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
+	TryInitiateClaimed(operation.LeaseClaim, operation.TrackSpec) operation.InitiationResult
+	BindBackend(operation.Initiation, string) bool
+	BeginCall(operation.Initiation) bool
+	Activate(operation.Initiation) operation.InitiationCompletion
+	AbortInitiation(operation.Initiation) operation.InitiationCompletion
+}
+
+// MaintenanceClaims is the exact per-lease exclusion authority needed by
+// restart and update handlers. It cannot start or settle lifecycle operations.
+type MaintenanceClaims interface {
+	TryClaimLeaseNow(string) operation.LeaseClaimResult
+	ReleaseLease(operation.LeaseClaim) bool
+}
+
+var _ ProvisionOperations = (*operation.Registry)(nil)
+var _ ReconcilerOperations = (*operation.Registry)(nil)
+var _ RestoreOperations = (*operation.Registry)(nil)
+var _ MaintenanceClaims = (*operation.Registry)(nil)
+
+// ProvisionPlacement is the exact placement capability needed to initiate a
+// provision. It cannot project inventory, change readiness, settle callbacks,
+// or prune records.
+type ProvisionPlacement interface {
+	PlacementView
+	CurrentAdmissionBaseline() placement.AdmissionBaseline
+	ScopeAdmission(placement.AdmissionBaseline, []string) (placement.AdmissionScope, error)
+	BeginNewAttempt(placement.AdmissionScope, string, string, operation.OperationID, placement.PayloadFingerprint, placement.BackendRequestSnapshot, placement.CallbackPair) (placement.AttemptToken, bool, error)
+	BeginOwnedAttempt(placement.AdmissionBaseline, placement.RecordRevision, string, operation.OperationID, placement.PayloadFingerprint, placement.BackendRequestSnapshot, placement.CallbackPair) (placement.AttemptToken, bool, error)
+	ConfirmAttempt(placement.AttemptToken) (bool, error)
+	RefuseAttempt(placement.AttemptToken) (bool, error)
+}
+
+// ReconcilerPlacement is the inventory and repair authority owned by
+// reconciliation. It includes scoped attempt admission for repair work while
+// excluding callback settlement by operation identity.
+type ReconcilerPlacement interface {
+	PlacementView
+	PlacementProviderAuthority
+	VerifyBackendTopology([]string) error
+	ExpectedBackendStorageIdentity(string) (backendidentity.ID, bool)
+	CurrentAdmissionBaseline() placement.AdmissionBaseline
+	ScopeAdmission(placement.AdmissionBaseline, []string) (placement.AdmissionScope, error)
+	BeginInventorySession() placement.InventoryFence
+	EndInventorySession(placement.InventoryFence)
+	ProjectInventory(placement.InventoryFence, placement.InventoryProjection) (placement.ProjectionResult, error)
+	BeginNewAttempt(placement.AdmissionScope, string, string, operation.OperationID, placement.PayloadFingerprint, placement.BackendRequestSnapshot, placement.CallbackPair) (placement.AttemptToken, bool, error)
+	BeginOwnedAttempt(placement.AdmissionBaseline, placement.RecordRevision, string, operation.OperationID, placement.PayloadFingerprint, placement.BackendRequestSnapshot, placement.CallbackPair) (placement.AttemptToken, bool, error)
+	ConfirmAttempt(placement.AttemptToken) (bool, error)
+	RefuseAttempt(placement.AttemptToken) (bool, error)
+	ClaimAttempt(string, operation.OperationID) (placement.AttemptClaim, bool, error)
+	ReleaseAttemptClaim(placement.AttemptClaim) bool
+	ConfirmClaimedAttempt(placement.AttemptClaim) (bool, error)
+	RefuseClaimedAttempt(placement.AttemptClaim) (bool, error)
+	DeleteRecord(placement.RecordRevision) (bool, error)
+}
+
+// PlacementAuthorityStore is the composition-root aggregate implemented by
+// the durable store. Consumers receive one of the narrower ports above (or
+// CallbackPlacement), so unrelated authority is unavailable by construction.
+type PlacementAuthorityStore interface {
+	ProvisionPlacement
+	ReconcilerPlacement
+	CallbackLifecycleAuthority
+	CallbackPlacement
+}
+
+var _ ProvisionPlacement = (*placement.Store)(nil)
+var _ ReconcilerPlacement = (*placement.Store)(nil)
+var _ PlacementAuthorityStore = (*placement.Store)(nil)
 
 // LeaseRejecter defines the interface for rejecting leases on chain.
 // This is used by the TimeoutChecker to reject timed-out leases.

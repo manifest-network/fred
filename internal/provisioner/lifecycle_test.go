@@ -42,7 +42,7 @@ func newLifecycleTestManagerWithPayloadStore(t *testing.T, payloadStore *payload
 	})
 	require.NoError(t, err)
 
-	m, err := NewManager(ManagerConfig{
+	m, err := newTestManager(t, ManagerConfig{
 		ProviderUUID:     "provider-1",
 		CallbackBaseURL:  "http://localhost:8080",
 		PayloadStore:     payloadStore,
