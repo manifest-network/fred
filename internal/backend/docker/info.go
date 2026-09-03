@@ -191,14 +191,15 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 		}
 		if entry != nil {
 			return &backend.ProvisionInfo{
-				LeaseUUID:    entry.LeaseUUID,
-				ProviderUUID: entry.ProviderUUID,
-				Status:       backend.ProvisionStatusFailed,
-				CreatedAt:    entry.CreatedAt,
-				BackendName:  b.cfg.Name,
-				FailCount:    entry.FailCount,
-				Reason:       defaultReason(backend.ProvisionStatusFailed, entry.Reason),
-				Message:      entry.Message,
+				LeaseUUID:           entry.LeaseUUID,
+				ProviderUUID:        entry.ProviderUUID,
+				Status:              backend.ProvisionStatusFailed,
+				CreatedAt:           entry.CreatedAt,
+				BackendName:         b.cfg.Name,
+				FailCount:           entry.FailCount,
+				Reason:              defaultReason(backend.ProvisionStatusFailed, entry.Reason),
+				Message:             entry.Message,
+				LifecycleGeneration: entry.LifecycleGeneration,
 			}, nil
 		}
 	}

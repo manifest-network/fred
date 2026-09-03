@@ -1918,6 +1918,56 @@ func TestGetProvision_LegacyDiagEntry_NoVerboseLeak(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	assert.NotContains(t, info.Message, "/data/fred/volumes", "verbose operator detail must not leak into the tenant Message")
 	assert.Equal(t, backend.ReasonUnknown, info.Reason, "failed + empty reason must default to Unknown")
+	assert.Nil(t, info.LifecycleGeneration, "pre-upgrade diagnostics remain readable as unknown")
+}
+
+func TestGetProvision_DiagnosticsFallbackPreservesTypedLifecycleGeneration(t *testing.T) {
+	const (
+		leaseUUID   = "lease-typed-diagnostics"
+		lifecycleID = "9a72fbc1-38c8-4f31-87f7-f689979b9324"
+	)
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+	b.retentionStore = nil
+
+	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "diag.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = diagStore.Close() })
+	b.diagnosticsStore = diagStore
+
+	entry := leasesm.DiagnosticSnapshot(&leasesm.ProvisionState{
+		LeaseUUID:            leaseUUID,
+		ProviderUUID:         nominalDockerProviderUUID,
+		Tenant:               "tenant-a",
+		LastError:            "registry unavailable",
+		Reason:               backend.ReasonImagePullFailed,
+		Message:              "image pull failed",
+		FailCount:            1,
+		CallbackURL:          "https://fred.example/callbacks/provision?operation_id=" + lifecycleID,
+		LifecycleCallbackURL: "https://fred.example/callbacks/provision?lifecycle_id=" + lifecycleID,
+	})
+	require.NoError(t, diagStore.Store(entry))
+
+	info, err := b.GetProvision(context.Background(), leaseUUID)
+	require.NoError(t, err)
+	assert.Equal(t, &backend.LifecycleGenerationObservation{
+		Kind: backend.LifecycleGenerationTyped,
+		ID:   lifecycleID,
+	}, info.LifecycleGeneration)
+
+	listed, err := b.ListProvisions(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, listed, "diagnostic rows must not enter authoritative full inventory")
+
+	page, next, err := b.ListProvisionsPage(context.Background(), "", 100)
+	require.NoError(t, err)
+	assert.Empty(t, page, "diagnostic rows must not enter authoritative paged inventory")
+	assert.Empty(t, next)
+
+	lookedUp, err := b.LookupProvisions(context.Background(), []string{leaseUUID})
+	require.NoError(t, err)
+	assert.Empty(t, lookedUp, "diagnostic rows must not enter authoritative lookup inventory")
 }
 
 // --- Workload field fixtures ---
@@ -3302,6 +3352,7 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer callbackServer.Close()
+	const leaseUUID = "lease-diag"
 
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
@@ -3314,7 +3365,7 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	rebuildCallbackSender(b, callbackServer.Client())
 
 	req := backend.ProvisionRequest{
-		LeaseUUID:    "lease-diag",
+		LeaseUUID:    leaseUUID,
 		Tenant:       "tenant-a",
 		ProviderUUID: "prov-1",
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
@@ -3331,7 +3382,7 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	// Verify diagnostics were persisted. entry.Error carries the VERBOSE
 	// operator detail (the raw underlying error) — this is the operator-only
 	// side that never reaches the tenant (ENG-508).
-	entry, err := diagStore.Get("lease-diag")
+	entry, err := diagStore.Get(leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, entry)
 	assert.Contains(t, entry.Error, "image pull failed")
@@ -3339,21 +3390,26 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	assert.Equal(t, 1, entry.FailCount)
 	assert.Equal(t, "tenant-a", entry.Tenant)
 	assert.Equal(t, "prov-1", entry.ProviderUUID)
+	wantGeneration := &backend.LifecycleGenerationObservation{
+		Kind: backend.LifecycleGenerationLegacy,
+	}
+	assert.Equal(t, wantGeneration, entry.LifecycleGeneration)
 
 	// In-memory GetProvision should still work.
-	info, err := b.GetProvision(context.Background(), "lease-diag")
+	info, err := b.GetProvision(context.Background(), leaseUUID)
 	require.NoError(t, err)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
+	assert.Equal(t, wantGeneration, info.LifecycleGeneration)
 
 	// Now simulate deprovision (remove from in-memory map).
 	b.provisionsMu.Lock()
-	delete(b.provisions, "lease-diag")
+	delete(b.provisions, leaseUUID)
 	b.provisionsMu.Unlock()
 
 	// GetProvision should fall back to diagnostics store. The tenant-facing
 	// ProvisionInfo carries only the curated Reason/Message — never the verbose
 	// operator detail (ENG-508).
-	info, err = b.GetProvision(context.Background(), "lease-diag")
+	info, err = b.GetProvision(context.Background(), leaseUUID)
 	require.NoError(t, err)
 	assert.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	// (reason, message) must be consistent: an image-pull failure reports
@@ -3363,6 +3419,8 @@ func TestProvision_FailurePersistsDiagnostics(t *testing.T) {
 	assert.NotContains(t, info.Message, "registry unreachable", "curated Message must not carry the verbose cause")
 	assert.Equal(t, 1, info.FailCount)
 	assert.Equal(t, "prov-1", info.ProviderUUID)
+	assert.Equal(t, wantGeneration, info.LifecycleGeneration,
+		"diagnostics fallback must retain the failed provision's lifecycle-generation observation")
 
 	// GetProvision for unknown lease still returns ErrNotProvisioned.
 	_, err = b.GetProvision(context.Background(), "nonexistent")

@@ -616,6 +616,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Docker failure diagnostics now persist and re-project the non-secret
+  lifecycle generation observed from the provision's callback pair. Removing
+  an in-memory failed provision therefore no longer downgrades its diagnostics
+  fallback to an unknown observation. Diagnostics remain non-authoritative and
+  excluded from full inventory and placement settlement. (ENG-632)
 - Docker crash recovery now preserves an exact provision cohort while its
   containers or required health checks are still transitional; a later healthy
   inventory settles the original operation instead of tearing the cohort down

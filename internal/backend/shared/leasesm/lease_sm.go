@@ -1432,21 +1432,28 @@ func ShortID(id string) string {
 // Use only for diagnostics-store writes; not a general ProvisionState
 // projection helper.
 //
-// Omits SKU, Image, Status, Quantity, CallbackURL, Items, ContainerIDs,
-// Manifest, StackManifest, and ServiceContainers — those are operational
-// state that's either already on the lease's authoritative record or
-// not relevant to the on-disk diagnostic blob a future operator reads
-// to understand a failure.
+// Omits SKU, Image, Status, Quantity, the raw callback URLs, Items,
+// ContainerIDs, Manifest, StackManifest, and ServiceContainers — those are
+// operational state that's either already on the lease's authoritative record
+// or not relevant to the on-disk diagnostic blob a future operator reads. The
+// callback pair is reduced to its historical, non-secret lifecycle-generation
+// observation so a singular diagnostics fallback preserves read-model parity.
+// It does not grant causal authority and must not enter fleet inventory or
+// settlement.
 func DiagnosticSnapshot(prov *ProvisionState) shared.DiagnosticEntry {
+	lifecycleGeneration := backend.ObserveLifecycleGeneration(
+		prov.CallbackURL, prov.LifecycleCallbackURL,
+	)
 	return shared.DiagnosticEntry{
-		LeaseUUID:    prov.LeaseUUID,
-		ProviderUUID: prov.ProviderUUID,
-		Tenant:       prov.Tenant,
-		Error:        prov.LastError,
-		Reason:       prov.Reason,
-		Message:      prov.Message,
-		FailCount:    prov.FailCount,
-		CreatedAt:    time.Now(),
+		LeaseUUID:           prov.LeaseUUID,
+		ProviderUUID:        prov.ProviderUUID,
+		Tenant:              prov.Tenant,
+		Error:               prov.LastError,
+		Reason:              prov.Reason,
+		Message:             prov.Message,
+		FailCount:           prov.FailCount,
+		LifecycleGeneration: &lifecycleGeneration,
+		CreatedAt:           time.Now(),
 	}
 }
 

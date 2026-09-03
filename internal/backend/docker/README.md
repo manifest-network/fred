@@ -1153,6 +1153,14 @@ If log retrieval fails for a specific instance, its value is the placeholder `<l
 
 Returns a single provision record. This is the primary endpoint for retrieving full failure diagnostics after a sanitized callback.
 
+For newly persisted failure diagnostics, `lifecycle_generation` remains the
+same non-secret observation before and after this endpoint falls back to
+`diagnostics.db`. Pre-upgrade rows omit the field and remain readable as
+unknown. This historical value is read-model metadata only: the recreateable
+diagnostics store carries no lifecycle authority, diagnostics-only rows never
+enter `GET /provisions` inventory, and no settlement or repair decision may
+rely on the singular fallback.
+
 **Response (`200`):**
 
 ```json

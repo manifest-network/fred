@@ -283,9 +283,10 @@ const (
 	LifecycleGenerationUnusable LifecycleGenerationKind = "unusable"
 )
 
-// LifecycleGenerationObservation is an internal backend-inventory fact. A nil
+// LifecycleGenerationObservation is an internal backend observation. A nil
 // *LifecycleGenerationObservation on ProvisionInfo is equivalent to Unknown
-// and preserves compatibility with older and third-party backends.
+// and preserves compatibility with older and third-party backends. Its
+// authority depends on the provenance documented on ProvisionInfo's field.
 type LifecycleGenerationObservation struct {
 	Kind LifecycleGenerationKind `json:"kind"`
 	ID   string                  `json:"id,omitempty"`
@@ -321,9 +322,11 @@ type ProvisionInfo struct {
 
 	// LifecycleGeneration reports only the class and, for current typed
 	// callbacks, canonical UUID of the callback pair persisted by the backend.
-	// It is consumed by providerd reconciliation and MUST NOT be copied into a
-	// tenant-facing response. Nil means that the backend did not report this
-	// upgraded internal observation.
+	// Only an observation from complete identity-bearing ListProvisions inventory
+	// is settlement evidence. A point lookup may repeat a historical diagnostics
+	// observation for read-model continuity, but it is never settlement authority.
+	// The field MUST NOT be copied into a tenant-facing response. Nil means that
+	// the backend did not report this upgraded internal observation.
 	LifecycleGeneration *LifecycleGenerationObservation `json:"lifecycle_generation,omitempty"`
 
 	// Partition is the retained record's optional sub-tenant grouping key

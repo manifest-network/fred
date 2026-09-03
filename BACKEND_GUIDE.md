@@ -440,7 +440,7 @@ List currently provisioned resources. Used by Fred for reconciliation. Keyset-pa
 - `fail_count` - Number of provision failures for this lease
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
 - `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
-- `lifecycle_generation` (optional) - Non-secret internal observation of the callback pair actually persisted for this live provision: `unknown`, `legacy`, `typed` (with one canonical UUIDv4 `id`), or `unusable`. Never return either callback URL here. Omission is backward-compatible and is treated as `unknown`; retained-only/diagnostic records should omit it. Fred uses an exact typed match to settle a durable attempt and to verify lifecycle authority against its prepared placement database; it never treats this field as permission to bootstrap an absent authority file.
+- `lifecycle_generation` (optional) - Non-secret internal observation of the callback pair actually persisted for this live provision: `unknown`, `legacy`, `typed` (with one canonical UUIDv4 `id`), or `unusable`. Never return either callback URL here. Omission is backward-compatible and is treated as `unknown`; retained-only records should omit it, and diagnostic-only records MUST NOT appear in list/lookup inventory. Fred uses an exact typed match from a complete, identity-bearing inventory to settle a durable attempt and to verify lifecycle authority against its prepared placement database; it never treats this field as permission to bootstrap an absent authority file. A singular `GET /provisions/{lease_uuid}` diagnostics fallback may repeat its historically captured observation for read-model continuity, but that expiring/recreateable diagnostic is not settlement or repair authority.
 - `image` / `sku` (omitempty) - Image and SKU for non-stack (single-service) leases
 - `quantity` - Total expected container count across all items
 - `items` (omitempty) - Per-service items for stack leases
@@ -478,6 +478,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 - `fail_count` - Number of provision failures
 - `reason` (omitempty) - Stable machine-readable failure category (CamelCase, e.g. `ContainerExited`, `ImagePullFailed`, `Internal`, `Unknown`). Open/add-only set; consumers must tolerate unknown values.
 - `message` (omitempty) - Curated human-readable failure message. MUST NOT contain host paths or raw command output (those stay in the backend's own logs).
+- `lifecycle_generation` (optional) - A live record reports the same non-secret observation described for `GET /provisions`. A persisted diagnostics fallback may repeat the historical observation captured with the failure so point reads do not change shape after teardown. It remains observability only: diagnostic rows are excluded from list/lookup inventory and MUST NOT authorize settlement, repair, or mutation.
 
 **Error Responses:**
 - `404 Not Found` - Lease not provisioned (or diagnostics expired)
