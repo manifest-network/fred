@@ -611,6 +611,76 @@ func TestProvision_ReProvisionFailed(t *testing.T) {
 	b.wg.Wait()
 }
 
+func TestProvision_ReProvisionUsesLockedPredecessorSnapshot(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440101"
+	payload := validManifestJSON("nginx:latest")
+	removeCalls := 0
+	mock := &mockDockerClient{
+		RemoveContainerFn: func(context.Context, string) error {
+			removeCalls++
+			return nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, map[string]*provision{
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Status: backend.ProvisionStatusFailed,
+			FailCount: 2, Quantity: 1, ContainerIDs: []string{"old-container"},
+		}},
+	})
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-app-0", "docker-small", "tenant-a"))
+	prepareFailedProvisionReplacement(t, b, mock, leaseUUID, "tenant-a", "docker-small", payload)
+
+	b.provisionsMu.RLock()
+	predecessor := b.provisions[leaseUUID]
+	b.provisionsMu.RUnlock()
+	// Legacy/compact projections may have only the Docker wrapper's immutable
+	// resource authority populated; the actor mirror is not the source of truth.
+	b.provisionsMu.Lock()
+	predecessor.ProvisionState.ResourceProfiles = nil
+	b.provisionsMu.Unlock()
+	baseList := mock.ListManagedContainersFn
+	listEntered := make(chan struct{})
+	releaseList := make(chan struct{})
+	var enterOnce sync.Once
+	mock.ListManagedContainersFn = func(ctx context.Context) ([]ContainerInfo, error) {
+		enterOnce.Do(func() { close(listEntered) })
+		<-releaseList
+		return baseList(ctx)
+	}
+
+	req := newProvisionRequest(leaseUUID, "tenant-a", "docker-small", 1, payload)
+	req.CallbackURL = "https://new.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+	result := make(chan error, 1)
+	go func() { result <- b.Provision(t.Context(), req) }()
+	select {
+	case <-listEntered:
+	case <-time.After(3 * time.Second):
+		close(releaseList)
+		t.Fatal("replacement provision did not reach predecessor inventory")
+	}
+
+	// Model a lock-correct in-place actor update after Provision releases its
+	// initial lock. Pointer identity alone is an ABA-prone CAS: the read-only
+	// validation must notice the changed value before it tears anything down.
+	b.provisionsMu.Lock()
+	predecessor.Message = "actor update after snapshot"
+	b.provisionsMu.Unlock()
+	close(releaseList)
+
+	err := waitForAsyncTestResult(t, result, "replacement provision snapshot validation")
+	require.ErrorContains(t, err, "predecessor changed during read-only validation")
+	b.provisionsMu.RLock()
+	current := b.provisions[leaseUUID]
+	b.provisionsMu.RUnlock()
+	assert.Same(t, predecessor, current, "a changed predecessor must remain authoritative")
+	assert.Equal(t, "actor update after snapshot", current.Message)
+	assert.Zero(t, removeCalls, "changed predecessor validation must fail before teardown")
+}
+
 // TestProvision_ReProvision_ClearsVolumeCleanupAttempts is a regression
 // guard for the bug where re-provision of a failed lease inherited a
 // stale volumeCleanupAttempts counter from the previous provision.

@@ -294,12 +294,13 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 			return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
 		}
 		return &xfsVolumeManager{
-			dataPath:        dataPath,
-			mountPoint:      mountPoint,
-			logger:          logger,
-			minAvgFileBytes: minAvgFileBytes,
-			activeIDs:       make(map[uint32]string),
-			volumeToID:      make(map[string]uint32),
+			dataPath:          dataPath,
+			mountPoint:        mountPoint,
+			logger:            logger,
+			minAvgFileBytes:   minAvgFileBytes,
+			projectAttributes: linuxXFSProjectAttributeReader{},
+			activeIDs:         make(map[uint32]string),
+			volumeToID:        make(map[string]uint32),
 		}, nil
 	case "zfs":
 		return &zfsVolumeManager{dataPath: dataPath, logger: logger}, nil

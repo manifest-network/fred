@@ -1667,13 +1667,14 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	assert.True(t, xfsReportListsProject(t, mount, projID), "nonzero open-inode usage must retain the dquot")
 
 	// Recovery must have repaired the replayed pre-reset sibling before its zero
-	// proof. Accept only xfs_quota's recognized clean project-check report.
-	checkCmd := xfsProjectCheckDefaultCmd(deleteStagePath)
-	checkProcess := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(checkCmd, mount)...)
-	checkProcess.Env = append(os.Environ(), "LC_ALL=C")
-	checkOut, checkErr := checkProcess.CombinedOutput()
-	require.NoError(t, checkErr, "check recovered delete-stage project: %s", checkOut)
-	require.NoError(t, validateXFSProjectCheckOutput(checkOut, deleteStagePath))
+	// proof. Read the typed kernel attribute rather than xfsprogs report prose.
+	deleteStageRoot, err := os.OpenRoot(deleteStagePath)
+	require.NoError(t, err)
+	deleteStageAttr, readAttrErr := (linuxXFSProjectAttributeReader{}).ReadProjectAttributes(deleteStageRoot)
+	closeRootErr := deleteStageRoot.Close()
+	require.NoError(t, readAttrErr)
+	require.NoError(t, closeRootErr)
+	require.NoError(t, validateXFSDefaultProject(deleteStageAttr))
 
 	require.NoError(t, dataFile.Close(), "closing the last reference releases the unlinked project inode")
 	restartedAgain, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())

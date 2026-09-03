@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -52,45 +53,28 @@ func prepareDeleteStageForTest(
 	require.NoError(t, mgr.rememberDurableDeleteStage(stage))
 }
 
-func TestValidateXFSProjectCheckOutput(t *testing.T) {
+func TestValidateXFSDefaultProject(t *testing.T) {
 	t.Parallel()
+	assert.Equal(t, uintptr(28), unsafe.Sizeof(linuxFSXAttr{}),
+		"FS_IOC_FSGETXATTR encodes the stable Linux UAPI structure size")
 
-	const dirPath = "/srv/fred/volumes/.fred-xfs-delete-42-volume"
-	cleanSummary := "Checking project 0 (path " + dirPath + ")...\n" +
-		"Processed 1 (/custom/projects and cmdline) paths for project 0 with recursion depth limited (0).\n"
 	tests := []struct {
 		name    string
-		out     string
+		attr    linuxFSXAttr
 		wantErr bool
 	}{
-		{name: "silent clean report"},
-		{name: "current clean summary", out: cleanSummary},
 		{
-			name: "project id mismatch",
-			out: "Checking project 0 (path " + dirPath + ")...\n" +
-				dirPath + " - project identifier is not set (inode=42, tree=0)\n" +
-				"Processed 1 (/etc/projects and cmdline) paths for project 0 with recursion depth limited (0).\n",
-			wantErr: true,
+			name: "default project with inheritance",
+			attr: linuxFSXAttr{XFlags: linuxFSXFlagProjInherit},
 		},
-		{
-			name: "inheritance mismatch",
-			out: "Checking project 0 (path " + dirPath + ")...\n" +
-				dirPath + " - project inheritance flag is not set\n" +
-				"Processed 1 (/etc/projects and cmdline) paths for project 0 with recursion depth limited (0).\n",
-			wantErr: true,
-		},
-		{name: "wrong path", out: strings.Replace(cleanSummary, dirPath, "/wrong", 1), wantErr: true},
-		{name: "wrong project", out: strings.Replace(cleanSummary, "project 0", "project 7", 1), wantErr: true},
-		{name: "wrong count", out: strings.Replace(cleanSummary, "Processed 1", "Processed 2", 1), wantErr: true},
-		{name: "wrong depth", out: strings.Replace(cleanSummary, "limited (0)", "limited (1)", 1), wantErr: true},
-		{name: "extra output", out: cleanSummary + "warning\n", wantErr: true},
-		{name: "localized output", out: "Verification du projet 0...\nTraite 1 chemin.\n", wantErr: true},
+		{name: "missing inheritance", wantErr: true},
+		{name: "non-default project", attr: linuxFSXAttr{ProjectID: 42}, wantErr: true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := validateXFSProjectCheckOutput([]byte(tc.out), dirPath)
+			err := validateXFSDefaultProject(tc.attr)
 			if tc.wantErr {
 				require.Error(t, err)
 				return
@@ -145,6 +129,32 @@ esac`,
 	blockProofAt := strings.Index(commandText, xfsProjectReportCmd("b", xfsDeleteTestProjectID))
 	require.GreaterOrEqual(t, triggerAt, 0)
 	assert.Greater(t, blockProofAt, triggerAt)
+}
+
+func TestReadProjectQuotaUsageRejectsSuccessfulDiagnosticStderr(t *testing.T) {
+	mgr := newXfsManagerForTest(t.TempDir())
+	installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"%s"*)
+    printf '#%d 0 0 0 0\n'
+    printf 'cannot setup path\n' >&2
+    ;;
+esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID), xfsDeleteTestProjectID))
+
+	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	require.ErrorContains(t, err, "diagnostic stderr")
+}
+
+func TestReadProjectQuotaUsageReportsNonzeroExitStderrSeparately(t *testing.T) {
+	mgr := newXfsManagerForTest(t.TempDir())
+	installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"%s"*)
+    printf 'quota device unavailable\n' >&2
+    exit 23
+    ;;
+esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID)))
+
+	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	require.ErrorContains(t, err, "stderr: quota device unavailable")
 }
 
 func TestParseXFSDeleteStageNameRequiresCanonicalTypedAuthority(t *testing.T) {
@@ -265,9 +275,7 @@ func TestXFSPrepareDeleteStageResetsAndAttestsDefaultProjectBeforePublication(t 
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
-	logPath := installXFSQuotaFixture(t, `case "$*" in
-  *"project -c -d 0"*) test "$LC_ALL" = C || exit 24 ;;
-esac`)
+	logPath := installXFSQuotaFixture(t, "")
 	root, parent, err := openXFSRootCapabilities(dataPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
@@ -276,28 +284,68 @@ esac`)
 	commands, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	lines := strings.Split(strings.TrimSpace(string(commands)), "\n")
-	require.Len(t, lines, 2)
+	require.Len(t, lines, 1)
 	assert.Contains(t, lines[0], xfsProjectResetToDefaultCmd(stage.hostPath(dataPath)))
-	assert.Contains(t, lines[1], xfsProjectCheckDefaultCmd(stage.hostPath(dataPath)))
 	assert.DirExists(t, stage.hostPath(dataPath))
 	assert.Equal(t, stage, mgr.durableDeleteStages[stage.volumeID.value()])
 }
 
-func TestXFSPrepareDeleteStageRejectsFailedDefaultProjectAttestation(t *testing.T) {
+func TestXFSPrepareDeleteStageRollsBackFailedDefaultProjectReset(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
 	installXFSQuotaFixture(t, `case "$*" in
-  *"project -c -d 0"*) printf 'mismatched-stage-path\n' ;;
+  *"project -s -d 0"*) exit 24 ;;
 esac`)
 	root, parent, err := openXFSRootCapabilities(dataPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
 
 	err = mgr.prepareXFSDeleteStage(t.Context(), root, parent, stage)
-	require.ErrorContains(t, err, "reported mismatched inodes")
-	assert.NoDirExists(t, stage.hostPath(dataPath), "failed attestation must durably roll back the unpublished sibling")
+	require.ErrorContains(t, err, "reset xfs delete-stage")
+	assert.NoDirExists(t, stage.hostPath(dataPath), "failed reset must durably roll back the unpublished sibling")
 	assert.Empty(t, mgr.durableDeleteStages)
+}
+
+func TestXFSPrepareDeleteStageRollsBackFailedProjectAttributeAttestation(t *testing.T) {
+	readFailure := errors.New("injected project-attribute read failure")
+	for _, tc := range []struct {
+		name   string
+		reader fixedXFSProjectAttributeReader
+		want   string
+	}{
+		{
+			name:   "read failure",
+			reader: fixedXFSProjectAttributeReader{err: readFailure},
+			want:   readFailure.Error(),
+		},
+		{
+			name: "attribute mismatch",
+			reader: fixedXFSProjectAttributeReader{attr: linuxFSXAttr{
+				ProjectID: xfsDeleteTestProjectID,
+				XFlags:    linuxFSXFlagProjInherit,
+				Padding:   [8]byte{},
+			}},
+			want: "remains assigned to project",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataPath := t.TempDir()
+			mgr := newXfsManagerForTest(dataPath)
+			mgr.projectAttributes = tc.reader
+			stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+			installXFSQuotaFixture(t, "")
+			root, parent, err := openXFSRootCapabilities(dataPath)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
+
+			err = mgr.prepareXFSDeleteStage(t.Context(), root, parent, stage)
+			require.ErrorContains(t, err, tc.want)
+			assert.NoDirExists(t, stage.hostPath(dataPath),
+				"failed kernel attestation must durably roll back the unpublished sibling")
+			assert.Empty(t, mgr.durableDeleteStages)
+		})
+	}
 }
 
 func TestXFSDestroyMarkerFirstPartialDeleteRecoversAfterRestart(t *testing.T) {
@@ -518,11 +566,9 @@ func TestXFSRecoveredPreResetDeleteStageIsNormalizedBeforeCleanup(t *testing.T) 
 	require.NoError(t, err)
 	logText := string(commands)
 	resetAt := strings.Index(logText, xfsProjectResetToDefaultCmd(stage.hostPath(dataPath)))
-	checkAt := strings.Index(logText, xfsProjectCheckDefaultCmd(stage.hostPath(dataPath)))
 	blockProofAt := strings.Index(logText, "report -p -b -n -N")
 	require.GreaterOrEqual(t, resetAt, 0)
-	assert.Greater(t, checkAt, resetAt)
-	assert.Greater(t, blockProofAt, checkAt, "usage proof must follow recovered-stage normalization")
+	assert.Greater(t, blockProofAt, resetAt, "usage proof must follow recovered-stage normalization")
 	assert.NoDirExists(t, stage.hostPath(dataPath))
 }
 

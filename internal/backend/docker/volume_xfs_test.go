@@ -159,11 +159,12 @@ func TestXfsQuotaArgs_TrailingArgIsMountpoint(t *testing.T) {
 // Destroy teardown path without any live XFS mount or xfs_quota tooling.
 func newXfsManagerForTest(dataPath string) *xfsVolumeManager {
 	return &xfsVolumeManager{
-		dataPath:   dataPath,
-		mountPoint: dataPath,
-		logger:     slog.Default(),
-		activeIDs:  make(map[uint32]string),
-		volumeToID: make(map[string]uint32),
+		dataPath:          dataPath,
+		mountPoint:        dataPath,
+		logger:            slog.Default(),
+		projectAttributes: fixedXFSProjectAttributeReader{attr: linuxFSXAttr{XFlags: linuxFSXFlagProjInherit}},
+		activeIDs:         make(map[uint32]string),
+		volumeToID:        make(map[string]uint32),
 	}
 }
 

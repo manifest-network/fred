@@ -99,6 +99,25 @@ func TestManagedVolumeNameRejectsZFSDatasetSelectors(t *testing.T) {
 	}
 }
 
+func TestZFSVolumeManagerListReturnsOnlyBindReadyDirectories(t *testing.T) {
+	root := t.TempDir()
+	// Runtime List is a directory read. An empty PATH makes the regression to
+	// ListForProof deterministic: that implementation would try to spawn zfs.
+	t.Setenv("PATH", t.TempDir())
+	name := canonicalVolumeName(testZFSLeaseUUID, "app", 0)
+	require.NoError(t, os.Mkdir(filepath.Join(root, name), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, volumePrefix+"foreign"), []byte("not a volume"), 0o600))
+
+	mgr := &zfsVolumeManager{
+		dataPath:      root,
+		parentDataset: "tank/fred",
+		logger:        slog.Default(),
+	}
+	got, err := mgr.List()
+	require.NoError(t, err)
+	assert.Equal(t, []string{name}, got)
+}
+
 func TestZFSVolumeManagerRejectsInvalidNameAtEveryDatasetBoundary(t *testing.T) {
 	t.Parallel()
 

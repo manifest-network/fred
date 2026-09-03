@@ -616,6 +616,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Docker crash recovery now preserves an exact provision cohort while its
+  containers or required health checks are still transitional; a later healthy
+  inventory settles the original operation instead of tearing the cohort down
+  and reporting a false failure. Failed-predecessor replacement also snapshots
+  its projection under lock and compares both generation and value before any
+  teardown or publication, preventing torn reads and pointer-ABA overwrites.
+  (ENG-632)
+- XFS delete-stage normalization now verifies the project-zero inode and
+  project-inheritance flag through Linux's typed `FS_IOC_FSGETXATTR` interface
+  instead of parsing localized, version-specific `xfs_quota project -c` prose.
+  Numeric quota reports keep stdout separate from diagnostics and reject any
+  stderr rather than allowing a warning to masquerade as authoritative zero
+  usage. ZFS runtime inventory again returns only bind-ready directories; its
+  wider dataset/directory union remains confined to storage-identity proof.
+  (ENG-632)
 - Docker stack admission now proves that quantity expansion is injective before
   Compose can mutate substrate (`web` quantity 2 conflicts with unscaled
   `web-0`). Compose PS attribution uses the same exact generated-key map instead

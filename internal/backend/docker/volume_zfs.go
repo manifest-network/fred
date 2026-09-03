@@ -219,12 +219,13 @@ func (z *zfsVolumeManager) Destroy(ctx context.Context, id string) error {
 	return nil
 }
 
-const zfsVolumeInventoryTimeout = 10 * time.Second
-
 func (z *zfsVolumeManager) List() ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), zfsVolumeInventoryTimeout)
-	defer cancel()
-	return z.ListForProof(ctx)
+	// Runtime callers need bind-ready directories only. Storage-identity proof
+	// deliberately uses the wider dataset+directory union in ListForProof; using
+	// that proof inventory here would expose unmounted datasets and foreign
+	// artifacts as ordinary tenant volumes and would replace the caller's
+	// lifetime with a background subprocess timeout.
+	return z.rootWatch.list(z.dataPath)
 }
 
 // ListForProof unions the directory view with exact depth-one ZFS children.

@@ -12,12 +12,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/fsidentity"
@@ -59,6 +63,10 @@ func inodeHardLimit(sizeMB, minAvgFileBytes int64) int64 {
 }
 
 // xfsVolumeManager creates directories with XFS project quotas.
+type xfsProjectAttributeReader interface {
+	ReadProjectAttributes(*os.Root) (linuxFSXAttr, error)
+}
+
 type xfsVolumeManager struct {
 	dataPath string
 	// mountPoint is the XFS mount that contains dataPath, resolved once at
@@ -70,6 +78,10 @@ type xfsVolumeManager struct {
 	// minAvgFileBytes is the ratio used by inodeHardLimit to derive each volume's
 	// XFS inode hard limit from its block quota. Set from Config.GetMinAvgFileBytes().
 	minAvgFileBytes int64
+	// projectAttributes is a descriptor-rooted kernel reader. Keeping the
+	// interface at its consumer boundary lets filesystem-free unit tests model
+	// the UAPI result without weakening the production XFS check.
+	projectAttributes xfsProjectAttributeReader
 
 	// rootWatch refuses to report an emptiness it cannot vouch for (ENG-687).
 	rootWatch volumeRootWatch
@@ -266,14 +278,6 @@ func (x *xfsVolumeManager) reserveProjectID(
 	x.activeIDs[candidate] = volumeID
 	x.volumeToID[volumeID] = candidate
 	return candidate, &createdXFSProjectIDReservation{volumeID: volumeID, projID: candidate}, nil
-}
-
-// assignProjectID is retained for allocation-focused callers and tests. Create
-// uses reserveProjectID directly so its failure compensation retains ownership
-// provenance.
-func (x *xfsVolumeManager) assignProjectID(volumeID string) (uint32, error) {
-	projID, _, err := x.reserveProjectID(volumeID)
-	return projID, err
 }
 
 // registerProjectIDLocked records an observed marker without allowing it to
@@ -512,36 +516,6 @@ func (x *xfsVolumeManager) removeStageAuthorityLocked(stage xfsStageName) error 
 		delete(x.recoveredStages, volumeID)
 	}
 	return nil
-}
-
-// writeProjectIDFile persists the project ID as a decimal string inside
-// the volume directory.
-func writeProjectIDFile(dirPath string, id uint32) error {
-	root, err := os.OpenRoot(dirPath)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = root.Close() }()
-	return writeProjectIDFileInVolumeRoot(root, id)
-}
-
-// readProjectIDFile reads the project ID back from the marker file.
-func readProjectIDFile(dirPath string) (uint32, error) {
-	root, err := os.OpenRoot(dirPath)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = root.Close() }()
-	return readProjectIDFileInVolumeRoot(root)
-}
-
-func writeProjectIDFileAtRoot(root *os.Root, volumeID managedVolumeName, id uint32) error {
-	volumeRoot, err := openAttestedManagedVolumeRoot(root, volumeID)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = volumeRoot.Close() }()
-	return writeProjectIDFileInVolumeRoot(volumeRoot, id)
 }
 
 func readProjectIDFileAtRoot(root *os.Root, volumeID managedVolumeName) (uint32, error) {
@@ -963,34 +937,77 @@ func xfsProjectResetToDefaultCmd(dirPath string) string {
 	return fmt.Sprintf("project -s -d 0 -p %s 0", dirPath)
 }
 
-// xfsProjectCheckDefaultCmd independently verifies the assignment above. The
-// project check prints every mismatched inode; callers require both exit success
-// and a recognized clean report before publishing the sibling as teardown
-// authority.
-func xfsProjectCheckDefaultCmd(dirPath string) string {
-	return fmt.Sprintf("project -c -d 0 -p %s 0", dirPath)
+// linuxFSXAttr is the stable Linux UAPI struct consumed by
+// FS_IOC_FSGETXATTR. Keep the explicit padding: the ioctl request encodes the
+// structure's 28-byte size.
+type linuxFSXAttr struct {
+	XFlags     uint32
+	ExtentSize uint32
+	Nextents   uint32
+	ProjectID  uint32
+	CowExtSize uint32
+	Padding    [8]byte
 }
 
-// validateXFSProjectCheckOutput accepts the two clean-output shapes emitted by
-// supported xfsprogs versions. Some versions are silent on success; current
-// versions always print a prologue and summary even when every inode matches.
-// Anything else remains a fail-closed mismatch because `project -c` does not
-// signal inode mismatches through its exit status.
-func validateXFSProjectCheckOutput(out []byte, dirPath string) error {
-	got := strings.TrimSpace(string(out))
-	if got == "" {
-		return nil
+// _IOR('X', 31, struct fsxattr), from linux/fs.h. Linux architecture families
+// differ in the read-direction bits, so inherit those from x/sys' generated
+// FS_IOC_GETFLAGS constant instead of baking in the amd64 request value.
+// Querying the inode directly avoids treating localized or version-specific
+// xfsprogs prose as authority.
+const linuxFSIOCFSGetXAttr = (uintptr(unix.FS_IOC_GETFLAGS) & 0xc0000000) |
+	(unsafe.Sizeof(linuxFSXAttr{}) << 16) |
+	(uintptr('X') << 8) |
+	31
+
+const (
+	linuxXFSFilesystemMagic = 0x58465342
+	linuxFSXFlagProjInherit = 0x00000200
+)
+
+type linuxXFSProjectAttributeReader struct{}
+
+func (linuxXFSProjectAttributeReader) ReadProjectAttributes(root *os.Root) (linuxFSXAttr, error) {
+	file, err := root.Open(".")
+	if err != nil {
+		return linuxFSXAttr{}, err
 	}
-	lines := strings.Split(got, "\n")
-	prologue := fmt.Sprintf("Checking project 0 (path %s)...", dirPath)
-	const summaryPrefix = "Processed 1 ("
-	const summarySuffix = " and cmdline) paths for project 0 with recursion depth limited (0)."
-	if len(lines) != 2 || lines[0] != prologue ||
-		!strings.HasPrefix(lines[1], summaryPrefix) ||
-		!strings.HasSuffix(lines[1], summarySuffix) {
-		return fmt.Errorf("xfs_quota reported mismatched inodes or unexpected output: %s", got)
+	defer func() { _ = file.Close() }()
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(int(file.Fd()), &filesystem); err != nil {
+		return linuxFSXAttr{}, err
+	}
+	if uint64(filesystem.Type) != linuxXFSFilesystemMagic {
+		return linuxFSXAttr{}, fmt.Errorf("opened delete-stage is on filesystem type %#x, want XFS", filesystem.Type)
+	}
+	var attr linuxFSXAttr
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		file.Fd(),
+		linuxFSIOCFSGetXAttr,
+		uintptr(unsafe.Pointer(&attr)), // #nosec G103 -- stable Linux fsxattr UAPI buffer
+	)
+	runtime.KeepAlive(file)
+	if errno != 0 {
+		return linuxFSXAttr{}, errno
+	}
+	return attr, nil
+}
+
+func validateXFSDefaultProject(attr linuxFSXAttr) error {
+	if attr.ProjectID != 0 {
+		return fmt.Errorf("inode remains assigned to project %d, want default project 0", attr.ProjectID)
+	}
+	if attr.XFlags&linuxFSXFlagProjInherit == 0 {
+		return errors.New("inode has no project inheritance flag")
 	}
 	return nil
+}
+
+func (x *xfsVolumeManager) projectAttributeReader() xfsProjectAttributeReader {
+	if x.projectAttributes != nil {
+		return x.projectAttributes
+	}
+	return linuxXFSProjectAttributeReader{}
 }
 
 // xfsLimitCmd is the `limit -p` command that sets the block hard limit (bhard) and
@@ -1267,17 +1284,15 @@ func (x *xfsVolumeManager) normalizeXFSDeleteStageProjectWith(
 		cancel()
 		return fmt.Errorf("reset xfs delete-stage %q to project 0: %w: %s", stage.value(), resetErr, out)
 	}
-	checkCmd := xfsProjectCheckDefaultCmd(parent.DisplayPath(stage.value()))
-	checkProcess := exec.CommandContext(resetCtx, "xfs_quota", xfsQuotaArgs(checkCmd, x.mountPoint)...)
-	// project(8)'s clean-output summary is localized. Pin it so the strict
-	// parser below cannot mistake a translated success report for a mismatch.
-	checkProcess.Env = append(os.Environ(), "LC_ALL=C")
-	checkOut, checkErr := checkProcess.CombinedOutput()
 	cancel()
-	if checkErr != nil {
-		return fmt.Errorf("attest xfs delete-stage %q project 0: %w: %s", stage.value(), checkErr, checkOut)
+	attr, attrErr := x.projectAttributeReader().ReadProjectAttributes(stageRoot)
+	if attrErr != nil {
+		return fmt.Errorf("read xfs delete-stage %q project attributes: %w", stage.value(), attrErr)
 	}
-	if err := validateXFSProjectCheckOutput(checkOut, parent.DisplayPath(stage.value())); err != nil {
+	// The sibling is an empty, private deletion capability, never an allocation
+	// root. Its project ID is the authority; the independent identity and
+	// emptiness checks below prevent content from being smuggled beneath it.
+	if err := validateXFSDefaultProject(attr); err != nil {
 		return fmt.Errorf("attest xfs delete-stage %q project 0: %w", stage.value(), err)
 	}
 	if err := syncOSRoot(stageRoot); err != nil {
@@ -2420,9 +2435,10 @@ func (x *xfsVolumeManager) Usage(ctx context.Context, id string) (int64, error) 
 	if err != nil {
 		return 0, fmt.Errorf("read project ID marker for %s: %w", dirPath, err)
 	}
-	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(xfsProjectReportCmd("b", projID), x.mountPoint)...).CombinedOutput()
+	command := xfsProjectReportCmd("b", projID)
+	out, err := runXFSQuotaReport(ctx, command, x.mountPoint)
 	if err != nil {
-		return 0, fmt.Errorf("xfs_quota report for %s (proj %d): %w: %s", dirPath, projID, err, out)
+		return 0, fmt.Errorf("xfs_quota report for %s (proj %d): %w", dirPath, projID, err)
 	}
 	blocks, err := parseXfsReportUsedBlocks(string(out), projID)
 	if err != nil {
@@ -2485,14 +2501,37 @@ func parseXfsReportUsed(out string, projID uint32) (int64, bool, error) {
 	return result, found, nil
 }
 
+// runXFSQuotaReport keeps machine-readable stdout separate from diagnostics.
+// A successful exit with stderr is still uncertain: report callers interpret
+// an absent project row as authoritative zero, so discarding a warning could
+// incorrectly authorize quota teardown. Reject diagnostics explicitly while
+// retaining strict parsing for stdout.
+func runXFSQuotaReport(ctx context.Context, command, mountPoint string) ([]byte, error) {
+	process := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(command, mountPoint)...)
+	var stderr strings.Builder
+	process.Stderr = &stderr
+	stdout, err := process.Output()
+	diagnostic := strings.TrimSpace(stderr.String())
+	if err != nil {
+		if diagnostic == "" {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: stderr: %s", err, diagnostic)
+	}
+	if diagnostic != "" {
+		return nil, fmt.Errorf("xfs_quota exited successfully with diagnostic stderr: %s", diagnostic)
+	}
+	return stdout, nil
+}
+
 func (x *xfsVolumeManager) readProjectQuotaUsage(ctx context.Context, projID uint32, resource string) (int64, error) {
 	if resource != "b" && resource != "i" {
 		return 0, fmt.Errorf("unsupported xfs project quota resource %q", resource)
 	}
 	command := xfsProjectReportCmd(resource, projID)
-	out, err := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(command, x.mountPoint)...).CombinedOutput()
+	out, err := runXFSQuotaReport(ctx, command, x.mountPoint)
 	if err != nil {
-		return 0, fmt.Errorf("xfs_quota %s for project %d: %w: %s", command, projID, err, out)
+		return 0, fmt.Errorf("xfs_quota %s for project %d: %w", command, projID, err)
 	}
 	used, found, err := parseXfsReportUsed(string(out), projID)
 	if err != nil {

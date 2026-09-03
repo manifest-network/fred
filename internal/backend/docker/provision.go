@@ -240,8 +240,8 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// The reservation is also this lease's ownership claim on its canonical
 	// volumes, so every publish carries Items and immutable sizing together.
 	var prevFailCount int
-	var oldItems []backend.LeaseItem
 	var oldProvision *provision
+	var oldSnapshot recoveredProvision
 	b.provisionsMu.Lock()
 	if existing, exists := b.provisions[req.LeaseUUID]; exists {
 		if existing.Status != backend.ProvisionStatusFailed {
@@ -249,9 +249,11 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			return b.refuseOperationIntent(intent,
 				fmt.Errorf("%w: %s", backend.ErrAlreadyProvisioned, req.LeaseUUID))
 		}
-		// Capture data needed for cleanup, then release lock before Docker API calls.
-		prevFailCount = existing.FailCount
-		oldItems = slices.Clone(existing.Items)
+		// Keep the pointer solely as a generation/CAS token. Every value used
+		// after dropping provisionsMu comes from this deep snapshot: actors and
+		// cleanup paths intentionally mutate published provisions in place.
+		oldSnapshot = recoveredFromProvision(existing)
+		prevFailCount = oldSnapshot.FailCount
 		oldProvision = existing
 	}
 	candidate := recoveredProvision{ //exhaustruct:enforce
@@ -308,14 +310,20 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	var predecessorAllocationIDs []string
 	var predecessorAllocations []shared.ResolvedAdoptInstance
 	if oldProvision != nil {
-		if oldProvision.Tenant != req.Tenant || oldProvision.ProviderUUID != req.ProviderUUID {
+		predecessorUnchanged := func() bool {
+			b.provisionsMu.RLock()
+			defer b.provisionsMu.RUnlock()
+			return b.provisions[req.LeaseUUID] == oldProvision &&
+				provisionMatchesRecovered(oldProvision, oldSnapshot)
+		}
+		if oldSnapshot.Tenant != req.Tenant || oldSnapshot.ProviderUUID != req.ProviderUUID {
 			return b.refuseOperationIntent(intent, fmt.Errorf(
 				"failed provision predecessor belongs to a different tenant or provider",
 			))
 		}
 		var predecessorErr error
 		predecessorAllocationIDs, predecessorAllocations, predecessorErr = resolvedProvisionAllocations(
-			req.LeaseUUID, oldItems, oldProvision.ResourceProfiles,
+			req.LeaseUUID, oldSnapshot.Items, oldSnapshot.resourceProfiles,
 		)
 		if predecessorErr != nil {
 			return b.refuseOperationIntent(intent, fmt.Errorf(
@@ -343,10 +351,10 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			}
 		}
 		if activeIdentity, hasActiveIdentity := runtimeIdentityForRelease(active); hasActiveIdentity {
-			oldLifecycleURL := oldProvision.LifecycleCallbackURL
+			oldLifecycleURL := oldSnapshot.LifecycleCallbackURL
 			if activeIdentity.Class() == shared.ReleaseAuthorityLegacy {
 				oldLifecycleURL, err = backend.ResolveLifecycleCallbackURL(
-					oldProvision.CallbackURL, oldProvision.LifecycleCallbackURL,
+					oldSnapshot.CallbackURL, oldSnapshot.LifecycleCallbackURL,
 				)
 				if err != nil {
 					cancelInventory()
@@ -357,9 +365,9 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			}
 			if activeIdentity.Tenant() != req.Tenant ||
 				activeIdentity.ProviderUUID() != req.ProviderUUID ||
-				oldProvision.Tenant != activeIdentity.Tenant() ||
-				oldProvision.ProviderUUID != activeIdentity.ProviderUUID() ||
-				oldProvision.CallbackURL != activeIdentity.CallbackURL() ||
+				oldSnapshot.Tenant != activeIdentity.Tenant() ||
+				oldSnapshot.ProviderUUID != activeIdentity.ProviderUUID() ||
+				oldSnapshot.CallbackURL != activeIdentity.CallbackURL() ||
 				oldLifecycleURL != activeIdentity.LifecycleCallbackURL() {
 				cancelInventory()
 				return b.refuseOperationIntent(intent, fmt.Errorf(
@@ -380,6 +388,11 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 				errors.New("candidate provision substrate exists before worker admission"),
 			)
 		}
+		if !predecessorUnchanged() {
+			return b.refuseOperationIntent(intent, errors.New(
+				"failed provision predecessor changed during read-only validation",
+			))
+		}
 		if classification.legacyAuthority != nil {
 			if classification.legacyPredecessor == nil || b.releaseStore == nil {
 				return b.latchAmbiguousOperationOutcome(
@@ -397,6 +410,11 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 				))
 			}
 		}
+		if !predecessorUnchanged() {
+			return b.refuseOperationIntent(intent, errors.New(
+				"failed provision predecessor changed before teardown",
+			))
+		}
 
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		remaining, teardownErr := b.teardownLeaseContainers(
@@ -413,7 +431,8 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		}
 
 		b.provisionsMu.Lock()
-		if b.provisions[req.LeaseUUID] != oldProvision {
+		if b.provisions[req.LeaseUUID] != oldProvision ||
+			!provisionMatchesRecovered(oldProvision, oldSnapshot) {
 			b.provisionsMu.Unlock()
 			return b.latchAmbiguousOperationOutcome(
 				"publish replacement provision reservation",
@@ -458,7 +477,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		// still owns the reusable volumes and failed runtime projection. Move pool
 		// accounting and the map back together before settling a candidate that was
 		// explicitly rejected by the actor.
-		predecessor := recoveredFromProvision(oldProvision)
+		predecessor := oldSnapshot
 		predecessor.Status = backend.ProvisionStatusFailed
 		predecessor.ContainerIDs = nil
 		predecessor.ServiceContainers = nil
@@ -471,7 +490,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 			)
 		}
 		if replaceErr := b.pool.ReplaceResolvedAll(
-			allocatedIDs, predecessorAllocations, oldProvision.Tenant,
+			allocatedIDs, predecessorAllocations, oldSnapshot.Tenant,
 		); replaceErr != nil {
 			b.provisionsMu.Unlock()
 			return b.latchAmbiguousOperationOutcome(

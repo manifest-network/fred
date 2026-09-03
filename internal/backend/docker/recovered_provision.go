@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"reflect"
 	"slices"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -67,6 +68,13 @@ func recoveredFromProvision(p *provision) recoveredProvision {
 		rec.ServiceContainers = sc
 	}
 	return rec
+}
+
+// provisionMatchesRecovered compares a published, lock-protected projection
+// with a previously captured deep snapshot. Pointer identity alone cannot
+// detect the intentional in-place mutations performed by lease actors.
+func provisionMatchesRecovered(p *provision, snapshot recoveredProvision) bool {
+	return p != nil && reflect.DeepEqual(recoveredFromProvision(p), snapshot)
 }
 
 // enrichReserved sets the post-validation workload metadata on a reserved

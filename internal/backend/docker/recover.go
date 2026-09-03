@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -439,7 +438,7 @@ func (b *Backend) changedProvisionRecoveryLeases(
 			changed[leaseUUID] = "generation changed"
 			continue
 		}
-		if !reflect.DeepEqual(recoveredFromProvision(current), prior.value) {
+		if !provisionMatchesRecovered(current, prior.value) {
 			changed[leaseUUID] = "projection changed"
 		}
 	}

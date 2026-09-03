@@ -317,6 +317,54 @@ func TestRecoverOperationIntent_BoundsContainerInspection(t *testing.T) {
 	assert.Empty(t, pending, "timed-out inspection must not manufacture a completion")
 }
 
+func TestRecoverOperationIntent_PreservesProvisionWhoseHealthIsStillStarting(t *testing.T) {
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	spec := dockerOperationIntentSpec(t, storageID)
+	spec.HealthCheckServices = []string{spec.Items[0].ServiceName}
+	_, err = store.BeginOperationIntent(spec)
+	require.NoError(t, err)
+	container := dockerIntentContainer(spec, "container-1", spec.Items[0].SKU, 0)
+	container.Health = HealthStatusStarting
+	b := newOperationIntentRecoveryBackend(
+		t, store, storageID, []ContainerInfo{container}, readyIntentProjection(spec, container.ContainerID),
+	)
+	teardownCalls := 0
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		teardownCalls++
+		return nil
+	}}
+
+	err = b.recoverOperationIntents(context.Background(), nil)
+	require.ErrorContains(t, err, "container substrate remains non-terminal")
+	assert.Zero(t, teardownCalls, "transitional health must not be converted into destructive failure recovery")
+	intents, listErr := store.ListOperationIntents()
+	require.NoError(t, listErr)
+	assert.Len(t, intents, 1, "the write-ahead intent is the next restart's recovery authority")
+	pending, listErr := store.ListPending()
+	require.NoError(t, listErr)
+	assert.Empty(t, pending, "a transitional observation is not a terminal callback outcome")
+
+	container.Health = HealthStatusHealthy
+	recovered := newOperationIntentRecoveryBackend(
+		t, store, storageID, []ContainerInfo{container}, readyIntentProjection(spec, container.ContainerID),
+	)
+	require.NoError(t, recovered.recoverOperationIntents(context.Background(), nil))
+	intents, listErr = store.ListOperationIntents()
+	require.NoError(t, listErr)
+	assert.Empty(t, intents)
+	pending, listErr = store.ListPending()
+	require.NoError(t, listErr)
+	require.Len(t, pending, 1)
+	assert.Equal(t, backend.CallbackStatusSuccess, pending[0].Status,
+		"a later healthy observation must settle the preserved operation normally")
+}
+
 func TestProvisionReleaseAppendFailureRetainsIntentUntilRestartRecovery(t *testing.T) {
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)

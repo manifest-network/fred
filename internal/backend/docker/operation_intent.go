@@ -1137,7 +1137,9 @@ func (b *Backend) classifyOperationIntentSubstrate(
 		}
 	}
 	if len(seen) != len(expected) {
-		if claim.Kind() != shared.OperationIntentProvision || len(seen) > len(expected) {
+		// Every observed instance was admitted through the expected-set lookup
+		// above, and duplicates are rejected, so seen cannot exceed expected.
+		if claim.Kind() != shared.OperationIntentProvision {
 			return operationIntentSubstrate{}, fmt.Errorf(
 				"partial substrate: found %d current containers, expected %d",
 				len(seen), len(expected),
@@ -1166,7 +1168,13 @@ func (b *Backend) classifyOperationIntentSubstrate(
 			needsTeardown: claim.Kind() == shared.OperationIntentProvision,
 			currentIDs:    currentIDs,
 		}, nil
-	case claim.Kind() == shared.OperationIntentProvision && ready+failed+nonterminal == len(expected):
+	case nonterminal != 0:
+		// A running container whose health check is still starting is evidence
+		// that the interrupted worker may still converge. Preserve the exact
+		// intent and substrate for the next bounded recovery pass; tearing the
+		// cohort down would turn an observation gap into a terminal failure.
+		return operationIntentSubstrate{}, fmt.Errorf("container substrate remains non-terminal")
+	case claim.Kind() == shared.OperationIntentProvision && ready+failed == len(expected):
 		return operationIntentSubstrate{
 			status:        backend.CallbackStatusFailed,
 			errMsg:        interruptedOperationFailure,
@@ -1174,8 +1182,6 @@ func (b *Backend) classifyOperationIntentSubstrate(
 			needsTeardown: true,
 			currentIDs:    currentIDs,
 		}, nil
-	case nonterminal != 0:
-		return operationIntentSubstrate{}, fmt.Errorf("container substrate remains non-terminal")
 	default:
 		return operationIntentSubstrate{}, fmt.Errorf("mixed ready and failed substrate state")
 	}
