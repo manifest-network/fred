@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -394,6 +396,321 @@ func TestRecoverState_PendingRestoreCleanupCountsAllocationWithoutRestartablePro
 		LeaseUUID: destinationLease,
 	})
 	require.ErrorIs(t, restartErr, backend.ErrInvalidState)
+}
+
+func TestRestore_CanceledWhileWaitingForRecoverySnapshotHasNoSideEffects(t *testing.T) {
+	const (
+		sourceLease      = "0192f1a0-1111-7abc-8def-000000000209"
+		destinationLease = "0192f1a0-2222-7abc-8def-000000000210"
+	)
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+	retentions := attachRetentionStore(t, b)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+	seedActiveRetained(t, retentions, sourceLease)
+	original, err := retentions.Get(sourceLease)
+	require.NoError(t, err)
+	require.NotNil(t, original)
+	preSnapshotReadReached := make(chan struct{})
+	b.volumes = &mockVolumeManager{
+		UsageFn: func(context.Context, string) (int64, error) {
+			close(preSnapshotReadReached)
+			return 0, nil
+		},
+	}
+
+	b.recoverySnapshotMu.Lock()
+	var unlockSnapshot sync.Once
+	unlock := func() { unlockSnapshot.Do(b.recoverySnapshotMu.Unlock) }
+	t.Cleanup(unlock)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	restoreDone := make(chan error, 1)
+	req := restoreRequest(
+		destinationLease, sourceLease, "http://localhost/callbacks/provision",
+	)
+	// Force the read-only demote proof so Usage gives the test a positive
+	// synchronization point at the final external read before recoverySnapshotMu.
+	req.Items[0].SKU = "docker-micro"
+	go func() {
+		restoreDone <- b.Restore(ctx, req)
+	}()
+
+	// Prove Restore completed its last observable pre-lock read. With the writer
+	// still held, it cannot cross into durable admission.
+	waitForTestSignal(t, preSnapshotReadReached, "Restore's pre-snapshot demote proof")
+	select {
+	case err := <-restoreDone:
+		t.Fatalf("Restore returned before reaching the recovery snapshot gate: %v", err)
+	default:
+	}
+	cancel()
+
+	unlock()
+	require.ErrorIs(t, waitForAsyncTestResult(t, restoreDone, "canceled Restore"), context.Canceled)
+
+	intents, err := b.operationIntents.ListOperationIntents()
+	require.NoError(t, err)
+	assert.Empty(t, intents)
+	b.provisionsMu.RLock()
+	_, projected := b.provisions[destinationLease]
+	b.provisionsMu.RUnlock()
+	assert.False(t, projected)
+	assert.Nil(t, b.pool.GetAllocation(destinationLease+"-app-0"))
+	current, err := retentions.Get(sourceLease)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+	assert.Equal(t, *original, *current)
+}
+
+func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
+	const (
+		sourceLease      = "0192f1a0-1111-7abc-8def-000000000211"
+		destinationLease = "0192f1a0-2222-7abc-8def-000000000212"
+		stableLease      = "0192f1a0-3333-7abc-8def-000000000213"
+	)
+	const stableOperationID = shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	stableCallbackURL := "https://stable.example/callbacks/provision?operation_id=" + stableOperationID.String()
+	stableLifecycleURL, err := backend.ResolveLifecycleCallbackURL(stableCallbackURL, "")
+	require.NoError(t, err)
+	stableItems := []backend.LeaseItem{{
+		SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+	}}
+	stableContainer := ContainerInfo{
+		ContainerID: "stable-container", Name: "fred-" + stableLease + "-app-0", LeaseUUID: stableLease,
+		Tenant: "tenant-b", ProviderUUID: nominalDockerProviderUUID,
+		SKU: "docker-small", ServiceName: manifest.DefaultServiceName, InstanceIndex: 0,
+		Image: "nginx:latest", CallbackURL: stableCallbackURL, LifecycleCallbackURL: stableLifecycleURL,
+		Status: "running", Health: HealthStatusNone, CreatedAt: time.Now().Add(-time.Hour),
+	}
+
+	inventoryEntered := make(chan struct{})
+	releaseInventory := make(chan struct{})
+	var releaseInventoryOnce sync.Once
+	t.Cleanup(func() { releaseInventoryOnce.Do(func() { close(releaseInventory) }) })
+	rollbackInventoryEntered := make(chan struct{})
+	releaseRollbackInventory := make(chan struct{})
+	var releaseRollbackInventoryOnce sync.Once
+	t.Cleanup(func() { releaseRollbackInventoryOnce.Do(func() { close(releaseRollbackInventory) }) })
+	var firstRecovery = true
+	var blockRollbackRecovery bool
+	var staleRestoreContainer ContainerInfo
+	var inventoryMu sync.Mutex
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			inventoryMu.Lock()
+			if firstRecovery {
+				firstRecovery = false
+				inventoryMu.Unlock()
+				close(inventoryEntered)
+				<-releaseInventory
+				return []ContainerInfo{stableContainer}, nil
+			}
+			if blockRollbackRecovery {
+				blockRollbackRecovery = false
+				container := staleRestoreContainer
+				inventoryMu.Unlock()
+				close(rollbackInventoryEntered)
+				<-releaseRollbackInventory
+				return []ContainerInfo{stableContainer, container}, nil
+			}
+			inventoryMu.Unlock()
+			return nil, nil
+		},
+		PullImageFn: func(context.Context, string, time.Duration) error {
+			return nil
+		},
+		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
+			return &ContainerInfo{Status: "running"}, nil
+		},
+	}
+	b := newBackendForProvisionTest(t, mock, nil)
+	retentions := attachRetentionStore(t, b)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+	seedActiveRetained(t, retentions, sourceLease)
+	stableProfiles := testResourceProfiles(t, stableItems)
+	stableAuthority, err := shared.NewReleaseRuntimeAuthority(
+		stableOperationID, "tenant-b", nominalDockerProviderUUID,
+		stableCallbackURL, stableLifecycleURL,
+	)
+	require.NoError(t, err)
+	require.NoError(t, b.releaseStore.AppendActive(stableLease, shared.Release{
+		Manifest: validManifestJSON("nginx:latest"), Image: "stack", OperationID: stableOperationID,
+		Items: stableItems, ResourceProfiles: stableProfiles, RuntimeAuthority: &stableAuthority,
+		Status: "active", CreatedAt: stableContainer.CreatedAt,
+	}))
+	b.cfg.StartupVerifyDuration = time.Millisecond
+	b.compose = &mockComposeExecutor{
+		UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
+			return errors.New("compose up boom")
+		},
+		DownFn: func(context.Context, string, time.Duration) error {
+			return nil
+		},
+	}
+	restorePreSnapshotReadReached := make(chan struct{})
+	rollbackHandoffReached := make(chan struct{})
+	var signalRestorePreSnapshotRead sync.Once
+	var signalRollbackHandoff sync.Once
+	var rollbackHandoffMu sync.Mutex
+	observeRollbackHandoff := false
+	sourceRetainedVolume := retainedName(canonicalVolumeName(
+		sourceLease, manifest.DefaultServiceName, 0,
+	))
+	b.volumes = &mockVolumeManager{
+		RenameVolumeFn: func(string, string) error { return nil },
+		UsageFn: func(context.Context, string) (int64, error) {
+			signalRestorePreSnapshotRead.Do(func() { close(restorePreSnapshotReadReached) })
+			return 0, nil
+		},
+		EnsureQuotaFn: func(_ context.Context, name string, _ int64) error {
+			rollbackHandoffMu.Lock()
+			observe := observeRollbackHandoff
+			rollbackHandoffMu.Unlock()
+			if observe && name == sourceRetainedVolume {
+				signalRollbackHandoff.Do(func() { close(rollbackHandoffReached) })
+			}
+			return nil
+		},
+	}
+
+	operationAdmitted := make(chan struct{})
+	b.operationIntents = &stagedRecoveryOperationIntentJournal{
+		delegate:          b.operationIntents,
+		operationAdmitted: operationAdmitted,
+	}
+	recoverErr := make(chan error, 1)
+	go func() { recoverErr <- b.recoverState(context.Background()) }()
+	select {
+	case <-inventoryEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovery did not enter Docker inventory")
+	}
+
+	// Recovery owns the write side after capturing an absent destination
+	// baseline. Restore may complete all read-only validation, but it must not
+	// create its durable operation intent (or any substrate/accounting state)
+	// until that snapshot publishes. Otherwise the whole accepted restore could
+	// fit between recovery's endpoint reads and stale inventory could resurrect
+	// its rolled-back generation.
+	restoreReq := restoreRequest(
+		destinationLease, sourceLease, "http://localhost/callbacks/provision",
+	)
+	// Force a read-only demote measurement immediately before snapshot admission,
+	// giving this test a positive pre-lock progress barrier.
+	restoreReq.Items[0].SKU = "docker-micro"
+	restoreLifecycleURL, err := backend.ResolveLifecycleCallbackURL(restoreReq.CallbackURL, "")
+	require.NoError(t, err)
+	staleRestoreContainer = ContainerInfo{
+		ContainerID: "transient-restore-container", Name: "fred-" + destinationLease + "-app-0",
+		LeaseUUID: destinationLease, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+		SKU: restoreReq.Items[0].SKU, ServiceName: manifest.DefaultServiceName, InstanceIndex: 0,
+		Image: "nginx:latest", CallbackURL: restoreReq.CallbackURL,
+		LifecycleCallbackURL: restoreLifecycleURL, Status: "running",
+		Health: HealthStatusNone, CreatedAt: time.Now(),
+	}
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- b.Restore(context.Background(), restoreReq)
+	}()
+	waitForTestSignal(t, restorePreSnapshotReadReached, "Restore's pre-snapshot demote proof")
+	select {
+	case <-operationAdmitted:
+		t.Fatal("restore admitted while recovery held an absent destination snapshot")
+	default:
+	}
+
+	releaseInventoryOnce.Do(func() { close(releaseInventory) })
+	require.NoError(t, waitForAsyncTestResult(t, recoverErr, "initial recovery publication"))
+	select {
+	case <-operationAdmitted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("restore did not admit after recovery published")
+	}
+	require.NoError(t, waitForAsyncTestResult(t, restoreDone, "Restore admission"))
+
+	// The unrelated lease must still converge in the same recovery pass; the
+	// restore fence is a lifecycle boundary, not a reason to abandon the fleet
+	// snapshot or globally defer otherwise-stable leases.
+	b.provisionsMu.RLock()
+	stable := b.provisions[stableLease]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, stable)
+	assert.Equal(t, backend.ProvisionStatusReady, stable.Status)
+	assert.NotNil(t, b.pool.GetAllocation(stableLease+"-app-0"))
+
+	// Drive the accepted operation through its real actor failure and the
+	// production restoring reconciler. The rollback handoff is also protected by
+	// recoverySnapshotMu, so the final state contains neither half of a transient
+	// destination generation.
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		provision := b.provisions[destinationLease]
+		failed := provision != nil && provision.Status == backend.ProvisionStatusFailed
+		b.provisionsMu.RUnlock()
+		claims, listErr := b.operationIntents.ListOperationIntents()
+		return listErr == nil && failed && len(claims) == 0 &&
+			!b.leaseActorProcessingOrQueued(destinationLease)
+	}, 5*time.Second, 10*time.Millisecond, "accepted restore must settle Failed before rollback")
+	entry, err := retentions.Get(sourceLease)
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	require.Equal(t, shared.RetentionStatusRestoring, entry.Status)
+
+	// Now park a second recovery after it inventories the failed restore's
+	// transient container. The production reconciler may perform slow physical
+	// cleanup concurrently, but its final intent/source/pool/projection handoff
+	// must wait for recovery publication. Without that read-side boundary it can
+	// disappear completely while the stale snapshot is open, after which recovery
+	// resurrects the destination allocation (the absent→transient→absent ABA).
+	inventoryMu.Lock()
+	blockRollbackRecovery = true
+	inventoryMu.Unlock()
+	rollbackRecoveryDone := make(chan error, 1)
+	go func() { rollbackRecoveryDone <- b.recoverState(context.Background()) }()
+	select {
+	case <-rollbackInventoryEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rollback recovery did not inventory the transient restore container")
+	}
+	reconcileDone := make(chan error, 1)
+	rollbackHandoffMu.Lock()
+	observeRollbackHandoff = true
+	rollbackHandoffMu.Unlock()
+	go func() { reconcileDone <- b.reconcileRestoring(context.Background(), *entry) }()
+	// EnsureQuota on the re-quarantined source is the final external mutation
+	// before the recoverySnapshotMu read-side handoff. Reaching it proves the
+	// reconciler progressed beyond teardown and is parked at the intended gate.
+	waitForTestSignal(t, rollbackHandoffReached, "restore rollback's pre-snapshot quota handoff")
+	select {
+	case reconcileErr := <-reconcileDone:
+		t.Fatalf("restore handback crossed an open recovery snapshot: %v", reconcileErr)
+	default:
+	}
+	stillRestoring, err := retentions.Get(sourceLease)
+	require.NoError(t, err)
+	require.NotNil(t, stillRestoring)
+	assert.Equal(t, shared.RetentionStatusRestoring, stillRestoring.Status)
+
+	releaseRollbackInventoryOnce.Do(func() { close(releaseRollbackInventory) })
+	require.NoError(t, waitForAsyncTestResult(t, rollbackRecoveryDone, "rollback recovery publication"))
+	require.NoError(t, waitForAsyncTestResult(t, reconcileDone, "restore source handback"))
+
+	entry, err = retentions.Get(sourceLease)
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, shared.RetentionStatusActive, entry.Status)
+	allocationID := destinationLease + "-" + manifest.DefaultServiceName + "-0"
+	assert.Nil(t, b.pool.GetAllocation(allocationID))
+	b.provisionsMu.RLock()
+	_, destinationExists := b.provisions[destinationLease]
+	b.provisionsMu.RUnlock()
+	assert.False(t, destinationExists)
 }
 
 func TestRecoverState_ActiveRestoreReleaseWithNoSurvivorsRemainsRepairableAcrossRestarts(t *testing.T) {

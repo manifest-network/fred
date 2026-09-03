@@ -803,12 +803,19 @@ The journal's volume-cleanup attempt count (and every cleanup-only failure) is
 also durable, so a restart cannot reset the applicable close retry/give-up
 policy.
 
-Recovery and live Deprovision share a backend-local recovery guard, so the
-managed-container inventory and close-intent read form one stable authority
-snapshot. Recovery loads every close intent before validating ordinary callback
-labels or exact release/container cohorts and keeps the guard through close
-resumption; unrelated Provision and Restore commands are not paused. Partial or
-zero survivors are expected after teardown starts, so a full close rebuilds a
+Recovery, live Deprovision admission/settlement, and Restore's operation-intent
+to `restoring` admission bridge and rollback handback share a backend-local
+recovery-snapshot guard. Recovery holds the exclusive side from managed-container
+inventory through durable journal reads and the matching provision/pool
+publication. Live paths hold the shared side only across their durable
+authority capture and projection/accounting handoffs; destructive Docker and
+volume operations hold neither side. This prevents a close, or a restore
+admitted and completely rolled back during inventory collection, from
+disappearing before an older snapshot is published. Provision remains
+available; Restore admission may wait for snapshot publication. Recovered
+closes resume afterward under the per-lease command fence and a fresh journal
+read. Partial or zero survivors are expected after teardown starts, so a full
+close rebuilds a
 conservative `deprovisioning` projection and resource reservation from its
 immutable snapshot instead of attempting to reconstruct authority from whatever
 Docker still reports or repricing it from mutable configuration. Retained and

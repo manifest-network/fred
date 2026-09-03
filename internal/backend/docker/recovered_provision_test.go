@@ -58,6 +58,7 @@ func TestRecoveredFromProvision_ClonesReferenceFields(t *testing.T) {
 			LeaseUUID:         "lease-1",
 			Status:            backend.ProvisionStatusFailing,
 			Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+			ResourceProfiles:  []shared.SKUResourceSnapshot{{SKU: "docker-small", CPUCores: 0.5, MemoryMB: 512, ScratchDiskMB: 64}},
 			ContainerIDs:      []string{"c1"},
 			ServiceContainers: map[string][]string{"app": {"c1"}},
 		},
@@ -71,10 +72,13 @@ func TestRecoveredFromProvision_ClonesReferenceFields(t *testing.T) {
 	rec.Items[0].ServiceName = "mutated"
 	rec.ContainerIDs[0] = "mutated"
 	rec.ServiceContainers["app"][0] = "mutated"
+	rec.ProvisionState.ResourceProfiles[0].ScratchDiskMB = 1024
 	rec.resourceProfiles[0].ScratchDiskMB = 2048
 	assert.Equal(t, "app", src.Items[0].ServiceName, "Items must be cloned")
 	assert.Equal(t, "c1", src.ContainerIDs[0], "ContainerIDs must be cloned")
 	assert.Equal(t, "c1", src.ServiceContainers["app"][0], "ServiceContainers must be deep-cloned")
+	assert.Equal(t, int64(64), src.ProvisionState.ResourceProfiles[0].ScratchDiskMB,
+		"embedded provision-state resource profiles must be cloned")
 	assert.Equal(t, int64(64), src.ResourceProfiles[0].ScratchDiskMB, "resource profiles must be cloned")
 	assert.Equal(t, 2, rec.volumeCleanupAttempts, "wrapper field carried")
 }

@@ -165,6 +165,10 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	cb = waitForCallback(t, callbackCh, newLease, 3*time.Minute)
 	require.Equal(t, backend.CallbackStatusSuccess, cb.Status,
 		"restore callback must report success; error: %s", cb.Error)
+	// Callback settlement and source-finalizer deletion are separate durable
+	// crash boundaries. Drive the level-triggered retention reconciler explicitly
+	// instead of waiting for the production sweep cadence.
+	finalizeRestoreRetentionForTest(t, b, b.retentionStore, origLease)
 
 	// ── STEP 6a: Sentinel survives in the new lease's container ────────────
 	newContainerID := getContainerID(t, newLease)

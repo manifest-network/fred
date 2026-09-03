@@ -28,6 +28,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // setupBtrfsLoopback creates a btrfs filesystem on a loopback file and mounts it.
@@ -417,16 +418,13 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	replayReq.LifecycleCallbackURL = replayCallbacks.lifecycleURL
 	require.NoError(t, b.Provision(ctx, replayReq))
 
-	failTimeout := time.After(3 * time.Minute)
-	var failure backend.CallbackPayload
-	for failure.Status != backend.CallbackStatusFailed {
-		select {
-		case cb := <-replayCh:
-			failure = cb
-		case <-failTimeout:
-			t.Fatal("timeout waiting for the re-provision to fail closed on the symlinked volume leaf")
-		}
+	select {
+	case <-b.stopCtx.Done():
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for the re-provision to fail closed on the symlinked volume leaf")
 	}
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous,
+		"a failed replacement after predecessor teardown must retain its intent for cold recovery")
 
 	// 5. The refusal must be attributable, and must have happened at the guard.
 	assert.Equal(t, float64(1), testutil.ToFloat64(volumeBindSymlinkRejectedTotal)-before,
@@ -449,7 +447,31 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	assert.NotZero(t, linkInfo.Mode()&fs.ModeSymlink,
 		"the planted symlink must still be there: the guard rejects, it never unlinks")
 
-	require.NoError(t, b.Deprovision(ctx, leaseUUID))
+	// The replacement tore down the predecessor before bind validation failed, so
+	// the exact candidate intent cannot be settled in this process. Its terminal
+	// storage-authority latch suppresses callbacks until a fresh process reopens
+	// the journals and classifies the now-quiescent substrate.
+	select {
+	case callback := <-replayCh:
+		t.Fatalf("unexpected callback before cold recovery: %+v", callback)
+	case <-time.After(500 * time.Millisecond):
+	}
+	cfg := b.cfg
+	require.NoError(t, b.Stop())
+	restarted, err := New(cfg, slog.Default())
+	require.NoError(t, err)
+	intents, err := restarted.callbackStore.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "the failed replacement intent must survive the stopped backend")
+	require.NoError(t, restarted.Start(ctx))
+	t.Cleanup(func() { _ = restarted.Stop() })
+	failure := waitForCallback(t, replayCh, leaseUUID, 30*time.Second)
+	require.Equal(t, backend.CallbackStatusFailed, failure.Status)
+	recovered, err := restarted.GetProvision(ctx, leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, backend.ProvisionStatusFailed, recovered.Status,
+		"cold recovery must restore the predecessor as a close-admissible Failed projection")
+	require.NoError(t, restarted.Deprovision(ctx, leaseUUID))
 }
 
 func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
@@ -924,13 +946,12 @@ func TestIntegration_Docker_ProvisionRollbackLeakIsReapedAfterRestart(t *testing
 	case <-time.After(2 * time.Minute):
 		t.Fatal("failed volume compensation did not stop the backend")
 	}
-	remaining, err := b1.callbackStore.ListOperationIntents()
-	require.NoError(t, err)
-	require.Len(t, remaining, 1,
-		"cleanup failure must preserve the exact operation intent for cold recovery")
-	pending, err := b1.callbackStore.ListPending()
-	require.NoError(t, err)
-	assert.Empty(t, pending, "the stopped backend must not publish a failure before cleanup recovery")
+	_, err = b1.callbackStore.ListOperationIntents()
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous,
+		"the terminal backend must refuse journal reads until a fresh process reopens them")
+	require.ErrorIs(t, b1.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+	_, err = b1.callbackStore.ListPending()
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
 	assert.NotNil(t, b1.pool.GetAllocation(leaseUUID+"-app-0"),
 		"capacity must remain reserved while the leaked volume is still claimed")
 	select {
@@ -945,6 +966,10 @@ func TestIntegration_Docker_ProvisionRollbackLeakIsReapedAfterRestart(t *testing
 	b1Stopped = true
 	b2, err := New(cfg, logger)
 	require.NoError(t, err)
+	remaining, err := b2.callbackStore.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, remaining, 1,
+		"cleanup failure must preserve the exact operation intent for cold recovery")
 	require.NoError(t, b2.Start(ctx))
 	t.Cleanup(func() { _ = b2.Stop() })
 	callback := waitForCallback(t, callbackCh, leaseUUID, 2*time.Minute)
@@ -1446,6 +1471,17 @@ func xfsReportListsProject(t *testing.T, mount string, projID uint32) bool {
 	return false
 }
 
+func requireXFSProjectEventuallyAbsent(t *testing.T, mount string, projID uint32) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for xfsReportListsProject(t, mount, projID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("project-quota entry %d remained visible after pending inode cleanup", projID)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // TestIntegration_XFS_Destroy_ClearsQuotaEntry is the ENG-459 regression. Since
 // ENG-449/454 made per-volume project quotas actually apply, Create sets a projid +
 // bhard limit on every volume; the pre-fix Destroy removed the directory but left
@@ -1560,8 +1596,11 @@ func TestIntegration_XFS_InterruptedCreateStageRecoveryClearsQuota(t *testing.T)
 		"successful recovery must consume its reconstructed stage authority")
 	require.NoDirExists(t, stagePath, "recovery must remove the private create stage")
 	require.NoDirExists(t, finalPath, "recovery must never publish an interrupted create")
-	assert.False(t, xfsReportListsProject(t, mount, projID),
-		"recovery must clear the interrupted stage's block and inode limits")
+	// Clearing the limits precedes unlinking the typed stage so crash recovery
+	// never loses its project-ID authority. XFS may retire that last unlinked
+	// inode asynchronously; require eventual dquot disappearance rather than
+	// racing the inodegc worker immediately after recovery returns.
+	requireXFSProjectEventuallyAbsent(t, mount, projID)
 }
 
 // TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode exercises
@@ -1628,11 +1667,13 @@ func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing
 	assert.True(t, xfsReportListsProject(t, mount, projID), "nonzero open-inode usage must retain the dquot")
 
 	// Recovery must have repaired the replayed pre-reset sibling before its zero
-	// proof. `project -c` reports nothing only when the exact inode is project 0.
-	checkOut, checkErr := exec.CommandContext(ctx, "xfs_quota",
-		xfsQuotaArgs(xfsProjectCheckDefaultCmd(deleteStagePath), mount)...).CombinedOutput()
+	// proof. Accept only xfs_quota's recognized clean project-check report.
+	checkCmd := xfsProjectCheckDefaultCmd(deleteStagePath)
+	checkProcess := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(checkCmd, mount)...)
+	checkProcess.Env = append(os.Environ(), "LC_ALL=C")
+	checkOut, checkErr := checkProcess.CombinedOutput()
 	require.NoError(t, checkErr, "check recovered delete-stage project: %s", checkOut)
-	assert.Empty(t, strings.TrimSpace(string(checkOut)))
+	require.NoError(t, validateXFSProjectCheckOutput(checkOut, deleteStagePath))
 
 	require.NoError(t, dataFile.Close(), "closing the last reference releases the unlinked project inode")
 	restartedAgain, err := newVolumeManager(dataPath, "xfs", 1024, slog.Default())

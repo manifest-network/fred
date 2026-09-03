@@ -56,6 +56,7 @@ func recoveredFromProvision(p *provision) recoveredProvision {
 		resourceProfiles:      shared.CloneSKUResourceSnapshot(p.ResourceProfiles),
 		volumeCleanupAttempts: p.VolumeCleanupAttempts,
 	}
+	rec.ResourceProfiles = shared.CloneSKUResourceSnapshot(p.ProvisionState.ResourceProfiles)
 	rec.Items = slices.Clone(p.Items)
 	rec.ContainerIDs = slices.Clone(p.ContainerIDs)
 	if p.ServiceContainers != nil {

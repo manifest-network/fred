@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -329,6 +330,127 @@ func (b *Backend) resumeRecoveredClose(
 	return nil
 }
 
+// listRecoveryPendingIntents returns the exact operation/maintenance leases
+// that ordinary inventory recovery must not replace from a stale Docker
+// snapshot. Callers re-run it under provisionsMu immediately before publishing:
+// an admission that lands after the first inventory snapshot is then either
+// visible here, or is still blocked from capturing/publishing its projection.
+func (b *Backend) listRecoveryPendingIntents(
+	closeIntents map[string]shared.CloseIntentClaim,
+) (map[string]struct{}, map[string]shared.OperationIntentClaim, error) {
+	pending := make(map[string]struct{})
+	operations := make(map[string]shared.OperationIntentClaim)
+	if b.operationIntents == nil && b.callbackStore == nil {
+		return pending, operations, nil
+	}
+
+	var operationClaims []shared.OperationIntentClaim
+	var err error
+	if b.operationIntents != nil {
+		operationClaims, err = b.operationIntents.ListOperationIntents()
+	} else {
+		operationClaims, err = b.callbackStore.ListOperationIntents()
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("list operation intents before state recovery: %w", err)
+	}
+	for _, claim := range operationClaims {
+		if claim.Backend() != b.Name() || claim.BackendStorageID() != b.storageIdentity {
+			return nil, nil, fmt.Errorf(
+				"operation intent for lease %q belongs to backend %q storage %s, not backend %q storage %s",
+				claim.LeaseUUID(), claim.Backend(), claim.BackendStorageID(), b.Name(), b.storageIdentity,
+			)
+		}
+		if profileErr := validateDockerResourceProfiles(claim.Items(), claim.ResourceProfiles()); profileErr != nil {
+			return nil, nil, fmt.Errorf(
+				"operation intent for lease %q has invalid resource authority: %w",
+				claim.LeaseUUID(), profileErr,
+			)
+		}
+		if _, closing := closeIntents[claim.LeaseUUID()]; closing {
+			return nil, nil, fmt.Errorf(
+				"lease %q has simultaneous durable close and operation intents",
+				claim.LeaseUUID(),
+			)
+		}
+		pending[claim.LeaseUUID()] = struct{}{}
+		operations[claim.LeaseUUID()] = claim
+	}
+
+	if b.callbackStore == nil {
+		return pending, operations, nil
+	}
+	maintenanceClaims, err := b.callbackStore.ListMaintenanceIntents()
+	if err != nil {
+		return nil, nil, fmt.Errorf("list maintenance intents before state recovery: %w", err)
+	}
+	for _, claim := range maintenanceClaims {
+		if _, closing := closeIntents[claim.LeaseUUID()]; closing {
+			return nil, nil, fmt.Errorf(
+				"lease %q has simultaneous durable close and maintenance intents",
+				claim.LeaseUUID(),
+			)
+		}
+		if _, operating := operations[claim.LeaseUUID()]; operating {
+			return nil, nil, fmt.Errorf(
+				"lease %q has simultaneous durable operation and maintenance intents",
+				claim.LeaseUUID(),
+			)
+		}
+		pending[claim.LeaseUUID()] = struct{}{}
+	}
+	return pending, operations, nil
+}
+
+type provisionRecoveryBaseline struct {
+	pointer *provision
+	value   recoveredProvision
+}
+
+func (b *Backend) snapshotProvisionRecoveryBaseline() map[string]provisionRecoveryBaseline {
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	baseline := make(map[string]provisionRecoveryBaseline, len(b.provisions))
+	for leaseUUID, current := range b.provisions {
+		baseline[leaseUUID] = provisionRecoveryBaseline{
+			pointer: current,
+			value:   recoveredFromProvision(current),
+		}
+	}
+	return baseline
+}
+
+// changedProvisionRecoveryLeases is called with provisionsMu held. Pointer
+// identity detects replacement generations even when their values happen to be
+// equal; the deep value detects actor and cleanup mutations that intentionally
+// update a published provision in place. Stack manifests are immutable after
+// publication, while recoveredFromProvision clones every mutable slice/map.
+func (b *Backend) changedProvisionRecoveryLeases(
+	baseline map[string]provisionRecoveryBaseline,
+) map[string]string {
+	changed := make(map[string]string)
+	for leaseUUID, prior := range baseline {
+		current, exists := b.provisions[leaseUUID]
+		if !exists {
+			changed[leaseUUID] = "lease was removed"
+			continue
+		}
+		if current != prior.pointer {
+			changed[leaseUUID] = "generation changed"
+			continue
+		}
+		if !reflect.DeepEqual(recoveredFromProvision(current), prior.value) {
+			changed[leaseUUID] = "projection changed"
+		}
+	}
+	for leaseUUID := range b.provisions {
+		if _, existed := baseline[leaseUUID]; !existed {
+			changed[leaseUUID] = "lease was added"
+		}
+	}
+	return changed
+}
+
 // recoverState rebuilds in-memory state from Docker containers.
 // Handles multi-unit leases by grouping containers by lease UUID.
 // Merges with existing state to preserve in-flight provisions.
@@ -351,13 +473,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	if err := b.recoverMaintenanceIntents(ctx); err != nil {
 		return err
 	}
-	b.closeSnapshotMu.Lock()
-	closeSnapshotLocked := true
+	b.recoverySnapshotMu.Lock()
+	recoverySnapshotLocked := true
 	defer func() {
-		if closeSnapshotLocked {
-			b.closeSnapshotMu.Unlock()
+		if recoverySnapshotLocked {
+			b.recoverySnapshotMu.Unlock()
 		}
 	}()
+	provisionBaseline := b.snapshotProvisionRecoveryBaseline()
 
 	containers, err := b.listManagedContainersForRecovery(ctx)
 	if err != nil {
@@ -369,9 +492,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// validation: those sources are expected to become incomplete as close
 	// progresses, and treating that intentional destruction as ordinary
 	// provision corruption would wedge startup at precisely the crash boundary
-	// the journal exists to bridge. closeSnapshotMu excludes only close admission
-	// and terminal settlement while inventory, journal, provisions, and pool are
-	// published as one snapshot; slow destructive cleanup holds neither side.
+	// the journal exists to bridge. recoverySnapshotMu excludes lifecycle
+	// admission and terminal durable handoffs while inventory, journals,
+	// provisions, and pool are published as one snapshot; slow destructive
+	// cleanup holds neither side.
 	closeIntents := make(map[string]shared.CloseIntentClaim)
 	if b.callbackStore != nil {
 		claims, listErr := b.callbackStore.ListCloseIntents()
@@ -388,56 +512,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			closeIntents[claim.LeaseUUID()] = claim
 		}
 	}
-	pendingIntentLeases := make(map[string]struct{})
-	operationClaimsByLease := make(map[string]shared.OperationIntentClaim)
-	if b.callbackStore != nil {
-		operationClaims, listErr := b.callbackStore.ListOperationIntents()
-		if listErr != nil {
-			return fmt.Errorf("list operation intents before state recovery: %w", listErr)
-		}
-		for _, claim := range operationClaims {
-			if claim.Backend() != b.Name() || claim.BackendStorageID() != b.storageIdentity {
-				return fmt.Errorf(
-					"operation intent for lease %q belongs to backend %q storage %s, not backend %q storage %s",
-					claim.LeaseUUID(), claim.Backend(), claim.BackendStorageID(), b.Name(), b.storageIdentity,
-				)
-			}
-			if profileErr := validateDockerResourceProfiles(claim.Items(), claim.ResourceProfiles()); profileErr != nil {
-				return fmt.Errorf(
-					"operation intent for lease %q has invalid resource authority: %w",
-					claim.LeaseUUID(), profileErr,
-				)
-			}
-			if _, closing := closeIntents[claim.LeaseUUID()]; closing {
-				return fmt.Errorf(
-					"lease %q has simultaneous durable close and operation intents",
-					claim.LeaseUUID(),
-				)
-			}
-			pendingIntentLeases[claim.LeaseUUID()] = struct{}{}
-			operationClaimsByLease[claim.LeaseUUID()] = claim
-		}
-	}
-	if b.callbackStore != nil {
-		maintenanceClaims, listErr := b.callbackStore.ListMaintenanceIntents()
-		if listErr != nil {
-			return fmt.Errorf("list maintenance intents before state recovery: %w", listErr)
-		}
-		for _, claim := range maintenanceClaims {
-			if _, closing := closeIntents[claim.LeaseUUID()]; closing {
-				return fmt.Errorf(
-					"lease %q has simultaneous durable close and maintenance intents",
-					claim.LeaseUUID(),
-				)
-			}
-			if _, operating := operationClaimsByLease[claim.LeaseUUID()]; operating {
-				return fmt.Errorf(
-					"lease %q has simultaneous durable operation and maintenance intents",
-					claim.LeaseUUID(),
-				)
-			}
-			pendingIntentLeases[claim.LeaseUUID()] = struct{}{}
-		}
+	pendingIntentLeases, operationClaimsByLease, err := b.listRecoveryPendingIntents(closeIntents)
+	if err != nil {
+		return err
 	}
 	// A restoring source row owns the destination's adopted bytes until an exact
 	// active Release is durable. Its destination snapshot is therefore the
@@ -1419,6 +1496,41 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	// Merge with existing state and detect status transitions.
 	b.provisionsMu.Lock()
+	// Close the intent-snapshot/publication TOCTOU without globally serializing
+	// slow inventory collection with admissions. If an operation was admitted
+	// after the first snapshot, it is either visible in this re-read or is still
+	// waiting on provisionsMu before it can capture/publish a projection. Union
+	// rather than replace: settlement between the two reads only means preserving
+	// one live generation for an extra recovery pass, which is conservative.
+	latestPendingIntentLeases, _, err := b.listRecoveryPendingIntents(closeIntents)
+	if err != nil {
+		b.provisionsMu.Unlock()
+		return err
+	}
+	for leaseUUID := range latestPendingIntentLeases {
+		pendingIntentLeases[leaseUUID] = struct{}{}
+	}
+	// A concurrent operation may have changed one lease while this pass collected
+	// inventory. Remove only those stale per-lease products: the live projection
+	// and current pool keys are overlaid/preserved below, while unrelated leases
+	// still converge in this pass. This avoids both stale-generation publication
+	// and fleet-wide starvation from one hot lease.
+	changedProjectionLeases := b.changedProvisionRecoveryLeases(provisionBaseline)
+	for leaseUUID, reason := range changedProjectionLeases {
+		if _, closing := closeIntents[leaseUUID]; closing {
+			// recoverySnapshotMu prevents this claim from settling while we
+			// publish. Its immutable snapshot, not the teardown worker's
+			// intentionally changing volatile projection, remains authoritative.
+			delete(changedProjectionLeases, leaseUUID)
+			continue
+		}
+		delete(building, leaseUUID)
+		delete(allocsByLease, leaseUUID)
+		delete(cohortIssues, leaseUUID)
+		delete(firstExitedByLease, leaseUUID)
+		b.logger.Debug("provision changed while recovery collected inventory; preserving its live generation",
+			"lease_uuid", leaseUUID, "reason", reason)
+	}
 
 	const incompleteCohortMessage = leasesm.ErrMsgCohortDiverged
 	cohortDirectFailures := make(map[string]struct{}, len(cohortIssues))
@@ -1543,6 +1655,28 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// The immutable close claim supersedes every volatile projection.
 			// Cleanup-only closes deliberately remove a stale projection; full
 			// closes use the conservative value materialized above.
+			continue
+		}
+		if _, changed := changedProjectionLeases[uuid]; changed {
+			// Inventory and its derived allocation snapshot predate this live
+			// projection generation. Preserve the exact actor-owned value and its
+			// existing pool keys; the next recovery pass can converge it from a
+			// fresh baseline without delaying unrelated leases in this pass.
+			final[uuid] = existing
+			continue
+		}
+		if _, pending := pendingIntentLeases[uuid]; pending {
+			// A durable operation/maintenance intent closes the admission-to-
+			// projection-publication window that the volatile status alone cannot
+			// represent. In particular, re-provisioning a Failed lease records its
+			// candidate intent before synchronously tearing down the predecessor,
+			// while the predecessor intentionally remains Failed and authoritative.
+			// Replacing that pointer from a concurrent inventory refresh would make
+			// the exact post-teardown compare-and-swap report an ambiguous outcome
+			// even though no competing command exists. Keep both the live projection
+			// and (via ResetPreserving below) its current allocation generation until
+			// the intent owner publishes the candidate atomically.
+			final[uuid] = existing
 			continue
 		}
 		if _, hasContainers := building[uuid]; hasContainers {
@@ -1729,8 +1863,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// delayed Set after the publication locks are released.
 	activeProvisions.Set(readyCount)
 	b.provisionsMu.Unlock()
-	b.closeSnapshotMu.Unlock()
-	closeSnapshotLocked = false
+	b.recoverySnapshotMu.Unlock()
+	recoverySnapshotLocked = false
 
 	updateResourceMetrics(b.pool.Stats())
 	b.refreshRetentionAccounting()

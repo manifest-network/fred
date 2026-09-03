@@ -52,6 +52,101 @@ func prepareDeleteStageForTest(
 	require.NoError(t, mgr.rememberDurableDeleteStage(stage))
 }
 
+func TestValidateXFSProjectCheckOutput(t *testing.T) {
+	t.Parallel()
+
+	const dirPath = "/srv/fred/volumes/.fred-xfs-delete-42-volume"
+	cleanSummary := "Checking project 0 (path " + dirPath + ")...\n" +
+		"Processed 1 (/custom/projects and cmdline) paths for project 0 with recursion depth limited (0).\n"
+	tests := []struct {
+		name    string
+		out     string
+		wantErr bool
+	}{
+		{name: "silent clean report"},
+		{name: "current clean summary", out: cleanSummary},
+		{
+			name: "project id mismatch",
+			out: "Checking project 0 (path " + dirPath + ")...\n" +
+				dirPath + " - project identifier is not set (inode=42, tree=0)\n" +
+				"Processed 1 (/etc/projects and cmdline) paths for project 0 with recursion depth limited (0).\n",
+			wantErr: true,
+		},
+		{
+			name: "inheritance mismatch",
+			out: "Checking project 0 (path " + dirPath + ")...\n" +
+				dirPath + " - project inheritance flag is not set\n" +
+				"Processed 1 (/etc/projects and cmdline) paths for project 0 with recursion depth limited (0).\n",
+			wantErr: true,
+		},
+		{name: "wrong path", out: strings.Replace(cleanSummary, dirPath, "/wrong", 1), wantErr: true},
+		{name: "wrong project", out: strings.Replace(cleanSummary, "project 0", "project 7", 1), wantErr: true},
+		{name: "wrong count", out: strings.Replace(cleanSummary, "Processed 1", "Processed 2", 1), wantErr: true},
+		{name: "wrong depth", out: strings.Replace(cleanSummary, "limited (0)", "limited (1)", 1), wantErr: true},
+		{name: "extra output", out: cleanSummary + "warning\n", wantErr: true},
+		{name: "localized output", out: "Verification du projet 0...\nTraite 1 chemin.\n", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateXFSProjectCheckOutput([]byte(tc.out), dirPath)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestWaitForZeroProjectQuotaUsageTriggersAndPollsExactID(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	readyPath := filepath.Join(t.TempDir(), "inodegc-ready")
+	t.Setenv("FRED_TEST_XFS_READY", readyPath)
+	logPath := installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"%s"*) ;;
+  *"report -p -b -n -N -L %d -U %d"*)
+    if [ -e "$FRED_TEST_XFS_READY" ]; then
+      printf '#%d 0 0 0 0\n'
+    else
+      printf '#%d 7 0 0 0\n'
+    fi
+    ;;
+  *"report -p -i -n -N -L %d -U %d"*)
+    if [ -e "$FRED_TEST_XFS_READY" ]; then
+      printf '#%d 0 0 0 0\n'
+    else
+      printf '#%d 1 0 0 0\n'
+      printf ready > "$FRED_TEST_XFS_READY"
+    fi
+    ;;
+esac`,
+		xfsInodeGCTriggerCmd(),
+		xfsDeleteTestProjectID, xfsDeleteTestProjectID,
+		xfsDeleteTestProjectID, xfsDeleteTestProjectID,
+		xfsDeleteTestProjectID, xfsDeleteTestProjectID,
+		xfsDeleteTestProjectID, xfsDeleteTestProjectID,
+	))
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	blocks, inodes, err := mgr.waitForZeroProjectQuotaUsage(ctx, xfsDeleteTestProjectID)
+	require.NoError(t, err)
+	assert.Zero(t, blocks)
+	assert.Zero(t, inodes)
+	commands, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	commandText := string(commands)
+	assert.Equal(t, 1, strings.Count(commandText, xfsInodeGCTriggerCmd()),
+		"cleanup must trigger pending inode inactivation once before polling the exact retiring ID")
+	triggerAt := strings.Index(commandText, xfsInodeGCTriggerCmd())
+	blockProofAt := strings.Index(commandText, xfsProjectReportCmd("b", xfsDeleteTestProjectID))
+	require.GreaterOrEqual(t, triggerAt, 0)
+	assert.Greater(t, blockProofAt, triggerAt)
+}
+
 func TestParseXFSDeleteStageNameRequiresCanonicalTypedAuthority(t *testing.T) {
 	t.Parallel()
 
@@ -170,7 +265,9 @@ func TestXFSPrepareDeleteStageResetsAndAttestsDefaultProjectBeforePublication(t 
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
 	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
-	logPath := installXFSQuotaFixture(t, "")
+	logPath := installXFSQuotaFixture(t, `case "$*" in
+  *"project -c -d 0"*) test "$LC_ALL" = C || exit 24 ;;
+esac`)
 	root, parent, err := openXFSRootCapabilities(dataPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close(); _ = parent.Close() })
@@ -255,6 +352,36 @@ func TestXFSDestroyMarkerFirstPartialDeleteRecoversAfterRestart(t *testing.T) {
 	assert.Contains(t, string(commands), xfsLimitClearCmd(stage.projID))
 }
 
+func TestXFSDeleteInodeGCTriggerFailureRetainsTombstone(t *testing.T) {
+	dataPath := t.TempDir()
+	mgr := newXfsManagerForTest(dataPath)
+	stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
+	prepareDeleteStageForTest(t, mgr, stage)
+	logPath := installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"%s"*) exit 23 ;;
+esac`, xfsInodeGCTriggerCmd()))
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	err := mgr.cleanupXFSDeleteStage(ctx, stage)
+	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
+	require.ErrorContains(t, err, fmt.Sprintf("before project %d usage proof", stage.projID))
+	assert.DirExists(t, stage.hostPath(dataPath),
+		"a failed inode-GC trigger must retain the typed cleanup tombstone")
+	assert.Equal(t, stage, mgr.durableDeleteStages[stage.volumeID.value()])
+	assert.Equal(t, stage.projID, mgr.volumeToID[stage.volumeID.value()])
+	assert.Equal(t, stage.volumeID.value(), mgr.activeIDs[stage.projID])
+
+	commands, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr)
+	commandText := string(commands)
+	assert.Equal(t, 1, strings.Count(commandText, xfsInodeGCTriggerCmd()))
+	assert.NotContains(t, commandText, "report -p",
+		"an unproven trigger must stop before exact retiring-ID reads")
+	assert.NotContains(t, commandText, xfsLimitClearCmd(stage.projID),
+		"an unproven trigger must stop before clearing quota authority")
+}
+
 func TestXFSDeleteUsageProofFailureRetainsTombstone(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -305,8 +432,10 @@ esac`,
 			stage := mustXFSDeleteStage(t, xfsDeleteTestProjectID, xfsStageTestVolume)
 			prepareDeleteStageForTest(t, mgr, stage)
 			installXFSQuotaFixture(t, tc.body)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
 
-			err := mgr.cleanupXFSDeleteStage(t.Context(), stage)
+			err := mgr.cleanupXFSDeleteStage(ctx, stage)
 			require.ErrorContains(t, err, tc.want)
 			require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 			assert.DirExists(t, stage.hostPath(dataPath))
@@ -329,8 +458,10 @@ func TestXFSDestroyAbsentMappedVolumePersistsAuthorityBeforeUsageProof(t *testin
   *"report -p -b -n -N"*) printf '#%d 9 0 0 0\n' ;;
   *"report -p -i -n -N"*) printf '#%d 1 0 0 0\n' ;;
 esac`, stage.projID, stage.projID))
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
 
-	err := mgr.Destroy(t.Context(), stage.volumeID.value())
+	err := mgr.Destroy(ctx, stage.volumeID.value())
 	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 	require.ErrorContains(t, err, "still uses 9 blocks and 1 inodes")
 	assert.DirExists(t, stage.hostPath(dataPath),

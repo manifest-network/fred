@@ -169,12 +169,16 @@ type Backend struct {
 	// recoverState. Without serialization, concurrent calls can detect
 	// the same ready→failed transitions and send duplicate callbacks.
 	recoverMu sync.Mutex
-	// closeSnapshotMu makes Docker inventory plus the close-intent journal one
-	// authoritative recovery snapshot without serializing slow substrate cleanup.
-	// Recovery holds the write side only through provisions+pool publication;
-	// close admission and exact settlement hold the read side only around their
-	// durable transactions. Destructive work holds neither side.
-	closeSnapshotMu sync.RWMutex
+	// recoverySnapshotMu prevents close/restore lifecycle boundaries from crossing
+	// Docker inventory plus the matching volatile-projection and pool publication.
+	// Recovery holds the write side through publication. Close authority capture
+	// and settlement plus Restore's intent-to-Restoring admission bridge hold the
+	// read side around their evidence reads and durable mutations; restore rollback
+	// holds it through operation settlement, source-authority handback, pool release,
+	// and projection removal. Slow destructive work holds neither side because a
+	// durable close/Restoring record bridges that work. Provision and maintenance
+	// concurrency use their separate baseline/intent fences.
+	recoverySnapshotMu sync.RWMutex
 
 	// retentionAccountingMu serializes refreshRetentionAccounting's
 	// recompute-from-store + SetRetainedDisk so a stale snapshot can never

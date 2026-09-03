@@ -965,9 +965,32 @@ func xfsProjectResetToDefaultCmd(dirPath string) string {
 
 // xfsProjectCheckDefaultCmd independently verifies the assignment above. The
 // project check prints every mismatched inode; callers require both exit success
-// and empty output before publishing the sibling as teardown authority.
+// and a recognized clean report before publishing the sibling as teardown
+// authority.
 func xfsProjectCheckDefaultCmd(dirPath string) string {
 	return fmt.Sprintf("project -c -d 0 -p %s 0", dirPath)
+}
+
+// validateXFSProjectCheckOutput accepts the two clean-output shapes emitted by
+// supported xfsprogs versions. Some versions are silent on success; current
+// versions always print a prologue and summary even when every inode matches.
+// Anything else remains a fail-closed mismatch because `project -c` does not
+// signal inode mismatches through its exit status.
+func validateXFSProjectCheckOutput(out []byte, dirPath string) error {
+	got := strings.TrimSpace(string(out))
+	if got == "" {
+		return nil
+	}
+	lines := strings.Split(got, "\n")
+	prologue := fmt.Sprintf("Checking project 0 (path %s)...", dirPath)
+	const summaryPrefix = "Processed 1 ("
+	const summarySuffix = " and cmdline) paths for project 0 with recursion depth limited (0)."
+	if len(lines) != 2 || lines[0] != prologue ||
+		!strings.HasPrefix(lines[1], summaryPrefix) ||
+		!strings.HasSuffix(lines[1], summarySuffix) {
+		return fmt.Errorf("xfs_quota reported mismatched inodes or unexpected output: %s", got)
+	}
+	return nil
 }
 
 // xfsLimitCmd is the `limit -p` command that sets the block hard limit (bhard) and
@@ -991,6 +1014,17 @@ func xfsLimitClearCmd(projID uint32) string {
 // project rows when proving deletion safety.
 func xfsProjectReportCmd(resource string, projID uint32) string {
 	return fmt.Sprintf("report -p -%s -n -N -L %d -U %d", resource, projID, projID)
+}
+
+// xfsInodeGCTriggerCmd reads exactly project 0. XFS treats an ID-0 quota read
+// as the start of a reporting scan and flushes or expedites pending inode-GC
+// work for the containing mount (the kernel implementation is version-specific).
+// The `quota` command uses XFS_GETQUOTA for that single ID rather than scanning
+// the filesystem-global quota table. Cleanup still polls the exact retiring ID
+// under a bounded context because accounting visibility is not guaranteed by
+// the command boundary on every supported kernel.
+func xfsInodeGCTriggerCmd() string {
+	return "quota -p -i -n -N 0"
 }
 
 func createXFSStageDirectory(
@@ -1234,16 +1268,17 @@ func (x *xfsVolumeManager) normalizeXFSDeleteStageProjectWith(
 		return fmt.Errorf("reset xfs delete-stage %q to project 0: %w: %s", stage.value(), resetErr, out)
 	}
 	checkCmd := xfsProjectCheckDefaultCmd(parent.DisplayPath(stage.value()))
-	checkOut, checkErr := exec.CommandContext(resetCtx, "xfs_quota", xfsQuotaArgs(checkCmd, x.mountPoint)...).CombinedOutput()
+	checkProcess := exec.CommandContext(resetCtx, "xfs_quota", xfsQuotaArgs(checkCmd, x.mountPoint)...)
+	// project(8)'s clean-output summary is localized. Pin it so the strict
+	// parser below cannot mistake a translated success report for a mismatch.
+	checkProcess.Env = append(os.Environ(), "LC_ALL=C")
+	checkOut, checkErr := checkProcess.CombinedOutput()
 	cancel()
 	if checkErr != nil {
 		return fmt.Errorf("attest xfs delete-stage %q project 0: %w: %s", stage.value(), checkErr, checkOut)
 	}
-	if strings.TrimSpace(string(checkOut)) != "" {
-		return fmt.Errorf(
-			"attest xfs delete-stage %q project 0: xfs_quota reported mismatched inodes: %s",
-			stage.value(), strings.TrimSpace(string(checkOut)),
-		)
+	if err := validateXFSProjectCheckOutput(checkOut, parent.DisplayPath(stage.value())); err != nil {
+		return fmt.Errorf("attest xfs delete-stage %q project 0: %w", stage.value(), err)
 	}
 	if err := syncOSRoot(stageRoot); err != nil {
 		return fmt.Errorf("sync project-0 xfs delete-stage %q: %w", stage.value(), err)
@@ -1533,25 +1568,23 @@ func (x *xfsVolumeManager) cleanupXFSDeleteStageWith(
 	// open-unlinked project inode remains. The higher-level teardown gate also
 	// requires containers to be stopped; this is the XFS defense in depth.
 	clearCtx, cancel := newDetachedBoundedContext(ctx, 30*time.Second)
-	blocks, blockErr := x.readProjectQuotaUsage(clearCtx, stage.projID, "b")
-	if blockErr != nil {
+	blocks, inodes, usageErr := x.waitForZeroProjectQuotaUsage(clearCtx, stage.projID)
+	if usageErr != nil && blocks == 0 && inodes == 0 {
 		cancel()
 		_ = stageRoot.Close()
-		return fmt.Errorf("prove zero block usage for xfs delete-stage %q: %w", stage.value(), blockErr)
-	}
-	inodes, inodeErr := x.readProjectQuotaUsage(clearCtx, stage.projID, "i")
-	if inodeErr != nil {
-		cancel()
-		_ = stageRoot.Close()
-		return fmt.Errorf("prove zero inode usage for xfs delete-stage %q: %w", stage.value(), inodeErr)
+		return fmt.Errorf("prove zero usage for xfs delete-stage %q: %w", stage.value(), usageErr)
 	}
 	if blocks != 0 || inodes != 0 {
 		cancel()
 		_ = stageRoot.Close()
-		return fmt.Errorf(
+		refusal := fmt.Errorf(
 			"refuse to clear xfs project quota for delete-stage %q: project %d still uses %d blocks and %d inodes",
 			stage.value(), stage.projID, blocks, inodes,
 		)
+		if usageErr != nil {
+			return errors.Join(refusal, fmt.Errorf("wait for pending xfs inode cleanup: %w", usageErr))
+		}
+		return refusal
 	}
 	clearCmd := xfsLimitClearCmd(stage.projID)
 	out, clearErr := exec.CommandContext(clearCtx, "xfs_quota", xfsQuotaArgs(clearCmd, x.mountPoint)...).CombinedOutput()
@@ -2471,6 +2504,53 @@ func (x *xfsVolumeManager) readProjectQuotaUsage(ctx context.Context, projID uin
 		return 0, nil
 	}
 	return used, nil
+}
+
+func (x *xfsVolumeManager) waitForZeroProjectQuotaUsage(
+	ctx context.Context,
+	projID uint32,
+) (blocks int64, inodes int64, err error) {
+	const (
+		initialPollInterval = 100 * time.Millisecond
+		maximumPollInterval = time.Second
+	)
+	pollInterval := initialPollInterval
+
+	triggerCmd := xfsInodeGCTriggerCmd()
+	if out, triggerErr := exec.CommandContext(
+		ctx, "xfs_quota", xfsQuotaArgs(triggerCmd, x.mountPoint)...,
+	).CombinedOutput(); triggerErr != nil {
+		return 0, 0, fmt.Errorf("xfs_quota %s before project %d usage proof: %w: %s",
+			triggerCmd, projID, triggerErr, out)
+	}
+
+	for {
+		blocks, err = x.readProjectQuotaUsage(ctx, projID, "b")
+		if err != nil {
+			return blocks, inodes, err
+		}
+		inodes, err = x.readProjectQuotaUsage(ctx, projID, "i")
+		if err != nil {
+			return blocks, inodes, err
+		}
+		if blocks == 0 && inodes == 0 {
+			return 0, 0, nil
+		}
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return blocks, inodes, ctx.Err()
+		case <-timer.C:
+		}
+		pollInterval = min(2*pollInterval, maximumPollInterval)
+	}
 }
 
 func (x *xfsVolumeManager) loadProjectIDs() error {

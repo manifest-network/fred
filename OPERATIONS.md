@@ -1061,10 +1061,14 @@ queue. Its row is committed before destructive work and intentionally survives
 container absence, process restarts, `callback_max_age`, and transient cleanup
 errors. Do not infer from zero containers that it is stale.
 
-Recovery and live Deprovision share a backend-local recovery guard from the
-container/intent snapshot through close resumption. This prevents a completed
-close from racing a stale inventory publication without pausing unrelated
-Provision or Restore commands.
+Recovery, live Deprovision admission/settlement, and Restore's intent-to-
+`restoring` admission and rollback handback share a backend-local
+recovery-snapshot guard. Recovery holds the exclusive side only through
+inventory and matching provision/pool publication; live paths hold the shared
+side only for authority capture and durable handoffs, not destructive substrate
+work. This prevents a completed close or fully rolled-back restore from racing
+stale inventory publication. Provision remains available; Restore can wait for
+the current publication.
 
 For an ordinary full close, recovery reconstructs a conservative
 `deprovisioning` projection and resource reservation from the row's immutable

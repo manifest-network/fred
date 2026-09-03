@@ -35,8 +35,8 @@ func (b *Backend) acquireCloseIntent(
 	if b.callbackStore == nil {
 		return shared.CloseIntentClaim{}, false, nil
 	}
-	b.closeSnapshotMu.RLock()
-	defer b.closeSnapshotMu.RUnlock()
+	b.recoverySnapshotMu.RLock()
+	defer b.recoverySnapshotMu.RUnlock()
 	if existing, found, err := b.callbackStore.GetCloseIntent(leaseUUID); err != nil {
 		return shared.CloseIntentClaim{}, false, fmt.Errorf("read durable close intent: %w", err)
 	} else if found {
@@ -620,8 +620,8 @@ func (b *Backend) resolveCloseIntent(
 		// Settlement is one recovery-visible state change: a writer may see the
 		// close before this block or the finalized projection/accounting after it,
 		// never a resolved journal paired with stale live state.
-		b.closeSnapshotMu.RLock()
-		defer b.closeSnapshotMu.RUnlock()
+		b.recoverySnapshotMu.RLock()
+		defer b.recoverySnapshotMu.RUnlock()
 		if prepare != nil {
 			if err := prepare(); err != nil {
 				return err

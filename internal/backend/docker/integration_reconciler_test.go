@@ -1085,6 +1085,10 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 		LifecycleCallbackURL: restoreCallbacks.lifecycleURL,
 	}))
 	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, env.callbackCh, newLease, 3*time.Minute).Status)
+	// Callback settlement and source-finalizer deletion are separate durable
+	// crash boundaries. Drive the level-triggered retention reconciler explicitly
+	// instead of waiting for the production sweep cadence.
+	finalizeRestoreRetentionForTest(t, env.backend, env.backend.retentionStore, leaseUUID)
 
 	// 5. Sentinel survived; record gone.
 	out := execInContainer(t, getContainerID(t, newLease), []string{"cat", "/data/sentinel.txt"})

@@ -49,6 +49,10 @@ func (j *blockingOperationIntentJournal) BeginOperationIntent(
 	return j.delegate.BeginOperationIntent(spec)
 }
 
+func (j *blockingOperationIntentJournal) ListOperationIntents() ([]shared.OperationIntentClaim, error) {
+	return j.delegate.ListOperationIntents()
+}
+
 func (j *blockingOperationIntentJournal) ResolveOperationIntent(
 	claim shared.OperationIntentClaim,
 	status backend.CallbackStatus,
@@ -67,6 +71,10 @@ func (fixedOperationIntentProbeJournal) BeginOperationIntent(
 	shared.OperationIntentSpec,
 ) (shared.OperationIntentAdmission, error) {
 	return shared.OperationIntentAdmission{}, errors.New("unexpected BeginOperationIntent after exact probe")
+}
+
+func (fixedOperationIntentProbeJournal) ListOperationIntents() ([]shared.OperationIntentClaim, error) {
+	return nil, nil
 }
 
 func (fixedOperationIntentProbeJournal) ResolveOperationIntent(

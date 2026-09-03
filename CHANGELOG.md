@@ -733,7 +733,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the immutable source quota through the Btrfs/XFS/ZFS abstraction, pre-counts
   the retained footprint, and exact-CAS reactivates/backfills the source before
   releasing destination allocations. Any uncertainty stays `restoring` and
-  live-counted, so a transient failure can over-deny but never over-admit.
+  live-counted, so a transient failure can over-deny but never over-admit. A
+  backend-local recovery-snapshot guard now also makes restore admission and
+  final rollback handoff indivisible with respect to inventory publication, so
+  recovery cannot resurrect a transient destination after the same restore has
+  completely rolled back.
   (ENG-632)
 - Restore destination authority now fences Provision and Restore for as long as
   any source retention finalizer owns that destination. A plain,

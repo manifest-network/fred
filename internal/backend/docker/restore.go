@@ -406,6 +406,12 @@ func (b *Backend) reconcileRestoringWithAuthority(
 	// handing the durable row back to Active. A callback-store failure therefore
 	// leaves Restoring + the live reservation as a level-triggered retry vehicle;
 	// moving this after the CAS would strand an Existing intent until restart.
+	// Keep operation settlement, Restoring→Active handback, pool release, and
+	// projection removal indivisible from recovery publication. Physical teardown
+	// and re-quarantine above need no snapshot lock because the Restoring row is
+	// still durable authority throughout them.
+	b.recoverySnapshotMu.RLock()
+	defer b.recoverySnapshotMu.RUnlock()
 	if err := b.settleRolledBackRestoreIntent(e, intent); err != nil {
 		return fmt.Errorf("settle rolled-back restore intent for %q: %w", e.NewLeaseUUID, err)
 	}
@@ -1708,6 +1714,21 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	if err != nil {
 		return fmt.Errorf("marshal restore manifest for durable intent: %w", err)
 	}
+	// Bridge admission into durable Restoring authority as one recovery-visible
+	// transition. A recovery snapshot that began before this lock cannot observe
+	// transient destination substrate or accounting: Restore waits until that
+	// snapshot is published before creating its intent. Once admitted, the intent
+	// and then the Restoring row protect every pre-claim side effect across crashes.
+	b.recoverySnapshotMu.RLock()
+	recoverySnapshotHeld := true
+	defer func() {
+		if recoverySnapshotHeld {
+			b.recoverySnapshotMu.RUnlock()
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	intent, proceed, err := b.beginOperationIntent(
 		shared.OperationIntentRestore,
 		req.LeaseUUID,
@@ -1851,6 +1872,8 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			return b.refuseOperationIntent(intent, fmt.Errorf("claim retention: %w", err))
 		}
 	}
+	b.recoverySnapshotMu.RUnlock()
+	recoverySnapshotHeld = false
 
 	// Claim flipped the record active→restoring (drops it from the active
 	// projection); the live allocation above already counts the bytes, so this
@@ -2675,6 +2698,13 @@ func (b *Backend) rollbackUnacceptedRestoreAdoption(
 	if !prepared {
 		return fmt.Errorf("restore failed; durable source cleanup remains pending: %w", cause)
 	}
+	// Physical cleanup above is bridged by the Restoring row. From exact
+	// operation settlement through source-authority handback, pool release, and
+	// projection removal, recovery must observe either the complete before-state
+	// or the complete after-state rather than resurrecting the destination from a
+	// stale Docker inventory snapshot.
+	b.recoverySnapshotMu.RLock()
+	defer b.recoverySnapshotMu.RUnlock()
 	if err := b.settleUnacceptedRestoreIntent(intent); err != nil {
 		b.removeProvision(leaseUUID)
 		return fmt.Errorf("restore failed; durable operation settlement remains pending: %s: %w", cause.Error(), err)

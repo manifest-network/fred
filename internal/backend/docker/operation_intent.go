@@ -21,6 +21,7 @@ const refusedOperationFailure = "backend refused operation before asynchronous a
 type operationIntentJournal interface {
 	ProbeOperationIntent(shared.OperationIntentProbe) (shared.OperationIntentAdmissionDisposition, error)
 	BeginOperationIntent(shared.OperationIntentSpec) (shared.OperationIntentAdmission, error)
+	ListOperationIntents() ([]shared.OperationIntentClaim, error)
 	ResolveOperationIntent(shared.OperationIntentClaim, backend.CallbackStatus, string) (shared.CallbackEntry, error)
 }
 

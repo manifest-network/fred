@@ -33,6 +33,35 @@ import (
 // used when a test upgrades from an ephemeral seam to the real journal.
 const nominalDockerProviderUUID = "22222222-2222-4222-8222-222222222222"
 
+const asyncTestResultTimeout = 5 * time.Second
+
+// waitForAsyncTestResult keeps concurrency regressions local to the assertion
+// that owns the goroutine. Without a bounded receive, a broken lock handoff can
+// leave the entire docker package waiting for the global `go test` timeout.
+func waitForAsyncTestResult(t *testing.T, results <-chan error, operation string) error {
+	t.Helper()
+	timer := time.NewTimer(asyncTestResultTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-results:
+		return err
+	case <-timer.C:
+		t.Fatalf("timeout waiting for %s", operation)
+		return context.DeadlineExceeded
+	}
+}
+
+func waitForTestSignal(t *testing.T, signal <-chan struct{}, operation string) {
+	t.Helper()
+	timer := time.NewTimer(asyncTestResultTimeout)
+	defer timer.Stop()
+	select {
+	case <-signal:
+	case <-timer.C:
+		t.Fatalf("timeout waiting for %s", operation)
+	}
+}
+
 func testResourceProfiles(t *testing.T, items []backend.LeaseItem) []shared.SKUResourceSnapshot {
 	t.Helper()
 	cfg := DefaultConfig()
@@ -352,6 +381,13 @@ func (j noopOperationIntentJournal) BeginOperationIntent(
 	return j.store.BeginOperationIntent(spec)
 }
 
+func (j noopOperationIntentJournal) ListOperationIntents() ([]shared.OperationIntentClaim, error) {
+	if j.store == nil {
+		return nil, nil
+	}
+	return j.store.ListOperationIntents()
+}
+
 func (noopOperationIntentJournal) ResolveOperationIntent(
 	shared.OperationIntentClaim,
 	backend.CallbackStatus,
@@ -386,6 +422,10 @@ func (j durableTestOperationIntentJournal) BeginOperationIntent(
 		spec.BackendStorageID = j.storageID
 	}
 	return j.store.BeginOperationIntent(spec)
+}
+
+func (j durableTestOperationIntentJournal) ListOperationIntents() ([]shared.OperationIntentClaim, error) {
+	return j.store.ListOperationIntents()
 }
 
 func (j durableTestOperationIntentJournal) ResolveOperationIntent(
