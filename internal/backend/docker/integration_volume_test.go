@@ -485,7 +485,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	cfg.ProvisionTimeout = time.Nanosecond
 	restarted, err := New(cfg, slog.Default())
 	require.NoError(t, err)
-	intents, err = listOperationIntentsForCallbackTest(t, restarted.callbackStore)
+	intents, err = restarted.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
 	require.Len(t, intents, 1, "the failed replacement intent must survive the stopped backend")
 	require.Equal(t, leaseUUID, intents[0].LeaseUUID())
