@@ -126,7 +126,9 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 	// container left anywhere. This is the pre-ENG-567 danger zone: the
 	// allowlist saw Failed + VolumeCleanupAttempts==0 (no Deprovision ever
 	// ran) and dropped the pool key here.
-	require.NoError(t, b.docker.RemoveContainer(ctx, containerID))
+	mutator, ok := b.docker.(dockerMutationSink)
+	require.True(t, ok, "the integration backend must retain its Docker mutation capability")
+	require.NoError(t, mutator.RemoveContainer(ctx, containerID))
 
 	// 5. Run recoverState again with the container gone.
 	require.NoError(t, b.RefreshState(ctx))

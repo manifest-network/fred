@@ -37,6 +37,15 @@ func retainCloseServer(t *testing.T) (*httptest.Server, <-chan struct{}) {
 	return server, done
 }
 
+func startRetainCloseReplay(t *testing.T, b *Backend) {
+	t.Helper()
+	startCallbackReplayForTest(b)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+}
+
 // stageVolumeDirs creates on-host volume directories under root for each
 // (name -> relative subpaths) entry, mirroring the on-disk layout the deprovision
 // writable-path-only detector inspects. A canonical fred-{lease}-{svc}-{idx}
@@ -66,7 +75,7 @@ func stageVolumeDirs(t *testing.T, root string, layout map[string][]string) {
 func TestDeprovision_WritablePathOnly_DestroyedNotRetained(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
@@ -75,28 +84,30 @@ func TestDeprovision_WritablePathOnly_DestroyedNotRetained(t *testing.T) {
 	// docker-micro at 512 MB (disk_mb > 0) — proves the budget contribution is 0
 	// because the volume is destroyed, NOT because the SKU is sized at 0.
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-wp", "web", 0)
+	canonical0 := canonicalVolumeName(durableCallbackTestLeaseUUID, "web", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-wp": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-wp", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL + "/callbacks/provision",
+			CallbackURL:   testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "grafana/grafana:11.1.0"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
 	// Pre-allocate the live footprint (simulates a running provision).
-	require.NoError(t, b.pool.TryAllocate("lease-wp-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-web-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(512), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=512 MB")
 
 	reclaimedBefore := testutil.ToFloat64(retentionWritablePathReclaimedTotal)
@@ -110,20 +121,22 @@ func TestDeprovision_WritablePathOnly_DestroyedNotRetained(t *testing.T) {
 
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(canonical0)
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn:     func() ([]string, error) { return []string{canonical0}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 	}
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-wp"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	select {
 	case <-callbackDone:
@@ -138,7 +151,7 @@ func TestDeprovision_WritablePathOnly_DestroyedNotRetained(t *testing.T) {
 		"writable-path-only volume must NOT be renamed into the retained namespace")
 
 	// No retention record must exist — no per-tenant slot, nothing to restore.
-	rec, err := rs.Get("lease-wp")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, rec, "writable-path-only close must write no retention record")
 
@@ -163,34 +176,36 @@ func TestDeprovision_WritablePathOnly_DestroyedNotRetained(t *testing.T) {
 func TestDeprovision_StatefulVolume_RetainedNotDestroyed(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
 	defer rs.Close()
 
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-sf", "web", 0)
+	canonical0 := canonicalVolumeName(durableCallbackTestLeaseUUID, "web", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-sf": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-sf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL + "/callbacks/provision",
+			CallbackURL:   testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-sf-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-web-0", "docker-micro", "tenant-a"))
 
 	// Mixed-content volume: a declared-VOLUME subdir (data/) AND a _wp/ subtree.
 	// The presence of stateful data must force RETAIN despite the _wp subtree.
@@ -201,20 +216,22 @@ func TestDeprovision_StatefulVolume_RetainedNotDestroyed(t *testing.T) {
 
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(canonical0)
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn:     func() ([]string, error) { return []string{canonical0}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 	}
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-sf"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	select {
 	case <-callbackDone:
@@ -226,7 +243,7 @@ func TestDeprovision_StatefulVolume_RetainedNotDestroyed(t *testing.T) {
 	assert.Equal(t, [][2]string{{canonical0, retainedName(canonical0)}}, renamed,
 		"stateful volume must be retained (renamed into the retained namespace)")
 
-	rec, err := rs.Get("lease-sf")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, rec, "stateful close must write a retention record")
 	assert.Equal(t, []string{retainedName(canonical0)}, rec.RetainedVolumeNames)
@@ -245,7 +262,7 @@ func TestDeprovision_StatefulVolume_RetainedNotDestroyed(t *testing.T) {
 func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
@@ -255,16 +272,16 @@ func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testi
 		{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},   // stateful (declared VOLUME)
 		{SKU: "docker-micro", Quantity: 1, ServiceName: "dash"}, // writable-path-only (grafana-style)
 	}
-	dbVol := canonicalVolumeName("lease-mx", "db", 0)
-	dashVol := canonicalVolumeName("lease-mx", "dash", 0)
+	dbVol := canonicalVolumeName(durableCallbackTestLeaseUUID, "db", 0)
+	dashVol := canonicalVolumeName(durableCallbackTestLeaseUUID, "dash", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-mx": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-mx", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			CallbackURL:  server.URL + "/callbacks/provision",
+			CallbackURL:  testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:        items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 				"db":   {Image: "redis:7"},
@@ -274,13 +291,15 @@ func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testi
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-mx-db-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-mx-dash-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-db-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-dash-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
 
 	volRoot := t.TempDir()
@@ -291,20 +310,22 @@ func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testi
 
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(dbVol, dashVol)
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn:     func() ([]string, error) { return []string{dbVol, dashVol}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 	}
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-mx"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	select {
 	case <-callbackDone:
@@ -316,7 +337,7 @@ func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testi
 	assert.Equal(t, []string{dashVol}, destroyed, "only the writable-path-only volume must be destroyed")
 	assert.Equal(t, [][2]string{{dbVol, retainedName(dbVol)}}, renamed, "only the stateful volume must be retained")
 
-	rec, err := rs.Get("lease-mx")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, rec, "mixed lease must write a record for its stateful service")
 
@@ -355,34 +376,36 @@ func TestDeprovision_MixedLease_RetainsStatefulReclaimsWritablePathOnly(t *testi
 func TestDeprovision_WritablePathOnly_WithXFSMarker_StillReclaimed(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
 	defer rs.Close()
 
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-xfs", "web", 0)
+	canonical0 := canonicalVolumeName(durableCallbackTestLeaseUUID, "web", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-xfs": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-xfs", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL + "/callbacks/provision",
+			CallbackURL:   testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "grafana/grafana:11.1.0"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-xfs-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-web-0", "docker-micro", "tenant-a"))
 
 	volRoot := t.TempDir()
 	stageVolumeDirs(t, volRoot, map[string][]string{
@@ -393,20 +416,22 @@ func TestDeprovision_WritablePathOnly_WithXFSMarker_StillReclaimed(t *testing.T)
 
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(canonical0)
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn:     func() ([]string, error) { return []string{canonical0}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 	}
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-xfs"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	select {
 	case <-callbackDone:
@@ -417,7 +442,7 @@ func TestDeprovision_WritablePathOnly_WithXFSMarker_StillReclaimed(t *testing.T)
 	assert.Equal(t, []string{canonical0}, destroyed,
 		"writable-path-only volume must be reclaimed even with the xfs .fred-project-id marker present")
 	assert.Empty(t, renamed)
-	rec, err := rs.Get("lease-xfs")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	assert.Nil(t, rec)
 }
@@ -430,53 +455,57 @@ func TestDeprovision_WritablePathOnly_WithXFSMarker_StillReclaimed(t *testing.T)
 func TestDeprovision_AmbiguousVolume_RetainedConservatively(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
 	defer rs.Close()
 
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-amb", "web", 0)
+	canonical0 := canonicalVolumeName(durableCallbackTestLeaseUUID, "web", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-amb": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-amb", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL + "/callbacks/provision",
+			CallbackURL:   testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-amb-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-web-0", "docker-micro", "tenant-a"))
 
 	// defaultDir points at an empty temp dir; the volume's own directory is never
 	// created, so HostPath(name) resolves to a non-existent path → ReadDir errors.
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(canonical0)
 	b.volumes = &mockVolumeManager{
 		defaultDir: t.TempDir(),
-		ListFn:     func() ([]string, error) { return []string{canonical0}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 	}
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-amb"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	select {
 	case <-callbackDone:
@@ -487,7 +516,7 @@ func TestDeprovision_AmbiguousVolume_RetainedConservatively(t *testing.T) {
 	assert.Empty(t, destroyed, "ambiguous (uninspectable) volume must NOT be destroyed")
 	assert.Equal(t, [][2]string{{canonical0, retainedName(canonical0)}}, renamed,
 		"ambiguous volume must be retained conservatively")
-	rec, err := rs.Get("lease-amb")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	assert.NotNil(t, rec, "ambiguous volume must be retained with a record")
 }
@@ -526,34 +555,36 @@ func TestBuildStatefulVolumeBinds_RejectsReservedWritablePathName(t *testing.T) 
 func TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
 	defer rs.Close()
 
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-mk", "web", 0)
+	canonical0 := canonicalVolumeName(durableCallbackTestLeaseUUID, "web", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-mk": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-mk", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL + "/callbacks/provision",
+			CallbackURL:   testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-mk-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-web-0", "docker-micro", "tenant-a"))
 
 	// A stateful directory named like the xfs marker, alongside a _wp subtree.
 	volRoot := t.TempDir()
@@ -563,20 +594,22 @@ func TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained(t *testing.T) {
 
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(canonical0)
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn:     func() ([]string, error) { return []string{canonical0}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 	}
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-mk"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	select {
 	case <-callbackDone:
@@ -587,7 +620,7 @@ func TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained(t *testing.T) {
 	assert.Empty(t, destroyed, "a marker-NAMED stateful directory is tenant data → must not be destroyed")
 	assert.Equal(t, [][2]string{{canonical0, retainedName(canonical0)}}, renamed,
 		"volume with a marker-named stateful dir (plus _wp) must be retained")
-	rec, err := rs.Get("lease-mk")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	assert.NotNil(t, rec)
 }
@@ -623,8 +656,10 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 		return nil
 	}
 
-	binds := b.setupWritablePathBinds(context.Background(), "grafana/grafana:11.1.0",
-		[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
+		return b.setupWritablePathBinds(mutations, context.Background(), "grafana/grafana:11.1.0",
+			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+	})
 
 	// Stale tenant content is wiped; fresh image content is reseeded.
 	_, statErr := os.Stat(staleFile)
@@ -669,8 +704,10 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 		return nil
 	}
 
-	binds := b.setupWritablePathBinds(context.Background(), "img",
-		[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
+		return b.setupWritablePathBinds(mutations, context.Background(), "img",
+			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+	})
 
 	assert.NotContains(t, binds, filepath.Join(wpDir, "var", "lib", "grafana"),
 		"a symlink bind source must not be mounted into the container")
@@ -699,8 +736,10 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 		return nil
 	}
 
-	binds := b.setupWritablePathBinds(context.Background(), "img",
-		[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
+		return b.setupWritablePathBinds(mutations, context.Background(), "img",
+			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
+	})
 
 	assert.Empty(t, binds,
 		"must fail closed (emit no binds) when the _wp root cannot be opened for confinement checks")
@@ -752,7 +791,7 @@ func TestWritablePathExtractDir(t *testing.T) {
 func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
@@ -762,16 +801,16 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 		{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},
 		{SKU: "docker-micro", Quantity: 1, ServiceName: "cache"},
 	}
-	dbVol := canonicalVolumeName("lease-rt", "db", 0)
-	cacheVol := canonicalVolumeName("lease-rt", "cache", 0)
+	dbVol := canonicalVolumeName(durableCallbackTestLeaseUUID, "db", 0)
+	cacheVol := canonicalVolumeName(durableCallbackTestLeaseUUID, "cache", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-rt": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-rt", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			CallbackURL:  server.URL + "/callbacks/provision",
+			CallbackURL:  testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:        items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 				"db":    {Image: "redis:7"},
@@ -781,13 +820,15 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-rt-db-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-rt-cache-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-db-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-cache-0", "docker-micro", "tenant-a"))
 
 	volRoot := t.TempDir()
 	stageVolumeDirs(t, volRoot, map[string][]string{
@@ -795,21 +836,12 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 		cacheVol: {"data"}, // stateful
 	})
 
-	renamedSet := map[string]bool{}
+	inventory := newVolumeSet(dbVol, cacheVol)
 	cacheRenameAttempts := 0
 	var renameLog [][2]string
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn: func() ([]string, error) {
-			// Return only volumes still under their canonical name (not yet renamed).
-			var out []string
-			for _, v := range []string{dbVol, cacheVol} {
-				if !renamedSet[v] {
-					out = append(out, v)
-				}
-			}
-			return out, nil
-		},
+		ListFn:     inventory.list,
 		RenameVolumeFn: func(old, newName string) error {
 			if old == cacheVol {
 				cacheRenameAttempts++
@@ -817,8 +849,8 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 					return assert.AnError // transient failure on the first attempt
 				}
 			}
-			renamedSet[old] = true
 			renameLog = append(renameLog, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 		DestroyFn: func(_ context.Context, id string) error {
@@ -828,11 +860,11 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 	}
 
 	// Attempt 1 fails on the cache rename → lease kept Failed for retry.
-	require.Error(t, b.Deprovision(context.Background(), "lease-rt"),
+	require.Error(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID),
 		"attempt 1 must fail on the transient cache-rename error")
 
 	// Retry succeeds.
-	require.NoError(t, b.Deprovision(context.Background(), "lease-rt"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 	select {
 	case <-callbackDone:
 	case <-time.After(2 * time.Second):
@@ -845,7 +877,7 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 		{cacheVol, retainedName(cacheVol)},
 	}, renameLog)
 
-	rec, err := rs.Get("lease-rt")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, rec)
 	assert.Equal(t, items, rec.Items,
@@ -869,7 +901,7 @@ func TestDeprovision_MultiItemPartialRenameRetry_KeepsFullItems(t *testing.T) {
 func TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted(t *testing.T) {
 	server, _ := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
@@ -879,16 +911,16 @@ func TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted(t *testing.T)
 		{SKU: "docker-micro", Quantity: 1, ServiceName: "db"},   // stateful → refused (destroyed OK)
 		{SKU: "docker-micro", Quantity: 1, ServiceName: "dash"}, // writable-path-only → Destroy FAILS
 	}
-	dbVol := canonicalVolumeName("lease-rf", "db", 0)
-	dashVol := canonicalVolumeName("lease-rf", "dash", 0)
+	dbVol := canonicalVolumeName(durableCallbackTestLeaseUUID, "db", 0)
+	dashVol := canonicalVolumeName(durableCallbackTestLeaseUUID, "dash", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-rf": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-rf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			CallbackURL:  server.URL + "/callbacks/provision",
+			CallbackURL:  testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:        items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
 				"db":   {Image: "redis:7"},
@@ -898,14 +930,16 @@ func TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted(t *testing.T)
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 300 // < 512 → durableItems=[db]=512 breaches → refuse-to-retain
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-rf-db-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-rf-dash-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-db-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-dash-0", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre-condition: live F=1024 MB")
 
 	volRoot := t.TempDir()
@@ -914,21 +948,25 @@ func TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted(t *testing.T)
 		dashVol: {filepath.Join(writablePathSubdir, "var")}, // writable-path-only
 	})
 
+	inventory := newVolumeSet(dbVol, dashVol)
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn:     func() ([]string, error) { return []string{dbVol, dashVol}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			if id == dashVol {
 				return assert.AnError // the writable-path-only Destroy fails (bytes remain on disk)
 			}
-			return nil // the refused stateful Destroy succeeds
+			return inventory.destroy(context.Background(), id) // the refused stateful Destroy succeeds
 		},
-		RenameVolumeFn: func(_, _ string) error { return nil },
+		RenameVolumeFn: func(old, newName string) error {
+			inventory.rename(old, newName)
+			return nil
+		},
 	}
 
 	// The close errors because the wp-only Destroy failed; the lease stays Failed
 	// for retry. The deferred hand-off runs on return.
-	require.Error(t, b.Deprovision(context.Background(), "lease-rf"),
+	require.Error(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID),
 		"close must surface the failed writable-path-only Destroy")
 
 	// Live must NOT be released: dash's bytes remain on disk, so counting them
@@ -946,34 +984,36 @@ func TestDeprovision_RefuseToRetain_WpDestroyFail_KeepsLiveCounted(t *testing.T)
 func TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
 	defer rs.Close()
 
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-wpf", "web", 0)
+	canonical0 := canonicalVolumeName(durableCallbackTestLeaseUUID, "web", 0)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-wpf": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-wpf", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL + "/callbacks/provision",
+			CallbackURL:   testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"web": {Image: "redis:7"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-wpf-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-web-0", "docker-micro", "tenant-a"))
 
 	// Stage a volume whose ONLY top-level entry named _wp is a FILE, not a directory.
 	volRoot := t.TempDir()
@@ -982,20 +1022,22 @@ func TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively(t *testing.
 
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(canonical0)
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn:     func() ([]string, error) { return []string{canonical0}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 	}
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-wpf"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	select {
 	case <-callbackDone:
@@ -1006,7 +1048,7 @@ func TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively(t *testing.
 	assert.Empty(t, destroyed, "a non-directory _wp must NOT be treated as scaffolding → never destroyed")
 	assert.Equal(t, [][2]string{{canonical0, retainedName(canonical0)}}, renamed,
 		"volume with a non-directory _wp must be retained conservatively")
-	rec, err := rs.Get("lease-wpf")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	assert.NotNil(t, rec, "conservatively-retained volume must have a record")
 }
@@ -1025,37 +1067,39 @@ func TestDeprovision_WritablePathSubdirIsFile_RetainedConservatively(t *testing.
 func TestDeprovision_PartialInstanceRetain_CapCheckCountsOnlyRetained(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
+	rs, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "retention.db"),
 	})
 	require.NoError(t, err)
 	defer rs.Close()
 
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "svc"}}
-	inst0 := canonicalVolumeName("lease-pi", "svc", 0) // writable-path-only → reclaimed
-	inst1 := canonicalVolumeName("lease-pi", "svc", 1) // stateful → retained
+	inst0 := canonicalVolumeName(durableCallbackTestLeaseUUID, "svc", 0) // writable-path-only → reclaimed
+	inst1 := canonicalVolumeName(durableCallbackTestLeaseUUID, "svc", 1) // stateful → retained
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-pi": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-pi", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
-			CallbackURL:   server.URL + "/callbacks/provision",
+			CallbackURL:   testOperationCallbackURL(server.URL + "/callbacks/provision"),
 			Items:         items,
 			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{"svc": {Image: "redis:7"}}},
 		}},
 	})
 
 	withMicroSKU(b, 512)
-	b.retentionStore = rs
+	bindBackendToRetentionFixtureStore(t, b, rs)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	b.cfg.RetainOnClose = true
 	b.cfg.MaxRetainedDiskMB = 600 // accurate 512 retains; over-counted 1024 would refuse+destroy
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	startRetainCloseReplay(t, b)
 
-	require.NoError(t, b.pool.TryAllocate("lease-pi-svc-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-pi-svc-1", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-svc-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(durableCallbackTestLeaseUUID+"-svc-1", "docker-micro", "tenant-a"))
 
 	volRoot := t.TempDir()
 	stageVolumeDirs(t, volRoot, map[string][]string{
@@ -1065,20 +1109,22 @@ func TestDeprovision_PartialInstanceRetain_CapCheckCountsOnlyRetained(t *testing
 
 	var destroyed []string
 	var renamed [][2]string
+	inventory := newVolumeSet(inst0, inst1)
 	b.volumes = &mockVolumeManager{
 		defaultDir: volRoot,
-		ListFn:     func() ([]string, error) { return []string{inst0, inst1}, nil },
+		ListFn:     inventory.list,
 		DestroyFn: func(_ context.Context, id string) error {
 			destroyed = append(destroyed, id)
-			return nil
+			return inventory.destroy(context.Background(), id)
 		},
 		RenameVolumeFn: func(old, newName string) error {
 			renamed = append(renamed, [2]string{old, newName})
+			inventory.rename(old, newName)
 			return nil
 		},
 	}
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-pi"))
+	require.NoError(t, b.Deprovision(context.Background(), durableCallbackTestLeaseUUID))
 
 	select {
 	case <-callbackDone:
@@ -1090,7 +1136,7 @@ func TestDeprovision_PartialInstanceRetain_CapCheckCountsOnlyRetained(t *testing
 	assert.Equal(t, []string{inst0}, destroyed, "only the writable-path-only instance must be reclaimed")
 	assert.Equal(t, [][2]string{{inst1, retainedName(inst1)}}, renamed,
 		"the retained stateful instance must survive (cap check must count only retained instances)")
-	rec, err := rs.Get("lease-pi")
+	rec, err := rs.Get(durableCallbackTestLeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, rec, "the partially-retained lease must keep a record for its durable instance")
 }

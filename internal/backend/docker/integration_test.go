@@ -1584,7 +1584,7 @@ func TestIntegration_Docker_RestartLifecycle(t *testing.T) {
 	oldContainerID := containersBefore[0].ID
 
 	// Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 	})
@@ -1674,7 +1674,7 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
@@ -1769,7 +1769,7 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
@@ -1788,7 +1788,7 @@ func TestIntegration_Docker_GetReleases_History(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, releases, 2, "expected 2 releases after provision + update")
 
-	// Release 1: version=1, busybox, superseded (ActivateLatest marks previous as superseded)
+	// Release 1: version=1, busybox, superseded (typed maintenance activation marks it superseded)
 	assert.Equal(t, 1, releases[0].Version)
 	assert.Equal(t, "busybox:latest", releaseServiceImage(t, releases[0], manifest.DefaultServiceName))
 	assert.Equal(t, "superseded", releases[0].Status)
@@ -1866,7 +1866,7 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
@@ -1953,7 +1953,7 @@ func TestIntegration_Docker_RestartFromFailed(t *testing.T) {
 	require.Equal(t, backend.ProvisionStatusFailed, prov.Status)
 
 	// Restart from Failed state → should now succeed (QoL improvement)
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 	})
@@ -2021,7 +2021,7 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
@@ -2036,7 +2036,7 @@ func TestIntegration_Docker_FullLifecycle(t *testing.T) {
 	}
 
 	// 3. Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 	})
@@ -2117,7 +2117,7 @@ func TestIntegration_Docker_MultiContainerRestart(t *testing.T) {
 	}
 
 	// Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 	})
@@ -2197,7 +2197,7 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
@@ -2273,7 +2273,7 @@ func TestIntegration_Docker_UpdateBadImage_FailsWithRelease(t *testing.T) {
 	badPayload, err := json.Marshal(badManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     badPayload,
@@ -2354,7 +2354,7 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	alpinePayload, err := json.Marshal(alpineManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     alpinePayload,
@@ -2369,7 +2369,7 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	}
 
 	// 3. Update back to busybox
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     payload, // original busybox manifest
@@ -2459,7 +2459,7 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
 
 	// Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 	})
@@ -2541,7 +2541,7 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	newPayload, err := json.Marshal(newManifest)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     newPayload,
@@ -2972,7 +2972,7 @@ func TestIntegration_Stack_Restart(t *testing.T) {
 	}
 
 	// Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 	})
@@ -3043,7 +3043,7 @@ func TestIntegration_Stack_Update(t *testing.T) {
 	updatedPayload, err := json.Marshal(updatedStack)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     updatedPayload,
@@ -3212,7 +3212,7 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 
 	// Step 2: Restart
-	err = b.Restart(ctx, backend.RestartRequest{
+	err = b.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 	})
@@ -3234,7 +3234,7 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	updatedPayload, err := json.Marshal(updatedStack)
 	require.NoError(t, err)
 
-	err = b.Update(ctx, backend.UpdateRequest{
+	err = b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 		Payload:     updatedPayload,

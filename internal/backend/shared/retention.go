@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -110,7 +111,11 @@ var (
 	ErrLegacyRestoringRetention = errors.New("v0.13 retention journal contains an unresolved restoring record")
 )
 
-// RetentionEntry records the data needed to restore a soft-deleted lease.
+// RetentionEntry is a detached read DTO for one durable retention row. Its
+// exported fields support inspection, projection, and v0.13 decoding; passing
+// a modified value back to a runtime state transition grants no authority.
+// Active, Restoring, and Reaping writes are derived by CloseSettlement,
+// RestoreSettlement, or exact RetentionStore-issued proofs.
 type RetentionEntry struct {
 	OriginalLeaseUUID string `json:"original_lease_uuid"`
 	Tenant            string `json:"tenant"`
@@ -122,7 +127,8 @@ type RetentionEntry struct {
 	// never a security boundary (isolation stays keyed on Tenant) and never
 	// load-bearing for restore/reap correctness (a record with a wrong or
 	// missing partition remains fully restorable). Stamped only at soft-delete
-	// time by the close path; see PutActiveMerged for the retry merge rule.
+	// time by the close path; see CloseSettlement.RecordRetention for the retry
+	// merge rule.
 	Partition    string              `json:"partition,omitempty"`
 	ProviderUUID string              `json:"provider_uuid"`
 	Items        []backend.LeaseItem `json:"items"`
@@ -131,15 +137,17 @@ type RetentionEntry struct {
 	// records written before exact profile snapshots existed.
 	ResourceProfiles []SKUResourceSnapshot `json:"resource_profiles,omitempty"`
 	// DestinationItems and DestinationResourceProfiles are the immutable
-	// ownership authority for a restore destination. ClaimForRestoreWithAuthority
-	// writes them in the same transaction that changes Active to Restoring, before
+	// ownership authority for a restore destination. RestoreSettlement writes
+	// them in the same transaction that changes Active to Restoring, before
 	// any retained volume is adopted. They let recovery rebuild and finalize a
-	// successful destination even when its initial active Release append failed
-	// and the operation intent has already been consumed. Both fields are required
-	// while Restoring and are cleared when rollback returns the source to Active.
+	// successful destination even when its initial active Release append failed.
+	// The terminal operation outcome selects commit versus rollback; this snapshot
+	// supplies the immutable data needed to execute that decision. Both fields are
+	// required while Restoring and are cleared when rollback returns the source to
+	// Active.
 	DestinationItems            []backend.LeaseItem   `json:"destination_items,omitempty"`
 	DestinationResourceProfiles []SKUResourceSnapshot `json:"destination_resource_profiles,omitempty"`
-	DestinationOperationID      OperationID           `json:"destination_operation_id,omitempty"`
+	DestinationOperationID      OperationID           `json:"destination_operation_id,omitzero"`
 	// DestinationCallbackURL is retained only as the paired operation identity
 	// needed to validate DestinationLifecycleCallbackURL. Lifecycle observations
 	// are always delivered to the latter; the operation URL is never reused to
@@ -157,6 +165,123 @@ type RetentionEntry struct {
 	ReapingSince                    time.Time               `json:"reaping_since,omitempty"`
 }
 
+type retentionEntryEnvelope struct {
+	SchemaVersion uint8          `json:"schema_version"`
+	Entry         RetentionEntry `json:"entry"`
+}
+
+// legacyRetentionEntryJSON is exactly the durable v0.13 record shape. It is
+// decoded only while the daemon is stopped and before storage identity is
+// bound; newer versionless fields cannot be smuggled through that adoption
+// boundary.
+type legacyRetentionEntryJSON struct {
+	OriginalLeaseUUID   string                  `json:"original_lease_uuid"`
+	Tenant              string                  `json:"tenant"`
+	Partition           string                  `json:"partition,omitempty"`
+	ProviderUUID        string                  `json:"provider_uuid"`
+	Items               []backend.LeaseItem     `json:"items"`
+	StackManifest       *manifest.StackManifest `json:"stack_manifest"`
+	CallbackURL         string                  `json:"callback_url"`
+	RetainedVolumeNames []string                `json:"retained_volume_names"`
+	Status              string                  `json:"status"`
+	NewLeaseUUID        string                  `json:"new_lease_uuid,omitempty"`
+	Generation          int                     `json:"generation"`
+	CreatedAt           time.Time               `json:"created_at"`
+	RestoringSince      time.Time               `json:"restoring_since,omitempty"`
+	ReapingSince        time.Time               `json:"reaping_since,omitempty"`
+}
+
+func marshalRetentionEntry(entry RetentionEntry) ([]byte, error) {
+	return json.Marshal(retentionEntryEnvelope{
+		SchemaVersion: authoritativeRowSchemaVersion,
+		Entry:         entry,
+	})
+}
+
+func decodeRetentionEntry(value []byte) (RetentionEntry, error) {
+	var envelope retentionEntryEnvelope
+	if err := decodeStrictAuthoritativeObject(
+		value, maxAuthoritativeRecordBytes, &envelope,
+	); err != nil {
+		return RetentionEntry{}, err
+	}
+	if envelope.SchemaVersion != authoritativeRowSchemaVersion {
+		return RetentionEntry{}, fmt.Errorf(
+			"unsupported retention-entry schema version %d",
+			envelope.SchemaVersion,
+		)
+	}
+	return envelope.Entry, nil
+}
+
+func unmarshalRetentionEntry(value []byte, destination *RetentionEntry) error {
+	if destination == nil {
+		return errors.New("retention entry destination is nil")
+	}
+	entry, err := decodeRetentionEntry(value)
+	if err != nil {
+		return err
+	}
+	*destination = entry
+	return nil
+}
+
+func decodeLegacyRetentionEntry(value []byte) (RetentionEntry, error) {
+	var old legacyRetentionEntryJSON
+	if err := decodeStrictAuthoritativeObject(
+		value, maxAuthoritativeRecordBytes, &old,
+	); err != nil {
+		return RetentionEntry{}, err
+	}
+	return RetentionEntry{
+		OriginalLeaseUUID:   old.OriginalLeaseUUID,
+		Tenant:              old.Tenant,
+		Partition:           old.Partition,
+		ProviderUUID:        old.ProviderUUID,
+		Items:               old.Items,
+		StackManifest:       old.StackManifest,
+		CallbackURL:         old.CallbackURL,
+		RetainedVolumeNames: old.RetainedVolumeNames,
+		Status:              old.Status,
+		NewLeaseUUID:        old.NewLeaseUUID,
+		Generation:          old.Generation,
+		CreatedAt:           old.CreatedAt,
+		RestoringSince:      old.RestoringSince,
+		ReapingSince:        old.ReapingSince,
+	}, nil
+}
+
+var versionlessCurrentRetentionFields = map[string]struct{}{
+	"original_lease_uuid": {}, "tenant": {}, "partition": {},
+	"provider_uuid": {}, "items": {}, "resource_profiles": {},
+	"destination_items": {}, "destination_resource_profiles": {},
+	"destination_operation_id": {}, "destination_callback_url": {},
+	"destination_lifecycle_callback_url": {}, "stack_manifest": {},
+	"callback_url": {}, "retained_volume_names": {}, "status": {},
+	"new_lease_uuid": {}, "generation": {}, "created_at": {},
+	"restoring_since": {}, "reaping_since": {},
+}
+
+func upgradeVersionlessCurrentRetentionEntry(value []byte) (RetentionEntry, error) {
+	object, err := decodeExactRawJSONObject(
+		value, versionlessCurrentRetentionFields,
+	)
+	if err != nil {
+		return RetentionEntry{}, err
+	}
+	envelope, err := json.Marshal(struct {
+		SchemaVersion uint8                      `json:"schema_version"`
+		Entry         map[string]json.RawMessage `json:"entry"`
+	}{
+		SchemaVersion: authoritativeRowSchemaVersion,
+		Entry:         object,
+	})
+	if err != nil {
+		return RetentionEntry{}, err
+	}
+	return decodeRetentionEntry(envelope)
+}
+
 func validateRetentionEntryResourceProfiles(entry *RetentionEntry) error {
 	if len(entry.ResourceProfiles) > 0 {
 		if _, err := backend.ValidateOperationQuantities(entry.Items); err != nil {
@@ -171,7 +296,7 @@ func validateRetentionEntryResourceProfiles(entry *RetentionEntry) error {
 	hasDestinationProfiles := len(entry.DestinationResourceProfiles) > 0
 	if entry.Status != RetentionStatusRestoring {
 		if hasDestinationItems || hasDestinationProfiles ||
-			entry.DestinationOperationID != "" ||
+			!entry.DestinationOperationID.IsZero() ||
 			entry.DestinationCallbackURL != "" ||
 			entry.DestinationLifecycleCallbackURL != "" {
 			return errors.New("retention restore destination authority requires a restoring record")
@@ -225,8 +350,8 @@ func validateRetentionEntryResourceProfiles(entry *RetentionEntry) error {
 	if callbackOperationID != entry.DestinationOperationID {
 		return fmt.Errorf(
 			"retention restore destination operation ID %q differs from callback authority %q",
-			entry.DestinationOperationID,
-			callbackOperationID,
+			entry.DestinationOperationID.Fingerprint(),
+			callbackOperationID.Fingerprint(),
 		)
 	}
 	return nil
@@ -338,19 +463,6 @@ type RetentionStore struct {
 	onReindex func(count int, dur time.Duration, trigger string)
 }
 
-// NewRetentionStore opens or creates a bbolt database for retention persistence.
-// No background cleanup loop is started; the docker backend drives reaping and
-// eviction explicitly via the MarkReaping* / ListReaping / ListExpired methods
-// (reapExpiredRetentions, evictRetentionsToCap, and the retryReapingRecords sweep
-// in restore.go), plus PutReaping for deprovision give-up tombstones.
-//
-// Deprecated: this compatibility-only constructor creates an unbound journal.
-// Application composition roots are repository-guarded to use
-// OpenIdentityBoundRetentionStore and cannot obtain authority from this value.
-func NewRetentionStore(cfg RetentionStoreConfig) (*RetentionStore, error) {
-	return newRetentionStore(cfg, backendidentity.VerifiedStorage{}, nil)
-}
-
 // OpenIdentityBoundRetentionStore opens an initialized authoritative
 // retention journal without creating or repairing it.
 func OpenIdentityBoundRetentionStore(
@@ -372,22 +484,28 @@ func newRetentionStore(
 	storage backendidentity.VerifiedStorage,
 	gate *backendidentity.StorageAuthorityGate,
 ) (*RetentionStore, error) {
+	if !storage.Valid() {
+		return nil, errors.New("verified backend storage authority is required")
+	}
+	if gate == nil || !gate.Valid() {
+		return nil, errors.New("backend storage authority gate is required")
+	}
 	storeCfg := boltStoreConfig{
 		DBPath:     cfg.DBPath,
 		BucketName: retentionBucketName,
 		Label:      "retention",
 	}
-	var base *boltStore
-	var err error
-	if storage.Valid() {
-		base, err = openIdentityBoundBoltStore(storeCfg, authoritativeStoreRetention, storage, gate)
-	} else {
-		base, err = openBoltStore(storeCfg)
-	}
+	base, err := openIdentityBoundBoltStore(
+		storeCfg, authoritativeStoreRetention, storage, gate,
+	)
 	if err != nil {
 		return nil, err
 	}
 	s := &RetentionStore{boltStore: base, onReindex: cfg.OnReindex}
+	if err := s.view(validateRetentionRootBuckets); err != nil {
+		_ = base.Close()
+		return nil, fmt.Errorf("validate bound retention journal: %w", err)
+	}
 	// Derived index: rebuilt from the primary bucket on open, before the store is
 	// published to any other goroutine (so no lock needed). Fail-closed on a malformed
 	// record — a corrupt retention record is a data-integrity event, not something to
@@ -401,6 +519,25 @@ func newRetentionStore(
 	s.byTenant, s.byStatus = byTenant, byStatus
 	s.fireReindex(count, time.Since(start), "open")
 	return s, nil
+}
+
+func validateRetentionRootBuckets(tx *bolt.Tx) error {
+	return validateAuthoritativeRootBuckets(
+		tx, "retention", retentionBucketName, storeIdentityBucketName,
+	)
+}
+
+// Healthy revalidates both the exact authority root and every current row.
+// The derived indexes cannot establish health: they intentionally contain no
+// representation of an unknown future bucket and may predate an external
+// mutation detected by the runtime authority checks.
+func (s *RetentionStore) Healthy() error {
+	return s.view(func(tx *bolt.Tx) error {
+		if err := validateRetentionRootBuckets(tx); err != nil {
+			return err
+		}
+		return inspectRetentionBucket(tx, nil)
+	})
 }
 
 func inspectRetentionBucket(tx *bolt.Tx, collect func(RetentionEntry)) error {
@@ -418,7 +555,21 @@ func inspectRetentionBucket(tx *bolt.Tx, collect func(RetentionEntry)) error {
 			return fmt.Errorf("retention record with key length %d is a nested bucket", len(key))
 		}
 		var entry RetentionEntry
-		if err := json.Unmarshal(value, &entry); err != nil {
+		var err error
+		var fields map[string]json.RawMessage
+		if uniqueErr := validateUniqueJSONObject(value, maxAuthoritativeRecordBytes); uniqueErr != nil {
+			return fmt.Errorf("decode retention record with key length %d: %w", len(key), uniqueErr)
+		}
+		if decodeErr := json.Unmarshal(value, &fields); decodeErr != nil {
+			return fmt.Errorf("decode retention record with key length %d: %w", len(key), decodeErr)
+		}
+		_, versioned := fields["schema_version"]
+		if identityBound || versioned {
+			entry, err = decodeRetentionEntry(value)
+		} else {
+			entry, err = decodeLegacyRetentionEntry(value)
+		}
+		if err != nil {
 			return fmt.Errorf("decode retention record with key length %d: %w", len(key), err)
 		}
 		if err := validateAuthoritativeRetentionIdentity(key, &entry); err != nil {
@@ -468,7 +619,7 @@ func isLegacyRestoringRetentionEntry(entry *RetentionEntry) bool {
 		len(entry.ResourceProfiles) == 0 &&
 		len(entry.DestinationItems) == 0 &&
 		len(entry.DestinationResourceProfiles) == 0 &&
-		entry.DestinationOperationID == "" &&
+		entry.DestinationOperationID.IsZero() &&
 		entry.DestinationCallbackURL == "" &&
 		entry.DestinationLifecycleCallbackURL == ""
 }
@@ -494,6 +645,139 @@ func validateAuthoritativeRetentionIdentity(key []byte, entry *RetentionEntry) e
 	}
 }
 
+func normalizeLegacyRetentionBucketForAdoption(tx *bolt.Tx) error {
+	bucket := tx.Bucket(retentionBucketName)
+	if bucket == nil {
+		return errors.New("retention bucket is missing")
+	}
+	type rewrite struct {
+		key   []byte
+		value []byte
+	}
+	var rewrites []rewrite
+	budget := newStoppedAuthoritativeInspectionBudget()
+	if err := bucket.ForEach(func(key, value []byte) error {
+		if err := budget.observe(key, value); err != nil {
+			return err
+		}
+		if value == nil {
+			return fmt.Errorf("retention record with key length %d is a nested bucket", len(key))
+		}
+		entry, err := decodeLegacyRetentionEntry(value)
+		if err != nil {
+			return fmt.Errorf("decode retention record with key length %d: %w", len(key), err)
+		}
+		if err := validateAuthoritativeRetentionIdentity(key, &entry); err != nil {
+			return fmt.Errorf("validate retention record identity with key length %d: %w", len(key), err)
+		}
+		if err := validateRetentionSourceAuthorityForBinding(&entry); err != nil {
+			return fmt.Errorf("validate retention record source with key length %d: %w", len(key), err)
+		}
+		if err := validateRetentionEntryResourceProfiles(&entry); err != nil {
+			if isLegacyRestoringRetentionEntry(&entry) {
+				return fmt.Errorf(
+					"%w: source %s destination %s generation %d; restart the complete matching v0.13 lineage in isolation and let its retention reconciler commit or roll back the restore, then drain callbacks, stop it, take a new backup, and retry adoption; do not edit this row or synthesize destination authority",
+					ErrLegacyRestoringRetention,
+					entry.OriginalLeaseUUID,
+					entry.NewLeaseUUID,
+					entry.Generation,
+				)
+			}
+			return fmt.Errorf("validate retention record with key length %d: %w", len(key), err)
+		}
+		encoded, err := marshalRetentionEntry(entry)
+		if err != nil {
+			return fmt.Errorf("encode adopted retention record with key length %d: %w", len(key), err)
+		}
+		if len(encoded) > maxAuthoritativeRecordBytes {
+			return fmt.Errorf(
+				"adopted retention record with key length %d exceeds %d bytes",
+				len(key), maxAuthoritativeRecordBytes,
+			)
+		}
+		rewrites = append(rewrites, rewrite{key: slices.Clone(key), value: encoded})
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, rewrite := range rewrites {
+		if err := bucket.Put(rewrite.key, rewrite.value); err != nil {
+			return fmt.Errorf("rewrite v0.13 retention record: %w", err)
+		}
+	}
+	return nil
+}
+
+func upgradeVersionlessCurrentRetentionBucket(tx *bolt.Tx) error {
+	bucket := tx.Bucket(retentionBucketName)
+	if bucket == nil {
+		return errors.New("retention bucket is missing")
+	}
+	type rewrite struct {
+		key   []byte
+		value []byte
+	}
+	var rewrites []rewrite
+	var sawCurrent, sawVersionless bool
+	if err := bucket.ForEach(func(key, value []byte) error {
+		if value == nil {
+			return fmt.Errorf("retention record with key length %d is a nested bucket", len(key))
+		}
+		object, err := decodeExactRawJSONObject(
+			value,
+			map[string]struct{}{
+				"schema_version": {},
+				"entry":          {},
+			},
+		)
+		var entry RetentionEntry
+		if err == nil {
+			if _, versioned := object["schema_version"]; versioned {
+				sawCurrent = true
+				entry, err = decodeRetentionEntry(value)
+			} else {
+				err = errors.New("versioned retention envelope omits schema_version")
+			}
+		} else {
+			// A current-branch compatibility row is the entry object itself,
+			// and therefore cannot satisfy the two-field envelope allow-list.
+			sawVersionless = true
+			entry, err = upgradeVersionlessCurrentRetentionEntry(value)
+		}
+		if err != nil {
+			return fmt.Errorf("decode retention record with key length %d: %w", len(key), err)
+		}
+		if sawCurrent && sawVersionless {
+			return errors.New("retention journal mixes versioned and versionless records")
+		}
+		if err := validateAuthoritativeRetentionIdentity(key, &entry); err != nil {
+			return fmt.Errorf("validate retention identity with key length %d: %w", len(key), err)
+		}
+		if err := validateRetentionSourceAuthorityForBinding(&entry); err != nil {
+			return fmt.Errorf("validate retention source with key length %d: %w", len(key), err)
+		}
+		if err := validateRetentionEntryResourceProfiles(&entry); err != nil {
+			return fmt.Errorf("validate retention record with key length %d: %w", len(key), err)
+		}
+		if sawVersionless {
+			encoded, err := marshalRetentionEntry(entry)
+			if err != nil {
+				return fmt.Errorf("encode upgraded retention record with key length %d: %w", len(key), err)
+			}
+			rewrites = append(rewrites, rewrite{key: slices.Clone(key), value: encoded})
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, rewrite := range rewrites {
+		if err := bucket.Put(rewrite.key, rewrite.value); err != nil {
+			return fmt.Errorf("upgrade versionless retention record: %w", err)
+		}
+	}
+	return nil
+}
+
 func PrepareBoundRetentionStoreStorage(
 	path *BoundAuthoritativeStorePath,
 	storage backendidentity.PendingStorage,
@@ -506,9 +790,28 @@ func PrepareBoundRetentionStoreStorage(
 	if err != nil {
 		return err
 	}
+	validate := func(tx *bolt.Tx) error {
+		if err := validateRetentionRootBuckets(tx); err != nil {
+			return err
+		}
+		if profile == backendidentity.InitializationProfileExisting {
+			if tx.Bucket(storeIdentityBucketName) == nil {
+				return normalizeLegacyRetentionBucketForAdoption(tx)
+			}
+			if err := verifyStoreIdentityBinding(
+				tx,
+				authoritativeStoreRetention,
+				storage.ID(),
+			); err != nil {
+				return err
+			}
+			return upgradeVersionlessCurrentRetentionBucket(tx)
+		}
+		return inspectRetentionBucket(tx, nil)
+	}
 	return initializeIdentityBoundBoltStoreBound(
 		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(), allowCreate,
-		func(tx *bolt.Tx) error { return inspectRetentionBucket(tx, nil) },
+		validate,
 	)
 }
 
@@ -520,7 +823,13 @@ func CheckBoundRetentionStoreStorage(
 		return errors.New("pending backend storage authority is required")
 	}
 	return checkIdentityBoundBoltStoreBound(
-		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(), nil,
+		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(),
+		func(tx *bolt.Tx) error {
+			if err := validateRetentionRootBuckets(tx); err != nil {
+				return err
+			}
+			return inspectRetentionBucket(tx, nil)
+		},
 	)
 }
 
@@ -532,13 +841,25 @@ func VerifyBoundRetentionStoreStorage(
 		return errors.New("verified backend storage authority is required")
 	}
 	return checkIdentityBoundBoltStoreBound(
-		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(), nil,
+		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(),
+		func(tx *bolt.Tx) error {
+			if err := validateRetentionRootBuckets(tx); err != nil {
+				return err
+			}
+			return inspectRetentionBucket(tx, nil)
+		},
 	)
 }
 
 func VerifyRetentionStoreStorage(dbPath string, storage backendidentity.VerifiedStorage) error {
 	return verifyIdentityBoundBoltStore(
-		dbPath, retentionBucketName, "retention", authoritativeStoreRetention, storage, nil,
+		dbPath, retentionBucketName, "retention", authoritativeStoreRetention, storage,
+		func(tx *bolt.Tx) error {
+			if err := validateRetentionRootBuckets(tx); err != nil {
+				return err
+			}
+			return inspectRetentionBucket(tx, nil)
+		},
 	)
 }
 
@@ -579,32 +900,19 @@ func (s *RetentionStore) scanIndex() (byTenant, byStatus map[string]map[string]s
 	byStatus = map[string]map[string]struct{}{}
 	err = s.view(func(tx *bolt.Tx) error {
 		return tx.Bucket(retentionBucketName).ForEach(func(k, v []byte) error {
-			if s.binding == nil {
-				// Explicitly unbound stores retain the historical lightweight
-				// projection scan used by tests and offline migration helpers. This
-				// lets a later full-record read surface localized corruption without
-				// preventing the store from opening. Production constructors cannot
-				// reach this branch: identity-bound stores decode and validate every
-				// authority-bearing field below before publishing an index.
-				var indexed struct {
-					Tenant string `json:"tenant"`
-					Status string `json:"status"`
-				}
-				if uerr := json.Unmarshal(v, &indexed); uerr != nil {
-					return fmt.Errorf("malformed retention record %q: %w", string(k), uerr)
-				}
-				uuid := string(k)
-				idxAdd(byTenant, indexed.Tenant, uuid)
-				idxAdd(byStatus, indexed.Status, uuid)
-				count++
-				return nil
-			}
 			var e RetentionEntry
-			if uerr := json.Unmarshal(v, &e); uerr != nil {
+			if uerr := unmarshalRetentionEntry(v, &e); uerr != nil {
 				// Use the bucket key (the OriginalLeaseUUID by convention) — a
 				// totally-malformed record has an empty e.OriginalLeaseUUID, so the
 				// operator-facing store-open failure must name the key to be lookup-able.
 				return fmt.Errorf("malformed retention record %q: %w", string(k), uerr)
+			}
+			if s.binding == nil {
+				uuid := string(k)
+				idxAdd(byTenant, e.Tenant, uuid)
+				idxAdd(byStatus, e.Status, uuid)
+				count++
+				return nil
 			}
 			// Index on the bucket key used by getAll's subsequent Get. An
 			// identity-bound store validates below that this key is canonical and
@@ -669,10 +977,12 @@ func (s *RetentionStore) indexApply(uuid string, oldE, newE *RetentionEntry) {
 	}
 }
 
-// Put persists a RetentionEntry, upserting by OriginalLeaseUUID. It reads the
+// putUnsafe persists a RetentionEntry, upserting by OriginalLeaseUUID. It is
+// retained only for package-local wire-compatibility and corruption tests;
+// production transitions are issued by the typed settlement APIs. It reads the
 // pre-image in-txn so the index can drop the stale partition membership of any
 // record being overwritten (a status/tenant change must not leave a phantom).
-func (s *RetentionStore) Put(e RetentionEntry) error {
+func (s *RetentionStore) putUnsafe(e RetentionEntry) error {
 	if err := validateRetentionEntryResourceProfiles(&e); err != nil {
 		return err
 	}
@@ -680,7 +990,7 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 	e.ResourceProfiles = CloneSKUResourceSnapshot(e.ResourceProfiles)
 	e.DestinationItems = slices.Clone(e.DestinationItems)
 	e.DestinationResourceProfiles = CloneSKUResourceSnapshot(e.DestinationResourceProfiles)
-	data, err := json.Marshal(e)
+	data, err := marshalRetentionEntry(e)
 	if err != nil {
 		return fmt.Errorf("failed to marshal retention entry: %w", err)
 	}
@@ -691,7 +1001,7 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 		bkt := tx.Bucket(retentionBucketName)
 		if raw := bkt.Get([]byte(e.OriginalLeaseUUID)); raw != nil {
 			oldE = &RetentionEntry{}
-			if uerr := json.Unmarshal(raw, oldE); uerr != nil {
+			if uerr := unmarshalRetentionEntry(raw, oldE); uerr != nil {
 				return fmt.Errorf("malformed retention record %q: %w", e.OriginalLeaseUUID, uerr)
 			}
 		}
@@ -704,9 +1014,10 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 	return nil
 }
 
-// PutActiveMerged atomically upserts the soft-delete record for a closing lease,
-// merging mergeVolumes into any existing record's RetainedVolumeNames. Single txn,
-// so it is safe against a concurrent ClaimForRestoreWithAuthority (no Get→Put TOCTOU):
+// putActiveMerged atomically upserts the soft-delete record for a closing lease.
+// It is package-private because CloseSettlement is the sole production authority.
+// It merges base.RetainedVolumeNames into any existing record's RetainedVolumeNames. Single txn,
+// so it is safe against a concurrent RestoreSettlement claim (no Get→Put TOCTOU):
 //   - absent: writes `base` fresh (caller sets CreatedAt=now, Generation=0, Status=active).
 //   - existing ACTIVE: PRESERVES the stored CreatedAt and Generation, writes the
 //     UNION of stored RetainedVolumeNames and base.RetainedVolumeNames (dedup), and
@@ -716,7 +1027,10 @@ func (s *RetentionStore) Put(e RetentionEntry) error {
 //     the record; a blind write would corrupt the CAS. Caller defers (keeps lease Failed).
 //
 // Returns (ok bool, err error): ok=false + nil err means "deferred, record is restoring".
-func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
+func (s *RetentionStore) putActiveMerged(
+	base RetentionEntry,
+	validateStored func(RetentionEntry) error,
+) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var (
@@ -727,12 +1041,19 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 		bkt := tx.Bucket(retentionBucketName)
 		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
 			var stored RetentionEntry
-			if err := json.Unmarshal(raw, &stored); err != nil {
+			if err := unmarshalRetentionEntry(raw, &stored); err != nil {
 				return fmt.Errorf("malformed retention record %q: %w", base.OriginalLeaseUUID, err)
 			}
 			oldE = &stored
 			if stored.Status != RetentionStatusActive {
 				return nil // restoring (or otherwise non-active): refuse, ok stays false
+			}
+			if validateStored != nil {
+				if err := validateStored(stored); err != nil {
+					return fmt.Errorf(
+						"existing active retention authority differs: %w", err,
+					)
+				}
 			}
 			if err := mergeRetentionResourceProfiles(&base, &stored); err != nil {
 				return fmt.Errorf("merge retention resource profiles for %q: %w", base.OriginalLeaseUUID, err)
@@ -768,7 +1089,7 @@ func (s *RetentionStore) PutActiveMerged(base RetentionEntry) (bool, error) {
 		if err := validateRetentionEntryResourceProfiles(&base); err != nil {
 			return fmt.Errorf("validate retention record %q: %w", base.OriginalLeaseUUID, err)
 		}
-		data, err := json.Marshal(base)
+		data, err := marshalRetentionEntry(base)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
 		}
@@ -825,7 +1146,7 @@ func mergeRetentionResourceProfiles(base *RetentionEntry, stored *RetentionEntry
 	return nil
 }
 
-// PutReaping writes a reaping tombstone for an ABANDONED on-disk footprint (a
+// putReaping writes a reaping tombstone for an ABANDONED on-disk footprint (a
 // deprovision give-up). It is idempotent and never clobbers a still-counted record:
 //   - absent: writes a fresh reaping record (stamps ReapingSince=now).
 //   - existing reaping: unions RetainedVolumeNames and PRESERVES ReapingSince (aging).
@@ -833,21 +1154,25 @@ func mergeRetentionResourceProfiles(base *RetentionEntry, stored *RetentionEntry
 //     already counts the footprint (or owns it for restore); a blind reaping write
 //     would corrupt accounting/CAS. Caller treats ok=false as "already tracked".
 //
-// Single txn, so it is safe against a concurrent ClaimForRestoreWithAuthority. (ENG-376)
-func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
+// Single txn, so it is safe against a concurrent RestoreSettlement claim. (ENG-376)
+func (s *RetentionStore) putReaping(
+	base RetentionEntry,
+	validateStored func(RetentionEntry) error,
+) (ReapingRetentionProof, bool, error) {
 	base.Status = RetentionStatusReaping
 	base.ReapingSince = time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var (
-		ok   bool
-		oldE *RetentionEntry
+		proof ReapingRetentionProof
+		ok    bool
+		oldE  *RetentionEntry
 	)
 	err := s.update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
 		if raw := bkt.Get([]byte(base.OriginalLeaseUUID)); raw != nil {
 			var stored RetentionEntry
-			if err := json.Unmarshal(raw, &stored); err != nil {
+			if err := unmarshalRetentionEntry(raw, &stored); err != nil {
 				return fmt.Errorf("malformed retention record %q: %w", base.OriginalLeaseUUID, err)
 			}
 			// Capture the pre-image as a value copy BEFORE the reaping-branch
@@ -858,6 +1183,13 @@ func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 			case RetentionStatusActive, RetentionStatusRestoring:
 				return nil // already counted/owned — refuse, ok stays false
 			case RetentionStatusReaping:
+				if validateStored != nil {
+					if err := validateStored(stored); err != nil {
+						return fmt.Errorf(
+							"existing reaping retention authority differs: %w", err,
+						)
+					}
+				}
 				if err := mergeReapingResourceProfiles(&base, &stored); err != nil {
 					return fmt.Errorf("merge reaping resource profiles for %q: %w", base.OriginalLeaseUUID, err)
 				}
@@ -877,20 +1209,29 @@ func (s *RetentionStore) PutReaping(base RetentionEntry) (bool, error) {
 			}
 			base.ResourceProfiles = CloneSKUResourceSnapshot(base.ResourceProfiles)
 		}
-		data, err := json.Marshal(base)
+		data, err := marshalRetentionEntry(base)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		if s.binding == nil {
+			// Unbound stores exist only in package-local v0.13/schema tests.
+			proof = ReapingRetentionProof{row: bytes.Clone(data)}
+		} else {
+			proof, err = s.mintReapingProof(data)
+			if err != nil {
+				return err
+			}
 		}
 		ok = true
 		return bkt.Put([]byte(base.OriginalLeaseUUID), data)
 	})
 	if err != nil {
-		return false, err
+		return ReapingRetentionProof{}, false, err
 	}
 	if ok {
 		s.indexApply(base.OriginalLeaseUUID, oldE, &base)
 	}
-	return ok, nil
+	return proof, ok, nil
 }
 
 func mergeReapingResourceProfiles(base *RetentionEntry, stored *RetentionEntry) error {
@@ -950,7 +1291,7 @@ func (s *RetentionStore) Get(orig string) (*RetentionEntry, error) {
 			return nil
 		}
 		entry = &RetentionEntry{}
-		if err := json.Unmarshal(raw, entry); err != nil {
+		if err := unmarshalRetentionEntry(raw, entry); err != nil {
 			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if err := validateRetentionEntryResourceProfiles(entry); err != nil {
@@ -964,7 +1305,7 @@ func (s *RetentionStore) Get(orig string) (*RetentionEntry, error) {
 // Delete removes a RetentionEntry by original lease UUID. It is idempotent:
 // no error is returned when the entry is absent. It reads the pre-image in-txn
 // so the index can drop the deleted record's partition membership.
-func (s *RetentionStore) Delete(orig string) error {
+func (s *RetentionStore) deleteUnsafe(orig string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var oldE *RetentionEntry
@@ -972,7 +1313,7 @@ func (s *RetentionStore) Delete(orig string) error {
 		bkt := tx.Bucket(retentionBucketName)
 		if raw := bkt.Get([]byte(orig)); raw != nil {
 			oldE = &RetentionEntry{}
-			if uerr := json.Unmarshal(raw, oldE); uerr != nil {
+			if uerr := unmarshalRetentionEntry(raw, oldE); uerr != nil {
 				return fmt.Errorf("malformed retention record %q: %w", orig, uerr)
 			}
 		}
@@ -985,12 +1326,14 @@ func (s *RetentionStore) Delete(orig string) error {
 	return nil
 }
 
-// DeleteIfRestoring atomically removes a restore source finalizer only while
-// the exact destination and generation still own it. It is the success-side
+// deleteIfRestoringUnsafe is retained for package-local historical storage tests.
+// Production finalization consumes RestoringRetentionProof through DeleteRestoring.
+// It removes a restore source finalizer only while the exact destination and
+// generation still own it. It is the success-side
 // counterpart to RevertToActiveWithResourceProfiles' generation CAS: a stale finalizer snapshot
 // must never delete a newer restore attempt or a record whose authority has
 // returned to active/reaping. deleted=false means absent or changed authority.
-func (s *RetentionStore) DeleteIfRestoring(
+func (s *RetentionStore) deleteIfRestoringUnsafe(
 	orig string,
 	newLease string,
 	expectGen int,
@@ -1007,7 +1350,7 @@ func (s *RetentionStore) DeleteIfRestoring(
 		if raw == nil {
 			return nil
 		}
-		if err := json.Unmarshal(raw, &oldE); err != nil {
+		if err := unmarshalRetentionEntry(raw, &oldE); err != nil {
 			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if err := validateRetentionEntryResourceProfiles(&oldE); err != nil {
@@ -1132,7 +1475,7 @@ func (s *RetentionStore) getAll(uuids []string, keep func(*RetentionEntry) bool)
 				continue
 			}
 			var e RetentionEntry
-			if uerr := json.Unmarshal(raw, &e); uerr != nil {
+			if uerr := unmarshalRetentionEntry(raw, &e); uerr != nil {
 				return fmt.Errorf("malformed retention record %q: %w", u, uerr)
 			}
 			if err := validateRetentionEntryResourceProfiles(&e); err != nil {
@@ -1201,14 +1544,15 @@ func (s *RetentionStore) ListReaping() ([]RetentionEntry, error) {
 	})
 }
 
-// DeleteIfActive atomically removes a record ONLY if it is still ACTIVE. Returns
-// (names, deleted, err); deleted=false (nil names) when absent or not active (e.g.
+// deleteIfActiveUnsafe is retained for package-local historical storage tests.
+// Production pruning is encapsulated by RetentionOrphanPruner.Sweep.
+// It returns (names, deleted, err); deleted=false (nil names) when absent or not active (e.g.
 // concurrently claimed for restore). Used by reconcileOrphanedRetentions (ENG-370)
 // to prune an orphaned active record whose backing volumes have already vanished
 // out-of-band — the ACTIVE-only CAS guarantees a concurrent restore (active→restoring)
 // is never clobbered. The returned names are unused there: the volumes are already
 // gone, so there is nothing to destroy.
-func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
+func (s *RetentionStore) deleteIfActiveUnsafe(orig string) ([]string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var (
@@ -1223,7 +1567,7 @@ func (s *RetentionStore) DeleteIfActive(orig string) ([]string, bool, error) {
 			return nil
 		}
 		var e RetentionEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
+		if err := unmarshalRetentionEntry(raw, &e); err != nil {
 			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if e.Status != RetentionStatusActive {
@@ -1250,7 +1594,7 @@ func (s *RetentionStore) filter(keep func(*RetentionEntry) bool) ([]RetentionEnt
 		bkt := tx.Bucket(retentionBucketName)
 		return bkt.ForEach(func(k, v []byte) error {
 			var e RetentionEntry
-			if err := json.Unmarshal(v, &e); err != nil {
+			if err := unmarshalRetentionEntry(v, &e); err != nil {
 				return fmt.Errorf("malformed retention record %q: %w", string(k), err)
 			}
 			if err := validateRetentionEntryResourceProfiles(&e); err != nil {
@@ -1265,13 +1609,16 @@ func (s *RetentionStore) filter(keep func(*RetentionEntry) bool) ([]RetentionEnt
 	return results, err
 }
 
-// ClaimForRestoreWithAuthority atomically binds the exact destination Items and
+// claimForRestoreWithAuthorityUnsafe atomically binds the exact destination Items and
 // ResourceProfiles while transitioning the source ACTIVE -> RESTORING. The
 // destination snapshot is the durable recovery/finalization authority for the
 // write-ahead window in which the restore succeeded but its active Release was
 // not persisted. It is deliberately part of this same transaction: adopted
 // bytes must never exist without either source or destination sizing authority.
-func (s *RetentionStore) ClaimForRestoreWithAuthority(
+//
+// Package-local storage tests use this compatibility mutator; production uses
+// PrepareRestoreClaim followed by ClaimForRestore.
+func (s *RetentionStore) claimForRestoreWithAuthorityUnsafe(
 	orig, newLease string,
 	maxAge time.Duration,
 	destinationItems []backend.LeaseItem,
@@ -1279,7 +1626,7 @@ func (s *RetentionStore) ClaimForRestoreWithAuthority(
 	destinationOperationID OperationID,
 	destinationCallbackURL, destinationLifecycleCallbackURL string,
 ) (*RetentionEntry, error) {
-	return s.ClaimForRestoreWithAuthorityAt(
+	return s.claimForRestoreWithAuthorityAtUnsafe(
 		orig,
 		newLease,
 		maxAge,
@@ -1292,12 +1639,12 @@ func (s *RetentionStore) ClaimForRestoreWithAuthority(
 	)
 }
 
-// ClaimForRestoreWithAuthorityAt is ClaimForRestoreWithAuthority with the
+// claimForRestoreWithAuthorityAtUnsafe is claimForRestoreWithAuthorityUnsafe with the
 // durable operation-admission timestamp supplied explicitly. Docker reuses the
 // operation intent's CreatedAt here and in the destination Release so a
 // pre-side-effect release-capacity proof and every later finalizer retry encode
 // byte-identical authority.
-func (s *RetentionStore) ClaimForRestoreWithAuthorityAt(
+func (s *RetentionStore) claimForRestoreWithAuthorityAtUnsafe(
 	orig, newLease string,
 	maxAge time.Duration,
 	destinationItems []backend.LeaseItem,
@@ -1339,14 +1686,14 @@ func (s *RetentionStore) ClaimForRestoreWithAuthorityAt(
 	if callbackOperationID != destinationOperationID {
 		return nil, fmt.Errorf(
 			"restore destination operation ID %q differs from callback authority %q",
-			destinationOperationID,
-			callbackOperationID,
+			destinationOperationID.Fingerprint(),
+			callbackOperationID.Fingerprint(),
 		)
 	}
 	if destinationCreatedAt.IsZero() {
 		return nil, errors.New("restore destination requires a durable admission timestamp")
 	}
-	return s.claimForRestoreWithAuthority(
+	proof, err := s.claimForRestoreWithAuthority(
 		orig,
 		newLease,
 		maxAge,
@@ -1356,6 +1703,44 @@ func (s *RetentionStore) ClaimForRestoreWithAuthorityAt(
 		destinationCallbackURL,
 		destinationLifecycleCallbackURL,
 		destinationCreatedAt,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	entry := proof.Entry()
+	return &entry, nil
+}
+
+// ClaimForRestore consumes an exact store-issued restore capability and
+// atomically transitions its source retention from Active to Restoring. Every
+// security- or causality-bearing destination field comes from the sealed
+// operation claim used by PrepareRestoreClaim; maxAge remains an operator
+// policy rather than request authority.
+func (s *RestoreSettlement) ClaimForRestore(
+	candidate RestoreClaimCandidate,
+	maxAge time.Duration,
+) (RestoringRetentionProof, error) {
+	if err := validateRestoreClaimCandidate(s, candidate); err != nil {
+		return RestoringRetentionProof{}, err
+	}
+	authority := candidate.authority
+	unlock := s.operations.lockLease(authority.LeaseUUID())
+	defer unlock()
+	if err := s.operations.callbacks.requireCurrentOperationAuthority(authority); err != nil {
+		return RestoringRetentionProof{}, err
+	}
+	return s.retentions.claimForRestoreWithAuthority(
+		authority.SourceLeaseUUID(),
+		authority.LeaseUUID(),
+		maxAge,
+		authority.EffectiveItems(),
+		authority.ResourceProfiles(),
+		authority.OperationID(),
+		authority.CallbackURL(),
+		authority.LifecycleCallbackURL(),
+		authority.CreatedAt(),
+		authority.SourceGeneration(),
 	)
 }
 
@@ -1367,12 +1752,14 @@ func (s *RetentionStore) claimForRestoreWithAuthority(
 	destinationOperationID OperationID,
 	destinationCallbackURL, destinationLifecycleCallbackURL string,
 	destinationCreatedAt time.Time,
-) (*RetentionEntry, error) {
+	expectedGeneration int,
+) (RestoringRetentionProof, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var (
-		out  *RetentionEntry
-		oldE RetentionEntry
+		proof RestoringRetentionProof
+		out   *RetentionEntry
+		oldE  RetentionEntry
 	)
 	err := s.update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(retentionBucketName)
@@ -1381,7 +1768,7 @@ func (s *RetentionStore) claimForRestoreWithAuthority(
 			return ErrNoRetention
 		}
 		var e RetentionEntry
-		if err := json.Unmarshal(raw, &e); err != nil {
+		if err := unmarshalRetentionEntry(raw, &e); err != nil {
 			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if err := validateRetentionEntryResourceProfiles(&e); err != nil {
@@ -1389,6 +1776,14 @@ func (s *RetentionStore) claimForRestoreWithAuthority(
 		}
 		if e.Status != RetentionStatusActive {
 			return ErrNotRestorable
+		}
+		if expectedGeneration > 0 && e.Generation+1 != expectedGeneration {
+			return fmt.Errorf(
+				"%w: restore source generation changed: operation expects %d, next generation is %d",
+				ErrNotRestorable,
+				expectedGeneration,
+				e.Generation+1,
+			)
 		}
 		if maxAge > 0 && time.Since(e.CreatedAt) >= maxAge {
 			return ErrNoRetention // about to be reaped
@@ -1406,31 +1801,43 @@ func (s *RetentionStore) claimForRestoreWithAuthority(
 		if err := validateRetentionEntryResourceProfiles(&e); err != nil {
 			return fmt.Errorf("invalid claimed retention record %q: %w", orig, err)
 		}
-		data, err := json.Marshal(e)
+		data, err := marshalRetentionEntry(e)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
+		}
+		if s.binding == nil {
+			// Unbound stores exist only in package-local v0.13/schema tests.
+			// Preserve their DTO construction without minting a capability.
+			proof = RestoringRetentionProof{row: bytes.Clone(data)}
+		} else {
+			proof, err = s.mintRestoringProof(data)
+			if err != nil {
+				return err
+			}
 		}
 		out = &e
 		return bkt.Put([]byte(orig), data)
 	})
 	if err != nil {
-		return nil, err
+		return RestoringRetentionProof{}, err
 	}
 	if out != nil {
 		s.indexApply(orig, &oldE, out)
 	}
-	return out, nil
+	return proof, nil
 }
 
-// UpdateRestoringDestinationCallbacks atomically moves the callback route for
-// one exact restore destination generation. Maintenance may move a route to a
+// updateRestoringDestinationCallbacksUnsafe is retained only for package-local
+// historical storage tests. Production route authority is operation-settlement owned.
+// It moves the callback route for one exact restore destination generation.
+// Maintenance may move a route to a
 // new base, but it cannot rotate or downgrade the lifecycle authority, nor can
 // it change the operation ID that committed the destination lineage.
 //
 // The caller must hold the destination command fence across this CAS and its
 // subsequent actor admission. updated=false means the supplied source,
 // destination, or generation no longer owns the finalizer.
-func (s *RetentionStore) UpdateRestoringDestinationCallbacks(
+func (s *RetentionStore) updateRestoringDestinationCallbacksUnsafe(
 	orig, newLease string,
 	expectGeneration int,
 	callbackURL, lifecycleCallbackURL string,
@@ -1445,7 +1852,7 @@ func (s *RetentionStore) UpdateRestoringDestinationCallbacks(
 			return nil
 		}
 		var entry RetentionEntry
-		if err := json.Unmarshal(raw, &entry); err != nil {
+		if err := unmarshalRetentionEntry(raw, &entry); err != nil {
 			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if err := validateRetentionEntryResourceProfiles(&entry); err != nil {
@@ -1475,8 +1882,8 @@ func (s *RetentionStore) UpdateRestoringDestinationCallbacks(
 		if callbackOperationID != entry.DestinationOperationID {
 			return fmt.Errorf(
 				"restore destination callback operation ID %q differs from finalizer authority %q",
-				callbackOperationID,
-				entry.DestinationOperationID,
+				callbackOperationID.Fingerprint(),
+				entry.DestinationOperationID.Fingerprint(),
 			)
 		}
 
@@ -1485,7 +1892,7 @@ func (s *RetentionStore) UpdateRestoringDestinationCallbacks(
 		if err := validateRetentionEntryResourceProfiles(&entry); err != nil {
 			return fmt.Errorf("invalid updated retention record %q: %w", orig, err)
 		}
-		encoded, err := json.Marshal(entry)
+		encoded, err := marshalRetentionEntry(entry)
 		if err != nil {
 			return fmt.Errorf("marshal updated retention record %q: %w", orig, err)
 		}
@@ -1498,12 +1905,13 @@ func (s *RetentionStore) UpdateRestoringDestinationCallbacks(
 	return updated, err
 }
 
-// MarkReapingIfActive atomically transitions an ACTIVE record to reaping and
-// returns its volume names for the caller to destroy AFTER the txn commits.
+// markReapingIfActiveUnsafe is retained for package-local historical storage tests.
+// Production transitions consume ActiveRetentionCandidate through BeginReaping.
+// It returns its volume names for the caller to destroy AFTER the txn commits.
 // ok=false (nil names) when absent or not active (e.g. concurrently claimed for
 // restore). The record is NOT deleted — it is the finalizer tombstone that keeps
 // the footprint counted until the volumes are confirmed gone. (ENG-376)
-func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error) {
+func (s *RetentionStore) markReapingIfActiveUnsafe(orig string) ([]string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var (
@@ -1518,7 +1926,7 @@ func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error
 		if raw == nil {
 			return nil
 		}
-		if err := json.Unmarshal(raw, &oldE); err != nil {
+		if err := unmarshalRetentionEntry(raw, &oldE); err != nil {
 			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if err := validateRetentionEntryResourceProfiles(&oldE); err != nil {
@@ -1531,7 +1939,7 @@ func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error
 		newE.Status = RetentionStatusReaping
 		newE.ReapingSince = time.Now()
 		names = newE.RetainedVolumeNames
-		data, err := json.Marshal(newE)
+		data, err := marshalRetentionEntry(newE)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
 		}
@@ -1547,12 +1955,14 @@ func (s *RetentionStore) MarkReapingIfActive(orig string) ([]string, bool, error
 	return names, ok, nil
 }
 
-// MarkReapingIfExpired atomically transitions an ACTIVE, expired record to
-// reaping and returns its volume names for the caller to destroy AFTER the txn
+// markReapingIfExpiredUnsafe is retained for package-local historical storage tests.
+// Production expiry consumes ActiveRetentionCandidate through BeginExpiredReaping.
+// It transitions an expired Active row to Reaping and returns its volume names
+// for the caller to destroy AFTER the txn
 // commits. The record is NOT deleted — it stays a
 // counted tombstone until the volumes are confirmed gone. Returns ok=false when
 // absent, not active, or not yet expired, and a no-op when maxAge<=0. (ENG-376)
-func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration) ([]string, bool, error) {
+func (s *RetentionStore) markReapingIfExpiredUnsafe(orig string, maxAge time.Duration) ([]string, bool, error) {
 	if maxAge <= 0 {
 		return nil, false, nil
 	}
@@ -1570,7 +1980,7 @@ func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration)
 		if raw == nil {
 			return nil
 		}
-		if err := json.Unmarshal(raw, &oldE); err != nil {
+		if err := unmarshalRetentionEntry(raw, &oldE); err != nil {
 			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if err := validateRetentionEntryResourceProfiles(&oldE); err != nil {
@@ -1586,7 +1996,7 @@ func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration)
 		newE.Status = RetentionStatusReaping
 		newE.ReapingSince = time.Now()
 		names = newE.RetainedVolumeNames
-		data, err := json.Marshal(newE)
+		data, err := marshalRetentionEntry(newE)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
 		}
@@ -1602,8 +2012,9 @@ func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration)
 	return names, ok, nil
 }
 
-// RevertToActiveWithResourceProfiles is the restore-rollback commit. In
-// addition to the generation CAS, it binds the transition to the exact
+// revertToActiveWithResourceProfilesUnsafe is retained for package-local historical
+// storage tests. Production rollback consumes RestoringRetentionProof.
+// In addition to the generation CAS, it binds the transition to the exact
 // destination lease and atomically persists the resource snapshot whose disk
 // quotas the caller has just measured and applied.
 //
@@ -1612,7 +2023,7 @@ func (s *RetentionStore) MarkReapingIfExpired(orig string, maxAge time.Duration)
 // row without the quota authority just established on disk. Rows that already
 // carry a snapshot must match exactly; a stale caller may never replace durable
 // sizing authority. Returns false without mutation when ownership changed.
-func (s *RetentionStore) RevertToActiveWithResourceProfiles(
+func (s *RetentionStore) revertToActiveWithResourceProfilesUnsafe(
 	orig string,
 	expectNewLease string,
 	expectGen int,
@@ -1631,7 +2042,7 @@ func (s *RetentionStore) RevertToActiveWithResourceProfiles(
 		if raw == nil {
 			return nil
 		}
-		if err := json.Unmarshal(raw, &oldE); err != nil {
+		if err := unmarshalRetentionEntry(raw, &oldE); err != nil {
 			return fmt.Errorf("malformed retention record %q: %w", orig, err)
 		}
 		if err := validateRetentionEntryResourceProfiles(&oldE); err != nil {
@@ -1656,14 +2067,14 @@ func (s *RetentionStore) RevertToActiveWithResourceProfiles(
 		newE.NewLeaseUUID = ""
 		newE.DestinationItems = nil
 		newE.DestinationResourceProfiles = nil
-		newE.DestinationOperationID = ""
+		newE.DestinationOperationID = OperationID{}
 		newE.DestinationCallbackURL = ""
 		newE.DestinationLifecycleCallbackURL = ""
 		newE.RestoringSince = time.Time{}
 		if err := validateRetentionEntryResourceProfiles(&newE); err != nil {
 			return fmt.Errorf("invalid reverted retention record %q: %w", orig, err)
 		}
-		data, err := json.Marshal(newE)
+		data, err := marshalRetentionEntry(newE)
 		if err != nil {
 			return fmt.Errorf("failed to marshal retention entry: %w", err)
 		}

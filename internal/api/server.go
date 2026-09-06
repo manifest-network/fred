@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -21,9 +20,9 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
-	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
-	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
 )
 
 const (
@@ -52,15 +51,15 @@ const (
 // terminal application result, so a backend can preserve per-lease ordering by
 // waiting for the HTTP response before sending the next durable delivery.
 type CallbackPublisher interface {
-	PublishCallback(ctx context.Context, callback backend.CallbackPayload) error
+	PublishCallback(ctx context.Context, request hmacauth.VerifiedRequest) error
 }
 
-// callbackRequestAuthenticator returns the exact DTO it authenticated. The
-// production implementation selects a per-storage-lineage key from the bounded
-// body; keeping decode inside this boundary prevents authentication and
-// application from interpreting duplicate JSON differently.
+// callbackRequestAuthenticator returns opaque evidence for the exact request
+// envelope it authenticated. The per-storage-lineage implementation may decode
+// the bounded body only to select a key; callback semantics are derived again
+// from the proof's immutable bytes inside the application authority.
 type callbackRequestAuthenticator interface {
-	VerifyCallbackRequest(*http.Request) (backend.CallbackPayload, error)
+	VerifyCallbackEvidence(*http.Request) (hmacauth.VerifiedRequest, error)
 }
 
 // StatusChecker provides status information about provisioning.
@@ -120,18 +119,17 @@ type ServerConfig struct {
 // ServerDeps holds the runtime dependencies for the API server.
 // These are the collaborators injected into the server at startup.
 type ServerDeps struct {
-	ChainClient        ChainClient
-	BackendRouter      *backend.Router
-	CallbackPublisher  CallbackPublisher
-	PayloadPublisher   PayloadPublisher
-	PayloadPersister   PayloadPersister   // Required — /update returns 500 without it (ENG-619).
-	PayloadStoreHealth PayloadStoreHealth // Optional — health probe for the payload store's bbolt DB.
-	StatusChecker      StatusChecker
-	PlacementLookup    PlacementLookup            // Required by providerd; nil is supported only by isolated/test API embeddings.
-	LifecycleCallbacks LifecycleCallbackAuthority // Required by providerd for typed restart/update callback routes.
-	MaintenanceClaims  MaintenanceClaims          // Required by providerd for restart/update lifecycle exclusion.
-	RestoreService     RestoreService             // Required by /restore; missing service returns 503.
-	EventBroker        *EventBroker               // Optional — if nil, the events endpoint returns 501.
+	ChainClient           ChainClient
+	BackendRouter         *backend.Router
+	CallbackPublisher     CallbackPublisher
+	PayloadPublisher      PayloadPublisher
+	PayloadStoreHealth    PayloadStoreHealth // Optional — health probe for the payload store's bbolt DB.
+	StatusChecker         StatusChecker
+	PlacementLookup       PlacementLookup                // Required by providerd; nil is supported only by isolated/test API embeddings.
+	MaintenanceService    MaintenanceService             // Required by providerd for durable restart/update execution.
+	RestoreService        RestoreService                 // Required by /restore; missing service returns 503.
+	EventBroker           *EventBroker                   // Optional — if nil, the events endpoint returns 501.
+	CallbackProofVerifier hmacauth.CallbackProofVerifier // Required whenever callback authentication is configured.
 }
 
 // NewServer creates a new API server.
@@ -177,15 +175,12 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		TokenTracker:       tracker,
 		StatusChecker:      statusChecker,
 		PlacementLookup:    placementLookup,
-		LifecycleCallbacks: deps.LifecycleCallbacks,
-		MaintenanceClaims:  deps.MaintenanceClaims,
+		MaintenanceService: deps.MaintenanceService,
 		RestoreService:     deps.RestoreService,
-		PayloadPersister:   deps.PayloadPersister,
 		PayloadStoreHealth: deps.PayloadStoreHealth,
 		EventBroker:        eventBroker,
 		ProviderUUID:       cfg.ProviderUUID,
 		Bech32Prefix:       cfg.Bech32Prefix,
-		CallbackBaseURL:    cfg.CallbackBaseURL,
 	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling
@@ -219,14 +214,18 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		return nil, fmt.Errorf("callback HMAC keyring cannot be combined with legacy callback secret")
 	}
 	if len(cfg.CallbackHMACSecrets) != 0 {
-		keyring, err := NewCallbackKeyringAuthenticator(cfg.CallbackHMACSecrets)
+		keyring, err := NewCallbackKeyringAuthenticator(
+			cfg.CallbackHMACSecrets, deps.CallbackProofVerifier,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("create callback HMAC keyring: %w", err)
 		}
 		callbackAuth = keyring.WithCanonicalPathPrefix(cfg.CallbackCanonicalPathPrefix)
 	} else if cfg.CallbackSecret != "" {
 		var err error
-		legacyAuth, err := NewCallbackAuthenticator(cfg.CallbackSecret)
+		legacyAuth, err := NewCallbackAuthenticator(
+			cfg.CallbackSecret, deps.CallbackProofVerifier,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("create callback authenticator: %w", err)
 		}
@@ -325,9 +324,10 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 			// Authorization is required for the /v1/leases/* routes (Bearer tokens
 			// extracted by handlers.go:extractBearerToken). Content-Type is required
 			// for any POST with a JSON body (application/json is not a CORS-simple
-			// type). /workloads itself is unauthenticated, but the CORS middleware
-			// applies globally so we list every header any route may need.
-			AllowedHeaders:   []string{"Authorization", "Content-Type"},
+			// type), and restart/update require Idempotency-Key. /workloads itself is
+			// unauthenticated, but the CORS middleware applies globally so we list
+			// every header any route may need.
+			AllowedHeaders:   []string{"Authorization", "Content-Type", idempotencyKeyHeader},
 			AllowCredentials: false,
 		}).Handler(handler)
 	} else {
@@ -377,7 +377,7 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	callback, err := s.callbackAuthenticator.VerifyCallbackRequest(r)
+	request, err := s.callbackAuthenticator.VerifyCallbackEvidence(r)
 	if err != nil {
 		if errors.Is(err, errInvalidCallbackPayload) {
 			slog.Warn("invalid callback payload",
@@ -394,65 +394,16 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		writeError(w, errMsgUnauthorized, http.StatusUnauthorized)
 		return
 	}
-
-	if callback.LeaseUUID == "" {
-		writeError(w, "lease_uuid is required", http.StatusBadRequest)
-		return
-	}
-
-	if !config.IsValidUUID(callback.LeaseUUID) {
-		writeError(w, "lease_uuid must be a valid UUID", http.StatusBadRequest)
-		return
-	}
-
-	// The backend posts to the callback URL fred supplied. RequestURI is part of
-	// the verified HMAC, so either typed capability is authenticated even though
-	// backends need not understand or copy it into their JSON payload. Parse the
-	// raw query with error reporting: URL.Query silently drops malformed escapes,
-	// which could otherwise downgrade a malformed typed route to legacy.
-	callback.OperationID = ""
-	callback.LifecycleID = ""
-	callbackQuery, err := url.ParseQuery(r.URL.RawQuery)
+	callback, err := callbackwire.DecodeVerified(request)
 	if err != nil {
-		writeError(w, "callback query is malformed", http.StatusBadRequest)
+		slog.Warn("invalid callback payload or route",
+			"error", err,
+			"remote_addr", r.RemoteAddr,
+		)
+		writeError(w, "invalid request body", http.StatusBadRequest)
 		return
-	}
-	operationID, present, err := operation.ParseQuery(callbackQuery)
-	if err != nil {
-		writeError(w, "operation_id must be a single canonical UUIDv4", http.StatusBadRequest)
-		return
-	}
-	if present {
-		callback.OperationID = operationID.String()
-	}
-	lifecycleID, lifecyclePresent, err := lifecycle.ParseQuery(callbackQuery)
-	if err != nil {
-		writeError(w, "lifecycle_id must be a single canonical UUIDv4", http.StatusBadRequest)
-		return
-	}
-	if present && lifecyclePresent {
-		writeError(w, "callback URL must carry exactly one capability kind", http.StatusBadRequest)
-		return
-	}
-	if lifecyclePresent {
-		callback.LifecycleID = lifecycleID.String()
 	}
 
-	switch callback.Status {
-	case backend.CallbackStatusSuccess, backend.CallbackStatusFailed, backend.CallbackStatusDeprovisioned:
-		// ok
-	default:
-		writeError(w, "status must be 'success', 'failed', or 'deprovisioned'", http.StatusBadRequest)
-		return
-	}
-	if present && callback.Status == backend.CallbackStatusDeprovisioned {
-		writeError(w, "deprovisioned status requires lifecycle or legacy callback authority", http.StatusBadRequest)
-		return
-	}
-	if callback.Retained && callback.Status != backend.CallbackStatusDeprovisioned {
-		writeError(w, "retained requires deprovisioned status", http.StatusBadRequest)
-		return
-	}
 	// Do not short-circuit callbacks that have no active operation-registry entry.
 	// Restart and update use lifecycle authority for an already-active lease, so
 	// their completion callbacks legitimately have no provision/restore operation.
@@ -460,11 +411,11 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 	// callback authority instead of treating registry membership as authority.
 
 	slog.Info("received provision callback",
-		"lease_uuid", callback.LeaseUUID,
-		"status", callback.Status,
+		"lease_uuid", callback.LeaseUUID(),
+		"status", callback.Status(),
 	)
 
-	if err := s.callbackPublisher.PublishCallback(r.Context(), callback); err != nil {
+	if err := s.callbackPublisher.PublishCallback(r.Context(), request); err != nil {
 		// Callback delivery is owned by the backend's durable outbox. Any
 		// application failure is retryable, including the brief startup and
 		// shutdown windows where the provisioner is not accepting work.

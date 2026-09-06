@@ -1,16 +1,19 @@
 package leasesm
 
 import (
+	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/maintenanceid"
 )
 
 func TestMaintenanceRecoveryProjectionAcceptsLegacyRuntimeAuthority(t *testing.T) {
@@ -21,18 +24,7 @@ func TestMaintenanceRecoveryProjectionAcceptsLegacyRuntimeAuthority(t *testing.T
 		newURL       = "https://new.example/callbacks/provision"
 	)
 	dir := t.TempDir()
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(dir, "releases.db"),
-	})
-	require.NoError(t, err)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(dir, "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, callbacks.Close())
-		require.NoError(t, releases.Close())
-	})
+	callbacks, releases, storage, gate := newBoundLeaseSMMaintenanceStores(t, dir, "docker-a")
 
 	oldAuthority, err := shared.NewLegacyRuntimeAuthority(
 		"tenant-a", providerUUID, oldURL, oldURL,
@@ -42,14 +34,48 @@ func TestMaintenanceRecoveryProjectionAcceptsLegacyRuntimeAuthority(t *testing.T
 	profiles := []shared.SKUResourceSnapshot{{
 		SKU: "sku-a", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
 	}}
-	source := shared.Release{
+	legacySource := shared.Release{
+		Version:  1,
 		Manifest: []byte(`{"services":{"app":{"image":"nginx:1.27"}}}`),
-		Image:    "stack", Items: items, ResourceProfiles: profiles,
-		LegacyRuntimeAuthority: &oldAuthority,
-		Status:                 "active", CreatedAt: time.Now().Add(-time.Minute),
+		Image:    "stack", Status: "active", CreatedAt: time.Now().Add(-time.Minute),
 	}
-	require.NoError(t, releases.AppendActive(leaseUUID, source))
-	active, sourceClaim, err := releases.ClaimLatestActive(leaseUUID)
+	// Seed the exact bare v0.13 wire shape, then drive the real stopped-upgrade
+	// APIs. This preserves compatibility coverage without retaining a public
+	// current-writer escape hatch for legacy authority.
+	require.NoError(t, releases.Close())
+	db, err := bolt.Open(filepath.Join(dir, "releases.db"), 0o600, nil)
+	require.NoError(t, err)
+	encoded, err := json.Marshal(struct {
+		SchemaVersion uint8            `json:"schema_version"`
+		Releases      []shared.Release `json:"releases"`
+	}{SchemaVersion: 1, Releases: []shared.Release{legacySource}})
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("releases")).Put([]byte(leaseUUID), encoded)
+	}))
+	require.NoError(t, db.Close())
+	releases, err = shared.OpenIdentityBoundReleaseStore(
+		shared.ReleaseStoreConfig{DBPath: filepath.Join(dir, "releases.db")}, storage, gate,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, callbacks.Close())
+		require.NoError(t, releases.Close())
+	})
+	backfiller, err := shared.NewReleaseBackfiller(callbacks, releases)
+	require.NoError(t, err)
+	require.NoError(t, backfiller.BackfillLegacyActiveAuthorityContext(
+		context.Background(), leaseUUID, legacySource, items, profiles,
+	))
+	backfilled, err := releases.LatestActive(leaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, backfilled)
+	require.NoError(t, backfiller.BackfillLegacyRuntimeAuthorityContext(
+		context.Background(), leaseUUID, *backfilled, oldAuthority,
+	))
+	settlement, err := shared.NewMaintenanceSettlement(callbacks, releases)
+	require.NoError(t, err)
+	active, sourceClaim, err := settlement.ClaimLatestActive(leaseUUID)
 	require.NoError(t, err)
 	newAuthority, err := shared.NewLegacyRuntimeAuthority(
 		"tenant-a", providerUUID, newURL, newURL,
@@ -60,35 +86,50 @@ func TestMaintenanceRecoveryProjectionAcceptsLegacyRuntimeAuthority(t *testing.T
 	target.Status = "deploying"
 	target.CreatedAt = time.Now()
 	target.LegacyRuntimeAuthority = &newAuthority
-	storageID, err := backendidentity.Parse("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	maintenanceID, err := maintenanceid.New()
 	require.NoError(t, err)
-	admission, err := callbacks.BeginMaintenanceIntent(shared.MaintenanceIntentSpec{
-		Kind: shared.MaintenanceIntentRestart, SourceRelease: sourceClaim,
-		TargetRelease: target, Backend: "docker-a", BackendStorageID: storageID,
-	})
+	request, err := settlement.NewMaintenanceRequestAuthority(
+		maintenanceID, shared.MaintenanceIntentRestart, leaseUUID, newURL, nil,
+	)
 	require.NoError(t, err)
-	appendClaim, err := callbacks.StartMaintenanceAppend(admission)
+	candidate, err := settlement.NewMaintenanceIntentCandidate(request, sourceClaim, target)
+	require.NoError(t, err)
+	admission, err := settlement.BeginMaintenanceIntent(candidate)
+	require.NoError(t, err)
+	appendClaim, err := settlement.StartMaintenanceAppend(
+		createdMaintenanceDispatch(t, admission),
+	)
+	require.NoError(t, err)
+	targetClaim, err := settlement.AppendMaintenance(appendClaim)
+	require.NoError(t, err)
+	targetClaim, err = settlement.BindMaintenanceIntentTarget(targetClaim)
+	require.NoError(t, err)
+	bindLeaseSMMaintenanceExecutor(t, settlement)
+	execution, err := settlement.StartMaintenanceExecution(targetClaim)
+	require.NoError(t, err)
+	physical := settlement.ExecuteMaintenance(t.Context(), execution)
+	success, ok := physical.(shared.MaintenanceExecutionSuccess)
+	require.True(t, ok)
+	committed, err := settlement.ActivateMaintenance(success)
 	require.NoError(t, err)
 
-	reply := make(chan error, 1)
-	message, err := NewMaintenanceRecoveredSuccessMsg(
-		appendClaim.Intent(),
+	message, _, err := NewMaintenanceRecoveredSuccessMsg(
+		committed,
 		MaintenanceRecoveryProjection{
 			ContainerIDs:      []string{"container-a"},
 			ServiceContainers: map[string][]string{"app": {"container-a"}},
 		},
-		reply,
 	)
 	require.NoError(t, err)
-	recovered, ok := message.(maintenanceRecoveredMsg)
+	recovered, ok := message.envelope.message.(maintenanceRecoveredMsg)
 	require.True(t, ok)
 	assert.True(t, recovered.success.applyRecoveredRuntimeAuthority)
 	assert.Equal(t, newURL, recovered.success.recoveredCallbackURL)
 	assert.Equal(t, newURL, recovered.success.recoveredLifecycleCallbackURL)
 
 	state := &ProvisionState{}
-	require.NotNil(t, recovered.success.OnSuccess)
-	recovered.success.OnSuccess(state)
+	require.NotNil(t, recovered.success.release)
+	applyReplaceReleaseAuthority(state, recovered.success)
 	assert.Equal(t, "tenant-a", state.Tenant)
 	assert.Equal(t, providerUUID, state.ProviderUUID)
 	assert.Equal(t, items, state.Items)

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"syscall"
@@ -279,10 +280,11 @@ type boltStore struct {
 }
 
 type openedStoreIdentityBinding struct {
-	dbPath    string
-	fileInfo  os.FileInfo
-	kind      authoritativeStoreKind
-	storageID backendidentity.ID
+	dbPath      string
+	fileInfo    os.FileInfo
+	kind        authoritativeStoreKind
+	backendName string
+	storageID   backendidentity.ID
 }
 
 // boltStoreConfig configures a boltStore.
@@ -520,10 +522,11 @@ func openIdentityBoundBoltStore(
 	}
 	store := newBoltStore(db, cfg)
 	store.binding = &openedStoreIdentityBinding{
-		dbPath:    cfg.DBPath,
-		fileInfo:  fileInfo,
-		kind:      kind,
-		storageID: storage.ID(),
+		dbPath:      cfg.DBPath,
+		fileInfo:    fileInfo,
+		kind:        kind,
+		backendName: storage.BackendName(),
+		storageID:   storage.ID(),
 	}
 	store.backendAuthorityGate = gate
 	if err := gate.Error(); err != nil {
@@ -759,6 +762,27 @@ func verifyStoreIdentityBinding(
 		}
 	}
 	return nil
+}
+
+// validateAuthoritativeRootBuckets is the store-wide downgrade fence for
+// journals whose complete top-level schema is known by their typed opener.
+// bbolt's Tx.ForEach visits only top-level buckets; nested schemas remain the
+// responsibility of their owning row decoder.
+func validateAuthoritativeRootBuckets(
+	tx *bolt.Tx,
+	label string,
+	allowedBucketNames ...[]byte,
+) error {
+	allowed := make(map[string]struct{}, len(allowedBucketNames))
+	for _, name := range allowedBucketNames {
+		allowed[string(name)] = struct{}{}
+	}
+	return tx.ForEach(func(name []byte, _ *bolt.Bucket) error {
+		if _, ok := allowed[string(name)]; ok {
+			return nil
+		}
+		return fmt.Errorf("%s journal contains unsupported top-level bucket %q", label, name)
+	})
 }
 
 func openExistingBoltDB(dbPath string, readOnly, allowEmpty bool) (*bolt.DB, os.FileInfo, error) {
@@ -1077,6 +1101,78 @@ func (s *boltStore) startCleanup(label string, cleanupInterval time.Duration, re
 			return nil
 		}, label, onPanic)
 	})
+}
+
+// startCleanupAsync is the readiness-safe variant for stores whose cleanup
+// implementation cooperates with s.ctx. The initial pass belongs to the
+// tracked maintenance goroutine: opening a backend therefore never waits for a
+// fleet-sized expiry scan, while Close still joins the pass after cancellation.
+//
+// Keep startCleanup above for the older single-transaction stores until their
+// cleanup functions can observe cancellation. Moving a non-cooperative cleanup
+// into this goroutine would merely move its unbounded shutdown wait.
+func (s *boltStore) startCleanupAsync(
+	label string,
+	cleanupInterval time.Duration,
+	removeExpired func(time.Duration) (int, error),
+	onPanic util.PanicHandler,
+) {
+	interval := cleanupInterval
+	if interval <= 0 {
+		interval = s.maxAge
+	}
+	cleanup := func() error {
+		removed, err := removeExpired(s.maxAge)
+		if err != nil {
+			return err
+		}
+		if removed > 0 {
+			slog.Debug("cleaned up expired "+label, "count", removed)
+		}
+		return nil
+	}
+	s.wg.Go(func() {
+		if s.ctx.Err() != nil {
+			return
+		}
+		runInitialCleanupSafely(label, cleanup, onPanic)
+		if s.ctx.Err() != nil {
+			return
+		}
+		util.StartCleanupLoop(s.ctx, interval, cleanup, label, onPanic)
+	})
+}
+
+func runInitialCleanupSafely(
+	label string,
+	cleanup util.CleanupFunc,
+	onPanic util.PanicHandler,
+) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error(label+" initial cleanup panic — recovering to keep fred alive",
+				"panic", recovered,
+				"stack", string(debug.Stack()),
+			)
+			if onPanic != nil {
+				func() {
+					defer func() {
+						if hookPanic := recover(); hookPanic != nil {
+							slog.Error("cleanup panic handler itself panicked",
+								"component", label,
+								"panic", hookPanic,
+								"stack", string(debug.Stack()),
+							)
+						}
+					}()
+					onPanic(recovered)
+				}()
+			}
+		}
+	}()
+	if err := cleanup(); err != nil {
+		slog.Warn("initial "+label+" cleanup failed", "error", err)
+	}
 }
 
 // removeOlderThan is a generic cleanup helper for bbolt stores that store

@@ -70,8 +70,8 @@ Images are validated before pull. The registry is extracted from the image refer
 |---|---|---|---|---|
 | CallbackSecret | `callback_secret` | string | *(required, min 32 bytes)* | Bidirectional HMAC-SHA256 key; must match this backend's providerd `backends[].hmac_secret` and be unique across backends |
 | CallbackInsecureSkipVerify | `callback_insecure_skip_verify` | bool | `false` | Skip TLS verification for callbacks (dev only) |
-| CallbackDBPath | `callback_db_path` | string | `"callbacks.db"` | Path to the identity-bound bbolt operation-intent, maintenance-intent, non-expiring close-finalizer, and callback-outbox journals; back it up with `releases.db`, `retention.db`, both storage-identity markers, and the matching substrate |
-| CallbackMaxAge | `callback_max_age` | duration | `24h` | Maximum age of legacy callbacks and typed lifecycle observations; operation/maintenance intents, close intents, and exact operation/maintenance completions never expire; must be positive |
+| CallbackDBPath | `callback_db_path` | string | `"callbacks.db"` | Path to the identity-bound bbolt operation-state, maintenance-intent, non-expiring close-finalizer, and callback-outbox journals; back it up with `releases.db`, `retention.db`, both storage-identity markers, and the matching substrate |
+| CallbackMaxAge | `callback_max_age` | duration | `24h` | Maximum age of typed lifecycle observations; Pending and terminal operation rows, maintenance/close intents, and exact operation/maintenance completions never expire; pre-identity v0.13 callback rows must be drained before upgrade and are never runtime queue entries; must be positive |
 
 Provision and restore requests carry two callback endpoints. The Docker backend
 persists the exact operation completion URL as `fred.callback_url` and the
@@ -89,6 +89,15 @@ first attempt. Exact operation/maintenance completions and lifecycle events for
 one lease therefore remain independently replayable and FIFO ordered;
 successful delivery removes only that event. Lifecycle coalescing and age
 cleanup never remove an exact completion.
+For provision and restore, the same transaction that enqueues the exact callback
+transitions the immutable operation row from Pending to Succeeded or Failed.
+Delivery removes only the FIFO event; the terminal operation row remains as
+exact retry and restore-recovery authority until a later authorized lease
+transition atomically supersedes or retires it.
+Recovery receives a sealed `OperationRecoveryState`: only
+`OperationIntentClaim` can settle Pending work, while `OperationSucceeded` and
+`OperationFailed` are typed, non-resolvable terminal evidence. Restore planning
+is a closed type switch; nil/absence cannot construct a rollback plan.
 Because maintenance completions share the lease's stable lifecycle URL and do
 not carry `maintenance_id` on the wire, Docker refuses the next restart, update,
 or custom-domain replacement for that lease while a prior exact maintenance
@@ -103,17 +112,19 @@ and health refuse a nonempty old bucket, and the current sender never invents a
 storage identity for an old row. See `DEPLOYMENT.md` for the stopped cutover;
 rolling either direction across this callback-store boundary is unsupported.
 
-Provision/restore admission also commits an immutable per-lease operation intent,
+Provision/restore admission also commits an immutable per-lease Pending operation row,
 including the exact resolved CPU/memory/durable-disk/scratch profiles, before its first
 substrate mutation. That snapshot moves unchanged into the live provision and
-successful release. Restart/update/custom-domain replacement similarly commits a
+successful release. Terminal settlement changes only its typed state and records
+the exact callback atomically; a restore handback requires the matching Failed
+row and treats absence as invalid authority. Restart/update/custom-domain replacement similarly commits a
 separately typed maintenance intent before appending its exact target release or
 touching Docker. A store-assigned canonical UUIDv4 identifies that intent, target
 release, and every target container. The cancelable pre-append admission and
 append-started authority are distinct opaque capabilities; advancing to the
 latter invalidates every stale cancellation token before `releases.db` can be
-mutated. Deprovision uses the separate
-`pending_callback_close_intents` journal described under
+mutated. Deprovision uses the close variant of `callback_lease_mutation_heads`
+described under
 [Durable close finalization](#durable-close-finalization). None of these causal
 intent classes is governed by `callback_max_age`.
 
@@ -137,23 +148,20 @@ Every new release persists immutable ordered `Items` and the canonical resource
 profile snapshot used for admission. A stack-form v0.13 row has neither field:
 recovery derives the complete service/SKU/domain/index cohort from exact Docker
 labels, checks it against the active manifest, and freezes `Items` plus every
-then-current SKU profile under an exact whole-release compare-and-swap. The
-older service-name-less cohort instead runs the stop/rename/recreate migration
-before ordinary recovery. A transitional items-only row is backfilled only
-under an exact version-and-items compare-and-swap. Keep the deployed v0.13 SKU
+then-current SKU profile under an exact whole-release compare-and-swap. A
+service-name-less pre-stack cohort is unsupported and startup refuses it before
+any substrate mutation. A transitional items-only row is backfilled only under
+an exact version-and-items compare-and-swap. Keep the deployed v0.13 SKU
 mapping, numeric profiles, and `container_tmpfs_size_mb` unchanged through the
 first successful upgraded startup. Because v0.13 did not persist desired
 quantity in its release row, the mandatory provider-side placement preflight in
 `DEPLOYMENT.md` must still compare the exposed frozen `Items` with the
 height-pinned chain workload before providerd starts.
 
-Each encoded per-lease history is capped at 32 MiB. Before a provision,
-restore, or one-time legacy migration mutates substrate, the backend proves that
-the exact terminal release can fit after deterministic compaction. The legacy
-proof includes the complete tokenless runtime authority, and the post-health
-write commits that authority with the manifest, items, and profiles before
-rollback cleanup is scheduled. Compaction always preserves
-the index-latest row, most recent active row, and newest legacy-migration row.
+Each encoded per-lease history is capped at 32 MiB. Before a provision or
+restore mutates substrate, the backend proves that the exact terminal release
+can fit after deterministic compaction. Compaction always preserves the
+index-latest row and most recent active row.
 It removes expired disposable audit entries first, then the oldest fresh
 disposable entries, so capacity pressure may shorten audit history before
 `releases_max_age` but cannot discard recovery or rollback-cleanup authority. If
@@ -193,45 +201,13 @@ that can purge the release while stranding remaining tenant volumes. Restore a
 complete pre-close snapshot or follow Deployment's chain-proven manual data
 decision procedure.
 
-`ErrV013OrphanRollbackRemnant` is the narrow stopped `-prev` case with no
-release, retention, or managed-volume authority. The classifier requires one
-dense cohort whose immutable IDs, lease/backend/provider/tenant/SKU/image/domain,
-callback pair, names/indexes, and explicit `created`/`exited`/`dead` states are
-coherent. Its stderr includes the provider and a bounded, sorted
-`immutable_container_ids` JSON array; record those full IDs and never use
-reusable names as cleanup handles. The Docker preflight derives the cohort while
-the journal parents, managed-volume root, and daemon SystemID are pinned and
-re-attested; record that SystemID and require it again during exact-ID
-reinspection. Do not delete anything until the stopped provider's separate
-read-only `placement-preflight` mode, invoked with
-`-prove-terminal-orphan <lease-uuid>` and `-expected-backend <name>`, proves the
-exact lease present and terminal in the same provider's complete height-pinned
-snapshot and absent from a pristine v0.13 placement database. Require its
-printed provider UUID to equal the Docker diagnostic. That verdict is necessary
-but not sufficient: follow the exact-ID reinspection/removal procedure in
-`DEPLOYMENT.md`, then rerun both proofs and require this Docker adoption
-preflight itself to pass before taking the final backup or sealing.
-
-The same preflight recognizes migration crash generations without inventing
-their missing authority. A rollback-only original/`-prev` cohort is resumable,
-including the exact case where Docker still records the old bind source after
-the managed parent was already renamed to its service-aware name. A complete
-pre-`RecordMigration` `-prev` cohort plus v0.13's authorityless stack generation
-emits a bounded sorted `immutable_stack_container_ids` JSON array and requires
-re-inspecting, stopping if needed, and removing without force only those
-diagnostic-proven immutable stack IDs from a stopped backup, rerunning the proof,
-taking a fresh backup, then letting current startup resume from the rollback
-cohort. A post-`RecordMigration` authorityless stack
-with partial/full `-prev` cleanup is not repairable from those remnants: restore
-a known-good pre-migration snapshot or use a dedicated proof-bearing repair.
-Never infer quantity or callback identity from a partial rollback set.
-
-Release adoption likewise normalizes only exact v0.13 writer shapes: the
-flat-active/semantically-equal-stack-active pair from `RecordMigration`, and
-post-active `deploying` rows whose parsed manifests are semantically identical
-to `LatestActive`. A differing environment, command, or other manifest field is
-an unresolved update/restart generation and fails without store or marker
-mutation. See `DEPLOYMENT.md` for the stopped recovery procedures.
+The supported v0.13 upgrade shape is an ordinary stack-form cohort with a
+complete service label and coherent tokenless callback identity. Any pre-stack
+container, `-prev` rollback remnant, authorityless migration generation, or
+other partial topology fails the read-only preflight and normal startup before
+mutation. This release intentionally has no in-place converter or inference
+path for those shapes; restore a known-good supported snapshot or use a separate
+proof-bearing repair procedure.
 
 Storage-identity initialization binds the physical parent directories of both
 markers and all three authoritative journals (`callbacks.db`, `releases.db`,
@@ -321,18 +297,15 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 |---|---|---|---|---|
 | ImagePullTimeout | `image_pull_timeout` | duration | `5m` | Timeout for pulling images |
 | ContainerCreateTimeout | `container_create_timeout` | duration | `30s` | Timeout for creating containers |
-| ContainerStartTimeout | `container_start_timeout` | duration | `30s` | Timeout for starting containers |
+| ContainerStartTimeout | `container_start_timeout` | duration | `30s` | Timeout for starting containers; also the maximum one-shot cold-recovery stabilization window for an exact `created` or paused non-progressing provision cohort, capped by its remaining operation deadline, before it is failed and torn down |
 | ProvisionTimeout | `provision_timeout` | duration | `10m` | Maximum time for the entire provisioning operation. Validated as positive — must be `> 0`. |
 | ReconcileInterval | `reconcile_interval` | duration | `5m` | How often to reconcile state with Docker |
 | StartupVerifyDuration | `startup_verify_duration` | duration | `5s` | Grace period after start before verifying containers are still running |
 | ContainerStopTimeout | `container_stop_timeout` | duration | `30s` | Grace period before SIGKILL when stopping containers |
-| MigrationReadyTimeout | `migration_ready_timeout` | duration | `90s` | Caps how long a recover-time migration waits for the new stack-form container to reach `healthy` (or `running` when no health check is declared) before declaring the migration failed for that lease |
-| MigrationGracePeriod | `migration_grace_period` | duration | `1m` | How long the renamed `-prev` legacy container lingers after a successful recover-time migration before forced removal (preserves rollback potential) |
 
 Configuration loading starts from `DefaultConfig`, so omitted YAML keys receive
 the values above. For programmatic configs, zero
-`container_stop_timeout`, `migration_ready_timeout`, and
-`migration_grace_period` values select those same defaults; negative values are
+`container_stop_timeout` selects its documented default; negative values are
 rejected. `startup_verify_duration: 0` likewise selects 5s rather than disabling
 verification. Image pull, container create/start, provision, and reconcile
 durations must remain positive. Durations use Go syntax (`h`, `m`, `s`); `d` and
@@ -509,39 +482,51 @@ Restore-specific re-deploy behavior worth knowing:
 
 Restore is crash-safe and self-healing. A retention record carries one of three persisted statuses — `active` (awaiting restore or reap), `restoring` (a restore is in flight), and `reaping` (volumes are pending physical destruction). Adoption renames volumes and applies the destination filesystem quota; rollback must reverse both mutations safely:
 
-The `reaping` status is a finalizer tombstone (ENG-376): when a retained record is reaped (grace-expired, cap-evicted, or abandoned by a deprovision give-up) the record is **not** deleted at the active→reaping transition — it outlives its volumes and is `Delete`d only once every volume is confirmed destroyed. The bytes still sit on disk, so a reaping record keeps counting against the retained footprint while it is no longer restore-claimable. A record that cannot be reclaimed sticks in `reaping` (observable via the `fred_docker_backend_retention_reaping_leases` / `fred_docker_backend_retention_reaping_bytes` gauges); a failed destroy / give-up / uncommitted revert also bumps `fred_docker_backend_retention_leaked_total`.
+The `reaping` status is a finalizer tombstone (ENG-376): when a retained record
+is grace-expired or cap-evicted, the record is **not** deleted at the
+active→reaping transition. It outlives its volumes and is deleted only after
+every volume is confirmed destroyed. The bytes therefore remain counted while
+the record is no longer restore-claimable. A record that cannot be reclaimed
+stays `reaping` (observable via
+`fred_docker_backend_retention_reaping_leases` /
+`fred_docker_backend_retention_reaping_bytes`), and a failed destroy increments
+`fred_docker_backend_retention_leaked_total`. A historical v0.13 give-up
+tombstone remains readable and converges through the same finalizer; current
+close failure keeps its non-expiring close intent instead of creating one.
 
-A tombstone is a *name-keyed* scheduled destroy — it carries strings, not proof
-of ownership — and while a restore is in flight the original lease's data wears
-the new lease's canonical name, so the finalizer re-checks ownership **at destroy
-time**, not just when the record was written (ENG-659). A name owned by a restore
-source finalizer is skipped and the record is kept. The next sweep retries after
-that restore either rolls back and re-quarantines the name or proves commit from
-an exact active destination Release. In the committed case the destination's
-release/provision authority continues to claim the bytes; the source row may
-remain as identity for a zero-survivor Failed destination until a plain Restart
-reaches Ready and finalizer reconciliation consumes it, or close hands it off.
-Finalizer deletion is never permission for the old tombstone to destroy those
-bytes. An unreadable retention store likewise means nothing is destroyed that
-pass. Both cases are counted on
-`fred_docker_backend_retention_reap_skips_total{reason}` and are deliberately
-**not** counted as leaks—nothing is abandoned, and the footprint keeps counting
-while the record stays `reaping`.
+A tombstone scopes cleanup to one exact lease namespace; it does not carry a
+caller-authored destroy list. A restore cannot acquire that lease as its
+destination: the completed close that produced the retention row installed a
+permanent mutation head, so operation admission fails before the source can move
+to `restoring` (ENG-659). The inverse ordering is also excluded because a pending
+restore operation prevents close admission. The finalizer still re-checks live
+ownership at destroy time, so a re-provisioned lease is never reclaimed, and an
+unreadable retention store means nothing is destroyed that pass. Those holds are
+counted by `fred_docker_backend_retention_reap_skips_total{reason}` and are
+deliberately **not** counted as leaks—the footprint keeps counting while the
+record stays `reaping`.
 
 - **Restore failure before commit:** the new lease's compose project is torn down
   and adopted volumes are **re-quarantined**. The backend proves/reapplies the
-  immutable source quota and settles the exact failed operation before it
+  immutable source quota and transitions the exact operation row to Failed while
+  atomically enqueueing its callback before it
   pre-counts the retained footprint, CAS-reactivates the source, and releases
   destination allocations. After actor acceptance, physical rollback parks the
-  row `restoring` until the actor has durably settled its Failed callback; the
-  periodic sweep completes the handback. Any uncertainty remains `restoring`
-  and live-counted.
+  row `restoring` until the actor has durably recorded Failed and enqueued its
+  callback; the periodic sweep completes the handback from that terminal row.
+  Successful callback delivery does not remove it, and absence fails closed.
+  Any uncertainty remains `restoring` and live-counted.
 - **Committed restore followed by failure:** an exact active destination Release
   is the durable commit marker. It is retained even if the destination is now
-  Failed or absent; a matching pending intent is settled as success. With zero
-  survivors, recovery publishes a conservative Failed destination, keeps its
+  Failed or absent; a matching Pending operation is transitioned to Succeeded.
+  An exact Succeeded operation plus the immutable source finalizer reconstructs
+  a missing active Release; Failed plus an exact committed Release is
+  contradictory authority and fails closed. With zero survivors, recovery
+  publishes a conservative Failed destination, keeps its
   exact allocation, and retains the source finalizer as tenant/provider identity
-  across repeated restarts. Once the exact restore intent is settled, a plain
+  across repeated restarts. Once no Pending or contradictory Failed restore
+  operation remains (an authorized successor may already have retired Succeeded
+  history), a plain
   Restart may repair the destination; reaching Ready lets reconciliation consume
   that row. Close first commits a complete close intent and then deletes it
   before teardown.
@@ -549,15 +534,19 @@ while the record stays `reaping`.
 - **Destination mutation fence:** while the source row remains `restoring`, new
   Provision and Restore operations for its destination are rejected. Before
   commit, maintenance is rejected too. After an exact active Release proves
-  commit and the exact restore intent settles, a plain Restart may recover a
+  commit and no Pending or contradictory Failed restore operation remains, a
+  plain Restart may recover a
   committed Failed destination. Update and custom-domain redeploys remain fenced
   until that Restart reaches Ready and finalizer reconciliation consumes the
   row. The volatile provision map alone cannot release that fence.
 - **Crash mid-restore**: on the next startup (and on every periodic sweep) the
   backend reconciles dangling `restoring` records — recognizing exact committed
-  Releases and rolling back only pre-commit generations before the orphan-volume
-  reaper runs. The complete decision and mutation hold the destination lease's
-  command fence, so a stale failed snapshot cannot race a restart to Ready. A
+  Releases and rolling back only pre-commit generations. The restoring record is
+  itself the exact ownership/finalizer authority; no unattributed-volume reaper
+  infers destructive permission. The complete decision and mutation hold the destination lease's
+  command fence and typed exclusive actor-quiescence claim, so queued messages,
+  handlers, workers, terminal handoff, and actor replacement cannot race a stale
+  failed snapshot to Ready. A
   backend-local recovery-snapshot fence also serializes Restore's durable
   admission and rollback handback with inventory-to-projection/pool publication,
   so an absent-to-transient-to-absent restore cannot be resurrected from stale
@@ -678,10 +667,25 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
 
 **One concept: the lease actor is the scope of atomicity for its messages and its workers.** Everything else falls out of that invariant:
 
-- **Registry atomicity** — the actor registry (`b.actors`) is guarded by a mutex; `routeToLease(uuid, msg)` resolves-or-creates AND enqueues under that mutex, so callers never hold a `*leaseActor` pointer. Stale-pointer races are unreachable by construction.
+- **Typed registry atomicity** — the actor registry (`b.actors`) is guarded by
+  a mutex. The closed `ActorCommandMessage` set may resolve-or-create through
+  `routeToLease`; the closed `ActorObservationMessage` set must instead carry an
+  exact provision pointer plus deep immutable generation snapshot.
+  `routeActorObservation` revalidates that claim, the recovery reservation,
+  actor resolution, and enqueue under the same registry critical section. Its
+  bound validator runs again immediately before serial actor handling, closing
+  the enqueue-to-handle window. Delayed die/cohort observations therefore cannot
+  materialize an actor after rollback or target a replacement actor, and callers
+  never retain an actor pointer.
 - **Worker ownership** — every worker goroutine (provision, restart, update, diag) is spawned by the actor and tracked by its per-actor `workers` barrier (a channel-signaled reference counter; see `work_barrier.go`). Normal actor exit waits for `workers.Zero()` before registry deletion and inbox drain. The wait is bounded: a stuck worker aborts a preempting state transition (so deprovision cannot tear down underneath it), while shutdown eventually returns `ErrShutdownDrainTimeout`, leaves dependencies open, and makes the process exit non-zero. The barrier's channel-based wait means a wedged worker adds no leaked waiter on top of itself.
+- **Typed recovery quiescence** — restore reconciliation must acquire an opaque `QuiescenceClaim` from the exact registry actor before reading mutable recovery inputs. One activity count overlaps queued/handling messages, worker execution, and worker-to-terminal-message handoff. The claim holds admission and activity gates and pins the actor against retirement/replacement until release; routing refuses without blocking while it is held. A missing claim defers that lease. Recovery never composes racy inbox-depth and worker-idleness snapshots into authority.
 - **Drain-with-handle** — on exit, any message in the inbox is processed via `handle()` (not just closed-and-dropped). Terminal events delivered during the shutdown window still drive their SM transition. Silent drops are gone.
-- **Non-blocking routing** — `routeToLease` uses a non-blocking inbox send under the registry mutex. A wedged actor cannot stall the event loop; full-inbox refusals increment `die_event_dropped_total` and the reconciler re-detects within its cycle.
+- **Non-blocking routing** — both command and exact-generation observation
+  routers use a non-blocking inbox send under the registry mutex. A wedged actor
+  cannot stall the event loop. Observation refusal—including generation drift,
+  a recovery reservation, shutdown, or a full inbox—is retried from current
+  state by reconciliation. Container-death refusal increments
+  `die_event_dropped_total`; cohort-divergence refusal is logged.
 
 Every lease is owned by a per-lease actor goroutine with a bounded inbox (16 messages). All transitions flow through a state machine, one per actor, which serializes transitions and owns the side effects (callback emission, diagnostics persistence, gauge updates). The SM's initial state is the lease's current `Status` at actor creation — new leases start in `Provisioning`, recovered leases start in whatever state they were in.
 
@@ -724,12 +728,29 @@ The edges above are the complete set of allowed transitions; any event not liste
 
 - **`Ready → Failing` guard.** The `ContainerDied` trigger fires only if a Docker `Inspect` confirms the container actually exited. Die events can be duplicated or stale; the guard filters them.
 - **Preemption via `OnExit` cancellation + `workers.Zero()`.** `Failing`, `Provisioning`, `Restarting`, and `Updating` each own one async worker goroutine (diag gather, provision, or replace). Every transition out of these states calls the worker's `CancelFunc` via `OnExit`, then `a.waitForWorkers()` selects on the per-actor `workers.Zero()` channel until the goroutine has returned and its terminal `sendTerminal` has landed in the inbox. If that bounded wait expires, the state transition fails and `Deprovision` refuses substrate teardown; a retry can proceed once the worker actually drains. This preserves the rule that a canceled worker cannot recreate containers after close.
-- **Durable cohort divergence.** Recovery compares the exact service/SKU/index/domain/image set observed from Docker with the active release's durable `Items`. A mismatch is a typed `Ready → Failed` transition (or a directly materialized cold-start failure), not a fabricated container-death event. True v0.13 live rows are upgraded by startup migration, which writes ordered items and canonical resource profiles before ordinary recovery; transitional items-only rows are version-and-items CAS-backfilled.
+- **Durable cohort divergence.** Recovery compares the exact service/SKU/index/domain/image set observed from Docker with the active release's durable `Items`. A mismatch is a typed `Ready → Failed` transition (or a directly materialized cold-start failure), not a fabricated container-death event. Supported stack-form v0.13 rows receive ordered items and canonical resource profiles under compare-and-swap before ordinary recovery; transitional items-only rows are version-and-items CAS-backfilled.
 - **Exact-key command fence.** A zero-value-ready, ref-counted keyed mutex serializes mutation admission, complete restore reconciliation, and teardown for one lease. Unrelated leases never share a stripe, idle entries are removed, and durable journals—not the mutex—remain crash-recovery authority.
+- **Construction-bound recovery exclusion.** Background operation,
+  maintenance, and close convergence can receive a short-lived recovery scope
+  only from the backend's fixed coordinator. That coordinator holds both the
+  exact command-fence key and an actor-registry/quiescence reservation across
+  classification or cleanup. Live close instead presents an actor-owned scope
+  minted only after its transition has drained the worker. Copies are revoked
+  when either callback returns, so a durable claim or stale actor reference is
+  not independently destructive authority.
 - **Defense-in-depth `Ignore` on `Deprovisioning`.** Cancellation is best-effort: a goroutine can race past the cancel signal and fire its completion event anyway. `Deprovisioning` ignores every such event (`DiagGathered`, `ProvisionCompleted`, `ProvisionErrored`, `ReplaceCompleted`, `ReplaceRecovered`, `ReplaceFailed`) so the race is structurally safe.
 - **One terminal decision per transition.** Provision, failure, and replace callback decisions live in SM entry actions (`onEnterReadyFromProvision`, `onEnterFailedFromDiag`, `onEnterFailedFromProvision`, `onEnterReadyFromReplaceCompleted`, `onEnterReadyFromReplaceRecovered`, `onEnterFailedFromReplace`), never in workers. Deprovision settlement is instead owned by the durable close finalizer: its precise resolution atomically removes the close capability and enqueues one lifecycle result. Worker preemption, ignored late events, and the durable claim together prevent a second logical settlement; HTTP redelivery of the one outbox entry remains expected.
 - **Three `Replace*` events for two terminal states.** `ReplaceCompleted` means restart/update succeeded (→ `Ready`, Success callback). `ReplaceRecovered` means it failed but rollback restored a working lease (→ `Ready`, Failed callback with rollback suffix). `ReplaceFailed` means both the operation and the rollback failed (→ `Failed`, Failed callback).
-- **Non-blocking routing, reconciler backstop.** `routeToLease` is non-blocking: a full inbox returns false rather than blocking the caller. `containerEventLoop` and the reconcile die-event dispatch treat refusal as "reconciler will re-detect within its cycle" and increment `die_event_dropped_total`. One wedged actor can no longer stall die-event delivery for other leases.
+- **Non-blocking routing, reconciler backstop.** Command routing and
+  `routeActorObservation` are non-blocking. Container-event and reconcile
+  observations carry the exact provision-generation snapshot that produced
+  them. Admission atomically rejects an already-stale claim, and the bound actor
+  message discards one that becomes stale while queued, instead of creating or
+  targeting the wrong actor.
+  Container-death refusal is counted in `die_event_dropped_total`,
+  cohort-divergence refusal is logged, and the reconciler re-detects both from
+  current state. One wedged actor cannot stall die-event delivery for other
+  leases.
 
 ### Observability
 
@@ -739,8 +760,14 @@ The edges above are the complete set of allowed transitions; any event not liste
 - `fred_docker_backend_lease_actor_inbox_depth` — histogram of per-actor inbox depth; p99 near 0 is healthy.
 - `fred_docker_backend_lease_actor_panics_total` — counts panics recovered inside actor handlers. Any non-zero is a bug; the actor survives and keeps processing, but the message that panicked did not drive its transition.
 - `fred_docker_backend_lease_terminal_event_dropped_total{event}` — worker terminal sends refused because the actor had exited (pathological `waitForWorkers` timeout). Should be zero in normal operation.
-- `fred_docker_backend_die_event_dropped_total{source}` — container-death events refused because the actor's inbox was full or the backend was shutting down. `source` is `event_loop` or `reconcile`. Not data loss — the reconciler re-detects — but a sustained non-zero value flags a wedged actor or chronic burst.
+- `fred_docker_backend_die_event_dropped_total{source}` — container-death
+  observations refused because their exact generation was stale, recovery held
+  the actor key, the backend was shutting down, or the current actor's inbox was
+  unavailable. `source` is `event_loop` or `reconcile`. The reconciler
+  re-detects current failures; sustained growth flags churn, recovery contention,
+  a wedged actor, or chronic burst.
 - `fred_docker_backend_pending_close_intents` and `fred_docker_backend_oldest_close_intent_age_seconds` — unlabeled aggregate count and oldest age for the non-expiring destructive-close journal. A brief non-zero value is normal while a close runs; sustained age means a finalizer dependency is unavailable. Use the lease-scoped recovery log to identify the row without introducing an unbounded lease label.
+- `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason}` — interrupted exact provisions that exhausted bounded cold recovery. `reason` is `container_start_timeout` when a non-progressing `created`/paused cohort's shorter start-stabilization window wins, or `provision_timeout` when the operation deadline wins (including an inert cohort with less operation time remaining). It can increment again only when a later failure leaves that same complete non-terminal cohort for another startup; correlate it with `teardown_fallback_total{operation="provision_cleanup"}` and the lease-scoped warning.
 - `fred_docker_backend_reconciliation_total{outcome}` and `fred_docker_backend_reconciliation_last_success_timestamp_seconds` — the runtime signal for `recoverState`, including maintenance-WAL convergence. A valid but semantically indeterminate maintenance row can make a pass report `outcome="error"` and leave last-success stale while `/health` remains green and `callback_store_errors_total` remains unchanged; those latter signals validate structural store access, not every substrate classification. During startup the equivalent failure exits before the periodic loop starts and appears as `failed to recover state` with the lease-scoped nested error.
 - `fred_docker_backend_retention_sweep_total{outcome}` — one increment per periodic retention-sweep pass, `success` or `error`. The sum across outcomes is a liveness heartbeat (it advances every tick regardless of result); `{outcome="error"}` means a sweep stage failed — usually an unenumerable retention store, but the orphan stage reports a failed volume-root enumeration here too, so the joined stage error is what identifies the actual failing dependency. Every stage runs on every pass and the stage errors are joined, so the log line names all of them rather than only the first.
 - `fred_docker_backend_retention_accounting_refresh_failed_total` — the retained-disk projection could not be recomputed and the previous value was kept. Safe (a zeroed projection would over-admit) but it means the five retention gauges and the pool's retained input are stale while this rises.
@@ -763,13 +790,19 @@ The bounds are nested and aggregate where cardinality matters:
   context is not retained after construction.
 - `Start` shares the shorter of its caller context and 30 seconds across initial
   identity/connectivity reads, then uses the backend lifecycle context with one
-  30-minute overall crash-recovery budget.
+  finite overall crash-recovery budget. Production derives it as the saturating
+  sum of every sequential phase's local maximum (51m10s with defaults), so a
+  future/skewed operation admission still receives a fresh operation window
+  after every earlier phase consumes its cap.
 - Within that overall budget, interrupted-volume recovery and its
   clean-inventory proof each use a fixed two-minute filesystem-only child
   deadline; `container_stop_timeout` cannot inflate them.
-- Later startup phases each use one aggregate
-  `max(2m, container_stop_timeout)` budget. A longer configured stop grace is
-  therefore honored for one container without multiplying that grace per lease.
+- Retention reconciliation, quota reconciliation, and retention reap each use one aggregate
+  `max(2m, container_stop_timeout)` budget. State rebuild retains its 30-minute
+  cap; operation recovery receives the larger of that ordinary phase budget and
+  its configured provision/read/cleanup sum; the final identity proof receives
+  one Docker read budget. A longer configured stop grace is therefore honored
+  for one container without multiplying that grace per lease.
 - Ordinary recovery Docker list/inspect boundaries are capped at 30 seconds.
   Cold-start diagnostics share one 30-second context across every failed lease,
   and orphan-network cleanup shares one across the whole network set.
@@ -780,64 +813,86 @@ Local filesystem deadlines are cooperative: one blocking kernel call cannot be
 forcibly interrupted, and a very large recursive top-level removal can cross
 the nominal budget. Recovery checks cancellation between top-level entries and
 phases and makes no further mutations afterward.
-These bounds are independent of the longer `migration_ready_timeout` used to
-observe a legacy replacement becoming ready. They are internal safety bounds,
-not YAML keys; zero-valued internal fields select these production defaults.
+These are internal safety bounds, not YAML keys; zero-valued internal fields
+select these production defaults.
 
 `recoverState` proceeds in this order:
 
 1. **Classify maintenance WALs lease by lease** -- decode the complete maintenance-intent journal, then re-read and classify each exact row under that lease's command fence. A live actor that owns the same `maintenance_id` remains the serial owner. Otherwise recovery joins the exact source/target Release with a fresh bounded strict Docker inventory; it never relies on one fleet-wide point-in-time snapshot and never reruns Compose. An indeterminate row returns before ordinary projection can reinterpret a mixed source/target cohort. Partial-target cleanup revalidates and removes immutable Docker IDs individually, so an error on a later sibling may leave safe idempotent progress while the WAL remains for the next pass; reusable names are never cleanup authority.
 2. **List managed containers** -- filters by `fred.managed=true` label for the ordinary projection.
-3. **Stabilize lifecycle authority** -- recovery holds the exclusive side of a backend-local snapshot guard from ordinary managed-container inventory through close/restore durable-authority reads and matching provision/pool publication. Live Deprovision and Restore paths hold the shared side only for authority capture and durable handoffs, not destructive substrate work. Load every close intent before ordinary callback-label or release-cohort validation. Containers owned by a close are deliberately excluded from those exact-cohort checks because teardown may already have removed some or all siblings. Provision remains available; Restore admission or final rollback may wait for the current snapshot publication.
-4. **Resume an unfinished legacy migration** -- a pre-commit original/`-prev` cohort is converged idempotently. Once `RecordMigration` has persisted exact `Items` and resource profiles, remaining `-prev` containers are cleanup-only: recovery validates the complete live Compose cohort first and never infers topology from a partially cleaned rollback set. When exact stopped adoption proved a v0.13 committed-migration cohort whose row omitted those current fields, recovery writes `Items`, profiles, and the migration marker in one transaction so an immediately admitted close captures the rollback containers' immutable IDs before it may retire release history.
-5. **Validate ordinary callback and release cohorts** -- every sibling must carry one coherent callback pair. Current releases must carry complete matching typed runtime authority. A complete callback-bearing v0.13 cohort is CAS-fenced with a distinct `LegacyRuntimeAuthority` that freezes its canonical principal and tokenless pair without manufacturing an operation ID; an active callbackless pre-label cohort is rejected by mandatory stopped adoption because provider callback authority cannot be minted safely. Either authority's exact `Items` and resource profiles must match the observed service/SKU/index/domain/image set; a mismatch fails the lease closed. With no survivors, it reconstructs the exact identity, callback route, topology, and conservative allocation as Failed. A still-unbackfilled v0.13 stack row is derived only from a complete, identity-consistent, dense cohort and exact active manifest, then receives the whole-release and legacy-runtime backfills before any operation may erase its last container. The first and every subsequent restart, update, or custom-domain replacement stays legacy/tokenless; its independent UUIDv4 `maintenance_id` is exact replacement WAL/cohort identity, not provider callback authority. Only a later genuine provision or restore rotates callback authority to typed. A pending operation intent owns its own generation transition and resource snapshot and is classified separately during startup.
-6. **Group by lease UUID** -- ordinary containers are grouped into provision records. The highest `FailCount` across containers in a lease is used (handles partial re-provisions).
-7. **Rebuild close owners** -- a full close publishes a conservative `deprovisioning` projection and full resource reservation solely from its immutable journal snapshot, even with zero survivors. Cleanup-only closes reserve their durable topology without publishing a tenant provision.
-8. **Rebuild restore destination authority** -- a source `restoring` finalizer
+3. **Stabilize lifecycle authority** -- recovery holds the exclusive side of a backend-local snapshot guard from ordinary managed-container inventory through close/restore durable-authority reads and matching provision/pool publication. Live Deprovision and Restore paths hold the shared side only for authority capture and durable handoffs, not destructive substrate work. Load every close intent before ordinary callback-label or release-cohort validation. Containers owned by a close are deliberately excluded from those exact-cohort checks because teardown may already have removed some or all siblings. Provision validation remains available, but its short accepted-intent-to-projection handoff can wait for the current snapshot publication; Restore admission or final rollback may wait at its corresponding handoff.
+4. **Validate ordinary callback and release cohorts** -- every sibling must carry one coherent callback pair. Current releases must carry complete matching typed runtime authority. A complete callback-bearing stack-form v0.13 cohort is CAS-fenced with a distinct `LegacyRuntimeAuthority` that freezes its canonical principal and tokenless pair without manufacturing an operation ID; a pre-stack or callbackless cohort is rejected because provider callback authority cannot be minted safely. Either authority's exact `Items` and resource profiles must match the observed service/SKU/index/domain/image set; a mismatch fails the lease closed. With no survivors, it reconstructs the exact identity, callback route, topology, and conservative allocation as Failed. A still-unbackfilled v0.13 stack row is derived only from a complete, identity-consistent, dense cohort and exact active manifest, then receives the whole-release and runtime-authority backfills before any operation may erase its last container. The first and every subsequent restart, update, or custom-domain replacement stays tokenless; its independent UUIDv4 `maintenance_id` is exact replacement journal/cohort identity, not provider callback authority. Only a later genuine provision or restore rotates callback authority to typed. A pending operation intent owns its own generation transition and resource snapshot and is classified separately during startup.
+5. **Group by lease UUID** -- ordinary containers are grouped into provision records. The highest `FailCount` across containers in a lease is used (handles partial re-provisions).
+6. **Rebuild close owners** -- a full close publishes a conservative `deprovisioning` projection and full resource reservation solely from its immutable journal snapshot, even with zero survivors. Cleanup-only closes reserve their durable topology without publishing a tenant provision.
+7. **Rebuild restore destination authority** -- a source `restoring` finalizer
    supplies exact destination operation ID, items, manifest, profiles, callback
    pair, and allocation. Without
    a matching active Release it remains pre-commit rollback authority and does
    not create a restartable projection. An exact matching Release is committed
    authority: retain the Release, recover zero survivors as a conservative
    Failed destination with its allocation held, and let the later startup
-   operation-intent phase settle a matching surviving intent as success. Retain
+   operation phase transition a matching Pending row to Succeeded. Retain
    the source finalizer as identity until a
    successful plain Restart reaches Ready and reconciliation consumes it, or
    close persists a full intent and takes ownership. Update and custom-domain
    redeploys stay fenced until finalizer consumption.
-9. **Detect ready-to-failed transitions** -- if a provision was in-memory as `ready` but Docker shows a container as exited/dead, or if its exact durable cohort diverges, the typed state-machine transition marks it `failed`, increments `FailCount`, and emits the lifecycle callback.
-10. **Cold-start FailCount correction** -- provisions recovered as `failed` with no prior in-memory state have their `FailCount` incremented by 1. The label value was written at creation time (before the crash), so the increment accounts for the observed failure.
-11. **Preserve in-flight provisions** -- in-flight operation state and its resource reservation survive an inventory rebuild. A pending operation intent remains excluded from ordinary inference and is settled by the later startup operation-intent phase.
-12. **Reset resource accounting** -- allocations are rebuilt atomically from operation-intent, active-release, restore-finalizer, and close snapshots while reservations for every still-tracked lease are preserved. Docker uses durable `disk_mb` or its mutually exclusive pinned scratch allowance; mutable configuration is used only while explicitly upgrading supported legacy evidence.
-13. **Resume admitted closes** -- after conservative projections and reservations are visible and the recovery guard is released, retry every close under its per-lease command fence after re-reading the durable journal. Transient failures retain the journal and durable cleanup-attempt count for the next level-triggered pass.
-14. **Orphaned network cleanup** -- if `NetworkIsolation` is enabled, removes any managed networks whose tenant has no active provisions and no connected containers.
+8. **Detect ready-to-failed transitions** -- if a provision was in-memory as `ready` but Docker shows a container as exited/dead, or if its exact durable cohort diverges, the typed state-machine transition marks it `failed`, increments `FailCount`, and emits the lifecycle callback.
+9. **Cold-start FailCount correction** -- provisions recovered as `failed` with no prior in-memory state have their `FailCount` incremented by 1. The label value was written at creation time (before the crash), so the increment accounts for the observed failure.
+10. **Preserve in-flight provisions** -- Pending operation state and its resource reservation survive an inventory rebuild. A Pending provision remains excluded from ordinary inference and is settled by the later startup operation phase. Succeeded/Failed operation rows are durable decisions, not in-flight work.
+11. **Reset resource accounting** -- allocations are rebuilt atomically from operation-intent, active-release, restore-finalizer, and close snapshots while reservations for every still-tracked lease are preserved. Docker uses durable `disk_mb` or its mutually exclusive pinned scratch allowance; mutable configuration is used only while explicitly upgrading supported v0.13 evidence.
+12. **Resume admitted closes** -- after conservative projections and reservations are visible and the recovery guard is released, retry every close under its per-lease command fence after re-reading the durable journal. Transient failures retain the journal and durable execution generation for the next level-triggered pass.
+13. **Orphaned network cleanup** -- if `NetworkIsolation` is enabled, removes any managed networks whose tenant has no active provisions and no connected containers.
 
-During `Start`, the next phases preflight operation intents against that
-projection, reconcile restore/retention finalizers, settle exact operation
-intents, and only then run quota backfill, orphan-volume cleanup, and retention
-reaping. Periodic `recoverState` retries maintenance and close convergence; a
+During `Start`, the next phase lets Pending provision and restore operations
+exclusively classify and settle their exact substrate; only afterward may
+restore/retention finalizers reconcile, followed by quota backfill,
+and retention reaping. Unattributed managed volumes are preserved for explicit
+operator attribution; there is no inference-driven cleanup phase or separate preflight
+owner that can consume an operation's empty destination. Periodic `recoverState`
+retries maintenance and close convergence; a
 crash-surviving operation intent is a startup boundary rather than a
-providerd-triggered remote refresh.
+providerd-triggered remote refresh. An exact provision cohort in a transitional
+state is re-inspected during that startup rather than requiring supervisor
+restarts. An exact-empty provision or restore receives the full remaining
+`provision_timeout`, including one final bounded inventory read. A visible
+`created`/paused cohort gets at most the recovery process's current
+`container_start_timeout`, capped by the operation deadline, while running
+health checks and restarting substrate get only the budget computed from the
+durable admission time and current `provision_timeout` (and never more than one
+fresh timeout when a persisted timestamp is in the future after clock
+rollback). A terminal sibling or an exhausted bound produces the ordinary
+failed-operation cleanup; an inspection error or shutdown preserves the exact
+Pending row and all substrate evidence. An interrupted restore does not wait out a
+second cold-start budget: after exact source, destination, callback, and topology
+proofs under the destination command fence, recovery must also hold the typed
+exclusive actor-quiescence capability described above. Ready may
+commit while partial, failed, paused, and other non-terminal substrate enters
+the existing teardown → re-quarantine → source-quota → failed-settlement →
+source-handback sequence. Failed settlement atomically records the terminal
+operation outcome and callback; that Failed row drives a handback retry, while an
+absent row fails closed. A committed destination Release always wins and is
+never rolled back. Timeout exhaustion for provision increments
+`fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason}`
+with `reason` equal to whichever of `container_start_timeout` or
+`provision_timeout` expired first; it increments again only if later failure
+leaves the same complete non-terminal cohort for another startup.
 
 ### Durable close finalization
 
 Deprovision never begins destructive work from volatile provision state alone.
-It first commits an opaque UUIDv4 capability under
-`pending_callback_close_intents`, with an immutable snapshot of:
+It first commits an opaque UUIDv4 close capability as the lease's tagged head in
+`callback_lease_mutation_heads`, with an immutable snapshot of:
 
 - lease, backend/storage, tenant, and provider identity;
 - ordered items and the complete manifest;
 - exact operation/lifecycle callback pair and the close-time retention policy;
 - exact per-SKU CPU, memory, durable disk, and scratch profiles used by the lease;
-- selected release version plus SHA-256 digest; and
-- exact immutable Docker IDs of legacy migration rollback containers (names are
-  retained only for audit/identity checking and are never deletion authority).
+- selected release version plus SHA-256 digest.
 
 Validation bounds aggregate quantities and target count, rejects partial
 callback pairs or divergent manifest topology, and verifies the row on every
 mutation through an opaque digest-bearing claim. The release fence prevents a
-delayed close from deleting a newer deployment. Immutable Docker IDs prevent a
-delayed rollback cleanup from deleting a replacement that reused an old name.
+delayed close from deleting a newer deployment.
 If release history is already absent, retirement is idempotently complete: the
 close row itself carries the bounded cleanup snapshot and prevents any newer
 operation from creating a release for that lease.
@@ -857,69 +912,68 @@ cannot start for the same lease while teardown owns it.
 
 The normal completion order is mandatory:
 
-1. Finish container, rollback-container, retention, and volume work; persist each
-   failed volume-cleanup attempt (and every cleanup-only failure) in the close
-   row.
+1. Advance the durable execution generation, then run the construction-bound
+   container, retention, and volume workflow. Callers cannot choose targets or
+   inject a finalizer.
 2. Delete release history only if its selected generation still matches the
    stored version/digest fence. An already-absent key is an idempotent retired
    state, including after history-store loss; a changed history is a conflict and
    remains intact. Cleanup authority stays in the close row, not in the release
    key.
 3. In one `callbacks.db` transaction, enqueue the terminal lifecycle callback
-   and delete the precise close row. Callbackless legacy/cleanup-only work
-   deletes only the row. Then send a non-blocking, coalescing notification to the
-   tracked callback replay loop; the durable row, not the notification, owns
-   delivery.
+   and replace the precise close row with a permanent closed-UUID receipt.
+   Callbackless cleanup still writes that receipt. Then send a non-blocking,
+   exact-lease commit wake to the tracked callback replay loop; the mailbox
+   coalesces repeats for that lease without discarding other lease identities.
+   The durable row, not the wake, owns delivery.
 4. Delete the volatile provision projection only after steps 2 and 3 commit.
 
 A crash at any earlier boundary leaves the close row as the retry owner. The
 callback sender may fail after step 3 without reopening teardown: no HTTP runs in
 the lease actor or startup recovery, the durable outbox owns delivery, and its
-periodic 30-second sweep backs up the immediate wake. A full close persists its
-cleanup-attempt count across restart and applies the existing terminal give-up
-policy; a cleanup-only close
-cannot safely retain or create a tenant/reaping tombstone, so it never gives up
-after an arbitrary attempt count and keeps retrying until cleanup is definitive.
+periodic 30-second sweep backs up the immediate wake. There is no attempt-count
+terminalization. A plain error or ambiguous effect preserves the exact Started
+generation; restart performs read-only strict classification. Only executor-
+minted `Destroyed` or `Retained` evidence can cross terminal settlement, while
+`Incomplete` evidence can authorize another durable generation.
+When a complete Release or exact container cohort supplies tenant/provider
+identity, that pair remains in the sealed close authority and every late-
+container cleanup must match it. Only a true orphan with no principal witness
+uses the weaker sealed authority: exact retired lease UUID plus reserved
+`fred.*` managed labels under the attested backend/storage identity. Tenant and
+provider are always both present or both absent; a mixed representation fails
+decode. Closed receipts never expire, but recovery point-looks up only UUIDs in
+the live inventory, so each sweep is O(live substrate), not O(close history).
 The log `durable close recovery remains pending` includes the lease UUID and
-durable attempt count. Corrupt rows or simultaneous close/operation rows make
-callback-store health fail closed; pending but valid close work is reported in
-logs rather than an unbounded lease-labeled metric.
+durable execution generation. Corrupt rows or simultaneous close/operation rows make
+callback-store health fail closed. A terminal operation row is history rather
+than active mutation authority, so close admission atomically retires it instead
+of leaving both rows. Pending but valid close work is reported in logs rather
+than an unbounded lease-labeled metric.
 
-### Legacy migration crash boundaries
+Startup never destroys a managed volume merely because no current container or
+row names it. Absence from several projections is not destruction authority: a
+late Docker effect, incomplete legacy observation, or unavailable journal can
+all produce the same view. A valid but unattributed `fred-*` volume is therefore
+preserved for explicit operator attribution. Exact operation, close, and
+retention finalizers remain the only automatic volume destroyers.
 
-A legacy-to-Compose migration initiated by this version is restart-safe at
-every boundary. An already-interrupted v0.13 migration first passes the stopped
-adoption classifications above; v0.13's Compose writer omitted backend,
-provider, and callback labels, so mixed/committed authorityless generations are
-not silently treated as current writer output.
+The `fred-` and `fred-retained-` prefixes are reserved storage authority. Do
+not place backups, scratch files, symlinks, or non-directory artifacts with
+either prefix inside `volume_data_path`: startup deliberately rejects a member
+whose exact managed grammar and quota substrate cannot be attested rather than
+hiding unaccounted bytes. A v0.13 active Release is conservatively treated as
+claiming its whole parsed lease namespace because its backfilled quantity came
+from the surviving dense container prefix and cannot prove that a higher
+original instance never existed; the mandatory chain preflight resolves that
+mismatch. Current typed releases remain exact-name claims.
 
-1. Before stop/rename, the original containers and volumes remain authoritative;
-   the next boot replans normally.
-2. After any container has been renamed to its exact `-prev` name, the planner
-   rediscovers that rollback generation. Container and volume renames are
-   idempotent, and Compose converges the complete lease cohort.
-3. After Compose succeeds, the backend durably records the wrapped manifest and
-   exact ordered `Items` cohort **before** scheduling any `-prev` removal. A
-   release-store failure aborts startup and preserves both generations for the
-   next recovery attempt.
-4. After that release commit, exact `-prev` containers are cleanup-only. A
-   restart first validates the complete live Compose cohort against durable
-   `Items`, then reschedules the remaining tracked cleanup. It never infers the
-   desired instance count from whichever rollback containers happen to survive
-   a partially completed cleanup.
-
-Consequently, operators should not manually rename a migration-created
-`-prev` container merely because the daemon restarted mid-migration. Preserve
-the release store with the Docker substrate and let recovery resume when the
-preflight identifies a rollback-only cohort or current writer generation. If it
-reports an authorityless v0.13 stack, partial rollback cleanup, or divergent
-evidence, keep the backend stopped and follow the exact backup/immutable-ID
-procedure in `DEPLOYMENT.md`; old v0.13 restart does not manufacture the omitted
-authority.
-
-After state recovery, the backend also runs **orphaned volume cleanup**: lists all `fred-` prefixed directories in `volume_data_path` and destroys the ones **nothing claims**. This catches volumes leaked by crashes between volume creation and container creation, or between container removal and volume destruction.
-
-> **One ownership check, not six (ENG-658).** "Nothing claims it" is not a set this sweep computes for itself — it asks the same owner table every other destroy in this backend asks (`volume_destroy.go`), assembled from the live provision map plus the retention store. That matters because a volume's *name* does not establish ownership: while a restore is in flight the original lease's data wears the new lease's canonical name, so any path that derives a destroy set from a prefix or from `canonicalVolumeName` is, for that window, naming another lease's data. `Destroy` is deliberately absent from the internal `volumeManager` interface so no other call site can reach it, and a store read that fails means the sweep destroys nothing that run rather than guessing. A refused destroy is counted on `fred_docker_backend_volume_destroy_refused_total{site,reason}` and logged with the owning lease.
+> **Exact authority, not inferred garbage collection.** A volume's *name* does
+> not establish ownership: while a restore is in flight the original lease's
+> data wears the new lease's canonical name. Every automatic destroy is reached
+> from an exact durable operation, close, or retention finalizer and is checked
+> against the live/retention ownership projection. Unknown managed volumes are
+> never promoted into another lease and never selected by a global orphan scan.
 
 ## Callback Protocol
 
@@ -975,11 +1029,21 @@ Full diagnostics (exit codes, OOM status, container logs) are available via the 
 - Retries abort immediately if the backend is shutting down (`stopCtx` is canceled).
 - A 2xx response is considered success; any other status triggers a retry.
 - Operation, maintenance, and lifecycle completion paths atomically enqueue the
-  durable result and send a non-blocking, coalescing wake to the tracked replay
-  loop. Only that loop performs HTTP retry I/O, so a slow callback cannot extend
-  a lease actor, API handler, or startup-recovery critical section. The 30s sweep
-  is the fallback when a wake is lost, already pending, or sent before the loop
-  starts.
+  durable result and send a non-blocking commit wake naming the exact affected
+  lease. The mailbox coalesces repeats for one lease without losing other lease
+  identities, and a stronger handoff transfers work after a canceled drainer
+  releases ownership. Only the tracked loop performs HTTP retry I/O, so a slow
+  callback cannot extend a lease actor, API handler, or startup-recovery critical
+  section. The 30s sweep discovers pre-start rows and retries dormant failed heads.
+- Semantic publication is construction-bound to the exact callback and release
+  journals. Operation and maintenance status comes from sealed terminal proofs;
+  substrate classification receives only a release-scoped generation proof.
+  An autonomous runtime failure can publish only after the exact journal pair
+  upgrades that proof to a phase-qualified observation permit while no Pending,
+  maintenance, close, or closed head exists. Publication re-attests both facts.
+  Callback URLs, backend lineage, status, and retained state are therefore not
+  caller-selected. The callback sender owns only authenticated transport, replay,
+  and precise removal after 2xx.
 - Exhaustion or cancellation keeps the same durable FIFO head for a later replay.
   One slow callback can occupy one replay worker and its per-lease FIFO lock for
   up to 2m15s, but it cannot block another lease or backend node.

@@ -177,7 +177,7 @@ func TestClose_LegacyByteIdentical(t *testing.T) {
 // another tenant's record is untouched.
 func TestClose_GlobalCapStillRefusesBudgetedTenant(t *testing.T) {
 	b, rs, leaseUUID := newCloseHarness(t, "tenant-a", deployManifestWithLabel("com.example.customer", "cust-1"))
-	b.cfg.MaxRetainedDiskMB = 1536 // one 1024MB footprint + slack, never two
+	b.cfg.MaxRetainedDiskMB = 768 // one 512MB footprint + slack, never two
 	b.cfg.RetentionPartitionSource = "manifest.label:com.example.customer"
 	b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
 		"tenant-a": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 500000, MaxPartitions: 64},
@@ -208,14 +208,14 @@ func TestClose_ScopedRefusals(t *testing.T) {
 	const srcKey = "com.example.customer"
 
 	t.Run("tenant scope", func(t *testing.T) {
-		// docker-micro at 1024 MB each. Tenant disk cap 4096; 4 held = 4096 (full);
-		// incoming 1024 → 4096+1024 > 4096 breaches the tenant scope. CountCap 200
+		// docker-micro is snapshotted at 512 MB. Tenant disk cap 2048; 4 held = 2048 (full);
+		// incoming 512 → 2048+512 > 2048 breaches the tenant scope. CountCap 200
 		// (>5) so no eviction fires before the disk gate.
 		b, rs, leaseUUID := newCloseHarness(t, "tenant-a", nil)
 		b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
-			"tenant-a": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 4096, MaxPartitions: 0}, // elevation-only, tight disk
+			"tenant-a": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 2048, MaxPartitions: 0}, // elevation-only, tight disk
 		}
-		for i := 0; i < 4; i++ { // 4×1024 fills the tenant budget exactly
+		for i := 0; i < 4; i++ { // 4×512 fills the tenant budget exactly
 			putActivePart(t, rs, fmt.Sprintf("t-%d", i), "tenant-a", "", time.Now().Add(-time.Hour))
 		}
 		bareBefore := testutil.ToFloat64(retentionRefusedTotal)
@@ -232,20 +232,20 @@ func TestClose_ScopedRefusals(t *testing.T) {
 	})
 
 	t.Run("partition scope", func(t *testing.T) {
-		// cust-a already holds 4×1024 = its full per-partition disk sub-cap (4096);
-		// incoming labeled cust-a → 4096+1024 > 4096 breaches L2. PerPartitionMaxLeases
+		// cust-a already holds 4×512 = its full per-partition disk sub-cap (2048);
+		// incoming labeled cust-a → 2048+512 > 2048 breaches L2. PerPartitionMaxLeases
 		// 10 (>4) and CountCap 200 so no eviction fires before the disk gate; L1 disk
 		// (500000) is slack, so the FIRST breach is at the partition scope.
 		b, rs, leaseUUID := newCloseHarness(t, "tenant-a", deployManifestWithLabel(srcKey, "cust-a"))
 		b.cfg.RetentionPartitionSource = "manifest.label:" + srcKey
 		b.cfg.RetentionTenantBudgets = map[string]RetentionTenantBudget{
 			"tenant-a": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 500000,
-				MaxPartitions: 64, PerPartitionMaxLeases: 10, PerPartitionMaxDiskMB: 4096},
+				MaxPartitions: 64, PerPartitionMaxLeases: 10, PerPartitionMaxDiskMB: 2048},
 		}
 		var perr error
 		b.partitionSource, perr = shared.ParsePartitionSource(b.cfg.RetentionPartitionSource)
 		require.NoError(t, perr)
-		for i := 0; i < 4; i++ { // cust-a already holds 4×1024 = its full disk sub-cap
+		for i := 0; i < 4; i++ { // cust-a already holds 4×512 = its full disk sub-cap
 			putActivePart(t, rs, fmt.Sprintf("p-%d", i), "tenant-a", "cust-a", time.Now().Add(-time.Hour))
 		}
 		scopedBefore := testutil.ToFloat64(retentionRefusedByScopeTotal.WithLabelValues(refuseScopePartition))

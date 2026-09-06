@@ -45,11 +45,10 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 	// the competing lifecycle action this test intends to exercise instead.
 	f.addLease(targetLease, billingtypes.LEASE_STATE_PENDING, "sku-restore")
 
-	operations := f.tracker.Operations()
 	events := &fleetRestoreEventRecorder{}
-	callbacks, err := newCallbackServiceForTest(CallbackServiceConfig{
-		Operations: operations,
-		Chain:      f.chain,
+	callbacks, err := newCallbackServiceForTest(callbackServiceTestConfig{
+		Coordinator: f.coordinator,
+		Chain:       f.chain,
 		Acknowledger: fleetRestoreAcknowledgerFunc(func(
 			_ context.Context, leaseUUID string,
 		) (bool, string, error) {
@@ -58,9 +57,8 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 			f.chainMu.Unlock()
 			return true, "restore-ack", nil
 		}),
-		Placement: f.placement,
-		Events:    events,
-		Backends:  f.router,
+		Events:   events,
+		Backends: f.router,
 	})
 	require.NoError(t, err)
 
@@ -76,32 +74,33 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 		if !present {
 			return fmt.Errorf("restore callback URL has no operation ID")
 		}
-		command, commandErr := NewCallbackCommand(backend.CallbackPayload{
+		command := callbackCommand(t, backend.CallbackPayload{
 			LeaseUUID:        request.LeaseUUID,
 			Status:           backend.CallbackStatusSuccess,
 			Backend:          owner.name,
 			OperationID:      operationID.String(),
-			BackendStorageID: defaultCallbackTestStorageIdentity.String(),
+			BackendStorageID: testBackendStorageID(owner.name).String(),
 		})
-		if commandErr != nil {
-			return fmt.Errorf("build exact callback command: %w", commandErr)
-		}
 		if callbackErr := callbacks.HandleCallback(ctx, command); callbackErr != nil {
 			return fmt.Errorf("apply inline restore callback: %w", callbackErr)
 		}
 		return nil
 	})
 
+	setTestProviderControlPlane(t, f.execution, f.chain, nil)
+	restoreCoordinator, err := f.execution.RestoreCoordinator(
+		placement.RestoreStartObserver(func(leaseUUID, backendName string) {
+			events.Publish(backend.LeaseStatusEvent{
+				LeaseUUID: leaseUUID,
+				Status:    backend.ProvisionStatusRestarting,
+				Timestamp: time.Now(),
+			})
+		}),
+	)
+	require.NoError(t, err)
 	service, err := restoreapp.NewService(restoreapp.Config{
-		ProviderUUID: f.providerUUID,
-		CallbackURL: func(id operation.OperationID) (string, error) {
-			return BuildCallbackURLForOperation("http://fred.invalid", id)
-		},
-		Leases:     f.chain,
-		Backends:   restoreapp.BackendResolverFunc(f.resolveRestoreBackend),
-		Operations: operations,
-		Authority:  f.placement,
-		Events:     events,
+		Coordinator: restoreCoordinator,
+		Events:      events,
 	})
 	require.NoError(t, err)
 
@@ -131,7 +130,7 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 	require.Equal(t, placement.StateConfirmed, f.placement.Lookup(targetLeaseUUID).State())
 	f.assertPlacementPinned(targetLease, owner.name)
 	f.assertPlacementPinned(sourceLease, owner.name)
-	require.False(t, operations.Contains(targetLeaseUUID),
+	require.False(t, f.coordinator.RuntimeController().Contains(targetLeaseUUID),
 		"the inline exact callback must finish the process-local operation")
 	acked, _, _ := f.chainCalls()
 	require.Contains(t, acked, targetLeaseUUID)
@@ -144,21 +143,6 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 		"the pre-call event must precede an inline terminal callback",
 	)
 
-	// Both lifecycle claims must be released even though the callback completed
-	// during the backend call. Reacquiring them is a black-box leak check.
-	for _, leaseUUID := range []string{sourceLeaseUUID, targetLeaseUUID} {
-		claim := operations.TryClaimLeaseNow(leaseUUID)
-		require.Truef(t, claim.Acquired(), "lifecycle claim leaked for %s", leaseUUID)
-		require.True(t, operations.ReleaseLease(claim.Claim()))
-	}
-}
-
-func (f *fleet) resolveRestoreBackend(name string) restoreapp.RestoreBackend {
-	resolved := f.router.GetBackendByName(name)
-	if resolved == nil {
-		return nil
-	}
-	return resolved
 }
 
 type fleetRestoreAcknowledgerFunc func(context.Context, string) (bool, string, error)

@@ -22,16 +22,463 @@ import (
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 
+	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/fsidentity"
+	"github.com/manifest-network/fred/internal/util"
 )
 
-// storageMutationAdapters is deliberately held by Backend instead of passed
-// around as three raw clients. That makes storage authority an explicit
-// capability: callers can request a guarded mutation, but cannot accidentally
-// retain a raw Docker/Compose/volume mutation method across an actor wait.
-type storageMutationAdapters struct {
+// storageMutationOperations is the construction-only raw substrate. It is
+// captured by settlement-bound builders and never retained by Backend or
+// returned to a workflow.
+type storageMutationOperations struct {
+	docker  dockerMutationSink
+	compose composeMutationSink
+	volumes volumeMutationSink
 	backend *Backend
+}
+
+// resolveBackgroundStorageStep preserves retryability for ordinary idempotent
+// convergence failures, while making a broken call stack terminal once an
+// effect may have reached the substrate. It accepts only the bracket result,
+// never a writer or a target, so it cannot become another mutation facade.
+func (b *Backend) resolveBackgroundStorageStep(
+	operation string,
+	result substratemutation.StepResult,
+) error {
+	if result.Kind() == substratemutation.Invalid {
+		return fmt.Errorf("%s: background mutation bracket returned an invalid result", operation)
+	}
+	if result.EffectEntered() && result.Panicked() {
+		return b.latchAmbiguousOperationOutcome(
+			operation+" panic-safe background mutation bracket",
+			result.Err(),
+		)
+	}
+	return result.Err()
+}
+
+// newBackgroundMaintenanceCoordinator consumes the raw construction bundle and
+// returns only complete, target-free workflows. perform and every per-target
+// closure below are lexical construction details: Backend never retains either
+// the raw sinks or a generic mutation facade.
+func newBackgroundMaintenanceCoordinator(
+	backend *Backend,
+	ops storageMutationOperations,
+) (*backgroundMaintenanceCoordinator, error) {
+	if backend == nil || ops.backend != backend || util.IsNilInterface(ops.docker) ||
+		util.IsNilInterface(ops.compose) || util.IsNilInterface(ops.volumes) {
+		return nil, errors.New("background maintenance requires complete construction-bound substrate operations")
+	}
+	perform := func(
+		ctx context.Context,
+		operation string,
+		action func(context.Context) error,
+	) error {
+		if action == nil {
+			return fmt.Errorf("%s: background substrate action is unavailable", operation)
+		}
+		result := substratemutation.RunStep(
+			ctx,
+			operation,
+			backend.authorizeStorageMutation,
+			backend.completeStorageMutation,
+			action,
+		)
+		return backend.resolveBackgroundStorageStep(operation, result)
+	}
+
+	removeContainer := backgroundContainerRemove(func(ctx context.Context, id string) error {
+		return perform(ctx, "background remove container", func(ctx context.Context) error {
+			return ops.docker.RemoveContainer(ctx, id)
+		})
+	})
+	renameVolume := backgroundVolumeRename(func(ctx context.Context, oldName, newName string) error {
+		return perform(ctx, "background rename volume", func(ctx context.Context) error {
+			return ops.volumes.RenameVolume(ctx, oldName, newName)
+		})
+	})
+	ensureVolumeQuota := backgroundVolumeQuota(func(ctx context.Context, id string, sizeMB int64) error {
+		return perform(ctx, "background ensure volume quota", func(ctx context.Context) error {
+			return ops.volumes.EnsureQuota(ctx, id, sizeMB)
+		})
+	})
+	destroyVolumes := backgroundVolumeDestroyCapability{
+		destroyFn: func(ctx context.Context, id string) error {
+			return perform(ctx, "background destroy volume", func(ctx context.Context) error {
+				return ops.volumes.Destroy(ctx, id)
+			})
+		},
+	}
+	teardown := backgroundTeardownCapability{
+		downFn: func(ctx context.Context, leaseUUID string, timeout time.Duration) error {
+			return perform(ctx, "background compose down", func(ctx context.Context) error {
+				return ops.compose.Down(ctx, composeProjectName(leaseUUID), timeout)
+			})
+		},
+		removeFn: removeContainer,
+	}
+	removeTenantNetwork := backgroundTenantNetworkRemove(func(ctx context.Context, tenant string) error {
+		return perform(ctx, "background remove tenant network", func(ctx context.Context) error {
+			return ops.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
+		})
+	})
+
+	return &backgroundMaintenanceCoordinator{
+		recoverInterruptedVolumesFn: func(ctx context.Context) error {
+			return perform(ctx, "recover interrupted volume mutations", func(ctx context.Context) error {
+				return ops.volumes.RecoverInterruptedVolumeMutations(ctx)
+			})
+		},
+		recoverClosedLeasesFn: func(ctx context.Context) (map[string]struct{}, error) {
+			return backend.recoverClosedLeaseSubstrateUsing(ctx, removeContainer)
+		},
+		reconcileRetentionsFn: func(ctx context.Context) error {
+			return backend.reconcileRetentionsUsing(ctx, renameVolume, teardown, destroyVolumes, ensureVolumeQuota)
+		},
+		reconcileVolumeQuotasFn: func(ctx context.Context) error {
+			return backend.reconcileVolumeQuotasUsing(ctx, ensureVolumeQuota)
+		},
+		cleanupOrphanedNetworksFn: func(ctx context.Context) {
+			backend.cleanupOrphanedNetworksUsing(ctx, removeTenantNetwork)
+		},
+		reapExpiredRetentionsFn: func(ctx context.Context) (int, error) {
+			return backend.reapExpiredRetentionsUsing(ctx, destroyVolumes)
+		},
+		runRetentionSweepFn: func(ctx context.Context) error {
+			return backend.runRetentionSweepUsing(ctx, renameVolume, teardown, destroyVolumes, ensureVolumeQuota)
+		},
+	}, nil
+}
+
+// newStorageMutationOperations captures raw writers into a construction-only
+// value consumed immediately by exact settlement-bound executors.
+func newStorageMutationOperations(
+	backend *Backend,
+	docker dockerMutationSink,
+	compose composeMutationSink,
+	volumes volumeMutationSink,
+) storageMutationOperations {
+	return storageMutationOperations{backend: backend, docker: docker, compose: compose, volumes: volumes}
+}
+
+// storageMutations is a per-execution facade. Its scope is derived only from
+// the opaque Started subject; callers can choose an operation but cannot
+// substitute another lease, tenant, project, or canonical volume namespace.
+type storageMutations struct {
+	runner       substratemutation.Runner
+	ops          storageMutationOperations
+	leaseUUID    string
+	tenant       string
+	providerUUID string
+	callbackURL  string
+	lifecycleURL string
+	allowedLease map[string]struct{}
+	predecessor  *shared.Release
+	cleanupOnly  bool
+}
+
+// exactOperationTeardown is the only raw container-teardown projection of a
+// per-execution storageMutations value. It is constructed and consumed inside
+// one Runner.Step by teardownLeaseContainersWith. Its Started subject fixes the
+// lease/project, while every discovered container is freshly re-attested before
+// the raw writer is reached.
+//
+// Keeping these raw calls in the mutation choke-point is load-bearing: the
+// orchestration helper retains only teardownMutationCapability and therefore
+// cannot recover an unscoped Docker or Compose writer.
+type exactOperationTeardown struct {
+	mutations *storageMutations
+}
+
+func (c exactOperationTeardown) composeDown(
+	ctx context.Context,
+	leaseUUID string,
+	timeout time.Duration,
+) error {
+	if c.mutations == nil {
+		return errors.New("exact operation teardown is unavailable")
+	}
+	if err := c.mutations.requireLease(leaseUUID, "compose down"); err != nil {
+		return err
+	}
+	return c.mutations.ops.compose.Down(ctx, composeProjectName(leaseUUID), timeout)
+}
+
+func (c exactOperationTeardown) removeContainer(ctx context.Context, id string) error {
+	if c.mutations == nil {
+		return errors.New("exact operation teardown is unavailable")
+	}
+	if err := c.mutations.requireContainer(ctx, id); err != nil {
+		return err
+	}
+	return c.mutations.ops.docker.RemoveContainer(ctx, id)
+}
+
+func newOperationStorageMutations(
+	runner substratemutation.Runner,
+	subject shared.OperationPhysicalSubject,
+	ops storageMutationOperations,
+) *storageMutations {
+	intent := subject.Intent()
+	allowed := map[string]struct{}{subject.LeaseUUID(): {}}
+	if intent.Valid() && intent.Kind() == shared.OperationIntentRestore && intent.SourceLeaseUUID() != "" {
+		allowed[intent.SourceLeaseUUID()] = struct{}{}
+	}
+	tenant, providerUUID, callbackURL, lifecycleURL := "", "", "", ""
+	if intent.Valid() {
+		tenant = intent.Tenant()
+		providerUUID = intent.ProviderUUID()
+		callbackURL = intent.CallbackURL()
+		lifecycleURL = intent.LifecycleCallbackURL()
+	}
+	if receipt, historical := subject.FailedReceiptCleanup(); historical {
+		tenant = receipt.Tenant()
+		providerUUID = receipt.ProviderUUID()
+		callbackURL = receipt.CallbackURL()
+		lifecycleURL = receipt.LifecycleCallbackURL()
+	}
+	var predecessor *shared.Release
+	if release, ok := subject.PredecessorRelease(); ok {
+		predecessor = &release
+	}
+	return &storageMutations{
+		runner: runner, ops: ops, leaseUUID: subject.LeaseUUID(), tenant: tenant,
+		providerUUID: providerUUID, callbackURL: callbackURL,
+		lifecycleURL: lifecycleURL, allowedLease: allowed, predecessor: predecessor,
+	}
+}
+
+func newMaintenanceStorageMutations(
+	runner substratemutation.Runner,
+	subject shared.MaintenancePhysicalSubject,
+	ops storageMutationOperations,
+) *storageMutations {
+	intent := subject.Intent()
+	tenant, providerUUID, callbackURL, lifecycleURL := "", "", "", ""
+	if intent.Valid() {
+		tenant = intent.Tenant()
+		providerUUID = intent.ProviderUUID()
+		callbackURL = intent.CallbackURL()
+		lifecycleURL = intent.LifecycleCallbackURL()
+	}
+	if receipt, historical := subject.FailedReceiptCleanup(); historical {
+		tenant = receipt.Tenant()
+		providerUUID = receipt.ProviderUUID()
+		if target, ok := receipt.TargetRelease(); ok {
+			if authority, valid := runtimeIdentityForRelease(&target); valid {
+				callbackURL = authority.CallbackURL()
+				lifecycleURL = authority.LifecycleCallbackURL()
+			}
+		}
+	}
+	return &storageMutations{
+		runner: runner, ops: ops, leaseUUID: subject.LeaseUUID(), tenant: tenant,
+		providerUUID: providerUUID, callbackURL: callbackURL,
+		lifecycleURL: lifecycleURL,
+		allowedLease: map[string]struct{}{subject.LeaseUUID(): {}},
+	}
+}
+
+func (m *storageMutations) ownsLease(leaseUUID string) bool {
+	if m == nil || leaseUUID == "" {
+		return false
+	}
+	_, ok := m.allowedLease[leaseUUID]
+	return ok
+}
+
+func (m *storageMutations) requireLease(leaseUUID, operation string) error {
+	if m == nil || !m.ownsLease(leaseUUID) {
+		return fmt.Errorf("%s target lease %q differs from Started subject", operation, leaseUUID)
+	}
+	return nil
+}
+
+func (m *storageMutations) pullImage(ctx context.Context, image string, timeout time.Duration) error {
+	return m.runner.Prepare(ctx, "pull image", func(ctx context.Context) error {
+		return m.ops.docker.PullImage(ctx, image, timeout)
+	})
+}
+
+func (m *storageMutations) resolveImageUser(ctx context.Context, image, user string) (uid, gid int, err error) {
+	err = m.runner.Step(ctx, "inspect image user", func(ctx context.Context) error {
+		uid, gid, err = m.ops.docker.ResolveImageUser(ctx, image, user)
+		return err
+	})
+	return uid, gid, err
+}
+
+func (m *storageMutations) detectVolumeOwner(ctx context.Context, image string, paths []string) (uid, gid int, err error) {
+	err = m.runner.Step(ctx, "inspect image volume owner", func(ctx context.Context) error {
+		uid, gid, err = m.ops.docker.DetectVolumeOwner(ctx, image, paths)
+		return err
+	})
+	return uid, gid, err
+}
+
+func (m *storageMutations) detectWritablePaths(ctx context.Context, image string, uid int, parents []string) (paths []string, err error) {
+	err = m.runner.Step(ctx, "inspect image writable paths", func(ctx context.Context) error {
+		paths, err = m.ops.docker.DetectWritablePaths(ctx, image, uid, parents)
+		return err
+	})
+	return paths, err
+}
+
+func (m *storageMutations) effectEntered() bool {
+	return m != nil && m.runner.EffectEntered()
+}
+
+func (m *storageMutations) composeUp(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+	if project == nil || project.Name != composeProjectName(m.leaseUUID) {
+		return fmt.Errorf("compose up project differs from Started lease %q", m.leaseUUID)
+	}
+	return m.runner.Step(ctx, "compose up", func(ctx context.Context) error {
+		return m.ops.compose.Up(ctx, project, opts)
+	})
+}
+
+func (m *storageMutations) composeDown(ctx context.Context, leaseUUID string, timeout time.Duration) error {
+	if err := m.requireLease(leaseUUID, "compose down"); err != nil {
+		return err
+	}
+	return m.runner.Step(ctx, "compose down", func(ctx context.Context) error {
+		return m.ops.compose.Down(ctx, composeProjectName(leaseUUID), timeout)
+	})
+}
+
+func (m *storageMutations) requireContainer(ctx context.Context, id string) error {
+	if m == nil || id == "" {
+		return errors.New("container target is empty")
+	}
+	info, err := m.ops.backend.docker.InspectContainer(ctx, id)
+	if err != nil {
+		return fmt.Errorf("attest container %q before mutation: %w", id, err)
+	}
+	if info == nil || info.ContainerID != id || !m.ownsLease(info.LeaseUUID) ||
+		info.BackendName != m.ops.backend.cfg.Name {
+		return fmt.Errorf("container %q differs from Started subject", id)
+	}
+	// Cleanup-only close authority deliberately carries no principal or callback
+	// capability. Its exact durable lease/backend/storage lineage authorizes
+	// removal of every managed survivor in that namespace without relabeling it
+	// as a current runtime generation.
+	if m.cleanupOnly {
+		return nil
+	}
+	if info.Tenant == m.tenant && info.ProviderUUID == m.providerUUID &&
+		info.CallbackURL == m.callbackURL && info.LifecycleCallbackURL == m.lifecycleURL {
+		return nil
+	}
+	if m.predecessor != nil {
+		if authority, ok := runtimeIdentityForRelease(m.predecessor); ok &&
+			containerMatchesReleaseRuntimeIdentity(*info, authority) {
+			return nil
+		}
+	}
+	return fmt.Errorf("container %q runtime generation differs from Started subject", id)
+}
+
+func (m *storageMutations) removeContainer(ctx context.Context, id string) error {
+	if err := m.requireContainer(ctx, id); err != nil {
+		return err
+	}
+	return m.runner.Step(ctx, "remove container", func(ctx context.Context) error {
+		return m.ops.docker.RemoveContainer(ctx, id)
+	})
+}
+
+func (m *storageMutations) ensureTenantNetwork(ctx context.Context, tenant string) (networkID string, err error) {
+	if m == nil || tenant == "" || tenant != m.tenant {
+		return "", fmt.Errorf("tenant network target %q differs from Started subject", tenant)
+	}
+	err = m.runner.Step(ctx, "ensure tenant network", func(ctx context.Context) error {
+		networkID, err = m.ops.docker.EnsureTenantNetwork(ctx, tenant)
+		return err
+	})
+	return networkID, err
+}
+
+func (m *storageMutations) createVolume(ctx context.Context, id string, sizeMB int64) (path string, created bool, err error) {
+	name, parseErr := parseManagedVolumeName(id)
+	if parseErr != nil || !m.volumeNameInScope(name) {
+		return "", false, fmt.Errorf("create volume target %q differs from Started subject", id)
+	}
+	err = m.runner.Step(ctx, "create volume", func(ctx context.Context) error {
+		path, created, err = m.ops.volumes.Create(ctx, id, sizeMB)
+		return err
+	})
+	return path, created, err
+}
+
+func (m *storageMutations) volumeNameInScope(name managedVolumeName) bool {
+	if m == nil {
+		return false
+	}
+	_, ok := m.allowedLease[managedVolumeLeaseUUID(name)]
+	return ok
+}
+
+func (m *storageMutations) destroyVolume(ctx context.Context, id string) error {
+	name, err := parseManagedVolumeName(id)
+	if err != nil || !m.volumeNameInScope(name) {
+		return fmt.Errorf("destroy volume target %q differs from Started subject", id)
+	}
+	return m.runner.Step(ctx, "destroy volume", func(ctx context.Context) error {
+		return m.ops.volumes.Destroy(ctx, id)
+	})
+}
+
+func (m *storageMutations) canDestroyVolumes() bool { return m != nil && m.ops.volumes != nil }
+
+func (m *storageMutations) renameVolume(ctx context.Context, oldName, newName string) error {
+	oldParsed, oldErr := parseManagedVolumeName(oldName)
+	newParsed, newErr := parseManagedVolumeName(newName)
+	if oldErr != nil || newErr != nil || !m.volumeNameInScope(oldParsed) || !m.volumeNameInScope(newParsed) {
+		return fmt.Errorf("volume rename %q -> %q differs from Started subject", oldName, newName)
+	}
+	return m.runner.Step(ctx, "rename volume", func(ctx context.Context) error {
+		return m.ops.volumes.RenameVolume(ctx, oldName, newName)
+	})
+}
+
+func (m *storageMutations) removePath(ctx context.Context, path string) error {
+	volume, err := writablePathVolumeComponent(m.ops.backend.cfg.VolumeDataPath, path)
+	if err != nil || !m.volumeNameInScope(volume) {
+		return fmt.Errorf("writable path target differs from Started subject: %w", err)
+	}
+	return m.runner.Step(ctx, "remove managed writable path", func(ctx context.Context) error {
+		wp, err := parseStoragePathComponent(writablePathSubdir)
+		if err != nil {
+			return err
+		}
+		return removeManagedVolumeSubtree(m.ops.backend.cfg.VolumeDataPath, volume, wp)
+	})
+}
+
+func (m *storageMutations) extractImageContent(ctx context.Context, image string, paths []string, destination string, maxBytes, maxEntries int64) (failures map[string]error, err error) {
+	volume, scopeErr := writablePathVolumeComponent(m.ops.backend.cfg.VolumeDataPath, destination)
+	if scopeErr != nil || !m.volumeNameInScope(volume) {
+		return nil, fmt.Errorf("image extraction target differs from Started subject: %w", scopeErr)
+	}
+	err = m.runner.Step(ctx, "extract image content", func(ctx context.Context) error {
+		failures = m.ops.docker.ExtractImageContent(ctx, image, paths, destination, maxBytes, maxEntries)
+		return nil
+	})
+	return failures, err
+}
+
+func (m *storageMutations) prepareStatefulVolumeBinds(ctx context.Context, hostPath string, volumes []string, uid, gid int) (binds map[string]string, err error) {
+	name, parseErr := writablePathVolumeComponent(m.ops.backend.cfg.VolumeDataPath, filepath.Join(hostPath, writablePathSubdir))
+	if parseErr != nil || !m.volumeNameInScope(name) {
+		return nil, fmt.Errorf("stateful volume path differs from Started subject: %w", parseErr)
+	}
+	err = m.runner.Step(ctx, "prepare stateful volume binds", func(ctx context.Context) error {
+		binds, err = buildStatefulVolumeBindsContext(ctx, hostPath, volumes, uid, gid)
+		return err
+	})
+	return binds, err
 }
 
 // newBackendStorageAuthorityLifetime binds terminal storage withdrawal to both
@@ -245,23 +692,12 @@ func writablePathVolumeComponent(volumeRoot, path string) (managedVolumeName, er
 	return component, nil
 }
 
-// mutationAdapter supports the small number of package tests which construct a
-// Backend literal. Production Backends always receive the stored adapter in New.
-// The fallback is returned by value and never published, so concurrent test
-// calls cannot race on lazy initialization.
-func (b *Backend) mutationAdapter() storageMutationAdapters {
-	if b != nil && b.mutations.backend != nil {
-		return b.mutations
-	}
-	return storageMutationAdapters{backend: b}
-}
-
 // requireMutationAdmission makes a stopped or permanently drifted backend a
 // synchronous API refusal. Mutation adapters still re-attest later at the raw
 // choke point; this first check prevents a request from publishing actor/store
 // state when shutdown had already made every eventual substrate write illegal.
 func (b *Backend) requireMutationAdmission(ctx context.Context, operation string) error {
-	_, done, err := b.mutationAdapter().authorize(ctx, operation+" admission")
+	_, done, err := b.authorizeStorageMutation(ctx, operation+" admission")
 	if err != nil {
 		return err
 	}
@@ -331,40 +767,40 @@ func (b *Backend) latchAmbiguousOperationOutcome(operation string, cause error) 
 // stops, then re-attests storage identity under that joined lifetime. The
 // context is passed to the actual mutator, closing the gap where shutdown could
 // begin after verification but before the daemon receives the request.
-func (m storageMutationAdapters) authorize(ctx context.Context, operation string) (context.Context, func(), error) {
-	if m.backend == nil {
+func (b *Backend) authorizeStorageMutation(ctx context.Context, operation string) (context.Context, func(), error) {
+	if b == nil {
 		return nil, nil, fmt.Errorf("%s: Docker backend is required", operation)
 	}
 	if ctx == nil {
 		return nil, nil, fmt.Errorf("%s: context is required", operation)
 	}
-	if authorityErr := m.backend.terminalStorageAuthorityError(); authorityErr != nil {
+	if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 		return nil, nil, fmt.Errorf("%s: %w", operation, authorityErr)
 	}
 
 	joined, cancel := context.WithCancel(ctx)
 	stopAfter := func() bool { return false }
-	if m.backend.stopCtx != nil {
-		if err := m.backend.stopCtx.Err(); err != nil {
+	if b.stopCtx != nil {
+		if err := b.stopCtx.Err(); err != nil {
 			cancel()
-			if authorityErr := m.backend.terminalStorageAuthorityError(); authorityErr != nil {
+			if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 				return nil, nil, fmt.Errorf("%s: %w", operation, authorityErr)
 			}
 			return nil, nil, fmt.Errorf("%s: backend stopped: %w", operation, err)
 		}
-		stopAfter = context.AfterFunc(m.backend.stopCtx, cancel)
+		stopAfter = context.AfterFunc(b.stopCtx, cancel)
 	}
 	done := func() {
+		defer cancel()
 		stopAfter()
-		cancel()
 	}
 	// context.AfterFunc deliberately schedules asynchronously. Re-read the
 	// parent synchronously after registration so a stop racing the first check
 	// cannot slip a mutation through before the callback goroutine runs.
-	if m.backend.stopCtx != nil {
-		if err := m.backend.stopCtx.Err(); err != nil {
+	if b.stopCtx != nil {
+		if err := b.stopCtx.Err(); err != nil {
 			done()
-			if authorityErr := m.backend.terminalStorageAuthorityError(); authorityErr != nil {
+			if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 				return nil, nil, fmt.Errorf("%s: %w", operation, authorityErr)
 			}
 			return nil, nil, fmt.Errorf("%s: backend stopped while authorizing storage: %w", operation, err)
@@ -372,29 +808,29 @@ func (m storageMutationAdapters) authorize(ctx context.Context, operation string
 	}
 	if err := joined.Err(); err != nil {
 		done()
-		if authorityErr := m.backend.terminalStorageAuthorityError(); authorityErr != nil {
+		if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 			return nil, nil, fmt.Errorf("%s: %w", operation, authorityErr)
 		}
 		return nil, nil, fmt.Errorf("%s: operation canceled before storage authorization: %w", operation, err)
 	}
-	if err := m.backend.requireStorageIdentity(joined); err != nil {
+	if err := b.requireStorageIdentity(joined); err != nil {
 		done()
-		if authorityErr := m.backend.terminalStorageAuthorityError(); authorityErr != nil {
+		if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 			return nil, nil, fmt.Errorf("%s: %w", operation, authorityErr)
 		}
 		return nil, nil, fmt.Errorf("%s: %w", operation, err)
 	}
 	if err := joined.Err(); err != nil {
 		done()
-		if authorityErr := m.backend.terminalStorageAuthorityError(); authorityErr != nil {
+		if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 			return nil, nil, fmt.Errorf("%s: %w", operation, authorityErr)
 		}
 		return nil, nil, fmt.Errorf("%s: backend stopped after storage authorization: %w", operation, err)
 	}
-	if m.backend.stopCtx != nil {
-		if err := m.backend.stopCtx.Err(); err != nil {
+	if b.stopCtx != nil {
+		if err := b.stopCtx.Err(); err != nil {
 			done()
-			if authorityErr := m.backend.terminalStorageAuthorityError(); authorityErr != nil {
+			if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 				return nil, nil, fmt.Errorf("%s: %w", operation, authorityErr)
 			}
 			return nil, nil, fmt.Errorf("%s: backend stopped after storage authorization: %w", operation, err)
@@ -413,8 +849,8 @@ func (m storageMutationAdapters) authorize(ctx context.Context, operation string
 // Always preserve the raw mutation error. errors.Join gives callers both the
 // transport/filesystem result and any stronger identity-drift cause, including
 // when both happened concurrently.
-func (m storageMutationAdapters) completeMutation(ctx context.Context, operation string, mutationErr error) error {
-	postcheckErr := m.backend.requireStorageIdentity(ctx)
+func (b *Backend) completeStorageMutation(ctx context.Context, operation string, mutationErr error) error {
+	postcheckErr := b.requireStorageIdentity(ctx)
 	if postcheckErr != nil {
 		// Latch every failed postcheck, not only a proved permanent identity
 		// contradiction. Once a raw side effect ran, even a timeout leaves its
@@ -422,7 +858,7 @@ func (m storageMutationAdapters) completeMutation(ctx context.Context, operation
 		// cleanup in this process would turn missing evidence into a guess. A new
 		// process re-opens the durable stores and classifies the retained intent
 		// against freshly attested substrate evidence.
-		postcheckErr = m.backend.latchAmbiguousOperationOutcome(
+		postcheckErr = b.latchAmbiguousOperationOutcome(
 			operation+" post-mutation storage verification", postcheckErr,
 		)
 	} else if errors.Is(mutationErr, backendidentity.ErrMutationOutcomeAmbiguous) ||
@@ -433,214 +869,7 @@ func (m storageMutationAdapters) completeMutation(ctx context.Context, operation
 		// cleanup capability after a known-incomplete delete. The identity
 		// postcheck cannot consume either recovery obligation, so preserve the
 		// manager's typed cause and fail-stop exactly as for a failed postcheck.
-		mutationErr = m.backend.latchAmbiguousOperationOutcome(operation, mutationErr)
+		mutationErr = b.latchAmbiguousOperationOutcome(operation, mutationErr)
 	}
 	return errors.Join(mutationErr, postcheckErr)
-}
-
-func (m storageMutationAdapters) composeUp(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
-	ctx, done, err := m.authorize(ctx, "compose up")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.compose.Up(ctx, project, opts)
-	return m.completeMutation(ctx, "compose up", mutationErr)
-}
-
-func (m storageMutationAdapters) composeDown(ctx context.Context, projectName string, timeout time.Duration) error {
-	ctx, done, err := m.authorize(ctx, "compose down")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.compose.Down(ctx, projectName, timeout)
-	return m.completeMutation(ctx, "compose down", mutationErr)
-}
-
-func (m storageMutationAdapters) pullImage(ctx context.Context, imageName string, timeout time.Duration) error {
-	ctx, done, err := m.authorize(ctx, "pull image")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.docker.PullImage(ctx, imageName, timeout)
-	return m.completeMutation(ctx, "pull image", mutationErr)
-}
-
-func (m storageMutationAdapters) resolveImageUser(ctx context.Context, imageName, userOverride string) (int, int, error) {
-	ctx, done, err := m.authorize(ctx, "inspect image user")
-	if err != nil {
-		return 0, 0, err
-	}
-	defer done()
-	uid, gid, mutationErr := m.backend.docker.ResolveImageUser(ctx, imageName, userOverride)
-	return uid, gid, m.completeMutation(ctx, "inspect image user", mutationErr)
-}
-
-func (m storageMutationAdapters) detectVolumeOwner(ctx context.Context, imageName string, paths []string) (int, int, error) {
-	ctx, done, err := m.authorize(ctx, "inspect image volume owner")
-	if err != nil {
-		return 0, 0, err
-	}
-	defer done()
-	uid, gid, mutationErr := m.backend.docker.DetectVolumeOwner(ctx, imageName, paths)
-	return uid, gid, m.completeMutation(ctx, "inspect image volume owner", mutationErr)
-}
-
-func (m storageMutationAdapters) detectWritablePaths(ctx context.Context, imageName string, uid int, parents []string) ([]string, error) {
-	ctx, done, err := m.authorize(ctx, "inspect image writable paths")
-	if err != nil {
-		return nil, err
-	}
-	defer done()
-	paths, mutationErr := m.backend.docker.DetectWritablePaths(ctx, imageName, uid, parents)
-	return paths, m.completeMutation(ctx, "inspect image writable paths", mutationErr)
-}
-
-func (m storageMutationAdapters) extractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) (map[string]error, error) {
-	ctx, done, err := m.authorize(ctx, "extract image content")
-	if err != nil {
-		return nil, err
-	}
-	defer done()
-	failures := m.backend.docker.ExtractImageContent(ctx, imageName, paths, destDir, maxBytes, maxEntries)
-	return failures, m.completeMutation(ctx, "extract image content", nil)
-}
-
-func (m storageMutationAdapters) stopContainer(ctx context.Context, id string, timeout time.Duration) error {
-	ctx, done, err := m.authorize(ctx, "stop container")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.docker.StopContainer(ctx, id, timeout)
-	return m.completeMutation(ctx, "stop container", mutationErr)
-}
-
-func (m storageMutationAdapters) renameContainer(ctx context.Context, id, newName string) error {
-	ctx, done, err := m.authorize(ctx, "rename container")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.docker.RenameContainer(ctx, id, newName)
-	return m.completeMutation(ctx, "rename container", mutationErr)
-}
-
-func (m storageMutationAdapters) removeContainer(ctx context.Context, id string) error {
-	ctx, done, err := m.authorize(ctx, "remove container")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.docker.RemoveContainer(ctx, id)
-	return m.completeMutation(ctx, "remove container", mutationErr)
-}
-
-func (m storageMutationAdapters) ensureTenantNetwork(ctx context.Context, tenant string) (string, error) {
-	ctx, done, err := m.authorize(ctx, "ensure tenant network")
-	if err != nil {
-		return "", err
-	}
-	defer done()
-	networkID, mutationErr := m.backend.docker.EnsureTenantNetwork(ctx, tenant)
-	return networkID, m.completeMutation(ctx, "ensure tenant network", mutationErr)
-}
-
-func (m storageMutationAdapters) removeTenantNetworkIfEmpty(ctx context.Context, tenant string) error {
-	ctx, done, err := m.authorize(ctx, "remove tenant network")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.docker.RemoveTenantNetworkIfEmpty(ctx, tenant)
-	return m.completeMutation(ctx, "remove tenant network", mutationErr)
-}
-
-func (m storageMutationAdapters) createVolume(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
-	ctx, done, err := m.authorize(ctx, "create volume")
-	if err != nil {
-		return "", false, err
-	}
-	defer done()
-	// This is the raw storage sink behind createManagedVolume. That caller holds
-	// the volume-name stripe; this adapter contributes mutation authorization and
-	// the mandatory postcheck.
-	hostPath, created, mutationErr := m.backend.volumes.Create(ctx, id, sizeMB) //nolint:forbidigo
-	return hostPath, created, m.completeMutation(ctx, "create volume", mutationErr)
-}
-
-func (m storageMutationAdapters) recoverInterruptedVolumeMutations(ctx context.Context) error {
-	ctx, done, err := m.authorize(ctx, "recover interrupted volume mutations")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.volumes.RecoverInterruptedVolumeMutations(ctx)
-	return m.completeMutation(ctx, "recover interrupted volume mutations", mutationErr)
-}
-
-func (m storageMutationAdapters) destroyVolume(ctx context.Context, sink volumeDestroyer, id string) error {
-	ctx, done, err := m.authorize(ctx, "destroy volume")
-	if err != nil {
-		return err
-	}
-	defer done()
-	// volumeOp is the only caller and has already established exact ownership
-	// under the volume-name stripe. This adapter adds mutation authorization and
-	// the mandatory postcheck around the raw sink.
-	mutationErr := sink.Destroy(ctx, id) //nolint:forbidigo
-	return m.completeMutation(ctx, "destroy volume", mutationErr)
-}
-
-func (m storageMutationAdapters) ensureVolumeQuota(ctx context.Context, id string, sizeMB int64) error {
-	ctx, done, err := m.authorize(ctx, "ensure volume quota")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.volumes.EnsureQuota(ctx, id, sizeMB)
-	return m.completeMutation(ctx, "ensure volume quota", mutationErr)
-}
-
-func (m storageMutationAdapters) renameVolume(ctx context.Context, oldName, newName string) error {
-	ctx, done, err := m.authorize(ctx, "rename volume")
-	if err != nil {
-		return err
-	}
-	defer done()
-	mutationErr := m.backend.volumes.RenameVolume(ctx, oldName, newName)
-	return m.completeMutation(ctx, "rename volume", mutationErr)
-}
-
-func (m storageMutationAdapters) removePath(ctx context.Context, path string) error {
-	ctx, done, err := m.authorize(ctx, "remove tenant path")
-	if err != nil {
-		return err
-	}
-	defer done()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	volume, err := writablePathVolumeComponent(m.backend.cfg.VolumeDataPath, path)
-	if err != nil {
-		return err
-	}
-	wpComponent, err := parseStoragePathComponent(writablePathSubdir)
-	if err != nil {
-		return fmt.Errorf("validate writable-path directory name: %w", err)
-	}
-	mutationErr := removeManagedVolumeSubtree(m.backend.cfg.VolumeDataPath, volume, wpComponent)
-	return m.completeMutation(ctx, "remove tenant path", mutationErr)
-}
-
-func (m storageMutationAdapters) prepareStatefulVolumeBinds(ctx context.Context, hostPath string, imageVolumes []string, uid, gid int) (map[string]string, error) {
-	ctx, done, err := m.authorize(ctx, "prepare stateful volume binds")
-	if err != nil {
-		return nil, err
-	}
-	defer done()
-	binds, mutationErr := buildStatefulVolumeBindsContext(ctx, hostPath, imageVolumes, uid, gid)
-	return binds, m.completeMutation(ctx, "prepare stateful volume binds", mutationErr)
 }

@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"slices"
-	"sync"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 // reconcileInventory is an immutable collection result. Collection reports
@@ -26,6 +24,7 @@ type reconcileInventory struct {
 	retentionsAnswered          answeredSet
 	retentionsReportedByBackend map[string]map[string]struct{}
 	retentionStorageIdentities  map[string]backendidentity.ID
+	retentionCollected          map[string]placement.BackendRetentionInventory
 	backendStorageIdentities    map[string]backendidentity.ID
 
 	// untrustedPositiveObservations retains the conservative fact that a
@@ -36,81 +35,24 @@ type reconcileInventory struct {
 	untrustedPositiveObservations map[string]map[string]struct{}
 }
 
-func (inventory reconcileInventory) complete() bool {
-	if !inventory.fleet.complete ||
-		(inventory.retentionsAnswered != nil && !inventory.retentionsAnswered.complete()) ||
-		len(inventory.backendStorageIdentities) != len(inventory.fleet.answered) {
-		return false
+// collectInventory performs backend reads only through the exact typed sweep.
+// Each successful endpoint read returns an opaque one-shot receipt after its
+// positives are fenced. Paired receipts are classified centrally and every
+// unmatched half is consumed as untrusted before sealing, so policy code cannot
+// manufacture endpoint or negative authority. No observation becomes lifecycle
+// authority until the placement store accepts the semantic projection.
+func (r *Reconciler) collectInventory(
+	ctx context.Context,
+	sweep *placement.ReconciliationSweep,
+	pendingLeases []billingtypes.Lease,
+	activeLeases []billingtypes.Lease,
+) (reconcileInventory, error) {
+	if r.coordinator == nil || !r.coordinator.Valid() {
+		return reconcileInventory{}, errors.New("inventory projector is not bound")
 	}
-	for backendName := range inventory.fleet.answered {
-		if !inventory.backendStorageIdentities[backendName].Valid() {
-			return false
-		}
+	if sweep == nil || !sweep.Valid() {
+		return reconcileInventory{}, errors.New("reconciliation sweep is not bound")
 	}
-	return true
-}
-
-// emptyBackendNames returns raw, pre-projection drain evidence. Causal
-// filtering in projectPlacementInventory may hide an in-flight lease from the
-// durable placement projection, so backend emptiness must be computed from the
-// complete provision+retention responses themselves.
-func (inventory reconcileInventory) emptyBackendNames() []string {
-	if !inventory.complete() {
-		return nil
-	}
-	empty := make([]string, 0, len(inventory.backendStorageIdentities))
-	for backendName := range inventory.backendStorageIdentities {
-		if len(inventory.fleet.reportedByBackend[backendName]) == 0 &&
-			len(inventory.retentionsReportedByBackend[backendName]) == 0 {
-			empty = append(empty, backendName)
-		}
-	}
-	slices.Sort(empty)
-	return empty
-}
-
-// withoutConflictCandidates removes backends whose raw empty response is not
-// causally sufficient drain evidence. Most conflicts are formed from two
-// positive reporters, which cannot be empty. A contradiction against a durable
-// owner or attempt is different: that candidate may have answered empty before
-// its delayed remote mutation committed. Persisting it as both empty and a
-// conflict candidate would either make the projection self-contradictory or,
-// worse, authorize topology removal from an observation ordered before the
-// outstanding side effect.
-func withoutConflictCandidates(
-	emptyBackends []string,
-	quarantines ...map[string][]string,
-) []string {
-	if emptyBackends == nil || len(quarantines) == 0 {
-		return emptyBackends
-	}
-	candidates := make(map[string]struct{})
-	for _, quarantine := range quarantines {
-		for _, backendNames := range quarantine {
-			for _, backendName := range backendNames {
-				candidates[backendName] = struct{}{}
-			}
-		}
-	}
-	filtered := make([]string, 0, len(emptyBackends))
-	for _, backendName := range emptyBackends {
-		if _, conflicted := candidates[backendName]; !conflicted {
-			filtered = append(filtered, backendName)
-		}
-	}
-	return filtered
-}
-
-// collectInventory performs only external reads. Keeping it separate from the
-// projector makes the durability boundary visible: no collected observation
-// becomes lifecycle authority until the placement store accepts the complete
-// projection.
-func (r *Reconciler) collectInventory(ctx context.Context) (reconcileInventory, error) {
-	pendingLeases, activeLeases, err := r.collectChainLeaseInventory(ctx)
-	if err != nil {
-		return reconcileInventory{}, err
-	}
-
 	chainLeases := make(map[string]billingtypes.Lease, len(pendingLeases)+len(activeLeases))
 	for _, lease := range pendingLeases {
 		chainLeases[lease.Uuid] = lease
@@ -123,100 +65,47 @@ func (r *Reconciler) collectInventory(ctx context.Context) (reconcileInventory, 
 		chainLeases: chainLeases,
 		pending:     len(pendingLeases),
 		active:      len(activeLeases),
-		fleet:       r.fetchFleetSnapshot(ctx),
+		fleet:       r.fetchFleetSnapshot(ctx, sweep),
 	}
 	inventory.retentions,
 		inventory.retentionsAnswered,
 		inventory.retentionsReportedByBackend,
-		inventory.retentionStorageIdentities = r.fetchAllRetentions(ctx)
-	inventory.rejectCrossEndpointDuplicates()
-	inventory.reconcileStorageIdentities(r.placementAuthority)
-	return inventory, nil
-}
-
-// reconcileStorageIdentities admits a backend's evidence only when both
-// independent inventory endpoints report the same canonical physical storage
-// identity and it matches any durable historical pin. A replacement node is
-// therefore one unanswered backend; it cannot pause healthy siblings after a
-// baseline already exists.
-func (inventory *reconcileInventory) reconcileStorageIdentities(
-	resolver interface {
-		ExpectedBackendStorageIdentity(string) (backendidentity.ID, bool)
-	},
-) {
-	if inventory == nil {
-		return
+		inventory.retentionStorageIdentities,
+		inventory.retentionCollected = r.fetchAllRetentions(ctx, sweep)
+	configuredBackends, err := r.coordinator.BackendNames()
+	if err != nil {
+		return reconcileInventory{}, fmt.Errorf("enumerate configured backends: %w", err)
 	}
-	inventory.backendStorageIdentities = make(map[string]backendidentity.ID)
-	for backendName, provisionAnswered := range inventory.fleet.answered {
-		provisionID := inventory.fleet.storageIdentities[backendName]
-		retentionID := inventory.retentionStorageIdentities[backendName]
-		retentionAnswered := inventory.retentionsAnswered.heard(backendName)
-		if !retentionAnswered || !provisionID.Valid() ||
-			!retentionID.Valid() || provisionID != retentionID {
-			inventory.rejectBackend(backendName)
-			if provisionAnswered || retentionAnswered {
-				slog.Error("backend inventory storage identity is missing or inconsistent; ignoring both endpoints",
-					"backend", backendName,
-					"provision_storage_id", provisionID,
-					"retention_storage_id", retentionID,
-				)
-			}
-			continue
-		}
-		if expected, bound := resolver.ExpectedBackendStorageIdentity(backendName); bound && expected != provisionID {
-			inventory.rejectBackend(backendName)
-			slog.Error("backend storage identity differs from durable placement binding; ignoring backend",
-				"backend", backendName,
-				"observed_storage_id", provisionID,
-				"expected_storage_id", expected,
+	inventory.backendStorageIdentities = make(map[string]backendidentity.ID, len(configuredBackends))
+	for _, backendName := range configuredBackends {
+		provisionResponse, provisionAnswered := inventory.fleet.collectedByBackend[backendName]
+		retentionResponse, retentionAnswered := inventory.retentionCollected[backendName]
+		var disposition placement.BackendInventoryDisposition
+		switch {
+		case provisionAnswered && retentionAnswered:
+			disposition, err = sweep.RecordBackendInventory(
+				provisionResponse, retentionResponse,
 			)
+		case provisionAnswered:
+			err = sweep.RejectProvisionInventory(provisionResponse)
+		case retentionAnswered:
+			err = sweep.RejectRetentionInventory(retentionResponse)
+		}
+		if err != nil {
+			return reconcileInventory{}, fmt.Errorf(
+				"dispose backend inventory evidence for %q: %w", backendName, err,
+			)
+		}
+		if disposition == placement.BackendInventoryAuthoritative {
+			inventory.backendStorageIdentities[backendName] = provisionResponse.StorageID()
 			continue
 		}
-		if !provisionAnswered {
-			// RefreshState failed, but the stale positive response still carried
-			// the same physical identity as the independent retention endpoint.
-			// Preserve that conservative affinity without admitting this backend
-			// into the complete snapshot or allowing its absence to become
-			// authority.
-			continue
-		}
-		inventory.backendStorageIdentities[backendName] = provisionID
-	}
-}
-
-// rejectCrossEndpointDuplicates treats a backend that reports one lease as
-// both active and retained in the same sweep as unanswered on both endpoints.
-// The HTTP client already rejects malformed/duplicate identities within each
-// complete paginated response; this cross-endpoint check closes the remaining
-// gap. Its payload cannot become placement authority, but each positive lease
-// identity remains conservative exclusion evidence. The complete flag cannot
-// establish or advance the admission baseline.
-func (inventory *reconcileInventory) rejectCrossEndpointDuplicates() {
-	if inventory == nil {
-		return
-	}
-	for backendName, provisions := range inventory.fleet.reportedByBackend {
-		retentions := inventory.retentionsReportedByBackend[backendName]
-		if len(provisions) == 0 || len(retentions) == 0 {
-			continue
-		}
-		var duplicates []string
-		for leaseUUID := range provisions {
-			if _, duplicate := retentions[leaseUUID]; duplicate {
-				duplicates = append(duplicates, leaseUUID)
-			}
-		}
-		if len(duplicates) == 0 {
-			continue
-		}
-		slices.Sort(duplicates)
-		slog.Error("backend returned contradictory provision and retention inventory; ignoring both endpoints",
-			"backend", backendName,
-			"duplicate_lease_uuids", duplicates,
-		)
 		inventory.rejectBackend(backendName)
 	}
+	if err := sweep.SealInventory(); err != nil {
+		return reconcileInventory{}, fmt.Errorf("seal inventory evidence: %w", err)
+	}
+	return inventory, nil
 }
 
 func (inventory *reconcileInventory) rejectBackend(backendName string) {
@@ -244,6 +133,7 @@ func (inventory *reconcileInventory) rejectBackend(backendName string) {
 	inventory.fleet.markUnanswered(backendName)
 	inventory.retentionsAnswered[backendName] = false
 	delete(inventory.fleet.storageIdentities, backendName)
+	delete(inventory.fleet.provisionsByBackend, backendName)
 	delete(inventory.retentionStorageIdentities, backendName)
 	delete(inventory.backendStorageIdentities, backendName)
 	for leaseUUID, provision := range inventory.fleet.provisions {
@@ -270,38 +160,5 @@ func (r *Reconciler) collectChainLeaseInventory(
 		budget = chainInventoryTimeout
 	}
 
-	// Derive both deadlines before dispatch so neither paginated list consumes the
-	// other's wall-clock budget. The chain client is already shared concurrently
-	// by callbacks, the ack batcher, and reconciliation; its query stubs are safe
-	// for parallel read RPCs.
-	pendingCtx, cancelPending := context.WithTimeout(ctx, budget)
-	activeCtx, cancelActive := context.WithTimeout(ctx, budget)
-	var pendingErr, activeErr error
-	var reads sync.WaitGroup
-	reads.Go(func() {
-		defer cancelPending()
-		pending, pendingErr = r.chainClient.GetPendingLeases(pendingCtx, r.providerUUID)
-	})
-	reads.Go(func() {
-		defer cancelActive()
-		active, activeErr = r.chainClient.GetActiveLeasesByProvider(activeCtx, r.providerUUID)
-	})
-	reads.Wait()
-
-	var inventoryErrors []error
-	if pendingErr != nil {
-		inventoryErrors = append(inventoryErrors,
-			fmt.Errorf("failed to get pending leases: %w", pendingErr))
-	}
-	if activeErr != nil {
-		inventoryErrors = append(inventoryErrors,
-			fmt.Errorf("failed to get active leases: %w", activeErr))
-	}
-	if len(inventoryErrors) > 0 {
-		return nil, nil, errors.Join(inventoryErrors...)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	return pending, active, nil
+	return r.coordinator.CollectChainInventory(ctx, budget)
 }

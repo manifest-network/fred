@@ -252,8 +252,8 @@ func TestIdentityBoundHTTPClientUsesExactBoundPathForEverySideEffect(t *testing.
 	}{
 		{path: "/provision", call: func() error { return client.Provision(ctx, ProvisionRequest{}) }},
 		{path: "/deprovision", call: func() error { return client.Deprovision(ctx, "lease-a") }},
-		{path: "/restart", call: func() error { return client.Restart(ctx, RestartRequest{}) }},
-		{path: "/update", call: func() error { return client.Update(ctx, UpdateRequest{}) }},
+		{path: "/restart", call: func() error { return client.Restart(ctx, RestartRequest{MaintenanceID: testMaintenanceRequestID(t)}) }},
+		{path: "/update", call: func() error { return client.Update(ctx, UpdateRequest{MaintenanceID: testMaintenanceRequestID(t)}) }},
 		{path: "/restore", call: func() error { return client.Restore(ctx, RestoreRequest{}) }},
 		{path: "/reconcile_custom_domain", call: func() error {
 			return client.ReconcileCustomDomain(ctx, "lease-a", nil)

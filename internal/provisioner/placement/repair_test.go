@@ -38,7 +38,7 @@ func newProviderBoundRepairStore(t *testing.T, dbPath string) *Store {
 
 func repairBackendRequestSnapshot(t *testing.T) BackendRequestSnapshot {
 	t.Helper()
-	snapshot, err := NewBackendRequestSnapshot(
+	snapshot, err := newBackendRequestSnapshot(
 		"tenant-test", freshTestProviderUUID,
 		[]backend.LeaseItem{{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
 	)
@@ -67,12 +67,12 @@ func requireRepairTypedAttempt(
 	case StateAbsent:
 		scope, scopeErr := store.ScopeAdmission(baseline, []string{backendName})
 		require.NoError(t, scopeErr)
-		token, applied, err = store.BeginNewAttempt(
+		token, applied, err = store.beginNewAttempt(
 			scope, leaseUUID, backendName, operationID, PayloadFingerprint{},
 			repairBackendRequestSnapshot(t), testCallbackPair(operationID),
 		)
 	case StateConfirmed:
-		token, applied, err = store.BeginOwnedAttempt(
+		token, applied, err = store.beginOwnedAttempt(
 			baseline, current.RecordRevision(), backendName, operationID,
 			PayloadFingerprint{}, repairBackendRequestSnapshot(t), testCallbackPair(operationID),
 		)
@@ -233,7 +233,7 @@ func createRepairFixture(
 		ownerOperation, parseErr := operation.ParseID(repairOwnerOperation)
 		require.NoError(t, parseErr)
 		ownerAttempt := requireRepairTypedAttempt(t, store, repairLease, "backend-a", ownerOperation)
-		applied, confirmErr := store.ConfirmAttempt(ownerAttempt)
+		applied, confirmErr := confirmAttemptForTest(store, ownerAttempt)
 		require.NoError(t, confirmErr)
 		require.True(t, applied)
 	}
@@ -377,7 +377,7 @@ func TestAttemptRepairStaleCandidateCannotClearNewerSameBackendOperation(t *test
 	require.NoError(t, err)
 	ctx, evidence, drain, probe := requireAttemptRepairAuthorities(t, repair, stale)
 
-	settled, err := repair.store.RefuseOperation(repairLease, "backend-a", oldOperation)
+	settled, err := refuseOperationForTest(repair.store, repairLease, "backend-a", oldOperation)
 	require.NoError(t, err)
 	require.True(t, settled)
 	newOperation, err := operation.ParseID(repairNewOperation)
@@ -793,7 +793,7 @@ func TestAttemptRepairRejectsAttemptIndistinguishableFromPriorGeneration(t *test
 	operationID, err := operation.ParseID(repairOperation)
 	require.NoError(t, err)
 	ownerAttempt := requireRepairTypedAttempt(t, store, repairLease, "backend-a", operationID)
-	applied, err := store.ConfirmAttempt(ownerAttempt)
+	applied, err := confirmAttemptForTest(store, ownerAttempt)
 	require.NoError(t, err)
 	require.True(t, applied)
 	requireRepairTypedAttempt(t, store, repairLease, "backend-a", operationID)
@@ -834,7 +834,7 @@ func TestAttemptRepairRefusePreservesPriorDetachedLifecycleAuthority(t *testing.
 	ownerOperation, err := operation.ParseID(repairOwnerOperation)
 	require.NoError(t, err)
 	ownerAttempt := requireRepairTypedAttempt(t, store, repairLease, "backend-a", ownerOperation)
-	confirmed, err := store.ConfirmAttempt(ownerAttempt)
+	confirmed, err := confirmAttemptForTest(store, ownerAttempt)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireDeleteRecord(t, store, repairLease)
@@ -860,7 +860,7 @@ func TestAttemptRepairRefusePreservesPriorDetachedLifecycleAuthority(t *testing.
 	assert.Equal(t, StateAbsent, reopened.Lookup(repairLease).State())
 	ownerLifecycle, err := lifecycle.FromOperationID(ownerOperation)
 	require.NoError(t, err)
-	authorization := reopened.AuthorizeLifecycle(repairLease, ownerLifecycle)
+	authorization := reopened.authorizeLifecycle(repairLease, ownerLifecycle)
 	assert.Equal(t, LifecycleVerdictTeardownOnly, authorization.Verdict(),
 		"repairing a newer recordless attempt must not erase older teardown authority")
 }
@@ -1034,7 +1034,7 @@ func createConflictRepairFixture(t *testing.T) string {
 	store := newProviderBoundRepairStore(t, dbPath)
 	requireTestAdmission(t, store)
 	fence := store.BeginInventorySession()
-	_, err := store.ProjectInventory(fence, InventoryProjection{
+	_, err := projectInventoryAtFenceForTest(t, store, fence, InventoryProjection{
 		Conflicts: map[string][]string{
 			repairLease: {"backend-a", "backend-b"},
 		},
@@ -1051,7 +1051,7 @@ func createUntrustedPositiveRepairFixture(t *testing.T) string {
 	store := newProviderBoundRepairStore(t, dbPath)
 	requireTestAdmission(t, store)
 	fence := store.BeginInventorySession()
-	_, err := store.ProjectInventory(fence, InventoryProjection{
+	_, err := projectInventoryAtFenceForTest(t, store, fence, InventoryProjection{
 		UntrustedPositives: map[string][]string{
 			repairLease: {"backend-a"},
 		},

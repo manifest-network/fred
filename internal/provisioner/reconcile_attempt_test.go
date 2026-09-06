@@ -5,9 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
+	"net/http"
 	"net/url"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +20,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
-	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	redeliveryTarget = "lease-redelivery-target"
-	redeliverySource = "lease-redelivery-source"
+	redeliveryTarget = "11111111-1111-4111-8111-111111111111"
+	redeliverySource = "22222222-2222-4222-8222-222222222222"
 	redeliveryTenant = "tenant-redelivery"
 )
 
@@ -46,29 +46,151 @@ func redeliveryLease(uuid string, state billingtypes.LeaseState) billingtypes.Le
 
 func redeliveryRequestSnapshot(
 	t testing.TB,
+	store *placement.Store,
 	lease billingtypes.Lease,
 ) placement.BackendRequestSnapshot {
 	t.Helper()
-	snapshot, err := placement.NewBackendRequestSnapshot(
-		lease.Tenant, lease.ProviderUuid, ExtractLeaseItems(&lease),
-	)
+	snapshot, err := store.MintBackendRequestSnapshot(lease.Tenant, ExtractLeaseItems(&lease))
 	require.NoError(t, err)
 	return snapshot
 }
 
-func beginRedeliveryProvisionAttempt(
+var redeliveryExecutions sync.Map
+var redeliveryCoordinators sync.Map
+
+func persistAmbiguousProvisionOnStore(
 	t testing.TB,
-	store PlacementAuthorityStore,
-	backendName string,
-	operationID operation.OperationID,
-	fingerprint placement.PayloadFingerprint,
-) placement.AttemptToken {
+	store *placement.Store,
+	registry *operation.Registry,
+	router *backend.Router,
+	backendClient *mockReconcilerBackend,
+	target billingtypes.Lease,
+	payloadBytes []byte,
+) operation.OperationID {
 	t.Helper()
-	target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
-	return beginTestNewPlacementAttemptWithSnapshot(
-		t, store, redeliveryTarget, backendName, operationID, fingerprint,
-		redeliveryRequestSnapshot(t, target),
-	)
+	var coordinator *placement.OperationCoordinator
+	if existing, ok := redeliveryCoordinators.Load(store); ok {
+		coordinator = existing.(*placement.OperationCoordinator)
+	} else {
+		coordinator = bindTestOperationCoordinator(t, store)
+		redeliveryCoordinators.Store(store, coordinator)
+		t.Cleanup(func() { redeliveryCoordinators.Delete(store) })
+	}
+	var execution *placement.ExecutionCoordinator
+	if existing, ok := redeliveryExecutions.Load(store); ok {
+		execution = existing.(*placement.ExecutionCoordinator)
+	} else {
+		execution = bindTestBackendRuntime(t, coordinator, router)
+	}
+	var err error
+	chain := redeliveryChain([]billingtypes.Lease{target}, nil)
+	bindTestReconciliationCoordinator(t, store, execution, chain, nil, nil)
+	backendClient.mu.Lock()
+	previousErr := backendClient.provisionErr
+	backendClient.provisionErr = errors.New("connection reset after provision dispatch")
+	backendClient.mu.Unlock()
+	if target.State == billingtypes.LEASE_STATE_PENDING {
+		provision, bindErr := execution.ProvisionCoordinator(nil)
+		require.NoError(t, bindErr)
+		var request placement.ProvisionEventRequest
+		if payloadBytes == nil {
+			request, err = placement.NewProvisionEventRequest(target.Uuid, target.Tenant)
+		} else {
+			request, err = placement.NewPayloadProvisionEventRequest(
+				target.Uuid, target.Tenant,
+				func() ([]byte, error) { return append([]byte(nil), payloadBytes...), nil },
+			)
+		}
+		require.NoError(t, err)
+		result := provision.ExecuteCurrentLease(context.Background(), request)
+		require.Error(t, result.Err())
+	} else {
+		reconciliation := testReconciliationCoordinator(t, store)
+		sweep, sweepErr := reconciliation.BeginSweep()
+		require.NoError(t, sweepErr)
+		defer sweep.End()
+		backendNames, namesErr := reconciliation.BackendNames()
+		require.NoError(t, namesErr)
+		for _, backendName := range backendNames {
+			storageID := testBackendStorageID(backendName)
+			disposition := collectTestBackendInventory(
+				t, reconciliation, sweep, backendName, storageID, nil, nil,
+			)
+			require.Equal(t, placement.BackendInventoryAuthoritative, disposition)
+		}
+		require.NoError(t, sweep.SealInventory())
+		projected, projectErr := sweep.Project(placement.ReconciliationProjection{})
+		require.NoError(t, projectErr)
+		action, disposition, observeErr := projected.ObserveLiveAction(
+			context.Background(), target.Uuid,
+		)
+		require.NoError(t, observeErr)
+		require.Equal(t, placement.ReconciliationObservationReady, disposition)
+		fingerprint := placement.PayloadFingerprint{}
+		if payloadBytes != nil {
+			digest := sha256.Sum256(payloadBytes)
+			fingerprint, err = placement.NewPayloadFingerprint(digest[:])
+			require.NoError(t, err)
+		}
+		result := reconciliation.Provision(context.Background(), action, payloadBytes, fingerprint)
+		require.NoError(t, result.Err())
+		require.Error(t, result.Dispatch().CallErr())
+	}
+	record := store.Lookup(target.Uuid)
+	if record.Backend == "" {
+		require.Equal(t, placement.StateAttempting, record.State())
+	} else {
+		require.Equal(t, placement.StateConfirmed, record.State())
+	}
+	require.NotEmpty(t, record.Attempt)
+	operationID := record.AttemptOperationID()
+	require.True(t, operationID.Valid())
+	backendClient.mu.Lock()
+	backendClient.provisionErr = previousErr
+	backendClient.provisionCalls = nil
+	backendClient.mu.Unlock()
+	redeliveryExecutions.Store(store, execution)
+	t.Cleanup(func() { redeliveryExecutions.Delete(store) })
+	return operationID
+}
+
+// persistAmbiguousProvisionOnHTTPStore creates a pending write-ahead attempt
+// through the exact identity-bound transport. The server first returns an
+// indeterminate 500, then is left ready for the caller to select the recovery
+// response. This keeps refusal tests on the only boundary authorized to mint
+// causal evidence.
+func persistAmbiguousProvisionOnHTTPStore(
+	t testing.TB,
+	store *placement.Store,
+	router *backend.Router,
+	server *fakeBackendServer,
+	target billingtypes.Lease,
+) operation.OperationID {
+	t.Helper()
+	server.setProvisionResponse(http.StatusInternalServerError, `{"error":"uncertain"}`)
+	coordinator := bindTestOperationCoordinator(t, store)
+	redeliveryCoordinators.Store(store, coordinator)
+	t.Cleanup(func() { redeliveryCoordinators.Delete(store) })
+	execution := bindTestBackendRuntime(t, coordinator, router)
+	chain := redeliveryChain([]billingtypes.Lease{target}, nil)
+	bindTestReconciliationCoordinator(t, store, execution, chain, nil, nil)
+	provision, err := execution.ProvisionCoordinator(nil)
+	require.NoError(t, err)
+	request, err := placement.NewProvisionEventRequest(target.Uuid, target.Tenant)
+	require.NoError(t, err)
+	result := provision.ExecuteCurrentLease(context.Background(), request)
+	require.Error(t, result.Err())
+	record := store.Lookup(target.Uuid)
+	require.Equal(t, placement.StateAttempting, record.State())
+	operationID := record.AttemptOperationID()
+	require.True(t, operationID.Valid())
+	server.mu.Lock()
+	server.provisionCalls = make(map[string]int)
+	server.provisionRequests = make(map[string]backend.ProvisionRequest)
+	server.mu.Unlock()
+	redeliveryExecutions.Store(store, execution)
+	t.Cleanup(func() { redeliveryExecutions.Delete(store) })
+	return operationID
 }
 
 func redeliveryChain(
@@ -144,16 +266,103 @@ func redeliveryReconcilerWithPayload(
 	payloadStore *payload.Store,
 ) *Reconciler {
 	t.Helper()
-	runtime := &typedTestReconcilerRuntime{
-		mockInFlightTracker: newMockInFlightTracker(payloadStore),
-		operations:          registry,
+	if bound, ok := redeliveryExecutions.Load(store); ok {
+		execution := bound.(*placement.ExecutionCoordinator)
+		coordinator := bindTestReconciliationCoordinator(
+			t, store, execution, chainClient, payloadStore, nil,
+		)
+		reconciler, err := NewReconciler(
+			ReconcilerConfig{Coordinator: coordinator}, newMockInFlightTracker(payloadStore),
+		)
+		require.NoError(t, err)
+		return reconciler
 	}
-	reconciler, err := NewReconciler(ReconcilerConfig{
-		ProviderUUID:    placementstore.ProviderUUID,
-		CallbackBaseURL: "https://provider.example/callbacks/provision",
-	}, chainClient, noopAck, router, runtime, store)
+	coordinator := bindTestOperationCoordinator(t, store)
+	redeliveryCoordinators.Store(store, coordinator)
+	t.Cleanup(func() { redeliveryCoordinators.Delete(store) })
+	execution := bindTestBackendRuntime(t, coordinator, router)
+	reconciliation := bindTestReconciliationCoordinator(
+		t, store, execution, chainClient, payloadStore, nil,
+	)
+	reconciler, err := NewReconciler(
+		ReconcilerConfig{Coordinator: reconciliation}, newMockInFlightTracker(payloadStore),
+	)
 	require.NoError(t, err)
 	return reconciler
+}
+
+func redeliveryRuntime(t testing.TB, store *placement.Store) operation.RuntimeController {
+	t.Helper()
+	value, ok := redeliveryCoordinators.Load(store)
+	require.True(t, ok, "redelivery fixture must retain its bound operation coordinator")
+	return value.(*placement.OperationCoordinator).RuntimeController()
+}
+
+func openRedeliveryStore(t testing.TB, dbPath string) *placement.Store {
+	t.Helper()
+	routes, err := placement.NewCallbackRouteFactory("https://provider.example/callbacks/provision")
+	require.NoError(t, err)
+	store, err := placementstore.NewStore(dbPath, placement.WithCallbackRouteFactory(routes))
+	require.NoError(t, err)
+	return store
+}
+
+// persistAmbiguousRestoreAttempt creates the write-ahead fact only through the
+// production restore application, then closes the process-local authority.
+// Reopening the Store is mandatory: recovery must not inherit the initiating
+// Registry, backend runtime, or chain reader.
+func persistAmbiguousRestoreAttempt(
+	t testing.TB,
+	dbPath string,
+	router *backend.Router,
+	backendClient *mockReconcilerBackend,
+	target billingtypes.Lease,
+) operation.OperationID {
+	t.Helper()
+	store := openRedeliveryStore(t, dbPath)
+	_, execution := seedTestTypedConfirmedPlacementsWithExecution(
+		t, store, router, map[string]string{
+			redeliverySource: backendClient.Name(),
+		},
+	)
+	source := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED)
+	chain := redeliveryChain([]billingtypes.Lease{target}, map[string]billingtypes.Lease{
+		redeliverySource: source,
+	})
+	setTestProviderControlPlane(t, execution, chain, nil)
+	restore, err := execution.RestoreCoordinator(nil)
+	require.NoError(t, err)
+	request, err := placement.NewRestoreApplicationRequest(
+		target.Uuid, target.Tenant, redeliverySource,
+	)
+	require.NoError(t, err)
+	backendClient.restoreErr = errors.New("connection reset after restore dispatch")
+	result := restore.ExecuteApplication(context.Background(), request)
+	require.Error(t, result.CallErr())
+	record := store.Lookup(target.Uuid)
+	require.Equal(t, placement.StateAttempting, record.State())
+	operationID := record.AttemptOperationID()
+	require.True(t, operationID.Valid())
+	backendClient.restoreErr = nil
+	backendClient.restoreCalls = nil
+	require.NoError(t, store.Close())
+	return operationID
+}
+
+func persistAmbiguousProvisionAttempt(
+	t testing.TB,
+	dbPath string,
+	router *backend.Router,
+	backendClient *mockReconcilerBackend,
+	lease billingtypes.Lease,
+) {
+	t.Helper()
+	store := openRedeliveryStore(t, dbPath)
+	_ = persistAmbiguousProvisionOnStore(
+		t, store, operation.NewRegistry(), router, backendClient, lease, nil,
+	)
+	require.True(t, store.Lookup(lease.Uuid).AttemptOperationID().Valid())
+	require.NoError(t, store.Close())
 }
 
 func requireCallbackOperationID(t *testing.T, callbackURL string) operation.OperationID {
@@ -174,12 +383,11 @@ func TestReconciler_RedeliversNeverReceivedProvisionWithExactIdentity(t *testing
 	router := redeliveryRouter(t, backendA)
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("2f399495-6c7a-4e04-86b4-eb1d18372201")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
-	)
 	registry := operation.NewRegistry()
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store, registry, router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
+	)
 	reconciler := redeliveryReconciler(
 		t, store, router,
 		redeliveryChain([]billingtypes.Lease{
@@ -193,7 +401,7 @@ func TestReconciler_RedeliversNeverReceivedProvisionWithExactIdentity(t *testing
 	firstRequest := backendA.provisionCalls[0]
 	assert.Equal(t, operationID, requireCallbackOperationID(t, firstRequest.CallbackURL))
 	assert.Equal(t, placement.StateAttempting, store.Lookup(redeliveryTarget).State())
-	assert.Zero(t, registry.Count())
+	assert.Zero(t, redeliveryRuntime(t, store).Count())
 
 	backendA.provisionErr = nil
 	require.NoError(t, reconciler.ReconcileAll(t.Context()))
@@ -203,37 +411,33 @@ func TestReconciler_RedeliversNeverReceivedProvisionWithExactIdentity(t *testing
 		"every retry must reproduce the complete request, not merely its backend")
 	assert.Equal(t, operationID, requireCallbackOperationID(t, secondRequest.CallbackURL))
 	assert.Equal(t, placement.StateConfirmed, store.Lookup(redeliveryTarget).State())
-	recovered, exists := registry.Lookup(redeliveryTarget)
-	require.True(t, exists)
-	assert.Equal(t, operationID, recovered.ID)
-	assert.Equal(t, operation.KindProvision, recovered.Kind)
-	assert.Equal(t, backendA.Name(), recovered.Backend)
+	assert.True(t, redeliveryRuntime(t, store).Contains(redeliveryTarget))
 
-	callback := registry.TryClaimCallback(redeliveryTarget, operationID)
-	require.True(t, callback.Claimed(),
+	coordinatorValue, ok := redeliveryCoordinators.Load(store)
+	require.True(t, ok)
+	applied, err := confirmPlacementOperationForTest(
+		coordinatorValue.(*placement.OperationCoordinator),
+		redeliveryTarget, backendA.Name(), operationID,
+	)
+	require.NoError(t, err)
+	require.True(t, applied,
 		"the backend callback must settle through the recovered registry record")
-	assert.True(t, registry.FinishSettlement(callback.Claim()))
 }
 
 func TestReconciler_RedeliversProvisionAfterProviderRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	router := redeliveryRouter(t, backendA)
-	store1, err := placementstore.NewStore(dbPath)
-	require.NoError(t, err)
+	store1 := openRedeliveryStore(t, dbPath)
 	armTestPlacementTopology(t, store1, backendTopologyNames(router))
-	operationID, err := operation.ParseID("91bb340a-ed31-470f-84d7-dcd4fa955468")
-	require.NoError(t, err)
 	originalTarget := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
 	originalTarget.Items[0].CustomDomain = "original.example.test"
-	beginTestNewPlacementAttemptWithSnapshot(
-		t, store1, redeliveryTarget, backendA.Name(), operationID,
-		placement.PayloadFingerprint{}, redeliveryRequestSnapshot(t, originalTarget),
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store1, operation.NewRegistry(), router, backendA, originalTarget, nil,
 	)
 	require.NoError(t, store1.Close())
 
-	store2, err := placementstore.NewStore(dbPath)
-	require.NoError(t, err)
+	store2 := openRedeliveryStore(t, dbPath)
 	t.Cleanup(func() { require.NoError(t, store2.Close()) })
 	reopened := store2.Lookup(redeliveryTarget)
 	require.True(t, reopened.AttemptMetadata().Valid())
@@ -241,8 +445,8 @@ func TestReconciler_RedeliversProvisionAfterProviderRestart(t *testing.T) {
 	assert.Equal(t, operationID, reopened.AttemptMetadata().OperationID())
 	durableCallbacks := reopened.AttemptMetadata().CallbackPair()
 	require.NotEmpty(t, durableCallbacks.OperationURL())
-	assert.NotContains(t, durableCallbacks.OperationURL(), "provider.example",
-		"the attempt predates the restarted provider's callback-base configuration")
+	assert.Contains(t, durableCallbacks.OperationURL(), "provider.example",
+		"the Store-bound callback origin must survive restart unchanged")
 	registry := operation.NewRegistry()
 	mutatedTarget := originalTarget
 	mutatedTarget.Items = append([]billingtypes.LeaseItem(nil), originalTarget.Items...)
@@ -262,40 +466,25 @@ func TestReconciler_RedeliversProvisionAfterProviderRestart(t *testing.T) {
 	require.Len(t, backendA.provisionCalls[0].Items, 1)
 	assert.Equal(t, "original.example.test", backendA.provisionCalls[0].Items[0].CustomDomain,
 		"mutable chain fields cannot rewrite an already-authorized exact request")
-	recovered, exists := registry.Lookup(redeliveryTarget)
-	require.True(t, exists)
-	assert.Equal(t, operationID, recovered.ID)
+	assert.True(t, redeliveryRuntime(t, store2).Contains(redeliveryTarget))
 }
 
 func TestFleet_ProviderRestartRedeliversPersistedAttemptAcrossHTTPBoundary(t *testing.T) {
 	fleet := newFleet(t, fleetOptions{backendCount: 2})
-	fleet.addLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING, "sku-redelivery")
+	induceFleetAmbiguousProvision(t, fleet, redeliveryTarget, "sku-redelivery", 1)
 	leaseUUID := fleetLeaseUUID(redeliveryTarget)
-	armTestPlacementTopology(t, fleet.placement, backendTopologyNames(fleet.router))
-	operationID, err := operation.ParseID("f9ff2480-313f-48aa-a004-dda0221ad67f")
-	require.NoError(t, err)
-	scope, err := fleet.placement.ScopeAdmission(
-		fleet.placement.CurrentAdmissionBaseline(), []string{"backend-1"},
-	)
-	require.NoError(t, err)
-	_, begun, err := fleet.placement.BeginNewAttempt(
-		scope, leaseUUID, "backend-1", operationID,
-		placement.PayloadFingerprint{},
-		redeliveryRequestSnapshot(t, *chaintest.NewMockLeaseWithSKU(
-			leaseUUID, "tenant-1", fleet.providerUUID,
-			billingtypes.LEASE_STATE_PENDING, "sku-redelivery",
-		)),
-		testPlacementCallbackPair(t, operationID),
-	)
-	require.NoError(t, err)
-	require.True(t, begun)
-	require.Zero(t, fleet.tracker.Operations().Count(),
+	operationID := fleet.placement.Lookup(leaseUUID).AttemptOperationID()
+	require.True(t, operationID.Valid())
+	require.Zero(t, fleet.coordinator.RuntimeController().Count(),
 		"the simulated process exits in the write-ahead window before registration")
 
 	require.NoError(t, fleet.placement.Close())
+	callbackRoutes, err := placement.NewCallbackRouteFactory("http://fred.invalid")
+	require.NoError(t, err)
 	reopened, err := placementstore.NewStore(
 		fleet.placementPath,
 		placement.WithClock(func() time.Time { return time.Now().Add(-fleet.placementAge) }),
+		placement.WithCallbackRouteFactory(callbackRoutes),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
@@ -304,7 +493,13 @@ func TestFleet_ProviderRestartRedeliversPersistedAttemptAcrossHTTPBoundary(t *te
 		testOperationRegistry: newTestOperationRegistry(),
 		payloads:              fleet.payloads,
 	}
-	fleet.reconciler, err = NewReconciler(
+	fleet.coordinator, err = fleet.tracker.bindPlacementStore(reopened)
+	require.NoError(t, err)
+	fleet.execution = bindTestBackendRuntime(t, fleet.coordinator, fleet.router)
+	fleet.reconcilerCfg.Coordinator = bindTestReconciliationCoordinator(
+		t, fleet.placement, fleet.execution, fleet.chain, fleet.payloads, nil,
+	)
+	fleet.reconciler, err = newTestReconciler(t,
 		fleet.reconcilerCfg,
 		fleet.chain,
 		fleet.acknowledger,
@@ -322,32 +517,31 @@ func TestFleet_ProviderRestartRedeliversPersistedAttemptAcrossHTTPBoundary(t *te
 	assert.Equal(t, fleet.providerUUID, request.ProviderUUID)
 	assert.Zero(t, fleet.backendAt(2).provisionCount(leaseUUID),
 		"redelivery cannot load-balance to a different HTTP backend")
-	recovered, exists := fleet.tracker.Operations().Lookup(leaseUUID)
-	require.True(t, exists)
-	assert.Equal(t, operationID, recovered.ID)
-	assert.Equal(t, "backend-1", recovered.Backend)
+	assert.True(t, fleet.coordinator.RuntimeController().Contains(leaseUUID))
 	assert.Equal(t, placement.StateConfirmed, fleet.placement.Lookup(leaseUUID).State())
 }
 
 func TestReconciler_AcceptedOldAttemptGetsFreshCallbackTimeoutWindow(t *testing.T) {
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	router := redeliveryRouter(t, backendA)
+	callbackRoutes, err := placement.NewCallbackRouteFactory("https://provider.example/callbacks/provision")
+	require.NoError(t, err)
 	store, err := placementstore.NewStore(
 		filepath.Join(t.TempDir(), "placements.db"),
 		placement.WithClock(func() time.Time { return time.Now().Add(-24 * time.Hour) }),
+		placement.WithCallbackRouteFactory(callbackRoutes),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("074b5679-30fb-44d8-a204-676094d826f2")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+	registry := operation.NewRegistry()
+	_ = persistAmbiguousProvisionOnStore(
+		t, store, registry, router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
 	oldAttempt := store.Lookup(redeliveryTarget)
 	require.Less(t, oldAttempt.SetAt, time.Now().Add(-23*time.Hour))
 
-	registry := operation.NewRegistry()
 	reconciler := redeliveryReconciler(
 		t, store, router,
 		redeliveryChain([]billingtypes.Lease{
@@ -355,34 +549,41 @@ func TestReconciler_AcceptedOldAttemptGetsFreshCallbackTimeoutWindow(t *testing.
 		}, nil),
 		registry,
 	)
-	recoveryStarted := time.Now()
 	require.NoError(t, reconciler.ReconcileAll(t.Context()))
 
-	recovered, exists := registry.Lookup(redeliveryTarget)
-	require.True(t, exists)
-	assert.False(t, recovered.StartedAt.Before(recoveryStarted),
-		"redelivery acceptance starts a new volatile callback-wait window")
+	coordinatorValue, ok := redeliveryCoordinators.Load(store)
+	require.True(t, ok)
+	coordinator := coordinatorValue.(*placement.OperationCoordinator)
 	rejecter := &mockRejecter{rejectFn: func(
 		context.Context, []string, string,
 	) (uint64, []string, error) {
 		t.Fatal("freshly recovered operation must not be rejected as timed out")
 		return 0, nil, nil
 	}}
-	NewTimeoutChecker(TimeoutCheckerConfig{
-		Operations: registry,
-		Rejecter:   rejecter,
-		Timeout:    time.Hour,
-	}).CheckOnce(t.Context())
-	assert.True(t, registry.Contains(redeliveryTarget))
+	checker, err := NewTimeoutChecker(TimeoutCheckerConfig{
+		Coordinator: func() *placement.TimeoutCoordinator {
+			executionValue, exists := redeliveryExecutions.Load(store)
+			require.True(t, exists)
+			execution := executionValue.(*placement.ExecutionCoordinator)
+			setTestProviderRejecter(t, execution, rejecter)
+			timeouts, bindErr := execution.TimeoutCoordinator()
+			require.NoError(t, bindErr)
+			return timeouts
+		}(),
+		Timeout:       time.Hour,
+		CheckInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	checker.CheckOnce(t.Context())
+	assert.True(t, coordinator.RuntimeController().Contains(redeliveryTarget))
 }
 
 func TestReconciler_RedeliveryRebuildsExactPersistedPayload(t *testing.T) {
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	router := redeliveryRouter(t, backendA)
-	store := newTestPlacementAuthority(t)
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	store := openRedeliveryStore(t, dbPath)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("77220174-9267-43b8-8284-4a2181a39f01")
-	require.NoError(t, err)
 	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "payloads.db"),
 	})
@@ -391,17 +592,16 @@ func TestReconciler_RedeliveryRebuildsExactPersistedPayload(t *testing.T) {
 	payloadBytes := []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`)
 	require.True(t, payloadStore.Store(redeliveryTarget, payloadBytes))
 	payloadHash := sha256.Sum256(payloadBytes)
-	fingerprint, err := placement.NewPayloadFingerprint(payloadHash[:])
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, fingerprint,
-	)
+	registry := operation.NewRegistry()
 	target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
 	target.MetaHash = payloadHash[:]
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store, registry, router, backendA, target, payloadBytes,
+	)
 	reconciler := redeliveryReconcilerWithPayload(
 		t, store, router,
 		redeliveryChain([]billingtypes.Lease{target}, nil),
-		operation.NewRegistry(), payloadStore,
+		registry, payloadStore,
 	)
 
 	require.NoError(t, reconciler.ReconcileAll(t.Context()))
@@ -417,14 +617,13 @@ func TestReconciler_RedeliveryRejectsPayloadDifferentFromDurableAttempt(t *testi
 	router := redeliveryRouter(t, backendA)
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("2c8409f1-b041-43fd-a46f-6ccacde8f354")
-	require.NoError(t, err)
 	authorizedPayload := []byte(`{"version":"attempt-authorized"}`)
 	authorizedHash := sha256.Sum256(authorizedPayload)
-	fingerprint, err := placement.NewPayloadFingerprint(authorizedHash[:])
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, fingerprint,
+	registry := operation.NewRegistry()
+	target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+	target.MetaHash = authorizedHash[:]
+	_ = persistAmbiguousProvisionOnStore(
+		t, store, registry, router, backendA, target, authorizedPayload,
 	)
 	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "payloads.db"),
@@ -432,12 +631,10 @@ func TestReconciler_RedeliveryRejectsPayloadDifferentFromDurableAttempt(t *testi
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, payloadStore.Close()) })
 	require.True(t, payloadStore.Store(redeliveryTarget, []byte(`{"version":"persisted"}`)))
-	target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
-	target.MetaHash = authorizedHash[:]
 	reconciler := redeliveryReconcilerWithPayload(
 		t, store, router,
 		redeliveryChain([]billingtypes.Lease{target}, nil),
-		operation.NewRegistry(), payloadStore,
+		registry, payloadStore,
 	)
 
 	require.NoError(t, reconciler.ReconcileAll(t.Context()))
@@ -449,10 +646,16 @@ func TestReconciler_RedeliveryRejectsPayloadDifferentFromDurableAttempt(t *testi
 func TestReconciler_RedeliveryUsesUpdatedActivePayloadFingerprint(t *testing.T) {
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	router := redeliveryRouter(t, backendA)
-	store := newTestPlacementAuthority(t)
-	seedTestTypedConfirmedPlacements(t, store, backendTopologyNames(router), map[string]string{
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	store := openRedeliveryStore(t, dbPath)
+	registry := operation.NewRegistry()
+	seededCoordinator, seededExecution := seedTestTypedConfirmedPlacementsWithExecution(t, store, router, map[string]string{
 		redeliveryTarget: backendA.Name(),
 	})
+	redeliveryCoordinators.Store(store, seededCoordinator)
+	t.Cleanup(func() { redeliveryCoordinators.Delete(store) })
+	redeliveryExecutions.Store(store, seededExecution)
+	t.Cleanup(func() { redeliveryExecutions.Delete(store) })
 	payloadStore, err := payload.NewStore(payload.StoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "payloads.db"),
 	})
@@ -461,24 +664,15 @@ func TestReconciler_RedeliveryUsesUpdatedActivePayloadFingerprint(t *testing.T) 
 	updatedPayload := []byte(`{"version":"updated-after-create"}`)
 	require.NoError(t, payloadStore.Put(redeliveryTarget, updatedPayload))
 	updatedHash := sha256.Sum256(updatedPayload)
-	fingerprint, err := placement.NewPayloadFingerprint(updatedHash[:])
-	require.NoError(t, err)
-	operationID, err := operation.ParseID("673d344a-40f5-48aa-a552-032bb9799797")
-	require.NoError(t, err)
-	current := store.Lookup(redeliveryTarget)
-	_, applied, err := store.BeginOwnedAttempt(
-		store.CurrentAdmissionBaseline(), current.RecordRevision(), backendA.Name(), operationID,
-		fingerprint,
-		redeliveryRequestSnapshot(t, redeliveryLease(
-			redeliveryTarget, billingtypes.LEASE_STATE_ACTIVE,
-		)),
-		testPlacementCallbackPair(t, operationID),
-	)
-	require.NoError(t, err)
-	require.True(t, applied)
 	target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_ACTIVE)
 	createPayloadHash := sha256.Sum256([]byte(`{"version":"original-create"}`))
 	target.MetaHash = createPayloadHash[:]
+	_ = persistAmbiguousProvisionOnStore(
+		t, store, registry, router, backendA, target, updatedPayload,
+	)
+	require.NoError(t, store.Close())
+	store = openRedeliveryStore(t, dbPath)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	reconciler := redeliveryReconcilerWithPayload(
 		t, store, router, redeliveryChain([]billingtypes.Lease{target}, nil),
 		operation.NewRegistry(), payloadStore,
@@ -496,31 +690,52 @@ func TestReconciler_RedeliveryRefusalAndLocalTransportGatesSettleConservatively(
 	tests := []struct {
 		name      string
 		err       error
+		status    int
+		body      string
 		wantState placement.State
 	}{
-		{name: "validation refusal", err: backend.ErrValidation, wantState: placement.StateAbsent},
-		{name: "coded capacity refusal", err: backend.ErrCapacityRefused, wantState: placement.StateAbsent},
+		{
+			name: "validation refusal", err: backend.ErrValidation,
+			status: http.StatusBadRequest, body: `{"error":"bad request"}`,
+			wantState: placement.StateAbsent,
+		},
+		{
+			name: "coded capacity refusal", err: backend.ErrCapacityRefused,
+			status:    http.StatusServiceUnavailable,
+			body:      `{"error":"full","code":"insufficient_resources"}`,
+			wantState: placement.StateAbsent,
+		},
 		{name: "circuit open", err: backend.ErrCircuitOpen, wantState: placement.StateAttempting},
 		{name: "identity unbound", err: backend.ErrBackendStorageIdentityUnbound, wantState: placement.StateAttempting},
 		{name: "identity mismatch", err: backend.ErrBackendStorageIdentityMismatch, wantState: placement.StateAttempting},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			backendA := &mockReconcilerBackend{name: "backend-a", provisionErr: test.err}
-			router := redeliveryRouter(t, backendA)
 			store := newTestPlacementAuthority(t)
-			armTestPlacementTopology(t, store, backendTopologyNames(router))
-			operationID, err := operation.ParseID("c623a0f9-b6cc-4497-871c-75cf50fe24d5")
-			require.NoError(t, err)
-			beginRedeliveryProvisionAttempt(
-				t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
-			)
+			registry := operation.NewRegistry()
+			target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+			var router *backend.Router
+			if test.status != 0 {
+				server, backendClient := provisionResponseBackendForTest(
+					t, "backend-a", http.StatusInternalServerError, `{"error":"uncertain"}`,
+				)
+				router = redeliveryRouter(t, backendClient)
+				armTestPlacementTopology(t, store, backendTopologyNames(router))
+				_ = persistAmbiguousProvisionOnHTTPStore(t, store, router, server, target)
+				server.setProvisionResponse(test.status, test.body)
+			} else {
+				backendBase := &mockReconcilerBackend{name: "backend-a"}
+				router = redeliveryRouter(t, backendBase)
+				armTestPlacementTopology(t, store, backendTopologyNames(router))
+				_ = persistAmbiguousProvisionOnStore(
+					t, store, registry, router, backendBase, target, nil,
+				)
+				backendBase.provisionErr = test.err
+			}
 			reconciler := redeliveryReconciler(
 				t, store, router,
-				redeliveryChain([]billingtypes.Lease{
-					redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING),
-				}, nil),
-				operation.NewRegistry(),
+				redeliveryChain([]billingtypes.Lease{target}, nil),
+				registry,
 			)
 
 			require.NoError(t, reconciler.ReconcileAll(t.Context()))
@@ -534,7 +749,6 @@ func TestReconciler_RedeliveryRequiresExactTargetProvider(t *testing.T) {
 		name         string
 		providerUUID string
 	}{
-		{name: "missing provider"},
 		{name: "different provider", providerUUID: "a6d6790d-d04b-48bd-ad91-675cb7a4b2ed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -542,29 +756,24 @@ func TestReconciler_RedeliveryRequiresExactTargetProvider(t *testing.T) {
 			router := redeliveryRouter(t, backendA)
 			store := newTestPlacementAuthority(t)
 			armTestPlacementTopology(t, store, backendTopologyNames(router))
-			operationID, err := operation.ParseID("37be74da-bcc8-4d49-85c0-480b997c196b")
-			require.NoError(t, err)
-			beginRedeliveryProvisionAttempt(
-				t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+			registry := operation.NewRegistry()
+			original := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+			_ = persistAmbiguousProvisionOnStore(
+				t, store, registry, router, backendA, original, nil,
 			)
 			target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
 			target.ProviderUuid = test.providerUUID
-			registry := operation.NewRegistry()
 			reconciler := redeliveryReconciler(
-				t, store, router, redeliveryChain([]billingtypes.Lease{target}, nil), registry,
+				t, store, router, redeliveryChain(
+					[]billingtypes.Lease{original},
+					map[string]billingtypes.Lease{redeliveryTarget: target},
+				), registry,
 			)
-			record := store.Lookup(redeliveryTarget)
-			result := reconciler.redeliverPlacementAttempt(
-				t.Context(), redeliveryTarget, record,
-				record.AttemptMetadata(), registry.Snapshot(),
-			)
-
-			assert.Equal(t, attemptRedeliveryDeferred, result.outcome)
-			require.Error(t, result.err)
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
 			assert.Empty(t, backendA.provisionCalls)
 			assert.Equal(t, placement.StateAttempting,
 				store.Lookup(redeliveryTarget).State())
-			assert.Zero(t, registry.Count())
+			assert.Zero(t, redeliveryRuntime(t, store).Count())
 		})
 	}
 }
@@ -577,36 +786,13 @@ func TestReconciler_RedeliversRestoreWithDurableSourceAndRecoveredKind(t *testin
 	}
 	router := redeliveryRouter(t, backendA)
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	storeBeforeRestart, err := placementstore.NewStore(dbPath)
-	require.NoError(t, err)
-	seedTestTypedConfirmedPlacements(t, storeBeforeRestart, backendTopologyNames(router), map[string]string{
-		redeliverySource: backendA.Name(),
-	})
-	operationID, err := operation.ParseID("ed00a025-e09c-44c1-af07-46621cf919c1")
-	require.NoError(t, err)
 	originalTarget := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
 	originalTarget.Items[0].CustomDomain = "restore-original.example.test"
-	claim, err := storeBeforeRestart.BeginAuthorizedRestore(
-		storeBeforeRestart.CurrentAdmissionBaseline(),
-		storeBeforeRestart.Lookup(redeliverySource).RecordRevision(),
-		redeliveryTarget,
-		operationID,
-		redeliveryRequestSnapshot(t, originalTarget),
-		testPlacementCallbackPair(t, operationID),
-	)
-	require.NoError(t, err)
-	_, err = storeBeforeRestart.AbandonRestore(claim)
-	require.NoError(t, err)
-	metadata := storeBeforeRestart.Lookup(redeliveryTarget).AttemptMetadata()
-	require.True(t, metadata.Valid())
-	assert.Equal(t, operation.KindRestore, metadata.Kind())
-	assert.Equal(t, redeliverySource, metadata.RestoreSourceLeaseUUID())
-	require.NoError(t, storeBeforeRestart.Close())
+	operationID := persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, originalTarget)
 
-	store, err := placementstore.NewStore(dbPath)
-	require.NoError(t, err)
+	store := openRedeliveryStore(t, dbPath)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	metadata = store.Lookup(redeliveryTarget).AttemptMetadata()
+	metadata := store.Lookup(redeliveryTarget).AttemptMetadata()
 	require.True(t, metadata.Valid())
 	assert.Equal(t, operation.KindRestore, metadata.Kind())
 	assert.Equal(t, redeliverySource, metadata.RestoreSourceLeaseUUID())
@@ -632,62 +818,34 @@ func TestReconciler_RedeliversRestoreWithDurableSourceAndRecoveredKind(t *testin
 	require.Len(t, request.Items, 1)
 	assert.Equal(t, "restore-original.example.test", request.Items[0].CustomDomain)
 	assert.Equal(t, operationID, requireCallbackOperationID(t, request.CallbackURL))
-	recovered, exists := registry.Lookup(redeliveryTarget)
-	require.True(t, exists)
-	assert.Equal(t, operationID, recovered.ID)
-	assert.Equal(t, operation.KindRestore, recovered.Kind)
+	assert.True(t, redeliveryRuntime(t, store).Contains(redeliveryTarget))
 	assert.Equal(t, placement.StateConfirmed, store.Lookup(redeliveryTarget).State())
 }
 
-func TestReconciler_RedeliversRestoreAfterAuthorizedSourceWasPruned(t *testing.T) {
+func TestReconciler_PreservesRestoreAttemptWhenSourceIsUnknownToChain(t *testing.T) {
 	backendA := &mockReconcilerBackend{name: "backend-a", restoreAccept: true}
 	router := redeliveryRouter(t, backendA)
-	store := newTestPlacementAuthority(t)
-	seedTestTypedConfirmedPlacements(t, store, backendTopologyNames(router), map[string]string{
-		redeliverySource: backendA.Name(),
-	})
-	operationID, err := operation.ParseID("4c5f5a83-dce8-4acb-96d9-610e73e66944")
-	require.NoError(t, err)
-	claim, err := store.BeginAuthorizedRestore(
-		store.CurrentAdmissionBaseline(),
-		store.Lookup(redeliverySource).RecordRevision(),
-		redeliveryTarget,
-		operationID,
-		redeliveryRequestSnapshot(t, redeliveryLease(
-			redeliveryTarget, billingtypes.LEASE_STATE_PENDING,
-		)),
-		testPlacementCallbackPair(t, operationID),
-	)
-	require.NoError(t, err)
-	_, err = store.AbandonRestore(claim)
-	require.NoError(t, err)
-	deleted, err := store.DeleteRecord(store.Lookup(redeliverySource).RecordRevision())
-	require.NoError(t, err)
-	require.True(t, deleted)
-	require.Equal(t, placement.StateAbsent, store.Lookup(redeliverySource).State())
-
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+	_ = persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, target)
+	store := openRedeliveryStore(t, dbPath)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	registry := operation.NewRegistry()
 	reconciler := redeliveryReconciler(
 		t, store, router, redeliveryChain([]billingtypes.Lease{target}, nil), registry,
 	)
-	record := store.Lookup(redeliveryTarget)
-	result := reconciler.redeliverPlacementAttempt(
-		t.Context(), redeliveryTarget, record, record.AttemptMetadata(), registry.Snapshot(),
-	)
-	require.Equal(t, attemptRedeliveryAccepted, result.outcome, result.err)
-	require.Len(t, backendA.restoreCalls, 1)
-	assert.Equal(t, redeliverySource, backendA.restoreCalls[0].FromLeaseUUID)
-	assert.Equal(t, operationID,
-		requireCallbackOperationID(t, backendA.restoreCalls[0].CallbackURL))
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+	assert.Empty(t, backendA.restoreCalls)
+	assert.Equal(t, placement.StateAttempting, store.Lookup(redeliveryTarget).State())
+	assert.Zero(t, redeliveryRuntime(t, store).Count())
 }
 
 func TestReconciler_RestoreRedeliveryRejectsChangedSourceAuthority(t *testing.T) {
 	tests := []struct {
-		name           string
-		mutateSource   func(*testing.T, *placement.Store)
-		chainSource    billingtypes.Lease
-		wantErrorMatch string
+		name                      string
+		sourceHasPendingOperation bool
+		chainSource               billingtypes.Lease
+		wantErrorMatch            string
 	}{
 		{
 			name: "wrong tenant",
@@ -708,59 +866,26 @@ func TestReconciler_RestoreRedeliveryRejectsChangedSourceAuthority(t *testing.T)
 			wantErrorMatch: "tenant and provider",
 		},
 		{
-			name: "source has pending operation",
-			mutateSource: func(t *testing.T, store *placement.Store) {
-				t.Helper()
-				pendingID, err := operation.ParseID("374c9e1c-6c11-409f-bff6-b7de423276ba")
-				require.NoError(t, err)
-				_, applied, err := store.BeginOwnedAttempt(
-					store.CurrentAdmissionBaseline(),
-					store.Lookup(redeliverySource).RecordRevision(),
-					"backend-a",
-					pendingID,
-					placement.PayloadFingerprint{},
-					redeliveryRequestSnapshot(t, redeliveryLease(
-						redeliverySource, billingtypes.LEASE_STATE_CLOSED,
-					)),
-					testPlacementCallbackPair(t, pendingID),
-				)
-				require.NoError(t, err)
-				require.True(t, applied)
-			},
-			chainSource:    redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED),
-			wantErrorMatch: "source placement",
+			name:                      "source has pending operation",
+			sourceHasPendingOperation: true,
+			chainSource:               redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED),
+			wantErrorMatch:            "source placement",
 		},
 	}
 
-	for index, test := range tests {
+	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			backendA := &mockReconcilerBackend{name: "backend-a", restoreAccept: true}
 			router := redeliveryRouter(t, backendA)
-			store := newTestPlacementAuthority(t)
-			seedTestTypedConfirmedPlacements(t, store, backendTopologyNames(router), map[string]string{
-				redeliverySource: backendA.Name(),
-			})
-			operationID, err := operation.ParseID(fmt.Sprintf(
-				"74887a71-e917-46a5-bdfb-eef0ba8832%02d", index,
-			))
-			require.NoError(t, err)
-			claim, err := store.BeginAuthorizedRestore(
-				store.CurrentAdmissionBaseline(),
-				store.Lookup(redeliverySource).RecordRevision(),
-				redeliveryTarget,
-				operationID,
-				redeliveryRequestSnapshot(t, redeliveryLease(
-					redeliveryTarget, billingtypes.LEASE_STATE_PENDING,
-				)),
-				testPlacementCallbackPair(t, operationID),
-			)
-			require.NoError(t, err)
-			_, err = store.AbandonRestore(claim)
-			require.NoError(t, err)
-			if test.mutateSource != nil {
-				test.mutateSource(t, store)
-			}
+			dbPath := filepath.Join(t.TempDir(), "placements.db")
 			target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
+			_ = persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, target)
+			if test.sourceHasPendingOperation {
+				source := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_ACTIVE)
+				persistAmbiguousProvisionAttempt(t, dbPath, router, backendA, source)
+			}
+			store := openRedeliveryStore(t, dbPath)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
 			registry := operation.NewRegistry()
 			reconciler := redeliveryReconciler(
 				t, store, router,
@@ -769,18 +894,11 @@ func TestReconciler_RestoreRedeliveryRejectsChangedSourceAuthority(t *testing.T)
 				}),
 				registry,
 			)
-			record := store.Lookup(redeliveryTarget)
-			result := reconciler.redeliverPlacementAttempt(
-				t.Context(), redeliveryTarget, record,
-				record.AttemptMetadata(), registry.Snapshot(),
-			)
-			assert.Equal(t, attemptRedeliveryDeferred, result.outcome)
-			require.Error(t, result.err)
-			assert.Contains(t, result.err.Error(), test.wantErrorMatch)
+			require.NoError(t, reconciler.ReconcileAll(t.Context()))
 			assert.Empty(t, backendA.restoreCalls)
 			assert.Equal(t, placement.StateAttempting,
 				store.Lookup(redeliveryTarget).State())
-			assert.Zero(t, registry.Count())
+			assert.Zero(t, redeliveryRuntime(t, store).Count())
 		})
 	}
 }
@@ -789,14 +907,11 @@ func TestReconciler_MalformedAttemptMetadataIsQuarantinedWithoutDispatch(t *test
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	router := redeliveryRouter(t, backendA)
-	storeBeforeCorruption, err := placementstore.NewStore(dbPath)
-	require.NoError(t, err)
+	storeBeforeCorruption := openRedeliveryStore(t, dbPath)
 	armTestPlacementTopology(t, storeBeforeCorruption, backendTopologyNames(router))
-	operationID, err := operation.ParseID("196c55d6-6f70-4d8f-89d7-d20e841d89a5")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, storeBeforeCorruption, backendA.Name(), operationID,
-		placement.PayloadFingerprint{},
+	_ = persistAmbiguousProvisionOnStore(
+		t, storeBeforeCorruption, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
 	require.NoError(t, storeBeforeCorruption.Close())
 
@@ -805,11 +920,15 @@ func TestReconciler_MalformedAttemptMetadataIsQuarantinedWithoutDispatch(t *test
 	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket([]byte("placements")).Put(
 			[]byte(redeliveryTarget),
-			[]byte(`{"attempt":"backend-a","set_at":"2026-08-25T15:00:00Z","revision":99}`),
+			[]byte(`{"schema":1,"attempt":"backend-a","set_at":"2026-08-25T15:00:00Z","revision":99}`),
 		)
 	}))
 	require.NoError(t, db.Close())
-	store, err := placement.OpenStore(dbPath, placementstore.ProviderUUID)
+	routes, err := placement.NewCallbackRouteFactory("https://provider.example/callbacks/provision")
+	require.NoError(t, err)
+	store, err := placement.OpenStore(
+		dbPath, placementstore.ProviderUUID, placement.WithCallbackRouteFactory(routes),
+	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	require.Equal(t, placement.StateUnusable, store.Lookup(redeliveryTarget).State())
@@ -836,21 +955,20 @@ func TestReconciler_CallbackContendingWithRedeliveryRetriesThenSettles(t *testin
 			close(release)
 		}
 	})
-	backendA := &mockReconcilerBackend{
-		name: "backend-a",
-		onProvision: func() {
-			entered <- struct{}{}
-			<-release
-		},
+	backendA := &mockReconcilerBackend{name: "backend-a"}
+	backendA.onProvision = func() {
+		entered <- struct{}{}
+		<-release
 	}
 	router := redeliveryRouter(t, backendA)
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("d6f72c45-a274-400f-8f22-82601bc88cfa")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+	backendA.onProvision = nil
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
+	backendA.onProvision = func() { entered <- struct{}{}; <-release }
 	target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
 	registry := operation.NewRegistry()
 	reconciler := redeliveryReconciler(
@@ -860,9 +978,11 @@ func TestReconciler_CallbackContendingWithRedeliveryRetriesThenSettles(t *testin
 	done := make(chan error, 1)
 	go func() { done <- reconciler.ReconcileAll(context.Background()) }()
 	<-entered
-	service, err := newCallbackServiceForTest(CallbackServiceConfig{
-		Operations: registry,
-		Placement:  store,
+	coordinatorValue, ok := redeliveryCoordinators.Load(store)
+	require.True(t, ok)
+	coordinator := coordinatorValue.(*placement.OperationCoordinator)
+	service, err := newCallbackServiceForTest(callbackServiceTestConfig{
+		Coordinator: coordinator,
 		Acknowledger: callbackAcknowledgerFunc(func(
 			context.Context, string,
 		) (bool, string, error) {
@@ -882,9 +1002,9 @@ func TestReconciler_CallbackContendingWithRedeliveryRetriesThenSettles(t *testin
 	close(release)
 	released = true
 	require.NoError(t, <-done)
-	require.True(t, registry.Contains(redeliveryTarget))
+	require.True(t, coordinator.RuntimeController().Contains(redeliveryTarget))
 	require.NoError(t, service.HandleCallback(t.Context(), command))
-	assert.False(t, registry.Contains(redeliveryTarget))
+	assert.False(t, coordinator.RuntimeController().Contains(redeliveryTarget))
 	assert.Equal(t, placement.StateConfirmed, store.Lookup(redeliveryTarget).State())
 }
 
@@ -898,12 +1018,11 @@ func TestReconciler_DownAttemptBackendDoesNotPauseHealthyBackendAdmission(t *tes
 	router := redeliveryRouter(t, backendA, backendB)
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("3c73fb65-d781-42d5-ac2a-94c015b08f4b")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+	_ = persistAmbiguousProvisionOnStore(
+		t, store, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
-	healthyLease := redeliveryLease("lease-healthy-backend", billingtypes.LEASE_STATE_PENDING)
+	healthyLease := redeliveryLease("33333333-3333-4333-8333-333333333333", billingtypes.LEASE_STATE_PENDING)
 	reconciler := redeliveryReconciler(
 		t, store, router,
 		redeliveryChain([]billingtypes.Lease{
@@ -925,12 +1044,12 @@ func TestReconciler_DownAttemptBackendDoesNotPauseHealthyBackendAdmission(t *tes
 func TestReconciler_TerminalAttemptConvergesByExactTeardown(t *testing.T) {
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	router := redeliveryRouter(t, backendA)
-	store := newTestPlacementAuthority(t)
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	store := openRedeliveryStore(t, dbPath)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("95a6dd1f-0239-459f-80c0-d28148db6522")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
 	terminal := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_CLOSED)
 	reconciler := redeliveryReconciler(
@@ -950,6 +1069,39 @@ func TestReconciler_TerminalAttemptConvergesByExactTeardown(t *testing.T) {
 		"queued operation/lifecycle callbacks retain their exact promoted generation")
 }
 
+func TestReconciler_NotFoundAttemptRemainsPreservedAfterProviderRestart(t *testing.T) {
+	backendA := &mockReconcilerBackend{name: "backend-a"}
+	router := redeliveryRouter(t, backendA)
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	store1 := openRedeliveryStore(t, dbPath)
+	armTestPlacementTopology(t, store1, backendTopologyNames(router))
+	persistAmbiguousProvisionOnStore(
+		t, store1, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
+	)
+	require.NoError(t, store1.Close())
+
+	store2 := openRedeliveryStore(t, dbPath)
+	t.Cleanup(func() { require.NoError(t, store2.Close()) })
+	chainClient := redeliveryChain(nil, nil)
+	chainClient.GetLeaseFunc = func(context.Context, string) (*billingtypes.Lease, error) {
+		return nil, billingtypes.ErrLeaseNotFound
+	}
+	reconciler := redeliveryReconciler(
+		t, store2, router, chainClient, operation.NewRegistry(),
+	)
+
+	require.NoError(t, reconciler.ReconcileAll(t.Context()))
+	assert.Empty(t, backendA.deprovisionCalls)
+	record := store2.Lookup(redeliveryTarget)
+	assert.Equal(t, placement.StateAttempting, record.State())
+	assert.Equal(t, backendA.Name(), record.Attempt)
+	assert.True(t, record.AttemptOperationID().Valid())
+	assert.False(t, store2.CurrentLifecycle(redeliveryTarget).ID().Valid(),
+		"no-record cannot mint or retire lifecycle authority")
+	assert.Zero(t, redeliveryRuntime(t, store2).Count())
+}
+
 func TestReconciler_TerminalAttemptAmbiguousTeardownRetainsAuthority(t *testing.T) {
 	backendA := &mockReconcilerBackend{
 		name:           "backend-a",
@@ -958,10 +1110,9 @@ func TestReconciler_TerminalAttemptAmbiguousTeardownRetainsAuthority(t *testing.
 	router := redeliveryRouter(t, backendA)
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("2a7053d8-1945-4c69-ad2d-5c51a69a0830")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
 	terminal := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_REJECTED)
 	reconciler := redeliveryReconciler(
@@ -1000,12 +1151,10 @@ func TestReconciler_TerminalAttemptRequiresExactTargetSnapshot(t *testing.T) {
 			router := redeliveryRouter(t, backendA)
 			store := newTestPlacementAuthority(t)
 			armTestPlacementTopology(t, store, backendTopologyNames(router))
-			operationID, err := operation.ParseID(fmt.Sprintf(
-				"a55e1173-6b4d-4762-8081-e3c4b3c04d%02d", index,
-			))
-			require.NoError(t, err)
-			beginRedeliveryProvisionAttempt(
-				t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+			_ = index
+			_ = persistAmbiguousProvisionOnStore(
+				t, store, operation.NewRegistry(), router, backendA,
+				redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 			)
 			terminal := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_CLOSED)
 			test.mutate(&terminal)
@@ -1034,12 +1183,11 @@ func TestReconciler_DownTerminalAttemptBackendDoesNotBlockHealthyAdmission(t *te
 	router := redeliveryRouter(t, backendA, backendB)
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("702db9f6-4494-4528-9b1b-24d2fd24c47d")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+	_ = persistAmbiguousProvisionOnStore(
+		t, store, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
-	healthy := redeliveryLease("lease-healthy-terminal-peer", billingtypes.LEASE_STATE_PENDING)
+	healthy := redeliveryLease("44444444-4444-4444-8444-444444444444", billingtypes.LEASE_STATE_PENDING)
 	terminal := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_EXPIRED)
 	reconciler := redeliveryReconciler(
 		t, store, router,
@@ -1060,25 +1208,23 @@ func TestReconciler_DownTerminalAttemptBackendDoesNotBlockHealthyAdmission(t *te
 func TestReconciler_TerminalAttemptPreservesConfirmedOwnerAffinity(t *testing.T) {
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	router := redeliveryRouter(t, backendA)
-	store := newTestPlacementAuthority(t)
-	seedTestTypedConfirmedPlacements(t, store, backendTopologyNames(router), map[string]string{
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	store := openRedeliveryStore(t, dbPath)
+	registry := operation.NewRegistry()
+	seededCoordinator, seededExecution := seedTestTypedConfirmedPlacementsWithExecution(t, store, router, map[string]string{
 		redeliveryTarget: backendA.Name(),
 	})
-	operationID, err := operation.ParseID("99d64c34-94d3-483e-ab02-9c266c1595e6")
-	require.NoError(t, err)
-	_, applied, err := store.BeginOwnedAttempt(
-		store.CurrentAdmissionBaseline(),
-		store.Lookup(redeliveryTarget).RecordRevision(),
-		backendA.Name(),
-		operationID,
-		placement.PayloadFingerprint{},
-		redeliveryRequestSnapshot(t, redeliveryLease(
-			redeliveryTarget, billingtypes.LEASE_STATE_ACTIVE,
-		)),
-		testPlacementCallbackPair(t, operationID),
+	redeliveryCoordinators.Store(store, seededCoordinator)
+	t.Cleanup(func() { redeliveryCoordinators.Delete(store) })
+	redeliveryExecutions.Store(store, seededExecution)
+	t.Cleanup(func() { redeliveryExecutions.Delete(store) })
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store, registry, router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_ACTIVE), nil,
 	)
-	require.NoError(t, err)
-	require.True(t, applied)
+	require.NoError(t, store.Close())
+	store = openRedeliveryStore(t, dbPath)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	terminal := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_CLOSED)
 	reconciler := redeliveryReconciler(
 		t, store, router,
@@ -1113,10 +1259,9 @@ func TestReconciler_TerminalAttemptClaimsFenceCallbackAndInventory(t *testing.T)
 	router := redeliveryRouter(t, backendA)
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("27bed961-34b4-42b0-92d9-a6343a5da364")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+	operationID := persistAmbiguousProvisionOnStore(
+		t, store, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
 	terminal := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_CLOSED)
 	chainClient := redeliveryChain(
@@ -1128,10 +1273,11 @@ func TestReconciler_TerminalAttemptClaimsFenceCallbackAndInventory(t *testing.T)
 	done := make(chan error, 1)
 	go func() { done <- reconciler.ReconcileAll(context.Background()) }()
 	<-entered
-	service, err := newCallbackServiceForTest(CallbackServiceConfig{
-		Operations: registry,
-		Placement:  store,
-		Chain:      chainClient,
+	coordinatorValue, ok := redeliveryCoordinators.Load(store)
+	require.True(t, ok)
+	service, err := newCallbackServiceForTest(callbackServiceTestConfig{
+		Coordinator: coordinatorValue.(*placement.OperationCoordinator),
+		Chain:       chainClient,
 	})
 	require.NoError(t, err)
 	command := callbackCommand(t, backend.CallbackPayload{
@@ -1142,18 +1288,23 @@ func TestReconciler_TerminalAttemptClaimsFenceCallbackAndInventory(t *testing.T)
 	})
 	require.ErrorIs(t, service.HandleCallback(t.Context(), command), errCallbackRecoveryLeaseBusy)
 
-	lifecycleID, err := lifecycle.FromOperationID(operationID)
+	sweep, err := reconciler.coordinator.BeginSweep()
 	require.NoError(t, err)
-	fence := store.BeginInventorySession()
-	projection, err := store.ProjectInventory(fence, placement.InventoryProjection{
+	for _, backendName := range backendTopologyNames(router) {
+		disposition := collectTestBackendInventory(
+			t, reconciler.coordinator, sweep, backendName,
+			testBackendStorageID(backendName), []backend.ProvisionInfo{{
+				LeaseUUID: redeliveryTarget, BackendName: backendA.Name(),
+			}}, nil,
+		)
+		require.Equal(t, placement.BackendInventoryAuthoritative, disposition)
+	}
+	require.NoError(t, sweep.SealInventory())
+	_, err = sweep.Project(placement.ReconciliationProjection{
 		Placements: map[string]string{redeliveryTarget: backendA.Name()},
-		Lifecycles: map[string]placement.LifecycleObservation{
-			redeliveryTarget: {Kind: placement.LifecycleObservationTyped, ID: lifecycleID},
-		},
 	})
-	store.EndInventorySession(fence)
+	sweep.End()
 	require.NoError(t, err)
-	assert.Contains(t, projection.Fenced, redeliveryTarget)
 	assert.Equal(t, placement.StateAttempting, store.Lookup(redeliveryTarget).State())
 
 	close(release)
@@ -1166,78 +1317,17 @@ func TestReconciler_TerminalAttemptClaimsFenceCallbackAndInventory(t *testing.T)
 		"terminal callback cannot discard conservative retained-data affinity")
 }
 
-func TestReconciler_TerminalRestoreAttemptClaimsSourceDuringTeardown(t *testing.T) {
-	entered := make(chan struct{}, 1)
-	release := make(chan struct{})
-	released := false
-	t.Cleanup(func() {
-		if !released {
-			close(release)
-		}
-	})
-	backendA := &mockReconcilerBackend{
-		name: "backend-a",
-		onDeprovision: func() {
-			entered <- struct{}{}
-			<-release
-		},
-	}
-	router := redeliveryRouter(t, backendA)
-	store := newTestPlacementAuthority(t)
-	seedTestTypedConfirmedPlacements(t, store, backendTopologyNames(router), map[string]string{
-		redeliverySource: backendA.Name(),
-	})
-	operationID, err := operation.ParseID("a7b393b9-a272-4664-99eb-53bb66461bf2")
-	require.NoError(t, err)
-	claim, err := store.BeginAuthorizedRestore(
-		store.CurrentAdmissionBaseline(),
-		store.Lookup(redeliverySource).RecordRevision(),
-		redeliveryTarget,
-		operationID,
-		redeliveryRequestSnapshot(t, redeliveryLease(
-			redeliveryTarget, billingtypes.LEASE_STATE_PENDING,
-		)),
-		testPlacementCallbackPair(t, operationID),
-	)
-	require.NoError(t, err)
-	_, err = store.AbandonRestore(claim)
-	require.NoError(t, err)
-	terminal := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_CLOSED)
-	registry := operation.NewRegistry()
-	reconciler := redeliveryReconciler(
-		t, store, router,
-		redeliveryChain(nil, map[string]billingtypes.Lease{redeliveryTarget: terminal}),
-		registry,
-	)
-
-	done := make(chan error, 1)
-	go func() { done <- reconciler.ReconcileAll(context.Background()) }()
-	<-entered
-	assert.Equal(t, operation.LeaseClaimBusy,
-		registry.TryClaimLeaseNow(redeliverySource).Outcome(),
-		"source lifecycle mutations must not cross restore teardown")
-	assert.Equal(t, operation.LeaseClaimBusy,
-		registry.TryClaimLeaseNow(redeliveryTarget).Outcome())
-
-	close(release)
-	released = true
-	require.NoError(t, <-done)
-	assert.Equal(t, placement.StateConfirmed, store.Lookup(redeliveryTarget).State())
-}
-
 func TestReconciler_ConflictedAttemptCannotAuthorizeBackendCall(t *testing.T) {
 	backendA := &mockReconcilerBackend{name: "backend-a"}
 	backendB := &mockReconcilerBackend{name: "backend-b"}
 	router := redeliveryRouter(t, backendA, backendB)
 	store := newTestPlacementAuthority(t)
 	armTestPlacementTopology(t, store, backendTopologyNames(router))
-	operationID, err := operation.ParseID("847853b8-7ca8-41b8-8cdd-edf4e6d076e4")
-	require.NoError(t, err)
-	beginRedeliveryProvisionAttempt(
-		t, store, backendA.Name(), operationID, placement.PayloadFingerprint{},
+	_ = persistAmbiguousProvisionOnStore(
+		t, store, operation.NewRegistry(), router, backendA,
+		redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING), nil,
 	)
-	projectTestPlacementInventory(t, store, backendTopologyNames(router), placement.InventoryProjection{
-		Complete: true,
+	projectTestPlacementInventory(t, testReconciliationCoordinator(t, store), backendTopologyNames(router), placement.ReconciliationProjection{
 		Conflicts: map[string][]string{
 			redeliveryTarget: {backendA.Name(), backendB.Name()},
 		},

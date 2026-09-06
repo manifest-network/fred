@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	testSecret           = "test-secret-that-is-at-least-32-chars!"
-	handlerTestLeaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	testSecret               = "test-secret-that-is-at-least-32-chars!"
+	handlerTestLeaseUUID     = "550e8400-e29b-41d4-a716-446655440000"
+	handlerTestMaintenanceID = "6ba7b811-9dad-41d1-80b4-00c04fd430c8"
 )
 
 // --- HMAC sanity ----------------------------------------------------------
@@ -504,7 +505,7 @@ func TestRestart_MissingLeaseUUID(t *testing.T) {
 
 func TestRestart_MissingCallbackURL(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000"}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","maintenance_id":"6ba7b811-9dad-41d1-80b4-00c04fd430c8"}`
 	req := signedPostRequest("/restart", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -514,7 +515,7 @@ func TestRestart_MissingCallbackURL(t *testing.T) {
 
 func TestRestart_InvalidCallbackURL(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"ftp://invalid/callbacks/provision"}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","maintenance_id":"6ba7b811-9dad-41d1-80b4-00c04fd430c8","callback_url":"ftp://invalid/callbacks/provision"}`
 	req := signedPostRequest("/restart", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -524,7 +525,7 @@ func TestRestart_InvalidCallbackURL(t *testing.T) {
 
 func TestRestart_PassesValidation(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"http://localhost/callbacks/provision"}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","maintenance_id":"6ba7b811-9dad-41d1-80b4-00c04fd430c8","callback_url":"http://localhost/callbacks/provision"}`
 	req := signedPostRequest("/restart", body)
 	w := httptest.NewRecorder()
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
@@ -542,7 +543,7 @@ func TestUpdate_MissingLeaseUUID(t *testing.T) {
 
 func TestUpdate_MissingCallbackURL(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","maintenance_id":"6ba7b811-9dad-41d1-80b4-00c04fd430c8","payload":"eyJpbWFnZSI6Im5naW54In0="}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -552,7 +553,7 @@ func TestUpdate_MissingCallbackURL(t *testing.T) {
 
 func TestUpdate_MissingPayload(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"http://localhost/callbacks/provision"}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","maintenance_id":"6ba7b811-9dad-41d1-80b4-00c04fd430c8","callback_url":"http://localhost/callbacks/provision"}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -562,7 +563,7 @@ func TestUpdate_MissingPayload(t *testing.T) {
 
 func TestUpdate_InvalidCallbackURL(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"ftp://invalid","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","maintenance_id":"6ba7b811-9dad-41d1-80b4-00c04fd430c8","callback_url":"ftp://invalid","payload":"eyJpbWFnZSI6Im5naW54In0="}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -572,7 +573,7 @@ func TestUpdate_InvalidCallbackURL(t *testing.T) {
 
 func TestUpdate_PassesValidation(t *testing.T) {
 	handler := newTestHandler()
-	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","callback_url":"http://localhost/callbacks/provision","payload":"eyJpbWFnZSI6Im5naW54In0="}`
+	body := `{"lease_uuid":"550e8400-e29b-41d4-a716-446655440000","maintenance_id":"6ba7b811-9dad-41d1-80b4-00c04fd430c8","callback_url":"http://localhost/callbacks/provision","payload":"eyJpbWFnZSI6Im5naW54In0="}`
 	req := signedPostRequest("/update", body)
 	w := httptest.NewRecorder()
 	assert.Panics(t, func() { handler.ServeHTTP(w, req) })
@@ -681,6 +682,21 @@ func TestHandleProvision(t *testing.T) {
 		mb := &mockBackend{
 			ProvisionFunc: func(context.Context, backend.ProvisionRequest) error {
 				return fmt.Errorf("no capacity: %w", backend.ErrInsufficientResources)
+			},
+		}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/provision", validBody))
+
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		var resp ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Equal(t, backend.CodeInsufficientResources, resp.Code)
+	})
+
+	t.Run("operation receipt capacity returns definitive coded 503", func(t *testing.T) {
+		mb := &mockBackend{
+			ProvisionFunc: func(context.Context, backend.ProvisionRequest) error {
+				return &shared.OperationReceiptCapacityError{Limit: 100_000}
 			},
 		}
 		w := httptest.NewRecorder()
@@ -1074,12 +1090,13 @@ func TestHandleListProvisions_Filtered(t *testing.T) {
 }
 
 func TestHandleRestart(t *testing.T) {
-	validBody := fmt.Sprintf(`{"lease_uuid":%q,"callback_url":"http://localhost/callbacks/provision"}`, handlerTestLeaseUUID)
+	validBody := fmt.Sprintf(`{"lease_uuid":%q,"maintenance_id":%q,"callback_url":"http://localhost/callbacks/provision"}`, handlerTestLeaseUUID, handlerTestMaintenanceID)
 
 	t.Run("success returns 202", func(t *testing.T) {
 		mb := &mockBackend{
 			RestartFunc: func(_ context.Context, req backend.RestartRequest) error {
 				assert.Equal(t, handlerTestLeaseUUID, req.LeaseUUID)
+				assert.Equal(t, handlerTestMaintenanceID, req.MaintenanceID.String())
 				return nil
 			},
 		}
@@ -1090,6 +1107,18 @@ func TestHandleRestart(t *testing.T) {
 		var resp StatusResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assert.Equal(t, "restarting", resp.Status)
+	})
+
+	t.Run("capacity refusal returns coded 503", func(t *testing.T) {
+		mb := &mockBackend{RestartFunc: func(context.Context, backend.RestartRequest) error {
+			return backend.ErrInsufficientResources
+		}}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/restart", validBody))
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		var response ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+		assert.Equal(t, backend.CodeInsufficientResources, response.Code)
 	})
 
 	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {
@@ -1131,12 +1160,13 @@ func TestHandleRestart(t *testing.T) {
 }
 
 func TestHandleUpdate(t *testing.T) {
-	validBody := fmt.Sprintf(`{"lease_uuid":%q,"callback_url":"http://localhost/callbacks/provision","payload":"eyJpbWFnZSI6Im5naW54In0="}`, handlerTestLeaseUUID)
+	validBody := fmt.Sprintf(`{"lease_uuid":%q,"maintenance_id":%q,"callback_url":"http://localhost/callbacks/provision","payload":"eyJpbWFnZSI6Im5naW54In0="}`, handlerTestLeaseUUID, handlerTestMaintenanceID)
 
 	t.Run("success returns 202", func(t *testing.T) {
 		mb := &mockBackend{
 			UpdateFunc: func(_ context.Context, req backend.UpdateRequest) error {
 				assert.Equal(t, handlerTestLeaseUUID, req.LeaseUUID)
+				assert.Equal(t, handlerTestMaintenanceID, req.MaintenanceID.String())
 				return nil
 			},
 		}
@@ -1147,6 +1177,18 @@ func TestHandleUpdate(t *testing.T) {
 		var resp StatusResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 		assert.Equal(t, "updating", resp.Status)
+	})
+
+	t.Run("capacity refusal returns coded 503", func(t *testing.T) {
+		mb := &mockBackend{UpdateFunc: func(context.Context, backend.UpdateRequest) error {
+			return backend.ErrInsufficientResources
+		}}
+		w := httptest.NewRecorder()
+		newMockHandler(mb).ServeHTTP(w, signedPostRequest("/update", validBody))
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		var response ErrorResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+		assert.Equal(t, backend.CodeInsufficientResources, response.Code)
 	})
 
 	t.Run("ErrNotProvisioned returns 404", func(t *testing.T) {

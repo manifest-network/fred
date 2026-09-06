@@ -35,6 +35,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/maintenanceid"
 )
 
 // Labels used for tracking managed containers.
@@ -1638,6 +1639,10 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 	if resp.State.Health != nil {
 		health = HealthStatus(resp.State.Health.Status)
 	}
+	maintenanceID, err := parseContainerMaintenanceID(resp.Config.Labels[LabelMaintenanceID])
+	if err != nil {
+		return nil, fmt.Errorf("container %s: %w", resp.ID, err)
+	}
 
 	info := &ContainerInfo{
 		ContainerID:          resp.ID,
@@ -1649,7 +1654,7 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		ServiceName:          resp.Config.Labels[LabelServiceName],
 		CallbackURL:          resp.Config.Labels[LabelCallbackURL],
 		LifecycleCallbackURL: resp.Config.Labels[LabelLifecycleCallbackURL],
-		MaintenanceID:        shared.MaintenanceID(resp.Config.Labels[LabelMaintenanceID]),
+		MaintenanceID:        maintenanceID,
 		Image:                resp.Config.Image,
 		Status:               resp.State.Status,
 		Health:               health,
@@ -1745,6 +1750,18 @@ func (d *DockerClient) listManagedContainers(
 			)
 			continue
 		}
+		maintenanceID, err := parseContainerMaintenanceID(c.Labels[LabelMaintenanceID])
+		if err != nil {
+			if strict {
+				return nil, fmt.Errorf("managed container %s has malformed Fred labels: %w", c.ID, err)
+			}
+			slog.Warn("skipping managed container with malformed maintenance identity",
+				"container_id", c.ID[:12],
+				"lease_uuid", c.Labels[LabelLeaseUUID],
+				"error", err,
+			)
+			continue
+		}
 
 		var name string
 		if len(c.Names) > 0 {
@@ -1761,7 +1778,7 @@ func (d *DockerClient) listManagedContainers(
 			ServiceName:          c.Labels[LabelServiceName],
 			CallbackURL:          c.Labels[LabelCallbackURL],
 			LifecycleCallbackURL: c.Labels[LabelLifecycleCallbackURL],
-			MaintenanceID:        shared.MaintenanceID(c.Labels[LabelMaintenanceID]),
+			MaintenanceID:        maintenanceID,
 			Image:                c.Image,
 			Status:               c.State,
 			InstanceIndex:        meta.InstanceIndex,
@@ -1805,16 +1822,7 @@ func validateStrictManagedContainerLabels(containerID, backendName string, label
 	if labels[LabelManaged] != "true" {
 		return fmt.Errorf("managed container %s is missing the exact managed label", containerID)
 	}
-	// v0.13's legacy migration writer accidentally omitted the backend,
-	// provider, and callback fields from the stack generation it created. The
-	// strict inventory must surface those containers to the cross-journal cohort
-	// verifier rather than dropping or rejecting them one at a time: only a
-	// complete exact `-prev` rollback cohort plus the matching active release can
-	// supply the missing authority. This narrow label shape grants no authority
-	// by itself; every unexplained or stack-only instance is rejected by
-	// verifyStorageIdentityInitializationEvidence.
-	v013MigrationStack := isV013MigrationGeneratedStackLabels(labels)
-	if got := labels[LabelBackendName]; got != backendName && !v013MigrationStack {
+	if got := labels[LabelBackendName]; got != backendName {
 		return fmt.Errorf(
 			"managed container %s belongs to backend %q, expected exact backend %q",
 			containerID, got, backendName,
@@ -1822,6 +1830,14 @@ func validateStrictManagedContainerLabels(containerID, backendName string, label
 	}
 	if leaseUUID := labels[LabelLeaseUUID]; !backend.IsCanonicalLeaseUUID(leaseUUID) {
 		return fmt.Errorf("managed container %s has invalid lease identity %q", containerID, leaseUUID)
+	}
+	if labels[LabelServiceName] == "" {
+		return fmt.Errorf(
+			"%w: managed container %s has no %s label; use the documented stopped-upgrade preflight and remove or migrate this workload with the prior release",
+			ErrPreStackWorkloadUnsupported,
+			containerID,
+			LabelServiceName,
+		)
 	}
 	for _, required := range []struct {
 		label       string
@@ -1834,9 +1850,6 @@ func validateStrictManagedContainerLabels(containerID, backendName string, label
 		if labels[required.label] == "" {
 			return fmt.Errorf("managed container %s has an empty %s label", containerID, required.description)
 		}
-	}
-	if v013MigrationStack {
-		return nil
 	}
 	for _, required := range []struct {
 		label       string
@@ -1854,22 +1867,18 @@ func validateStrictManagedContainerLabels(containerID, backendName string, label
 	); err != nil {
 		return fmt.Errorf("managed container %s has invalid callback identity: %w", containerID, err)
 	}
-	if maintenanceID := shared.MaintenanceID(labels[LabelMaintenanceID]); maintenanceID != "" && !maintenanceID.Valid() {
-		return fmt.Errorf("managed container %s has invalid maintenance ID %q", containerID, maintenanceID)
+	if _, err := parseContainerMaintenanceID(labels[LabelMaintenanceID]); err != nil {
+		return fmt.Errorf("managed container %s has invalid maintenance ID %q: %w",
+			containerID, labels[LabelMaintenanceID], err)
 	}
 	return nil
 }
 
-// isV013MigrationGeneratedStackLabels recognizes the exact authority omission
-// in v0.13's executeLegacyMigration buildComposeProject call. All four fields
-// were omitted together; accepting a partial omission would turn corruption or
-// a hand-edited label set into compatibility authority.
-func isV013MigrationGeneratedStackLabels(labels map[string]string) bool {
-	return labels[LabelServiceName] == manifest.DefaultServiceName &&
-		labels[LabelBackendName] == "" &&
-		labels[LabelProviderUUID] == "" &&
-		labels[LabelCallbackURL] == "" &&
-		labels[LabelLifecycleCallbackURL] == ""
+func parseContainerMaintenanceID(raw string) (shared.MaintenanceID, error) {
+	if raw == "" {
+		return shared.MaintenanceID{}, nil
+	}
+	return maintenanceid.Parse(raw)
 }
 
 // TenantNetworkName returns a deterministic network name for a tenant address.
@@ -2013,21 +2022,26 @@ func (b *Backend) tenantNetworkMu(tenant string) *sync.Mutex {
 	return &b.tenantNetworkStripes[h.Sum32()%tenantNetworkStripeCount]
 }
 
-// ensureTenantNetwork wraps DockerClient.EnsureTenantNetwork with the
-// per-tenant mutex so the returned network ID cannot be removed by a
-// concurrent deprovision before the caller attaches a container to it.
-func (b *Backend) ensureTenantNetwork(ctx context.Context, tenant string) (string, error) {
+func (b *Backend) ensureTenantNetworkWith(mutations *storageMutations, ctx context.Context, tenant string) error {
 	mu := b.tenantNetworkMu(tenant)
 	mu.Lock()
 	defer mu.Unlock()
-	return b.mutationAdapter().ensureTenantNetwork(ctx, tenant)
+	_, err := mutations.ensureTenantNetwork(ctx, tenant)
+	return err
 }
 
-// releaseTenantNetwork removes the tenant network iff no other lease in
-// b.provisions still references the tenant. The caller MUST have already
-// removed its own provision entry from b.provisions before calling this —
-// otherwise its own entry would veto removal.
-func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error {
+// removeOrphanedTenantNetworkUsing consumes a tenant selected by the fixed
+// managed-network sweep and revalidates it under the same stripe used by
+// EnsureTenantNetwork. No caller-retained service can invoke removeNetwork or
+// select an arbitrary tenant.
+func (b *Backend) removeOrphanedTenantNetworkUsing(
+	ctx context.Context,
+	tenant string,
+	removeNetwork backgroundTenantNetworkRemove,
+) error {
+	if removeNetwork == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
 	mu := b.tenantNetworkMu(tenant)
 	mu.Lock()
 	defer mu.Unlock()
@@ -2041,7 +2055,7 @@ func (b *Backend) releaseTenantNetwork(ctx context.Context, tenant string) error
 	}
 	b.provisionsMu.RUnlock()
 
-	return b.mutationAdapter().removeTenantNetworkIfEmpty(ctx, tenant)
+	return removeNetwork(ctx, tenant)
 }
 
 // HealthStatus represents the health check status of a Docker container.

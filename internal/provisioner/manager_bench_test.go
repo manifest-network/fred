@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 )
@@ -41,6 +42,12 @@ func (m *mockBenchBackend) GetInfo(ctx context.Context, leaseUUID string) (*back
 func (m *mockBenchBackend) Deprovision(ctx context.Context, leaseUUID string) error { return nil }
 func (m *mockBenchBackend) ListProvisions(ctx context.Context) ([]backend.ProvisionInfo, error) {
 	return nil, nil
+}
+func (m *mockBenchBackend) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]backend.ProvisionInfo, backendidentity.ID, error) {
+	rows, err := m.ListProvisions(ctx)
+	return rows, testBackendStorageID(m.name), err
 }
 func (m *mockBenchBackend) LookupProvisions(ctx context.Context, uuids []string) ([]backend.ProvisionInfo, error) {
 	return nil, nil
@@ -71,6 +78,12 @@ func (m *mockBenchBackend) GetLoadStats(_ context.Context) (*backend.LoadStats, 
 
 func (m *mockBenchBackend) ListRetentions(_ context.Context) ([]backend.RetainedLease, error) {
 	return nil, nil
+}
+func (m *mockBenchBackend) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]backend.RetainedLease, backendidentity.ID, error) {
+	rows, err := m.ListRetentions(ctx)
+	return rows, testBackendStorageID(m.name), err
 }
 
 // BenchmarkWatermill_Publish benchmarks Watermill message publishing.
@@ -212,8 +225,7 @@ func TestManager_HighThroughput(t *testing.T) {
 	}
 
 	mgr, err := newTestManager(t, ManagerConfig{
-		ProviderUUID:    "provider-uuid",
-		CallbackBaseURL: "http://localhost:8080",
+		ProviderUUID: "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 
@@ -306,8 +318,7 @@ func TestManager_BurstTraffic(t *testing.T) {
 	}
 
 	mgr, err := newTestManager(t, ManagerConfig{
-		ProviderUUID:    "provider-uuid",
-		CallbackBaseURL: "http://localhost:8080",
+		ProviderUUID: "provider-uuid",
 	}, router, mockChain)
 	require.NoError(t, err)
 

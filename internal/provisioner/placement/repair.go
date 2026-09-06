@@ -191,8 +191,8 @@ func newRepairRecord(leaseUUID string, p Placement) RepairRecord {
 
 // AttemptRepair holds an exclusive bbolt lock on an existing placement
 // database. Opening it performs only read transactions; the only exposed
-// mutation is Refuse, which delegates to Store.RefuseOperation for an opaque
-// candidate returned by MatchAttempt.
+// mutation is Refuse, which consumes an opaque exact claimed generation
+// returned by MatchAttempt.
 type AttemptRepair struct {
 	store                 *Store
 	sourceInfo            os.FileInfo
@@ -1470,6 +1470,9 @@ func (repair *AttemptRepair) refuseAttemptContextLocked(
 					return err
 				}
 			} else if err := capabilities.Delete([]byte(candidate.leaseUUID)); err != nil {
+				return err
+			}
+			if err := reclaimDetachedMaintenanceCommandsForLeaseTx(tx, candidate.leaseUUID); err != nil {
 				return err
 			}
 			return validateBoundRepairContext(ctx, evidence.context, evidence.notAfter)

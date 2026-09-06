@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sony/gobreaker"
 
@@ -25,7 +24,9 @@ import (
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/httpurl"
+	"github.com/manifest-network/fred/internal/maintenanceid"
 	"github.com/manifest-network/fred/internal/util"
+	"github.com/manifest-network/fred/internal/uuidv4"
 )
 
 // Backend defines the interface for interacting with a provisioning backend.
@@ -313,11 +314,12 @@ type ProvisionInfo struct {
 	// for a soft-deleted (Status=retained) lease. Zero for live provisions.
 	RetainedUntil time.Time `json:"retained_until,omitempty"`
 	// Tenant is the owning tenant. It crosses the backend→providerd hop (an
-	// HMAC-signed, trusted internal hop, like RestoreRequest.Tenant) so the
-	// closed-lease authz fallback (when the chain has pruned the lease) can bind
-	// a retained record to its owner. It MUST NOT be copied into tenant-facing
-	// API responses (LeaseStatusResponse/LeaseProvisionResponse), which would
-	// leak one tenant's address to another.
+	// HMAC-signed, trusted internal hop, like RestoreRequest.Tenant) so a complete
+	// identity-bearing inventory can bind a live placement's runtime maintenance
+	// principal, and so the closed-lease authz fallback (when the chain has
+	// pruned the lease) can bind a retained record to its owner. It MUST NOT be
+	// copied into tenant-facing API responses (LeaseStatusResponse/
+	// LeaseProvisionResponse), which would leak one tenant's address to another.
 	Tenant string `json:"tenant,omitempty"`
 
 	// LifecycleGeneration reports only the class and, for current typed
@@ -771,9 +773,8 @@ func parseCanonicalCallbackQueryID(rawValue, parameter string, invalidURL error)
 	if err != nil {
 		return "", fmt.Errorf("%w: decode %s: %w", invalidURL, parameter, err)
 	}
-	parsedID, err := uuid.Parse(decodedValue)
-	if err != nil || parsedID.String() != decodedValue || parsedID.Version() != uuid.Version(4) ||
-		parsedID.Variant() != uuid.RFC4122 {
+	parsedID, err := uuidv4.Parse(decodedValue, invalidURL)
+	if err != nil {
 		return "", fmt.Errorf("%w: %s must be a canonical UUIDv4", invalidURL, parameter)
 	}
 	return parsedID.String(), nil
@@ -781,16 +782,17 @@ func parseCanonicalCallbackQueryID(rawValue, parameter string, invalidURL error)
 
 // RestartRequest contains the data needed to restart a lease's containers.
 type RestartRequest struct {
-	LeaseUUID   string `json:"lease_uuid"`
-	CallbackURL string `json:"callback_url"`
+	LeaseUUID     string           `json:"lease_uuid"`
+	MaintenanceID maintenanceid.ID `json:"maintenance_id"`
+	CallbackURL   string           `json:"callback_url"`
 }
 
 // UpdateRequest contains the data needed to update a lease to a new manifest.
 type UpdateRequest struct {
-	LeaseUUID   string `json:"lease_uuid"`
-	CallbackURL string `json:"callback_url"`
-	Payload     []byte `json:"payload"`
-	PayloadHash string `json:"payload_hash,omitempty"`
+	LeaseUUID     string           `json:"lease_uuid"`
+	MaintenanceID maintenanceid.ID `json:"maintenance_id"`
+	CallbackURL   string           `json:"callback_url"`
+	Payload       []byte           `json:"payload"`
 }
 
 // RestoreRequest contains the data needed to restore a soft-deleted lease's
@@ -909,7 +911,7 @@ var ErrValidation = errors.New("validation error")
 //
 // Deliberately NOT wrapping ErrValidation. ErrValidation is the reconciler's
 // PERMANENT branch — it rejects a PENDING lease and CLOSES an ACTIVE one
-// on-chain (handleProvisionError) — and a body fred could not parse is no
+// on-chain (handleProvisionResult) — and a body fred could not parse is no
 // evidence that the tenant is at fault.
 //
 // Scope, stated precisely (ENG-739): this is an operator-introduced
@@ -1050,6 +1052,24 @@ var (
 	// identity header. Callers may refuse the exact write-ahead attempt.
 	ErrBackendUpgradeRequired = errors.New("backend must be upgraded before side effects are enabled")
 )
+
+// backendUpgradeRequiredError is private proof that the identity-bound client
+// itself observed the upgraded-only route missing before any legacy handler
+// could decode or execute the request. The public sentinel remains available
+// for compatibility, but an arbitrary transport error that merely wraps that
+// sentinel cannot manufacture no-dispatch evidence.
+type backendUpgradeRequiredError struct{ backend string }
+
+func (err *backendUpgradeRequiredError) Error() string {
+	return fmt.Sprintf("%s: %q", ErrBackendUpgradeRequired, err.backend)
+}
+
+func (*backendUpgradeRequiredError) Unwrap() error { return ErrBackendUpgradeRequired }
+
+func isBackendUpgradeRequiredProof(err error) bool {
+	var proof *backendUpgradeRequiredError
+	return errors.As(err, &proof)
+}
 
 // backendStorageIdentityMissingResponseError retains the response class that
 // accompanied a missing identity header. ErrBackendStorageIdentityMissing
@@ -1507,7 +1527,7 @@ func (c *HTTPClient) do(req *http.Request) (*http.Response, error) {
 		if identityContext.mode == requestIdentitySideEffect &&
 			resp.StatusCode == http.StatusNotFound {
 			discardAndCloseResponse(resp)
-			return nil, fmt.Errorf("%w: %q", ErrBackendUpgradeRequired, c.name)
+			return nil, &backendUpgradeRequiredError{backend: c.name}
 		}
 		missingErr := &backendStorageIdentityMissingResponseError{
 			backend:    c.name,
@@ -1543,8 +1563,18 @@ func discardAndCloseResponse(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	drainResponseBody(resp.Body)
 	_ = resp.Body.Close()
+}
+
+// maxResponseDrainBytes bounds the best-effort work spent making a backend
+// connection reusable after the caller has all protocol-relevant bytes. A
+// backend response is an untrusted stream: draining it to EOF would otherwise
+// let a peer keep one worker reading arbitrary data until the request deadline.
+const maxResponseDrainBytes int64 = 64 << 10
+
+func drainResponseBody(body io.Reader) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxResponseDrainBytes))
 }
 
 func responseStorageIdentity(resp *http.Response) (backendidentity.ID, error) {
@@ -1582,12 +1612,12 @@ func (c *HTTPClient) recordMetrics(operation string, start time.Time, err error)
 }
 
 // readErrorBodyBytes reads up to 4 KiB from an HTTP response body for
-// inclusion in error messages. Remaining bytes are drained to allow
-// connection reuse. If reading fails, a placeholder message is returned.
+// inclusion in error messages. A bounded remainder is drained for connection
+// reuse without trusting the backend to terminate the stream. If reading
+// fails, a placeholder message is returned.
 func readErrorBodyBytes(resp *http.Response) []byte {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	// Drain any remaining bytes so the underlying connection can be reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
+	drainResponseBody(resp.Body)
 	if err != nil {
 		return []byte(fmt.Sprintf("<body read error: %v>", err))
 	}
@@ -1600,13 +1630,12 @@ func readErrorBody(resp *http.Response) string {
 }
 
 // decodeJSONLimited reads at most limit bytes from r, then JSON-unmarshals into dst.
-// Returns ErrResponseTooLarge if the body exceeds limit. Remaining bytes are drained
-// to allow connection reuse.
+// Returns ErrResponseTooLarge if the body exceeds limit. A bounded remainder
+// is drained for connection reuse without trusting the backend to reach EOF.
 func decodeJSONLimited(r io.ReadCloser, limit int64, dst any) error {
 	lr := io.LimitReader(r, limit+1)
 	body, err := io.ReadAll(lr)
-	// Drain any remaining bytes so the underlying connection can be reused.
-	_, _ = io.Copy(io.Discard, r)
+	drainResponseBody(r)
 	if err != nil {
 		return fmt.Errorf("read response body: %w", err)
 	}
@@ -1832,29 +1861,50 @@ func doGet[T any](c *HTTPClient, ctx context.Context, metric, url string, maxByt
 	return v, nil
 }
 
-// Provision sends a provision request to the backend.
-func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err error) {
+// Provision sends a provision request to the backend while preserving the
+// legacy Backend surface. Placement settlement uses InvokeProvision so causal
+// transport evidence is not flattened back into an arbitrary error tree.
+func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) error {
+	return c.provisionCall(ctx, req).Err()
+}
+
+// provisionCall executes one request and mints its causal outcome at the exact
+// transport branch that observed it.
+func (c *HTTPClient) provisionCall(
+	ctx context.Context,
+	req ProvisionRequest,
+) (outcome ProvisionCallOutcome) {
 	start := time.Now()
-	defer func() { c.recordMetrics("provision", start, err) }()
+	defer func() { c.recordMetrics("provision", start, outcome.Err()) }()
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal provision request: %w", err)
+		return notDispatchedProvisionCall(fmt.Errorf("marshal provision request: %w", err))
 	}
 
+	var observed ProvisionCallOutcome
 	_, cbErr := c.cb.Execute(func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/provision", bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			callErr := fmt.Errorf("create request: %w", err)
+			observed = notDispatchedProvisionCall(callErr)
+			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			observed = notDispatchedProvisionCall(err)
 			return nil, err
 		}
 
 		resp, err := c.do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("provision request failed: %w", err)
+			callErr := fmt.Errorf("provision request failed: %w", err)
+			if isBackendUpgradeRequiredProof(err) {
+				observed = notDispatchedProvisionCall(callErr)
+			} else {
+				observed = ambiguousProvisionCall(callErr)
+			}
+			return nil, callErr
 		}
 		defer func() { _ = resp.Body.Close() }()
 
@@ -1864,27 +1914,50 @@ func (c *HTTPClient) Provision(ctx context.Context, req ProvisionRequest) (err e
 			switch resp.StatusCode {
 			case http.StatusBadRequest:
 				// 400: validation error — permanent, won't succeed on retry.
-				return nil, c.parseValidationError(readErrorBodyBytes(resp), "provision")
+				callErr := c.parseValidationError(readErrorBodyBytes(resp), "provision")
+				if errors.Is(callErr, ErrValidation) {
+					observed = refusedProvisionCall(callErr, ProvisionRefusalValidation)
+				} else {
+					observed = ambiguousProvisionCall(callErr)
+				}
+				return nil, callErr
 			case http.StatusConflict:
 				// 409: the backend reports a conflict. Callers must validate it
 				// against authoritative inventory before treating it as ownership.
-				return nil, fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
+				callErr := fmt.Errorf("%w: %s", ErrAlreadyProvisioned, readErrorBody(resp))
+				observed = ambiguousProvisionCall(callErr)
+				return nil, callErr
 			case http.StatusServiceUnavailable:
 				// Only the contract envelope and shared code authorize refusal
 				// settlement. A bare/proxy 503 remains ambiguous.
-				return nil, c.parseCapacityError(readErrorBodyBytes(resp), "provision")
+				callErr := c.parseCapacityError(readErrorBodyBytes(resp), "provision")
+				if errors.Is(callErr, ErrCapacityRefused) {
+					observed = refusedProvisionCall(callErr, ProvisionRefusalCapacity)
+				} else {
+					observed = ambiguousProvisionCall(callErr)
+				}
+				return nil, callErr
 			default:
-				return nil, fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+				callErr := fmt.Errorf("provision failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+				observed = ambiguousProvisionCall(callErr)
+				return nil, callErr
 			}
 		}
 
+		observed = acceptedProvisionCall()
 		return nil, nil
 	})
 
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
+	if observed.Valid() {
+		return observed
 	}
-	return cbErr
+	if isCircuitBreakerError(cbErr) {
+		return notDispatchedProvisionCall(ErrCircuitOpen)
+	}
+	if cbErr != nil {
+		return ambiguousProvisionCall(cbErr)
+	}
+	return ambiguousProvisionCall(errors.New("provision transport returned no causal outcome"))
 }
 
 // GetInfo retrieves lease information including connection details.
@@ -2136,138 +2209,184 @@ func (c *HTTPClient) GetLogs(ctx context.Context, leaseUUID string, tail int) (m
 	return *result, nil
 }
 
-// Restart sends a restart request to the backend.
-func (c *HTTPClient) Restart(ctx context.Context, req RestartRequest) (err error) {
-	start := time.Now()
-	defer func() { c.recordMetrics("restart", start, err) }()
-
-	body, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("marshal restart request: %w", err)
-	}
-
-	_, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restart", bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
-			return nil, err
-		}
-
-		resp, err := c.do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("restart request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		switch resp.StatusCode {
-		case http.StatusAccepted:
-			return nil, nil
-		case http.StatusNotFound:
-			return nil, ErrNotProvisioned
-		case http.StatusConflict:
-			return nil, ErrInvalidState
-		default:
-			return nil, fmt.Errorf("restart failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
-		}
-	})
-
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
-	}
-	return cbErr
+// Restart preserves the legacy Backend surface. Placement consumes InvokeRestart
+// so a verified refusal cannot be confused with an arbitrary wrapped error.
+func (c *HTTPClient) Restart(ctx context.Context, req RestartRequest) error {
+	return c.restartCall(ctx, req).Err()
 }
 
-// Update sends an update request to the backend.
-func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) (err error) {
+func (c *HTTPClient) restartCall(
+	ctx context.Context,
+	req RestartRequest,
+) MaintenanceCallOutcome {
+	return executeHTTPMaintenanceCall(c, ctx, "restart", req)
+}
+
+// Update preserves the legacy Backend surface. Placement consumes InvokeUpdate.
+func (c *HTTPClient) Update(ctx context.Context, req UpdateRequest) error {
+	return c.updateCall(ctx, req).Err()
+}
+
+func (c *HTTPClient) updateCall(
+	ctx context.Context,
+	req UpdateRequest,
+) MaintenanceCallOutcome {
+	return executeHTTPMaintenanceCall(c, ctx, "update", req)
+}
+
+func executeHTTPMaintenanceCall[T RestartRequest | UpdateRequest](
+	c *HTTPClient,
+	ctx context.Context,
+	operation string,
+	req T,
+) (outcome MaintenanceCallOutcome) {
 	start := time.Now()
-	defer func() { c.recordMetrics("update", start, err) }()
+	defer func() { c.recordMetrics(operation, start, outcome.Err()) }()
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal update request: %w", err)
+		return notDispatchedMaintenanceCall(fmt.Errorf("marshal %s request: %w", operation, err))
 	}
-
+	var observed MaintenanceCallOutcome
 	_, cbErr := c.cb.Execute(func() (any, error) {
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/update", bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(
+			ctx, http.MethodPost, c.baseURL+"/"+operation, bytes.NewReader(body),
+		)
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			callErr := fmt.Errorf("create request: %w", err)
+			observed = notDispatchedMaintenanceCall(callErr)
+			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			observed = notDispatchedMaintenanceCall(err)
 			return nil, err
 		}
 
 		resp, err := c.do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("update request failed: %w", err)
+			callErr := fmt.Errorf("%s request failed: %w", operation, err)
+			if isBackendUpgradeRequiredProof(err) {
+				observed = notDispatchedMaintenanceCall(callErr)
+			} else {
+				observed = ambiguousMaintenanceCall(callErr)
+			}
+			return nil, callErr
 		}
 		defer func() { _ = resp.Body.Close() }()
 
 		switch resp.StatusCode {
 		case http.StatusAccepted:
+			observed = acceptedMaintenanceCall()
 			return nil, nil
 		case http.StatusBadRequest:
-			return nil, c.parseValidationError(readErrorBodyBytes(resp), "update")
+			callErr := c.parseValidationError(readErrorBodyBytes(resp), operation)
+			if errors.Is(callErr, ErrValidation) {
+				observed = refusedMaintenanceCall(callErr, MaintenanceRefusalValidation)
+			} else {
+				observed = ambiguousMaintenanceCall(callErr)
+			}
+			return nil, callErr
 		case http.StatusNotFound:
+			observed = refusedMaintenanceCall(ErrNotProvisioned, MaintenanceRefusalNotProvisioned)
 			return nil, ErrNotProvisioned
 		case http.StatusConflict:
+			observed = refusedMaintenanceCall(ErrInvalidState, MaintenanceRefusalInvalidState)
 			return nil, ErrInvalidState
+		case http.StatusServiceUnavailable:
+			callErr := c.parseCapacityError(readErrorBodyBytes(resp), operation)
+			if errors.Is(callErr, ErrCapacityRefused) {
+				observed = refusedMaintenanceCall(callErr, MaintenanceRefusalCapacity)
+			} else {
+				observed = ambiguousMaintenanceCall(callErr)
+			}
+			return nil, callErr
 		default:
-			return nil, fmt.Errorf("update failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+			callErr := fmt.Errorf("%s failed with status %d: %s", operation, resp.StatusCode, readErrorBody(resp))
+			observed = ambiguousMaintenanceCall(callErr)
+			return nil, callErr
 		}
 	})
 
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
+	if observed.Valid() {
+		return observed
 	}
-	return cbErr
+	if isCircuitBreakerError(cbErr) {
+		return notDispatchedMaintenanceCall(ErrCircuitOpen)
+	}
+	if cbErr != nil {
+		return ambiguousMaintenanceCall(cbErr)
+	}
+	return ambiguousMaintenanceCall(fmt.Errorf("%s transport returned no causal outcome", operation))
 }
 
-// Restore sends a restore request to the backend.
-func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error) {
+// Restore preserves the legacy Backend surface. Placement consumes InvokeRestore
+// so only transport-minted causal evidence reaches durable settlement.
+func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) error {
+	return c.restoreCall(ctx, req).Err()
+}
+
+// restoreCall executes one restore request and mints its causal outcome at the
+// exact transport branch that observed it.
+func (c *HTTPClient) restoreCall(
+	ctx context.Context,
+	req RestoreRequest,
+) (outcome RestoreCallOutcome) {
 	start := time.Now()
-	defer func() { c.recordMetrics("restore", start, err) }()
+	defer func() { c.recordMetrics("restore", start, outcome.Err()) }()
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal restore request: %w", err)
+		return notDispatchedRestoreCall(fmt.Errorf("marshal restore request: %w", err))
 	}
 
+	var observed RestoreCallOutcome
 	_, cbErr := c.cb.Execute(func() (any, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/restore", bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			callErr := fmt.Errorf("create request: %w", err)
+			observed = notDispatchedRestoreCall(callErr)
+			return nil, callErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		if err := c.prepareRequest(httpReq, body, requestIdentitySideEffect); err != nil {
+			observed = notDispatchedRestoreCall(err)
 			return nil, err
 		}
 
 		resp, err := c.do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("restore request failed: %w", err)
+			callErr := fmt.Errorf("restore request failed: %w", err)
+			if isBackendUpgradeRequiredProof(err) {
+				observed = notDispatchedRestoreCall(callErr)
+			} else {
+				observed = ambiguousRestoreCall(callErr)
+			}
+			return nil, callErr
 		}
 		defer func() { _ = resp.Body.Close() }()
 
 		switch resp.StatusCode {
 		case http.StatusAccepted:
+			observed = acceptedRestoreCall()
 			return nil, nil
 		case http.StatusUnprocessableEntity:
 			// 422 is overloaded: bare 422 = ErrNotRetained; 422 with
 			// code="demote_exceeds_tier" = ErrDemoteDataExceedsTier.
 			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
 			if perr != nil {
+				observed = ambiguousRestoreCall(perr)
 				return nil, perr
 			}
 			switch code {
 			case "":
 				// No discriminator: the documented bare 422.
+				observed = refusedRestoreCall(ErrNotRetained, RestoreRefusalNotRetained)
 				return nil, ErrNotRetained
 			case CodeDemoteExceedsTier:
-				return nil, detailOr(ErrDemoteDataExceedsTier, msg)
+				callErr := detailOr(ErrDemoteDataExceedsTier, msg)
+				observed = refusedRestoreCall(callErr, RestoreRefusalDemoteDataExceedsTier)
+				return nil, callErr
 			default:
 				// A code fred does not know is evidence AGAINST "no retained
 				// data", not for it — yet this used to fall through to
@@ -2275,9 +2394,13 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 				// data found for that lease". That discarded the message the
 				// backend was obliged to curate and replaced it with a positive
 				// claim about the tenant's data that its own body contradicted.
-				// Relay the backend's words at the status it chose instead.
+				// Preserve the declared detail for operator diagnostics, but keep the
+				// outcome ambiguous: an unknown protocol verdict cannot authorize
+				// durable settlement or a tenant-facing lease-state claim.
 				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
-				return nil, detailOr(ErrRestoreRefused, msg)
+				callErr := detailOr(ErrRestoreRefused, msg)
+				observed = ambiguousRestoreCall(callErr)
+				return nil, callErr
 			}
 		case http.StatusConflict:
 			// Restore overloads 409 for two sentinels: the backend tags the
@@ -2287,42 +2410,65 @@ func (c *HTTPClient) Restore(ctx context.Context, req RestoreRequest) (err error
 			// ErrInvalidState (wrong lease state for restore).
 			code, msg, perr := c.parseErrorCode(readErrorBodyBytes(resp), "restore")
 			if perr != nil {
+				observed = ambiguousRestoreCall(perr)
 				return nil, perr
 			}
 			if code == CodeAlreadyProvisioned {
-				return nil, detailOr(ErrAlreadyProvisioned, msg)
+				callErr := detailOr(ErrAlreadyProvisioned, msg)
+				observed = ambiguousRestoreCall(callErr)
+				return nil, callErr
 			}
-			// An unrecognized code is left on ErrInvalidState deliberately,
-			// unlike the 422 above. The asymmetry is the 404 remap: for 422 fred
-			// CHANGES the status class and asserts that no retained data exists,
-			// which an unknown code contradicts. Here the tenant gets 409 — the
-			// status the backend itself chose, and RFC 9110's 409 already means
-			// "conflict with the current state of the resource", so fred is
-			// restating the backend's verdict rather than inventing one. The
-			// message is carried for operators either way.
+			// An unrecognized code keeps ErrInvalidState only as an operator-facing
+			// diagnostic. Its causal outcome remains ambiguous, so higher layers
+			// cannot turn this public sentinel into a tenant-facing state claim.
 			if code != "" {
 				c.noteUnrecognizedErrorCode("restore", resp.StatusCode, code)
+				callErr := detailOr(ErrInvalidState, msg)
+				observed = ambiguousRestoreCall(callErr)
+				return nil, callErr
 			}
-			return nil, detailOr(ErrInvalidState, msg)
+			callErr := detailOr(ErrInvalidState, msg)
+			observed = refusedRestoreCall(callErr, RestoreRefusalInvalidState)
+			return nil, callErr
 		case http.StatusServiceUnavailable:
 			// Match Provision: only a contract-conforming coded refusal may settle.
-			return nil, c.parseCapacityError(readErrorBodyBytes(resp), "restore")
+			callErr := c.parseCapacityError(readErrorBodyBytes(resp), "restore")
+			if errors.Is(callErr, ErrCapacityRefused) {
+				observed = refusedRestoreCall(callErr, RestoreRefusalCapacity)
+			} else {
+				observed = ambiguousRestoreCall(callErr)
+			}
+			return nil, callErr
 		case http.StatusBadRequest:
 			// Reconstruct the validation sub-category sentinel from the
 			// validation_code body field (matching Provision/Update). Restore's
 			// prelude returns ErrUnknownSKU/ErrInvalidManifest/ErrImageNotAllowed
 			// via GetSKUProfile/ValidateImage; the returned error still wraps
 			// ErrValidation so the breaker allowlist and 400 mapping hold.
-			return nil, c.parseValidationError(readErrorBodyBytes(resp), "restore")
+			callErr := c.parseValidationError(readErrorBodyBytes(resp), "restore")
+			if errors.Is(callErr, ErrValidation) {
+				observed = refusedRestoreCall(callErr, RestoreRefusalValidation)
+			} else {
+				observed = ambiguousRestoreCall(callErr)
+			}
+			return nil, callErr
 		default:
-			return nil, fmt.Errorf("restore failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+			callErr := fmt.Errorf("restore failed with status %d: %s", resp.StatusCode, readErrorBody(resp))
+			observed = ambiguousRestoreCall(callErr)
+			return nil, callErr
 		}
 	})
 
-	if isCircuitBreakerError(cbErr) {
-		return ErrCircuitOpen
+	if observed.Valid() {
+		return observed
 	}
-	return cbErr
+	if isCircuitBreakerError(cbErr) {
+		return notDispatchedRestoreCall(ErrCircuitOpen)
+	}
+	if cbErr != nil {
+		return ambiguousRestoreCall(cbErr)
+	}
+	return ambiguousRestoreCall(errors.New("restore transport returned no causal outcome"))
 }
 
 // GetReleases retrieves release history for a lease.

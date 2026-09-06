@@ -3,7 +3,6 @@ package docker
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -28,19 +27,14 @@ func TestSettleCommittedOperationBeforeCloseRequiresExactOperationLineage(t *tes
 
 			spec := dockerOperationIntentSpec(t, b.storageIdentity)
 			spec.Kind = kind
+			currentOperationID := mustTestOperationIDFromCallbackURL(t, spec.CallbackURL)
 			if kind == shared.OperationIntentRestore {
 				const sourceLeaseUUID = "123e4567-e89b-42d3-a456-426614174001"
 				spec.SourceLeaseUUID = sourceLeaseUUID
 				spec.SourceGeneration = 1
 				stack, err := manifest.ParsePayload(spec.Manifest)
 				require.NoError(t, err)
-				retentions, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-					DBPath: filepath.Join(dir, "retentions.db"),
-				})
-				require.NoError(t, err)
-				t.Cleanup(func() { require.NoError(t, retentions.Close()) })
-				b.retentionStore = retentions
-				require.NoError(t, retentions.Put(shared.RetentionEntry{
+				require.NoError(t, putRetentionForTest(t, stores.retentions, shared.RetentionEntry{
 					OriginalLeaseUUID: sourceLeaseUUID,
 					Tenant:            spec.Tenant,
 					ProviderUUID:      spec.ProviderUUID,
@@ -52,31 +46,12 @@ func TestSettleCommittedOperationBeforeCloseRequiresExactOperationLineage(t *tes
 				}))
 			}
 
-			admission, err := stores.callbacks.BeginOperationIntent(spec)
-			require.NoError(t, err)
-			require.Equal(t, shared.OperationIntentAdmissionCreated, admission.Disposition)
-			if kind == shared.OperationIntentRestore {
-				claimed, claimErr := b.retentionStore.ClaimForRestoreWithAuthority(
-					spec.SourceLeaseUUID,
-					spec.LeaseUUID,
-					0,
-					spec.Items,
-					spec.ResourceProfiles,
-					admission.Claim.OperationID(),
-					spec.CallbackURL,
-					spec.LifecycleCallbackURL,
-				)
-				require.NoError(t, claimErr)
-				require.Equal(t, spec.SourceGeneration, claimed.Generation)
-			}
-
-			const olderOperationID = shared.OperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")
-			require.NotEqual(t, admission.Claim.OperationID(), olderOperationID)
+			olderOperationID := mustDockerOperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 			olderCallbackURL := strings.Replace(
-				spec.CallbackURL, admission.Claim.OperationID().String(), olderOperationID.String(), 1,
+				spec.CallbackURL, currentOperationID.String(), olderOperationID.String(), 1,
 			)
 			olderLifecycleCallbackURL := strings.Replace(
-				spec.LifecycleCallbackURL, admission.Claim.OperationID().String(), olderOperationID.String(), 1,
+				spec.LifecycleCallbackURL, currentOperationID.String(), olderOperationID.String(), 1,
 			)
 			olderAuthority, authorityErr := shared.NewReleaseRuntimeAuthority(
 				olderOperationID,
@@ -86,41 +61,45 @@ func TestSettleCommittedOperationBeforeCloseRequiresExactOperationLineage(t *tes
 				olderLifecycleCallbackURL,
 			)
 			require.NoError(t, authorityErr)
-			require.NoError(t, stores.releases.Append(spec.LeaseUUID, shared.Release{
-				Manifest:         spec.Manifest,
-				Image:            "stack",
-				OperationID:      olderOperationID,
-				Items:            spec.Items,
-				ResourceProfiles: spec.ResourceProfiles,
-				RuntimeAuthority: &olderAuthority,
-				Status:           "active",
-				CreatedAt:        time.Now(),
-			}))
+			seedProvisionReleaseForLeaseTest(t, stores.callbacks, stores.releases, stores.operations,
+				spec.LeaseUUID, shared.Release{
+					Manifest:         spec.Manifest,
+					Image:            "stack",
+					OperationID:      olderOperationID,
+					Items:            spec.Items,
+					ResourceProfiles: spec.ResourceProfiles,
+					RuntimeAuthority: &olderAuthority,
+					Status:           "active",
+					CreatedAt:        time.Now(),
+				})
+
+			admission := beginOperationIntentForSettlementTest(t, stores.operations, spec)
+			require.Equal(t, shared.OperationIntentAdmissionCreated, admission.Disposition())
+			operationClaim := createdDockerOperationClaim(t, admission)
+			require.NotEqual(t, operationClaim.OperationID(), olderOperationID)
+			if kind == shared.OperationIntentRestore {
+				restoreCandidate, claimErr := stores.restore.PrepareRestoreClaim(operationClaim)
+				require.NoError(t, claimErr)
+				claimedProof, claimErr := stores.restore.ClaimForRestore(restoreCandidate, 0)
+				require.NoError(t, claimErr)
+				require.Equal(t, spec.SourceGeneration, claimedProof.Entry().Generation)
+			}
 
 			require.NoError(t, b.settleCommittedOperationBeforeClose(spec.LeaseUUID))
-			intents, err := stores.callbacks.ListOperationIntents()
+			intents, err := stores.operations.ListOperationIntents()
 			require.NoError(t, err)
 			require.Len(t, intents, 1,
 				"same content from an older operation must not settle the current intent")
-			assert.Equal(t, admission.Claim.OperationID(), intents[0].OperationID())
+			assert.Equal(t, operationClaim.OperationID(), intents[0].OperationID())
 			pending, err := stores.callbacks.ListPending()
 			require.NoError(t, err)
 			assert.Empty(t, pending)
 
 			// The exact causal release proves that this operation crossed its commit
 			// boundary before Close reached the actor drain point.
-			require.NoError(t, stores.releases.AppendActive(spec.LeaseUUID, shared.Release{
-				Manifest:         spec.Manifest,
-				Image:            "stack",
-				OperationID:      admission.Claim.OperationID(),
-				Items:            spec.Items,
-				ResourceProfiles: spec.ResourceProfiles,
-				RuntimeAuthority: mustReleaseRuntimeAuthorityForIntent(t, admission.Claim),
-				Status:           "active",
-				CreatedAt:        time.Now(),
-			}))
+			commitOperationSuccessForTest(t, stores.operations, operationClaim)
 			require.NoError(t, b.settleCommittedOperationBeforeClose(spec.LeaseUUID))
-			intents, err = stores.callbacks.ListOperationIntents()
+			intents, err = stores.operations.ListOperationIntents()
 			require.NoError(t, err)
 			assert.Empty(t, intents)
 			pending, err = stores.callbacks.ListPending()
@@ -138,32 +117,23 @@ func TestSettleCommittedOperationBeforeMaintenanceFencesUnresolvedLineage(t *tes
 	t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
 
 	spec := dockerOperationIntentSpec(t, b.storageIdentity)
-	admission, err := stores.callbacks.BeginOperationIntent(spec)
-	require.NoError(t, err)
-	require.Equal(t, shared.OperationIntentAdmissionCreated, admission.Disposition)
+	admission := beginOperationIntentForSettlementTest(t, stores.operations, spec)
+	require.Equal(t, shared.OperationIntentAdmissionCreated, admission.Disposition())
+	operationClaim := createdDockerOperationClaim(t, admission)
 
-	err = b.settleCommittedOperationBeforeMaintenance(spec.LeaseUUID)
+	err := b.settleCommittedOperationBeforeMaintenance(spec.LeaseUUID)
 	require.ErrorIs(t, err, backend.ErrInvalidState)
-	intents, err := stores.callbacks.ListOperationIntents()
+	intents, err := stores.operations.ListOperationIntents()
 	require.NoError(t, err)
 	require.Len(t, intents, 1, "uncommitted operation must retain sole mutation authority")
 	pending, err := stores.callbacks.ListPending()
 	require.NoError(t, err)
 	assert.Empty(t, pending)
 
-	require.NoError(t, stores.releases.AppendActive(spec.LeaseUUID, shared.Release{
-		Manifest:         spec.Manifest,
-		Image:            "stack",
-		OperationID:      admission.Claim.OperationID(),
-		Items:            spec.Items,
-		ResourceProfiles: spec.ResourceProfiles,
-		RuntimeAuthority: mustReleaseRuntimeAuthorityForIntent(t, admission.Claim),
-		Status:           "active",
-		CreatedAt:        admission.Claim.CreatedAt(),
-	}))
+	commitOperationSuccessForTest(t, stores.operations, operationClaim)
 
 	require.NoError(t, b.settleCommittedOperationBeforeMaintenance(spec.LeaseUUID))
-	intents, err = stores.callbacks.ListOperationIntents()
+	intents, err = stores.operations.ListOperationIntents()
 	require.NoError(t, err)
 	assert.Empty(t, intents)
 	pending, err = stores.callbacks.ListPending()
@@ -178,37 +148,19 @@ func TestRecoverCommittedRestoreWithNoSurvivorsRetainsExactAuthority(t *testing.
 	const (
 		sourceLeaseUUID      = "0192f1a0-1111-7abc-8def-000000000501"
 		destinationLeaseUUID = "0192f1a0-2222-7abc-8def-000000000502"
-		operationID          = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 		providerUUID         = "22222222-2222-4222-8222-222222222222"
 	)
+	operationID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			return nil, nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
-	bindTestStorageIdentity(t, b, mock)
 	t.Cleanup(b.stopCancel)
 
-	retentions, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retentions.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, retentions.Close()) })
-	b.retentionStore = retentions
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "releases.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, releases.Close()) })
-	b.releaseStore = releases
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: b.cfg.CallbackDBPath,
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, callbacks.Close()) })
-	b.callbackStore = callbacks
-	b.operationIntents = callbacks
+	retentions := attachRetentionStore(t, b)
+	callbacks := b.callbackStore
 
 	sourceItems := []backend.LeaseItem{{
 		SKU: "docker-small", ServiceName: manifest.DefaultServiceName, Quantity: 2,
@@ -222,7 +174,7 @@ func TestRecoverCommittedRestoreWithNoSurvivorsRetainsExactAuthority(t *testing.
 	stack := restoreStackManifest()
 	manifestBytes, err := json.Marshal(stack)
 	require.NoError(t, err)
-	require.NoError(t, retentions.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, retentions, shared.RetentionEntry{
 		OriginalLeaseUUID: sourceLeaseUUID,
 		Tenant:            "tenant-a",
 		ProviderUUID:      providerUUID,
@@ -235,13 +187,11 @@ func TestRecoverCommittedRestoreWithNoSurvivorsRetainsExactAuthority(t *testing.
 	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + operationID.String()
 	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
 	require.NoError(t, err)
-	admission, err := callbacks.BeginOperationIntent(shared.OperationIntentSpec{
+	spec := shared.OperationIntentSpec{
 		Kind:                 shared.OperationIntentRestore,
 		LeaseUUID:            destinationLeaseUUID,
 		CallbackURL:          callbackURL,
 		LifecycleCallbackURL: lifecycleCallbackURL,
-		Backend:              b.Name(),
-		BackendStorageID:     b.storageIdentity,
 		Tenant:               "tenant-a",
 		ProviderUUID:         providerUUID,
 		Items:                destinationItems,
@@ -250,50 +200,27 @@ func TestRecoverCommittedRestoreWithNoSurvivorsRetainsExactAuthority(t *testing.
 		Manifest:             manifestBytes,
 		SourceLeaseUUID:      sourceLeaseUUID,
 		SourceGeneration:     1,
-	})
+	}
+	admission := beginOperationIntentForSettlementTest(t, b.operationSettlement, spec)
+	operationClaim := createdDockerOperationClaim(t, admission)
+	require.Equal(t, operationID, operationClaim.OperationID())
+	restoreCandidate, err := b.restoreSettlement.PrepareRestoreClaim(operationClaim)
 	require.NoError(t, err)
-	require.Equal(t, operationID, admission.Claim.OperationID())
-	claimed, err := retentions.ClaimForRestoreWithAuthority(
-		sourceLeaseUUID,
-		destinationLeaseUUID,
-		0,
-		destinationItems,
-		destinationProfiles,
-		admission.Claim.OperationID(),
-		callbackURL,
-		lifecycleCallbackURL,
-	)
+	claimedProof, err := b.restoreSettlement.ClaimForRestore(restoreCandidate, 0)
 	require.NoError(t, err)
+	claimed := claimedProof.Entry()
 	require.Equal(t, 1, claimed.Generation)
-	runtimeAuthority, err := shared.NewReleaseRuntimeAuthority(
-		admission.Claim.OperationID(),
-		"tenant-a",
-		providerUUID,
-		callbackURL,
-		lifecycleCallbackURL,
-	)
-	require.NoError(t, err)
-	require.NoError(t, releases.Append(destinationLeaseUUID, shared.Release{
-		Manifest:         manifestBytes,
-		Image:            "stack",
-		OperationID:      admission.Claim.OperationID(),
-		Items:            destinationItems,
-		ResourceProfiles: destinationProfiles,
-		RuntimeAuthority: &runtimeAuthority,
-		Status:           "active",
-		CreatedAt:        time.Now(),
-	}))
+	commitOperationSuccessForTest(t, b.operationSettlement, operationClaim)
 
 	ctx := context.Background()
 	require.NoError(t, b.RefreshState(ctx))
 	assertRecoveredCommittedRestore(
 		t, b, destinationLeaseUUID, providerUUID, destinationItems, destinationProfiles,
 	)
-	require.NoError(t, b.preflightOperationIntentRecovery(ctx))
+	require.NoError(t, b.recoverOperationIntents(ctx))
 	require.NoError(t, b.reconcileRetentions(ctx))
-	require.NoError(t, b.recoverOperationIntents(ctx, nil))
 
-	intents, err := callbacks.ListOperationIntents()
+	intents, err := b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
 	assert.Empty(t, intents)
 	pending, err := callbacks.ListPending()

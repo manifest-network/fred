@@ -2,6 +2,7 @@ package shared
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,9 +11,10 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
@@ -31,12 +33,15 @@ const (
 	// Multiple workers preserve per-lease isolation without creating one
 	// goroutine and one simultaneous HTTP retry chain per queued lease.
 	callbackReplayWorkerLimit = 16
+	// callbackReplayLeaseQuantum prevents one lease with a long successful
+	// suffix from monopolizing a replay worker. Per-lease FIFO remains enforced
+	// by drain ownership; a remaining suffix is requeued behind other leases.
+	callbackReplayLeaseQuantum = 1
 
-	// callbackIdentityVerificationTimeout bounds the read-only substrate proof
-	// performed before an exact completion is persisted. A wedged Docker/K8s
-	// control plane must defer delivery, not keep the short journal-mutation lock
-	// forever or prevent the completion from reaching durable storage.
-	callbackIdentityVerificationTimeout = 10 * time.Second
+	// callbackResponseDrainLimit bounds work spent on an unused peer response.
+	// Reading through EOF within this small prefix preserves HTTP connection
+	// reuse; a larger or endless body is closed immediately after the prefix.
+	callbackResponseDrainLimit int64 = 4 << 10
 )
 
 type callbackAttemptOutcome uint8
@@ -51,30 +56,132 @@ const (
 	callbackAttemptDeferReplay
 )
 
+type callbackReplayWakeKind uint8
+
+const (
+	callbackReplayWakeInvalid callbackReplayWakeKind = iota
+	callbackReplayWakeCommit
+	callbackReplayWakeHandoff
+)
+
+// callbackReplayWake is a store-minted scheduling fact for exactly one lease.
+// Commit preserves an already-dormant failed head; handoff is stronger and may
+// retry it because a retiring drainer can no longer consume periodic fallback.
+type callbackReplayWake struct {
+	leaseUUID string
+	kind      callbackReplayWakeKind
+}
+
+func newCallbackReplayCommitWake(leaseUUID string) callbackReplayWake {
+	return callbackReplayWake{leaseUUID: leaseUUID, kind: callbackReplayWakeCommit}
+}
+
+func newCallbackReplayHandoffWake(leaseUUID string) callbackReplayWake {
+	return callbackReplayWake{leaseUUID: leaseUUID, kind: callbackReplayWakeHandoff}
+}
+
+func (wake callbackReplayWake) valid() bool {
+	return (wake.kind == callbackReplayWakeCommit || wake.kind == callbackReplayWakeHandoff) &&
+		validateCanonicalLeaseUUID(wake.leaseUUID) == nil
+}
+
+// callbackReplayMailbox coalesces repeated scheduling facts without discarding
+// the identities of other leases. The one-slot signal is only readiness; the
+// protected map is the complete pending fact set, with handoff dominating a
+// normal commit for the same lease.
+type callbackReplayMailbox struct {
+	mu      sync.Mutex
+	ready   chan struct{}
+	pending map[string]callbackReplayWakeKind
+	// runClaim is a process-lifetime ownership bit shared even by an accidental
+	// value copy of CallbackSender because every copy retains this mailbox pointer.
+	// A sender lifecycle has exactly one replay coordinator.
+	runClaim atomic.Bool
+}
+
+func newCallbackReplayMailbox() *callbackReplayMailbox {
+	return &callbackReplayMailbox{
+		ready:   make(chan struct{}, 1),
+		pending: make(map[string]callbackReplayWakeKind),
+	}
+}
+
+func (mailbox *callbackReplayMailbox) publish(wake callbackReplayWake) {
+	if mailbox == nil || mailbox.ready == nil || !wake.valid() {
+		return
+	}
+	mailbox.mu.Lock()
+	if mailbox.pending == nil {
+		mailbox.mu.Unlock()
+		return
+	}
+	if wake.kind > mailbox.pending[wake.leaseUUID] {
+		mailbox.pending[wake.leaseUUID] = wake.kind
+	}
+	select {
+	case mailbox.ready <- struct{}{}:
+	default:
+	}
+	mailbox.mu.Unlock()
+}
+
+func (mailbox *callbackReplayMailbox) take() []callbackReplayWake {
+	if mailbox == nil || mailbox.ready == nil {
+		return nil
+	}
+	mailbox.mu.Lock()
+	if mailbox.pending == nil {
+		mailbox.mu.Unlock()
+		return nil
+	}
+	pending := mailbox.pending
+	mailbox.pending = make(map[string]callbackReplayWakeKind)
+	mailbox.mu.Unlock()
+	wakes := make([]callbackReplayWake, 0, len(pending))
+	for leaseUUID, kind := range pending {
+		wakes = append(wakes, callbackReplayWake{leaseUUID: leaseUUID, kind: kind})
+	}
+	return wakes
+}
+
+func (mailbox *callbackReplayMailbox) pendingCount() int {
+	if mailbox == nil {
+		return 0
+	}
+	mailbox.mu.Lock()
+	defer mailbox.mu.Unlock()
+	return len(mailbox.pending)
+}
+
 // defaultCallbackBackoff defines the default delay before each retry attempt.
 var defaultCallbackBackoff = [CallbackMaxAttempts]time.Duration{0, 1 * time.Second, 5 * time.Second}
 
-// CallbackSender handles HMAC-signed callback delivery with retry and persistence.
+// CallbackSender transports and replays already-durable callbacks with bounded
+// retry and HMAC authentication. It has no semantic settlement authority;
+// CallbackPublisher owns publication into its outbox.
 type CallbackSender struct {
-	store                       *CallbackStore
-	httpClient                  *http.Client
-	secret                      string
-	logger                      *slog.Logger
-	stopCtx                     context.Context
-	backoff                     [CallbackMaxAttempts]time.Duration
-	deliveryTimeout             time.Duration
-	replayInterval              time.Duration
-	identityVerificationTimeout time.Duration
-	onDelivery                  func(outcome string) // nil-safe; injected by the caller for metrics
-	onStoreError                func()               // nil-safe; called when bbolt persistence fails
-	onReplayPanic               func(any)            // nil-safe; called when one lease replay panics
-	beforeReplay                func(context.Context) error
-	beforeDelivery              func(context.Context) error
-	storageIdentity             backendidentity.ID
-	// replayWake coalesces durable-outbox notifications. Journal owners only
-	// publish facts; the tracked replay goroutine performs network I/O so a slow
-	// callback cannot extend an API or startup-recovery critical section.
-	replayWake chan struct{}
+	store           *CallbackStore
+	httpClient      *http.Client
+	secret          string
+	logger          *slog.Logger
+	stopCtx         context.Context
+	backoff         [CallbackMaxAttempts]time.Duration
+	deliveryTimeout time.Duration
+	replayInterval  time.Duration
+	attestor        *CallbackStorageAttestor
+	onDelivery      func(outcome string) // nil-safe; injected by the caller for metrics
+	onStoreError    func()               // nil-safe; called when bbolt persistence fails
+	onReplayPanic   func(any)            // nil-safe; called when one lease replay panics
+	storageIdentity backendidentity.ID
+	// replayWake coalesces lease-identified durable-outbox notifications. Journal
+	// owners only publish facts; the tracked replay goroutine schedules the exact
+	// affected lease without restarting unrelated deferred retry chains.
+	replayWake *callbackReplayMailbox
+	// replayRetry is the stronger operator/lifecycle nudge exposed by
+	// NotifyPendingCallbacks. Keeping it distinct from commit discovery lets a
+	// caller deliberately retry dormant work without making every ordinary
+	// outbox commit churn an outage backlog.
+	replayRetry chan struct{}
 	// deliveryLocks serialize short FIFO journal mutations for exactly one
 	// lease. They are released before callback HTTP so actor/API/recovery paths
 	// can durably append while an older head is in flight.
@@ -89,27 +196,26 @@ type CallbackSender struct {
 }
 
 type callbackLeaseLock struct {
-	mu   sync.Mutex
+	gate *semaphore.Weighted
 	refs uint64
 }
 
 // CallbackSenderConfig configures a CallbackSender.
 type CallbackSenderConfig struct {
-	Store                       *CallbackStore
-	HTTPClient                  *http.Client
-	Secret                      string
-	Logger                      *slog.Logger
-	StopCtx                     context.Context
-	OnDelivery                  func(outcome string)                // optional metrics callback
-	OnStoreError                func()                              // optional; called when bbolt persistence fails
-	OnReplayPanic               func(any)                           // optional; called after recovering a lease replay panic
-	BeforeReplay                func(context.Context) error         // required for durable senders; optional for ephemeral; fail-closed substrate re-attestation
-	BeforeDelivery              func(context.Context) error         // required for durable senders; optional for ephemeral; runs before enqueue and every HTTP attempt
-	StorageIdentity             backendidentity.ID                  // captured in every current durable row and delivered payload
-	Backoff                     *[CallbackMaxAttempts]time.Duration // retry delays; nil uses default {0, 1s, 5s}
-	DeliveryTimeout             time.Duration                       // total delivery-attempt-chain budget; zero uses backend.DefaultCallbackDeliveryTimeout
-	ReplayInterval              time.Duration                       // zero uses DefaultCallbackReplayInterval
-	IdentityVerificationTimeout time.Duration                       // zero uses the bounded 10s default
+	// Store is the exact identity-bound outbox this transport drains.
+	Store *CallbackStore
+	// StorageAttestor binds Store to its runtime substrate verifier, storage
+	// identity, authority gate, lifecycle, and finite verification budget.
+	StorageAttestor *CallbackStorageAttestor
+	HTTPClient      *http.Client
+	Secret          string
+	Logger          *slog.Logger
+	OnDelivery      func(outcome string)                // optional metrics callback
+	OnStoreError    func()                              // optional; called when bbolt persistence fails
+	OnReplayPanic   func(any)                           // optional; called after recovering a lease replay panic
+	Backoff         *[CallbackMaxAttempts]time.Duration // retry delays; nil uses default {0, 1s, 5s}
+	DeliveryTimeout time.Duration                       // total delivery-attempt-chain budget; zero uses backend.DefaultCallbackDeliveryTimeout
+	ReplayInterval  time.Duration                       // zero uses DefaultCallbackReplayInterval
 }
 
 // RejectCallbackRedirect keeps an HMAC-signed callback bound to its exact
@@ -124,12 +230,17 @@ func RejectCallbackRedirect(*http.Request, []*http.Request) error {
 // sufficiently strong signing secret, and physical storage identity are
 // mandatory: asynchronous operation completions must not be constructible
 // without their outbox and exact backend authority. Its lifecycle owner must
-// start exactly one tracked RunReplayLoop before reporting ready, cancel StopCtx
-// during shutdown, and join that loop before closing Store.
+// start exactly one tracked RunReplayLoop before reporting ready, cancel the
+// StorageAttestor lifecycle during shutdown, and join that loop before closing
+// Store.
 func NewCallbackSender(cfg CallbackSenderConfig) (*CallbackSender, error) {
-	if cfg.Store == nil {
-		return nil, errors.New("callback sender: durable store is required")
+	if cfg.Store == nil || cfg.Store.boltStore == nil || cfg.Store.binding == nil ||
+		cfg.Store.backendAuthorityGate == nil {
+		return nil, errors.New("callback sender: exact identity-bound durable store is required")
 	}
+	// A durable sender inherits lineage solely from the marker-bound outbox;
+	// there is no independent identity input that could restamp that authority.
+	_, storeIdentity := cfg.Store.journalBackendIdentity("")
 	if len(cfg.Secret) < hmacauth.MinSecretLength {
 		return nil, fmt.Errorf(
 			"callback sender: HMAC secret must be at least %d bytes, got %d",
@@ -137,28 +248,13 @@ func NewCallbackSender(cfg CallbackSenderConfig) (*CallbackSender, error) {
 			len(cfg.Secret),
 		)
 	}
-	if !cfg.StorageIdentity.Valid() {
+	if !storeIdentity.Valid() {
 		return nil, errors.New("callback sender: backend storage identity is required")
 	}
-	if cfg.BeforeDelivery == nil {
-		return nil, errors.New("callback sender: delivery storage re-attestation hook is required")
+	if cfg.StorageAttestor == nil || !cfg.StorageAttestor.validFor(cfg.Store) {
+		return nil, errors.New("callback sender: exact callback storage attestor is required")
 	}
-	if cfg.BeforeReplay == nil {
-		return nil, errors.New("callback sender: replay storage re-attestation hook is required")
-	}
-	return newCallbackSender(cfg)
-}
-
-// NewEphemeralCallbackSender explicitly constructs a non-durable sender for
-// isolated tests in sibling internal packages. A repository-level invariant
-// rejects production callers; backend request handlers must use
-// NewCallbackSender so a process crash cannot erase acceptance or completion
-// evidence.
-func NewEphemeralCallbackSender(cfg CallbackSenderConfig) (*CallbackSender, error) {
-	if cfg.Store != nil {
-		return nil, errors.New("ephemeral callback sender: Store must be nil")
-	}
-	return newCallbackSender(cfg)
+	return newCallbackSender(cfg, storeIdentity)
 }
 
 // MustNewCallbackSender is the explicit panic-on-programmer-error form. It is
@@ -173,25 +269,15 @@ func MustNewCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
 	return sender
 }
 
-// MustNewEphemeralCallbackSender is the explicit panic-on-programmer-error
-// counterpart for isolated non-durable tests.
-func MustNewEphemeralCallbackSender(cfg CallbackSenderConfig) *CallbackSender {
-	sender, err := NewEphemeralCallbackSender(cfg)
-	if err != nil {
-		panic(err)
-	}
-	return sender
-}
-
-func newCallbackSender(cfg CallbackSenderConfig) (*CallbackSender, error) {
+func newCallbackSender(
+	cfg CallbackSenderConfig,
+	storageIdentity backendidentity.ID,
+) (*CallbackSender, error) {
 	if cfg.HTTPClient == nil {
 		return nil, errors.New("callback sender: HTTP client is required")
 	}
 	if cfg.Logger == nil {
 		return nil, errors.New("callback sender: logger is required")
-	}
-	if cfg.StopCtx == nil {
-		return nil, errors.New("callback sender: stop context is required")
 	}
 	if cfg.ReplayInterval < 0 {
 		return nil, errors.New("callback sender: replay interval must not be negative")
@@ -199,8 +285,9 @@ func newCallbackSender(cfg CallbackSenderConfig) (*CallbackSender, error) {
 	if cfg.DeliveryTimeout < 0 {
 		return nil, errors.New("callback sender: delivery timeout must not be negative")
 	}
-	if cfg.IdentityVerificationTimeout < 0 {
-		return nil, errors.New("callback sender: identity verification timeout must not be negative")
+	if cfg.StorageAttestor == nil || cfg.StorageAttestor.stopCtx == nil ||
+		cfg.StorageAttestor.stopCtx.Err() != nil {
+		return nil, errors.New("callback sender: live storage attestor lifecycle is required")
 	}
 
 	backoff := defaultCallbackBackoff
@@ -214,10 +301,6 @@ func newCallbackSender(cfg CallbackSenderConfig) (*CallbackSender, error) {
 	deliveryTimeout := cfg.DeliveryTimeout
 	if deliveryTimeout == 0 {
 		deliveryTimeout = backend.DefaultCallbackDeliveryTimeout
-	}
-	identityVerificationTimeout := cfg.IdentityVerificationTimeout
-	if identityVerificationTimeout == 0 {
-		identityVerificationTimeout = callbackIdentityVerificationTimeout
 	}
 
 	deliveryLocksMu := &sync.Mutex{}
@@ -241,305 +324,26 @@ func newCallbackSender(cfg CallbackSenderConfig) (*CallbackSender, error) {
 	httpClient.Jar = nil
 
 	return &CallbackSender{
-		store:                       cfg.Store,
-		httpClient:                  &httpClient,
-		secret:                      cfg.Secret,
-		logger:                      cfg.Logger,
-		stopCtx:                     cfg.StopCtx,
-		backoff:                     backoff,
-		deliveryTimeout:             deliveryTimeout,
-		replayInterval:              replayInterval,
-		identityVerificationTimeout: identityVerificationTimeout,
-		onDelivery:                  cfg.OnDelivery,
-		onStoreError:                cfg.OnStoreError,
-		onReplayPanic:               cfg.OnReplayPanic,
-		beforeReplay:                cfg.BeforeReplay,
-		beforeDelivery:              cfg.BeforeDelivery,
-		storageIdentity:             cfg.StorageIdentity,
-		replayWake:                  make(chan struct{}, 1),
-		deliveryLocksMu:             deliveryLocksMu,
-		deliveryLocks:               deliveryLocks,
-		drainLocksMu:                drainLocksMu,
-		drainLocks:                  drainLocks,
+		store:           cfg.Store,
+		httpClient:      &httpClient,
+		secret:          cfg.Secret,
+		logger:          cfg.Logger,
+		stopCtx:         cfg.StorageAttestor.stopCtx,
+		backoff:         backoff,
+		deliveryTimeout: deliveryTimeout,
+		replayInterval:  replayInterval,
+		attestor:        cfg.StorageAttestor,
+		onDelivery:      cfg.OnDelivery,
+		onStoreError:    cfg.OnStoreError,
+		onReplayPanic:   cfg.OnReplayPanic,
+		storageIdentity: storageIdentity,
+		replayWake:      newCallbackReplayMailbox(),
+		replayRetry:     make(chan struct{}, 1),
+		deliveryLocksMu: deliveryLocksMu,
+		deliveryLocks:   deliveryLocks,
+		drainLocksMu:    drainLocksMu,
+		drainLocks:      drainLocks,
 	}, nil
-}
-
-// SendOperationCallback publishes an exact requested-operation completion to
-// the durable outbox. The tracked replay loop owns HMAC-signed HTTP delivery;
-// this caller only persists under the short journal-mutation lock and wakes
-// that loop, so a slow endpoint cannot extend an actor or API critical section. An explicitly
-// ephemeral sender still delivers inline because it has no durable owner.
-// The caller must provide the callbackURL (resolved from its own state) and
-// the backendName (so Fred can label metrics per-backend without a placement
-// lookup, which is often already deleted for intentional deprovisions).
-func (s *CallbackSender) SendOperationCallback(leaseUUID, callbackURL, backendName string, status backend.CallbackStatus, errMsg string) {
-	s.sendOperationCallback(context.Background(), leaseUUID, callbackURL, backendName, status, errMsg)
-}
-
-// SendOperationCallbackContext is the cancellation-aware operation API for a
-// worker whose owning lease may be torn down before enqueue. Cancellation is
-// checked after acquiring the sender's keyed lease lock, closing the race where
-// a deprovision removes the queue just before a stale worker persists its exact
-// completion. Once persisted, the durable outbox remains the delivery owner.
-func (s *CallbackSender) SendOperationCallbackContext(ctx context.Context, leaseUUID, callbackURL, backendName string, status backend.CallbackStatus, errMsg string) {
-	if ctx == nil {
-		s.logger.Error("refusing operation callback with nil ownership context", "lease_uuid", leaseUUID)
-		return
-	}
-	s.sendOperationCallback(ctx, leaseUUID, callbackURL, backendName, status, errMsg)
-}
-
-func (s *CallbackSender) sendOperationCallback(ctx context.Context, leaseUUID, callbackURL, backendName string, status backend.CallbackStatus, errMsg string) {
-	if status != backend.CallbackStatusSuccess && status != backend.CallbackStatusFailed {
-		s.logger.Error("refusing invalid operation callback status",
-			"status", status,
-			"lease_uuid", leaseUUID,
-		)
-		return
-	}
-	if callbackURL != "" {
-		if err := backend.ValidateOperationCallbackURL(callbackURL); err != nil {
-			s.logger.Error("refusing invalid operation callback URL",
-				"error", err,
-				"lease_uuid", leaseUUID,
-			)
-			return
-		}
-	}
-	s.enqueueAndNotify(ctx, leaseUUID, callbackURL, backendName, status, errMsg, false, CallbackDeliveryKindOperation)
-}
-
-// SendLifecycleCallback sends a typed, observation-only lifecycle callback.
-// Autonomous failure and teardown observations belong on this route;
-// provision/restore and durable maintenance completion use their exact causal
-// claims. Enqueue atomically coalesces older typed lifecycle observations, but
-// never exact completions or protected legacy records.
-func (s *CallbackSender) SendLifecycleCallback(leaseUUID, callbackURL, backendName string, status backend.CallbackStatus, errMsg string, retained bool) {
-	if status != backend.CallbackStatusSuccess &&
-		status != backend.CallbackStatusFailed &&
-		status != backend.CallbackStatusDeprovisioned {
-		s.logger.Error("refusing invalid lifecycle callback status",
-			"status", status,
-			"lease_uuid", leaseUUID,
-		)
-		return
-	}
-	if retained && status != backend.CallbackStatusDeprovisioned {
-		s.logger.Error("refusing retained flag on non-deprovision lifecycle callback",
-			"status", status,
-			"lease_uuid", leaseUUID,
-		)
-		return
-	}
-	if callbackURL != "" {
-		if err := backend.ValidateLifecycleCallbackURL(callbackURL); err != nil {
-			s.logger.Error("refusing invalid lifecycle callback URL",
-				"error", err,
-				"lease_uuid", leaseUUID,
-			)
-			return
-		}
-	}
-	s.enqueueAndNotify(context.Background(), leaseUUID, callbackURL, backendName, status, errMsg, retained, CallbackDeliveryKindLifecycle)
-}
-
-// SendMaintenanceCallback atomically settles an exact maintenance intent into
-// the durable FIFO, then wakes the tracked replay loop. A persistence or
-// terminal identity error leaves the intent untouched for periodic or cold
-// recovery; callers must never synthesize a second lifecycle observation.
-func (s *CallbackSender) SendMaintenanceCallback(
-	claim MaintenanceIntentClaim,
-	status backend.CallbackStatus,
-	errMsg string,
-) error {
-	if s.store == nil {
-		return errors.New("durable callback store is required for maintenance settlement")
-	}
-	if !claim.Valid() {
-		return errors.New("valid maintenance intent claim is required")
-	}
-	if status != backend.CallbackStatusSuccess && status != backend.CallbackStatusFailed {
-		return fmt.Errorf("invalid maintenance callback status %q", status)
-	}
-	if s.beforeDelivery != nil {
-		if err := s.verifyIdentityBounded(context.Background()); err != nil {
-			if isTerminalStorageAuthorityError(err) {
-				return fmt.Errorf("maintenance callback lost storage authority: %w", err)
-			}
-			s.logger.Warn("persisting maintenance callback while backend identity re-attestation is transiently unavailable",
-				"error", err, "lease_uuid", claim.LeaseUUID())
-		}
-	}
-
-	unlock := s.lockLease(claim.LeaseUUID())
-	defer unlock()
-	if s.beforeDelivery != nil {
-		if err := s.verifyIdentityBounded(context.Background()); err != nil {
-			if isTerminalStorageAuthorityError(err) {
-				return fmt.Errorf("maintenance callback lost storage authority while waiting for FIFO: %w", err)
-			}
-			s.logger.Warn("persisting maintenance callback after transient post-FIFO identity re-attestation failure",
-				"error", err, "lease_uuid", claim.LeaseUUID())
-		}
-	}
-	deliveryID, err := uuid.NewRandom()
-	if err != nil {
-		return fmt.Errorf("allocate maintenance callback delivery ID: %w", err)
-	}
-	entry := callbackEntryForMaintenanceIntent(claim.entry, deliveryID.String(), status, errMsg)
-	if err := validateNewCallbackEntry(entry, time.Now()); err != nil {
-		return err
-	}
-	if _, err := s.store.resolveMaintenanceIntentLocked(claim, entry); err != nil {
-		s.reportStoreError()
-		return fmt.Errorf("persist maintenance callback: %w", err)
-	}
-	// The bbolt transaction above is the completion boundary. Network delivery
-	// belongs exclusively to the tracked replay loop; waking it is non-blocking
-	// and the durable row remains authoritative if no loop is running yet.
-	s.NotifyPendingCallbacks()
-	return nil
-}
-
-func (s *CallbackSender) enqueueAndNotify(ownerCtx context.Context, leaseUUID, callbackURL, backendName string, status backend.CallbackStatus, errMsg string, retained bool, kind CallbackDeliveryKind) {
-	if callbackURL == "" {
-		s.logger.Warn("no callback URL for lease", "lease_uuid", leaseUUID)
-		return
-	}
-
-	entry := CallbackEntry{
-		LeaseUUID:    leaseUUID,
-		CallbackURL:  callbackURL,
-		DeliveryKind: kind,
-		Success:      status != backend.CallbackStatusFailed,
-		Status:       status,
-		Backend:      backendName,
-		BackendStorageID: func() string {
-			if s.storageIdentity.Valid() {
-				return s.storageIdentity.String()
-			}
-			return ""
-		}(),
-		Error:     errMsg,
-		Retained:  retained,
-		CreatedAt: time.Now(),
-	}
-
-	if ownerCtx != nil {
-		if err := ownerCtx.Err(); err != nil {
-			s.logger.Debug("suppressing callback enqueue for canceled lease operation",
-				"lease_uuid", leaseUUID,
-				"error", err,
-			)
-			return
-		}
-	}
-	identityVerified := true
-	if s.beforeDelivery != nil {
-		err := s.verifyIdentityBounded(ownerCtx)
-		if err != nil {
-			identityVerified = false
-			if isTerminalStorageAuthorityError(err) {
-				s.logger.Error("suppressing callback from terminally unsafe backend storage",
-					"error", err,
-					"lease_uuid", leaseUUID,
-				)
-				return
-			}
-			s.logger.Warn("persisting callback but deferring delivery until backend identity is re-attested",
-				"error", err,
-				"lease_uuid", leaseUUID,
-			)
-		}
-	}
-
-	unlock := s.lockLease(leaseUUID)
-	defer unlock()
-	if ownerCtx != nil {
-		if err := ownerCtx.Err(); err != nil {
-			s.logger.Debug("suppressing callback enqueue for canceled lease operation",
-				"lease_uuid", leaseUUID,
-				"error", err,
-			)
-			return
-		}
-	}
-	// Recheck after joining the per-lease FIFO. A root can drift while this
-	// sender waits behind an older callback; persisting after only the pre-lock
-	// proof would let a replacement-substrate completion enter the durable
-	// queue. The second probe is independently bounded.
-	if s.beforeDelivery != nil {
-		if err := s.verifyIdentityBounded(ownerCtx); err != nil {
-			identityVerified = false
-			if isTerminalStorageAuthorityError(err) {
-				s.logger.Error("suppressing callback that lost storage authority while waiting for lease FIFO",
-					"error", err, "lease_uuid", leaseUUID)
-				return
-			}
-		} else {
-			identityVerified = true
-		}
-	}
-	// The owner can be canceled while the post-lock identity probe is in
-	// progress. Recheck at the final pre-mutation boundary so deprovision cannot
-	// race that bounded probe and leave a stale completion in the durable FIFO.
-	// Once the transaction below commits, the durable row—not ownerCtx—remains
-	// authoritative and replay must continue independently of this caller.
-	if ownerCtx != nil {
-		if err := ownerCtx.Err(); err != nil {
-			s.logger.Debug("suppressing callback enqueue for canceled lease operation after identity verification",
-				"lease_uuid", leaseUUID,
-				"error", err,
-			)
-			return
-		}
-	}
-
-	if s.store == nil {
-		if !identityVerified {
-			return
-		}
-		body, err := callbackEntryPayload(entry, s.storageIdentity)
-		if err != nil {
-			s.logger.Error("failed to marshal callback payload", "error", err, "lease_uuid", leaseUUID)
-			return
-		}
-		s.DeliverCallback(leaseUUID, callbackURL, body)
-		return
-	}
-
-	// Persist callback before notifying its delivery owner so it survives restarts.
-	// Success remains populated with the pre-Status encoding for schema
-	// continuity. New entries live in the v2 queue, which v0.13 deliberately does
-	// not read; see DEPLOYMENT.md for the callback-store rollback boundary.
-	var persistErr error
-	if kind == CallbackDeliveryKindOperation {
-		persistErr = s.store.settleOperationCallbackLocked(entry)
-	} else {
-		_, persistErr = s.store.storeEntryLocked(entry)
-	}
-	if persistErr != nil {
-		if errors.Is(persistErr, errTerminalLifecyclePending) {
-			s.logger.Debug("suppressing lifecycle observation behind pending terminal callback",
-				"lease_uuid", leaseUUID,
-				"status", status,
-			)
-			// The already-durable terminal head remains the replay loop's work.
-			s.NotifyPendingCallbacks()
-			return
-		}
-		s.logger.Error("failed to persist callback; suppressing delivery past unknown durable state",
-			"error", persistErr,
-			"lease_uuid", leaseUUID,
-		)
-		s.reportStoreError()
-		return
-	}
-
-	// A durable sender never performs HTTP in the actor/API/recovery call stack.
-	// Notify is deliberately non-blocking; the periodic replay sweep is the
-	// level-triggered fallback if the tracked loop is not running or is busy.
-	s.NotifyPendingCallbacks()
 }
 
 func isTerminalStorageAuthorityError(err error) bool {
@@ -547,35 +351,15 @@ func isTerminalStorageAuthorityError(err error) bool {
 		errors.Is(err, backendidentity.ErrMutationOutcomeAmbiguous)
 }
 
-func (s *CallbackSender) verifyIdentityBounded(ownerCtx context.Context) error {
-	return s.verifyCallbackPreconditionBounded(ownerCtx, s.beforeDelivery)
-}
-
-func (s *CallbackSender) verifyCallbackPreconditionBounded(
-	ownerCtx context.Context,
-	check func(context.Context) error,
-) error {
-	verificationCtx, cancelVerification := context.WithTimeout(
-		s.stopCtx, s.identityVerificationTimeout,
-	)
-	stopOwnerCancellation := func() bool { return false }
-	if ownerCtx != nil {
-		stopOwnerCancellation = context.AfterFunc(ownerCtx, cancelVerification)
-	}
-	err := check(verificationCtx)
-	stopOwnerCancellation()
-	cancelVerification()
-	return err
-}
-
-// DeliverCallback attempts to deliver a callback with retries.
+// deliverCallback attempts to deliver a callback with retries.
 // Returns true if delivery succeeded.
-func (s *CallbackSender) DeliverCallback(leaseUUID, callbackURL string, body []byte) bool {
+func (s *CallbackSender) deliverCallback(leaseUUID, callbackURL string, body []byte) bool {
 	// Share one deadline across the complete retry chain, including
 	// backoff. A slow 503 must not receive a fresh full application budget on
 	// every retry and retain this lease's wire-drain ownership for
-	// CallbackMaxAttempts times the configured timeout. Quick failures can still retry with whatever
-	// budget remains; durable replay owns the head after this context expires.
+	// CallbackMaxAttempts times the configured timeout. Quick failures can still
+	// retry with whatever budget remains; durable replay owns the head after this
+	// context expires.
 	deliveryCtx, cancel := context.WithTimeout(s.stopCtx, s.deliveryTimeout)
 	defer cancel()
 
@@ -596,15 +380,13 @@ func (s *CallbackSender) DeliverCallback(leaseUUID, callbackURL string, body []b
 			case <-timer.C:
 			}
 		}
-		if s.beforeDelivery != nil {
-			if err := s.beforeDelivery(deliveryCtx); err != nil {
-				s.logger.Warn("callback delivery deferred by backend identity verification",
-					"error", err,
-					"lease_uuid", leaseUUID,
-				)
-				s.reportDelivery("failure")
-				return false
-			}
+		if err := s.attestor.verify(deliveryCtx); err != nil {
+			s.logger.Warn("callback delivery deferred by backend identity verification",
+				"error", err,
+				"lease_uuid", leaseUUID,
+			)
+			s.reportDelivery("failure")
+			return false
 		}
 
 		switch s.trySendCallback(deliveryCtx, leaseUUID, callbackURL, body) {
@@ -664,9 +446,11 @@ func (s *CallbackSender) trySendCallback(
 		return callbackAttemptRetry
 	}
 
-	// Always read and close the response body to allow connection reuse.
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// Drain only a small prefix of the unused response. An untrusted callback
+	// peer must not make one lease's durable drainer consume an arbitrary body
+	// for the full delivery budget. net/http reuses the connection only when
+	// CopyN reaches EOF; oversized bodies are intentionally closed early.
+	_, _ = io.CopyN(io.Discard, resp.Body, callbackResponseDrainLimit+1)
 	_ = resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -680,57 +464,209 @@ func (s *CallbackSender) trySendCallback(
 	s.logger.Warn("callback returned error status",
 		"status", resp.StatusCode,
 		"lease_uuid", leaseUUID,
-		"body", string(respBody),
 	)
 	return callbackAttemptRetry
 }
 
-// ReplayPendingCallbacks drains callbacks that remain durable after a failed
-// live delivery or previous shutdown. Discovery reads only lease-identifying
-// keys; one elected drainer per lease re-lists the current durable head between
-// sends. Corruption therefore quarantines the identifiable lease while healthy
-// leases continue to drain, and CallbackStore.Healthy still reports the fault.
-func (s *CallbackSender) ReplayPendingCallbacks() {
+type callbackReplayOutcome uint8
+
+const (
+	callbackReplayEmpty callbackReplayOutcome = iota
+	callbackReplayMore
+	callbackReplayDeferred
+)
+
+type callbackReplayCompletion struct {
+	leaseUUID string
+	outcome   callbackReplayOutcome
+}
+
+func publishCallbackReplayCompletion(
+	ctx context.Context,
+	completions chan<- callbackReplayCompletion,
+	completion callbackReplayCompletion,
+) bool {
+	select {
+	case completions <- completion:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// callbackReplayQueue is the process-local scheduling view of the durable
+// outbox. Durable rows remain the authority. This queue exists only to bound
+// concurrency, deduplicate lease work, and let a newly discovered lease move
+// ahead of a large outage backlog without weakening per-lease FIFO.
+type callbackReplayQueue struct {
+	ready    *list.List
+	queued   map[string]*list.Element
+	inFlight map[string]struct{}
+	dormant  map[string]struct{}
+	dirty    map[string]struct{}
+}
+
+func newCallbackReplayQueue() *callbackReplayQueue {
+	return &callbackReplayQueue{
+		ready:    list.New(),
+		queued:   make(map[string]*list.Element),
+		inFlight: make(map[string]struct{}),
+		dormant:  make(map[string]struct{}),
+		dirty:    make(map[string]struct{}),
+	}
+}
+
+func (q *callbackReplayQueue) discover(
+	leaseUUIDs []string,
+	retryDormant bool,
+	prioritizeNew bool,
+) {
+	present := make(map[string]struct{}, len(leaseUUIDs))
+	for _, leaseUUID := range leaseUUIDs {
+		if leaseUUID == "" {
+			continue
+		}
+		present[leaseUUID] = struct{}{}
+		if _, active := q.inFlight[leaseUUID]; active {
+			// A commit wake can race the drainer's final empty check. Remember the
+			// edge so completion rechecks this lease instead of consuming the wake.
+			if prioritizeNew || retryDormant {
+				q.dirty[leaseUUID] = struct{}{}
+			}
+			continue
+		}
+		if _, waiting := q.queued[leaseUUID]; waiting {
+			continue
+		}
+		if _, deferred := q.dormant[leaseUUID]; deferred {
+			if !retryDormant {
+				continue
+			}
+			delete(q.dormant, leaseUUID)
+			q.enqueueBack(leaseUUID)
+			continue
+		}
+		if prioritizeNew {
+			q.enqueueFront(leaseUUID)
+		} else {
+			q.enqueueBack(leaseUUID)
+		}
+	}
+	// A failed delivery remains dormant only while a durable row still exists.
+	// Retiring absent keys keeps a long-running loop's memory proportional to
+	// the current outbox rather than its historical lease cardinality.
+	for leaseUUID := range q.dormant {
+		if _, exists := present[leaseUUID]; !exists {
+			delete(q.dormant, leaseUUID)
+		}
+	}
+}
+
+func (q *callbackReplayQueue) wake(wake callbackReplayWake) {
+	if q == nil || !wake.valid() {
+		return
+	}
+	leaseUUID := wake.leaseUUID
+	if _, active := q.inFlight[leaseUUID]; active {
+		// Unlike a fleet-wide scan, this fact proves the active lease itself changed
+		// while its worker was draining. Completion must therefore recheck it.
+		q.dirty[leaseUUID] = struct{}{}
+		return
+	}
+	if _, waiting := q.queued[leaseUUID]; waiting {
+		return
+	}
+	if _, deferred := q.dormant[leaseUUID]; deferred {
+		if wake.kind != callbackReplayWakeHandoff {
+			// A newly appended suffix cannot overtake the failed durable head. Leave
+			// ordinary commit work dormant until explicit or periodic retry.
+			return
+		}
+		delete(q.dormant, leaseUUID)
+	}
+	q.enqueueFront(leaseUUID)
+}
+
+func (q *callbackReplayQueue) enqueueFront(leaseUUID string) {
+	if leaseUUID == "" {
+		return
+	}
+	if element := q.queued[leaseUUID]; element != nil {
+		q.ready.MoveToFront(element)
+		return
+	}
+	q.queued[leaseUUID] = q.ready.PushFront(leaseUUID)
+}
+
+func (q *callbackReplayQueue) enqueueBack(leaseUUID string) {
+	if leaseUUID == "" || q.queued[leaseUUID] != nil {
+		return
+	}
+	q.queued[leaseUUID] = q.ready.PushBack(leaseUUID)
+}
+
+func (q *callbackReplayQueue) next() (string, bool) {
+	element := q.ready.Front()
+	if element == nil {
+		return "", false
+	}
+	leaseUUID, ok := element.Value.(string)
+	return leaseUUID, ok && leaseUUID != ""
+}
+
+func (q *callbackReplayQueue) dispatched(leaseUUID string) {
+	element := q.queued[leaseUUID]
+	if element == nil {
+		return
+	}
+	q.ready.Remove(element)
+	delete(q.queued, leaseUUID)
+	q.inFlight[leaseUUID] = struct{}{}
+}
+
+func (q *callbackReplayQueue) completed(completion callbackReplayCompletion) {
+	leaseUUID := completion.leaseUUID
+	delete(q.inFlight, leaseUUID)
+	_, dirty := q.dirty[leaseUUID]
+	delete(q.dirty, leaseUUID)
+
+	switch completion.outcome {
+	case callbackReplayMore:
+		delete(q.dormant, leaseUUID)
+		q.enqueueBack(leaseUUID)
+	case callbackReplayDeferred:
+		if dirty {
+			delete(q.dormant, leaseUUID)
+			q.enqueueFront(leaseUUID)
+		} else {
+			q.dormant[leaseUUID] = struct{}{}
+		}
+	case callbackReplayEmpty:
+		delete(q.dormant, leaseUUID)
+		if dirty {
+			q.enqueueFront(leaseUUID)
+		}
+	}
+}
+
+func (s *CallbackSender) discoverReplayWork(
+	queue *callbackReplayQueue,
+	retryDormant bool,
+	prioritizeNew bool,
+) {
 	if s.store == nil || s.stopCtx.Err() != nil {
 		return
 	}
-	if s.beforeReplay != nil {
-		if err := s.verifyCallbackPreconditionBounded(context.Background(), s.beforeReplay); err != nil {
-			s.logger.Error("callback replay suppressed by backend identity verification", "error", err)
-			return
-		}
+	if err := s.attestor.verify(s.stopCtx); err != nil {
+		s.logger.Error("callback replay suppressed by backend identity verification", "error", err)
+		return
 	}
-
 	leaseUUIDs, err := s.store.callbackLeaseUUIDs()
 	if err != nil {
 		s.logger.Error("callback outbox discovery found durable corruption", "error", err)
 		s.reportStoreError()
 	}
-	if len(leaseUUIDs) == 0 {
-		return
-	}
-
-	s.logger.Info("replaying pending callback leases", "count", len(leaseUUIDs))
-
-	jobs := make(chan string, len(leaseUUIDs))
-	for _, leaseUUID := range leaseUUIDs {
-		jobs <- leaseUUID
-	}
-	close(jobs)
-
-	workerCount := min(callbackReplayWorkerLimit, len(leaseUUIDs))
-	var workers sync.WaitGroup
-	for range workerCount {
-		workers.Go(func() {
-			for leaseUUID := range jobs {
-				if s.stopCtx.Err() != nil {
-					return
-				}
-				s.replayLease(leaseUUID)
-			}
-		})
-	}
-	workers.Wait()
+	queue.discover(leaseUUIDs, retryDormant, prioritizeNew)
 }
 
 // NotifyPendingCallbacks asks the tracked replay loop to drain the durable
@@ -743,12 +679,20 @@ func (s *CallbackSender) NotifyPendingCallbacks() {
 		return
 	}
 	select {
-	case s.replayWake <- struct{}{}:
+	case s.replayRetry <- struct{}{}:
 	default:
 	}
 }
 
-func (s *CallbackSender) replayLease(leaseUUID string) {
+// replayLeaseWithLimit owns one wire-drain election and reports whether the
+// lease is empty, has a successful suffix to schedule fairly, or must wait for
+// an explicit/periodic retry. A zero limit preserves the synchronous full-drain
+// helper used by focused tests and administrative benchmarks.
+func (s *CallbackSender) replayLeaseWithLimit(
+	leaseUUID string,
+	limit int,
+) (outcome callbackReplayOutcome) {
+	outcome = callbackReplayDeferred
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			s.logger.Error("panic while replaying callback outbox",
@@ -756,6 +700,7 @@ func (s *CallbackSender) replayLease(leaseUUID string) {
 				"lease_uuid", leaseUUID,
 			)
 			s.reportReplayPanic(recovered)
+			outcome = callbackReplayDeferred
 		}
 	}()
 
@@ -764,7 +709,7 @@ func (s *CallbackSender) replayLease(leaseUUID string) {
 	// queue remains level-triggered work for the current drainer or next sweep.
 	unlockDrain, acquired := s.tryLockDrainLease(leaseUUID)
 	if !acquired {
-		return
+		return callbackReplayDeferred
 	}
 	drainReleased := false
 	defer func() {
@@ -776,11 +721,11 @@ func (s *CallbackSender) replayLease(leaseUUID string) {
 			// retiring and cannot consume that fallback. Publish a handoff only
 			// after releasing drain ownership so a surviving loop can take over.
 			if s.stopCtx.Err() != nil {
-				s.store.notifyReplaySubscribers()
+				s.store.notifyReplayHandoff(leaseUUID)
 			}
 		}
 	}()
-	s.drainLease(leaseUUID, func() {
+	return s.drainLease(leaseUUID, limit, func() {
 		// Release drain ownership while the mutation lock still proves the
 		// queue empty. A concurrent enqueue can only commit and notify after
 		// this handoff, so a second sender cannot consume that wake while the
@@ -790,12 +735,20 @@ func (s *CallbackSender) replayLease(leaseUUID string) {
 	})
 }
 
-// RunReplayLoop drains the durable callback outbox once at startup and then
-// periodically until the sender lifecycle context is canceled. Backends run
-// one tracked instance so the initial replay cannot delay readiness, while
-// Stop still cancels and waits for any in-flight delivery before closing the
-// store.
+// RunReplayLoop continuously schedules the durable callback outbox until the
+// sender lifecycle context is canceled. At most callbackReplayWorkerLimit
+// leases perform HTTP concurrently, and each worker yields after one delivered
+// head. Unlike a sweep-wide worker batch, the scheduler keeps consuming commit
+// wakes while those requests are in flight, so fresh healthy work cannot sit
+// behind the complete cardinality of an outage backlog.
 func (s *CallbackSender) RunReplayLoop() {
+	if s == nil || s.replayWake == nil || !s.replayWake.runClaim.CompareAndSwap(false, true) {
+		return
+	}
+	s.runReplayLoop(newCallbackReplayQueue())
+}
+
+func (s *CallbackSender) runReplayLoop(queue *callbackReplayQueue) {
 	if s.store == nil {
 		return
 	}
@@ -804,20 +757,67 @@ func (s *CallbackSender) RunReplayLoop() {
 	// leaves a coalesced wake for the next pass; there is no gap between them.
 	unsubscribe := s.store.subscribeReplayWake(s.replayWake)
 	defer unsubscribe()
-	s.ReplayPendingCallbacks()
+
+	if queue == nil {
+		return
+	}
+	s.discoverReplayWork(queue, false, false)
+	jobs := make(chan string)
+	completions := make(chan callbackReplayCompletion, callbackReplayWorkerLimit)
+	var workers sync.WaitGroup
+	for range callbackReplayWorkerLimit {
+		workers.Go(func() {
+			for leaseUUID := range jobs {
+				completion := callbackReplayCompletion{
+					leaseUUID: leaseUUID,
+					outcome: s.replayLeaseWithLimit(
+						leaseUUID, callbackReplayLeaseQuantum,
+					),
+				}
+				if !publishCallbackReplayCompletion(s.stopCtx, completions, completion) {
+					return
+				}
+			}
+		})
+	}
+
 	timer := time.NewTimer(s.replayInterval)
-	defer timer.Stop()
-	for {
+	stopping := false
+	for s.stopCtx.Err() == nil {
+		leaseUUID, ready := queue.next()
+		var dispatch chan<- string
+		if ready {
+			dispatch = jobs
+		}
 		select {
 		case <-s.stopCtx.Done():
-			return
-		case <-s.replayWake:
-			s.ReplayPendingCallbacks()
+			stopping = true
+		case <-s.replayWake.ready:
+			wakes := s.replayWake.take()
+			if err := s.attestor.verify(s.stopCtx); err != nil {
+				s.logger.Error("callback replay wake suppressed by backend identity verification", "error", err)
+				continue
+			}
+			for _, wake := range wakes {
+				queue.wake(wake)
+			}
+		case <-s.replayRetry:
+			s.discoverReplayWork(queue, true, true)
 		case <-timer.C:
-			s.ReplayPendingCallbacks()
+			s.discoverReplayWork(queue, true, false)
 			timer.Reset(s.replayInterval)
+		case dispatch <- leaseUUID:
+			queue.dispatched(leaseUUID)
+		case completion := <-completions:
+			queue.completed(completion)
+		}
+		if stopping {
+			break
 		}
 	}
+	timer.Stop()
+	close(jobs)
+	workers.Wait()
 }
 
 // drainLease delivers one lease's durable outbox in sequence order while the
@@ -825,19 +825,47 @@ func (s *CallbackSender) RunReplayLoop() {
 // and precise removal; callback HTTP runs outside them so live settlement can
 // append promptly. Re-listing after every outcome is load-bearing because a
 // concurrent lifecycle enqueue may coalesce a previously observed suffix.
-func (s *CallbackSender) drainLease(leaseUUID string, releaseEmptyDrain func()) {
+
+func (s *CallbackSender) drainLease(
+	leaseUUID string,
+	limit int,
+	releaseEmptyDrain func(),
+) callbackReplayOutcome {
+	delivered := 0
 	for {
 		entry, found, err := s.nextPendingCallback(leaseUUID, releaseEmptyDrain)
 		if err != nil {
+			if s.stopCtx.Err() != nil && errors.Is(err, s.stopCtx.Err()) {
+				return callbackReplayDeferred
+			}
 			s.logger.Error("failed to list pending callbacks for lease; suppressing delivery",
 				"error", err,
 				"lease_uuid", leaseUUID,
 			)
 			s.reportStoreError()
-			return
+			return callbackReplayDeferred
 		}
 		if !found {
-			return
+			return callbackReplayEmpty
+		}
+		if limit > 0 && delivered >= limit {
+			return callbackReplayMore
+		}
+		if s.expiredLifecycleObservation(entry, time.Now()) {
+			if rmErr := s.removeDeliveredCallback(entry); rmErr != nil {
+				if s.stopCtx.Err() != nil && errors.Is(rmErr, s.stopCtx.Err()) {
+					return callbackReplayDeferred
+				}
+				s.logger.Error("failed to remove expired lifecycle callback; stopping lease drain",
+					"error", rmErr,
+					"lease_uuid", leaseUUID,
+					"delivery_id", entry.DeliveryID,
+				)
+				s.reportStoreError()
+				return callbackReplayDeferred
+			}
+			delivered++
+			continue
 		}
 		body, marshalErr := callbackEntryPayload(entry, s.storageIdentity)
 		if marshalErr != nil {
@@ -846,28 +874,49 @@ func (s *CallbackSender) drainLease(leaseUUID string, releaseEmptyDrain func()) 
 				"lease_uuid", leaseUUID,
 				"delivery_id", entry.DeliveryID,
 			)
-			return
+			return callbackReplayDeferred
 		}
-		if !s.DeliverCallback(entry.LeaseUUID, entry.CallbackURL, body) {
-			return
+		if !s.deliverCallback(entry.LeaseUUID, entry.CallbackURL, body) {
+			return callbackReplayDeferred
 		}
 		if rmErr := s.removeDeliveredCallback(entry); rmErr != nil {
+			if s.stopCtx.Err() != nil && errors.Is(rmErr, s.stopCtx.Err()) {
+				return callbackReplayDeferred
+			}
 			s.logger.Error("failed to remove delivered callback; stopping lease drain",
 				"error", rmErr,
 				"lease_uuid", leaseUUID,
 				"delivery_id", entry.DeliveryID,
 			)
 			s.reportStoreError()
-			return
+			return callbackReplayDeferred
 		}
+		delivered++
 	}
+}
+
+func (s *CallbackSender) expiredLifecycleObservation(
+	entry CallbackEntry,
+	now time.Time,
+) bool {
+	return s != nil && s.store != nil && s.store.maxAge > 0 &&
+		entry.storageVersion == callbackStorageV2 &&
+		entry.DeliveryKind == CallbackDeliveryKindLifecycle &&
+		entry.CreatedAt.Before(now.Add(-s.store.maxAge))
 }
 
 func (s *CallbackSender) nextPendingCallback(
 	leaseUUID string,
 	releaseEmptyDrain func(),
 ) (CallbackEntry, bool, error) {
-	unlock := s.lockLease(leaseUUID)
+	// Cancellation bounds queueing behind another journal owner. Once this gate
+	// is acquired, the authoritative bbolt read/write boundary is deliberately
+	// allowed to finish: abandoning an attempted commit would make its outcome
+	// ambiguous rather than make shutdown safer.
+	unlock, err := s.lockLeaseContext(s.stopCtx, leaseUUID)
+	if err != nil {
+		return CallbackEntry{}, false, err
+	}
 	defer unlock()
 	entries, err := s.store.listPending(leaseUUID)
 	if err != nil {
@@ -881,52 +930,37 @@ func (s *CallbackSender) nextPendingCallback(
 }
 
 func (s *CallbackSender) removeDeliveredCallback(entry CallbackEntry) error {
-	unlock := s.lockLease(entry.LeaseUUID)
+	unlock, err := s.lockLeaseContext(s.stopCtx, entry.LeaseUUID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	return s.store.removeEntryLocked(entry)
 }
 
 func callbackEntryPayload(entry CallbackEntry, storageIdentity backendidentity.ID) ([]byte, error) {
-	if entry.BackendStorageID == "" && entry.storageVersion == callbackStorageLegacy {
-		// A v0.13 row contains no storage-lineage evidence. The supported stopped
-		// upgrade drains this bucket before sealing an identity, so reaching it in
-		// a current sender is an operator-repair condition, not permission to bind
-		// old evidence to whichever substrate happens to be mounted now.
-		return nil, fmt.Errorf("legacy v0.13 callback lacks backend storage identity; drain it before upgrade")
-	}
-	if entry.BackendStorageID == "" && entry.storageVersion == callbackStorageV2 {
+	if entry.BackendStorageID == "" {
 		// Current durable decode already rejects this. Keep the payload boundary
 		// independently fail-closed in case a future caller bypasses store reads.
-		return nil, fmt.Errorf("current callback lacks backend storage identity")
+		return nil, fmt.Errorf("callback lacks backend storage identity")
 	}
 
-	// Explicit non-durable compatibility senders may still use the old
-	// Success-only shape. Current durable rows always carry Status.
-	status := entry.Status
-	if status == "" {
-		status = backend.CallbackStatusSuccess
-		if !entry.Success {
-			status = backend.CallbackStatusFailed
-		}
-	}
 	payload := backend.CallbackPayload{
 		LeaseUUID: entry.LeaseUUID,
-		Status:    status,
+		Status:    entry.Status,
 		Error:     entry.Error,
 		Backend:   entry.Backend,
 		Retained:  entry.Retained,
 	}
-	if entry.BackendStorageID != "" {
-		parsed, err := backendidentity.Parse(entry.BackendStorageID)
-		if err != nil {
-			return nil, fmt.Errorf("parse persisted callback backend storage identity: %w", err)
-		}
-		if storageIdentity.Valid() && parsed != storageIdentity {
-			return nil, fmt.Errorf("%w: persisted callback belongs to %s, current backend is %s",
-				backendidentity.ErrIdentityDrift, parsed, storageIdentity)
-		}
-		payload.BackendStorageID = parsed.String()
+	parsed, err := backendidentity.Parse(entry.BackendStorageID)
+	if err != nil {
+		return nil, fmt.Errorf("parse persisted callback backend storage identity: %w", err)
 	}
+	if storageIdentity.Valid() && parsed != storageIdentity {
+		return nil, fmt.Errorf("%w: persisted callback belongs to %s, current backend is %s",
+			backendidentity.ErrIdentityDrift, parsed, storageIdentity)
+	}
+	payload.BackendStorageID = parsed.String()
 	return json.Marshal(payload)
 }
 
@@ -934,22 +968,54 @@ func (s *CallbackSender) lockLease(leaseUUID string) func() {
 	return lockCallbackLease(s.deliveryLocksMu, s.deliveryLocks, leaseUUID)
 }
 
+func (s *CallbackSender) lockLeaseContext(
+	ctx context.Context,
+	leaseUUID string,
+) (func(), error) {
+	return lockCallbackLeaseContext(ctx, s.deliveryLocksMu, s.deliveryLocks, leaseUUID)
+}
+
 func (s *CallbackSender) tryLockDrainLease(leaseUUID string) (func(), bool) {
 	return tryLockCallbackLease(s.drainLocksMu, s.drainLocks, leaseUUID)
 }
 
-func lockCallbackLease(registryMu *sync.Mutex, registry map[string]*callbackLeaseLock, leaseUUID string) func() {
+func lockCallbackLease(
+	registryMu *sync.Mutex,
+	registry map[string]*callbackLeaseLock,
+	leaseUUID string,
+) func() {
+	unlock, err := lockCallbackLeaseContext(
+		context.Background(), registryMu, registry, leaseUUID,
+	)
+	if err != nil {
+		panic(fmt.Sprintf("background callback lease lock failed: %v", err))
+	}
+	return unlock
+}
+
+func lockCallbackLeaseContext(
+	ctx context.Context,
+	registryMu *sync.Mutex,
+	registry map[string]*callbackLeaseLock,
+	leaseUUID string,
+) (func(), error) {
+	if ctx == nil {
+		return nil, errors.New("callback lease lock requires a context")
+	}
 	registryMu.Lock()
 	lock := registry[leaseUUID]
 	if lock == nil {
-		lock = &callbackLeaseLock{}
+		lock = &callbackLeaseLock{gate: semaphore.NewWeighted(1)}
 		registry[leaseUUID] = lock
 	}
 	lock.refs++
 	registryMu.Unlock()
 
-	lock.mu.Lock()
-	return callbackLeaseUnlock(registryMu, registry, leaseUUID, lock)
+	if err := lock.gate.Acquire(ctx, 1); err != nil {
+		callbackLeaseReleaseReference(registryMu, registry, leaseUUID, lock)
+		return nil, err
+	}
+	return callbackLeaseUnlock(registryMu, registry, leaseUUID, lock), nil
 }
 
 // tryLockCallbackLease joins the ref-counted registry before trying the keyed
@@ -961,13 +1027,13 @@ func tryLockCallbackLease(registryMu *sync.Mutex, registry map[string]*callbackL
 	registryMu.Lock()
 	lock := registry[leaseUUID]
 	if lock == nil {
-		lock = &callbackLeaseLock{}
+		lock = &callbackLeaseLock{gate: semaphore.NewWeighted(1)}
 		registry[leaseUUID] = lock
 	}
 	lock.refs++
 	registryMu.Unlock()
 
-	if !lock.mu.TryLock() {
+	if !lock.gate.TryAcquire(1) {
 		callbackLeaseReleaseReference(registryMu, registry, leaseUUID, lock)
 		return nil, false
 	}
@@ -976,7 +1042,7 @@ func tryLockCallbackLease(registryMu *sync.Mutex, registry map[string]*callbackL
 
 func callbackLeaseUnlock(registryMu *sync.Mutex, registry map[string]*callbackLeaseLock, leaseUUID string, lock *callbackLeaseLock) func() {
 	return func() {
-		lock.mu.Unlock()
+		lock.gate.Release(1)
 		callbackLeaseReleaseReference(registryMu, registry, leaseUUID, lock)
 	}
 }
@@ -991,9 +1057,17 @@ func callbackLeaseReleaseReference(registryMu *sync.Mutex, registry map[string]*
 }
 
 func (s *CallbackSender) reportStoreError() {
-	if s.onStoreError != nil {
-		s.onStoreError()
+	if s.onStoreError == nil {
+		return
 	}
+	// Metrics/observer hooks are foreign application code. Their failure cannot
+	// terminate the sole level-triggered replay owner or mutate durable facts.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("panic in callback store-error hook", "panic", recovered)
+		}
+	}()
+	s.onStoreError()
 }
 
 func (s *CallbackSender) reportReplayPanic(recovered any) {
@@ -1012,7 +1086,15 @@ func (s *CallbackSender) reportReplayPanic(recovered any) {
 
 // reportDelivery calls the onDelivery hook if configured.
 func (s *CallbackSender) reportDelivery(outcome string) {
-	if s.onDelivery != nil {
-		s.onDelivery(outcome)
+	if s.onDelivery == nil {
+		return
 	}
+	// Delivery accounting is observational. A faulty hook must neither discard
+	// a failed durable head nor stop later replay of unrelated leases.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("panic in callback delivery hook", "panic", recovered)
+		}
+	}()
+	s.onDelivery(outcome)
 }

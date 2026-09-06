@@ -3,6 +3,7 @@ package shared
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -813,31 +814,21 @@ func resetPreservingResolver() SKUResolver {
 	}
 }
 
-func TestResetPreserving_NilKeepEqualsReset(t *testing.T) {
-	list := []ResourceAllocation{{LeaseUUID: "l1", Tenant: "t1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
+const (
+	resetProtectedLeaseA = "550e8400-e29b-41d4-a716-446655440000"
+	resetProtectedLeaseB = "550e8400-e29b-41d4-a716-446655440001"
+)
 
-	a := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
-	require.NoError(t, a.TryAllocate("stale-0", "sku", "t9")) // prior state that must be cleared
-	require.NoError(t, a.Reset(list))
-
-	b := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
-	require.NoError(t, b.TryAllocate("stale-0", "sku", "t9"))
-	require.NoError(t, b.ResetPreserving(list, nil))
-
-	assert.Equal(t, a.Stats(), b.Stats(), "nil keep must behave identically to Reset")
-	assert.Nil(t, b.GetAllocation("stale-0"), "nil keep preserves nothing")
-}
-
-func TestResetPreserving_RetainsMarkedEntryAbsentFromNewList(t *testing.T) {
+func TestResetConservatively_PreservesOwnerAbsentFromSnapshot(t *testing.T) {
 	p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
-	require.NoError(t, p.TryAllocate("inflight-app-0", "sku", "t1")) // the in-flight reservation to keep
+	inflightKey := resetProtectedLeaseA + "-app-0"
+	readyKey := resetProtectedLeaseB + "-app-0"
+	require.NoError(t, p.TryAllocate(inflightKey, "sku", "t1"))
 
-	// Rebuild from a snapshot that OMITS the in-flight lease (no container yet),
-	// but mark it to keep — mirroring recoverState dropping an in-flight lease
-	// from the container-derived list.
-	require.NoError(t, p.ResetPreserving(
-		[]ResourceAllocation{{LeaseUUID: "ready-app-0", Tenant: "t2", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
-		func(key string) bool { return key == "inflight-app-0" },
+	// Recovery omits the in-flight lease because it has no container yet. Absence
+	// cannot release its reservation; doing so would expose phantom capacity.
+	require.NoError(t, p.ResetConservatively(
+		[]ResourceAllocation{{LeaseUUID: readyKey, Tenant: "t2", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
 	))
 
 	s := p.Stats()
@@ -845,40 +836,109 @@ func TestResetPreserving_RetainsMarkedEntryAbsentFromNewList(t *testing.T) {
 	assert.Equal(t, int64(2048), s.AllocatedDiskMB)
 	assert.Equal(t, 2.0, s.AllocatedCPU)
 	assert.Equal(t, int64(1024), s.AllocatedMemoryMB)
-	assert.NotNil(t, p.GetAllocation("inflight-app-0"), "preserved entry survives")
+	assert.NotNil(t, p.GetAllocation(inflightKey), "preserved entry survives")
 	assert.Equal(t, int64(1024), p.TenantStats("t1").AllocatedDiskMB, "preserved lease's per-tenant usage is rebuilt")
 }
 
-func TestResetPreserving_PreservedWinsOverSameKeyInList_NoDoubleCount(t *testing.T) {
+func TestResetConservatively_RepresentedOwnerIsReplacedAsCohort(t *testing.T) {
 	p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
-	require.NoError(t, p.TryAllocate("dup-app-0", "sku", "t1"))
+	key0 := resetProtectedLeaseA + "-app-0"
+	key1 := resetProtectedLeaseA + "-app-1"
+	require.NoError(t, p.TryAllocate(key0, "sku", "t1"))
+	require.NoError(t, p.TryAllocate(key1, "sku", "t1"))
 
-	// The same key appears BOTH in the rebuild list and is marked to keep. It must
-	// be counted exactly once (the preserved entry wins).
-	require.NoError(t, p.ResetPreserving(
-		[]ResourceAllocation{{LeaseUUID: "dup-app-0", Tenant: "t1", SKU: "sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
-		func(key string) bool { return key == "dup-app-0" },
+	// A complete snapshot for this owner contains only instance zero. Replacing
+	// the owner as a cohort removes the stale sibling and counts key0 once.
+	require.NoError(t, p.ResetConservatively(
+		[]ResourceAllocation{{LeaseUUID: key0, Tenant: "t1", SKU: "sku", CPUCores: 2, MemoryMB: 1024, DiskMB: 2048}},
 	))
 
 	s := p.Stats()
-	assert.Equal(t, 1, s.AllocationCount, "same key must not double-count")
-	assert.Equal(t, int64(1024), s.AllocatedDiskMB)
-	assert.Equal(t, 1.0, s.AllocatedCPU)
-	assert.Equal(t, int64(1024), p.TenantStats("t1").AllocatedDiskMB, "per-tenant usage counted once")
+	assert.Equal(t, 1, s.AllocationCount)
+	assert.Equal(t, int64(2048), s.AllocatedDiskMB)
+	assert.Equal(t, 2.0, s.AllocatedCPU)
+	assert.Nil(t, p.GetAllocation(key1), "stale sibling from the represented owner must not survive")
 }
 
-func TestResetPreserving_DropsUnmarkedEntryAbsentFromNewList(t *testing.T) {
+func TestResetConservatively_EmptySnapshotFailsClosed(t *testing.T) {
 	p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
-	require.NoError(t, p.TryAllocate("stale-app-0", "sku", "t1"))
+	key := resetProtectedLeaseA + "-app-0"
+	require.NoError(t, p.TryAllocate(key, "sku", "t1"))
 
-	// keep matches nothing and the stale entry is absent from the new list → dropped
-	// (a Failed/Ready lease whose containers are gone must not be over-preserved).
-	require.NoError(t, p.ResetPreserving(nil, func(key string) bool { return false }))
+	require.NoError(t, p.ResetConservatively(nil))
 
 	s := p.Stats()
-	assert.Equal(t, 0, s.AllocationCount, "unmarked entry absent from the rebuild list is dropped")
-	assert.Equal(t, int64(0), s.AllocatedDiskMB)
-	assert.Nil(t, p.GetAllocation("stale-app-0"))
+	assert.Equal(t, 1, s.AllocationCount, "an empty observation cannot prove release")
+	assert.Equal(t, int64(1024), s.AllocatedDiskMB)
+	assert.NotNil(t, p.GetAllocation(key))
+}
+
+func TestResetConservatively_UsesExactUUIDOwnerNotTextPrefix(t *testing.T) {
+	p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
+	keyA := resetProtectedLeaseA + "-app-0"
+	keyB := resetProtectedLeaseB + "-app-0"
+	require.NoError(t, p.TryAllocate(keyA, "sku", "tenant-a"))
+	require.NoError(t, p.TryAllocate(keyB, "sku", "tenant-b"))
+
+	require.NoError(t, p.ResetConservatively(
+		[]ResourceAllocation{{LeaseUUID: keyA, Tenant: "tenant-a", SKU: "sku", CPUCores: 2, MemoryMB: 1024, DiskMB: 2048}},
+	))
+	assert.Equal(t, int64(2048), p.GetAllocation(keyA).DiskMB)
+	assert.NotNil(t, p.GetAllocation(keyB), "a distinct UUID sharing a textual prefix remains unrepresented")
+}
+
+func TestResetConservatively_AcceptsCanonicalUUIDv7LeaseOwner(t *testing.T) {
+	p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
+	key := "0192f1a0-1111-7abc-8def-000000000001-app-0"
+
+	require.NoError(t, p.ResetConservatively([]ResourceAllocation{{
+		LeaseUUID: key, Tenant: "tenant-a", SKU: "sku",
+		CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+	}}))
+	require.NotNil(t, p.GetAllocation(key))
+}
+
+func TestResetConservatively_RejectsMalformedKeysAtomically(t *testing.T) {
+	newPool := func(key string) *ResourcePool {
+		p := NewResourcePool(8, 8192, 8192, resetPreservingResolver(), nil)
+		require.NoError(t, p.TryAllocate(key, "sku", "tenant-a"))
+		return p
+	}
+	validKey := resetProtectedLeaseA + "-app-0"
+	validReplacement := ResourceAllocation{
+		LeaseUUID: resetProtectedLeaseB + "-app-0", Tenant: "tenant-b", SKU: "sku",
+		CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
+	}
+	t.Run("current snapshot", func(t *testing.T) {
+		p := newPool("not-a-canonical-allocation-key")
+		before := p.Stats()
+		err := p.ResetConservatively([]ResourceAllocation{validReplacement})
+		require.ErrorContains(t, err, "classify current recovery allocation")
+		assert.Equal(t, before, p.Stats())
+		assert.NotNil(t, p.GetAllocation("not-a-canonical-allocation-key"))
+		assert.Nil(t, p.GetAllocation(validReplacement.LeaseUUID))
+	})
+
+	t.Run("rebuilt snapshot", func(t *testing.T) {
+		p := newPool(validKey)
+		before := p.Stats()
+		bad := validReplacement
+		bad.LeaseUUID = resetProtectedLeaseB // missing the allocation suffix
+		err := p.ResetConservatively([]ResourceAllocation{bad})
+		require.ErrorContains(t, err, "classify rebuilt recovery allocation")
+		assert.Equal(t, before, p.Stats())
+		assert.NotNil(t, p.GetAllocation(validKey))
+		assert.Nil(t, p.GetAllocation(bad.LeaseUUID))
+	})
+}
+
+func TestResetConservatively_ExposesNoCallbackUnderPoolLock(t *testing.T) {
+	method, ok := reflect.TypeFor[*ResourcePool]().MethodByName("ResetConservatively")
+	require.True(t, ok)
+	for index := 1; index < method.Type.NumIn(); index++ {
+		assert.NotEqual(t, reflect.Func, method.Type.In(index).Kind(),
+			"recovery reset must not execute caller code while holding the pool lock")
+	}
 }
 
 func TestAvailableDiskMB_ClampsToZero(t *testing.T) {

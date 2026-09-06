@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backend/shared/workbarrier"
 )
 
@@ -33,8 +33,8 @@ var errActorTerminated = errors.New("lease actor terminated; retry will create a
 // down or report success while that worker may still publish a later write.
 var ErrWorkerDrainTimeout = errors.New("lease mutation worker did not drain before the safety deadline")
 
-type LeaseMessage interface {
-	isLeaseMessage()
+type leaseMessage interface {
+	isleaseMessage()
 	// doneChan returns the channel to close when processing finishes, or nil
 	// for fire-and-forget messages. Lifting this out of the handler dispatch
 	// lets shutdown drain pending messages without a per-type switch.
@@ -48,45 +48,245 @@ type LeaseMessage interface {
 	onPanic(err error)
 }
 
+// actorCommandMessage is the closed set of commands allowed to resolve or
+// create an actor. Observations intentionally do not implement this interface,
+// so a stale substrate event cannot materialize a new actor generation.
+type actorCommandMessage interface {
+	leaseMessage
+	isactorCommandMessage()
+}
+
+// actorObservationMessage is the closed set of substrate observations. A
+// substrate must route these with an exact provision-generation capability.
+type actorObservationMessage interface {
+	leaseMessage
+	isactorObservationMessage()
+	onStaleGeneration()
+}
+
+// messageEnvelope gives every externally admitted message affine, copy-safe
+// semantics. Copying an opaque wrapper copies only this pointer; exactly one
+// successful actor admission can consume the envelope. A refused enqueue
+// releases the claim so bounded routing retries remain possible.
+type messageEnvelope struct {
+	message  leaseMessage
+	accepted atomic.Bool
+}
+
+func newMessageEnvelope(message leaseMessage) *messageEnvelope {
+	return &messageEnvelope{message: message}
+}
+
+// ActorCommand is the opaque, one-shot capability for caller-authored work.
+// Its zero value is invalid and is refused by TryEnqueueCommand.
+type ActorCommand struct{ envelope *messageEnvelope }
+
+func newActorCommand(message actorCommandMessage) ActorCommand {
+	return ActorCommand{envelope: newMessageEnvelope(message)}
+}
+
+// ActorObservation is an opaque, one-shot substrate observation bound to an
+// exact durable runtime generation. Its constructors require a store-issued
+// RuntimeGenerationProof; admission and handling re-attest that proof through
+// the actor's provision store, so callers cannot substitute an always-current
+// classifier.
+type ActorObservation struct{ envelope *messageEnvelope }
+
+func newActorObservation(message actorObservationMessage) ActorObservation {
+	return ActorObservation{envelope: newMessageEnvelope(message)}
+}
+
+// RecoveryCommand is deliberately distinct from an ordinary ActorCommand:
+// recovery may repair an existing actor but must never resolve or create one.
+type RecoveryCommand struct{ envelope *messageEnvelope }
+
+func newRecoveryCommand(message leaseMessage) RecoveryCommand {
+	return RecoveryCommand{envelope: newMessageEnvelope(message)}
+}
+
+// ActorReply is the receive-only half of a caller-facing actor command. The
+// sending capability remains inside the private command value, so callers
+// cannot acknowledge their own request or share a writable channel with a
+// different actor command.
+type ActorReply struct {
+	result <-chan error
+}
+
+func newActorReply() (chan error, ActorReply) {
+	result := make(chan error, 1)
+	return result, ActorReply{result: result}
+}
+
+// Result exposes the command result as a receive-only channel for callers
+// which already own a cancellation policy.
+func (r ActorReply) Result() <-chan error { return r.result }
+
+// Wait waits for the actor's linearized decision or for ctx cancellation.
+func (r ActorReply) Wait(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("actor reply context is required")
+	}
+	if r.result == nil {
+		return errors.New("actor reply is invalid")
+	}
+	select {
+	case err := <-r.result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ActorCompletion is an optional, receive-only processing barrier for an
+// observation. The zero value is invalid; fire-and-forget observations use a
+// distinct constructor and therefore carry no latent nullable channel.
+type ActorCompletion struct {
+	done <-chan struct{}
+}
+
+func (c ActorCompletion) Done() <-chan struct{} { return c.done }
+
+// ObservationGenerationState is the exhaustive relationship between a queued
+// substrate observation and the current in-memory projection. The distinction
+// between Advanced and Superseded matters: an actor may itself advance fields
+// on the same projection, while a replacement pointer represents a different
+// generation.
+type ObservationGenerationState uint8
+
+const (
+	ObservationGenerationCurrent ObservationGenerationState = iota + 1
+	ObservationGenerationAdvanced
+	ObservationGenerationSuperseded
+	ObservationGenerationAbsent
+)
+
+// LeaseUUID returns the runtime generation to which this observation is bound.
+// The zero value returns an empty identity.
+func (observation ActorObservation) LeaseUUID() string {
+	message := observation.message()
+	switch value := message.(type) {
+	case containerDiedMsg:
+		return value.Runtime.LeaseUUID()
+	case cohortDivergedMsg:
+		return value.Runtime.LeaseUUID()
+	default:
+		return ""
+	}
+}
+
+func (observation ActorObservation) message() actorObservationMessage {
+	if observation.envelope == nil {
+		return nil
+	}
+	message, _ := observation.envelope.message.(actorObservationMessage)
+	return message
+}
+
+// Current reports whether both the durable Release and the volatile Ready
+// projection still describe the generation sealed into this observation.
+// Routing uses it before actor creation; the actor repeats the classification
+// at serial handling time.
+func (observation ActorObservation) Current(store LeaseProvisionStore) bool {
+	return classifyActorObservation(store, observation.message()) == ObservationGenerationCurrent
+}
+
+func classifyActorObservation(
+	store LeaseProvisionStore,
+	message actorObservationMessage,
+) ObservationGenerationState {
+	if nilActorCapability(store) || message == nil {
+		return ObservationGenerationAbsent
+	}
+	var proof shared.RuntimeGenerationProof
+	switch value := message.(type) {
+	case containerDiedMsg:
+		proof = value.Runtime
+	case cohortDivergedMsg:
+		proof = value.Runtime
+	default:
+		return ObservationGenerationAbsent
+	}
+	if !proof.Valid() {
+		return ObservationGenerationAbsent
+	}
+	if err := proof.Reattest(); err != nil {
+		return ObservationGenerationSuperseded
+	}
+	switch value := message.(type) {
+	case containerDiedMsg:
+		return store.ClassifyReadyInstance(proof, value.ContainerID)
+	case cohortDivergedMsg:
+		return store.ClassifyReadyRuntime(proof)
+	default:
+		return ObservationGenerationAbsent
+	}
+}
+
 // workerTerminalMessage is the closed set of messages produced by actor-owned
 // workers. Retirement may still apply these messages after external admission
 // has closed: they settle work that was accepted before retirement. Keeping the
 // distinction in the type system prevents a future caller-facing command from
 // being accidentally executed by the post-worker shutdown drain.
 type workerTerminalMessage interface {
-	LeaseMessage
+	leaseMessage
 	isWorkerTerminalMessage()
 }
 
-// ContainerDiedMsg signals a container belonging to this lease has died.
-// If Done is non-nil, the actor closes it after the message is processed,
-// letting synchronous callers block until completion. Exported so the
-// substrate's container event loop can construct values and route them
-// through the actor's inbox.
-type ContainerDiedMsg struct {
+// containerDiedMsg signals a container belonging to this lease has died.
+// Construction explicitly chooses fire-and-forget or completion-tracked form.
+type containerDiedMsg struct {
 	ContainerID string
+	Runtime     shared.RuntimeGenerationProof
 	Done        chan struct{}
 }
 
-func (ContainerDiedMsg) isLeaseMessage()           {}
-func (m ContainerDiedMsg) doneChan() chan struct{} { return m.Done }
+func (containerDiedMsg) isleaseMessage()            {}
+func (containerDiedMsg) isactorObservationMessage() {}
+func (m containerDiedMsg) doneChan() chan struct{}  { return m.Done }
+func (containerDiedMsg) onStaleGeneration()         {}
 
 // onPanic is a no-op: the caller (if any) unblocks via the done
 // channel which is closed by handle()'s defer regardless of panic.
-func (ContainerDiedMsg) onPanic(error) {}
+func (containerDiedMsg) onPanic(error) {}
 
-// DeprovisionMsg requests that the actor run the Deprovision flow. The
-// Reply channel receives the outcome; doneChan is always nil because
-// callers block on Reply instead. Exported so the substrate's Deprovision
-// shim can construct values and route them through the actor's inbox.
-type DeprovisionMsg struct {
+func NewContainerDiedObservation(
+	containerID string,
+	runtime shared.RuntimeGenerationProof,
+) (ActorObservation, error) {
+	if containerID == "" {
+		return ActorObservation{}, errors.New("container death observation requires a container id")
+	}
+	if !runtime.Valid() {
+		return ActorObservation{}, errors.New("container death observation requires an exact runtime generation")
+	}
+	return newActorObservation(containerDiedMsg{ContainerID: containerID, Runtime: runtime}), nil
+}
+
+func NewTrackedContainerDiedObservation(
+	containerID string,
+	runtime shared.RuntimeGenerationProof,
+) (ActorObservation, ActorCompletion, error) {
+	if containerID == "" {
+		return ActorObservation{}, ActorCompletion{}, errors.New("container death observation requires a container id")
+	}
+	if !runtime.Valid() {
+		return ActorObservation{}, ActorCompletion{}, errors.New("container death observation requires an exact runtime generation")
+	}
+	done := make(chan struct{})
+	return newActorObservation(containerDiedMsg{ContainerID: containerID, Runtime: runtime, Done: done}), ActorCompletion{done: done}, nil
+}
+
+// deprovisionMsg requests that the actor run the deprovision flow. Callers can
+// obtain one only through NewDeprovisionCommand, which owns the reply channel.
+type deprovisionMsg struct {
 	Ctx   context.Context
 	Reply chan error
 }
 
-func (DeprovisionMsg) isLeaseMessage()         {}
-func (DeprovisionMsg) doneChan() chan struct{} { return nil }
-func (m DeprovisionMsg) onPanic(err error) {
+func (deprovisionMsg) isleaseMessage()         {}
+func (deprovisionMsg) isactorCommandMessage()  {}
+func (deprovisionMsg) doneChan() chan struct{} { return nil }
+func (m deprovisionMsg) onPanic(err error) {
 	// Non-blocking send: Reply is buffered-1, caller receives at most
 	// once. On recover, make sure the caller gets something.
 	select {
@@ -95,24 +295,54 @@ func (m DeprovisionMsg) onPanic(err error) {
 	}
 }
 
-// CohortDivergedMsg reports that recovery observed a running instance cohort
+func NewDeprovisionCommand(ctx context.Context) (ActorCommand, ActorReply, error) {
+	if ctx == nil {
+		return ActorCommand{}, ActorReply{}, errors.New("deprovision context is required")
+	}
+	reply, receiver := newActorReply()
+	return newActorCommand(deprovisionMsg{Ctx: ctx, Reply: reply}), receiver, nil
+}
+
+// cohortDivergedMsg reports that recovery observed a running instance cohort
 // which does not match the durable desired release. It deliberately carries no
 // caller-authored error string: the state machine owns the fixed, tenant-safe
 // failure reason and callback message. Reply must be buffered by one, matching
-// DeprovisionMsg, so recovery can wait until both state mutation and durable
+// deprovisionMsg, so recovery can wait until both state mutation and durable
 // lifecycle callback enqueue have completed.
-type CohortDivergedMsg struct {
-	Ctx   context.Context
-	Reply chan error
+type cohortDivergedMsg struct {
+	Ctx     context.Context
+	Runtime shared.RuntimeGenerationProof
+	Reply   chan error
 }
 
-func (CohortDivergedMsg) isLeaseMessage()         {}
-func (CohortDivergedMsg) doneChan() chan struct{} { return nil }
-func (m CohortDivergedMsg) onPanic(err error) {
+func (cohortDivergedMsg) isleaseMessage()            {}
+func (cohortDivergedMsg) isactorObservationMessage() {}
+func (cohortDivergedMsg) doneChan() chan struct{}    { return nil }
+func (m cohortDivergedMsg) onStaleGeneration() {
+	select {
+	case m.Reply <- nil:
+	default:
+	}
+}
+func (m cohortDivergedMsg) onPanic(err error) {
 	select {
 	case m.Reply <- err:
 	default:
 	}
+}
+
+func NewCohortDivergedObservation(
+	ctx context.Context,
+	runtime shared.RuntimeGenerationProof,
+) (ActorObservation, ActorReply, error) {
+	if ctx == nil {
+		return ActorObservation{}, ActorReply{}, errors.New("cohort divergence context is required")
+	}
+	if !runtime.Valid() {
+		return ActorObservation{}, ActorReply{}, errors.New("cohort divergence observation requires an exact runtime generation")
+	}
+	reply, receiver := newActorReply()
+	return newActorObservation(cohortDivergedMsg{Ctx: ctx, Runtime: runtime, Reply: reply}), receiver, nil
 }
 
 // maintenanceRecoveryOutcome is deliberately private. Docker recovery can
@@ -139,21 +369,20 @@ type MaintenanceRecoveryProjection struct {
 // maintenanceRecoveredMsg converges a stale Restarting/Updating actor after
 // the exact durable maintenance Release has already reached a terminal state.
 // Its fields are private so callers cannot forge an outcome or bypass the
-// MaintenanceID fence; use one of the typed constructors below.
+// exact intent-generation fence; use one of the typed constructors below.
 //
 // The actor suppresses callback delivery for this message. Recovery resolves
 // the durable MaintenanceIntent only after the projection transition and
 // pending-route cleanup succeed, preserving Release -> actor -> outbox order.
 type maintenanceRecoveredMsg struct {
-	leaseUUID     string
-	maintenanceID shared.MaintenanceID
-	outcome       maintenanceRecoveryOutcome
-	success       ReplaceSuccessResult
-	failure       ReplaceFailureInfo
-	reply         chan error
+	maintenance shared.MaintenanceIntentClaim
+	outcome     maintenanceRecoveryOutcome
+	success     ReplaceSuccessResult
+	failure     ReplaceFailureInfo
+	reply       chan error
 }
 
-func (maintenanceRecoveredMsg) isLeaseMessage()         {}
+func (maintenanceRecoveredMsg) isleaseMessage()         {}
 func (maintenanceRecoveredMsg) doneChan() chan struct{} { return nil }
 func (m maintenanceRecoveredMsg) onPanic(err error) {
 	select {
@@ -165,24 +394,21 @@ func (m maintenanceRecoveredMsg) onPanic(err error) {
 // NewMaintenanceRecoveredSuccessMsg constructs the only recovery message that
 // may promote the pending target route and workload projection.
 func NewMaintenanceRecoveredSuccessMsg(
-	claim shared.MaintenanceIntentClaim,
+	active shared.MaintenanceReleaseActive,
 	projection MaintenanceRecoveryProjection,
-	reply chan error,
-) (LeaseMessage, error) {
-	result, err := validateMaintenanceRecoveryProjection(claim, projection, true)
+) (RecoveryCommand, ActorReply, error) {
+	result, err := validateActiveMaintenanceRecoveryProjection(active, projection)
 	if err != nil {
-		return nil, err
+		return RecoveryCommand{}, ActorReply{}, err
 	}
-	if reply == nil {
-		return nil, errors.New("maintenance recovery requires a reply channel")
-	}
-	return maintenanceRecoveredMsg{
-		leaseUUID:     claim.LeaseUUID(),
-		maintenanceID: claim.MaintenanceID(),
-		outcome:       maintenanceRecoveredSuccess,
-		success:       result,
-		reply:         reply,
-	}, nil
+	claim := active.Intent()
+	reply, receiver := newActorReply()
+	return newRecoveryCommand(maintenanceRecoveredMsg{
+		maintenance: claim,
+		outcome:     maintenanceRecoveredSuccess,
+		success:     result,
+		reply:       reply,
+	}), receiver, nil
 }
 
 // NewMaintenanceRecoveredFailureReadyMsg constructs a failed-maintenance
@@ -191,10 +417,9 @@ func NewMaintenanceRecoveredFailureReadyMsg(
 	claim shared.MaintenanceIntentClaim,
 	projection MaintenanceRecoveryProjection,
 	info ReplaceFailureInfo,
-	reply chan error,
-) (LeaseMessage, error) {
+) (RecoveryCommand, ActorReply, error) {
 	return newMaintenanceRecoveredFailureMsg(
-		claim, maintenanceRecoveredFailureReady, projection, info, reply,
+		claim, maintenanceRecoveredFailureReady, projection, info,
 	)
 }
 
@@ -204,10 +429,9 @@ func NewMaintenanceRecoveredFailureFailedMsg(
 	claim shared.MaintenanceIntentClaim,
 	projection MaintenanceRecoveryProjection,
 	info ReplaceFailureInfo,
-	reply chan error,
-) (LeaseMessage, error) {
+) (RecoveryCommand, ActorReply, error) {
 	return newMaintenanceRecoveredFailureMsg(
-		claim, maintenanceRecoveredFailureFailed, projection, info, reply,
+		claim, maintenanceRecoveredFailureFailed, projection, info,
 	)
 }
 
@@ -217,30 +441,29 @@ func NewMaintenanceRecoveredFailureFailedMsg(
 // transition, so a deferred outbox settlement cannot oscillate Ready/Failed or
 // replay ordinary transition side effects.
 func NewMaintenanceRecoveredRuntimeFailureMsg(
-	claim shared.MaintenanceIntentClaim,
+	active shared.MaintenanceReleaseActive,
 	projection MaintenanceRecoveryProjection,
-	reply chan error,
-) (LeaseMessage, error) {
-	result, err := validateMaintenanceRecoveryProjection(claim, projection, true)
+) (RecoveryCommand, ActorReply, error) {
+	result, err := validateActiveMaintenanceRecoveryProjection(active, projection)
 	if err != nil {
-		return nil, err
+		return RecoveryCommand{}, ActorReply{}, err
 	}
-	if reply == nil {
-		return nil, errors.New("maintenance recovery requires a reply channel")
-	}
-	return maintenanceRecoveredMsg{
-		leaseUUID:     claim.LeaseUUID(),
-		maintenanceID: claim.MaintenanceID(),
-		outcome:       maintenanceRecoveredSuccessRuntimeFailed,
-		success:       result,
+	claim := active.Intent()
+	reply, receiver := newActorReply()
+	return newRecoveryCommand(maintenanceRecoveredMsg{
+		maintenance: claim,
+		outcome:     maintenanceRecoveredSuccessRuntimeFailed,
+		success:     result,
 		failure: ReplaceFailureInfo{
-			Operation:   string(claim.Kind()),
-			CallbackErr: ErrMsgCohortDiverged,
-			Reason:      backend.ReasonInternal,
-			LastError:   ErrMsgCohortDiverged,
+			operation:     string(claim.Kind()),
+			callbackErr:   ErrMsgCohortDiverged,
+			reason:        backend.ReasonInternal,
+			lastError:     ErrMsgCohortDiverged,
+			authorityKind: replaceAuthorityRecovery,
+			maintenance:   claim,
 		},
 		reply: reply,
-	}, nil
+	}), receiver, nil
 }
 
 func newMaintenanceRecoveredFailureMsg(
@@ -248,30 +471,31 @@ func newMaintenanceRecoveredFailureMsg(
 	outcome maintenanceRecoveryOutcome,
 	projection MaintenanceRecoveryProjection,
 	info ReplaceFailureInfo,
-	reply chan error,
-) (LeaseMessage, error) {
-	result, err := validateMaintenanceRecoveryProjection(claim, projection, false)
+) (RecoveryCommand, ActorReply, error) {
+	result, err := validateMaintenanceFailureRecoveryProjection(claim, projection)
 	if err != nil {
-		return nil, err
+		return RecoveryCommand{}, ActorReply{}, err
 	}
-	if reply == nil {
-		return nil, errors.New("maintenance recovery requires a reply channel")
+	if info.authorityKind != replaceAuthorityRecovery ||
+		!info.maintenance.MatchesIntent(claim) {
+		return RecoveryCommand{}, ActorReply{}, errors.New(
+			"maintenance recovery failure details belong to another intent",
+		)
 	}
-	info.PreserveMaintenance = true
-	return maintenanceRecoveredMsg{
-		leaseUUID:     claim.LeaseUUID(),
-		maintenanceID: claim.MaintenanceID(),
-		outcome:       outcome,
-		success:       result,
-		failure:       info,
-		reply:         reply,
-	}, nil
+	reply, receiver := newActorReply()
+	info.preserveMaintenance = true
+	return newRecoveryCommand(maintenanceRecoveredMsg{
+		maintenance: claim,
+		outcome:     outcome,
+		success:     result,
+		failure:     info,
+		reply:       reply,
+	}), receiver, nil
 }
 
-func validateMaintenanceRecoveryProjection(
+func validateMaintenanceFailureRecoveryProjection(
 	claim shared.MaintenanceIntentClaim,
 	projection MaintenanceRecoveryProjection,
-	requireTargetRoute bool,
 ) (ReplaceSuccessResult, error) {
 	if !claim.Valid() {
 		return ReplaceSuccessResult{}, errors.New("maintenance recovery requires an exact intent claim")
@@ -281,31 +505,47 @@ func validateMaintenanceRecoveryProjection(
 		serviceContainers[service] = append([]string(nil), ids...)
 	}
 	result := ReplaceSuccessResult{
-		ContainerIDs:                  append([]string(nil), projection.ContainerIDs...),
-		ServiceContainers:             serviceContainers,
+		containerIDs:                  append([]string(nil), projection.ContainerIDs...),
+		serviceContainers:             serviceContainers,
+		authorityKind:                 replaceAuthorityRecovery,
+		maintenance:                   claim,
 		suppressMaintenanceSettlement: true,
 	}
-	if !requireTargetRoute {
-		return result, nil
+	return result, nil
+}
+
+// validateActiveMaintenanceRecoveryProjection binds an observed cohort to the
+// exact committed target generation. A bare intent contains a pre-append
+// Version=0 target and therefore cannot authorize a live projection update.
+func validateActiveMaintenanceRecoveryProjection(
+	active shared.MaintenanceReleaseActive,
+	projection MaintenanceRecoveryProjection,
+) (ReplaceSuccessResult, error) {
+	if !active.Valid() {
+		return ReplaceSuccessResult{}, errors.New("maintenance recovery requires an exact active release")
 	}
-	target := claim.TargetRelease()
+	claim := active.Intent()
+	target, ok := active.TargetRelease()
+	if !ok || target.Version <= 0 {
+		return ReplaceSuccessResult{}, errors.New("maintenance recovery active release has no exact target")
+	}
+	stack, err := validateCompleteReleaseProjection(
+		target, projection.ContainerIDs, projection.ServiceContainers,
+	)
+	if err != nil {
+		return ReplaceSuccessResult{}, fmt.Errorf("maintenance recovery target projection: %w", err)
+	}
 	authority, ok := target.RuntimeIdentity()
 	if !ok {
 		return ReplaceSuccessResult{}, errors.New("maintenance recovery target has no runtime authority")
 	}
-	stack, err := manifest.ParsePayload(target.Manifest)
-	if err != nil {
-		return ReplaceSuccessResult{}, fmt.Errorf("maintenance recovery target manifest: %w", err)
-	}
-	items := append([]backend.LeaseItem(nil), target.Items...)
-	resourceProfiles := shared.CloneSKUResourceSnapshot(target.ResourceProfiles)
-	result.OnSuccess = func(state *ProvisionState) {
-		state.Tenant = authority.Tenant()
-		state.ProviderUUID = authority.ProviderUUID()
-		state.Items = append([]backend.LeaseItem(nil), items...)
-		state.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
-		state.StackManifest = stack
-	}
+	result := newReplaceSuccessProjection(ReplaceSuccessProjection(projection))
+	result.authorityKind = replaceAuthorityRecovery
+	result.maintenance = claim
+	result.maintenanceRelease = active
+	result.suppressMaintenanceSettlement = true
+	result.release = &target
+	result.stackManifest = stack
 	result.applyRecoveredRuntimeAuthority = true
 	result.recoveredCallbackURL = authority.CallbackURL()
 	result.recoveredLifecycleCallbackURL = authority.LifecycleCallbackURL()
@@ -318,33 +558,47 @@ type diagGatheredMsg struct {
 	result diagResult
 }
 
-func (diagGatheredMsg) isLeaseMessage()          {}
+func (diagGatheredMsg) isleaseMessage()          {}
 func (diagGatheredMsg) doneChan() chan struct{}  { return nil }
 func (diagGatheredMsg) onPanic(error)            {} // no caller to unblock
 func (diagGatheredMsg) isWorkerTerminalMessage() {}
 
-// ProvisionRequestedMsg asks the actor to drive a provision flow. Carries
+// provisionRequestedMsg asks the actor to drive a provision flow. Carries
 // the Cancel func (stored on the actor so Provisioning.OnExit can preempt)
 // and a Work closure containing everything doProvision needs — the actor
 // doesn't need to know the arg shapes. After firing the SM
 // transition, the actor sends the Fire result on Ack and spawns a worker
 // (tracked by workers) to run Work. Backend.Provision blocks on Ack so it
-// knows whether the SM accepted the transition before returning. Exported
-// so the substrate's Provision shim can construct values and route them
-// through the actor's inbox.
-type ProvisionRequestedMsg struct {
-	Cancel context.CancelFunc
-	Work   func() (callbackErr string, reason backend.Reason, result ProvisionSuccessResult, failureLogs map[string]string, err error)
-	Ack    chan error
+// knows whether the SM accepted the transition before returning. Only the
+// validating NewProvisionCommand constructor can create one.
+type provisionRequestedMsg struct {
+	Ctx       context.Context
+	Ack       chan error
+	Operation shared.OperationIntentClaim
 }
 
-func (ProvisionRequestedMsg) isLeaseMessage()         {}
-func (ProvisionRequestedMsg) doneChan() chan struct{} { return nil }
-func (m ProvisionRequestedMsg) onPanic(err error) {
+func (provisionRequestedMsg) isleaseMessage()         {}
+func (provisionRequestedMsg) isactorCommandMessage()  {}
+func (provisionRequestedMsg) doneChan() chan struct{} { return nil }
+func (m provisionRequestedMsg) onPanic(err error) {
 	select {
 	case m.Ack <- err:
 	default:
 	}
+}
+
+func NewProvisionCommand(
+	ctx context.Context,
+	operation shared.OperationIntentClaim,
+) (ActorCommand, ActorReply, error) {
+	if ctx == nil {
+		return ActorCommand{}, ActorReply{}, errors.New("provision context is required")
+	}
+	if !operation.Valid() || operation.Kind() != shared.OperationIntentProvision {
+		return ActorCommand{}, ActorReply{}, errors.New("provision requires an exact pending operation")
+	}
+	ack, receiver := newActorReply()
+	return newActorCommand(provisionRequestedMsg{Ctx: ctx, Ack: ack, Operation: operation}), receiver, nil
 }
 
 // provisionCompletedMsg is sent by the doProvision goroutine on success.
@@ -355,7 +609,7 @@ type provisionCompletedMsg struct {
 	result ProvisionSuccessResult
 }
 
-func (provisionCompletedMsg) isLeaseMessage()          {}
+func (provisionCompletedMsg) isleaseMessage()          {}
 func (provisionCompletedMsg) doneChan() chan struct{}  { return nil }
 func (provisionCompletedMsg) onPanic(error)            {} // no caller to unblock
 func (provisionCompletedMsg) isWorkerTerminalMessage() {}
@@ -369,27 +623,43 @@ func (provisionCompletedMsg) isWorkerTerminalMessage() {}
 // from already-deleted containers — see doProvision's captureContainerLogs
 // call.
 type provisionErroredMsg struct {
-	callbackErr string
-	reason      backend.Reason // ENG-508
-	lastError   string
-	logs        map[string]string
+	callbackErr      string
+	reason           backend.Reason // ENG-508
+	lastError        string
+	logs             map[string]string
+	operationFailure shared.OperationReleaseUncommitted
 }
 
-func (provisionErroredMsg) isLeaseMessage()          {}
+func (provisionErroredMsg) isleaseMessage()          {}
 func (provisionErroredMsg) doneChan() chan struct{}  { return nil }
 func (provisionErroredMsg) onPanic(error)            {} // no caller to unblock
 func (provisionErroredMsg) isWorkerTerminalMessage() {}
 
-// RestartRequestedMsg / UpdateRequestedMsg carry a Cancel func + Work
-// closure + Ack chan, analogous to ProvisionRequestedMsg. The Work closure
+// operationAmbiguousMsg deliberately performs no FSM transition and publishes
+// no callback. Its arrival on the actor inbox is nevertheless required: it is
+// the ordered worker-to-actor handoff which makes the worker quiescent before
+// periodic durable-intent recovery may classify the substrate.
+type operationAmbiguousMsg struct {
+	kind          string
+	operationID   shared.OperationID
+	maintenanceID shared.MaintenanceID
+	err           error
+}
+
+func (operationAmbiguousMsg) isleaseMessage()          {}
+func (operationAmbiguousMsg) doneChan() chan struct{}  { return nil }
+func (operationAmbiguousMsg) onPanic(error)            {}
+func (operationAmbiguousMsg) isWorkerTerminalMessage() {}
+
+// restartRequestedMsg and updateRequestedMsg carry a Cancel func + Work
+// closure + Ack chan, analogous to provisionRequestedMsg. The Work closure
 // returns a ReplaceResult consumed by the actor to pick the right terminal
-// SM event (completed / recovered / failed). Exported so the substrate's
-// Restart / Update shims can construct values and route them through the
-// actor's inbox.
-type RestartRequestedMsg struct {
-	Cancel context.CancelFunc
-	Work   func() ReplaceResult
+// SM event (completed / recovered / failed). Their validating constructors
+// derive maintenance identity and callback authority from the exact target.
+type restartRequestedMsg struct {
+	Ctx    context.Context
 	Ack    chan error
+	Target shared.MaintenanceReleaseClaim
 	// The callback pair remains pending until replacement succeeds. New
 	// containers and the completion callback use it immediately, but failed
 	// maintenance leaves the committed runtime pair unchanged.
@@ -398,19 +668,20 @@ type RestartRequestedMsg struct {
 	Maintenance          shared.MaintenanceIntentClaim
 }
 
-func (RestartRequestedMsg) isLeaseMessage()         {}
-func (RestartRequestedMsg) doneChan() chan struct{} { return nil }
-func (m RestartRequestedMsg) onPanic(err error) {
+func (restartRequestedMsg) isleaseMessage()         {}
+func (restartRequestedMsg) isactorCommandMessage()  {}
+func (restartRequestedMsg) doneChan() chan struct{} { return nil }
+func (m restartRequestedMsg) onPanic(err error) {
 	select {
 	case m.Ack <- err:
 	default:
 	}
 }
 
-type UpdateRequestedMsg struct {
-	Cancel context.CancelFunc
-	Work   func() ReplaceResult
+type updateRequestedMsg struct {
+	Ctx    context.Context
 	Ack    chan error
+	Target shared.MaintenanceReleaseClaim
 	// The callback pair remains pending until replacement succeeds. New
 	// containers and the completion callback use it immediately, but failed
 	// maintenance leaves the committed runtime pair unchanged.
@@ -419,42 +690,111 @@ type UpdateRequestedMsg struct {
 	Maintenance          shared.MaintenanceIntentClaim
 }
 
-func (UpdateRequestedMsg) isLeaseMessage()         {}
-func (UpdateRequestedMsg) doneChan() chan struct{} { return nil }
-func (m UpdateRequestedMsg) onPanic(err error) {
+func (updateRequestedMsg) isleaseMessage()         {}
+func (updateRequestedMsg) isactorCommandMessage()  {}
+func (updateRequestedMsg) doneChan() chan struct{} { return nil }
+func (m updateRequestedMsg) onPanic(err error) {
 	select {
 	case m.Ack <- err:
 	default:
 	}
 }
 
-// RestoreRequestedMsg drives a restore (ENG-325) through the EXISTING
+func newMaintenanceCommand(
+	kind shared.MaintenanceIntentKind,
+	ctx context.Context,
+	target shared.MaintenanceReleaseClaim,
+) (context.Context, shared.MaintenanceReleaseClaim, shared.MaintenanceIntentClaim, chan error, ActorReply, error) {
+	if ctx == nil {
+		return nil, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance context is required")
+	}
+	if !target.Valid() {
+		return nil, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance command requires an exact bound target release")
+	}
+	maintenance := target.Intent()
+	if !maintenance.Valid() || maintenance.Kind() != kind || maintenance.MaintenanceID() != target.MaintenanceID() {
+		return nil, shared.MaintenanceReleaseClaim{}, shared.MaintenanceIntentClaim{}, nil, ActorReply{}, errors.New("maintenance command target differs from intent")
+	}
+	ack, receiver := newActorReply()
+	return ctx, target, maintenance, ack, receiver, nil
+}
+
+func newRestartCommand(
+	kind shared.MaintenanceIntentKind,
+	ctx context.Context,
+	target shared.MaintenanceReleaseClaim,
+) (ActorCommand, ActorReply, error) {
+	ctx, target, maintenance, ack, receiver, err := newMaintenanceCommand(kind, ctx, target)
+	if err != nil {
+		return ActorCommand{}, ActorReply{}, err
+	}
+	return newActorCommand(restartRequestedMsg{Ctx: ctx, Target: target, Ack: ack,
+		CallbackURL: maintenance.CallbackURL(), LifecycleCallbackURL: maintenance.LifecycleCallbackURL(), Maintenance: maintenance}), receiver, nil
+}
+
+func NewRestartCommand(ctx context.Context, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
+	return newRestartCommand(shared.MaintenanceIntentRestart, ctx, target)
+}
+
+// NewCustomDomainCommand preserves the restart-shaped actor transition while
+// requiring a target minted from custom-domain maintenance authority. Keeping
+// this constructor distinct prevents either caller from relabeling a generic
+// restart command with the wrong durable intent kind.
+func NewCustomDomainCommand(ctx context.Context, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
+	return newRestartCommand(shared.MaintenanceIntentCustomDomain, ctx, target)
+}
+
+func NewUpdateCommand(ctx context.Context, target shared.MaintenanceReleaseClaim) (ActorCommand, ActorReply, error) {
+	ctx, target, maintenance, ack, receiver, err := newMaintenanceCommand(shared.MaintenanceIntentUpdate, ctx, target)
+	if err != nil {
+		return ActorCommand{}, ActorReply{}, err
+	}
+	return newActorCommand(updateRequestedMsg{Ctx: ctx, Target: target, Ack: ack,
+		CallbackURL: maintenance.CallbackURL(), LifecycleCallbackURL: maintenance.LifecycleCallbackURL(), Maintenance: maintenance}), receiver, nil
+}
+
+// restoreRequestedMsg drives a restore (ENG-325) through the existing
 // replace machinery — same Cancel/Work/Ack/callback-pair shape as
-// RestartRequestedMsg. The difference is purely the SM event it fires:
+// restartRequestedMsg. The difference is purely the SM event it fires:
 // evRestoreRequested, which is permitted only from Provisioning (a
 // restore's new lease is reserved there), versus evRestartRequested
 // from Ready/Failed. The Work closure returns a ReplaceResult consumed
-// by spawnReplaceWorker exactly as for restart/update. Exported so the
-// substrate's Restore shim can construct values and route them through
-// the actor's inbox.
-type RestoreRequestedMsg struct {
-	Cancel context.CancelFunc
-	Work   func() ReplaceResult
-	Ack    chan error
+// by spawnReplaceWorker exactly as for restart/update. Only NewRestoreCommand
+// can create one, from exact restore operation authority.
+type restoreRequestedMsg struct {
+	Ctx context.Context
+	Ack chan error
 	// The callback pair is applied to the provision state by
 	// onEnterRestarting (reused for restore) before the actor acks — the
 	// actor, not the HTTP prelude, is the sole writer of those fields.
 	CallbackURL          string
 	LifecycleCallbackURL string
+	Operation            shared.OperationIntentClaim
 }
 
-func (RestoreRequestedMsg) isLeaseMessage()         {}
-func (RestoreRequestedMsg) doneChan() chan struct{} { return nil }
-func (m RestoreRequestedMsg) onPanic(err error) {
+func (restoreRequestedMsg) isleaseMessage()         {}
+func (restoreRequestedMsg) isactorCommandMessage()  {}
+func (restoreRequestedMsg) doneChan() chan struct{} { return nil }
+func (m restoreRequestedMsg) onPanic(err error) {
 	select {
 	case m.Ack <- err:
 	default:
 	}
+}
+
+func NewRestoreCommand(
+	ctx context.Context,
+	operation shared.OperationIntentClaim,
+) (ActorCommand, ActorReply, error) {
+	if ctx == nil {
+		return ActorCommand{}, ActorReply{}, errors.New("restore context is required")
+	}
+	if !operation.Valid() || operation.Kind() != shared.OperationIntentRestore {
+		return ActorCommand{}, ActorReply{}, errors.New("restore requires an exact pending operation")
+	}
+	ack, receiver := newActorReply()
+	return newActorCommand(restoreRequestedMsg{Ctx: ctx, Ack: ack,
+		CallbackURL: operation.CallbackURL(), LifecycleCallbackURL: operation.LifecycleCallbackURL(), Operation: operation}), receiver, nil
 }
 
 // replaceCompletedMsg / replaceRecoveredMsg / replaceFailedMsg fire the
@@ -472,7 +812,7 @@ type replaceCompletedMsg struct {
 	maintenanceID shared.MaintenanceID
 }
 
-func (replaceCompletedMsg) isLeaseMessage()          {}
+func (replaceCompletedMsg) isleaseMessage()          {}
 func (replaceCompletedMsg) doneChan() chan struct{}  { return nil }
 func (replaceCompletedMsg) onPanic(error)            {} // no caller to unblock
 func (replaceCompletedMsg) isWorkerTerminalMessage() {}
@@ -482,7 +822,7 @@ type replaceRecoveredMsg struct {
 	maintenanceID shared.MaintenanceID
 }
 
-func (replaceRecoveredMsg) isLeaseMessage()          {}
+func (replaceRecoveredMsg) isleaseMessage()          {}
 func (replaceRecoveredMsg) doneChan() chan struct{}  { return nil }
 func (replaceRecoveredMsg) onPanic(error)            {} // no caller to unblock
 func (replaceRecoveredMsg) isWorkerTerminalMessage() {}
@@ -492,7 +832,7 @@ type replaceFailedMsg struct {
 	maintenanceID shared.MaintenanceID
 }
 
-func (replaceFailedMsg) isLeaseMessage()          {}
+func (replaceFailedMsg) isleaseMessage()          {}
 func (replaceFailedMsg) doneChan() chan struct{}  { return nil }
 func (replaceFailedMsg) onPanic(error)            {} // no caller to unblock
 func (replaceFailedMsg) isWorkerTerminalMessage() {}
@@ -532,18 +872,16 @@ func (replaceFailedMsg) isWorkerTerminalMessage() {}
 // with themselves. SM transitions are synchronous inside handle() —
 // Fire dispatches OnExit / OnEntry in the actor's own goroutine.
 //
-// Exported as `LeaseActor` so the closure-builder NewLeaseActor can be
-// called from substrate packages and they can hold pointers into their
-// registries.
+// Exported so substrate packages can construct one from validated,
+// construction-bound dependencies and hold its pointer in their registries.
 type LeaseActor struct {
 	leaseUUID string
-	// cfg holds the substrate-agnostic dependencies the SM/actor consume.
-	// Set by NewLeaseActor via the supplied buildCfg closure; immutable
-	// after construction. All reach-back into substrate state goes
-	// through these closures — the actor holds no substrate pointer of
-	// its own.
+	// cfg holds the substrate-agnostic interfaces and fixed handlers consumed by
+	// the SM/actor. NewLeaseActor validates and freezes them; commands cannot
+	// supply executable behavior. The actor holds no substrate pointer of its
+	// own.
 	cfg   LeaseActorConfig
-	inbox chan LeaseMessage
+	inbox chan leaseMessage
 	done  chan struct{}
 	sm    *leaseSM
 	// pendingDeathInfo carries the inspected instance state from the SM's
@@ -601,6 +939,13 @@ type LeaseActor struct {
 	// states, so workers.Zero effectively waits for "the one worker
 	// currently running"; the count happens to always be 0 or 1.
 	workers *workbarrier.Barrier
+	// activity counts accepted/handling messages and workers. The actor overlaps
+	// the count across message->worker and worker->terminal-message hand-offs, so
+	// zero is a real quiescence proof rather than three racy snapshots. activityMu
+	// serializes count transitions with TryAcquireQuiescence; a recovery owner that
+	// claims zero holds the mutex and prevents any new actor mutation until release.
+	activityMu sync.Mutex
+	activity   int64
 	// currentMessageStart is the UnixNano timestamp of the message the
 	// actor is currently processing in handle(), or 0 when idle. Used by
 	// the stuck-actor sampler to detect hung handlers. Written by the
@@ -613,24 +958,20 @@ type LeaseActor struct {
 	// would otherwise Ignore evProvisionRequested and wedge the lease).
 	// Read and written only on the actor's own goroutine — no atomic.
 	terminated bool
-	// exiting is closed by the actor's exit sequence just before its final
-	// retirement drain, and observed by sendTerminal to reject late
-	// worker sends that would otherwise land in the inbox during the
-	// tiny window between the final drain completing and close(a.done)
-	// executing. Without this signal, a late orphan worker's
-	// sendTerminal (which can happen if waitForWorkers timed out)
-	// would see hasExited() == false (done not yet closed), succeed
-	// into the now-unmonitored inbox, and silently drop — under-
-	// counting leaseTerminalEventDroppedTotal.
-	//
-	// Closed-channel pattern chosen over atomic.Bool so the gate
-	// composes directly with sendTerminal's select, mirroring how
-	// `done` works and the broader Go idiom for one-shot broadcast
-	// signals (see context.Done()). exitingOnce wraps the close so
-	// tests can force the signal without panicking the production
-	// retirement path when it also closes the signal.
-	exiting     chan struct{}
-	exitingOnce sync.Once
+	// retirementRequested lets an exclusive quiescence capability retire an
+	// idle actor after recovery removes its projection. The claim marks retiring
+	// while it still owns admissionMu, so no external message can enter between
+	// registry-reservation release and the run loop observing this signal.
+	retirementRequested     chan struct{}
+	retirementRequestedOnce sync.Once
+	// terminalAdmissionMu linearizes worker terminal sends with the final
+	// retirement drain. Retirement closes admission while holding this gate;
+	// therefore every accepted terminal message is already in the inbox before
+	// the drain begins, and every later sender is refused. This ordering proof is
+	// stronger and smaller than observing a closing channel before and after a
+	// racy channel send.
+	terminalAdmissionMu     sync.Mutex
+	terminalAdmissionClosed bool
 	// admissionMu linearizes external TryEnqueue calls with retirement. The
 	// substrate holds its registry mutex while calling TryEnqueue, but the actor
 	// cannot take that registry mutex while beginning retirement without a lock
@@ -640,66 +981,110 @@ type LeaseActor struct {
 	retiring    bool
 }
 
-// Bounded inbox: full inbox blocks senders so Docker event bursts cannot
-// grow memory without bound.
+// Bounded inbox: admission refuses a full inbox so substrate event bursts
+// cannot grow memory or block while holding the actor-registry lock.
 const leaseActorInboxSize = 16
 
-// NewLeaseActor constructs a lease actor from a substrate-supplied config
-// builder. The builder closure receives the just-constructed *LeaseActor
-// so it can build closures (e.g. OnTerminated) that close over the actor
-// pointer for the "delete iff still-registered" CompareAndDelete check.
+// NewLeaseActor validates all composition capabilities before allocating or
+// spawning an actor. OnTerminated receives the completed actor explicitly, so
+// construction never leaks a half-built pointer through a config callback.
 //
-// CRITICAL: NewLeaseActor creates the actor AND spawns its run-loop
-// goroutine; callers needing registry-spawn atomicity (so a concurrent
-// resolve-or-create sees a runnable actor or no actor at all, never a
-// constructed-but-unspawned half-state) must hold the registry mutex
-// across the NewLeaseActor call. The Docker backend honors this by
-// invoking NewLeaseActor only from actorForLocked, which holds
-// b.actorsMu. K3s and other substrate implementers must apply the
-// same discipline: call NewLeaseActor under whatever mutex guards the
-// actor registry — otherwise a concurrent caller could observe a
-// registry entry whose actor hasn't started its inbox consumer.
+// CRITICAL: install is infallible and runs after validation/initialization but
+// before the run goroutine starts. The caller must hold its registry lock for
+// this entire call. Consequently an already-canceled StopCtx can retire only
+// an actor which is already registered, and a concurrent resolver observes
+// either that registered generation or no generation at all.
 //
 // Construction order:
 //  1. Allocate the actor with all per-actor primitives (inbox, done,
 //     exiting, workers).
-//  2. Call buildCfg(a) to obtain the substrate-supplied LeaseActorConfig
-//     and store it on the actor.
-//  3. Lift LeaseUUID off the cfg onto the actor struct (it's hot enough
+//  2. Store the already-validated LeaseActorConfig on the actor.
+//  3. Lift LeaseUUID off the config onto the actor struct (it's hot enough
 //     to merit avoiding the cfg dereference on every message).
 //  4. Initialize the SM eagerly so any external reader (DebugActors over
 //     /debug/actors) sees a non-nil pointer without synchronization on
 //     a lazy-init field.
-//  5. Record one ActorCreated metric event — moved here from the
+//  5. Invoke the infallible registry installer while the actor is inert.
+//  6. Record one ActorCreated metric event — moved here from the
 //     substrate's resolve-or-create function so a single SMMetrics
 //     adapter sees every actor construction regardless of substrate.
-//  6. Spawn the actor's goroutine via cfg.WG.Go(a.run) — moved here for
+//  7. Spawn the actor's goroutine via cfg.WG.Go(a.run) — moved here for
 //     the same "one place creates, one place spawns" reason. Substrate
 //     code calls NewLeaseActor while holding its registry mutex, so the
 //     resolve-or-create-then-enqueue invariant is preserved (spawn
 //     happens before NewLeaseActor returns, before the substrate
 //     releases its mutex).
-//
-// Most LeaseActorConfig fields do NOT depend on the actor pointer — they
-// capture substrate state (e.g., a backend pointer). The only fields
-// where the builder closure typically needs the actor pointer are
-// OnTerminated (for the "reg == a" CompareAndDelete check). Substrate
-// implementers should treat the actor pointer arg as a tool for that
-// closure, not as a general-purpose handle (LeaseUUID is already in
-// the cfg alongside it).
-func NewLeaseActor(buildCfg func(*LeaseActor) LeaseActorConfig) *LeaseActor {
-	a := &LeaseActor{
-		inbox:   make(chan LeaseMessage, leaseActorInboxSize),
-		done:    make(chan struct{}),
-		exiting: make(chan struct{}),
-		workers: workbarrier.New(),
+func NewLeaseActor(cfg LeaseActorConfig, install func(*LeaseActor)) (*LeaseActor, error) {
+	if err := validateLeaseActorConfig(cfg); err != nil {
+		return nil, err
 	}
-	a.cfg = buildCfg(a)
+	if install == nil {
+		return nil, errors.New("lease actor requires an atomic registry installer")
+	}
+	a := &LeaseActor{
+		inbox:               make(chan leaseMessage, leaseActorInboxSize),
+		done:                make(chan struct{}),
+		retirementRequested: make(chan struct{}),
+		workers:             workbarrier.New(),
+	}
+	a.cfg = cfg
 	a.leaseUUID = a.cfg.LeaseUUID
 	a.sm = newLeaseSM(a)
+	// Installation precedes the run loop by construction. An already-canceled
+	// StopCtx may retire immediately after Go, but OnTerminated will necessarily
+	// observe the installed actor and can remove it instead of racing a later
+	// caller-side insertion.
+	install(a)
 	a.cfg.Metrics.ActorCreated()
 	a.cfg.WG.Go(a.run)
-	return a
+	return a, nil
+}
+
+func validateLeaseActorConfig(cfg LeaseActorConfig) error {
+	switch {
+	case cfg.LeaseUUID == "":
+		return errors.New("lease actor requires a lease identity")
+	case cfg.Logger == nil:
+		return errors.New("lease actor requires a logger")
+	case cfg.StopCtx == nil:
+		return errors.New("lease actor requires a stop context")
+	case cfg.WG == nil:
+		return errors.New("lease actor requires a worker group")
+	case nilActorCapability(cfg.Inspector):
+		return errors.New("lease actor requires an instance inspector")
+	case nilActorCapability(cfg.Diag):
+		return errors.New("lease actor requires a diagnostics gatherer")
+	case nilActorCapability(cfg.ProvisionStore):
+		return errors.New("lease actor requires a provision store")
+	case nilActorCapability(cfg.Metrics):
+		return errors.New("lease actor requires metrics")
+	case cfg.OnTerminated == nil || cfg.PersistDiagnosticsFn == nil ||
+		cfg.PersistDiagnosticsWithLogsFn == nil || cfg.SendOperationSuccessFn == nil ||
+		cfg.SendOperationFailureFn == nil || cfg.SendLifecycleFailureFn == nil ||
+		cfg.SendMaintenanceSuccessFn == nil || cfg.SendMaintenanceFailureFn == nil ||
+		cfg.ProvisionWorkFn == nil || cfg.RestoreWorkFn == nil ||
+		cfg.MaintenanceWorkFn == nil || cfg.DoDeprovisionFn == nil:
+		return errors.New("lease actor requires all handler capabilities")
+	case cfg.RecoveryLineage == (shared.RecoveryLineage{}):
+		return errors.New("lease actor requires actor-owned close authority")
+	case cfg.WorkerDrainTimeout < 0:
+		return errors.New("lease actor worker drain timeout cannot be negative")
+	default:
+		return nil
+	}
+}
+
+func nilActorCapability(capability any) bool {
+	if capability == nil {
+		return true
+	}
+	value := reflect.ValueOf(capability)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func (a *LeaseActor) run() {
@@ -711,11 +1096,13 @@ func (a *LeaseActor) run() {
 		}
 		select {
 		case msg := <-a.inbox:
-			a.handle(msg)
+			a.handleAcceptedMessage(msg)
 		case <-a.cfg.StopCtx.Done():
 			// Shutdown: exit the main loop. retire stops caller admission,
 			// waits for in-flight workers, and applies their terminal events
 			// before the actor is torn down.
+			return
+		case <-a.retirementRequested:
 			return
 		}
 	}
@@ -740,7 +1127,7 @@ func (a *LeaseActor) retire() {
 	a.stopAdmission()
 	a.drainRetiringInbox()
 	_ = a.waitForWorkers()
-	a.closeExiting()
+	a.closeTerminalAdmission()
 	a.drainRetiringInbox()
 	a.removeFromRegistry()
 	close(a.done)
@@ -794,24 +1181,55 @@ func (a *LeaseActor) drainRetiringInbox() {
 		select {
 		case msg := <-a.inbox:
 			if terminal, ok := msg.(workerTerminalMessage); ok {
-				a.handle(terminal)
+				a.handleAcceptedMessage(terminal)
 				continue
 			}
-			a.rejectRetiringMessage(msg)
+			a.rejectAcceptedMessage(msg)
 		default:
 			return
 		}
 	}
 }
 
-func (a *LeaseActor) rejectRetiringMessage(msg LeaseMessage) {
+func (a *LeaseActor) handleAcceptedMessage(msg leaseMessage) {
+	defer a.endActivity()
+	a.handle(msg)
+}
+
+func (a *LeaseActor) rejectAcceptedMessage(msg leaseMessage) {
+	defer a.endActivity()
+	a.rejectRetiringMessage(msg)
+}
+
+func (a *LeaseActor) endActivity() {
+	a.activityMu.Lock()
+	a.activity--
+	a.activityMu.Unlock()
+}
+
+func (a *LeaseActor) beginWorkerActivity() {
+	a.activityMu.Lock()
+	a.activity++
+	a.workers.Add()
+	a.activityMu.Unlock()
+}
+
+func (a *LeaseActor) endWorkerActivity() {
+	// Keep activity non-zero until after the worker barrier is released. The
+	// terminal message was counted before sendTerminal returned, so the two
+	// activity intervals overlap on the normal hand-off.
+	a.workers.Done()
+	a.endActivity()
+}
+
+func (a *LeaseActor) rejectRetiringMessage(msg leaseMessage) {
 	msg.onPanic(errActorTerminated)
 	if ch := msg.doneChan(); ch != nil {
 		close(ch)
 	}
 }
 
-func (a *LeaseActor) handle(msg LeaseMessage) {
+func (a *LeaseActor) handle(msg leaseMessage) {
 	a.currentMessageStart.Store(time.Now().UnixNano())
 	defer a.currentMessageStart.Store(0)
 	defer func() {
@@ -840,29 +1258,49 @@ func (a *LeaseActor) handle(msg LeaseMessage) {
 			msg.onPanic(fmt.Errorf("handler panic: %v", r))
 		}
 	}()
+	if observation, ok := msg.(actorObservationMessage); ok {
+		generation := classifyActorObservation(a.cfg.ProvisionStore, observation)
+		if generation != ObservationGenerationCurrent {
+			// A same-pointer advance may have been authored by this serial actor, so
+			// discard only the old observation. Pointer replacement or absence is the
+			// generation boundary: close admission before acknowledging it and retire
+			// after this handler returns, so a replacement command resolves an FSM
+			// initialized from the replacement projection.
+			if generation != ObservationGenerationAdvanced {
+				a.stopAdmission()
+				a.terminated = true
+			}
+			observation.onStaleGeneration()
+			return
+		}
+	}
 	switch m := msg.(type) {
-	case ContainerDiedMsg:
-		a.handleContainerDied(m.ContainerID)
-	case DeprovisionMsg:
+	case containerDiedMsg:
+		a.handleContainerDied(m.ContainerID, m.Runtime)
+	case deprovisionMsg:
 		m.Reply <- a.handleDeprovision(m.Ctx)
-	case CohortDivergedMsg:
-		m.Reply <- a.handleCohortDiverged(m.Ctx)
+	case cohortDivergedMsg:
+		m.Reply <- a.handleCohortDiverged(m.Ctx, m.Runtime)
 	case maintenanceRecoveredMsg:
 		m.reply <- a.handleMaintenanceRecovered(m)
 	case diagGatheredMsg:
 		a.handleDiagGathered(m.result)
-	case ProvisionRequestedMsg:
+	case provisionRequestedMsg:
 		a.handleProvisionRequested(m)
-	case RestartRequestedMsg:
+	case restartRequestedMsg:
 		a.handleRestartRequested(m)
-	case UpdateRequestedMsg:
+	case updateRequestedMsg:
 		a.handleUpdateRequested(m)
-	case RestoreRequestedMsg:
+	case restoreRequestedMsg:
 		a.handleRestoreRequested(m)
 	case provisionCompletedMsg:
 		a.handleProvisionCompleted(m.result)
 	case provisionErroredMsg:
-		a.handleProvisionErrored(m.callbackErr, m.reason, m.lastError, m.logs)
+		a.handleProvisionErrored(
+			m.callbackErr, m.reason, m.lastError, m.logs, m.operationFailure,
+		)
+	case operationAmbiguousMsg:
+		a.handleOperationAmbiguous(m)
 	case replaceCompletedMsg:
 		a.handleReplaceCompleted(m.result, m.maintenanceID)
 	case replaceRecoveredMsg:
@@ -876,33 +1314,54 @@ func (a *LeaseActor) handle(msg LeaseMessage) {
 	}
 }
 
-func (a *LeaseActor) handleContainerDied(containerID string) {
-	_ = a.sm.Fire(a.cfg.StopCtx, evContainerDied, containerID)
+func (a *LeaseActor) handleOperationAmbiguous(msg operationAmbiguousMsg) {
+	// Ambiguity preserves the non-terminal journal and FSM state, but the live
+	// worker is finished. Releasing only this exact generation lets periodic
+	// recovery become the sole resolver instead of permanently skipping a
+	// maintenance intent whose process-local owner no longer exists.
+	a.clearMaintenanceWorker(msg.maintenanceID)
+	a.cfg.Logger.Error(
+		"substrate mutation outcome is ambiguous; preserving non-terminal state for durable recovery",
+		"lease_uuid", a.leaseUUID,
+		"operation", msg.kind,
+		"operation_fingerprint", msg.operationID.Fingerprint(),
+		"error", msg.err,
+	)
+}
+
+func (a *LeaseActor) handleContainerDied(
+	containerID string,
+	runtime shared.RuntimeGenerationProof,
+) {
+	_ = a.sm.containerDied(a.cfg.StopCtx, containerID, runtime)
 }
 
 func (a *LeaseActor) handleDiagGathered(result diagResult) {
 	// If we're no longer in Failing (e.g., Deprovision preempted), the SM's
 	// Ignore declarations on Failed/Deprovisioning drop this event; Fire
 	// returns an unhandled-trigger error we can safely discard.
-	_ = a.sm.Fire(a.cfg.StopCtx, evDiagGathered, result)
+	_ = a.sm.diagnosticsGathered(a.cfg.StopCtx, result)
 }
 
-func (a *LeaseActor) handleCohortDiverged(ctx context.Context) error {
-	return a.sm.Fire(ctx, evCohortDiverged)
+func (a *LeaseActor) handleCohortDiverged(
+	ctx context.Context,
+	runtime shared.RuntimeGenerationProof,
+) error {
+	return a.sm.cohortDiverged(ctx, runtime)
 }
 
 func (a *LeaseActor) handleMaintenanceRecovered(msg maintenanceRecoveredMsg) error {
-	if !msg.maintenanceID.Valid() {
+	if !msg.maintenance.Valid() {
 		return errors.New("maintenance recovery message has no exact identity")
 	}
-	if msg.leaseUUID != a.leaseUUID {
+	if msg.maintenance.LeaseUUID() != a.leaseUUID {
 		return errors.New("maintenance recovery message belongs to another lease")
 	}
-	if a.OwnsMaintenance(msg.maintenanceID) {
+	if a.OwnsMaintenance(msg.maintenance.MaintenanceID()) {
 		return errors.New("maintenance recovery refused while exact worker remains active")
 	}
 	if a.pendingMaintenance.Valid() &&
-		a.pendingMaintenance.MaintenanceID() != msg.maintenanceID {
+		!msg.maintenance.MatchesIntent(a.pendingMaintenance) {
 		return errors.New("maintenance recovery identity differs from actor generation")
 	}
 
@@ -953,22 +1412,16 @@ func (a *LeaseActor) handleMaintenanceRecovered(msg maintenanceRecoveredMsg) err
 	var err error
 	switch msg.outcome {
 	case maintenanceRecoveredSuccess:
-		err = a.fireAndVerify(evMaintenanceRecoveredSuccess, backend.ProvisionStatusReady, msg.success)
+		err = a.sm.maintenanceRecoveredSuccess(a.cfg.StopCtx, msg.success)
 	case maintenanceRecoveredFailureReady:
-		err = a.fireAndVerify(
-			evMaintenanceRecoveredFailureReady, backend.ProvisionStatusReady,
-			maintenanceRecoveryFailureArgs{projection: msg.success, failure: msg.failure},
-		)
+		err = a.sm.maintenanceRecoveredFailureReady(a.cfg.StopCtx,
+			maintenanceRecoveryFailureArgs{projection: msg.success, failure: msg.failure})
 	case maintenanceRecoveredFailureFailed:
-		err = a.fireAndVerify(
-			evMaintenanceRecoveredFailureFailed, backend.ProvisionStatusFailed,
-			maintenanceRecoveryFailureArgs{projection: msg.success, failure: msg.failure},
-		)
+		err = a.sm.maintenanceRecoveredFailureFailed(a.cfg.StopCtx,
+			maintenanceRecoveryFailureArgs{projection: msg.success, failure: msg.failure})
 	case maintenanceRecoveredSuccessRuntimeFailed:
-		err = a.fireAndVerify(
-			evMaintenanceRecoveredSuccessRuntimeFailed, backend.ProvisionStatusFailed,
-			maintenanceRecoveryFailureArgs{projection: msg.success, failure: msg.failure},
-		)
+		err = a.sm.maintenanceRecoveredRuntimeFailed(a.cfg.StopCtx,
+			maintenanceRecoveryFailureArgs{projection: msg.success, failure: msg.failure})
 	default:
 		return errors.New("maintenance recovery message has invalid outcome")
 	}
@@ -979,31 +1432,6 @@ func (a *LeaseActor) handleMaintenanceRecovered(msg maintenanceRecoveredMsg) err
 	// Clear the exact pending authority only after the transition commits; the
 	// caller then atomically converts the durable intent into its outbox row.
 	a.sm.clearPendingReplaceRoute()
-	return nil
-}
-
-// fireAndVerify fires an SM event and verifies the transition landed in
-// the expected destination state. This is the ONLY way caller-facing
-// handlers should commit an SM transition — the raw sm.Fire call is
-// unsafe because stateless returns nil both on Permit (SM transitioned)
-// and Ignore (SM deliberately did nothing), so a naive
-// `if err := sm.Fire(...); err != nil` lets Ignore paths masquerade as
-// success. That trap bit handleProvisionRequested on the
-// partial-Deprovision lifecycle (Deprovisioning.Ignore(evProvisionRequested)
-// → Fire returns nil → worker spawned against an SM still in
-// Deprovisioning → terminal provisionCompletedMsg also Ignored →
-// lease wedges with live containers, no Success callback).
-//
-// Returns nil iff the SM is in wantState after Fire; otherwise returns
-// the Fire error (unhandled trigger) OR an errFireIgnored wrapping the
-// actual state (Ignore-returns-nil).
-func (a *LeaseActor) fireAndVerify(ev leaseEvent, wantState backend.ProvisionStatus, args ...any) error {
-	if err := a.sm.Fire(a.cfg.StopCtx, ev, args...); err != nil {
-		return err
-	}
-	if state := a.sm.State(); state != wantState {
-		return fmt.Errorf("%v not accepted by SM from state %v", ev, state)
-	}
 	return nil
 }
 
@@ -1048,7 +1476,7 @@ func (a *LeaseActor) classifyReplaceReject(err error) error {
 // before exit (bounded by WorkerDrainTimeout). The orphan-worker race class is
 // eliminated under that happy-path wait; a timeout refuses the transition
 // which would otherwise permit conflicting substrate work.
-func (a *LeaseActor) handleProvisionRequested(msg ProvisionRequestedMsg) {
+func (a *LeaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 	if a.terminated {
 		// Actor has already completed Deprovision but not yet been
 		// removed from the registry (defer ordering). Reject so the
@@ -1057,16 +1485,20 @@ func (a *LeaseActor) handleProvisionRequested(msg ProvisionRequestedMsg) {
 		msg.Ack <- errActorTerminated
 		return
 	}
-	if err := a.fireAndVerify(evProvisionRequested, backend.ProvisionStatusProvisioning); err != nil {
+	if !msg.Operation.Valid() || msg.Operation.LeaseUUID() != a.leaseUUID {
+		msg.Ack <- errors.New("provision operation belongs to another lease")
+		return
+	}
+	if err := a.sm.requestProvision(a.cfg.StopCtx); err != nil {
 		msg.Ack <- err
 		return
 	}
-	// Publish the cancel capability only after the state machine accepted this
-	// request. A rejected/ignored duplicate must not replace the cancel function
-	// belonging to the worker that is already in flight.
-	a.workCancel = msg.Cancel
+	// The actor creates and owns the exact context passed to work. Callers cannot
+	// pair a closure using one context with an unrelated cancellation capability.
+	workerCtx, cancel := context.WithCancel(msg.Ctx)
+	a.workCancel = cancel
 	msg.Ack <- nil
-	a.spawnProvisionWorker(msg.Work)
+	a.spawnProvisionWorker(workerCtx, msg.Operation)
 }
 
 // spawnProvisionWorker runs doProvision (supplied as the work closure),
@@ -1077,8 +1509,11 @@ func (a *LeaseActor) handleProvisionRequested(msg ProvisionRequestedMsg) {
 // cleanup (see doProvision's defer) so the persisted diagnostic entry
 // contains useful debugging output even though the failed containers
 // have been removed.
-func (a *LeaseActor) spawnProvisionWorker(work func() (string, backend.Reason, ProvisionSuccessResult, map[string]string, error)) {
-	a.workers.Add()
+func (a *LeaseActor) spawnProvisionWorker(
+	ctx context.Context,
+	operation shared.OperationIntentClaim,
+) {
+	a.beginWorkerActivity()
 	a.cfg.WG.Go(func() {
 		// Exactly one sendTerminal call site (the middle defer), driven
 		// by terminalMsg. Defer ordering (LIFO):
@@ -1094,16 +1529,15 @@ func (a *LeaseActor) spawnProvisionWorker(work func() (string, backend.Reason, P
 		// message.
 		var terminalMsg workerTerminalMessage
 		var event string
-		defer a.workers.Done()
+		defer a.endWorkerActivity()
 		defer func() {
 			if terminalMsg == nil {
 				// Defensive: should not occur if the normal path runs
 				// to completion. If it does, treat as an error so the
 				// SM reaches Failed rather than wedging.
-				terminalMsg = provisionErroredMsg{
-					callbackErr: errMsgInternal,
-					reason:      backend.ReasonInternal,
-					lastError:   "provision worker exited without setting terminal event",
+				terminalMsg = operationAmbiguousMsg{
+					kind: string(operation.Kind()), operationID: operation.OperationID(),
+					err: errors.New("provision worker exited without a typed outcome"),
 				}
 				event = "provision_no_result"
 			}
@@ -1125,50 +1559,70 @@ func (a *LeaseActor) spawnProvisionWorker(work func() (string, backend.Reason, P
 				a.cfg.Metrics.WorkerPanic("provision")
 				// Override any terminalMsg set by the normal path —
 				// the panic means the post-set work did not complete.
-				terminalMsg = provisionErroredMsg{
-					callbackErr: errMsgInternal,
-					reason:      backend.ReasonInternal,
-					lastError:   fmt.Sprintf("worker panic: %v", r),
+				terminalMsg = operationAmbiguousMsg{
+					kind: string(operation.Kind()), operationID: operation.OperationID(),
+					err: fmt.Errorf("provision worker panic: %v", r),
 				}
 				event = "provision_panic"
 			}
 		}()
-		callbackErr, reason, result, failureLogs, err := work()
-		if err == nil {
+		outcome := a.cfg.ProvisionWorkFn(ctx, operation)
+		if err := validateProvisionWorkOutcome(outcome, operation); err != nil {
+			terminalMsg = operationAmbiguousMsg{
+				kind: string(operation.Kind()), operationID: operation.OperationID(), err: err,
+			}
+			event = "provision_invalid_outcome"
+			return
+		}
+		switch typed := outcome.(type) {
+		case provisionWorkSuccess:
 			// Pre-publish so a concurrent Deprovision-preempt reading
 			// prov.ContainerIDs sees the new IDs and can tear them down
 			// rather than leaving orphans.
 			a.cfg.ProvisionStore.UpdateFn(a.leaseUUID, func(p *ProvisionState) {
-				p.ContainerIDs = result.ContainerIDs
+				p.ContainerIDs = typed.result.containerIDs
 			})
-			terminalMsg = provisionCompletedMsg{result: result}
+			terminalMsg = provisionCompletedMsg(typed)
 			event = "provision_completed"
-		} else {
+		case provisionWorkFailure:
 			terminalMsg = provisionErroredMsg{
-				callbackErr: callbackErr,
-				reason:      reason, // authored by doProvision (ENG-508); "" ⇒ Unknown default at read boundary, fail-closed
-				lastError:   err.Error(),
-				logs:        failureLogs,
+				callbackErr:      typed.callbackErr,
+				reason:           typed.reason,
+				lastError:        typed.err.Error(),
+				logs:             typed.logs,
+				operationFailure: typed.proof,
 			}
 			event = "provision_errored"
+		case provisionWorkAmbiguous:
+			terminalMsg = operationAmbiguousMsg{
+				kind: string(operation.Kind()), operationID: operation.OperationID(), err: typed.err,
+			}
+			event = "provision_ambiguous"
 		}
 	})
 }
 
 func (a *LeaseActor) handleProvisionCompleted(result ProvisionSuccessResult) {
-	_ = a.sm.Fire(a.cfg.StopCtx, evProvisionCompleted, result)
+	_ = a.sm.provisionCompleted(a.cfg.StopCtx, result)
 }
 
-func (a *LeaseActor) handleProvisionErrored(callbackErr string, reason backend.Reason, lastError string, logs map[string]string) {
-	_ = a.sm.Fire(a.cfg.StopCtx, evProvisionErrored, provisionErrorInfo{
-		callbackErr: callbackErr,
-		reason:      reason,
-		lastError:   lastError,
-		logs:        logs,
+func (a *LeaseActor) handleProvisionErrored(
+	callbackErr string,
+	reason backend.Reason,
+	lastError string,
+	logs map[string]string,
+	operationFailure shared.OperationReleaseUncommitted,
+) {
+	_ = a.sm.provisionErrored(a.cfg.StopCtx, provisionErrorInfo{
+		callbackErr:      callbackErr,
+		reason:           reason,
+		lastError:        lastError,
+		logs:             logs,
+		operationFailure: operationFailure,
 	})
 }
 
-func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
+func (a *LeaseActor) handleRestartRequested(msg restartRequestedMsg) {
 	if a.terminated {
 		msg.Ack <- errActorTerminated
 		return
@@ -1181,11 +1635,10 @@ func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
 	}
 	// onEnterRestarting publishes Status=Restarting and captures the validated
 	// callback pair as pending inside this Fire before the ack.
-	if err := a.fireAndVerify(evRestartRequested, backend.ProvisionStatusRestarting,
-		replaceEntryArgs{
-			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
-			CallbackKind: replaceCallbackLifecycle, Maintenance: msg.Maintenance,
-		}); err != nil {
+	if err := a.sm.requestRestart(a.cfg.StopCtx, replaceEntryArgs{
+		CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+		CallbackKind: replaceCallbackLifecycle, Maintenance: msg.Maintenance,
+	}); err != nil {
 		// A concurrent same-lease restart that lost the race finds the SM
 		// already busy → classifyReplaceReject returns ErrInvalidState (409).
 		msg.Ack <- a.classifyReplaceReject(err)
@@ -1196,8 +1649,9 @@ func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
 	// func, which onExitProvisioning uses on Deprovision-preempt. workCancel
 	// is consumed only by onExitProvisioning, which can run only after the
 	// state was entered (i.e. after a successful fire).
-	a.workCancel = msg.Cancel
-	a.spawnReplaceWorker(msg.Work)
+	workerCtx, cancel := context.WithCancel(msg.Ctx)
+	a.workCancel = cancel
+	a.spawnMaintenanceWorker(workerCtx, msg.Target)
 	msg.Ack <- nil
 }
 
@@ -1212,18 +1666,21 @@ func (a *LeaseActor) handleRestartRequested(msg RestartRequestedMsg) {
 // identically. Because the prior Status was Provisioning (not Ready),
 // applyReplaceEntry sets replaceWasActive=false, so a successful restore
 // Inc's activeProvisions — bringing the lease from absent to active.
-func (a *LeaseActor) handleRestoreRequested(msg RestoreRequestedMsg) {
+func (a *LeaseActor) handleRestoreRequested(msg restoreRequestedMsg) {
 	if a.terminated {
 		msg.Ack <- errActorTerminated
 		return
 	}
+	if !msg.Operation.Valid() || msg.Operation.LeaseUUID() != a.leaseUUID {
+		msg.Ack <- errors.New("restore operation belongs to another lease")
+		return
+	}
 	// onEnterRestarting writes Status=Restarting and the callback pair inside
 	// this Fire, before the ack — preserving the handler-publish contract.
-	if err := a.fireAndVerify(evRestoreRequested, backend.ProvisionStatusRestarting,
-		replaceEntryArgs{
-			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
-			CallbackKind: replaceCallbackOperation,
-		}); err != nil {
+	if err := a.sm.requestRestore(a.cfg.StopCtx, replaceEntryArgs{
+		CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+		CallbackKind: replaceCallbackOperation,
+	}); err != nil {
 		// Restore is permitted only from Provisioning; from any other state
 		// (e.g. a duplicate after the SM already left Provisioning, or a
 		// concurrent Deprovision) classifyReplaceReject yields ErrInvalidState
@@ -1233,12 +1690,13 @@ func (a *LeaseActor) handleRestoreRequested(msg RestoreRequestedMsg) {
 	}
 	// Set workCancel only AFTER a successful fire (ENG-230 §4); see
 	// handleRestartRequested for the rationale.
-	a.workCancel = msg.Cancel
-	a.spawnReplaceWorker(msg.Work)
+	workerCtx, cancel := context.WithCancel(msg.Ctx)
+	a.workCancel = cancel
+	a.spawnRestoreWorker(workerCtx, msg.Operation)
 	msg.Ack <- nil
 }
 
-func (a *LeaseActor) handleUpdateRequested(msg UpdateRequestedMsg) {
+func (a *LeaseActor) handleUpdateRequested(msg updateRequestedMsg) {
 	if a.terminated {
 		msg.Ack <- errActorTerminated
 		return
@@ -1251,11 +1709,10 @@ func (a *LeaseActor) handleUpdateRequested(msg UpdateRequestedMsg) {
 	}
 	// onEnterUpdating publishes Status=Updating and captures the validated
 	// callback pair as pending inside this Fire before the ack.
-	if err := a.fireAndVerify(evUpdateRequested, backend.ProvisionStatusUpdating,
-		replaceEntryArgs{
-			CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
-			CallbackKind: replaceCallbackLifecycle, Maintenance: msg.Maintenance,
-		}); err != nil {
+	if err := a.sm.requestUpdate(a.cfg.StopCtx, replaceEntryArgs{
+		CallbackURL: msg.CallbackURL, LifecycleCallbackURL: msg.LifecycleCallbackURL,
+		CallbackKind: replaceCallbackLifecycle, Maintenance: msg.Maintenance,
+	}); err != nil {
 		// A concurrent same-lease update that lost the race finds the SM
 		// already busy → classifyReplaceReject returns ErrInvalidState (409).
 		msg.Ack <- a.classifyReplaceReject(err)
@@ -1263,8 +1720,9 @@ func (a *LeaseActor) handleUpdateRequested(msg UpdateRequestedMsg) {
 	}
 	// Set workCancel only AFTER a successful fire (ENG-230 §4); see
 	// handleRestartRequested for the rationale.
-	a.workCancel = msg.Cancel
-	a.spawnReplaceWorker(msg.Work)
+	workerCtx, cancel := context.WithCancel(msg.Ctx)
+	a.workCancel = cancel
+	a.spawnMaintenanceWorker(workerCtx, msg.Target)
 	msg.Ack <- nil
 }
 
@@ -1295,15 +1753,34 @@ func (a *LeaseActor) validateMaintenanceRequest(
 // the worker closure. It is used only when the worker's result sets
 // RecoveredIfSourceActive (the doRestart preflight branch): there the
 // recovered-vs-failed decision keys on wasActive (the actor-observed source)
-// instead of result.Restored, fixing the stale-route-time-snapshot edge.
-func (a *LeaseActor) spawnReplaceWorker(work func() ReplaceResult) {
+// instead of result.restored, fixing the stale-route-time-snapshot edge.
+func (a *LeaseActor) spawnMaintenanceWorker(
+	ctx context.Context,
+	target shared.MaintenanceReleaseClaim,
+) {
+	a.spawnReplaceWorker(ctx, target, shared.OperationIntentClaim{})
+}
+
+func (a *LeaseActor) spawnRestoreWorker(
+	ctx context.Context,
+	operation shared.OperationIntentClaim,
+) {
+	a.spawnReplaceWorker(ctx, shared.MaintenanceReleaseClaim{}, operation)
+}
+
+func (a *LeaseActor) spawnReplaceWorker(
+	ctx context.Context,
+	target shared.MaintenanceReleaseClaim,
+	operation shared.OperationIntentClaim,
+) {
 	wasActive := a.replaceWasActive
-	hasMaintenanceAuthority := a.pendingMaintenance.Valid()
-	maintenanceID := a.pendingMaintenance.MaintenanceID()
+	maintenance := a.pendingMaintenance
+	hasMaintenanceAuthority := maintenance.Valid()
+	maintenanceID := maintenance.MaintenanceID()
 	if hasMaintenanceAuthority {
 		a.markMaintenanceWorker(maintenanceID)
 	}
-	a.workers.Add()
+	a.beginWorkerActivity()
 	a.cfg.WG.Go(func() {
 		// Same defer structure as spawnProvisionWorker — see that
 		// function for the rationale. One sendTerminal call site in
@@ -1311,15 +1788,20 @@ func (a *LeaseActor) spawnReplaceWorker(work func() ReplaceResult) {
 		// to terminalMsg.
 		var terminalMsg workerTerminalMessage
 		var event string
-		defer a.workers.Done()
+		defer a.endWorkerActivity()
 		defer func() {
 			if terminalMsg == nil {
-				terminalMsg = replaceFailedMsg{info: ReplaceFailureInfo{
-					CallbackErr:         errMsgInternal,
-					Reason:              backend.ReasonInternal,
-					LastError:           "replace worker exited without setting terminal event",
-					PreserveMaintenance: hasMaintenanceAuthority,
-				}, maintenanceID: maintenanceID}
+				kind := string(shared.OperationIntentRestore)
+				operationID := shared.OperationID{}
+				if hasMaintenanceAuthority {
+					kind = string(maintenance.Kind())
+				} else if operation.Valid() {
+					operationID = operation.OperationID()
+				}
+				terminalMsg = operationAmbiguousMsg{
+					kind: kind, operationID: operationID, maintenanceID: maintenanceID,
+					err: errors.New("replace worker exited without a typed outcome"),
+				}
 				event = "replace_no_result"
 			}
 			if !a.sendTerminal(terminalMsg) {
@@ -1339,43 +1821,82 @@ func (a *LeaseActor) spawnReplaceWorker(work func() ReplaceResult) {
 					"stack", string(debug.Stack()),
 				)
 				a.cfg.Metrics.WorkerPanic("replace")
-				terminalMsg = replaceFailedMsg{info: ReplaceFailureInfo{
-					CallbackErr:         errMsgInternal,
-					Reason:              backend.ReasonInternal,
-					LastError:           fmt.Sprintf("worker panic: %v", r),
-					PreserveMaintenance: hasMaintenanceAuthority,
-				}, maintenanceID: maintenanceID}
+				kind := string(shared.OperationIntentRestore)
+				operationID := shared.OperationID{}
+				if hasMaintenanceAuthority {
+					kind = string(maintenance.Kind())
+				} else if operation.Valid() {
+					operationID = operation.OperationID()
+				}
+				terminalMsg = operationAmbiguousMsg{
+					kind: kind, operationID: operationID, maintenanceID: maintenanceID,
+					err: fmt.Errorf("replace worker panic: %v", r),
+				}
 				event = "replace_panic"
 			}
 		}()
-		result := work()
-		if result.Err == nil {
+		var outcome ReplaceWorkOutcome
+		if hasMaintenanceAuthority {
+			outcome = a.cfg.MaintenanceWorkFn(ctx, target)
+		} else {
+			outcome = a.cfg.RestoreWorkFn(ctx, operation)
+		}
+		if err := validateReplaceWorkOutcome(outcome, maintenance, operation); err != nil {
+			kind := string(shared.OperationIntentRestore)
+			operationID := shared.OperationID{}
+			if hasMaintenanceAuthority {
+				kind = string(maintenance.Kind())
+			} else if operation.Valid() {
+				operationID = operation.OperationID()
+			}
+			terminalMsg = operationAmbiguousMsg{
+				kind: kind, operationID: operationID, maintenanceID: maintenanceID, err: err,
+			}
+			event = "replace_invalid_outcome"
+			return
+		}
+		if ambiguous, ok := outcome.(replaceWorkAmbiguous); ok {
+			kind := string(shared.OperationIntentRestore)
+			operationID := shared.OperationID{}
+			if hasMaintenanceAuthority {
+				kind = string(maintenance.Kind())
+			} else if operation.Valid() {
+				operationID = operation.OperationID()
+			}
+			terminalMsg = operationAmbiguousMsg{
+				kind: kind, operationID: operationID, maintenanceID: maintenanceID, err: ambiguous.err,
+			}
+			event = "replace_ambiguous"
+			return
+		}
+		result := outcome.(replaceWorkTerminal).result
+		if result.err == nil {
 			a.cfg.ProvisionStore.UpdateFn(a.leaseUUID, func(p *ProvisionState) {
-				p.ContainerIDs = result.Success.ContainerIDs
-				if result.Success.ServiceContainers != nil {
-					p.ServiceContainers = result.Success.ServiceContainers
+				p.ContainerIDs = result.success.containerIDs
+				if result.success.serviceContainers != nil {
+					p.ServiceContainers = result.success.serviceContainers
 				}
 			})
 		}
-		// recovered-vs-failed: normally result.Restored, but a doRestart
+		// recovered-vs-failed: normally result.restored, but a doRestart
 		// preflight failure (no container touched) sets RecoveredIfSourceActive
 		// so the decision keys on the actor-observed pre-replace activeness
 		// (wasActive, captured above on the actor goroutine) — recovered iff
 		// the lease was Ready/running at replace-start. Every other path
-		// leaves the flag false → recovered == result.Restored (unchanged).
-		recovered := result.Restored
-		if result.RecoveredIfSourceActive {
+		// leaves the flag false → recovered == result.restored (unchanged).
+		recovered := result.restored
+		if result.recoveredIfSourceActive {
 			recovered = wasActive
 		}
 		switch {
-		case result.Err == nil:
-			terminalMsg = replaceCompletedMsg{result: result.Success, maintenanceID: maintenanceID}
+		case result.err == nil:
+			terminalMsg = replaceCompletedMsg{result: result.success, maintenanceID: maintenanceID}
 			event = "replace_completed"
 		case recovered:
-			terminalMsg = replaceRecoveredMsg{info: result.Failure, maintenanceID: maintenanceID}
+			terminalMsg = replaceRecoveredMsg{info: result.failure, maintenanceID: maintenanceID}
 			event = "replace_recovered"
 		default:
-			terminalMsg = replaceFailedMsg{info: result.Failure, maintenanceID: maintenanceID}
+			terminalMsg = replaceFailedMsg{info: result.failure, maintenanceID: maintenanceID}
 			event = "replace_failed"
 		}
 	})
@@ -1408,14 +1929,14 @@ func (a *LeaseActor) clearMaintenanceWorker(id shared.MaintenanceID) {
 	}
 	a.maintenanceWorkerMu.Lock()
 	if a.maintenanceWorkerID == id {
-		a.maintenanceWorkerID = ""
+		a.maintenanceWorkerID = shared.MaintenanceID{}
 	}
 	a.maintenanceWorkerMu.Unlock()
 }
 
 func (a *LeaseActor) clearAnyMaintenanceWorker() {
 	a.maintenanceWorkerMu.Lock()
-	a.maintenanceWorkerID = ""
+	a.maintenanceWorkerID = shared.MaintenanceID{}
 	a.maintenanceWorkerMu.Unlock()
 }
 
@@ -1423,21 +1944,21 @@ func (a *LeaseActor) handleReplaceCompleted(result ReplaceSuccessResult, ids ...
 	if len(ids) == 1 {
 		defer a.clearMaintenanceWorker(ids[0])
 	}
-	_ = a.sm.Fire(a.cfg.StopCtx, evReplaceCompleted, result)
+	_ = a.sm.replaceCompleted(a.cfg.StopCtx, result)
 }
 
 func (a *LeaseActor) handleReplaceRecovered(info ReplaceFailureInfo, ids ...shared.MaintenanceID) {
 	if len(ids) == 1 {
 		defer a.clearMaintenanceWorker(ids[0])
 	}
-	_ = a.sm.Fire(a.cfg.StopCtx, evReplaceRecovered, info)
+	_ = a.sm.replaceRecovered(a.cfg.StopCtx, info)
 }
 
 func (a *LeaseActor) handleReplaceFailed(info ReplaceFailureInfo, ids ...shared.MaintenanceID) {
 	if len(ids) == 1 {
 		defer a.clearMaintenanceWorker(ids[0])
 	}
-	_ = a.sm.Fire(a.cfg.StopCtx, evReplaceFailed, info)
+	_ = a.sm.replaceFailed(a.cfg.StopCtx, info)
 }
 
 // hasExited reports whether the actor's run loop has returned (a.done
@@ -1461,66 +1982,47 @@ func (a *LeaseActor) hasExited() bool {
 // swapped, removed) — the SM must record the outcome even during
 // shutdown to keep releaseStore / in-memory state / the callback record
 // consistent with the host. Returns false only if the actor has fully
-// exited (inbox no longer drained), the exiting channel is closed
-// (actor is in its exit sequence at the final drain), or the bounded
-// inbox is wedged; in either case the drop is counted via
+// exited (inbox no longer drained), terminal admission is closed
+// (actor is in its exit sequence at the final drain), or the bounded inbox is
+// wedged; in either case the drop is counted via
 // leaseTerminalEventDroppedTotal at the call site.
 //
-// Two refusal gates on the fast path:
-//   - hasExited(): a.done closed. Actor is fully torn down.
-//   - isExiting(): a.exiting closed just before the final retirement drain.
-//     Covers the narrow post-drain / pre-done window where a late
-//     worker could otherwise successfully enqueue into an inbox that
-//     no goroutine will drain, silently losing the event. Both
-//     channels also appear as select arms below so the main wait
-//     composes correctly, and a post-send non-blocking re-check
-//     guarantees the metric reflects reality when a late close
-//     races with a successful enqueue.
+// terminalAdmissionMu is held from the closed check through the send. The
+// retirement path takes the same gate before its final drain, making the two
+// possible orders explicit: the message is admitted before the drain, or the
+// sender observes closed admission and cannot enqueue.
 //
 // In normal operation (waitForWorkers returns cleanly) workers finish
 // before terminal admission closes, so these gates are pure defense
 // against the waitForWorkers-timeout edge case.
 func (a *LeaseActor) sendTerminal(msg workerTerminalMessage) bool {
-	if a.hasExited() || a.isExiting() {
+	a.terminalAdmissionMu.Lock()
+	defer a.terminalAdmissionMu.Unlock()
+	if a.terminalAdmissionClosed || a.hasExited() {
 		return false
 	}
+	a.activityMu.Lock()
+	a.activity++
+	a.activityMu.Unlock()
 	select {
 	case a.inbox <- msg:
-		// Re-check: exiting may have been closed between the pre-check
-		// and this send. Report as dropped so the metric is accurate.
-		// The message will rot in the inbox but no one relies on it.
-		if a.isExiting() {
-			return false
-		}
 		return true
 	case <-a.done:
-		return false
-	case <-a.exiting:
+		a.endActivity()
 		return false
 	case <-time.After(terminalSendTimeout):
+		a.endActivity()
 		return false
 	}
 }
 
-// isExiting reports whether the actor has closed its `exiting` channel, i.e.
-// retirement no longer admits terminal sends. The final drain runs immediately
-// after this gate closes. Symmetric with hasExited() but for the earlier gate.
-// Intra-package only — external lifecycle synchronization goes through Done().
-func (a *LeaseActor) isExiting() bool {
-	select {
-	case <-a.exiting:
-		return true
-	default:
-		return false
-	}
-}
-
-// closeExiting closes the exiting channel exactly once, even across
-// retirement and a test-driven close. Using
-// sync.Once keeps the close idempotent without a select-default
-// double-check idiom that would itself race under concurrent callers.
-func (a *LeaseActor) closeExiting() {
-	a.exitingOnce.Do(func() { close(a.exiting) })
+// closeTerminalAdmission is idempotent. Holding the gate until the state is
+// closed guarantees the caller's following drain observes every send that won
+// the ordering race.
+func (a *LeaseActor) closeTerminalAdmission() {
+	a.terminalAdmissionMu.Lock()
+	a.terminalAdmissionClosed = true
+	a.terminalAdmissionMu.Unlock()
 }
 
 // terminalSendTimeout bounds how long a terminal send will wait for inbox
@@ -1535,7 +2037,7 @@ const terminalSendTimeout = 10 * time.Second
 // stored for the same UUID after our exit started isn't clobbered.
 // Used as a deferred action on actor exit.
 func (a *LeaseActor) removeFromRegistry() {
-	a.cfg.OnTerminated(a.leaseUUID)
+	a.cfg.OnTerminated(a.leaseUUID, a)
 }
 
 // State returns the SM's current ProvisionStatus.
@@ -1567,6 +2069,78 @@ func (a *LeaseActor) CurrentMessageStart() int64 {
 	return a.currentMessageStart.Load()
 }
 
+// QuiescenceClaim is an opaque exclusive capability proving that one actor had
+// no accepted message or worker and cannot admit another. Only LeaseActor can
+// construct one. Release is idempotent so defer plus defensive cleanup is safe.
+type QuiescenceClaim struct {
+	state *quiescenceClaimState
+}
+
+type quiescenceClaimState struct {
+	actor    *LeaseActor
+	mu       sync.Mutex
+	released bool
+}
+
+func (c *QuiescenceClaim) Release() {
+	if c == nil || c.state == nil || c.state.actor == nil {
+		return
+	}
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	if c.state.released {
+		return
+	}
+	c.state.released = true
+	c.state.actor.activityMu.Unlock()
+	c.state.actor.admissionMu.Unlock()
+}
+
+// Retire marks the claimed idle actor as closed to future admission and wakes
+// its run loop. It succeeds only while this exact capability still owns both
+// actor gates; calling it after Release is a harmless no-op.
+func (c *QuiescenceClaim) Retire() bool {
+	if c == nil || c.state == nil || c.state.actor == nil {
+		return false
+	}
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	if c.state.released {
+		return false
+	}
+	c.state.actor.retiring = true
+	c.state.actor.retirementRequestedOnce.Do(func() {
+		close(c.state.actor.retirementRequested)
+	})
+	return true
+}
+
+// TryClaimQuiescence returns an exclusive typed capability only when no
+// accepted message or worker can still mutate this actor. During the claim,
+// non-blocking external enqueue is refused and retirement cannot replace the
+// claimed registry actor. A terminal sender cannot be excluded while its worker
+// exists because worker activity stays non-zero until after that terminal
+// message has itself been counted.
+func (a *LeaseActor) TryClaimQuiescence() *QuiescenceClaim {
+	if a == nil || !a.admissionMu.TryLock() {
+		return nil
+	}
+	if a.retiring {
+		a.admissionMu.Unlock()
+		return nil
+	}
+	if !a.activityMu.TryLock() {
+		a.admissionMu.Unlock()
+		return nil
+	}
+	if a.activity != 0 {
+		a.activityMu.Unlock()
+		a.admissionMu.Unlock()
+		return nil
+	}
+	return &QuiescenceClaim{state: &quiescenceClaimState{actor: a}}
+}
+
 // Done returns the channel that closes when the actor's run loop has
 // fully torn down (after external admission closes, workers and their
 // terminal messages settle, and the actor is removed from its registry).
@@ -1579,7 +2153,54 @@ func (a *LeaseActor) Done() <-chan struct{} {
 	return a.done
 }
 
-// TryEnqueue does a non-blocking enqueue of msg into the actor's inbox.
+// TryEnqueueCommand admits an opaque caller command exactly once.
+func (a *LeaseActor) TryEnqueueCommand(command ActorCommand) bool {
+	return a.tryEnqueueEnvelope(command.envelope, command.envelopeMessage())
+}
+
+func (c ActorCommand) envelopeMessage() leaseMessage {
+	if c.envelope == nil {
+		return nil
+	}
+	return c.envelope.message
+}
+
+// TryEnqueueObservation admits only an exact runtime-generation observation.
+func (a *LeaseActor) TryEnqueueObservation(observation ActorObservation) bool {
+	if observation.envelope == nil {
+		return false
+	}
+	message, ok := observation.envelope.message.(actorObservationMessage)
+	if !ok || message == nil {
+		return false
+	}
+	if observation.LeaseUUID() != a.leaseUUID {
+		return false
+	}
+	return a.tryEnqueueEnvelope(observation.envelope, message)
+}
+
+// TryEnqueueRecovery admits only a recovery capability. Recovery routing must
+// resolve an existing actor; ordinary command routing cannot accept this type.
+func (a *LeaseActor) TryEnqueueRecovery(command RecoveryCommand) bool {
+	if command.envelope == nil {
+		return false
+	}
+	return a.tryEnqueueEnvelope(command.envelope, command.envelope.message)
+}
+
+func (a *LeaseActor) tryEnqueueEnvelope(envelope *messageEnvelope, message leaseMessage) bool {
+	if envelope == nil || message == nil || !envelope.accepted.CompareAndSwap(false, true) {
+		return false
+	}
+	if a.tryEnqueue(message) {
+		return true
+	}
+	envelope.accepted.Store(false)
+	return false
+}
+
+// tryEnqueue does a non-blocking enqueue of an internal message into the actor's inbox.
 // Returns true on success, false if the actor is retiring or the inbox is
 // full. This is the primary entrypoint the substrate's routing layer uses to
 // deliver messages atomically with its registry-resolve operation; the caller
@@ -1590,32 +2211,50 @@ func (a *LeaseActor) Done() <-chan struct{} {
 // is either accepted for the live run loop, or refused while the still-
 // registered actor completes its retirement. The mutex is held only for the
 // non-blocking send and is never held while unregistering the actor.
-func (a *LeaseActor) TryEnqueue(msg LeaseMessage) bool {
-	a.admissionMu.Lock()
+func (a *LeaseActor) tryEnqueue(msg leaseMessage) bool {
+	if msg == nil {
+		return false
+	}
+	// Preserve the non-blocking routing contract even while recovery holds an
+	// exclusive quiescence claim or retirement is closing admission.
+	if !a.admissionMu.TryLock() {
+		return false
+	}
 	defer a.admissionMu.Unlock()
 	if a.retiring {
 		return false
 	}
+	// Routing is documented as non-blocking. A recovery owner may hold the
+	// quiescence gate across substrate mutation, so refuse rather than waiting on
+	// activityMu; blocking callers retry and lifecycle events have reconciliation
+	// as their backstop.
+	if !a.activityMu.TryLock() {
+		return false
+	}
+	a.activity++
 	select {
 	case a.inbox <- msg:
+		a.activityMu.Unlock()
 		return true
 	default:
+		a.activity--
+		a.activityMu.Unlock()
 		return false
 	}
 }
 
 // handleDeprovision runs inside the lease actor's message handler. It fires
 // the SM transition then runs the work synchronously, returning the outcome
-// on the DeprovisionMsg's reply channel.
+// through the constructor-owned deprovision reply capability.
 //
 // Migrated from internal/backend/docker/deprovision.go at PR5b-2 BC. The
 // body now reaches substrate-private state exclusively via the cfg seams:
-//   - lease existence check via cfg.ProvisionStore.Get (was b.provisions[uuid])
+//   - lease existence check via cfg.ProvisionStore.Exists (was b.provisions[uuid])
 //   - deprovision dispatch via cfg.DoDeprovisionFn (was b.doDeprovision)
 //   - logger via cfg.Logger
 //
 // The ctx threaded in is the actor-owned ctx from the inbound
-// DeprovisionMsg (which carries the caller's ctx from Backend.Deprovision).
+// deprovision command (which carries the caller's ctx from Backend.Deprovision).
 func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
 	// Attempt the SM transition. If it's not permitted, check whether the
 	// provision is already gone or we're in an unexpected state. Absence from
@@ -1623,21 +2262,16 @@ func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
 	// may still own containers, volumes, or a durable close journal, so it must
 	// still receive the idempotent request.
 	transitioned := true
-	if err := a.sm.Fire(ctx, evDeprovisionRequested); err != nil {
+	if err := a.sm.requestDeprovision(ctx); err != nil {
 		transitioned = false
-		if _, exists := a.cfg.ProvisionStore.Get(a.leaseUUID); exists {
+		if a.cfg.ProvisionStore.Exists(a.leaseUUID) {
 			a.cfg.Logger.Warn("deprovision transition denied by SM",
 				"lease_uuid", a.leaseUUID, "error", err)
-			if errors.Is(err, ErrWorkerDrainTimeout) {
-				// OnExit failed before stateless changed state, so the mutation
-				// worker still owns the lease. Running teardown here would allow
-				// that worker to land a later Compose Up after close and resurrect
-				// the workload. Preserve both state and substrate, and let a retry
-				// proceed once the barrier reaches zero.
-				return fmt.Errorf("deprovision refused while prior mutation remains in flight: %w", err)
-			}
-			// Fall through to the work anyway — the SM may not know every state
-			// (partial port). The work itself is idempotent.
+			// Every legitimate live state has an explicit deprovision transition or
+			// idempotent self-event. Any rejection therefore means the actor could not
+			// prove exclusive teardown authority (most importantly, a mutation worker
+			// failed to drain). Never compensate by running destructive work anyway.
+			return fmt.Errorf("deprovision refused before exclusive teardown: %w", err)
 		}
 	}
 	if transitioned && a.replaceCallbackKind == replaceCallbackLifecycle &&
@@ -1651,11 +2285,13 @@ func (a *LeaseActor) handleDeprovision(ctx context.Context) error {
 			p.LifecycleCallbackURL = a.pendingReplaceLifecycleCallbackURL
 		})
 	}
-	err := a.cfg.DoDeprovisionFn(ctx, a.leaseUUID)
+	closeScope := newActorCloseScope(a)
+	defer closeScope.revoke()
+	err := a.cfg.DoDeprovisionFn(ctx, closeScope)
 	// If the provision entry was fully removed (success path), signal the
 	// run loop to exit so a subsequent re-provision with the same UUID
 	// creates a fresh actor instead of being Ignored by a stale SM.
-	if _, exists := a.cfg.ProvisionStore.Get(a.leaseUUID); !exists {
+	if !a.cfg.ProvisionStore.Exists(a.leaseUUID) {
 		a.terminated = true
 	}
 	return err

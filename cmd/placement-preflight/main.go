@@ -5,8 +5,6 @@
 // lock, publishes a required backup, then seals the verified database atomically.
 // Explicit --initialize-fresh mode instead proves that chain and every backend
 // are quiescent and empty before publishing a new placement authority.
-// Explicit --prove-terminal-orphan mode holds the stopped legacy database
-// read-only and combines exact row absence with positive terminal chain evidence.
 package main
 
 import (
@@ -39,7 +37,6 @@ const (
 	inspectSuccessVerdict     = "READY_TO_PREPARE"
 	prepareSuccessVerdict     = "PREPARED_FOR_CUTOVER"
 	freshSuccessVerdict       = "INITIALIZED_FOR_CUTOVER"
-	terminalOrphanVerdict     = "TERMINAL_ORPHAN_PROVED"
 )
 
 var version = "dev"
@@ -165,11 +162,6 @@ type legacyUpgradeInspector interface {
 		map[string]placement.BackendInventory,
 		placement.LegacyUpgradeChainProof,
 	) (placement.LegacyUpgradePreflightSummary, error)
-	ProveTerminalOrphanContext(
-		context.Context,
-		string,
-		placement.TerminalOrphanChainProof,
-	) (placement.TerminalOrphanProofSummary, error)
 	Close() error
 }
 
@@ -295,16 +287,6 @@ func runWithDependencies(
 		"",
 		"independently supplied exact backend-name roster as a JSON array (required with -initialize-fresh or -print-fresh-confirmation)",
 	)
-	proveTerminalOrphan := flags.String(
-		"prove-terminal-orphan",
-		"",
-		"prove that one canonical terminal lease has no v0.13 placement row (read-only; requires -expected-backend)",
-	)
-	expectedBackend := flags.String(
-		"expected-backend",
-		"",
-		"exact configured backend expected to own the local stopped Docker remnant (required with -prove-terminal-orphan)",
-	)
 	confirmQuiesced := flags.String("confirm-quiesced", "", "exact quiescence acknowledgement required with -initialize-fresh")
 	confirmInsecureChain := flags.String(
 		"confirm-insecure-chain",
@@ -336,35 +318,6 @@ func runWithDependencies(
 	}
 	if *proofTimeout <= 0 {
 		return fmt.Errorf("-proof-timeout must be positive")
-	}
-	terminalFlagSet := make(map[string]bool, 2)
-	flags.Visit(func(parsed *flag.Flag) {
-		if parsed.Name == "prove-terminal-orphan" || parsed.Name == "expected-backend" {
-			terminalFlagSet[parsed.Name] = true
-		}
-	})
-	proveTerminalOrphanSet := terminalFlagSet["prove-terminal-orphan"]
-	expectedBackendSet := terminalFlagSet["expected-backend"]
-	terminalOrphanMode := proveTerminalOrphanSet || expectedBackendSet
-	if proveTerminalOrphanSet != expectedBackendSet {
-		return fmt.Errorf("-prove-terminal-orphan and -expected-backend must be supplied together")
-	}
-	if terminalOrphanMode && (*proveTerminalOrphan == "" || *expectedBackend == "") {
-		return fmt.Errorf("-prove-terminal-orphan and -expected-backend must both be non-empty")
-	}
-	if terminalOrphanMode && (*prepare || *initializeFresh || *printFreshConfirmation) {
-		return fmt.Errorf(
-			"-prove-terminal-orphan is mutually exclusive with -prepare, -initialize-fresh, and -print-fresh-confirmation",
-		)
-	}
-	if terminalOrphanMode {
-		parsedLeaseUUID, err := uuid.Parse(*proveTerminalOrphan)
-		if err != nil || parsedLeaseUUID == uuid.Nil || parsedLeaseUUID.String() != *proveTerminalOrphan {
-			return fmt.Errorf(
-				"%w: -prove-terminal-orphan must be one canonical non-nil UUID",
-				placement.ErrTerminalOrphanProof,
-			)
-		}
 	}
 	if *initializeFresh && *printFreshConfirmation {
 		return fmt.Errorf("-initialize-fresh and -print-fresh-confirmation are mutually exclusive")
@@ -454,23 +407,6 @@ func runWithDependencies(
 	}
 	if err := requireAuthenticatedChainProofTransport(cfg, *confirmInsecureChain); err != nil {
 		return err
-	}
-	if terminalOrphanMode {
-		if !slices.Contains(configuredBackendNames(cfg), *expectedBackend) {
-			return fmt.Errorf(
-				"-expected-backend %q is not an exact configured backend name",
-				*expectedBackend,
-			)
-		}
-		return runTerminalOrphanProof(
-			ctx,
-			*proofTimeout,
-			cfg,
-			*proveTerminalOrphan,
-			*expectedBackend,
-			stdout,
-			dependencies,
-		)
 	}
 	if *initializeFresh {
 		expectedRoster, err := parseExpectedBackendRoster(*expectedBackends)
@@ -832,98 +768,6 @@ func runFreshInitialization(
 	}
 	if err := writeCompleteVerdict(stdout, output.Bytes()); err != nil {
 		return newDurablePreflightVerdictFailure(preflightInitialized, err)
-	}
-	return nil
-}
-
-func runTerminalOrphanProof(
-	ctx context.Context,
-	proofTimeout time.Duration,
-	cfg *config.Config,
-	leaseUUID string,
-	expectedBackend string,
-	stdout io.Writer,
-	dependencies commandDependencies,
-) (runErr error) {
-	inspector, err := dependencies.openLegacyUpgradeInspector(cfg.PlacementStoreDBPath)
-	if err != nil {
-		return err
-	}
-	closed := false
-	closeInspector := func() error {
-		if closed {
-			return nil
-		}
-		closed = true
-		return inspector.Close()
-	}
-	defer func() {
-		if closeErr := closeInspector(); closeErr != nil {
-			closeErr = fmt.Errorf("close placement database: %w", closeErr)
-			if runErr == nil {
-				runErr = closeErr
-			} else {
-				runErr = errors.Join(runErr, closeErr)
-			}
-		}
-	}()
-
-	proofCtx, cancel := context.WithTimeout(ctx, proofTimeout)
-	defer cancel()
-	snapshot, err := snapshotProviderLeases(
-		proofCtx,
-		cfg,
-		dependencies.newFreshChainClient,
-	)
-	if err != nil {
-		return err
-	}
-	chainProof, err := placement.NewTerminalOrphanChainProof(
-		snapshot,
-		cfg.ProviderUUID,
-		leaseUUID,
-	)
-	if err != nil {
-		return err
-	}
-	summary, err := inspector.ProveTerminalOrphanContext(
-		proofCtx,
-		expectedBackend,
-		chainProof,
-	)
-	if err != nil {
-		return err
-	}
-
-	// This is one necessary input to a separate exact-ID Docker cleanup, never
-	// sufficient authority by itself. Close the stopped placement file before
-	// rendering it, then publish the complete verdict through one writer call.
-	if err := closeInspector(); err != nil {
-		return fmt.Errorf("close placement database: %w", err)
-	}
-	encodedLeaseUUID, err := json.Marshal(summary.LeaseUUID)
-	if err != nil {
-		return fmt.Errorf("encode terminal orphan lease UUID: %w", err)
-	}
-	encodedBackend, err := json.Marshal(summary.ExpectedBackend)
-	if err != nil {
-		return fmt.Errorf("encode terminal orphan backend name: %w", err)
-	}
-	encodedProviderUUID, err := json.Marshal(summary.ProviderUUID)
-	if err != nil {
-		return fmt.Errorf("encode terminal orphan provider UUID: %w", err)
-	}
-	verdict := fmt.Appendf(
-		nil,
-		"%s: lease=%s backend=%s provider=%s chain_height=%d placement=absent\n",
-		terminalOrphanVerdict,
-		encodedLeaseUUID,
-		encodedBackend,
-		encodedProviderUUID,
-		summary.ChainHeight,
-	)
-	if err := writeCompleteVerdict(stdout, verdict); err != nil {
-		return fmt.Errorf("write terminal orphan verdict: %w", err)
 	}
 	return nil
 }

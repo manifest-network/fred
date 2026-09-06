@@ -38,9 +38,9 @@ func TestRun_RenameOverOpenAfterBackupCannotProducePass(t *testing.T) {
 		return os.Rename(replacementPath, dbPath)
 	}
 	var stdout bytes.Buffer
-	err = runWithDependencies(t.Context(), append(repairArgs(configPath),
+	err = runWithDependencies(t.Context(), append(repairArgs(t, configPath, dbPath),
 		"-apply", "-backup", backupPath,
-		"-confirm", repairConfirmation(),
+		"-confirm", repairConfirmation(t, dbPath),
 		"-attest-drained", drainedAttestation,
 	), &stdout, &bytes.Buffer{}, dependencies)
 
@@ -83,9 +83,9 @@ func TestRun_BackupParentReplacementBeforePublicationCannotMutate(t *testing.T) 
 	}
 
 	var stdout bytes.Buffer
-	err = runWithDependencies(t.Context(), append(repairArgs(configPath),
+	err = runWithDependencies(t.Context(), append(repairArgs(t, configPath, dbPath),
 		"-apply", "-backup", backupPath,
-		"-confirm", repairConfirmation(),
+		"-confirm", repairConfirmation(t, dbPath),
 		"-attest-drained", drainedAttestation,
 	), &stdout, &bytes.Buffer{}, dependencies)
 
@@ -140,9 +140,9 @@ func TestRun_BackupParentReplacementAfterPublicationCannotProducePass(t *testing
 	}
 
 	var stdout bytes.Buffer
-	err = runWithDependencies(t.Context(), append(repairArgs(configPath),
+	err = runWithDependencies(t.Context(), append(repairArgs(t, configPath, dbPath),
 		"-apply", "-backup", backupPath,
-		"-confirm", repairConfirmation(),
+		"-confirm", repairConfirmation(t, dbPath),
 		"-attest-drained", drainedAttestation,
 	), &stdout, &bytes.Buffer{}, dependencies)
 

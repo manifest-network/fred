@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -223,6 +224,7 @@ func TestPreparePlacementBackendsRejectsMissingAuthorityBeforeBackendIO(t *testi
 	cfg := &config.Config{
 		PlacementStoreDBPath: filepath.Join(t.TempDir(), "absent.db"),
 		ProviderUUID:         startupChainSnapshot{}.ProviderUUID(),
+		CallbackBaseURL:      "https://provider.test",
 		CallbackSecret:       config.Secret("0123456789abcdef0123456789abcdef"),
 		Backends: []config.BackendConfig{{
 			Name: "backend-a", URL: server.URL, SKUs: []string{"sku-a"}, IsDefault: true,
@@ -377,6 +379,7 @@ func startupProviderConfig(
 	return &config.Config{
 		PlacementStoreDBPath: path,
 		ProviderUUID:         startupChainSnapshot{}.ProviderUUID(),
+		CallbackBaseURL:      "https://provider.test",
 		CallbackSecret:       config.Secret("0123456789abcdef0123456789abcdef"),
 		Backends: []config.BackendConfig{{
 			Name: "backend-a", URL: backendURL, Timeout: time.Second,
@@ -454,4 +457,16 @@ func TestNewProductionBackendClientSignsWithBackendSpecificKey(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NoError(t, client.Health(t.Context()))
+}
+
+func TestProductionBackendTLSConfigPinsTLS13WithSystemRoots(t *testing.T) {
+	t.Parallel()
+
+	tlsConfig, err := productionBackendTLSConfig(config.BackendConfig{})
+	require.NoError(t, err)
+	require.NotNil(t, tlsConfig)
+	assert.Equal(t, uint16(tls.VersionTLS13), tlsConfig.MinVersion)
+	assert.Nil(t, tlsConfig.RootCAs, "nil selects the verified host system roots")
+	assert.False(t, tlsConfig.InsecureSkipVerify)
+	assert.Empty(t, tlsConfig.Certificates)
 }

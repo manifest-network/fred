@@ -2,7 +2,6 @@ package shared
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,11 +63,11 @@ type Release struct {
 	// current or v0.13 runtime authority. A maintenance ID is immutable across
 	// deploying, active, failed, and superseded states and is also placed on
 	// every replacement container.
-	MaintenanceID MaintenanceID `json:"maintenance_id,omitempty"`
+	MaintenanceID MaintenanceID `json:"maintenance_id,omitzero"`
 	// OperationID is the exact causal token of the provision/restore generation
 	// that first committed this release lineage. Maintenance releases preserve it.
 	// Empty is accepted only for v0.13/legacy rows.
-	OperationID OperationID `json:"operation_id,omitempty"`
+	OperationID OperationID `json:"operation_id,omitzero"`
 	// Items is the immutable emitted instance topology for this release. It equals
 	// the requested topology except that a DNS-deferred custom domain is empty,
 	// matching the labels and routers actually committed to the substrate. New
@@ -96,17 +95,143 @@ type Release struct {
 	// otherwise a later restart could not reconstruct the active release's
 	// principal, callback route, or resource ownership.
 	LegacyRuntimeAuthority *LegacyRuntimeAuthority `json:"legacy_runtime_authority,omitempty"`
-	// LegacyMigration identifies a release produced by Docker's one-time
-	// legacy-to-Compose migration. It remains durable cleanup authority even when
-	// a later update supersedes this release: Deprovision consumes the original
-	// Items before deleting release history so crash-window `-prev` rollback
-	// containers cannot outlive the evidence that names their exact cohort.
-	LegacyMigration bool           `json:"legacy_migration,omitempty"`
-	Status          string         `json:"status"`
-	CreatedAt       time.Time      `json:"created_at"`
-	Error           string         `json:"error,omitempty"`
-	Reason          backend.Reason `json:"reason,omitempty"`
-	Message         string         `json:"message,omitempty"`
+	Status                 string                  `json:"status"`
+	CreatedAt              time.Time               `json:"created_at"`
+	Error                  string                  `json:"error,omitempty"`
+	Reason                 backend.Reason          `json:"reason,omitempty"`
+	Message                string                  `json:"message,omitempty"`
+}
+
+type releaseHistoryEnvelope struct {
+	SchemaVersion uint8     `json:"schema_version"`
+	Releases      []Release `json:"releases"`
+}
+
+// v0.13 wrote a bare array containing only this shape. Keeping a separate wire
+// type prevents the stopped adoption path from silently treating a newer,
+// versionless authority field as legacy data.
+type legacyReleaseJSON struct {
+	Version   int            `json:"version"`
+	Manifest  []byte         `json:"manifest"`
+	Image     string         `json:"image"`
+	Status    string         `json:"status"`
+	CreatedAt time.Time      `json:"created_at"`
+	Error     string         `json:"error,omitempty"`
+	Reason    backend.Reason `json:"reason,omitempty"`
+	Message   string         `json:"message,omitempty"`
+}
+
+func marshalReleaseHistory(releases []Release) ([]byte, error) {
+	return json.Marshal(releaseHistoryEnvelope{
+		SchemaVersion: authoritativeRowSchemaVersion,
+		Releases:      releases,
+	})
+}
+
+func decodeReleaseHistory(value []byte) ([]Release, error) {
+	var envelope releaseHistoryEnvelope
+	if err := decodeStrictAuthoritativeObject(
+		value, maxAuthoritativeRecordBytes, &envelope,
+	); err != nil {
+		return nil, err
+	}
+	if envelope.SchemaVersion != authoritativeRowSchemaVersion {
+		return nil, fmt.Errorf(
+			"unsupported release-history schema version %d",
+			envelope.SchemaVersion,
+		)
+	}
+	return envelope.Releases, nil
+}
+
+func decodeLegacyReleaseHistory(value []byte) ([]Release, error) {
+	var legacy []legacyReleaseJSON
+	if err := decodeStrictAuthoritativeArray(value, maxAuthoritativeRecordBytes, &legacy); err != nil {
+		return nil, err
+	}
+	releases := make([]Release, len(legacy))
+	for index, old := range legacy {
+		releases[index] = Release{
+			Version:   old.Version,
+			Manifest:  old.Manifest,
+			Image:     old.Image,
+			Status:    old.Status,
+			CreatedAt: old.CreatedAt,
+			Error:     old.Error,
+			Reason:    old.Reason,
+			Message:   old.Message,
+		}
+	}
+	return releases, nil
+}
+
+var versionlessCurrentReleaseFields = map[string]struct{}{
+	"version": {}, "manifest": {}, "image": {}, "maintenance_id": {},
+	"operation_id": {}, "items": {}, "resource_profiles": {},
+	"runtime_authority": {}, "legacy_runtime_authority": {},
+	"status": {}, "created_at": {}, "error": {},
+	"reason": {}, "message": {},
+}
+
+var versionlessRuntimeAuthorityFields = map[string]struct{}{
+	"tenant": {}, "provider_uuid": {}, "callback_url": {},
+	"lifecycle_callback_url": {},
+}
+
+// upgradeVersionlessCurrentReleaseHistory recognizes only the unpublished
+// identity-bound wire shape written earlier on this branch. It is called from
+// the explicit stopped Prepare Existing transaction, never by a live store.
+func upgradeVersionlessCurrentReleaseHistory(value []byte) ([]Release, error) {
+	if err := validateUniqueJSONArray(value, maxAuthoritativeRecordBytes); err != nil {
+		return nil, err
+	}
+	var rawReleases []json.RawMessage
+	if err := json.Unmarshal(value, &rawReleases); err != nil {
+		return nil, err
+	}
+	upgraded := make([]json.RawMessage, len(rawReleases))
+	for index, raw := range rawReleases {
+		object, err := decodeExactRawJSONObject(
+			raw, versionlessCurrentReleaseFields,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("release %d: %w", index, err)
+		}
+		for _, field := range []string{"runtime_authority", "legacy_runtime_authority"} {
+			authorityRaw, present := object[field]
+			if !present || bytes.Equal(bytes.TrimSpace(authorityRaw), []byte("null")) {
+				continue
+			}
+			authority, err := decodeExactRawJSONObject(
+				authorityRaw, versionlessRuntimeAuthorityFields,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("release %d field %q: %w", index, field, err)
+			}
+			authority["schema_version"] = json.RawMessage("1")
+			encoded, err := json.Marshal(authority)
+			if err != nil {
+				return nil, fmt.Errorf("release %d field %q: %w", index, field, err)
+			}
+			object[field] = encoded
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return nil, fmt.Errorf("release %d: %w", index, err)
+		}
+		upgraded[index] = encoded
+	}
+	envelope, err := json.Marshal(struct {
+		SchemaVersion uint8             `json:"schema_version"`
+		Releases      []json.RawMessage `json:"releases"`
+	}{
+		SchemaVersion: authoritativeRowSchemaVersion,
+		Releases:      upgraded,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return decodeReleaseHistory(envelope)
 }
 
 // ReleaseRuntimeAuthority is the immutable observational identity paired with
@@ -122,6 +247,7 @@ type ReleaseRuntimeAuthority struct {
 }
 
 type releaseRuntimeAuthorityJSON struct {
+	SchemaVersion        uint8  `json:"schema_version"`
 	Tenant               string `json:"tenant"`
 	ProviderUUID         string `json:"provider_uuid"`
 	CallbackURL          string `json:"callback_url"`
@@ -140,6 +266,7 @@ type LegacyRuntimeAuthority struct {
 }
 
 type legacyRuntimeAuthorityJSON struct {
+	SchemaVersion        uint8  `json:"schema_version"`
 	Tenant               string `json:"tenant"`
 	ProviderUUID         string `json:"provider_uuid"`
 	CallbackURL          string `json:"callback_url"`
@@ -208,6 +335,7 @@ func (authority LegacyRuntimeAuthority) MarshalJSON() ([]byte, error) {
 		return nil, errors.New("legacy runtime authority is invalid")
 	}
 	return json.Marshal(legacyRuntimeAuthorityJSON{
+		SchemaVersion:        authoritativeRowSchemaVersion,
 		Tenant:               authority.tenant,
 		ProviderUUID:         authority.providerUUID,
 		CallbackURL:          authority.callbackURL,
@@ -220,8 +348,11 @@ func (authority *LegacyRuntimeAuthority) UnmarshalJSON(data []byte) error {
 		return errors.New("legacy runtime authority destination is nil")
 	}
 	var wire legacyRuntimeAuthorityJSON
-	if err := json.Unmarshal(data, &wire); err != nil {
+	if err := decodeStrictAuthoritativeObject(data, maxAuthoritativeRecordBytes, &wire); err != nil {
 		return err
+	}
+	if wire.SchemaVersion != authoritativeRowSchemaVersion {
+		return fmt.Errorf("unsupported legacy runtime authority schema version %d", wire.SchemaVersion)
 	}
 	parsed, err := NewLegacyRuntimeAuthority(
 		wire.Tenant,
@@ -282,7 +413,7 @@ func NewReleaseRuntimeAuthority(
 
 func (authority ReleaseRuntimeAuthority) OperationID() OperationID {
 	if !authority.valid {
-		return ""
+		return OperationID{}
 	}
 	return authority.operationID
 }
@@ -320,6 +451,7 @@ func (authority ReleaseRuntimeAuthority) MarshalJSON() ([]byte, error) {
 		return nil, errors.New("runtime authority is invalid")
 	}
 	return json.Marshal(releaseRuntimeAuthorityJSON{
+		SchemaVersion:        authoritativeRowSchemaVersion,
 		Tenant:               authority.tenant,
 		ProviderUUID:         authority.providerUUID,
 		CallbackURL:          authority.callbackURL,
@@ -332,8 +464,11 @@ func (authority *ReleaseRuntimeAuthority) UnmarshalJSON(data []byte) error {
 		return errors.New("runtime authority destination is nil")
 	}
 	var wire releaseRuntimeAuthorityJSON
-	if err := json.Unmarshal(data, &wire); err != nil {
+	if err := decodeStrictAuthoritativeObject(data, maxAuthoritativeRecordBytes, &wire); err != nil {
 		return err
+	}
+	if wire.SchemaVersion != authoritativeRowSchemaVersion {
+		return fmt.Errorf("unsupported runtime authority schema version %d", wire.SchemaVersion)
 	}
 	operationID, err := parseOperationCallbackID(wire.CallbackURL)
 	if err != nil {
@@ -369,20 +504,6 @@ type ReleaseStoreConfig struct {
 	OnCleanupPanic  util.PanicHandler // Optional: invoked on cleanup-loop panic.
 }
 
-// NewReleaseStore opens or creates a bbolt database for release persistence.
-//
-// Deprecated: this compatibility-only constructor creates an unbound journal.
-// Application composition roots are repository-guarded to use
-// OpenIdentityBoundReleaseStore and cannot obtain authority from this value.
-func NewReleaseStore(cfg ReleaseStoreConfig) (*ReleaseStore, error) {
-	s, err := newReleaseStore(cfg, backendidentity.VerifiedStorage{}, nil)
-	if err != nil {
-		return nil, err
-	}
-	s.StartMaintenance()
-	return s, nil
-}
-
 // OpenIdentityBoundReleaseStore opens an initialized authoritative release
 // journal without creating or repairing it. Maintenance remains paused until
 // StartMaintenance so callers can verify their complete store set first.
@@ -405,19 +526,21 @@ func newReleaseStore(
 	storage backendidentity.VerifiedStorage,
 	gate *backendidentity.StorageAuthorityGate,
 ) (*ReleaseStore, error) {
+	if !storage.Valid() {
+		return nil, errors.New("verified backend storage authority is required")
+	}
+	if gate == nil || !gate.Valid() {
+		return nil, errors.New("backend storage authority gate is required")
+	}
 	storeCfg := boltStoreConfig{
 		DBPath:     cfg.DBPath,
 		BucketName: releasesBucketName,
 		MaxAge:     cfg.MaxAge,
 		Label:      "releases",
 	}
-	var base *boltStore
-	var err error
-	if storage.Valid() {
-		base, err = openIdentityBoundBoltStore(storeCfg, authoritativeStoreReleases, storage, gate)
-	} else {
-		base, err = openBoltStore(storeCfg)
-	}
+	base, err := openIdentityBoundBoltStore(
+		storeCfg, authoritativeStoreReleases, storage, gate,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -426,13 +549,22 @@ func newReleaseStore(
 		cleanupInterval: cfg.CleanupInterval,
 		onCleanupPanic:  cfg.OnCleanupPanic,
 	}
-	if storage.Valid() {
-		if err := store.view(inspectReleaseBucket); err != nil {
-			_ = base.Close()
-			return nil, fmt.Errorf("validate bound release journal: %w", err)
+	if err := store.view(func(tx *bolt.Tx) error {
+		if err := validateReleaseRootBuckets(tx); err != nil {
+			return err
 		}
+		return inspectReleaseBucket(tx)
+	}); err != nil {
+		_ = base.Close()
+		return nil, fmt.Errorf("validate bound release journal: %w", err)
 	}
 	return store, nil
+}
+
+func validateReleaseRootBuckets(tx *bolt.Tx) error {
+	return validateAuthoritativeRootBuckets(
+		tx, "release", releasesBucketName, storeIdentityBucketName,
+	)
 }
 
 // StartMaintenance performs the initial pruning pass and starts the periodic
@@ -442,7 +574,7 @@ func (s *ReleaseStore) StartMaintenance() {
 		return
 	}
 	s.cleanupOnce.Do(func() {
-		s.startCleanup("releases", s.cleanupInterval, s.RemoveOlderThan, s.onCleanupPanic)
+		s.startCleanup("releases", s.cleanupInterval, s.removeOlderThan, s.onCleanupPanic)
 	})
 }
 
@@ -451,7 +583,12 @@ func (s *ReleaseStore) StartMaintenance() {
 // invalid row health-green would defer the failure until the next recovery or
 // close, after the original operation may already have committed externally.
 func (s *ReleaseStore) Healthy() error {
-	return s.view(inspectReleaseBucket)
+	return s.view(func(tx *bolt.Tx) error {
+		if err := validateReleaseRootBuckets(tx); err != nil {
+			return err
+		}
+		return inspectReleaseBucket(tx)
+	})
 }
 
 // ReleaseStoreInspection is read-only v0.13 adoption evidence.
@@ -478,25 +615,8 @@ type releaseHistoryCapacitySnapshot struct {
 }
 
 type releaseHistoryCapacityEntry struct {
-	encodedBytes    int
-	status          string
-	legacyMigration bool
-}
-
-// LegacyActiveAuthorityClass makes the one v0.13 migration-marker backfill an
-// explicit authority choice rather than a boolean flag. The zero value is
-// invalid: callers must select ordinary observed workload authority or the
-// stronger, whole-cohort-proven RecordMigration class.
-type LegacyActiveAuthorityClass uint8
-
-const (
-	LegacyActiveAuthorityWorkload LegacyActiveAuthorityClass = iota + 1
-	LegacyActiveAuthorityMigration
-)
-
-func (class LegacyActiveAuthorityClass) valid() bool {
-	return class == LegacyActiveAuthorityWorkload ||
-		class == LegacyActiveAuthorityMigration
+	encodedBytes int
+	status       string
 }
 
 // CheckLegacyActiveAuthorityCapacity simulates the exact startup backfill that
@@ -509,14 +629,12 @@ func (inspection ReleaseStoreInspection) CheckLegacyActiveAuthorityCapacity(
 	expected Release,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
-	class LegacyActiveAuthorityClass,
 ) error {
 	return inspection.checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
 		leaseUUID,
 		expected,
 		items,
 		resourceProfiles,
-		class,
 		nil,
 		backend.MaxStoredReleaseHistoryBytes,
 	)
@@ -531,7 +649,6 @@ func (inspection ReleaseStoreInspection) CheckLegacyActiveAuthorityAndRuntimeCap
 	expected Release,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
-	class LegacyActiveAuthorityClass,
 	authority LegacyRuntimeAuthority,
 ) error {
 	return inspection.checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
@@ -539,7 +656,6 @@ func (inspection ReleaseStoreInspection) CheckLegacyActiveAuthorityAndRuntimeCap
 		expected,
 		items,
 		resourceProfiles,
-		class,
 		&authority,
 		backend.MaxStoredReleaseHistoryBytes,
 	)
@@ -550,7 +666,6 @@ func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityCapacityWithi
 	expected Release,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
-	class LegacyActiveAuthorityClass,
 	limitBytes int,
 ) error {
 	return inspection.checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
@@ -558,7 +673,6 @@ func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityCapacityWithi
 		expected,
 		items,
 		resourceProfiles,
-		class,
 		nil,
 		limitBytes,
 	)
@@ -569,19 +683,15 @@ func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityAndRuntimeCap
 	expected Release,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
-	class LegacyActiveAuthorityClass,
 	authority *LegacyRuntimeAuthority,
 	limitBytes int,
 ) error {
 	if expected.Version <= 0 || expected.Status != "active" {
 		return errors.New("legacy active release fence must name a positive active version")
 	}
-	if expected.OperationID != "" || len(expected.Items) != 0 ||
-		len(expected.ResourceProfiles) != 0 || expected.LegacyMigration {
+	if !expected.OperationID.IsZero() || len(expected.Items) != 0 ||
+		len(expected.ResourceProfiles) != 0 {
 		return errors.New("legacy active release fence contains current authority fields")
-	}
-	if !class.valid() {
-		return errors.New("legacy active release authority class is invalid")
 	}
 	if err := ValidateSKUResourceSnapshot(items, resourceProfiles); err != nil {
 		return fmt.Errorf("backfill legacy active release authority: %w", err)
@@ -599,7 +709,6 @@ func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityAndRuntimeCap
 	candidate := cloneRelease(expected)
 	candidate.Items = slices.Clone(items)
 	candidate.ResourceProfiles = CloneSKUResourceSnapshot(resourceProfiles)
-	candidate.LegacyMigration = class == LegacyActiveAuthorityMigration
 	if authority != nil {
 		if !authority.valid {
 			return errors.New("legacy runtime authority is invalid")
@@ -691,9 +800,8 @@ func (inspection ReleaseStoreInspection) checkActiveReplacementCapacity(
 	}
 	snapshot.entries = slices.Clone(snapshot.entries)
 	snapshot.entries[snapshot.activeIndex] = releaseHistoryCapacityEntry{
-		encodedBytes:    len(encoded),
-		status:          candidate.Status,
-		legacyMigration: candidate.LegacyMigration,
+		encodedBytes: len(encoded),
+		status:       candidate.Status,
 	}
 	return checkReleaseHistoryCapacitySnapshot(
 		snapshot,
@@ -708,7 +816,7 @@ func checkReleaseHistoryCapacitySnapshot(
 	if len(snapshot.entries) == 0 {
 		return errors.New("release capacity snapshot is empty")
 	}
-	encodedBytes := releaseHistoryArrayFramingBytes + len(snapshot.entries) - 1
+	encodedBytes := releaseHistoryEnvelopeFramingBytes + len(snapshot.entries) - 1
 	for _, entry := range snapshot.entries {
 		encodedBytes += entry.encodedBytes
 	}
@@ -719,12 +827,6 @@ func checkReleaseHistoryCapacitySnapshot(
 	protected[len(snapshot.entries)-1] = true
 	for index := len(snapshot.entries) - 1; index >= 0; index-- {
 		if snapshot.entries[index].status == "active" {
-			protected[index] = true
-			break
-		}
-	}
-	for index := len(snapshot.entries) - 1; index >= 0; index-- {
-		if snapshot.entries[index].legacyMigration {
 			protected[index] = true
 			break
 		}
@@ -831,6 +933,7 @@ func inspectReleaseBucket(tx *bolt.Tx) error {
 		func(key, value []byte) error {
 			return validateAuthoritativeRecord(key, value, maxAuthoritativeRecordBytes)
 		},
+		decodeReleaseHistory,
 	)
 	return err
 }
@@ -850,6 +953,13 @@ func inspectReleaseBucketForAdoption(
 		capacity,
 		allowLegacyMultipleActive,
 		budget.observe,
+		func(value []byte) ([]Release, error) {
+			trimmed := bytes.TrimSpace(value)
+			if len(trimmed) > 0 && trimmed[0] == '{' {
+				return decodeReleaseHistory(value)
+			}
+			return decodeLegacyReleaseHistory(value)
+		},
 	)
 }
 
@@ -860,6 +970,7 @@ func inspectReleaseBucketWithObserver(
 	capacity map[string]releaseHistoryCapacitySnapshot,
 	allowLegacyMultipleActive bool,
 	observe func(key, value []byte) error,
+	decodeHistory func([]byte) ([]Release, error),
 ) (bool, error) {
 	bucket := tx.Bucket(releasesBucketName)
 	if bucket == nil {
@@ -867,6 +978,9 @@ func inspectReleaseBucketWithObserver(
 	}
 	if observe == nil {
 		return false, errors.New("release record observer is required")
+	}
+	if decodeHistory == nil {
+		return false, errors.New("release history decoder is required")
 	}
 	requiresNormalization := false
 	err := bucket.ForEach(func(key, value []byte) error {
@@ -879,8 +993,8 @@ func inspectReleaseBucketWithObserver(
 		if !backend.IsCanonicalLeaseUUID(string(key)) {
 			return fmt.Errorf("release history key with length %d is not a canonical lease UUID", len(key))
 		}
-		var releases []Release
-		if err := json.Unmarshal(value, &releases); err != nil {
+		releases, err := decodeHistory(value)
+		if err != nil {
 			return fmt.Errorf("decode release history with key length %d: %w", len(key), err)
 		}
 		legacyMultipleActive, err := validateReleaseHistoryForAdoption(
@@ -931,9 +1045,12 @@ func PrepareBoundReleaseStoreStorage(
 	if err != nil {
 		return err
 	}
-	validate := inspectReleaseBucket
+	var validate func(*bolt.Tx) error
 	if profile == backendidentity.InitializationProfileExisting {
 		validate = func(tx *bolt.Tx) error {
+			if err := validateReleaseRootBuckets(tx); err != nil {
+				return err
+			}
 			if tx.Bucket(storeIdentityBucketName) != nil {
 				// A pending-initialization replay can encounter the transaction
 				// that already normalized and bound this exact store. Verify the
@@ -946,9 +1063,16 @@ func PrepareBoundReleaseStoreStorage(
 				); err != nil {
 					return err
 				}
-				return inspectReleaseBucket(tx)
+				return upgradeVersionlessCurrentReleaseBucket(tx)
 			}
 			return normalizeLegacyReleaseBucketForAdoption(tx)
+		}
+	} else {
+		validate = func(tx *bolt.Tx) error {
+			if err := validateReleaseRootBuckets(tx); err != nil {
+				return err
+			}
+			return inspectReleaseBucket(tx)
 		}
 	}
 	return initializeIdentityBoundBoltStoreBound(
@@ -965,7 +1089,13 @@ func CheckBoundReleaseStoreStorage(
 		return errors.New("pending backend storage authority is required")
 	}
 	return checkIdentityBoundBoltStoreBound(
-		path, releasesBucketName, "releases", authoritativeStoreReleases, storage.ID(), nil,
+		path, releasesBucketName, "releases", authoritativeStoreReleases, storage.ID(),
+		func(tx *bolt.Tx) error {
+			if err := validateReleaseRootBuckets(tx); err != nil {
+				return err
+			}
+			return inspectReleaseBucket(tx)
+		},
 	)
 }
 
@@ -977,13 +1107,25 @@ func VerifyBoundReleaseStoreStorage(
 		return errors.New("verified backend storage authority is required")
 	}
 	return checkIdentityBoundBoltStoreBound(
-		path, releasesBucketName, "releases", authoritativeStoreReleases, storage.ID(), nil,
+		path, releasesBucketName, "releases", authoritativeStoreReleases, storage.ID(),
+		func(tx *bolt.Tx) error {
+			if err := validateReleaseRootBuckets(tx); err != nil {
+				return err
+			}
+			return inspectReleaseBucket(tx)
+		},
 	)
 }
 
 func VerifyReleaseStoreStorage(dbPath string, storage backendidentity.VerifiedStorage) error {
 	return verifyIdentityBoundBoltStore(
-		dbPath, releasesBucketName, "releases", authoritativeStoreReleases, storage, nil,
+		dbPath, releasesBucketName, "releases", authoritativeStoreReleases, storage,
+		func(tx *bolt.Tx) error {
+			if err := validateReleaseRootBuckets(tx); err != nil {
+				return err
+			}
+			return inspectReleaseBucket(tx)
+		},
 	)
 }
 
@@ -1007,14 +1149,14 @@ func maxVersion(releases []Release) int {
 // readable only for v0.13 rows; whenever a snapshot is present it must exactly
 // and canonically cover valid desired items.
 func validateStoredRelease(release Release) error {
-	if release.MaintenanceID != "" && !release.MaintenanceID.Valid() {
+	if !release.MaintenanceID.IsZero() && !release.MaintenanceID.Valid() {
 		return errors.New("maintenance ID is not a canonical UUIDv4")
 	}
-	if release.MaintenanceID != "" && release.OperationID == "" &&
+	if !release.MaintenanceID.IsZero() && release.OperationID.IsZero() &&
 		release.LegacyRuntimeAuthority == nil {
 		return errors.New("maintenance ID requires durable runtime authority")
 	}
-	typed := release.OperationID != ""
+	typed := !release.OperationID.IsZero()
 	if legacy := release.LegacyRuntimeAuthority; legacy != nil {
 		if !legacy.valid {
 			return errors.New("legacy runtime authority is invalid")
@@ -1032,7 +1174,7 @@ func validateStoredRelease(release Release) error {
 			return errors.New("legacy runtime authority is not canonical")
 		}
 	}
-	if release.OperationID == "" {
+	if release.OperationID.IsZero() {
 		if release.RuntimeAuthority != nil {
 			return errors.New("legacy release cannot carry runtime authority")
 		}
@@ -1126,7 +1268,7 @@ func validateReleaseHistoryForAdoption(
 			return false, fmt.Errorf("release history has non-increasing version %d", releases[index].Version)
 		}
 		previousVersion = releases[index].Version
-		if maintenanceID := releases[index].MaintenanceID; maintenanceID != "" {
+		if maintenanceID := releases[index].MaintenanceID; !maintenanceID.IsZero() {
 			if previous, exists := maintenanceIDs[maintenanceID]; exists {
 				return false, fmt.Errorf(
 					"release %d duplicates maintenance ID from release %d",
@@ -1172,7 +1314,7 @@ func validateReleaseHistoryForAdoption(
 // append-before-Compose crash window during stopped adoption. A deploying row
 // after LatestActive is ambiguous because Docker may run either manifest: the
 // process could have stopped before Compose or after Compose+health but before
-// ActivateLatest. Container image/topology labels do not prove environment,
+// the typed maintenance activation transaction. Container image/topology labels do not prove environment,
 // command, or other manifest fields. A row is safely normalizable only when its
 // complete parsed manifest is semantically identical to LatestActive; any
 // number of such stopped retry rows carry no distinct workload authority and
@@ -1204,8 +1346,8 @@ func validateV013StoppedDeployingTails(
 		return nil, nil
 	}
 	active := releases[latestActive]
-	if active.OperationID != "" || len(active.Items) != 0 ||
-		len(active.ResourceProfiles) != 0 || active.LegacyMigration ||
+	if !active.OperationID.IsZero() || len(active.Items) != 0 ||
+		len(active.ResourceProfiles) != 0 ||
 		len(active.Manifest) == 0 {
 		return nil, errors.New(
 			"stopped release history has post-active deploying rows whose LatestActive is not wire-recognizable v0.13 authority",
@@ -1213,8 +1355,8 @@ func validateV013StoppedDeployingTails(
 	}
 	for _, index := range deployingIndexes {
 		candidate := releases[index]
-		if candidate.OperationID != "" || len(candidate.Items) != 0 ||
-			len(candidate.ResourceProfiles) != 0 || candidate.LegacyMigration ||
+		if !candidate.OperationID.IsZero() || len(candidate.Items) != 0 ||
+			len(candidate.ResourceProfiles) != 0 ||
 			candidate.Image != "stack" || len(candidate.Manifest) == 0 {
 			return nil, fmt.Errorf(
 				"stopped release %d is an unresolved deploying row that is not a wire-recognizable v0.13 Update/Restart row",
@@ -1255,8 +1397,8 @@ func validateV013RecordMigrationHistory(releases []Release, activeIndexes []int)
 	oldIndex, migratedIndex := activeIndexes[0], activeIndexes[1]
 	for index := range releases {
 		release := releases[index]
-		if release.OperationID != "" || len(release.Items) != 0 ||
-			len(release.ResourceProfiles) != 0 || release.LegacyMigration {
+		if !release.OperationID.IsZero() || len(release.Items) != 0 ||
+			len(release.ResourceProfiles) != 0 {
 			return fmt.Errorf("release %d contains post-v0.13 authority fields", release.Version)
 		}
 	}
@@ -1376,10 +1518,10 @@ func encodeReleaseHistory(releases []Release) ([]byte, error) {
 func encodeReleaseHistoryWithinLimit(releases []Release, limitBytes int) ([]byte, error) {
 	if limitBytes <= 0 {
 		return nil, &ReleaseHistoryCapacityError{
-			LimitBytes: limitBytes, RequiredBytes: releaseHistoryArrayFramingBytes,
+			LimitBytes: limitBytes, RequiredBytes: releaseHistoryEnvelopeFramingBytes,
 		}
 	}
-	encoded, err := json.Marshal(releases)
+	encoded, err := marshalReleaseHistory(releases)
 	if err != nil {
 		return nil, err
 	}
@@ -1391,13 +1533,14 @@ func encodeReleaseHistoryWithinLimit(releases []Release, limitBytes int) ([]byte
 	return encoded, nil
 }
 
-const releaseHistoryArrayFramingBytes = 2 // '[' + ']'
+// The per-release sizes used by capacity planning sit between this exact v1
+// envelope prefix/suffix; commas are accounted separately.
+const releaseHistoryEnvelopeFramingBytes = len(`{"schema_version":1,"releases":[]}`)
 
 // compactReleaseHistoryWithinLimit selects the largest deterministic suffix of
 // non-authoritative history that fits beside the records required for recovery
-// and cleanup. The index-latest row preserves max-version monotonicity, the
-// most-recent active row is runtime rehydration authority, and the most-recent
-// LegacyMigration row names any rollback-window cohort. Expired disposable
+// and cleanup. The index-latest row preserves max-version monotonicity and the
+// most-recent active row is runtime rehydration authority. Expired disposable
 // rows are removed before fresh ones; within either class the oldest version is
 // removed first. A caller therefore loses the least-recent audit history while
 // every safety-bearing record remains intact.
@@ -1411,12 +1554,12 @@ func compactReleaseHistoryWithinLimit(
 	}
 	if limitBytes <= 0 {
 		return nil, 0, &ReleaseHistoryCapacityError{
-			LimitBytes: limitBytes, RequiredBytes: releaseHistoryArrayFramingBytes,
+			LimitBytes: limitBytes, RequiredBytes: releaseHistoryEnvelopeFramingBytes,
 		}
 	}
 
 	entryBytes := make([]int, len(releases))
-	encodedBytes := releaseHistoryArrayFramingBytes + len(releases) - 1
+	encodedBytes := releaseHistoryEnvelopeFramingBytes + len(releases) - 1
 	for index := range releases {
 		encoded, err := json.Marshal(releases[index])
 		if err != nil {
@@ -1435,13 +1578,6 @@ func compactReleaseHistoryWithinLimit(
 	if activeIndex >= 0 {
 		protected[activeIndex] = true
 	}
-	for index := len(releases) - 1; index >= 0; index-- {
-		if releases[index].LegacyMigration {
-			protected[index] = true
-			break
-		}
-	}
-
 	removed := make([]bool, len(releases))
 	removedCount := 0
 	removeClass := func(expired bool) {
@@ -1524,9 +1660,8 @@ func newReleaseHistoryCapacitySnapshot(
 			)
 		}
 		snapshot.entries[index] = releaseHistoryCapacityEntry{
-			encodedBytes:    len(encoded),
-			status:          releases[index].Status,
-			legacyMigration: releases[index].LegacyMigration,
+			encodedBytes: len(encoded),
+			status:       releases[index].Status,
 		}
 	}
 	return snapshot, nil
@@ -1584,20 +1719,19 @@ func normalizeLegacyReleaseBucketForAdoption(tx *bolt.Tx) error {
 		if !backend.IsCanonicalLeaseUUID(string(key)) {
 			return fmt.Errorf("release history key with length %d is not a canonical lease UUID", len(key))
 		}
-		var releases []Release
-		if err := json.Unmarshal(value, &releases); err != nil {
+		releases, err := decodeLegacyReleaseHistory(value)
+		if err != nil {
 			return fmt.Errorf("decode release history with key length %d: %w", len(key), err)
 		}
 		requiresNormalization, err := validateReleaseHistoryForAdoption(releases, true)
 		if err != nil {
 			return fmt.Errorf("validate release history with key length %d: %w", len(key), err)
 		}
-		if !requiresNormalization {
-			return nil
-		}
-		releases, err = normalizeLegacyReleaseHistoryForAdoption(releases)
-		if err != nil {
-			return fmt.Errorf("normalize release history with key length %d: %w", len(key), err)
+		if requiresNormalization {
+			releases, err = normalizeLegacyReleaseHistoryForAdoption(releases)
+			if err != nil {
+				return fmt.Errorf("normalize release history with key length %d: %w", len(key), err)
+			}
 		}
 		encoded, err := compactAndEncodeReleaseHistory(
 			releases,
@@ -1624,6 +1758,68 @@ func normalizeLegacyReleaseBucketForAdoption(tx *bolt.Tx) error {
 	return inspectReleaseBucket(tx)
 }
 
+func upgradeVersionlessCurrentReleaseBucket(tx *bolt.Tx) error {
+	bucket := tx.Bucket(releasesBucketName)
+	if bucket == nil {
+		return errors.New("releases bucket is missing")
+	}
+	type rewrite struct {
+		key   []byte
+		value []byte
+	}
+	var rewrites []rewrite
+	var sawCurrent, sawVersionless bool
+	if err := bucket.ForEach(func(key, value []byte) error {
+		if value == nil {
+			return fmt.Errorf("release history with key length %d is a nested bucket", len(key))
+		}
+		if !backend.IsCanonicalLeaseUUID(string(key)) {
+			return fmt.Errorf("release history key with length %d is not a canonical lease UUID", len(key))
+		}
+		trimmed := bytes.TrimSpace(value)
+		if len(trimmed) == 0 {
+			return fmt.Errorf("release history with key length %d is empty", len(key))
+		}
+		var releases []Release
+		var err error
+		switch trimmed[0] {
+		case '{':
+			sawCurrent = true
+			releases, err = decodeReleaseHistory(value)
+		case '[':
+			sawVersionless = true
+			releases, err = upgradeVersionlessCurrentReleaseHistory(value)
+		default:
+			err = errors.New("expected a versioned object or versionless compatibility array")
+		}
+		if err != nil {
+			return fmt.Errorf("decode release history with key length %d: %w", len(key), err)
+		}
+		if sawCurrent && sawVersionless {
+			return errors.New("release journal mixes versioned and versionless histories")
+		}
+		if err := validateReleaseHistory(releases); err != nil {
+			return fmt.Errorf("validate release history with key length %d: %w", len(key), err)
+		}
+		if trimmed[0] == '[' {
+			encoded, err := encodeReleaseHistory(releases)
+			if err != nil {
+				return fmt.Errorf("encode upgraded release history with key length %d: %w", len(key), err)
+			}
+			rewrites = append(rewrites, rewrite{key: slices.Clone(key), value: encoded})
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, rewrite := range rewrites {
+		if err := bucket.Put(rewrite.key, rewrite.value); err != nil {
+			return fmt.Errorf("upgrade versionless release history: %w", err)
+		}
+	}
+	return nil
+}
+
 func validReleaseStatus(status string) bool {
 	switch status {
 	case "deploying", "active", "failed", "superseded":
@@ -1640,39 +1836,37 @@ func (s *ReleaseStore) requireCanonicalLeaseUUID(leaseUUID string) error {
 	return nil
 }
 
-// Append adds a new release for a lease, auto-assigning Version.
-func (s *ReleaseStore) Append(leaseUUID string, r Release) error {
-	if r.MaintenanceID != "" {
+// append adds a raw release for package-local storage and schema tests. Runtime
+// writers must cross a typed operation or maintenance settlement.
+func (s *ReleaseStore) append(leaseUUID string, r Release) error {
+	if !r.MaintenanceID.IsZero() {
 		return ErrMaintenanceReleaseClaimRequired
 	}
-	return s.append(leaseUUID, r, false)
+	return s.appendRelease(leaseUUID, r, false)
 }
 
-// AppendActive atomically supersedes every prior active release and appends a
-// new active release with the next version. Success-boundary callers use this
-// instead of composing Append and ActivateLatest across two crash boundaries.
+// appendActive atomically supersedes every prior active release and appends a
+// new active release with the next version. Package-local tests use it to seed
+// exact histories that are not the result of a runtime transition.
 // An empty Status is accepted because the method itself supplies the state;
 // any other explicit status must agree with that authority.
-func (s *ReleaseStore) AppendActive(leaseUUID string, r Release) error {
-	if r.MaintenanceID != "" {
+func (s *ReleaseStore) appendActive(leaseUUID string, r Release) error {
+	if !r.MaintenanceID.IsZero() {
 		return ErrMaintenanceReleaseClaimRequired
 	}
 	if r.Status != "" && r.Status != "active" {
 		return errors.New("active release append requires active or empty status")
 	}
 	r.Status = "active"
-	return s.append(leaseUUID, r, true)
+	return s.appendRelease(leaseUUID, r, true)
 }
 
-// CheckAppendActiveCapacity proves, without writing, that AppendActive can
+// checkAppendActiveCapacity proves, without writing, that appendActive can
 // retain every load-bearing record after deterministic capacity compaction.
-// Callers that have durably accepted an asynchronous operation use this before
-// the first substrate side effect; a capacity error is then a definitive
-// refusal and the write-ahead intent can be canceled safely. AppendActive still
-// repeats the same plan transactionally because recovery must converge after a
-// crash and a read-only proof is not itself a storage reservation.
-func (s *ReleaseStore) CheckAppendActiveCapacity(leaseUUID string, r Release) error {
-	if r.MaintenanceID != "" {
+// Production operation admission uses CheckOperationReleaseCapacity with a
+// store-issued OperationReleaseCandidate instead.
+func (s *ReleaseStore) checkAppendActiveCapacity(leaseUUID string, r Release) error {
+	if !r.MaintenanceID.IsZero() {
 		return ErrMaintenanceReleaseClaimRequired
 	}
 	if r.Status != "" && r.Status != "active" {
@@ -1687,7 +1881,7 @@ func (s *ReleaseStore) CheckAppendActiveCapacity(leaseUUID string, r Release) er
 	)
 }
 
-func (s *ReleaseStore) append(leaseUUID string, r Release, supersedeActive bool) error {
+func (s *ReleaseStore) appendRelease(leaseUUID string, r Release, supersedeActive bool) error {
 	return s.appendWithinLimit(
 		leaseUUID,
 		r,
@@ -1757,7 +1951,7 @@ func (s *ReleaseStore) appendWithinLimit(
 }
 
 func validateAppendRelease(r Release) error {
-	if r.MaintenanceID != "" {
+	if !r.MaintenanceID.IsZero() {
 		return errors.New("maintenance releases require AppendMaintenance")
 	}
 	if err := validateStoredRelease(r); err != nil {
@@ -1806,7 +2000,9 @@ func planAppendedReleaseHistoryWithPolicy(
 ) ([]Release, int, error) {
 	var releases []Release
 	if data != nil {
-		if err := json.Unmarshal(data, &releases); err != nil {
+		var err error
+		releases, err = decodeReleaseHistory(data)
+		if err != nil {
 			return nil, 0, fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
 		}
 		if err := validateReleaseHistory(releases); err != nil {
@@ -1853,7 +2049,7 @@ func planAppendedReleaseHistoryWithPolicy(
 }
 
 // checkDeployingReleaseTerminalCapacity closes the Append-before-Compose
-// capacity window used by Restart and Update. ActivateLatest slightly expands
+// capacity window used by Restart and Update. Maintenance activation slightly expands
 // the two status strings when the previous active row is also protected
 // migration authority; proving that terminal shape now prevents an otherwise
 // deterministic post-Compose write failure. The failure terminal is smaller
@@ -1894,7 +2090,9 @@ func (s *ReleaseStore) List(leaseUUID string) ([]Release, error) {
 		if data == nil {
 			return nil
 		}
-		if err := json.Unmarshal(data, &releases); err != nil {
+		var err error
+		releases, err = decodeReleaseHistory(data)
+		if err != nil {
 			return err
 		}
 		if err := validateReleaseHistory(releases); err != nil {
@@ -1906,12 +2104,12 @@ func (s *ReleaseStore) List(leaseUUID string) ([]Release, error) {
 	return releases, err
 }
 
-// BackfillActiveResourceProfiles freezes the current resource authority onto a
+// backfillActiveResourceProfiles freezes the current resource authority onto a
 // pre-v0.14 active release. The expected version and items form a compare-and-
 // swap fence: a concurrent update cannot receive profiles belonging to an
 // older topology. Existing exact profiles are accepted idempotently; divergent
 // profiles fail closed.
-func (s *ReleaseStore) BackfillActiveResourceProfiles(
+func (s *ReleaseStore) backfillActiveResourceProfiles(
 	leaseUUID string,
 	version int,
 	items []backend.LeaseItem,
@@ -1954,7 +2152,9 @@ func (s *ReleaseStore) backfillActiveResourceProfilesWithinLimit(
 			return fmt.Errorf("release history for %s no longer exists", leaseUUID)
 		}
 		var releases []Release
-		if err := json.Unmarshal(data, &releases); err != nil {
+		var err error
+		releases, err = decodeReleaseHistory(data)
+		if err != nil {
 			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
 		}
 		if err := validateReleaseHistory(releases); err != nil {
@@ -2002,28 +2202,25 @@ func (s *ReleaseStore) backfillActiveResourceProfilesWithinLimit(
 	})
 }
 
-// BackfillLegacyActiveAuthority freezes the exact desired topology and
+// backfillLegacyActiveAuthority freezes the exact desired topology and
 // resource profiles that v0.13 omitted from an otherwise valid active release.
 // The expected release is a compare-and-swap fence over every v0.13 field, not
 // merely its version: a same-version manual rewrite cannot acquire authority
-// from a stale container observation. The migration class may be selected only
-// when the caller holds exact whole-cohort proof of v0.13 RecordMigration;
-// persisting the marker in this same transaction ensures an immediate close can
-// capture rollback-container IDs before release retirement. A replay after the
-// exact write committed is idempotent.
-func (s *ReleaseStore) BackfillLegacyActiveAuthority(
+// from a stale container observation. The supplied Items must exactly match the
+// stack-shaped manifest, so the only authority this can manufacture is the
+// complete workload cohort observed during the stopped v0.13 upgrade. A replay
+// after the exact write committed is idempotent.
+func (s *ReleaseStore) backfillLegacyActiveAuthority(
 	leaseUUID string,
 	expected Release,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
-	class LegacyActiveAuthorityClass,
 ) error {
 	return s.backfillLegacyActiveAuthorityWithinLimit(
 		leaseUUID,
 		expected,
 		items,
 		resourceProfiles,
-		class,
 		backend.MaxStoredReleaseHistoryBytes,
 	)
 }
@@ -2033,7 +2230,6 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 	expected Release,
 	items []backend.LeaseItem,
 	resourceProfiles []SKUResourceSnapshot,
-	class LegacyActiveAuthorityClass,
 	limitBytes int,
 ) error {
 	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
@@ -2042,14 +2238,10 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 	if expected.Version <= 0 || expected.Status != "active" {
 		return errors.New("legacy active release fence must name a positive active version")
 	}
-	if expected.OperationID != "" || len(expected.Items) != 0 ||
-		len(expected.ResourceProfiles) != 0 || expected.LegacyMigration {
+	if !expected.OperationID.IsZero() || len(expected.Items) != 0 ||
+		len(expected.ResourceProfiles) != 0 {
 		return errors.New("legacy active release fence contains current authority fields")
 	}
-	if !class.valid() {
-		return errors.New("legacy active release authority class is invalid")
-	}
-	legacyMigration := class == LegacyActiveAuthorityMigration
 	if err := ValidateSKUResourceSnapshot(items, resourceProfiles); err != nil {
 		return fmt.Errorf("backfill legacy active release authority: %w", err)
 	}
@@ -2073,7 +2265,9 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 			return fmt.Errorf("release history for %s no longer exists", leaseUUID)
 		}
 		var releases []Release
-		if err := json.Unmarshal(data, &releases); err != nil {
+		var err error
+		releases, err = decodeReleaseHistory(data)
+		if err != nil {
 			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
 		}
 		if err := validateReleaseHistory(releases); err != nil {
@@ -2096,18 +2290,13 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 		}
 		if len(active.Items) > 0 || len(active.ResourceProfiles) > 0 {
 			if slices.Equal(active.Items, durableItems) &&
-				slices.Equal(active.ResourceProfiles, durableProfiles) &&
-				active.LegacyMigration == legacyMigration {
+				slices.Equal(active.ResourceProfiles, durableProfiles) {
 				return nil
 			}
 			return fmt.Errorf("active release for %s has divergent backfilled authority", leaseUUID)
 		}
-		if active.LegacyMigration != expected.LegacyMigration {
-			return fmt.Errorf("active release for %s changed before legacy authority backfill", leaseUUID)
-		}
 		active.Items = durableItems
 		active.ResourceProfiles = durableProfiles
-		active.LegacyMigration = legacyMigration
 		if err := validateReleaseHistory(releases); err != nil {
 			return fmt.Errorf("invalid backfilled release data for %s: %w", leaseUUID, err)
 		}
@@ -2123,7 +2312,7 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 	})
 }
 
-// BackfillLegacyRuntimeAuthority CAS-persists the exact tokenless principal
+// backfillLegacyRuntimeAuthority CAS-persists the exact tokenless principal
 // and callback pair observed on a validated v0.13 active cohort. Callers must
 // complete whole-cohort validation before invoking this method. Once durable,
 // the authority permits recovery to materialize the same active Release after
@@ -2131,7 +2320,7 @@ func (s *ReleaseStore) backfillLegacyActiveAuthorityWithinLimit(
 //
 // This intentionally does not manufacture an OperationID: the two authority
 // classes remain disjoint on disk and in the type system.
-func (s *ReleaseStore) BackfillLegacyRuntimeAuthority(
+func (s *ReleaseStore) backfillLegacyRuntimeAuthority(
 	leaseUUID string,
 	expected Release,
 	authority LegacyRuntimeAuthority,
@@ -2142,7 +2331,7 @@ func (s *ReleaseStore) BackfillLegacyRuntimeAuthority(
 	if expected.Version <= 0 || expected.Status != "active" {
 		return errors.New("legacy runtime authority fence must name a positive active version")
 	}
-	if expected.OperationID != "" || expected.RuntimeAuthority != nil ||
+	if !expected.OperationID.IsZero() || expected.RuntimeAuthority != nil ||
 		len(expected.Items) == 0 || len(expected.ResourceProfiles) == 0 {
 		return errors.New("legacy runtime authority fence is not a fully backfilled v0.13 release")
 	}
@@ -2161,7 +2350,9 @@ func (s *ReleaseStore) BackfillLegacyRuntimeAuthority(
 			return fmt.Errorf("release history for %s no longer exists", leaseUUID)
 		}
 		var releases []Release
-		if err := json.Unmarshal(data, &releases); err != nil {
+		var err error
+		releases, err = decodeReleaseHistory(data)
+		if err != nil {
 			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
 		}
 		if err := validateReleaseHistory(releases); err != nil {
@@ -2179,9 +2370,8 @@ func (s *ReleaseStore) BackfillLegacyRuntimeAuthority(
 			!bytes.Equal(active.Manifest, expected.Manifest) || active.Image != expected.Image ||
 			!active.CreatedAt.Equal(expected.CreatedAt) || active.Error != expected.Error ||
 			active.Reason != expected.Reason || active.Message != expected.Message ||
-			active.OperationID != "" || active.RuntimeAuthority != nil ||
+			!active.OperationID.IsZero() || active.RuntimeAuthority != nil ||
 			active.MaintenanceID != expected.MaintenanceID ||
-			active.LegacyMigration != expected.LegacyMigration ||
 			!slices.Equal(active.Items, expected.Items) ||
 			!slices.Equal(active.ResourceProfiles, expected.ResourceProfiles) {
 			return fmt.Errorf("active release for %s changed before legacy runtime authority backfill", leaseUUID)
@@ -2256,10 +2446,10 @@ func (s *ReleaseStore) LeaseUUIDs() ([]string, error) {
 	return leaseUUIDs, err
 }
 
-// UpdateLatestStatus updates the status and curated (reason, message) of the
-// most recent release. The verbose per-failure detail is intentionally NOT
-// stored here — callers log it and surface only the curated pair to tenants.
-func (s *ReleaseStore) UpdateLatestStatus(leaseUUID, status string, reason backend.Reason, message string) error {
+// updateLatestStatus updates the status and curated (reason, message) of the
+// most recent release for package-local transition tests. Runtime transitions
+// use proof-specific settlement APIs.
+func (s *ReleaseStore) updateLatestStatus(leaseUUID, status string, reason backend.Reason, message string) error {
 	return s.updateLatestStatusWithinLimit(
 		leaseUUID,
 		status,
@@ -2289,7 +2479,9 @@ func (s *ReleaseStore) updateLatestStatusWithinLimit(
 		}
 
 		var releases []Release
-		if err := json.Unmarshal(data, &releases); err != nil {
+		var err error
+		releases, err = decodeReleaseHistory(data)
+		if err != nil {
 			return fmt.Errorf("failed to unmarshal releases: %w", err)
 		}
 		if err := validateReleaseHistory(releases); err != nil {
@@ -2335,9 +2527,9 @@ func (s *ReleaseStore) updateLatestStatusWithinLimit(
 	})
 }
 
-// ActivateLatest marks the most recent release as "active" and all previous
-// "active" releases as "superseded" in a single transaction.
-func (s *ReleaseStore) ActivateLatest(leaseUUID string) error {
+// activateLatest marks the most recent release as "active" and all previous
+// "active" releases as "superseded" for package-local history tests.
+func (s *ReleaseStore) activateLatest(leaseUUID string) error {
 	return s.activateLatestWithinLimit(leaseUUID, backend.MaxStoredReleaseHistoryBytes)
 }
 
@@ -2353,7 +2545,9 @@ func (s *ReleaseStore) activateLatestWithinLimit(leaseUUID string, limitBytes in
 		}
 
 		var releases []Release
-		if err := json.Unmarshal(data, &releases); err != nil {
+		var err error
+		releases, err = decodeReleaseHistory(data)
+		if err != nil {
 			return fmt.Errorf("failed to unmarshal releases: %w", err)
 		}
 		if err := validateReleaseHistory(releases); err != nil {
@@ -2394,242 +2588,10 @@ func (s *ReleaseStore) activateLatestWithinLimit(leaseUUID string, limitBytes in
 	})
 }
 
-// RecordLegacyMigration appends an "active" release entry for a recover-time
-// v0.13 migration so the lease's release history captures the wrap-and-rename
-// step and its tokenless runtime identity in one commit. Idempotent: if the
-// most-recent active entry already carries the same wrapped manifest, desired
-// topology, and authority, the call is a no-op. An older manifest-only entry is
-// upgraded in place so migration recovery gains an exact cohort invariant
-// without inflating release history.
-//
-// Used exclusively by the docker backend's migrate.go (Task 9).
-func (s *ReleaseStore) RecordLegacyMigration(
-	leaseUUID string,
-	manifest []byte,
-	items []backend.LeaseItem,
-	resourceProfiles []SKUResourceSnapshot,
-	authority LegacyRuntimeAuthority,
-) error {
-	return s.RecordLegacyMigrationAt(
-		leaseUUID,
-		manifest,
-		items,
-		resourceProfiles,
-		authority,
-		time.Now(),
-	)
-}
-
-// CheckRecordLegacyMigrationCapacity proves that the exact migration release,
-// including its runtime authority, can be committed after deterministic history
-// compaction. createdAt must be reused by RecordLegacyMigrationAt so the proof
-// and the post-substrate write have identical wire size; Docker calls this
-// before stopping or renaming a legacy cohort.
-func (s *ReleaseStore) CheckRecordLegacyMigrationCapacity(
-	leaseUUID string,
-	manifest []byte,
-	items []backend.LeaseItem,
-	resourceProfiles []SKUResourceSnapshot,
-	authority LegacyRuntimeAuthority,
-	createdAt time.Time,
-) error {
-	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
-		return err
-	}
-	if err := validateLegacyMigrationReleaseInput(items, resourceProfiles, authority, createdAt); err != nil {
-		return err
-	}
-	durableManifest := slices.Clone(manifest)
-	durableItems := slices.Clone(items)
-	durableProfiles := CloneSKUResourceSnapshot(resourceProfiles)
-	return s.view(func(tx *bolt.Tx) error {
-		_, _, err := planMigrationReleaseHistory(
-			tx.Bucket(releasesBucketName).Get([]byte(leaseUUID)),
-			leaseUUID,
-			durableManifest,
-			durableItems,
-			durableProfiles,
-			authority,
-			createdAt,
-			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
-			backend.MaxStoredReleaseHistoryBytes,
-		)
-		return err
-	})
-}
-
-// RecordLegacyMigrationAt is RecordLegacyMigration with an explicit admission
-// timestamp.
-// It exists so the pre-side-effect capacity proof and post-Compose durable
-// commit can describe the exact same release bytes.
-func (s *ReleaseStore) RecordLegacyMigrationAt(
-	leaseUUID string,
-	manifest []byte,
-	items []backend.LeaseItem,
-	resourceProfiles []SKUResourceSnapshot,
-	authority LegacyRuntimeAuthority,
-	createdAt time.Time,
-) error {
-	return s.recordLegacyMigrationWithinLimit(
-		leaseUUID,
-		manifest,
-		items,
-		resourceProfiles,
-		authority,
-		createdAt,
-		backend.MaxStoredReleaseHistoryBytes,
-	)
-}
-
-func (s *ReleaseStore) recordLegacyMigrationWithinLimit(
-	leaseUUID string,
-	manifest []byte,
-	items []backend.LeaseItem,
-	resourceProfiles []SKUResourceSnapshot,
-	authority LegacyRuntimeAuthority,
-	createdAt time.Time,
-	limitBytes int,
-) error {
-	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
-		return err
-	}
-	if err := validateLegacyMigrationReleaseInput(items, resourceProfiles, authority, createdAt); err != nil {
-		return err
-	}
-	durableManifest := slices.Clone(manifest)
-	durableItems := slices.Clone(items)
-	durableProfiles := CloneSKUResourceSnapshot(resourceProfiles)
-	return s.update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(releasesBucketName)
-		releases, changed, err := planMigrationReleaseHistory(
-			bucket.Get([]byte(leaseUUID)),
-			leaseUUID,
-			durableManifest,
-			durableItems,
-			durableProfiles,
-			authority,
-			createdAt,
-			releaseHistoryCapacityCutoff(s.maxAge, time.Now()),
-			limitBytes,
-		)
-		if err != nil {
-			return err
-		}
-		if !changed {
-			return nil
-		}
-		encoded, err := encodeReleaseHistoryWithinLimit(releases, limitBytes)
-		if err != nil {
-			return fmt.Errorf("marshal migration releases: %w", err)
-		}
-		return bucket.Put([]byte(leaseUUID), encoded)
-	})
-}
-
-func validateLegacyMigrationReleaseInput(
-	items []backend.LeaseItem,
-	resourceProfiles []SKUResourceSnapshot,
-	authority LegacyRuntimeAuthority,
-	createdAt time.Time,
-) error {
-	if len(items) == 0 {
-		return errors.New("migration release requires desired items")
-	}
-	if err := ValidateSKUResourceSnapshot(items, resourceProfiles); err != nil {
-		return fmt.Errorf("migration release resource profiles: %w", err)
-	}
-	if !authority.valid {
-		return errors.New("migration release requires valid legacy runtime authority")
-	}
-	if createdAt.IsZero() {
-		return errors.New("migration release requires an admission timestamp")
-	}
-	return nil
-}
-
-func planMigrationReleaseHistory(
-	data []byte,
-	leaseUUID string,
-	manifest []byte,
-	items []backend.LeaseItem,
-	resourceProfiles []SKUResourceSnapshot,
-	authority LegacyRuntimeAuthority,
-	createdAt time.Time,
-	cutoff time.Time,
-	limitBytes int,
-) ([]Release, bool, error) {
-	var releases []Release
-	if data != nil {
-		if err := json.Unmarshal(data, &releases); err != nil {
-			return nil, false, fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
-		}
-		if err := validateReleaseHistory(releases); err != nil {
-			return nil, false, fmt.Errorf("invalid release data for %s: %w", leaseUUID, err)
-		}
-		if err := rejectRawMaintenanceHistoryMutation(releases); err != nil {
-			return nil, false, err
-		}
-	}
-
-	latestActive := latestActiveReleaseIndex(releases)
-	if latestActive >= 0 && bytes.Equal(releases[latestActive].Manifest, manifest) {
-		if releases[latestActive].OperationID != "" || releases[latestActive].RuntimeAuthority != nil {
-			return nil, false, fmt.Errorf("active migration release for %s has typed runtime authority", leaseUUID)
-		}
-		if existing := releases[latestActive].LegacyRuntimeAuthority; existing != nil && *existing != authority {
-			return nil, false, fmt.Errorf("active migration release for %s has divergent legacy runtime authority", leaseUUID)
-		}
-		if len(releases[latestActive].Items) != 0 &&
-			!slices.Equal(releases[latestActive].Items, items) {
-			return nil, false, fmt.Errorf("active migration release for %s has divergent desired items", leaseUUID)
-		}
-		if len(releases[latestActive].ResourceProfiles) > 0 &&
-			!slices.Equal(releases[latestActive].ResourceProfiles, resourceProfiles) {
-			return nil, false, fmt.Errorf("active migration release for %s has divergent resource profiles", leaseUUID)
-		}
-		if slices.Equal(releases[latestActive].Items, items) &&
-			slices.Equal(releases[latestActive].ResourceProfiles, resourceProfiles) &&
-			releases[latestActive].LegacyMigration &&
-			releases[latestActive].LegacyRuntimeAuthority != nil {
-			return releases, false, nil
-		}
-		releases[latestActive].Items = slices.Clone(items)
-		releases[latestActive].ResourceProfiles = CloneSKUResourceSnapshot(resourceProfiles)
-		releases[latestActive].LegacyMigration = true
-		releases[latestActive].LegacyRuntimeAuthority = cloneLegacyRuntimeAuthority(&authority)
-	} else {
-		for index := range releases {
-			if releases[index].Status == "active" {
-				releases[index].Status = "superseded"
-			}
-		}
-		releases = append(releases, Release{
-			Version:                maxVersion(releases) + 1,
-			Manifest:               slices.Clone(manifest),
-			Image:                  "stack",
-			Items:                  slices.Clone(items),
-			ResourceProfiles:       CloneSKUResourceSnapshot(resourceProfiles),
-			LegacyRuntimeAuthority: cloneLegacyRuntimeAuthority(&authority),
-			LegacyMigration:        true,
-			Status:                 "active",
-			CreatedAt:              createdAt,
-		})
-	}
-	if err := validateReleaseHistory(releases); err != nil {
-		return nil, false, fmt.Errorf("invalid migration release data for %s: %w", leaseUUID, err)
-	}
-	compacted, _, err := compactReleaseHistoryWithinLimit(releases, cutoff, limitBytes)
-	if err != nil {
-		return nil, false, fmt.Errorf("compact migration release history: %w", err)
-	}
-	if err := validateReleaseHistory(compacted); err != nil {
-		return nil, false, fmt.Errorf("invalid compacted migration release history: %w", err)
-	}
-	return compacted, true, nil
-}
-
-// Delete removes all releases for a lease. No-op if not found.
-func (s *ReleaseStore) Delete(leaseUUID string) error {
+// delete is retained only for package-local schema and corruption tests. A
+// production close retires release history through CloseSettlement's exact
+// fenced transition; sibling packages cannot delete authority directly.
+func (s *ReleaseStore) delete(leaseUUID string) error {
 	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
 		return err
 	}
@@ -2640,7 +2602,9 @@ func (s *ReleaseStore) Delete(leaseUUID string) error {
 			return nil
 		}
 		var releases []Release
-		if err := json.Unmarshal(data, &releases); err != nil {
+		var err error
+		releases, err = decodeReleaseHistory(data)
+		if err != nil {
 			return fmt.Errorf("failed to unmarshal releases: %w", err)
 		}
 		if err := validateReleaseHistory(releases); err != nil {
@@ -2655,7 +2619,7 @@ func (s *ReleaseStore) Delete(leaseUUID string) error {
 
 func rejectRawMaintenanceHistoryMutation(releases []Release) error {
 	if slices.ContainsFunc(releases, func(release Release) bool {
-		return release.MaintenanceID != ""
+		return !release.MaintenanceID.IsZero()
 	}) {
 		return ErrMaintenanceReleaseClaimRequired
 	}
@@ -2664,74 +2628,11 @@ func rejectRawMaintenanceHistoryMutation(releases []Release) error {
 
 func rejectUnresolvedMaintenanceHistoryMutation(releases []Release) error {
 	if slices.ContainsFunc(releases, func(release Release) bool {
-		return release.MaintenanceID != "" && release.Status == "deploying"
+		return !release.MaintenanceID.IsZero() && release.Status == "deploying"
 	}) {
 		return ErrMaintenanceReleaseClaimRequired
 	}
 	return nil
-}
-
-// DeleteCloseHistory removes a lease's release history only while the release
-// selected at close admission still matches the caller's exact fence. Absence
-// is success because a crash may happen after this transaction commits but
-// before the close journal is resolved. A zero fence proves that no release
-// existed at admission and therefore refuses to erase a subsequently-created
-// history.
-//
-// The selected row is the most-recent active release, or the index-latest row
-// when no active release exists. This mirrors close admission and lets a close
-// preempt a persisted-but-incomplete update while still fencing the live
-// topology it is authorized to destroy.
-func (s *ReleaseStore) DeleteCloseHistory(
-	leaseUUID string,
-	version int,
-	digest [sha256.Size]byte,
-) error {
-	if err := s.requireCanonicalLeaseUUID(leaseUUID); err != nil {
-		return err
-	}
-	if version < 0 {
-		return fmt.Errorf("close release version cannot be negative")
-	}
-	if (version == 0) != (digest == ([sha256.Size]byte{})) {
-		return fmt.Errorf("close release fence must be wholly absent or wholly present")
-	}
-
-	return s.update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(releasesBucketName)
-		if bucket == nil {
-			return fmt.Errorf("releases bucket missing")
-		}
-		key := []byte(leaseUUID)
-		data := bucket.Get(key)
-		if data == nil {
-			// Idempotent replay after the deletion transaction committed.
-			return nil
-		}
-		if version == 0 {
-			return fmt.Errorf("release history appeared after close admission for %s", leaseUUID)
-		}
-
-		var releases []Release
-		if err := json.Unmarshal(data, &releases); err != nil {
-			return fmt.Errorf("corrupted release data for %s: %w", leaseUUID, err)
-		}
-		if err := validateReleaseHistory(releases); err != nil {
-			return fmt.Errorf("invalid release data for %s: %w", leaseUUID, err)
-		}
-		selected := releaseForCloseFence(releases)
-		if selected == nil {
-			return fmt.Errorf("release history for %s is empty", leaseUUID)
-		}
-		encoded, err := json.Marshal(selected)
-		if err != nil {
-			return fmt.Errorf("marshal release fence for %s: %w", leaseUUID, err)
-		}
-		if selected.Version != version || sha256.Sum256(encoded) != digest {
-			return fmt.Errorf("release history changed after close admission for %s", leaseUUID)
-		}
-		return bucket.Delete(key)
-	})
 }
 
 func releaseForCloseFence(releases []Release) *Release {
@@ -2746,7 +2647,7 @@ func releaseForCloseFence(releases []Release) *Release {
 	return &releases[len(releases)-1]
 }
 
-// RemoveOlderThan prunes release history older than maxAge while preserving each
+// removeOlderThan prunes release history older than maxAge while preserving each
 // lease's load-bearing records. For every lease it ALWAYS retains its index-latest
 // entry — the entry the runtime mutators append to / activate, and (because Append
 // assigns the next version to the tail) the holder of the lease's maximum version,
@@ -2756,13 +2657,10 @@ func releaseForCloseFence(releases []Release) *Release {
 // entry is itself the active release or no active release exists, two otherwise. Only
 // entries that are BOTH older than the cutoff AND not protected are pruned, so a
 // lease's record is never emptied and its live manifest is never removed (ENG-440).
-// The most-recent LegacyMigration entry is protected too: a later update may
-// supersede it while its rollback-window containers still exist, and pruning that
-// row would erase the exact cleanup authority required by Deprovision.
 // Corrupt or empty values are preserved and fail the sweep closed: exact release
 // topology is recovery authority, so ambiguity must remain visible for repair.
 // Returns the number of valid release entries removed.
-func (s *ReleaseStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
+func (s *ReleaseStore) removeOlderThan(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
 	removed := 0
 
@@ -2786,7 +2684,9 @@ func (s *ReleaseStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 				return fmt.Errorf("release history key with length %d is not canonical", len(k))
 			}
 			var releases []Release
-			if err := json.Unmarshal(v, &releases); err != nil {
+			var err error
+			releases, err = decodeReleaseHistory(v)
+			if err != nil {
 				// Exact release topology is now recovery authority. Deleting a
 				// corrupt row would turn "unknown desired cohort" into apparent
 				// permission to infer topology from whatever containers survived,
@@ -2802,20 +2702,13 @@ func (s *ReleaseStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 			}
 
 			// Protected indices (never pruned): the index-latest entry (holds the max
-			// version), the most-recent "active" entry (the manifest-rehydration
-			// source), and the most-recent legacy-migration entry (exact cleanup
-			// authority for any surviving rollback-window containers).
+			// version) and the most-recent "active" entry (the manifest-rehydration
+			// source).
 			keepLatest := len(releases) - 1
 			keepActive := -1
-			keepMigration := -1
 			for i := len(releases) - 1; i >= 0; i-- {
-				if keepActive < 0 && releases[i].Status == "active" {
+				if releases[i].Status == "active" {
 					keepActive = i
-				}
-				if keepMigration < 0 && releases[i].LegacyMigration {
-					keepMigration = i
-				}
-				if keepActive >= 0 && keepMigration >= 0 {
 					break
 				}
 			}
@@ -2823,7 +2716,7 @@ func (s *ReleaseStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 			kept := make([]Release, 0, len(releases))
 			prunedHere := 0
 			for i, r := range releases {
-				if i != keepLatest && i != keepActive && i != keepMigration && r.CreatedAt.Before(cutoff) {
+				if i != keepLatest && i != keepActive && r.CreatedAt.Before(cutoff) {
 					prunedHere++
 					continue
 				}

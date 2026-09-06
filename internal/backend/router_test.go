@@ -180,6 +180,20 @@ func TestRouter_GetBackendByName(t *testing.T) {
 	assert.Nil(t, b)
 }
 
+func TestRouter_HasBackendDoesNotExposeClient(t *testing.T) {
+	backend1 := NewMockBackend(MockBackendConfig{Name: "backend-one"})
+	router, err := NewRouter(RouterConfig{
+		Backends: []BackendEntry{{Backend: backend1}},
+	})
+	require.NoError(t, err)
+
+	assert.True(t, router.HasBackend("backend-one"))
+	assert.False(t, router.HasBackend("nonexistent"))
+
+	var nilRouter *Router
+	assert.False(t, nilRouter.HasBackend("backend-one"))
+}
+
 func TestRouter_NilBackend(t *testing.T) {
 	validBackend := NewMockBackend(MockBackendConfig{Name: "valid"})
 	var typedNilBackend *MockBackend

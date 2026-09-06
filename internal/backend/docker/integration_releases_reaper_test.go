@@ -133,7 +133,7 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	// THE ENG-440 ASSERTION: a real Restart must succeed. Pre-fix this returned
 	// ErrInvalidState "no stored manifest" synchronously, because the reaped record
 	// left the recovered StackManifest nil.
-	require.NoError(t, b2.Restart(ctx, backend.RestartRequest{
+	require.NoError(t, b2.Restart(ctx, backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: callbacks.lifecycleURL,
 	}), "Restart must not fail with 'no stored manifest' after the reap")

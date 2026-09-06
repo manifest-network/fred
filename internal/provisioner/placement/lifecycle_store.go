@@ -6,14 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
+	"unicode/utf8"
 
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/strictjson"
 )
 
 var lifecycleCapabilityBucketName = []byte("placement_lifecycle_capabilities")
+
+const lifecycleCapabilitySchema = 1
 
 // LifecycleVerdict is the exhaustive result of checking a typed lifecycle
 // callback capability. Its zero value grants no authority.
@@ -43,6 +50,171 @@ type LifecycleAuthorization struct {
 	id      lifecycle.ID
 	verdict LifecycleVerdict
 	retired bool
+}
+
+// runtimePrincipal is the durable tenant/provider identity of the live backend
+// generation. It is deliberately distinct from attempt request metadata: a
+// later refused attempt may clear its own reconstruction data without erasing
+// the current owner's maintenance principal.
+type runtimePrincipal struct {
+	tenant       string
+	providerUUID string
+}
+
+func (principal runtimePrincipal) valid() bool {
+	return strings.TrimSpace(principal.tenant) != "" && utf8.ValidString(principal.tenant) &&
+		strings.TrimSpace(principal.providerUUID) != "" && utf8.ValidString(principal.providerUUID)
+}
+
+func (principal runtimePrincipal) validOptional() bool {
+	return principal == (runtimePrincipal{}) || principal.valid()
+}
+
+// RuntimePrincipalObservation is an opaque, inventory-scoped capability. Only
+// the Store-bound inventory projector can construct one, and projectInventory
+// accepts it only with the exact issuing fence, backend storage identity, and
+// lifecycle observation. The zero value grants no authority.
+type RuntimePrincipalObservation struct {
+	issuer         *Store
+	fenceRevision  uint64
+	fenceEpoch     uint64
+	leaseUUID      string
+	backendName    string
+	backendStorage backendidentity.ID
+	lifecycle      LifecycleObservation
+	principal      runtimePrincipal
+}
+
+// mintRuntimePrincipalObservation narrows one concrete, identity-bearing
+// backend inventory row into an opaque capability for the current inventory
+// session. Callers must supply the storage identity returned by that same
+// authenticated inventory lane; final projection cross-checks every field.
+func (s *Store) mintRuntimePrincipalObservation(
+	fence inventoryFence,
+	storageID backendidentity.ID,
+	provision backend.ProvisionInfo,
+) (RuntimePrincipalObservation, error) {
+	if s == nil || !fence.valid() || fence.issuer != s || !storageID.Valid() ||
+		!canonicalLeaseUUID(provision.LeaseUUID) ||
+		strings.TrimSpace(provision.Tenant) == "" || !utf8.ValidString(provision.Tenant) ||
+		!canonicalLeaseUUID(provision.ProviderUUID) {
+		return RuntimePrincipalObservation{}, errors.New("invalid runtime principal observation")
+	}
+	observation, err := lifecycleObservationFromProvision(provision.LifecycleGeneration)
+	if err != nil {
+		return RuntimePrincipalObservation{}, err
+	}
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return RuntimePrincipalObservation{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if fence.epoch != s.authorityEpoch || s.activeSnapshots[fence.revision] == 0 ||
+		provision.ProviderUUID != s.providerUUID {
+		return RuntimePrincipalObservation{}, errors.New("runtime principal observation is outside current authority")
+	}
+	if _, configured := s.backendTopologySet[provision.BackendName]; !configured {
+		return RuntimePrincipalObservation{}, errors.New("runtime principal backend is not configured")
+	}
+	if expected, bound := s.backendStorageIDs[provision.BackendName]; bound && expected != storageID {
+		return RuntimePrincipalObservation{}, errors.New("runtime principal storage identity does not match durable authority")
+	}
+	return RuntimePrincipalObservation{
+		issuer: s, fenceRevision: fence.revision, fenceEpoch: fence.epoch,
+		leaseUUID: provision.LeaseUUID, backendName: provision.BackendName,
+		backendStorage: storageID, lifecycle: observation,
+		principal: runtimePrincipal{tenant: provision.Tenant, providerUUID: provision.ProviderUUID},
+	}, nil
+}
+
+func lifecycleObservationFromProvision(
+	observation *backend.LifecycleGenerationObservation,
+) (LifecycleObservation, error) {
+	if observation == nil {
+		return LifecycleObservation{}, errors.New("runtime principal requires lifecycle evidence")
+	}
+	switch observation.Kind {
+	case backend.LifecycleGenerationLegacy:
+		if observation.ID != "" {
+			return LifecycleObservation{}, errors.New("legacy runtime principal carries a lifecycle ID")
+		}
+		return LifecycleObservation{Kind: LifecycleObservationLegacy}, nil
+	case backend.LifecycleGenerationTyped:
+		id, err := lifecycle.ParseID(observation.ID)
+		if err != nil {
+			return LifecycleObservation{}, fmt.Errorf("runtime principal lifecycle ID: %w", err)
+		}
+		return LifecycleObservation{Kind: LifecycleObservationTyped, ID: id}, nil
+	default:
+		return LifecycleObservation{}, errors.New("runtime principal requires usable lifecycle evidence")
+	}
+}
+
+func (observation RuntimePrincipalObservation) validFor(
+	store *Store,
+	fence inventoryFence,
+	leaseUUID, backendName string,
+	storageID backendidentity.ID,
+	lifecycleObservation LifecycleObservation,
+) bool {
+	return observation.issuer == store && observation.fenceRevision == fence.revision &&
+		observation.fenceEpoch == fence.epoch && observation.leaseUUID == leaseUUID &&
+		observation.backendName == backendName && observation.backendStorage == storageID &&
+		observation.lifecycle == lifecycleObservation && observation.principal.valid()
+}
+
+func applyRuntimePrincipalObservation(
+	capability lifecycleCapability,
+	observation RuntimePrincipalObservation,
+	mayEstablish bool,
+) (lifecycleCapability, bool) {
+	if capability.unusable || capability.retired || capability.attemptBackend != "" ||
+		!mayEstablish || capability.backend != observation.backendName ||
+		!lifecycleObservationConsistent(observation.lifecycle, true, capability) {
+		return capability, false
+	}
+	if capability.principal == (runtimePrincipal{}) {
+		capability.principal = observation.principal
+		return capability, true
+	}
+	if capability.principal == observation.principal {
+		return capability, false
+	}
+	// One lifecycle generation cannot change tenant or provider identity. Preserve
+	// the contradictory durable evidence as an explicit quarantine rather than
+	// accepting either side as maintenance authority.
+	capability.unusable = true
+	return capability, true
+}
+
+// validateRuntimePrincipalObservationsLocked proves that opaque principals are
+// from this exact inventory session and agree with every independently supplied
+// projection fact. Caller holds s.mu.
+func (s *Store) validateRuntimePrincipalObservationsLocked(
+	fence inventoryFence,
+	projection inventoryProjection,
+) error {
+	if !projection.complete && len(projection.runtimePrincipals) != 0 {
+		return fmt.Errorf(
+			"%w: partial projection carries runtime principal authority",
+			ErrInvalidPlacement,
+		)
+	}
+	for leaseUUID, observation := range projection.runtimePrincipals {
+		backendName := projection.Placements[leaseUUID]
+		storageID := projection.backendStorageIdentities[backendName]
+		generation := projection.lifecycles[leaseUUID]
+		if !observation.validFor(
+			s, fence, leaseUUID, backendName, storageID, generation,
+		) {
+			return fmt.Errorf(
+				"%w: runtime principal for lease %q does not match its inventory authority",
+				ErrInvalidPlacement,
+				leaseUUID,
+			)
+		}
+	}
+	return nil
 }
 
 // Verdict reports the exhaustive authorization outcome.
@@ -93,6 +265,7 @@ func (result LifecycleAuthorization) ID() lifecycle.ID {
 type lifecycleCapability struct {
 	backend        string
 	id             lifecycle.ID
+	principal      runtimePrincipal
 	retired        bool
 	attemptBackend string
 	attemptID      lifecycle.ID
@@ -113,8 +286,11 @@ type lifecycleCapability struct {
 }
 
 type persistedLifecycleCapability struct {
+	Schema         int    `json:"schema"`
 	Backend        string `json:"backend,omitempty"`
 	ID             string `json:"id,omitempty"`
+	Tenant         string `json:"tenant,omitempty"`
+	ProviderUUID   string `json:"provider_uuid,omitempty"`
 	Retired        bool   `json:"retired,omitempty"`
 	AttemptBackend string `json:"attempt_backend,omitempty"`
 	AttemptID      string `json:"attempt_id,omitempty"`
@@ -338,6 +514,12 @@ func quarantineLifecycleBindings(
 				if err != nil || capability.backend != placement.Backend ||
 					capability.id != wantID || capability.retired {
 					quarantine(leaseUUID, "confirmed operation metadata does not match lifecycle generation")
+					continue
+				}
+				if capability.principal.valid() &&
+					(capability.principal.tenant != placement.attemptRequestSnapshot.Tenant() ||
+						capability.principal.providerUUID != placement.attemptRequestSnapshot.ProviderUUID()) {
+					quarantine(leaseUUID, "runtime principal does not match confirmed operation metadata")
 				}
 			}
 			continue
@@ -367,12 +549,16 @@ func decodeLifecycleCapability(value []byte) (lifecycleCapability, error) {
 	if len(value) == 0 {
 		return lifecycleCapability{}, errors.New("empty lifecycle capability")
 	}
-	if _, err := decodeUniqueJSONObject(value); err != nil {
-		return lifecycleCapability{}, fmt.Errorf("invalid lifecycle JSON object: %w", err)
-	}
 	var persisted persistedLifecycleCapability
-	if err := json.Unmarshal(value, &persisted); err != nil {
+	if err := strictjson.DecodeObject(
+		value, maxAuthorityLifecycleValueBytes, &persisted,
+	); err != nil {
 		return lifecycleCapability{}, err
+	}
+	if persisted.Schema != lifecycleCapabilitySchema {
+		return lifecycleCapability{}, fmt.Errorf(
+			"unsupported lifecycle capability schema %d", persisted.Schema,
+		)
 	}
 
 	currentID, err := parseOptionalLifecycleID(persisted.ID)
@@ -386,6 +572,7 @@ func decodeLifecycleCapability(value []byte) (lifecycleCapability, error) {
 	capability := lifecycleCapability{
 		backend:        persisted.Backend,
 		id:             currentID,
+		principal:      runtimePrincipal{tenant: persisted.Tenant, providerUUID: persisted.ProviderUUID},
 		retired:        persisted.Retired,
 		attemptBackend: persisted.AttemptBackend,
 		attemptID:      attemptID,
@@ -409,8 +596,11 @@ func encodeLifecycleCapability(capability lifecycleCapability) ([]byte, error) {
 		return nil, err
 	}
 	persisted := persistedLifecycleCapability{
+		Schema:         lifecycleCapabilitySchema,
 		Backend:        capability.backend,
 		Retired:        capability.retired,
+		Tenant:         capability.principal.tenant,
+		ProviderUUID:   capability.principal.providerUUID,
 		AttemptBackend: capability.attemptBackend,
 		Unusable:       capability.unusable,
 	}
@@ -428,6 +618,9 @@ func validateLifecycleCapability(capability lifecycleCapability) error {
 		return errors.New("raw corrupt lifecycle capability cannot be encoded")
 	}
 	if capability.unusable {
+		if !capability.principal.validOptional() {
+			return errors.New("runtime principal is incomplete")
+		}
 		if capability.backend == "" && capability.id.Valid() {
 			return errors.New("unusable lifecycle capability ID has no backend evidence")
 		}
@@ -443,6 +636,9 @@ func validateLifecycleCapability(capability lifecycleCapability) error {
 			return nil
 		}
 		return nil
+	}
+	if !capability.principal.validOptional() {
+		return errors.New("runtime principal is incomplete")
 	}
 	if capability.backend == "" && capability.id.Valid() {
 		return errors.New("lifecycle capability ID has no backend")
@@ -467,7 +663,7 @@ func lifecycleIDForOperation(operationID operation.OperationID) (lifecycle.ID, e
 // selector for a provenance-gated legacy owner, without consulting
 // payload-supplied backend metadata. Pending attempt markers never grant
 // authority.
-func (s *Store) AuthorizeLifecycle(
+func (s *Store) authorizeLifecycle(
 	leaseUUID string,
 	id lifecycle.ID,
 ) LifecycleAuthorization {
@@ -611,7 +807,7 @@ func authorizeLifecycleCapability(
 // already deleted, the exact retirement deletes the capability itself; a
 // duplicate then returns Missing. The durable delete is still the at-most-once
 // publication boundary.
-func (s *Store) RetireLifecycle(
+func (s *Store) retireLifecycle(
 	leaseUUID string,
 	id lifecycle.ID,
 ) (LifecycleAuthorization, error) {
@@ -642,11 +838,17 @@ func (s *Store) RetireLifecycle(
 
 	if _, placementExists := s.cache[leaseUUID]; !placementExists {
 		if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+			if err := rejectPendingMaintenanceTx(tx, leaseUUID); err != nil {
+				return err
+			}
 			bucket := tx.Bucket(lifecycleCapabilityBucketName)
 			if bucket == nil {
 				return errors.New("placement lifecycle capability bucket missing")
 			}
-			return bucket.Delete([]byte(leaseUUID))
+			if err := bucket.Delete([]byte(leaseUUID)); err != nil {
+				return err
+			}
+			return reclaimDetachedMaintenanceCommandsForLeaseTx(tx, leaseUUID)
 		}); err != nil {
 			return LifecycleAuthorization{}, mutationFailure("retire detached lifecycle capability", err)
 		}
@@ -665,6 +867,9 @@ func (s *Store) RetireLifecycle(
 		return LifecycleAuthorization{}, mutationFailure("encode retired lifecycle capability", err)
 	}
 	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+		if err := rejectPendingMaintenanceTx(tx, leaseUUID); err != nil {
+			return err
+		}
 		bucket := tx.Bucket(lifecycleCapabilityBucketName)
 		if bucket == nil {
 			return errors.New("placement lifecycle capability bucket missing")
@@ -705,9 +910,17 @@ func (s *Store) lifecycleWithAttemptLocked(
 func promoteAttemptLifecycle(
 	backendName string,
 	operationID operation.OperationID,
+	requestSnapshot BackendRequestSnapshot,
 ) lifecycleCapability {
 	wantID, _ := lifecycleIDForOperation(operationID)
-	return lifecycleCapability{backend: backendName, id: wantID}
+	return lifecycleCapability{
+		backend: backendName,
+		id:      wantID,
+		principal: runtimePrincipal{
+			tenant:       requestSnapshot.Tenant(),
+			providerUUID: requestSnapshot.ProviderUUID(),
+		},
+	}
 }
 
 func clearAttemptLifecycle(
@@ -740,7 +953,9 @@ func projectPositiveLifecycle(
 		if err == nil && observationPresent &&
 			observation.Kind == LifecycleObservationTyped &&
 			observation.ID == wantID && markerExact {
-			return promoteAttemptLifecycle(backendName, existing.attemptOperationID), true, true
+			return promoteAttemptLifecycle(
+				backendName, existing.attemptOperationID, existing.attemptRequestSnapshot,
+			), true, true
 		}
 		if markerExact && capability.backend == "" {
 			if observationPresent {
@@ -875,6 +1090,9 @@ func (s *Store) putPlacementWithLifecycleLocked(
 		return mutationFailure("encode lifecycle capability for "+operationName, err)
 	}
 	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+		if err := rejectPendingMaintenanceTx(tx, leaseUUID); err != nil {
+			return err
+		}
 		placements := tx.Bucket(bucketName)
 		capabilities := tx.Bucket(lifecycleCapabilityBucketName)
 		if placements == nil || capabilities == nil {

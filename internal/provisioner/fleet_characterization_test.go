@@ -18,6 +18,7 @@ package provisioner
 // updating.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/url"
@@ -81,7 +82,7 @@ func TestFleet_V013UpgradeBackfillsExistingWorkloadsWithoutMovingThem(t *testing
 		t, "lease-active", f.providerUUID, backend.ProvisionStatusReady,
 	)
 	f.backendAt(1).seedRetention("lease-retained")
-	require.Zero(t, f.tracker.Operations().Count())
+	require.Zero(t, f.coordinator.RuntimeController().Count())
 	require.Empty(t, f.placement.List())
 
 	require.NoError(t, f.sweep())
@@ -115,13 +116,10 @@ func TestFleet_ProvisionCarriesExactTypedOperationAcrossHTTP(t *testing.T) {
 	callbackID, present, err := operation.ParseQuery(callbackURL.Query())
 	require.NoError(t, err)
 	require.True(t, present)
+	require.True(t, callbackID.Valid())
 
-	record, tracked := f.tracker.Operations().Lookup(fleetLeaseUUID("lease-typed"))
-	require.True(t, tracked)
-	require.Equal(t, operation.KindProvision, record.Kind)
-	require.Equal(t, callbackID, record.ID,
-		"the callback capability crossing HTTP must identify the tracked operation")
-	require.Equal(t, "backend-1", record.Backend)
+	require.True(t, f.coordinator.RuntimeController().Contains(fleetLeaseUUID("lease-typed")),
+		"the callback capability crossing HTTP must retain the exact live operation")
 
 	p := f.placement.Lookup(fleetLeaseUUID("lease-typed"))
 	require.Equal(t, placement.StateConfirmed, p.State())
@@ -129,75 +127,77 @@ func TestFleet_ProvisionCarriesExactTypedOperationAcrossHTTP(t *testing.T) {
 	require.Empty(t, p.Attempt)
 }
 
-func TestFleet_CompleteInventoryNeverClearsAmbiguousAttemptFromSilence(t *testing.T) {
+func TestFleet_CompleteInventoryRecoversAmbiguousAttemptByExactRedelivery(t *testing.T) {
 	t.Parallel()
-	f := newFleet(t, fleetOptions{})
+	f := newFleet(t, fleetOptions{backendSKUs: map[int][]string{
+		2: {"sku-ambiguous"},
+	}})
 	require.NoError(t, f.sweep(), "arm startup placement authority")
-
-	operationID, tracked := f.tracker.TryTrackInFlightWithOperationID(
-		fleetLeaseUUID("lease-ambiguous"), "tenant-a", nil, "backend-2",
-	)
-	require.True(t, tracked)
-	baseline := f.placement.CurrentAdmissionBaseline()
-	scope, err := f.placement.ScopeAdmission(baseline, backendTopologyNames(f.router))
-	require.NoError(t, err)
-	_, applied, err := f.placement.BeginNewAttempt(
-		scope,
-		fleetLeaseUUID("lease-ambiguous"), "backend-2", operationID,
-		placement.PayloadFingerprint{}, testBackendRequestSnapshot(t),
-		testPlacementCallbackPair(t, operationID),
-	)
-	require.NoError(t, err)
-	require.True(t, applied)
-	require.True(t, f.tracker.UntrackInFlightIfOperationID(
-		fleetLeaseUUID("lease-ambiguous"), operationID),
-		"model an ambiguous synchronous response that retained only durable intent")
+	induceFleetAmbiguousProvision(t, f, "lease-ambiguous", "sku-ambiguous", 2)
 	require.Equal(t, placement.StateAttempting,
 		f.placement.Lookup(fleetLeaseUUID("lease-ambiguous")).State())
 
 	require.NoError(t, f.sweep())
 
-	require.Equal(t, placement.StateAttempting,
-		f.placement.Lookup(fleetLeaseUUID("lease-ambiguous")).State(),
-		"inventory silence cannot prove that an ambiguously timed-out request never committed later")
-	for _, srv := range f.servers {
-		require.Zero(t, srv.provisionCount("lease-ambiguous"),
-			"settling an inventory-disproved attempt must not manufacture a backend call")
-	}
+	recovered := f.placement.Lookup(fleetLeaseUUID("lease-ambiguous"))
+	require.Equal(t, placement.StateConfirmed, recovered.State(),
+		"inventory silence cannot clear the attempt; exact idempotent redelivery must resolve it")
+	require.Equal(t, "backend-2", recovered.Backend)
+	require.Equal(t, 2, f.backendAt(2).provisionCount("lease-ambiguous"),
+		"the ambiguous first dispatch and exact idempotent redelivery are both observable")
 }
 
-func TestFleet_IncompleteInventoryKeepsUnresolvedAttempt(t *testing.T) {
+func TestFleet_IncompleteInventoryStillRecoversExactAttempt(t *testing.T) {
 	t.Parallel()
-	f := newFleet(t, fleetOptions{})
+	f := newFleet(t, fleetOptions{backendSKUs: map[int][]string{
+		2: {"sku-unknown"},
+	}})
 	require.NoError(t, f.sweep(), "arm startup placement authority")
-
-	operationID, tracked := f.tracker.TryTrackInFlightWithOperationID(
-		fleetLeaseUUID("lease-unknown"), "tenant-a", nil, "backend-2",
-	)
-	require.True(t, tracked)
-	baseline := f.placement.CurrentAdmissionBaseline()
-	scope, err := f.placement.ScopeAdmission(baseline, backendTopologyNames(f.router))
-	require.NoError(t, err)
-	_, applied, err := f.placement.BeginNewAttempt(
-		scope, fleetLeaseUUID("lease-unknown"), "backend-2", operationID,
-		placement.PayloadFingerprint{}, testBackendRequestSnapshot(t),
-		testPlacementCallbackPair(t, operationID),
-	)
-	require.NoError(t, err)
-	require.True(t, applied)
-	require.True(t, f.tracker.UntrackInFlightIfOperationID(
-		fleetLeaseUUID("lease-unknown"), operationID))
+	induceFleetAmbiguousProvision(t, f, "lease-unknown", "sku-unknown", 2)
 	f.backendAt(2).setFault(faultRetentionsOnly)
 
 	require.NoError(t, f.sweep())
 
 	p := f.placement.Lookup(fleetLeaseUUID("lease-unknown"))
-	require.Equal(t, placement.StateAttempting, p.State())
-	require.Equal(t, "backend-2", p.Attempt,
-		"a missing half of the attempted backend's inventory cannot prove absence")
+	require.Equal(t, placement.StateConfirmed, p.State())
+	require.Equal(t, "backend-2", p.Backend,
+		"a missing inventory endpoint cannot erase affinity or block exact idempotent redelivery")
+	require.Equal(t, 2, f.backendAt(2).provisionCount("lease-unknown"),
+		"recovery must redeliver the same durable operation despite partial inventory")
 }
 
-func TestFleet_IncompleteRetentionInventoryCannotAuthorizeProvision(t *testing.T) {
+func induceFleetAmbiguousProvision(
+	t *testing.T,
+	f *fleet,
+	leaseName, sku string,
+	backendIndex int,
+) {
+	t.Helper()
+	f.addLease(leaseName, billingtypes.LEASE_STATE_PENDING, sku)
+	require.True(t, f.placement.CurrentAdmissionBaseline().Valid(),
+		"fleet fixture must retain its projected admission baseline")
+	target := f.backendAt(backendIndex)
+	target.setProvisionHook(func(context.Context, backend.ProvisionRequest) error {
+		return errors.New("ambiguous provision transport outcome")
+	})
+	defer target.setProvisionHook(nil)
+	setTestProviderControlPlane(t, f.execution, f.chain, nil)
+	provision, err := f.execution.ProvisionCoordinator(nil)
+	require.NoError(t, err)
+	event, err := placement.NewProvisionEventRequest(
+		fleetLeaseUUID(leaseName), "tenant-1",
+	)
+	require.NoError(t, err)
+	result := provision.ExecuteCurrentLease(t.Context(), event)
+	require.Equal(t, placement.ProvisionEventUncertain, result.Disposition())
+	require.Error(t, result.Err())
+	require.False(t, f.coordinator.RuntimeController().Contains(fleetLeaseUUID(leaseName)),
+		"an ambiguous synchronous result leaves only durable write-ahead evidence")
+	require.Equal(t, target.name, f.placement.Lookup(fleetLeaseUUID(leaseName)).Attempt,
+		"ambiguous result: %v", result.Err())
+}
+
+func TestFleet_IncompleteRetentionInventoryDoesNotBlockHealthyProvision(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
 	f.addLease("lease-no-authority", billingtypes.LEASE_STATE_PENDING)
@@ -205,13 +205,16 @@ func TestFleet_IncompleteRetentionInventoryCannotAuthorizeProvision(t *testing.T
 
 	require.NoError(t, f.sweep())
 
+	total := 0
 	for _, srv := range f.servers {
-		require.Zero(t, srv.provisionCount("lease-no-authority"),
-			"a partial retention inventory must not authorize a backend side effect on %s", srv.name)
+		total += srv.provisionCount("lease-no-authority")
 	}
-	require.False(t, f.tracker.Operations().Contains(fleetLeaseUUID("lease-no-authority")),
-		"a refused pre-side-effect operation must be released")
-	require.Equal(t, placement.StateAbsent,
+	require.Equal(t, 1, total,
+		"one unavailable backend must not globally pause provisioning on healthy topology")
+	require.Zero(t, f.backendAt(3).provisionCount("lease-no-authority"),
+		"the backend with incomplete inventory cannot receive new placement")
+	require.True(t, f.coordinator.RuntimeController().Contains(fleetLeaseUUID("lease-no-authority")))
+	require.Equal(t, placement.StateConfirmed,
 		f.placement.Lookup(fleetLeaseUUID("lease-no-authority")).State())
 }
 
@@ -528,9 +531,10 @@ func TestFleet_OrphanOnFaultedBackend_IsNotDeprovisioned(t *testing.T) {
 }
 
 // The payload store is the input to re-provisioning an ACTIVE lease. Deleting a
-// live lease's payload during a degraded sweep would make the NEXT sweep see
-// errPayloadNotAvailable, classify it as permanent, and close a healthy ACTIVE
-// lease on chain. This guards the chainLeases-filtering trap directly.
+// live lease's payload during a degraded sweep would make the next sweep lose
+// the only bytes authorized by the durable payload fingerprint. Missing bytes
+// now preserve and retry the exact attempt, but cannot reconstruct the request;
+// this guards that irreversible authority loss directly.
 func TestFleet_PayloadForLiveLease_SurvivesDegradedSweep(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
@@ -758,9 +762,10 @@ func TestFleet_DegradedSweep_StillCleansOrphanedPayload(t *testing.T) {
 }
 
 // The payload pass's other half: a chain fred cannot reach must not be read as
-// "the lease is gone". Deleting a live lease's payload makes the NEXT sweep see
-// errPayloadNotAvailable, classify it permanent, and close a healthy ACTIVE
-// lease on chain.
+// "the lease is gone". Deleting a live lease's payload makes the next sweep
+// unable to reproduce the bytes authorized by its durable fingerprint. That
+// condition is retriable and never closes the lease, but it still strands the
+// exact request until the payload is restored.
 func TestFleet_UnreachableChain_KeepsPayload(t *testing.T) {
 	t.Parallel()
 	f := newFleet(t, fleetOptions{})
@@ -848,7 +853,10 @@ func TestFleet_FleetSnapshot_ExcludesNonAnsweringBackendAndStampsOwner(t *testin
 
 	f.backendAt(2).setFault(faultConnReset)
 
-	snap := f.reconciler.fetchFleetSnapshot(t.Context())
+	sweep, err := f.reconciler.coordinator.BeginSweep()
+	require.NoError(t, err)
+	defer sweep.End()
+	snap := f.reconciler.fetchFleetSnapshot(t.Context(), sweep)
 
 	require.False(t, snap.complete, "one backend did not answer")
 	require.Equal(t, answeredSet{

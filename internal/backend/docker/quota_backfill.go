@@ -29,7 +29,13 @@ import (
 // untagged; unlike Create it never creates a missing volume. It must run after
 // recoverState (so b.provisions is populated) and reconcileRetentions (so the
 // fred-retained- namespace is settled), and before the serving loops.
-func (b *Backend) reconcileVolumeQuotas(ctx context.Context) error {
+func (b *Backend) reconcileVolumeQuotasUsing(
+	ctx context.Context,
+	ensureQuota backgroundVolumeQuota,
+) error {
+	if ensureQuota == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
 	if b.cfg.VolumeDataPath == "" {
 		return nil // noop backend: no quota-enforced volumes
 	}
@@ -43,8 +49,7 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) error {
 	want := make(map[string]int64)
 	var reconcileErrs []error
 
-	// Active leases. Snapshot under RLock; do NOT hold it across the quota exec
-	// calls below (mirrors cleanupOrphanedVolumes).
+	// Active leases. Snapshot under RLock; do NOT hold it across quota subprocesses.
 	b.provisionsMu.RLock()
 	for leaseUUID, prov := range b.provisions {
 		resourceProfiles := prov.ResourceProfiles
@@ -168,7 +173,7 @@ func (b *Backend) reconcileVolumeQuotas(ctx context.Context) error {
 			absent++ // expected but not on disk (stateless instance, or already gone)
 			continue
 		}
-		if cerr := b.mutationAdapter().ensureVolumeQuota(ctx, name, sizeMB); cerr != nil {
+		if cerr := ensureQuota(ctx, name, sizeMB); cerr != nil {
 			failed++
 			volumeQuotaBackfillTotal.WithLabelValues("failed").Inc()
 			b.logger.Warn("quota backfill: failed to re-apply quota",

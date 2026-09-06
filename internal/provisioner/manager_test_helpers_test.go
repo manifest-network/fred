@@ -11,62 +11,681 @@ import (
 	"testing"
 
 	"github.com/ThreeDotsLabs/watermill/message"
+	"github.com/google/uuid"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
-	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testsupport/placementstore"
+	"github.com/manifest-network/fred/internal/util"
 )
+
+// Legacy fixture ports live in test code only. Production application
+// services receive concrete coordinator-minted capabilities instead of these
+// independently implementable authority aggregates.
+type ReconcilerPlacement interface {
+	PlacementView
+	VerifyProviderUUID(string) error
+	VerifyBackendTopology([]string) error
+	ExpectedBackendStorageIdentity(string) (backendidentity.ID, bool)
+	CurrentAdmissionBaseline() placement.AdmissionBaseline
+}
+
+type PlacementAuthorityStore interface {
+	ReconcilerPlacement
+	BindOperationCoordinator(func(int)) (*placement.OperationCoordinator, error)
+}
 
 // testHandlerDeps preserves concise fixture construction while production
 // HandlerDeps stays capability-narrow. The helper below performs the same
-// explicit composition as Manager; none of these compatibility inputs can
-// reach a production HandlerSet.
+// explicit composition as Manager. A concrete Registry/Store pair is joined
+// immediately, and only the resulting coordinator reaches CallbackService.
 type testHandlerDeps struct {
-	ChainClient        ChainClient
-	Orchestrator       *ProvisionOrchestrator
-	EventOperations    EventOperations
-	Operations         CallbackOperations
-	Tracker            *testOperationRegistry
-	Acknowledger       Acknowledger
-	PayloadStore       *payload.Store
-	Publisher          message.Publisher
-	BackendRouter      BackendRouter
-	Placement          CallbackPlacement
-	LifecycleAuthority CallbackLifecycleAuthority
-	CallbackEvents     CallbackEventSink
-	Callbacks          CallbackApplication
-}
-
-// denyCallbackLifecycleAuthority is the explicit fail-closed lifecycle port
-// for unit fixtures that are not exercising an authorized lifecycle callback.
-// Production Manager always supplies its durable placement store; keeping this
-// non-nil in the compatibility composer prevents an unrelated missing
-// dependency from obscuring the behavior a unit test actually targets.
-type denyCallbackLifecycleAuthority struct{}
-
-func (denyCallbackLifecycleAuthority) AuthorizeLifecycle(
-	string,
-	lifecycle.ID,
-) placement.LifecycleAuthorization {
-	return placement.LifecycleAuthorization{}
-}
-
-func (denyCallbackLifecycleAuthority) RetireLifecycle(
-	string,
-	lifecycle.ID,
-) (placement.LifecycleAuthorization, error) {
-	return placement.LifecycleAuthorization{}, nil
+	ChainClient    ChainClient
+	Orchestrator   *ProvisionOrchestrator
+	Tracker        *testOperationRegistry
+	Acknowledger   Acknowledger
+	PayloadStore   *payload.Store
+	Publisher      message.Publisher
+	BackendRouter  BackendRouter
+	Placement      *placement.Store
+	Coordinator    *placement.OperationCoordinator
+	CallbackEvents CallbackEventSink
+	Callbacks      CallbackApplication
 }
 
 type testProvisionStartSink struct {
 	mu        sync.RWMutex
 	publisher message.Publisher
+}
+
+type mutableTestProvisionLeaseReader struct {
+	mu     sync.RWMutex
+	leases map[string]*billingtypes.Lease
+}
+
+// testReconciliationChain upgrades a provision-only exact reader into the
+// complete chain capability required at the reconciliation construction
+// boundary. Inventory and terminal writes are intentionally inert because
+// these orchestrator fixtures never execute a reconciliation sweep.
+type testReconciliationChain struct {
+	placement.ProvisionLeaseReader
+}
+
+func (testReconciliationChain) GetPendingLeases(
+	context.Context,
+	string,
+) ([]billingtypes.Lease, error) {
+	return nil, nil
+}
+
+func (testReconciliationChain) GetActiveLeasesByProvider(
+	context.Context,
+	string,
+) ([]billingtypes.Lease, error) {
+	return nil, nil
+}
+
+func (testReconciliationChain) RejectLeases(
+	context.Context,
+	[]string,
+	string,
+) (uint64, []string, error) {
+	return 0, nil, nil
+}
+
+func (testReconciliationChain) CloseLeases(
+	context.Context,
+	[]string,
+	string,
+) (uint64, []string, error) {
+	return 0, nil, nil
+}
+
+func (reader *mutableTestProvisionLeaseReader) GetLease(
+	_ context.Context,
+	leaseUUID string,
+) (*billingtypes.Lease, error) {
+	reader.mu.RLock()
+	defer reader.mu.RUnlock()
+	lease := reader.leases[leaseUUID]
+	if lease == nil {
+		return nil, nil
+	}
+	clone := *lease
+	clone.Items = slices.Clone(lease.Items)
+	return &clone, nil
+}
+
+func (reader *mutableTestProvisionLeaseReader) set(lease *billingtypes.Lease) {
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	clone := *lease
+	clone.Items = slices.Clone(lease.Items)
+	reader.leases[lease.Uuid] = &clone
+}
+
+type testProvisionFixture struct {
+	reader       *mutableTestProvisionLeaseReader
+	sink         *testProvisionStartSink
+	providerUUID string
+}
+
+var testProvisionFixtures sync.Map
+var testReconciliationCoordinators sync.Map
+var testManagerPlacements sync.Map
+var testManagerChains sync.Map
+
+// canonicalManagerTestChain migrates historical fixture labels to the exact
+// provider identity bound to every test placement Store. Values that name a
+// genuinely different provider remain different so authorization tests keep
+// exercising the production mismatch path.
+type canonicalManagerTestChain struct{ ManagerChainClient }
+
+type canonicalReconciliationTestChain struct{ placement.ReconciliationChain }
+
+// seededReconciliationTestChain makes legacy pre-construction in-flight
+// fixtures observable through the same exact-read boundary as production.
+// The operation itself is replayed later through ProvisionCoordinator; no raw
+// Registry mutation surface is reintroduced.
+type seededReconciliationTestChain struct {
+	placement.ReconciliationChain
+	seeds *testOperationSeedReader
+}
+
+type testOperationSeedReader struct {
+	mu    sync.RWMutex
+	seeds map[string]testOperationSeed
+}
+
+func newTestOperationSeedReader(seeds []testOperationSeed) *testOperationSeedReader {
+	reader := &testOperationSeedReader{seeds: make(map[string]testOperationSeed, len(seeds))}
+	for _, seed := range seeds {
+		reader.seeds[seed.leaseUUID] = seed
+	}
+	return reader
+}
+
+func (reader *testOperationSeedReader) set(seed testOperationSeed) {
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	reader.seeds[seed.leaseUUID] = seed
+}
+
+func (reader *testOperationSeedReader) delete(leaseUUID string) {
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	delete(reader.seeds, leaseUUID)
+}
+
+func (reader *testOperationSeedReader) get(leaseUUID string) (testOperationSeed, bool) {
+	reader.mu.RLock()
+	defer reader.mu.RUnlock()
+	seed, ok := reader.seeds[leaseUUID]
+	return seed, ok
+}
+
+func (chain seededReconciliationTestChain) GetLease(
+	ctx context.Context, leaseUUID string,
+) (*billingtypes.Lease, error) {
+	if seed, ok := chain.seeds.get(leaseUUID); ok {
+		items := make([]billingtypes.LeaseItem, 0, len(seed.items))
+		for _, item := range seed.items {
+			items = append(items, billingtypes.LeaseItem{
+				SkuUuid: item.SKU, Quantity: uint64(item.Quantity),
+				ServiceName: item.ServiceName, CustomDomain: item.CustomDomain,
+			})
+		}
+		return &billingtypes.Lease{
+			Uuid: leaseUUID, Tenant: seed.tenant,
+			ProviderUuid: placementstore.ProviderUUID,
+			State:        billingtypes.LEASE_STATE_PENDING,
+			Items:        items,
+		}, nil
+	}
+	return chain.ReconciliationChain.GetLease(ctx, leaseUUID)
+}
+
+func canonicalManagerLease(lease *billingtypes.Lease) *billingtypes.Lease {
+	if lease == nil {
+		return nil
+	}
+	copy := *lease
+	copy.Items = append([]billingtypes.LeaseItem(nil), lease.Items...)
+	if copy.ProviderUuid == "" || copy.ProviderUuid == "provider-1" ||
+		copy.ProviderUuid == "provider-uuid" {
+		copy.ProviderUuid = placementstore.ProviderUUID
+	}
+	return &copy
+}
+
+func canonicalInventoryTestLease(lease billingtypes.Lease) billingtypes.Lease {
+	copy := *canonicalManagerLease(&lease)
+	return copy
+}
+
+func (chain canonicalReconciliationTestChain) GetLease(
+	ctx context.Context, leaseUUID string,
+) (*billingtypes.Lease, error) {
+	lease, err := chain.ReconciliationChain.GetLease(ctx, leaseUUID)
+	lease = canonicalManagerLease(lease)
+	if lease != nil {
+		// Historical handler fixtures often described only the state under test.
+		// Fill their omitted positive identity at this test-only chain boundary;
+		// explicit foreign UUIDs, tenants, and providers remain untouched so the
+		// authorization regressions still exercise the production fail-closed path.
+		if lease.Uuid == "" {
+			lease.Uuid = leaseUUID
+		}
+		if lease.Tenant == "" {
+			lease.Tenant = "tenant-a"
+		}
+	}
+	return lease, err
+}
+
+func (chain canonicalReconciliationTestChain) GetPendingLeases(
+	ctx context.Context, providerUUID string,
+) ([]billingtypes.Lease, error) {
+	leases, err := chain.ReconciliationChain.GetPendingLeases(ctx, providerUUID)
+	for index := range leases {
+		leases[index] = canonicalInventoryTestLease(leases[index])
+	}
+	return leases, err
+}
+
+func (chain canonicalReconciliationTestChain) GetActiveLeasesByProvider(
+	ctx context.Context, providerUUID string,
+) ([]billingtypes.Lease, error) {
+	leases, err := chain.ReconciliationChain.GetActiveLeasesByProvider(ctx, providerUUID)
+	for index := range leases {
+		leases[index] = canonicalInventoryTestLease(leases[index])
+	}
+	return leases, err
+}
+
+func (chain canonicalManagerTestChain) GetLease(
+	ctx context.Context, leaseUUID string,
+) (*billingtypes.Lease, error) {
+	lease, err := chain.ManagerChainClient.GetLease(ctx, leaseUUID)
+	return canonicalManagerLease(lease), err
+}
+
+func (chain canonicalManagerTestChain) GetPendingLeases(
+	ctx context.Context, providerUUID string,
+) ([]billingtypes.Lease, error) {
+	leases, err := chain.ManagerChainClient.GetPendingLeases(ctx, providerUUID)
+	for index := range leases {
+		leases[index] = *canonicalManagerLease(&leases[index])
+	}
+	return leases, err
+}
+
+func (chain canonicalManagerTestChain) GetActiveLeasesByProvider(
+	ctx context.Context, providerUUID string,
+) ([]billingtypes.Lease, error) {
+	leases, err := chain.ManagerChainClient.GetActiveLeasesByProvider(ctx, providerUUID)
+	for index := range leases {
+		leases[index] = *canonicalManagerLease(&leases[index])
+	}
+	return leases, err
+}
+
+// testInventoryBackend keeps dependent-package fixtures on the same opaque
+// collection path as production. Tests may stage the next endpoint response,
+// but only a sweep-bound Collect call can turn it into projection evidence.
+type testInventoryBackend struct {
+	backend.Backend
+	mu sync.Mutex
+	// suppressProvision lets fixture setup register an accepted backend call
+	// without mutating the behavioral double or consuming its injected error.
+	suppressProvision bool
+
+	storageID  backendidentity.ID
+	provisions []backend.ProvisionInfo
+	retentions []backend.RetainedLease
+	staged     bool
+}
+
+func (client *testInventoryBackend) Provision(
+	ctx context.Context,
+	request backend.ProvisionRequest,
+) error {
+	client.mu.Lock()
+	suppress := client.suppressProvision
+	client.mu.Unlock()
+	if suppress {
+		return nil
+	}
+	return client.Backend.Provision(ctx, request)
+}
+
+func (client *testInventoryBackend) RefreshState(ctx context.Context) error {
+	client.mu.Lock()
+	staged := client.staged
+	client.mu.Unlock()
+	if staged {
+		return nil
+	}
+	return client.Backend.RefreshState(ctx)
+}
+
+func (client *testInventoryBackend) stage(
+	storageID backendidentity.ID,
+	provisions []backend.ProvisionInfo,
+	retentions []backend.RetainedLease,
+) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.storageID = storageID
+	client.provisions = cloneTestProvisionInfos(provisions)
+	client.retentions = slices.Clone(retentions)
+	client.staged = true
+}
+
+func (client *testInventoryBackend) clearStage() {
+	client.mu.Lock()
+	client.provisions = nil
+	client.retentions = nil
+	client.staged = false
+	client.mu.Unlock()
+}
+
+func (client *testInventoryBackend) ListProvisionsWithIdentity(
+	ctx context.Context,
+) ([]backend.ProvisionInfo, backendidentity.ID, error) {
+	client.mu.Lock()
+	if client.staged {
+		rows, storageID := cloneTestProvisionInfos(client.provisions), client.storageID
+		client.mu.Unlock()
+		return rows, storageID, nil
+	}
+	client.mu.Unlock()
+	rows, err := client.ListProvisions(ctx)
+	return cloneTestProvisionInfos(rows), testBackendStorageID(client.Name()), err
+}
+
+func (client *testInventoryBackend) ListRetentionsWithIdentity(
+	ctx context.Context,
+) ([]backend.RetainedLease, backendidentity.ID, error) {
+	client.mu.Lock()
+	if client.staged {
+		rows, storageID := slices.Clone(client.retentions), client.storageID
+		client.mu.Unlock()
+		return rows, storageID, nil
+	}
+	client.mu.Unlock()
+	rows, err := client.ListRetentions(ctx)
+	return slices.Clone(rows), testBackendStorageID(client.Name()), err
+}
+
+func cloneTestProvisionInfos(rows []backend.ProvisionInfo) []backend.ProvisionInfo {
+	cloned := make([]backend.ProvisionInfo, len(rows))
+	for index, row := range rows {
+		cloned[index] = row
+		cloned[index].Items = slices.Clone(row.Items)
+		cloned[index].ServiceImages = maps.Clone(row.ServiceImages)
+		if row.LifecycleGeneration != nil {
+			generation := *row.LifecycleGeneration
+			cloned[index].LifecycleGeneration = &generation
+		}
+	}
+	return cloned
+}
+
+type testInventoryRouter struct {
+	router   BackendRouter
+	backends map[string]*testInventoryBackend
+}
+
+func newTestInventoryRouter(router BackendRouter) *testInventoryRouter {
+	result := &testInventoryRouter{
+		router: router, backends: make(map[string]*testInventoryBackend),
+	}
+	for _, client := range router.Backends() {
+		if client != nil {
+			if _, exactTransport := client.(*backend.HTTPClient); exactTransport {
+				continue
+			}
+			result.backends[client.Name()] = &testInventoryBackend{Backend: client}
+		}
+	}
+	return result
+}
+
+func (router *testInventoryRouter) wrap(client backend.Backend) backend.Backend {
+	if client == nil {
+		return nil
+	}
+	// Keep the exact production transport visible to backend.Invoke*. Wrapping
+	// it would intentionally erase causal refusal authority and turn every
+	// response into a conservative ambiguous outcome.
+	if _, exactTransport := client.(*backend.HTTPClient); exactTransport {
+		return client
+	}
+	return router.backends[client.Name()]
+}
+
+func (router *testInventoryRouter) Route(sku string) backend.Backend {
+	return router.wrap(router.router.Route(sku))
+}
+
+func (router *testInventoryRouter) RouteForProvision(
+	ctx context.Context, sku string, inFlight map[string]int,
+) backend.Backend {
+	return router.wrap(router.router.RouteForProvision(ctx, sku, inFlight))
+}
+
+func (router *testInventoryRouter) RouteForProvisionAmong(
+	ctx context.Context,
+	sku string,
+	eligible map[string]struct{},
+	inFlight map[string]int,
+) backend.Backend {
+	return router.wrap(router.router.RouteForProvisionAmong(ctx, sku, eligible, inFlight))
+}
+
+func (router *testInventoryRouter) GetBackendByName(name string) backend.Backend {
+	return router.wrap(router.router.GetBackendByName(name))
+}
+
+func (router *testInventoryRouter) HasBackend(name string) bool {
+	return router.GetBackendByName(name) != nil
+}
+
+func (router *testInventoryRouter) Backends() []backend.Backend {
+	clients := router.router.Backends()
+	result := make([]backend.Backend, 0, len(clients))
+	for _, client := range clients {
+		result = append(result, router.wrap(client))
+	}
+	return result
+}
+
+var testExecutionInventoryRouters sync.Map
+var testReconciliationInventoryRouters sync.Map
+var testReconciliationExecutions sync.Map
+var testExecutionProviderControls sync.Map
+var testOperationExecutions sync.Map
+
+type testProviderControlPlane struct {
+	mu       sync.RWMutex
+	chain    placement.ReconciliationChain
+	rejecter interface {
+		RejectLeases(context.Context, []string, string) (uint64, []string, error)
+	}
+	ack Acknowledger
+}
+
+func (control *testProviderControlPlane) set(
+	chain placement.ReconciliationChain,
+	ack Acknowledger,
+) {
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	if chain != nil {
+		control.chain = chain
+	}
+	if ack != nil {
+		control.ack = ack
+	}
+}
+
+func (control *testProviderControlPlane) snapshot() (
+	placement.ReconciliationChain,
+	interface {
+		RejectLeases(context.Context, []string, string) (uint64, []string, error)
+	},
+	Acknowledger,
+) {
+	control.mu.RLock()
+	defer control.mu.RUnlock()
+	return control.chain, control.rejecter, control.ack
+}
+
+func (control *testProviderControlPlane) GetLease(
+	ctx context.Context,
+	leaseUUID string,
+) (*billingtypes.Lease, error) {
+	chain, _, _ := control.snapshot()
+	if chain != nil {
+		return chain.GetLease(ctx, leaseUUID)
+	}
+	return &billingtypes.Lease{
+		Uuid: leaseUUID, Tenant: "tenant-test", ProviderUuid: placementstore.ProviderUUID,
+		State: billingtypes.LEASE_STATE_PENDING,
+		Items: []billingtypes.LeaseItem{{SkuUuid: "sku-test", Quantity: 1}},
+	}, nil
+}
+
+func (control *testProviderControlPlane) GetPendingLeases(
+	ctx context.Context, providerUUID string,
+) ([]billingtypes.Lease, error) {
+	chain, _, _ := control.snapshot()
+	if chain == nil {
+		return nil, nil
+	}
+	return chain.GetPendingLeases(ctx, providerUUID)
+}
+
+func (control *testProviderControlPlane) GetActiveLeasesByProvider(
+	ctx context.Context, providerUUID string,
+) ([]billingtypes.Lease, error) {
+	chain, _, _ := control.snapshot()
+	if chain == nil {
+		return nil, nil
+	}
+	return chain.GetActiveLeasesByProvider(ctx, providerUUID)
+}
+
+func (control *testProviderControlPlane) RejectLeases(
+	ctx context.Context, leaseUUIDs []string, reason string,
+) (uint64, []string, error) {
+	chain, rejecter, _ := control.snapshot()
+	if rejecter != nil {
+		return rejecter.RejectLeases(ctx, leaseUUIDs, reason)
+	}
+	if chain == nil {
+		return 0, nil, nil
+	}
+	return chain.RejectLeases(ctx, leaseUUIDs, reason)
+}
+
+func (control *testProviderControlPlane) CloseLeases(
+	ctx context.Context, leaseUUIDs []string, reason string,
+) (uint64, []string, error) {
+	chain, _, _ := control.snapshot()
+	if chain == nil {
+		return 0, nil, nil
+	}
+	return chain.CloseLeases(ctx, leaseUUIDs, reason)
+}
+
+func (control *testProviderControlPlane) Acknowledge(
+	ctx context.Context, leaseUUID string,
+) (bool, string, error) {
+	_, _, ack := control.snapshot()
+	if ack == nil {
+		return true, "", nil
+	}
+	return ack.Acknowledge(ctx, leaseUUID)
+}
+
+func setTestProviderRejecter(
+	t testing.TB,
+	execution *placement.ExecutionCoordinator,
+	rejecter interface {
+		RejectLeases(context.Context, []string, string) (uint64, []string, error)
+	},
+) {
+	t.Helper()
+	value, ok := testExecutionProviderControls.Load(execution)
+	require.True(t, ok)
+	control := value.(*testProviderControlPlane)
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	control.rejecter = rejecter
+}
+
+func setTestProviderControlPlane(
+	t testing.TB,
+	execution *placement.ExecutionCoordinator,
+	chain placement.ReconciliationChain,
+	ack Acknowledger,
+) {
+	t.Helper()
+	value, ok := testExecutionProviderControls.Load(execution)
+	if !ok {
+		// Manager-owned executions already carry the production control plane
+		// built from this same chain; there is no mutable test adapter to replace.
+		return
+	}
+	value.(*testProviderControlPlane).set(chain, ack)
+}
+
+func authenticatedCallbackCoordinatorForTest(
+	coordinator *placement.OperationCoordinator,
+	chain CallbackChain,
+	ack Acknowledger,
+) (*placement.AuthenticatedCallbackCoordinator, error) {
+	value, ok := testOperationExecutions.Load(coordinator)
+	if !ok {
+		return nil, errors.New("test operation coordinator has no backend execution")
+	}
+	control, ok := chain.(placement.ReconciliationChain)
+	if !ok || control == nil {
+		return nil, errCallbackChainUnavailable
+	}
+	if ack == nil {
+		return nil, errCallbackAcknowledgerUnavailable
+	}
+	execution := value.(*placement.ExecutionCoordinator)
+	providerControl, exists := testExecutionProviderControls.Load(execution)
+	if !exists {
+		return nil, errors.New("test execution has no provider control plane")
+	}
+	providerControl.(*testProviderControlPlane).set(
+		canonicalReconciliationTestChain{ReconciliationChain: control}, ack,
+	)
+	return execution.AuthenticatedCallbackCoordinator(callbackTestProofConsumer)
+}
+
+func bindTestBackendRuntime(
+	t testing.TB,
+	coordinator *placement.OperationCoordinator,
+	router BackendRouter,
+) *placement.ExecutionCoordinator {
+	t.Helper()
+	fixture := newTestInventoryRouter(router)
+	control := &testProviderControlPlane{}
+	execution, err := coordinator.BindBackendRuntime(fixture, control)
+	require.NoError(t, err)
+	testExecutionInventoryRouters.Store(execution, fixture)
+	testExecutionProviderControls.Store(execution, control)
+	testOperationExecutions.Store(coordinator, execution)
+	t.Cleanup(func() {
+		testExecutionInventoryRouters.Delete(execution)
+		testExecutionProviderControls.Delete(execution)
+		testOperationExecutions.Delete(coordinator)
+	})
+	return execution
+}
+
+func collectTestBackendInventory(
+	t testing.TB,
+	reconciliation *placement.ReconciliationCoordinator,
+	sweep *placement.ReconciliationSweep,
+	backendName string,
+	storageID backendidentity.ID,
+	provisions []backend.ProvisionInfo,
+	retentions []backend.RetainedLease,
+) placement.BackendInventoryDisposition {
+	t.Helper()
+	value, ok := testReconciliationInventoryRouters.Load(reconciliation)
+	var fixture *testInventoryBackend
+	if ok {
+		fixture = value.(*testInventoryRouter).backends[backendName]
+		if fixture != nil {
+			fixture.stage(storageID, provisions, retentions)
+			defer fixture.clearStage()
+		}
+	}
+	provisionReceipt, err := sweep.CollectProvisionInventory(t.Context(), backendName)
+	require.NoError(t, err)
+	retentionReceipt, err := sweep.CollectRetentionInventory(t.Context(), backendName)
+	require.NoError(t, err)
+	if fixture == nil {
+		require.Equal(t, storageID, provisionReceipt.StorageID())
+		require.Equal(t, storageID, retentionReceipt.StorageID())
+	}
+	disposition, err := sweep.RecordBackendInventory(provisionReceipt, retentionReceipt)
+	require.NoError(t, err)
+	return disposition
 }
 
 func (sink *testProvisionStartSink) setPublisher(publisher message.Publisher) {
@@ -85,44 +704,75 @@ func (sink *testProvisionStartSink) PublishProvisionStarting(leaseUUID string) {
 func composeTestHandlerSet(t testing.TB, deps testHandlerDeps) *HandlerSet {
 	t.Helper()
 
-	eventOperations := deps.EventOperations
-	callbackOperations := deps.Operations
-	if provider := deps.Tracker; provider != nil {
-		if eventOperations == nil {
-			eventOperations = provider.Operations()
-		}
-		if callbackOperations == nil {
-			callbackOperations = provider.Operations()
+	if deps.ChainClient == nil {
+		deps.ChainClient = &chaintest.MockClient{}
+	}
+	if util.IsNilInterface(deps.Acknowledger) {
+		deps.Acknowledger = &mockAcknowledger{}
+	}
+	if deps.Tracker == nil {
+		deps.Tracker = newTestOperationRegistry()
+	}
+	if deps.BackendRouter == nil {
+		defaultBackend := &mockManagerBackend{name: "test-backend"}
+		deps.BackendRouter = &mockBackendRouter{
+			routeFn: func(string) backend.Backend { return defaultBackend },
+			getBackendByNameFn: func(name string) backend.Backend {
+				if name == defaultBackend.name {
+					return defaultBackend
+				}
+				return nil
+			},
+			backendsFn: func() []backend.Backend { return []backend.Backend{defaultBackend} },
 		}
 	}
-	if deps.Orchestrator != nil {
-		if eventOperations == nil {
-			var ok bool
-			eventOperations, ok = deps.Orchestrator.operations.(EventOperations)
-			require.True(t, ok, "test provision operations must expose event claims")
+	if deps.Orchestrator == nil {
+		eventTracker := deps.Tracker
+		var eventStore any
+		if deps.Placement != nil {
+			eventStore = deps.Placement
 		}
-		if callbackOperations == nil {
-			var ok bool
-			callbackOperations, ok = deps.Orchestrator.operations.(CallbackOperations)
-			require.True(t, ok, "test provision operations must expose callback claims")
+		if deps.Coordinator != nil {
+			// Callback-only fixtures may already bind deps.Placement to another
+			// Registry. The independent event handler capability is still mandatory,
+			// so give its otherwise-unused orchestrator a private exact pair.
+			eventTracker = newTestOperationRegistry()
+			eventStore = nil
 		}
+		deps.Orchestrator = newTestProvisionOrchestrator(
+			t, "provider-1", "http://callback", deps.BackendRouter, eventTracker, eventStore,
+			deps.ChainClient,
+		)
 		if deps.Placement == nil {
-			deps.Placement = testCallbackPlacement(t, deps.Orchestrator)
-		}
-		if startSink, ok := deps.Orchestrator.startEvents.(*testProvisionStartSink); ok {
-			startSink.setPublisher(deps.Publisher)
+			deps.Placement = deps.Tracker.callbackStore
 		}
 	}
 
+	if deps.Orchestrator != nil {
+		if deps.Placement == nil && deps.Tracker != nil {
+			deps.Placement = deps.Tracker.callbackStore
+		}
+		if fixture, ok := testProvisionFixtures.Load(deps.Orchestrator); ok {
+			fixture.(testProvisionFixture).sink.setPublisher(deps.Publisher)
+		}
+	}
+	if deps.Tracker != nil && deps.Placement != nil {
+		deps.Tracker.callbackStore = deps.Placement
+	}
+
 	callbacks := deps.Callbacks
-	if callbacks == nil && callbackOperations != nil {
-		lifecycleAuthority := deps.LifecycleAuthority
-		if lifecycleAuthority == nil && deps.Orchestrator != nil {
-			lifecycleAuthority, _ = deps.Orchestrator.placementStore.(CallbackLifecycleAuthority)
+	coordinator := deps.Coordinator
+	if coordinator == nil && deps.Tracker != nil && deps.Placement != nil {
+		deps.Tracker.bindingMu.Lock()
+		coordinator = deps.Tracker.coordinator
+		deps.Tracker.bindingMu.Unlock()
+		if coordinator == nil {
+			var err error
+			coordinator, err = deps.Tracker.bindPlacementStore(deps.Placement)
+			require.NoError(t, err)
 		}
-		if lifecycleAuthority == nil {
-			lifecycleAuthority = denyCallbackLifecycleAuthority{}
-		}
+	}
+	if callbacks == nil && coordinator != nil {
 		callbackEvents := deps.CallbackEvents
 		if callbackEvents == nil {
 			// Older handler-unit fixtures observe their adapter output as Watermill
@@ -132,35 +782,26 @@ func composeTestHandlerSet(t testing.TB, deps testHandlerDeps) *HandlerSet {
 				publishLeaseStatusEvent(deps.Publisher, leaseUUID, status, failure)
 			})
 		}
-		var deprovisionObserver CallbackDeprovisionObserver
-		if deps.Orchestrator != nil {
-			deprovisionObserver = callbackDeprovisionObserverFunc(
-				deps.Orchestrator.forgetDeprovisionCandidate,
-			)
-		}
 		var err error
-		callbacks, err = newCallbackServiceForTest(CallbackServiceConfig{
-			Operations:          callbackOperations,
-			Chain:               deps.ChainClient,
-			Acknowledger:        deps.Acknowledger,
-			Placement:           deps.Placement,
-			LifecycleAuthority:  lifecycleAuthority,
-			Payloads:            deps.PayloadStore,
-			Events:              callbackEvents,
-			Backends:            deps.BackendRouter,
-			DeprovisionObserver: deprovisionObserver,
+		callbacks, err = newCallbackServiceForTest(callbackServiceTestConfig{
+			Coordinator:  coordinator,
+			Chain:        deps.ChainClient,
+			Acknowledger: deps.Acknowledger,
+			Payloads:     deps.PayloadStore,
+			Events:       callbackEvents,
+			Backends:     deps.BackendRouter,
 		})
 		require.NoError(t, err)
 	}
 
-	return NewHandlerSet(HandlerDeps{
-		ChainClient:     deps.ChainClient,
-		Orchestrator:    deps.Orchestrator,
-		EventOperations: eventOperations,
-		PayloadStore:    deps.PayloadStore,
-		Publisher:       deps.Publisher,
-		Callbacks:       callbacks,
+	handler, err := NewHandlerSet(HandlerDeps{
+		Events:       deps.Orchestrator.HandlerEvents(),
+		PayloadStore: deps.PayloadStore,
+		Publisher:    deps.Publisher,
+		Callbacks:    callbacks,
 	})
+	require.NoError(t, err)
+	return handler
 }
 
 // startTestProvisioning mirrors the event handler's lease-claim discipline so
@@ -185,26 +826,59 @@ func startTestProvisioning(
 		copy.State = billingtypes.LEASE_STATE_PENDING
 		dispatchLease = &copy
 	}
-	claimResult := orchestrator.operations.TryClaimLeaseNow(lease.Uuid)
-	if !claimResult.Acquired() {
-		if claimResult.Outcome() == operation.LeaseClaimBusy {
-			return nil
+	if fixture, ok := testProvisionFixtures.Load(orchestrator); ok {
+		provisionFixture := fixture.(testProvisionFixture)
+		if reader := provisionFixture.reader; reader != nil {
+			if dispatchLease.ProviderUuid == "" {
+				copy := *dispatchLease
+				copy.ProviderUuid = provisionFixture.providerUUID
+				dispatchLease = &copy
+			}
+			reader.set(dispatchLease)
 		}
-		return fmt.Errorf("test lease claim failed: outcome %d", claimResult.Outcome())
 	}
-	claim := claimResult.Claim()
-	defer func() {
-		require.True(t, orchestrator.operations.ReleaseLease(claim),
-			"test must release the exact provisioning lease claim")
-	}()
-	return orchestrator.StartProvisioningClaimed(ctx, claim, dispatchLease, opts)
+	var (
+		request placement.ProvisionEventRequest
+		err     error
+	)
+	if dispatchLease.MetaHash != nil {
+		request, err = placement.NewPayloadProvisionEventRequest(
+			dispatchLease.Uuid, dispatchLease.Tenant,
+			func() ([]byte, error) { return slices.Clone(opts.Payload), nil },
+		)
+	} else {
+		request, err = placement.NewProvisionEventRequest(
+			dispatchLease.Uuid, dispatchLease.Tenant,
+		)
+	}
+	if err != nil {
+		return err
+	}
+	result := orchestrator.HandlerEvents().startFromCurrentLease(ctx, request)
+	return result.Err()
 }
 
-func testCallbackPlacement(t testing.TB, orchestrator *ProvisionOrchestrator) CallbackPlacement {
-	t.Helper()
-	placementPort, ok := orchestrator.placementStore.(CallbackPlacement)
-	require.True(t, ok, "test placement authority must expose callback settlement")
-	return placementPort
+func concreteTestCallbackStore(authority any) *placement.Store {
+	switch authority := authority.(type) {
+	case *placement.Store:
+		return authority
+	case *testPlacementAuthorityAdapter:
+		return authority.authority
+	case *testProviderBoundPlacementAuthority:
+		if authority == nil {
+			return nil
+		}
+		return concreteTestCallbackStore(authority.PlacementAuthorityStore)
+	default:
+		return nil
+	}
+}
+
+func (manager *Manager) callbackPlacementStore() *placement.Store {
+	// Manager intentionally retains only purpose-specific capabilities. Tests
+	// that need a Store must keep the Store they supplied at construction rather
+	// than recovering mutation authority from the composed service.
+	return nil
 }
 
 // newTestPlacementAuthority gives ordinary manager/orchestrator tests the same
@@ -213,47 +887,83 @@ func testCallbackPlacement(t testing.TB, orchestrator *ProvisionOrchestrator) Ca
 // directly so missing and typed-nil authorities are never papered over.
 func newTestPlacementAuthority(t testing.TB) *placement.Store {
 	t.Helper()
-	store, err := placementstore.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	routes, err := placement.NewCallbackRouteFactory("https://provider.test/callback")
+	require.NoError(t, err)
+	store, err := placementstore.NewStore(
+		filepath.Join(t.TempDir(), "placements.db"),
+		placement.WithCallbackRouteFactory(routes),
+	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	return store
 }
 
+func bindTestOperationCoordinator(
+	t testing.TB,
+	store *placement.Store,
+) *placement.OperationCoordinator {
+	t.Helper()
+	require.NotNil(t, store)
+	coordinator, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	return coordinator
+}
+
 func projectTestPlacementInventory(
 	t testing.TB,
-	store ReconcilerPlacement,
+	reconciliation *placement.ReconciliationCoordinator,
 	backendNames []string,
-	projection placement.InventoryProjection,
-) placement.ProjectionResult {
+	projection placement.ReconciliationProjection,
+) *placement.ProjectedReconciliationSweep {
 	t.Helper()
 	require.NotEmpty(t, backendNames, "typed placement projection requires an explicit topology")
-	configureTestPlacementTopology(t, store, backendNames)
-	if projection.Complete && projection.BackendStorageIdentities == nil {
-		projection.BackendStorageIdentities = make(map[string]backendidentity.ID, len(backendNames))
-		for _, backendName := range backendNames {
-			projection.BackendStorageIdentities[backendName] = testBackendStorageID(backendName)
+	require.NotNil(t, reconciliation)
+	sweep, err := reconciliation.BeginSweep()
+	require.NoError(t, err)
+	defer sweep.End()
+	reported := make(map[string][]backend.ProvisionInfo, len(backendNames))
+	for leaseUUID, backendName := range projection.Placements {
+		reported[backendName] = append(reported[backendName], backend.ProvisionInfo{
+			LeaseUUID: leaseUUID, BackendName: backendName,
+		})
+	}
+	for leaseUUID, candidates := range projection.Conflicts {
+		for _, backendName := range candidates {
+			reported[backendName] = append(reported[backendName], backend.ProvisionInfo{
+				LeaseUUID: leaseUUID, BackendName: backendName,
+			})
 		}
 	}
-	if projection.Complete && projection.EmptyBackends == nil {
-		nonempty := make(map[string]struct{})
-		for _, backendName := range projection.Placements {
-			nonempty[backendName] = struct{}{}
-		}
-		for _, backendNames := range projection.Conflicts {
-			for _, backendName := range backendNames {
-				nonempty[backendName] = struct{}{}
-			}
-		}
-		projection.EmptyBackends = make([]string, 0, len(backendNames))
-		for _, backendName := range backendNames {
-			if _, present := nonempty[backendName]; !present {
-				projection.EmptyBackends = append(projection.EmptyBackends, backendName)
-			}
+	untrustedByBackend := make(map[string][]string)
+	for leaseUUID, backendCandidates := range projection.UntrustedPositives {
+		for _, backendName := range backendCandidates {
+			untrustedByBackend[backendName] = append(untrustedByBackend[backendName], leaseUUID)
 		}
 	}
-	fence := store.BeginInventorySession()
-	defer store.EndInventorySession(fence)
-	result, err := store.ProjectInventory(fence, projection)
+	for _, backendName := range backendNames {
+		storageID := testBackendStorageID(backendName)
+		rows := reported[backendName]
+		wantDisposition := placement.BackendInventoryAuthoritative
+		if leaseUUIDs := untrustedByBackend[backendName]; len(leaseUUIDs) != 0 {
+			for _, leaseUUID := range leaseUUIDs {
+				rows = append(rows, backend.ProvisionInfo{
+					LeaseUUID: leaseUUID, BackendName: backendName,
+				})
+			}
+			storageID = backendidentity.ID{}
+			wantDisposition = placement.BackendInventoryUntrusted
+		}
+		disposition := collectTestBackendInventory(
+			t, reconciliation, sweep, backendName, storageID, rows, nil,
+		)
+		require.Equal(t, wantDisposition, disposition)
+	}
+	require.NoError(t, sweep.SealInventory())
+	result, err := sweep.Project(placement.ReconciliationProjection{
+		Placements:         projection.Placements,
+		Conflicts:          projection.Conflicts,
+		UntrustedPositives: projection.UntrustedPositives,
+	})
 	require.NoError(t, err)
 	return result
 }
@@ -265,21 +975,44 @@ type testTopologyConfigurator interface {
 	) error
 }
 
+func configureTestTopologyAuthority(
+	store any,
+	backendNames []string,
+	identities map[string]backendidentity.ID,
+) error {
+	if concrete, ok := store.(*placement.Store); ok {
+		return placementstore.ConfigureBackendTopologyWithStorageIdentities(
+			concrete, backendNames, identities,
+		)
+	}
+	configurator, ok := store.(testTopologyConfigurator)
+	if !ok {
+		return errors.New("test placement authority cannot configure topology")
+	}
+	return configurator.ConfigureBackendTopologyWithStorageIdentities(backendNames, identities)
+}
+
 func configureTestPlacementTopology(
 	t testing.TB,
 	store ReconcilerPlacement,
 	backendNames []string,
 ) {
 	t.Helper()
-	configurator, ok := store.(testTopologyConfigurator)
-	require.True(t, ok, "test placement authority must expose identity-bearing topology setup")
 	identities := make(map[string]backendidentity.ID, len(backendNames))
 	for _, backendName := range backendNames {
 		identities[backendName] = testBackendStorageID(backendName)
 	}
-	require.NoError(t, configurator.ConfigureBackendTopologyWithStorageIdentities(
-		backendNames, identities,
-	))
+	require.NoError(t, configureTestTopologyAuthority(store, backendNames, identities))
+}
+
+var (
+	pendingTestInventory     sync.Map
+	testStoreReconciliations sync.Map
+	testReconciliationStores sync.Map
+)
+
+func pendingInventoryKey(store ReconcilerPlacement) *placement.Store {
+	return concreteTestCallbackStore(store)
 }
 
 func armTestPlacementTopology(
@@ -288,8 +1021,84 @@ func armTestPlacementTopology(
 	backendNames []string,
 ) {
 	t.Helper()
-	projectTestPlacementInventory(t, store, backendNames, placement.InventoryProjection{Complete: true})
-	require.True(t, store.CurrentAdmissionBaseline().Valid())
+	configureTestPlacementTopology(t, store, backendNames)
+	key := pendingInventoryKey(store)
+	require.NotNil(t, key)
+	pendingTestInventory.Store(key, slices.Clone(backendNames))
+}
+
+func bindTestReconciliationCoordinator(
+	t testing.TB,
+	store ReconcilerPlacement,
+	execution *placement.ExecutionCoordinator,
+	chain placement.ReconciliationChain,
+	payloads placement.AttemptPayloadReader,
+	observe placement.ProvisionStartObserver,
+) *placement.ReconciliationCoordinator {
+	t.Helper()
+	chain = canonicalReconciliationTestChain{ReconciliationChain: chain}
+	setTestProviderControlPlane(t, execution, chain, nil)
+	reconciliation, err := execution.ReconciliationCoordinator(payloads, observe)
+	require.NoError(t, err)
+	testReconciliationExecutions.Store(reconciliation, execution)
+	t.Cleanup(func() { testReconciliationExecutions.Delete(reconciliation) })
+	if fixture, ok := testExecutionInventoryRouters.Load(execution); ok {
+		testReconciliationInventoryRouters.Store(reconciliation, fixture)
+		t.Cleanup(func() { testReconciliationInventoryRouters.Delete(reconciliation) })
+	}
+	key := pendingInventoryKey(store)
+	testStoreReconciliations.Store(key, reconciliation)
+	testReconciliationStores.Store(reconciliation, store)
+	t.Cleanup(func() {
+		testStoreReconciliations.Delete(key)
+		testReconciliationStores.Delete(reconciliation)
+	})
+	if value, pending := pendingTestInventory.LoadAndDelete(key); pending {
+		backendNames := value.([]string)
+		projectTestPlacementInventory(
+			t, reconciliation, backendNames, placement.ReconciliationProjection{},
+		)
+		require.True(t, store.CurrentAdmissionBaseline().Valid())
+	}
+	return reconciliation
+}
+
+func testReconciliationPlacement(
+	t testing.TB,
+	reconciliation *placement.ReconciliationCoordinator,
+) ReconcilerPlacement {
+	t.Helper()
+	value, ok := testReconciliationStores.Load(reconciliation)
+	require.True(t, ok)
+	return value.(ReconcilerPlacement)
+}
+
+func setTestReconciliationAcknowledger(
+	t testing.TB,
+	reconciliation *placement.ReconciliationCoordinator,
+	ack Acknowledger,
+) {
+	t.Helper()
+	value, ok := testReconciliationExecutions.Load(reconciliation)
+	if !ok {
+		return
+	}
+	execution := value.(*placement.ExecutionCoordinator)
+	providerControl, mutable := testExecutionProviderControls.Load(execution)
+	if !mutable {
+		return
+	}
+	providerControl.(*testProviderControlPlane).set(nil, ack)
+}
+
+func testReconciliationCoordinator(
+	t testing.TB,
+	store ReconcilerPlacement,
+) *placement.ReconciliationCoordinator {
+	t.Helper()
+	value, ok := testStoreReconciliations.Load(pendingInventoryKey(store))
+	require.True(t, ok, "test Store must be bound through a reconciliation coordinator")
+	return value.(*placement.ReconciliationCoordinator)
 }
 
 func testPlacementCallbackPair(
@@ -305,22 +1114,11 @@ func testPlacementCallbackPair(
 func makeTestPlacementCallbackPair(
 	id operation.OperationID,
 ) (placement.CallbackPair, error) {
-	callbackURL, err := BuildCallbackURLForOperation(
-		"https://provider.test/callback", id,
-	)
+	factory, err := placement.NewCallbackRouteFactory("https://provider.test/callback")
 	if err != nil {
 		return placement.CallbackPair{}, err
 	}
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	if err != nil {
-		return placement.CallbackPair{}, err
-	}
-	pair, err := placement.NewCallbackPair(id, callbackURL, lifecycleCallbackURL)
-	if err != nil {
-		return placement.CallbackPair{}, err
-	}
-	return pair, nil
-
+	return factory.ForOperation(id)
 }
 
 func mustTestPlacementCallbackPair(id operation.OperationID) placement.CallbackPair {
@@ -331,68 +1129,98 @@ func mustTestPlacementCallbackPair(id operation.OperationID) placement.CallbackP
 	return pair
 }
 
-func testBackendRequestSnapshot(t testing.TB) placement.BackendRequestSnapshot {
+func testBackendRequestSnapshot(
+	t testing.TB,
+	store *placement.Store,
+) placement.BackendRequestSnapshot {
 	t.Helper()
-	return mustTestBackendRequestSnapshot()
-}
-
-func mustTestBackendRequestSnapshot() placement.BackendRequestSnapshot {
-	snapshot, err := placement.NewBackendRequestSnapshot(
-		"tenant-test", "provider-test",
+	snapshot, err := store.MintBackendRequestSnapshot(
+		"tenant-test",
 		[]backend.LeaseItem{{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
 	)
-	if err != nil {
-		panic(err)
-	}
+	require.NoError(t, err)
 	return snapshot
 }
 
 func beginTestNewPlacementAttempt(
 	t testing.TB,
-	store PlacementAuthorityStore,
+	store *placement.Store,
+	authority *placement.ProvisionCoordinator,
 	leaseUUID, backendName string,
 	operationID operation.OperationID,
-) placement.AttemptToken {
+) operation.OperationID {
 	return beginTestNewPlacementAttemptWithFingerprint(
-		t, store, leaseUUID, backendName, operationID, placement.PayloadFingerprint{},
+		t, store, authority, leaseUUID, backendName, operationID, placement.PayloadFingerprint{},
 	)
 }
 
 func beginTestNewPlacementAttemptWithFingerprint(
 	t testing.TB,
-	store PlacementAuthorityStore,
+	store *placement.Store,
+	authority *placement.ProvisionCoordinator,
 	leaseUUID, backendName string,
 	operationID operation.OperationID,
 	fingerprint placement.PayloadFingerprint,
-) placement.AttemptToken {
+) operation.OperationID {
 	return beginTestNewPlacementAttemptWithSnapshot(
-		t, store, leaseUUID, backendName, operationID, fingerprint,
-		testBackendRequestSnapshot(t),
+		t, store, authority, leaseUUID, backendName, operationID, fingerprint,
+		testBackendRequestSnapshot(t, store),
 	)
 }
 
 func beginTestNewPlacementAttemptWithSnapshot(
 	t testing.TB,
-	store PlacementAuthorityStore,
+	store *placement.Store,
+	authority *placement.ProvisionCoordinator,
 	leaseUUID, backendName string,
 	operationID operation.OperationID,
 	fingerprint placement.PayloadFingerprint,
 	requestSnapshot placement.BackendRequestSnapshot,
-) placement.AttemptToken {
+) operation.OperationID {
 	t.Helper()
-	baseline := store.CurrentAdmissionBaseline()
-	require.True(t, baseline.Valid(), "test placement admission must be armed before beginning an attempt")
-	scope, err := store.ScopeAdmission(baseline, []string{backendName})
+	require.NotNil(t, store)
+	require.NotNil(t, authority)
+	chainValue, ok := callbackProvisionChains.Load(authority)
+	require.True(t, ok, "test provision coordinator must retain its bound chain reader")
+	chain := chainValue.(*callbackChainStub)
+	items := requestSnapshot.Items()
+	chainItems := make([]billingtypes.LeaseItem, 0, len(items))
+	for _, item := range items {
+		chainItems = append(chainItems, billingtypes.LeaseItem{
+			SkuUuid: item.SKU, Quantity: uint64(item.Quantity),
+			ServiceName: item.ServiceName, CustomDomain: item.CustomDomain,
+		})
+	}
+	chain.getLease = func(context.Context, string) (*billingtypes.Lease, error) {
+		return &billingtypes.Lease{
+			Uuid: leaseUUID, Tenant: requestSnapshot.Tenant(),
+			ProviderUuid: placementstore.ProviderUUID,
+			State:        billingtypes.LEASE_STATE_PENDING, Items: chainItems,
+		}, nil
+	}
+	if coordinatorValue, known := callbackOperationCoordinators.Load(authority); known {
+		coordinator := coordinatorValue.(*placement.OperationCoordinator)
+		if executionValue, bound := testOperationExecutions.Load(coordinator); bound {
+			execution := executionValue.(*placement.ExecutionCoordinator)
+			if controlValue, exists := testExecutionProviderControls.Load(execution); exists {
+				control := controlValue.(*testProviderControlPlane)
+				original, _, _ := control.snapshot()
+				control.set(canonicalReconciliationTestChain{
+					ReconciliationChain: chain,
+				}, nil)
+				defer control.set(original, nil)
+			}
+		}
+	}
+	event, err := placement.NewProvisionEventRequest(leaseUUID, requestSnapshot.Tenant())
 	require.NoError(t, err)
-	token, applied, err := store.BeginNewAttempt(
-		scope, leaseUUID, backendName, operationID, fingerprint,
-		requestSnapshot,
-		testPlacementCallbackPair(t, operationID),
-	)
-	require.NoError(t, err)
-	require.True(t, applied)
-	require.True(t, token.Valid())
-	return token
+	result := authority.ExecuteCurrentLease(context.Background(), event)
+	if result.Err() == nil {
+		return operation.OperationID{}
+	}
+	actual := store.Lookup(leaseUUID).AttemptOperationID()
+	require.True(t, actual.Valid(), "failed fixture dispatch must preserve an exact attempt: %v", result.Err())
+	return actual
 }
 
 func seedTestConfirmedPlacements(
@@ -402,8 +1230,7 @@ func seedTestConfirmedPlacements(
 	placements map[string]string,
 ) {
 	t.Helper()
-	projectTestPlacementInventory(t, store, backendNames, placement.InventoryProjection{
-		Complete:   true,
+	projectTestPlacementInventory(t, testReconciliationCoordinator(t, store), backendNames, placement.ReconciliationProjection{
 		Placements: placements,
 	})
 }
@@ -417,35 +1244,104 @@ func seedTestTypedConfirmedPlacements(
 	store PlacementAuthorityStore,
 	backendNames []string,
 	placements map[string]string,
-) {
+) *placement.OperationCoordinator {
 	t.Helper()
-	armTestPlacementTopology(t, store, backendNames)
-	operations := operation.NewRegistry()
-	for leaseUUID, backendName := range placements {
-		claimResult := operations.TryClaimLeaseNow(leaseUUID)
-		require.True(t, claimResult.Acquired())
-		claim := claimResult.Claim()
-		tracked := operations.TryInitiateClaimed(claim, operation.TrackSpec{
-			LeaseUUID: leaseUUID,
-			Tenant:    "tenant-a",
-			Backend:   backendName,
-			Kind:      operation.KindProvision,
+	entries := make([]backend.BackendEntry, 0, len(backendNames))
+	for index, backendName := range backendNames {
+		entries = append(entries, backend.BackendEntry{
+			Backend:   backend.NewMockBackend(backend.MockBackendConfig{Name: backendName}),
+			IsDefault: index == 0,
 		})
-		require.True(t, tracked.Started())
-		initiation := tracked.Capability()
-		require.True(t, operations.BeginCall(initiation))
-		require.Equal(t, operation.InitiationActivated, operations.Activate(initiation))
-		require.True(t, operations.ReleaseLease(claim))
-		attempt := beginTestNewPlacementAttempt(
-			t, store, leaseUUID, backendName, initiation.ID(),
-		)
-		confirmed, err := store.ConfirmAttempt(attempt)
-		require.NoError(t, err)
-		require.True(t, confirmed)
-		settlement := operations.TryClaimCallback(leaseUUID, initiation.ID())
-		require.True(t, settlement.Claimed())
-		require.True(t, operations.FinishSettlement(settlement.Claim()))
 	}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: entries})
+	require.NoError(t, err)
+	coordinator, _ := seedTestTypedConfirmedPlacementsWithExecution(
+		t, store, router, placements,
+	)
+	return coordinator
+}
+
+func seedTestTypedConfirmedPlacementsWithExecution(
+	t testing.TB,
+	store PlacementAuthorityStore,
+	router BackendRouter,
+	placements map[string]string,
+) (*placement.OperationCoordinator, *placement.ExecutionCoordinator) {
+	t.Helper()
+	backendNames := backendTopologyNames(router)
+	armTestPlacementTopology(t, store, backendNames)
+	coordinator, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution := bindTestBackendRuntime(t, coordinator, router)
+	reconciliation := bindTestReconciliationCoordinator(
+		t, store, execution,
+		testReconciliationChain{ProvisionLeaseReader: &callbackChainStub{}}, nil, nil,
+	)
+	sweep, err := reconciliation.BeginSweep()
+	require.NoError(t, err)
+	defer sweep.End()
+	byBackend := make(map[string][]backend.ProvisionInfo, len(backendNames))
+	for leaseUUID, backendName := range placements {
+		id, parseErr := operation.ParseID(uuid.NewString())
+		require.NoError(t, parseErr)
+		byBackend[backendName] = append(byBackend[backendName], backend.ProvisionInfo{
+			LeaseUUID: leaseUUID, BackendName: backendName,
+			ProviderUUID: reconciliation.ProviderUUID(), Tenant: "tenant-test",
+			LifecycleGeneration: &backend.LifecycleGenerationObservation{
+				Kind: backend.LifecycleGenerationTyped,
+				ID:   id.String(),
+			},
+		})
+	}
+	for _, backendName := range backendNames {
+		disposition := collectTestBackendInventory(
+			t, reconciliation, sweep, backendName, testBackendStorageID(backendName),
+			byBackend[backendName], nil,
+		)
+		require.Equal(t, placement.BackendInventoryAuthoritative, disposition)
+	}
+	require.NoError(t, sweep.SealInventory())
+	_, err = sweep.Project(placement.ReconciliationProjection{Placements: placements})
+	require.NoError(t, err)
+	pendingTestInventory.Delete(pendingInventoryKey(store))
+	return coordinator, execution
+}
+
+func confirmPlacementOperationForTest(
+	coordinator *placement.OperationCoordinator,
+	leaseUUID, backendName string,
+	id operation.OperationID,
+) (bool, error) {
+	if coordinator == nil || !coordinator.RuntimeController().Contains(leaseUUID) {
+		return false, nil
+	}
+	callbacks, err := authenticatedCallbackCoordinatorForTest(
+		coordinator,
+		&callbackChainStub{getLease: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid: leaseUUID, Tenant: "tenant-test", ProviderUuid: placementstore.ProviderUUID,
+				State: billingtypes.LEASE_STATE_PENDING,
+			}, nil
+		}},
+		callbackAcknowledgerFunc(func(context.Context, string) (bool, string, error) {
+			return true, "tx-test", nil
+		}),
+	)
+	if err != nil {
+		return false, err
+	}
+	proof, err := callbackProofForTest(backend.CallbackPayload{
+		LeaseUUID: leaseUUID, Status: backend.CallbackStatusSuccess,
+		OperationID: id.String(), BackendStorageID: testBackendStorageID(backendName).String(),
+	})
+	if err != nil {
+		return false, err
+	}
+	_, err = callbacks.Apply(context.Background(), proof)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func deleteTestPlacement(
@@ -456,7 +1352,11 @@ func deleteTestPlacement(
 	t.Helper()
 	revision := store.Lookup(leaseUUID).RecordRevision()
 	require.True(t, revision.Valid(), "test placement must exist before deletion")
-	deleted, err := store.DeleteRecord(revision)
+	deleter, ok := any(store).(interface {
+		DeleteRecord(placement.RecordRevision) (bool, error)
+	})
+	require.True(t, ok, "test placement authority must expose fixture deletion")
+	deleted, err := deleter.DeleteRecord(revision)
 	require.NoError(t, err)
 	require.True(t, deleted)
 }
@@ -480,33 +1380,56 @@ func newTestManager(
 	t testing.TB,
 	cfg ManagerConfig,
 	router *backend.Router,
-	chainClient ChainClient,
+	chainClient ManagerChainClient,
 ) (*Manager, error) {
 	t.Helper()
 	if cfg.PlacementStore == nil {
 		cfg.PlacementStore = newTestPlacementAuthority(t)
 	}
+	if !cfg.CallbackProofConsumer.Valid() {
+		cfg.CallbackProofConsumer = callbackTestProofConsumer
+	}
+	// Production accepts only the concrete provider-bound Store. Historical
+	// unit fixtures used display labels such as "provider-1"; normalize those
+	// fixtures to the canonical authority instead of weakening the constructor
+	// with a test-only provider wrapper.
+	cfg.ProviderUUID = placementstore.ProviderUUID
 	backendNames := backendTopologyNames(router)
 	if len(backendNames) > 0 {
 		configureTestPlacementTopology(t, cfg.PlacementStore, backendNames)
 	}
-	// Most historical unit fixtures use short semantic provider labels. Bind the
-	// test aggregate explicitly at the constructor boundary while production
-	// tests that exercise the real Store call NewManager directly.
-	cfg.PlacementStore = &testProviderBoundPlacementAuthority{
-		PlacementAuthorityStore: cfg.PlacementStore,
-		providerUUID:            cfg.ProviderUUID,
-	}
-	manager, err := NewManager(cfg, router, chainClient)
+	manager, err := NewManager(cfg, router, canonicalManagerTestChain{chainClient})
 	if err != nil {
 		return nil, err
 	}
+	testManagerPlacements.Store(manager, cfg.PlacementStore)
+	testManagerChains.Store(manager, chainClient)
+	t.Cleanup(func() {
+		testManagerPlacements.Delete(manager)
+		testManagerChains.Delete(manager)
+	})
 	armTestPlacementAdmission(t, cfg.PlacementStore, router)
+	if len(backendNames) > 0 {
+		bindTestReconciliationCoordinator(
+			t, cfg.PlacementStore, manager.executionCoordinator,
+			chainClient, manager.PayloadStore(), nil,
+		)
+	}
 	return manager, nil
 }
 
-type testOperationRegistryProvider interface {
-	Operations() *operation.Registry
+// managerTestPlacement returns the Store explicitly supplied to newTestManager.
+// It is test-only observation plumbing: Manager deliberately exposes no raw
+// Store or Registry escape hatch in production.
+func managerTestPlacement(manager *Manager) *placement.Store {
+	if manager == nil {
+		return nil
+	}
+	store, ok := testManagerPlacements.Load(manager)
+	if !ok {
+		return nil
+	}
+	return store.(*placement.Store)
 }
 
 // legacyTestPlacementStore is confined to test fixtures that predate opaque
@@ -537,17 +1460,70 @@ func newTestProvisionOrchestrator(
 	router BackendRouter,
 	tracker *testOperationRegistry,
 	store any,
+	leaseReaders ...placement.ProvisionLeaseReader,
 ) *ProvisionOrchestrator {
 	t.Helper()
 	require.NotNil(t, tracker)
-	require.NotNil(t, tracker.Operations())
+	if len(router.Backends()) == 0 {
+		defaultBackend := &mockManagerBackend{name: "test-backend"}
+		router = &mockBackendRouter{
+			routeFn: func(string) backend.Backend { return defaultBackend },
+			getBackendByNameFn: func(name string) backend.Backend {
+				if name == defaultBackend.name {
+					return defaultBackend
+				}
+				return nil
+			},
+			backendsFn: func() []backend.Backend { return []backend.Backend{defaultBackend} },
+		}
+	}
 
 	authority := testPlacementAuthority(t, store, router)
-	orch, err := NewProvisionOrchestrator(
-		providerUUID, callbackBaseURL, router, tracker.Operations(), authority,
-		&testProvisionStartSink{},
+	coordinator, err := tracker.bindPlacementStore(authority)
+	require.NoError(t, err)
+	execution := bindTestBackendRuntime(t, coordinator, router)
+	var leaseReader placement.ProvisionLeaseReader
+	var mutableReader *mutableTestProvisionLeaseReader
+	if len(leaseReaders) != 0 {
+		leaseReader = leaseReaders[0]
+	} else {
+		mutableReader = &mutableTestProvisionLeaseReader{leases: make(map[string]*billingtypes.Lease)}
+		leaseReader = mutableReader
+	}
+	startSink := &testProvisionStartSink{}
+	callbackChain := &callbackChainStub{
+		getLease: leaseReader.GetLease,
+	}
+	chain := testReconciliationChain{ProvisionLeaseReader: callbackChain}
+	setTestProviderControlPlane(t, execution, chain, nil)
+	provision, err := execution.ProvisionCoordinator(
+		func(leaseUUID, _ string) { startSink.PublishProvisionStarting(leaseUUID) },
 	)
 	require.NoError(t, err)
+	reconciliation := bindTestReconciliationCoordinator(
+		t, authority, execution,
+		chain, nil, nil,
+	)
+	if adapter, ok := authority.(*testPlacementAuthorityAdapter); ok {
+		adapter.reconciliation = reconciliation
+	}
+	orch, err := NewProvisionOrchestrator(provision)
+	require.NoError(t, err)
+	testProvisionFixtures.Store(orch, testProvisionFixture{
+		reader: mutableReader, sink: startSink, providerUUID: reconciliation.ProviderUUID(),
+	})
+	t.Cleanup(func() { testProvisionFixtures.Delete(orch) })
+	testReconciliationCoordinators.Store(provision, reconciliation)
+	t.Cleanup(func() { testReconciliationCoordinators.Delete(provision) })
+	callbackProvisionCoordinators.Store(coordinator, provision)
+	callbackProvisionChains.Store(provision, callbackChain)
+	callbackOperationCoordinators.Store(provision, coordinator)
+	t.Cleanup(func() {
+		callbackProvisionChains.Delete(provision)
+		callbackOperationCoordinators.Delete(provision)
+	})
+	tracker.callbackStore = concreteTestCallbackStore(authority)
+	require.NotNil(t, tracker.callbackStore)
 	return orch
 }
 
@@ -563,7 +1539,7 @@ func testPlacementAuthority(
 		return authority
 	}
 	if authority, ok := store.(PlacementAuthorityStore); ok {
-		require.False(t, isNilPlacementAuthorityStore(authority),
+		require.False(t, util.IsNilInterface(authority),
 			"typed-nil placement authority must be tested through the production constructor")
 		armTestPlacementAdmission(t, authority, router)
 		return authority
@@ -587,16 +1563,34 @@ func testReconcilerPlacement(
 	t testing.TB,
 	store any,
 	router BackendRouter,
-) ReconcilerPlacement {
+	registry *testOperationRegistry,
+	coordinator *placement.OperationCoordinator,
+) (ReconcilerPlacement, *placement.OperationCoordinator, *placement.ExecutionCoordinator) {
 	t.Helper()
+	bindExecution := func(coordinator *placement.OperationCoordinator) *placement.ExecutionCoordinator {
+		t.Helper()
+		return bindTestBackendRuntime(t, coordinator, router)
+	}
 	if store == nil {
 		authority := newTestPlacementAuthority(t)
 		armTestPlacementAdmission(t, authority, router)
-		return authority
+		if coordinator == nil {
+			var err error
+			coordinator, err = registry.bindPlacementStore(authority)
+			require.NoError(t, err)
+		}
+		return authority, coordinator, bindExecution(coordinator)
 	}
 	if authority, ok := store.(ReconcilerPlacement); ok {
 		armTestPlacementAdmission(t, authority, router)
-		return authority
+		if coordinator == nil {
+			binder, ok := store.(PlacementAuthorityStore)
+			require.True(t, ok)
+			var err error
+			coordinator, err = registry.bindPlacementStore(binder)
+			require.NoError(t, err)
+		}
+		return authority, coordinator, bindExecution(coordinator)
 	}
 	raw, ok := store.(legacyTestPlacementStore)
 	require.True(t, ok, "test placement fixture must expose a typed reconciler port or legacy test adapter")
@@ -607,29 +1601,37 @@ func testReconcilerPlacement(
 		attempts:                 make(map[placement.AttemptToken]testAttemptIdentity),
 	}
 	armTestPlacementAdmission(t, base, router)
+	if coordinator == nil {
+		var err error
+		coordinator, err = registry.bindPlacementStore(base.authority)
+		require.NoError(t, err)
+	}
+	execution := bindExecution(coordinator)
+	reconciliation := bindTestReconciliationCoordinator(
+		t, base.authority, execution, &callbackChainStub{}, nil, nil,
+	)
+	base.reconciliation = reconciliation
 	adapter := &testReconcilerPlacementAdapter{
 		testPlacementAuthorityAdapter: base,
-		inventoryCutoffs:              make(map[placement.InventoryFence]uint64),
 		topology:                      backendTopologyNames(router),
 		overlay:                       make(map[string]placement.Placement),
 	}
-	require.NoError(t, adapter.seedRawPlacements())
-	return adapter
+	require.NoError(t, adapter.seedRawPlacements(t))
+	return adapter, coordinator, execution
 }
 
 type testReconcilerPlacementAdapter struct {
 	*testPlacementAuthorityAdapter
 
-	inventoryMu      sync.Mutex
-	inventoryCutoffs map[placement.InventoryFence]uint64
-	topology         []string
+	topology []string
 	// overlay retains deliberately unrepresentable legacy/corrupt fixtures.
 	// Their invalid typed revision makes them non-authoritative, while keeping
 	// them visible exercises the reconciler's defensive fail-closed branches.
 	overlay map[string]placement.Placement
 }
 
-func (a *testReconcilerPlacementAdapter) seedRawPlacements() error {
+func (a *testReconcilerPlacementAdapter) seedRawPlacements(t testing.TB) error {
+	t.Helper()
 	placements := make(map[string]string)
 	conflicts := make(map[string][]string)
 	attempts := make(map[string]placement.Placement)
@@ -648,67 +1650,15 @@ func (a *testReconcilerPlacementAdapter) seedRawPlacements() error {
 		}
 	}
 	if len(placements) != 0 || len(conflicts) != 0 {
-		fence := a.authority.BeginInventorySession()
-		_, err := a.authority.ProjectInventory(fence, placement.InventoryProjection{
+		projectTestPlacementInventory(t, a.reconciliation, a.topology, placement.ReconciliationProjection{
 			Placements: placements,
 			Conflicts:  conflicts,
 		})
-		a.authority.EndInventorySession(fence)
-		if err != nil {
-			return err
-		}
+		pendingTestInventory.Delete(a.authority)
 	}
 
-	baseline := a.authority.CurrentAdmissionBaseline()
-	if !baseline.Valid() {
-		return errors.New("test placement admission baseline is not armed")
-	}
-	scope, err := a.authority.ScopeAdmission(baseline, a.topology)
-	if err != nil {
-		return err
-	}
-	id, err := operation.ParseID("00000000-0000-4000-8000-000000000001")
-	if err != nil {
-		return err
-	}
-	callbackURL, err := BuildCallbackURLForOperation("https://provider.test/callback", id)
-	if err != nil {
-		return err
-	}
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	if err != nil {
-		return err
-	}
-	callbackPair, err := placement.NewCallbackPair(id, callbackURL, lifecycleCallbackURL)
-	if err != nil {
-		return err
-	}
-	requestSnapshot, err := placement.NewBackendRequestSnapshot(
-		"tenant-test", "provider-test",
-		[]backend.LeaseItem{{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
-	)
-	if err != nil {
-		return err
-	}
-	for leaseUUID, current := range attempts {
-		var applied bool
-		if current.Backend == "" {
-			_, applied, err = a.authority.BeginNewAttempt(
-				scope, leaseUUID, current.Attempt, id,
-				placement.PayloadFingerprint{}, requestSnapshot, callbackPair,
-			)
-		} else {
-			_, applied, err = a.authority.BeginOwnedAttempt(
-				baseline, a.authority.Lookup(leaseUUID).RecordRevision(), current.Attempt, id,
-				placement.PayloadFingerprint{}, requestSnapshot, callbackPair,
-			)
-		}
-		if err != nil {
-			return err
-		}
-		if !applied {
-			return fmt.Errorf("seed test placement attempt for %s: placement changed", leaseUUID)
-		}
+	if len(attempts) != 0 {
+		return errors.New("legacy raw attempt fixtures must use a high-level provision application")
 	}
 	return nil
 }
@@ -757,95 +1707,6 @@ func (a *testReconcilerPlacementAdapter) List() map[string]placement.Placement {
 	return result
 }
 
-func (a *testReconcilerPlacementAdapter) BeginInventorySession() placement.InventoryFence {
-	cutoff := a.BeginInventorySnapshot()
-	fence := a.authority.BeginInventorySession()
-	a.inventoryMu.Lock()
-	a.inventoryCutoffs[fence] = cutoff
-	a.inventoryMu.Unlock()
-	return fence
-}
-
-func (a *testReconcilerPlacementAdapter) EndInventorySession(fence placement.InventoryFence) {
-	a.inventoryMu.Lock()
-	cutoff, ok := a.inventoryCutoffs[fence]
-	delete(a.inventoryCutoffs, fence)
-	a.inventoryMu.Unlock()
-	if ok {
-		a.EndInventorySnapshot(cutoff)
-	}
-	a.authority.EndInventorySession(fence)
-}
-
-func (a *testReconcilerPlacementAdapter) ProjectInventory(
-	fence placement.InventoryFence,
-	input placement.InventoryProjection,
-) (placement.ProjectionResult, error) {
-	a.inventoryMu.Lock()
-	cutoff, ok := a.inventoryCutoffs[fence]
-	a.inventoryMu.Unlock()
-	if !ok {
-		return placement.ProjectionResult{}, placement.ErrInvalidInventoryFence
-	}
-
-	placements := maps.Clone(input.Placements)
-	conflicts := maps.Clone(input.Conflicts)
-	_, fencedConflicts, err := a.SetConflictsIfNotNewer(conflicts, cutoff)
-	if err != nil {
-		return placement.ProjectionResult{}, err
-	}
-	_, fencedPlacements, err := a.SetBatchIfNotNewer(placements, cutoff)
-	if err != nil {
-		return placement.ProjectionResult{}, err
-	}
-	for leaseUUID := range fencedConflicts {
-		delete(conflicts, leaseUUID)
-	}
-	for leaseUUID := range fencedPlacements {
-		delete(placements, leaseUUID)
-	}
-
-	result, err := a.authority.ProjectInventory(fence, placement.InventoryProjection{
-		Complete:                 input.Complete,
-		BackendStorageIdentities: maps.Clone(input.BackendStorageIdentities),
-		EmptyBackends:            slices.Clone(input.EmptyBackends),
-		Placements:               placements,
-		Lifecycles:               maps.Clone(input.Lifecycles),
-		Conflicts:                conflicts,
-	})
-	if result.Fenced == nil {
-		result.Fenced = make(map[string]struct{}, len(fencedConflicts)+len(fencedPlacements))
-	}
-	for leaseUUID := range fencedConflicts {
-		result.Fenced[leaseUUID] = struct{}{}
-	}
-	for leaseUUID := range fencedPlacements {
-		result.Fenced[leaseUUID] = struct{}{}
-	}
-	return result, err
-}
-
-func (a *testReconcilerPlacementAdapter) DeleteRecord(
-	revision placement.RecordRevision,
-) (bool, error) {
-	leaseUUID := ""
-	for candidate, current := range a.authority.List() {
-		if current.RecordRevision() == revision {
-			leaseUUID = candidate
-			break
-		}
-	}
-	if leaseUUID == "" {
-		return false, placement.ErrInvalidRecordRevision
-	}
-	raw := a.legacyTestPlacementStore.Lookup(leaseUUID)
-	deleted, err := a.DeleteIfRevision(leaseUUID, raw.Revision())
-	if err != nil || !deleted {
-		return deleted, err
-	}
-	return a.authority.DeleteRecord(revision)
-}
-
 var _ ReconcilerPlacement = (*testReconcilerPlacementAdapter)(nil)
 
 // testPlacementAuthorityAdapter keeps the extensive legacy placement mock
@@ -854,14 +1715,22 @@ var _ ReconcilerPlacement = (*testReconcilerPlacementAdapter)(nil)
 // are mirrored into the raw mock only for test observation/error injection.
 type testPlacementAuthorityAdapter struct {
 	legacyTestPlacementStore
-	authority *placement.Store
+	authority      *placement.Store
+	reconciliation *placement.ReconciliationCoordinator
 
 	mu       sync.Mutex
 	attempts map[placement.AttemptToken]testAttemptIdentity
+	topology []string
 }
 
 func (a *testPlacementAuthorityAdapter) VerifyProviderUUID(providerUUID string) error {
 	return a.authority.VerifyProviderUUID(providerUUID)
+}
+
+func (a *testPlacementAuthorityAdapter) BindOperationCoordinator(
+	countObserver func(int),
+) (*placement.OperationCoordinator, error) {
+	return a.authority.BindOperationCoordinator(countObserver)
 }
 
 type testProviderBoundPlacementAuthority struct {
@@ -881,11 +1750,9 @@ func (authority *testProviderBoundPlacementAuthority) ConfigureBackendTopologyWi
 	backendNames []string,
 	storageIDs map[string]backendidentity.ID,
 ) error {
-	configurator, ok := authority.PlacementAuthorityStore.(testTopologyConfigurator)
-	if !ok {
-		return errors.New("embedded test placement authority cannot configure topology")
-	}
-	return configurator.ConfigureBackendTopologyWithStorageIdentities(backendNames, storageIDs)
+	return configureTestTopologyAuthority(
+		authority.PlacementAuthorityStore, backendNames, storageIDs,
+	)
 }
 
 type testProviderBoundReconcilerPlacement struct {
@@ -905,11 +1772,9 @@ func (authority *testProviderBoundReconcilerPlacement) ConfigureBackendTopologyW
 	backendNames []string,
 	storageIDs map[string]backendidentity.ID,
 ) error {
-	configurator, ok := authority.ReconcilerPlacement.(testTopologyConfigurator)
-	if !ok {
-		return errors.New("embedded test placement authority cannot configure topology")
-	}
-	return configurator.ConfigureBackendTopologyWithStorageIdentities(backendNames, storageIDs)
+	return configureTestTopologyAuthority(
+		authority.ReconcilerPlacement, backendNames, storageIDs,
+	)
 }
 
 // constructorPlacementAuthoritySpy uses the real provider-bound store while
@@ -931,10 +1796,26 @@ type testAttemptIdentity struct {
 
 func (a *testPlacementAuthorityAdapter) Lookup(leaseUUID string) placement.Placement {
 	current := a.legacyTestPlacementStore.Lookup(leaseUUID)
+	internal := a.authority.Lookup(leaseUUID)
+	// Joined dispatch settlement intentionally bypasses this compatibility
+	// adapter: production owns the concrete Store, not an independently
+	// spliceable mutation port. Once an adapter-issued attempt has reached that
+	// coordinator, the concrete Store is therefore the authoritative test view.
+	a.mu.Lock()
+	joinedAttempt := false
+	for _, identity := range a.attempts {
+		if identity.leaseUUID == leaseUUID {
+			joinedAttempt = true
+			break
+		}
+	}
+	a.mu.Unlock()
+	if joinedAttempt || internal.State() != placement.StateAbsent {
+		return internal
+	}
 	if current.State() != placement.StateConfirmed || current.Attempt != "" {
 		return current
 	}
-	internal := a.authority.Lookup(leaseUUID)
 	if internal.State() == placement.StateAbsent {
 		if err := a.projectConfirmed(leaseUUID, current.Backend); err != nil {
 			return current
@@ -947,14 +1828,6 @@ func (a *testPlacementAuthorityAdapter) Lookup(leaseUUID string) placement.Place
 	return current
 }
 
-func (a *testPlacementAuthorityAdapter) BeginInventorySession() placement.InventoryFence {
-	return a.authority.BeginInventorySession()
-}
-
-func (a *testPlacementAuthorityAdapter) EndInventorySession(fence placement.InventoryFence) {
-	a.authority.EndInventorySession(fence)
-}
-
 func (a *testPlacementAuthorityAdapter) VerifyBackendTopology(names []string) error {
 	return a.authority.VerifyBackendTopology(names)
 }
@@ -963,7 +1836,13 @@ func (a *testPlacementAuthorityAdapter) ConfigureBackendTopologyWithStorageIdent
 	names []string,
 	identities map[string]backendidentity.ID,
 ) error {
-	return a.authority.ConfigureBackendTopologyWithStorageIdentities(names, identities)
+	if err := placementstore.ConfigureBackendTopologyWithStorageIdentities(
+		a.authority, names, identities,
+	); err != nil {
+		return err
+	}
+	a.topology = slices.Clone(names)
+	return nil
 }
 
 func (a *testPlacementAuthorityAdapter) CurrentAdmissionBaseline() placement.AdmissionBaseline {
@@ -976,220 +1855,57 @@ func (a *testPlacementAuthorityAdapter) ExpectedBackendStorageIdentity(
 	return a.authority.ExpectedBackendStorageIdentity(backendName)
 }
 
-func (a *testPlacementAuthorityAdapter) ScopeAdmission(
-	baseline placement.AdmissionBaseline,
-	eligibleNames []string,
-) (placement.AdmissionScope, error) {
-	return a.authority.ScopeAdmission(baseline, eligibleNames)
-}
-
-func (a *testPlacementAuthorityAdapter) ProjectInventory(
-	fence placement.InventoryFence,
-	input placement.InventoryProjection,
-) (placement.ProjectionResult, error) {
-	return a.authority.ProjectInventory(fence, input)
-}
-
 func (a *testPlacementAuthorityAdapter) projectConfirmed(leaseUUID, backendName string) error {
-	fence := a.authority.BeginInventorySession()
-	defer a.authority.EndInventorySession(fence)
-	_, err := a.authority.ProjectInventory(fence, placement.InventoryProjection{
+	if a.reconciliation == nil || !a.reconciliation.Valid() {
+		return errors.New("test reconciliation coordinator is unavailable")
+	}
+	sweep, err := a.reconciliation.BeginSweep()
+	if err != nil {
+		return err
+	}
+	defer sweep.End()
+	for _, name := range a.topology {
+		present := []backend.ProvisionInfo(nil)
+		if name == backendName {
+			present = []backend.ProvisionInfo{{
+				LeaseUUID: leaseUUID, BackendName: backendName,
+			}}
+		}
+		storageID := testBackendStorageID(name)
+		value, ok := testReconciliationInventoryRouters.Load(a.reconciliation)
+		if !ok {
+			return errors.New("test reconciliation inventory runtime is unavailable")
+		}
+		fixture := value.(*testInventoryRouter).backends[name]
+		if fixture == nil {
+			return fmt.Errorf("test reconciliation backend %q is unavailable", name)
+		}
+		fixture.stage(storageID, present, nil)
+		provisionReceipt, collectErr := sweep.CollectProvisionInventory(context.Background(), name)
+		if collectErr != nil {
+			fixture.clearStage()
+			return collectErr
+		}
+		retentionReceipt, collectErr := sweep.CollectRetentionInventory(context.Background(), name)
+		fixture.clearStage()
+		if collectErr != nil {
+			return collectErr
+		}
+		if disposition, collectErr := sweep.RecordBackendInventory(
+			provisionReceipt, retentionReceipt,
+		); collectErr != nil {
+			return collectErr
+		} else if disposition != placement.BackendInventoryAuthoritative {
+			return fmt.Errorf("test reconciliation backend %q inventory was not authoritative", name)
+		}
+	}
+	if err := sweep.SealInventory(); err != nil {
+		return err
+	}
+	_, err = sweep.Project(placement.ReconciliationProjection{
 		Placements: map[string]string{leaseUUID: backendName},
 	})
 	return err
-}
-
-func (a *testPlacementAuthorityAdapter) BeginNewAttempt(
-	scope placement.AdmissionScope,
-	leaseUUID, backendName string,
-	id operation.OperationID,
-	payloadFingerprint placement.PayloadFingerprint,
-	requestSnapshot placement.BackendRequestSnapshot,
-	callbackPair placement.CallbackPair,
-) (placement.AttemptToken, bool, error) {
-	if _, err := a.SetAttempting(leaseUUID, backendName); err != nil {
-		return placement.AttemptToken{}, false, err
-	}
-	token, applied, err := a.authority.BeginNewAttempt(
-		scope, leaseUUID, backendName, id, payloadFingerprint, requestSnapshot, callbackPair,
-	)
-	if err != nil || !applied {
-		_ = a.ClearAttempt(leaseUUID, backendName)
-		return placement.AttemptToken{}, applied, err
-	}
-	a.mu.Lock()
-	a.attempts[token] = testAttemptIdentity{leaseUUID: leaseUUID, backendName: backendName}
-	a.mu.Unlock()
-	return token, true, nil
-}
-
-func (a *testPlacementAuthorityAdapter) BeginOwnedAttempt(
-	baseline placement.AdmissionBaseline,
-	revision placement.RecordRevision,
-	backendName string,
-	id operation.OperationID,
-	payloadFingerprint placement.PayloadFingerprint,
-	requestSnapshot placement.BackendRequestSnapshot,
-	callbackPair placement.CallbackPair,
-) (placement.AttemptToken, bool, error) {
-	// Legacy mock snapshots cannot mint RecordRevision. Mirror their exact raw
-	// owner CAS first, then bind the typed attempt to the adapter's private
-	// durable authority. Race/CAS tests use placement.Store directly.
-	leaseUUID := ""
-	for candidate, current := range a.authority.List() {
-		if current.RecordRevision() == revision {
-			leaseUUID = candidate
-			break
-		}
-	}
-	if leaseUUID == "" {
-		return placement.AttemptToken{}, false, placement.ErrInvalidRecordRevision
-	}
-	if _, err := a.SetAttempting(leaseUUID, backendName); err != nil {
-		return placement.AttemptToken{}, false, err
-	}
-	internal := a.authority.Lookup(leaseUUID)
-	if internal.State() == placement.StateAbsent {
-		if err := a.projectConfirmed(leaseUUID, backendName); err != nil {
-			_ = a.ClearAttempt(leaseUUID, backendName)
-			return placement.AttemptToken{}, false, err
-		}
-		internal = a.authority.Lookup(leaseUUID)
-	}
-	token, applied, err := a.authority.BeginOwnedAttempt(
-		baseline, internal.RecordRevision(), backendName, id,
-		payloadFingerprint, requestSnapshot, callbackPair,
-	)
-	if err != nil || !applied {
-		_ = a.ClearAttempt(leaseUUID, backendName)
-		return placement.AttemptToken{}, applied, err
-	}
-	a.mu.Lock()
-	a.attempts[token] = testAttemptIdentity{leaseUUID: leaseUUID, backendName: backendName}
-	a.mu.Unlock()
-	return token, true, nil
-}
-
-func (a *testPlacementAuthorityAdapter) ConfirmAttempt(token placement.AttemptToken) (bool, error) {
-	applied, err := a.authority.ConfirmAttempt(token)
-	if err != nil || !applied {
-		return applied, err
-	}
-	identity, ok := a.takeAttempt(token)
-	if !ok {
-		return false, placement.ErrInvalidAttemptToken
-	}
-	if err := a.Confirm(identity.leaseUUID, identity.backendName); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (a *testPlacementAuthorityAdapter) RefuseAttempt(token placement.AttemptToken) (bool, error) {
-	applied, err := a.authority.RefuseAttempt(token)
-	if err != nil || !applied {
-		return applied, err
-	}
-	identity, ok := a.takeAttempt(token)
-	if !ok {
-		return false, placement.ErrInvalidAttemptToken
-	}
-	if err := a.ClearAttempt(identity.leaseUUID, identity.backendName); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (a *testPlacementAuthorityAdapter) takeAttempt(token placement.AttemptToken) (testAttemptIdentity, bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	identity, ok := a.attempts[token]
-	delete(a.attempts, token)
-	return identity, ok
-}
-
-func (a *testPlacementAuthorityAdapter) ConfirmOperation(
-	leaseUUID, backendName string,
-	id operation.OperationID,
-) (bool, error) {
-	applied, err := a.authority.ConfirmOperation(leaseUUID, backendName, id)
-	if err != nil || applied || !id.Valid() {
-		return applied, err
-	}
-	// Legacy callback fixtures seed the raw mock directly, so no typed attempt
-	// exists in authority. The callback service has already claimed the exact
-	// operation ID; mirror that validated test operation into the observable
-	// mock without weakening the production store.
-	current := a.Lookup(leaseUUID)
-	if current.Attempt != backendName {
-		return current.Attempt == "" && current.Backend == backendName, nil
-	}
-	if err := a.Confirm(leaseUUID, backendName); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (a *testPlacementAuthorityAdapter) RefuseOperation(
-	leaseUUID, backendName string,
-	id operation.OperationID,
-) (bool, error) {
-	applied, err := a.authority.RefuseOperation(leaseUUID, backendName, id)
-	if err != nil || applied || !id.Valid() {
-		return applied, err
-	}
-	if a.Lookup(leaseUUID).Attempt != backendName {
-		return false, nil
-	}
-	if err := a.ClearAttempt(leaseUUID, backendName); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (a *testPlacementAuthorityAdapter) ClaimAttempt(
-	leaseUUID string,
-	id operation.OperationID,
-) (placement.AttemptClaim, bool, error) {
-	return a.authority.ClaimAttempt(leaseUUID, id)
-}
-
-func (a *testPlacementAuthorityAdapter) ReleaseAttemptClaim(
-	claim placement.AttemptClaim,
-) bool {
-	return a.authority.ReleaseAttemptClaim(claim)
-}
-
-func (a *testPlacementAuthorityAdapter) ConfirmClaimedAttempt(
-	claim placement.AttemptClaim,
-) (bool, error) {
-	return a.authority.ConfirmClaimedAttempt(claim)
-}
-
-func (a *testPlacementAuthorityAdapter) RefuseClaimedAttempt(
-	claim placement.AttemptClaim,
-) (bool, error) {
-	return a.authority.RefuseClaimedAttempt(claim)
-}
-
-func (a *testPlacementAuthorityAdapter) AuthorizeLifecycle(
-	leaseUUID string,
-	id lifecycle.ID,
-) placement.LifecycleAuthorization {
-	return a.authority.AuthorizeLifecycle(leaseUUID, id)
-}
-
-func (a *testPlacementAuthorityAdapter) RetireLifecycle(
-	leaseUUID string,
-	id lifecycle.ID,
-) (placement.LifecycleAuthorization, error) {
-	return a.authority.RetireLifecycle(leaseUUID, id)
-}
-
-func (a *testPlacementAuthorityAdapter) DeleteRecord(
-	revision placement.RecordRevision,
-) (bool, error) {
-	return a.authority.DeleteRecord(revision)
 }
 
 var _ PlacementAuthorityStore = (*testPlacementAuthorityAdapter)(nil)

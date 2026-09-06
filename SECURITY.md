@@ -97,6 +97,16 @@ Go backends in this repository can import `internal/hmacauth` and call `hmacauth
 
 **Implementation:** `internal/api/callback_auth.go`, `internal/hmacauth/`
 
+**Callback capability confidentiality.** The canonical `operation_id` and
+`lifecycle_id` values embedded in callback URLs are bearer-style causal
+capabilities, not diagnostic identifiers. Their typed Go values render a
+domain-separated, non-reversible fingerprint when passed to `slog` or generic
+`fmt` formatting; obtaining canonical text requires an explicit wire/persistence
+conversion. Raw callback URLs are still strings at HTTP and database
+boundaries, so they and their canonical query values must never be copied into
+logs, tickets, metrics, or traces. Use the typed fingerprint when operators
+need to correlate one operation across components.
+
 ### Backend Authentication (HMAC-SHA256)
 
 Fred authenticates requests to backends using the same HMAC-SHA256 scheme. The docker-backend verifies these signatures via auth middleware on all contract endpoints: `POST /provision`, `POST /deprovision`, `POST /restart`, `POST /update`, `POST /restore`, `POST /reconcile_custom_domain`, `GET /info/{lease_uuid}`, `GET /logs/{lease_uuid}`, `GET /provisions`, `GET /provisions/{lease_uuid}`, `GET /retentions`, `GET /releases/{lease_uuid}`. The monitoring endpoints `GET /health`, `GET /stats`, and `GET /metrics` are unauthenticated.
@@ -134,6 +144,12 @@ Used tokens are tracked in a persistent bbolt database keyed by the normalized s
 | `GET /releases` | No | Idempotent read |
 | `GET /events` | No | Read-only WebSocket stream |
 | `POST /data` | No | Has own idempotency guard (409 on duplicate upload) |
+
+Restart and update additionally require a canonical UUIDv4
+`Idempotency-Key`. A client uses a fresh bearer token for each HTTP attempt but
+reuses the same idempotency key for retries of one exact command. Fred and the
+backend persist that command identity so a transport retry cannot repeat an
+already-admitted container replacement; divergent reuse is rejected.
 
 **Configuration:** Requires `token_tracker_db_path`. Mandatory when `production_mode: true`. When not configured (non-production), replay protection is disabled entirely — tokens can be replayed within their 30-second validity window. This is acceptable for development but **must not be used in production**.
 
@@ -409,7 +425,7 @@ Optional TLS for the gRPC connection to the chain. Supports custom CA file. `grp
 
 ### TLS (providerd → backend, ENG-103)
 
-TLS, including optional mutual TLS, protects both backend HTTP hops. Plaintext is supported only outside production mode. Provider `production_mode: true` requires every backend URL and `callback_base_url` to use HTTPS and verifies backend peers against the configured private CA or system roots; bundled-backend production mode independently forbids disabling callback peer verification. A self-signed private CA is a valid trust anchor—the leaf chain and hostname/IP SAN are still verified. Both settings are required for the full production invariant: request HMAC does not authenticate the backend's response identity, inventory, or refusal verdict, while callback HMAC does not provide confidentiality for causal tokens. When TLS is enabled, both sides pin TLS 1.3 as the minimum version (`internal/tlsconfig/tlsconfig.go:37,61`). Certificates are loaded once at startup; rotation requires a restart (tracked in ENG-294).
+TLS, including optional mutual TLS, protects both backend HTTP hops. Plaintext is supported only outside production mode. Provider `production_mode: true` requires every backend URL and `callback_base_url` to use HTTPS and verifies backend peers against the configured private CA or system roots; bundled-backend production mode independently forbids disabling callback peer verification. A self-signed private CA is a valid trust anchor—the leaf chain and hostname/IP SAN are still verified. Both settings are required for the full production invariant: request HMAC does not authenticate the backend's response identity, inventory, or refusal verdict, while callback HMAC does not provide confidentiality for causal tokens. Fred's native providerd-to-backend client and bundled-backend listener pin TLS 1.3 as the minimum version (`internal/tlsconfig/tlsconfig.go:37,61`). The reverse callback connection uses Go's verified default HTTPS transport and, in the deployed topology, terminates at the operator-managed reverse proxy; its protocol floor is therefore a deployment property rather than an invariant enforced by this repository. Certificates loaded directly by Fred are loaded once at startup; rotation requires a restart (tracked in ENG-294).
 
 The reference deployment uses different verified chains in each direction:
 providerd verifies backend IP-SAN certificates against an internal private CA
@@ -496,6 +512,7 @@ Network isolation places each tenant's containers in a dedicated Docker bridge n
 | Secret | Minimum Length | Constant-Time | Logged |
 |--------|---------------|---------------|--------|
 | `backends[].hmac_secret` (providerd) / that backend's `callback_secret` | 32 bytes; unique per backend | Yes (`hmac.Equal`) | Never |
+| Callback `operation_id` / `lifecycle_id` capability | Canonical random UUIDv4 | Exact typed comparison after HMAC authentication | Never; only a domain-separated fingerprint |
 | Payload `meta_hash` | 64 hex chars | Yes (`subtle.ConstantTimeCompare`) | Never |
 | ADR-036 signatures | N/A | secp256k1 library verify | Signature logged in debug (public data) |
 

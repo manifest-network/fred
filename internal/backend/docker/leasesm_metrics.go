@@ -46,13 +46,3 @@ func (dockerSMMetrics) ActorPanic() {
 func (dockerSMMetrics) TerminalEventDropped(event string) {
 	leaseTerminalEventDroppedTotal.WithLabelValues(event).Inc()
 }
-
-// ActiveProvisionsInc increments the active-provisions gauge.
-func (dockerSMMetrics) ActiveProvisionsInc() {
-	activeProvisions.Inc()
-}
-
-// ActiveProvisionsDec decrements the active-provisions gauge.
-func (dockerSMMetrics) ActiveProvisionsDec() {
-	activeProvisions.Dec()
-}

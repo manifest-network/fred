@@ -13,9 +13,12 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
+	const leaseUUID = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+	operationID := mustDockerOperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
 	eventCh := make(chan ContainerEvent, 1)
 	errCh := make(chan error)
 
@@ -27,6 +30,14 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer callbackServer.Close()
+	callbackURL := callbackServer.URL + "?operation_id=" + operationID.String()
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	require.NoError(t, err)
+	items := []backend.LeaseItem{{
+		SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+	}}
+	profiles := testResourceProfiles(t, items)
+	stack := restoreStackManifest()
 
 	mock := &mockDockerClient{
 		ContainerEventsFn: func(ctx context.Context) (<-chan ContainerEvent, <-chan error) {
@@ -45,14 +56,18 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 	}
 
 	b := newBackendForTest(mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
-			Tenant:       "tenant-a",
-			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusReady,
-			CallbackURL:  callbackServer.URL},
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+			ContainerIDs: []string{"c1"}, Status: backend.ProvisionStatusReady,
+			CallbackURL: callbackURL, LifecycleCallbackURL: lifecycleCallbackURL,
+			ActiveOperationID: operationID, Items: items, ResourceProfiles: profiles,
+			StackManifest: stack,
+		},
 		},
 	})
+	installReadyRuntimeProofForTest(t, b, leaseUUID)
 	rebuildCallbackSender(b, callbackServer.Client())
+	startCallbackReplayForTest(b)
 	defer b.stopCancel()
 
 	// Start the event loop in a goroutine.
@@ -69,13 +84,13 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
 		defer b.provisionsMu.RUnlock()
-		prov := b.provisions["lease-1"]
+		prov := b.provisions[leaseUUID]
 		return prov != nil && prov.Status == backend.ProvisionStatusFailed
 	}, 2*time.Second, 10*time.Millisecond)
 
 	// Verify fail count incremented.
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[leaseUUID]
 	assert.Equal(t, 1, prov.FailCount)
 	assert.Contains(t, prov.LastError, leasesm.ErrMsgContainerExited)
 	b.provisionsMu.RUnlock()
@@ -86,11 +101,12 @@ func TestContainerEventLoop_DetectsDeathAndFailsLease(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 
 	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
-	assert.Equal(t, "lease-1", callbackPayload.LeaseUUID)
+	assert.Equal(t, leaseUUID, callbackPayload.LeaseUUID)
 
 	// Clean up.
 	b.stopCancel()
 	<-done
+	b.wg.Wait()
 }
 
 func TestContainerEventLoop_IgnoresNonReadyLease(t *testing.T) {

@@ -352,6 +352,7 @@ func provisionToInfo(prov *provision, backendName string) backend.ProvisionInfo 
 	)
 	info := backend.ProvisionInfo{
 		LeaseUUID:           prov.LeaseUUID,
+		Tenant:              prov.Tenant,
 		ProviderUUID:        prov.ProviderUUID,
 		Status:              prov.Status,
 		CreatedAt:           prov.CreatedAt,

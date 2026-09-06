@@ -27,6 +27,22 @@ func seedCloseDeprovisionLease(
 	stores closeRecoveryStores,
 ) {
 	t.Helper()
+	seedCloseDeprovisionLeaseWithCallback(
+		t, b, stores,
+		testOperationCallbackURL("https://callbacks.invalid/callbacks/provision"),
+	)
+}
+
+func seedCloseDeprovisionLeaseWithCallback(
+	t *testing.T,
+	b *Backend,
+	stores closeRecoveryStores,
+	callbackURL string,
+) {
+	t.Helper()
+	if callbackURL == "" {
+		callbackURL = testOperationCallbackURL("https://callbacks.invalid/callbacks/provision")
+	}
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", ServiceName: "app", Quantity: 1,
 	}}
@@ -36,28 +52,52 @@ func seedCloseDeprovisionLease(
 	stack, err := manifest.ParsePayload(payload)
 	require.NoError(t, err)
 	resourceProfiles := testResourceProfiles(t, items)
+	var lifecycleCallbackURL string
+	var operationID shared.OperationID
+	var runtimeAuthority *shared.ReleaseRuntimeAuthority
+	lifecycleCallbackURL, err = backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	require.NoError(t, err)
+	operationID = mustTestOperationIDFromCallbackURL(t, callbackURL)
+	authority, authorityErr := shared.NewReleaseRuntimeAuthority(
+		operationID,
+		"tenant-a",
+		closeDeprovisionProviderUUID,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
+	require.NoError(t, authorityErr)
+	runtimeAuthority = &authority
 	b.provisionsMu.Lock()
 	b.provisions[closeDeprovisionLeaseUUID] = &provision{
 		ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:     closeDeprovisionLeaseUUID,
-			Tenant:        "tenant-a",
-			ProviderUUID:  closeDeprovisionProviderUUID,
-			Items:         items,
-			Quantity:      1,
-			StackManifest: stack,
-			Status:        backend.ProvisionStatusReady,
+			LeaseUUID:            closeDeprovisionLeaseUUID,
+			Tenant:               "tenant-a",
+			ProviderUUID:         closeDeprovisionProviderUUID,
+			Items:                items,
+			Quantity:             1,
+			StackManifest:        stack,
+			Status:               backend.ProvisionStatusReady,
+			CallbackURL:          callbackURL,
+			LifecycleCallbackURL: lifecycleCallbackURL,
+			ActiveOperationID:    operationID,
+			ResourceProfiles:     resourceProfiles,
 		},
-		ResourceProfiles: resourceProfiles,
 	}
 	b.provisionsMu.Unlock()
-	require.NoError(t, stores.releases.Append(closeDeprovisionLeaseUUID, shared.Release{
+	release := shared.Release{
 		Manifest:         payload,
 		Image:            "stack",
+		OperationID:      operationID,
 		Items:            items,
 		ResourceProfiles: resourceProfiles,
+		RuntimeAuthority: runtimeAuthority,
 		Status:           "active",
 		CreatedAt:        time.Now(),
-	}))
+	}
+	seedProvisionReleaseForLeaseTest(
+		t, stores.callbacks, stores.releases, stores.operations,
+		closeDeprovisionLeaseUUID, release,
+	)
 }
 
 func TestDoDeprovision_CommitsCloseIntentBeforeTeardown(t *testing.T) {
@@ -77,7 +117,7 @@ func TestDoDeprovision_CommitsCloseIntentBeforeTeardown(t *testing.T) {
 		return nil
 	}}
 
-	require.NoError(t, b.doDeprovision(context.Background(), closeDeprovisionLeaseUUID))
+	require.NoError(t, b.doDeprovisionForTest(t, context.Background(), closeDeprovisionLeaseUUID))
 	_, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
 	require.NoError(t, err)
 	require.False(t, found, "terminal settlement must consume the exact close capability")
@@ -104,34 +144,37 @@ func TestAcquireCloseIntentUsesFencedReleaseTopology(t *testing.T) {
 	targetPayload := validStackManifestJSON(map[string]string{
 		"app": "docker.io/library/nginx:1.28",
 	})
-	require.NoError(t, stores.releases.Append(closeDeprovisionLeaseUUID, shared.Release{
-		Manifest:         targetPayload,
-		Image:            "stack",
-		Items:            targetItems,
-		ResourceProfiles: testResourceProfiles(t, targetItems),
-		Status:           "deploying",
-		CreatedAt:        time.Now().Add(time.Second),
-	}))
-	require.NoError(t, stores.releases.ActivateLatest(closeDeprovisionLeaseUUID))
+	sourceRelease, err := stores.releases.LatestActive(closeDeprovisionLeaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, sourceRelease)
+	activateMaintenanceReleaseForTest(
+		t, stores.maintenance, closeDeprovisionLeaseUUID,
+		shared.MaintenanceIntentUpdate, shared.Release{
+			Manifest:         targetPayload,
+			Image:            "stack",
+			OperationID:      sourceRelease.OperationID,
+			Items:            targetItems,
+			ResourceProfiles: testResourceProfiles(t, targetItems),
+			RuntimeAuthority: sourceRelease.RuntimeAuthority,
+			Status:           "deploying",
+			CreatedAt:        time.Now().Add(time.Second),
+		})
 
 	b.provisionsMu.RLock()
 	projection := b.provisions[closeDeprovisionLeaseUUID]
 	require.NotNil(t, projection)
-	oldStack := projection.StackManifest
 	oldItems := append([]backend.LeaseItem(nil), projection.Items...)
 	b.provisionsMu.RUnlock()
 	require.NotEqual(t, targetItems, oldItems)
 
+	// Production settles an already-active maintenance target before close
+	// admission so the maintenance callback records Success and the close fence
+	// is derived from that target generation rather than its superseded source.
+	require.NoError(t, b.settleMaintenanceBeforeClose(closeDeprovisionLeaseUUID))
 	claim, found, err := b.acquireCloseIntent(
 		context.Background(),
 		closeDeprovisionLeaseUUID,
 		true,
-		"tenant-a",
-		closeDeprovisionProviderUUID,
-		oldItems,
-		oldStack,
-		"",
-		"",
 	)
 	require.NoError(t, err)
 	require.True(t, found)
@@ -149,441 +192,35 @@ func TestAcquireCloseIntentUsesFencedReleaseTopology(t *testing.T) {
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
-func TestAcquireCloseIntentUsesFencedLegacyRuntimeAuthority(t *testing.T) {
-	dir := t.TempDir()
-	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, nil)
-	seedCloseDeprovisionLease(t, b, stores)
-
-	const callbackURL = "https://fred.example/callbacks/provision?lease_uuid=" + closeDeprovisionLeaseUUID
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	require.NoError(t, err)
-	authority, err := shared.NewLegacyRuntimeAuthority(
-		"tenant-authoritative",
-		closeDeprovisionProviderUUID,
-		callbackURL,
-		lifecycleCallbackURL,
-	)
-	require.NoError(t, err)
-	active, err := stores.releases.LatestActive(closeDeprovisionLeaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, active)
-	require.NoError(t, stores.releases.BackfillLegacyRuntimeAuthority(
-		closeDeprovisionLeaseUUID, *active, authority,
-	))
-	stack, err := manifest.ParsePayload(active.Manifest)
-	require.NoError(t, err)
-
-	// Model a stale in-memory projection after the durable v0.13 authority was
-	// frozen. Close must fence the principal and callback pair from the Release,
-	// not combine the Release topology with these caller-supplied values.
-	claim, found, err := b.acquireCloseIntent(
-		context.Background(),
-		closeDeprovisionLeaseUUID,
-		true,
-		"tenant-stale",
-		"33333333-3333-4333-8333-333333333333",
-		active.Items,
-		stack,
-		"https://stale.example/callback",
-		"",
-	)
-	require.NoError(t, err)
-	require.True(t, found)
-	require.Equal(t, authority.Tenant(), claim.Tenant())
-	require.Equal(t, authority.ProviderUUID(), claim.ProviderUUID())
-	require.Equal(t, authority.CallbackURL(), claim.CallbackURL())
-	require.Equal(t, authority.LifecycleCallbackURL(), claim.LifecycleCallbackURL())
-
-	closeCloseRecoveryBackend(t, b, stores)
-}
-
-func TestDoDeprovision_UnmarkedExactRollbackUsesSelectedReleaseAuthority(t *testing.T) {
-	dir := t.TempDir()
-	const callbackURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	require.NoError(t, err)
-	var removed []string
-	mock := &mockDockerClient{
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{{
-				ContainerID:          "immutable-prev-id",
-				Name:                 "fred-" + closeDeprovisionLeaseUUID + "-app-0-prev",
-				LeaseUUID:            closeDeprovisionLeaseUUID,
-				Tenant:               "tenant-a",
-				ProviderUUID:         closeDeprovisionProviderUUID,
-				BackendName:          "docker",
-				SKU:                  "docker-small",
-				Image:                "docker.io/library/nginx:1.27",
-				CallbackURL:          callbackURL,
-				LifecycleCallbackURL: lifecycleCallbackURL,
-				InstanceIndex:        0,
-				Status:               "exited",
-			}}, nil
-		},
-		RemoveContainerFn: func(_ context.Context, containerID string) error {
-			removed = append(removed, containerID)
-			return nil
-		},
-	}
-	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
-	seedCloseDeprovisionLease(t, b, stores)
-	b.provisionStore.UpdateFn(closeDeprovisionLeaseUUID, func(state *leasesm.ProvisionState) {
-		state.CallbackURL = callbackURL
-		state.LifecycleCallbackURL = lifecycleCallbackURL
-	})
-
-	active, err := stores.releases.LatestActive(closeDeprovisionLeaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, active)
-	require.False(t, active.LegacyMigration,
-		"an exact rollback name alone must not mint migration provenance")
-
-	b.compose = &mockComposeExecutor{DownFn: func(
-		context.Context,
-		string,
-		time.Duration,
-	) error {
-		claim, found, claimErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
-		require.NoError(t, claimErr)
-		require.True(t, found)
-		require.Equal(t, []shared.CloseLegacyRollbackTarget{{
-			ContainerID: "immutable-prev-id",
-			Name:        "fred-" + closeDeprovisionLeaseUUID + "-app-0-prev",
-		}}, claim.LegacyRollbackTargets(),
-			"Close must freeze the immutable ID before Compose can retire the release")
-		return nil
-	}}
-
-	require.NoError(t, b.doDeprovision(context.Background(), closeDeprovisionLeaseUUID))
-	require.Equal(t, []string{"immutable-prev-id"}, removed)
-	history, err := stores.releases.List(closeDeprovisionLeaseUUID)
-	require.NoError(t, err)
-	require.Empty(t, history, "release history retires only after exact rollback cleanup")
-
-	closeCloseRecoveryBackend(t, b, stores)
-}
-
-func TestCloseLegacyRollbackTargetsRejectsUnmarkedAmbiguity(t *testing.T) {
-	const callbackURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	require.NoError(t, err)
-	base := ContainerInfo{
-		ContainerID:          "immutable-prev-id",
-		Name:                 "fred-" + closeDeprovisionLeaseUUID + "-app-0-prev",
-		LeaseUUID:            closeDeprovisionLeaseUUID,
-		Tenant:               "tenant-a",
-		ProviderUUID:         closeDeprovisionProviderUUID,
-		BackendName:          "docker",
-		SKU:                  "docker-small",
-		Image:                "docker.io/library/nginx:1.27",
-		CallbackURL:          callbackURL,
-		LifecycleCallbackURL: lifecycleCallbackURL,
-		InstanceIndex:        0,
-		Status:               "exited",
-	}
-	for name, containers := range map[string][]ContainerInfo{
-		"wrong exact name": func() []ContainerInfo {
-			candidate := base
-			candidate.Name = "fred-" + closeDeprovisionLeaseUUID + "-app-1-prev"
-			return []ContainerInfo{candidate}
-		}(),
-		"out of range index": func() []ContainerInfo {
-			candidate := base
-			candidate.InstanceIndex = 1
-			candidate.Name = "fred-" + closeDeprovisionLeaseUUID + "-app-1-prev"
-			return []ContainerInfo{candidate}
-		}(),
-		"wrong SKU": func() []ContainerInfo {
-			candidate := base
-			candidate.SKU = "docker-large"
-			return []ContainerInfo{candidate}
-		}(),
-		"wrong custom domain": func() []ContainerInfo {
-			candidate := base
-			candidate.CustomDomain = "wrong.example"
-			return []ContainerInfo{candidate}
-		}(),
-		"wrong image": func() []ContainerInfo {
-			candidate := base
-			candidate.Image = "docker.io/library/alpine:3.22"
-			return []ContainerInfo{candidate}
-		}(),
-		"wrong tenant": func() []ContainerInfo {
-			candidate := base
-			candidate.Tenant = "tenant-b"
-			return []ContainerInfo{candidate}
-		}(),
-		"wrong provider": func() []ContainerInfo {
-			candidate := base
-			candidate.ProviderUUID = "33333333-3333-4333-8333-333333333333"
-			return []ContainerInfo{candidate}
-		}(),
-		"running replacement": func() []ContainerInfo {
-			candidate := base
-			candidate.Status = "running"
-			return []ContainerInfo{candidate}
-		}(),
-		"duplicate index": {
-			base,
-			func() ContainerInfo {
-				candidate := base
-				candidate.ContainerID = "second-prev-id"
-				return candidate
-			}(),
-		},
-		"unsafe immutable ID": func() []ContainerInfo {
-			candidate := base
-			candidate.ContainerID = "forged\nidentifier"
-			return []ContainerInfo{candidate}
-		}(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			mock := &mockDockerClient{
-				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-					return containers, nil
-				},
-			}
-			b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
-			t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
-			seedCloseDeprovisionLease(t, b, stores)
-			history, err := stores.releases.List(closeDeprovisionLeaseUUID)
-			require.NoError(t, err)
-
-			_, err = b.closeLegacyRollbackTargets(
-				context.Background(),
-				closeDeprovisionLeaseUUID,
-				history,
-				"tenant-a",
-				closeDeprovisionProviderUUID,
-				callbackURL,
-				lifecycleCallbackURL,
-			)
-			require.Error(t, err)
-		})
-	}
-}
-
-func TestCloseLegacyRollbackTargetsMarkedMigrationRequiresCoherentIdentity(t *testing.T) {
-	const callbackURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	require.NoError(t, err)
-	items := []backend.LeaseItem{{
-		SKU: "docker-small", ServiceName: "app", Quantity: 2,
-	}}
-	history := []shared.Release{{
-		Version:          1,
-		Manifest:         validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
-		Image:            "stack",
-		Items:            items,
-		ResourceProfiles: testResourceProfiles(t, items),
-		Status:           "active",
-		CreatedAt:        time.Now(),
-		LegacyMigration:  true,
-	}}
-	base := ContainerInfo{
-		ContainerID:          "immutable-prev-id-0",
-		Name:                 "fred-" + closeDeprovisionLeaseUUID + "-app-0-prev",
-		LeaseUUID:            closeDeprovisionLeaseUUID,
-		Tenant:               "tenant-a",
-		ProviderUUID:         closeDeprovisionProviderUUID,
-		BackendName:          "docker",
-		SKU:                  "docker-small",
-		Image:                "docker.io/library/nginx:1.27",
-		CallbackURL:          callbackURL,
-		LifecycleCallbackURL: lifecycleCallbackURL,
-		InstanceIndex:        0,
-		Status:               "exited",
-	}
-
-	for name, mutate := range map[string]func([]ContainerInfo) []ContainerInfo{
-		"empty tenant": func(containers []ContainerInfo) []ContainerInfo {
-			containers[0].Tenant = ""
-			return containers
-		},
-		"noncanonical provider": func(containers []ContainerInfo) []ContainerInfo {
-			containers[0].ProviderUUID = "provider-a"
-			return containers
-		},
-		"divergent tenant": func(containers []ContainerInfo) []ContainerInfo {
-			second := containers[0]
-			second.ContainerID = "immutable-prev-id-1"
-			second.Name = "fred-" + closeDeprovisionLeaseUUID + "-app-1-prev"
-			second.InstanceIndex = 1
-			second.Tenant = "tenant-b"
-			return append(containers, second)
-		},
-		"divergent provider": func(containers []ContainerInfo) []ContainerInfo {
-			second := containers[0]
-			second.ContainerID = "immutable-prev-id-1"
-			second.Name = "fred-" + closeDeprovisionLeaseUUID + "-app-1-prev"
-			second.InstanceIndex = 1
-			second.ProviderUUID = "33333333-3333-4333-8333-333333333333"
-			return append(containers, second)
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			containers := mutate([]ContainerInfo{base})
-			b := &Backend{
-				cfg: Config{Name: "docker"},
-				docker: &mockDockerClient{ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-					return containers, nil
-				}},
-			}
-			_, err := b.closeLegacyRollbackTargets(
-				context.Background(), closeDeprovisionLeaseUUID, history, "", "", "", "",
-			)
-			require.Error(t, err)
-		})
-	}
-
-	t.Run("partial coherent cohort remains exact immutable authority", func(t *testing.T) {
-		partial := base
-		partial.ContainerID = "immutable-prev-id-1"
-		partial.Name = "fred-" + closeDeprovisionLeaseUUID + "-app-1-prev"
-		partial.InstanceIndex = 1
-		b := &Backend{
-			cfg: Config{Name: "docker"},
-			docker: &mockDockerClient{ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-				return []ContainerInfo{partial}, nil
-			}},
-		}
-		targets, err := b.closeLegacyRollbackTargets(
-			context.Background(), closeDeprovisionLeaseUUID, history, "", "", "", "",
-		)
-		require.NoError(t, err)
-		require.Equal(t, []shared.CloseLegacyRollbackTarget{{
-			ContainerID: partial.ContainerID,
-			Name:        partial.Name,
-		}}, targets)
-	})
-}
-
-func TestCloseLegacyRollbackTargetsMarkedMigrationMatchesTypedActiveAuthority(t *testing.T) {
-	const (
-		operationID = shared.OperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")
-		callbackURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
-	)
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	require.NoError(t, err)
-	authority, err := shared.NewReleaseRuntimeAuthority(
-		operationID,
-		"tenant-a",
-		closeDeprovisionProviderUUID,
-		callbackURL,
-		lifecycleCallbackURL,
-	)
-	require.NoError(t, err)
-	items := []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", Quantity: 1}}
-	profiles := testResourceProfiles(t, items)
-	manifestBytes := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
-	history := []shared.Release{
-		{
-			Version: 1, Manifest: manifestBytes, Image: "stack", Items: items,
-			ResourceProfiles: profiles, Status: "superseded", CreatedAt: time.Now(), LegacyMigration: true,
-		},
-		{
-			Version: 2, Manifest: manifestBytes, Image: "stack", OperationID: operationID,
-			Items: items, ResourceProfiles: profiles, RuntimeAuthority: &authority,
-			Status: "active", CreatedAt: time.Now().Add(time.Second),
-		},
-	}
-	cloned := ContainerInfo{
-		ContainerID:          "same-name-replacement-id",
-		Name:                 "fred-" + closeDeprovisionLeaseUUID + "-app-0-prev",
-		LeaseUUID:            closeDeprovisionLeaseUUID,
-		Tenant:               "different-tenant",
-		ProviderUUID:         "33333333-3333-4333-8333-333333333333",
-		BackendName:          "docker",
-		SKU:                  "docker-small",
-		Image:                "docker.io/library/nginx:1.27",
-		CallbackURL:          callbackURL,
-		LifecycleCallbackURL: lifecycleCallbackURL,
-		InstanceIndex:        0,
-		Status:               "exited",
-	}
-	b := &Backend{
-		cfg: Config{Name: "docker"},
-		docker: &mockDockerClient{ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{cloned}, nil
-		}},
-	}
-	_, err = b.closeLegacyRollbackTargets(
-		context.Background(), closeDeprovisionLeaseUUID, history, "", "", "", "",
-	)
-	require.ErrorContains(t, err, "differs from active release authority")
-}
-
 func TestDoDeprovision_CloseSettlementDoesNotPerformCallbackIOInline(t *testing.T) {
 	dir := t.TempDir()
 	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, nil)
-	seedCloseDeprovisionLease(t, b, stores)
 	const operationURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
+	seedCloseDeprovisionLeaseWithCallback(t, b, stores, operationURL)
 	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(operationURL, "")
 	require.NoError(t, err)
-	b.provisionStore.UpdateFn(closeDeprovisionLeaseUUID, func(p *leasesm.ProvisionState) {
-		p.CallbackURL = operationURL
-		p.LifecycleCallbackURL = lifecycleURL
-	})
+	require.NotEmpty(t, lifecycleURL)
 	var requests atomic.Int32
 	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
-		Store:   stores.callbacks,
-		Secret:  "test-secret-that-is-at-least-32-bytes",
-		Logger:  b.logger,
-		StopCtx: b.stopCtx,
+		Store: stores.callbacks,
+		StorageAttestor: callbackStorageAttestorForTest(
+			t, stores.callbacks, b.stopCtx, allowTestCallbackDelivery,
+		),
+		Secret: "test-secret-that-is-at-least-32-bytes",
+		Logger: b.logger,
+
 		HTTPClient: &http.Client{Transport: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			requests.Add(1)
 			return nil, errors.New("callback transport must not run in close actor")
 		})},
-		BeforeReplay:    func(context.Context) error { return nil },
-		BeforeDelivery:  func(context.Context) error { return nil },
-		StorageIdentity: b.storageIdentity,
 	})
 
-	require.NoError(t, b.doDeprovision(context.Background(), closeDeprovisionLeaseUUID))
+	require.NoError(t, b.doDeprovisionForTest(t, context.Background(), closeDeprovisionLeaseUUID))
 	require.Zero(t, requests.Load(), "durable settlement must only wake the tracked replay worker")
 	pending, err := stores.callbacks.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 	require.Equal(t, backend.CallbackStatusDeprovisioned, pending[0].Status)
-
-	closeCloseRecoveryBackend(t, b, stores)
-}
-
-func TestDoDeprovision_ReleaseFenceRefusesChangedAuthority(t *testing.T) {
-	dir := t.TempDir()
-	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, nil)
-	seedCloseDeprovisionLease(t, b, stores)
-
-	b.compose = &mockComposeExecutor{DownFn: func(
-		context.Context,
-		string,
-		time.Duration,
-	) error {
-		// The close intent has already fenced the active release. Model an
-		// impossible-under-normal-admission writer to prove the destructive
-		// finalizer fails closed rather than deleting changed authority.
-		return stores.releases.UpdateLatestStatus(
-			closeDeprovisionLeaseUUID,
-			"failed",
-			backend.ReasonUpdateFailed,
-			"mutated after close admission",
-		)
-	}}
-
-	err := b.doDeprovision(context.Background(), closeDeprovisionLeaseUUID)
-	require.ErrorContains(t, err, "release history changed after close admission")
-	_, found, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
-	require.NoError(t, readErr)
-	require.True(t, found, "a fence mismatch must retain durable recovery authority")
-	releases, readErr := stores.releases.List(closeDeprovisionLeaseUUID)
-	require.NoError(t, readErr)
-	require.Len(t, releases, 1, "changed release evidence must not be erased")
-	b.provisionsMu.RLock()
-	projection := b.provisions[closeDeprovisionLeaseUUID]
-	b.provisionsMu.RUnlock()
-	require.NotNil(t, projection, "the retry owner survives until finalization is durable")
-	require.Equal(t, backend.ProvisionStatusFailed, projection.Status)
 
 	closeCloseRecoveryBackend(t, b, stores)
 }
@@ -633,16 +270,26 @@ func TestDoDeprovision_CleanupOnlyClaimCleansUnprojectedSubstrate(t *testing.T) 
 				"app": "docker.io/library/nginx:1.27",
 			})
 			resourceProfiles := testResourceProfiles(t, items)
-			require.NoError(t, stores.releases.Append(closeDeprovisionLeaseUUID, shared.Release{
-				Manifest:         payload,
-				Image:            "stack",
-				Items:            items,
-				ResourceProfiles: resourceProfiles,
-				Status:           "active",
-				CreatedAt:        time.Now(),
-			}))
+			operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+			runtimeAuthority, authorityErr := shared.NewReleaseRuntimeAuthority(
+				operationID, "tenant-a", closeDeprovisionProviderUUID,
+				callbackURL, lifecycleCallbackURL,
+			)
+			require.NoError(t, authorityErr)
+			seedProvisionReleaseForLeaseTest(
+				t, stores.callbacks, stores.releases, stores.operations,
+				closeDeprovisionLeaseUUID, shared.Release{
+					Manifest:         payload,
+					Image:            "stack",
+					OperationID:      operationID,
+					Items:            items,
+					ResourceProfiles: resourceProfiles,
+					RuntimeAuthority: &runtimeAuthority,
+					Status:           "active",
+					CreatedAt:        time.Now(),
+				})
 
-			err := b.doDeprovision(context.Background(), closeDeprovisionLeaseUUID)
+			err := b.doDeprovisionForTest(t, context.Background(), closeDeprovisionLeaseUUID)
 			if testCase.wantPending {
 				require.ErrorContains(t, err, testCase.destroyErr.Error())
 			} else {
@@ -659,7 +306,7 @@ func TestDoDeprovision_CleanupOnlyClaimCleansUnprojectedSubstrate(t *testing.T) 
 			require.Equal(t, testCase.wantPending, found)
 			if found {
 				require.True(t, claim.CleanupOnly())
-				require.Equal(t, testCase.wantAttempts, claim.CleanupAttempts())
+				require.Equal(t, testCase.wantAttempts, claim.ExecutionGeneration().Number())
 			}
 			releases, readErr := stores.releases.List(closeDeprovisionLeaseUUID)
 			require.NoError(t, readErr)
@@ -677,4 +324,98 @@ func TestDoDeprovision_CleanupOnlyClaimCleansUnprojectedSubstrate(t *testing.T) 
 			closeCloseRecoveryBackend(t, b, stores)
 		})
 	}
+}
+
+func TestDoDeprovision_FailedInitialOperationBecomesCleanupOnlyCloseAndPermanentFence(t *testing.T) {
+	dir := t.TempDir()
+	visible := true
+	late := ContainerInfo{
+		ContainerID:   "late-initial-failed-operation",
+		LeaseUUID:     closeDeprovisionLeaseUUID,
+		Tenant:        "tenant-a",
+		ProviderUUID:  closeDeprovisionProviderUUID,
+		BackendName:   DefaultConfig().Name,
+		SKU:           "docker-small",
+		ServiceName:   "app",
+		InstanceIndex: 0,
+		Status:        "running",
+	}
+	removed := 0
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			if !visible {
+				return nil, nil
+			}
+			return []ContainerInfo{late}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			require.Equal(t, late.ContainerID, containerID)
+			removed++
+			visible = false
+			return nil
+		},
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
+	b.compose = &mockComposeExecutor{DownFn: func(
+		context.Context,
+		string,
+		time.Duration,
+	) error {
+		// Model Compose removing substrate which became visible only after the
+		// operation's exact failure was already durable.
+		visible = false
+		return nil
+	}}
+	items := []backend.LeaseItem{{
+		SKU: "docker-small", ServiceName: "app", Quantity: 1,
+	}}
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	candidate, err := stores.operations.NewOperationIntentCandidate(shared.OperationIntentSpec{
+		Kind:                 shared.OperationIntentProvision,
+		LeaseUUID:            closeDeprovisionLeaseUUID,
+		CallbackURL:          callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL,
+		Tenant:               "tenant-a",
+		ProviderUUID:         closeDeprovisionProviderUUID,
+		Items:                items,
+		ResourceProfiles:     testResourceProfiles(t, items),
+		Manifest: validStackManifestJSON(map[string]string{
+			"app": "docker.io/library/nginx:1.27",
+		}),
+	})
+	require.NoError(t, err)
+	admission, err := stores.operations.BeginOperationIntent(candidate)
+	require.NoError(t, err)
+	claim, created := admission.CreatedClaim()
+	require.True(t, created)
+	require.Equal(t, operationID, claim.OperationID())
+	uncommitted := commitPreEffectOperationFailureForTest(t, stores.operations, claim)
+	require.NoError(t, b.callbackPublisher.PublishOperationFailureContext(
+		context.Background(), uncommitted, "initial operation definitively refused",
+	))
+
+	require.NoError(t, b.doDeprovisionForTest(
+		t, context.Background(), closeDeprovisionLeaseUUID,
+	))
+	_, found, err := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.NoError(t, err)
+	require.False(t, found, "cleanup must consume the failed-operation head")
+	closed, err := stores.callbacks.LookupClosedLeaseReceipts(
+		[]string{closeDeprovisionLeaseUUID},
+	)
+	require.NoError(t, err)
+	require.Len(t, closed, 1)
+	require.Equal(t, shared.ClosedLeaseAuthorityOrphan, closed[0].AuthorityKind())
+
+	// A still-later daemon Create is owned by the permanent close receipt, not
+	// by the now-archived failure witness, and is removed before projection.
+	visible = true
+	require.NoError(t, b.recoverState(context.Background()))
+	require.Equal(t, 1, removed)
+	b.provisionsMu.RLock()
+	_, projected := b.provisions[closeDeprovisionLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.False(t, projected)
+
+	closeCloseRecoveryBackend(t, b, stores)
 }

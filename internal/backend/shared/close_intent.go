@@ -26,7 +26,7 @@ import (
 const (
 	maxCloseIntentEntryBytes      = 4 << 20
 	maxCloseIntentIdentityBytes   = 4 << 10
-	maxCloseRollbackTargetBytes   = 4 << 10
+	maxClosePhysicalNameBytes     = 4 << 10
 	closeIntentPreemptedOperation = "operation preempted by lease close"
 )
 
@@ -45,22 +45,11 @@ const (
 	CloseIntentAdmissionExisting
 )
 
-// CloseLegacyRollbackTarget identifies one exact pre-Compose rollback
-// container. ContainerID is the immutable deletion authority. Name is retained
-// alongside it for operator evidence and defense-in-depth identity checks; a
-// delayed cleanup must never resolve a reused name to a different container.
-type CloseLegacyRollbackTarget struct {
-	ContainerID string `json:"container_id"`
-	Name        string `json:"name"`
-}
-
-// CloseIntentSpec is the immutable input to destructive lease cleanup. It is
-// persisted before the first substrate mutation so restart recovery never has
-// to reconstruct authority from a partial set of survivors.
-type CloseIntentSpec struct {
+// closeIntentSpec is the coordinator-derived description of destructive lease
+// cleanup. newCloseIntentCandidate validates and detaches it before admission,
+// so restart recovery never reconstructs authority from partial survivors.
+type closeIntentSpec struct {
 	LeaseUUID        string
-	Backend          string
-	BackendStorageID backendidentity.ID
 	Tenant           string
 	ProviderUUID     string
 	Items            []backend.LeaseItem
@@ -77,34 +66,91 @@ type CloseIntentSpec struct {
 	CleanupOnly   bool
 
 	// ActiveReleaseVersion and ActiveReleaseDigest fence cleanup to the exact
-	// release inspected before admission. The digest is intentionally supplied
-	// by the release owner: this journal binds it but does not reinterpret the
+	// release selected by CloseSettlement under the shared per-lease gate. The
+	// callback journal binds this internal snapshot but does not reinterpret the
 	// release store's canonical encoding.
-	ActiveReleaseVersion int
-	ActiveReleaseDigest  [sha256.Size]byte
+	ActiveReleaseVersion     int
+	ActiveReleaseDigest      [sha256.Size]byte
+	ActiveReleaseOperationID OperationID
+}
 
-	LegacyRollbackTargets []CloseLegacyRollbackTarget
+// closeIntentCandidate is a store-minted, immutable admission capability. Its
+// private issuer and storage lineage prevent a close assembled for one backend
+// journal from authorizing destructive work through another. The zero value is
+// invalid.
+type closeIntentCandidate struct {
+	issuer    *CallbackStore
+	spec      closeIntentSpec
+	backend   string
+	storageID backendidentity.ID
+}
+
+func newCloseIntentCandidate(
+	issuer *CallbackStore,
+	spec closeIntentSpec,
+	backendName string,
+	storageID backendidentity.ID,
+) (closeIntentCandidate, error) {
+	candidate := closeIntentCandidate{
+		issuer: issuer, spec: cloneCloseIntentSpec(spec),
+		backend: backendName, storageID: storageID,
+	}
+	if err := validateCloseIntentCandidate(candidate); err != nil {
+		return closeIntentCandidate{}, err
+	}
+	return candidate, nil
+}
+
+func cloneCloseIntentSpec(spec closeIntentSpec) closeIntentSpec {
+	spec.Items = slices.Clone(spec.Items)
+	spec.ResourceProfiles = CloneSKUResourceSnapshot(spec.ResourceProfiles)
+	spec.Manifest = bytes.Clone(spec.Manifest)
+	return spec
 }
 
 // CloseIntentAdmission is returned only after the close barrier is durably
 // committed. Existing is an exact idempotent retry and returns the original
-// capability, including its persisted cleanup-attempt count.
+// capability, including its persisted physical-execution generation.
 type CloseIntentAdmission struct {
-	Claim       CloseIntentClaim
-	Disposition CloseIntentAdmissionDisposition
+	claim       CloseIntentClaim
+	disposition CloseIntentAdmissionDisposition
 	// OperationPreempted reports that this transaction replaced an unresolved
 	// operation intent with its exact failed operation callback.
-	OperationPreempted bool
+	operationPreempted bool
 	// MaintenancePreempted reports that this same transaction replaced an
 	// unresolved maintenance intent with its failed lifecycle completion.
-	MaintenancePreempted bool
+	maintenancePreempted bool
+}
+
+// Claim returns the journal-issued cleanup authority. Both a newly-created
+// close and its exact replay carry the same durable authority, allowing cleanup
+// to resume after a crash without letting callers assemble an admission.
+func (admission CloseIntentAdmission) Claim() CloseIntentClaim { return admission.claim }
+
+// Disposition reports whether this call created the durable close barrier or
+// replayed the exact existing barrier.
+func (admission CloseIntentAdmission) Disposition() CloseIntentAdmissionDisposition {
+	return admission.disposition
+}
+
+// OperationPreempted reports whether admitting this close terminalized an
+// unresolved operation in the same transaction.
+func (admission CloseIntentAdmission) OperationPreempted() bool {
+	return admission.operationPreempted
+}
+
+// MaintenancePreempted reports whether admitting this close terminalized an
+// unresolved maintenance replacement in the same transaction.
+func (admission CloseIntentAdmission) MaintenancePreempted() bool {
+	return admission.maintenancePreempted
 }
 
 // CloseIntentClaim is an opaque, copy-safe capability for one exact durable
 // close. It contains no caller-settable authority. Every mutation verifies the
 // lease key and SHA-256 digest against bbolt, so using two copies cannot replay
-// a resolve or overwrite a refreshed cleanup-attempt count.
+// a resolve or overwrite a refreshed physical-execution generation.
 type CloseIntentClaim struct {
+	settlement          *CloseSettlement
 	entry               closeIntentEntry
 	intentID            uuid.UUID
 	storageID           backendidentity.ID
@@ -153,97 +199,165 @@ func (c CloseIntentClaim) ActiveReleaseDigest() [sha256.Size]byte {
 	return c.activeReleaseDigest
 }
 
-func (c CloseIntentClaim) LegacyRollbackTargets() []CloseLegacyRollbackTarget {
-	return slices.Clone(c.entry.LegacyRollbackTargets)
+func (c CloseIntentClaim) ActiveReleaseOperationID() OperationID {
+	return c.entry.ActiveReleaseOperationID
 }
 
-func (c CloseIntentClaim) CleanupAttempts() int { return c.entry.CleanupAttempts }
+// CloseExecutionGeneration is an opaque monotonic durable generation. Zero is
+// the not-started phase and cannot authorize physical work.
+type CloseExecutionGeneration struct{ value int }
+
+func (generation CloseExecutionGeneration) Valid() bool { return generation.value > 0 }
+func (generation CloseExecutionGeneration) Number() int { return generation.value }
+
+func (c CloseIntentClaim) ExecutionGeneration() CloseExecutionGeneration {
+	return CloseExecutionGeneration{value: c.entry.ExecutionGeneration}
+}
 func (c CloseIntentClaim) CreatedAt() time.Time { return c.entry.CreatedAt }
 
 type closeIntentEntry struct {
-	IntentID              string                      `json:"intent_id"`
-	LeaseUUID             string                      `json:"lease_uuid"`
-	Backend               string                      `json:"backend"`
-	BackendStorageID      string                      `json:"backend_storage_id"`
-	Tenant                string                      `json:"tenant"`
-	ProviderUUID          string                      `json:"provider_uuid"`
-	Items                 []backend.LeaseItem         `json:"items"`
-	ResourceProfiles      []SKUResourceSnapshot       `json:"resource_profiles"`
-	Manifest              []byte                      `json:"manifest"`
-	CallbackURL           string                      `json:"callback_url,omitempty"`
-	LifecycleCallbackURL  string                      `json:"lifecycle_callback_url,omitempty"`
-	RetainOnClose         bool                        `json:"retain_on_close"`
-	CleanupOnly           bool                        `json:"cleanup_only"`
-	ActiveReleaseVersion  int                         `json:"active_release_version"`
-	ActiveReleaseDigest   string                      `json:"active_release_digest"`
-	LegacyRollbackTargets []CloseLegacyRollbackTarget `json:"legacy_rollback_targets,omitempty"`
-	CleanupAttempts       int                         `json:"cleanup_attempts"`
-	CreatedAt             time.Time                   `json:"created_at"`
+	IntentID                 string                `json:"intent_id"`
+	LeaseUUID                string                `json:"lease_uuid"`
+	Backend                  string                `json:"backend"`
+	BackendStorageID         string                `json:"backend_storage_id"`
+	Tenant                   string                `json:"tenant"`
+	ProviderUUID             string                `json:"provider_uuid"`
+	Items                    []backend.LeaseItem   `json:"items"`
+	ResourceProfiles         []SKUResourceSnapshot `json:"resource_profiles"`
+	Manifest                 []byte                `json:"manifest"`
+	CallbackURL              string                `json:"callback_url,omitempty"`
+	LifecycleCallbackURL     string                `json:"lifecycle_callback_url,omitempty"`
+	RetainOnClose            bool                  `json:"retain_on_close"`
+	CleanupOnly              bool                  `json:"cleanup_only"`
+	ActiveReleaseVersion     int                   `json:"active_release_version"`
+	ActiveReleaseDigest      string                `json:"active_release_digest"`
+	ActiveReleaseOperationID OperationID           `json:"active_release_operation_id,omitzero"`
+	ExecutionGeneration      int                   `json:"cleanup_attempts"`
+	CreatedAt                time.Time             `json:"created_at"`
 }
 
-// BeginCloseIntent durably publishes a close barrier before destructive work.
-// If an asynchronous provision/restore intent still exists, this same bbolt
-// transaction first converts it into its exact failed operation callback. A
-// crash can therefore expose both durable facts or neither, never a close that
-// silently erased the operation completion it preempted.
-func (s *CallbackStore) BeginCloseIntent(spec CloseIntentSpec) (CloseIntentAdmission, error) {
-	if err := validateCloseIntentSpec(spec); err != nil {
+// closeIntentAdmissionAuthority is a sealed description of the callback-head
+// transition that may publish a close. Failed-over-active and
+// Failed-without-Release authority are intentionally unrepresentable as an
+// ordinary terminal-operation transition.
+type closeIntentAdmissionAuthority interface {
+	isCloseIntentAdmissionAuthority()
+}
+
+type directCloseIntentAdmissionAuthority struct{}
+
+func (directCloseIntentAdmissionAuthority) isCloseIntentAdmissionAuthority() {}
+
+type failedSuccessorCloseIntentAdmissionAuthority struct {
+	predecessor failedOperationOverRelease
+}
+
+func (failedSuccessorCloseIntentAdmissionAuthority) isCloseIntentAdmissionAuthority() {}
+
+type failedWithoutReleaseCleanupCloseIntentAdmissionAuthority struct {
+	absence failedOperationWithoutRelease
+}
+
+func (failedWithoutReleaseCleanupCloseIntentAdmissionAuthority) isCloseIntentAdmissionAuthority() {}
+
+// beginCloseIntentLocked durably publishes the ordinary close barrier before
+// destructive work. A terminal Failed operation cannot enter through this
+// path; it requires one of the distinct pair-bound witnesses below.
+func (s *CallbackStore) beginCloseIntentLocked(
+	candidate closeIntentCandidate,
+) (CloseIntentAdmission, error) {
+	return s.beginCloseIntentWithAuthorityLocked(
+		candidate, directCloseIntentAdmissionAuthority{},
+	)
+}
+
+// beginCloseIntentAfterFailedSuccessorLocked consumes the store-bound proof
+// that the current Failed operation succeeded one exact still-active Release.
+// This keeps the exceptional lineage in its own transition type instead of
+// weakening the generic operation/close identity rule.
+func (s *CallbackStore) beginCloseIntentAfterFailedSuccessorLocked(
+	candidate closeIntentCandidate,
+	predecessor failedOperationOverRelease,
+) (CloseIntentAdmission, error) {
+	if predecessor.callbacks != s || predecessor.releases == nil {
+		return CloseIntentAdmission{}, errors.New(
+			"failed-successor close authority belongs to another journal pair",
+		)
+	}
+	return s.beginCloseIntentWithAuthorityLocked(
+		candidate,
+		failedSuccessorCloseIntentAdmissionAuthority{predecessor: predecessor},
+	)
+}
+
+// beginCleanupCloseAfterFailedOperationLocked consumes exact Failed-head plus
+// Release-absence authority. The distinct admission type cannot be routed into
+// a projected close, retention, or a terminal-operation lineage transition.
+func (s *CallbackStore) beginCleanupCloseAfterFailedOperationLocked(
+	candidate closeIntentCandidate,
+	absence failedOperationWithoutRelease,
+) (CloseIntentAdmission, error) {
+	if absence.callbacks != s || absence.releases == nil {
+		return CloseIntentAdmission{}, errors.New(
+			"failed-operation cleanup authority belongs to another journal pair",
+		)
+	}
+	return s.beginCloseIntentWithAuthorityLocked(
+		candidate,
+		failedWithoutReleaseCleanupCloseIntentAdmissionAuthority{absence: absence},
+	)
+}
+
+func (s *CallbackStore) beginCloseIntentWithAuthorityLocked(
+	candidate closeIntentCandidate,
+	authority closeIntentAdmissionAuthority,
+) (CloseIntentAdmission, error) {
+	if candidate.issuer != s && (candidate.issuer != nil || s == nil ||
+		s.boltStore == nil || s.binding != nil) {
+		return CloseIntentAdmission{}, errors.New(
+			"close intent candidate was not minted by this callback journal",
+		)
+	}
+	if err := validateCloseIntentCandidate(candidate); err != nil {
 		return CloseIntentAdmission{}, err
 	}
+	spec := candidate.spec
 	entry := closeIntentEntry{
-		LeaseUUID:             spec.LeaseUUID,
-		Backend:               spec.Backend,
-		BackendStorageID:      spec.BackendStorageID.String(),
-		Tenant:                spec.Tenant,
-		ProviderUUID:          spec.ProviderUUID,
-		Items:                 slices.Clone(spec.Items),
-		ResourceProfiles:      CloneSKUResourceSnapshot(spec.ResourceProfiles),
-		Manifest:              bytes.Clone(spec.Manifest),
-		CallbackURL:           spec.CallbackURL,
-		LifecycleCallbackURL:  spec.LifecycleCallbackURL,
-		RetainOnClose:         spec.RetainOnClose,
-		CleanupOnly:           spec.CleanupOnly,
-		ActiveReleaseVersion:  spec.ActiveReleaseVersion,
-		ActiveReleaseDigest:   encodeCloseReleaseDigest(spec.ActiveReleaseDigest),
-		LegacyRollbackTargets: slices.Clone(spec.LegacyRollbackTargets),
+		LeaseUUID:                spec.LeaseUUID,
+		Backend:                  candidate.backend,
+		BackendStorageID:         candidate.storageID.String(),
+		Tenant:                   spec.Tenant,
+		ProviderUUID:             spec.ProviderUUID,
+		Items:                    slices.Clone(spec.Items),
+		ResourceProfiles:         CloneSKUResourceSnapshot(spec.ResourceProfiles),
+		Manifest:                 bytes.Clone(spec.Manifest),
+		CallbackURL:              spec.CallbackURL,
+		LifecycleCallbackURL:     spec.LifecycleCallbackURL,
+		RetainOnClose:            spec.RetainOnClose,
+		CleanupOnly:              spec.CleanupOnly,
+		ActiveReleaseVersion:     spec.ActiveReleaseVersion,
+		ActiveReleaseDigest:      encodeCloseReleaseDigest(spec.ActiveReleaseDigest),
+		ActiveReleaseOperationID: spec.ActiveReleaseOperationID,
 	}
 
-	unlock := s.lockDeliveryLease(entry.LeaseUUID)
-	defer unlock()
 	admission := CloseIntentAdmission{}
 	err := s.update(func(tx *bolt.Tx) error {
-		closeBucket := tx.Bucket(callbackCloseIntentBucketName)
-		if closeBucket == nil {
-			return fmt.Errorf("callback close intent bucket missing")
+		head, present, err := getLeaseMutationHeadTx(tx, entry.LeaseUUID)
+		if err != nil {
+			return err
 		}
-		operationBucket := tx.Bucket(callbackOperationIntentBucketName)
-		if operationBucket == nil {
-			return fmt.Errorf("callback operation intent bucket missing")
-		}
-		maintenanceBucket := tx.Bucket(callbackMaintenanceIntentBucketName)
-		if maintenanceBucket == nil {
-			return fmt.Errorf("callback maintenance intent bucket missing")
-		}
-		key := []byte(entry.LeaseUUID)
-		if closeBucket.Bucket(key) != nil {
-			return fmt.Errorf("callback close intent %q is a nested bucket", entry.LeaseUUID)
-		}
-		if current := closeBucket.Get(key); current != nil {
-			claim, decodeErr := decodeCloseIntent(key, current)
-			if decodeErr != nil {
-				return decodeErr
-			}
-			if operationBucket.Get(key) != nil || operationBucket.Bucket(key) != nil ||
-				maintenanceBucket.Get(key) != nil || maintenanceBucket.Bucket(key) != nil {
-				return fmt.Errorf("lease %q has a close intent overlapping earlier work", entry.LeaseUUID)
-			}
-			if !closeIntentEntryMatchesSpec(claim.entry, entry) {
+		if current, ok := head.(closeLeaseMutationHead); ok {
+			if !closeIntentEntryMatchesSpec(current.claim.entry, entry) {
 				return fmt.Errorf("%w for lease %q", ErrCloseIntentConflict, entry.LeaseUUID)
 			}
 			admission = CloseIntentAdmission{
-				Claim: claim, Disposition: CloseIntentAdmissionExisting,
+				claim: current.claim, disposition: CloseIntentAdmissionExisting,
 			}
 			return nil
+		}
+		if _, closed := head.(closedLeaseMutationHead); closed {
+			return fmt.Errorf("%w for lease %q: lease is permanently closed",
+				ErrCloseIntentConflict, entry.LeaseUUID)
 		}
 
 		intentID, err := uuid.NewRandom()
@@ -257,23 +371,15 @@ func (s *CallbackStore) BeginCloseIntent(spec CloseIntentSpec) (CloseIntentAdmis
 			return err
 		}
 
-		// Put the close row first so a callback insertion failure exercises the
-		// transaction's rollback in the safety-critical direction as well.
-		if err := closeBucket.Put(key, data); err != nil {
-			return err
+		claim, decodeErr := decodeCloseIntent([]byte(entry.LeaseUUID), data)
+		if decodeErr != nil {
+			return decodeErr
 		}
-
-		if operationBucket.Bucket(key) != nil {
-			return fmt.Errorf("callback operation intent %q is a nested bucket", entry.LeaseUUID)
-		}
-		if operationBucket.Get(key) != nil && maintenanceBucket.Get(key) != nil {
-			return fmt.Errorf("lease %q has simultaneous operation and maintenance intents", entry.LeaseUUID)
-		}
-		if current := operationBucket.Get(key); current != nil {
-			operationClaim, decodeErr := decodeOperationIntent(key, current)
-			if decodeErr != nil {
-				return decodeErr
-			}
+		var transition leaseMutationTransition
+		var transitionErr error
+		switch current := head.(type) {
+		case operationLeaseMutationHead:
+			operationClaim := current.claim
 			if operationClaim.Backend() != entry.Backend ||
 				operationClaim.BackendStorageID().String() != entry.BackendStorageID {
 				return fmt.Errorf(
@@ -281,37 +387,120 @@ func (s *CallbackStore) BeginCloseIntent(spec CloseIntentSpec) (CloseIntentAdmis
 					entry.LeaseUUID,
 				)
 			}
-			callback, callbackErr := callbackEntryForIntent(
-				*operationClaim.entry, backend.CallbackStatusFailed, closeIntentPreemptedOperation,
-			)
-			if callbackErr != nil {
-				return callbackErr
-			}
-			preemptedDeliveryID, idErr := uuid.NewRandom()
-			if idErr != nil {
-				return fmt.Errorf("allocate preempted operation callback delivery ID: %w", idErr)
-			}
-			callback.DeliveryID = preemptedDeliveryID.String()
-			if err := operationIntentMatchesCallback(*operationClaim.entry, callback); err != nil {
-				return err
-			}
-			if _, _, err := putCallbackEntryTx(tx, callback); err != nil {
-				return err
-			}
-			if err := operationBucket.Delete(key); err != nil {
-				return err
-			}
-			admission.OperationPreempted = true
-		}
+			var operationReceipt operationIntentEntry
+			switch admissionAuthority := authority.(type) {
+			case directCloseIntentAdmissionAuthority:
+				if operationClaim.entry.State != operationIntentPending {
+					if operationClaim.entry.State != operationIntentSucceeded ||
+						entry.ActiveReleaseVersion == 0 ||
+						operationClaim.OperationID() != entry.ActiveReleaseOperationID ||
+						(!entry.CleanupOnly && (operationClaim.Tenant() != entry.Tenant ||
+							operationClaim.ProviderUUID() != entry.ProviderUUID)) {
+						return fmt.Errorf(
+							"%w for lease %q: terminal operation does not match the close release lineage",
+							ErrCloseIntentConflict, entry.LeaseUUID,
+						)
+					}
+					operationReceipt = *operationClaim.entry
+					transition, transitionErr = newReplaceOperationWithCloseLeaseMutation(
+						operationClaim, operationReceipt, claim,
+					)
+					break
+				}
+				if !entry.CleanupOnly && (operationClaim.Tenant() != entry.Tenant ||
+					operationClaim.ProviderUUID() != entry.ProviderUUID) {
+					return fmt.Errorf(
+						"%w for lease %q: pending operation and close have different principal authority",
+						ErrCloseIntentConflict, entry.LeaseUUID,
+					)
+				}
+				callback := operationFailureCallbackEntry(
+					*operationClaim.entry, closeIntentPreemptedOperation,
+				)
+				preemptedDeliveryID, idErr := uuid.NewRandom()
+				if idErr != nil {
+					return fmt.Errorf("allocate preempted operation callback delivery ID: %w", idErr)
+				}
+				callback.DeliveryID = preemptedDeliveryID.String()
+				if err := operationIntentMatchesCallback(*operationClaim.entry, callback); err != nil {
+					return err
+				}
+				if _, _, err := putCallbackEntryTx(tx, callback); err != nil {
+					return err
+				}
+				terminal := *operationClaim.entry
+				terminal.State = operationIntentFailed
+				terminal.SettledAt = callback.CreatedAt
+				terminal.SettlementError = callback.Error
+				// This terminal value exists only as the receipt atomically
+				// consumed by the close transition. It never becomes a Failed
+				// operation head, so it cannot mint predecessor authority.
+				terminal.FailurePredecessor = operationFailurePredecessorRecord{
+					Kind: operationFailurePredecessorAbsent,
+				}
+				operationReceipt = terminal
+				admission.operationPreempted = true
+				transition, transitionErr = newReplaceOperationWithCloseLeaseMutation(
+					operationClaim, operationReceipt, claim,
+				)
 
-		if maintenanceBucket.Bucket(key) != nil {
-			return fmt.Errorf("callback maintenance intent %q is a nested bucket", entry.LeaseUUID)
-		}
-		if current := maintenanceBucket.Get(key); current != nil {
-			maintenanceClaim, decodeErr := decodeMaintenanceIntent(key, current)
-			if decodeErr != nil {
-				return decodeErr
+			case failedSuccessorCloseIntentAdmissionAuthority:
+				if operationClaim.entry.State != operationIntentFailed {
+					return fmt.Errorf(
+						"%w for lease %q: failed-successor authority does not match the current operation",
+						ErrCloseIntentConflict, entry.LeaseUUID,
+					)
+				}
+				operationReceipt = *operationClaim.entry
+				predecessor := ReleaseClaim{
+					issuer:    admissionAuthority.predecessor.releases,
+					leaseUUID: entry.LeaseUUID, version: entry.ActiveReleaseVersion,
+					digest: candidate.spec.ActiveReleaseDigest,
+				}
+				if !admissionAuthority.predecessor.validForHeadAndRelease(
+					s, admissionAuthority.predecessor.releases,
+					operationClaim, predecessor,
+				) {
+					return fmt.Errorf(
+						"%w for lease %q: failed operation does not seal the close release",
+						ErrCloseIntentConflict, entry.LeaseUUID,
+					)
+				}
+				transition, transitionErr = newReplaceFailedOperationWithCloseLeaseMutation(
+					operationClaim, admissionAuthority.predecessor,
+					operationReceipt, claim,
+				)
+
+			case failedWithoutReleaseCleanupCloseIntentAdmissionAuthority:
+				if operationClaim.entry.State != operationIntentFailed ||
+					!entry.CleanupOnly || entry.ActiveReleaseVersion != 0 ||
+					entry.ActiveReleaseDigest != "" ||
+					!entry.ActiveReleaseOperationID.IsZero() ||
+					!admissionAuthority.absence.validForHead(
+						s, admissionAuthority.absence.releases, operationClaim,
+					) {
+					return fmt.Errorf(
+						"%w for lease %q: failed-operation absence does not authorize this cleanup",
+						ErrCloseIntentConflict, entry.LeaseUUID,
+					)
+				}
+				operationReceipt = *operationClaim.entry
+				transition, transitionErr = newReplaceFailedOperationWithCloseLeaseMutation(
+					operationClaim, admissionAuthority.absence,
+					operationReceipt, claim,
+				)
+
+			default:
+				return fmt.Errorf("unsupported close admission authority %T", authority)
 			}
+		case maintenanceLeaseMutationHead:
+			if _, direct := authority.(directCloseIntentAdmissionAuthority); !direct {
+				return fmt.Errorf(
+					"%w for lease %q: derived operation authority no longer matches the callback head",
+					ErrCloseIntentConflict, entry.LeaseUUID,
+				)
+			}
+			maintenanceClaim := current.claim
 			if maintenanceClaim.Backend() != entry.Backend ||
 				maintenanceClaim.BackendStorageID().String() != entry.BackendStorageID {
 				return fmt.Errorf(
@@ -327,10 +516,11 @@ func (s *CallbackStore) BeginCloseIntent(spec CloseIntentSpec) (CloseIntentAdmis
 					entry.LeaseUUID,
 				)
 			}
-			if entry.Tenant != maintenanceClaim.Tenant() ||
-				entry.ProviderUUID != maintenanceClaim.ProviderUUID() {
+			if (!entry.CleanupOnly && (entry.Tenant != maintenanceClaim.Tenant() ||
+				entry.ProviderUUID != maintenanceClaim.ProviderUUID())) ||
+				entry.ActiveReleaseOperationID != maintenanceClaim.TargetRelease().OperationID {
 				return fmt.Errorf(
-					"maintenance and close intents have different tenant or provider authority for lease %q",
+					"maintenance and close intents have different release lineage or principal authority for lease %q",
 					entry.LeaseUUID,
 				)
 			}
@@ -347,28 +537,46 @@ func (s *CallbackStore) BeginCloseIntent(spec CloseIntentSpec) (CloseIntentAdmis
 			if err := validateNewCallbackEntry(callback, time.Now()); err != nil {
 				return err
 			}
-			if _, _, err := putCallbackEntryTx(tx, callback); err != nil {
+			storedCallback, _, err := putCallbackEntryTx(tx, callback)
+			if err != nil {
 				return err
 			}
-			if err := maintenanceBucket.Delete(key); err != nil {
-				return err
+			receipt := maintenanceCompletionRecordFor(
+				maintenanceClaim, callback.Status, callback.Error, callback.CreatedAt,
+				storedCallback.Sequence,
+			)
+			transition, transitionErr = newReplaceMaintenanceWithCloseLeaseMutation(
+				maintenanceClaim, receipt, claim,
+			)
+			admission.maintenancePreempted = true
+		default:
+			if _, direct := authority.(directCloseIntentAdmissionAuthority); !direct {
+				return fmt.Errorf(
+					"%w for lease %q: derived operation authority no longer matches the callback head",
+					ErrCloseIntentConflict, entry.LeaseUUID,
+				)
 			}
-			admission.MaintenancePreempted = true
+			if present {
+				return fmt.Errorf("unsupported callback lease mutation head %T", head)
+			}
+			transition, transitionErr = newPublishCloseLeaseMutation(claim)
 		}
-
-		claim, decodeErr := decodeCloseIntent(key, data)
-		if decodeErr != nil {
-			return decodeErr
+		if transitionErr != nil {
+			return transitionErr
 		}
-		admission.Claim = claim
-		admission.Disposition = CloseIntentAdmissionCreated
+		written, transitionErr := applyLeaseMutationTx(tx, transition)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		admission.claim = written.(closeLeaseMutationHead).claim
+		admission.disposition = CloseIntentAdmissionCreated
 		return nil
 	})
 	if err != nil {
 		return CloseIntentAdmission{}, err
 	}
-	if admission.OperationPreempted || admission.MaintenancePreempted {
-		s.notifyReplaySubscribers()
+	if admission.operationPreempted || admission.maintenancePreempted {
+		s.notifyReplayCommit(candidate.spec.LeaseUUID)
 	}
 	return admission, nil
 }
@@ -376,54 +584,58 @@ func (s *CallbackStore) BeginCloseIntent(spec CloseIntentSpec) (CloseIntentAdmis
 // GetCloseIntent returns the current exact close capability for leaseUUID.
 // Absence is reported as (zero, false, nil). The returned digest is a snapshot;
 // a concurrent/refreshed mutation makes it safely stale.
-func (s *CallbackStore) GetCloseIntent(leaseUUID string) (CloseIntentClaim, bool, error) {
+func (s *CallbackStore) getCloseIntentLocked(leaseUUID string) (CloseIntentClaim, bool, error) {
 	if err := validateCanonicalLeaseUUID(leaseUUID); err != nil {
 		return CloseIntentClaim{}, false, err
 	}
-	unlock := s.lockDeliveryLease(leaseUUID)
-	defer unlock()
 	var claim CloseIntentClaim
 	found := false
 	err := s.view(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(callbackCloseIntentBucketName)
-		if bucket == nil {
-			return fmt.Errorf("callback close intent bucket missing")
+		head, present, err := getLeaseMutationHeadTx(tx, leaseUUID)
+		if err != nil || !present {
+			return err
 		}
-		key := []byte(leaseUUID)
-		if bucket.Bucket(key) != nil {
-			return fmt.Errorf("callback close intent %q is a nested bucket", leaseUUID)
-		}
-		value := bucket.Get(key)
-		if value == nil {
+		close, ok := head.(closeLeaseMutationHead)
+		if !ok {
 			return nil
 		}
-		var decodeErr error
-		claim, decodeErr = decodeCloseIntent(key, value)
-		found = decodeErr == nil
-		return decodeErr
+		claim = close.claim
+		found = true
+		return nil
 	})
 	return claim, found, err
+}
+
+// GetCloseIntent is a read-only diagnostic snapshot. The returned value is
+// deliberately not bound to a CloseSettlement and therefore cannot authorize
+// cleanup progress, release retirement, or terminal settlement.
+func (s *CallbackStore) GetCloseIntent(leaseUUID string) (CloseIntentClaim, bool, error) {
+	unlock := s.lockDeliveryLease(leaseUUID)
+	defer unlock()
+	return s.getCloseIntentLocked(leaseUUID)
 }
 
 // ListCloseIntents returns durable recovery capabilities in deterministic
 // canonical lease order. Close intents never expire: they are the sole causal
 // authority for destructive cleanup after a crash.
-func (s *CallbackStore) ListCloseIntents() ([]CloseIntentClaim, error) {
+func (s *CallbackStore) listCloseIntents() ([]CloseIntentClaim, error) {
 	var claims []CloseIntentClaim
 	err := s.view(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(callbackCloseIntentBucketName)
+		bucket := tx.Bucket(callbackLeaseMutationHeadBucketName)
 		if bucket == nil {
-			return fmt.Errorf("callback close intent bucket missing")
+			return fmt.Errorf("callback lease mutation head bucket missing")
 		}
 		return bucket.ForEach(func(key, value []byte) error {
 			if value == nil {
-				return fmt.Errorf("callback close intent %q is a nested bucket", key)
+				return fmt.Errorf("callback lease mutation head %q is a nested bucket", key)
 			}
-			claim, err := decodeCloseIntent(key, value)
+			head, err := decodeLeaseMutationHead(key, value)
 			if err != nil {
 				return err
 			}
-			claims = append(claims, claim)
+			if close, ok := head.(closeLeaseMutationHead); ok {
+				claims = append(claims, close.claim)
+			}
 			return nil
 		})
 	})
@@ -436,37 +648,49 @@ func (s *CallbackStore) ListCloseIntents() ([]CloseIntentClaim, error) {
 	return claims, nil
 }
 
-// IncrementCloseCleanupAttempts atomically persists one cleanup attempt and
-// returns the only claim current enough to resolve or increment again. A stale
-// copied claim cannot overwrite this counter or reset a restart budget.
-func (s *CallbackStore) IncrementCloseCleanupAttempts(
+// ListCloseIntents returns read-only diagnostic snapshots. Recovery code that
+// needs usable capabilities must call CloseSettlement.ListCloseIntents.
+func (s *CallbackStore) ListCloseIntents() ([]CloseIntentClaim, error) {
+	return s.listCloseIntents()
+}
+
+// advanceCloseExecutionGenerationLocked atomically persists the next Started
+// generation and returns the only claim current enough to execute or settle it.
+// A stale copied claim cannot overwrite this monotonic causal boundary.
+func (s *CallbackStore) advanceCloseExecutionGenerationLocked(
 	claim CloseIntentClaim,
 ) (CloseIntentClaim, error) {
 	if err := validateCloseIntentClaim(claim); err != nil {
 		return CloseIntentClaim{}, err
 	}
-	unlock := s.lockDeliveryLease(claim.LeaseUUID())
-	defer unlock()
 	var refreshed CloseIntentClaim
 	err := s.update(func(tx *bolt.Tx) error {
 		if err := verifyCloseIntentTx(tx, claim); err != nil {
 			return err
 		}
-		if claim.entry.CleanupAttempts == math.MaxInt {
-			return fmt.Errorf("callback close intent cleanup-attempt counter exhausted")
+		if claim.entry.ExecutionGeneration == math.MaxInt {
+			return fmt.Errorf("callback close intent execution-generation counter exhausted")
 		}
 		entry := cloneCloseIntentEntry(claim.entry)
-		entry.CleanupAttempts++
+		entry.ExecutionGeneration++
 		data, err := marshalCloseIntent(entry)
 		if err != nil {
 			return err
 		}
-		bucket := tx.Bucket(callbackCloseIntentBucketName)
-		if err := bucket.Put([]byte(entry.LeaseUUID), data); err != nil {
+		candidate, err := decodeCloseIntent([]byte(entry.LeaseUUID), data)
+		if err != nil {
 			return err
 		}
-		refreshed, err = decodeCloseIntent([]byte(entry.LeaseUUID), data)
-		return err
+		transition, err := newAdvanceCloseLeaseMutation(claim, candidate)
+		if err != nil {
+			return err
+		}
+		written, err := applyLeaseMutationTx(tx, transition)
+		if err != nil {
+			return err
+		}
+		refreshed = written.(closeLeaseMutationHead).claim
+		return nil
 	})
 	if err != nil {
 		return CloseIntentClaim{}, err
@@ -474,32 +698,34 @@ func (s *CallbackStore) IncrementCloseCleanupAttempts(
 	return refreshed, nil
 }
 
-// ResolveCloseIntent atomically removes one precise close and enqueues its
-// terminal lifecycle observation. Callbackless legacy closes delete only the
-// intent. Failed and deprovisioned are the only valid close outcomes.
-func (s *CallbackStore) ResolveCloseIntent(
+// resolveCloseIntentLocked atomically advances one precise close and enqueues its
+// lifecycle observation. The exact destroyed or retained outcome replaces
+// cleanup authority with an immutable, indefinite closed-lease head.
+// Incomplete or ambiguous work never reaches this function, so it necessarily
+// retains the close head. Callbackless closes omit only the callback, never the
+// fence.
+func (s *CallbackStore) resolveCloseIntentLocked(
 	claim CloseIntentClaim,
-	status backend.CallbackStatus,
+	outcome closeCompletion,
 	errMsg string,
-	retained bool,
 ) (CallbackEntry, error) {
 	if err := validateCloseIntentClaim(claim); err != nil {
 		return CallbackEntry{}, err
 	}
-	switch status {
-	case backend.CallbackStatusFailed:
-		if retained {
-			return CallbackEntry{}, fmt.Errorf("failed close callback cannot be retained")
-		}
-	case backend.CallbackStatusDeprovisioned:
-		if retained && !claim.RetainOnClose() {
-			return CallbackEntry{}, fmt.Errorf("close callback cannot retain an unretained close")
-		}
+	var status backend.CallbackStatus
+	retained := false
+	switch outcome {
+	case closeCompletionDestroyed:
+		status = backend.CallbackStatusDeprovisioned
+	case closeCompletionRetained:
+		status = backend.CallbackStatusDeprovisioned
+		retained = true
 	default:
-		return CallbackEntry{}, fmt.Errorf("close intent has invalid completion status %q", status)
+		return CallbackEntry{}, errors.New("close intent has invalid private completion")
 	}
 
 	callbackless := claim.CallbackURL() == "" && claim.LifecycleCallbackURL() == ""
+	settledAt := time.Now()
 	var entry CallbackEntry
 	if !callbackless {
 		deliveryID, err := uuid.NewRandom()
@@ -511,21 +737,18 @@ func (s *CallbackStore) ResolveCloseIntent(
 			LeaseUUID:        claim.LeaseUUID(),
 			CallbackURL:      claim.LifecycleCallbackURL(),
 			DeliveryKind:     CallbackDeliveryKindLifecycle,
-			Success:          status != backend.CallbackStatusFailed,
 			Status:           status,
 			Backend:          claim.Backend(),
 			BackendStorageID: claim.BackendStorageID().String(),
 			Error:            errMsg,
 			Retained:         retained,
-			CreatedAt:        time.Now(),
+			CreatedAt:        settledAt,
 		}
-		if err := validateNewCallbackEntry(entry, time.Now()); err != nil {
+		if err := validateNewCallbackEntry(entry, settledAt); err != nil {
 			return CallbackEntry{}, err
 		}
 	}
 
-	unlock := s.lockDeliveryLease(claim.LeaseUUID())
-	defer unlock()
 	var data []byte
 	err := s.update(func(tx *bolt.Tx) error {
 		if err := verifyCloseIntentTx(tx, claim); err != nil {
@@ -538,7 +761,18 @@ func (s *CallbackStore) ResolveCloseIntent(
 				return err
 			}
 		}
-		return tx.Bucket(callbackCloseIntentBucketName).Delete([]byte(claim.LeaseUUID()))
+		var transition leaseMutationTransition
+		var transitionErr error
+		closed, err := newClosedLeaseMutationHead(claim, settledAt)
+		if err != nil {
+			return err
+		}
+		transition, transitionErr = newCompleteCloseLeaseMutation(claim, closed)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		_, err = applyLeaseMutationTx(tx, transition)
+		return err
 	})
 	if err != nil {
 		return CallbackEntry{}, err
@@ -551,27 +785,27 @@ func (s *CallbackStore) ResolveCloseIntent(
 	entry.storageDeliveryID = entry.DeliveryID
 	entry.storageKey = string(callbackSequenceKey(entry.Sequence))
 	entry.storageDigest = sha256.Sum256(data)
-	s.notifyReplaySubscribers()
+	s.notifyReplayCommit(entry.LeaseUUID)
 	return entry, nil
 }
 
-func validateCloseIntentSpec(spec CloseIntentSpec) error {
+func validateCloseIntentCandidate(candidate closeIntentCandidate) error {
+	if err := backendname.Validate(candidate.backend); err != nil {
+		return fmt.Errorf("callback close intent backend: %w", err)
+	}
+	if !candidate.storageID.Valid() {
+		return fmt.Errorf("callback close intent requires a valid backend storage identity")
+	}
+	return validateCloseIntentSpec(candidate.spec)
+}
+
+func validateCloseIntentSpec(spec closeIntentSpec) error {
 	if err := validateCanonicalLeaseUUID(spec.LeaseUUID); err != nil {
 		return err
 	}
-	if err := backendname.Validate(spec.Backend); err != nil {
-		return fmt.Errorf("callback close intent backend: %w", err)
-	}
 	if spec.CleanupOnly {
-		if spec.Tenant != "" {
-			if err := validateCloseIntentIdentity("tenant", spec.Tenant); err != nil {
-				return err
-			}
-		}
-		if spec.ProviderUUID != "" {
-			if err := validateCloseIntentIdentity("provider", spec.ProviderUUID); err != nil {
-				return err
-			}
+		if spec.Tenant != "" || spec.ProviderUUID != "" {
+			return fmt.Errorf("cleanup-only callback close intent cannot carry principal authority")
 		}
 		if spec.CallbackURL != "" || spec.LifecycleCallbackURL != "" {
 			return fmt.Errorf("cleanup-only callback close intent cannot carry a callback pair")
@@ -586,9 +820,6 @@ func validateCloseIntentSpec(spec CloseIntentSpec) error {
 		if err := validateCloseIntentIdentity("provider", spec.ProviderUUID); err != nil {
 			return err
 		}
-	}
-	if !spec.BackendStorageID.Valid() {
-		return fmt.Errorf("callback close intent requires a valid backend storage identity")
 	}
 	if len(spec.Items) == 0 {
 		return fmt.Errorf("callback close intent requires lease items")
@@ -658,35 +889,21 @@ func validateCloseIntentSpec(spec CloseIntentSpec) error {
 	case spec.ActiveReleaseVersion > 0 && spec.ActiveReleaseDigest == ([sha256.Size]byte{}):
 		return fmt.Errorf("callback close intent release fence must be wholly absent or wholly present")
 	}
-	if spec.CleanupOnly && spec.ActiveReleaseVersion == 0 {
-		return fmt.Errorf("cleanup-only callback close intent requires an active release fence")
+	if !spec.ActiveReleaseOperationID.IsZero() && !spec.ActiveReleaseOperationID.Valid() {
+		return errors.New("callback close intent active release operation ID must be a canonical UUIDv4")
 	}
-	if spec.ActiveReleaseVersion == 0 && len(spec.LegacyRollbackTargets) != 0 {
-		return fmt.Errorf("callback close intent rollback targets require an active release fence")
+	if spec.ActiveReleaseVersion == 0 && !spec.ActiveReleaseOperationID.IsZero() {
+		return errors.New("callback close intent operation lineage requires an active release fence")
 	}
-	if len(spec.LegacyRollbackTargets) > backend.MaxOperationQuantity {
-		return fmt.Errorf(
-			"callback close intent has %d rollback targets; maximum is %d",
-			len(spec.LegacyRollbackTargets), backend.MaxOperationQuantity,
-		)
-	}
-	seenContainerIDs := make(map[string]struct{}, len(spec.LegacyRollbackTargets))
-	seenNames := make(map[string]struct{}, len(spec.LegacyRollbackTargets))
-	for i, target := range spec.LegacyRollbackTargets {
-		if err := validateCloseRollbackTargetValue(i, "container ID", target.ContainerID); err != nil {
+	if spec.ActiveReleaseVersion > 0 && spec.CallbackURL != "" &&
+		!spec.ActiveReleaseOperationID.IsZero() {
+		operationID, err := parseOperationCallbackID(spec.CallbackURL)
+		if err != nil {
 			return err
 		}
-		if err := validateCloseRollbackTargetValue(i, "name", target.Name); err != nil {
-			return err
+		if operationID != spec.ActiveReleaseOperationID {
+			return errors.New("callback close intent callback does not match active release operation lineage")
 		}
-		if _, exists := seenContainerIDs[target.ContainerID]; exists {
-			return fmt.Errorf("callback close intent rollback container ID %q is duplicated", target.ContainerID)
-		}
-		if _, exists := seenNames[target.Name]; exists {
-			return fmt.Errorf("callback close intent rollback name %q is duplicated", target.Name)
-		}
-		seenContainerIDs[target.ContainerID] = struct{}{}
-		seenNames[target.Name] = struct{}{}
 	}
 	return nil
 }
@@ -706,25 +923,27 @@ func validateCloseIntentEntry(entry closeIntentEntry, leaseUUID string) error {
 	if err != nil {
 		return err
 	}
-	if entry.CleanupAttempts < 0 {
-		return fmt.Errorf("callback close intent cleanup attempts cannot be negative")
+	if entry.ExecutionGeneration < 0 {
+		return fmt.Errorf("callback close intent execution generation cannot be negative")
 	}
-	if err := validateCloseIntentSpec(CloseIntentSpec{
-		LeaseUUID:             entry.LeaseUUID,
-		Backend:               entry.Backend,
-		BackendStorageID:      storageID,
-		Tenant:                entry.Tenant,
-		ProviderUUID:          entry.ProviderUUID,
-		Items:                 entry.Items,
-		ResourceProfiles:      entry.ResourceProfiles,
-		Manifest:              entry.Manifest,
-		CallbackURL:           entry.CallbackURL,
-		LifecycleCallbackURL:  entry.LifecycleCallbackURL,
-		RetainOnClose:         entry.RetainOnClose,
-		CleanupOnly:           entry.CleanupOnly,
-		ActiveReleaseVersion:  entry.ActiveReleaseVersion,
-		ActiveReleaseDigest:   activeDigest,
-		LegacyRollbackTargets: entry.LegacyRollbackTargets,
+	if err := validateCloseIntentCandidate(closeIntentCandidate{
+		spec: closeIntentSpec{
+			LeaseUUID:                entry.LeaseUUID,
+			Tenant:                   entry.Tenant,
+			ProviderUUID:             entry.ProviderUUID,
+			Items:                    entry.Items,
+			ResourceProfiles:         entry.ResourceProfiles,
+			Manifest:                 entry.Manifest,
+			CallbackURL:              entry.CallbackURL,
+			LifecycleCallbackURL:     entry.LifecycleCallbackURL,
+			RetainOnClose:            entry.RetainOnClose,
+			CleanupOnly:              entry.CleanupOnly,
+			ActiveReleaseVersion:     entry.ActiveReleaseVersion,
+			ActiveReleaseDigest:      activeDigest,
+			ActiveReleaseOperationID: entry.ActiveReleaseOperationID,
+		},
+		backend:   entry.Backend,
+		storageID: storageID,
 	}); err != nil {
 		return err
 	}
@@ -748,12 +967,18 @@ func validateCloseIntentClaim(claim CloseIntentClaim) error {
 }
 
 func decodeCloseIntent(key, value []byte) (CloseIntentClaim, error) {
-	if err := validateUniqueJSONObject(value, maxCloseIntentEntryBytes); err != nil {
+	var entry closeIntentEntry
+	if err := decodeStrictAuthoritativeObject(value, maxCloseIntentEntryBytes, &entry); err != nil {
 		return CloseIntentClaim{}, fmt.Errorf("decode callback close intent %q: %w", key, err)
 	}
-	var entry closeIntentEntry
-	if err := json.Unmarshal(value, &entry); err != nil {
-		return CloseIntentClaim{}, fmt.Errorf("decode callback close intent %q: %w", key, err)
+	if entry.ActiveReleaseOperationID.IsZero() && entry.ActiveReleaseVersion > 0 && entry.CallbackURL != "" {
+		// Compatibility with close rows written before the active release's
+		// operation lineage was stored separately from its callback pair.
+		operationID, err := parseOperationCallbackID(entry.CallbackURL)
+		if err != nil {
+			return CloseIntentClaim{}, fmt.Errorf("decode callback close intent %q lineage: %w", key, err)
+		}
+		entry.ActiveReleaseOperationID = operationID
 	}
 	if err := validateCloseIntentEntry(entry, string(key)); err != nil {
 		return CloseIntentClaim{}, fmt.Errorf("invalid callback close intent %q: %w", key, err)
@@ -783,43 +1008,28 @@ func marshalCloseIntent(entry closeIntentEntry) ([]byte, error) {
 }
 
 func verifyCloseIntentTx(tx *bolt.Tx, claim CloseIntentClaim) error {
-	bucket := tx.Bucket(callbackCloseIntentBucketName)
-	if bucket == nil {
-		return fmt.Errorf("callback close intent bucket missing")
+	head, present, err := getLeaseMutationHeadTx(tx, claim.LeaseUUID())
+	if err != nil {
+		return err
 	}
-	key := []byte(claim.LeaseUUID())
-	if bucket.Bucket(key) != nil {
-		return fmt.Errorf("callback close intent %q is a nested bucket", claim.LeaseUUID())
-	}
-	current := bucket.Get(key)
-	if current == nil {
+	if !present {
 		return fmt.Errorf("callback close intent no longer exists for lease %q", claim.LeaseUUID())
 	}
-	if sha256.Sum256(current) != claim.digest {
+	close, ok := head.(closeLeaseMutationHead)
+	if !ok {
+		return fmt.Errorf("callback close intent for lease %q was replaced by %q",
+			claim.LeaseUUID(), head.headKind())
+	}
+	if close.claim.digest != claim.digest {
 		return fmt.Errorf("callback close intent changed before precise mutation")
 	}
 	return nil
 }
 
-// rejectOperationWhileClosingTx is the shared admission fence for new
-// operation intents and late operation completions. Callers already hold the
-// per-lease journal-mutation lock; keeping the durable check in their bbolt
-// transaction prevents either path from recreating operation authority after
-// close won.
-func rejectOperationWhileClosingTx(tx *bolt.Tx, leaseUUID string) error {
-	bucket := tx.Bucket(callbackCloseIntentBucketName)
-	if bucket == nil {
-		return fmt.Errorf("callback close intent bucket missing")
-	}
-	key := []byte(leaseUUID)
-	if bucket.Bucket(key) != nil {
-		return fmt.Errorf("callback close intent %q is a nested bucket", leaseUUID)
-	}
-	if bucket.Get(key) != nil {
-		return fmt.Errorf("%w for lease %q: close is already admitted",
-			ErrOperationIntentConflict, leaseUUID)
-	}
-	return nil
+// requireCloseIntent re-attests one exact close while its settlement owns the
+// per-lease transition gate.
+func (s *CallbackStore) requireCloseIntent(claim CloseIntentClaim) error {
+	return s.view(func(tx *bolt.Tx) error { return verifyCloseIntentTx(tx, claim) })
 }
 
 func closeIntentEntryMatchesSpec(left, right closeIntentEntry) bool {
@@ -837,14 +1047,13 @@ func closeIntentEntryMatchesSpec(left, right closeIntentEntry) bool {
 		left.CleanupOnly == right.CleanupOnly &&
 		left.ActiveReleaseVersion == right.ActiveReleaseVersion &&
 		left.ActiveReleaseDigest == right.ActiveReleaseDigest &&
-		slices.Equal(left.LegacyRollbackTargets, right.LegacyRollbackTargets)
+		left.ActiveReleaseOperationID == right.ActiveReleaseOperationID
 }
 
 func cloneCloseIntentEntry(entry closeIntentEntry) closeIntentEntry {
 	entry.Items = slices.Clone(entry.Items)
 	entry.ResourceProfiles = CloneSKUResourceSnapshot(entry.ResourceProfiles)
 	entry.Manifest = bytes.Clone(entry.Manifest)
-	entry.LegacyRollbackTargets = slices.Clone(entry.LegacyRollbackTargets)
 	return entry
 }
 
@@ -897,17 +1106,17 @@ func validateCloseIntentIdentity(label, value string) error {
 	return nil
 }
 
-func validateCloseRollbackTargetValue(index int, label, value string) error {
+func validateClosePhysicalName(index int, label, value string) error {
 	if strings.TrimSpace(value) == "" {
 		return fmt.Errorf("callback close intent rollback target %d requires %s", index, label)
 	}
 	if strings.TrimSpace(value) != value {
 		return fmt.Errorf("callback close intent rollback target %d %s has surrounding whitespace", index, label)
 	}
-	if len(value) > maxCloseRollbackTargetBytes || !utf8.ValidString(value) {
+	if len(value) > maxClosePhysicalNameBytes || !utf8.ValidString(value) {
 		return fmt.Errorf(
 			"callback close intent rollback target %d %s is invalid or exceeds %d bytes",
-			index, label, maxCloseRollbackTargetBytes,
+			index, label, maxClosePhysicalNameBytes,
 		)
 	}
 	for _, character := range value {

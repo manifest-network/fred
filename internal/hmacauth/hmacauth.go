@@ -69,15 +69,126 @@
 package hmacauth
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// VerifiedRequest is immutable evidence that one exact HTTP request envelope
+// passed HMAC verification. Its zero value is invalid and its fields are
+// deliberately private: application code can inspect a verified request but
+// cannot manufacture one from an already-decoded DTO.
+//
+// route identifies the key selected before verification (for example a
+// backend storage lineage). Binding it into the proof prevents a caller from
+// authenticating with one key and later attributing the same bytes to another
+// key route.
+type VerifiedRequest struct {
+	method  string
+	uri     string
+	body    []byte
+	route   string
+	issuer  *callbackProofIssuer
+	purpose verifiedRequestPurpose
+}
+
+var (
+	_ fmt.Formatter  = VerifiedRequest{}
+	_ slog.LogValuer = VerifiedRequest{}
+)
+
+const verifiedRequestDiagnostic = "hmacauth.VerifiedRequest{redacted}"
+
+// Format prevents generic formatting, including reflective %+v and %#v
+// formatting, from exposing the authenticated URI, body, or selected key
+// route. Explicit accessors remain available to the narrowly scoped consumer.
+func (request VerifiedRequest) Format(state fmt.State, _ rune) {
+	_, _ = state.Write([]byte(verifiedRequestDiagnostic))
+}
+
+// LogValue keeps structured logging on the same redacted representation as
+// generic formatting. In particular, slog must not reflect over private proof
+// fields when a proof is passed through slog.Any.
+func (request VerifiedRequest) LogValue() slog.Value {
+	return slog.StringValue(verifiedRequestDiagnostic)
+}
+
+// callbackProofIssuer is deliberately non-zero-sized. Go permits pointers to
+// distinct zero-sized allocations to compare equal, which would collapse two
+// independently constructed proof boundaries into one ambient authority.
+type callbackProofIssuer struct{ marker byte }
+
+// CallbackProofVerifier is the sole capability that can mint callback proof
+// for one process-local verification boundary. Its zero value is invalid.
+// The HMAC key remains owned by the API keyring; this capability binds a
+// successfully verified envelope to the exact settlement consumer assembled
+// beside it by the composition root.
+type CallbackProofVerifier struct {
+	issuer *callbackProofIssuer
+}
+
+// CallbackProofConsumer accepts proof minted by exactly one paired verifier.
+// It cannot verify a signature or mint proof itself, so giving it to the
+// settlement coordinator does not also give that coordinator ingress
+// authentication authority. Its zero value is invalid.
+type CallbackProofConsumer struct {
+	issuer *callbackProofIssuer
+}
+
+// NewCallbackProofBoundary constructs matched verifier and consumer
+// capabilities. Proof minted by any other boundary is rejected even when the
+// request bytes and HMAC secret are identical.
+func NewCallbackProofBoundary() (CallbackProofVerifier, CallbackProofConsumer) {
+	issuer := &callbackProofIssuer{marker: 1}
+	return CallbackProofVerifier{issuer: issuer}, CallbackProofConsumer{issuer: issuer}
+}
+
+// Valid reports whether the verifier belongs to a constructed boundary.
+func (verifier CallbackProofVerifier) Valid() bool { return verifier.issuer != nil }
+
+// Valid reports whether the consumer belongs to a constructed boundary.
+func (consumer CallbackProofConsumer) Valid() bool { return consumer.issuer != nil }
+
+// Accepts reports whether request was minted for this exact boundary.
+func (consumer CallbackProofConsumer) Accepts(request VerifiedRequest) bool {
+	return consumer.Valid() && request.ValidCallback() && request.issuer == consumer.issuer
+}
+
+type verifiedRequestPurpose uint8
+
+const verifiedPurposeCallback verifiedRequestPurpose = 1
+
+// Valid reports whether the request was minted by this package's verifier.
+func (request VerifiedRequest) Valid() bool {
+	return request.issuer != nil && request.method != "" &&
+		request.uri != ""
+}
+
+// Method returns the exact HMAC-covered HTTP method.
+func (request VerifiedRequest) Method() string { return request.method }
+
+// URI returns the exact HMAC-covered canonical request URI.
+func (request VerifiedRequest) URI() string { return request.uri }
+
+// KeyRoute returns the immutable route whose key authenticated this request.
+func (request VerifiedRequest) KeyRoute() string { return request.route }
+
+// Body returns a detached copy of the exact HMAC-covered body bytes.
+func (request VerifiedRequest) Body() []byte { return bytes.Clone(request.body) }
+
+// ValidCallback reports whether the proof was minted by the callback-specific
+// verifier after checking the exact configured callback path.
+func (request VerifiedRequest) ValidCallback() bool {
+	return request.Valid() && request.purpose == verifiedPurposeCallback
+}
 
 const (
 	// SignatureHeader is the HTTP header name for HMAC signatures.
@@ -170,30 +281,86 @@ func VerifyWithTime(
 	maxAge, clockSkew time.Duration,
 	now time.Time,
 ) error {
+	_, err := verifyRoutedWithTime(
+		secret, method, uri, body, signature, "", 0, maxAge, clockSkew, now,
+	)
+	return err
+}
+
+// VerifyRoutedWithTime verifies one callback request and, on success,
+// mints immutable evidence containing the exact signed envelope and selected
+// key route. callbackPath is the exact escaped path after applying any static
+// reverse-proxy prefix; a signature for another endpoint cannot be promoted to
+// callback authority.
+func (verifier CallbackProofVerifier) VerifyRoutedWithTime(
+	secret, method, uri string,
+	body []byte,
+	signature, route, callbackPath string,
+	maxAge, clockSkew time.Duration,
+	now time.Time,
+) (VerifiedRequest, error) {
+	if !verifier.Valid() {
+		return VerifiedRequest{}, fmt.Errorf("callback proof verifier is unavailable")
+	}
+	if method != http.MethodPost {
+		return VerifiedRequest{}, fmt.Errorf("callback method must be POST")
+	}
+	parsed, err := url.ParseRequestURI(uri)
+	if err != nil {
+		return VerifiedRequest{}, fmt.Errorf("invalid callback request URI: %w", err)
+	}
+	if callbackPath == "" || parsed.EscapedPath() != callbackPath {
+		return VerifiedRequest{}, fmt.Errorf("callback request path mismatch")
+	}
+	request, err := verifyRoutedWithTime(
+		secret, method, uri, body, signature, route, verifiedPurposeCallback,
+		maxAge, clockSkew, now,
+	)
+	if err != nil {
+		return VerifiedRequest{}, err
+	}
+	request.issuer = verifier.issuer
+	return request, nil
+}
+
+func verifyRoutedWithTime(
+	secret, method, uri string,
+	body []byte,
+	signature, route string,
+	purpose verifiedRequestPurpose,
+	maxAge, clockSkew time.Duration,
+	now time.Time,
+) (VerifiedRequest, error) {
 	timestamp, sigHex, ok := ParseSignature(signature)
 	if !ok {
-		return fmt.Errorf("invalid signature format: expected t=<timestamp>,sha256=<hex>")
+		return VerifiedRequest{}, fmt.Errorf("invalid signature format: expected t=<timestamp>,sha256=<hex>")
 	}
 
 	signedAt := time.Unix(timestamp, 0)
 	if now.Sub(signedAt) > maxAge {
-		return fmt.Errorf("signature expired: signed %v ago, max age is %v", now.Sub(signedAt).Round(time.Second), maxAge)
+		return VerifiedRequest{}, fmt.Errorf("signature expired: signed %v ago, max age is %v", now.Sub(signedAt).Round(time.Second), maxAge)
 	}
 	if signedAt.After(now.Add(clockSkew)) {
-		return fmt.Errorf("signature timestamp too far in future: %v ahead", signedAt.Sub(now).Round(time.Second))
+		return VerifiedRequest{}, fmt.Errorf("signature timestamp too far in future: %v ahead", signedAt.Sub(now).Round(time.Second))
 	}
 
 	providedSig, err := hex.DecodeString(sigHex)
 	if err != nil {
-		return fmt.Errorf("invalid signature encoding: %w", err)
+		return VerifiedRequest{}, fmt.Errorf("invalid signature encoding: %w", err)
 	}
 
 	expectedSig := ComputeMAC(secret, timestamp, method, uri, body)
 	if !hmac.Equal(providedSig, expectedSig) {
-		return fmt.Errorf("signature mismatch")
+		return VerifiedRequest{}, fmt.Errorf("signature mismatch")
 	}
 
-	return nil
+	return VerifiedRequest{
+		method:  method,
+		uri:     uri,
+		body:    bytes.Clone(body),
+		route:   route,
+		purpose: purpose,
+	}, nil
 }
 
 // --- *http.Request convenience wrappers ---------------------------------
@@ -216,11 +383,6 @@ func SignRequest(secret string, req *http.Request, body []byte) string {
 // The caller must read r.Body first and pass it; this wrapper does not
 // touch r.Body. Equivalent to
 // Verify(secret, r.Method, r.URL.RequestURI(), body, signature, maxAge).
-//
-// Note: (*api.CallbackAuthenticator).VerifyRequest has different
-// semantics — it reads the body itself before verifying. The names do
-// not collide at the type system level (different packages) but be
-// aware which one you are calling.
 func VerifyRequest(secret string, r *http.Request, body []byte, signature string, maxAge time.Duration) error {
 	return Verify(secret, r.Method, r.URL.RequestURI(), body, signature, maxAge)
 }

@@ -359,6 +359,17 @@ func (r *Router) GetBackendByName(name string) Backend {
 	return r.backendsByName[name]
 }
 
+// HasBackend reports whether name belongs to this immutable router topology.
+// It deliberately exposes no mutation-capable backend client, which makes it
+// suitable for observational consumers such as bounded metric-label filters.
+func (r *Router) HasBackend(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.backendsByName[name]
+	return ok
+}
+
 // BackendHealth represents the health status of a single backend.
 type BackendHealth struct {
 	Name    string `json:"name"`

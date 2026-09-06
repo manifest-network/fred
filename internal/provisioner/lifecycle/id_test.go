@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"encoding"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -31,7 +32,6 @@ func TestIDZeroValueIsInvalid(t *testing.T) {
 	text, err := id.MarshalText()
 	assert.ErrorIs(t, err, ErrInvalidID)
 	assert.Nil(t, text)
-	assert.Equal(t, ID{}, newID(uuid.Nil))
 }
 
 func TestParseIDAcceptsOnlyCanonicalUUIDv4(t *testing.T) {
@@ -87,6 +87,22 @@ func TestFromOperationIDRejectsInvalidSource(t *testing.T) {
 	id, err := FromOperationID(operation.OperationID{})
 	assert.ErrorIs(t, err, ErrInvalidID)
 	assert.False(t, id.Valid())
+}
+
+func TestIDDiagnosticFingerprintDoesNotExposeCapability(t *testing.T) {
+	id := mustTestID(t, canonicalTestID)
+	fingerprint := id.Fingerprint()
+	assert.Equal(t, "life_f7aefa02b22dfc3f4042008e", fingerprint)
+	assert.NotContains(t, id.LogValue().String(), id.String())
+	assert.Equal(t, "invalid", (ID{}).Fingerprint())
+	for _, formatted := range []string{
+		fmt.Sprint(id), fmt.Sprintf("%s", id), fmt.Sprintf("%q", id),
+		fmt.Sprintf("%v", id), fmt.Sprintf("%#v", id),
+		fmt.Errorf("lifecycle %s", id).Error(),
+	} {
+		assert.Contains(t, formatted, fingerprint)
+		assert.NotContains(t, formatted, canonicalTestID)
+	}
 }
 
 func TestIDImplementsTextMarshaler(t *testing.T) {

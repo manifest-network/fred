@@ -37,6 +37,39 @@ func (f *CommandFence) Lock(leaseUUID string) func() {
 	f.mu.Unlock()
 
 	entry.mu.Lock()
+	return f.unlockFunc(leaseUUID, entry)
+}
+
+// TryLock acquires leaseUUID only when doing so cannot wait. It is intended for
+// level-triggered background convergence: a live caller already owning the
+// command is authoritative, so recovery should defer that lease without
+// stalling unrelated work. The returned unlock function is idempotent.
+func (f *CommandFence) TryLock(leaseUUID string) (func(), bool) {
+	f.mu.Lock()
+	if f.entries == nil {
+		f.entries = make(map[string]*commandFenceEntry)
+	}
+	entry := f.entries[leaseUUID]
+	if entry == nil {
+		entry = &commandFenceEntry{}
+		f.entries[leaseUUID] = entry
+	}
+	entry.refs++
+	f.mu.Unlock()
+
+	if !entry.mu.TryLock() {
+		f.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 && f.entries[leaseUUID] == entry {
+			delete(f.entries, leaseUUID)
+		}
+		f.mu.Unlock()
+		return nil, false
+	}
+	return f.unlockFunc(leaseUUID, entry), true
+}
+
+func (f *CommandFence) unlockFunc(leaseUUID string, entry *commandFenceEntry) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {

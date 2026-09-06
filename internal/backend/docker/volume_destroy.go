@@ -14,12 +14,13 @@ package docker
 //
 // So ownership is resolved HERE, once, from the control plane — the live provision map
 // plus the retention store — and `Destroy` is deliberately absent from the
-// volumeManager interface the rest of the package holds, which makes
-// `b.volumes.Destroy(...)` a compile error everywhere else. Go has no file-level
-// visibility, so that stops the unchecked CALL, not the capability itself: another file
-// in this package could re-obtain it with the same type assertion. The forbidigo rule in
-// .golangci.yml (pattern `\.Destroy$`, excluded only for this file) is what closes that
-// half. (ENG-658)
+// volumeReader interface the rest of the package holds, which makes
+// `b.volumes.Destroy(...)` a compile error. Its closure-only read projection
+// cannot be asserted back to a writer, while Backend retains only opaque,
+// Started-subject executors and target-free background workflows. The raw
+// destroy sink therefore
+// cannot be recovered from Backend; this ownership choke point is the only
+// production caller of the guarded destroy operation. (ENG-658)
 
 import (
 	"context"
@@ -30,14 +31,16 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
-// volumeDestroyer is the destroy capability, split off volumeManager so no other call
-// site can reach it through b.volumes. It is obtained by assertion in volumeOp rather
-// than held as a second Backend field on purpose: ~150 tests assign b.volumes directly,
-// and a parallel field would silently keep pointing at the manager they replaced —
-// destroying through the wrong one. New asserts it once at startup so a
-// misconfiguration fails there rather than mid-reap (see assertVolumeDestroyer).
+// volumeDestroyer is the irreversible part of volumeMutationSink. Backend does
+// not retain it; settlement-bound Guards capture it at construction and
+// volumeOp can only request a guarded destroy after proving ownership.
 type volumeDestroyer interface {
 	Destroy(ctx context.Context, id string) error
+}
+
+type volumeDestroyMutationCapability interface {
+	destroyVolume(context.Context, string) error
+	canDestroyVolumes() bool
 }
 
 // claimKind records WHY a volume is spoken for. It never affects whether a destroy is
@@ -134,9 +137,8 @@ func claimPermits(claim volumeClaim, owner string) bool {
 func (b *Backend) snapshotVolumeClaims() (*volumeClaims, error) {
 	claims := &volumeClaims{byName: make(map[string]volumeClaim)}
 
-	// Live provisions. Deliberately calls canonicalVolumeName rather than formatting
-	// the name inline: cleanupOrphanedVolumes used to keep its own copy of that format
-	// string, which is precisely the kind of duplicate that drifts.
+	// Live provisions. Deliberately calls canonicalVolumeName rather than duplicating
+	// the storage identity format at this authority boundary.
 	b.provisionsMu.RLock()
 	for leaseUUID, prov := range b.provisions {
 		for _, item := range prov.Items {
@@ -180,10 +182,9 @@ func (b *Backend) snapshotVolumeClaims() (*volumeClaims, error) {
 			}
 		case shared.RetentionStatusReaping:
 			// No claim, deliberately. A reaping record is a scheduled DESTROY, not an
-			// assertion of ownership — claiming its names would make the finalizer
-			// unable to run its own tombstone. The names it carries are re-checked
-			// against this table at destroy time all the same (ENG-659), which is what
-			// stops a tombstone written before ENG-647 from naming live data.
+			// assertion of ownership — claiming its namespace would make the finalizer
+			// unable to run its own tombstone. A live provision in that namespace is
+			// independently represented above and still refuses cleanup.
 		}
 	}
 	return claims, nil
@@ -248,12 +249,6 @@ type destroyReport struct {
 	// Claimed: another lease owns these bytes. Not an error — the deliberate skip.
 	// They are still on disk, so their footprint must stay counted.
 	Claimed []string
-	// ClaimedBy records WHO owns each refused name. Callers need it because the claim
-	// kind decides how the refusal resolves, and therefore what an operator should do:
-	// a restore-held name clears itself when that restore rolls back, whereas a name a
-	// LIVE provision holds clears only when that lease is next closed. Reporting both as
-	// one reason sends the runbook's triage after a restore that does not exist.
-	ClaimedBy map[string]volumeClaim
 	// Unproven: ownership could not be established (the retention store could not be
 	// read, or the manager cannot destroy at all). Nothing was attempted.
 	Unproven []string
@@ -283,9 +278,9 @@ func (r destroyReport) err() error {
 
 // volumeOp is one logical operation's guarded access to volume destruction.
 //
-// owner is the lease asserting ownership; "" means no lease does, which is how the two
-// collectors (the startup orphan sweep and the retention finalizer) ask for "destroy
-// only what nothing claims". The claim table is resolved lazily and at most once per
+// owner is the lease asserting ownership; "" is reserved for an exact tombstone-backed
+// retention finalizer asking for "destroy only what nothing claims". There is no
+// unattributed-volume collector. The claim table is resolved lazily and at most once per
 // op, so a close pays one retention-store read no matter how many volumes it touches —
 // the same cost it paid before this existed.
 //
@@ -368,14 +363,18 @@ func (o *volumeOp) partition(candidates []string) (mine, foreign []string, err e
 // destroyReport), because "refused" and "failed" and "gone" lead to three different
 // decisions about pool reservations and record lifetimes. Call report.err() for the
 // collapsed view.
-func (o *volumeOp) destroy(ctx context.Context, site string, names ...string) destroyReport {
+func (o *volumeOp) destroy(
+	mutations volumeDestroyMutationCapability,
+	ctx context.Context,
+	site string,
+	names ...string,
+) destroyReport {
 	var rep destroyReport
 	if len(names) == 0 {
 		return rep
 	}
 
-	sink, ok := o.b.volumes.(volumeDestroyer)
-	if !ok {
+	if mutations == nil || !mutations.canDestroyVolumes() {
 		// Unreachable with any manager in this repo; see volumeDestroyer's doc. Refuse
 		// rather than panic — the safe reading of "I cannot destroy" is "I did not".
 		rep.Unproven = names
@@ -411,7 +410,7 @@ func (o *volumeOp) destroy(ctx context.Context, site string, names ...string) de
 			o.refuse(&rep, site, name, claim, "refusing to destroy a volume another lease owns")
 			continue
 		}
-		claim, refused, err := o.destroyOne(ctx, sink, name)
+		claim, refused, err := o.destroyOne(mutations, ctx, name)
 		if refused {
 			o.refuse(&rep, site, name, claim,
 				"refusing to destroy a volume a live provision claimed after the ownership snapshot")
@@ -437,7 +436,11 @@ func (o *volumeOp) destroy(ctx context.Context, site string, names ...string) de
 // re-provision that adopted the directory is seen rather than deleted out from under
 // (ENG-681). A provision that arrives entirely after this check still loses its bytes —
 // but that is the give-up's decision about abandoned data (ENG-676), not a torn read.
-func (o *volumeOp) destroyOne(ctx context.Context, sink volumeDestroyer, name string) (volumeClaim, bool, error) {
+func (o *volumeOp) destroyOne(
+	mutations volumeDestroyMutationCapability,
+	ctx context.Context,
+	name string,
+) (volumeClaim, bool, error) {
 	if isRetainedVolume(name) {
 		// Nothing creates a fred-retained- name — setupVolBinds only ever builds
 		// canonical ones — so there is no create to serialize against here, and no
@@ -445,7 +448,7 @@ func (o *volumeOp) destroyOne(ctx context.Context, sink volumeDestroyer, name st
 		// the stripe would only block an unrelated volume's create for the length of
 		// this RemoveAll, and this is the bulk path (evictOldest can pass 32 records'
 		// worth of retained names through a single close).
-		return volumeClaim{}, false, o.b.mutationAdapter().destroyVolume(ctx, sink, name)
+		return volumeClaim{}, false, mutations.destroyVolume(ctx, name)
 	}
 	mu := o.b.volumeNameMu(name)
 	mu.Lock()
@@ -453,7 +456,7 @@ func (o *volumeOp) destroyOne(ctx context.Context, sink volumeDestroyer, name st
 	if claim, claimed := o.b.liveClaim(name); claimed && !claimPermits(claim, o.owner) {
 		return claim, true, nil
 	}
-	return volumeClaim{}, false, o.b.mutationAdapter().destroyVolume(ctx, sink, name)
+	return volumeClaim{}, false, mutations.destroyVolume(ctx, name)
 }
 
 // refuse records one name left alone because ownership said no: the report bucket, the
@@ -463,10 +466,6 @@ func (o *volumeOp) destroyOne(ctx context.Context, sink volumeDestroyer, name st
 // operator reading the log cannot reconstruct afterwards.
 func (o *volumeOp) refuse(rep *destroyReport, site, name string, claim volumeClaim, why string) {
 	rep.Claimed = append(rep.Claimed, name)
-	if rep.ClaimedBy == nil {
-		rep.ClaimedBy = make(map[string]volumeClaim, 1)
-	}
-	rep.ClaimedBy[name] = claim
 	volumeDestroyRefusedTotal.WithLabelValues(site, destroyRefusedClaimed).Inc()
 	o.logger.Warn(why,
 		"site", site, "volume_id", name, "asking_lease_uuid", o.owner,

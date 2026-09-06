@@ -14,6 +14,7 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testsupport/placementstore"
@@ -47,11 +48,13 @@ func TestManager_RecoversAmbiguousProvisionCallbackAcrossRegistryAndStoreRestart
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			const (
-				leaseUUID    = "lease-ambiguous-restart"
+				leaseUUID    = "018f47a2-8b1c-7def-8123-456789abcde1"
 				providerUUID = placementstore.ProviderUUID
 				backendName  = "backend-a"
 			)
 			dbPath := filepath.Join(t.TempDir(), "placements.db")
+			callbackRoutes, err := placement.NewCallbackRouteFactory("https://fred.example.test")
+			require.NoError(t, err)
 			backendClient := &mockManagerBackend{
 				name:         backendName,
 				provisionErr: errors.New("connection reset after remote dispatch"),
@@ -98,16 +101,22 @@ func TestManager_RecoversAmbiguousProvisionCallbackAcrossRegistryAndStoreRestart
 				},
 			}
 
-			store1, err := placementstore.NewStore(dbPath)
+			store1, err := placementstore.NewStore(
+				dbPath, placement.WithCallbackRouteFactory(callbackRoutes),
+			)
 			require.NoError(t, err)
 			configureTestPlacementTopology(t, store1, []string{backendName})
 			manager1, err := NewManager(ManagerConfig{
-				ProviderUUID:    providerUUID,
-				CallbackBaseURL: "http://callback.example",
-				PlacementStore:  store1,
+				ProviderUUID:          providerUUID,
+				PlacementStore:        store1,
+				CallbackProofConsumer: callbackTestProofConsumer,
 			}, router, chainClient)
 			require.NoError(t, err)
 			armTestPlacementAdmission(t, store1, router)
+			bindTestReconciliationCoordinator(
+				t, store1, manager1.executionCoordinator,
+				chainClient, manager1.PayloadStore(), nil,
+			)
 			firstStartCtx, cancelFirstStart := context.WithCancel(context.Background())
 			firstStartErr := make(chan error, 1)
 			go func() { firstStartErr <- manager1.Start(firstStartCtx) }()
@@ -117,20 +126,21 @@ func TestManager_RecoversAmbiguousProvisionCallbackAcrossRegistryAndStoreRestart
 				t.Fatal("first manager did not start")
 			}
 
-			lease := &billingtypes.Lease{
-				Uuid: leaseUUID, ProviderUuid: providerUUID, Tenant: "tenant-a",
-				State: billingtypes.LEASE_STATE_PENDING,
-				Items: []billingtypes.LeaseItem{{SkuUuid: "sku-a", Quantity: 1}},
-			}
-			err = startTestProvisioning(
-				t, manager1.orchestrator, context.Background(), lease, ProvisionOpts{},
-			)
-			require.ErrorIs(t, err, ErrProvisioningFailed)
+			require.NoError(t, manager1.PublishLeaseEvent(chain.LeaseEvent{
+				Type: chain.LeaseCreated, LeaseUUID: leaseUUID,
+				ProviderUUID: providerUUID, Tenant: "tenant-a",
+			}))
+			require.Eventually(t, func() bool {
+				return store1.Lookup(leaseUUID).State() == placement.StateAttempting
+			}, 5*time.Second, 10*time.Millisecond,
+				"ambiguous backend outcome must preserve its durable attempt")
 			beforeRestart := store1.Lookup(leaseUUID)
 			require.Equal(t, placement.StateAttempting, beforeRestart.State())
 			require.True(t, beforeRestart.AttemptOperationID().Valid())
 			operationID := beforeRestart.AttemptOperationID()
-			assert.Zero(t, manager1.operations.Count(),
+			require.Eventually(t, func() bool {
+				return manager1.InFlightCount() == 0
+			}, 5*time.Second, 10*time.Millisecond,
 				"ambiguous return removes only the ephemeral operation record")
 			cancelFirstStart()
 			require.NoError(t, manager1.Close())
@@ -142,18 +152,19 @@ func TestManager_RecoversAmbiguousProvisionCallbackAcrossRegistryAndStoreRestart
 			}
 			require.NoError(t, store1.Close())
 
-			store2, err := placementstore.NewStore(dbPath)
+			store2, err := placementstore.NewStore(
+				dbPath, placement.WithCallbackRouteFactory(callbackRoutes),
+			)
 			require.NoError(t, err)
 			manager2, err := NewManager(ManagerConfig{
-				ProviderUUID:     providerUUID,
-				CallbackBaseURL:  "http://callback.example",
-				PlacementStore:   store2,
-				AckBatchInterval: time.Millisecond,
-				AckBatchSize:     1,
+				ProviderUUID:          providerUUID,
+				PlacementStore:        store2,
+				AckBatchInterval:      time.Millisecond,
+				AckBatchSize:          1,
+				CallbackProofConsumer: callbackTestProofConsumer,
 			}, router, chainClient)
 			require.NoError(t, err)
-			require.NotSame(t, manager1.operations, manager2.operations)
-			assert.Zero(t, manager2.operations.Count(),
+			assert.Zero(t, manager2.InFlightCount(),
 				"the replacement manager starts with a fresh registry")
 			afterRestart := store2.Lookup(leaseUUID)
 			require.Equal(t, operationID, afterRestart.AttemptOperationID(),
@@ -168,14 +179,16 @@ func TestManager_RecoversAmbiguousProvisionCallbackAcrossRegistryAndStoreRestart
 				t.Fatal("replacement manager did not start")
 			}
 
-			require.NoError(t, manager2.PublishCallback(context.Background(), backend.CallbackPayload{
+			proof, proofErr := callbackProofForTest(backend.CallbackPayload{
 				LeaseUUID:        leaseUUID,
 				Status:           tt.status,
 				Error:            "backend refused",
 				Backend:          "body-controlled-backend",
 				BackendStorageID: testBackendStorageID(backendName).String(),
 				OperationID:      operationID.String(),
-			}))
+			})
+			require.NoError(t, proofErr)
+			require.NoError(t, manager2.PublishCallback(context.Background(), proof))
 			settledPlacement := store2.Lookup(leaseUUID)
 			assert.Equal(t, tt.wantState, settledPlacement.State())
 			assert.Empty(t, settledPlacement.Attempt,

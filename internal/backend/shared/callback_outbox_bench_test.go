@@ -35,7 +35,7 @@ func BenchmarkCallbackOutboxLifecycleEnqueue(b *testing.B) {
 			b.ReportMetric(float64(leaseCount), "backlog_leases")
 			b.ResetTimer()
 			for b.Loop() {
-				if _, err := store.StoreEntry(entry); err != nil {
+				if _, err := store.storeEntry(entry); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -65,10 +65,6 @@ func BenchmarkCallbackOutboxReplayBacklog(b *testing.B) {
 			seedCallbackBenchmarkBacklog(b, store, leaseCount)
 			assertCallbackBenchmarkBacklog(b, store, leaseCount)
 
-			storageIdentity, err := backendidentity.Parse(callbackBenchmarkStorageID)
-			if err != nil {
-				b.Fatal(err)
-			}
 			var requests atomic.Int64
 			client := &http.Client{Transport: callbackBenchmarkRoundTripper(func(*http.Request) (*http.Response, error) {
 				requests.Add(1)
@@ -79,27 +75,29 @@ func BenchmarkCallbackOutboxReplayBacklog(b *testing.B) {
 				}, nil
 			})}
 			noBackoff := [CallbackMaxAttempts]time.Duration{}
-			sender, err := NewCallbackSender(CallbackSenderConfig{
-				Store:           store,
-				HTTPClient:      client,
-				Secret:          "callback-benchmark-secret-value!",
-				Logger:          slog.New(slog.DiscardHandler),
-				StopCtx:         context.Background(),
-				Backoff:         &noBackoff,
-				BeforeReplay:    func(context.Context) error { return nil },
-				BeforeDelivery:  func(context.Context) error { return nil },
-				StorageIdentity: storageIdentity,
-			})
+			storageID, err := backendidentity.Parse(callbackBenchmarkStorageID)
 			if err != nil {
 				b.Fatal(err)
 			}
+			sender, err := newCallbackSender(CallbackSenderConfig{
+				Store:      store,
+				HTTPClient: client,
+				Secret:     "callback-benchmark-secret-value!",
+				Logger:     slog.New(slog.DiscardHandler),
+
+				Backoff: &noBackoff,
+			}, storageID)
+			if err != nil {
+				b.Fatal(err)
+			}
+			sender.attestor = newSyntheticCallbackStorageAttestorForTest(b, context.Background())
 
 			iterations := int64(0)
 			b.ReportAllocs()
 			b.ReportMetric(float64(leaseCount), "due_callbacks")
 			b.ResetTimer()
 			for b.Loop() {
-				sender.ReplayPendingCallbacks()
+				sender.replayPendingCallbacks()
 				iterations++
 			}
 
@@ -125,7 +123,7 @@ func (roundTrip callbackBenchmarkRoundTripper) RoundTrip(request *http.Request) 
 
 func newCallbackBenchmarkStore(b *testing.B) *CallbackStore {
 	b.Helper()
-	store, err := NewCallbackStore(CallbackStoreConfig{
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
 		DBPath: filepath.Join(b.TempDir(), "callbacks.db"),
 	})
 	if err != nil {
@@ -149,7 +147,7 @@ func seedCallbackBenchmarkBacklog(
 	for index := range leaseCount {
 		leaseUUID := callbackBenchmarkLeaseUUID(index)
 		leases[index] = leaseUUID
-		if _, err := store.StoreEntry(callbackBenchmarkEntry(leaseUUID)); err != nil {
+		if _, err := store.storeEntry(callbackBenchmarkEntry(leaseUUID)); err != nil {
 			b.Fatalf("seed callback %d: %v", index, err)
 		}
 	}
@@ -176,7 +174,6 @@ func callbackBenchmarkEntry(leaseUUID string) CallbackEntry {
 		LeaseUUID:        leaseUUID,
 		CallbackURL:      callbackBenchmarkURL,
 		DeliveryKind:     CallbackDeliveryKindLifecycle,
-		Success:          true,
 		Status:           backend.CallbackStatusSuccess,
 		Backend:          "benchmark",
 		BackendStorageID: callbackBenchmarkStorageID,

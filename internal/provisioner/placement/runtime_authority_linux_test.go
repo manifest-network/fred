@@ -97,7 +97,7 @@ func TestRuntimeAuthorityRejectsPermissionLinkAndSymlinkDrift(t *testing.T) {
 			mutate(t, path)
 
 			operationID := requireOperationID(t, "99003")
-			token, applied, writeErr := store.BeginNewAttempt(
+			token, applied, writeErr := store.beginNewAttempt(
 				scope, "lease-after-metadata-drift", "backend-a", operationID,
 				PayloadFingerprint{}, testBackendRequestSnapshot(t), testCallbackPair(operationID),
 			)
@@ -138,7 +138,7 @@ func TestRuntimeAuthorityRenameOverOpenWithdrawsAdmissionBeforeWrite(t *testing.
 	require.NoError(t, os.Rename(replacementPath, authorityPath))
 
 	operationID := requireOperationID(t, "99002")
-	token, applied, err := store.BeginNewAttempt(
+	token, applied, err := store.beginNewAttempt(
 		scope, "lease-after-path-replacement", "backend-a", operationID,
 		PayloadFingerprint{}, testBackendRequestSnapshot(t), testCallbackPair(operationID),
 	)

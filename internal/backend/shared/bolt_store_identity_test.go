@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -22,7 +23,7 @@ type fakeAuthoritativeStoreWriteTransaction struct {
 	rollbackCalls int
 }
 
-func newTestStorageAuthorityGate(t *testing.T) *backendidentity.StorageAuthorityGate {
+func newTestStorageAuthorityGate(t testing.TB) *backendidentity.StorageAuthorityGate {
 	t.Helper()
 	gate, err := backendidentity.NewStorageAuthorityGate(func(error) {})
 	require.NoError(t, err)
@@ -95,7 +96,7 @@ func TestBoundInitializationRejectsReadableAuthoritativeStoreBeforeBinding(t *te
 	for _, mode := range []os.FileMode{0o640, 0o644} {
 		t.Run(mode.String(), func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "callbacks.db")
-			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+			store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 			require.NoError(t, err)
 			require.NoError(t, store.Close())
 			require.NoError(t, os.Chmod(dbPath, mode))
@@ -343,6 +344,46 @@ func TestIdentityBoundStoreOpenRequiresConstructedAuthorityGate(t *testing.T) {
 	}
 }
 
+func TestIdentityBoundCallbackStoreDerivesEveryDurableLineage(t *testing.T) {
+	dbPath, storage := initializeBoundCallbackStore(t)
+	store, err := OpenIdentityBoundCallbackStore(
+		CallbackStoreConfig{DBPath: dbPath}, storage, newTestStorageAuthorityGate(t),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	foreignStorage := callbackStorageID(t, "6ba7b811-9dad-41d1-80b4-00c04fd430c8")
+	require.Equal(t, "docker-a", storage.BackendName())
+
+	operationSpec := testOperationIntentSpec(t, "bound-lineage")
+	operationAdmission, err := beginTestOperationIntent(t, store, operationSpec)
+	require.NoError(t, err)
+	require.Equal(t, OperationIntentAdmissionCreated, operationAdmission.Disposition())
+	operationClaim, created := operationAdmission.CreatedClaim()
+	require.True(t, created)
+	assert.Equal(t, storage.BackendName(), operationClaim.Backend())
+	assert.Equal(t, storage.ID(), operationClaim.BackendStorageID())
+
+	closeSpec := testCloseIntentSpec(t, "bound-lineage")
+	closeCandidate, err := store.NewCloseIntentCandidate(closeSpec)
+	require.NoError(t, err)
+	closeAdmission, err := store.BeginCloseIntent(closeCandidate)
+	require.NoError(t, err)
+	require.Equal(t, CloseIntentAdmissionCreated, closeAdmission.Disposition())
+	assert.Equal(t, storage.BackendName(), closeAdmission.Claim().Backend())
+	assert.Equal(t, storage.ID(), closeAdmission.Claim().BackendStorageID())
+
+	lifecycleLease := testLeaseUUID("bound-lifecycle-lineage")
+	stored, err := store.storeEntry(CallbackEntry{
+		LeaseUUID: lifecycleLease, CallbackURL: operationSpec.LifecycleCallbackURL,
+		DeliveryKind: CallbackDeliveryKindLifecycle,
+		Status:       backend.CallbackStatusFailed, Backend: "foreign-backend",
+		BackendStorageID: foreignStorage.String(), CreatedAt: time.Now(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, storage.BackendName(), stored.Backend)
+	assert.Equal(t, storage.ID().String(), stored.BackendStorageID)
+}
+
 func TestIdentityBoundCallbackStoreRefusesMissingSchemaBuckets(t *testing.T) {
 	for _, bucketName := range callbackCurrentSchemaBuckets() {
 		bucketName := append([]byte(nil), bucketName...)
@@ -370,6 +411,29 @@ func TestIdentityBoundCallbackStoreRefusesMissingSchemaBuckets(t *testing.T) {
 				return nil
 			}))
 			require.NoError(t, db.Close())
+		})
+	}
+}
+
+func TestIdentityBoundCallbackStoreRejectsUnshippedMultiBucketSchema(t *testing.T) {
+	for _, bucketName := range callbackUnshippedSchemaBuckets() {
+		bucketName := append([]byte(nil), bucketName...)
+		t.Run(string(bucketName), func(t *testing.T) {
+			dbPath, storage := initializeBoundCallbackStore(t)
+			db, err := bolt.Open(dbPath, 0o600, nil)
+			require.NoError(t, err)
+			require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+				_, createErr := tx.CreateBucket(bucketName)
+				return createErr
+			}))
+			require.NoError(t, db.Close())
+
+			require.ErrorContains(t, VerifyCallbackStoreStorage(dbPath, storage), "unshipped")
+			store, err := OpenIdentityBoundCallbackStore(
+				CallbackStoreConfig{DBPath: dbPath}, storage, newTestStorageAuthorityGate(t),
+			)
+			require.ErrorContains(t, err, "unshipped")
+			assert.Nil(t, store)
 		})
 	}
 }
@@ -465,21 +529,26 @@ func TestBoundAuthoritativeStoreNeverPublishesIntoReplacementParent(t *testing.T
 func TestRetentionBindingRejectsRedirectedRecordIdentity(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "retention.db")
-	store, err := NewRetentionStore(RetentionStoreConfig{DBPath: dbPath})
+	store, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
-	require.NoError(t, store.Put(RetentionEntry{
+	require.NoError(t, store.putForTest(RetentionEntry{
 		OriginalLeaseUUID: "11111111-1111-4111-8111-111111111111",
 		ProviderUUID:      "22222222-2222-4222-8222-222222222222",
 		Status:            RetentionStatusActive,
 	}))
 	require.NoError(t, store.Close())
+	legacy, err := json.Marshal(legacyRetentionEntryJSON{
+		OriginalLeaseUUID: "11111111-1111-4111-8111-111111111111",
+		ProviderUUID:      "22222222-2222-4222-8222-222222222222",
+		Status:            RetentionStatusActive,
+	})
+	require.NoError(t, err)
 	db, err := bolt.Open(dbPath, 0o600, nil)
 	require.NoError(t, err)
 	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(retentionBucketName)
-		value := append([]byte(nil), bucket.Get([]byte("11111111-1111-4111-8111-111111111111"))...)
 		require.NoError(t, bucket.Delete([]byte("11111111-1111-4111-8111-111111111111")))
-		return bucket.Put([]byte("33333333-3333-4333-8333-333333333333"), value)
+		return bucket.Put([]byte("33333333-3333-4333-8333-333333333333"), legacy)
 	}))
 	require.NoError(t, db.Close())
 
@@ -493,9 +562,9 @@ func TestRetentionBindingRejectsRedirectedRecordIdentity(t *testing.T) {
 func TestReleaseBindingRejectsImpossibleHistory(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "releases.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
-	require.NoError(t, store.Append("11111111-1111-4111-8111-111111111111", Release{Status: "active"}))
+	require.NoError(t, store.append("11111111-1111-4111-8111-111111111111", Release{Status: "active"}))
 	require.NoError(t, store.Close())
 	db, err := bolt.Open(dbPath, 0o600, nil)
 	require.NoError(t, err)
@@ -763,7 +832,11 @@ func readRawReleaseHistory(t *testing.T, dbPath, leaseUUID string) []Release {
 	require.NoError(t, err)
 	var releases []Release
 	require.NoError(t, db.View(func(tx *bolt.Tx) error {
-		return json.Unmarshal(tx.Bucket(releasesBucketName).Get([]byte(leaseUUID)), &releases)
+		var decodeErr error
+		releases, decodeErr = decodeReleaseHistory(
+			tx.Bucket(releasesBucketName).Get([]byte(leaseUUID)),
+		)
+		return decodeErr
 	}))
 	require.NoError(t, db.Close())
 	return releases
@@ -812,7 +885,7 @@ func TestIdentityBoundReleaseStoreRejectsNonCanonicalRuntimeKeysWithoutMutation(
 	t.Cleanup(func() { _ = store.Close() })
 
 	const invalidLeaseUUID = "not-a-canonical-lease-uuid"
-	err = store.Append(invalidLeaseUUID, Release{Status: "active", CreatedAt: time.Now()})
+	err = store.append(invalidLeaseUUID, Release{Status: "active", CreatedAt: time.Now()})
 	require.ErrorContains(t, err, "canonical lease UUID")
 	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
 		assert.Nil(t, tx.Bucket(releasesBucketName).Get([]byte(invalidLeaseUUID)))
@@ -830,10 +903,10 @@ func TestIdentityBoundReleaseStoreRejectsNonCanonicalRuntimeKeysWithoutMutation(
 
 	_, err = store.List(invalidLeaseUUID)
 	require.ErrorContains(t, err, "canonical lease UUID")
-	require.ErrorContains(t, store.Delete(invalidLeaseUUID), "canonical lease UUID")
+	require.ErrorContains(t, store.delete(invalidLeaseUUID), "canonical lease UUID")
 	_, err = store.LeaseUUIDs()
 	require.ErrorContains(t, err, "not canonical")
-	_, err = store.RemoveOlderThan(time.Minute)
+	_, err = store.removeOlderThan(time.Minute)
 	require.ErrorContains(t, err, "not canonical")
 
 	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {

@@ -2,8 +2,6 @@ package docker
 
 import (
 	"context"
-	"log/slog"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,48 +11,42 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 type refusingReleaseHistoryCapacityPlanner struct {
-	appendCalls    int
-	migrationCalls int
+	appendCalls int
+}
+
+type blockingRefusingReleaseHistoryCapacityPlanner struct {
+	refusingReleaseHistoryCapacityPlanner
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingRefusingReleaseHistoryCapacityPlanner) CheckOperationReleaseCapacity(
+	candidate shared.OperationReleaseCandidate,
+) error {
+	close(p.entered)
+	<-p.release
+	return p.refusingReleaseHistoryCapacityPlanner.CheckOperationReleaseCapacity(candidate)
 }
 
 func (*refusingReleaseHistoryCapacityPlanner) capacityError() error {
 	return &shared.ReleaseHistoryCapacityError{LimitBytes: 64, RequiredBytes: 65}
 }
 
-func (p *refusingReleaseHistoryCapacityPlanner) CheckAppendActiveCapacity(
-	string,
-	shared.Release,
+func (p *refusingReleaseHistoryCapacityPlanner) CheckOperationReleaseCapacity(
+	shared.OperationReleaseCandidate,
 ) error {
 	p.appendCalls++
 	return p.capacityError()
 }
 
-func (p *refusingReleaseHistoryCapacityPlanner) CheckRecordLegacyMigrationCapacity(
-	string,
-	[]byte,
-	[]backend.LeaseItem,
-	[]shared.SKUResourceSnapshot,
-	shared.LegacyRuntimeAuthority,
-	time.Time,
-) error {
-	p.migrationCalls++
-	return p.capacityError()
-}
-
 func attachCapacityAdmissionCallbackStore(t *testing.T, b *Backend) *shared.CallbackStore {
 	t.Helper()
-	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "capacity_callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	b.callbackStore = store
-	b.operationIntents = store
-	return store
+	attachBoundOperationHandoffStores(t, b)
+	require.NotNil(t, b.callbackStore)
+	return b.callbackStore
 }
 
 func assertCapacityRefusalSettled(
@@ -62,9 +54,9 @@ func assertCapacityRefusalSettled(
 	store *shared.CallbackStore,
 ) {
 	t.Helper()
-	intents, err := store.ListOperationIntents()
+	intents, err := listOperationIntentsForCallbackTest(t, store)
 	require.NoError(t, err)
-	assert.Empty(t, intents, "a pre-mutation capacity refusal must consume its intent")
+	assert.Empty(t, intents, "a pre-mutation capacity refusal must leave no pending intent")
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
@@ -119,6 +111,59 @@ func TestProvisionReleaseCapacityRefusalPrecedesSubstrateMutation(t *testing.T) 
 	assertCapacityRefusalSettled(t, callbacks)
 }
 
+func TestProvisionCapacityRefusalCannotRaceRecoveryPublication(t *testing.T) {
+	b := newBackendForProvisionTest(t, &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
+	}, nil)
+	callbacks := attachCapacityAdmissionCallbackStore(t, b)
+	planner := &blockingRefusingReleaseHistoryCapacityPlanner{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	b.releaseCapacityPlanner = planner
+	spec := dockerOperationIntentSpec(t, b.storageIdentity)
+
+	provisionDone := make(chan error, 1)
+	go func() {
+		provisionDone <- b.Provision(context.Background(), backend.ProvisionRequest{
+			LeaseUUID:            spec.LeaseUUID,
+			Tenant:               spec.Tenant,
+			ProviderUUID:         spec.ProviderUUID,
+			Items:                spec.Items,
+			CallbackURL:          spec.CallbackURL,
+			LifecycleCallbackURL: spec.LifecycleCallbackURL,
+			Payload:              spec.Manifest,
+		})
+	}()
+	select {
+	case <-planner.entered:
+	case <-time.After(time.Second):
+		t.Fatal("provision did not reach the post-intent capacity boundary")
+	}
+
+	// The intent is Pending but no projection exists. Recovery must wait for the
+	// typed admission-to-projection bridge instead of manufacturing a synthetic
+	// Provisioning generation from an intent that can settle synchronously.
+	recoveryDone := make(chan error, 1)
+	go func() { recoveryDone <- b.recoverState(context.Background()) }()
+	select {
+	case err := <-recoveryDone:
+		t.Fatalf("recovery crossed an unsettled pre-projection admission: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(planner.release)
+	require.ErrorIs(t, <-provisionDone, shared.ErrReleaseHistoryCapacity)
+	require.NoError(t, <-recoveryDone)
+	b.provisionsMu.RLock()
+	_, phantom := b.provisions[spec.LeaseUUID]
+	b.provisionsMu.RUnlock()
+	assert.False(t, phantom, "terminal refusal must not reappear as a recovered pending projection")
+	assertCapacityRefusalSettled(t, callbacks)
+}
+
 func TestRestoreReleaseCapacityRefusalPrecedesSubstrateMutation(t *testing.T) {
 	mock := &mockDockerClient{}
 	b := newBackendForProvisionTest(t, mock, nil)
@@ -168,41 +213,4 @@ func TestRestoreReleaseCapacityRefusalPrecedesSubstrateMutation(t *testing.T) {
 	b.provisionsMu.RUnlock()
 	assert.False(t, reserved)
 	assertCapacityRefusalSettled(t, callbacks)
-}
-
-func TestLegacyMigrationReleaseCapacityRefusalPrecedesSubstrateMutation(t *testing.T) {
-	b, dockerState, volumes, _ := newMigrationTestBackend(t)
-	planner := &refusingReleaseHistoryCapacityPlanner{}
-	b.releaseCapacityPlanner = planner
-	stopCalls := 0
-	dockerState.stopContainer = func(context.Context, string, time.Duration) error {
-		stopCalls++
-		return nil
-	}
-
-	migration := &legacyMigration{
-		LeaseUUID:    "lease-capacity-migration",
-		Tenant:       "tenant-a",
-		ProviderUUID: nominalDockerProviderUUID,
-		SKU:          "docker-micro",
-		Stack: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
-			manifest.DefaultServiceName: {Image: "docker.io/library/nginx:1.27"},
-		}},
-		Instances: []legacyMigrationInstance{{
-			LegacyContainer: ContainerInfo{
-				ContainerID:   "legacy-container",
-				InstanceIndex: 0,
-				CallbackURL:   "https://fred.example/callbacks/provision",
-			},
-			NewContainerName: "fred-lease-capacity-migration-app-0",
-			PrevName:         "fred-lease-capacity-migration-app-0-prev",
-		}},
-	}
-
-	err := b.executeLegacyMigration(context.Background(), migration, slog.Default())
-	require.ErrorIs(t, err, shared.ErrReleaseHistoryCapacity)
-	assert.Equal(t, 1, planner.migrationCalls)
-	assert.Zero(t, stopCalls)
-	assert.Empty(t, volumes.renames)
-	assert.Nil(t, dockerState.lastComposeProject)
 }

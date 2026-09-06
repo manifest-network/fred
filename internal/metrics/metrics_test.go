@@ -76,6 +76,7 @@ var labelledMetricNames = []string{
 	"fred_provisioner_ack_batch_fee_gas_errors_total",
 	"fred_provisioner_ack_batch_individual_fallbacks_total",
 	"fred_provisioner_ack_batcher_lane_restarts_total",
+	"fred_provisioner_backend_invocation_panics_total",
 	"fred_provisioner_provisioning_duration_seconds",
 	"fred_provisioner_provisioning_total",
 	"fred_provisioner_lifecycle_callback_outcomes_total",
@@ -108,6 +109,7 @@ func allCollectors() []prometheus.Collector {
 		ReconcilerDeferredLeasesTotal,
 		ReconcilerPanicsTotal,
 		LifecycleEventSinkPanicsTotal,
+		BackendInvocationPanicsTotal,
 		SignerOOGRetriesTotal,
 		GasSimulationTotal,
 		GasSimulated,
@@ -274,6 +276,15 @@ func TestCounterVecLabels(t *testing.T) {
 		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventProvisionStarting)
 		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRestarting)
 		LifecycleEventSinkPanicsTotal.WithLabelValues(LifecycleEventRestoreRefused)
+	})
+	assert.NotPanics(t, func() {
+		BackendInvocationPanicsTotal.WithLabelValues(OperationProvision)
+		BackendInvocationPanicsTotal.WithLabelValues(OperationRestore)
+		BackendInvocationPanicsTotal.WithLabelValues(OperationDeprovision)
+		BackendInvocationPanicsTotal.WithLabelValues(OperationRestart)
+		BackendInvocationPanicsTotal.WithLabelValues(OperationUpdate)
+		BackendInvocationPanicsTotal.WithLabelValues(OperationGetProvision)
+		BackendInvocationPanicsTotal.WithLabelValues(OperationReconcileCustomDomain)
 	})
 	assert.NotPanics(t, func() {
 		SignerOOGRetriesTotal.WithLabelValues("retried")

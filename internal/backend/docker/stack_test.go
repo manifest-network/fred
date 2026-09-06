@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -23,10 +24,12 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
-	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
-const stackMaintenanceLeaseUUID = "11111111-1111-4111-8111-111111111111"
+const (
+	stackMaintenanceLeaseUUID = "11111111-1111-4111-8111-111111111111"
+	stackFixtureLeaseUUID     = "33333333-3333-4333-8333-333333333333"
+)
 
 // installStackStrictCohortInventory makes the Docker inventory observed by a
 // stack replacement come from the exact labels emitted by its last successful
@@ -40,7 +43,7 @@ func installStackStrictCohortInventory(
 	composeMock *mockComposeExecutor,
 ) {
 	t.Helper()
-	require.Nil(t, dockerMock.ListManagedContainersFn)
+	originalList := dockerMock.ListManagedContainersFn
 
 	type serviceSnapshot struct {
 		image  string
@@ -51,10 +54,12 @@ func installStackStrictCohortInventory(
 		services map[string]serviceSnapshot
 	}
 	var (
-		mu      sync.Mutex
-		current projectSnapshot
+		mu              sync.Mutex
+		current         projectSnapshot
+		strictPublished bool
 	)
 	originalUp := composeMock.UpFn
+	originalInspect := dockerMock.InspectContainerFn
 	composeMock.UpFn = func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
 		if originalUp != nil {
 			if err := originalUp(ctx, project, opts); err != nil {
@@ -73,6 +78,20 @@ func installStackStrictCohortInventory(
 		}
 		mu.Lock()
 		current = snapshot
+		strictPublished = true
+		mu.Unlock()
+		return nil
+	}
+	originalDown := composeMock.DownFn
+	composeMock.DownFn = func(ctx context.Context, projectName string, timeout time.Duration) error {
+		if originalDown != nil {
+			if err := originalDown(ctx, projectName, timeout); err != nil {
+				return err
+			}
+		}
+		mu.Lock()
+		current = projectSnapshot{}
+		strictPublished = true
 		mu.Unlock()
 		return nil
 	}
@@ -83,7 +102,11 @@ func installStackStrictCohortInventory(
 			name:     current.name,
 			services: maps.Clone(current.services),
 		}
+		published := strictPublished
 		mu.Unlock()
+		if !published && originalList != nil {
+			return originalList(ctx)
+		}
 		if snapshot.name == "" {
 			return nil, nil
 		}
@@ -101,6 +124,10 @@ func installStackStrictCohortInventory(
 			if err != nil {
 				return nil, fmt.Errorf("parse %s for service %q: %w", LabelInstanceIndex, container.Service, err)
 			}
+			createdAt, err := time.Parse(time.RFC3339, service.labels[LabelCreatedAt])
+			if err != nil {
+				return nil, fmt.Errorf("parse %s for service %q: %w", LabelCreatedAt, container.Service, err)
+			}
 			inventory = append(inventory, ContainerInfo{
 				ContainerID:          container.ID,
 				LeaseUUID:            service.labels[LabelLeaseUUID],
@@ -111,15 +138,47 @@ func installStackStrictCohortInventory(
 				ServiceName:          service.labels[LabelServiceName],
 				CallbackURL:          service.labels[LabelCallbackURL],
 				LifecycleCallbackURL: service.labels[LabelLifecycleCallbackURL],
-				MaintenanceID:        shared.MaintenanceID(service.labels[LabelMaintenanceID]),
+				MaintenanceID:        mustParseMaintenanceID(t, service.labels[LabelMaintenanceID]),
 				Image:                service.image,
 				Status:               container.State,
 				Health:               HealthStatus(container.Health),
+				CreatedAt:            createdAt,
 				InstanceIndex:        instanceIndex,
 				CustomDomain:         service.labels[LabelCustomDomain],
 			})
 		}
 		return inventory, nil
+	}
+	dockerMock.InspectContainerFn = func(ctx context.Context, containerID string) (*ContainerInfo, error) {
+		if originalInspect == nil {
+			return nil, fmt.Errorf("strict cohort fixture has no container inspector")
+		}
+		inspected, err := originalInspect(ctx, containerID)
+		if err != nil {
+			return nil, err
+		}
+		inventory, err := dockerMock.ListManagedContainersFn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, listed := range inventory {
+			if listed.ContainerID != containerID {
+				continue
+			}
+			// Docker Inspect repeats the immutable labels returned by List and
+			// adds a fresher runtime state. Keep the exact generated identity while
+			// allowing individual tests to model a changing status/health result.
+			if inspected != nil {
+				if inspected.Status != "" {
+					listed.Status = inspected.Status
+				}
+				listed.Health = inspected.Health
+				listed.ExitCode = inspected.ExitCode
+				listed.OOMKilled = inspected.OOMKilled
+			}
+			return &listed, nil
+		}
+		return nil, fmt.Errorf("container %q is absent from the exact fixture inventory", containerID)
 	}
 }
 
@@ -144,18 +203,8 @@ func seedStackMaintenanceAuthority(
 	manifestBytes, err := json.Marshal(stack)
 	require.NoError(t, err)
 	profiles := testResourceProfiles(t, items)
-	dir := t.TempDir()
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(dir, "stack-maintenance-releases.db"),
-	})
-	require.NoError(t, err)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(dir, "stack-maintenance-callbacks.db"),
-	})
-	require.NoError(t, err)
-	b.releaseStore = releases
-	b.callbackStore = callbacks
-	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
+	attachBoundOperationHandoffStores(t, b)
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
 		Manifest:         manifestBytes,
 		Image:            "stack",
 		OperationID:      operationID,
@@ -167,7 +216,7 @@ func seedStackMaintenanceAuthority(
 		),
 		Status:    "active",
 		CreatedAt: time.Now(),
-	}))
+	})
 
 	b.provisionsMu.Lock()
 	provision := b.provisions[leaseUUID]
@@ -187,8 +236,6 @@ func seedStackMaintenanceAuthority(
 	t.Cleanup(func() {
 		b.stopCancel()
 		b.wg.Wait()
-		require.NoError(t, callbacks.Close())
-		require.NoError(t, releases.Close())
 	})
 }
 
@@ -299,14 +346,18 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 	var mu sync.Mutex
 	volumeIDs := []string{}
 
-	volDir := t.TempDir()
+	volumeRoot := t.TempDir()
 	vm := &mockVolumeManager{
-		defaultDir: volDir,
+		defaultDir: volumeRoot,
 		CreateFn: func(ctx context.Context, id string, sizeMB int64) (string, bool, error) {
 			mu.Lock()
 			volumeIDs = append(volumeIDs, id)
 			mu.Unlock()
-			return volDir, true, nil
+			path := filepath.Join(volumeRoot, id)
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				return "", false, err
+			}
+			return path, true, nil
 		},
 	}
 
@@ -351,23 +402,31 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 	}))
 	defer callbackServer.Close()
 
+	installStackStrictCohortInventory(t, mock, composeMock)
 	b := newBackendForProvisionTest(t, mock, nil)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
 	b.compose = composeMock
 	b.volumes = vm
+	b.cfg.VolumeDataPath = volumeRoot
 	// Add a disk-enabled SKU profile.
 	b.cfg.SKUProfiles["docker-small-disk"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024}
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	req := newStackProvisionRequest("lease-1", "tenant-a", items, payload)
-	req.CallbackURL = callbackServer.URL
+	req := newStackProvisionRequest(stackFixtureLeaseUUID, "tenant-a", items, payload)
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
+	rebuildCallbackSender(b, callbackServer.Client())
+	startCallbackReplayForTest(b)
 
 	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
-	<-callbackReceived
+	waitForTestSignal(t, callbackReceived, "service-aware stack callback")
 
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackFixtureLeaseUUID]
 	status := prov.Status
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status)
@@ -375,10 +434,11 @@ func TestStackProvision_VolumeIDsAreServiceAware(t *testing.T) {
 	mu.Lock()
 	slices.Sort(volumeIDs)
 	mu.Unlock()
-	assert.Equal(t, []string{"fred-lease-1-db-0", "fred-lease-1-web-0"}, volumeIDs)
+	assert.Equal(t, []string{
+		canonicalVolumeName(stackFixtureLeaseUUID, "db", 0),
+		canonicalVolumeName(stackFixtureLeaseUUID, "web", 0),
+	}, volumeIDs)
 
-	b.stopCancel()
-	b.wg.Wait()
 }
 
 // --- Finding 2: per-service health check verification ---
@@ -445,28 +505,33 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 	}))
 	defer callbackServer.Close()
 
+	installStackStrictCohortInventory(t, mock, composeMock)
 	b := newBackendForProvisionTest(t, mock, nil)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
 	b.compose = composeMock
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	req := newStackProvisionRequest("lease-1", "tenant-a", items, payload)
-	req.CallbackURL = callbackServer.URL
+	req := newStackProvisionRequest(stackFixtureLeaseUUID, "tenant-a", items, payload)
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
+	rebuildCallbackSender(b, callbackServer.Client())
+	startCallbackReplayForTest(b)
 
 	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
-	<-callbackReceived
+	waitForTestSignal(t, callbackReceived, "per-service health callback")
 
 	assert.Equal(t, backend.CallbackStatusSuccess, callbackPayload.Status, "provision should succeed with per-service health checks")
 
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackFixtureLeaseUUID]
 	status := prov.Status
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status)
 
-	b.stopCancel()
-	b.wg.Wait()
 }
 
 // --- Finding 3: re-provision cleans up old stack allocations ---
@@ -474,12 +539,16 @@ func TestStackProvision_PerServiceHealthCheck(t *testing.T) {
 func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 	removedContainers := map[string]bool{}
+	var oldContainers []ContainerInfo
 	var mu sync.Mutex
 	mock := &mockDockerClient{
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			mu.Lock()
+			defer mu.Unlock()
 			removedContainers[containerID] = true
-			mu.Unlock()
+			oldContainers = slices.DeleteFunc(oldContainers, func(container ContainerInfo) bool {
+				return container.ContainerID == containerID
+			})
 			return nil
 		},
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
@@ -505,7 +574,7 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		"db":  "postgres:16",
 	})
 	oldProfiles := testResourceProfiles(t, oldItems)
-	oldOperationID := shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	oldOperationID := mustDockerOperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
 	oldCallbackURL := "https://old.example/callbacks/provision?operation_id=" + oldOperationID.String()
 	oldLifecycleURL, err := backend.ResolveLifecycleCallbackURL(oldCallbackURL, "")
 	require.NoError(t, err)
@@ -513,24 +582,30 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		oldOperationID, "tenant-a", nominalDockerProviderUUID, oldCallbackURL, oldLifecycleURL,
 	)
 	require.NoError(t, err)
-	oldContainers := []ContainerInfo{
+	oldContainers = []ContainerInfo{
 		{
 			ContainerID: "old-web-c1", LeaseUUID: leaseUUID, Tenant: "tenant-a",
 			ProviderUUID: nominalDockerProviderUUID, SKU: "docker-small", ServiceName: "web",
+			BackendName:   DefaultConfig().Name,
 			InstanceIndex: 0, CallbackURL: oldCallbackURL, LifecycleCallbackURL: oldLifecycleURL,
 			Image: "nginx:latest", Status: "running",
 		},
 		{
 			ContainerID: "old-db-c1", LeaseUUID: leaseUUID, Tenant: "tenant-a",
 			ProviderUUID: nominalDockerProviderUUID, SKU: "docker-small", ServiceName: "db",
+			BackendName:   DefaultConfig().Name,
 			InstanceIndex: 0, CallbackURL: oldCallbackURL, LifecycleCallbackURL: oldLifecycleURL,
 			Image: "postgres:16", Status: "running",
 		},
 	}
 	mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		return slices.Clone(oldContainers), nil
 	}
 	mock.InspectContainerFn = func(_ context.Context, containerID string) (*ContainerInfo, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		for _, container := range oldContainers {
 			if container.ContainerID == containerID {
 				copy := container
@@ -540,6 +615,10 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
 	}
 
+	composeMock.DownFn = func(context.Context, string, time.Duration) error {
+		return errors.New("force strict per-container predecessor teardown")
+	}
+	installStackStrictCohortInventory(t, mock, composeMock)
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
 		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Tenant:               "tenant-a",
@@ -562,16 +641,14 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 					"db":  {Image: "postgres:16"},
 				},
 			}},
-			ResourceProfiles: shared.CloneSKUResourceSnapshot(oldProfiles),
 		},
 	})
-	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
-	require.NoError(t, err)
-	nominalIntents := b.operationIntents.(noopOperationIntentJournal)
-	b.operationIntents = durableTestOperationIntentJournal{store: nominalIntents.store, storageID: storageID}
-	b.callbackStore = nominalIntents.store
-	releases := attachReleaseStore(t, b)
-	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
+	attachReleaseStore(t, b)
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
 		Manifest:         oldPayload,
 		Image:            "stack",
 		OperationID:      oldOperationID,
@@ -580,10 +657,7 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		RuntimeAuthority: &oldAuthority,
 		Status:           "active",
 		CreatedAt:        time.Now().Add(-time.Hour),
-	}))
-	composeMock.DownFn = func(context.Context, string, time.Duration) error {
-		return errors.New("force strict per-container predecessor teardown")
-	}
+	})
 	b.compose = composeMock
 
 	// Pre-allocate old stack resources with service-aware IDs.
@@ -613,17 +687,11 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 	})
 
 	req := newStackProvisionRequest(leaseUUID, "tenant-a", newItems, payload)
-	const candidateOperationID = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	candidateOperationID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	req.CallbackURL = callbackServer.URL + "?operation_id=" + candidateOperationID.String()
 
 	err = b.Provision(context.Background(), req)
 	require.NoError(t, err)
-
-	// Old containers should be removed during re-provision cleanup (synchronous phase).
-	mu.Lock()
-	assert.True(t, removedContainers["old-web-c1"], "old web container should be removed")
-	assert.True(t, removedContainers["old-db-c1"], "old db container should be removed")
-	mu.Unlock()
 
 	require.Eventually(t, func() bool {
 		b.provisionsMu.RLock()
@@ -631,6 +699,13 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 		return b.provisions[leaseUUID] != nil &&
 			b.provisions[leaseUUID].Status == backend.ProvisionStatusReady
 	}, 5*time.Second, time.Millisecond)
+
+	// The asynchronous replacement worker must remove the exact predecessor
+	// generation before publishing the candidate generation.
+	mu.Lock()
+	assert.True(t, removedContainers["old-web-c1"], "old web container should be removed")
+	assert.True(t, removedContainers["old-db-c1"], "old db container should be removed")
+	mu.Unlock()
 
 	b.provisionsMu.RLock()
 	prov := b.provisions[leaseUUID]
@@ -647,8 +722,6 @@ func TestStackReProvision_CleansUpOldStackAllocations(t *testing.T) {
 	stats := b.pool.Stats()
 	assert.Greater(t, stats.AllocatedCPU, float64(0), "resources should be allocated for new provision")
 
-	b.stopCancel()
-	b.wg.Wait()
 }
 
 // --- Stack Restart tests ---
@@ -730,12 +803,12 @@ func TestStackRestart_Success(t *testing.T) {
 	b.compose = composeMock
 	seedStackMaintenanceAuthority(
 		t, b, stackMaintenanceLeaseUUID, stackManifest, items,
-		shared.OperationID(lifecycleID), oldOperationURL, oldLifecycleURL,
+		mustDockerOperationID(lifecycleID), oldOperationURL, oldLifecycleURL,
 		callbackServer.Client(),
 	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   stackMaintenanceLeaseUUID,
 		CallbackURL: newLifecycleURL,
 	})
@@ -772,7 +845,7 @@ func TestStackRestart_Success(t *testing.T) {
 	b.wg.Wait()
 }
 
-func TestStackRestart_FailureRollsBack(t *testing.T) {
+func TestStackRestart_ComposeUpFailurePreservesRecoveryAuthority(t *testing.T) {
 	stackManifest := &manifest.StackManifest{
 		Services: map[string]*manifest.Manifest{
 			"web": {Image: "nginx:latest"},
@@ -814,12 +887,7 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 			upCallCount++
 			call := upCallCount
 			mu.Unlock()
-			if call == 1 {
-				// First Up (restart) fails.
-				return fmt.Errorf("compose up failed")
-			}
-			// Second Up (rollback) succeeds.
-			return nil
+			return fmt.Errorf("compose up failed (attempt %d)", call)
 		},
 		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
 			return []composeContainerSummary{
@@ -845,7 +913,7 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	operationID := shared.OperationID("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
+	operationID := mustDockerOperationID("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
 	operationURL := callbackServer.URL + "?operation_id=" + operationID.String()
 	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + operationID.String()
 	seedStackMaintenanceAuthority(
@@ -854,27 +922,37 @@ func TestStackRestart_FailureRollsBack(t *testing.T) {
 	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   stackMaintenanceLeaseUUID,
 		CallbackURL: lifecycleURL,
 	})
 	require.NoError(t, err)
 
-	awaitStackMaintenanceCallback(t, b, callbackReceived)
+	require.Eventually(t, func() bool {
+		intent, found, readErr := b.maintenanceSettlement.GetMaintenanceIntent(stackMaintenanceLeaseUUID)
+		return readErr == nil && found &&
+			intent.ExecutionPhase() == shared.MaintenanceExecutionStarted &&
+			!b.actorOwnsMaintenance(stackMaintenanceLeaseUUID, intent.MaintenanceID())
+	}, 5*time.Second, time.Millisecond,
+		"the exact Started restart must hand off from the live worker to recovery")
+	select {
+	case <-callbackReceived:
+		t.Fatal("an ambiguous Compose result must not emit a terminal callback")
+	default:
+	}
 
-	// Even though rollback succeeded, the operation failed — callback should report failure.
-	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
-
-	// After rollback via Compose, provision should be back to Ready.
+	// Compose Up crossed the external-effect boundary. Its error cannot prove
+	// that Docker published nothing, so neither rollback nor a terminal actor
+	// projection is safe until strict inventory recovery classifies the cohort.
 	b.provisionsMu.RLock()
 	prov := b.provisions[stackMaintenanceLeaseUUID]
 	status := prov.Status
 	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusReady, status)
+	assert.Equal(t, backend.ProvisionStatusRestarting, status)
 
-	// Verify Up was called twice (restart + rollback).
+	// Recovery, not an immediate second mutation, owns the ambiguous outcome.
 	mu.Lock()
-	assert.Equal(t, 2, upCallCount, "should call Up twice: restart + rollback")
+	assert.Equal(t, 1, upCallCount, "ambiguous restart must not attempt an unsafe rollback")
 	mu.Unlock()
 
 	b.stopCancel()
@@ -954,7 +1032,7 @@ func TestStackUpdate_Success(t *testing.T) {
 	b.compose = composeMock
 	seedStackMaintenanceAuthority(
 		t, b, stackMaintenanceLeaseUUID, oldStack, items,
-		shared.OperationID(lifecycleID), oldOperationURL, oldLifecycleURL,
+		mustDockerOperationID(lifecycleID), oldOperationURL, oldLifecycleURL,
 		callbackServer.Client(),
 	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
@@ -964,7 +1042,7 @@ func TestStackUpdate_Success(t *testing.T) {
 		"db":  "postgres:16",
 	})
 
-	err := b.Update(context.Background(), backend.UpdateRequest{
+	err := b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   stackMaintenanceLeaseUUID,
 		CallbackURL: newLifecycleURL,
 		Payload:     newPayload,
@@ -1029,7 +1107,7 @@ func TestGetInfo_Stack(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		stackFixtureLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: stackFixtureLeaseUUID,
 			Status: backend.ProvisionStatusReady,
 			StackManifest: &manifest.StackManifest{
 				Services: map[string]*manifest.Manifest{
@@ -1045,8 +1123,23 @@ func TestGetInfo_Stack(t *testing.T) {
 		},
 	})
 	b.cfg.HostAddress = "10.0.0.1"
+	// newBackendForProvisionTest installs the same strict inventory boundary used
+	// after Compose mutations. This fixture starts from an already-running stack,
+	// so publish that pre-existing cohort as Docker would instead of relying on
+	// point Inspect calls that are not membership evidence.
+	mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) {
+		return []ContainerInfo{
+			{
+				ContainerID: "web-c1", Image: "nginx:latest", Status: "running",
+				Ports: map[string]PortBinding{
+					"80/tcp": {HostIP: "0.0.0.0", HostPort: "8080"},
+				},
+			},
+			{ContainerID: "db-c1", Image: "postgres:16", Status: "running", Ports: map[string]PortBinding{}},
+		}, nil
+	}
 
-	info, err := b.GetInfo(context.Background(), "lease-1")
+	info, err := b.GetInfo(context.Background(), stackFixtureLeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, info)
 
@@ -1085,7 +1178,7 @@ func TestGetLogs_Stack(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		stackFixtureLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: stackFixtureLeaseUUID,
 			Status: backend.ProvisionStatusReady,
 			StackManifest: &manifest.StackManifest{
 				Services: map[string]*manifest.Manifest{
@@ -1101,7 +1194,7 @@ func TestGetLogs_Stack(t *testing.T) {
 		},
 	})
 
-	logs, err := b.GetLogs(context.Background(), "lease-1", 50)
+	logs, err := b.GetLogs(context.Background(), stackFixtureLeaseUUID, 50)
 	require.NoError(t, err)
 	assert.Len(t, logs, 2)
 	assert.Equal(t, "logs from web-c1", logs["web/0"])
@@ -1116,7 +1209,7 @@ func TestGetLogs_Stack_MultiInstance(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		stackFixtureLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: stackFixtureLeaseUUID,
 			Status: backend.ProvisionStatusReady,
 			StackManifest: &manifest.StackManifest{
 				Services: map[string]*manifest.Manifest{"web": {Image: "nginx"}},
@@ -1128,7 +1221,7 @@ func TestGetLogs_Stack_MultiInstance(t *testing.T) {
 		},
 	})
 
-	logs, err := b.GetLogs(context.Background(), "lease-1", 50)
+	logs, err := b.GetLogs(context.Background(), stackFixtureLeaseUUID, 50)
 	require.NoError(t, err)
 	assert.Equal(t, "w1", logs["web/0"])
 	assert.Equal(t, "w2", logs["web/1"])
@@ -1150,7 +1243,7 @@ func TestDeprovision_Stack(t *testing.T) {
 	composeMock := &mockComposeExecutor{
 		DownFn: func(ctx context.Context, projectName string, timeout time.Duration) error {
 			downCalled = true
-			assert.Equal(t, "fred-lease-1", projectName)
+			assert.Equal(t, composeProjectName(stackFixtureLeaseUUID), projectName)
 			return nil
 		},
 	}
@@ -1161,7 +1254,7 @@ func TestDeprovision_Stack(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		stackFixtureLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: stackFixtureLeaseUUID,
 			Tenant:   "tenant-a",
 			Status:   backend.ProvisionStatusReady,
 			Quantity: 2,
@@ -1181,11 +1274,12 @@ func TestDeprovision_Stack(t *testing.T) {
 	})
 	b.compose = composeMock
 	b.volumes = vm
+	installReadyRuntimeProofForTest(t, b, stackFixtureLeaseUUID)
 	// Pre-allocate with service-aware IDs.
-	_ = b.pool.TryAllocate("lease-1-web-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-db-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(stackFixtureLeaseUUID+"-web-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(stackFixtureLeaseUUID+"-db-0", "docker-small", "tenant-a")
 
-	err := b.Deprovision(context.Background(), "lease-1")
+	err := b.Deprovision(context.Background(), stackFixtureLeaseUUID)
 	require.NoError(t, err)
 
 	// Compose Down was called instead of individual RemoveContainer.
@@ -1193,11 +1287,14 @@ func TestDeprovision_Stack(t *testing.T) {
 
 	// Service-aware volumes destroyed.
 	slices.Sort(destroyedVols)
-	assert.Equal(t, []string{"fred-lease-1-db-0", "fred-lease-1-web-0"}, destroyedVols)
+	assert.Equal(t, []string{
+		canonicalVolumeName(stackFixtureLeaseUUID, "db", 0),
+		canonicalVolumeName(stackFixtureLeaseUUID, "web", 0),
+	}, destroyedVols)
 
 	// Provision removed.
 	b.provisionsMu.RLock()
-	_, exists := b.provisions["lease-1"]
+	_, exists := b.provisions[stackFixtureLeaseUUID]
 	b.provisionsMu.RUnlock()
 	assert.False(t, exists)
 
@@ -1208,7 +1305,7 @@ func TestDeprovision_Stack(t *testing.T) {
 
 // --- Compose failure tests ---
 
-func TestStackProvision_ComposeUpFailure(t *testing.T) {
+func TestStackProvision_ComposeUpFailurePreservesRecoveryAuthority(t *testing.T) {
 	var downCalled bool
 	var mu sync.Mutex
 
@@ -1239,55 +1336,52 @@ func TestStackProvision_ComposeUpFailure(t *testing.T) {
 		"db":  "postgres:16",
 	})
 
-	var callbackPayload backend.CallbackPayload
-	callbackReceived := make(chan struct{})
+	callbackReceived := make(chan struct{}, 1)
 	callbackServer := newCallbackTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&callbackPayload)
 		w.WriteHeader(http.StatusOK)
-		select {
-		case <-callbackReceived:
-		default:
-			close(callbackReceived)
-		}
+		callbackReceived <- struct{}{}
 	}))
 	defer callbackServer.Close()
 
 	b := newBackendForProvisionTest(t, mock, nil)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
 	b.compose = composeMock
-	rebuildCallbackSender(b, callbackServer.Client())
 
-	req := newStackProvisionRequest("lease-1", "tenant-a", items, payload)
-	req.CallbackURL = callbackServer.URL
+	req := newStackProvisionRequest(stackFixtureLeaseUUID, "tenant-a", items, payload)
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL)
 
 	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
-
+	awaitProvisionWorkerQuiescence(t, b, stackFixtureLeaseUUID)
 	select {
 	case <-callbackReceived:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for callback")
+		t.Fatal("post-effect Compose Up error published a terminal callback")
+	default:
 	}
-
-	// Callback should indicate failure.
-	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
 
 	// Compose Down should be called for cleanup.
 	mu.Lock()
 	assert.True(t, downCalled, "compose down should be called on up failure")
 	mu.Unlock()
 
-	// Provision status should be failed.
+	// Compose Up crossed an external effect boundary. Its error cannot prove
+	// that Docker published nothing, so exact recovery authority must survive.
 	b.provisionsMu.RLock()
-	prov := b.provisions["lease-1"]
-	assert.Equal(t, backend.ProvisionStatusFailed, prov.Status)
+	prov := b.provisions[stackFixtureLeaseUUID]
+	assert.Equal(t, backend.ProvisionStatusProvisioning, prov.Status)
 	b.provisionsMu.RUnlock()
+	intents, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1)
+	assert.Equal(t, shared.OperationExecutionStarted, intents[0].ExecutionPhase())
 
-	// Resources should be released.
+	// The Started operation continues to own its reserved capacity until
+	// recovery proves Ready or exact absence.
 	stats := b.pool.Stats()
-	assert.Equal(t, 0, stats.AllocationCount)
-
-	b.stopCancel()
-	b.wg.Wait()
+	assert.Equal(t, 2, stats.AllocationCount)
 }
 
 func TestDeprovision_Stack_DownFallback(t *testing.T) {
@@ -1324,9 +1418,9 @@ func TestDeprovision_Stack_DownFallback(t *testing.T) {
 	}
 
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		stackFixtureLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: stackFixtureLeaseUUID,
 			Tenant:       "tenant-a",
-			ProviderUUID: "prov-1",
+			ProviderUUID: nominalDockerProviderUUID,
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			StackManifest: &manifest.StackManifest{
@@ -1345,10 +1439,22 @@ func TestDeprovision_Stack_DownFallback(t *testing.T) {
 	})
 	b.compose = composeMock
 	b.volumes = vm
-	_ = b.pool.TryAllocate("lease-1-web-0", "docker-small", "tenant-a")
-	_ = b.pool.TryAllocate("lease-1-db-0", "docker-small", "tenant-a")
+	installReadyRuntimeProofForTest(t, b, stackFixtureLeaseUUID)
+	mock.InspectContainerFn = func(_ context.Context, containerID string) (*ContainerInfo, error) {
+		b.provisionsMu.RLock()
+		projection := b.provisions[stackFixtureLeaseUUID]
+		info := &ContainerInfo{
+			ContainerID: containerID, LeaseUUID: stackFixtureLeaseUUID,
+			BackendName: b.cfg.Name, Tenant: projection.Tenant, ProviderUUID: projection.ProviderUUID,
+			CallbackURL: projection.CallbackURL, LifecycleCallbackURL: projection.LifecycleCallbackURL,
+		}
+		b.provisionsMu.RUnlock()
+		return info, nil
+	}
+	_ = b.pool.TryAllocate(stackFixtureLeaseUUID+"-web-0", "docker-small", "tenant-a")
+	_ = b.pool.TryAllocate(stackFixtureLeaseUUID+"-db-0", "docker-small", "tenant-a")
 
-	err := b.Deprovision(context.Background(), "lease-1")
+	err := b.Deprovision(context.Background(), stackFixtureLeaseUUID)
 	require.NoError(t, err)
 
 	// Both containers should be removed individually as fallback.
@@ -1359,7 +1465,7 @@ func TestDeprovision_Stack_DownFallback(t *testing.T) {
 
 	// Provision removed.
 	b.provisionsMu.RLock()
-	_, exists := b.provisions["lease-1"]
+	_, exists := b.provisions[stackFixtureLeaseUUID]
 	b.provisionsMu.RUnlock()
 	assert.False(t, exists)
 
@@ -1370,7 +1476,7 @@ func TestDeprovision_Stack_DownFallback(t *testing.T) {
 
 // --- Stack recoverState tests ---
 
-func TestRecoverState_Stack(t *testing.T) {
+func TestRecoverState_StackUnprovenCohortDoesNotMintCapacityAuthority(t *testing.T) {
 	now := time.Now()
 
 	mock := &mockDockerClient{
@@ -1378,9 +1484,9 @@ func TestRecoverState_Stack(t *testing.T) {
 			return []ContainerInfo{
 				{
 					ContainerID:   "web-c1",
-					LeaseUUID:     "lease-1",
+					LeaseUUID:     stackFixtureLeaseUUID,
 					Tenant:        "tenant-a",
-					ProviderUUID:  "prov-1",
+					ProviderUUID:  nominalDockerProviderUUID,
 					SKU:           "docker-small",
 					ServiceName:   "web",
 					InstanceIndex: 0,
@@ -1391,9 +1497,9 @@ func TestRecoverState_Stack(t *testing.T) {
 				},
 				{
 					ContainerID:   "db-c1",
-					LeaseUUID:     "lease-1",
+					LeaseUUID:     stackFixtureLeaseUUID,
 					Tenant:        "tenant-a",
-					ProviderUUID:  "prov-1",
+					ProviderUUID:  nominalDockerProviderUUID,
 					SKU:           "docker-small",
 					ServiceName:   "db",
 					InstanceIndex: 0,
@@ -1410,7 +1516,7 @@ func TestRecoverState_Stack(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, b.provisions, 1)
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackFixtureLeaseUUID]
 	require.NotNil(t, prov)
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
 	assert.ElementsMatch(t, []string{"web-c1", "db-c1"}, prov.ContainerIDs)
@@ -1444,9 +1550,11 @@ func TestRecoverState_Stack(t *testing.T) {
 	assert.Equal(t, "", dbItem.CustomDomain,
 		"services without a CustomDomain label must restore with an empty CustomDomain")
 
-	// Resource allocations should use service-aware IDs.
+	// Container labels can rebuild the observational projection, but they do not
+	// mint an immutable resource snapshot. A cold empty pool therefore omits the
+	// unproven cohort; existing allocations are preserved on a live reset.
 	stats := b.pool.Stats()
-	assert.Equal(t, 2, stats.AllocationCount)
+	assert.Equal(t, 0, stats.AllocationCount)
 }
 
 func TestRecoverState_StackMultiInstance(t *testing.T) {
@@ -1457,9 +1565,9 @@ func TestRecoverState_StackMultiInstance(t *testing.T) {
 			return []ContainerInfo{
 				{
 					ContainerID:   "web-c0",
-					LeaseUUID:     "lease-1",
+					LeaseUUID:     stackFixtureLeaseUUID,
 					Tenant:        "tenant-a",
-					ProviderUUID:  "prov-1",
+					ProviderUUID:  nominalDockerProviderUUID,
 					SKU:           "docker-small",
 					ServiceName:   "web",
 					InstanceIndex: 0,
@@ -1469,9 +1577,9 @@ func TestRecoverState_StackMultiInstance(t *testing.T) {
 				},
 				{
 					ContainerID:   "web-c1",
-					LeaseUUID:     "lease-1",
+					LeaseUUID:     stackFixtureLeaseUUID,
 					Tenant:        "tenant-a",
-					ProviderUUID:  "prov-1",
+					ProviderUUID:  nominalDockerProviderUUID,
 					SKU:           "docker-small",
 					ServiceName:   "web",
 					InstanceIndex: 1,
@@ -1487,7 +1595,7 @@ func TestRecoverState_StackMultiInstance(t *testing.T) {
 	err := b.recoverState(context.Background())
 	require.NoError(t, err)
 
-	prov := b.provisions["lease-1"]
+	prov := b.provisions[stackFixtureLeaseUUID]
 	require.NotNil(t, prov)
 
 	// Two containers for the same service should produce one item with quantity 2.
@@ -1576,7 +1684,7 @@ func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
 	b.cfg.Ingress = IngressConfig{
 		Enabled: true, WildcardDomain: "barney0.manifest0.net", Entrypoint: "websecure",
 	}
-	operationID := shared.OperationID("123e4567-e89b-42d3-a456-426614174000")
+	operationID := mustDockerOperationID("123e4567-e89b-42d3-a456-426614174000")
 	operationURL := callbackServer.URL + "?operation_id=" + operationID.String()
 	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + operationID.String()
 	seedStackMaintenanceAuthority(
@@ -1585,7 +1693,7 @@ func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
 	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   stackMaintenanceLeaseUUID,
 		CallbackURL: lifecycleURL,
 	}))
@@ -1601,20 +1709,11 @@ func TestStackRestart_PreservesCustomDomainInItems(t *testing.T) {
 		"Restart must preserve prov.Items[*].CustomDomain — downstream label-emission depends on it")
 }
 
-// TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed lifts the
-// rollback-itself-fails invariant from the deleted
-// TestUpdate_RollbackFailed_SetsStatusFailed. The existing
-// TestStackRestart_FailureRollsBack covers SUCCESSFUL rollback
-// (status returns to Ready); this test covers the orthogonal case
-// where rollback ITSELF fails and status must escalate to Failed.
-//
-// Targets Update specifically (rather than Restart) because the
-// deleted test was Update-shape. The code path is unified — both
-// doRestart and doUpdate call doReplaceContainers, which in turn
-// calls rollbackViaCompose — so this test also exercises the
-// Restart-rollback-failed path by construction. Restart-only
-// rollback-success coverage is in TestStackRestart_FailureRollsBack.
-func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
+// TestStackUpdate_ComposeUpFailurePreservesRecoveryAuthority proves that a raw
+// Compose error cannot authorize either rollback or terminal failure. Compose
+// may have published some or all of the target cohort before returning the
+// error, so only strict inventory recovery may settle the Started generation.
+func TestStackUpdate_ComposeUpFailurePreservesRecoveryAuthority(t *testing.T) {
 	payload := validStackManifestJSON(map[string]string{
 		manifest.DefaultServiceName: "nginx:latest",
 	})
@@ -1642,9 +1741,6 @@ func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
 	composeMock := &mockComposeExecutor{
 		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
 			upCalls++
-			// Both attempts fail: the update's new-gen Up AND the rollback Up.
-			// This drives doReplaceContainers' rollbackViaCompose return false,
-			// which the SM escalates to Failed.
 			return fmt.Errorf("simulated compose up failure (attempt %d)", upCalls)
 		},
 		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
@@ -1679,7 +1775,7 @@ func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	operationID := shared.OperationID("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
+	operationID := mustDockerOperationID("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
 	operationURL := callbackServer.URL + "?operation_id=" + operationID.String()
 	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + operationID.String()
 	seedStackMaintenanceAuthority(
@@ -1688,59 +1784,37 @@ func TestStackUpdate_RollbackOnReplaceError_EscalatesToFailed(t *testing.T) {
 	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{
+	require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   stackMaintenanceLeaseUUID,
 		CallbackURL: lifecycleURL,
 		Payload:     payload,
 	}))
 	require.Eventually(t, func() bool {
-		intent, found, err := b.callbackStore.GetMaintenanceIntent(stackMaintenanceLeaseUUID)
-		if err != nil || !found || b.actorOwnsMaintenance(stackMaintenanceLeaseUUID, intent.MaintenanceID()) {
-			return false
-		}
-		b.provisionsMu.RLock()
-		status := b.provisions[stackMaintenanceLeaseUUID].Status
-		b.provisionsMu.RUnlock()
-		return status == backend.ProvisionStatusFailed
-	}, 5*time.Second, time.Millisecond, "failed replacement must release its exact worker authority")
+		intent, found, err := b.maintenanceSettlement.GetMaintenanceIntent(stackMaintenanceLeaseUUID)
+		return err == nil && found &&
+			intent.ExecutionPhase() == shared.MaintenanceExecutionStarted &&
+			!b.actorOwnsMaintenance(stackMaintenanceLeaseUUID, intent.MaintenanceID())
+	}, 5*time.Second, time.Millisecond,
+		"the exact Started update must hand off from the live worker to recovery")
 	select {
 	case <-callbackReceived:
-		t.Fatal("ambiguous rollback failure must preserve callback settlement for recovery")
+		t.Fatal("an ambiguous Compose result must preserve callback settlement for recovery")
 	default:
 	}
-	require.NoError(t, b.recoverMaintenanceIntents(context.Background()))
-	awaitStackMaintenanceCallback(t, b, callbackReceived)
 
-	// Up should be called twice: once for the new generation (fails),
-	// once for the rollback (also fails).
-	assert.GreaterOrEqual(t, upCalls, 2,
-		"compose.Up must be tried for both the update and the rollback before status escalates")
-
-	// The durable resolver reports the curated update failure only after it has
-	// classified the ambiguous substrate outcome; the verbose Compose errors stay
-	// in backend logs rather than crossing the tenant callback boundary.
-	assert.Equal(t, backend.CallbackStatusFailed, callbackPayload.Status)
-	assert.Equal(t, backend.MsgUpdateFailed, callbackPayload.Error)
-
-	// Final status must be Failed — when rollback itself fails, neither
-	// the new nor the old generation is healthy; the lease is genuinely
-	// broken and the operator/tenant needs to know.
+	assert.Equal(t, 1, upCalls,
+		"an ambiguous update must not perform a second, potentially destructive mutation")
 	b.provisionsMu.RLock()
 	prov := b.provisions[stackMaintenanceLeaseUUID]
 	status := prov.Status
 	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusFailed, status,
-		"rollback failure must escalate status to Failed — not silently leave at the in-flight Updating state")
+	assert.Equal(t, backend.ProvisionStatusUpdating, status,
+		"post-effect ambiguity must remain non-terminal until strict recovery settles it")
 }
 
-// TestStackRestart_RollbackClearsLastError lifts coverage from the
-// deleted TestRestart_RollbackClearsLastError. After a Restart's
-// compose.Up fails and the rollback reinstates the old containers,
-// prov.LastError must be cleared (a stale LastError would confuse
-// the operator into thinking the lease is still in a degraded state)
-// and prov.FailCount must still reflect the attempted-but-rolled-back
-// failure.
-func TestStackRestart_RollbackClearsLastError(t *testing.T) {
+// TestStackRestart_AmbiguousFailureDoesNotManufactureDiagnostics proves that
+// an unclassified Compose result cannot overwrite the last terminal evidence.
+func TestStackRestart_AmbiguousFailureDoesNotManufactureDiagnostics(t *testing.T) {
 	payload := validStackManifestJSON(map[string]string{
 		manifest.DefaultServiceName: "nginx:latest",
 	})
@@ -1761,8 +1835,8 @@ func TestStackRestart_RollbackClearsLastError(t *testing.T) {
 			StackManifest:     stack,
 			ServiceContainers: map[string][]string{manifest.DefaultServiceName: {"old-c1"}},
 			ContainerIDs:      []string{"old-c1"},
-			LastError:         "",
-			FailCount:         0,
+			LastError:         "previous terminal diagnostic",
+			FailCount:         7,
 		}},
 	}
 
@@ -1770,12 +1844,7 @@ func TestStackRestart_RollbackClearsLastError(t *testing.T) {
 	composeMock := &mockComposeExecutor{
 		UpFn: func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
 			upCalls++
-			if upCalls == 1 {
-				// First Up (new generation) fails.
-				return fmt.Errorf("simulated compose up failure")
-			}
-			// Rollback Up succeeds.
-			return nil
+			return fmt.Errorf("simulated compose up failure")
 		},
 		PSFn: func(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
 			return []composeContainerSummary{
@@ -1808,7 +1877,7 @@ func TestStackRestart_RollbackClearsLastError(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, provisions)
 	b.compose = composeMock
-	operationID := shared.OperationID("123e4567-e89b-42d3-a456-426614174000")
+	operationID := mustDockerOperationID("123e4567-e89b-42d3-a456-426614174000")
 	operationURL := callbackServer.URL + "?operation_id=" + operationID.String()
 	lifecycleURL := callbackServer.URL + "?lifecycle_id=" + operationID.String()
 	seedStackMaintenanceAuthority(
@@ -1817,20 +1886,32 @@ func TestStackRestart_RollbackClearsLastError(t *testing.T) {
 	)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   stackMaintenanceLeaseUUID,
 		CallbackURL: lifecycleURL,
 	}))
-	awaitStackMaintenanceCallback(t, b, callbackReceived)
+	require.Eventually(t, func() bool {
+		intent, found, readErr := b.maintenanceSettlement.GetMaintenanceIntent(stackMaintenanceLeaseUUID)
+		return readErr == nil && found &&
+			intent.ExecutionPhase() == shared.MaintenanceExecutionStarted &&
+			!b.actorOwnsMaintenance(stackMaintenanceLeaseUUID, intent.MaintenanceID())
+	}, 5*time.Second, time.Millisecond,
+		"the exact Started restart must hand off from the live worker to recovery")
+	select {
+	case <-callbackReceived:
+		t.Fatal("an ambiguous Compose result must not emit a terminal callback")
+	default:
+	}
 
 	b.provisionsMu.RLock()
 	prov := b.provisions[stackMaintenanceLeaseUUID]
 	b.provisionsMu.RUnlock()
 
-	assert.Equal(t, backend.ProvisionStatusReady, prov.Status,
-		"status must be Ready after a successful rollback reinstated old generation")
-	assert.Empty(t, prov.LastError,
-		"LastError must be cleared after successful rollback — a stale error would confuse operator triage")
-	assert.Equal(t, 1, prov.FailCount,
-		"FailCount must still reflect the attempted-but-rolled-back failure")
+	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status,
+		"post-effect ambiguity must remain non-terminal until strict recovery settles it")
+	assert.Equal(t, "previous terminal diagnostic", prov.LastError,
+		"ambiguity is not terminal evidence and must not replace the last exact diagnostic")
+	assert.Equal(t, 7, prov.FailCount,
+		"ambiguity is not a proven failure and must not increment the terminal failure count")
+	assert.Equal(t, 1, upCalls, "ambiguous restart must not attempt an unsafe rollback")
 }

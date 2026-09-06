@@ -1003,13 +1003,6 @@ func validateXFSDefaultProject(attr linuxFSXAttr) error {
 	return nil
 }
 
-func (x *xfsVolumeManager) projectAttributeReader() xfsProjectAttributeReader {
-	if x.projectAttributes != nil {
-		return x.projectAttributes
-	}
-	return linuxXFSProjectAttributeReader{}
-}
-
 // xfsLimitCmd is the `limit -p` command that sets the block hard limit (bhard) and
 // the inode hard limit (ihard) for projID in a single quotactl. ihard is a plain
 // integer count (no unit suffix). See ENG-548.
@@ -1285,7 +1278,7 @@ func (x *xfsVolumeManager) normalizeXFSDeleteStageProjectWith(
 		return fmt.Errorf("reset xfs delete-stage %q to project 0: %w: %s", stage.value(), resetErr, out)
 	}
 	cancel()
-	attr, attrErr := x.projectAttributeReader().ReadProjectAttributes(stageRoot)
+	attr, attrErr := x.projectAttributes.ReadProjectAttributes(stageRoot)
 	if attrErr != nil {
 		return fmt.Errorf("read xfs delete-stage %q project attributes: %w", stage.value(), attrErr)
 	}
@@ -2399,9 +2392,9 @@ func (x *xfsVolumeManager) RenameVolume(ctx context.Context, oldName, newName st
 }
 
 // HostPath returns the absolute path of the volume directory under the
-// configured data path. The directory may or may not exist; callers use
-// this to compute paths for not-yet-renamed or about-to-be-created
-// volumes (see migrate.go in Task 9).
+// configured data path. The directory may or may not exist; callers use it
+// only to address a validated managed-volume identity before creation or
+// while executing an authority-bound rename.
 func (x *xfsVolumeManager) HostPath(name string) string {
 	volumeID, err := parseManagedVolumeName(name)
 	if err != nil {
@@ -2436,13 +2429,20 @@ func (x *xfsVolumeManager) Usage(ctx context.Context, id string) (int64, error) 
 		return 0, fmt.Errorf("read project ID marker for %s: %w", dirPath, err)
 	}
 	command := xfsProjectReportCmd("b", projID)
-	out, err := runXFSQuotaReport(ctx, command, x.mountPoint)
+	report, err := runXFSQuotaReport(ctx, command, x.mountPoint)
 	if err != nil {
 		return 0, fmt.Errorf("xfs_quota report for %s (proj %d): %w", dirPath, projID, err)
 	}
-	blocks, err := parseXfsReportUsedBlocks(string(out), projID)
+	blocks, err := parseXfsReportUsedBlocks(string(report.stdout), projID)
 	if err != nil {
+		if report.diagnostic != "" {
+			err = errors.Join(err, fmt.Errorf("xfs_quota diagnostic: %s", report.diagnostic))
+		}
 		return 0, fmt.Errorf("read used blocks for proj %d under %s: %w", projID, dirPath, err)
+	}
+	if report.diagnostic != "" {
+		x.logger.Warn("xfs_quota emitted a diagnostic alongside an exact usage row",
+			"project_id", projID, "diagnostic", report.diagnostic)
 	}
 	return blocks * xfsBlockBytes, nil
 }
@@ -2501,12 +2501,15 @@ func parseXfsReportUsed(out string, projID uint32) (int64, bool, error) {
 	return result, found, nil
 }
 
-// runXFSQuotaReport keeps machine-readable stdout separate from diagnostics.
-// A successful exit with stderr is still uncertain: report callers interpret
-// an absent project row as authoritative zero, so discarding a warning could
-// incorrectly authorize quota teardown. Reject diagnostics explicitly while
-// retaining strict parsing for stdout.
-func runXFSQuotaReport(ctx context.Context, command, mountPoint string) ([]byte, error) {
+// xfsQuotaReport keeps the machine-readable channel distinct from diagnostics.
+// A caller can accept a strictly parsed exact row while refusing to treat an
+// empty stdout as authoritative absence when the tool also emitted a warning.
+type xfsQuotaReport struct {
+	stdout     []byte
+	diagnostic string
+}
+
+func runXFSQuotaReport(ctx context.Context, command, mountPoint string) (xfsQuotaReport, error) {
 	process := exec.CommandContext(ctx, "xfs_quota", xfsQuotaArgs(command, mountPoint)...)
 	var stderr strings.Builder
 	process.Stderr = &stderr
@@ -2514,14 +2517,11 @@ func runXFSQuotaReport(ctx context.Context, command, mountPoint string) ([]byte,
 	diagnostic := strings.TrimSpace(stderr.String())
 	if err != nil {
 		if diagnostic == "" {
-			return nil, err
+			return xfsQuotaReport{}, err
 		}
-		return nil, fmt.Errorf("%w: stderr: %s", err, diagnostic)
+		return xfsQuotaReport{}, fmt.Errorf("%w: stderr: %s", err, diagnostic)
 	}
-	if diagnostic != "" {
-		return nil, fmt.Errorf("xfs_quota exited successfully with diagnostic stderr: %s", diagnostic)
-	}
-	return stdout, nil
+	return xfsQuotaReport{stdout: stdout, diagnostic: diagnostic}, nil
 }
 
 func (x *xfsVolumeManager) readProjectQuotaUsage(ctx context.Context, projID uint32, resource string) (int64, error) {
@@ -2529,18 +2529,25 @@ func (x *xfsVolumeManager) readProjectQuotaUsage(ctx context.Context, projID uin
 		return 0, fmt.Errorf("unsupported xfs project quota resource %q", resource)
 	}
 	command := xfsProjectReportCmd(resource, projID)
-	out, err := runXFSQuotaReport(ctx, command, x.mountPoint)
+	report, err := runXFSQuotaReport(ctx, command, x.mountPoint)
 	if err != nil {
 		return 0, fmt.Errorf("xfs_quota %s for project %d: %w", command, projID, err)
 	}
-	used, found, err := parseXfsReportUsed(string(out), projID)
+	used, found, err := parseXfsReportUsed(string(report.stdout), projID)
 	if err != nil {
 		return 0, err
 	}
 	if !found {
+		if report.diagnostic != "" {
+			return 0, fmt.Errorf("xfs_quota cannot prove project %d absent: %s", projID, report.diagnostic)
+		}
 		// With no report row the kernel has no initialized dquot for the ID, so
 		// there can be neither usage nor a limit left to clear.
 		return 0, nil
+	}
+	if report.diagnostic != "" {
+		x.logger.Warn("xfs_quota emitted a diagnostic alongside an exact usage row",
+			"project_id", projID, "resource", resource, "diagnostic", report.diagnostic)
 	}
 	return used, nil
 }

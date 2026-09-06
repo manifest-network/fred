@@ -2,7 +2,6 @@ package docker
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +20,13 @@ func mustReleaseRuntimeAuthorityForIntent(
 	claim shared.OperationIntentClaim,
 ) *shared.ReleaseRuntimeAuthority {
 	t.Helper()
-	authority, err := releaseRuntimeAuthorityForIntent(claim)
+	authority, err := releaseRuntimeAuthorityForOperation(
+		claim.OperationID(),
+		claim.Tenant(),
+		claim.ProviderUUID(),
+		claim.CallbackURL(),
+		claim.LifecycleCallbackURL(),
+	)
 	require.NoError(t, err)
 	require.NotNil(t, authority)
 	return authority
@@ -34,18 +39,10 @@ func reopenProvisionCommitBackend(
 	mock *mockDockerClient,
 ) (*Backend, closeRecoveryStores) {
 	t.Helper()
-	b := newBackendForTest(mock, nil)
-	b.cfg.CallbackDBPath = filepath.Join(dir, "callbacks.db")
-	b.cfg.ReleasesDBPath = filepath.Join(dir, "releases.db")
-	b.storageIdentity = storageID
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: b.cfg.CallbackDBPath})
-	require.NoError(t, err)
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: b.cfg.ReleasesDBPath})
-	require.NoError(t, err)
-	b.callbackStore = callbacks
-	b.operationIntents = callbacks
-	b.releaseStore = releases
-	return b, closeRecoveryStores{callbacks: callbacks, releases: releases}
+	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
+	require.Equal(t, storageID, b.storageIdentity,
+		"reopening the same journal set must recover the same storage authority")
+	return b, stores
 }
 
 func TestRecoverCommittedProvisionConvergesAcrossTwoRestarts(t *testing.T) {
@@ -56,25 +53,17 @@ func TestRecoverCommittedProvisionConvergesAcrossTwoRestarts(t *testing.T) {
 	writer, stores := openCloseRecoveryBackend(t, dir, mock, nil)
 	storageID := writer.storageIdentity
 	spec := dockerOperationIntentSpec(t, storageID)
-	admission, err := stores.callbacks.BeginOperationIntent(spec)
-	require.NoError(t, err)
-	require.NoError(t, stores.releases.AppendActive(spec.LeaseUUID, shared.Release{
-		Manifest:         spec.Manifest,
-		Image:            "stack",
-		OperationID:      admission.Claim.OperationID(),
-		Items:            admission.Claim.EffectiveItems(),
-		ResourceProfiles: admission.Claim.ResourceProfiles(),
-		RuntimeAuthority: mustReleaseRuntimeAuthorityForIntent(t, admission.Claim),
-		Status:           "active",
-		CreatedAt:        time.Now(),
-	}))
-	// Exact crash injection: AppendActive crossed the durable success boundary,
+	admission := beginOperationIntentForSettlementTest(t, stores.operations, spec)
+	commitOperationReleaseWithoutPublishingTest(
+		t, stores.operations, createdDockerOperationClaim(t, admission),
+	)
+	// Exact crash injection: the typed release commit crossed the durable success boundary,
 	// but ResolveOperationIntent has not replaced the intent with its callback.
 	closeCloseRecoveryBackend(t, writer, stores)
 
 	firstRestart, firstStores := reopenProvisionCommitBackend(t, dir, storageID, mock)
 	require.NoError(t, firstRestart.recoverState(context.Background()))
-	require.NoError(t, firstRestart.recoverOperationIntents(context.Background(), nil))
+	require.NoError(t, firstRestart.recoverOperationIntents(context.Background()))
 	active, err := firstStores.releases.LatestActive(spec.LeaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, active)
@@ -105,7 +94,7 @@ func TestRecoverCommittedProvisionConvergesAcrossTwoRestarts(t *testing.T) {
 	allocation := secondRestart.pool.GetAllocation(spec.LeaseUUID + "-app-0")
 	require.NotNil(t, allocation)
 	assert.Equal(t, spec.Tenant, allocation.Tenant)
-	intents, err := secondStores.callbacks.ListOperationIntents()
+	intents, err := secondStores.operations.ListOperationIntents()
 	require.NoError(t, err)
 	assert.Empty(t, intents)
 	pending, err := secondStores.callbacks.ListPending()
@@ -156,19 +145,11 @@ func TestRecoverCommittedProvisionAfterRestart(t *testing.T) {
 			b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
 			t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
 			spec := dockerOperationIntentSpec(t, b.storageIdentity)
-			admission, err := stores.callbacks.BeginOperationIntent(spec)
-			require.NoError(t, err)
+			admission := beginOperationIntentForSettlementTest(t, stores.operations, spec)
 			containers = tt.containers(spec)
-			require.NoError(t, stores.releases.AppendActive(spec.LeaseUUID, shared.Release{
-				Manifest:         spec.Manifest,
-				Image:            "stack",
-				OperationID:      admission.Claim.OperationID(),
-				Items:            admission.Claim.EffectiveItems(),
-				ResourceProfiles: admission.Claim.ResourceProfiles(),
-				RuntimeAuthority: mustReleaseRuntimeAuthorityForIntent(t, admission.Claim),
-				Status:           "active",
-				CreatedAt:        time.Now(),
-			}))
+			commitOperationReleaseWithoutPublishingTest(
+				t, stores.operations, createdDockerOperationClaim(t, admission),
+			)
 
 			// Model the new process startup order. recoverState must first publish a
 			// terminal projection and its full conservative reservation; only then may
@@ -178,7 +159,7 @@ func TestRecoverCommittedProvisionAfterRestart(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, backend.ProvisionStatusFailed, projection.Status)
 			assert.Equal(t, spec.ProviderUUID, projection.ProviderUUID)
-			assert.Equal(t, admission.Claim.EffectiveItems(), projection.Items)
+			assert.Equal(t, createdDockerOperationClaim(t, admission).EffectiveItems(), projection.Items)
 			b.provisionsMu.RLock()
 			recoveredTenant := b.provisions[spec.LeaseUUID].Tenant
 			recoveredLifecycleCallbackURL := b.provisions[spec.LeaseUUID].LifecycleCallbackURL
@@ -193,11 +174,11 @@ func TestRecoverCommittedProvisionAfterRestart(t *testing.T) {
 
 			before, err := stores.releases.List(spec.LeaseUUID)
 			require.NoError(t, err)
-			require.NoError(t, b.recoverOperationIntents(context.Background(), nil))
+			require.NoError(t, b.recoverOperationIntents(context.Background()))
 			after, err := stores.releases.List(spec.LeaseUUID)
 			require.NoError(t, err)
 			assert.Equal(t, before, after, "recovery must not mint or replace the committed Release")
-			intents, err := stores.callbacks.ListOperationIntents()
+			intents, err := stores.operations.ListOperationIntents()
 			require.NoError(t, err)
 			assert.Empty(t, intents)
 			pending, err := stores.callbacks.ListPending()
@@ -211,49 +192,64 @@ func TestRecoverCommittedProvisionAfterRestart(t *testing.T) {
 
 func TestRecoverProvisionDoesNotCommitFromAnotherReleaseGeneration(t *testing.T) {
 	for _, tt := range []struct {
-		name                  string
-		operationID           shared.OperationID
-		expectUnresolvedError string
+		name        string
+		operationID shared.OperationID
 	}{
-		{
-			name:                  "legacy empty operation ID",
-			operationID:           "",
-			expectUnresolvedError: "legacy predecessor has no durable runtime authority",
-		},
-		{name: "different operation ID", operationID: "9a72fbc1-38c8-4f31-87f7-f689979b9324"},
+		{name: "migrated legacy predecessor", operationID: shared.OperationID{}},
+		{name: "different operation ID", operationID: mustDockerOperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
+			inventoryReads := 0
 			mock := &mockDockerClient{
-				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
+				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+					inventoryReads++
+					return nil, nil
+				},
 			}
 			b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
 			t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
+			// An empty exact-candidate inventory is not absence proof: Docker may
+			// still publish a Create accepted by the process that wrote the intent.
+			// Keep the production recovery semantics while bounding this fixture.
+			b.cfg.ContainerStartTimeout = 5 * time.Millisecond
+			b.cfg.ProvisionTimeout = 40 * time.Millisecond
 			spec := dockerOperationIntentSpec(t, b.storageIdentity)
-			admission, err := stores.callbacks.BeginOperationIntent(spec)
-			require.NoError(t, err)
-			var runtimeAuthority *shared.ReleaseRuntimeAuthority
 			if tt.operationID.Valid() {
-				oldID := admission.Claim.OperationID().String()
-				callbackURL := strings.Replace(spec.CallbackURL, oldID, tt.operationID.String(), 1)
-				lifecycleCallbackURL := strings.Replace(spec.LifecycleCallbackURL, oldID, tt.operationID.String(), 1)
-				runtimeAuthority, err = releaseRuntimeAuthorityForOperation(
+				currentID := mustTestOperationIDFromCallbackURL(t, spec.CallbackURL)
+				callbackURL := strings.Replace(spec.CallbackURL, currentID.String(), tt.operationID.String(), 1)
+				lifecycleCallbackURL := strings.Replace(spec.LifecycleCallbackURL, currentID.String(), tt.operationID.String(), 1)
+				runtimeAuthority, authorityErr := releaseRuntimeAuthorityForOperation(
 					tt.operationID, spec.Tenant, spec.ProviderUUID, callbackURL, lifecycleCallbackURL,
 				)
-				require.NoError(t, err)
+				require.NoError(t, authorityErr)
+				seedProvisionReleaseForLeaseTest(t, stores.callbacks, stores.releases, stores.operations,
+					spec.LeaseUUID, shared.Release{
+						Manifest: spec.Manifest, Image: "stack", OperationID: tt.operationID,
+						Items: spec.Items, ResourceProfiles: spec.ResourceProfiles,
+						RuntimeAuthority: runtimeAuthority, Status: "active", CreatedAt: time.Now(),
+					})
+			} else {
+				legacyAuthority, authorityErr := shared.NewLegacyRuntimeAuthority(
+					spec.Tenant, spec.ProviderUUID,
+					"https://fred.example/callbacks/provision",
+					"https://fred.example/callbacks/provision",
+				)
+				require.NoError(t, authorityErr)
+				seedUpgradedV013ReleaseForBackendTest(t, b, spec.LeaseUUID, shared.Release{
+					Manifest: spec.Manifest, Image: "stack", Status: "active", CreatedAt: time.Now(),
+				}, spec.Items, spec.ResourceProfiles, legacyAuthority)
+				stores.releases = b.releaseStore
+				var ok bool
+				stores.operations, ok = concreteOperationSettlementForTest(b.operationSettlement)
+				require.True(t, ok)
+				stores.restore = b.restoreSettlement
+				stores.maintenance = b.maintenanceSettlement
+				stores.close = b.closeSettlement
 			}
-			require.NoError(t, stores.releases.AppendActive(spec.LeaseUUID, shared.Release{
-				Manifest:         spec.Manifest,
-				Image:            "stack",
-				OperationID:      tt.operationID,
-				Items:            admission.Claim.EffectiveItems(),
-				ResourceProfiles: admission.Claim.ResourceProfiles(),
-				RuntimeAuthority: runtimeAuthority,
-				Status:           "active",
-				CreatedAt:        time.Now(),
-			}))
+			admission := beginOperationIntentForSettlementTest(t, stores.operations, spec)
 
-			committed, err := b.operationIntentHasCommittedRelease(admission.Claim)
+			committed, err := b.operationIntentHasCommittedRelease(createdDockerOperationClaim(t, admission))
 			require.NoError(t, err)
 			assert.False(t, committed, "another generation must not commit the pending operation")
 
@@ -261,31 +257,27 @@ func TestRecoverProvisionDoesNotCommitFromAnotherReleaseGeneration(t *testing.T)
 			candidate, err := b.GetProvision(context.Background(), spec.LeaseUUID)
 			require.NoError(t, err)
 			assert.Equal(t, backend.ProvisionStatusProvisioning, candidate.Status)
-			assert.Equal(t, admission.Claim.EffectiveItems(), candidate.Items)
+			assert.Equal(t, createdDockerOperationClaim(t, admission).EffectiveItems(), candidate.Items)
 			b.provisionsMu.RLock()
 			candidateCallbackURL := b.provisions[spec.LeaseUUID].CallbackURL
 			b.provisionsMu.RUnlock()
 			assert.Equal(t, spec.CallbackURL, candidateCallbackURL,
 				"the temporary cleanup projection must come from the pending intent")
 
-			recoveryErr := b.recoverOperationIntents(context.Background(), nil)
-			if tt.expectUnresolvedError != "" {
-				require.ErrorContains(t, recoveryErr, tt.expectUnresolvedError)
-				intents, listErr := stores.callbacks.ListOperationIntents()
-				require.NoError(t, listErr)
-				require.Len(t, intents, 1,
-					"ambiguous legacy authority must retain the exact operation evidence")
-				pending, listErr := stores.callbacks.ListPending()
-				require.NoError(t, listErr)
-				assert.Empty(t, pending)
-				return
-			}
+			readsBeforeRecovery := inventoryReads
+			recoveryErr := b.recoverOperationIntents(context.Background())
 			require.NoError(t, recoveryErr)
+			assert.GreaterOrEqual(t, inventoryReads-readsBeforeRecovery, 2,
+				"a different active generation must not turn the first empty candidate inventory into absence proof")
 			pending, err := stores.callbacks.ListPending()
 			require.NoError(t, err)
 			require.Len(t, pending, 1)
 			assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
 			assert.Equal(t, interruptedOperationFailure, pending[0].Error)
+			intents, err := stores.operations.ListOperationIntents()
+			require.NoError(t, err)
+			assert.Empty(t, intents,
+				"the bounded ambiguity window must terminate in an exact failed receipt")
 
 			recovered, err := b.GetProvision(context.Background(), spec.LeaseUUID)
 			require.NoError(t, err)
@@ -293,14 +285,20 @@ func TestRecoverProvisionDoesNotCommitFromAnotherReleaseGeneration(t *testing.T)
 			b.provisionsMu.RLock()
 			recoveredCallbackURL := b.provisions[spec.LeaseUUID].CallbackURL
 			b.provisionsMu.RUnlock()
-			assert.Equal(t, runtimeAuthority.CallbackURL(), recoveredCallbackURL,
-				"failed candidate recovery must restore the older release authority")
-			assert.NotEqual(t, spec.CallbackURL, recoveredCallbackURL)
 			active, err := stores.releases.LatestActive(spec.LeaseUUID)
 			require.NoError(t, err)
 			require.NotNil(t, active)
+			activeAuthority, ok := active.RuntimeIdentity()
+			require.True(t, ok)
+			assert.Equal(t, activeAuthority.CallbackURL(), recoveredCallbackURL,
+				"failed candidate recovery must restore the older release authority")
+			assert.NotEqual(t, spec.CallbackURL, recoveredCallbackURL)
 			assert.Equal(t, tt.operationID, active.OperationID,
 				"failure settlement must not append a candidate release")
+			history, err := stores.releases.List(spec.LeaseUUID)
+			require.NoError(t, err)
+			require.Len(t, history, 1,
+				"recovery must preserve the predecessor without minting a candidate generation")
 		})
 	}
 }
@@ -325,40 +323,40 @@ func TestRecoverProvisionPublishesExactLineageOverByteIdenticalOlderRelease(t *t
 	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
 	t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
 	spec := dockerOperationIntentSpec(t, b.storageIdentity)
-	admission, err := stores.callbacks.BeginOperationIntent(spec)
-	require.NoError(t, err)
-	containers = []ContainerInfo{dockerIntentContainer(spec, "container-1", spec.Items[0].SKU, 0)}
-
-	const olderID = shared.OperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")
-	newID := admission.Claim.OperationID().String()
+	olderID := mustDockerOperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	newID := mustTestOperationIDFromCallbackURL(t, spec.CallbackURL).String()
 	olderCallbackURL := strings.Replace(spec.CallbackURL, newID, olderID.String(), 1)
 	olderLifecycleURL := strings.Replace(spec.LifecycleCallbackURL, newID, olderID.String(), 1)
 	olderAuthority, err := releaseRuntimeAuthorityForOperation(
 		olderID, spec.Tenant, spec.ProviderUUID, olderCallbackURL, olderLifecycleURL,
 	)
 	require.NoError(t, err)
-	require.NoError(t, stores.releases.AppendActive(spec.LeaseUUID, shared.Release{
-		Manifest:         spec.Manifest,
-		Image:            "stack",
-		OperationID:      olderID,
-		Items:            admission.Claim.EffectiveItems(),
-		ResourceProfiles: admission.Claim.ResourceProfiles(),
-		RuntimeAuthority: olderAuthority,
-		Status:           "active",
-		CreatedAt:        time.Now(),
-	}))
+	seedProvisionReleaseForLeaseTest(t, stores.callbacks, stores.releases, stores.operations,
+		spec.LeaseUUID, shared.Release{
+			Manifest:         spec.Manifest,
+			Image:            "stack",
+			OperationID:      olderID,
+			Items:            spec.Items,
+			ResourceProfiles: spec.ResourceProfiles,
+			RuntimeAuthority: olderAuthority,
+			Status:           "active",
+			CreatedAt:        time.Now(),
+		})
+	admission := beginOperationIntentForSettlementTest(t, stores.operations, spec)
+	started := startPendingOperationForRecoveryTest(t, b)
+	containers = []ContainerInfo{dockerIntentContainer(spec, "container-1", spec.Items[0].SKU, 0)}
 
 	require.NoError(t, b.recoverState(context.Background()))
-	require.NoError(t, b.recoverOperationIntents(context.Background(), nil))
+	require.NoError(t, b.recoverOperationIntents(context.Background()))
 	history, err := stores.releases.List(spec.LeaseUUID)
 	require.NoError(t, err)
 	require.Len(t, history, 2)
 	latest := history[len(history)-1]
-	assert.Equal(t, admission.Claim.OperationID(), latest.OperationID)
-	assert.True(t, latest.CreatedAt.Equal(admission.Claim.CreatedAt()),
+	assert.Equal(t, started.OperationID(), latest.OperationID)
+	assert.True(t, latest.CreatedAt.Equal(createdDockerOperationClaim(t, admission).CreatedAt()),
 		"cold recovery must reuse the admission timestamp proven before side effects")
 	require.NotNil(t, latest.RuntimeAuthority)
-	assert.Equal(t, admission.Claim.CallbackURL(), latest.RuntimeAuthority.CallbackURL())
+	assert.Equal(t, createdDockerOperationClaim(t, admission).CallbackURL(), latest.RuntimeAuthority.CallbackURL())
 	assert.Equal(t, "superseded", history[0].Status)
 	assert.Equal(t, "active", latest.Status)
 	pending, err := stores.callbacks.ListPending()
@@ -367,72 +365,9 @@ func TestRecoverProvisionPublishesExactLineageOverByteIdenticalOlderRelease(t *t
 	assert.Equal(t, backend.CallbackStatusSuccess, pending[0].Status)
 }
 
-func TestRecoverProvisionFailsClosedOnSameOperationIDDivergence(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		mutate func(*shared.Release)
-	}{
-		{
-			name: "manifest",
-			mutate: func(release *shared.Release) {
-				release.Manifest = validStackManifestJSON(map[string]string{
-					"app": "docker.io/library/busybox:1.37",
-				})
-			},
-		},
-		{
-			name: "effective items",
-			mutate: func(release *shared.Release) {
-				release.Items[0].Quantity = 2
-			},
-		},
-		{
-			name: "resource profiles",
-			mutate: func(release *shared.Release) {
-				release.ResourceProfiles[0].CPUCores++
-			},
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			mock := &mockDockerClient{
-				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
-			}
-			b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
-			t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
-			spec := dockerOperationIntentSpec(t, b.storageIdentity)
-			admission, err := stores.callbacks.BeginOperationIntent(spec)
-			require.NoError(t, err)
-			release := shared.Release{
-				Manifest:         spec.Manifest,
-				Image:            "stack",
-				OperationID:      admission.Claim.OperationID(),
-				Items:            admission.Claim.EffectiveItems(),
-				ResourceProfiles: admission.Claim.ResourceProfiles(),
-				RuntimeAuthority: mustReleaseRuntimeAuthorityForIntent(t, admission.Claim),
-				Status:           "active",
-				CreatedAt:        time.Now(),
-			}
-			tt.mutate(&release)
-			require.NoError(t, stores.releases.AppendActive(spec.LeaseUUID, release))
-
-			err = b.recoverState(context.Background())
-			require.ErrorContains(t, err, "active release with matching operation ID differs")
-			intents, listErr := stores.callbacks.ListOperationIntents()
-			require.NoError(t, listErr)
-			assert.Len(t, intents, 1, "ambiguous same-token evidence must remain durable")
-			pending, listErr := stores.callbacks.ListPending()
-			require.NoError(t, listErr)
-			assert.Empty(t, pending)
-		})
-	}
-}
-
 func TestRestoreFinalizerAcceptsCommittedMaintenanceBaseMove(t *testing.T) {
-	const (
-		operationID  = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
-		providerUUID = "22222222-2222-4222-8222-222222222222"
-	)
+	const providerUUID = "22222222-2222-4222-8222-222222222222"
+	operationID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	oldOperationURL := "https://old.example/callbacks/provision?operation_id=" + operationID.String()
 	oldLifecycleURL := "https://old.example/callbacks/provision?lifecycle_id=" + operationID.String()
 	newOperationURL := "https://new.example/callbacks/provision?operation_id=" + operationID.String()
@@ -485,9 +420,9 @@ func TestRecoverCommittedRestoreWithNoSurvivorsUsesMovedReleaseRoute(t *testing.
 	const (
 		sourceLease  = "0192f1a0-1111-4abc-8def-000000000201"
 		destination  = "0192f1a0-2222-4abc-8def-000000000202"
-		operationID  = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 		providerUUID = "22222222-2222-4222-8222-222222222222"
 	)
+	operationID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	oldOperationURL := "https://old.example/callbacks/provision?operation_id=" + operationID.String()
 	oldLifecycleURL := "https://old.example/callbacks/provision?lifecycle_id=" + operationID.String()
 	newOperationURL := "https://new.example/callbacks/provision?operation_id=" + operationID.String()
@@ -497,13 +432,12 @@ func TestRecoverCommittedRestoreWithNoSurvivorsUsesMovedReleaseRoute(t *testing.
 	payload := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
 	stack, err := manifest.ParsePayload(payload)
 	require.NoError(t, err)
-	dir := t.TempDir()
-	retentions, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(dir, "retentions.db"),
-	})
-	require.NoError(t, err)
-	defer retentions.Close()
-	require.NoError(t, retentions.Put(shared.RetentionEntry{
+	b := newBackendForProvisionTest(t, &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
+	}, nil)
+	defer b.stopCancel()
+	retentions := attachRetentionStore(t, b)
+	require.NoError(t, putRetentionForTest(t, retentions, shared.RetentionEntry{
 		OriginalLeaseUUID: sourceLease,
 		Tenant:            "tenant-a",
 		ProviderUUID:      providerUUID,
@@ -513,38 +447,41 @@ func TestRecoverCommittedRestoreWithNoSurvivorsUsesMovedReleaseRoute(t *testing.
 		Status:            shared.RetentionStatusActive,
 		CreatedAt:         time.Now(),
 	}))
-	claimed, err := retentions.ClaimForRestoreWithAuthority(
-		sourceLease,
-		destination,
-		0,
-		items,
-		profiles,
-		operationID,
-		oldOperationURL,
-		oldLifecycleURL,
+	operationCandidate, err := b.operationSettlement.NewOperationIntentCandidate(
+		shared.OperationIntentSpec{
+			Kind: shared.OperationIntentRestore, LeaseUUID: destination,
+			CallbackURL: oldOperationURL, LifecycleCallbackURL: oldLifecycleURL,
+			Tenant: "tenant-a", ProviderUUID: providerUUID,
+			Items: items, ResourceProfiles: profiles, EffectiveItems: items,
+			Manifest: payload, SourceLeaseUUID: sourceLease, SourceGeneration: 1,
+		},
 	)
 	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(dir, "releases.db"),
-	})
+	operationAdmission, err := b.operationSettlement.BeginOperationIntent(operationCandidate)
 	require.NoError(t, err)
-	defer releases.Close()
+	operationClaim, created := operationAdmission.CreatedClaim()
+	require.True(t, created)
+	restoreCandidate, err := b.restoreSettlement.PrepareRestoreClaim(operationClaim)
+	require.NoError(t, err)
+	claimedProof, err := b.restoreSettlement.ClaimForRestore(restoreCandidate, 0)
+	require.NoError(t, err)
+	require.True(t, claimedProof.Valid())
+	committed := commitOperationReleaseWithoutPublishingTest(t, b.operationSettlement, operationClaim)
+	require.NoError(t, b.callbackPublisher.PublishOperationSuccessContext(context.Background(), committed))
+	acknowledgePendingCallbacksForTest(t, b.callbackStore)
+	active, err := b.releaseStore.LatestActive(destination)
+	require.NoError(t, err)
+	require.NotNil(t, active)
 	authority, err := shared.NewReleaseRuntimeAuthority(
 		operationID, "tenant-a", providerUUID, newOperationURL, newLifecycleURL,
 	)
 	require.NoError(t, err)
-	require.NoError(t, releases.AppendActive(destination, shared.Release{
-		Manifest: payload, Image: "stack", OperationID: operationID,
-		Items: items, ResourceProfiles: profiles, RuntimeAuthority: &authority,
-		Status: "active", CreatedAt: time.Now(),
-	}))
-	b := newBackendForTest(&mockDockerClient{
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
-	}, nil)
-	defer b.stopCancel()
-	b.retentionStore = retentions
-	b.releaseStore = releases
+	target := *active
+	target.Version = 0
+	target.RuntimeAuthority = &authority
+	activateMaintenanceReleaseForTest(
+		t, b.maintenanceSettlement, destination, shared.MaintenanceIntentUpdate, target,
+	)
 	require.NoError(t, b.recoverState(context.Background()))
 	b.provisionsMu.RLock()
 	recovered := b.provisions[destination]

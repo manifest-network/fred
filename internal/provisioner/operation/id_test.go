@@ -10,6 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 const canonicalTestOperationID = "123e4567-e89b-42d3-a456-426614174000"
@@ -25,7 +27,7 @@ func TestOperationIDZeroValueIsInvalid(t *testing.T) {
 	var id OperationID
 
 	assert.False(t, id.Valid())
-	assert.Equal(t, "invalid", id.String())
+	assert.Empty(t, id.String())
 	text, err := id.MarshalText()
 	assert.ErrorIs(t, err, ErrInvalidID)
 	assert.Nil(t, text)
@@ -152,6 +154,17 @@ func TestOperationIDComparable(t *testing.T) {
 	_, hasTwo := set[two]
 	assert.True(t, hasOne)
 	assert.False(t, hasTwo)
+}
+
+func TestOperationIDIsTheBackendOperationIDWithoutConversion(t *testing.T) {
+	providerID := mustTestOperationID(t, canonicalTestOperationID)
+	acceptBackendID := func(id shared.OperationID) shared.OperationID { return id }
+	acceptProviderID := func(id OperationID) OperationID { return id }
+	backendID := acceptBackendID(providerID)
+	roundTrip := acceptProviderID(backendID)
+
+	assert.Equal(t, providerID, backendID)
+	assert.Equal(t, providerID, roundTrip)
 }
 
 func FuzzOperationIDTextRoundTrip(f *testing.F) {

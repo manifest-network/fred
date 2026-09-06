@@ -1,10 +1,13 @@
 package shared
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"math"
 	"sync"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 // SKUResolver resolves a SKU identifier to its resource profile.
@@ -200,7 +203,7 @@ type ResolvedAdoptInstance struct {
 //
 // Gating the delta and committing all reservations under ONE lock is what makes
 // admission correct on three axes: (1) EXACT — a per-volume disk gate would
-// double-count the retained bytes still in the projection until ClaimForRestoreWithAuthority
+// double-count the retained bytes still in the projection until RestoreSettlement.ClaimForRestore
 // and reject a fitting multi-volume promote; (2) ATOMIC — no concurrent
 // TryAllocate/restore can consume disk between the delta check and the
 // reservations, so the pool cannot be over-committed; and (3) CONSISTENT — the
@@ -644,14 +647,35 @@ func (s ResourceStats) AvailableDiskMB() int64 {
 // returns an error without changing the existing snapshot if an allocation is
 // malformed or the rebuilt accounting cannot be represented.
 func (p *ResourcePool) Reset(allocations []ResourceAllocation) error {
-	return p.ResetPreserving(allocations, nil)
+	return p.reset(allocations, false)
 }
 
-// ResetPreserving is the recovery-safe variant of Reset. It rebuilds the pool's
-// live allocations from allocations, but first RETAINS every current allocation
-// for which keep returns true. Retained entries take precedence over any
-// same-key entry in allocations (deduped by allocation key), so an allocation
-// present in both is counted exactly once.
+const canonicalLeaseUUIDTextLength = 36
+
+var errInvalidResourceAllocation = errors.New("invalid resource allocation lease UUID")
+
+// allocationLeaseUUID returns the canonical owner encoded in a pool allocation
+// key. Current keys are either {leaseUUID}-{service}-{index} or the stopped
+// v0.13 shape {leaseUUID}-{index}; in both forms the fixed-width UUID and the
+// following delimiter make ownership collision-free even when two UUIDs share
+// an arbitrary textual prefix.
+func allocationLeaseUUID(key string) (string, error) {
+	if len(key) <= canonicalLeaseUUIDTextLength+1 || key[canonicalLeaseUUIDTextLength] != '-' {
+		return "", fmt.Errorf("allocation key %q has no canonical lease owner", key)
+	}
+	leaseUUID := key[:canonicalLeaseUUIDTextLength]
+	if !backend.IsCanonicalLeaseUUID(leaseUUID) {
+		return "", fmt.Errorf("allocation key %q: %w", key, errInvalidResourceAllocation)
+	}
+	return leaseUUID, nil
+}
+
+// ResetConservatively is the recovery-safe variant of Reset. It replaces every
+// current lease owner represented by allocations and preserves every current
+// owner absent from that snapshot. The polarity is deliberately fail-closed:
+// an incomplete recovery publication can retain capacity, but cannot erase a
+// live reservation and expose phantom capacity. Only the exact terminal path
+// that owns an allocation may release an absent owner.
 //
 // recoverState rebuilds the pool from a container-derived snapshot each tick,
 // but a lease that is mid-operation (Provisioning/Restarting/Updating) may have
@@ -660,48 +684,63 @@ func (p *ResourcePool) Reset(allocations []ResourceAllocation) error {
 // from that snapshot. Dropping their reservation on the rebuild would let
 // TryAllocate momentarily see phantom free capacity and over-admit past physical
 // capacity, leaving the pool over-committed once the lease re-registers
-// (ENG-546). The caller marks those in-flight leases via keep so their existing
-// reservations survive the rebuild, keyed identically — read from the live pool
-// rather than reconstructed, so the reservation is preserved even in the window
-// before its Items are populated.
+// (ENG-546). Preserving all unrepresented owners makes that safety independent
+// of a caller-maintained classification set and also covers the window before
+// an operation's Items are populated.
 //
-// keep receives each current allocation's key and is invoked while the pool lock
-// is held, so it must not call back into ResourcePool or perform expensive or
-// blocking work. A nil keep preserves nothing, making ResetPreserving identical
-// to Reset. Like Reset, it returns an error without publishing a partial
-// snapshot when the rebuilt accounting is invalid or overflows.
-func (p *ResourcePool) ResetPreserving(allocations []ResourceAllocation, keep func(key string) bool) error {
+// No caller code runs while the pool lock is held. Both existing and rebuilt
+// allocation keys must expose a canonical fixed-width lease owner; malformed
+// recovery input fails atomically without changing the previous snapshot.
+func (p *ResourcePool) ResetConservatively(allocations []ResourceAllocation) error {
+	return p.reset(allocations, true)
+}
+
+func (p *ResourcePool) reset(
+	allocations []ResourceAllocation,
+	preserveUnrepresented bool,
+) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Snapshot the entries to retain from the CURRENT allocations before
-	// clearing, keyed by allocation key so a same-key entry in allocations
-	// cannot double-count them in the rebuild below.
-	var preserved map[string]ResourceAllocation
-	if keep != nil {
-		for key, alloc := range p.allocations {
-			if keep(key) {
-				if preserved == nil {
-					preserved = make(map[string]ResourceAllocation)
-				}
-				preserved[key] = alloc
+	// First validate the complete ownership grammar and collect the owners the
+	// incoming snapshot can replace authoritatively. Validation precedes the
+	// replacement map so any malformed input leaves the pool byte-for-byte intact.
+	representedOwners := make(map[string]struct{}, len(allocations))
+	if preserveUnrepresented {
+		for key := range p.allocations {
+			if _, err := allocationLeaseUUID(key); err != nil {
+				return fmt.Errorf("classify current recovery allocation: %w", err)
 			}
+		}
+		for _, alloc := range allocations {
+			leaseUUID, err := allocationLeaseUUID(alloc.LeaseUUID)
+			if err != nil {
+				return fmt.Errorf("classify rebuilt recovery allocation: %w", err)
+			}
+			representedOwners[leaseUUID] = struct{}{}
 		}
 	}
 
 	// Build and validate a replacement snapshot before publishing any of it. This
 	// keeps Reset atomic even if a library caller supplies a non-finite allocation
-	// or enough entries to overflow an aggregate. Duplicate input keys are folded
-	// last-wins, matching the allocation map, while preserved entries still win.
-	rebuilt := make(map[string]ResourceAllocation, len(allocations)+len(preserved))
-	for _, alloc := range allocations {
-		if _, isPreserved := preserved[alloc.LeaseUUID]; isPreserved {
-			continue
+	// or enough entries to overflow an aggregate. An unrepresented current owner
+	// is copied first; a represented owner is replaced as a cohort, so stale
+	// sibling keys cannot survive a smaller authoritative snapshot. Duplicate
+	// input keys are folded last-wins, matching the allocation map.
+	rebuilt := make(map[string]ResourceAllocation, len(allocations)+len(p.allocations))
+	if preserveUnrepresented {
+		for key, alloc := range p.allocations {
+			leaseUUID, err := allocationLeaseUUID(key)
+			if err != nil {
+				return fmt.Errorf("classify current recovery allocation: %w", err)
+			}
+			if _, represented := representedOwners[leaseUUID]; !represented {
+				rebuilt[key] = alloc
+			}
 		}
-		rebuilt[alloc.LeaseUUID] = alloc
 	}
-	for key, alloc := range preserved {
-		rebuilt[key] = alloc
+	for _, alloc := range allocations {
+		rebuilt[alloc.LeaseUUID] = alloc
 	}
 
 	allocatedCPU, allocatedMemory, allocatedDisk, tenantUsage, err := aggregateAllocations(rebuilt)

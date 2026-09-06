@@ -40,7 +40,8 @@
 // AdmissionScope containing exactly the backends that answered both inventories;
 // only a genuinely recordless PENDING reconciliation may use that scope.
 //
-// ProjectInventory applies positive observations at a causal fence. An exact
+// ReconciliationSweep.Project applies positive observations at its inseparable
+// causal fence. An exact
 // positive confirms its attempted owner only when an active upgraded backend
 // reports the same paired typed lifecycle generation. Older/unknown generations
 // preserve the attempt; retention-only evidence carries no lifecycle authority.

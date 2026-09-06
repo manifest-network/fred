@@ -3,7 +3,6 @@ package docker
 import (
 	"context"
 	"math"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,14 +13,49 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
 
+const (
+	releaseCohortLeaseUUID      = "11111111-1111-4111-8111-111111111111"
+	releaseCohortEmptyLeaseUUID = "33333333-3333-4333-8333-333333333333"
+	releaseCohortProviderUUID   = "22222222-2222-4222-8222-222222222222"
+	releaseCohortTenant         = "tenant-1"
+	releaseCohortOperationID    = "9a72fbc1-38c8-4f31-87f7-f689979b9324"
+	releaseCohortCallbackURL    = "https://fred.example/callbacks/provision?operation_id=" + releaseCohortOperationID
+	releaseCohortLifecycleURL   = "https://fred.example/callbacks/provision?lifecycle_id=" + releaseCohortOperationID
+)
+
+func seedReleaseCohort(
+	t *testing.T,
+	b *Backend,
+	leaseUUID string,
+	manifestBytes []byte,
+	items []backend.LeaseItem,
+) {
+	t.Helper()
+	operationID := mustDockerOperationID(releaseCohortOperationID)
+	authority, err := shared.NewReleaseRuntimeAuthority(
+		operationID,
+		releaseCohortTenant,
+		releaseCohortProviderUUID,
+		releaseCohortCallbackURL,
+		releaseCohortLifecycleURL,
+	)
+	require.NoError(t, err)
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
+		Manifest: manifestBytes, Image: "stack", OperationID: operationID,
+		Items: items, ResourceProfiles: testResourceProfiles(t, items),
+		RuntimeAuthority: &authority, Status: "active", CreatedAt: time.Now(),
+	})
+}
+
 func newReleaseCohortBackend(t *testing.T, existing map[string]*provision) *Backend {
 	t.Helper()
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", Quantity: 2, ServiceName: "app",
 	}}
 	container := ContainerInfo{
-		ContainerID: "c0", LeaseUUID: "lease-1", Tenant: "tenant-1", ProviderUUID: "provider-1",
+		ContainerID: "c0", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
 		SKU: "docker-small", ServiceName: "app", InstanceIndex: 0, Image: "nginx:1.25",
+		CallbackURL: releaseCohortCallbackURL, LifecycleCallbackURL: releaseCohortLifecycleURL,
 		Status: "running", CreatedAt: time.Now(),
 	}
 	b := newBackendForTest(&mockDockerClient{
@@ -30,18 +64,9 @@ func newReleaseCohortBackend(t *testing.T, existing map[string]*provision) *Back
 		},
 	}, existing)
 	t.Cleanup(b.stopCancel)
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "releases.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, releases.Close()) })
-	require.NoError(t, releases.Append("lease-1", shared.Release{
-		Manifest:         []byte(`{"image":"nginx:1.25"}`),
-		Items:            items,
-		ResourceProfiles: testResourceProfiles(t, items),
-		Image:            "stack", Status: "active", CreatedAt: time.Now(),
-	}))
-	b.releaseStore = releases
+	seedReleaseCohort(
+		t, b, releaseCohortLeaseUUID, []byte(`{"image":"nginx:1.25"}`), items,
+	)
 	return b
 }
 
@@ -54,12 +79,12 @@ func TestValidateRecoveredReleaseCohort_ExactInstanceSet(t *testing.T) {
 	}
 	cohort := []ContainerInfo{
 		{
-			ContainerID: "c0", LeaseUUID: "lease-1", Tenant: "tenant-1", ProviderUUID: "provider-1",
+			ContainerID: "c0", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
 			SKU: "docker-small", ServiceName: "app", InstanceIndex: 0, Image: "nginx:1.25",
 			CustomDomain: "tenant.example",
 		},
 		{
-			ContainerID: "c1", LeaseUUID: "lease-1", Tenant: "tenant-1", ProviderUUID: "provider-1",
+			ContainerID: "c1", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
 			SKU: "docker-small", ServiceName: "app", InstanceIndex: 1, Image: "nginx:1.25",
 			CustomDomain: "tenant.example",
 		},
@@ -144,7 +169,7 @@ func TestValidateRecoveredReleaseCohort_RejectsUnboundedDurableQuantities(t *tes
 			)
 
 			b := newBackendForTest(&mockDockerClient{}, nil)
-			_, err := b.recoveredReleaseAllocations("lease-1", "tenant-1", items, nil)
+			_, err := b.recoveredReleaseAllocations(releaseCohortLeaseUUID, releaseCohortTenant, items, nil)
 			require.ErrorContains(t, err, "validate durable release quantities")
 		})
 	}
@@ -159,13 +184,15 @@ func TestRecoverState_ExactCohortRestoresDurableItemOrder(t *testing.T) {
 	// accepted operation. The set is exact, but list order is not authority.
 	containers := []ContainerInfo{
 		{
-			ContainerID: "db-0", LeaseUUID: "lease-1", Tenant: "tenant-1", ProviderUUID: "provider-1",
+			ContainerID: "db-0", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
 			SKU: "docker-small", ServiceName: "db", InstanceIndex: 0, Image: "postgres:17",
+			CallbackURL: releaseCohortCallbackURL, LifecycleCallbackURL: releaseCohortLifecycleURL,
 			Status: "running", CreatedAt: time.Now(),
 		},
 		{
-			ContainerID: "web-0", LeaseUUID: "lease-1", Tenant: "tenant-1", ProviderUUID: "provider-1",
+			ContainerID: "web-0", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
 			SKU: "docker-small", ServiceName: "web", InstanceIndex: 0, Image: "nginx:1.25",
+			CallbackURL: releaseCohortCallbackURL, LifecycleCallbackURL: releaseCohortLifecycleURL,
 			Status: "running", CreatedAt: time.Now(),
 		},
 	}
@@ -175,21 +202,12 @@ func TestRecoverState_ExactCohortRestoresDurableItemOrder(t *testing.T) {
 		},
 	}, nil)
 	t.Cleanup(b.stopCancel)
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "releases.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, releases.Close()) })
-	require.NoError(t, releases.Append("lease-1", shared.Release{
-		Manifest:         []byte(`{"services":{"web":{"image":"nginx:1.25"},"db":{"image":"postgres:17"}}}`),
-		Items:            items,
-		ResourceProfiles: testResourceProfiles(t, items),
-		Image:            "stack", Status: "active", CreatedAt: time.Now(),
-	}))
-	b.releaseStore = releases
+	seedReleaseCohort(t, b, releaseCohortLeaseUUID,
+		[]byte(`{"services":{"web":{"image":"nginx:1.25"},"db":{"image":"postgres:17"}}}`), items,
+	)
 
 	require.NoError(t, b.recoverState(context.Background()))
-	info, err := b.GetProvision(context.Background(), "lease-1")
+	info, err := b.GetProvision(context.Background(), releaseCohortLeaseUUID)
 	require.NoError(t, err)
 	require.Equal(t, items, info.Items,
 		"recovery must preserve durable operation order, not Docker list order")
@@ -199,7 +217,7 @@ func TestRecoverState_PartialDurableReleaseCohortFailsClosedOnColdStart(t *testi
 	b := newReleaseCohortBackend(t, nil)
 
 	require.NoError(t, b.recoverState(context.Background()))
-	info, err := b.GetProvision(context.Background(), "lease-1")
+	info, err := b.GetProvision(context.Background(), releaseCohortLeaseUUID)
 	require.NoError(t, err)
 	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	require.Equal(t, backend.ReasonInternal, info.Reason)
@@ -215,44 +233,41 @@ func TestRecoverState_PartialDurableReleaseCohortFailsClosedOnColdStart(t *testi
 		"a missing stateful sibling must not make its disk reservation appear free")
 }
 
-func TestRecoverState_ExactReleaseWithNoSurvivorsFailsStartupClosed(t *testing.T) {
+func TestRecoverState_ExactReleaseWithNoSurvivorsPublishesFailedProjection(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			return nil, nil
 		},
 	}, nil)
 	t.Cleanup(b.stopCancel)
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "releases.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, releases.Close()) })
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", Quantity: 1, ServiceName: "app",
 	}}
-	require.NoError(t, releases.Append("lease-with-no-survivors", shared.Release{
-		Manifest:         []byte(`{"image":"nginx:1.25"}`),
-		Items:            items,
-		ResourceProfiles: testResourceProfiles(t, items),
-		Image:            "stack", Status: "active", CreatedAt: time.Now(),
-	}))
-	b.releaseStore = releases
+	seedReleaseCohort(
+		t, b, releaseCohortEmptyLeaseUUID, []byte(`{"image":"nginx:1.25"}`), items,
+	)
 
-	err = b.recoverState(context.Background())
-	require.ErrorContains(t, err, `durable release cohort for lease "lease-with-no-survivors" cannot be materialized`)
-	require.ErrorContains(t, err, "found 0 containers, expected 1")
+	require.NoError(t, b.recoverState(context.Background()))
+	info, err := b.GetProvision(context.Background(), releaseCohortEmptyLeaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
+	require.Equal(t, backend.ReasonInternal, info.Reason)
+	require.Equal(t, 1, b.pool.Stats().AllocationCount,
+		"the missing instance remains conservatively reserved")
 }
 
 func TestRecoverState_DuplicateSurvivorDoesNotDoubleCountAllocation(t *testing.T) {
 	containers := []ContainerInfo{
 		{
-			ContainerID: "c0", LeaseUUID: "lease-1", Tenant: "tenant-1", ProviderUUID: "provider-1",
+			ContainerID: "c0", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
 			SKU: "docker-small", ServiceName: "app", InstanceIndex: 0, Image: "nginx:1.25",
+			CallbackURL: releaseCohortCallbackURL, LifecycleCallbackURL: releaseCohortLifecycleURL,
 			Status: "running", CreatedAt: time.Now(),
 		},
 		{
-			ContainerID: "duplicate-c0", LeaseUUID: "lease-1", Tenant: "tenant-1", ProviderUUID: "provider-1",
+			ContainerID: "duplicate-c0", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
 			SKU: "docker-small", ServiceName: "app", InstanceIndex: 0, Image: "nginx:1.25",
+			CallbackURL: releaseCohortCallbackURL, LifecycleCallbackURL: releaseCohortLifecycleURL,
 			Status: "running", CreatedAt: time.Now(),
 		},
 	}
@@ -262,24 +277,15 @@ func TestRecoverState_DuplicateSurvivorDoesNotDoubleCountAllocation(t *testing.T
 		},
 	}, nil)
 	t.Cleanup(b.stopCancel)
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "releases.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, releases.Close()) })
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", Quantity: 1, ServiceName: "app",
 	}}
-	require.NoError(t, releases.Append("lease-1", shared.Release{
-		Manifest:         []byte(`{"image":"nginx:1.25"}`),
-		Items:            items,
-		ResourceProfiles: testResourceProfiles(t, items),
-		Image:            "stack", Status: "active", CreatedAt: time.Now(),
-	}))
-	b.releaseStore = releases
+	seedReleaseCohort(
+		t, b, releaseCohortLeaseUUID, []byte(`{"image":"nginx:1.25"}`), items,
+	)
 
 	require.NoError(t, b.recoverState(context.Background()))
-	info, err := b.GetProvision(context.Background(), "lease-1")
+	info, err := b.GetProvision(context.Background(), releaseCohortLeaseUUID)
 	require.NoError(t, err)
 	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	stats := b.pool.Stats()
@@ -292,15 +298,15 @@ func TestRecoverState_DuplicateSurvivorDoesNotDoubleCountAllocation(t *testing.T
 
 func TestRecoverState_PartialDurableReleaseCohortTransitionsExistingActor(t *testing.T) {
 	existing := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-1", Tenant: "tenant-1", ProviderUUID: "provider-1",
+		releaseCohortLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
 			Status: backend.ProvisionStatusReady, Quantity: 2, CreatedAt: time.Now(),
 		}},
 	}
 	b := newReleaseCohortBackend(t, existing)
 
 	require.NoError(t, b.recoverState(context.Background()))
-	info, err := b.GetProvision(context.Background(), "lease-1")
+	info, err := b.GetProvision(context.Background(), releaseCohortLeaseUUID)
 	require.NoError(t, err)
 	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	require.Equal(t, backend.ReasonInternal, info.Reason)

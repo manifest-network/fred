@@ -7,14 +7,11 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 
-	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -76,72 +73,6 @@ func TestStorageIdentityEvidenceNeverSuggestsNewWithPendingLegacyCallback(t *tes
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "requires a drained callback outbox")
 	assert.NotContains(t, err.Error(), "use new")
-}
-
-func TestStorageIdentityEvidenceAdmitsExactV013Boundary2WithRenamedVolume(t *testing.T) {
-	const (
-		leaseUUID    = "550e8400-e29b-41d4-a716-446655440000"
-		providerUUID = "22222222-2222-4222-8222-222222222222"
-		callbackURL  = "https://fred.example/callbacks/provision"
-	)
-	cfg := storageIdentityEvidenceTestConfig(t)
-	cfg.VolumeDataPath = t.TempDir()
-	cfg.SKUMapping = map[string]string{"sku-stateful": "stateful"}
-	cfg.SKUProfiles = map[string]SKUProfile{
-		"stateful": {CPUCores: 1, MemoryMB: 512, DiskMB: 1024},
-	}
-	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-	writeLegacyAuthorityStores(t, cfg)
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: cfg.ReleasesDBPath})
-	require.NoError(t, err)
-	require.NoError(t, releases.Append(leaseUUID, shared.Release{
-		Manifest:  []byte(`{"image":"nginx:1.27"}`),
-		Image:     "nginx:1.27",
-		Status:    "active",
-		CreatedAt: time.Unix(1_700_000_000, 0),
-	}))
-	require.NoError(t, releases.Close())
-
-	newVolume := canonicalVolumeName(leaseUUID, manifest.DefaultServiceName, 0)
-	require.NoError(t, os.MkdirAll(filepath.Join(cfg.VolumeDataPath, newVolume, "data"), 0o700))
-	oldSource := filepath.Join(cfg.VolumeDataPath, "fred-"+leaseUUID+"-0", "data")
-	_, statErr := os.Stat(oldSource)
-	require.ErrorIs(t, statErr, os.ErrNotExist,
-		"fixture must match Docker's stale bind source after v0.13 renamed the parent")
-
-	dockerClient := &mockDockerClient{
-		PingFn: func(context.Context) error { return nil },
-		DaemonInfoFn: func(context.Context) (DaemonSecurityInfo, error) {
-			return DaemonSecurityInfo{SystemID: "daemon-system-a"}, nil
-		},
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{{
-				ContainerID:   "prev-0",
-				Name:          "fred-" + leaseUUID + "-app-0-prev",
-				LeaseUUID:     leaseUUID,
-				Tenant:        "tenant-a",
-				ProviderUUID:  providerUUID,
-				SKU:           "sku-stateful",
-				InstanceIndex: 0,
-				CallbackURL:   callbackURL,
-				Image:         "nginx:1.27",
-				Status:        "exited",
-				Mounts: []ContainerMount{{
-					Type: "bind", Source: oldSource, Target: "/data",
-				}},
-			}}, nil
-		},
-	}
-	volumes := &mockVolumeManager{ListFn: func() ([]string, error) {
-		return []string{newVolume}, nil
-	}}
-
-	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-		t.Context(), cfg, dockerClient, volumes,
-	)
-	require.NoError(t, err,
-		"old-absent/new-present is the exact idempotently resumable v0.13 boundary-2 shape")
-	assert.Equal(t, StorageIdentityAdoptionReady, verdict)
 }
 
 func TestInitializeStorageIdentityRejectsSeparateStoreParentReplacementBeforePublication(t *testing.T) {
@@ -311,12 +242,18 @@ func storageIdentityEvidenceTestConfig(t *testing.T) Config {
 
 func writeLegacyAuthorityStores(t *testing.T, cfg Config) {
 	t.Helper()
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: cfg.ReleasesDBPath})
-	require.NoError(t, err)
-	require.NoError(t, releases.Close())
-	retentions, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: cfg.RetentionDBPath})
-	require.NoError(t, err)
-	require.NoError(t, retentions.Close())
+	for path, bucketName := range map[string]string{
+		cfg.ReleasesDBPath:  "releases",
+		cfg.RetentionDBPath: "retention",
+	} {
+		db, err := bolt.Open(path, 0o600, nil)
+		require.NoError(t, err)
+		require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+			_, createErr := tx.CreateBucket([]byte(bucketName))
+			return createErr
+		}))
+		require.NoError(t, db.Close())
+	}
 }
 
 func writeLegacyCallbackStore(t *testing.T, path string, rows map[string][]byte) {

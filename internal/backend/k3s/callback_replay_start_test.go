@@ -11,7 +11,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
@@ -38,28 +37,33 @@ func TestBackend_Start_PendingCallbackReplayDoesNotWaitForDelivery(t *testing.T)
 	b, err := newBackendWithTestIdentity(cfg, slog.Default())
 	require.NoError(t, err)
 	bindK3sTestStorageIdentity(t, b)
+	attestor := shared.MustNewCallbackStorageAttestor(
+		b.callbackStore,
+		k3sCallbackStorageVerifier{verifier: b.storageVerifier, gate: b.storeAuthorityGate},
+		b.stopCtx,
+	)
 	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
 		Store:           b.callbackStore,
+		StorageAttestor: attestor,
 		HTTPClient:      client,
 		Secret:          string(cfg.CallbackSecret),
-		StorageIdentity: b.storageIdentity,
-		BeforeDelivery:  b.VerifyStorageIdentity,
-		BeforeReplay:    b.VerifyStorageIdentity,
 		Logger:          slog.Default(),
-		StopCtx:         b.stopCtx,
+
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: 2 * time.Second,
 	})
-	_, err = b.callbackStore.StoreEntry(shared.CallbackEntry{
-		LeaseUUID:        "550e8400-e29b-41d4-a716-446655440000",
-		CallbackURL:      "https://fred.example/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
-		DeliveryKind:     shared.CallbackDeliveryKindLifecycle,
-		Success:          false,
-		Status:           backend.CallbackStatusFailed,
-		BackendStorageID: b.storageIdentity.String(),
-		CreatedAt:        time.Now(),
-	})
+	maintenanceSettlement, err := shared.NewMaintenanceSettlement(b.callbackStore, b.releaseStore)
 	require.NoError(t, err)
+	b.callbackPublisher = mustNewCallbackPublisherForTest(t, shared.CallbackPublisherConfig{
+		OperationSettlement:   concreteK3sOperationSettlement(b),
+		MaintenanceSettlement: maintenanceSettlement,
+		StorageAttestor:       attestor,
+		Logger:                slog.Default(),
+	})
+	seedK3sProvisionIntentForTest(
+		t, b, "550e8400-e29b-41d4-a716-446655440000", "https://fred.example/callbacks/provision",
+	)
+	require.NoError(t, b.recoverOperationIntents(t.Context()))
 
 	var stopOnce sync.Once
 	var stopErr error

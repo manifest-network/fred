@@ -80,6 +80,28 @@ func TestCommandFenceUnrelatedKeysDoNotBlock(t *testing.T) {
 	}
 }
 
+func TestCommandFenceTryLockDefersBusyKeyWithoutLeakingReference(t *testing.T) {
+	var fence CommandFence
+	unlock := fence.Lock("lease-a")
+	if _, acquired := fence.TryLock("lease-a"); acquired {
+		t.Fatal("TryLock acquired a key owned by a live command")
+	}
+	if refs, entries := commandFenceRefs(&fence, "lease-a"); refs != 1 || entries != 1 {
+		t.Fatalf("failed TryLock leaked a reference: refs=%d entries=%d", refs, entries)
+	}
+	unlock()
+
+	tryUnlock, acquired := fence.TryLock("lease-a")
+	if !acquired {
+		t.Fatal("TryLock did not acquire an idle key")
+	}
+	tryUnlock()
+	tryUnlock()
+	if refs, entries := commandFenceRefs(&fence, "lease-a"); refs != 0 || entries != 0 {
+		t.Fatalf("TryLock unlock leaked state: refs=%d entries=%d", refs, entries)
+	}
+}
+
 func TestCommandFenceUnlockIsIdempotent(t *testing.T) {
 	var fence CommandFence
 	unlock := fence.Lock("lease-a")

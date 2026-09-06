@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -25,19 +26,14 @@ func projectForBaselineTest(
 	projection InventoryProjection,
 ) (ProjectionResult, error) {
 	t.Helper()
-	if projection.Complete && projection.BackendStorageIdentities == nil {
-		s.mu.RLock()
-		projection.BackendStorageIdentities = testBackendStorageIDs(s.backendTopology...)
-		s.mu.RUnlock()
-	}
-	if projection.Complete && projection.EmptyBackends == nil {
-		s.mu.RLock()
-		projection.EmptyBackends = emptyBackendsForTest(s.backendTopology, projection)
-		s.mu.RUnlock()
-	}
+	projection = inventoryProjectionEvidenceForTest(t, s, projection)
 	fence := s.BeginInventorySession()
-	result, err := s.ProjectInventory(fence, projection)
-	s.EndInventorySession(fence)
+	result, err := inventoryProjectorForTest(t, s).Project(fence, projection)
+	s.endInventorySession(fence, inventorySessionReport{
+		evidence: projection.AbsenceEvidence,
+		hasPositive: len(projection.Placements) != 0 ||
+			len(projection.Conflicts) != 0 || len(projection.UntrustedPositives) != 0,
+	})
 	return result, err
 }
 
@@ -48,7 +44,15 @@ func completeBackendObservationForTest(
 	retentions []string,
 ) CompleteBackendObservation {
 	t.Helper()
-	observation, err := NewCompleteBackendObservation(storageID, provisions, retentions)
+	typedProvisions := make([]backend.ProvisionInfo, len(provisions))
+	for index, leaseUUID := range provisions {
+		typedProvisions[index].LeaseUUID = leaseUUID
+	}
+	typedRetentions := make([]backend.RetainedLease, len(retentions))
+	for index, leaseUUID := range retentions {
+		typedRetentions[index].LeaseUUID = leaseUUID
+	}
+	observation, err := NewCompleteBackendObservation(storageID, typedProvisions, typedRetentions)
 	require.NoError(t, err)
 	return observation
 }
@@ -57,11 +61,17 @@ func TestNewCompleteBackendObservationRejectsMissingEvidence(t *testing.T) {
 	t.Parallel()
 
 	validID := testBackendStorageID("backend-a")
-	_, err := NewCompleteBackendObservation(backendidentity.ID{}, []string{}, []string{})
+	_, err := NewCompleteBackendObservation(
+		backendidentity.ID{}, []backend.ProvisionInfo{}, []backend.RetainedLease{},
+	)
 	require.ErrorIs(t, err, ErrBackendStorageIdentityUnbound)
-	_, err = NewCompleteBackendObservation(validID, []string(nil), []string{})
+	_, err = NewCompleteBackendObservation(
+		validID, []backend.ProvisionInfo(nil), []backend.RetainedLease{},
+	)
 	require.ErrorContains(t, err, "concrete provision and retention inventories")
-	_, err = NewCompleteBackendObservation(validID, []string{}, []string(nil))
+	_, err = NewCompleteBackendObservation(
+		validID, []backend.ProvisionInfo{}, []backend.RetainedLease(nil),
+	)
 	require.ErrorContains(t, err, "concrete provision and retention inventories")
 }
 
@@ -83,8 +93,8 @@ func TestStore_AdmissionBaselineRequiresConfiguredCompleteProjection(t *testing.
 	assert.False(t, s.CurrentAdmissionBaseline().Valid())
 	assert.False(t, s.InventoryBootstrapped())
 
-	_, err := projectForBaselineTest(t, s, InventoryProjection{Complete: true})
-	require.ErrorIs(t, err, ErrBackendTopologyNotConfigured)
+	_, err := s.BindInventoryProjector(nil)
+	require.Error(t, err)
 	assert.False(t, s.CurrentAdmissionBaseline().Valid())
 
 	require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-b", "backend-a"}))
@@ -94,7 +104,7 @@ func TestStore_AdmissionBaselineRequiresConfiguredCompleteProjection(t *testing.
 		"a partial projection cannot establish absence authority")
 	assert.False(t, s.InventoryBootstrapped())
 
-	_, err = projectForBaselineTest(t, s, InventoryProjection{Complete: true})
+	_, err = projectForBaselineTest(t, s, InventoryProjection{complete: true})
 	require.NoError(t, err)
 	baseline := s.CurrentAdmissionBaseline()
 	require.True(t, baseline.Valid())
@@ -103,7 +113,7 @@ func TestStore_AdmissionBaselineRequiresConfiguredCompleteProjection(t *testing.
 	partialFence := s.BeginInventorySession()
 	assert.True(t, s.CurrentAdmissionBaseline().Valid(),
 		"starting another inventory invalidates projection proofs, not the baseline")
-	_, err = s.ProjectInventory(partialFence, InventoryProjection{})
+	_, err = inventoryProjectorForTest(t, s).Project(partialFence, InventoryProjection{})
 	require.NoError(t, err)
 	s.EndInventorySession(partialFence)
 	assert.Equal(t, baseline, s.CurrentAdmissionBaseline(),
@@ -115,7 +125,7 @@ func TestStore_AdmissionBaselineSurvivesReopenWithMatchingTopology(t *testing.T)
 	s, err := newStoreForTest(dbPath)
 	require.NoError(t, err)
 	require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-b", "backend-a"}))
-	_, err = projectForBaselineTest(t, s, InventoryProjection{Complete: true})
+	_, err = projectForBaselineTest(t, s, InventoryProjection{complete: true})
 	require.NoError(t, err)
 	oldProcessBaseline := s.CurrentAdmissionBaseline()
 	require.True(t, oldProcessBaseline.Valid())
@@ -136,7 +146,7 @@ func TestStore_AdmissionBaselineSurvivesReopenWithMatchingTopology(t *testing.T)
 	assert.Equal(t, reopenedBaseline, reopened.CurrentAdmissionBaseline(),
 		"canonical reordering is an idempotent topology configuration")
 
-	token, applied, err := reopened.BeginNewAttempt(
+	token, applied, err := reopened.beginNewAttempt(
 		oldProcessScope, "foreign", "backend-a", requireOperationID(t, "9001"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9001")))
@@ -156,7 +166,7 @@ func TestStore_BackendTopologyChangesRequireRebaselineAndPreserveIdentityHistory
 	require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a", "backend-b"}))
 	assert.False(t, s.InventoryBootstrapped())
 	assert.False(t, s.CurrentAdmissionBaseline().Valid())
-	token, applied, err := s.BeginNewAttempt(
+	token, applied, err := s.beginNewAttempt(
 		firstScope, "lease-stale-add", "backend-a", requireOperationID(t, "9010"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9010")))
@@ -236,7 +246,7 @@ func TestStore_TopologyChangesRequireIdentityProbeAndCommitAtomically(t *testing
 	)
 	require.ErrorIs(t, err, ErrBackendTopologyInUse,
 		"a topology membership change must not treat an old topology's inventory as drain proof")
-	_, err = projectForBaselineTest(t, s, InventoryProjection{Complete: true})
+	_, err = projectForBaselineTest(t, s, InventoryProjection{complete: true})
 	require.NoError(t, err)
 	require.NoError(t, s.ConfigureBackendTopologyWithStorageIdentities(
 		[]string{"backend-a"}, map[string]backendidentity.ID{"backend-a": idA},
@@ -280,7 +290,7 @@ func TestStore_CompleteTopologyObservationMakesEmptyAdditionRevertibleAcrossRest
 	require.NoError(t, store.ConfigureBackendTopologyWithStorageIdentities(
 		[]string{"backend-a"}, map[string]backendidentity.ID{"backend-a": idA},
 	))
-	_, err = projectForBaselineTest(t, store, InventoryProjection{Complete: true})
+	_, err = projectForBaselineTest(t, store, InventoryProjection{complete: true})
 	require.NoError(t, err)
 	require.True(t, store.CurrentAdmissionBaseline().Valid())
 
@@ -423,6 +433,46 @@ func TestStore_CompleteTopologyObservationCannotOverrideDurableBackendReferences
 func TestStore_BackendRemovalRequiresEmptyInventoryAndNoLifecycleAuthority(t *testing.T) {
 	t.Parallel()
 
+	t.Run("interrupted later inventory invalidates earlier empty proof", func(t *testing.T) {
+		t.Parallel()
+		dbPath := filepath.Join(t.TempDir(), "placements.db")
+		store, err := newStoreForTest(dbPath)
+		require.NoError(t, err)
+		idA := testBackendStorageID("backend-a")
+		idB := testBackendStorageID("backend-b")
+		require.NoError(t, store.ConfigureBackendTopologyWithStorageIdentities(
+			[]string{"backend-a", "backend-b"},
+			map[string]backendidentity.ID{"backend-a": idA, "backend-b": idB},
+		))
+		_, err = projectForBaselineTest(t, store, InventoryProjection{complete: true})
+		require.NoError(t, err)
+
+		fence, err := store.beginInventorySession()
+		require.NoError(t, err)
+		require.NoError(t, store.recordUnprojectedPositives(
+			fence,
+			"backend-b",
+			inventoryPositiveProvision,
+			[]string{"11638ef8-1401-4f14-a355-1ae02afeb35b"},
+		))
+		pendingSweepID := store.pendingInventorySweepID
+		require.NotZero(t, pendingSweepID)
+		require.NoError(t, store.Close())
+
+		reopened, err := OpenStore(dbPath, freshTestProviderUUID)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = reopened.Close() })
+		err = reopened.ConfigureBackendTopologyWithCompleteObservations(
+			[]string{"backend-a"},
+			map[string]CompleteBackendObservation{
+				"backend-a": completeBackendObservationForTest(t, idA, []string{}, []string{}),
+			},
+		)
+		require.ErrorIs(t, err, ErrBackendTopologyInUse)
+		require.ErrorContains(t, err, fmt.Sprintf("inventory sweep %d", pendingSweepID))
+		assert.Equal(t, []string{"backend-a", "backend-b"}, reopened.backendTopology)
+	})
+
 	t.Run("no current complete inventory", func(t *testing.T) {
 		t.Parallel()
 		s := newTestStore(t)
@@ -437,7 +487,7 @@ func TestStore_BackendRemovalRequiresEmptyInventoryAndNoLifecycleAuthority(t *te
 		s := newTestStore(t)
 		require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a", "backend-b"}))
 		_, err := projectForBaselineTest(t, s, InventoryProjection{
-			Complete: true,
+			complete: true,
 			Placements: map[string]string{
 				"11638ef8-1401-4f14-a355-1ae02afeb35b": "backend-b",
 			},
@@ -452,7 +502,7 @@ func TestStore_BackendRemovalRequiresEmptyInventoryAndNoLifecycleAuthority(t *te
 		t.Parallel()
 		s := newTestStore(t)
 		require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a", "backend-b"}))
-		_, err := projectForBaselineTest(t, s, InventoryProjection{Complete: true})
+		_, err := projectForBaselineTest(t, s, InventoryProjection{complete: true})
 		require.NoError(t, err)
 		capability := lifecycleCapability{
 			backend: "backend-b",
@@ -475,7 +525,7 @@ func TestStore_BackendRemovalRequiresEmptyInventoryAndNoLifecycleAuthority(t *te
 		t.Parallel()
 		s := newTestStore(t)
 		require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a", "backend-b"}))
-		_, err := projectForBaselineTest(t, s, InventoryProjection{Complete: true})
+		_, err := projectForBaselineTest(t, s, InventoryProjection{complete: true})
 		require.NoError(t, err)
 		require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket(lifecycleCapabilityBucketName).Put(
@@ -492,10 +542,10 @@ func TestStore_BackendRemovalRequiresEmptyInventoryAndNoLifecycleAuthority(t *te
 		t.Parallel()
 		s := newTestStore(t)
 		require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a", "backend-b"}))
-		_, err := projectForBaselineTest(t, s, InventoryProjection{Complete: true})
+		_, err := projectForBaselineTest(t, s, InventoryProjection{complete: true})
 		require.NoError(t, err)
 		require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a"}))
-		_, err = projectForBaselineTest(t, s, InventoryProjection{Complete: true})
+		_, err = projectForBaselineTest(t, s, InventoryProjection{complete: true})
 		require.NoError(t, err)
 		require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a", "backend-b"}))
 	})
@@ -519,7 +569,7 @@ func TestStore_BackendTopologyReactivationSurvivesReopen(t *testing.T) {
 	initial, err := newStoreForTest(dbPath)
 	require.NoError(t, err)
 	require.NoError(t, configureBackendTopologyForTest(initial, []string{"backend-b", "backend-a"}))
-	_, err = projectForBaselineTest(t, initial, InventoryProjection{Complete: true})
+	_, err = projectForBaselineTest(t, initial, InventoryProjection{complete: true})
 	require.NoError(t, err)
 	require.True(t, initial.CurrentAdmissionBaseline().Valid())
 	initialTopologyID := initial.topologyID
@@ -530,7 +580,7 @@ func TestStore_BackendTopologyReactivationSurvivesReopen(t *testing.T) {
 	require.NoError(t, configureBackendTopologyForTest(reduced, []string{"backend-a"}))
 	assert.Equal(t, initialTopologyID+1, reduced.topologyID)
 	assert.False(t, reduced.CurrentAdmissionBaseline().Valid())
-	_, err = projectForBaselineTest(t, reduced, InventoryProjection{Complete: true})
+	_, err = projectForBaselineTest(t, reduced, InventoryProjection{complete: true})
 	require.NoError(t, err)
 	require.True(t, reduced.CurrentAdmissionBaseline().Valid())
 	reducedTopologyID := reduced.topologyID
@@ -543,7 +593,7 @@ func TestStore_BackendTopologyReactivationSurvivesReopen(t *testing.T) {
 	assert.Equal(t, []string{"backend-a", "backend-b"}, reactivated.backendTopology)
 	assert.False(t, reactivated.CurrentAdmissionBaseline().Valid(),
 		"the reduced topology's absence authority must not authorize the restored topology")
-	_, err = projectForBaselineTest(t, reactivated, InventoryProjection{Complete: true})
+	_, err = projectForBaselineTest(t, reactivated, InventoryProjection{complete: true})
 	require.NoError(t, err)
 	require.NoError(t, reactivated.Close())
 
@@ -653,7 +703,7 @@ func TestStore_ConfigureBackendTopologyValidatesNamesAndProjectionMembership(t *
 	s := newTestStore(t)
 	require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a"}))
 	_, err := projectForBaselineTest(t, s, InventoryProjection{
-		Complete:   true,
+		complete:   true,
 		Placements: map[string]string{"lease": "backend-b"},
 	})
 	require.ErrorIs(t, err, ErrBackendNotInTopology)
@@ -661,7 +711,7 @@ func TestStore_ConfigureBackendTopologyValidatesNamesAndProjectionMembership(t *
 
 	baseline := requireAdmissionBaseline(t, s, "backend-a")
 	scope := requireAdmissionScope(t, s, baseline, "backend-a")
-	token, applied, err := s.BeginNewAttempt(
+	token, applied, err := s.beginNewAttempt(
 		scope, "lease", "backend-b", requireOperationID(t, "9020"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9020")))
@@ -796,7 +846,7 @@ func TestStore_CompleteProjectionDoesNotArmBaselineWhenTransactionFails(t *testi
 	oversizedLease := strings.Repeat("z", bolt.MaxKeySize+1)
 
 	_, err = projectForBaselineTest(t, s, InventoryProjection{
-		Complete:   true,
+		complete:   true,
 		Placements: map[string]string{oversizedLease: "backend-a"},
 	})
 	require.Error(t, err)
@@ -871,7 +921,7 @@ func TestStore_ScopeAdmissionIsZeroSafeSubsetBoundAndDefensive(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, empty.Valid(), "an explicitly issued deny-all scope is valid")
 	assert.False(t, empty.Allows("backend-a"))
-	token, applied, err := s.BeginNewAttempt(
+	token, applied, err := s.beginNewAttempt(
 		empty, "lease-empty", "backend-a", requireOperationID(t, "9030"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9030")))
@@ -892,20 +942,20 @@ func TestDurableBackendNamesUsesValidatedPlacementDecoder(t *testing.T) {
 		wantErr   bool
 	}{
 		{
-			name: "forward-compatible unknown field",
-			value: []byte(`{"backend":"backend-a",` +
+			name: "unknown current field",
+			value: []byte(`{"schema":1,"backend":"backend-a",` +
 				`"set_at":"2026-08-25T15:00:00Z","revision":1,` +
 				`"future":{"nested":true}}`),
-			wantNames: []string{"backend-a"},
+			wantErr: true,
 		},
 		{
 			name: "known conflict candidates",
-			value: []byte(`{"conflict":true,` +
+			value: []byte(`{"schema":1,"conflict":true,` +
 				`"conflict_backends":["backend-b","backend-a"],` +
 				`"set_at":"2026-08-25T15:00:00Z","revision":1}`),
 			wantNames: []string{"backend-a", "backend-b"},
 		},
-		{name: "raw legacy backend", value: []byte("backend-a"), wantNames: []string{"backend-a"}},
+		{name: "raw legacy backend", value: []byte("backend-a"), wantErr: true},
 		{
 			name: "duplicate ownership field",
 			value: []byte(`{"backend":"backend-a","backend":"backend-b",` +
@@ -987,7 +1037,7 @@ func TestStore_BeginNewAttemptRequiresCurrentAdmissionScopeAndExactEligibility(t
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			token, applied, err := s.BeginNewAttempt(
+			token, applied, err := s.beginNewAttempt(
 				tt.scope, "invalid-scope-"+tt.name, "backend-a",
 				requireOperationID(t, fmt.Sprint(9040+i)), PayloadFingerprint{},
 				testBackendRequestSnapshot(t),
@@ -999,7 +1049,7 @@ func TestStore_BeginNewAttemptRequiresCurrentAdmissionScopeAndExactEligibility(t
 		})
 	}
 
-	token, applied, err := s.BeginNewAttempt(
+	token, applied, err := s.beginNewAttempt(
 		scopeA, "outside-scope", "backend-b", requireOperationID(t, "9050"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9050")))
@@ -1010,7 +1060,7 @@ func TestStore_BeginNewAttemptRequiresCurrentAdmissionScopeAndExactEligibility(t
 	assert.Equal(t, StateAbsent, s.Lookup("outside-scope").State())
 
 	require.NoError(t, configureBackendTopologyForTest(s, []string{"backend-a", "backend-b", "backend-c"}))
-	token, applied, err = s.BeginNewAttempt(
+	token, applied, err = s.beginNewAttempt(
 		scopeA, "stale-scope", "backend-a", requireOperationID(t, "9051"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9051")))
@@ -1029,7 +1079,7 @@ func TestStore_BeginNewAttemptIsExactInsertIfAbsentCAS(t *testing.T) {
 	// An observation inserted after a caller saw absence wins the admission CAS.
 	require.Equal(t, StateAbsent, s.Lookup("toctou").State())
 	requireConfirmedPlacement(t, s, "toctou", "backend-a")
-	token, applied, err := s.BeginNewAttempt(
+	token, applied, err := s.beginNewAttempt(
 		scope, "toctou", "backend-a", requireOperationID(t, "9050"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9050")))
@@ -1058,7 +1108,7 @@ func TestStore_BeginNewAttemptIsExactInsertIfAbsentCAS(t *testing.T) {
 				outcomes <- outcome{err: parseErr}
 				return
 			}
-			token, applied, err := s.BeginNewAttempt(
+			token, applied, err := s.beginNewAttempt(
 				scope, "concurrent", "backend-a", opID, PayloadFingerprint{},
 				testBackendRequestSnapshot(t), testCallbackPair(opID))
 
@@ -1090,7 +1140,7 @@ func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T
 	revision := s.Lookup("owned").RecordRevision()
 	require.True(t, revision.Valid())
 
-	token, applied, err := s.BeginOwnedAttempt(
+	token, applied, err := s.beginOwnedAttempt(
 		baseline, revision, "backend-a", requireOperationID(t, "9100"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9100")))
@@ -1100,7 +1150,7 @@ func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T
 	require.True(t, token.Valid())
 	assert.Equal(t, "backend-a", s.Lookup("owned").Attempt)
 
-	second, applied, err := s.BeginOwnedAttempt(
+	second, applied, err := s.beginOwnedAttempt(
 		baseline, revision, "backend-a", requireOperationID(t, "9101"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9101")))
@@ -1111,7 +1161,7 @@ func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T
 	require.True(t, mustRefuseAttempt(t, s, token))
 
 	freshRevision := s.Lookup("owned").RecordRevision()
-	wrongOwner, applied, err := s.BeginOwnedAttempt(
+	wrongOwner, applied, err := s.beginOwnedAttempt(
 		baseline, freshRevision, "backend-b", requireOperationID(t, "9102"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9102")))
@@ -1122,7 +1172,7 @@ func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T
 
 	require.True(t, mustDeleteRecord(t, s, freshRevision))
 	requireConfirmedPlacement(t, s, "owned", "backend-a")
-	stale, applied, err := s.BeginOwnedAttempt(
+	stale, applied, err := s.beginOwnedAttempt(
 		baseline, freshRevision, "backend-a", requireOperationID(t, "9103"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9103")))
@@ -1134,7 +1184,7 @@ func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T
 	other := newTestStore(t)
 	requireConfirmedPlacement(t, other, "owned", "backend-a")
 	foreignRevision := other.Lookup("owned").RecordRevision()
-	foreign, applied, err := s.BeginOwnedAttempt(
+	foreign, applied, err := s.beginOwnedAttempt(
 		baseline, foreignRevision, "backend-a", requireOperationID(t, "9104"), PayloadFingerprint{},
 		testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "9104")))
@@ -1146,14 +1196,14 @@ func TestStore_BeginOwnedAttemptRequiresExactConfirmedOwnerRevision(t *testing.T
 
 func mustRefuseAttempt(t *testing.T, s *Store, token AttemptToken) bool {
 	t.Helper()
-	applied, err := s.RefuseAttempt(token)
+	applied, err := refuseAttemptForTest(s, token)
 	require.NoError(t, err)
 	return applied
 }
 
 func mustDeleteRecord(t *testing.T, s *Store, revision RecordRevision) bool {
 	t.Helper()
-	applied, err := s.DeleteRecord(revision)
+	applied, err := s.deleteRecord(revision)
 	require.NoError(t, err)
 	return applied
 }
@@ -1200,7 +1250,7 @@ func TestStore_InventoryConflictPreservesPendingAttemptIdentity(t *testing.T) {
 	fingerprint, err := NewPayloadFingerprint(payloadHash[:])
 	require.NoError(t, err)
 	scope := requireAdmissionScope(t, s, s.CurrentAdmissionBaseline(), "backend-a")
-	token, applied, err := s.BeginNewAttempt(
+	token, applied, err := s.beginNewAttempt(
 		scope, "lease", "backend-a", opID, fingerprint,
 		testBackendRequestSnapshot(t), testCallbackPair(opID))
 
@@ -1240,21 +1290,21 @@ func TestStore_InventoryConflictPreservesPendingAttemptIdentity(t *testing.T) {
 	assert.Equal(t, []string{"backend-a", "backend-b"}, observed.ConflictBackends)
 }
 
-func TestStore_CompleteProjectionKeepsPriorBaselineOnFailedRefresh(t *testing.T) {
+func TestStore_FailedProjectionWithdrawsPriorBaselineUntilCompleteRefresh(t *testing.T) {
 	s := newTestStore(t)
-	baseline := requireAdmissionBaseline(t, s, "backend-a")
+	requireAdmissionBaseline(t, s, "backend-a")
 	oversizedLease := strings.Repeat("x", bolt.MaxKeySize+1)
 
 	_, err := projectForBaselineTest(t, s, InventoryProjection{
-		Complete: true,
+		complete: true,
 		Placements: map[string]string{
 			"lease-written-before-failure": "backend-a",
 			oversizedLease:                 "backend-a",
 		},
 	})
 	require.Error(t, err)
-	assert.Equal(t, baseline, s.CurrentAdmissionBaseline())
-	assert.True(t, s.InventoryBootstrapped())
+	assert.False(t, s.CurrentAdmissionBaseline().Valid())
+	assert.False(t, s.InventoryBootstrapped())
 	assert.Equal(t, StateAbsent, s.Lookup("lease-written-before-failure").State(),
 		"the placement mutation before the rejected key must roll back with metadata")
 }

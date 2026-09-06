@@ -47,7 +47,7 @@ func parseXfsReportHardBlocks(out string, projID uint32) (int64, error) {
 // (guaranteed present after a successful Create) and runs the SAME report flags
 // as production Usage() — `report -p -b -n -N` (never -h, which scales to strings
 // and breaks exact equality).
-func xfsBhardBytes(t *testing.T, mount string, mgr volumeManager, volName string) int64 {
+func xfsBhardBytes(t *testing.T, mount string, mgr volumeReader, volName string) int64 {
 	t.Helper()
 	projID, err := readProjectIDFile(mgr.HostPath(volName))
 	require.NoError(t, err, "read project-id marker for %s", volName)
@@ -111,7 +111,7 @@ func newRestoreQuotaBackend(t *testing.T, mgr volumeManager) (*Backend, <-chan b
 	b.volumes = mgr
 	var mu sync.Mutex
 	var down []string
-	b.compose = happyComposeMock(&mu, &down, nil)
+	b.compose = happyComposeMock(t, mock, &mu, &down, nil)
 	rebuildCallbackSender(b, testCallbackClient) // pick up testCallbackSecret so callback HMAC verifies
 	attachRetentionStore(t, b)
 	stopReplay := startRestoreCallbackReplay(t, b)
@@ -139,7 +139,7 @@ func seedRetainedForRestore(t *testing.T, b *Backend, mgr volumeManager, orig, o
 	writeNonSparse(t, filepath.Join(hostPath, "data.bin"), dataMiB)
 	require.NoError(t, mgr.RenameVolume(context.Background(), canon, retainedName(canon)))
 	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retainedName(canon)) })
-	require.NoError(t, b.retentionStore.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, b.retentionStore, shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		Tenant:              "tenant-a",
 		ProviderUUID:        testProviderUUID,

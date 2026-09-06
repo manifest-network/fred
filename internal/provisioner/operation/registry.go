@@ -71,24 +71,6 @@ func (kind Kind) valid() bool {
 	}
 }
 
-// TrackSpec contains the immutable facts recorded when an operation starts.
-// StartedAt defaults to time.Now when it is zero. Its zero value is invalid.
-type TrackSpec struct {
-	LeaseUUID string
-	Tenant    string
-	Items     []backend.LeaseItem
-	Backend   string
-	StartedAt time.Time
-	Kind      Kind
-}
-
-// Valid reports whether spec contains the minimum identity needed by the
-// registry. Tenant, backend, and items are metadata and may legitimately be
-// empty while an operation is being recovered.
-func (spec TrackSpec) Valid() bool {
-	return spec.LeaseUUID != "" && spec.Kind.valid()
-}
-
 // Record is an immutable snapshot of one tracked operation. Mutating the Items
 // slice returned by Registry methods cannot mutate registry state.
 type Record struct {
@@ -324,6 +306,7 @@ type Registry struct {
 	lastSnapshotRevision uint64
 	drained              chan struct{}
 	draining             bool
+	settlementAuthority  *settlementAuthorityMarker
 	mu                   sync.RWMutex
 }
 
@@ -400,7 +383,7 @@ func deterministicOperationID(sequence uint64) OperationID {
 	return newOperationID(value)
 }
 
-// RecoverClaimed installs one exact durable operation identity as active under
+// recoverClaimed installs one exact durable operation identity as active under
 // an already-held lease claim. It is intentionally distinct from ordinary
 // initiation:
 // callers cannot allocate a replacement ID, recover without the same
@@ -411,28 +394,29 @@ func deterministicOperationID(sequence uint64) OperationID {
 // OperationID. The ID has already crossed a strict durable decoder; this method
 // nevertheless revalidates it so the invalid zero value can never authorize
 // callback settlement.
-func (registry *Registry) RecoverClaimed(
+func (registry *Registry) recoverClaimed(
 	claim LeaseClaim,
 	id OperationID,
-	spec TrackSpec,
+	recovered RecoveredOperation,
 ) RecoveryResult {
-	if !spec.Valid() || spec.Backend == "" || spec.Tenant == "" || !id.Valid() ||
-		!claim.Valid() || claim.leaseUUID != spec.LeaseUUID {
+	if !recovered.valid() || !id.Valid() || !claim.Valid() ||
+		claim.leaseUUID != recovered.spec.leaseUUID {
 		return RecoveryInvalid
 	}
+	spec := recovered.spec
 
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	if registry.draining {
 		return RecoveryInvalid
 	}
-	if claim.registry != registry.identity || registry.leaseClaims[spec.LeaseUUID] != claim {
+	if claim.registry != registry.identity || registry.leaseClaims[spec.leaseUUID] != claim {
 		return RecoveryInvalid
 	}
-	if _, exists := registry.operations[spec.LeaseUUID]; exists {
+	if _, exists := registry.operations[spec.leaseUUID]; exists {
 		return RecoveryBusy
 	}
-	token := newOperationToken(registry.identity, spec.LeaseUUID, id)
+	token := newOperationToken(registry.identity, spec.leaseUUID, id)
 	if !token.valid() {
 		return RecoveryInvalid
 	}
@@ -440,13 +424,13 @@ func (registry *Registry) RecoverClaimed(
 	return RecoveryInstalled
 }
 
-// TryInitiateClaimed registers a preparing operation under the exact lease
-// action capability held by reconciliation.
-func (registry *Registry) TryInitiateClaimed(
+// tryInitiateClaimed registers one private validated sum arm under the exact
+// lease-action capability held by its application coordinator.
+func (registry *Registry) tryInitiateClaimed(
 	claim LeaseClaim,
-	spec TrackSpec,
+	spec operationSpec,
 ) InitiationResult {
-	if !spec.Valid() || !claim.Valid() || claim.leaseUUID != spec.LeaseUUID {
+	if !spec.valid() || !claim.Valid() || claim.leaseUUID != spec.leaseUUID {
 		return InitiationResult{outcome: TrackInvalid}
 	}
 
@@ -455,16 +439,16 @@ func (registry *Registry) TryInitiateClaimed(
 	if registry.draining {
 		return InitiationResult{outcome: TrackInvalid}
 	}
-	if claim.registry != registry.identity || registry.leaseClaims[spec.LeaseUUID] != claim {
+	if claim.registry != registry.identity || registry.leaseClaims[spec.leaseUUID] != claim {
 		return InitiationResult{outcome: TrackInvalid}
 	}
-	if _, exists := registry.operations[spec.LeaseUUID]; exists {
+	if _, exists := registry.operations[spec.leaseUUID]; exists {
 		return InitiationResult{outcome: TrackBusy}
 	}
 	return registry.initiateLocked(spec)
 }
 
-func (registry *Registry) initiateLocked(spec TrackSpec) InitiationResult {
+func (registry *Registry) initiateLocked(spec operationSpec) InitiationResult {
 	// installLocked needs the capability stored with the record, while the
 	// capability itself contains the token allocated there. Install explicitly
 	// so both values are born under the same registry lock.
@@ -472,44 +456,44 @@ func (registry *Registry) initiateLocked(spec TrackSpec) InitiationResult {
 	if !id.Valid() {
 		return InitiationResult{outcome: TrackInvalid}
 	}
-	token := newOperationToken(registry.identity, spec.LeaseUUID, id)
+	token := newOperationToken(registry.identity, spec.leaseUUID, id)
 	initiation := newInitiation(token)
 	registry.installRecordLocked(spec, token, PhasePreparing, initiation)
 	return InitiationResult{initiation: initiation, outcome: TrackStarted}
 }
 
 func (registry *Registry) installRecordLocked(
-	spec TrackSpec,
+	spec operationSpec,
 	token operationToken,
 	phase Phase,
 	initiation Initiation,
 ) {
 	registry.armDrainSignalLocked()
-	startedAt := spec.StartedAt
+	startedAt := spec.startedAt
 	if startedAt.IsZero() {
 		startedAt = time.Now()
 	}
 	record := Record{
-		LeaseUUID:  spec.LeaseUUID,
-		Tenant:     spec.Tenant,
-		Items:      slices.Clone(spec.Items),
-		Backend:    spec.Backend,
+		LeaseUUID:  spec.leaseUUID,
+		Tenant:     spec.tenant,
+		Items:      slices.Clone(spec.items),
+		Backend:    spec.backend,
 		ID:         token.operationID(),
 		StartedAt:  startedAt,
-		Kind:       spec.Kind,
+		Kind:       spec.kind,
 		Phase:      phase,
 		Settlement: SettlementUnclaimed,
 	}
-	registry.operations[spec.LeaseUUID] = trackedOperation{
+	registry.operations[spec.leaseUUID] = trackedOperation{
 		record:     record,
 		token:      token,
 		initiation: initiation,
 	}
-	registry.markMutationLocked(spec.LeaseUUID)
+	registry.markMutationLocked(spec.leaseUUID)
 	registry.notifyCountLocked()
 }
 
-// BindBackend binds the exact preparing initiation to the authoritative
+// bindBackend binds the exact preparing initiation to the authoritative
 // backend discovered after the operation was registered. Restore uses this to
 // avoid trusting caller-supplied routing: the operation begins with no backend,
 // placement.BeginAuthorizedRestore atomically selects the exact pre-authorized
@@ -518,7 +502,7 @@ func (registry *Registry) installRecordLocked(
 //
 // Binding is one-shot. Invalid, foreign, stale, already-bound, claimed, or
 // non-preparing operations return false without mutation.
-func (registry *Registry) BindBackend(initiation Initiation, backendName string) bool {
+func (registry *Registry) bindBackend(initiation Initiation, backendName string) bool {
 	if !initiation.Valid() || initiation.token.registry != registry.identity || backendName == "" {
 		return false
 	}
@@ -536,9 +520,9 @@ func (registry *Registry) BindBackend(initiation Initiation, backendName string)
 	return true
 }
 
-// BeginCall advances the exact preparing operation to calling immediately
+// beginCall advances the exact preparing operation to calling immediately
 // before invoking the synchronous backend method.
-func (registry *Registry) BeginCall(initiation Initiation) bool {
+func (registry *Registry) beginCall(initiation Initiation) bool {
 	if !initiation.Valid() || initiation.token.registry != registry.identity {
 		return false
 	}
@@ -556,18 +540,18 @@ func (registry *Registry) BeginCall(initiation Initiation) bool {
 	return true
 }
 
-// Activate completes an accepted synchronous backend return. If an inline
+// activate completes an accepted synchronous backend return. If an inline
 // callback is settling, it retains ownership; if it already finished, this
 // call only retires the call barrier left behind for the initiator.
-func (registry *Registry) Activate(initiation Initiation) InitiationCompletion {
+func (registry *Registry) activate(initiation Initiation) InitiationCompletion {
 	return registry.completeInitiation(initiation, true)
 }
 
-// AbortInitiation completes a local preflight failure or a synchronous backend
+// abortInitiation completes a local preflight failure or a synchronous backend
 // result that was not accepted. A callback that already claimed or finished
 // the exact operation wins, because it is stronger evidence than the caller's
 // cleanup path.
-func (registry *Registry) AbortInitiation(initiation Initiation) InitiationCompletion {
+func (registry *Registry) abortInitiation(initiation Initiation) InitiationCompletion {
 	return registry.completeInitiation(initiation, false)
 }
 
@@ -623,13 +607,38 @@ func (registry *Registry) completeInitiation(
 	return InitiationAborted
 }
 
-// Snapshot returns a causal operation boundary. Even a new registry with
+// snapshot returns a causal operation boundary. Even a new registry with
 // revision zero returns an explicitly valid snapshot.
-func (registry *Registry) Snapshot() TrackerSnapshot {
+func (registry *Registry) snapshot() TrackerSnapshot {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	registry.pruneMutationsLocked()
 	return newTrackerSnapshot(registry.identity, registry.mutationRevision)
+}
+
+// captureReconciliationBoundary snapshots the mutation clock and active lease
+// set under one Registry lock. Taking Snapshot and LeaseUUIDs separately would
+// allow an operation to cross the gap and leave inventory projection with two
+// facts from different causal instants.
+func (registry *Registry) captureReconciliationBoundary() ReconciliationBoundary {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	registry.pruneMutationsLocked()
+	inFlight := make(map[string]struct{}, len(registry.operations)+len(registry.leaseClaims))
+	for leaseUUID := range registry.operations {
+		inFlight[leaseUUID] = struct{}{}
+	}
+	// Observed reconciliation actions hold a lease claim before they can
+	// dispatch. Capturing claims as in-flight makes the action/sweep race safe in
+	// both orders when joined to the Store inventory epoch: a claim acquired
+	// first is causally excluded by the newer sweep; when the newer sweep starts
+	// first, its Store epoch invalidates the older projected action.
+	for leaseUUID := range registry.leaseClaims {
+		inFlight[leaseUUID] = struct{}{}
+	}
+	return newReconciliationBoundary(
+		registry.identity, registry.mutationRevision, inFlight,
+	)
 }
 
 func (registry *Registry) pruneMutationsLocked() {
@@ -641,9 +650,9 @@ func (registry *Registry) pruneMutationsLocked() {
 	registry.lastSnapshotRevision = registry.mutationRevision
 }
 
-// TryClaimLease acquires an exclusive lease-action claim only when the lease
+// tryClaimLease acquires an exclusive lease-action claim only when the lease
 // has not mutated after snapshot.
-func (registry *Registry) TryClaimLease(leaseUUID string, snapshot TrackerSnapshot) LeaseClaimResult {
+func (registry *Registry) tryClaimLease(leaseUUID string, snapshot TrackerSnapshot) LeaseClaimResult {
 	if leaseUUID == "" || !snapshot.Valid() || snapshot.registry != registry.identity {
 		return LeaseClaimResult{outcome: LeaseClaimInvalid}
 	}
@@ -664,10 +673,10 @@ func (registry *Registry) TryClaimLease(leaseUUID string, snapshot TrackerSnapsh
 	return registry.tryClaimLeaseLocked(leaseUUID, snapshot.revision, false)
 }
 
-// TryClaimLeaseNow is the event-path variant. Acquiring the claim itself marks
+// tryClaimLeaseNow is the event-path variant. Acquiring the claim itself marks
 // a mutation so an older reconciliation snapshot remains fenced even if the
 // claim is acquired and released between its inventory and action phases.
-func (registry *Registry) TryClaimLeaseNow(leaseUUID string) LeaseClaimResult {
+func (registry *Registry) tryClaimLeaseNow(leaseUUID string) LeaseClaimResult {
 	if leaseUUID == "" {
 		return LeaseClaimResult{outcome: LeaseClaimInvalid}
 	}
@@ -680,12 +689,12 @@ func (registry *Registry) TryClaimLeaseNow(leaseUUID string) LeaseClaimResult {
 	return registry.tryClaimLeaseLocked(leaseUUID, 0, true)
 }
 
-// TryClaimCallbackRecoveryLease acquires the same exclusive lease-action
-// capability as TryClaimLeaseNow, but remains available after BeginDrain.
+// tryClaimCallbackRecoveryLease acquires the same exclusive lease-action
+// capability as tryClaimLeaseNow, but remains available after beginDrain.
 // Only authenticated durable callback recovery should depend on this method:
 // shutdown closes every ordinary operation entry point while allowing backend
 // outbox deliveries to finish authority already persisted before the drain.
-func (registry *Registry) TryClaimCallbackRecoveryLease(leaseUUID string) LeaseClaimResult {
+func (registry *Registry) tryClaimCallbackRecoveryLease(leaseUUID string) LeaseClaimResult {
 	if leaseUUID == "" {
 		return LeaseClaimResult{outcome: LeaseClaimInvalid}
 	}
@@ -719,8 +728,8 @@ func (registry *Registry) tryClaimLeaseLocked(
 	return LeaseClaimResult{claim: claim, outcome: LeaseClaimAcquired}
 }
 
-// ReleaseLease releases only the exact lease claim supplied by its owner.
-func (registry *Registry) ReleaseLease(claim LeaseClaim) bool {
+// releaseLease releases only the exact lease claim supplied by its owner.
+func (registry *Registry) releaseLease(claim LeaseClaim) bool {
 	if !claim.Valid() || claim.registry != registry.identity {
 		return false
 	}
@@ -736,32 +745,32 @@ func (registry *Registry) ReleaseLease(claim LeaseClaim) bool {
 	return true
 }
 
-// BeginDrain irreversibly closes ordinary operation and lease-action
+// beginDrain irreversibly closes ordinary operation and lease-action
 // admission. Existing operations and claims remain valid and may settle;
 // authenticated durable callback recovery uses its dedicated claim method.
-// Calling BeginDrain more than once is harmless.
-func (registry *Registry) BeginDrain() {
+// Calling beginDrain more than once is harmless.
+func (registry *Registry) beginDrain() {
 	registry.mu.Lock()
 	registry.draining = true
 	registry.mu.Unlock()
 }
 
-// TryClaimCallback acquires terminal callback ownership for the exact
+// tryClaimCallback acquires terminal callback ownership for the exact
 // operation ID. A callback may settle while the backend call is executing, but
 // not while its callback URL and durable intent are still being prepared.
-func (registry *Registry) TryClaimCallback(leaseUUID string, id OperationID) SettlementResult {
+func (registry *Registry) tryClaimCallback(leaseUUID string, id OperationID) SettlementResult {
 	return registry.tryClaimSettlement(leaseUUID, id, SettlementTerminal, settlementCallback)
 }
 
-// TryClaimTimeout acquires timeout ownership only after the synchronous
+// tryClaimTimeout acquires timeout ownership only after the synchronous
 // backend call has returned accepted and the operation is active.
-func (registry *Registry) TryClaimTimeout(leaseUUID string, id OperationID) SettlementResult {
+func (registry *Registry) tryClaimTimeout(leaseUUID string, id OperationID) SettlementResult {
 	return registry.tryClaimSettlement(leaseUUID, id, SettlementTerminal, settlementTimeout)
 }
 
-// TryClaimDeprovision acquires deprovision ownership for the exact operation
+// tryClaimDeprovision acquires deprovision ownership for the exact operation
 // ID.
-func (registry *Registry) TryClaimDeprovision(leaseUUID string, id OperationID) SettlementResult {
+func (registry *Registry) tryClaimDeprovision(leaseUUID string, id OperationID) SettlementResult {
 	return registry.tryClaimSettlement(leaseUUID, id, SettlementDeprovision, settlementDeprovision)
 }
 
@@ -773,6 +782,10 @@ const (
 	settlementTimeout
 	settlementDeprovision
 )
+
+func (actor settlementActor) valid() bool {
+	return actor == settlementCallback || actor == settlementTimeout || actor == settlementDeprovision
+}
 
 func (registry *Registry) tryClaimSettlement(
 	leaseUUID string,
@@ -815,7 +828,7 @@ func (registry *Registry) tryClaimSettlement(
 		return SettlementResult{outcome: SettlementBusy}
 	}
 
-	claim := newSettlementClaim(tracked.token, registry.allocateClaimNonceLocked(), kind)
+	claim := newSettlementClaim(tracked.token, registry.allocateClaimNonceLocked(), kind, actor)
 	tracked.claim = claim
 	tracked.record.Settlement = kind
 	registry.operations[leaseUUID] = tracked
@@ -826,10 +839,10 @@ func (registry *Registry) tryClaimSettlement(
 	}
 }
 
-// ReleaseSettlement releases only the exact settlement claim. A claim released
+// releaseSettlement releases only the exact settlement claim. A claim released
 // and reacquired for the same operation has a new nonce, so a stale owner cannot
 // release the replacement claim.
-func (registry *Registry) ReleaseSettlement(claim SettlementClaim) bool {
+func (registry *Registry) releaseSettlement(claim SettlementClaim) bool {
 	if !claim.Valid() || claim.token.registry != registry.identity {
 		return false
 	}
@@ -846,9 +859,9 @@ func (registry *Registry) ReleaseSettlement(claim SettlementClaim) bool {
 	return true
 }
 
-// FinishSettlement removes only the operation owned by the exact settlement
+// finishSettlement removes only the operation owned by the exact settlement
 // claim.
-func (registry *Registry) FinishSettlement(claim SettlementClaim) bool {
+func (registry *Registry) finishSettlement(claim SettlementClaim) bool {
 	if !claim.Valid() || claim.token.registry != registry.identity {
 		return false
 	}
@@ -875,8 +888,8 @@ func (registry *Registry) FinishSettlement(claim SettlementClaim) bool {
 	return true
 }
 
-// Lookup returns an immutable snapshot of the tracked operation.
-func (registry *Registry) Lookup(leaseUUID string) (Record, bool) {
+// lookup returns an immutable snapshot of the tracked operation.
+func (registry *Registry) lookup(leaseUUID string) (Record, bool) {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	tracked, exists := registry.operations[leaseUUID]
@@ -886,32 +899,33 @@ func (registry *Registry) Lookup(leaseUUID string) (Record, bool) {
 	return tracked.record.clone(), true
 }
 
-// Contains reports whether leaseUUID has a tracked operation.
-func (registry *Registry) Contains(leaseUUID string) bool {
+// contains reports whether leaseUUID has a tracked operation.
+func (registry *Registry) contains(leaseUUID string) bool {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	_, exists := registry.operations[leaseUUID]
 	return exists
 }
 
-// Count returns the number of tracked operations.
-func (registry *Registry) Count() int {
+// count returns the number of tracked operations.
+func (registry *Registry) count() int {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	return len(registry.operations)
 }
 
-// WaitForDrain waits until no operation or lease-action claim remains, ctx is
+// waitForDrain waits until no operation or lease-action claim remains, ctx is
 // canceled, or timeout elapses, and returns the exact remaining work count.
-// Call BeginDrain first when a stable terminal result is required; authenticated
-// callback-recovery claims deliberately remain admissible while the callback
-// HTTP endpoint is live and are included whenever they are already present.
-func (registry *Registry) WaitForDrain(ctx context.Context, timeout time.Duration) int {
+// Call RuntimeController.BeginDrain first when a stable terminal result is
+// required; authenticated callback-recovery claims deliberately remain
+// admissible while the callback HTTP endpoint is live and are included whenever
+// they are already present.
+func (registry *Registry) waitForDrain(ctx context.Context, timeout time.Duration) int {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if timeout <= 0 {
-		return registry.PendingWorkCount()
+		return registry.pendingWorkCount()
 	}
 
 	timer := time.NewTimer(timeout)
@@ -927,9 +941,9 @@ func (registry *Registry) WaitForDrain(ctx context.Context, timeout time.Duratio
 
 		select {
 		case <-ctx.Done():
-			return registry.PendingWorkCount()
+			return registry.pendingWorkCount()
 		case <-timer.C:
-			return registry.PendingWorkCount()
+			return registry.pendingWorkCount()
 		case <-drained:
 			// Re-read under the lock: a new operation may have started after a
 			// prior generation drained but before this waiter resumed.
@@ -937,18 +951,18 @@ func (registry *Registry) WaitForDrain(ctx context.Context, timeout time.Duratio
 	}
 }
 
-// PendingWorkCount returns the number of operations plus exclusive lease
+// pendingWorkCount returns the number of operations plus exclusive lease
 // actions that shutdown must allow to finish. It intentionally differs from
-// Count, whose public/metric contract remains operation-only.
-func (registry *Registry) PendingWorkCount() int {
+// RuntimeController.Count, whose public/metric contract remains operation-only.
+func (registry *Registry) pendingWorkCount() int {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	return registry.pendingWorkCountLocked()
 }
 
-// PendingLeaseUUIDs returns the detached union of operation and lease-claim
+// pendingLeaseUUIDs returns the detached union of operation and lease-claim
 // identities for shutdown diagnostics.
-func (registry *Registry) PendingLeaseUUIDs() []string {
+func (registry *Registry) pendingLeaseUUIDs() []string {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	leases := make(map[string]struct{}, len(registry.operations)+len(registry.leaseClaims))
@@ -961,8 +975,8 @@ func (registry *Registry) PendingLeaseUUIDs() []string {
 	return slices.Collect(maps.Keys(leases))
 }
 
-// CountsByBackend returns a detached snapshot of operation counts per backend.
-func (registry *Registry) CountsByBackend() map[string]int {
+// countsByBackend returns a detached snapshot of operation counts per backend.
+func (registry *Registry) countsByBackend() map[string]int {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	counts := make(map[string]int, len(registry.operations))
@@ -972,15 +986,15 @@ func (registry *Registry) CountsByBackend() map[string]int {
 	return counts
 }
 
-// LeaseUUIDs returns a detached snapshot of tracked lease UUIDs.
-func (registry *Registry) LeaseUUIDs() []string {
+// leaseUUIDs returns a detached snapshot of tracked lease UUIDs.
+func (registry *Registry) leaseUUIDs() []string {
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()
 	return slices.Collect(maps.Keys(registry.operations))
 }
 
-// TimedOut returns detached snapshots of operations older than timeout.
-func (registry *Registry) TimedOut(timeout time.Duration) []Record {
+// timedOut returns detached snapshots of operations older than timeout.
+func (registry *Registry) timedOut(timeout time.Duration) []Record {
 	now := time.Now()
 	registry.mu.RLock()
 	defer registry.mu.RUnlock()

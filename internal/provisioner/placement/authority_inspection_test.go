@@ -410,13 +410,13 @@ func TestInspectAuthorityFile_RedactsValidTypedAttemptButReportsSafeState(t *tes
 	prepareAuthorityInspectionDB(t, path)
 	operationID, err := operation.ParseID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	require.NoError(t, err)
-	snapshot, err := NewBackendRequestSnapshot(
+	snapshot, err := newBackendRequestSnapshot(
 		"sensitive-tenant", authorityInspectionProvider,
 		[]backend.LeaseItem{{SKU: "sensitive-sku", Quantity: 1}},
 	)
 	require.NoError(t, err)
 	const callbackHost = "private-callback.example.invalid"
-	callbackPair, err := NewCallbackPair(
+	callbackPair, err := newCallbackPair(
 		operationID,
 		"https://"+callbackHost+"/callbacks/provision?operation_id="+operationID.String(),
 		"https://"+callbackHost+"/callbacks/provision?lifecycle_id="+operationID.String(),

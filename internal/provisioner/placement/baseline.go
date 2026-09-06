@@ -15,6 +15,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/backendname"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
@@ -112,10 +113,10 @@ type CompleteBackendObservation struct {
 // storage identity and whether both inventories were empty. Nil is distinct
 // from empty because a nil slice does not prove that an endpoint returned a
 // concrete collection.
-func NewCompleteBackendObservation[P, R any](
+func NewCompleteBackendObservation(
 	storageIdentity backendidentity.ID,
-	provisions []P,
-	retentions []R,
+	provisions []backend.ProvisionInfo,
+	retentions []backend.RetainedLease,
 ) (CompleteBackendObservation, error) {
 	if !storageIdentity.Valid() {
 		return CompleteBackendObservation{}, ErrBackendStorageIdentityUnbound
@@ -163,6 +164,10 @@ type topologyMetadata struct {
 	// means no complete drain evidence exists. Membership changes clear both.
 	InventoryTopologyID    uint64   `json:"inventory_topology_id,omitempty"`
 	EmptyInventoryBackends []string `json:"empty_inventory_backends,omitempty"`
+	// A non-zero PendingInventorySweepID proves that a sweep began before
+	// external inventory reads but did not durably finish its projection.
+	InventorySweepSequence  uint64 `json:"inventory_sweep_sequence,omitempty"`
+	PendingInventorySweepID uint64 `json:"pending_inventory_sweep_id,omitempty"`
 }
 
 func emptyTopologyMetadata() topologyMetadata {
@@ -179,7 +184,7 @@ func initializeMetadata(tx *bolt.Tx) error {
 		if b.Get(metadataStateKey) == nil {
 			return errors.New("placement metadata state missing")
 		}
-		return nil
+		return initializeMaintenanceCommandJournal(tx)
 	}
 
 	var err error
@@ -191,7 +196,10 @@ func initializeMetadata(tx *bolt.Tx) error {
 	if err != nil {
 		return err
 	}
-	return b.Put(metadataStateKey, encoded)
+	if err := b.Put(metadataStateKey, encoded); err != nil {
+		return err
+	}
+	return initializeMaintenanceCommandJournal(tx)
 }
 
 func loadTopologyMetadata(tx *bolt.Tx) (topologyMetadata, error) {
@@ -364,7 +372,8 @@ func topologyMetadataFieldAllowed(name string) bool {
 	switch name {
 	case "schema", "topology", "topology_fingerprint", "known_backends", "topology_id",
 		"baseline_fingerprint", "baseline_topology_id", "provider_uuid",
-		"known_backend_storage_ids", "inventory_topology_id", "empty_inventory_backends":
+		"known_backend_storage_ids", "inventory_topology_id", "empty_inventory_backends",
+		"inventory_sweep_sequence", "pending_inventory_sweep_id":
 		return true
 	default:
 		return false
@@ -390,7 +399,8 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 			len(metadata.KnownBackends) != 0 || len(metadata.KnownBackendStorageIDs) != 0 ||
 			metadata.BaselineFingerprint != "" ||
 			metadata.BaselineTopologyID != 0 || metadata.InventoryTopologyID != 0 ||
-			len(metadata.EmptyInventoryBackends) != 0 {
+			len(metadata.EmptyInventoryBackends) != 0 || metadata.InventorySweepSequence != 0 ||
+			metadata.PendingInventorySweepID != 0 {
 			return errors.New("malformed unconfigured placement metadata")
 		}
 		return nil
@@ -445,6 +455,9 @@ func validateTopologyMetadata(metadata topologyMetadata) error {
 	}
 	if metadata.InventoryTopologyID == 0 && len(metadata.EmptyInventoryBackends) != 0 {
 		return errors.New("placement empty-inventory evidence has no topology identity")
+	}
+	if metadata.PendingInventorySweepID > metadata.InventorySweepSequence {
+		return errors.New("pending placement inventory sweep is newer than its durable sequence")
 	}
 	if len(metadata.EmptyInventoryBackends) != 0 {
 		if err := validateCanonicalBackendNames(metadata.EmptyInventoryBackends, false); err != nil {
@@ -576,12 +589,12 @@ func (s *Store) VerifyProviderUUID(providerUUID string) error {
 	return nil
 }
 
-// ConfigureBackendTopologyWithStorageIdentities atomically verifies and pins
+// configureBackendTopologyWithStorageIdentities atomically verifies and pins
 // every proposed active name to the storage UUID observed before a topology
-// change. This identity-only boundary supports controlled migrations and test
-// fixtures; production topology changes use complete observations so the same
-// transaction can retain safe rollback evidence.
-func (s *Store) ConfigureBackendTopologyWithStorageIdentities(
+// change. It remains package-private because identity-only input is not
+// sufficient production authority for topology changes; production callers
+// must submit complete provision and retention observations.
+func (s *Store) configureBackendTopologyWithStorageIdentities(
 	names []string,
 	identities map[string]backendidentity.ID,
 ) error {
@@ -749,6 +762,7 @@ func (s *Store) configureBackendTopology(
 				s.inventoryTopologyID,
 				s.emptyInventoryBackends,
 				s.topologyID,
+				s.pendingInventorySweepID,
 			); err != nil {
 				return err
 			}
@@ -792,6 +806,7 @@ func rejectUnsafeBackendRemoval(
 	inventoryTopologyID uint64,
 	emptyInventoryBackends map[string]struct{},
 	currentTopologyID uint64,
+	pendingInventorySweepID uint64,
 ) error {
 	removed := make(map[string]struct{})
 	for _, backendName := range currentTopology {
@@ -800,6 +815,13 @@ func rejectUnsafeBackendRemoval(
 		}
 	}
 	if len(removed) != 0 {
+		if pendingInventorySweepID != 0 {
+			return fmt.Errorf(
+				"%w: inventory sweep %d may have observed an unrepresented positive on a removed backend",
+				ErrBackendTopologyInUse,
+				pendingInventorySweepID,
+			)
+		}
 		if inventoryTopologyID == 0 || inventoryTopologyID != currentTopologyID {
 			return fmt.Errorf(
 				"%w: no complete current-topology inventory proves removed backends are empty",
@@ -901,17 +923,19 @@ func (s *Store) topologyMetadataLocked() topologyMetadata {
 		storageIDs[backendName] = id.String()
 	}
 	return topologyMetadata{
-		Schema:                 topologyMetadataSchema,
-		ProviderUUID:           s.providerUUID,
-		Topology:               slices.Clone(s.backendTopology),
-		TopologyFingerprint:    s.topologyFingerprint,
-		KnownBackends:          slices.Sorted(maps.Keys(s.knownBackendNames)),
-		KnownBackendStorageIDs: storageIDs,
-		TopologyID:             s.topologyID,
-		BaselineFingerprint:    s.baselineFingerprint,
-		BaselineTopologyID:     s.baselineTopologyID,
-		InventoryTopologyID:    s.inventoryTopologyID,
-		EmptyInventoryBackends: slices.Sorted(maps.Keys(s.emptyInventoryBackends)),
+		Schema:                  topologyMetadataSchema,
+		ProviderUUID:            s.providerUUID,
+		Topology:                slices.Clone(s.backendTopology),
+		TopologyFingerprint:     s.topologyFingerprint,
+		KnownBackends:           slices.Sorted(maps.Keys(s.knownBackendNames)),
+		KnownBackendStorageIDs:  storageIDs,
+		TopologyID:              s.topologyID,
+		BaselineFingerprint:     s.baselineFingerprint,
+		BaselineTopologyID:      s.baselineTopologyID,
+		InventoryTopologyID:     s.inventoryTopologyID,
+		EmptyInventoryBackends:  slices.Sorted(maps.Keys(s.emptyInventoryBackends)),
+		InventorySweepSequence:  s.inventorySweepSequence,
+		PendingInventorySweepID: s.pendingInventorySweepID,
 	}
 }
 
@@ -979,7 +1003,7 @@ func (s *Store) CurrentAdmissionBaseline() AdmissionBaseline {
 }
 
 func (s *Store) hasCurrentAdmissionBaselineLocked() bool {
-	if s.runtimeAuthorityFailure() != nil {
+	if s.runtimeAuthorityFailure() != nil || s.inventoryRecoveryRequired {
 		return false
 	}
 	if s.topologyID == 0 || s.baselineTopologyID != s.topologyID ||
@@ -1007,12 +1031,12 @@ func (s *Store) validateAdmissionBaselineLocked(baseline AdmissionBaseline) erro
 	return nil
 }
 
-// ScopeAdmission attenuates a current durable baseline to the exact configured
+// scopeAdmission attenuates a current durable baseline to the exact configured
 // backends that may receive a new recordless attempt. Names are canonicalized as
 // an unordered set, must be nonblank and unique, and must be a subset of the
 // baseline's topology. An empty input deliberately returns a valid deny-all
 // scope so callers do not need an unsafe nil-means-unrestricted convention.
-func (s *Store) ScopeAdmission(
+func (s *Store) scopeAdmission(
 	baseline AdmissionBaseline,
 	eligibleNames []string,
 ) (AdmissionScope, error) {
@@ -1084,9 +1108,202 @@ func (s *Store) validateConfiguredBackendLocked(backendName string) error {
 	return nil
 }
 
-func (s *Store) validateProjectionBackendsLocked(projection InventoryProjection) error {
+// deriveInventoryAuthorityLocked makes the sealed collector aggregate the sole
+// source of completeness, physical identities, and empty-backend evidence.
+// Caller holds s.mu.
+func (s *Store) deriveInventoryAuthorityLocked(projection *inventoryProjection) error {
+	if projection == nil || !projection.AbsenceEvidence.Present() {
+		return nil
+	}
+	if !projection.AbsenceEvidence.ValidFor(s.inventoryEvidence) {
+		return ErrInvalidInventoryEvidence
+	}
+	projection.complete = projection.AbsenceEvidence.Complete(s.inventoryEvidence)
+	projection.backendStorageIdentities = projection.AbsenceEvidence.StorageIdentities(
+		s.inventoryEvidence,
+	)
+	projection.emptyBackends = projection.AbsenceEvidence.EmptyBackends(s.inventoryEvidence)
+	if projection.complete {
+		conflictCandidates := make(map[string]struct{})
+		for _, quarantines := range []map[string][]string{
+			projection.Conflicts, projection.UntrustedPositives,
+			projection.retentionPositives,
+		} {
+			for _, backendNames := range quarantines {
+				for _, backendName := range backendNames {
+					conflictCandidates[backendName] = struct{}{}
+				}
+			}
+		}
+		filtered := projection.emptyBackends[:0]
+		for _, backendName := range projection.emptyBackends {
+			if _, quarantined := conflictCandidates[backendName]; !quarantined {
+				filtered = append(filtered, backendName)
+			}
+		}
+		projection.emptyBackends = filtered
+	}
+	return nil
+}
+
+// validateProjectionAggregateLocked rejects partial or complete projections
+// combined with omitted, foreign, or misclassified positive DTOs. An omitted
+// trusted reporter is permitted only when the exact operation boundary marks
+// the lease causally excluded and the current durable row already accounts for
+// that backend with equivalent generation and principal semantics. Such a
+// redundant fact may discharge the marker; every non-equivalent exclusion
+// keeps it set. Untrusted reporters are never omittable because their semantic
+// class requires durable quarantine even when the backend name already appears
+// on the current row.
+// Caller holds s.mu.
+func (s *Store) validateProjectionAggregateLocked(
+	projection inventoryProjection,
+) error {
+	hasSubmittedPositives := len(projection.Placements) != 0 ||
+		len(projection.Conflicts) != 0 || len(projection.UntrustedPositives) != 0 ||
+		len(projection.retentionPositives) != 0
+	if !projection.AbsenceEvidence.Present() {
+		if hasSubmittedPositives || len(projection.causalExclusions) != 0 {
+			return fmt.Errorf(
+				"%w: positive projection has no sealed inventory aggregate",
+				ErrInvalidInventoryEvidence,
+			)
+		}
+		return nil
+	}
+	for leaseUUID := range projection.causalExclusions {
+		if leaseUUID == "" || !projection.AbsenceEvidence.LeasePresent(
+			s.inventoryEvidence, leaseUUID,
+		) {
+			return fmt.Errorf(
+				"%w: causal exclusion for lease %q has no sealed positive",
+				ErrInvalidInventoryEvidence, leaseUUID,
+			)
+		}
+	}
+	for _, leaseUUID := range projection.AbsenceEvidence.LeaseUUIDs(s.inventoryEvidence) {
+		reporters := projection.AbsenceEvidence.LeaseReporters(
+			s.inventoryEvidence, leaseUUID,
+		)
+		submitted := make(map[string]struct{})
+		if backendName := projection.Placements[leaseUUID]; backendName != "" {
+			submitted[backendName] = struct{}{}
+		}
+		for _, backendName := range projection.Conflicts[leaseUUID] {
+			submitted[backendName] = struct{}{}
+		}
+		for _, backendName := range projection.UntrustedPositives[leaseUUID] {
+			submitted[backendName] = struct{}{}
+		}
+		for _, backendName := range projection.retentionPositives[leaseUUID] {
+			submitted[backendName] = struct{}{}
+		}
+		durable := s.durableCandidateBackendsLocked(leaseUUID)
+		_, causallyExcluded := projection.causalExclusions[leaseUUID]
+		for _, backendName := range reporters {
+			if projection.AbsenceEvidence.UntrustedReporter(
+				s.inventoryEvidence, backendName, leaseUUID,
+			) && !slices.Contains(projection.UntrustedPositives[leaseUUID], backendName) &&
+				!slices.Contains(projection.Conflicts[leaseUUID], backendName) {
+				return fmt.Errorf(
+					"%w: untrusted reporter %q for lease %q was omitted from quarantine",
+					ErrInvalidInventoryEvidence, backendName, leaseUUID,
+				)
+			}
+			if _, included := submitted[backendName]; included {
+				continue
+			}
+			_, accounted := durable[backendName]
+			if !causallyExcluded || !accounted {
+				return fmt.Errorf(
+					"%w: snapshot reporter %q for lease %q was omitted outside its causal exclusion",
+					ErrInvalidInventoryEvidence, backendName, leaseUUID,
+				)
+			}
+		}
+	}
+	for leaseUUID, backendName := range projection.Placements {
+		if projection.AbsenceEvidence.TrustedReporter(
+			s.inventoryEvidence, backendName, leaseUUID,
+		) {
+			continue
+		}
+		return fmt.Errorf(
+			"%w: projected owner %q for lease %q lacks paired trusted evidence",
+			ErrInvalidInventoryEvidence, backendName, leaseUUID,
+		)
+	}
+	for leaseUUID, backendNames := range projection.Conflicts {
+		for _, backendName := range backendNames {
+			if !s.projectionCandidateObservedOrDurableLocked(
+				projection, leaseUUID, backendName,
+			) {
+				return fmt.Errorf(
+					"%w: conflict candidate %q for lease %q is foreign to the snapshot",
+					ErrInvalidInventoryEvidence, backendName, leaseUUID,
+				)
+			}
+		}
+	}
+	for leaseUUID, backendNames := range projection.UntrustedPositives {
+		for _, backendName := range backendNames {
+			if !projection.AbsenceEvidence.UntrustedReporter(
+				s.inventoryEvidence, backendName, leaseUUID,
+			) {
+				return fmt.Errorf(
+					"%w: untrusted candidate %q for lease %q lacks rejected evidence",
+					ErrInvalidInventoryEvidence, backendName, leaseUUID,
+				)
+			}
+		}
+	}
+	for leaseUUID, backendNames := range projection.retentionPositives {
+		if projection.complete {
+			return fmt.Errorf(
+				"%w: retention quarantine for lease %q accompanied a complete snapshot",
+				ErrInvalidInventoryEvidence, leaseUUID,
+			)
+		}
+		for _, backendName := range backendNames {
+			if !projection.AbsenceEvidence.RetentionReporter(
+				s.inventoryEvidence, backendName, leaseUUID,
+			) {
+				return fmt.Errorf(
+					"%w: retention candidate %q for lease %q lacks retention evidence",
+					ErrInvalidInventoryEvidence, backendName, leaseUUID,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) durableCandidateBackendsLocked(leaseUUID string) map[string]struct{} {
+	if record, exists := s.cache[leaseUUID]; exists {
+		return placementCandidateBackends(record)
+	}
+	return map[string]struct{}{}
+}
+
+func (s *Store) projectionCandidateObservedOrDurableLocked(
+	projection inventoryProjection,
+	leaseUUID string,
+	backendName string,
+) bool {
+	if projection.AbsenceEvidence.Reporter(s.inventoryEvidence, backendName, leaseUUID) {
+		return true
+	}
+	_, durable := s.durableCandidateBackendsLocked(leaseUUID)[backendName]
+	return durable
+}
+
+func (s *Store) validateProjectionBackendsLocked(projection inventoryProjection) error {
+	if projection.AbsenceEvidence.Present() &&
+		!projection.AbsenceEvidence.ValidFor(s.inventoryEvidence) {
+		return ErrInvalidInventoryEvidence
+	}
 	if s.topologyID == 0 {
-		if projection.Complete {
+		if projection.complete {
 			return ErrBackendTopologyNotConfigured
 		}
 		return nil
@@ -1094,7 +1311,7 @@ func (s *Store) validateProjectionBackendsLocked(projection InventoryProjection)
 	validate := func(backendName string) error {
 		return s.validateConfiguredBackendLocked(backendName)
 	}
-	for _, backendName := range projection.EmptyBackends {
+	for _, backendName := range projection.emptyBackends {
 		if err := validate(backendName); err != nil {
 			return err
 		}
@@ -1118,8 +1335,15 @@ func (s *Store) validateProjectionBackendsLocked(projection InventoryProjection)
 			}
 		}
 	}
-	observedOwners := make(map[backendidentity.ID]string, len(projection.BackendStorageIdentities))
-	for backendName, observedID := range projection.BackendStorageIdentities {
+	for _, backendNames := range projection.retentionPositives {
+		for _, backendName := range backendNames {
+			if err := validate(backendName); err != nil {
+				return err
+			}
+		}
+	}
+	observedOwners := make(map[backendidentity.ID]string, len(projection.backendStorageIdentities))
+	for backendName, observedID := range projection.backendStorageIdentities {
 		if err := validate(backendName); err != nil {
 			return err
 		}
@@ -1148,16 +1372,16 @@ func (s *Store) validateProjectionBackendsLocked(projection InventoryProjection)
 			}
 		}
 	}
-	if projection.Complete {
-		if len(projection.BackendStorageIdentities) != len(s.backendTopology) {
+	if projection.complete {
+		if len(projection.backendStorageIdentities) != len(s.backendTopology) {
 			return fmt.Errorf(
 				"%w: complete projection identified %d of %d backends",
 				ErrBackendStorageIdentityUnbound,
-				len(projection.BackendStorageIdentities), len(s.backendTopology),
+				len(projection.backendStorageIdentities), len(s.backendTopology),
 			)
 		}
 		for _, backendName := range s.backendTopology {
-			if !projection.BackendStorageIdentities[backendName].Valid() {
+			if !projection.backendStorageIdentities[backendName].Valid() {
 				return fmt.Errorf("%w: %q", ErrBackendStorageIdentityUnbound, backendName)
 			}
 		}
@@ -1168,7 +1392,7 @@ func (s *Store) validateProjectionBackendsLocked(projection InventoryProjection)
 // BeginNewAttempt records a write-ahead attempt only when the lease has no
 // durable placement evidence at the exact instant of insertion and the target
 // belongs to the supplied topology-bound admission scope.
-func (s *Store) BeginNewAttempt(
+func (s *Store) beginNewAttempt(
 	scope AdmissionScope,
 	leaseUUID, backendName string,
 	operationID operation.OperationID,
@@ -1205,6 +1429,9 @@ func (s *Store) BeginNewAttempt(
 	if s.restoreSourceClaimedLocked(leaseUUID) {
 		return AttemptToken{}, false, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, leaseUUID)
 	}
+	if err := s.unprojectedPositiveErrorLocked(leaseUUID); err != nil {
+		return AttemptToken{}, false, err
+	}
 	if _, exists := s.cache[leaseUUID]; exists {
 		return AttemptToken{}, false, nil
 	}
@@ -1224,7 +1451,7 @@ func (s *Store) BeginNewAttempt(
 // BeginOwnedAttempt records a write-ahead attempt only for the exact confirmed
 // owner revision supplied by the caller. Stale, foreign, absent, conflicted, or
 // already-attempting records fail the CAS without issuing a capability.
-func (s *Store) BeginOwnedAttempt(
+func (s *Store) beginOwnedAttempt(
 	baseline AdmissionBaseline,
 	revision RecordRevision,
 	backendName string,
@@ -1259,6 +1486,9 @@ func (s *Store) BeginOwnedAttempt(
 	}
 	if s.restoreSourceClaimedLocked(revision.leaseUUID) {
 		return AttemptToken{}, false, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, revision.leaseUUID)
+	}
+	if err := s.unprojectedPositiveErrorLocked(revision.leaseUUID); err != nil {
+		return AttemptToken{}, false, err
 	}
 	existing, exists := s.cache[revision.leaseUUID]
 	if !exists || existing.revision != revision.value ||

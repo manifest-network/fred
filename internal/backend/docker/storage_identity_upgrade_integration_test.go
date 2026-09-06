@@ -2,15 +2,12 @@ package docker
 
 import (
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,8 +16,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
@@ -73,7 +68,7 @@ func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
 		const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 		server := newStorageIdentityDockerServer(t, []container.Summary{{
 			ID:    "managed-container-a",
-			Names: []string{"/fred-" + leaseUUID + "-0"},
+			Names: []string{"/fred-" + leaseUUID + "-app-0"},
 			Image: "docker.io/library/alpine:3.22",
 			Labels: map[string]string{
 				LabelManaged:       "true",
@@ -83,23 +78,21 @@ func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
 				LabelProviderUUID:  "22222222-2222-4222-8222-222222222222",
 				LabelSKU:           "sku-stateless",
 				LabelInstanceIndex: "0",
+				LabelServiceName:   manifest.DefaultServiceName,
 				LabelCallbackURL:   callbackURL,
 			},
 		}})
 		cfg := storageIdentityIntegrationConfig(t, server.URL)
 		writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
 		writeLegacyAuthorityStores(t, cfg)
-		releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: cfg.ReleasesDBPath})
-		require.NoError(t, err)
-		require.NoError(t, releases.Append(leaseUUID, shared.Release{
+		writeRawV013ReleaseHistory(t, cfg.ReleasesDBPath, leaseUUID, []v013ReleaseWire{{
 			Version:  1,
-			Manifest: []byte(`{"image":"docker.io/library/alpine:3.22"}`),
-			Image:    "docker.io/library/alpine:3.22",
+			Manifest: []byte(`{"services":{"app":{"image":"docker.io/library/alpine:3.22"}}}`),
+			Image:    "stack",
 			Status:   "active",
-		}))
-		require.NoError(t, releases.Close())
+		}})
 
-		_, err = InitializeStorageIdentityForConfig(
+		_, err := InitializeStorageIdentityForConfig(
 			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeNew,
 		)
 		require.Error(t, err)
@@ -179,382 +172,6 @@ func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
 		)
 		require.ErrorContains(t, err, "docker daemon identity changed during lineage proof")
 	})
-}
-
-func TestIntegrationStorageIdentityPreflightClassifiesV013MigrationCrashArtifacts(t *testing.T) {
-	const (
-		leaseUUID    = "550e8400-e29b-41d4-a716-446655440000"
-		providerUUID = "22222222-2222-4222-8222-222222222222"
-		callbackURL  = "https://fred.example/callbacks/provision"
-		imageName    = "docker.io/library/nginx:1.27"
-	)
-	prev := func(index int) container.Summary {
-		return container.Summary{
-			ID:    fmt.Sprintf("prev-%d", index),
-			Names: []string{fmt.Sprintf("/fred-%s-app-%d-prev", leaseUUID, index)},
-			Image: imageName,
-			State: "exited",
-			Labels: map[string]string{
-				LabelManaged:       "true",
-				LabelBackendName:   "docker",
-				LabelLeaseUUID:     leaseUUID,
-				LabelTenant:        "tenant-a",
-				LabelProviderUUID:  providerUUID,
-				LabelSKU:           "sku-stateless",
-				LabelInstanceIndex: strconv.Itoa(index),
-				LabelCallbackURL:   callbackURL,
-			},
-		}
-	}
-	stack := func(index int) container.Summary {
-		return container.Summary{
-			ID:    fmt.Sprintf("stack-%d", index),
-			Names: []string{fmt.Sprintf("/fred-%s-app-%d", leaseUUID, index)},
-			Image: imageName,
-			State: "running",
-			Labels: map[string]string{
-				LabelManaged:       "true",
-				LabelLeaseUUID:     leaseUUID,
-				LabelTenant:        "tenant-a",
-				LabelSKU:           "sku-stateless",
-				LabelInstanceIndex: strconv.Itoa(index),
-				LabelServiceName:   manifest.DefaultServiceName,
-				// Wire-faithful v0.13 migration omission: BackendName,
-				// ProviderUUID, CallbackURL, and LifecycleCallbackURL are all
-				// absent. Strict inventory surfaces this only for whole-cohort
-				// fail-closed classification.
-			},
-		}
-	}
-
-	for _, test := range []struct {
-		name       string
-		containers []container.Summary
-		release    shared.Release
-		want       string
-		wantIDs    string
-	}{
-		{
-			name:       "pre RecordMigration complete cohorts",
-			containers: []container.Summary{prev(0), prev(1), stack(1), stack(0)},
-			release: shared.Release{
-				Manifest: []byte(`{"image":"docker.io/library/nginx:1.27"}`),
-				Image:    imageName, Status: "active",
-			},
-			want:    "pre-RecordMigration",
-			wantIDs: `immutable_stack_container_ids=["stack-0","stack-1"]`,
-		},
-		{
-			name:       "post RecordMigration partial rollback cleanup",
-			containers: []container.Summary{prev(1), stack(0), stack(1)},
-			release: shared.Release{
-				Manifest: []byte(`{"services":{"app":{"image":"docker.io/library/nginx:1.27"}}}`),
-				Image:    "stack", Status: "active",
-			},
-			want: "post-RecordMigration",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			server := newStorageIdentityDockerServer(t, test.containers)
-			cfg := storageIdentityIntegrationConfig(t, server.URL)
-			writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-			writeLegacyAuthorityStores(t, cfg)
-			releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: cfg.ReleasesDBPath})
-			require.NoError(t, err)
-			require.NoError(t, releases.Append(leaseUUID, test.release))
-			require.NoError(t, releases.Close())
-
-			_, err = PreflightStorageIdentityAdoptionForConfig(
-				t.Context(), cfg, discardStorageIdentityLogger(),
-			)
-			require.Error(t, err)
-			assert.True(t, errors.Is(err, ErrV013InterruptedMigration))
-			assert.ErrorContains(t, err, test.want)
-			if test.wantIDs != "" {
-				assert.ErrorContains(t, err, test.wantIDs)
-			} else {
-				assert.NotContains(t, err.Error(), "immutable_stack_container_ids")
-			}
-			assertNoStorageIdentityMarkers(t, cfg)
-		})
-	}
-}
-
-func TestIntegrationStorageIdentityPreflightClassifiesStoppedOrphanPrev(t *testing.T) {
-	const (
-		leaseUUID    = "550e8400-e29b-41d4-a716-446655440000"
-		providerUUID = "22222222-2222-4222-8222-222222222222"
-	)
-	prev := func(index int, id string) container.Summary {
-		state := "exited"
-		if index == 0 {
-			state = "created"
-		}
-		return container.Summary{
-			ID:    id,
-			Names: []string{fmt.Sprintf("/fred-%s-app-%d-prev", leaseUUID, index)},
-			Image: "docker.io/library/nginx:1.27",
-			State: state,
-			Labels: map[string]string{
-				LabelManaged:       "true",
-				LabelBackendName:   "docker",
-				LabelLeaseUUID:     leaseUUID,
-				LabelTenant:        "tenant-a",
-				LabelProviderUUID:  providerUUID,
-				LabelSKU:           "sku-stateless",
-				LabelInstanceIndex: strconv.Itoa(index),
-				LabelCallbackURL:   "https://fred.example/callbacks/provision",
-			},
-		}
-	}
-	server := newStorageIdentityDockerServer(t, []container.Summary{
-		prev(1, "orphan-prev-z"),
-		prev(0, "orphan-prev-a"),
-	})
-	cfg := storageIdentityIntegrationConfig(t, server.URL)
-	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-	writeLegacyAuthorityStores(t, cfg)
-
-	_, err := PreflightStorageIdentityAdoptionForConfig(
-		t.Context(), cfg, discardStorageIdentityLogger(),
-	)
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrV013OrphanRollbackRemnant))
-	assert.ErrorContains(t, err,
-		`immutable_container_ids=["orphan-prev-a","orphan-prev-z"]`)
-	assert.ErrorContains(t, err, `backend="docker"`)
-	assert.ErrorContains(t, err, `provider="22222222-2222-4222-8222-222222222222"`)
-	assert.ErrorContains(t, err, "placement-preflight -prove-terminal-orphan")
-	assert.ErrorContains(t, err, "necessary but not sufficient")
-	assertNoStorageIdentityMarkers(t, cfg)
-}
-
-func TestSortedImmutableContainerIDsAreDeterministicAndBounded(t *testing.T) {
-	t.Parallel()
-
-	ids, err := sortedImmutableContainerIDs([]ContainerInfo{
-		{ContainerID: "container-z"},
-		{ContainerID: "container-a"},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, []string{"container-a", "container-z"}, ids)
-
-	for name, containers := range map[string][]ContainerInfo{
-		"empty": nil,
-		"duplicate": {
-			{ContainerID: "container-a"},
-			{ContainerID: "container-a"},
-		},
-		"unsafe":       {{ContainerID: "container\nforged"}},
-		"oversized id": {{ContainerID: strings.Repeat("a", maxDiagnosticContainerIDBytes+1)}},
-		"oversized cohort": func() []ContainerInfo {
-			result := make([]ContainerInfo, backend.MaxOperationQuantity+1)
-			for index := range result {
-				result[index].ContainerID = fmt.Sprintf("container-%d", index)
-			}
-			return result
-		}(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			_, err := sortedImmutableContainerIDs(containers)
-			require.Error(t, err)
-		})
-	}
-}
-
-func TestProveStoppedV013RollbackCohortRequiresExactDenseIdentity(t *testing.T) {
-	t.Parallel()
-	const (
-		leaseUUID    = "550e8400-e29b-41d4-a716-446655440000"
-		providerUUID = "22222222-2222-4222-8222-222222222222"
-		callbackURL  = "https://fred.example/callbacks/provision"
-	)
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	require.NoError(t, err)
-	base := []ContainerInfo{
-		{
-			ContainerID: "prev-a", Name: "fred-" + leaseUUID + "-app-0-prev",
-			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: providerUUID,
-			BackendName: "docker", SKU: "sku-stateless", Image: "nginx:1.27",
-			CallbackURL: callbackURL, LifecycleCallbackURL: lifecycleCallbackURL,
-			CustomDomain: "legacy.example", InstanceIndex: 0, Status: "created",
-		},
-		{
-			ContainerID: "prev-b", Name: "fred-" + leaseUUID + "-app-1-prev",
-			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: providerUUID,
-			BackendName: "docker", SKU: "sku-stateless", Image: "nginx:1.27",
-			CallbackURL: callbackURL, LifecycleCallbackURL: lifecycleCallbackURL,
-			CustomDomain: "legacy.example", InstanceIndex: 1, Status: "exited",
-		},
-	}
-	proof, err := proveStoppedV013RollbackCohort(base, "docker")
-	require.NoError(t, err)
-	assert.Equal(t, providerUUID, proof.providerUUID)
-	assert.Equal(t, []string{"prev-a", "prev-b"}, proof.containerIDs)
-
-	clone := func() []ContainerInfo { return append([]ContainerInfo(nil), base...) }
-	for name, mutate := range map[string]func([]ContainerInfo) []ContainerInfo{
-		"wrong exact name": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].Name = "fred-" + leaseUUID + "-app-9-prev"
-			return cohort
-		},
-		"service label present": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].ServiceName = "app"
-			return cohort
-		},
-		"running": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].Status = "running"
-			return cohort
-		},
-		"paused": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].Status = "paused"
-			return cohort
-		},
-		"foreign backend": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].BackendName = "docker-b"
-			return cohort
-		},
-		"foreign provider": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].ProviderUUID = "33333333-3333-4333-8333-333333333333"
-			return cohort
-		},
-		"foreign tenant": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].Tenant = "tenant-b"
-			return cohort
-		},
-		"divergent SKU": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].SKU = "sku-other"
-			return cohort
-		},
-		"divergent image": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].Image = "alpine:3.22"
-			return cohort
-		},
-		"divergent domain": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].CustomDomain = "other.example"
-			return cohort
-		},
-		"divergent operation callback": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].CallbackURL = "https://other.example/callbacks/provision"
-			return cohort
-		},
-		"divergent lifecycle callback": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].LifecycleCallbackURL = "https://other.example/callbacks/provision"
-			return cohort
-		},
-		"negative index": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].InstanceIndex = -1
-			cohort[1].Name = "fred-" + leaseUUID + "-app--1-prev"
-			return cohort
-		},
-		"duplicate index": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].InstanceIndex = 0
-			cohort[1].Name = "fred-" + leaseUUID + "-app-0-prev"
-			return cohort
-		},
-		"sparse index": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].InstanceIndex = 2
-			cohort[1].Name = "fred-" + leaseUUID + "-app-2-prev"
-			return cohort
-		},
-		"unsafe ID": func(cohort []ContainerInfo) []ContainerInfo {
-			cohort[1].ContainerID = "forged\nidentifier"
-			return cohort
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			_, err := proveStoppedV013RollbackCohort(mutate(clone()), "docker")
-			require.Error(t, err)
-		})
-	}
-}
-
-func TestIntegrationStorageIdentityPreflightRejectsDivergentLegacyCallbacks(t *testing.T) {
-	const (
-		leaseUUID    = "550e8400-e29b-41d4-a716-446655440000"
-		providerUUID = "22222222-2222-4222-8222-222222222222"
-		imageName    = "docker.io/library/nginx:1.27"
-	)
-	prev := func(index int, callbackURL string) container.Summary {
-		return container.Summary{
-			ID:    fmt.Sprintf("prev-%d", index),
-			Names: []string{fmt.Sprintf("/fred-%s-app-%d-prev", leaseUUID, index)},
-			Image: imageName,
-			State: "exited",
-			Labels: map[string]string{
-				LabelManaged:       "true",
-				LabelBackendName:   "docker",
-				LabelLeaseUUID:     leaseUUID,
-				LabelTenant:        "tenant-a",
-				LabelProviderUUID:  providerUUID,
-				LabelSKU:           "sku-stateless",
-				LabelInstanceIndex: strconv.Itoa(index),
-				LabelCallbackURL:   callbackURL,
-			},
-		}
-	}
-	stack := func(index int) container.Summary {
-		return container.Summary{
-			ID:    fmt.Sprintf("stack-%d", index),
-			Names: []string{fmt.Sprintf("/fred-%s-app-%d", leaseUUID, index)},
-			Image: imageName,
-			State: "running",
-			Labels: map[string]string{
-				LabelManaged:       "true",
-				LabelLeaseUUID:     leaseUUID,
-				LabelTenant:        "tenant-a",
-				LabelSKU:           "sku-stateless",
-				LabelInstanceIndex: strconv.Itoa(index),
-				LabelServiceName:   manifest.DefaultServiceName,
-			},
-		}
-	}
-	callbacks := []string{
-		"https://fred-a.example/callbacks/provision",
-		"https://fred-b.example/callbacks/provision",
-	}
-
-	for _, test := range []struct {
-		name       string
-		containers []container.Summary
-	}{
-		{
-			name: "rollback-only migration cohort",
-			containers: []container.Summary{
-				prev(0, callbacks[0]), prev(1, callbacks[1]),
-			},
-		},
-		{
-			name: "pre-RecordMigration mixed cohort",
-			containers: []container.Summary{
-				prev(0, callbacks[0]), prev(1, callbacks[1]), stack(0), stack(1),
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			server := newStorageIdentityDockerServer(t, test.containers)
-			cfg := storageIdentityIntegrationConfig(t, server.URL)
-			writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-			writeLegacyAuthorityStores(t, cfg)
-			releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: cfg.ReleasesDBPath})
-			require.NoError(t, err)
-			require.NoError(t, releases.Append(leaseUUID, shared.Release{
-				Manifest: []byte(`{"image":"docker.io/library/nginx:1.27"}`),
-				Image:    imageName, Status: "active",
-			}))
-			require.NoError(t, releases.Close())
-			before := snapshotStorageIdentityAuthorityFiles(t, cfg)
-
-			_, err = PreflightStorageIdentityAdoptionForConfig(
-				t.Context(), cfg, discardStorageIdentityLogger(),
-			)
-			require.Error(t, err)
-			assert.ErrorContains(t, err, "callback_url differs")
-			assertStorageIdentityAuthorityUnchanged(t, cfg, before)
-		})
-	}
 }
 
 func storageIdentityIntegrationConfig(t *testing.T, dockerHost string) Config {

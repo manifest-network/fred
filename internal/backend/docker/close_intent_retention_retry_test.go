@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
-	"slices"
 	"testing"
 	"time"
 
@@ -17,106 +16,55 @@ import (
 
 func beginRetainedCloseRecoveryIntent(
 	t *testing.T,
-	b *Backend,
 	stores closeRecoveryStores,
 	callbackURL string,
-) ([]backend.LeaseItem, []shared.SKUResourceSnapshot) {
+) shared.CloseIntentClaim {
 	t.Helper()
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", ServiceName: "app", Quantity: 1,
 	}}
 	payload := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
 	resourceProfiles := testResourceProfiles(t, items)
-	require.NoError(t, stores.releases.Append(closeRecoveryLeaseUUID, shared.Release{
-		Manifest:         payload,
-		Image:            "stack",
-		Items:            items,
-		ResourceProfiles: resourceProfiles,
-		Status:           "active",
-		CreatedAt:        time.Now(),
-	}))
-	release, err := stores.releases.LatestActive(closeRecoveryLeaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, release)
-	version, digest, err := closeReleaseFence(release)
-	require.NoError(t, err)
 	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
 	require.NoError(t, err)
-	resourceProfiles, err = b.resolveResourceProfiles(items)
+	operationID := mustTestOperationIDFromCallbackURL(t, callbackURL)
+	runtimeAuthority, err := shared.NewReleaseRuntimeAuthority(
+		operationID,
+		"tenant-a",
+		closeRecoveryProviderUUID,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
 	require.NoError(t, err)
-	_, err = stores.callbacks.BeginCloseIntent(shared.CloseIntentSpec{
-		LeaseUUID:             closeRecoveryLeaseUUID,
-		Backend:               b.Name(),
-		BackendStorageID:      b.storageIdentity,
-		Tenant:                "tenant-a",
-		ProviderUUID:          "provider-a",
-		Items:                 items,
-		ResourceProfiles:      resourceProfiles,
-		Manifest:              payload,
-		ActiveReleaseVersion:  version,
-		ActiveReleaseDigest:   digest,
-		CallbackURL:           callbackURL,
-		LifecycleCallbackURL:  lifecycleCallbackURL,
-		RetainOnClose:         true,
-		LegacyRollbackTargets: nil,
-	})
+	seedProvisionReleaseForLeaseTest(
+		t, stores.callbacks, stores.releases, stores.operations,
+		closeRecoveryLeaseUUID, shared.Release{
+			Manifest:         payload,
+			Image:            "stack",
+			OperationID:      operationID,
+			Items:            items,
+			ResourceProfiles: resourceProfiles,
+			RuntimeAuthority: &runtimeAuthority,
+			Status:           "active",
+			CreatedAt:        time.Now(),
+		})
+	request, err := stores.close.NewCloseRequest(closeRecoveryLeaseUUID, true)
 	require.NoError(t, err)
-	return items, resourceProfiles
+	admission, err := stores.close.BeginClose(request)
+	require.NoError(t, err)
+	return admission.Claim()
 }
 
 func seedCompletedRetention(
 	t *testing.T,
-	store *shared.RetentionStore,
-	items []backend.LeaseItem,
-	resourceProfiles []shared.SKUResourceSnapshot,
+	settlement *shared.CloseSettlement,
+	claim shared.CloseIntentClaim,
 	volumeNames ...string,
 ) {
 	t.Helper()
-	require.NoError(t, store.Put(shared.RetentionEntry{
-		OriginalLeaseUUID:   closeRecoveryLeaseUUID,
-		Tenant:              "tenant-a",
-		ProviderUUID:        "provider-a",
-		Items:               items,
-		ResourceProfiles:    resourceProfiles,
-		RetainedVolumeNames: volumeNames,
-		Status:              shared.RetentionStatusActive,
-		CreatedAt:           time.Now(),
-	}))
-}
-
-func admitCloseAtCleanupAttempt(
-	t *testing.T,
-	b *Backend,
-	stores closeRecoveryStores,
-	leaseUUID string,
-	attempts int,
-) shared.CloseIntentClaim {
-	t.Helper()
-	b.provisionsMu.RLock()
-	projection := b.provisions[leaseUUID]
-	b.provisionsMu.RUnlock()
-	require.NotNil(t, projection)
-	claim, found, err := b.acquireCloseIntent(
-		context.Background(),
-		leaseUUID,
-		true,
-		projection.Tenant,
-		projection.ProviderUUID,
-		projection.Items,
-		projection.StackManifest,
-		projection.CallbackURL,
-		projection.LifecycleCallbackURL,
-	)
+	ok, err := settlement.RecordRetention(claim, "", volumeNames)
 	require.NoError(t, err)
-	require.True(t, found)
-	for range attempts {
-		claim, err = stores.callbacks.IncrementCloseCleanupAttempts(claim)
-		require.NoError(t, err)
-	}
-	b.provisionsMu.Lock()
-	b.provisions[leaseUUID].VolumeCleanupAttempts = attempts
-	b.provisionsMu.Unlock()
-	return claim
+	require.True(t, ok)
 }
 
 func TestRecoverState_RetainedCloseAfterAllRenamesPublishesRetained(t *testing.T) {
@@ -129,10 +77,9 @@ func TestRecoverState_RetainedCloseAfterAllRenamesPublishesRetained(t *testing.T
 		},
 	}
 	b, stores := openCloseRecoveryBackend(t, dir, mock, volumes.manager())
-	retentions := attachRetentionStore(t, b)
 	const operationURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
-	items, resourceProfiles := beginRetainedCloseRecoveryIntent(t, b, stores, operationURL)
-	seedCompletedRetention(t, retentions, items, resourceProfiles, retainedVolume)
+	claim := beginRetainedCloseRecoveryIntent(t, stores, operationURL)
+	seedCompletedRetention(t, stores.close, claim, retainedVolume)
 
 	// This is the post-crash state: PutActiveMerged and every rename committed,
 	// while release retirement and close resolution did not. Recovery sees no
@@ -165,10 +112,9 @@ func TestRecoverState_RetainedCloseMissingRecordedVolumeStaysPending(t *testing.
 		},
 	}
 	b, stores := openCloseRecoveryBackend(t, dir, mock, volumes.manager())
-	retentions := attachRetentionStore(t, b)
 	const operationURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
-	items, resourceProfiles := beginRetainedCloseRecoveryIntent(t, b, stores, operationURL)
-	seedCompletedRetention(t, retentions, items, resourceProfiles, retainedVolume)
+	claim := beginRetainedCloseRecoveryIntent(t, stores, operationURL)
+	seedCompletedRetention(t, stores.close, claim, retainedVolume)
 
 	// Startup itself remains available, but this close must not consume either
 	// finalizer or enqueue a terminal callback without physical completion proof.
@@ -176,7 +122,7 @@ func TestRecoverState_RetainedCloseMissingRecordedVolumeStaysPending(t *testing.
 	claim, found, err := stores.callbacks.GetCloseIntent(closeRecoveryLeaseUUID)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Equal(t, 1, claim.CleanupAttempts())
+	require.Equal(t, 1, claim.ExecutionGeneration().Number())
 	pending, err := stores.callbacks.ListPending()
 	require.NoError(t, err)
 	require.Empty(t, pending)
@@ -187,7 +133,7 @@ func TestRecoverState_RetainedCloseMissingRecordedVolumeStaysPending(t *testing.
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
-func TestDoDeprovision_AmbiguousVolumeCleanupNeverConsumesCloseAtRetryLimit(t *testing.T) {
+func TestDoDeprovision_AmbiguousVolumeCleanupNeverConsumesClose(t *testing.T) {
 	dir := t.TempDir()
 	volumeName := canonicalVolumeName(closeDeprovisionLeaseUUID, "app", 0)
 	var b *Backend
@@ -203,57 +149,57 @@ func TestDoDeprovision_AmbiguousVolumeCleanupNeverConsumesCloseAtRetryLimit(t *t
 	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, volumes)
 	seedCloseDeprovisionLease(t, b, stores)
 
-	admitCloseAtCleanupAttempt(
-		t,
-		b,
-		stores,
-		closeDeprovisionLeaseUUID,
-		maxVolumeCleanupAttempts-1,
-	)
-
-	err := b.doDeprovision(context.Background(), closeDeprovisionLeaseUUID)
+	err := b.doDeprovisionForTest(t, context.Background(), closeDeprovisionLeaseUUID)
 	require.Error(t, err)
 	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	_, _, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.ErrorIs(t, readErr, backendidentity.ErrMutationOutcomeAmbiguous,
+		"the ambiguous substrate outcome must revoke every authoritative store read in this backend lifetime")
+	b.provisionsMu.RLock()
+	projection := b.provisions[closeDeprovisionLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.NotNil(t, projection)
+	require.Equal(t, backend.ProvisionStatusFailed, projection.Status)
+	storageID := b.storageIdentity
+
+	closeCloseRecoveryBackend(t, b, stores)
+
+	// Durable preservation is observable only after a fresh process generation
+	// reopens and re-attests the exact same storage lineage. Letting the latched
+	// instance keep reading its journals would split substrate and durable
+	// authority precisely when their ordering is unknown.
+	b, stores = openCloseRecoveryBackend(t, dir, &mockDockerClient{}, nil)
+	require.Equal(t, storageID, b.storageIdentity, "restart must re-attest the same storage generation")
 	claim, found, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
 	require.NoError(t, readErr)
-	require.True(t, found, "ambiguous cleanup must retain its durable finalizer")
-	require.Equal(t, maxVolumeCleanupAttempts-1, claim.CleanupAttempts(),
-		"ambiguity is evidence to preserve, not a failed cleanup attempt")
+	require.True(t, found, "ambiguous cleanup must retain its durable finalizer across restart")
+	require.Equal(t, 1, claim.ExecutionGeneration().Number(),
+		"ambiguity must preserve the exact durable Started generation")
 	releases, readErr := stores.releases.List(closeDeprovisionLeaseUUID)
 	require.NoError(t, readErr)
 	require.NotEmpty(t, releases, "ambiguous cleanup must retain its exact release fence")
 	pending, readErr := stores.callbacks.ListPending()
 	require.NoError(t, readErr)
 	require.Empty(t, pending, "an unclassified close outcome cannot publish a terminal callback")
-	b.provisionsMu.RLock()
-	projection := b.provisions[closeDeprovisionLeaseUUID]
-	b.provisionsMu.RUnlock()
-	require.NotNil(t, projection)
-	require.Equal(t, backend.ProvisionStatusFailed, projection.Status)
-	require.Equal(t, maxVolumeCleanupAttempts-1, projection.VolumeCleanupAttempts)
 
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
-func TestDoDeprovision_RetainedCloseAccountingReadFailurePreservesAllAuthority(t *testing.T) {
+func TestDoDeprovision_RetainedCloseAuthorityReadFailurePreservesAllAuthority(t *testing.T) {
 	dir := t.TempDir()
 	volumeName := canonicalVolumeName(closeDeprovisionLeaseUUID, "app", 0)
-	retentionPath := filepath.Join(dir, "retention.db")
-	retentions, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: retentionPath})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = retentions.Close() })
-
-	volumes := &mockVolumeManager{
-		ListFn: func() ([]string, error) { return []string{volumeName}, nil },
-	}
+	volumeState := newVolumeSet(volumeName)
+	volumes := volumeState.manager()
 	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, volumes)
+	retentionPath := filepath.Join(dir, "retention.db")
+	retentions := stores.retentions
 	b.cfg.RetainOnClose = true
-	b.retentionStore = retentions
 	volumes.RenameVolumeFn = func(oldName, newName string) error {
 		require.Equal(t, volumeName, oldName)
 		require.Equal(t, retainedName(volumeName), newName)
-		// PutActiveMerged has committed at this point. Closing the store models an
-		// EIO/read failure in the accounting refresh before terminal hand-off.
+		require.NoError(t, volumeState.rename(oldName, newName))
+		// PutActiveMerged and the physical rename have committed at this point.
+		// Closing the store makes strict terminal classification unavailable.
 		return retentions.Close()
 	}
 	seedCloseDeprovisionLease(t, b, stores)
@@ -263,12 +209,12 @@ func TestDoDeprovision_RetainedCloseAccountingReadFailurePreservesAllAuthority(t
 		"tenant-a",
 	))
 
-	err = b.doDeprovision(context.Background(), closeDeprovisionLeaseUUID)
-	require.ErrorContains(t, err, "refresh retained close accounting")
+	err := b.doDeprovisionForTest(t, context.Background(), closeDeprovisionLeaseUUID)
+	require.ErrorContains(t, err, "database not open")
 	claim, found, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
 	require.NoError(t, readErr)
 	require.True(t, found)
-	require.Zero(t, claim.CleanupAttempts())
+	require.Equal(t, 1, claim.ExecutionGeneration().Number())
 	releases, readErr := stores.releases.List(closeDeprovisionLeaseUUID)
 	require.NoError(t, readErr)
 	require.Len(t, releases, 1,
@@ -285,7 +231,11 @@ func TestDoDeprovision_RetainedCloseAccountingReadFailurePreservesAllAuthority(t
 		"live accounting must remain until retained accounting is readable")
 
 	// The ACTIVE fact itself committed before the injected read failure.
-	reopened, reopenErr := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: retentionPath})
+	reopened, reopenErr := shared.OpenIdentityBoundRetentionStore(
+		shared.RetentionStoreConfig{DBPath: retentionPath},
+		b.storageAuthority,
+		b.storeAuthorityGate,
+	)
 	require.NoError(t, reopenErr)
 	t.Cleanup(func() { _ = reopened.Close() })
 	record, readErr := reopened.Get(closeDeprovisionLeaseUUID)
@@ -296,68 +246,14 @@ func TestDoDeprovision_RetainedCloseAccountingReadFailurePreservesAllAuthority(t
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
-func TestDoDeprovision_GiveUpTombstoneFailurePreservesAllAuthority(t *testing.T) {
-	dir := t.TempDir()
-	volumeName := canonicalVolumeName(closeDeprovisionLeaseUUID, "app", 0)
-	retentions, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(dir, "retention.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = retentions.Close() })
-
-	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, &mockVolumeManager{
-		ListFn: func() ([]string, error) { return []string{volumeName}, nil },
-		DestroyFn: func(context.Context, string) error {
-			require.NoError(t, retentions.Close(), "inject failure after close admission")
-			return errors.New("injected volume failure")
-		},
-	})
-	b.retentionStore = retentions
-	seedCloseDeprovisionLease(t, b, stores)
-	admitCloseAtCleanupAttempt(
-		t,
-		b,
-		stores,
-		closeDeprovisionLeaseUUID,
-		maxVolumeCleanupAttempts-1,
-	)
-	require.NoError(t, b.pool.TryAllocate(
-		closeDeprovisionLeaseUUID+"-app-0",
-		"docker-small",
-		"tenant-a",
-	))
-
-	err = b.doDeprovision(context.Background(), closeDeprovisionLeaseUUID)
-	require.ErrorContains(t, err, "record counted give-up footprint")
-	claim, found, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
-	require.NoError(t, readErr)
-	require.True(t, found)
-	require.Equal(t, maxVolumeCleanupAttempts, claim.CleanupAttempts())
-	releases, readErr := stores.releases.List(closeDeprovisionLeaseUUID)
-	require.NoError(t, readErr)
-	require.Len(t, releases, 1)
-	pending, readErr := stores.callbacks.ListPending()
-	require.NoError(t, readErr)
-	require.Empty(t, pending)
-	b.provisionsMu.RLock()
-	projection := b.provisions[closeDeprovisionLeaseUUID]
-	b.provisionsMu.RUnlock()
-	require.NotNil(t, projection)
-	require.Equal(t, backend.ProvisionStatusFailed, projection.Status)
-	require.Equal(t, 1, b.pool.Stats().AllocationCount,
-		"failed tombstone ownership must keep the live reservation")
-
-	closeCloseRecoveryBackend(t, b, stores)
-}
-
 func TestRefreshRetentionAccountingChecked_UnknownSKUKeepsLastProjection(t *testing.T) {
 	dir := t.TempDir()
 	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, nil)
-	retentions := attachRetentionStore(t, b)
+	retentions := stores.retentions
 	profile := b.cfg.SKUProfiles["docker-small"]
 	profile.DiskMB = 1024
 	b.cfg.SKUProfiles["docker-small"] = profile
-	require.NoError(t, retentions.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, retentions, shared.RetentionEntry{
 		OriginalLeaseUUID: "retained-lease",
 		Tenant:            "tenant-a",
 		ProviderUUID:      "provider-a",
@@ -371,92 +267,10 @@ func TestRefreshRetentionAccountingChecked_UnknownSKUKeepsLastProjection(t *test
 	require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
 
 	delete(b.cfg.SKUProfiles, "docker-small")
-	err := b.refreshRetentionAccountingChecked()
-	require.ErrorContains(t, err, "unresolved SKU profiles")
+	require.NoError(t, b.refreshRetentionAccountingChecked(),
+		"durable retention profiles make accounting independent of mutable SKU configuration")
 	require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB,
-		"an unknown SKU must keep the last attested projection, never publish an undercount")
+		"the exact stored profile must preserve the attested projection")
 
 	closeCloseRecoveryBackend(t, b, stores)
-}
-
-func TestValidateCompletedRetention(t *testing.T) {
-	leaseUUID := closeRecoveryLeaseUUID
-	tenant := "tenant-a"
-	providerUUID := "provider-a"
-	items := []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", Quantity: 1}}
-	resourceProfiles := []shared.SKUResourceSnapshot{{
-		SKU: "docker-small", CPUCores: 0.5, MemoryMB: 512, DiskMB: 1024,
-	}}
-	retainedVolume := retainedName(canonicalVolumeName(leaseUUID, "app", 0))
-	physical := map[string]struct{}{retainedVolume: {}}
-	valid := func() *shared.RetentionEntry {
-		return &shared.RetentionEntry{
-			OriginalLeaseUUID:   leaseUUID,
-			Tenant:              tenant,
-			ProviderUUID:        providerUUID,
-			Items:               slices.Clone(items),
-			ResourceProfiles:    shared.CloneSKUResourceSnapshot(resourceProfiles),
-			Status:              shared.RetentionStatusActive,
-			RetainedVolumeNames: []string{retainedVolume},
-		}
-	}
-	withMutation := func(mutate func(*shared.RetentionEntry)) *shared.RetentionEntry {
-		record := valid()
-		mutate(record)
-		return record
-	}
-
-	tests := []struct {
-		name       string
-		record     *shared.RetentionEntry
-		physical   map[string]struct{}
-		wantErrSub string
-	}{
-		{name: "valid", record: valid(), physical: physical},
-		{name: "nil record", physical: physical, wantErrSub: "requires a record"},
-		{name: "foreign identity", record: &shared.RetentionEntry{
-			OriginalLeaseUUID: "different-lease", Status: shared.RetentionStatusActive,
-			RetainedVolumeNames: []string{retainedVolume},
-		}, physical: physical, wantErrSub: "identity mismatch"},
-		{name: "non-active", record: &shared.RetentionEntry{
-			OriginalLeaseUUID: leaseUUID, Status: shared.RetentionStatusRestoring,
-			RetainedVolumeNames: []string{retainedVolume},
-		}, physical: physical, wantErrSub: "is not active"},
-		{name: "empty names", record: &shared.RetentionEntry{
-			OriginalLeaseUUID: leaseUUID, Status: shared.RetentionStatusActive,
-		}, physical: physical, wantErrSub: "has no retained volume names"},
-		{name: "foreign volume name", record: &shared.RetentionEntry{
-			OriginalLeaseUUID: leaseUUID, Status: shared.RetentionStatusActive,
-			RetainedVolumeNames: []string{"fred-retained-different-lease-app-0"},
-		}, physical: physical, wantErrSub: "malformed or foreign"},
-		{name: "empty volume suffix", record: &shared.RetentionEntry{
-			OriginalLeaseUUID: leaseUUID, Status: shared.RetentionStatusActive,
-			RetainedVolumeNames: []string{retainedVolumePrefix + leaseUUID + "-"},
-		}, physical: physical, wantErrSub: "malformed or foreign"},
-		{name: "missing physical volume", record: valid(), physical: map[string]struct{}{}, wantErrSub: "references missing"},
-		{name: "divergent tenant", record: withMutation(func(record *shared.RetentionEntry) {
-			record.Tenant = "other"
-		}), physical: physical, wantErrSub: "divergent lease identity"},
-		{name: "divergent provider", record: withMutation(func(record *shared.RetentionEntry) {
-			record.ProviderUUID = "other"
-		}), physical: physical, wantErrSub: "divergent lease identity"},
-		{name: "divergent items", record: withMutation(func(record *shared.RetentionEntry) {
-			record.Items[0].Quantity = 2
-		}), physical: physical, wantErrSub: "divergent items"},
-		{name: "divergent resource snapshot", record: withMutation(func(record *shared.RetentionEntry) {
-			record.ResourceProfiles[0].DiskMB++
-		}), physical: physical, wantErrSub: "divergent resource snapshot"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateCompletedRetention(
-				leaseUUID, tenant, providerUUID, items, resourceProfiles, tt.record, tt.physical,
-			)
-			if tt.wantErrSub == "" {
-				require.NoError(t, err)
-				return
-			}
-			require.ErrorContains(t, err, tt.wantErrSub)
-		})
-	}
 }

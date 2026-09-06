@@ -21,7 +21,8 @@ func newInterruptedVolumeStartBackend(t *testing.T) (*Backend, *mockDockerClient
 }
 
 func TestStartInterruptedVolumeRecoveryFailurePreventsPublicationChecks(t *testing.T) {
-	b, _ := newInterruptedVolumeStartBackend(t)
+	b, dockerClient := newInterruptedVolumeStartBackend(t)
+	dockerClient.CloseFn = func() error { return nil }
 	recoveryErr := errors.New("simulated exact stage cleanup failure")
 	recoveryCalls := 0
 	b.volumes = &mockVolumeManager{
@@ -92,4 +93,30 @@ func TestStartInterruptedVolumeRecoveryPrecedesManagedInventory(t *testing.T) {
 	require.ErrorContains(t, err, "managed volume substrate validation failed")
 	require.ErrorContains(t, err, "name is invalid")
 	assert.Equal(t, []string{"recover", "postcondition", "inventory"}, calls)
+}
+
+func TestStartPreservesUnattributedManagedVolume(t *testing.T) {
+	b, dockerClient := newInterruptedVolumeStartBackend(t)
+	dockerClient.CloseFn = func() error { return nil }
+	stray := canonicalVolumeName(
+		"0192f1a0-1111-4abc-8def-000000000799",
+		"app",
+		0,
+	)
+	b.volumes = &mockVolumeManager{
+		RecoverInterruptedVolumeMutationsFn:   func(context.Context) error { return nil },
+		RequireNoInterruptedVolumeMutationsFn: func(context.Context) error { return nil },
+		ListFn: func() ([]string, error) {
+			return []string{stray}, nil
+		},
+		DestroyFn: func(context.Context, string) error {
+			t.Fatal("startup must not infer destruction authority for an unattributed volume")
+			return nil
+		},
+	}
+	installTestStorageMutationAdapters(b)
+	bindRetentionOrphanPrunerForTest(t, b)
+
+	require.NoError(t, b.Start(context.Background()))
+	require.NoError(t, b.Stop())
 }

@@ -90,6 +90,20 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		provisionsTotal.WithLabelValues("accepted").Inc()
 		return nil
 	}
+	releaseCandidate, err := b.operationSettlement.PrepareOperationRelease(intent)
+	if err != nil {
+		provisionsTotal.WithLabelValues("rejected").Inc()
+		return b.refuseProvisionIntent(intent, fmt.Errorf(
+			"prepare exact provision failure authority: %w", err,
+		))
+	}
+	operationFailure, err := b.operationSettlement.RefuseOperationExecution(releaseCandidate)
+	if err != nil {
+		provisionsTotal.WithLabelValues("rejected").Inc()
+		return b.refuseProvisionIntent(intent, fmt.Errorf(
+			"mint exact pre-effect provision failure: %w", err,
+		))
+	}
 
 	b.provisionsMu.Lock()
 	// Mirror docker-backend's status-aware check: only entries in
@@ -132,6 +146,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 		LifecycleCallbackURL: lifecycleCallbackURL,
 		FailCount:            prevFailCount,
 		CreatedAt:            time.Now(),
+		operationFailure:     operationFailure,
 		ctx:                  ctx,
 		cancel:               cancel,
 	}
@@ -188,6 +203,7 @@ type stubFailure struct {
 	lifecycleGeneration backend.LifecycleGenerationObservation
 	failCount           int
 	leaseCtx            context.Context
+	operationFailure    shared.OperationExecutionFailure
 }
 
 // claimStubFailure takes provisionsMu, marks the lease failed, and returns
@@ -236,7 +252,8 @@ func (b *Backend) claimStubFailure(p *provision) (f stubFailure, ok bool) {
 		// Deprovision will call cancel() inside the same lock before
 		// deleting the map entry, so this read is race-free and the
 		// later phases see the latest cancellation state.
-		leaseCtx: p.ctx,
+		leaseCtx:         p.ctx,
+		operationFailure: p.operationFailure,
 	}
 	b.provisionsMu.Unlock()
 	return f, true
@@ -288,9 +305,9 @@ func (b *Backend) persistStubDiagnostic(f stubFailure) (canceled bool) {
 }
 
 // sendStubFailureCallback is checkpoint 2 and the callback send. ENG-189
-// case (c): shared.CallbackSender.SendOperationCallback persists to bbolt BEFORE
-// delivery, so without this guard a torn-down lease can still have a stale
-// status=failed callback queued for replay.
+// case (c): CallbackPublisher persists the fixed failed outcome to bbolt BEFORE
+// CallbackSender can deliver it, so without this guard a torn-down lease can
+// still have a stale status=failed callback queued for replay.
 //
 // It re-checks cancellation rather than trusting the caller, so a
 // composition that drops persistStubDiagnostic's early return still
@@ -312,14 +329,20 @@ func (b *Backend) sendStubFailureCallback(f stubFailure) {
 		return
 	}
 
-	b.callbackSender.SendOperationCallbackContext(
+	uncommitted, err := b.operationSettlement.CommitOperationFailure(f.operationFailure)
+	if err != nil {
+		b.logger.Error("failed to commit stub operation failure",
+			"error", err, "lease_uuid", f.leaseUUID)
+		return
+	}
+	if err := b.callbackPublisher.PublishOperationFailureContext(
 		f.leaseCtx,
-		f.leaseUUID,
-		f.callbackURL,
-		b.cfg.Name,
-		backend.CallbackStatusFailed,
+		uncommitted,
 		stubProvisionerErrMsg,
-	)
+	); err != nil {
+		b.logger.Error("failed to publish stub operation failure",
+			"error", err, "lease_uuid", f.leaseUUID)
+	}
 }
 
 // Deprovision is idempotent: removes the in-memory record if present
@@ -362,10 +385,18 @@ func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
 	// replaced its intent with a durable completion, absence is a no-op; adding
 	// a generic callback here would create a duplicate exact completion.
 	if b.callbackStore != nil {
-		if _, err := b.callbackStore.FailOperationIntentIfPresent(
-			leaseUUID, "provision canceled by deprovision",
-		); err != nil {
-			return fmt.Errorf("persist preempted provision completion: %w", err)
+		claims, err := b.operationSettlement.ListOperationIntents()
+		if err != nil {
+			return fmt.Errorf("load preempted provision operation: %w", err)
+		}
+		for _, claim := range claims {
+			if claim.LeaseUUID() != leaseUUID {
+				continue
+			}
+			if err := b.resolvePreEffectOperationRefusal(claim, "provision canceled by deprovision"); err != nil {
+				return fmt.Errorf("persist preempted provision completion: %w", err)
+			}
+			break
 		}
 	}
 	return nil

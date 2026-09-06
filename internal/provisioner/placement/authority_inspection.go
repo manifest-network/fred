@@ -545,6 +545,14 @@ func inspectAuthorityTransaction(
 			"the placements bucket is missing",
 		)
 	}
+	// A partial bucket set is neither the exact v0.13 root nor the exact
+	// current root. Do not reinterpret its placement rows under either schema:
+	// doing so can incorrectly upgrade the more useful mixed/incomplete verdict
+	// to corruption merely because the remaining bucket still carries the other
+	// schema's row encoding.
+	if !legacyShape && !currentShape {
+		return
+	}
 
 	if legacyShape {
 		assessment.report.Classification = AuthorityPristineV013
@@ -684,6 +692,15 @@ func inspectCurrentMetadata(
 	}
 	var encoded []byte
 	if err := bucket.ForEach(func(key, value []byte) error {
+		if bytes.Equal(key, maintenanceCommandBucketName) {
+			if value != nil {
+				assessment.corruptFinding(
+					"maintenance_journal_not_nested",
+					"the maintenance command journal is not a nested bucket",
+				)
+			}
+			return nil
+		}
 		if !bytes.Equal(key, metadataStateKey) {
 			assessment.mixedFinding(
 				"unexpected_metadata_entry",
@@ -713,6 +730,12 @@ func inspectCurrentMetadata(
 			"current placement metadata could not be traversed",
 		)
 		return topologyMetadata{}, false
+	}
+	if err := verifyMaintenanceCommandJournalInMetadata(bucket); err != nil {
+		assessment.corruptFinding(
+			"maintenance_journal_corrupt",
+			"the maintenance command journal is structurally inconsistent",
+		)
 	}
 	if len(encoded) == 0 {
 		assessment.mixedFinding(
@@ -1014,21 +1037,8 @@ func decodeAuthorityPlacement(leaseUUID string, value []byte) (Placement, bool) 
 	if len(value) > maxAuthorityRowValueBytes {
 		return Placement{}, false
 	}
-	if len(value) > 0 && value[0] != '{' {
-		if json.Valid(value) || !validLegacyBackendName(value) {
-			return Placement{}, false
-		}
-		return Placement{Backend: string(value)}, true
-	}
-	if len(value) == 0 {
-		return Placement{}, false
-	}
-	fields, err := decodeUniqueJSONObject(value)
+	persisted, fields, err := decodeCurrentPlacementRecord(value)
 	if err != nil {
-		return Placement{}, false
-	}
-	var persisted record
-	if err := json.Unmarshal(value, &persisted); err != nil {
 		return Placement{}, false
 	}
 	operationID, operationErr := decodeOperationID(persisted.OperationID)

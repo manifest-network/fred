@@ -44,6 +44,48 @@ func newTrackerSnapshot(registry registryIdentity, revision uint64) TrackerSnaps
 	return TrackerSnapshot{registry: registry, revision: revision}
 }
 
+// ReconciliationBoundary is one atomic view of the Registry at the beginning
+// of an inventory sweep. It keeps the causal mutation revision and the set of
+// operations that were active at that revision inseparable. Callers can ask
+// observational questions, but only the Registry authority that minted the
+// boundary can consume it to acquire a lease claim.
+//
+// The zero value is invalid. Its private maps are detached at construction and
+// cannot be spliced with a snapshot from another Registry or sweep.
+type ReconciliationBoundary struct {
+	snapshot TrackerSnapshot
+	inFlight map[string]struct{}
+}
+
+// Valid reports whether the boundary was atomically issued by a Registry.
+func (boundary ReconciliationBoundary) Valid() bool {
+	return boundary.snapshot.Valid() && boundary.inFlight != nil
+}
+
+// WasInFlight reports whether leaseUUID had a tracked operation at the exact
+// boundary. It is observational only and grants no claim or settlement power.
+func (boundary ReconciliationBoundary) WasInFlight(leaseUUID string) bool {
+	if !boundary.Valid() || leaseUUID == "" {
+		return false
+	}
+	_, present := boundary.inFlight[leaseUUID]
+	return present
+}
+
+func newReconciliationBoundary(
+	registry registryIdentity,
+	revision uint64,
+	inFlight map[string]struct{},
+) ReconciliationBoundary {
+	if !registry.valid() || inFlight == nil {
+		return ReconciliationBoundary{}
+	}
+	return ReconciliationBoundary{
+		snapshot: newTrackerSnapshot(registry, revision),
+		inFlight: inFlight,
+	}
+}
+
 // operationToken is the registry-private identity shared by its public,
 // purpose-specific initiation and settlement capabilities. Keeping this token
 // private prevents callers from bypassing the phase-aware transition APIs.
@@ -157,15 +199,23 @@ type SettlementClaim struct {
 	token operationToken
 	nonce uint64
 	kind  SettlementKind
+	actor settlementActor
 }
 
 // Valid reports whether claim was explicitly issued by a registry.
 func (claim SettlementClaim) Valid() bool {
-	return claim.token.valid() && claim.nonce != 0 && claim.kind.validClaimKind()
+	return claim.token.valid() && claim.nonce != 0 && claim.kind.validClaimKind() &&
+		claim.actor.valid() &&
+		((claim.actor == settlementDeprovision) == (claim.kind == SettlementDeprovision))
 }
 
-func newSettlementClaim(token operationToken, nonce uint64, kind SettlementKind) SettlementClaim {
-	claim := SettlementClaim{token: token, nonce: nonce, kind: kind}
+func newSettlementClaim(
+	token operationToken,
+	nonce uint64,
+	kind SettlementKind,
+	actor settlementActor,
+) SettlementClaim {
+	claim := SettlementClaim{token: token, nonce: nonce, kind: kind, actor: actor}
 	if !claim.Valid() {
 		return SettlementClaim{}
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 )
 
 // startTestManager creates a Manager with the given mocks, starts it, and
@@ -50,9 +51,9 @@ func startTestManager(t *testing.T, cfg ManagerConfig, mockBackend *mockManagerB
 }
 
 func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
-	const leaseUUID = "int-lease-1"
+	const leaseUUID = "10000000-0000-4000-8000-000000000001"
 	const tenant = "int-tenant-1"
-	const providerUUID = "int-provider-1"
+	const providerUUID = placementstore.ProviderUUID
 	const skuUUID = "int-sku-1"
 
 	// Channel-based notification for async provision call.
@@ -82,7 +83,6 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 
 	manager := startTestManager(t, ManagerConfig{
 		ProviderUUID:     providerUUID,
-		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
 	}, mockBackend, mockChain)
@@ -119,12 +119,12 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 	assert.True(t, manager.IsInFlight(leaseUUID))
 
 	// Step 3: Publish success callback.
-	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
+	err = manager.PublishCallback(context.Background(), callbackCommand(t, backend.CallbackPayload{
 		LeaseUUID:        leaseUUID,
 		Status:           backend.CallbackStatusSuccess,
 		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
-		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
-	})
+		OperationID:      lastManagerBackendOperationID(t, mockBackend, leaseUUID),
+	}))
 	require.NoError(t, err)
 
 	// Step 4: Wait for AcknowledgeLeases to be called.
@@ -142,9 +142,9 @@ func TestIntegration_FullProvisionAcknowledge(t *testing.T) {
 }
 
 func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
-	const leaseUUID = "int-fail-lease-1"
+	const leaseUUID = "10000000-0000-4000-8000-000000000002"
 	const tenant = "int-fail-tenant-1"
-	const providerUUID = "int-fail-provider-1"
+	const providerUUID = placementstore.ProviderUUID
 	const skuUUID = "int-fail-sku-1"
 
 	mockBackend := &mockManagerBackend{name: "test"}
@@ -163,7 +163,6 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 
 	manager := startTestManager(t, ManagerConfig{
 		ProviderUUID:     providerUUID,
-		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
 	}, mockBackend, mockChain)
@@ -188,13 +187,13 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 	assert.True(t, manager.IsInFlight(leaseUUID))
 
 	// Publish failure callback.
-	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
+	err = manager.PublishCallback(context.Background(), callbackCommand(t, backend.CallbackPayload{
 		LeaseUUID:        leaseUUID,
 		Status:           backend.CallbackStatusFailed,
 		Error:            "container crashed",
 		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
-		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
-	})
+		OperationID:      lastManagerBackendOperationID(t, mockBackend, leaseUUID),
+	}))
 	require.NoError(t, err)
 
 	// Wait for RejectLeases call.
@@ -212,9 +211,9 @@ func TestIntegration_ProvisionFailure_RejectsLease(t *testing.T) {
 }
 
 func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
-	const leaseUUID = "int-close-lease-1"
+	const leaseUUID = "10000000-0000-4000-8000-000000000003"
 	const tenant = "int-close-tenant-1"
-	const providerUUID = "int-close-provider-1"
+	const providerUUID = placementstore.ProviderUUID
 	const skuUUID = "int-close-sku-1"
 
 	mockBackend := &mockManagerBackend{name: "test"}
@@ -239,7 +238,6 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 
 	manager := startTestManager(t, ManagerConfig{
 		ProviderUUID:     providerUUID,
-		CallbackBaseURL:  "http://localhost:8080",
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,
 	}, mockBackend, mockChain)
@@ -265,12 +263,12 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 		return len(mockBackend.provisionCalls) > 0
 	}, 5*time.Second, 20*time.Millisecond)
 
-	err = manager.PublishCallback(context.Background(), backend.CallbackPayload{
+	err = manager.PublishCallback(context.Background(), callbackCommand(t, backend.CallbackPayload{
 		LeaseUUID:        leaseUUID,
 		Status:           backend.CallbackStatusSuccess,
 		BackendStorageID: testBackendStorageID(mockBackend.Name()).String(),
-		OperationID:      mustInFlightOperationID(t, manager, leaseUUID),
-	})
+		OperationID:      lastManagerBackendOperationID(t, mockBackend, leaseUUID),
+	}))
 	require.NoError(t, err)
 
 	select {
@@ -311,9 +309,9 @@ func TestIntegration_LeaseClosed_Deprovisions(t *testing.T) {
 }
 
 func TestIntegration_PayloadFlow(t *testing.T) {
-	const leaseUUID = "int-payload-lease-1"
+	const leaseUUID = "10000000-0000-4000-8000-000000000004"
 	const tenant = "int-payload-tenant-1"
-	const providerUUID = "int-payload-provider-1"
+	const providerUUID = placementstore.ProviderUUID
 	const skuUUID = "int-payload-sku-1"
 
 	payloadData := []byte(`{"image":"busybox:latest"}`)
@@ -350,7 +348,6 @@ func TestIntegration_PayloadFlow(t *testing.T) {
 
 	manager := startTestManager(t, ManagerConfig{
 		ProviderUUID:     providerUUID,
-		CallbackBaseURL:  "http://localhost:8080",
 		PayloadStore:     payloadStore,
 		AckBatchInterval: 50 * time.Millisecond,
 		AckBatchSize:     1,

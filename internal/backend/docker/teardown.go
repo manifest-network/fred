@@ -50,10 +50,45 @@ import (
 // failure is itself an error: we cannot prove the host is clean, and the safe
 // direction is to keep the lease tracked and retry (cleanup gates fail open toward
 // "keep", counted in a metric).
-func (b *Backend) teardownLeaseContainers(ctx context.Context, leaseUUID string, recordedIDs []string,
+func (b *Backend) teardownLeaseContainersWith(mutations *storageMutations, ctx context.Context, leaseUUID string, recordedIDs []string,
 	stopTimeout time.Duration, operation string, logger *slog.Logger) ([]string, error) {
+	if mutations == nil {
+		return recordedIDs, errors.New("teardown mutation capability is unavailable")
+	}
+	if err := mutations.requireLease(leaseUUID, "container teardown"); err != nil {
+		return recordedIDs, err
+	}
+
+	// Compose Down failure is only the trigger for the exact rediscovery and
+	// per-container fallback below. Bracket the complete convergent operation as
+	// one tenant Step: recording the intermediate Down error as its own Step
+	// would poison an otherwise successful fallback and permanently retain the
+	// Started intent. The adapter is lexical to this exact Started subject; it
+	// cannot select another lease, project, or container authority.
+	var remaining []string
+	err := mutations.runner.Step(ctx, operation+" convergent container teardown", func(mutationCtx context.Context) error {
+		var teardownErr error
+		remaining, teardownErr = b.teardownLeaseContainersUsing(
+			exactOperationTeardown{mutations: mutations}, mutationCtx, leaseUUID,
+			recordedIDs, stopTimeout, operation, logger,
+		)
+		return teardownErr
+	})
+	return remaining, err
+}
+
+type teardownMutationCapability interface {
+	composeDown(context.Context, string, time.Duration) error
+	removeContainer(context.Context, string) error
+}
+
+func (b *Backend) teardownLeaseContainersUsing(mutations teardownMutationCapability, ctx context.Context, leaseUUID string, recordedIDs []string,
+	stopTimeout time.Duration, operation string, logger *slog.Logger) ([]string, error) {
+	if mutations == nil {
+		return recordedIDs, errors.New("teardown mutation capability is unavailable")
+	}
 	projectName := composeProjectName(leaseUUID)
-	downErr := b.mutationAdapter().composeDown(ctx, projectName, stopTimeout)
+	downErr := mutations.composeDown(ctx, leaseUUID, stopTimeout)
 	if downErr == nil {
 		logger.Info("compose down completed", "project", projectName)
 		return nil, nil
@@ -88,7 +123,7 @@ func (b *Backend) teardownLeaseContainers(ctx context.Context, leaseUUID string,
 		remaining []string
 	)
 	for _, id := range ids {
-		if rmErr := b.mutationAdapter().removeContainer(ctx, id); rmErr != nil {
+		if rmErr := mutations.removeContainer(ctx, id); rmErr != nil {
 			logger.Error("failed to remove container", "container_id", leasesm.ShortID(id), "error", rmErr)
 			errs = append(errs, fmt.Errorf("container %s: %w", leasesm.ShortID(id), rmErr))
 			remaining = append(remaining, id)

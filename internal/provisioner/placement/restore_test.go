@@ -14,12 +14,17 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 )
 
-func TestStoreExportsOnlyRevisionBoundRestoreAdmission(t *testing.T) {
+func TestRestoreCoordinatorExportsOnlyApplicationBoundary(t *testing.T) {
 	storeType := reflect.TypeOf((*Store)(nil))
 	_, unchecked := storeType.MethodByName("BeginRestore")
 	assert.False(t, unchecked, "unchecked tenant-unaware restore admission must remain package-private")
 	_, authorized := storeType.MethodByName("BeginAuthorizedRestore")
-	assert.True(t, authorized, "production restore admission must require an exact source revision")
+	assert.False(t, authorized, "raw Store restore admission must remain package-private")
+	coordinatorType := reflect.TypeOf((*RestoreCoordinator)(nil))
+	_, rawAdmission := coordinatorType.MethodByName("BeginAuthorizedRestore")
+	assert.False(t, rawAdmission, "raw restore admission must remain inaccessible")
+	_, execute := coordinatorType.MethodByName("ExecuteApplication")
+	assert.True(t, execute, "restore must expose one construction-bound application transaction")
 }
 
 func newRestoreTestStore(t *testing.T) *Store {
@@ -39,7 +44,7 @@ func TestStore_InventoryBootstrappedIsDurableAndTopologyBound(t *testing.T) {
 	requireAdmissionBaseline(t, s, "backend-a", "backend-b")
 	assert.True(t, s.InventoryBootstrapped())
 	fence := s.BeginInventorySession()
-	_, err = s.ProjectInventory(fence, InventoryProjection{})
+	_, err = inventoryProjectorForTest(t, s).Project(fence, InventoryProjection{})
 	s.EndInventorySession(fence)
 	require.NoError(t, err)
 	assert.True(t, s.InventoryBootstrapped(),
@@ -263,19 +268,19 @@ func TestStore_RestoreSettlementLifecycle(t *testing.T) {
 	}{
 		{
 			name:       "accepted confirmation promotes target",
-			settle:     (*Store).ConfirmRestore,
+			settle:     (*Store).confirmRestore,
 			wantState:  StateConfirmed,
 			wantOwner:  "backend-a",
 			wantTarget: true,
 		},
 		{
 			name:      "definitive refusal removes attempt-only target",
-			settle:    (*Store).RefuseRestore,
+			settle:    (*Store).refuseRestore,
 			wantState: StateAbsent,
 		},
 		{
 			name:       "ambiguous outcome retains durable target attempt",
-			settle:     (*Store).AbandonRestore,
+			settle:     (*Store).abandonRestore,
 			wantState:  StateAttempting,
 			wantTarget: true,
 		},
@@ -323,8 +328,8 @@ func TestStore_RestoreSettlementDefersToExactAttemptClaim(t *testing.T) {
 		name   string
 		settle func(*Store, RestoreClaim) (bool, error)
 	}{
-		{name: "confirm", settle: (*Store).ConfirmRestore},
-		{name: "refuse", settle: (*Store).RefuseRestore},
+		{name: "confirm", settle: (*Store).confirmRestore},
+		{name: "refuse", settle: (*Store).refuseRestore},
 	}
 
 	for index, test := range tests {
@@ -337,7 +342,7 @@ func TestStore_RestoreSettlementDefersToExactAttemptClaim(t *testing.T) {
 			)
 			require.NoError(t, err)
 
-			recoveryClaim, claimed, err := s.ClaimAttempt("target", operationID)
+			recoveryClaim, claimed, err := s.claimAttempt("target", operationID)
 			require.NoError(t, err)
 			require.True(t, claimed)
 			before := s.Lookup("target")
@@ -349,7 +354,7 @@ func TestStore_RestoreSettlementDefersToExactAttemptClaim(t *testing.T) {
 				"restore settlement cannot cross an exact callback recovery claim")
 			assert.Empty(t, s.restoreClaims)
 
-			confirmed, err := s.ConfirmClaimedAttempt(recoveryClaim)
+			confirmed, err := s.confirmClaimedAttempt(recoveryClaim)
 			require.NoError(t, err)
 			require.True(t, confirmed)
 			assert.Equal(t, StateConfirmed, s.Lookup("target").State())
@@ -365,9 +370,9 @@ func TestStore_RestoreClaimIsZeroForeignAndNonceSafe(t *testing.T) {
 	assert.False(t, (RestoreClaim{}).Valid())
 	assert.Empty(t, (RestoreClaim{}).Backend())
 	for _, settle := range []func(RestoreClaim) (bool, error){
-		s.ConfirmRestore,
-		s.RefuseRestore,
-		s.AbandonRestore,
+		s.confirmRestore,
+		s.refuseRestore,
+		s.abandonRestore,
 	} {
 		consumed, err := settle(RestoreClaim{})
 		require.ErrorIs(t, err, ErrInvalidRestoreClaim)
@@ -377,7 +382,7 @@ func TestStore_RestoreClaimIsZeroForeignAndNonceSafe(t *testing.T) {
 	opID := requireOperationID(t, "7201")
 	claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 	require.NoError(t, err)
-	consumed, err := other.AbandonRestore(claim)
+	consumed, err := other.abandonRestore(claim)
 	require.ErrorIs(t, err, ErrInvalidRestoreClaim)
 	assert.False(t, consumed)
 	assert.Contains(t, s.restoreClaims, "source")
@@ -385,15 +390,15 @@ func TestStore_RestoreClaimIsZeroForeignAndNonceSafe(t *testing.T) {
 	forged := claim
 	forged.nonce++
 	require.True(t, forged.Valid(), "the structural copy remains nonzero but was never issued")
-	consumed, err = s.ConfirmRestore(forged)
+	consumed, err = s.confirmRestore(forged)
 	require.NoError(t, err)
 	assert.False(t, consumed)
 	assert.Contains(t, s.restoreClaims, "source")
 
-	consumed, err = s.AbandonRestore(claim)
+	consumed, err = s.abandonRestore(claim)
 	require.NoError(t, err)
 	assert.True(t, consumed)
-	consumed, err = s.AbandonRestore(claim)
+	consumed, err = s.abandonRestore(claim)
 	require.NoError(t, err)
 	assert.False(t, consumed)
 }
@@ -440,7 +445,7 @@ func TestStore_BeginRestoreExclusivelyClaimsSourceConcurrently(t *testing.T) {
 	}
 	require.True(t, winner.Valid())
 	assert.Len(t, s.restoreClaims, 1)
-	consumed, err := s.AbandonRestore(winner)
+	consumed, err := s.abandonRestore(winner)
 	require.NoError(t, err)
 	assert.True(t, consumed)
 }
@@ -494,7 +499,7 @@ func TestStore_RestoreClaimFencesTypedSourceMutations(t *testing.T) {
 	claim, err := beginTestRestore(t, s, s.CurrentAdmissionBaseline(), "source", "target", opID)
 	require.NoError(t, err)
 
-	token, applied, err := s.BeginOwnedAttempt(
+	token, applied, err := s.beginOwnedAttempt(
 		s.CurrentAdmissionBaseline(), sourceRevision, "backend-a", requireOperationID(t, "7502"),
 		PayloadFingerprint{}, testBackendRequestSnapshot(t),
 		testCallbackPair(requireOperationID(t, "7502")))
@@ -503,15 +508,15 @@ func TestStore_RestoreClaimFencesTypedSourceMutations(t *testing.T) {
 	assert.False(t, applied)
 	assert.False(t, token.Valid())
 
-	deleted, err := s.DeleteRecord(sourceRevision)
+	deleted, err := s.deleteRecord(sourceRevision)
 	require.ErrorIs(t, err, ErrRestoreSourceClaimed)
 	assert.False(t, deleted)
 	assert.Equal(t, StateConfirmed, s.Lookup("source").State())
 
-	consumed, err := s.AbandonRestore(claim)
+	consumed, err := s.abandonRestore(claim)
 	require.NoError(t, err)
 	assert.True(t, consumed)
-	deleted, err = s.DeleteRecord(sourceRevision)
+	deleted, err = s.deleteRecord(sourceRevision)
 	require.NoError(t, err)
 	assert.True(t, deleted, "settlement releases the source mutation fence")
 }
@@ -556,16 +561,16 @@ func TestStore_ProjectInventoryFencesRestoreSourceOwnerAndConflictMutation(t *te
 			fence := s.BeginInventorySession()
 			defer s.EndInventorySession(fence)
 
-			result, err := s.ProjectInventory(fence, tt.projection)
+			result, err := projectInventoryAtFenceForTest(t, s, fence, tt.projection)
 			require.NoError(t, err)
 			assert.Contains(t, result.Fenced, "source")
 			assert.Equal(t, "backend-a", s.Lookup("source").Backend)
 			assert.False(t, s.Lookup("source").Conflict)
 
-			consumed, err := s.AbandonRestore(claim)
+			consumed, err := s.abandonRestore(claim)
 			require.NoError(t, err)
 			assert.True(t, consumed)
-			result, err = s.ProjectInventory(fence, tt.projection)
+			result, err = projectInventoryAtFenceForTest(t, s, fence, tt.projection)
 			require.NoError(t, err)
 			assert.NotContains(t, result.Fenced, "source")
 			tt.assertAfter(t, s.Lookup("source"))
@@ -579,16 +584,16 @@ func TestStore_RestoreSettlementToleratesFastExactCallback(t *testing.T) {
 		apply     func(*Store, string, string, operation.OperationID) (bool, error)
 		wantState State
 	}{
-		{name: "success", apply: (*Store).ConfirmOperation, wantState: StateConfirmed},
-		{name: "failure", apply: (*Store).RefuseOperation, wantState: StateAbsent},
+		{name: "success", apply: confirmOperationForTest, wantState: StateConfirmed},
+		{name: "failure", apply: refuseOperationForTest, wantState: StateAbsent},
 	}
 	settlements := []struct {
 		name  string
 		apply func(*Store, RestoreClaim) (bool, error)
 	}{
-		{name: "confirm", apply: (*Store).ConfirmRestore},
-		{name: "refuse", apply: (*Store).RefuseRestore},
-		{name: "abandon", apply: (*Store).AbandonRestore},
+		{name: "confirm", apply: (*Store).confirmRestore},
+		{name: "refuse", apply: (*Store).refuseRestore},
+		{name: "abandon", apply: (*Store).abandonRestore},
 	}
 
 	for i, callback := range callbacks {
@@ -625,7 +630,7 @@ func TestStore_RestoreSettlementReleasesSourceClaimOnTargetWriteFailure(t *testi
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 
-	consumed, err := s.ConfirmRestore(claim)
+	consumed, err := s.confirmRestore(claim)
 	require.Error(t, err)
 	assert.True(t, consumed)
 	assert.Empty(t, s.restoreClaims,
@@ -652,7 +657,7 @@ func TestStore_BeginRestoreRefusesLeaseAlreadyClaimedAsAnotherSource(t *testing.
 	assert.Equal(t, StateConfirmed, s.Lookup("source-a").State())
 	assert.Len(t, s.restoreClaims, 1)
 
-	consumed, err := s.AbandonRestore(first)
+	consumed, err := s.abandonRestore(first)
 	require.NoError(t, err)
 	assert.True(t, consumed)
 }

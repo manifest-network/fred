@@ -1,7 +1,7 @@
 package leasesm
 
 import (
-	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +11,12 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
+
+func handleRecoveryCommand(t *testing.T, actor *LeaseActor, command RecoveryCommand) {
+	t.Helper()
+	require.True(t, actor.TryEnqueueRecovery(command))
+	actor.handleAcceptedMessage(<-actor.inbox)
+}
 
 func maintenanceRecoveryActor(
 	t *testing.T,
@@ -37,7 +43,7 @@ func maintenanceRecoveryActor(
 		SendMaintenanceCallbackFn: func(shared.MaintenanceIntentClaim, backend.CallbackStatus, string) {
 			deliveries++
 		},
-		SendLifecycleCallbackFn: func(string, string, backend.CallbackStatus, string) {
+		SendLifecycleFailureFn: func(shared.RuntimeGenerationProof, string) {
 			deliveries++
 		},
 	})
@@ -49,27 +55,49 @@ func maintenanceRecoveryActor(
 }
 
 func targetMaintenanceRecoveryProjection(
-	_ shared.MaintenanceIntentClaim,
+	claim shared.MaintenanceIntentClaim,
 ) MaintenanceRecoveryProjection {
-	return MaintenanceRecoveryProjection{}
+	projection := MaintenanceRecoveryProjection{
+		ServiceContainers: make(map[string][]string),
+	}
+	for _, item := range claim.TargetRelease().Items {
+		for instance := range item.Quantity {
+			id := fmt.Sprintf("%s-%d", item.ServiceName, instance)
+			projection.ContainerIDs = append(projection.ContainerIDs, id)
+			projection.ServiceContainers[item.ServiceName] = append(
+				projection.ServiceContainers[item.ServiceName], id,
+			)
+		}
+	}
+	return projection
+}
+
+func activeMaintenanceForRecovery(
+	t *testing.T,
+	claim shared.MaintenanceIntentClaim,
+) shared.MaintenanceReleaseActive {
+	t.Helper()
+	result := testMaintenanceSuccess(t, claim, ReplaceSuccessProjection{})
+	require.True(t, result.success.maintenanceRelease.Valid())
+	return result.success.maintenanceRelease
 }
 
 func TestMaintenanceRecoveredSuccessPromotesExactProjectionWithoutDelivery(t *testing.T) {
 	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
+	active := activeMaintenanceForRecovery(t, claim)
 	actor, store, deliveries := maintenanceRecoveryActor(
 		t, backend.ProvisionStatusUpdating, claim,
 	)
 	target := claim.TargetRelease()
 	targetStack, err := manifest.ParsePayload(target.Manifest)
 	require.NoError(t, err)
-	reply := make(chan error, 1)
 	projection := targetMaintenanceRecoveryProjection(claim)
 	projection.ContainerIDs = []string{"target-1"}
 	projection.ServiceContainers = map[string][]string{"app": {"target-1"}}
-	msg, err := NewMaintenanceRecoveredSuccessMsg(claim, projection, reply)
+	msg, reply, err := NewMaintenanceRecoveredSuccessMsg(active, projection)
 	require.NoError(t, err)
-	actor.handle(msg)
-	require.NoError(t, <-reply)
+	handleRecoveryCommand(t, actor, msg)
+	require.NoError(t, reply.Wait(t.Context()))
 
 	assert.Equal(t, backend.ProvisionStatusReady, actor.State())
 	state, found := store.Get(testActorLeaseUUID)
@@ -87,7 +115,7 @@ func TestMaintenanceRecoveredSuccessPromotesExactProjectionWithoutDelivery(t *te
 func TestMaintenanceRecoveredFailureProjectionIsTypedAndKeepsSourceRoute(t *testing.T) {
 	for _, test := range []struct {
 		name string
-		new  func(shared.MaintenanceIntentClaim, MaintenanceRecoveryProjection, ReplaceFailureInfo, chan error) (LeaseMessage, error)
+		new  func(shared.MaintenanceIntentClaim, MaintenanceRecoveryProjection, ReplaceFailureInfo) (RecoveryCommand, ActorReply, error)
 		want backend.ProvisionStatus
 	}{
 		{name: "exact source ready", new: NewMaintenanceRecoveredFailureReadyMsg, want: backend.ProvisionStatusReady},
@@ -98,13 +126,13 @@ func TestMaintenanceRecoveredFailureProjectionIsTypedAndKeepsSourceRoute(t *test
 			actor, store, deliveries := maintenanceRecoveryActor(
 				t, backend.ProvisionStatusRestarting, claim,
 			)
-			reply := make(chan error, 1)
-			msg, err := test.new(claim, MaintenanceRecoveryProjection{}, ReplaceFailureInfo{
-				Operation: "restart", CallbackErr: "interrupted", LastError: "interrupted",
-			}, reply)
+			info := maintenanceRecoveryFailureInfo(t, claim, ReplaceFailureDetails{
+				CallbackErr: "interrupted", LastError: "interrupted",
+			})
+			msg, reply, err := test.new(claim, MaintenanceRecoveryProjection{}, info)
 			require.NoError(t, err)
-			actor.handle(msg)
-			require.NoError(t, <-reply)
+			handleRecoveryCommand(t, actor, msg)
+			require.NoError(t, reply.Wait(t.Context()))
 
 			assert.Equal(t, test.want, actor.State())
 			state, found := store.Get(testActorLeaseUUID)
@@ -121,38 +149,130 @@ func TestMaintenanceRecoveredRejectsWrongIdentityAndActiveWorker(t *testing.T) {
 	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentRestart)
 	other := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentRestart)
 	actor, _, _ := maintenanceRecoveryActor(t, backend.ProvisionStatusRestarting, claim)
+	otherInfo := maintenanceRecoveryFailureInfo(t, other, ReplaceFailureDetails{})
+	_, _, err := NewMaintenanceRecoveredFailureFailedMsg(
+		claim, MaintenanceRecoveryProjection{}, otherInfo,
+	)
+	require.ErrorContains(t, err, "details belong to another intent")
 
-	reply := make(chan error, 1)
-	wrong, err := NewMaintenanceRecoveredFailureFailedMsg(
-		other, MaintenanceRecoveryProjection{}, ReplaceFailureInfo{}, reply,
+	wrong, wrongReply, err := NewMaintenanceRecoveredFailureFailedMsg(
+		other, MaintenanceRecoveryProjection{}, otherInfo,
 	)
 	require.NoError(t, err)
-	actor.handle(wrong)
-	assert.ErrorContains(t, <-reply, "differs from actor generation")
+	handleRecoveryCommand(t, actor, wrong)
+	assert.ErrorContains(t, wrongReply.Wait(t.Context()), "differs from actor generation")
 	assert.Equal(t, backend.ProvisionStatusRestarting, actor.State())
 
 	actor.markMaintenanceWorker(claim.MaintenanceID())
-	reply = make(chan error, 1)
-	owned, err := NewMaintenanceRecoveredFailureFailedMsg(
-		claim, MaintenanceRecoveryProjection{}, ReplaceFailureInfo{}, reply,
+	claimInfo := maintenanceRecoveryFailureInfo(t, claim, ReplaceFailureDetails{})
+	owned, ownedReply, err := NewMaintenanceRecoveredFailureFailedMsg(
+		claim, MaintenanceRecoveryProjection{}, claimInfo,
 	)
 	require.NoError(t, err)
-	actor.handle(owned)
-	assert.ErrorContains(t, <-reply, "worker remains active")
+	handleRecoveryCommand(t, actor, owned)
+	assert.ErrorContains(t, ownedReply.Wait(t.Context()), "worker remains active")
 	assert.Equal(t, backend.ProvisionStatusRestarting, actor.State())
+}
+
+func TestMaintenanceRecoveredCannotComposeAcrossSettlementsWithSameIntent(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(*testing.T, shared.MaintenanceIntentClaim, *shared.MaintenanceSettlement) (RecoveryCommand, ActorReply)
+	}{
+		{
+			name: "success",
+			run: func(
+				t *testing.T,
+				foreign shared.MaintenanceIntentClaim,
+				settlement *shared.MaintenanceSettlement,
+			) (RecoveryCommand, ActorReply) {
+				active, err := settlement.ProveMaintenanceActive(foreign)
+				require.NoError(t, err)
+				command, reply, err := NewMaintenanceRecoveredSuccessMsg(
+					active, targetMaintenanceRecoveryProjection(foreign),
+				)
+				require.NoError(t, err)
+				return command, reply
+			},
+		},
+		{
+			name: "failure",
+			run: func(
+				t *testing.T,
+				foreign shared.MaintenanceIntentClaim,
+				_ *shared.MaintenanceSettlement,
+			) (RecoveryCommand, ActorReply) {
+				info, err := NewMaintenanceRecoveryFailureInfo(
+					foreign,
+					ReplaceFailureDetails{
+						CallbackErr: "definitive failure",
+						Reason:      backend.ReasonInternal,
+						LastError:   "definitive failure",
+					},
+				)
+				require.NoError(t, err)
+				command, reply, err := NewMaintenanceRecoveredFailureFailedMsg(
+					foreign, MaintenanceRecoveryProjection{}, info,
+				)
+				require.NoError(t, err)
+				return command, reply
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claim := newTestMaintenanceClaim(
+				t, testActorLeaseUUID, shared.MaintenanceIntentRestart,
+			)
+			if test.name == "success" {
+				_ = activeMaintenanceForRecovery(t, claim)
+			} else {
+				_ = testMaintenanceFailure(
+					t, claim, fmt.Errorf("definitive failure"), false, false,
+					ReplaceFailureDetails{
+						CallbackErr: "definitive failure",
+						Reason:      backend.ReasonInternal,
+						LastError:   "definitive failure",
+					},
+				)
+			}
+
+			value, ok := maintenanceAuthorities.Load(claim.MaintenanceID())
+			require.True(t, ok)
+			authority := value.(testMaintenanceAuthority)
+			foreignSettlement, err := shared.NewMaintenanceSettlement(
+				authority.callbacks, authority.releases,
+			)
+			require.NoError(t, err)
+			foreign, found, err := foreignSettlement.GetMaintenanceIntent(claim.LeaseUUID())
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, claim.MaintenanceID(), foreign.MaintenanceID())
+			assert.False(t, foreign.MatchesIntent(claim),
+				"a separately minted settlement capability is not actor authority")
+
+			actor, _, _ := maintenanceRecoveryActor(
+				t, backend.ProvisionStatusRestarting, claim,
+			)
+			command, reply := test.run(t, foreign, foreignSettlement)
+			handleRecoveryCommand(t, actor, command)
+			assert.ErrorContains(t, reply.Wait(t.Context()), "differs from actor generation")
+			assert.Equal(t, backend.ProvisionStatusRestarting, actor.State())
+			assert.True(t, actor.pendingMaintenance.MatchesIntent(claim))
+		})
+	}
 }
 
 func TestMaintenanceRecoveredIsIdempotentAfterWorkerTerminalWins(t *testing.T) {
 	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentRestart)
+	active := activeMaintenanceForRecovery(t, claim)
 	actor, _, deliveries := maintenanceRecoveryActor(t, backend.ProvisionStatusReady, claim)
 	for range 2 {
-		reply := make(chan error, 1)
-		msg, err := NewMaintenanceRecoveredSuccessMsg(
-			claim, targetMaintenanceRecoveryProjection(claim), reply,
+		msg, reply, err := NewMaintenanceRecoveredSuccessMsg(
+			active, targetMaintenanceRecoveryProjection(claim),
 		)
 		require.NoError(t, err)
-		actor.handle(msg)
-		require.NoError(t, <-reply)
+		handleRecoveryCommand(t, actor, msg)
+		require.NoError(t, reply.Wait(t.Context()))
 	}
 	assert.Equal(t, backend.ProvisionStatusReady, actor.State())
 	assert.False(t, actor.pendingMaintenance.Valid())
@@ -162,14 +282,15 @@ func TestMaintenanceRecoveredIsIdempotentAfterWorkerTerminalWins(t *testing.T) {
 func TestMaintenanceRecoveredCorrectsContradictoryTerminalProjection(t *testing.T) {
 	t.Run("durable success corrects failed actor", func(t *testing.T) {
 		claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
+		active := activeMaintenanceForRecovery(t, claim)
 		actor, store, deliveries := maintenanceRecoveryActor(t, backend.ProvisionStatusFailed, claim)
-		reply := make(chan error, 1)
 		projection := targetMaintenanceRecoveryProjection(claim)
 		projection.ContainerIDs = []string{"target"}
-		msg, err := NewMaintenanceRecoveredSuccessMsg(claim, projection, reply)
+		projection.ServiceContainers = map[string][]string{"app": {"target"}}
+		msg, reply, err := NewMaintenanceRecoveredSuccessMsg(active, projection)
 		require.NoError(t, err)
-		actor.handle(msg)
-		require.NoError(t, <-reply)
+		handleRecoveryCommand(t, actor, msg)
+		require.NoError(t, reply.Wait(t.Context()))
 		assert.Equal(t, backend.ProvisionStatusReady, actor.State())
 		state, found := store.Get(testActorLeaseUUID)
 		require.True(t, found)
@@ -181,16 +302,17 @@ func TestMaintenanceRecoveredCorrectsContradictoryTerminalProjection(t *testing.
 	t.Run("durable failure corrects ready actor", func(t *testing.T) {
 		claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
 		actor, _, deliveries := maintenanceRecoveryActor(t, backend.ProvisionStatusReady, claim)
-		reply := make(chan error, 1)
-		msg, err := NewMaintenanceRecoveredFailureFailedMsg(
+		info := maintenanceRecoveryFailureInfo(t, claim, ReplaceFailureDetails{
+			CallbackErr: "interrupted", LastError: "interrupted",
+		})
+		msg, reply, err := NewMaintenanceRecoveredFailureFailedMsg(
 			claim,
 			MaintenanceRecoveryProjection{},
-			ReplaceFailureInfo{Operation: "update", CallbackErr: "interrupted", LastError: "interrupted"},
-			reply,
+			info,
 		)
 		require.NoError(t, err)
-		actor.handle(msg)
-		require.NoError(t, <-reply)
+		handleRecoveryCommand(t, actor, msg)
+		require.NoError(t, reply.Wait(t.Context()))
 		assert.Equal(t, backend.ProvisionStatusFailed, actor.State())
 		assert.Zero(t, *deliveries)
 	})
@@ -198,6 +320,7 @@ func TestMaintenanceRecoveredCorrectsContradictoryTerminalProjection(t *testing.
 
 func TestMaintenanceRecoveredRuntimeFailureIsCompoundAndIdempotent(t *testing.T) {
 	claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
+	active := activeMaintenanceForRecovery(t, claim)
 	actor, store, deliveries := maintenanceRecoveryActor(
 		t, backend.ProvisionStatusUpdating, claim,
 	)
@@ -219,11 +342,10 @@ func TestMaintenanceRecoveredRuntimeFailureIsCompoundAndIdempotent(t *testing.T)
 				state.CallbackURL = "https://source.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8"
 			})
 		}
-		reply := make(chan error, 1)
-		msg, err := NewMaintenanceRecoveredRuntimeFailureMsg(claim, projection, reply)
+		msg, reply, err := NewMaintenanceRecoveredRuntimeFailureMsg(active, projection)
 		require.NoError(t, err)
-		actor.handle(msg)
-		require.NoError(t, <-reply)
+		handleRecoveryCommand(t, actor, msg)
+		require.NoError(t, reply.Wait(t.Context()))
 		assert.Equal(t, backend.ProvisionStatusFailed, actor.State())
 		state, found := store.Get(testActorLeaseUUID)
 		require.True(t, found)
@@ -242,47 +364,62 @@ func TestMaintenanceRecoveredSameStateRepairsProvisionAfterEntryActionPanic(t *t
 	for _, test := range []struct {
 		name    string
 		state   backend.ProvisionStatus
-		newMsg  func(shared.MaintenanceIntentClaim, MaintenanceRecoveryProjection, ReplaceFailureInfo, chan error) (LeaseMessage, error)
-		failure ReplaceFailureInfo
+		newMsg  func(shared.MaintenanceIntentClaim, MaintenanceRecoveryProjection, ReplaceFailureInfo) (RecoveryCommand, ActorReply, error)
+		details ReplaceFailureDetails
 	}{
 		{
-			name:    "ready source",
-			state:   backend.ProvisionStatusReady,
-			newMsg:  NewMaintenanceRecoveredFailureReadyMsg,
-			failure: ReplaceFailureInfo{CallbackErr: "interrupted", LastError: "interrupted", Reason: backend.ReasonRestartFailed},
+			name:   "ready source",
+			state:  backend.ProvisionStatusReady,
+			newMsg: NewMaintenanceRecoveredFailureReadyMsg,
+			details: ReplaceFailureDetails{
+				CallbackErr: "interrupted", LastError: "interrupted", Reason: backend.ReasonRestartFailed,
+			},
 		},
 		{
-			name:    "failed source",
-			state:   backend.ProvisionStatusFailed,
-			newMsg:  NewMaintenanceRecoveredFailureFailedMsg,
-			failure: ReplaceFailureInfo{CallbackErr: "interrupted", LastError: "interrupted", Reason: backend.ReasonUpdateFailed},
+			name:   "failed source",
+			state:  backend.ProvisionStatusFailed,
+			newMsg: NewMaintenanceRecoveredFailureFailedMsg,
+			details: ReplaceFailureDetails{
+				CallbackErr: "interrupted", LastError: "interrupted", Reason: backend.ReasonUpdateFailed,
+			},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			claim := newTestMaintenanceClaim(t, testActorLeaseUUID, shared.MaintenanceIntentUpdate)
 			actor, store, deliveries := maintenanceRecoveryActor(t, test.state, claim)
+			failure := maintenanceRecoveryFailureInfo(t, claim, test.details)
 			store.UpdateFn(testActorLeaseUUID, func(state *ProvisionState) {
 				state.Status = backend.ProvisionStatusUpdating
 				state.FailCount = 11
 			})
-			reply := make(chan error, 1)
-			msg, err := test.newMsg(
-				claim, MaintenanceRecoveryProjection{}, test.failure, reply,
+			msg, reply, err := test.newMsg(
+				claim, MaintenanceRecoveryProjection{}, failure,
 			)
 			require.NoError(t, err)
-			actor.handle(msg)
-			require.NoError(t, <-reply)
+			handleRecoveryCommand(t, actor, msg)
+			require.NoError(t, reply.Wait(t.Context()))
 			projected, found := store.Get(testActorLeaseUUID)
 			require.True(t, found)
 			assert.Equal(t, test.state, projected.Status)
-			assert.Equal(t, test.failure.CallbackErr, projected.Message)
-			assert.Equal(t, test.failure.LastError, projected.LastError)
-			assert.Equal(t, test.failure.Reason, projected.Reason)
+			assert.Equal(t, failure.callbackErr, projected.Message)
+			assert.Equal(t, failure.lastError, projected.LastError)
+			assert.Equal(t, failure.reason, projected.Reason)
 			assert.Equal(t, 11, projected.FailCount)
 			assert.Contains(t, projected.CallbackURL, "source.example")
 			assert.Zero(t, *deliveries)
 		})
 	}
+}
+
+func maintenanceRecoveryFailureInfo(
+	t *testing.T,
+	claim shared.MaintenanceIntentClaim,
+	details ReplaceFailureDetails,
+) ReplaceFailureInfo {
+	t.Helper()
+	info, err := NewMaintenanceRecoveryFailureInfo(claim, details)
+	require.NoError(t, err)
+	return info
 }
 
 func TestRestartUpdateRejectMissingMaintenanceAuthorityBeforeTransition(t *testing.T) {
@@ -293,11 +430,10 @@ func TestRestartUpdateRejectMissingMaintenanceAuthorityBeforeTransition(t *testi
 		})
 		actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{ProvisionStore: store})
 		ack := make(chan error, 1)
-		work := func() ReplaceResult { return ReplaceResult{Err: errors.New("must not run")} }
 		if update {
-			actor.handleUpdateRequested(UpdateRequestedMsg{Work: work, Ack: ack})
+			actor.handleUpdateRequested(updateRequestedMsg{Ctx: t.Context(), Ack: ack})
 		} else {
-			actor.handleRestartRequested(RestartRequestedMsg{Work: work, Ack: ack})
+			actor.handleRestartRequested(restartRequestedMsg{Ctx: t.Context(), Ack: ack})
 		}
 		assert.ErrorContains(t, <-ack, "valid maintenance intent claim")
 		assert.Equal(t, backend.ProvisionStatusReady, actor.State())

@@ -23,13 +23,13 @@ func TestReleaseRuntimeIdentityIsAValidatedDisjointProjection(t *testing.T) {
 	)
 	require.NoError(t, err)
 	legacyRelease := typedRelease
-	legacyRelease.OperationID = ""
+	legacyRelease.OperationID = OperationID{}
 	legacyRelease.RuntimeAuthority = nil
 	legacyRelease.LegacyRuntimeAuthority = &legacyAuthority
 	legacy, ok := legacyRelease.RuntimeIdentity()
 	require.True(t, ok)
 	assert.Equal(t, ReleaseAuthorityLegacy, legacy.Class())
-	assert.Empty(t, legacy.OperationID())
+	assert.True(t, legacy.OperationID().IsZero())
 	assert.Equal(t, legacyAuthority.CallbackURL(), legacy.CallbackURL())
 
 	for _, release := range []Release{
@@ -43,7 +43,7 @@ func TestReleaseRuntimeIdentityIsAValidatedDisjointProjection(t *testing.T) {
 		}(),
 		func() Release {
 			mismatched := typedRelease
-			mismatched.OperationID = "9a72fbc1-38c8-4f31-87f7-f689979b9324"
+			mismatched.OperationID = mustSharedOperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 			return mismatched
 		}(),
 		func() Release {

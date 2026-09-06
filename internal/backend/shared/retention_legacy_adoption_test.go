@@ -76,12 +76,27 @@ func TestIdentityBoundIncompleteRestoringRetentionIsNeverClassifiedAsV013(t *tes
 	dbPath := filepath.Join(t.TempDir(), "retention.db")
 	entry := v013RestoringRetentionFixture()
 	writeV013RetentionStore(t, dbPath, entry)
+	currentRaw, err := marshalRetentionEntry(RetentionEntry{
+		OriginalLeaseUUID: entry.OriginalLeaseUUID,
+		Tenant:            entry.Tenant, Partition: entry.Partition,
+		ProviderUUID: entry.ProviderUUID, Items: entry.Items,
+		StackManifest: entry.StackManifest, CallbackURL: entry.CallbackURL,
+		RetainedVolumeNames: entry.RetainedVolumeNames, Status: entry.Status,
+		NewLeaseUUID: entry.NewLeaseUUID, Generation: entry.Generation,
+		CreatedAt: entry.CreatedAt, RestoringSince: entry.RestoringSince,
+		ReapingSince: entry.ReapingSince,
+	})
+	require.NoError(t, err)
 
 	db, err := bolt.Open(dbPath, 0o600, nil)
 	require.NoError(t, err)
 	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucket(storeIdentityBucketName)
-		return err
+		if _, err := tx.CreateBucket(storeIdentityBucketName); err != nil {
+			return err
+		}
+		return tx.Bucket(retentionBucketName).Put(
+			[]byte(entry.OriginalLeaseUUID), currentRaw,
+		)
 	}))
 	require.NoError(t, db.Close())
 

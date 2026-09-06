@@ -131,7 +131,7 @@ esac`,
 	assert.Greater(t, blockProofAt, triggerAt)
 }
 
-func TestReadProjectQuotaUsageRejectsSuccessfulDiagnosticStderr(t *testing.T) {
+func TestReadProjectQuotaUsageAcceptsExactRowWithSuccessfulDiagnosticStderr(t *testing.T) {
 	mgr := newXfsManagerForTest(t.TempDir())
 	installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
   *"%s"*)
@@ -140,8 +140,21 @@ func TestReadProjectQuotaUsageRejectsSuccessfulDiagnosticStderr(t *testing.T) {
     ;;
 esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID), xfsDeleteTestProjectID))
 
+	used, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
+	require.NoError(t, err)
+	assert.Zero(t, used)
+}
+
+func TestReadProjectQuotaUsageRejectsDiagnosticWhenProjectRowIsAbsent(t *testing.T) {
+	mgr := newXfsManagerForTest(t.TempDir())
+	installXFSQuotaFixture(t, fmt.Sprintf(`case "$*" in
+  *"%s"*)
+    printf 'cannot setup path\n' >&2
+    ;;
+esac`, xfsProjectReportCmd("b", xfsDeleteTestProjectID)))
+
 	_, err := mgr.readProjectQuotaUsage(t.Context(), xfsDeleteTestProjectID, "b")
-	require.ErrorContains(t, err, "diagnostic stderr")
+	require.ErrorContains(t, err, "cannot prove")
 }
 
 func TestReadProjectQuotaUsageReportsNonzeroExitStderrSeparately(t *testing.T) {

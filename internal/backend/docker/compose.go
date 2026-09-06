@@ -15,8 +15,14 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// composeExecutor wraps Docker Compose operations for stack deployments.
-type composeExecutor interface {
+// composeReader is the only Compose surface retained by Backend.
+type composeReader interface {
+	// PS lists containers belonging to the project.
+	PS(ctx context.Context, projectName string) ([]composeContainerSummary, error)
+}
+
+// composeMutationSink is captured only by settlement-bound Guards.
+type composeMutationSink interface {
 	// Up creates and starts services from the project.
 	// Compose diffs current vs desired state: creates missing containers,
 	// recreates changed ones, starts stopped ones.
@@ -24,9 +30,6 @@ type composeExecutor interface {
 
 	// Down stops and removes all containers for the project.
 	Down(ctx context.Context, projectName string, timeout time.Duration) error
-
-	// PS lists containers belonging to the project.
-	PS(ctx context.Context, projectName string) ([]composeContainerSummary, error)
 }
 
 // composeUpOpts configures a Compose Up operation.
@@ -91,7 +94,7 @@ func newComposeService(dockerHost string) (*composeService, error) {
 			if dockerHost != "" {
 				opts = append(opts, mobyclient.WithHost(dockerHost))
 			}
-			return mobyclient.NewClientWithOpts(opts...)
+			return mobyclient.New(opts...)
 		}),
 	); err != nil {
 		return nil, fmt.Errorf("initialize docker cli: %w", err)

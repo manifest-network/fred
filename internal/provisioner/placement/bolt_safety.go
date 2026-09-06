@@ -115,10 +115,10 @@ func verifyPublishedEntryIdentity(entry fsidentity.Entry, expected os.FileInfo) 
 	return nil
 }
 
-// verifyExactAuthorityBucketSet is used only by offline creation/migration
-// postconditions. Runtime schema checks deliberately remain forward-compatible,
-// while a tool claiming to have created one exact authority must reject any
-// unexpected top-level state that was raced in or copied from another store.
+// verifyExactAuthorityBucketSet is shared by offline postconditions and live
+// Open/Healthy checks. An unknown root may carry authority a newer writer
+// understands, so treating it as forward-compatible would permit an older
+// binary to write through a downgrade boundary.
 func verifyExactAuthorityBucketSet(tx *bolt.Tx) error {
 	if tx == nil {
 		return errors.New("placement database transaction is required")

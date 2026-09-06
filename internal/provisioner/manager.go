@@ -14,12 +14,15 @@ import (
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/ThreeDotsLabs/watermill/message/router/middleware"
 	"github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -30,21 +33,16 @@ var errCallbackRuntimeUnavailable = errors.New("backend callback runtime is not 
 
 // Manager is the typed production runtime and owns the single process-local
 // operation registry shared through narrow consumer capability ports.
-var _ ReconcilerRuntime = (*Manager)(nil)
 
 // Manager handles the provisioning lifecycle. Chain and payload events use
 // Watermill; backend callbacks use a synchronous application path so the
 // backend's durable per-lease ordering survives provider ingress.
 type Manager struct {
 	providerUUID    string
-	callbackBaseURL string
-	router          *backend.Router
-	chainClient     ChainClient
 	publisher       message.Publisher
-	callbackHandler func(context.Context, backend.CallbackPayload) error
+	callbackHandler func(context.Context, hmacauth.VerifiedRequest) error
 	wmRouter        *message.Router
 	payloadStore    *payload.Store
-	placementStore  PlacementAuthorityStore
 	ackBatcher      *AckBatcher
 
 	// callbackAdmissionMu closes the admission gate atomically with respect to
@@ -70,13 +68,19 @@ type Manager struct {
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
 
-	// operations is the single process-local lifecycle registry owned by this
-	// manager. Durable attempts and backend inventory recover its ephemeral state
-	// after restart.
-	operations *operation.Registry
+	// timeoutWG owns the checker started by Start. timeoutMu closes the narrow
+	// Start/Close publication race around its derived cancellation function, so
+	// Close always joins the goroutine even when the caller forgot to cancel the
+	// Start context.
+	timeoutMu         sync.Mutex
+	timeoutStarted    bool
+	timeoutClosed     bool
+	timeoutStopCancel context.CancelFunc
+	timeoutWG         sync.WaitGroup
 
-	// Orchestrator for provisioning coordination
-	orchestrator *ProvisionOrchestrator
+	operationRuntime     operation.RuntimeController
+	executionCoordinator *placement.ExecutionCoordinator
+	handlers             *HandlerSet
 
 	// Timeout checker for callback timeouts
 	timeoutChecker *TimeoutChecker
@@ -89,6 +93,75 @@ type Manager struct {
 	leaseEventSink LeaseEventSink
 }
 
+// ManagerChainClient is the single chain capability shared by every
+// provisioner application assembled by Manager, including reconciliation's
+// ACTIVE inventory. Narrow consumers such as AckBatcher still receive only
+// ChainClient.
+type ManagerChainClient interface {
+	ChainClient
+	GetActiveLeasesByProvider(context.Context, string) ([]billingtypes.Lease, error)
+}
+
+// managerProviderControlPlane is the sole broad placement composition port.
+// It joins the one production chain client to the acknowledgement batcher
+// built over that same client; only this value crosses into placement wiring.
+type managerProviderControlPlane struct {
+	chain ManagerChainClient
+	ack   *AckBatcher
+}
+
+func newManagerProviderControlPlane(
+	chainClient ManagerChainClient,
+	cfg AckBatcherConfig,
+) (*managerProviderControlPlane, *AckBatcher, error) {
+	if util.IsNilInterface(chainClient) {
+		return nil, nil, errors.New("manager chain client is required")
+	}
+	ackBatcher := NewAckBatcher(chainClient, cfg)
+	return &managerProviderControlPlane{chain: chainClient, ack: ackBatcher}, ackBatcher, nil
+}
+
+func (control *managerProviderControlPlane) GetLease(
+	ctx context.Context, leaseUUID string,
+) (*billingtypes.Lease, error) {
+	lease, err := control.chain.GetLease(ctx, leaseUUID)
+	// The concrete gRPC client historically represents query NotFound as an
+	// empty successful response. Normalize that transport convention only at
+	// this production adapter boundary; the placement observation algebra keeps
+	// arbitrary nil,nil responses uncertain.
+	if lease == nil && err == nil {
+		return nil, billingtypes.ErrLeaseNotFound
+	}
+	return lease, err
+}
+func (control *managerProviderControlPlane) GetPendingLeases(
+	ctx context.Context, providerUUID string,
+) ([]billingtypes.Lease, error) {
+	return control.chain.GetPendingLeases(ctx, providerUUID)
+}
+func (control *managerProviderControlPlane) GetActiveLeasesByProvider(
+	ctx context.Context, providerUUID string,
+) ([]billingtypes.Lease, error) {
+	return control.chain.GetActiveLeasesByProvider(ctx, providerUUID)
+}
+func (control *managerProviderControlPlane) RejectLeases(
+	ctx context.Context, leaseUUIDs []string, reason string,
+) (uint64, []string, error) {
+	return control.chain.RejectLeases(ctx, leaseUUIDs, reason)
+}
+func (control *managerProviderControlPlane) CloseLeases(
+	ctx context.Context, leaseUUIDs []string, reason string,
+) (uint64, []string, error) {
+	return control.chain.CloseLeases(ctx, leaseUUIDs, reason)
+}
+func (control *managerProviderControlPlane) Acknowledge(
+	ctx context.Context, leaseUUID string,
+) (bool, string, error) {
+	return control.ack.Acknowledge(ctx, leaseUUID)
+}
+
+var _ placement.ProviderControlPlane = (*managerProviderControlPlane)(nil)
+
 // LeaseEventSink receives lease status events for real-time delivery (e.g., WebSocket).
 type LeaseEventSink interface {
 	Publish(event backend.LeaseStatusEvent)
@@ -96,20 +169,20 @@ type LeaseEventSink interface {
 
 // ManagerConfig configures the provision manager.
 type ManagerConfig struct {
-	ProviderUUID         string
-	CallbackBaseURL      string                  // Base URL for backend callbacks (e.g., "http://fred.example.com:8080")
-	PayloadStore         *payload.Store          // Optional external payload store (if nil, manager won't handle payloads)
-	PlacementStore       PlacementAuthorityStore // Required durable multi-backend placement authority
-	LeaseEventSink       LeaseEventSink          // Optional sink for real-time lease events (nil = disabled)
-	CallbackTimeout      time.Duration           // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
-	TimeoutCheckInterval time.Duration           // How often to check for timeouts (default: 1 minute)
-	AckBatchInterval     time.Duration           // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
-	AckBatchSize         int                     // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
-	AckLaneCount         int                     // Number of parallel ack lanes (default: 1)
+	ProviderUUID          string
+	PayloadStore          *payload.Store                 // Optional external payload store (if nil, manager won't handle payloads)
+	PlacementStore        *placement.Store               // Required durable multi-backend placement authority
+	LeaseEventSink        LeaseEventSink                 // Optional sink for real-time lease events (nil = disabled)
+	CallbackTimeout       time.Duration                  // Timeout for backend callbacks (default: 10 minutes, 0 = disabled)
+	TimeoutCheckInterval  time.Duration                  // How often to check for timeouts (default: 1 minute)
+	AckBatchInterval      time.Duration                  // How long to wait before flushing ack batch (default: DefaultAckBatchInterval)
+	AckBatchSize          int                            // Maximum acks to batch before flushing (default: DefaultAckBatchSize)
+	AckLaneCount          int                            // Number of parallel ack lanes (default: 1)
+	CallbackProofConsumer hmacauth.CallbackProofConsumer // Exact API verifier boundary accepted for settlement.
 }
 
 // NewManager creates a new provision manager with Watermill routing.
-func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClient) (*Manager, error) {
+func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerChainClient) (*Manager, error) {
 	if router == nil {
 		return nil, errors.New("backend router is required")
 	}
@@ -119,13 +192,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 	if cfg.ProviderUUID == "" {
 		return nil, errors.New("provider UUID is required")
 	}
-	if cfg.CallbackBaseURL == "" {
-		return nil, errors.New("callback base URL is required")
-	}
-	if _, err := parseCallbackBaseURL(cfg.CallbackBaseURL); err != nil {
-		return nil, err
-	}
-	if isNilPlacementAuthorityStore(cfg.PlacementStore) {
+	if cfg.PlacementStore == nil {
 		return nil, ErrPlacementStoreUnavailable
 	}
 	if err := cfg.PlacementStore.VerifyProviderUUID(cfg.ProviderUUID); err != nil {
@@ -138,6 +205,9 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		backendTopologyNames(router),
 	); err != nil {
 		return nil, fmt.Errorf("verify placement backend topology: %w", err)
+	}
+	if !cfg.CallbackProofConsumer.Valid() {
+		return nil, errors.New("callback proof consumer is required")
 	}
 
 	// Apply defaults for callback timeout using cmp.Or
@@ -178,25 +248,36 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 		middleware.Recoverer,
 	)
 
-	// Create ack batcher (NewAckBatcher applies defaults internally via cmp.Or)
-	ackBatcher := NewAckBatcher(chainClient, AckBatcherConfig{
+	// Construct the one provider control plane and its lifecycle-owned batcher
+	// together, so chain reads/writes can never be paired with an acknowledger
+	// built over another client.
+	providerControlPlane, ackBatcher, err := newManagerProviderControlPlane(chainClient, AckBatcherConfig{
 		ProviderUUID:  cfg.ProviderUUID,
 		BatchInterval: cfg.AckBatchInterval,
 		BatchSize:     cfg.AckBatchSize,
 		LaneCount:     cfg.AckLaneCount,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("bind provider control plane: %w", err)
+	}
 	// The batcher is deliberately NOT started here: a long-lived goroutine set
 	// must be owned by a lifecycle, not by a constructor. Start() launches it
 	// (see the ordering note there). The synchronous callback admission gate is
 	// opened only after that launch, and the reconciler's first ack is gated
 	// behind <-Running() in cmd/providerd/main.go.
 
-	operations := operation.NewRegistryWithCountObserver(func(count int) {
+	operationCoordinator, err := cfg.PlacementStore.BindOperationCoordinator(func(count int) {
 		metrics.InFlightProvisions.Set(float64(count))
 	})
-	orchestrator, err := NewProvisionOrchestrator(
-		cfg.ProviderUUID, cfg.CallbackBaseURL, router, operations, cfg.PlacementStore,
-		provisionStartEventSinkFunc(func(leaseUUID string) {
+	if err != nil {
+		return nil, fmt.Errorf("bind operation settlement coordinator: %w", err)
+	}
+	executionCoordinator, err := operationCoordinator.BindBackendRuntime(router, providerControlPlane)
+	if err != nil {
+		return nil, fmt.Errorf("bind backend execution coordinator: %w", err)
+	}
+	provisionCoordinator, err := executionCoordinator.ProvisionCoordinator(
+		placement.ProvisionStartObserver(func(leaseUUID, _ string) {
 			// Provision start and callback completion use the same synchronous
 			// sink. Sending only the terminal side directly would let a queued
 			// Watermill Provisioning event overtake Ready/Failed at subscribers.
@@ -205,6 +286,10 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 			)
 		}),
 	)
+	if err != nil {
+		return nil, fmt.Errorf("bind provision execution coordinator: %w", err)
+	}
+	orchestrator, err := NewProvisionOrchestrator(provisionCoordinator)
 	if err != nil {
 		return nil, fmt.Errorf("create provision orchestrator: %w", err)
 	}
@@ -220,51 +305,55 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 			publishLeaseStatusToSink(cfg.LeaseEventSink, leaseUUID, status, failure)
 		})
 	}
+	callbackCoordinator, err := executionCoordinator.AuthenticatedCallbackCoordinator(
+		cfg.CallbackProofConsumer,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("bind authenticated callback coordinator: %w", err)
+	}
+	deprovisionObserver := provisionCoordinator.DeprovisionCompletionObserver()
 	callbacks, err := NewCallbackService(CallbackServiceConfig{
-		Operations:         operations,
-		Chain:              chainClient,
-		Acknowledger:       ackBatcher,
-		Placement:          cfg.PlacementStore,
-		StorageIdentities:  cfg.PlacementStore,
-		LifecycleAuthority: cfg.PlacementStore,
-		Payloads:           cfg.PayloadStore,
-		Events:             callbackEvents,
-		Backends:           router,
-		DeprovisionObserver: callbackDeprovisionObserverFunc(
-			orchestrator.forgetDeprovisionCandidate,
-		),
+		Coordinator:         callbackCoordinator,
+		Payloads:            cfg.PayloadStore,
+		Events:              callbackEvents,
+		Backends:            router,
+		DeprovisionObserver: deprovisionObserver,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create callback service: %w", err)
 	}
-	handlers := NewHandlerSet(HandlerDeps{
-		ChainClient:     chainClient,
-		Orchestrator:    orchestrator,
-		EventOperations: operations,
-		PayloadStore:    cfg.PayloadStore,
-		Publisher:       pubSub,
-		Callbacks:       callbacks,
+	handlers, err := NewHandlerSet(HandlerDeps{
+		Events:       orchestrator.HandlerEvents(),
+		PayloadStore: cfg.PayloadStore,
+		Publisher:    pubSub,
+		Callbacks:    callbacks,
 	})
-	timeoutChecker := NewTimeoutChecker(TimeoutCheckerConfig{
-		Operations:    operations,
-		Rejecter:      chainClient,
+	if err != nil {
+		return nil, fmt.Errorf("create handler set: %w", err)
+	}
+	timeoutCoordinator, err := executionCoordinator.TimeoutCoordinator()
+	if err != nil {
+		return nil, fmt.Errorf("bind callback timeout coordinator: %w", err)
+	}
+	timeoutChecker, err := NewTimeoutChecker(TimeoutCheckerConfig{
+		Coordinator:   timeoutCoordinator,
 		Timeout:       callbackTimeout,
 		CheckInterval: timeoutCheckInterval,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("create callback timeout checker: %w", err)
+	}
 
 	m := &Manager{
 		providerUUID:         cfg.ProviderUUID,
-		callbackBaseURL:      cfg.CallbackBaseURL,
-		router:               router,
-		chainClient:          chainClient,
 		publisher:            pubSub,
-		callbackHandler:      handlers.HandleBackendCallbackPayload,
+		callbackHandler:      handlers.HandleBackendCallbackEvidence,
 		wmRouter:             wmRouter,
 		payloadStore:         cfg.PayloadStore,
-		placementStore:       cfg.PlacementStore,
 		ackBatcher:           ackBatcher,
-		operations:           operations,
-		orchestrator:         orchestrator,
+		operationRuntime:     operationCoordinator.RuntimeController(),
+		executionCoordinator: executionCoordinator,
+		handlers:             handlers,
 		timeoutChecker:       timeoutChecker,
 		callbackTimeout:      callbackTimeout,
 		timeoutCheckInterval: timeoutCheckInterval,
@@ -336,7 +425,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ChainClie
 // backendTopologyNames returns the router's exact durable storage identities.
 // It intentionally preserves the router's inventory boundary; canonical
 // sorting and validation belong to the placement store that persists it.
-func backendTopologyNames(router BackendRouter) []string {
+func backendTopologyNames(router backendRouter) []string {
 	if util.IsNilInterface(router) {
 		return nil
 	}
@@ -412,9 +501,21 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.openCallbackAdmission()
 	defer m.pauseCallbackAdmission()
 
-	// Start callback timeout checker in background.
-	// This goroutine exits when ctx is canceled, which happens before Close() in production.
-	go m.timeoutChecker.Start(ctx)
+	// The timeout checker is Manager-owned, panic-contained at its external
+	// reject boundary, and joined by Close. The caller context still stops it
+	// during normal orchestration shutdown; m.stopCtx covers direct Close calls.
+	m.timeoutMu.Lock()
+	if !m.timeoutStarted && !m.timeoutClosed {
+		timeoutCtx, timeoutCancel := context.WithCancel(m.stopCtx)
+		stopOnCallerCancel := context.AfterFunc(ctx, timeoutCancel)
+		m.timeoutStarted = true
+		m.timeoutStopCancel = timeoutCancel
+		m.timeoutWG.Go(func() {
+			defer stopOnCallerCancel()
+			m.timeoutChecker.Start(timeoutCtx)
+		})
+	}
+	m.timeoutMu.Unlock()
 
 	// Run Watermill router (blocks until ctx canceled)
 	return m.wmRouter.Run(ctx)
@@ -424,11 +525,6 @@ func (m *Manager) Start(ctx context.Context) error {
 // This can be used to wait for the manager to be ready before publishing events.
 func (m *Manager) Running() chan struct{} {
 	return m.wmRouter.Running()
-}
-
-// AckBatcher returns the batcher as an Acknowledger for use by the reconciler.
-func (m *Manager) AckBatcher() Acknowledger {
-	return m.ackBatcher
 }
 
 // Close shuts down the provision manager.
@@ -450,6 +546,16 @@ func (m *Manager) Close() error {
 	if m.callbackStopCancel != nil {
 		m.callbackStopCancel()
 	}
+	// Stop timeout settlement before draining handlers. It holds exact operation
+	// claims while calling the chain; its bounded context releases those claims
+	// before stores and other manager-owned lifecycle components are closed.
+	m.timeoutMu.Lock()
+	m.timeoutClosed = true
+	if m.timeoutStopCancel != nil {
+		m.timeoutStopCancel()
+	}
+	m.timeoutMu.Unlock()
+	m.timeoutWG.Wait()
 
 	// Log in-flight provisions to help operators understand state during shutdown
 	count := m.InFlightCount()
@@ -494,11 +600,6 @@ func (m *Manager) Close() error {
 		m.stopCancel()
 	}
 
-	// Note: The timeout checker goroutine exits when its context is canceled.
-	// In production, the context is canceled before Close() is called,
-	// so the goroutine will have already exited or will exit promptly.
-	// We don't wait here because tests may call Close() without canceling the context.
-
 	// Close payload store if configured
 	var payloadErr error
 	if m.payloadStore != nil {
@@ -542,7 +643,7 @@ func (m *Manager) PublishLeaseEvent(event chain.LeaseEvent) error {
 // events remain on Watermill, but its router intentionally starts each message
 // handler in a separate goroutine and therefore cannot provide this ordering
 // boundary.
-func (m *Manager) PublishCallback(ctx context.Context, callback backend.CallbackPayload) error {
+func (m *Manager) PublishCallback(ctx context.Context, callback hmacauth.VerifiedRequest) error {
 	if !m.admitCallback() {
 		return errCallbackRuntimeUnavailable
 	}

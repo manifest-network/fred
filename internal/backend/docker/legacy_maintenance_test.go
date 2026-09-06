@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -40,26 +39,16 @@ func seedLegacyStackMaintenanceAuthority(
 	)
 	require.NoError(t, err)
 
-	dir := t.TempDir()
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(dir, "legacy-maintenance-releases.db"),
-	})
-	require.NoError(t, err)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(dir, "legacy-maintenance-callbacks.db"),
-	})
-	require.NoError(t, err)
-	b.releaseStore = releases
-	b.callbackStore = callbacks
-	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
-		Manifest:               manifestBytes,
-		Image:                  "stack",
-		Items:                  slices.Clone(items),
-		ResourceProfiles:       shared.CloneSKUResourceSnapshot(profiles),
-		LegacyRuntimeAuthority: &authority,
-		Status:                 "active",
-		CreatedAt:              time.Now().Add(-time.Minute),
-	}))
+	seedUpgradedV013ReleaseForBackendTest(t, b, leaseUUID, shared.Release{
+		Manifest:  manifestBytes,
+		Image:     "stack",
+		Status:    "active",
+		CreatedAt: time.Now().Add(-time.Minute),
+	},
+		slices.Clone(items),
+		shared.CloneSKUResourceSnapshot(profiles),
+		authority,
+	)
 
 	b.provisionsMu.Lock()
 	provision := b.provisions[leaseUUID]
@@ -77,8 +66,6 @@ func seedLegacyStackMaintenanceAuthority(
 	t.Cleanup(func() {
 		b.stopCancel()
 		b.wg.Wait()
-		require.NoError(t, callbacks.Close())
-		require.NoError(t, releases.Close())
 	})
 }
 
@@ -141,11 +128,11 @@ func TestV013LegacyReleaseFirstMaintenanceOperations(t *testing.T) {
 			expectedCallbackURL := newCallbackURL
 			switch operation {
 			case "restart":
-				require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+				require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 					LeaseUUID: stackMaintenanceLeaseUUID, CallbackURL: newCallbackURL,
 				}))
 			case "update":
-				require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{
+				require.NoError(t, b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
 					LeaseUUID:   stackMaintenanceLeaseUUID,
 					CallbackURL: newCallbackURL,
 					Payload: validStackManifestJSON(map[string]string{
@@ -171,7 +158,7 @@ func TestV013LegacyReleaseFirstMaintenanceOperations(t *testing.T) {
 			active, err := b.releaseStore.LatestActive(stackMaintenanceLeaseUUID)
 			require.NoError(t, err)
 			require.NotNil(t, active)
-			assert.Empty(t, active.OperationID)
+			assert.True(t, active.OperationID.IsZero())
 			assert.Nil(t, active.RuntimeAuthority)
 			require.NotNil(t, active.LegacyRuntimeAuthority)
 			assert.Equal(t, expectedCallbackURL, active.LegacyRuntimeAuthority.CallbackURL())
@@ -223,7 +210,7 @@ func TestV013LegacyReleaseSubsequentMaintenanceRollbackPreservesSourceAuthority(
 			projects = append(projects, projectAuthority{
 				callbackURL:          labels[LabelCallbackURL],
 				lifecycleCallbackURL: labels[LabelLifecycleCallbackURL],
-				maintenanceID:        shared.MaintenanceID(labels[LabelMaintenanceID]),
+				maintenanceID:        mustParseMaintenanceID(t, labels[LabelMaintenanceID]),
 			})
 			upMu.Unlock()
 			if call == 2 {
@@ -272,7 +259,7 @@ func TestV013LegacyReleaseSubsequentMaintenanceRollbackPreservesSourceAuthority(
 
 	// Establish a real prior maintenance generation. The next restart must treat
 	// this active target (including its MaintenanceID) as rollback authority.
-	require.NoError(t, b.Restart(t.Context(), backend.RestartRequest{
+	require.NoError(t, b.Restart(t.Context(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID: stackMaintenanceLeaseUUID, CallbackURL: oldCallbackURL,
 	}))
 	awaitStackMaintenanceCallback(t, b, callbackReceived)
@@ -286,11 +273,25 @@ func TestV013LegacyReleaseSubsequentMaintenanceRollbackPreservesSourceAuthority(
 	require.Equal(t, oldCallbackURL, sourceAuthority.CallbackURL())
 
 	// The forward replacement publishes the requested new callback base, then
-	// fails. Rollback succeeds and must rebuild the prior exact generation rather
-	// than relabeling it with the failed target's route or MaintenanceID.
-	require.NoError(t, b.Restart(t.Context(), backend.RestartRequest{
+	// returns an error. Compose Up may have taken effect before returning an
+	// error, so live execution must preserve the Started intent as ambiguous. A
+	// later strict recovery pass observes the exact source generation and is the
+	// only authority allowed to settle the failure.
+	failedMaintenanceID := newTestMaintenanceID(t)
+	require.NoError(t, b.Restart(t.Context(), backend.RestartRequest{MaintenanceID: failedMaintenanceID,
 		LeaseUUID: stackMaintenanceLeaseUUID, CallbackURL: newCallbackURL,
 	}))
+	require.Eventually(t, func() bool {
+		upMu.Lock()
+		defer upMu.Unlock()
+		return upCalls >= 2
+	}, time.Second, time.Millisecond, "ambiguous replacement did not cross Compose Up")
+	require.Eventually(t, func() bool {
+		return !b.actorOwnsMaintenance(stackMaintenanceLeaseUUID, failedMaintenanceID)
+	}, time.Second, time.Millisecond,
+		"actor did not durably hand the ambiguous maintenance generation to recovery")
+	b.cfg.ProvisionTimeout = time.Nanosecond
+	require.NoError(t, b.recoverMaintenanceIntents(t.Context()))
 	awaitStackMaintenanceCallback(t, b, callbackReceived)
 
 	callbackMu.Lock()
@@ -312,7 +313,7 @@ func TestV013LegacyReleaseSubsequentMaintenanceRollbackPreservesSourceAuthority(
 	assert.Equal(t, sourceMaintenanceID, active.MaintenanceID)
 	assert.Equal(t, oldCallbackURL, activeAuthority.CallbackURL())
 	assert.Equal(t, oldCallbackURL, activeAuthority.LifecycleCallbackURL())
-	assert.Empty(t, active.OperationID)
+	assert.True(t, active.OperationID.IsZero())
 	assert.Nil(t, active.RuntimeAuthority)
 
 	b.provisionsMu.RLock()
@@ -325,18 +326,13 @@ func TestV013LegacyReleaseSubsequentMaintenanceRollbackPreservesSourceAuthority(
 	assert.Equal(t, oldCallbackURL, projectedLifecycleCallbackURL)
 
 	upMu.Lock()
-	require.Len(t, projects, 3, "first maintenance, failed target, successful rollback")
+	require.Len(t, projects, 2, "first maintenance and ambiguous target")
 	failedTarget := projects[1]
-	rollback := projects[2]
 	upMu.Unlock()
 	assert.Equal(t, newCallbackURL, failedTarget.callbackURL)
 	assert.Equal(t, newCallbackURL, failedTarget.lifecycleCallbackURL)
 	assert.True(t, failedTarget.maintenanceID.Valid())
 	assert.NotEqual(t, sourceMaintenanceID, failedTarget.maintenanceID)
-	assert.Equal(t, oldCallbackURL, rollback.callbackURL)
-	assert.Equal(t, oldCallbackURL, rollback.lifecycleCallbackURL)
-	assert.Equal(t, sourceMaintenanceID, rollback.maintenanceID,
-		"rollback labels must name the prior active maintenance generation")
 }
 
 func TestReleaseRuntimeAuthoritiesForMaintenanceRejectsAuthorityClassChange(t *testing.T) {
@@ -347,7 +343,7 @@ func TestReleaseRuntimeAuthoritiesForMaintenanceRejectsAuthorityClassChange(t *t
 	require.NoError(t, err)
 	active := shared.Release{LegacyRuntimeAuthority: &authority, Status: "active"}
 
-	typedID := shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	typedID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	_, _, err = releaseRuntimeAuthoritiesForMaintenance(
 		active,
 		authority.Tenant(),

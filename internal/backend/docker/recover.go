@@ -29,6 +29,20 @@ type recoveredInstanceKey struct {
 	index   int
 }
 
+// durableRecoveryAllocationCohort is a complete reservation reconstructed from
+// immutable intent/release/close/finalizer authority. It is deliberately not
+// interchangeable with a container-observed prefix: on cold start the complete
+// cohort must enter the pool even while its projection is in-flight.
+type durableRecoveryAllocationCohort struct {
+	allocations []shared.ResourceAllocation
+}
+
+func newDurableRecoveryAllocationCohort(
+	allocations []shared.ResourceAllocation,
+) durableRecoveryAllocationCohort {
+	return durableRecoveryAllocationCohort{allocations: allocations}
+}
+
 func runtimeIdentityForRelease(release *shared.Release) (shared.ReleaseRuntimeIdentity, bool) {
 	if release == nil {
 		return shared.ReleaseRuntimeIdentity{}, false
@@ -207,8 +221,8 @@ func recoveredSnapshotAllocations(
 // before recovery chooses any sibling as its in-memory representative. Docker
 // list order is not an authority boundary: every sibling must carry the exact
 // same operation/lifecycle generation, or the lease is quarantined by failing
-// recovery deterministically. An all-empty legacy cohort remains callbackless;
-// mixing an empty sibling with a routed sibling is still divergence.
+// recovery deterministically. An all-empty v0.13 stack cohort remains
+// callbackless; mixing an empty sibling with a routed sibling is divergence.
 func recoveredCallbackPairs(containers []ContainerInfo) (map[string]recoveredCallbackPair, error) {
 	return recoveredCallbackPairsExcept(containers, nil)
 }
@@ -219,7 +233,15 @@ func recoveredCallbackPairsExcept(
 ) (map[string]recoveredCallbackPair, error) {
 	grouped := make(map[string][]ContainerInfo)
 	for _, container := range containers {
-		if container.LeaseUUID == "" || container.SKU == "" || isLegacyRollbackRemnant(container) {
+		if isPreStackContainer(container) {
+			return nil, fmt.Errorf(
+				"%w: lease %q container %q has no service identity",
+				ErrPreStackWorkloadUnsupported,
+				container.LeaseUUID,
+				container.ContainerID,
+			)
+		}
+		if container.LeaseUUID == "" || container.SKU == "" {
 			continue
 		}
 		if _, skipped := skippedLeases[container.LeaseUUID]; skipped {
@@ -304,7 +326,7 @@ func (b *Backend) resumeRecoveredClose(
 	if b.callbackStore == nil {
 		return errors.New("resume recovered close requires a callback store")
 	}
-	current, found, err := b.callbackStore.GetCloseIntent(claim.LeaseUUID())
+	current, found, err := b.closeSettlement.GetCloseIntent(claim.LeaseUUID())
 	if err != nil {
 		return fmt.Errorf("re-read recovered close intent: %w", err)
 	}
@@ -317,13 +339,14 @@ func (b *Backend) resumeRecoveredClose(
 			current.LeaseUUID(), current.Backend(), current.BackendStorageID(), b.Name(), b.storageIdentity,
 		)
 	}
-	reply := make(chan error, 1)
-	if err := b.routeToLeaseBlocking(ctx, current.LeaseUUID(), leasesm.DeprovisionMsg{
-		Ctx: ctx, Reply: reply,
-	}); err != nil {
+	command, reply, commandErr := leasesm.NewDeprovisionCommand(ctx)
+	if commandErr != nil {
+		return fmt.Errorf("construct recovered close actor command: %w", commandErr)
+	}
+	if err := b.routeToLeaseBlocking(ctx, current.LeaseUUID(), command); err != nil {
 		return fmt.Errorf("route recovered close through lease actor: %w", err)
 	}
-	if err := b.waitForReply(ctx, reply); err != nil {
+	if err := b.waitForReply(ctx, reply.Result()); err != nil {
 		return fmt.Errorf("apply recovered close through lease actor: %w", err)
 	}
 	return nil
@@ -334,71 +357,118 @@ func (b *Backend) resumeRecoveredClose(
 // snapshot. Callers re-run it under provisionsMu immediately before publishing:
 // an admission that lands after the first inventory snapshot is then either
 // visible here, or is still blocked from capturing/publishing its projection.
+type recoveryIntentClass uint8
+
+const (
+	recoveryOperationIntent recoveryIntentClass = iota + 1
+	recoveryMaintenanceIntent
+)
+
+// recoveryIntentGeneration is a comparable identity for the exact durable
+// mutation authority observed by one recovery snapshot. Lease membership alone
+// is insufficient: O1 settling while O2 is admitted for the same lease is a
+// generation change and must invalidate every product derived from O1.
+type recoveryIntentGeneration struct {
+	class recoveryIntentClass
+	id    string
+}
+
+func changedRecoveryIntentGenerations(
+	before, after map[string]recoveryIntentGeneration,
+) map[string]struct{} {
+	changed := make(map[string]struct{})
+	for leaseUUID, prior := range before {
+		if current, ok := after[leaseUUID]; !ok || current != prior {
+			changed[leaseUUID] = struct{}{}
+		}
+	}
+	for leaseUUID, current := range after {
+		if prior, ok := before[leaseUUID]; !ok || current != prior {
+			changed[leaseUUID] = struct{}{}
+		}
+	}
+	return changed
+}
+
 func (b *Backend) listRecoveryPendingIntents(
 	closeIntents map[string]shared.CloseIntentClaim,
-) (map[string]struct{}, map[string]shared.OperationIntentClaim, error) {
+) (
+	map[string]struct{},
+	map[string]shared.OperationIntentClaim,
+	map[string]recoveryIntentGeneration,
+	error,
+) {
 	pending := make(map[string]struct{})
 	operations := make(map[string]shared.OperationIntentClaim)
-	if b.operationIntents == nil && b.callbackStore == nil {
-		return pending, operations, nil
+	generations := make(map[string]recoveryIntentGeneration)
+	if b.operationSettlement == nil {
+		return pending, operations, generations, nil
 	}
 
-	var operationClaims []shared.OperationIntentClaim
-	var err error
-	if b.operationIntents != nil {
-		operationClaims, err = b.operationIntents.ListOperationIntents()
-	} else {
-		operationClaims, err = b.callbackStore.ListOperationIntents()
-	}
+	operationClaims, err := b.operationSettlement.ListOperationIntents()
 	if err != nil {
-		return nil, nil, fmt.Errorf("list operation intents before state recovery: %w", err)
+		return nil, nil, nil, fmt.Errorf("list operation intents before state recovery: %w", err)
 	}
 	for _, claim := range operationClaims {
 		if claim.Backend() != b.Name() || claim.BackendStorageID() != b.storageIdentity {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"operation intent for lease %q belongs to backend %q storage %s, not backend %q storage %s",
 				claim.LeaseUUID(), claim.Backend(), claim.BackendStorageID(), b.Name(), b.storageIdentity,
 			)
 		}
 		if profileErr := validateDockerResourceProfiles(claim.Items(), claim.ResourceProfiles()); profileErr != nil {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"operation intent for lease %q has invalid resource authority: %w",
 				claim.LeaseUUID(), profileErr,
 			)
 		}
 		if _, closing := closeIntents[claim.LeaseUUID()]; closing {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"lease %q has simultaneous durable close and operation intents",
 				claim.LeaseUUID(),
 			)
 		}
 		pending[claim.LeaseUUID()] = struct{}{}
 		operations[claim.LeaseUUID()] = claim
+		generations[claim.LeaseUUID()] = recoveryIntentGeneration{
+			class: recoveryOperationIntent,
+			id:    claim.OperationID().String(),
+		}
 	}
 
 	if b.callbackStore == nil {
-		return pending, operations, nil
+		return pending, operations, generations, nil
 	}
-	maintenanceClaims, err := b.callbackStore.ListMaintenanceIntents()
+	maintenanceClaims, err := b.maintenanceSettlement.ListMaintenanceIntents()
 	if err != nil {
-		return nil, nil, fmt.Errorf("list maintenance intents before state recovery: %w", err)
+		return nil, nil, nil, fmt.Errorf("list maintenance intents before state recovery: %w", err)
 	}
 	for _, claim := range maintenanceClaims {
+		if claim.Backend() != b.Name() || claim.BackendStorageID() != b.storageIdentity {
+			return nil, nil, nil, fmt.Errorf(
+				"maintenance intent for lease %q belongs to backend %q storage %s, not backend %q storage %s",
+				claim.LeaseUUID(), claim.Backend(), claim.BackendStorageID(), b.Name(), b.storageIdentity,
+			)
+		}
 		if _, closing := closeIntents[claim.LeaseUUID()]; closing {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"lease %q has simultaneous durable close and maintenance intents",
 				claim.LeaseUUID(),
 			)
 		}
 		if _, operating := operations[claim.LeaseUUID()]; operating {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"lease %q has simultaneous durable operation and maintenance intents",
 				claim.LeaseUUID(),
 			)
 		}
 		pending[claim.LeaseUUID()] = struct{}{}
+		generations[claim.LeaseUUID()] = recoveryIntentGeneration{
+			class: recoveryMaintenanceIntent,
+			id:    claim.MaintenanceID().String(),
+		}
 	}
-	return pending, operations, nil
+	return pending, operations, generations, nil
 }
 
 type provisionRecoveryBaseline struct {
@@ -409,6 +479,14 @@ type provisionRecoveryBaseline struct {
 func (b *Backend) snapshotProvisionRecoveryBaseline() map[string]provisionRecoveryBaseline {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
+	return b.snapshotProvisionRecoveryBaselineLocked()
+}
+
+// snapshotProvisionRecoveryBaselineLocked is the publication-side form of
+// snapshotProvisionRecoveryBaseline. The caller owns provisionsMu (read or
+// write); keeping that fact in the name makes accidental recursive locking
+// visible at review time.
+func (b *Backend) snapshotProvisionRecoveryBaselineLocked() map[string]provisionRecoveryBaseline {
 	baseline := make(map[string]provisionRecoveryBaseline, len(b.provisions))
 	for leaseUUID, current := range b.provisions {
 		baseline[leaseUUID] = provisionRecoveryBaseline{
@@ -466,6 +544,17 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	}
 	b.recoverMu.Lock()
 	defer b.recoverMu.Unlock()
+	closedLeaseUUIDs := make(map[string]struct{})
+	// A terminal Failed operation remains the durable owner of any daemon-side
+	// Create that becomes visible after settlement. Remove that exact late
+	// generation before maintenance or ordinary inventory recovery can interpret
+	// it as a live lease. Keep the complete failed-head set as an exclusion below
+	// too: a Create appearing between these two inventory reads is deferred to the
+	// next level-triggered sweep rather than published Ready.
+	failedOperationFence, err := b.recoverFailedOperationSubstrate(ctx)
+	if err != nil {
+		return err
+	}
 	// Resolve restart/update WALs before ordinary recovery interprets the
 	// source/target snapshot. A live actor generation is skipped under the same
 	// per-lease command fence and remains protected below as an in-flight lease.
@@ -480,10 +569,42 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}()
 	provisionBaseline := b.snapshotProvisionRecoveryBaseline()
+	runtimeGenerationProofs, err := b.captureRuntimeGenerationProofs()
+	if err != nil {
+		return err
+	}
 
 	containers, err := b.listManagedContainersForRecovery(ctx)
 	if err != nil {
 		return err
+	}
+	for _, container := range containers {
+		if isPreStackContainer(container) {
+			return fmt.Errorf(
+				"%w: lease %q container %q has no service identity",
+				ErrPreStackWorkloadUnsupported,
+				container.LeaseUUID,
+				container.ContainerID,
+			)
+		}
+	}
+	// A closed container may become visible after the strict cleanup observation
+	// above. Batch-resolve only UUIDs in this newer inventory, validate the same
+	// sealed authority now, and exclude them from publication; the next
+	// level-triggered sweep performs targeted removal.
+	closedReceipts, err := b.closedLeaseRecoveryReceipts(containers)
+	if err != nil {
+		return err
+	}
+	if _, err := closedLeaseRecoveryTargets(closedReceipts, containers); err != nil {
+		return err
+	}
+	for leaseUUID := range closedReceipts {
+		closedLeaseUUIDs[leaseUUID] = struct{}{}
+	}
+	failedOperationContainerIDs, err := failedOperationFence.targetContainerIDs(containers)
+	if err != nil {
+		return fmt.Errorf("apply failed-operation recovery fence: %w", err)
 	}
 
 	// A durable close intent is the sole recovery authority once teardown has
@@ -497,7 +618,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// cleanup holds neither side.
 	closeIntents := make(map[string]shared.CloseIntentClaim)
 	if b.callbackStore != nil {
-		claims, listErr := b.callbackStore.ListCloseIntents()
+		claims, listErr := b.closeSettlement.ListCloseIntents()
 		if listErr != nil {
 			return fmt.Errorf("list close intents before state recovery: %w", listErr)
 		}
@@ -511,14 +632,15 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			closeIntents[claim.LeaseUUID()] = claim
 		}
 	}
-	pendingIntentLeases, operationClaimsByLease, err := b.listRecoveryPendingIntents(closeIntents)
+	pendingIntentLeases, operationClaimsByLease, intentGenerations, err := b.listRecoveryPendingIntents(closeIntents)
 	if err != nil {
 		return err
 	}
 	// A restoring source row owns the destination's adopted bytes until an exact
 	// active Release is durable. Its destination snapshot is therefore the
-	// recovery authority after the operation intent has been consumed (including
-	// the crash window where the restore succeeded but Release.Append failed).
+	// immutable finalization authority alongside the terminal operation outcome
+	// (including the crash window where the restore succeeded but Release.Append
+	// failed).
 	// Load it before inspecting container SKUs so recovery never falls back to
 	// mutable configuration for that generation.
 	restoreAuthorityByDestination := make(map[string]shared.RetentionEntry)
@@ -528,6 +650,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			return fmt.Errorf("list restore destination authorities before state recovery: %w", listErr)
 		}
 		for _, source := range restoring {
+			if _, closed := closedLeaseUUIDs[source.NewLeaseUUID]; closed {
+				continue
+			}
 			if len(source.DestinationItems) == 0 {
 				continue // Pre-authority row: no exact destination sizing proof.
 			}
@@ -546,75 +671,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if _, closing := closeIntents[container.LeaseUUID]; closing {
 			continue
 		}
+		if _, failedOperation := failedOperationFence.failedLeases[container.LeaseUUID]; failedOperation {
+			continue
+		}
+		if _, failedGeneration := failedOperationContainerIDs[container.ContainerID]; failedGeneration {
+			continue
+		}
+		if _, closed := closedLeaseUUIDs[container.LeaseUUID]; closed {
+			continue
+		}
 		ordinaryContainers = append(ordinaryContainers, container)
 	}
 
-	// Recover-time migration pre-pass. Groups any legacy single-service
-	// containers by lease and produces a per-lease migration plan. Runs
-	// BEFORE the main recovery loop so all in-memory provision state
-	// observed by Update / Restart paths is post-migration consistent
-	// (per QA's Task 6 carry-over note: prov.Items mutation must not
-	// race ahead of prov.ServiceContainers population).
-	//
-	// Each plan is then executed atomically per lease by
-	// executeLegacyMigration in the loop below. Any per-lease
-	// failure aborts startup with operator-actionable guidance —
-	// fred refuses to run with half-migrated state because the
-	// stack-only downstream code can't drive a mixed cohort.
-	legacyPlans, committedPrevRemnants, planErr := b.planLegacyMigrations(ctx, ordinaryContainers)
-	if planErr != nil {
-		return fmt.Errorf("plan legacy migrations: %w", planErr)
-	}
-	for _, plan := range legacyPlans {
-		b.logger.Info("legacy lease migration planned",
-			"lease_uuid", plan.LeaseUUID,
-			"tenant", plan.Tenant,
-			"sku", plan.SKU,
-			"instances", len(plan.Instances),
-		)
-	}
-	if len(legacyPlans) > 0 {
-		// Execute each plan atomically per lease. Any per-lease failure
-		// aborts startup with operator-actionable guidance — fred refuses
-		// to run with half-migrated state because the stack-only code
-		// downstream can't drive a mixed cohort.
-		for _, plan := range legacyPlans {
-			// Start intentionally supplies the backend lifetime rather than its
-			// shorter caller context, but that must not make a wedged Docker or
-			// Compose mutation process-lifetime blocking. Bound each lease's whole
-			// migration; periodic reconciliation may impose a tighter parent.
-			migrationTimeout := max(
-				cmp.Or(b.cfg.ProvisionTimeout, 10*time.Minute),
-				cmp.Or(b.cfg.MigrationReadyTimeout, defaultMigrationReadyTimeout),
-			)
-			migrationCtx, cancelMigration := context.WithTimeout(ctx, migrationTimeout)
-			migrationErr := b.executeLegacyMigration(migrationCtx, plan, b.logger)
-			cancelMigration()
-			if migrationErr != nil {
-				b.logger.Error("legacy migration failed; fred refuses to start with unmigrated legacy containers — "+
-					"investigate the failure cause and re-run fred (migration is idempotent), "+
-					"or deprovision the lease manually if data loss is acceptable",
-					"lease_uuid", plan.LeaseUUID, "error", migrationErr)
-				return fmt.Errorf("legacy migration failed: lease %s: %w", plan.LeaseUUID, migrationErr)
-			}
-		}
-		// Re-list managed containers: migration changed every container's
-		// name + label set, so the slice captured at the top of this
-		// function is stale and the main loop below would otherwise see
-		// the old names.
-		refreshed, err := b.listManagedContainersForRecovery(ctx)
-		if err != nil {
-			return fmt.Errorf("re-list managed containers after migration: %w", err)
-		}
-		containers = refreshed
-		ordinaryContainers = ordinaryContainers[:0]
-		for _, container := range containers {
-			if _, closing := closeIntents[container.LeaseUUID]; closing {
-				continue
-			}
-			ordinaryContainers = append(ordinaryContainers, container)
-		}
-	}
 	callbackPairs, err := recoveredCallbackPairsExcept(ordinaryContainers, pendingIntentLeases)
 	if err != nil {
 		return fmt.Errorf("validate recovered callback cohorts: %w", err)
@@ -626,16 +694,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// between the previous active release and the candidate generation.
 	containersByLease := make(map[string][]ContainerInfo)
 	for _, container := range ordinaryContainers {
-		if container.LeaseUUID == "" || isLegacyRollbackRemnant(container) {
+		if container.LeaseUUID == "" {
 			continue
 		}
 		containersByLease[container.LeaseUUID] = append(containersByLease[container.LeaseUUID], container)
 	}
-	releaseLeaseUUIDs := make(map[string]struct{}, len(containersByLease)+len(committedPrevRemnants))
+	releaseLeaseUUIDs := make(map[string]struct{}, len(containersByLease))
 	for leaseUUID := range containersByLease {
-		releaseLeaseUUIDs[leaseUUID] = struct{}{}
-	}
-	for leaseUUID := range committedPrevRemnants {
 		releaseLeaseUUIDs[leaseUUID] = struct{}{}
 	}
 	if b.releaseStore != nil {
@@ -645,6 +710,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 		for _, leaseUUID := range storedLeaseUUIDs {
 			if _, closing := closeIntents[leaseUUID]; closing {
+				continue
+			}
+			if _, closed := closedLeaseUUIDs[leaseUUID]; closed {
 				continue
 			}
 			releaseLeaseUUIDs[leaseUUID] = struct{}{}
@@ -676,14 +744,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				return fmt.Errorf("read active release for lease %q: %w", leaseUUID, releaseErr)
 			}
 			if release == nil {
-				if _, committed := committedPrevRemnants[leaseUUID]; committed {
-					return fmt.Errorf("durably migrated lease %q no longer has an active release", leaseUUID)
-				}
 				continue
 			}
 			if len(release.Items) == 0 {
 				if _, pending := pendingIntentLeases[leaseUUID]; !pending {
-					items, deriveErr := deriveLegacyActiveReleaseItems(
+					items, deriveErr := deriveV013ActiveReleaseItems(
 						release,
 						containersByLease[leaseUUID],
 					)
@@ -702,17 +767,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 							profileErr,
 						)
 					}
-					migrationEvidence := committedPrevRemnants[leaseUUID]
-					authorityClass := shared.LegacyActiveAuthorityWorkload
-					if migrationEvidence.legacyAuthorityClass != 0 {
-						authorityClass = migrationEvidence.legacyAuthorityClass
-					}
-					if backfillErr := b.releaseStore.BackfillLegacyActiveAuthority(
-						leaseUUID,
+					if backfillErr := b.releaseBackfiller.BackfillLegacyActiveAuthorityContext(
+						ctx, leaseUUID,
 						*release,
 						items,
 						resourceProfiles,
-						authorityClass,
 					); backfillErr != nil {
 						return fmt.Errorf(
 							"persist v0.13 active release authority for lease %q: %w",
@@ -722,7 +781,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					}
 					release.Items = items
 					release.ResourceProfiles = resourceProfiles
-					release.LegacyMigration = authorityClass == shared.LegacyActiveAuthorityMigration
 				}
 			}
 			releasesByLease[leaseUUID] = release
@@ -731,8 +789,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				if profileErr != nil {
 					return fmt.Errorf("resolve v0.13 active release resource profiles for lease %q: %w", leaseUUID, profileErr)
 				}
-				if profileErr := b.releaseStore.BackfillActiveResourceProfiles(
-					leaseUUID, release.Version, release.Items, resourceProfiles,
+				if profileErr := b.releaseBackfiller.BackfillActiveResourceProfilesContext(
+					ctx, leaseUUID, release.Version, release.Items, resourceProfiles,
 				); profileErr != nil {
 					return fmt.Errorf("backfill v0.13 active release resource profiles for lease %q: %w", leaseUUID, profileErr)
 				}
@@ -742,6 +800,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				if profileErr := validateDockerResourceProfiles(release.Items, release.ResourceProfiles); profileErr != nil {
 					return fmt.Errorf("validate active release resource profiles for lease %q: %w", leaseUUID, profileErr)
 				}
+			}
+			if proof, ok := runtimeGenerationProofs[leaseUUID]; ok &&
+				!proof.MatchesRelease(*release) {
+				// Inventory must be interpreted only against the release generation
+				// captured before that inventory began. A maintenance commit or
+				// same-version legacy backfill invalidates this pass's observation.
+				delete(runtimeGenerationProofs, leaseUUID)
 			}
 			if _, pending := pendingIntentLeases[leaseUUID]; pending {
 				continue
@@ -755,7 +820,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// proactively, before an ordinary runtime failure or later replacement can
 			// remove the last container. Callbackless pre-label cohorts remain on the
 			// older conservative path because no callback authority can be minted.
-			if release.OperationID == "" && release.RuntimeAuthority == nil &&
+			if release.OperationID.IsZero() && release.RuntimeAuthority == nil &&
 				release.LegacyRuntimeAuthority == nil && len(containersByLease[leaseUUID]) > 0 {
 				pair := callbackPairs[leaseUUID]
 				if pair.callbackURL != "" {
@@ -770,8 +835,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 						return fmt.Errorf("freeze v0.13 runtime authority for lease %q: %w",
 							leaseUUID, authorityErr)
 					}
-					if backfillErr := b.releaseStore.BackfillLegacyRuntimeAuthority(
-						leaseUUID, *release, legacyAuthority,
+					if backfillErr := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
+						ctx, leaseUUID, *release, legacyAuthority,
 					); backfillErr != nil {
 						return fmt.Errorf("persist v0.13 runtime authority for lease %q: %w",
 							leaseUUID, backfillErr)
@@ -782,7 +847,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		}
 	}
 
-	allocsByLease := make(map[string][]shared.ResourceAllocation)
+	durableAllocsByLease := make(map[string]durableRecoveryAllocationCohort)
 	building := make(map[string]*recoveredProvision)
 	// firstExitedByLease[uuid] is the container ID of the first container we
 	// observed in an exited state for that lease. Used to fire containerDiedMsg
@@ -796,20 +861,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// Skip containers without required labels
 		if c.LeaseUUID == "" || c.SKU == "" {
 			b.logger.Warn("skipping container with missing labels", "container_id", leasesm.ShortID(c.ContainerID))
-			continue
-		}
-
-		// Skip migration -prev remnants. These are legacy containers renamed
-		// by executeLegacyMigration's rollback window — they still carry the
-		// fred.lease_uuid + fred.managed labels but no fred.service_name, so
-		// without this guard the legacy-single-item branch below would
-		// process them as live leases (inflating prov.Quantity and appending
-		// a spurious LeaseItem{ServiceName:""}). The migration pre-pass now
-		// deliberately consumes both original legacy names and `-prev` rollback
-		// remnants, re-converges the durable migration, and schedules tracked
-		// cleanup. This guard keeps those remnants out of the live projection
-		// during the inspection grace window.
-		if isLegacyRollbackRemnant(c) {
 			continue
 		}
 
@@ -833,7 +884,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					if predecessorIdentity, ok := runtimeIdentityForRelease(release); ok &&
 						containerMatchesReleaseRuntimeIdentity(c, predecessorIdentity) {
 						resourceProfiles = release.ResourceProfiles
-					} else if release.OperationID == "" && release.RuntimeAuthority == nil &&
+					} else if release.OperationID.IsZero() && release.RuntimeAuthority == nil &&
 						release.LegacyRuntimeAuthority == nil {
 						// Transitional v0.13 rows can reach this pass before their
 						// tokenless identity has been frozen. Sizing a visibly
@@ -850,12 +901,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		} else if source, pendingFinalize := restoreAuthorityByDestination[c.LeaseUUID]; pendingFinalize {
 			resourceProfiles = source.DestinationResourceProfiles
 		}
-		var resources shared.SKUResourceSnapshot
 		if len(resourceProfiles) > 0 {
-			var found bool
-			resources, found = shared.LookupSKUResourceSnapshotRow(resourceProfiles, c.SKU)
+			resources, found := shared.LookupSKUResourceSnapshotRow(resourceProfiles, c.SKU)
 			if !found {
 				return fmt.Errorf("durable resource profiles for lease %q omit observed SKU %q", c.LeaseUUID, c.SKU)
+			}
+			if _, diskErr := resources.EffectiveDiskMB(); diskErr != nil {
+				return fmt.Errorf("durable resource profile for lease %q SKU %q: %w", c.LeaseUUID, c.SKU, diskErr)
 			}
 		} else {
 			legacyItems := []backend.LeaseItem{{SKU: c.SKU, Quantity: 1, ServiceName: cmp.Or(c.ServiceName, manifest.DefaultServiceName)}}
@@ -869,15 +921,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				skippedUnknownSKU++
 				continue
 			}
-			resources = legacyProfiles[0]
 			resourceProfiles = legacyProfiles
 		}
-		profile := resources.Profile()
-		effectiveDiskMB, diskErr := resources.EffectiveDiskMB()
-		if diskErr != nil {
-			return fmt.Errorf("durable resource profile for lease %q SKU %q: %w", c.LeaseUUID, c.SKU, diskErr)
-		}
-
 		// Check if we already have a provision record for this lease
 		prov, exists := building[c.LeaseUUID]
 		if !exists {
@@ -911,14 +956,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Message:              "",
 					CallbackURL:          callbackPair.callbackURL,
 					LifecycleCallbackURL: callbackPair.lifecycleCallbackURL,
+					ActiveReleaseVersion: 0,
+					ActiveOperationID:    shared.OperationID{},
 					Items:                nil, // rebuilt from labels below
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         make([]string, 0),
 					StackManifest:        nil, // restored below
 					ServiceContainers:    nil, // rebuilt from labels below
 				},
-				resourceProfiles:      shared.CloneSKUResourceSnapshot(resourceProfiles),
-				volumeCleanupAttempts: 0,
 			}
 
 			// Restore manifest from the last successful (active) release so
@@ -1014,22 +1059,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			}
 		}
 
-		// Use instance-specific allocation ID, grouped by lease for filtering.
-		// Stack uses service-aware IDs: {leaseUUID}-{serviceName}-{instanceIndex}
-		var instanceID string
-		if c.ServiceName != "" {
-			instanceID = fmt.Sprintf("%s-%s-%d", c.LeaseUUID, c.ServiceName, c.InstanceIndex)
-		} else {
-			instanceID = fmt.Sprintf("%s-%d", c.LeaseUUID, c.InstanceIndex)
-		}
-		allocsByLease[c.LeaseUUID] = append(allocsByLease[c.LeaseUUID], shared.ResourceAllocation{
-			LeaseUUID: instanceID,
-			Tenant:    c.Tenant,
-			SKU:       c.SKU,
-			CPUCores:  profile.CPUCores,
-			MemoryMB:  profile.MemoryMB,
-			DiskMB:    effectiveDiskMB,
-		})
 	}
 
 	// An uncommitted provision intent is the complete cleanup authority for its
@@ -1079,14 +1108,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Message:              "",
 					CallbackURL:          claim.CallbackURL(),
 					LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+					ActiveReleaseVersion: 0,
+					ActiveOperationID:    shared.OperationID{},
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,
 					StackManifest:        stackManifest,
 					ServiceContainers:    nil,
 				},
-				resourceProfiles:      resourceProfiles,
-				volumeCleanupAttempts: 0,
 			}
 			building[leaseUUID] = recovered
 		} else {
@@ -1104,7 +1133,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			recovered.Items = items
 			recovered.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
 			recovered.StackManifest = stackManifest
-			recovered.resourceProfiles = resourceProfiles
 		}
 		allocations, allocationErr := recoveredSnapshotAllocations(
 			leaseUUID, claim.Tenant(), items, resourceProfiles,
@@ -1112,7 +1140,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if allocationErr != nil {
 			return fmt.Errorf("rebuild pending provision allocations for lease %q: %w", leaseUUID, allocationErr)
 		}
-		allocsByLease[leaseUUID] = allocations
+		durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)
 	}
 
 	// A current Release carries an all-or-nothing runtime identity specifically
@@ -1168,14 +1196,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Message:              "",
 					CallbackURL:          authority.CallbackURL(),
 					LifecycleCallbackURL: authority.LifecycleCallbackURL(),
+					ActiveReleaseVersion: release.Version,
+					ActiveOperationID:    authority.OperationID(),
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,
 					StackManifest:        stackManifest,
 					ServiceContainers:    nil,
 				},
-				resourceProfiles:      resourceProfiles,
-				volumeCleanupAttempts: 0,
 			}
 			building[leaseUUID] = recovered
 			if _, already := cohortIssues[leaseUUID]; !already {
@@ -1189,11 +1217,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			recovered.ProviderUUID = authority.ProviderUUID()
 			recovered.CallbackURL = authority.CallbackURL()
 			recovered.LifecycleCallbackURL = authority.LifecycleCallbackURL()
+			recovered.ActiveReleaseVersion = release.Version
+			recovered.ActiveOperationID = authority.OperationID()
 			recovered.SKU = items[0].SKU
 			recovered.Quantity = quantity
 			recovered.Items = items
 			recovered.StackManifest = stackManifest
-			recovered.resourceProfiles = resourceProfiles
+			recovered.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
 		}
 		allocations, allocationErr := recoveredSnapshotAllocations(
 			leaseUUID, authority.Tenant(), items, resourceProfiles,
@@ -1201,7 +1231,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if allocationErr != nil {
 			return fmt.Errorf("rebuild durable runtime allocations for lease %q: %w", leaseUUID, allocationErr)
 		}
-		allocsByLease[leaseUUID] = allocations
+		durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)
 	}
 
 	// A full close needs a conservative in-memory retry owner even when Docker
@@ -1221,7 +1251,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					allocationErr,
 				)
 			}
-			allocsByLease[leaseUUID] = allocations
+			durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)
 			continue
 		}
 		stackManifest, parseErr := manifest.ParsePayload(claim.Manifest())
@@ -1237,7 +1267,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		for _, container := range containers {
 			if container.LeaseUUID == leaseUUID &&
 				container.ContainerID != "" &&
-				!isLegacyRollbackRemnant(container) {
+				container.ServiceName != "" {
 				containerIDSet[container.ContainerID] = struct{}{}
 			}
 		}
@@ -1257,14 +1287,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				Message:              "",
 				CallbackURL:          claim.CallbackURL(),
 				LifecycleCallbackURL: claim.LifecycleCallbackURL(),
+				ActiveReleaseVersion: claim.ActiveReleaseVersion(),
+				ActiveOperationID:    claim.ActiveReleaseOperationID(),
 				Items:                items,
 				ResourceProfiles:     claim.ResourceProfiles(),
 				ContainerIDs:         containerIDs,
 				StackManifest:        stackManifest,
 				ServiceContainers:    nil,
 			},
-			resourceProfiles:      claim.ResourceProfiles(),
-			volumeCleanupAttempts: claim.CleanupAttempts(),
 		}
 		allocations, allocationErr := recoveredSnapshotAllocations(
 			leaseUUID, claim.Tenant(), items, claim.ResourceProfiles(),
@@ -1272,7 +1302,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if allocationErr != nil {
 			return fmt.Errorf("rebuild durable close allocations for lease %q: %w", leaseUUID, allocationErr)
 		}
-		allocsByLease[leaseUUID] = allocations
+		durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)
 	}
 	// Rebuild every destination still owned by a restore source finalizer. The
 	// finalizer remains load-bearing both before and after its active Release is
@@ -1353,7 +1383,16 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			recovered.ProviderUUID = source.ProviderUUID
 			recovered.Items = items
 			recovered.Quantity = quantity
-			recovered.resourceProfiles = resourceProfiles
+			recovered.ResourceProfiles = shared.CloneSKUResourceSnapshot(resourceProfiles)
+			// A visible partial restore can precede the destination Release commit.
+			// Only the committed branch above proved a current destination release;
+			// the uncommitted variant deliberately carries no active-release version.
+			if committed {
+				recovered.ActiveReleaseVersion = release.Version
+			} else {
+				recovered.ActiveReleaseVersion = 0
+			}
+			recovered.ActiveOperationID = source.DestinationOperationID
 			recovered.StackManifest = source.StackManifest
 		case committed:
 			callbackURL := source.DestinationCallbackURL
@@ -1394,14 +1433,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					Message:              "",
 					CallbackURL:          callbackURL,
 					LifecycleCallbackURL: lifecycleCallbackURL,
+					ActiveReleaseVersion: release.Version,
+					ActiveOperationID:    release.OperationID,
 					Items:                items,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 					ContainerIDs:         nil,
 					StackManifest:        source.StackManifest,
 					ServiceContainers:    nil,
 				},
-				resourceProfiles:      resourceProfiles,
-				volumeCleanupAttempts: 0,
 			}
 			cohortIssues[leaseUUID] = errors.New("committed restore destination has no surviving containers")
 		default:
@@ -1416,7 +1455,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if allocationErr != nil {
 			return fmt.Errorf("rebuild restore finalizer allocations for destination %q: %w", leaseUUID, allocationErr)
 		}
-		allocsByLease[leaseUUID] = allocations
+		durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)
 	}
 	// Release Items are the immutable ordered operation input. Docker's list
 	// order is explicitly unspecified, so even an exact set match must restore
@@ -1446,7 +1485,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			}
 			recovered.Items = slices.Clone(release.Items)
 			recovered.Quantity = desiredQuantity
-			recovered.resourceProfiles = shared.CloneSKUResourceSnapshot(release.ResourceProfiles)
+			recovered.ResourceProfiles = shared.CloneSKUResourceSnapshot(release.ResourceProfiles)
+			if identity, ok := release.RuntimeIdentity(); ok {
+				recovered.ActiveReleaseVersion = release.Version
+				recovered.ActiveOperationID = identity.OperationID()
+			}
 			allocations, allocationErr := b.recoveredReleaseAllocations(
 				leaseUUID, recovered.Tenant, release.Items, release.ResourceProfiles,
 			)
@@ -1460,7 +1503,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// Replace the survivor-derived allocation set even when the cohort is
 			// incomplete or duplicated. The durable desired topology is the safe
 			// accounting authority until explicit teardown releases its volumes.
-			allocsByLease[leaseUUID] = allocations
+			durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)
 		}
 	}
 	for leaseUUID, cohortErr := range cohortIssues {
@@ -1501,20 +1544,23 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// waiting on provisionsMu before it can capture/publish a projection. Union
 	// rather than replace: settlement between the two reads only means preserving
 	// one live generation for an extra recovery pass, which is conservative.
-	latestPendingIntentLeases, _, err := b.listRecoveryPendingIntents(closeIntents)
+	latestPendingIntentLeases, _, latestIntentGenerations, err := b.listRecoveryPendingIntents(closeIntents)
 	if err != nil {
 		b.provisionsMu.Unlock()
 		return err
 	}
-	for leaseUUID := range latestPendingIntentLeases {
-		pendingIntentLeases[leaseUUID] = struct{}{}
-	}
+	changedIntentLeases := changedRecoveryIntentGenerations(intentGenerations, latestIntentGenerations)
+	pendingIntentLeases = latestPendingIntentLeases
+	intentGenerations = latestIntentGenerations
 	// A concurrent operation may have changed one lease while this pass collected
 	// inventory. Remove only those stale per-lease products: the live projection
 	// and current pool keys are overlaid/preserved below, while unrelated leases
 	// still converge in this pass. This avoids both stale-generation publication
 	// and fleet-wide starvation from one hot lease.
 	changedProjectionLeases := b.changedProvisionRecoveryLeases(provisionBaseline)
+	for leaseUUID := range changedIntentLeases {
+		changedProjectionLeases[leaseUUID] = "durable operation generation changed"
+	}
 	for leaseUUID, reason := range changedProjectionLeases {
 		if _, closing := closeIntents[leaseUUID]; closing {
 			// recoverySnapshotMu prevents this claim from settling while we
@@ -1524,7 +1570,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			continue
 		}
 		delete(building, leaseUUID)
-		delete(allocsByLease, leaseUUID)
+		delete(durableAllocsByLease, leaseUUID)
 		delete(cohortIssues, leaseUUID)
 		delete(firstExitedByLease, leaseUUID)
 		b.logger.Debug("provision changed while recovery collected inventory; preserving its live generation",
@@ -1639,7 +1685,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	// Publish: materialize every rebuilt entry into a fresh *provision (the only
 	// path a recoveredProvision reaches b.provisions). A fresh struct clears
-	// stale fields (LastError, VolumeCleanupAttempts) exactly as the prior
+	// stale fields such as LastError exactly as the prior
 	// fresh-&provision{}+swap did.
 	final := make(map[string]*provision, len(building))
 	for uuid, rec := range building {
@@ -1654,6 +1700,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// The immutable close claim supersedes every volatile projection.
 			// Cleanup-only closes deliberately remove a stale projection; full
 			// closes use the conservative value materialized above.
+			continue
+		}
+		if _, closed := closedLeaseUUIDs[uuid]; closed {
+			// A successful close permanently retires the UUID. Its sealed receipt
+			// supersedes both stale volatile state and any pre-close release row.
 			continue
 		}
 		if _, changed := changedProjectionLeases[uuid]; changed {
@@ -1673,15 +1724,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			// Replacing that pointer from a concurrent inventory refresh would make
 			// the exact post-teardown compare-and-swap report an ambiguous outcome
 			// even though no competing command exists. Keep both the live projection
-			// and (via ResetPreserving below) its current allocation generation until
+			// and (via the conservative pool rebuild below) its current allocation generation until
 			// the intent owner publishes the candidate atomically.
 			final[uuid] = existing
 			continue
 		}
 		if _, hasContainers := building[uuid]; hasContainers {
-			// By-design (ENG-414): only the in-flight statuses below (plus a Failed
-			// lease mid volume-cleanup-retry, ENG-603) are preserved here. Ready and
-			// Failing/Failed[VCA==0] deliberately fall through to the container-derived
+			// By-design (ENG-414): only the in-flight statuses below are preserved
+			// here. Ready and Failing/Failed deliberately fall through to the container-derived
 			// (materialized) value, so a crashed-then-running lease recovers to Ready
 			// (locked by TestRecoverState_FailCountAntiRegression).
 			// recoverState cannot distinguish that legitimate recovery from the narrow
@@ -1704,27 +1754,6 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				// The deprovision goroutine owns this lease; do not resurrect it
 				// to a container-derived status (ENG-193 explicit case).
 				final[uuid] = existing
-			case backend.ProvisionStatusFailed:
-				// ENG-603: a Failed lease mid volume-cleanup-retry
-				// (VolumeCleanupAttempts>0) reached deprovision.go's VCA-increment
-				// block ONLY after its containers were successfully torn down (the
-				// partial-container-failure branch returns without incrementing), so
-				// its ContainerIDs are already nil and any container this snapshot
-				// still lists for it is necessarily STALE — captured before the
-				// concurrent doDeprovision's compose Down removed it, then merged here
-				// after doDeprovision set Status=Failed. Resurrecting it to a
-				// container-derived Ready (the general fall-through) would drop the
-				// VolumeCleanupAttempts count and, once the next reconcile GCs the
-				// phantom-Ready no-container entry, abandon the volume-cleanup retry
-				// AND leak the still-held pool reservation (released only on a terminal
-				// success or give-up). Preserve by pointer — same rationale as the
-				// Deprovisioning case above and the ENG-546/562/563 Failed[VCA>0] pool
-				// preservation. VCA==0 Failed leases still fall through to the
-				// container-derived value so a Ready→crash→running lease recovers to
-				// Ready (TestRecoverState_FailCountAntiRegression).
-				if existing.VolumeCleanupAttempts > 0 {
-					final[uuid] = existing
-				}
 			}
 			continue
 		}
@@ -1750,120 +1779,167 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			final[uuid] = existing
 		}
 	}
-	// Build the container-derived allocations list, excluding leases with an
-	// in-flight re-provision op (provisioning/restarting/updating). Their
-	// container-derived allocations are in flux (old containers being torn down /
-	// new ones materializing) or absent, so counting them would race the
-	// authoritative reservation — the original ENG-546 exclusion. Those leases'
-	// reservations are instead carried forward from the live pool by the general
-	// preserve rule below (they are in `final`), so the exclusion is behavior-
-	// preserving rather than strictly required — but keep it: it avoids counting
-	// in-flux container values and is a margin against a duplicate-container
-	// double-count should a reservation key ever be lost. Do NOT drop it without
-	// restoring that guard.
-	var allocations []shared.ResourceAllocation
-	for uuid, allocs := range allocsByLease {
-		if claim, closing := closeIntents[uuid]; closing && claim.CleanupOnly() {
-			// Cleanup-only deliberately has no provision projection. Its durable
-			// topology nevertheless counts until finalization succeeds; a later
-			// sweep sees the resolved claim absent and drops these allocations.
-			allocations = append(allocations, allocs...)
-			continue
+	// Candidate construction intentionally does not hold the actor registry: slow
+	// inventory parsing must not pause unrelated lease admission. Publication is a
+	// much smaller critical section. Drop provisionsMu, then reacquire the two
+	// authorities in their canonical actorsMu -> provisionsMu order through an
+	// opaque capability. Any lease that changed in the gap, gained a durable
+	// operation, or still has an active actor is preserved for the next sweep.
+	publicationBaseline := b.snapshotProvisionRecoveryBaselineLocked()
+	b.provisionsMu.Unlock()
+
+	publicationDeferred := make(map[string]struct{})
+	var cohortTransitionGenerations []shared.RuntimeGenerationProof
+	var failedGenerations []shared.RuntimeGenerationProof
+	var totalContainers int
+	var leaseCount int
+	publishErr := func() error {
+		publication := b.beginRecoveryProjectionPublication()
+		defer publication.Release()
+
+		deferLease := func(leaseUUID, reason string) {
+			publicationDeferred[leaseUUID] = struct{}{}
+			if current := b.provisions[leaseUUID]; current != nil {
+				final[leaseUUID] = current
+			} else {
+				delete(final, leaseUUID)
+			}
+			delete(durableAllocsByLease, leaseUUID)
+			delete(cohortIssues, leaseUUID)
+			delete(firstExitedByLease, leaseUUID)
+			b.logger.Debug("deferring stale recovery product",
+				"lease_uuid", leaseUUID, "reason", reason)
 		}
-		if prov, ok := final[uuid]; ok {
-			switch prov.Status {
-			case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+
+		// A command may durably enter the write-ahead window while the candidate
+		// was being assembled, even if it has not yet acquired provisionsMu to
+		// publish its volatile generation. Re-read both operation and maintenance
+		// journals inside the final actor/projection gate and preserve those leases.
+		latestPending, _, latestGenerations, err := b.listRecoveryPendingIntents(closeIntents)
+		if err != nil {
+			return fmt.Errorf("re-read pending operations before state publication: %w", err)
+		}
+		for leaseUUID := range changedRecoveryIntentGenerations(intentGenerations, latestGenerations) {
+			deferLease(leaseUUID, "durable operation generation changed during publication hand-off")
+		}
+		pendingIntentLeases = latestPending
+		intentGenerations = latestGenerations
+
+		// Revalidate the exact map generation after the unlocked hand-off. Pointer
+		// identity catches replacements; the deep snapshot catches intentional
+		// in-place actor/worker mutations. Never publish inventory derived from the
+		// older value.
+		changedDuringHandoff := b.changedProvisionRecoveryLeases(publicationBaseline)
+		for leaseUUID, reason := range changedDuringHandoff {
+			deferLease(leaseUUID, reason+" during publication hand-off")
+			prior, existedBefore := publicationBaseline[leaseUUID]
+			current, existsNow := b.provisions[leaseUUID]
+			if existedBefore != existsNow || (existsNow && current != prior.pointer) {
+				// A pointer-generation crossing makes registry provenance ambiguous.
+				// Retire an idle actor so the next route initializes from current;
+				// an active actor remains fenced by the deferral and is retried later.
+				publication.ClaimReplacement(leaseUUID)
+			}
+		}
+
+		// Fence every actual pointer replacement/removal. Also retire idle orphan
+		// actors for absent->absent leases; otherwise a Ready FSM can outlive its
+		// dropped projection and reject all future provisions for that UUID.
+		keys := make(map[string]struct{}, len(final)+len(b.provisions))
+		for leaseUUID := range final {
+			keys[leaseUUID] = struct{}{}
+		}
+		for leaseUUID := range b.provisions {
+			keys[leaseUUID] = struct{}{}
+		}
+		for _, leaseUUID := range publication.ActorLeaseUUIDs() {
+			keys[leaseUUID] = struct{}{}
+		}
+		for leaseUUID := range keys {
+			current, currentExists := b.provisions[leaseUUID]
+			candidate, candidateExists := final[leaseUUID]
+			switch {
+			case !currentExists && !candidateExists:
+				if !publication.ClaimOrphanActor(leaseUUID) {
+					deferLease(leaseUUID, "actor is active without a projection")
+				}
+			case currentExists != candidateExists || current != candidate:
+				if !publication.ClaimReplacement(leaseUUID) {
+					deferLease(leaseUUID, "actor still owns the current projection")
+				}
+			}
+		}
+
+		// Complete durable cohorts always enter the rebuild, including on a cold
+		// start where no prior pool reservation exists. Container-derived prefixes
+		// are deliberately not admissible accounting authority: an existing owner is
+		// preserved by ResetConservatively, while a cold-start container must first
+		// acquire an exact Release/v0.13 adoption before it can affect admission.
+		var allocations []shared.ResourceAllocation
+		for _, cohort := range durableAllocsByLease {
+			allocations = append(allocations, cohort.allocations...)
+		}
+
+		// Recovery absence is not terminal evidence. Preserve any existing owner
+		// omitted by inventory so a missing classification can leak capacity but
+		// can never expose phantom capacity. Exact close/rollback paths own Release.
+		if err := b.pool.ResetConservatively(allocations); err != nil {
+			return fmt.Errorf("rebuild recovered resource pool: %w", err)
+		}
+
+		// Pool and actor authority are now secured. Retire every superseded idle
+		// actor before publishing its replacement, then expose the matching map.
+		// Release opens routing only after both changes are visible.
+		publication.RetireClaimedActors()
+		b.provisions = final
+
+		cohortTransitionGenerations = make([]shared.RuntimeGenerationProof, 0, len(cohortTransitionLeases))
+		for _, leaseUUID := range cohortTransitionLeases {
+			if _, deferred := publicationDeferred[leaseUUID]; deferred {
 				continue
 			}
-		}
-		allocations = append(allocations, allocs...)
-	}
-	// Pool-authoritative preservation: the ResourcePool is the source of truth for
-	// a tracked lease's reserved footprint. Preserve the reservation of EVERY lease
-	// still tracked in b.provisions (`final`). ResetPreserving can only retain a key
-	// that physically exists in the live pool, so this keeps exactly the
-	// reservations really held and drops orphan keys of untracked leases. This one
-	// rule subsumes the former per-status allowlist (Provisioning/Restarting/
-	// Updating/Deprovisioning + Failed[VolumeCleanupAttempts>0]; ENG-546/562/563)
-	// AND additionally keeps the still-held key of a Ready→crash→GC'd Failed lease,
-	// a restore-rollback re-quarantine failure, and a deprovision partial-removal
-	// failure — all Failed/VCA==0 leases whose bytes are still on disk that the
-	// allowlist dropped (ENG-567).
-	//
-	// INVARIANT this relies on (test-locked): every path that frees a lease's bytes
-	// also Releases its pool key, or Deletes the lease from b.provisions (which
-	// drops it from `final`). Release sites are small and greppable: deprovision.go
-	// releaseLive, provision.go failure defer + re-provision cleanup, restore.go
-	// releaseAll. A genuinely-failed provision releases its key on the doProvision
-	// failure path, so it has nothing to preserve.
-	//
-	// Race-freedom (unchanged from ENG-546): this runs while provisionsMu is held;
-	// every reservation site (Provision, Restore) registers its provision entry
-	// under provisionsMu BEFORE it reserves in the pool, so any reservation present
-	// here is already in `final`, and a not-yet-registered Provision is blocked on
-	// provisionsMu until we release.
-	trackedUUIDs := make([]string, 0, len(final))
-	for uuid := range final {
-		trackedUUIDs = append(trackedUUIDs, uuid)
-	}
-	// A pre-acceptance restore can deliberately remove its volatile Provisioning
-	// marker while re-quarantine/finalizer cleanup remains pending. If durable
-	// failure settlement itself failed, the operation intent still names the
-	// exact destination whose live pool reservation must survive this refresh.
-	// Once the intent settles, the retention row's DestinationItems/Profiles is
-	// sufficient to reconstruct the exact allocation without manufacturing a
-	// Restart-admissible Failed projection.
-	for uuid := range pendingIntentLeases {
-		if _, alreadyTracked := final[uuid]; !alreadyTracked {
-			trackedUUIDs = append(trackedUUIDs, uuid)
-		}
-	}
-	if err := b.pool.ResetPreserving(allocations, func(key string) bool {
-		// Allocation keys are {leaseUUID}-{service}-{index}. leaseUUID is not
-		// canonicalized at ingress (IsValidUUID = uuid.Parse, config.go; accepts
-		// hyphenless / urn:uuid: / braced / uppercase forms and keeps the original
-		// string verbatim into the key, provision.go). The match is still
-		// collision-free: no distinct valid-UUID string is a proper prefix of
-		// another, and the trailing "-" delimiter guards the token boundary.
-		for _, uuid := range trackedUUIDs {
-			if strings.HasPrefix(key, uuid+"-") {
-				return true
+			if proof, ok := runtimeGenerationProofs[leaseUUID]; ok {
+				cohortTransitionGenerations = append(cohortTransitionGenerations, proof)
 			}
 		}
-		return false
-	}); err != nil {
-		b.provisionsMu.Unlock()
-		return fmt.Errorf("rebuild recovered resource pool: %w", err)
-	}
-	// Publish the provision map only after the pool accepted its matching
-	// accounting snapshot. On error both authorities retain their previous
-	// values, so recovery cannot expose a half-published generation.
-	b.provisions = final
+		failedGenerations = make([]shared.RuntimeGenerationProof, 0, len(failedLeases))
+		for _, leaseUUID := range failedLeases {
+			if _, deferred := publicationDeferred[leaseUUID]; deferred {
+				continue
+			}
+			if proof, ok := runtimeGenerationProofs[leaseUUID]; ok {
+				failedGenerations = append(failedGenerations, proof)
+			}
+		}
 
-	// Snapshot aggregate stats from the recovered map before releasing the lock.
-	// After unlock, `final` aliases `b.provisions` and concurrent goroutines
-	// may modify both the map and the pointed-to provision structs.
-	var readyCount float64
-	totalContainers := 0
-	leaseCount := len(final)
-	activeTenants := make(map[string]bool, len(final))
-	for _, p := range final {
-		if p.Status == backend.ProvisionStatusReady {
-			readyCount++
+		var readyCount float64
+		totalContainers = 0
+		leaseCount = len(final)
+		for _, p := range final {
+			if p.Status == backend.ProvisionStatusReady {
+				readyCount++
+			}
+			totalContainers += len(p.ContainerIDs)
 		}
-		totalContainers += len(p.ContainerIDs)
-		if p.Tenant != "" {
-			activeTenants[p.Tenant] = true
-		}
+		// Publish the gauge before releasing provisionsMu. A live transition
+		// therefore applies its delta strictly after this recovered baseline.
+		activeProvisions.Set(readyCount)
+		return nil
+	}()
+	if publishErr != nil {
+		return publishErr
 	}
-	// Publish the gauge while the recovered provision snapshot is still locked.
-	// A live transition that waits on provisionsMu will update its own Inc/Dec
-	// only after this baseline is visible, rather than being overwritten by a
-	// delayed Set after the publication locks are released.
-	activeProvisions.Set(readyCount)
-	b.provisionsMu.Unlock()
 	b.recoverySnapshotMu.Unlock()
 	recoverySnapshotLocked = false
+	// Closed UUIDs were already excluded from the just-published snapshot by the
+	// batch lookup over its inventory. Perform destructive cleanup only after
+	// releasing the snapshot gate: a slow Docker remove must not block unrelated
+	// close admission/settlement. The fresh strict inventory catches a Create
+	// that appeared after the publication read; a still-later Create is excluded
+	// and removed by the next level-triggered sweep.
+	if _, err := b.recoverClosedLeaseSubstrate(ctx); err != nil {
+		return err
+	}
 
 	updateResourceMetrics(b.pool.Stats())
 	b.refreshRetentionAccounting()
@@ -1880,13 +1956,13 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	for _, leaseUUID := range slices.Sorted(maps.Keys(closeIntents)) {
 		closeErr := b.resumeRecoveredClose(ctx, closeIntents[leaseUUID])
 		if closeErr != nil {
-			cleanupAttempts := closeIntents[leaseUUID].CleanupAttempts()
-			if current, found, readErr := b.callbackStore.GetCloseIntent(leaseUUID); readErr == nil && found {
-				cleanupAttempts = current.CleanupAttempts()
+			executionGeneration := closeIntents[leaseUUID].ExecutionGeneration().Number()
+			if current, found, readErr := b.closeSettlement.GetCloseIntent(leaseUUID); readErr == nil && found {
+				executionGeneration = current.ExecutionGeneration().Number()
 			}
 			b.logger.Error("durable close recovery remains pending",
 				"lease_uuid", leaseUUID,
-				"cleanup_attempts", cleanupAttempts,
+				"execution_generation", executionGeneration,
 				"error", closeErr,
 			)
 			continue
@@ -1897,17 +1973,21 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// Existing actors retain their own serialized SM state across periodic
 	// recovery. Drive a typed Ready→Failed transition and wait for its reply so
 	// the in-memory map, state machine, and lifecycle callback cannot diverge.
-	slices.Sort(cohortTransitionLeases)
-	for _, leaseUUID := range cohortTransitionLeases {
-		reply := make(chan error, 1)
-		if err := b.routeToLeaseBlocking(ctx, leaseUUID, leasesm.CohortDivergedMsg{
-			Ctx:   ctx,
-			Reply: reply,
-		}); err != nil {
-			return fmt.Errorf("route durable cohort divergence for lease %q: %w", leaseUUID, err)
+	slices.SortFunc(cohortTransitionGenerations, func(left, right shared.RuntimeGenerationProof) int {
+		return cmp.Compare(left.LeaseUUID(), right.LeaseUUID())
+	})
+	for _, generation := range cohortTransitionGenerations {
+		observation, reply, observationErr := leasesm.NewCohortDivergedObservation(ctx, generation)
+		if observationErr != nil {
+			return fmt.Errorf("construct cohort divergence for lease %q: %w", generation.LeaseUUID(), observationErr)
 		}
-		if err := b.waitForReply(ctx, reply); err != nil {
-			return fmt.Errorf("apply durable cohort divergence for lease %q: %w", leaseUUID, err)
+		if !b.routeActorObservation(observation) {
+			b.logger.Debug("stale cohort-divergence observation discarded",
+				"lease_uuid", generation.LeaseUUID())
+			continue
+		}
+		if err := b.waitForReply(ctx, reply.Result()); err != nil {
+			return fmt.Errorf("apply durable cohort divergence for lease %q: %w", generation.LeaseUUID(), err)
 		}
 	}
 
@@ -1915,7 +1995,12 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// transitions (failedLeases) are handled by the SM's Failing state,
 	// whose OnEntry action spawns the async diag goroutine — same code
 	// path as a live container-death event.
-	allFailed := append(slices.Clone(coldStartFailed), cohortFailed...)
+	allFailed := make([]string, 0, len(coldStartFailed)+len(cohortFailed))
+	for _, leaseUUID := range append(slices.Clone(coldStartFailed), cohortFailed...) {
+		if _, deferred := publicationDeferred[leaseUUID]; !deferred {
+			allFailed = append(allFailed, leaseUUID)
+		}
+	}
 	// failedDiag carries the gathered diagnostic together with the instance
 	// identity (CreatedAt) captured at snapshot time, so the write loop below
 	// can verify it is still enriching the SAME failed instance the diag was
@@ -1927,6 +2012,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	failedDiagnostics := make(map[string]failedDiag, len(allFailed))
 	diagnosticCtx, cancelDiagnostics := b.recoveryDockerReadContext(ctx)
 	for _, uuid := range coldStartFailed {
+		if _, deferred := publicationDeferred[uuid]; deferred {
+			continue
+		}
 		b.provisionsMu.RLock()
 		prov, ok := b.provisions[uuid]
 		if !ok {
@@ -2013,19 +2101,23 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// terminal Failed callback from Failed.OnEntryFrom(evDiagGathered).
 	// Callback suppression on concurrent Deprovision is handled
 	// structurally by Failing.OnExit.
-	for _, uuid := range failedLeases {
-		containerID, ok := firstExitedByLease[uuid]
+	for _, generation := range failedGenerations {
+		containerID, ok := firstExitedByLease[generation.LeaseUUID()]
 		if !ok {
 			// Shouldn't happen: if we detected a Ready→Failed transition,
 			// some container for this lease was observed as exited.
 			b.logger.Warn("ready→failed transition detected but no exited container",
-				"lease_uuid", uuid)
+				"lease_uuid", generation.LeaseUUID())
 			continue
 		}
-		if !b.routeToLease(uuid, leasesm.ContainerDiedMsg{ContainerID: containerID}) {
+		observation, observationErr := leasesm.NewContainerDiedObservation(containerID, generation)
+		if observationErr != nil {
+			return fmt.Errorf("construct container death observation: %w", observationErr)
+		}
+		if !b.routeActorObservation(observation) {
 			dieEventDroppedTotal.WithLabelValues("reconcile").Inc()
 			b.logger.Warn("die event dropped during reconcile dispatch; reconciler will re-detect",
-				"lease_uuid", uuid, "container_id", leasesm.ShortID(containerID))
+				"lease_uuid", generation.LeaseUUID(), "container_id", leasesm.ShortID(containerID))
 		}
 	}
 
@@ -2043,193 +2135,23 @@ func (b *Backend) recoverState(ctx context.Context) error {
 
 	// Clean up orphaned tenant networks if network isolation is enabled
 	if b.cfg.IsNetworkIsolation() {
-		b.cleanupOrphanedNetworks(ctx, activeTenants)
-	}
-
-	// A restart may interrupt the grace cleanup after removing only part of a
-	// legacy cohort. Resume removal only after this sweep has validated the live
-	// stack against the exact durable release, and never while a write-ahead
-	// operation owns the generation transition.
-	for _, leaseUUID := range slices.Sorted(maps.Keys(committedPrevRemnants)) {
-		if _, pending := pendingIntentLeases[leaseUUID]; pending {
-			b.logger.Info("retaining migration rollback remnants while an operation is pending",
-				"lease_uuid", leaseUUID,
-			)
-			continue
-		}
-		if _, diverged := cohortIssues[leaseUUID]; diverged {
-			continue
-		}
-		cohort := committedPrevRemnants[leaseUUID]
-		targets := make([]legacyRollbackCleanupTarget, 0, len(cohort.remnants))
-		for _, remnant := range cohort.remnants {
-			targets = append(targets, legacyRollbackCleanupTarget{
-				ContainerID: remnant.ContainerID,
-				Name:        remnant.Name,
-			})
-		}
-		b.scheduleLegacyPrevCleanup(targets, b.logger.With("lease_uuid", leaseUUID))
+		b.cleanupOrphanedNetworks(ctx)
 	}
 
 	return nil
 }
 
-// cleanupOrphanedVolumes destroys volumes on disk that have no matching provision.
-// This catches volumes leaked by crashes between volume creation and container creation,
-// or between container removal and volume destruction. Called once at startup after
-// recoverState populates the provision map.
-// activeReleaseClaimsVolume reports whether the exact canonical name appears in
-// its lease's active release. The name-level check matters after a failed
-// re-provision: the predecessor Release must keep its reusable volumes, but it
-// must not shield fresh candidate-only volumes merely because they share a lease
-// UUID. A legacy active release without item authority remains fail-safe and
-// protects the whole lease namespace until migration supplies exact items.
-func (b *Backend) activeReleaseClaimsVolume(volumeID string) (bool, error) {
-	if b.releaseStore == nil {
-		return false, nil
+// cleanupOrphanedNetworksUsing removes managed networks whose tenant has no
+// active provisions. The inventory only selects candidates: each tenant is
+// revalidated under its network stripe immediately before the guarded remove,
+// so a concurrent provision cannot lose the network it is about to use.
+func (b *Backend) cleanupOrphanedNetworksUsing(
+	ctx context.Context,
+	removeNetwork backgroundTenantNetworkRemove,
+) {
+	if removeNetwork == nil {
+		return
 	}
-	leaseUUID, ok := leaseUUIDFromVolumeName(volumeID)
-	if !ok {
-		return false, nil
-	}
-	rel, err := b.releaseStore.LatestActive(leaseUUID)
-	if err != nil {
-		// Fail safe: a transient release-store read error must NOT let the reaper
-		// destroy a volume that may have an active release. Surface the failure so
-		// startup cannot report readiness with an unclassified quota footprint.
-		b.logger.Warn("cleanupOrphanedVolumes: release-store read failed; keeping volume (fail-safe)", "volume_id", volumeID, "error", err)
-		return false, fmt.Errorf("read active release for orphan candidate %q: %w", volumeID, err)
-	}
-	if rel == nil {
-		return false, nil
-	}
-	if len(rel.Items) == 0 {
-		return true, nil
-	}
-	for _, item := range rel.Items {
-		for index := range item.Quantity {
-			if canonicalVolumeName(leaseUUID, item.ServiceName, index) == volumeID {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
-func (b *Backend) cleanupOrphanedVolumes(ctx context.Context) error {
-	volumeIDs, err := b.volumes.List()
-	if err != nil {
-		return fmt.Errorf("list volumes: %w", err)
-	}
-	if len(volumeIDs) == 0 {
-		return nil
-	}
-
-	// An orphan is a volume NOTHING claims — that is the whole definition, and the
-	// owner table (volume_destroy.go) is what answers it. This function used to build
-	// its own parallel version of that table: live-provision canonicals plus, for every
-	// retention record, the canonicals its renames may have left behind. Both halves
-	// are now in one place, which matters because the second half was written months
-	// after the close path's copy and the two had to agree forever (ENG-658).
-	//
-	// The protection it encoded is unchanged and still load-bearing: reconcileRetentions
-	// runs immediately before this in Start and re-quarantines crash-stranded canonical
-	// volumes back into the fred-retained- namespace, but a rename that FAILED (a real
-	// error, not a benign no-op) leaves the volume canonical-named and in no live
-	// provision — so an unclaimed-means-destroy loop would reap it. The table claims it,
-	// via the record, exactly as the expected set did.
-	//
-	// Resolve up front rather than per volume: a store read error must skip the whole
-	// run (we cannot tell a leak from a retained canonical we failed to protect), and
-	// this way the run costs one read no matter how many volumes are on disk.
-	//
-	// Unlike the retention sweep, this sweep is NOT exposed to a concurrent claim
-	// (checked for ENG-681): cmd/docker-backend builds and binds the HTTP server that
-	// serves /provision only after Start returns, and Start runs this before it launches
-	// the retention reaper, the reconcile loop and the event loop — so no goroutine that
-	// could publish a provision is running yet. It is covered by the choke point's
-	// destroy-time re-check anyway, at the cost of an uncontended mutex per orphan;
-	// depending on that ordering rather than on the lock would be depending on it
-	// forever.
-	op := b.volumeOp("", b.logger)
-	table, err := op.claims()
-	if err != nil {
-		// Count it, and at the same per-volume granularity every other site uses: this
-		// is the documented ticketing signal, and the sweep bails before reaching
-		// op.destroy, so nothing else would report it. The count is the volumes whose
-		// fate this run could not decide — every non-retained name on disk.
-		undecided := 0
-		for _, id := range volumeIDs {
-			if !isRetainedVolume(id) {
-				undecided++
-			}
-		}
-		volumeDestroyRefusedTotal.WithLabelValues(destroySiteOrphanGC, destroyRefusedUnreadable).Add(float64(undecided))
-		b.logger.Error("cleanupOrphanedVolumes: ownership unresolvable; skipping orphan destruction this run (fail-safe)",
-			"undecided_volumes", undecided, "error", err)
-		return fmt.Errorf("resolve orphan volume ownership: %w", err)
-	}
-
-	candidates := make([]string, 0, len(volumeIDs))
-	for _, id := range volumeIDs {
-		if isRetainedVolume(id) {
-			// A name property, not a claim: the retained namespace is where a closed
-			// lease's data deliberately lives, and the retention sweep owns reaping it.
-			continue
-		}
-		if _, unclaimed := table.mayDestroy(id, ""); !unclaimed {
-			// Claimed by a live provision or a retention record — i.e. every healthy
-			// lease's volume, on every boot. Filtered QUIETLY and before the release
-			// probe: this is the ordinary case, not a refusal, and neither a log line,
-			// a counter, nor a release-store read per live volume is warranted. That is
-			// why this site emits no reason="claimed" series; the docs say so rather
-			// than implying otherwise. The destroy below re-checks against the same
-			// table regardless, so the guard does not depend on this filter being
-			// right — only the noise does.
-			continue
-		}
-		hasActiveRelease, releaseErr := b.activeReleaseClaimsVolume(id)
-		if releaseErr != nil {
-			return releaseErr
-		}
-		if hasActiveRelease {
-			// A successfully-provisioned lease keeps an active release until it is
-			// cleanly deprovisioned, so a volume whose lease still has one is not a
-			// create-crash leak — its containers were merely removed out-of-band
-			// (e.g. an operator `docker prune`). Reaping it would silently destroy
-			// retained tenant data (ENG-505). Over-keeping a stale volume is the safe
-			// direction here; a genuine leak has no release.
-			//
-			// Deliberately NOT folded into the owner table: this is a per-name RELEASE
-			// -store read, not a claim, and a record's absence there is meaningful. Fold
-			// it in and a give-up tombstone whose purgeReleaseHistory failed would become
-			// permanently unreapable instead of self-healing.
-			b.logger.Warn("cleanupOrphanedVolumes: active release still claims volume; not reaping it", "volume_id", id)
-			continue
-		}
-		candidates = append(candidates, id)
-	}
-
-	rep := op.destroy(ctx, destroySiteOrphanGC, candidates...)
-	for _, id := range rep.Destroyed {
-		b.logger.Info("destroyed orphaned volume", "volume_id", id)
-	}
-	if len(rep.Destroyed) > 0 || len(rep.Errs) > 0 || rep.refused() > 0 {
-		b.logger.Info("orphaned volume cleanup complete",
-			"destroyed", len(rep.Destroyed), "failed", len(rep.Errs), "claimed", len(rep.Claimed))
-	}
-	if err := rep.err(); err != nil {
-		return fmt.Errorf("destroy orphaned volumes: %w", err)
-	}
-	return nil
-}
-
-// cleanupOrphanedNetworks removes managed networks whose tenant has no active provisions.
-// activeTenants is a cheap precheck to skip tenants obviously still in use;
-// releaseTenantNetwork re-validates against a live b.provisions scan under
-// the per-tenant mutex, so this path is safe against a Provision() arriving
-// concurrently with reconcile.
-func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map[string]bool) {
 	phaseCtx, cancelPhase := b.recoveryDockerReadContext(ctx)
 	defer cancelPhase()
 	networks, err := b.docker.ListManagedNetworks(phaseCtx)
@@ -2244,8 +2166,8 @@ func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map
 			return
 		}
 		tenant := n.Labels[LabelTenant]
-		if tenant != "" && !activeTenants[tenant] && len(n.Containers) == 0 {
-			err := b.releaseTenantNetwork(phaseCtx, tenant)
+		if tenant != "" && len(n.Containers) == 0 {
+			err := b.removeOrphanedTenantNetworkUsing(phaseCtx, tenant, removeNetwork)
 			if err != nil {
 				b.logger.Warn("failed to remove orphaned network", "network", n.Name, "error", err)
 			} else {
@@ -2257,6 +2179,12 @@ func (b *Backend) cleanupOrphanedNetworks(ctx context.Context, activeTenants map
 
 // reconcileLoop periodically reconciles the in-memory state with Docker.
 // Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
+const periodicReconcileTimeout = 30 * time.Second
+
+func (b *Backend) periodicReconcileContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(b.stopCtx, periodicReconcileTimeout)
+}
+
 func (b *Backend) reconcileLoop() {
 	ticker := time.NewTicker(b.cfg.ReconcileInterval)
 	defer ticker.Stop()
@@ -2267,9 +2195,9 @@ func (b *Backend) reconcileLoop() {
 			return
 		case <-ticker.C:
 			func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				ctx, cancel := b.periodicReconcileContext()
 				defer cancel()
-				if err := b.recoverState(ctx); err != nil {
+				if err := b.reconcileStateAndOperations(ctx); err != nil {
 					b.logger.Error("reconciliation failed", "error", err)
 					reconciliationTotal.WithLabelValues("error").Inc()
 				} else {
@@ -2279,6 +2207,22 @@ func (b *Backend) reconcileLoop() {
 			}()
 		}
 	}
+}
+
+// reconcileStateAndOperations is the level-triggered convergence unit for the
+// periodic loop. State projection runs first because operation classification
+// may need the recovered reservation/projection. Pending operation intents run
+// on every cadence, not only at process startup: if the actor committed its
+// Release but the intent -> callback transaction transiently failed, the
+// durable sealed claim remains sufficient to retry exact settlement here.
+func (b *Backend) reconcileStateAndOperations(ctx context.Context) error {
+	if err := b.recoverState(ctx); err != nil {
+		return err
+	}
+	if err := b.recoverLiveOperationIntents(ctx); err != nil {
+		return fmt.Errorf("recover interrupted operations: %w", err)
+	}
+	return nil
 }
 
 // containerEventLoop subscribes to Docker container "die" events and triggers
@@ -2313,7 +2257,23 @@ func (b *Backend) containerEventLoop() {
 						return
 					}
 					if leaseUUID, found := b.findLeaseByContainerID(event.ContainerID); found {
-						if !b.routeToLease(leaseUUID, leasesm.ContainerDiedMsg{ContainerID: event.ContainerID}) {
+						if b.releaseStore == nil {
+							b.logger.Error("container event ignored without durable release authority",
+								"lease_uuid", leaseUUID)
+							continue
+						}
+						generation, generationErr := b.releaseStore.ProveRuntimeGeneration(leaseUUID)
+						if generationErr != nil {
+							b.logger.Warn("container event ignored without current runtime generation",
+								"lease_uuid", leaseUUID, "error", generationErr)
+							continue
+						}
+						observation, observationErr := leasesm.NewContainerDiedObservation(event.ContainerID, generation)
+						if observationErr != nil {
+							b.logger.Error("invalid container event ignored", "error", observationErr)
+							continue
+						}
+						if !b.routeActorObservation(observation) {
 							dieEventDroppedTotal.WithLabelValues("event_loop").Inc()
 							b.logger.Warn("die event dropped at event loop dispatch; reconciler will re-detect",
 								"lease_uuid", leaseUUID, "container_id", leasesm.ShortID(event.ContainerID))
@@ -2349,12 +2309,17 @@ func (b *Backend) findLeaseByContainerID(containerID string) (string, bool) {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
 
+	leaseUUID := ""
 	for uuid, prov := range b.provisions {
 		for _, cid := range prov.ContainerIDs {
 			if cid == containerID {
-				return uuid, true
+				if leaseUUID != "" && leaseUUID != uuid {
+					// A duplicate substrate identity has no unique actor owner.
+					return "", false
+				}
+				leaseUUID = uuid
 			}
 		}
 	}
-	return "", false
+	return leaseUUID, leaseUUID != ""
 }

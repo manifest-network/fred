@@ -712,7 +712,6 @@ func (s *Server) handleDeprovision(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	if err := s.backend.Deprovision(r.Context(), req.LeaseUUID); err != nil {
 		s.errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -730,6 +729,10 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateMutatingLeaseUUID("lease_uuid", req.LeaseUUID); err != nil {
 		s.errorResponse(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !req.MaintenanceID.Valid() {
+		s.errorResponse(w, http.StatusBadRequest, "maintenance_id must be a canonical UUIDv4")
 		return
 	}
 	if req.CallbackURL == "" {
@@ -752,6 +755,12 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrValidation) {
 			s.validationErrorResponse(w, err)
+			return
+		}
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.logger.Error("restart failed", "lease_uuid", req.LeaseUUID, "error", err)
@@ -905,6 +914,10 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		s.errorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if !req.MaintenanceID.Valid() {
+		s.errorResponse(w, http.StatusBadRequest, "maintenance_id must be a canonical UUIDv4")
+		return
+	}
 	if req.CallbackURL == "" {
 		s.errorResponse(w, http.StatusBadRequest, "callback_url is required")
 		return
@@ -930,6 +943,12 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, backend.ErrValidation) {
 			s.validationErrorResponse(w, err)
+			return
+		}
+		if errors.Is(err, backend.ErrInsufficientResources) {
+			s.errorResponseWithCode(
+				w, http.StatusServiceUnavailable, err.Error(), backend.CodeInsufficientResources,
+			)
 			return
 		}
 		s.logger.Error("update failed", "lease_uuid", req.LeaseUUID, "error", err)

@@ -55,15 +55,16 @@ type provision struct {
 	// the same lock as the Status=Failed mutation. Map-path and
 	// diagnostics-fallback wire returns from GetProvision agree on
 	// fail_count (BACKEND_GUIDE documents fail_count as a wire field).
-	FailCount int
-	CreatedAt time.Time
+	FailCount        int
+	CreatedAt        time.Time
+	operationFailure shared.OperationExecutionFailure
 
 	// ctx / cancel form the per-lease cancellable lifecycle wired in
 	// ENG-189. Provision creates the pair as a child of b.stopCtx and
 	// stores both here; Deprovision calls cancel() inside provisionsMu
 	// before deleting the map entry; runStubProvisioner captures ctx
 	// under the lock and checks ctx.Err() before each external write
-	// (diagnosticsStore.Store, callbackSender.SendOperationCallback) so a
+	// (diagnosticsStore.Store, callbackPublisher.PublishOperationFailure) so a
 	// concurrent Deprovision that wins the lock between the worker's
 	// unlock and its post-unlock store touches still aborts the writes
 	// for a torn-down lease. Mirrors docker-backend's leasesm.OnExit
@@ -102,13 +103,15 @@ type Backend struct {
 	provisions   map[string]*provision
 	provisionsMu sync.RWMutex
 
-	callbackStore    *shared.CallbackStore
-	operationIntents operationIntentJournal
-	commandFence     shared.CommandFence
-	diagnosticsStore *shared.DiagnosticsStore
-	releaseStore     *shared.ReleaseStore
+	callbackStore       *shared.CallbackStore
+	commandFence        shared.CommandFence
+	diagnosticsStore    *shared.DiagnosticsStore
+	releaseStore        *shared.ReleaseStore
+	operationSettlement operationSettlementService
+	recoveryCoordinator *shared.RecoveryCoordinator
 
-	callbackSender *shared.CallbackSender
+	callbackPublisher *shared.CallbackPublisher
+	callbackSender    *shared.CallbackSender
 
 	// stopCtx is canceled on shutdown; stopCancel triggers it. Canceling
 	// aborts in-flight callback retries (see shared.CallbackSender).
@@ -204,6 +207,23 @@ func (verifier productionK3sStorageIdentityVerifier) StorageIdentity() backendid
 
 func (verifier productionK3sStorageIdentityVerifier) Verify(ctx context.Context) error {
 	return verifier.backend.verifyStorageIdentity(ctx, verifier.authority)
+}
+
+type k3sCallbackStorageVerifier struct {
+	verifier k3sStorageIdentityVerifier
+	gate     *backendidentity.StorageAuthorityGate
+}
+
+func (verifier k3sCallbackStorageVerifier) StorageIdentity() backendidentity.ID {
+	return verifier.verifier.StorageIdentity()
+}
+
+func (verifier k3sCallbackStorageVerifier) StorageAuthorityGate() *backendidentity.StorageAuthorityGate {
+	return verifier.gate
+}
+
+func (verifier k3sCallbackStorageVerifier) Verify(ctx context.Context) error {
+	return verifier.verifier.Verify(ctx)
 }
 
 type existingK3sStorageIdentity struct{}
@@ -614,34 +634,83 @@ func newBackend(
 		_ = diagStore.Close()
 		return nil, fmt.Errorf("failed to open release store: %w", err)
 	}
+	operationSettlement, err := shared.NewOperationSettlement(cbStore, releaseStore)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("bind operation journals: %w", err)
+	}
+	maintenanceSettlement, err := shared.NewMaintenanceSettlement(cbStore, releaseStore)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("bind maintenance journals: %w", err)
+	}
 
 	b := &Backend{
-		cfg:                cfg,
-		logger:             logger.With("backend", cfg.Name),
-		pool:               pool,
-		provisions:         make(map[string]*provision),
-		callbackStore:      cbStore,
-		operationIntents:   cbStore,
-		diagnosticsStore:   diagStore,
-		releaseStore:       releaseStore,
-		storageIdentity:    storage.ID(),
-		storageAuthority:   storage,
-		storeAuthorityGate: storeAuthorityGate,
-		stopCtx:            stopCtx,
-		stopCancel:         stopCancel,
+		cfg:                 cfg,
+		logger:              logger.With("backend", cfg.Name),
+		pool:                pool,
+		provisions:          make(map[string]*provision),
+		callbackStore:       cbStore,
+		diagnosticsStore:    diagStore,
+		releaseStore:        releaseStore,
+		operationSettlement: operationSettlement,
+		storageIdentity:     storage.ID(),
+		storageAuthority:    storage,
+		storeAuthorityGate:  storeAuthorityGate,
+		stopCtx:             stopCtx,
+		stopCancel:          stopCancel,
 	}
 
 	b.storageVerifier = productionK3sStorageIdentityVerifier{backend: b, authority: storage}
+	if err := bindK3sStubOperationExecutor(b, operationSettlement); err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("bind K3s operation substrate authority: %w", err)
+	}
+	b.recoveryCoordinator, err = shared.NewRecoveryCoordinator(shared.RecoveryCoordinatorConfig{
+		Operations: operationSettlement, Maintenance: maintenanceSettlement,
+		ExcludeLease: func(ctx context.Context, leaseUUID string, run func() error) (bool, error) {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			unlock, acquired := b.commandFence.TryLock(leaseUUID)
+			if !acquired {
+				return false, nil
+			}
+			defer unlock()
+			return true, run()
+		},
+	})
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("bind K3s recovery authority: %w", err)
+	}
+	callbackStorageAttestor, err := shared.NewCallbackStorageAttestor(
+		cbStore,
+		k3sCallbackStorageVerifier{verifier: b.storageVerifier, gate: b.storeAuthorityGate},
+		b.stopCtx,
+	)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("bind callback storage attestor: %w", err)
+	}
 
 	callbackSender, err := shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:           cbStore,
+		StorageAttestor: callbackStorageAttestor,
 		HTTPClient:      httpClient,
 		Secret:          string(cfg.CallbackSecret),
 		Logger:          b.logger,
-		StopCtx:         b.stopCtx,
-		BeforeReplay:    b.VerifyStorageIdentity,
-		BeforeDelivery:  b.VerifyStorageIdentity,
-		StorageIdentity: storage.ID(),
+
 		OnDelivery: func(outcome string) {
 			callbackDeliveryTotal.WithLabelValues(outcome).Inc()
 		},
@@ -659,6 +728,22 @@ func newBackend(
 		return nil, fmt.Errorf("configure durable callback sender: %w", err)
 	}
 	b.callbackSender = callbackSender
+	callbackPublisher, err := shared.NewCallbackPublisher(shared.CallbackPublisherConfig{
+		OperationSettlement:   operationSettlement,
+		MaintenanceSettlement: maintenanceSettlement,
+		StorageAttestor:       callbackStorageAttestor,
+		Logger:                b.logger,
+		OnStoreError: func() {
+			callbackStoreErrorsTotal.Inc()
+		},
+	})
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		return nil, fmt.Errorf("configure callback publisher: %w", err)
+	}
+	b.callbackPublisher = callbackPublisher
 
 	constructionComplete = true
 	return b, nil
@@ -677,7 +762,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	if err := b.VerifyStorageIdentity(ctx); err != nil {
 		return err
 	}
-	if err := b.recoverOperationIntents(); err != nil {
+	if err := b.recoverOperationIntents(ctx); err != nil {
 		callbackStoreErrorsTotal.Inc()
 		return fmt.Errorf("recover interrupted operations: %w", err)
 	}

@@ -17,15 +17,37 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 )
 
+func TestProvisionReleaseJSONOmitsZeroMaintenanceID(t *testing.T) {
+	encoded, err := json.Marshal(Release{
+		Version: 1, Manifest: []byte(`{"services":{}}`), Image: "stack",
+		Status: "active", CreatedAt: time.Now(),
+	})
+	require.NoError(t, err)
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(encoded, &fields))
+	assert.NotContains(t, fields, "maintenance_id",
+		"ordinary provision/restore releases must keep the optional typed ID absent")
+	assert.NotContains(t, fields, "operation_id",
+		"legacy releases must keep the optional typed ID absent")
+
+	maintenanceID := newTestMaintenanceID(t)
+	operationID := mustSharedOperationID("550e8400-e29b-41d4-a716-446655440000")
+	encoded, err = json.Marshal(Release{MaintenanceID: maintenanceID, OperationID: operationID})
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(encoded, &fields))
+	assert.JSONEq(t, `"`+maintenanceID.String()+`"`, string(fields["maintenance_id"]))
+	assert.JSONEq(t, `"`+operationID.String()+`"`, string(fields["operation_id"]))
+}
+
 func TestReleaseStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_releases.db")
 
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	t.Run("append and list", func(t *testing.T) {
-		err := store.Append("lease-1", Release{
+		err := store.append("lease-1", Release{
 			Manifest:  []byte(`{"image":"nginx:1.0"}`),
 			Image:     "nginx:1.0",
 			Status:    "active",
@@ -42,7 +64,7 @@ func TestReleaseStore(t *testing.T) {
 	})
 
 	t.Run("append auto-increments version", func(t *testing.T) {
-		err := store.Append("lease-1", Release{
+		err := store.append("lease-1", Release{
 			Manifest:  []byte(`{"image":"nginx:2.0"}`),
 			Image:     "nginx:2.0",
 			Status:    "deploying",
@@ -78,7 +100,7 @@ func TestReleaseStore(t *testing.T) {
 	})
 
 	t.Run("update latest status", func(t *testing.T) {
-		err := store.UpdateLatestStatus("lease-1", "superseded", "", "")
+		err := store.updateLatestStatus("lease-1", "superseded", "", "")
 		require.NoError(t, err)
 
 		latest, err := store.Latest("lease-1")
@@ -87,7 +109,7 @@ func TestReleaseStore(t *testing.T) {
 	})
 
 	t.Run("update latest status with reason and message", func(t *testing.T) {
-		err := store.Append("lease-1", Release{
+		err := store.append("lease-1", Release{
 			Manifest:  []byte(`{"image":"nginx:3.0"}`),
 			Image:     "nginx:3.0",
 			Status:    "deploying",
@@ -95,7 +117,7 @@ func TestReleaseStore(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		err = store.UpdateLatestStatus("lease-1", "failed", backend.ReasonImagePullFailed, "image pull failed")
+		err = store.updateLatestStatus("lease-1", "failed", backend.ReasonImagePullFailed, "image pull failed")
 		require.NoError(t, err)
 
 		latest, err := store.Latest("lease-1")
@@ -106,12 +128,12 @@ func TestReleaseStore(t *testing.T) {
 	})
 
 	t.Run("update latest on nonexistent is no-op", func(t *testing.T) {
-		err := store.UpdateLatestStatus("nonexistent", "active", "", "")
+		err := store.updateLatestStatus("nonexistent", "active", "", "")
 		require.NoError(t, err)
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		err := store.Delete("lease-1")
+		err := store.delete("lease-1")
 		require.NoError(t, err)
 
 		releases, err := store.List("lease-1")
@@ -120,24 +142,24 @@ func TestReleaseStore(t *testing.T) {
 	})
 
 	t.Run("delete nonexistent is no-op", func(t *testing.T) {
-		err := store.Delete("nonexistent")
+		err := store.delete("nonexistent")
 		require.NoError(t, err)
 	})
 }
 
 func TestUpdateLatestStatus_PersistsReasonMessage(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "reason_message.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
-	require.NoError(t, store.Append("l1", Release{
+	require.NoError(t, store.append("l1", Release{
 		Image:     "nginx:1.0",
 		Status:    "deploying",
 		CreatedAt: time.Now(),
 	}))
 
-	require.NoError(t, store.UpdateLatestStatus("l1", "failed", backend.ReasonUpdateFailed, "update failed"))
+	require.NoError(t, store.updateLatestStatus("l1", "failed", backend.ReasonUpdateFailed, "update failed"))
 
 	rels, err := store.List("l1")
 	require.NoError(t, err)
@@ -151,29 +173,29 @@ func TestUpdateLatestStatus_PersistsReasonMessage(t *testing.T) {
 func TestReleaseStore_ActivateLatest(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "activate_releases.db")
 
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	// Create 3 releases: v1 active, v2 superseded, v3 deploying.
-	require.NoError(t, store.Append("lease-1", Release{
+	require.NoError(t, store.append("lease-1", Release{
 		Image:     "nginx:1.0",
 		Status:    "active",
 		CreatedAt: time.Now(),
 	}))
-	require.NoError(t, store.Append("lease-1", Release{
+	require.NoError(t, store.append("lease-1", Release{
 		Image:     "nginx:2.0",
 		Status:    "superseded",
 		CreatedAt: time.Now(),
 	}))
-	require.NoError(t, store.Append("lease-1", Release{
+	require.NoError(t, store.append("lease-1", Release{
 		Image:     "nginx:3.0",
 		Status:    "deploying",
 		CreatedAt: time.Now(),
 	}))
 
 	// Activate latest: v1,v2 should become superseded, v3 should become active
-	err = store.ActivateLatest("lease-1")
+	err = store.activateLatest("lease-1")
 	require.NoError(t, err)
 
 	releases, err := store.List("lease-1")
@@ -185,18 +207,18 @@ func TestReleaseStore_ActivateLatest(t *testing.T) {
 	assert.Empty(t, releases[2].Error, "v3 should have no error")
 
 	t.Run("nonexistent is no-op", func(t *testing.T) {
-		err := store.ActivateLatest("nonexistent")
+		err := store.activateLatest("nonexistent")
 		require.NoError(t, err)
 	})
 
 	t.Run("single release", func(t *testing.T) {
-		require.NoError(t, store.Append("lease-single", Release{
+		require.NoError(t, store.append("lease-single", Release{
 			Image:     "redis:7",
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}))
 
-		err := store.ActivateLatest("lease-single")
+		err := store.activateLatest("lease-single")
 		require.NoError(t, err)
 
 		releases, err := store.List("lease-single")
@@ -206,24 +228,24 @@ func TestReleaseStore_ActivateLatest(t *testing.T) {
 	})
 
 	t.Run("failed releases stay failed", func(t *testing.T) {
-		require.NoError(t, store.Append("lease-mixed", Release{
+		require.NoError(t, store.append("lease-mixed", Release{
 			Image:     "app:1.0",
 			Status:    "active",
 			CreatedAt: time.Now(),
 		}))
-		require.NoError(t, store.Append("lease-mixed", Release{
+		require.NoError(t, store.append("lease-mixed", Release{
 			Image:     "app:2.0",
 			Status:    "failed",
 			Error:     "crash",
 			CreatedAt: time.Now(),
 		}))
-		require.NoError(t, store.Append("lease-mixed", Release{
+		require.NoError(t, store.append("lease-mixed", Release{
 			Image:     "app:3.0",
 			Status:    "deploying",
 			CreatedAt: time.Now(),
 		}))
 
-		err := store.ActivateLatest("lease-mixed")
+		err := store.activateLatest("lease-mixed")
 		require.NoError(t, err)
 
 		releases, err := store.List("lease-mixed")
@@ -237,18 +259,18 @@ func TestReleaseStore_ActivateLatest(t *testing.T) {
 
 func TestReleaseStore_LatestActive(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "latest_active.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	t.Run("returns active release skipping failed", func(t *testing.T) {
-		require.NoError(t, store.Append("lease-1", Release{
+		require.NoError(t, store.append("lease-1", Release{
 			Image:     "postgres:17",
 			Manifest:  []byte(`{"image":"postgres:17"}`),
 			Status:    "active",
 			CreatedAt: time.Now(),
 		}))
-		require.NoError(t, store.Append("lease-1", Release{
+		require.NoError(t, store.append("lease-1", Release{
 			Image:     "postgres:18",
 			Manifest:  []byte(`{"image":"postgres:18"}`),
 			Status:    "failed",
@@ -263,7 +285,7 @@ func TestReleaseStore_LatestActive(t *testing.T) {
 	})
 
 	t.Run("returns nil when no active release", func(t *testing.T) {
-		require.NoError(t, store.Append("lease-2", Release{
+		require.NoError(t, store.append("lease-2", Release{
 			Image:  "app:1.0",
 			Status: "failed",
 		}))
@@ -280,11 +302,11 @@ func TestReleaseStore_LatestActive(t *testing.T) {
 	})
 
 	t.Run("rejects a second active release without changing the first", func(t *testing.T) {
-		require.NoError(t, store.Append("lease-3", Release{
+		require.NoError(t, store.append("lease-3", Release{
 			Image:  "app:1.0",
 			Status: "active",
 		}))
-		err := store.Append("lease-3", Release{
+		err := store.append("lease-3", Release{
 			Image:  "app:2.0",
 			Status: "active",
 		})
@@ -300,10 +322,10 @@ func TestReleaseStore_LatestActive(t *testing.T) {
 func TestReleaseStore_Persistence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "persist_releases.db")
 
-	store1, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store1, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
-	err = store1.Append("lease-persist", Release{
+	err = store1.append("lease-persist", Release{
 		Manifest:  []byte(`{"image":"redis:7"}`),
 		Image:     "redis:7",
 		Status:    "active",
@@ -312,7 +334,7 @@ func TestReleaseStore_Persistence(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store1.Close())
 
-	store2, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store2, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store2.Close()
 
@@ -323,14 +345,14 @@ func TestReleaseStore_Persistence(t *testing.T) {
 }
 
 func TestReleaseStore_EmptyPath(t *testing.T) {
-	_, err := NewReleaseStore(ReleaseStoreConfig{})
+	_, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{})
 	assert.Error(t, err)
 }
 
 func TestReleaseStore_Healthy(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "healthy_releases.db")
 
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -339,7 +361,7 @@ func TestReleaseStore_Healthy(t *testing.T) {
 }
 
 func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "runtime_streaming_releases.db"),
 	})
 	require.NoError(t, err)
@@ -349,7 +371,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 		"00000000-0000-4000-8000-000000000001",
 		"00000000-0000-4000-8000-000000000002",
 	} {
-		require.NoError(t, store.AppendActive(leaseUUID, Release{
+		require.NoError(t, store.appendActive(leaseUUID, Release{
 			Manifest:  []byte{},
 			Status:    "active",
 			CreatedAt: time.Now(),
@@ -369,7 +391,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 				maxTotalBytes:  1 << 20,
 			})
 			_, inspectErr := inspectReleaseBucketWithObserver(
-				tx, nil, nil, nil, false, budget.observe,
+				tx, nil, nil, nil, false, budget.observe, decodeReleaseHistory,
 			)
 			return inspectErr
 		})
@@ -385,7 +407,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 				maxTotalBytes:  1,
 			})
 			_, inspectErr := inspectReleaseBucketWithObserver(
-				tx, nil, nil, nil, false, budget.observe,
+				tx, nil, nil, nil, false, budget.observe, decodeReleaseHistory,
 			)
 			return inspectErr
 		})
@@ -437,7 +459,7 @@ func TestReleaseProjectionResponseCeilingCoversWorstLegacyExpansion(t *testing.T
 func TestReleaseStore_CloseIdempotent(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "idempotent_releases.db")
 
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	require.NoError(t, store.Close())
@@ -446,25 +468,25 @@ func TestReleaseStore_CloseIdempotent(t *testing.T) {
 
 func TestReleaseStore_RemoveOlderThan(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "releases_ttl.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	// Old lease - all releases are old
-	require.NoError(t, store.Append("old-lease", Release{
+	require.NoError(t, store.append("old-lease", Release{
 		Image:     "nginx:old",
 		Status:    "active",
 		CreatedAt: time.Now().Add(-48 * time.Hour),
 	}))
 
 	// Fresh lease
-	require.NoError(t, store.Append("fresh-lease", Release{
+	require.NoError(t, store.append("fresh-lease", Release{
 		Image:     "nginx:fresh",
 		Status:    "active",
 		CreatedAt: time.Now(),
 	}))
 
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	removed, err := store.removeOlderThan(24 * time.Hour)
 	require.NoError(t, err)
 	// ENG-440: the old lease's lone "active" release is load-bearing (recoverState
 	// rehydrates the manifest from it), so it is now RETAINED, not reaped.
@@ -482,7 +504,7 @@ func TestReleaseStore_RemoveOlderThan(t *testing.T) {
 func TestReleaseStore_AppendCorruptedData(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "corrupt_releases.db")
 
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -495,7 +517,7 @@ func TestReleaseStore_AppendCorruptedData(t *testing.T) {
 
 	// Append should detect the corruption and return an error instead of
 	// silently discarding existing data.
-	err = store.Append("corrupt-lease", Release{
+	err = store.append("corrupt-lease", Release{
 		Image:     "nginx:latest",
 		Status:    "deploying",
 		CreatedAt: time.Now(),
@@ -511,27 +533,27 @@ func TestReleaseStore_AppendCorruptedData(t *testing.T) {
 func TestReleaseStore_InitialCleanup(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "initial_cleanup_releases.db")
 
-	store1, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store1, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
-	require.NoError(t, store1.Append("old-lease", Release{
+	require.NoError(t, store1.append("old-lease", Release{
 		Image:     "nginx:superseded",
 		Status:    "superseded",
 		CreatedAt: time.Now().Add(-48 * time.Hour),
 	}))
-	require.NoError(t, store1.Append("old-lease", Release{
+	require.NoError(t, store1.append("old-lease", Release{
 		Image:     "nginx:old",
 		Status:    "active",
 		CreatedAt: time.Now().Add(-48 * time.Hour),
 	}))
-	require.NoError(t, store1.Append("fresh-lease", Release{
+	require.NoError(t, store1.append("fresh-lease", Release{
 		Image:     "nginx:fresh",
 		Status:    "active",
 		CreatedAt: time.Now(),
 	}))
 	require.NoError(t, store1.Close())
 
-	store2, err := NewReleaseStore(ReleaseStoreConfig{
+	store2, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: dbPath,
 		MaxAge: 24 * time.Hour,
 	})
@@ -559,11 +581,11 @@ func TestReleaseStore_InitialCleanup(t *testing.T) {
 // (ENG-440). Seed such a slice directly so len(1) < maxVersion(5).
 func TestReleaseStore_Append_VersionDerivedFromMax(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "version_max.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
-	seeded, err := json.Marshal([]Release{
+	seeded, err := marshalReleaseHistory([]Release{
 		{Version: 5, Image: "nginx:5", Status: "active", CreatedAt: time.Now()},
 	})
 	require.NoError(t, err)
@@ -571,7 +593,7 @@ func TestReleaseStore_Append_VersionDerivedFromMax(t *testing.T) {
 		return tx.Bucket(releasesBucketName).Put([]byte("lease-1"), seeded)
 	}))
 
-	require.NoError(t, store.Append("lease-1", Release{
+	require.NoError(t, store.append("lease-1", Release{
 		Image: "nginx:6", Status: "deploying", CreatedAt: time.Now(),
 	}))
 
@@ -588,18 +610,18 @@ func TestReleaseStore_Append_VersionDerivedFromMax(t *testing.T) {
 // un-Restartable.
 func TestReleaseStore_RemoveOlderThan_KeepsLoneOldActive(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "keep_lone_active.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
-	require.NoError(t, store.Append("lease-1", Release{
+	require.NoError(t, store.append("lease-1", Release{
 		Manifest:  []byte(`{"image":"nginx:1.25"}`),
 		Image:     "nginx:1.25",
 		Status:    "active",
 		CreatedAt: time.Now().Add(-100 * 24 * time.Hour),
 	}))
 
-	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	removed, err := store.removeOlderThan(90 * 24 * time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 0, removed, "the lone active release is load-bearing and must be retained")
 
@@ -614,16 +636,16 @@ func TestReleaseStore_RemoveOlderThan_KeepsLoneOldActive(t *testing.T) {
 // and index-latest entries.
 func TestReleaseStore_RemoveOlderThan_PrunesOldSupersededTail(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "prune_tail.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	old := time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, store.Append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: old}))
-	require.NoError(t, store.Append("lease-1", Release{Image: "v2", Status: "superseded", CreatedAt: old}))
-	require.NoError(t, store.Append("lease-1", Release{Image: "v3", Status: "active", CreatedAt: old}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: old}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v2", Status: "superseded", CreatedAt: old}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v3", Status: "active", CreatedAt: old}))
 
-	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	removed, err := store.removeOlderThan(90 * 24 * time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 2, removed, "the two old superseded entries are pruned")
 
@@ -641,15 +663,15 @@ func TestReleaseStore_RemoveOlderThan_PrunesOldSupersededTail(t *testing.T) {
 // max+1 collision-free.
 func TestReleaseStore_RemoveOlderThan_KeepsOldActiveWhenNewestIsFailed(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "active_then_failed.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	old := time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, store.Append("lease-1", Release{Image: "v1", Status: "active", CreatedAt: old}))
-	require.NoError(t, store.Append("lease-1", Release{Image: "v2", Status: "failed", CreatedAt: old}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v1", Status: "active", CreatedAt: old}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v2", Status: "failed", CreatedAt: old}))
 
-	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	removed, err := store.removeOlderThan(90 * 24 * time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 0, removed, "latest-active (v1) and index-latest (v2) are both protected")
 
@@ -659,52 +681,10 @@ func TestReleaseStore_RemoveOlderThan_KeepsOldActiveWhenNewestIsFailed(t *testin
 	assert.Equal(t, "v1", active.Image, "the older active release is the rehydration source and must survive")
 
 	// And a subsequent Append must not reuse v2 (the retained global max).
-	require.NoError(t, store.Append("lease-1", Release{Image: "v3", Status: "deploying", CreatedAt: time.Now()}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v3", Status: "deploying", CreatedAt: time.Now()}))
 	latest, err := store.Latest("lease-1")
 	require.NoError(t, err)
 	assert.Equal(t, 3, latest.Version, "next version is max(2)+1=3, never a reused 2")
-}
-
-// A restart/update can supersede the migration release before its background
-// rollback-window cleanup fires. The old row is then the only durable fact that
-// names the exact `-prev` cohort, so TTL pruning must retain it alongside the
-// current active release and the index-latest version holder.
-func TestReleaseStore_RemoveOlderThan_KeepsSupersededMigrationAuthority(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "keep_migration_authority.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	defer store.Close()
-
-	old := time.Now().Add(-100 * 24 * time.Hour)
-	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}}
-	resourceProfiles := []SKUResourceSnapshot{{
-		SKU: "docker-small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
-	}}
-	manifestAuthority := []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`)
-	require.NoError(t, store.Append("lease-1", Release{
-		Image: "migrated", Manifest: manifestAuthority, Items: items,
-		ResourceProfiles: resourceProfiles, LegacyMigration: true,
-		Status: "superseded", CreatedAt: old,
-	}))
-	require.NoError(t, store.Append("lease-1", Release{
-		Image: "current", Manifest: manifestAuthority, Items: items,
-		ResourceProfiles: resourceProfiles, Status: "active", CreatedAt: old,
-	}))
-	require.NoError(t, store.Append("lease-1", Release{
-		Image: "failed-candidate", Manifest: manifestAuthority, Items: items,
-		ResourceProfiles: resourceProfiles, Status: "failed", CreatedAt: old,
-	}))
-
-	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 0, removed,
-		"migration authority, current active release, and index-latest version must all survive")
-
-	releases, err := store.List("lease-1")
-	require.NoError(t, err)
-	require.Len(t, releases, 3)
-	assert.True(t, releases[0].LegacyMigration)
-	assert.Equal(t, items, releases[0].Items)
 }
 
 // TestReleaseStore_RemoveOlderThan_AppendAfterPruneNoVersionReuse is the end-to-end
@@ -712,19 +692,19 @@ func TestReleaseStore_RemoveOlderThan_KeepsSupersededMigrationAuthority(t *testi
 // fresh version (proves Change 1 + Change 2 together).
 func TestReleaseStore_RemoveOlderThan_AppendAfterPruneNoVersionReuse(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "prune_then_append.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	old := time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, store.Append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: old}))
-	require.NoError(t, store.Append("lease-1", Release{Image: "v2", Status: "superseded", CreatedAt: old}))
-	require.NoError(t, store.Append("lease-1", Release{Image: "v3", Status: "active", CreatedAt: old}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: old}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v2", Status: "superseded", CreatedAt: old}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v3", Status: "active", CreatedAt: old}))
 
-	_, err = store.RemoveOlderThan(90 * 24 * time.Hour) // prunes v1, v2 -> [v3]
+	_, err = store.removeOlderThan(90 * 24 * time.Hour) // prunes v1, v2 -> [v3]
 	require.NoError(t, err)
 
-	require.NoError(t, store.Append("lease-1", Release{Image: "v4", Status: "deploying", CreatedAt: time.Now()}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v4", Status: "deploying", CreatedAt: time.Now()}))
 	latest, err := store.Latest("lease-1")
 	require.NoError(t, err)
 	assert.Equal(t, 4, latest.Version, "after pruning to [v3], next version is max(3)+1=4, not len-derived 2")
@@ -734,15 +714,17 @@ func TestReleaseStore_RemoveOlderThan_AppendAfterPruneNoVersionReuse(t *testing.
 // reaper must preserve its bytes and fail closed so an operator can repair it.
 func TestReleaseStore_RemoveOlderThan_EmptyValueFailsClosed(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "empty_value.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
+	emptyHistory, err := marshalReleaseHistory(nil)
+	require.NoError(t, err)
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(releasesBucketName).Put([]byte("empty-lease"), []byte("[]"))
+		return tx.Bucket(releasesBucketName).Put([]byte("empty-lease"), emptyHistory)
 	}))
 
-	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	removed, err := store.removeOlderThan(90 * 24 * time.Hour)
 	require.ErrorContains(t, err, "release history is empty")
 	assert.Equal(t, 0, removed)
 
@@ -760,14 +742,14 @@ func TestReleaseStore_RemoveOlderThan_EmptyValueFailsClosed(t *testing.T) {
 // is a genuine RED->GREEN test of the new within-key pruning.)
 func TestReleaseStore_RemoveOlderThan_PrunesOldTailKeepsFreshActive(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "mixed_age.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
-	require.NoError(t, store.Append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: time.Now().Add(-100 * 24 * time.Hour)}))
-	require.NoError(t, store.Append("lease-1", Release{Image: "v2", Status: "active", CreatedAt: time.Now()})) // fresh
+	require.NoError(t, store.append("lease-1", Release{Image: "v1", Status: "superseded", CreatedAt: time.Now().Add(-100 * 24 * time.Hour)}))
+	require.NoError(t, store.append("lease-1", Release{Image: "v2", Status: "active", CreatedAt: time.Now()})) // fresh
 
-	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	removed, err := store.removeOlderThan(90 * 24 * time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 1, removed, "only the old superseded entry is pruned")
 
@@ -781,7 +763,7 @@ func TestReleaseStore_RemoveOlderThan_PrunesOldTailKeepsFreshActive(t *testing.T
 // let recovery infer a smaller desired cohort from partial survivors.
 func TestReleaseStore_RemoveOlderThan_CorruptValueFailsClosed(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "corrupt_reap.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -789,7 +771,7 @@ func TestReleaseStore_RemoveOlderThan_CorruptValueFailsClosed(t *testing.T) {
 		return tx.Bucket(releasesBucketName).Put([]byte("corrupt-lease"), []byte("not valid json"))
 	}))
 
-	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	removed, err := store.removeOlderThan(90 * 24 * time.Hour)
 	require.ErrorContains(t, err, "corrupted release history")
 	assert.Equal(t, 0, removed)
 
@@ -807,17 +789,17 @@ func TestReleaseStore_RemoveOlderThan_CorruptValueFailsClosed(t *testing.T) {
 // but a regression anchor for the no-active path).
 func TestReleaseStore_RemoveOlderThan_KeepsLoneOldNonActive(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "lone_failed.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
-	require.NoError(t, store.Append("lease-1", Release{
+	require.NoError(t, store.append("lease-1", Release{
 		Image:     "nginx:failed",
 		Status:    "failed",
 		CreatedAt: time.Now().Add(-100 * 24 * time.Hour),
 	}))
 
-	removed, err := store.RemoveOlderThan(90 * 24 * time.Hour)
+	removed, err := store.removeOlderThan(90 * 24 * time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 0, removed, "the index-latest entry is protected even with no active release")
 
@@ -827,145 +809,8 @@ func TestReleaseStore_RemoveOlderThan_KeepsLoneOldNonActive(t *testing.T) {
 	assert.Equal(t, "failed", releases[0].Status)
 }
 
-func testLegacyMigrationAuthority(t testing.TB) LegacyRuntimeAuthority {
-	t.Helper()
-	authority, err := NewLegacyRuntimeAuthority(
-		"tenant-a",
-		"22222222-2222-4222-8222-222222222222",
-		"https://fred.example/callbacks/provision",
-		"https://fred.example/callbacks/provision",
-	)
-	require.NoError(t, err)
-	return authority
-}
-
-func TestReleaseStore_RecordLegacyMigrationBackfillsDesiredItemsIdempotently(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "migration_releases.db"),
-	})
-	require.NoError(t, err)
-	defer store.Close()
-
-	manifest := []byte(`{"image":"nginx:1.25"}`)
-	require.NoError(t, store.Append("lease-1", Release{
-		Manifest: manifest, Image: "nginx:1.25", Status: "active", CreatedAt: time.Now(),
-	}))
-	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}}
-	profiles, err := BuildSKUResourceSnapshot(items, func(string) (SKUProfile, error) {
-		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
-	})
-	require.NoError(t, err)
-	authority := testLegacyMigrationAuthority(t)
-	require.NoError(t, store.RecordLegacyMigration("lease-1", manifest, items, profiles, authority))
-	require.NoError(t, store.RecordLegacyMigration("lease-1", manifest, items, profiles, authority))
-
-	releases, err := store.List("lease-1")
-	require.NoError(t, err)
-	require.Len(t, releases, 1, "backfill and exact replay must not inflate release history")
-	assert.Equal(t, items, releases[0].Items)
-	assert.True(t, releases[0].LegacyMigration)
-	assert.Equal(t, &authority, releases[0].LegacyRuntimeAuthority)
-
-	items[0].Quantity = 9
-	assert.Equal(t, 2, releases[0].Items[0].Quantity, "stored desired topology must not alias caller memory")
-}
-
-func TestReleaseStore_RecordLegacyMigrationRejectsDivergentAuthorityAndItems(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "migration_divergence.db"),
-	})
-	require.NoError(t, err)
-	defer store.Close()
-
-	manifest := []byte(`{"image":"nginx:1.25"}`)
-	firstItems := []backend.LeaseItem{{
-		SKU: "docker-small", Quantity: 1, ServiceName: "app",
-	}}
-	firstProfiles, err := BuildSKUResourceSnapshot(firstItems, func(string) (SKUProfile, error) {
-		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
-	})
-	require.NoError(t, err)
-	authority := testLegacyMigrationAuthority(t)
-	require.NoError(t, store.RecordLegacyMigration("lease-1", manifest, firstItems, firstProfiles, authority))
-	otherAuthority, authorityErr := NewLegacyRuntimeAuthority(
-		authority.Tenant(),
-		authority.ProviderUUID(),
-		"https://other.example/callbacks/provision",
-		"",
-	)
-	require.NoError(t, authorityErr)
-	authorityErr = store.RecordLegacyMigration(
-		"lease-1", manifest, firstItems, firstProfiles, otherAuthority,
-	)
-	require.ErrorContains(t, authorityErr, "divergent legacy runtime authority")
-	secondItems := []backend.LeaseItem{{
-		SKU: "docker-small", Quantity: 2, ServiceName: "app",
-	}}
-	err = store.RecordLegacyMigration("lease-1", manifest, secondItems, firstProfiles, authority)
-	require.ErrorContains(t, err, "divergent desired items")
-}
-
-func TestReleaseStore_LegacyMigrationCapacityIncludesRuntimeAuthority(t *testing.T) {
-	const limitBytes = 1024
-	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
-	profiles, err := BuildSKUResourceSnapshot(items, func(string) (SKUProfile, error) {
-		return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
-	})
-	require.NoError(t, err)
-	createdAt := time.Unix(1_700_000_000, 0).UTC()
-
-	shortStore, err := NewReleaseStore(ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "short-authority.db"),
-	})
-	require.NoError(t, err)
-	defer shortStore.Close()
-	require.NoError(t, shortStore.recordLegacyMigrationWithinLimit(
-		"lease-short-authority",
-		[]byte(`{"image":"nginx:1.25"}`),
-		items,
-		profiles,
-		testLegacyMigrationAuthority(t),
-		createdAt,
-		limitBytes,
-	), "the same release with a compact callback authority fits the synthetic limit")
-
-	longAuthority, err := NewLegacyRuntimeAuthority(
-		"tenant-a",
-		"22222222-2222-4222-8222-222222222222",
-		"https://fred.example/callbacks/provision?trace="+strings.Repeat("x", 2048),
-		"",
-	)
-	require.NoError(t, err)
-	longStore, err := NewReleaseStore(ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "long-authority.db"),
-	})
-	require.NoError(t, err)
-	defer longStore.Close()
-	err = longStore.recordLegacyMigrationWithinLimit(
-		"lease-long-authority",
-		[]byte(`{"image":"nginx:1.25"}`),
-		items,
-		profiles,
-		longAuthority,
-		createdAt,
-		limitBytes,
-	)
-	require.ErrorIs(t, err, ErrReleaseHistoryCapacity,
-		"capacity admission must account for the authority bytes committed after substrate work")
-
-	err = longStore.CheckRecordLegacyMigrationCapacity(
-		"lease-zero-authority",
-		[]byte(`{"image":"nginx:1.25"}`),
-		items,
-		profiles,
-		LegacyRuntimeAuthority{},
-		createdAt,
-	)
-	require.ErrorContains(t, err, "valid legacy runtime authority")
-}
-
 func TestReleaseStore_BackfillLegacyActiveAuthorityFreezesMultiSKUProfile(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "legacy_authority.db"),
 	})
 	require.NoError(t, err)
@@ -975,7 +820,7 @@ func TestReleaseStore_BackfillLegacyActiveAuthorityFreezesMultiSKUProfile(t *tes
 		Manifest: []byte(`{"services":{"web":{"image":"nginx:1.25"},"db":{"image":"postgres:16"}}}`),
 		Image:    "stack", Status: "active", CreatedAt: time.Now().UTC(),
 	}
-	require.NoError(t, store.Append("lease-1", legacy))
+	require.NoError(t, store.append("lease-1", legacy))
 	stored, err := store.LatestActive("lease-1")
 	require.NoError(t, err)
 	require.NotNil(t, stored)
@@ -994,13 +839,11 @@ func TestReleaseStore_BackfillLegacyActiveAuthorityFreezesMultiSKUProfile(t *tes
 		}
 	})
 	require.NoError(t, err)
-	err = store.BackfillLegacyActiveAuthority("lease-1", *stored, items, profiles, 0)
-	require.ErrorContains(t, err, "authority class is invalid")
-	require.NoError(t, store.BackfillLegacyActiveAuthority(
-		"lease-1", *stored, items, profiles, LegacyActiveAuthorityWorkload,
+	require.NoError(t, store.backfillLegacyActiveAuthority(
+		"lease-1", *stored, items, profiles,
 	))
-	require.NoError(t, store.BackfillLegacyActiveAuthority(
-		"lease-1", *stored, items, profiles, LegacyActiveAuthorityWorkload,
+	require.NoError(t, store.backfillLegacyActiveAuthority(
+		"lease-1", *stored, items, profiles,
 	),
 		"an exact retry after an uncertain commit must be idempotent")
 
@@ -1018,26 +861,25 @@ func TestReleaseStore_BackfillLegacyActiveAuthorityFreezesMultiSKUProfile(t *tes
 
 	changedFence := *stored
 	changedFence.Image = "manually-rewritten"
-	err = store.BackfillLegacyActiveAuthority(
+	err = store.backfillLegacyActiveAuthority(
 		"lease-1", changedFence, backfilled.Items, backfilled.ResourceProfiles,
-		LegacyActiveAuthorityWorkload,
 	)
 	require.ErrorContains(t, err, "changed before legacy authority backfill")
 }
 
 func TestReleaseStore_DeleteCloseHistory_ExactAndIdempotent(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "close_fence.db"),
 	})
 	require.NoError(t, err)
 	defer store.Close()
 
 	const leaseUUID = "lease-close"
-	require.NoError(t, store.Append(leaseUUID, Release{
+	require.NoError(t, store.append(leaseUUID, Release{
 		Manifest: []byte(`{"services":{"app":{"image":"nginx:1.0"}}}`),
 		Image:    "nginx:1.0", Status: "active", CreatedAt: time.Now(),
 	}))
-	require.NoError(t, store.Append(leaseUUID, Release{
+	require.NoError(t, store.append(leaseUUID, Release{
 		Manifest: []byte(`{"services":{"app":{"image":"nginx:2.0"}}}`),
 		Image:    "nginx:2.0", Status: "deploying", CreatedAt: time.Now(),
 	}))
@@ -1059,14 +901,14 @@ func TestReleaseStore_DeleteCloseHistory_ExactAndIdempotent(t *testing.T) {
 }
 
 func TestReleaseStore_DeleteCloseHistory_RejectsChangedOrUnexpectedHistory(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "close_fence_conflict.db"),
 	})
 	require.NoError(t, err)
 	defer store.Close()
 
 	const leaseUUID = "lease-close"
-	require.NoError(t, store.Append(leaseUUID, Release{
+	require.NoError(t, store.append(leaseUUID, Release{
 		Image: "nginx:1.0", Status: "active", CreatedAt: time.Now(),
 	}))
 	releases, err := store.List(leaseUUID)
@@ -1075,7 +917,7 @@ func TestReleaseStore_DeleteCloseHistory_RejectsChangedOrUnexpectedHistory(t *te
 	require.NoError(t, err)
 	digest := sha256.Sum256(encoded)
 
-	require.NoError(t, store.UpdateLatestStatus(
+	require.NoError(t, store.updateLatestStatus(
 		leaseUUID, "failed", backend.ReasonUpdateFailed, "changed after close admission",
 	))
 	err = store.DeleteCloseHistory(leaseUUID, releases[0].Version, digest)
@@ -1085,7 +927,7 @@ func TestReleaseStore_DeleteCloseHistory_RejectsChangedOrUnexpectedHistory(t *te
 	require.Len(t, remaining, 1, "a mismatched fence must preserve the evidence")
 
 	const unexpectedLease = "lease-unexpected"
-	require.NoError(t, store.Append(unexpectedLease, Release{
+	require.NoError(t, store.append(unexpectedLease, Release{
 		Image: "nginx:1.0", Status: "active", CreatedAt: time.Now(),
 	}))
 	err = store.DeleteCloseHistory(unexpectedLease, 0, [sha256.Size]byte{})
@@ -1097,7 +939,7 @@ func TestReleaseStore_DeleteCloseHistory_RejectsChangedOrUnexpectedHistory(t *te
 
 func putRawReleaseHistory(t *testing.T, store *ReleaseStore, leaseUUID string, releases []Release) []byte {
 	t.Helper()
-	encoded, err := json.Marshal(releases)
+	encoded, err := marshalReleaseHistory(releases)
 	require.NoError(t, err)
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(releasesBucketName).Put([]byte(leaseUUID), encoded)
@@ -1116,7 +958,7 @@ func rawReleaseHistory(t *testing.T, store *ReleaseStore, leaseUUID string) []by
 }
 
 func TestReleaseStore_CorruptAuthorityFailsEveryDecodeMutationClosed(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "corrupt_authority.db"),
 	})
 	require.NoError(t, err)
@@ -1131,15 +973,24 @@ func TestReleaseStore_CorruptAuthorityFailsEveryDecodeMutationClosed(t *testing.
 		Version:          1,
 		Manifest:         []byte(`{"services":{"app":{"image":"nginx:1.0"}}}`),
 		Image:            "nginx:1.0",
-		OperationID:      "not-a-canonical-uuid-v4",
 		Items:            items,
 		ResourceProfiles: profiles,
 		Status:           "active",
 		CreatedAt:        time.Now().Add(-time.Hour),
 	}
-	wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{corrupt})
 	selected, err := json.Marshal(corrupt)
 	require.NoError(t, err)
+	selected = []byte(strings.Replace(
+		string(selected), `"image":`, `"operation_id":"not-a-canonical-uuid-v4","image":`, 1,
+	))
+	wantRaw, err := json.Marshal(struct {
+		SchemaVersion uint8             `json:"schema_version"`
+		Releases      []json.RawMessage `json:"releases"`
+	}{authoritativeRowSchemaVersion, []json.RawMessage{selected}})
+	require.NoError(t, err)
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(releasesBucketName).Put([]byte(leaseUUID), wantRaw)
+	}))
 	digest := sha256.Sum256(selected)
 
 	assertInvalid := func(name string, err error) {
@@ -1149,21 +1000,18 @@ func TestReleaseStore_CorruptAuthorityFailsEveryDecodeMutationClosed(t *testing.
 	}
 	_, err = store.List(leaseUUID)
 	assertInvalid("List", err)
-	assertInvalid("Append", store.Append(leaseUUID, Release{
+	assertInvalid("Append", store.append(leaseUUID, Release{
 		Image: "nginx:2.0", Status: "deploying", CreatedAt: time.Now(),
 	}))
-	assertInvalid("BackfillActiveResourceProfiles", store.BackfillActiveResourceProfiles(
+	assertInvalid("BackfillActiveResourceProfiles", store.backfillActiveResourceProfiles(
 		leaseUUID, 1, items, profiles,
 	))
-	assertInvalid("UpdateLatestStatus", store.UpdateLatestStatus(
+	assertInvalid("UpdateLatestStatus", store.updateLatestStatus(
 		leaseUUID, "failed", backend.ReasonUpdateFailed, "failed",
 	))
-	assertInvalid("ActivateLatest", store.ActivateLatest(leaseUUID))
-	assertInvalid("RecordLegacyMigration", store.RecordLegacyMigration(
-		leaseUUID, corrupt.Manifest, items, profiles, testLegacyMigrationAuthority(t),
-	))
+	assertInvalid("ActivateLatest", store.activateLatest(leaseUUID))
 	assertInvalid("DeleteCloseHistory", store.DeleteCloseHistory(leaseUUID, 1, digest))
-	_, err = store.RemoveOlderThan(time.Minute)
+	_, err = store.removeOlderThan(time.Minute)
 	assertInvalid("RemoveOlderThan", err)
 }
 
@@ -1189,7 +1037,7 @@ func TestReleaseStore_ListRejectsCorruptItemsAndResourceProfiles(t *testing.T) {
 	}
 	for name, corrupt := range tests {
 		t.Run(name, func(t *testing.T) {
-			store, err := NewReleaseStore(ReleaseStoreConfig{
+			store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 				DBPath: filepath.Join(t.TempDir(), "corrupt_resources.db"),
 			})
 			require.NoError(t, err)
@@ -1221,14 +1069,14 @@ func TestReleaseStore_RejectsInvalidManifestAuthorityBeforePersisting(t *testing
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			store, err := NewReleaseStore(ReleaseStoreConfig{
+			store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 				DBPath: filepath.Join(t.TempDir(), "releases.db"),
 			})
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, store.Close()) })
 
 			const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
-			err = store.AppendActive(leaseUUID, Release{
+			err = store.appendActive(leaseUUID, Release{
 				Manifest: test.manifest,
 				Items: []backend.LeaseItem{{
 					SKU: "small", Quantity: 1, ServiceName: "app",
@@ -1266,7 +1114,7 @@ func TestReleaseStore_HealthAndRecoveryRejectPersistedManifestAuthority(t *testi
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			store, err := NewReleaseStore(ReleaseStoreConfig{
+			store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 				DBPath: filepath.Join(t.TempDir(), "releases.db"),
 			})
 			require.NoError(t, err)
@@ -1296,30 +1144,25 @@ func TestReleaseStore_HealthAndRecoveryRejectPersistedManifestAuthority(t *testi
 	}
 }
 
-func TestReleaseStore_AppendRejectsNonCanonicalOperationID(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "invalid_operation_id.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = store.Close() })
-
-	err = store.Append("lease", Release{
-		OperationID: "11111111-1111-4111-8111-11111111111A",
-		Status:      "active",
-		CreatedAt:   time.Now(),
-	})
+func TestReleaseJSONRejectsNonCanonicalOperationID(t *testing.T) {
+	var release Release
+	err := json.Unmarshal([]byte(`{
+		"operation_id":"11111111-1111-4111-8111-11111111111A",
+		"status":"active",
+		"created_at":"2026-09-04T00:00:00Z"
+	}`), &release)
 	require.ErrorContains(t, err, "canonical UUIDv4")
 }
 
 func TestReleaseStore_AssignsVersionBeforeValidationAndRollsBackDuplicateActive(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "release_invariants.db"),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
 
 	const leaseUUID = "lease-1"
-	require.NoError(t, store.Append(leaseUUID, Release{
+	require.NoError(t, store.append(leaseUUID, Release{
 		Version: 0, Status: "active", CreatedAt: time.Now(),
 	}))
 	releases, err := store.List(leaseUUID)
@@ -1328,17 +1171,17 @@ func TestReleaseStore_AssignsVersionBeforeValidationAndRollsBackDuplicateActive(
 	assert.Equal(t, 1, releases[0].Version)
 
 	wantRaw := rawReleaseHistory(t, store, leaseUUID)
-	err = store.Append(leaseUUID, Release{
+	err = store.append(leaseUUID, Release{
 		Version: 0, Status: "active", CreatedAt: time.Now(),
 	})
 	require.ErrorContains(t, err, "active records")
 	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
 
-	require.NoError(t, store.Append(leaseUUID, Release{
+	require.NoError(t, store.append(leaseUUID, Release{
 		Version: 0, Status: "deploying", CreatedAt: time.Now(),
 	}))
 	wantRaw = rawReleaseHistory(t, store, leaseUUID)
-	err = store.UpdateLatestStatus(leaseUUID, "active", "", "")
+	err = store.updateLatestStatus(leaseUUID, "active", "", "")
 	require.ErrorContains(t, err, "active records")
 	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
 
@@ -1350,17 +1193,17 @@ func TestReleaseStore_AssignsVersionBeforeValidationAndRollsBackDuplicateActive(
 }
 
 func TestReleaseStore_AppendActiveAtomicallySupersedesAndAssignsVersion(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "append_active.db"),
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
 
 	const leaseUUID = "lease-1"
-	require.NoError(t, store.Append(leaseUUID, Release{
+	require.NoError(t, store.append(leaseUUID, Release{
 		Status: "active", CreatedAt: time.Now(),
 	}))
-	require.NoError(t, store.AppendActive(leaseUUID, Release{
+	require.NoError(t, store.appendActive(leaseUUID, Release{
 		CreatedAt: time.Now(),
 	}))
 
@@ -1373,7 +1216,7 @@ func TestReleaseStore_AppendActiveAtomicallySupersedesAndAssignsVersion(t *testi
 }
 
 func TestReleaseStore_AppendActiveCapacityCompactsDeterministically(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "append_active_capacity.db"),
 	})
 	require.NoError(t, err)
@@ -1386,7 +1229,7 @@ func TestReleaseStore_AppendActiveCapacityCompactsDeterministically(t *testing.T
 		{Version: 1, Image: "expired", Status: "superseded", CreatedAt: now.Add(-48 * time.Hour), Error: "expired-history"},
 		{Version: 2, Image: "oldest-fresh", Status: "superseded", CreatedAt: now.Add(-3 * time.Hour), Error: "fresh-history"},
 		{Version: 3, Image: "newer-fresh", Status: "superseded", CreatedAt: now.Add(-2 * time.Hour), Error: "fresh-history"},
-		{Version: 4, Image: "migration", Status: "superseded", CreatedAt: now.Add(-time.Hour), LegacyMigration: true},
+		{Version: 4, Image: "recent-audit", Status: "superseded", CreatedAt: now.Add(-time.Hour)},
 		{Version: 5, Image: "old-active", Status: "active", CreatedAt: now.Add(-30 * time.Minute)},
 	}
 	raw := putRawReleaseHistory(t, store, leaseUUID, seed)
@@ -1404,7 +1247,7 @@ func TestReleaseStore_AppendActiveCapacityCompactsDeterministically(t *testing.T
 	// Force exactly two removals. The expired v1 must go before the oldest
 	// still-fresh v2; newer v3 and the now-superseded v5 remain audit history.
 	want := []Release{full[2], full[3], full[4], full[5]}
-	wantBytes, err := json.Marshal(want)
+	wantBytes, err := marshalReleaseHistory(want)
 	require.NoError(t, err)
 
 	require.NoError(t, store.appendWithinLimit(leaseUUID, candidate, true, len(wantBytes)))
@@ -1415,7 +1258,7 @@ func TestReleaseStore_AppendActiveCapacityCompactsDeterministically(t *testing.T
 	assert.Equal(t, []int{3, 4, 5, 6}, []int{
 		got[0].Version, got[1].Version, got[2].Version, got[3].Version,
 	})
-	assert.True(t, got[1].LegacyMigration, "latest migration cleanup authority must survive")
+	assert.Equal(t, "recent-audit", got[1].Image)
 	assert.Equal(t, "active", got[3].Status)
 
 	// The retained index-latest v6 holds the pre-prune maximum, so the next
@@ -1433,7 +1276,7 @@ func TestReleaseStore_AppendActiveCapacityCompactsDeterministically(t *testing.T
 }
 
 func TestReleaseStore_AppendActiveCapacityErrorRollsBackByteIdentically(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "append_active_capacity_rollback.db"),
 	})
 	require.NoError(t, err)
@@ -1442,7 +1285,7 @@ func TestReleaseStore_AppendActiveCapacityErrorRollsBackByteIdentically(t *testi
 	const leaseUUID = "lease-capacity-rollback"
 	now := time.Now()
 	wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{
-		{Version: 1, Image: "migration", Status: "superseded", CreatedAt: now.Add(-time.Hour), LegacyMigration: true, Error: "protected-migration-authority"},
+		{Version: 1, Image: "audit", Status: "superseded", CreatedAt: now.Add(-time.Hour)},
 		{Version: 2, Image: "old-active", Status: "active", CreatedAt: now},
 	})
 	candidate := Release{Image: "new-active", Status: "active", CreatedAt: now.Add(time.Minute)}
@@ -1455,8 +1298,8 @@ func TestReleaseStore_AppendActiveCapacityErrorRollsBackByteIdentically(t *testi
 		1<<20,
 	)
 	require.NoError(t, err)
-	protected := []Release{full[0], full[2]}
-	protectedBytes, err := json.Marshal(protected)
+	protected := []Release{full[2]}
+	protectedBytes, err := marshalReleaseHistory(protected)
 	require.NoError(t, err)
 
 	err = store.appendWithinLimit(leaseUUID, candidate, true, len(protectedBytes)-1)
@@ -1470,14 +1313,14 @@ func TestReleaseStore_AppendActiveCapacityErrorRollsBackByteIdentically(t *testi
 
 func TestReleaseStore_AppendActiveCapacityProofConvergesAfterColdReopen(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "append_active_capacity_cold_reopen.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	const leaseUUID = "lease-capacity-cold-reopen"
 	now := time.Now()
 	seedRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{
 		{Version: 1, Image: "discardable", Status: "superseded", CreatedAt: now.Add(-2 * time.Hour)},
-		{Version: 2, Image: "migration", Status: "superseded", CreatedAt: now.Add(-time.Hour), LegacyMigration: true},
+		{Version: 2, Image: "newer-discardable", Status: "superseded", CreatedAt: now.Add(-time.Hour)},
 		{Version: 3, Image: "old-active", Status: "active", CreatedAt: now.Add(-time.Minute)},
 	})
 	candidate := Release{Image: "recovered-active", Status: "active", CreatedAt: now}
@@ -1490,11 +1333,11 @@ func TestReleaseStore_AppendActiveCapacityProofConvergesAfterColdReopen(t *testi
 		1<<20,
 	)
 	require.NoError(t, err)
-	// Only the most-recent migration and new active row are load-bearing after
-	// the success boundary. Use their exact encoded size as a tiny injected
-	// ceiling so both disposable rows must be compacted.
-	want := []Release{full[1], full[3]}
-	wantRaw, err := json.Marshal(want)
+	// Only the new active row is load-bearing after the success boundary. Use
+	// its exact encoded size as a tiny injected ceiling so all prior audit rows
+	// must be compacted.
+	want := []Release{full[3]}
+	wantRaw, err := marshalReleaseHistory(want)
 	require.NoError(t, err)
 
 	require.NoError(t, store.checkAppendCapacityWithinLimit(
@@ -1507,12 +1350,12 @@ func TestReleaseStore_AppendActiveCapacityProofConvergesAfterColdReopen(t *testi
 		"pre-admission proof must remain read-only")
 	require.NoError(t, store.Close())
 
-	store, err = NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err = newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	require.NoError(t, store.appendWithinLimit(leaseUUID, candidate, true, len(wantRaw)))
 	require.NoError(t, store.Close())
 
-	store, err = NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err = newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
@@ -1524,39 +1367,8 @@ func TestReleaseStore_AppendActiveCapacityProofConvergesAfterColdReopen(t *testi
 }
 
 func TestReleaseStore_DeployingAppendReservesActivationAndFailureCapacity(t *testing.T) {
-	t.Run("activation_refused_before_append_when_only_migration_is_protected", func(t *testing.T) {
-		store, err := NewReleaseStore(ReleaseStoreConfig{
-			DBPath: filepath.Join(t.TempDir(), "activation_preflight.db"),
-		})
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-
-		const leaseUUID = "lease-activation"
-		now := time.Now()
-		wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{{
-			Version: 1, Image: "migration", Status: "active", CreatedAt: now, LegacyMigration: true,
-		}})
-		candidate := Release{Image: "deploying", Status: "deploying", CreatedAt: now.Add(time.Minute)}
-		currentShape, _, err := planAppendedReleaseHistory(
-			wantRaw,
-			leaseUUID,
-			candidate,
-			false,
-			time.Time{},
-			1<<20,
-		)
-		require.NoError(t, err)
-		currentBytes, err := json.Marshal(currentShape)
-		require.NoError(t, err)
-
-		err = store.appendWithinLimit(leaseUUID, candidate, false, len(currentBytes))
-		require.ErrorIs(t, err, ErrReleaseHistoryCapacity,
-			"the one-byte-larger terminal activation must be refused before Compose")
-		assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
-	})
-
 	t.Run("failed_status_drops_optional_metadata_instead_of_losing_terminal_state", func(t *testing.T) {
-		store, err := NewReleaseStore(ReleaseStoreConfig{
+		store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 			DBPath: filepath.Join(t.TempDir(), "failed_status_capacity.db"),
 		})
 		require.NoError(t, err)
@@ -1565,7 +1377,7 @@ func TestReleaseStore_DeployingAppendReservesActivationAndFailureCapacity(t *tes
 		const leaseUUID = "lease-failed-status"
 		now := time.Now()
 		raw := putRawReleaseHistory(t, store, leaseUUID, []Release{
-			{Version: 1, Image: "migration", Status: "active", CreatedAt: now, LegacyMigration: true},
+			{Version: 1, Image: "active", Status: "active", CreatedAt: now},
 			{Version: 2, Image: "candidate", Status: "deploying", CreatedAt: now.Add(time.Minute)},
 		})
 		require.NoError(t, store.updateLatestStatusWithinLimit(
@@ -1597,12 +1409,11 @@ func TestReleaseStoreInspection_ProvesLegacyBackfillCapacityBeforeMutation(t *te
 	candidate := cloneRelease(expected)
 	candidate.Items = slices.Clone(items)
 	candidate.ResourceProfiles = CloneSKUResourceSnapshot(profiles)
-	candidate.LegacyMigration = true
-	candidateBytes, err := json.Marshal([]Release{candidate})
+	candidateBytes, err := marshalReleaseHistory([]Release{candidate})
 	require.NoError(t, err)
 
 	dbPath := filepath.Join(t.TempDir(), "legacy_backfill_capacity.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	putRawReleaseHistory(t, store, leaseUUID, []Release{
 		{Version: 1, Image: "discardable", Status: "superseded", CreatedAt: now.Add(-time.Hour), Error: "historical detail"},
@@ -1617,11 +1428,10 @@ func TestReleaseStoreInspection_ProvesLegacyBackfillCapacityBeforeMutation(t *te
 		expected,
 		items,
 		profiles,
-		LegacyActiveAuthorityMigration,
 		len(candidateBytes),
 	))
 
-	store, err = NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err = newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	require.NoError(t, store.backfillLegacyActiveAuthorityWithinLimit(
@@ -1629,7 +1439,6 @@ func TestReleaseStoreInspection_ProvesLegacyBackfillCapacityBeforeMutation(t *te
 		expected,
 		items,
 		profiles,
-		LegacyActiveAuthorityMigration,
 		len(candidateBytes),
 	))
 	assert.Equal(t, candidateBytes, rawReleaseHistory(t, store, leaseUUID))
@@ -1645,7 +1454,7 @@ func TestReleaseStoreInspection_RejectsIrreducibleProfileBackfillAtomically(t *t
 		Image:    "stack", Items: items, Status: "active", CreatedAt: time.Now(),
 	}
 	dbPath := filepath.Join(t.TempDir(), "profile_backfill_capacity.db")
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{expected})
 	require.NoError(t, store.Close())
@@ -1660,7 +1469,7 @@ func TestReleaseStoreInspection_RejectsIrreducibleProfileBackfillAtomically(t *t
 	)
 	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
 
-	store, err = NewReleaseStore(ReleaseStoreConfig{DBPath: dbPath})
+	store, err = newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	err = store.backfillActiveResourceProfilesWithinLimit(

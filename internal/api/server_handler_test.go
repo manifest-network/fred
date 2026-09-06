@@ -13,13 +13,15 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // errCallbackPublisher is a CallbackPublisher that always returns an error.
 type errCallbackPublisher struct{ err error }
 
-func (p *errCallbackPublisher) PublishCallback(context.Context, backend.CallbackPayload) error {
+func (p *errCallbackPublisher) PublishCallback(context.Context, hmacauth.VerifiedRequest) error {
 	return p.err
 }
 
@@ -29,9 +31,10 @@ type capturingCallbackPublisher struct {
 	callback backend.CallbackPayload
 }
 
-func (p *capturingCallbackPublisher) PublishCallback(_ context.Context, cb backend.CallbackPayload) error {
+func (p *capturingCallbackPublisher) PublishCallback(_ context.Context, proof hmacauth.VerifiedRequest) error {
 	p.called = true
-	p.callback = cb
+	observation, _ := callbackwire.DecodeVerified(proof)
+	p.callback = observation.Payload()
 	return nil
 }
 
@@ -107,7 +110,7 @@ func TestHandleProvisionCallback_RejectsInvalidAuthenticatedOperationID(t *testi
 			srv.handleProvisionCallback(rr, req)
 
 			assert.Equal(t, http.StatusBadRequest, rr.Code)
-			assertErrorBody(t, rr, "operation_id must be a single canonical UUIDv4")
+			assertErrorBody(t, rr, "invalid request body")
 			assert.False(t, pub.called, "an invalid operation ID must fail before publication")
 		})
 	}
@@ -197,7 +200,7 @@ func TestHandleProvisionCallback_MissingLeaseUUID(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, pub.called)
-	assertErrorBody(t, rr, "lease_uuid is required")
+	assertErrorBody(t, rr, "invalid request body")
 }
 
 func TestHandleProvisionCallback_InvalidUUIDFormat(t *testing.T) {
@@ -211,7 +214,7 @@ func TestHandleProvisionCallback_InvalidUUIDFormat(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, pub.called)
-	assertErrorBody(t, rr, "lease_uuid must be a valid UUID")
+	assertErrorBody(t, rr, "invalid request body")
 }
 
 func TestHandleProvisionCallback_InvalidStatus(t *testing.T) {
@@ -225,7 +228,7 @@ func TestHandleProvisionCallback_InvalidStatus(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, pub.called)
-	assertErrorBody(t, rr, "status must be 'success', 'failed', or 'deprovisioned'")
+	assertErrorBody(t, rr, "invalid request body")
 }
 
 // TestHandleProvisionCallback_AcceptsDeprovisioned verifies that the HTTP

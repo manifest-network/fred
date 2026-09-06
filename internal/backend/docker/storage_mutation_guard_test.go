@@ -4,12 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -91,7 +87,7 @@ func TestStorageMutationGuard_ClosesFrontDoorMutationTOCTOU(t *testing.T) {
 		stopCancel:      stop,
 	}
 	installMarkerMutationTestVerifier(t, b, markerPath, anchorPath, daemonID)
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	require.NoError(t, b.requireStorageIdentity(context.Background()), "front-door attestation")
 	require.NoError(t, os.Remove(markerPath), "simulate storage replacement after request admission")
@@ -284,7 +280,7 @@ func TestStorageMutationGuard_PostcheckRejectsSuccessAfterIdentityDrift(t *testi
 		stopCtx: stopCtx, stopCancel: stop,
 	}
 	installMarkerMutationTestVerifier(t, b, markerPath, anchorPath, daemonID)
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	err = b.mutationAdapter().composeUp(context.Background(), &composetypes.Project{}, composeUpOpts{})
 	require.NoError(t, removeErr)
@@ -322,7 +318,7 @@ func TestStorageMutationGuard_PostcheckJoinsMutationAndIdentityErrors(t *testing
 		stopCtx: stopCtx, stopCancel: stop,
 	}
 	installMarkerMutationTestVerifier(t, b, markerPath, anchorPath, daemonID)
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	err = b.mutationAdapter().composeUp(context.Background(), &composetypes.Project{}, composeUpOpts{})
 	require.NoError(t, removeErr)
@@ -350,7 +346,7 @@ func TestStorageMutationGuard_ManagerAmbiguityLatchesBackendAfterSuccessfulPostc
 		storeAuthorityGate: storeAuthorityGate,
 	}
 	installMutationTestVerifier(t, b, func(context.Context) error { return nil })
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	_, _, err = b.mutationAdapter().createVolume(context.Background(),
 		"fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100)
@@ -381,7 +377,7 @@ func TestStorageMutationGuard_VolumeRecoveryPendingLatchesBackendAfterSuccessful
 		storeAuthorityGate: storeAuthorityGate,
 	}
 	installMutationTestVerifier(t, b, func(context.Context) error { return nil })
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	sink := b.volumes.(volumeDestroyer)
 	err = b.mutationAdapter().destroyVolume(context.Background(), sink,
@@ -414,7 +410,7 @@ func TestStorageMutationGuard_ManagerRenameAmbiguityLatchesBackendAfterSuccessfu
 		storeAuthorityGate: storeAuthorityGate,
 	}
 	installMutationTestVerifier(t, b, func(context.Context) error { return nil })
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	err = b.mutationAdapter().renameVolume(
 		context.Background(),
@@ -462,7 +458,7 @@ func TestStorageMutationGuard_CanceledPostcheckLatchesAmbiguity(t *testing.T) {
 		stopCtx: stopCtx, stopCancel: stop,
 	}
 	installMutationTestVerifier(t, b, func(ctx context.Context) error { return ctx.Err() })
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	err = b.mutationAdapter().composeUp(callerCtx, &composetypes.Project{}, composeUpOpts{})
 	require.Error(t, err)
@@ -489,7 +485,7 @@ func TestStorageMutationGuard_BackendStopPreventsMutation(t *testing.T) {
 		stopCtx: stopCtx,
 	}
 	installMutationTestVerifier(t, b, nil)
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	err := b.mutationAdapter().composeDown(context.Background(), "fred-lease", time.Second)
 	require.Error(t, err)
@@ -512,7 +508,7 @@ func TestStorageMutationGuard_BackendStopCancelsInFlightMutation(t *testing.T) {
 		stopCancel: stop,
 	}
 	installMutationTestVerifier(t, b, func(ctx context.Context) error { return ctx.Err() })
-	b.mutations = storageMutationAdapters{backend: b}
+	installTestStorageMutationAdapters(b)
 
 	result := make(chan error, 1)
 	go func() {
@@ -582,6 +578,160 @@ func installMarkerMutationTestVerifier(
 	})
 }
 
+type panicOnAuthorizationReleaseContext struct {
+	context.Context
+	done <-chan struct{}
+}
+
+func (ctx panicOnAuthorizationReleaseContext) Done() <-chan struct{} { return ctx.done }
+
+func (panicOnAuthorizationReleaseContext) AfterFunc(func()) func() bool {
+	return func() bool { panic("release boom") }
+}
+
+func newBackgroundMutationBracketTestCoordinator(
+	t *testing.T,
+	b *Backend,
+	volumes *mockVolumeManager,
+) *backgroundMaintenanceCoordinator {
+	t.Helper()
+	docker := &mockDockerClient{}
+	compose := &mockComposeExecutor{}
+	b.docker = docker
+	b.compose = compose
+	b.volumes = volumes
+	coordinator, err := newBackgroundMaintenanceCoordinator(
+		b,
+		newStorageMutationOperations(b, docker, compose, volumes),
+	)
+	require.NoError(t, err)
+	return coordinator
+}
+
+func TestBackgroundMutationBracket_ActionPanicLatchesAmbiguityAndStillCompletes(t *testing.T) {
+	t.Parallel()
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	b := &Backend{stopCtx: stopCtx, stopCancel: stop}
+	verifyCalls := 0
+	installMutationTestVerifier(t, b, func(context.Context) error {
+		verifyCalls++
+		return nil
+	})
+	coordinator := newBackgroundMutationBracketTestCoordinator(t, b, &mockVolumeManager{
+		RecoverInterruptedVolumeMutationsFn: func(context.Context) error {
+			panic("action boom")
+		},
+	})
+
+	err := coordinator.recoverInterruptedVolumes(context.Background())
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	assert.ErrorContains(t, err, "action panicked")
+	assert.Equal(t, 2, verifyCalls,
+		"completion attestation must still run after the action panics")
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+}
+
+func TestBackgroundMutationBracket_CompletionPanicLatchesAmbiguityAndReleases(t *testing.T) {
+	t.Parallel()
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	b := &Backend{stopCtx: stopCtx, stopCancel: stop}
+	verifyCalls := 0
+	installMutationTestVerifier(t, b, func(context.Context) error {
+		verifyCalls++
+		if verifyCalls == 2 {
+			panic("completion boom")
+		}
+		return nil
+	})
+	actionCalled := false
+	coordinator := newBackgroundMutationBracketTestCoordinator(t, b, &mockVolumeManager{
+		RecoverInterruptedVolumeMutationsFn: func(context.Context) error {
+			actionCalled = true
+			return nil
+		},
+	})
+
+	err := coordinator.recoverInterruptedVolumes(context.Background())
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	assert.ErrorContains(t, err, "completion attestation panicked")
+	assert.True(t, actionCalled)
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+}
+
+func TestBackgroundMutationBracket_ReleasePanicLatchesAmbiguity(t *testing.T) {
+	t.Parallel()
+	baseCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	b := &Backend{
+		stopCtx: panicOnAuthorizationReleaseContext{
+			Context: baseCtx,
+			done:    make(chan struct{}),
+		},
+		stopCancel: stop,
+	}
+	installMutationTestVerifier(t, b, func(context.Context) error { return nil })
+	actionCalled := false
+	coordinator := newBackgroundMutationBracketTestCoordinator(t, b, &mockVolumeManager{
+		RecoverInterruptedVolumeMutationsFn: func(context.Context) error {
+			actionCalled = true
+			return nil
+		},
+	})
+
+	err := coordinator.recoverInterruptedVolumes(context.Background())
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	assert.ErrorContains(t, err, "authorization release panicked")
+	assert.True(t, actionCalled)
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+}
+
+func TestBackgroundMutationBracket_OrdinaryFailureRemainsRetryable(t *testing.T) {
+	t.Parallel()
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	b := &Backend{stopCtx: stopCtx, stopCancel: stop}
+	installMutationTestVerifier(t, b, func(context.Context) error { return nil })
+	want := errors.New("transient volume cleanup failure")
+	coordinator := newBackgroundMutationBracketTestCoordinator(t, b, &mockVolumeManager{
+		RecoverInterruptedVolumeMutationsFn: func(context.Context) error { return want },
+	})
+
+	err := coordinator.recoverInterruptedVolumes(context.Background())
+	require.ErrorIs(t, err, want)
+	assert.NotErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	assert.NoError(t, b.terminalStorageAuthorityError())
+	select {
+	case <-stopCtx.Done():
+		t.Fatal("ordinary retryable background failure stopped the backend")
+	default:
+	}
+}
+
+func TestBackgroundMutationBracket_AuthorizationPanicRefusesWithoutLatching(t *testing.T) {
+	t.Parallel()
+	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	b := &Backend{stopCtx: stopCtx, stopCancel: stop}
+	installMutationTestVerifier(t, b, func(context.Context) error {
+		panic("authorization boom")
+	})
+	actionCalled := false
+	coordinator := newBackgroundMutationBracketTestCoordinator(t, b, &mockVolumeManager{
+		RecoverInterruptedVolumeMutationsFn: func(context.Context) error {
+			actionCalled = true
+			return nil
+		},
+	})
+
+	err := coordinator.recoverInterruptedVolumes(context.Background())
+	assert.ErrorContains(t, err, "authorization panicked")
+	assert.NotErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	assert.False(t, actionCalled)
+	assert.NoError(t, b.terminalStorageAuthorityError())
+}
+
 func TestVolumeRootWatch_MissingPinnedRootIsPermanentDrift(t *testing.T) {
 	t.Parallel()
 
@@ -594,134 +744,4 @@ func TestVolumeRootWatch_MissingPinnedRootIsPermanentDrift(t *testing.T) {
 	err := watch.verify(root)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errVolumeRootIdentityDrift)
-}
-
-// TestStorageMutationGuard_IsTheOnlyRawCapabilityCaller is a compile-adjacent
-// architectural invariant. Interfaces make Destroy unavailable to most code,
-// but Docker and Compose cannot express a read/write split without extensive
-// upstream adapters. The AST check prevents a future call site from silently
-// bypassing the last-moment lineage attestation.
-func TestStorageMutationGuard_IsTheOnlyRawCapabilityCaller(t *testing.T) {
-	t.Parallel()
-
-	mutators := map[string]map[string]bool{
-		"docker": {
-			"PullImage": true, "ResolveImageUser": true,
-			"CreateContainer": true, "StartContainer": true,
-			"StopContainer": true, "RenameContainer": true, "RemoveContainer": true,
-			"EnsureTenantNetwork": true, "RemoveTenantNetworkIfEmpty": true,
-			"DetectVolumeOwner": true, "DetectWritablePaths": true, "ExtractImageContent": true,
-		},
-		"compose": {"Up": true, "Down": true},
-		"volumes": {"Create": true, "EnsureQuota": true, "RenameVolume": true},
-	}
-
-	entries, err := os.ReadDir(".")
-	require.NoError(t, err)
-	fset := token.NewFileSet()
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || name == "storage_mutation_guard.go" {
-			continue
-		}
-		if name == "volume_lock.go" {
-			source, readErr := os.ReadFile(name)
-			require.NoError(t, readErr)
-			assert.Contains(t, string(source), ".mutationAdapter().createVolume(",
-				"the ownership/striping choke point must use the pre/post-attested volume capability")
-		}
-		if name == "volume_destroy.go" {
-			source, readErr := os.ReadFile(name)
-			require.NoError(t, readErr)
-			assert.Contains(t, string(source), ".mutationAdapter().destroyVolume(",
-				"the ownership/striping choke point must use the pre/post-attested volume capability")
-		}
-		file, parseErr := parser.ParseFile(fset, name, nil, 0)
-		require.NoError(t, parseErr, name)
-		ast.Inspect(file, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			selector, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			if selector.Sel.Name == "Destroy" {
-				pos := fset.Position(selector.Pos())
-				t.Errorf("raw Destroy mutation outside storage guard at %s", pos)
-				return true
-			}
-			capability, ok := selector.X.(*ast.SelectorExpr)
-			if !ok || !mutators[capability.Sel.Name][selector.Sel.Name] {
-				return true
-			}
-			pos := fset.Position(selector.Pos())
-			t.Errorf("raw %s.%s mutation outside storage guard at %s", capability.Sel.Name, selector.Sel.Name, pos)
-			return true
-		})
-	}
-}
-
-// TestStorageMutationGuard_RawMutatorsArePostAttested pins the second half of
-// the choke-point contract. Keeping raw calls in one file is insufficient if a
-// future adapter returns before re-attesting the storage lineage: a successful
-// call during a root replacement would again look definitive to its caller.
-func TestStorageMutationGuard_RawMutatorsArePostAttested(t *testing.T) {
-	t.Parallel()
-
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "storage_mutation_guard.go", nil, 0)
-	require.NoError(t, err)
-
-	mutators := map[string]map[string]bool{
-		"docker": {
-			"PullImage": true, "ResolveImageUser": true,
-			"StopContainer": true, "RenameContainer": true, "RemoveContainer": true,
-			"EnsureTenantNetwork": true, "RemoveTenantNetworkIfEmpty": true,
-			"DetectVolumeOwner": true, "DetectWritablePaths": true, "ExtractImageContent": true,
-		},
-		"compose": {"Up": true, "Down": true},
-		"volumes": {"Create": true, "EnsureQuota": true, "RenameVolume": true},
-	}
-	checked := 0
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Recv == nil || fn.Body == nil {
-			continue
-		}
-		var rawMutation, postcheck bool
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			switch called := call.Fun.(type) {
-			case *ast.Ident:
-				if called.Name == "buildStatefulVolumeBindsContext" {
-					rawMutation = true
-				}
-			case *ast.SelectorExpr:
-				if called.Sel.Name == "completeMutation" {
-					postcheck = true
-				}
-				if called.Sel.Name == "Destroy" {
-					rawMutation = true
-				}
-				if owner, ok := called.X.(*ast.Ident); ok && owner.Name == "os" && called.Sel.Name == "RemoveAll" {
-					rawMutation = true
-				}
-				if capability, ok := called.X.(*ast.SelectorExpr); ok && mutators[capability.Sel.Name][called.Sel.Name] {
-					rawMutation = true
-				}
-			}
-			return true
-		})
-		if !rawMutation {
-			continue
-		}
-		checked++
-		assert.True(t, postcheck, "%s calls a raw mutator without completeMutation", fn.Name.Name)
-	}
-	assert.Greater(t, checked, 0, "the invariant must discover the guarded raw mutation methods")
 }

@@ -22,7 +22,15 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/maintenanceid"
 )
+
+func testMaintenanceRequestID(t testing.TB) maintenanceid.ID {
+	t.Helper()
+	id, err := maintenanceid.New()
+	require.NoError(t, err)
+	return id
+}
 
 func TestHTTPClient_Provision(t *testing.T) {
 	// Create test server
@@ -1599,11 +1607,13 @@ func TestHTTPClient_Restart(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Restart(context.Background(), RestartRequest{
+	requestID := testMaintenanceRequestID(t)
+	err := client.Restart(context.Background(), RestartRequest{MaintenanceID: requestID,
 		LeaseUUID:   "lease-restart-1",
 		CallbackURL: "http://fred/callbacks/provision",
 	})
 	require.NoError(t, err)
+	assert.Equal(t, requestID, receivedReq.MaintenanceID)
 	assert.Equal(t, "lease-restart-1", receivedReq.LeaseUUID)
 	assert.Equal(t, "http://fred/callbacks/provision", receivedReq.CallbackURL)
 }
@@ -1620,7 +1630,7 @@ func TestHTTPClient_Restart_NotProvisioned(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Restart(context.Background(), RestartRequest{LeaseUUID: "nonexistent"})
+	err := client.Restart(context.Background(), RestartRequest{MaintenanceID: testMaintenanceRequestID(t), LeaseUUID: "nonexistent"})
 	assert.ErrorIs(t, err, ErrNotProvisioned)
 }
 
@@ -1636,7 +1646,7 @@ func TestHTTPClient_Restart_InvalidState(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Restart(context.Background(), RestartRequest{LeaseUUID: "busy-lease"})
+	err := client.Restart(context.Background(), RestartRequest{MaintenanceID: testMaintenanceRequestID(t), LeaseUUID: "busy-lease"})
 	assert.ErrorIs(t, err, ErrInvalidState)
 }
 
@@ -1652,7 +1662,7 @@ func TestHTTPClient_Restart_ServerError(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Restart(context.Background(), RestartRequest{LeaseUUID: "test"})
+	err := client.Restart(context.Background(), RestartRequest{MaintenanceID: testMaintenanceRequestID(t), LeaseUUID: "test"})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "500")
 }
@@ -1680,7 +1690,7 @@ func TestHTTPClient_Restart_WithHMAC(t *testing.T) {
 		Secret:  secret,
 	})
 
-	err := client.Restart(context.Background(), RestartRequest{
+	err := client.Restart(context.Background(), RestartRequest{MaintenanceID: testMaintenanceRequestID(t),
 		LeaseUUID:   "lease-hmac-restart",
 		CallbackURL: "http://fred/callbacks/provision",
 	})
@@ -1850,15 +1860,16 @@ func TestHTTPClient_Update(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Update(context.Background(), UpdateRequest{
+	requestID := testMaintenanceRequestID(t)
+	err := client.Update(context.Background(), UpdateRequest{MaintenanceID: requestID,
 		LeaseUUID:   "lease-update-1",
 		CallbackURL: "http://fred/callbacks/provision",
 		Payload:     []byte("base64-manifest"),
-		PayloadHash: "sha256-hash",
 	})
 	require.NoError(t, err)
+	assert.Equal(t, requestID, receivedReq.MaintenanceID)
 	assert.Equal(t, "lease-update-1", receivedReq.LeaseUUID)
-	assert.Equal(t, "sha256-hash", receivedReq.PayloadHash)
+	assert.Equal(t, []byte("base64-manifest"), receivedReq.Payload)
 }
 
 func TestHTTPClient_Update_NotProvisioned(t *testing.T) {
@@ -1873,7 +1884,7 @@ func TestHTTPClient_Update_NotProvisioned(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Update(context.Background(), UpdateRequest{LeaseUUID: "nonexistent"})
+	err := client.Update(context.Background(), UpdateRequest{MaintenanceID: testMaintenanceRequestID(t), LeaseUUID: "nonexistent"})
 	assert.ErrorIs(t, err, ErrNotProvisioned)
 }
 
@@ -1889,7 +1900,7 @@ func TestHTTPClient_Update_InvalidState(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Update(context.Background(), UpdateRequest{LeaseUUID: "busy-lease"})
+	err := client.Update(context.Background(), UpdateRequest{MaintenanceID: testMaintenanceRequestID(t), LeaseUUID: "busy-lease"})
 	assert.ErrorIs(t, err, ErrInvalidState)
 }
 
@@ -1910,7 +1921,7 @@ func TestHTTPClient_Update_ValidationError(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Update(context.Background(), UpdateRequest{LeaseUUID: "test"})
+	err := client.Update(context.Background(), UpdateRequest{MaintenanceID: testMaintenanceRequestID(t), LeaseUUID: "test"})
 	assert.ErrorIs(t, err, ErrValidation)
 	assert.ErrorIs(t, err, ErrInvalidManifest)
 }
@@ -1927,9 +1938,45 @@ func TestHTTPClient_Update_ServerError(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	err := client.Update(context.Background(), UpdateRequest{LeaseUUID: "test"})
+	err := client.Update(context.Background(), UpdateRequest{MaintenanceID: testMaintenanceRequestID(t), LeaseUUID: "test"})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "500")
+}
+
+func TestHTTPClient_MaintenanceCapacityRefusalIsDefinitive(t *testing.T) {
+	for name, invoke := range map[string]func(*HTTPClient) error{
+		"restart": func(client *HTTPClient) error {
+			return client.Restart(t.Context(), RestartRequest{
+				MaintenanceID: testMaintenanceRequestID(t),
+				LeaseUUID:     "lease-restart-capacity", CallbackURL: "https://fred.test/callback",
+			})
+		},
+		"update": func(client *HTTPClient) error {
+			return client.Update(t.Context(), UpdateRequest{
+				MaintenanceID: testMaintenanceRequestID(t),
+				LeaseUUID:     "lease-update-capacity", CallbackURL: "https://fred.test/callback",
+				Payload: []byte("manifest"),
+			})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+					"error": "maintenance receipt capacity exhausted",
+					"code":  CodeInsufficientResources,
+				}))
+			}))
+			defer server.Close()
+			client := newUnboundHTTPClientForTest(HTTPClientConfig{
+				Name: name + "-capacity", BaseURL: server.URL, Timeout: time.Second,
+			})
+
+			err := invoke(client)
+			assert.ErrorIs(t, err, ErrCapacityRefused)
+		})
+	}
 }
 
 func TestHTTPClient_Update_WithHMAC(t *testing.T) {
@@ -1955,7 +2002,7 @@ func TestHTTPClient_Update_WithHMAC(t *testing.T) {
 		Secret:  secret,
 	})
 
-	err := client.Update(context.Background(), UpdateRequest{
+	err := client.Update(context.Background(), UpdateRequest{MaintenanceID: testMaintenanceRequestID(t),
 		LeaseUUID:   "lease-hmac-update",
 		CallbackURL: "http://fred/callbacks/provision",
 		Payload:     []byte("manifest-data"),
@@ -2150,6 +2197,49 @@ func TestDecodeJSONLimited(t *testing.T) {
 		err := decodeJSONLimited(body, 1024, &info)
 		assert.Error(t, err)
 		assert.NotErrorIs(t, err, ErrResponseTooLarge)
+	})
+}
+
+type endlessCountingBody struct {
+	read   int64
+	closed bool
+}
+
+func (body *endlessCountingBody) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	body.read += int64(len(p))
+	return len(p), nil
+}
+
+func (body *endlessCountingBody) Close() error {
+	body.closed = true
+	return nil
+}
+
+func TestBackendResponseDrainsAreBounded(t *testing.T) {
+	t.Run("discard and close", func(t *testing.T) {
+		body := &endlessCountingBody{}
+		discardAndCloseResponse(&http.Response{Body: body})
+		assert.Equal(t, maxResponseDrainBytes, body.read)
+		assert.True(t, body.closed)
+	})
+
+	t.Run("error envelope", func(t *testing.T) {
+		body := &endlessCountingBody{}
+		got := readErrorBodyBytes(&http.Response{Body: body})
+		assert.Len(t, got, 4096)
+		assert.Equal(t, int64(4096)+maxResponseDrainBytes, body.read)
+	})
+
+	t.Run("oversized JSON", func(t *testing.T) {
+		const limit int64 = 32
+		body := &endlessCountingBody{}
+		var decoded map[string]any
+		err := decodeJSONLimited(body, limit, &decoded)
+		assert.ErrorIs(t, err, ErrResponseTooLarge)
+		assert.Equal(t, limit+1+maxResponseDrainBytes, body.read)
 	})
 }
 

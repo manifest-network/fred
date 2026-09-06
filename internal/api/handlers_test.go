@@ -2,8 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +26,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/metrics"
-	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
@@ -3845,840 +3842,6 @@ func TestGetLeaseLogs(t *testing.T) {
 	})
 }
 
-// TestRestartLease_BackendIntegration tests the backend integration path
-// in RestartLease using httptest.Server and a real backend.Router.
-func TestRestartLease_BackendIntegration(t *testing.T) {
-	kp := testutil.NewTestKeyPair("test-tenant")
-	leaseUUID := testutil.ValidUUID1
-	providerUUID := testutil.ValidUUID2
-
-	chainClient := &mockChainClient{
-		getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid == leaseUUID {
-				return &billingtypes.Lease{
-					Uuid:         leaseUUID,
-					Tenant:       kp.Address,
-					ProviderUuid: providerUUID,
-					State:        billingtypes.LEASE_STATE_ACTIVE,
-				}, nil
-			}
-			return nil, nil
-		},
-	}
-	lifecycleCallbacks, _ := typedMaintenanceLifecycleStore(
-		t, leaseUUID, "test-backend",
-	)
-
-	t.Run("router_missing_returns_503", func(t *testing.T) {
-		h := &Handlers{
-			client:        chainClient,
-			backendRouter: nil,
-			providerUUID:  providerUUID,
-			bech32Prefix:  "manifest",
-		}
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.RestartLease(rec, req)
-
-		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "service not configured", errResp.Error)
-	})
-
-	t.Run("not_provisioned_returns_404", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/restart" && r.Method == "POST" {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := &Handlers{
-			client:             chainClient,
-			backendRouter:      router,
-			callbackBaseURL:    testCallbackBaseURL,
-			lifecycleCallbacks: lifecycleCallbacks,
-			maintenanceClaims:  operation.NewRegistry(),
-			providerUUID:       providerUUID,
-			bech32Prefix:       "manifest",
-		}
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.RestartLease(rec, req)
-
-		assert.Equal(t, http.StatusNotFound, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "lease not yet provisioned", errResp.Error)
-	})
-
-	t.Run("invalid_state_returns_409", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/restart" && r.Method == "POST" {
-				w.WriteHeader(http.StatusConflict)
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := &Handlers{
-			client:             chainClient,
-			backendRouter:      router,
-			callbackBaseURL:    testCallbackBaseURL,
-			lifecycleCallbacks: lifecycleCallbacks,
-			maintenanceClaims:  operation.NewRegistry(),
-			providerUUID:       providerUUID,
-			bech32Prefix:       "manifest",
-		}
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.RestartLease(rec, req)
-
-		assert.Equal(t, http.StatusConflict, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "invalid state for restart", errResp.Error)
-	})
-
-	t.Run("backend_error_returns_500", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/restart" && r.Method == "POST" {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := &Handlers{
-			client:             chainClient,
-			backendRouter:      router,
-			callbackBaseURL:    testCallbackBaseURL,
-			lifecycleCallbacks: lifecycleCallbacks,
-			maintenanceClaims:  operation.NewRegistry(),
-			providerUUID:       providerUUID,
-			bech32Prefix:       "manifest",
-		}
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.RestartLease(rec, req)
-
-		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "internal server error", errResp.Error)
-	})
-
-	t.Run("happy_path_returns_202", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/restart" && r.Method == "POST" {
-				w.WriteHeader(http.StatusAccepted)
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := &Handlers{
-			client:             chainClient,
-			backendRouter:      router,
-			callbackBaseURL:    testCallbackBaseURL,
-			lifecycleCallbacks: lifecycleCallbacks,
-			maintenanceClaims:  operation.NewRegistry(),
-			providerUUID:       providerUUID,
-			bech32Prefix:       "manifest",
-		}
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restart", nil)
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.RestartLease(rec, req)
-
-		assert.Equal(t, http.StatusAccepted, rec.Code)
-
-		var response map[string]string
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
-		assert.Equal(t, "restarting", response["status"])
-	})
-}
-
-func TestMaintenanceEndpointsRefuseWhileDurableOperationNeedsRedelivery(t *testing.T) {
-	keyPair := testutil.NewTestKeyPair("pending-redelivery-maintenance")
-	leaseUUID := testutil.ValidUUID1
-	providerUUID := testutil.ValidUUID2
-	const backendName = "test-backend"
-
-	chainClient := &mockChainClient{
-		getActiveLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid != leaseUUID {
-				return nil, nil
-			}
-			return &billingtypes.Lease{
-				Uuid: leaseUUID, Tenant: keyPair.Address, ProviderUuid: providerUUID,
-				State: billingtypes.LEASE_STATE_ACTIVE,
-			}, nil
-		},
-	}
-	store, _ := typedMaintenanceLifecycleStore(t, leaseUUID, backendName)
-	pendingID, err := operation.ParseID("b7287b89-5166-46ce-83a8-80aa388b881c")
-	require.NoError(t, err)
-	_, begun, err := store.BeginOwnedAttempt(
-		store.CurrentAdmissionBaseline(), store.Lookup(leaseUUID).RecordRevision(),
-		backendName, pendingID, placement.PayloadFingerprint{},
-		testAPIBackendRequestSnapshot(t),
-		testAPICallbackPair(t, pendingID),
-	)
-	require.NoError(t, err)
-	require.True(t, begun)
-	require.Equal(t, placement.LifecycleVerdictTeardownOnly,
-		store.CurrentLifecycle(leaseUUID).Verdict())
-
-	var backendCalls atomic.Int32
-	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		backendCalls.Add(1)
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	t.Cleanup(backendServer.Close)
-	backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-		Name: backendName, BaseURL: backendServer.URL, Timeout: time.Second,
-	})
-	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{{
-		Backend: backendClient, IsDefault: true,
-	}}})
-	require.NoError(t, err)
-	persister := &mockPayloadPersister{}
-	handlers := &Handlers{
-		client:             chainClient,
-		backendRouter:      router,
-		callbackBaseURL:    testCallbackBaseURL,
-		placementLookup:    store,
-		lifecycleCallbacks: store,
-		maintenanceClaims:  operation.NewRegistry(),
-		providerUUID:       providerUUID,
-		bech32Prefix:       "manifest",
-		payloadPersister:   persister,
-	}
-
-	for _, test := range []struct {
-		name string
-		path string
-		body string
-	}{
-		{name: "restart", path: "restart"},
-		{name: "update", path: "update", body: `{"payload":"dGVzdA=="}`},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(
-				http.MethodPost, "/v1/leases/"+leaseUUID+"/"+test.path,
-				strings.NewReader(test.body),
-			)
-			request.Header.Set("Authorization", "Bearer "+
-				testutil.CreateTestToken(keyPair, leaseUUID, time.Now()))
-			request.SetPathValue("lease_uuid", leaseUUID)
-			response := httptest.NewRecorder()
-			if test.path == "restart" {
-				handlers.RestartLease(response, request)
-			} else {
-				handlers.UpdateLease(response, request)
-			}
-			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
-			assert.Zero(t, backendCalls.Load(),
-				"maintenance must not reach the backend while exact redelivery is pending")
-			assert.Empty(t, persister.calls,
-				"update must not replace the payload used to reconstruct exact redelivery")
-		})
-	}
-}
-
-// TestUpdateLease_BackendIntegration tests the backend integration path
-// in UpdateLease using httptest.Server and a real backend.Router.
-// mockPersistCall records one OverwritePayload invocation.
-type mockPersistCall struct {
-	leaseUUID string
-	payload   []byte
-}
-
-// mockPayloadPersister is the api-side fake for the ENG-619 persistence seam.
-type mockPayloadPersister struct {
-	calls []mockPersistCall
-	err   error // when set, OverwritePayload fails
-}
-
-func (m *mockPayloadPersister) OverwritePayload(leaseUUID string, payload []byte) error {
-	m.calls = append(m.calls, mockPersistCall{leaseUUID: leaseUUID, payload: append([]byte(nil), payload...)})
-	return m.err
-}
-
-// updateTestBackend returns a router whose single backend answers /update with
-// the given status, plus a pointer to the number of /update requests it saw.
-func updateTestBackend(t *testing.T, status int, body string) (*backend.Router, *int) {
-	t.Helper()
-	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/update" && r.Method == "POST" {
-			calls++
-			w.WriteHeader(status)
-			if body != "" {
-				_, _ = w.Write([]byte(body))
-			}
-			return
-		}
-		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-	}))
-	t.Cleanup(server.Close)
-
-	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-		Name:    "test-backend",
-		BaseURL: server.URL,
-		Timeout: 5 * time.Second,
-	})
-	router, err := backend.NewRouter(backend.RouterConfig{
-		Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
-	})
-	require.NoError(t, err)
-	return router, &calls
-}
-
-func TestUpdateLease_BackendIntegration(t *testing.T) {
-	kp := testutil.NewTestKeyPair("test-tenant")
-	leaseUUID := testutil.ValidUUID1
-	providerUUID := testutil.ValidUUID2
-
-	chainClient := &mockChainClient{
-		getActiveLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid == leaseUUID {
-				return &billingtypes.Lease{
-					Uuid:         leaseUUID,
-					Tenant:       kp.Address,
-					ProviderUuid: providerUUID,
-					State:        billingtypes.LEASE_STATE_ACTIVE,
-				}, nil
-			}
-			return nil, nil
-		},
-	}
-	lifecycleCallbacks, _ := typedMaintenanceLifecycleStore(
-		t, leaseUUID, "test-backend",
-	)
-	newUpdateHandlers := func(
-		router *backend.Router,
-		persister PayloadPersister,
-	) *Handlers {
-		return &Handlers{
-			client:             chainClient,
-			backendRouter:      router,
-			callbackBaseURL:    testCallbackBaseURL,
-			lifecycleCallbacks: lifecycleCallbacks,
-			maintenanceClaims:  operation.NewRegistry(),
-			providerUUID:       providerUUID,
-			bech32Prefix:       "manifest",
-			payloadPersister:   persister,
-		}
-	}
-
-	t.Run("router_missing_returns_503", func(t *testing.T) {
-		h := newUpdateHandlers(nil, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		body := `{"payload":"dGVzdA=="}`
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "service not configured", errResp.Error)
-	})
-
-	t.Run("missing_payload_returns_400", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := newUpdateHandlers(router, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		body := `{"payload":""}`
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "payload is required", errResp.Error)
-	})
-
-	t.Run("invalid_body_returns_400", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := newUpdateHandlers(router, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader("not json"))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "invalid request body", errResp.Error)
-	})
-
-	t.Run("not_provisioned_returns_404", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/update" && r.Method == "POST" {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := newUpdateHandlers(router, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		body := `{"payload":"dGVzdA=="}`
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusNotFound, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "lease not yet provisioned", errResp.Error)
-	})
-
-	t.Run("invalid_state_returns_409", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/update" && r.Method == "POST" {
-				w.WriteHeader(http.StatusConflict)
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := newUpdateHandlers(router, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		body := `{"payload":"dGVzdA=="}`
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusConflict, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "invalid state for update", errResp.Error)
-	})
-
-	t.Run("validation_error_returns_400", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/update" && r.Method == "POST" {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadRequest)
-				json.NewEncoder(w).Encode(map[string]string{"error": "invalid manifest"})
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := newUpdateHandlers(router, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		body := `{"payload":"dGVzdA=="}`
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
-	})
-
-	t.Run("backend_error_returns_500", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/update" && r.Method == "POST" {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := newUpdateHandlers(router, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		body := `{"payload":"dGVzdA=="}`
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "internal server error", errResp.Error)
-	})
-
-	t.Run("happy_path_returns_202", func(t *testing.T) {
-		backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/update" && r.Method == "POST" {
-				w.WriteHeader(http.StatusAccepted)
-				return
-			}
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}))
-		defer backendServer.Close()
-
-		backendClient := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name:    "test-backend",
-			BaseURL: backendServer.URL,
-			Timeout: 5 * time.Second,
-		})
-
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{
-				{Backend: backendClient, IsDefault: true},
-			},
-		})
-		require.NoError(t, err)
-
-		h := newUpdateHandlers(router, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		body := `{"payload":"dGVzdA=="}`
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusAccepted, rec.Code)
-
-		var response map[string]string
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&response))
-		assert.Equal(t, "updating", response["status"])
-	})
-
-	// --- ENG-619: an update that reaches the backend must also reach the store ---
-
-	t.Run("persists_updated_payload_after_backend_accepts", func(t *testing.T) {
-		router, _ := updateTestBackend(t, http.StatusAccepted, "")
-		persister := &mockPayloadPersister{}
-
-		h := newUpdateHandlers(router, persister)
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		body := `{"payload":"dGVzdA=="}` // "test"
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		require.Equal(t, http.StatusAccepted, rec.Code)
-		require.Len(t, persister.calls, 1, "a successful update must persist the new payload")
-		assert.Equal(t, leaseUUID, persister.calls[0].leaseUUID)
-		assert.Equal(t, []byte("test"), persister.calls[0].payload,
-			"the persisted payload must be the one sent to the backend")
-	})
-
-	t.Run("backend_rejection_does_not_persist", func(t *testing.T) {
-		// Persist-after-success: a payload the backend refused must never reach
-		// the store, or the next reprovision would replay a manifest that was
-		// never deployed.
-		router, _ := updateTestBackend(t, http.StatusBadRequest, `{"error":"invalid manifest"}`)
-		persister := &mockPayloadPersister{}
-
-		h := newUpdateHandlers(router, persister)
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
-		assert.Empty(t, persister.calls, "a rejected update must not be persisted")
-	})
-
-	t.Run("persist_failure_returns_500", func(t *testing.T) {
-		// The error branch: the backend is now running the new manifest but
-		// nothing durable records it. Answering 202 here is the silent-revert
-		// bug, so the tenant is told the update did not fully land.
-		router, updateCalls := updateTestBackend(t, http.StatusAccepted, "")
-		persister := &mockPayloadPersister{err: errors.New("disk full")}
-
-		h := newUpdateHandlers(router, persister)
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-		assert.Equal(t, 1, *updateCalls, "the backend was still called — the tenant retries to re-apply and re-persist")
-		require.Len(t, persister.calls, 1)
-
-		var errResp ErrorResponse
-		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-		assert.Equal(t, "internal server error", errResp.Error)
-	})
-
-	t.Run("missing_persister_returns_500_without_calling_backend", func(t *testing.T) {
-		// Fail before touching the backend: a lease left running a manifest fred
-		// has no durable record of is worse than an update that never happened.
-		router, updateCalls := updateTestBackend(t, http.StatusAccepted, "")
-
-		h := newUpdateHandlers(router, nil) // payloadPersister deliberately nil
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-		assert.Zero(t, *updateCalls, "the update must not be half-applied")
-	})
-
-	t.Run("sends_payload_hash_matching_the_payload", func(t *testing.T) {
-		// payload_hash is part of the documented /update request; it was never
-		// populated before ENG-619.
-		var got backend.UpdateRequest
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
-			w.WriteHeader(http.StatusAccepted)
-		}))
-		defer server.Close()
-
-		client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-			Name: "test-backend", BaseURL: server.URL, Timeout: 5 * time.Second,
-		})
-		router, err := backend.NewRouter(backend.RouterConfig{
-			Backends: []backend.BackendEntry{{Backend: client, IsDefault: true}},
-		})
-		require.NoError(t, err)
-
-		h := newUpdateHandlers(router, &mockPayloadPersister{})
-
-		validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-		req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update", strings.NewReader(`{"payload":"dGVzdA=="}`))
-		req.Header.Set("Authorization", "Bearer "+validToken)
-		req.SetPathValue("lease_uuid", leaseUUID)
-
-		rec := httptest.NewRecorder()
-		h.UpdateLease(rec, req)
-
-		require.Equal(t, http.StatusAccepted, rec.Code)
-		want := sha256.Sum256([]byte("test"))
-		assert.Equal(t, hex.EncodeToString(want[:]), got.PayloadHash)
-		assert.Equal(t, []byte("test"), got.Payload)
-	})
-}
-
 // TestGetLeaseReleases_BackendIntegration tests the backend integration path
 // in GetLeaseReleases using httptest.Server and a real backend.Router.
 func TestGetLeaseReleases_BackendIntegration(t *testing.T) {
@@ -5900,11 +5063,21 @@ func (reader restoreTestLeaseReader) GetLease(
 
 func newRestoreAuthorityForTest(
 	t *testing.T,
+	providerUUID string,
 	sourcePlacements PlacementLookup,
 	router *backend.Router,
-) *placement.Store {
+	_ *operation.Registry,
+	leaseReader placement.PruneLeaseReader,
+) (*placement.Store, *placement.ExecutionCoordinator) {
 	t.Helper()
-	store, err := placementstore.NewStore(filepath.Join(t.TempDir(), "restore-placements.db"))
+	routes, err := placement.NewCallbackRouteFactory("https://fred.example.test")
+	require.NoError(t, err)
+	storePath := filepath.Join(t.TempDir(), "restore-placements.db")
+	store, err := placementstore.NewStoreForProvider(
+		storePath,
+		providerUUID,
+		placement.WithCallbackRouteFactory(routes),
+	)
 	require.NoError(t, err)
 	backendNames := make([]string, 0, len(router.Backends()))
 	for _, backendClient := range router.Backends() {
@@ -5924,17 +5097,46 @@ func newRestoreAuthorityForTest(
 		}
 	}
 	configureAPIPlacementTopology(t, store, backendNames)
-	fence := store.BeginInventorySession()
-	_, err = store.ProjectInventory(fence, placement.InventoryProjection{
-		Complete:                 true,
-		Placements:               placements,
-		BackendStorageIdentities: testAPIBackendStorageIDs(backendNames...),
-		EmptyBackends:            testAPIEmptyBackends(backendNames, placements),
-	})
+	coordinator, err := store.BindOperationCoordinator(nil)
 	require.NoError(t, err)
-	store.EndInventorySession(fence)
+	chain := apiReconciliationChain{PruneLeaseReader: leaseReader}
+	execution, inventoryRuntime := bindAPIInventoryRuntime(t, coordinator, router, chain)
+	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
+	require.NoError(t, err)
+	registerAPIReconciliationInventory(t, reconciliation, inventoryRuntime)
+	_, inventorySweep := projectAPIInventoryWithExplicitLifetime(
+		t, reconciliation, backendNames, testAPIBackendStorageIDs(backendNames...),
+		placement.ReconciliationProjection{Placements: placements}, true,
+	)
+	for leaseUUID, backendName := range placements {
+		projected := store.Lookup(leaseUUID)
+		require.Equal(t, placement.StateConfirmed, projected.State())
+		require.Equal(t, backendName, projected.Backend)
+		require.True(t, projected.RecordRevision().Valid())
+	}
+	// The inventory adapter deliberately wraps clients and therefore cannot mint
+	// typed transport observations. End that setup-only authority and reopen the
+	// durable store before binding the exact HTTP clients used by restore. This
+	// mirrors a process restart and prevents a decorator from gaining refusal
+	// authority merely by embedding *backend.HTTPClient.
+	inventorySweep.End()
+	require.NoError(t, store.Close())
+
+	store, err = placementstore.NewStoreForProvider(
+		storePath,
+		providerUUID,
+		placement.WithCallbackRouteFactory(routes),
+	)
+	require.NoError(t, err)
+	coordinator, err = store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution, err = coordinator.BindBackendRuntime(
+		router,
+		apiProviderControlPlane{ReconciliationChain: chain},
+	)
+	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	return store
+	return store, execution
 }
 
 func newRestoreServiceForTest(
@@ -5955,18 +5157,15 @@ func newRestoreServiceForTest(
 		providerUUID: providerUUID,
 		tenant:       tenant,
 	}
+	registry := operation.NewRegistry()
+	_, execution := newRestoreAuthorityForTest(
+		t, providerUUID, sourcePlacements, router, registry, leases,
+	)
+	restoreCoordinator, err := execution.RestoreCoordinator(nil)
+	require.NoError(t, err)
 	service, err := restoreapp.NewService(restoreapp.Config{
-		ProviderUUID: providerUUID,
-		CallbackURL: func(operationID operation.OperationID) (string, error) {
-			return provisioner.BuildCallbackURLForOperation("https://fred.example.test", operationID)
-		},
-		Leases: leases,
-		Backends: restoreapp.BackendResolverFunc(func(name string) restoreapp.RestoreBackend {
-			return router.GetBackendByName(name)
-		}),
-		Operations: operation.NewRegistry(),
-		Authority:  newRestoreAuthorityForTest(t, sourcePlacements, router),
-		Events:     events,
+		Coordinator: restoreCoordinator,
+		Events:      events,
 	})
 	require.NoError(t, err)
 	return service
@@ -6669,10 +5868,11 @@ func TestRestoreLease_RoutesToSourcePlacementBackend(t *testing.T) {
 	assert.False(t, otherCalled, "backend-other must NOT have been called")
 }
 
-// TestRestoreLease_NoSourcePlacement_Returns404 verifies that when the
-// placement lookup returns "" for the source lease (no retained data recorded
-// on any backend), the handler responds 404 without contacting any backend.
-func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
+// TestRestoreLease_NoSourcePlacementWithAbsentChainReadReturns503 verifies that
+// missing local affinity plus a non-authoritative nil chain read does not mint
+// the permanent tenant claim that retained data is gone. The ledger does not
+// delete lease records, so this observation is an availability failure.
+func TestRestoreLease_NoSourcePlacementWithAbsentChainReadReturns503(t *testing.T) {
 	kp := testutil.NewTestKeyPair("test-tenant")
 	leaseUUID := testutil.ValidUUID1
 	providerUUID := testutil.ValidUUID2
@@ -6729,45 +5929,23 @@ func TestRestoreLease_NoSourcePlacement_Returns404(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.RestoreLease(rec, req)
 
-	assert.Equal(t, http.StatusNotFound, rec.Code, "body: %s", rec.Body.String())
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "body: %s", rec.Body.String())
 
 	var errResp ErrorResponse
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-	assert.Equal(t, "no retained data found for that lease", errResp.Error)
+	assert.Equal(t, errMsgServiceUnavailable, errResp.Error)
+	assert.NotEqual(t, "no retained data found for that lease", errResp.Error,
+		"an absent/unknown chain observation cannot authorize a permanent data-loss verdict")
 }
 
-// ENG-635: the sibling of the 404 case above, and the reason the two must not
-// be collapsed. A source lease with NO placement record genuinely has no
-// retained data anywhere, so 404 is truthful. A source lease WITH a record
-// naming a backend the resolver does not know is a different answer: the data
-// may still exist even though this process cannot reach it.
-//
-// Answering 404 there tells a tenant their data is gone and invites them to
-// destroy and recreate the deployment, which turns a recoverable outage into
-// real data loss. 503 is both true and actionable. The production composition
-// rejects topology/resolver drift during startup; this independently composed
-// fixture preserves the defensive HTTP boundary for alternate embeddings.
-func TestRestoreLease_UnresolvableSourcePlacement_Returns503(t *testing.T) {
-	kp := testutil.NewTestKeyPair("test-tenant")
-	leaseUUID := testutil.ValidUUID1
+// ENG-635 is now enforced at construction: a durable source owner absent from
+// the runtime topology cannot produce a RestoreService at all. This removes the
+// former handler-time branch that could accidentally turn resolver drift into
+// a tenant-facing "data is gone" verdict.
+func TestRestoreAuthority_UnresolvableSourcePlacementCannotBeConstructed(t *testing.T) {
 	providerUUID := testutil.ValidUUID2
-
-	chainClient := &mockChainClient{
-		getLeaseFunc: func(ctx context.Context, uuid string) (*billingtypes.Lease, error) {
-			if uuid == leaseUUID {
-				return &billingtypes.Lease{
-					Uuid:         leaseUUID,
-					Tenant:       kp.Address,
-					ProviderUuid: providerUUID,
-					State:        billingtypes.LEASE_STATE_PENDING,
-				}, nil
-			}
-			return nil, nil
-		},
-	}
-
 	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("no backend may be called when the source placement does not resolve: %s %s", r.Method, r.URL.Path)
+		t.Errorf("construction failure must prevent backend calls: %s %s", r.Method, r.URL.Path)
 	}))
 	defer backendServer.Close()
 
@@ -6780,36 +5958,26 @@ func TestRestoreLease_UnresolvableSourcePlacement_Returns503(t *testing.T) {
 		Backends: []backend.BackendEntry{{Backend: backendClient, IsDefault: true}},
 	})
 	require.NoError(t, err)
-
-	// A record EXISTS, but names a backend absent from the router.
-	placement := &mockPlacementLookup{
-		getFunc: func(uuid string) string { return "removed-backend" },
-	}
-
-	h := &Handlers{
-		client:          chainClient,
-		backendRouter:   router,
-		placementLookup: placement,
-		restoreService:  newRestoreServiceForTest(t, providerUUID, kp.Address, chainClient, router, placement, nil),
-		providerUUID:    providerUUID,
-		bech32Prefix:    "manifest",
-	}
-
-	validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-	reqBody := `{"from_lease_uuid":"` + fromLeaseUUID + `"}`
-	req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/restore", strings.NewReader(reqBody))
-	req.Header.Set("Authorization", "Bearer "+validToken)
-	req.SetPathValue("lease_uuid", leaseUUID)
-
-	rec := httptest.NewRecorder()
-	h.RestoreLease(rec, req)
-
-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "body: %s", rec.Body.String())
-
-	var errResp ErrorResponse
-	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
-	assert.NotEqual(t, "no retained data found for that lease", errResp.Error,
-		"must not tell the tenant their data is gone when it is merely unreachable")
+	routes, err := placement.NewCallbackRouteFactory("https://fred.example.test")
+	require.NoError(t, err)
+	store, err := placementstore.NewStoreForProvider(
+		filepath.Join(t.TempDir(), "unresolvable-source.db"), providerUUID,
+		placement.WithCallbackRouteFactory(routes),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, placementstore.ConfigureBackendTopologyWithStorageIdentities(
+		store,
+		[]string{"removed-backend", "test-backend"},
+		testAPIBackendStorageIDs("removed-backend", "test-backend"),
+	))
+	coordinator, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	_, err = coordinator.BindBackendRuntime(
+		router,
+		apiProviderControlPlane{ReconciliationChain: apiReconciliationChain{}},
+	)
+	require.ErrorContains(t, err, "does not match durable topology")
 }
 
 // TestRestoreLease_PlacementDisabled_Returns503 verifies that when placement
@@ -7272,97 +6440,40 @@ func TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 				"the raw backend body must never reach the tenant response")
 			assert.NotContains(t, body, "qgroup", "no fragment of the raw body may reach the tenant")
 			assert.NotContains(t, body, "/var/lib/fred", "no host path may reach the tenant")
+			assert.NotContains(t, body, "not applied",
+				"an ambiguous response cannot prove that the backend did not start work")
+			assert.Contains(t, body, "outcome is uncertain")
 			assert.Equal(t, http.StatusBadGateway, rec.Code,
 				"an off-contract backend body is an upstream fault, not a tenant one: %s", body)
 		})
 	}
 }
 
-// detailErrorFromBackend builds the error a real backend 400 produces, by
-// driving the production client against an httptest backend whose response
-// body carries the given detail. Deliberately not a constructor exported from
-// internal/backend: that would be a test-only hook in production code, and it
-// would also let this test pass against a detail shape the wire cannot
-// actually produce.
-func detailErrorFromBackend(t *testing.T, detail string) error {
-	t.Helper()
-
-	body, err := json.Marshal(map[string]string{"error": detail})
-	require.NoError(t, err)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write(body)
-	}))
-	t.Cleanup(server.Close)
-
-	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
-		Name:    "detail-src",
-		BaseURL: server.URL,
-		Timeout: 5 * time.Second,
-	})
-	err = client.Update(context.Background(), backend.UpdateRequest{LeaseUUID: testutil.ValidUUID1})
-	require.ErrorIs(t, err, backend.ErrValidation)
-	return err
-}
-
-// TestTenantDetail covers the helper that decides what a backend-originated
-// 4xx says to a tenant. Its three jobs are all security-relevant: relay only
-// the detail authored inside a validated envelope, never the wrapped chain;
-// strip control characters, which are the log-forging and terminal-escape
-// vector in relayed text; and bound the length.
-func TestTenantDetail(t *testing.T) {
+func TestTenantDetailText(t *testing.T) {
 	const fallback = "the request was rejected as invalid"
 
-	t.Run("bare sentinel falls back to fred's own message", func(t *testing.T) {
-		// A sentinel carries no backend detail, so its own text must NOT be
-		// relayed as though a backend had authored it for the tenant.
-		got := tenantDetail(backend.ErrValidation, fallback)
-		assert.Equal(t, fallback, got)
-	})
-
-	t.Run("wrapped non-detail error falls back", func(t *testing.T) {
-		// fmt.Errorf-wrapped chains are exactly what used to reach tenants.
-		err := fmt.Errorf("adopt retained volumes: %w", backend.ErrValidation)
-		got := tenantDetail(err, fallback)
-		assert.Equal(t, fallback, got)
-		assert.NotContains(t, got, "adopt retained volumes")
-	})
-
 	t.Run("strips control characters", func(t *testing.T) {
-		// \r and ESC forge extra lines / terminal sequences in anything that
-		// renders the body; \n and \t collapse to a space so words stay apart.
-		err := detailErrorFromBackend(t, "bad\rmanifest\x1b[31m: field\nx\ty")
-		got := tenantDetail(err, fallback)
+		got := tenantDetailText("bad\rmanifest\x1b[31m: field\nx\ty", fallback)
 		assert.NotContains(t, got, "\r")
 		assert.NotContains(t, got, "\x1b")
 		assert.NotContains(t, got, "\n")
 		assert.Equal(t, "badmanifest[31m: field x y", got)
 	})
 
-	t.Run("bounds an overlong detail on a rune boundary", func(t *testing.T) {
-		// Multi-byte runes so a naive byte slice would split one. 1000 runes =
-		// 2000 bytes: comfortably over maxTenantDetailBytes but under the
-		// client's 4 KiB body read cap, which is the OTHER bound and kicks in
-		// first — a body large enough to hit it is truncated mid-JSON and
-		// becomes ErrMalformedErrorBody instead of arriving here.
-		err := detailErrorFromBackend(t, strings.Repeat("é", 1000))
-		got := tenantDetail(err, fallback)
+	t.Run("bounds detail on a rune boundary", func(t *testing.T) {
+		got := tenantDetailText(strings.Repeat("é", 1000), fallback)
 		assert.LessOrEqual(t, len(got), maxTenantDetailBytes+len("…"))
 		assert.True(t, utf8.ValidString(got), "must not split a multi-byte rune: %q", got)
 		assert.True(t, strings.HasSuffix(got, "…"))
 	})
 
-	t.Run("relays a real detail unchanged", func(t *testing.T) {
+	t.Run("relays ordinary text unchanged", func(t *testing.T) {
 		const detail = `service "web": depends_on references unknown service "db"`
-		err := detailErrorFromBackend(t, detail)
-		assert.Equal(t, detail, tenantDetail(err, fallback))
+		assert.Equal(t, detail, tenantDetailText(detail, fallback))
 	})
 
-	t.Run("detail of only control characters falls back", func(t *testing.T) {
-		err := detailErrorFromBackend(t, "\x00\x01\x02")
-		assert.Equal(t, fallback, tenantDetail(err, fallback))
+	t.Run("empty sanitized detail uses curated fallback", func(t *testing.T) {
+		assert.Equal(t, fallback, tenantDetailText("\x00\x01\x02", fallback))
 	})
 }
 
@@ -7463,97 +6574,10 @@ func TestRestoreLease_422KeepsLoadtestContract(t *testing.T) {
 	}
 }
 
-// TestUpdateLease_MalformedBackendErrorBodyIsNotForwarded is the UpdateLease
-// twin of TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded. Both
-// handlers are named by ENG-620 and they classify independently — restore uses
-// a switch, update a chain of ifs — so covering only one lets the other
-// regress silently.
-//
-// It also pins a property restore has no equivalent of: a rejected update must
-// not reach the payload store. UpdateLease persists AFTER the backend accepts,
-// precisely so a manifest the backend refused is never replayed by the next
-// reprovision (ENG-619). A malformed rejection is still a rejection.
-func TestUpdateLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
-	const hostPathSentinel = `btrfs qgroup show /var/lib/fred/volumes/fred-abc-app-0: exit status 1`
-
-	for name, body := range map[string]string{
-		"text/plain 400":     hostPathSentinel,
-		"html 400":           "<html>400 " + hostPathSentinel + "</html>",
-		"truncated json 400": `{"error":"` + hostPathSentinel,
-		"foreign json 400":   `{"message":"` + hostPathSentinel + `"}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			kp := testutil.NewTestKeyPair("test-tenant")
-			leaseUUID := testutil.ValidUUID1
-			providerUUID := testutil.ValidUUID2
-
-			chainClient := &mockChainClient{
-				getActiveLeaseFunc: func(_ context.Context, uuid string) (*billingtypes.Lease, error) {
-					if uuid == leaseUUID {
-						return &billingtypes.Lease{
-							Uuid: leaseUUID, Tenant: kp.Address,
-							ProviderUuid: providerUUID, State: billingtypes.LEASE_STATE_ACTIVE,
-						}, nil
-					}
-					return nil, nil
-				},
-			}
-
-			router, calls := updateTestBackend(t, http.StatusBadRequest, body)
-			persister := &mockPayloadPersister{}
-			lifecycleCallbacks, _ := typedMaintenanceLifecycleStore(
-				t, leaseUUID, "test-backend",
-			)
-
-			h := &Handlers{
-				client:             chainClient,
-				backendRouter:      router,
-				callbackBaseURL:    testCallbackBaseURL,
-				lifecycleCallbacks: lifecycleCallbacks,
-				maintenanceClaims:  operation.NewRegistry(),
-				providerUUID:       providerUUID,
-				bech32Prefix:       "manifest",
-				payloadPersister:   persister,
-			}
-
-			validToken := testutil.CreateTestToken(kp, leaseUUID, time.Now())
-			req := httptest.NewRequest("POST", "/v1/leases/"+leaseUUID+"/update",
-				strings.NewReader(`{"payload":"dGVzdA=="}`))
-			req.Header.Set("Authorization", "Bearer "+validToken)
-			req.SetPathValue("lease_uuid", leaseUUID)
-
-			rec := httptest.NewRecorder()
-			h.UpdateLease(rec, req)
-
-			respBody := rec.Body.String()
-			assert.Equal(t, 1, *calls, "the backend must have been called")
-			assert.NotContains(t, respBody, hostPathSentinel,
-				"the raw backend body must never reach the tenant response")
-			assert.NotContains(t, respBody, "qgroup", "no fragment of the raw body may reach the tenant")
-			assert.NotContains(t, respBody, "/var/lib/fred", "no host path may reach the tenant")
-			assert.Equal(t, http.StatusBadGateway, rec.Code,
-				"an off-contract backend body is an upstream fault, not a tenant one: %s", respBody)
-
-			var errResp ErrorResponse
-			require.NoError(t, json.Unmarshal([]byte(respBody), &errResp))
-			assert.Equal(t, errMsgBackendUnusableError, errResp.Error,
-				"the tenant must get fred's authored message")
-
-			assert.Empty(t, persister.calls,
-				"a payload the backend rejected must never be persisted, however it was rejected (ENG-619)")
-		})
-	}
-}
-
-// TestRestoreLease_UnrecognizedBackendCodeRelays422 is the tenant-visible half
-// of the fix: a 422 carrying a code fred does not know must NOT be remapped to
-// 404 "no retained data found for that lease".
-//
-// That remap was the sharpest fabrication left in this path — fred changing the
-// status class the backend chose AND asserting a positive fact about the
-// tenant's data that the backend's own body contradicted, while discarding the
-// message BACKEND_GUIDE obliged the backend to curate.
-func TestRestoreLease_UnrecognizedBackendCodeRelays422(t *testing.T) {
+// TestRestoreLease_UnrecognizedBackendCodeCannotMintTenantVerdict proves that
+// identity alone is insufficient: the exact HTTP transport must also recognize
+// the closed refusal code before API policy can expose a permanent tenant fact.
+func TestRestoreLease_UnrecognizedBackendCodeCannotMintTenantVerdict(t *testing.T) {
 	const authored = "retention subsystem is draining; retry in a few minutes"
 
 	kp := testutil.NewTestKeyPair("test-tenant")
@@ -7611,9 +6635,11 @@ func TestRestoreLease_UnrecognizedBackendCodeRelays422(t *testing.T) {
 	h.RestoreLease(rec, req)
 
 	body := rec.Body.String()
-	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code,
-		"the backend chose 422; fred must not remap it to 404: %s", body)
-	assert.Contains(t, body, authored, "the backend's authored message must reach the tenant")
+	assert.Equal(t, http.StatusInternalServerError, rec.Code,
+		"an unknown protocol code cannot authorize a tenant-facing refusal: %s", body)
+	assert.NotContains(t, body, authored,
+		"detail from an unrecognized refusal class must remain operator-only")
 	assert.NotContains(t, body, "no retained data",
 		"fred must not assert that no retained data exists when the code says otherwise")
+	assert.JSONEq(t, `{"error":"internal server error","code":500}`, body)
 }

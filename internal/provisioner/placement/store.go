@@ -26,12 +26,16 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/metrics"
+	"github.com/manifest-network/fred/internal/provisioner/inventory"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/storeauthority"
+	"github.com/manifest-network/fred/internal/strictjson"
 )
 
 var bucketName = []byte("placements")
+
+const placementRecordSchema uint8 = 1
 
 // recordIssuerSequence provides process-local identities for opaque record
 // capabilities. RecordRevision is never serialized, so reopening a Store
@@ -95,6 +99,13 @@ var (
 	// ErrInvalidInventoryFence means a typed inventory fence was not issued by
 	// this store or was invalidated after it was issued.
 	ErrInvalidInventoryFence = errors.New("invalid placement inventory fence")
+	// ErrInvalidInventoryEvidence means negative evidence was not issued by the
+	// collector/topology atomically bound to this Store's reconciler.
+	ErrInvalidInventoryEvidence = errors.New("invalid placement inventory evidence")
+	// ErrUnprojectedInventoryPositive means current inventory already observed
+	// this recordless lease on a backend, but that affinity has not yet crossed
+	// the durable projection boundary. Retrying after projection is safe.
+	ErrUnprojectedInventoryPositive = errors.New("placement inventory positive is not yet projected")
 	// ErrInvalidRecordRevision means a typed record mutation was attempted with
 	// the invalid zero revision, including an unupgraded legacy record.
 	ErrInvalidRecordRevision = errors.New("invalid placement record revision")
@@ -138,20 +149,37 @@ func (s *Store) newRecordRevision(leaseUUID string, value uint64) RecordRevision
 	return RecordRevision{issuer: s.recordIssuer, leaseUUID: leaseUUID, value: value}
 }
 
-// InventoryFence is a causal placement-store boundary. Unlike RecordRevision,
+// inventoryFence is a causal placement-store boundary. Unlike RecordRevision,
 // an explicitly issued fence may represent revision zero. The private issuer
 // and authority epoch prevent mixing stores or reusing evidence after a newer
 // inventory session supersedes the collection that minted it.
-type InventoryFence struct {
-	issuer   *Store
-	revision uint64
-	epoch    uint64
+type inventoryFence struct {
+	issuer           *Store
+	revision         uint64
+	epoch            uint64
+	sweepID          uint64
+	recoveryRequired bool
 }
+
+type inventoryPositiveClass uint8
+
+const (
+	inventoryPositiveProvision inventoryPositiveClass = iota + 1
+	inventoryPositiveRetention
+	inventoryPositiveUntrusted
+)
+
+type inventoryPositiveObservation struct {
+	backendName string
+	class       inventoryPositiveClass
+}
+
+type inventoryProjectionMarker struct{ _ byte }
 
 // Valid reports whether the fence was explicitly issued by a placement store.
 // A store still revalidates the issuer and authority epoch when consuming it.
-func (fence InventoryFence) Valid() bool {
-	return fence.issuer != nil && fence.epoch != 0
+func (fence inventoryFence) valid() bool {
+	return fence.issuer != nil && fence.epoch != 0 && fence.sweepID != 0
 }
 
 // LifecycleObservationKind classifies the non-secret callback generation a
@@ -174,7 +202,7 @@ type LifecycleObservation struct {
 	ID   lifecycle.ID
 }
 
-// InventoryProjection is one fleet observation to be applied at a single
+// inventoryProjection is one fleet observation to be applied at a single
 // causal boundary. Complete must be true only when every backend in the
 // configured topology was authoritatively observed. A complete projection
 // establishes the durable admission baseline in the same transaction as its
@@ -191,37 +219,95 @@ type LifecycleObservation struct {
 // attempt or a durable quarantine because an earlier backend request may commit
 // after the inventory response.
 //
-// Lifecycles contains observations for active provisions only and may omit
-// retention-derived placements. Unknown observations are explicit zero values;
-// old backends may omit the wire fact, but that absence never establishes
-// lifecycle authority. ProjectInventory defensively copies all maps and slices
-// before use.
-type InventoryProjection struct {
-	Complete                 bool
-	BackendStorageIdentities map[string]backendidentity.ID
-	// EmptyBackends is raw collection evidence: each listed backend returned
-	// concrete empty provision and retention inventories in this complete
-	// snapshot. It is deliberately supplied separately from Placements because
-	// causal fencing may remove positive lease observations before projection.
-	// Complete projections must provide a non-nil slice; partial projections
-	// must leave it nil.
-	EmptyBackends []string
-	Placements    map[string]string
-	Lifecycles    map[string]LifecycleObservation
-	Conflicts     map[string][]string
+// Lifecycle generations and runtime principals are deliberately not public
+// inputs. The Store-bound private projector derives them from the exact
+// provision rows sealed
+// into AbsenceEvidence, so a caller cannot splice identity from another lease,
+// backend, or collection epoch into an otherwise valid projection.
+type inventoryProjection struct {
+	Placements map[string]string
+	Conflicts  map[string][]string
 	// UntrustedPositives requires one or more configured backend names per
 	// lease. It is distinct from Conflicts so a single rejected reporter cannot
 	// be accidentally promoted to an authoritative owner by projection.
 	UntrustedPositives map[string][]string
+	// retentionPositives is derived inside ReconciliationSweep from the sealed
+	// snapshot whenever the fleet observation is incomplete. A retention is a
+	// conservative positive but cannot establish current ownership while any
+	// peer is silent. Keeping this field private prevents callers from omitting
+	// or manufacturing that classification.
+	retentionPositives map[string][]string
+	// AbsenceEvidence is an opaque snapshot minted by the exact topology-bound
+	// inventory collector. Only ReconciliationSweep.Project can consume it;
+	// callers cannot
+	// assemble, omit, or mix its independent endpoint observations.
+	AbsenceEvidence inventory.Snapshot
+
+	// Derived only after AbsenceEvidence is matched to the exact collector bound
+	// to this Store. No caller can independently choose these authority facts.
+	complete                 bool
+	backendStorageIdentities map[string]backendidentity.ID
+	emptyBackends            []string
+	lifecycles               map[string]LifecycleObservation
+	runtimePrincipals        map[string]RuntimePrincipalObservation
+	// causalExclusions is derived from the exact operation boundary captured by
+	// ReconciliationSweep. Those positives were deliberately omitted from
+	// mutation policy; only a fact already represented by the exact durable
+	// aggregate may discharge their sweep marker.
+	causalExclusions map[string]struct{}
 }
 
-// ProjectionResult reports leases left unchanged because their durable
+// projectionResult reports leases left unchanged because their durable
 // evidence was newer than the input inventory or was exclusively claimed by a
 // restore source or callback recovery.
-type ProjectionResult struct {
+type projectionResult struct {
 	// Fenced contains the lease UUIDs whose submitted observations were not
 	// applied at this inventory boundary.
 	Fenced map[string]struct{}
+	// unresolvedPositives is the subset of fenced/causally excluded positives
+	// that the current durable aggregate does not already represent. It remains
+	// private because only ReconciliationSweep may use it to carry forward
+	// absence distrust; callers cannot choose which observations are discharged.
+	unresolvedPositives map[string]struct{}
+
+	// pruneAbsences is deliberately private. Only the Store that committed this
+	// exact projection can mint evidence consumable by its joined coordinator.
+	pruneAbsences map[string]PruneAbsenceProof
+}
+
+// PruneAbsence returns opaque proof that this exact projection observed one
+// current placement record absent from every accountable candidate owner. The
+// lookup key selects no mutation target: the returned proof already contains a
+// private Store-, coordinator-, fence-, lease-, and revision-bound identity.
+func (result projectionResult) pruneAbsence(leaseUUID string) (PruneAbsenceProof, bool) {
+	proof, ok := result.pruneAbsences[leaseUUID]
+	return proof, ok && proof.Valid()
+}
+
+// PruneAbsenceProof is negative inventory evidence minted by a projected
+// ReconciliationSweep.
+// It cannot be constructed or inspected outside placement, cannot survive a
+// Store reopen, and is invalidated when a newer inventory session begins. Its
+// zero value is invalid.
+type PruneAbsenceProof struct {
+	store       *Store
+	coordinator *operationCoordinatorMarker
+	fence       inventoryFence
+	projection  *inventoryProjectionMarker
+	record      RecordRevision
+	evidence    inventory.Snapshot
+}
+
+// Valid reports only structural validity. The joined coordinator revalidates
+// the live inventory epoch, registered snapshot, and exact record revision in
+// one Store critical section immediately before deletion.
+func (proof PruneAbsenceProof) Valid() bool {
+	return proof.store != nil && proof.coordinator != nil && proof.projection != nil &&
+		proof.fence.valid() &&
+		proof.fence.issuer == proof.store && proof.record.Valid() &&
+		proof.record.issuer == proof.store.recordIssuer &&
+		proof.evidence.Present() &&
+		proof.coordinator == proof.store.operationCoordinator
 }
 
 // AttemptToken is the exclusive capability for settling one durable
@@ -275,10 +361,10 @@ type BackendRequestSnapshot struct {
 	itemsJSON    string
 }
 
-// NewBackendRequestSnapshot validates and detaches the request facts persisted
-// before backend dispatch. The canonical JSON representation is deliberately
-// private so callers cannot manufacture a partially decoded snapshot.
-func NewBackendRequestSnapshot(
+// newBackendRequestSnapshot validates and detaches the complete persisted
+// representation. It is private because a production caller must never select
+// provider authority independently from the Store that will persist it.
+func newBackendRequestSnapshot(
 	tenant string,
 	providerUUID string,
 	items []backend.LeaseItem,
@@ -327,6 +413,26 @@ func NewBackendRequestSnapshot(
 	return BackendRequestSnapshot{
 		tenant: tenant, providerUUID: providerUUID, itemsJSON: string(encoded),
 	}, nil
+}
+
+// MintBackendRequestSnapshot binds tenant and items to this Store's exact
+// durable provider authority. The provider UUID is deliberately not an input,
+// making a cross-provider backend request unconstructable at production call
+// sites. The zero Store and withdrawn runtime authority fail closed.
+func (s *Store) MintBackendRequestSnapshot(
+	tenant string,
+	items []backend.LeaseItem,
+) (BackendRequestSnapshot, error) {
+	if s == nil {
+		return BackendRequestSnapshot{}, errors.New("placement store is required")
+	}
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return BackendRequestSnapshot{}, err
+	}
+	s.mu.RLock()
+	providerUUID := s.providerUUID
+	s.mu.RUnlock()
+	return newBackendRequestSnapshot(tenant, providerUUID, items)
 }
 
 // Valid reports whether the snapshot contains one complete exact request.
@@ -411,8 +517,11 @@ type CallbackPair struct {
 	lifecycleURL string
 }
 
-// NewCallbackPair validates and binds the exact callback destinations for id.
-func NewCallbackPair(
+// newCallbackPair validates and binds exact persisted callback destinations.
+// Runtime construction goes through CallbackRouteFactory.ForOperation so a
+// caller cannot select a second origin; this private validator is retained for
+// decoding the immutable URL pair written by an earlier process.
+func newCallbackPair(
 	id operation.OperationID,
 	operationURL string,
 	lifecycleURL string,
@@ -782,6 +891,19 @@ type Placement struct {
 	attemptCallbackPair           CallbackPair
 }
 
+func clonePlacement(placement Placement) Placement {
+	placement.ConflictBackends = slices.Clone(placement.ConflictBackends)
+	return placement
+}
+
+func clonePlacements(input map[string]Placement) map[string]Placement {
+	output := make(map[string]Placement, len(input))
+	for leaseUUID, placement := range input {
+		output[leaseUUID] = clonePlacement(placement)
+	}
+	return output
+}
+
 // State returns the placement's derived state. The zero Placement is Absent.
 func (p Placement) State() State {
 	if p.unusable || p.Conflict {
@@ -858,10 +980,11 @@ func (p Placement) AttemptMetadata() AttemptMetadata {
 	}
 }
 
-// record is the version-tolerant bbolt representation. The backend and set_at
-// field names retain compatibility with the ENG-335 JSON format. Before that
-// change, values were raw backend names; decodeRecord still accepts them.
+// record is the current bbolt representation. v0.13 raw names and the
+// pre-ENG-335 {backend,set_at} object are accepted only by the stopped
+// preparation path; a live Store requires this explicit schema boundary.
 type record struct {
+	Schema                 uint8               `json:"schema"`
 	Backend                string              `json:"backend"`
 	Attempt                string              `json:"attempt,omitempty"`
 	OperationID            string              `json:"operation_id,omitempty"`
@@ -899,6 +1022,10 @@ type Store struct {
 	now             func() time.Time
 	revision        uint64
 	authorityEpoch  uint64
+	// currentInventoryProjection makes negative evidence identify one exact
+	// successful ReconciliationSweep.Project invocation, not merely a reusable session
+	// fence. A second projection through the same session invalidates the first.
+	currentInventoryProjection *inventoryProjectionMarker
 	// Backend topology and its admission baseline are loaded from the metadata
 	// bucket. The baseline remains durable across process restart, but is usable
 	// only while it exactly matches the current topology identity.
@@ -907,6 +1034,7 @@ type Store struct {
 	backendTopologySet  map[string]struct{}
 	knownBackendNames   map[string]struct{}
 	backendStorageIDs   map[string]backendidentity.ID
+	callbackRoutes      *CallbackRouteFactory
 	topologyFingerprint string
 	topologyID          uint64
 	baselineFingerprint string
@@ -916,6 +1044,21 @@ type Store struct {
 	// usable for removal only while inventoryTopologyID equals topologyID.
 	inventoryTopologyID    uint64
 	emptyInventoryBackends map[string]struct{}
+	// pendingInventorySweepID is written before a sweep performs backend
+	// inventory reads and cleared atomically with its successful semantic
+	// projection (or by an orderly End that observed no positive at all).
+	// recoveryRequired is the process-local interpretation of a marker inherited
+	// from, or superseded after, an unfinished sweep: only a complete projection
+	// may restore fresh lease side-effect authority in that state.
+	inventorySweepSequence    uint64
+	pendingInventorySweepID   uint64
+	inventoryRecoveryRequired bool
+	// unprojectedPositives is the lease-local same-process half of the durable
+	// sweep marker. Sweep-owned collection installs typed reporter affinity here
+	// before an opaque endpoint receipt returns, so policy code cannot race the
+	// observation-to-projection window. A crash loses this map but not the durable
+	// pending marker.
+	unprojectedPositives map[string]map[uint64]map[inventoryPositiveObservation]struct{}
 	// restoreClaims are process-local source reservations held only across a
 	// synchronous backend Restore call. The durable target attempt is the
 	// authority after dispatch returns or this process restarts.
@@ -924,11 +1067,24 @@ type Store struct {
 	// attemptClaims are process-local reservations issued only when an
 	// authenticated callback names an exact unresolved attempt or confirmed
 	// lifecycle generation but its ephemeral Registry record is gone.
-	// ProjectInventory observes these claims and fences all submitted evidence
+	// ReconciliationSweep.Project observes these claims and fences all submitted evidence
 	// until chain and placement settlement finish.
 	attemptClaims map[string]AttemptClaim
 	attemptNonce  uint64
 	recordIssuer  uint64
+	// operationCoordinator is a one-shot construction binding. Callback and
+	// timeout placement settlement must pass through that exact Registry/Store
+	// pair rather than presenting caller-assembled lease/backend/operation tuples.
+	operationCoordinator *operationCoordinatorMarker
+	// boundOperationCoordinator retains the concrete one-to-one composition so
+	// independently constructed application services can reuse the same joined
+	// authority without attempting to bind either half a second time.
+	boundOperationCoordinator *OperationCoordinator
+	// inventoryEvidence is bound atomically with reconciliation's chain reader
+	// and recovery executor. Only snapshots from that exact collector/topology
+	// can mint or preserve destructive absence authority.
+	inventoryEvidence  inventory.Binding
+	inventoryProjector *inventoryProjector
 	// runtimeAuthorityFile retains the exact database inode opened by bbolt.
 	// Every authority-bearing read and write re-attests runtimeAuthorityPath
 	// against it; runtimeAuthorityGate permanently withdraws authority after a
@@ -950,6 +1106,18 @@ type Option func(*Store)
 // WithClock injects the clock used to stamp SetAt. Defaults to time.Now.
 func WithClock(now func() time.Time) Option {
 	return func(s *Store) { s.now = now }
+}
+
+// WithCallbackRouteFactory binds the sole validated callback origin to this
+// store for its entire lifetime. Every operation and lifecycle route is then
+// derived from the same construction-time authority; purpose facets cannot be
+// paired with another origin later.
+func WithCallbackRouteFactory(factory *CallbackRouteFactory) Option {
+	return func(s *Store) {
+		if factory != nil && factory.Valid() {
+			s.callbackRoutes = factory
+		}
+	}
 }
 
 // OpenStore opens an existing, fully prepared placement authority without
@@ -1018,7 +1186,9 @@ func OpenStore(dbPath, providerUUID string, opts ...Option) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("verify prepared placement db: %w", err)
 	}
-	store, err := loadStoreWithExpectedAuthority(db, info, opts...)
+	store, err := loadStoreWithExpectedAuthority(
+		db, info, verifiedAuthoritySchema{db: db}, opts...,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1033,29 +1203,60 @@ func OpenStore(dbPath, providerUUID string, opts ...Option) (*Store, error) {
 // database without performing any schema or migration writes. It takes
 // ownership of db and closes it on failure. Offline repair openers can use this
 // only after their own strict existing-schema checks.
+// verifiedAuthoritySchema is a package-local construction token. A Store can
+// be materialized only after the exact current bucket and row schemas have been
+// checked against the same open database handle. The db identity prevents a
+// proof obtained for one authority file from being replayed against another.
+type verifiedAuthoritySchema struct {
+	db *bolt.DB
+}
+
 func loadStore(db *bolt.DB, opts ...Option) (*Store, error) {
-	return loadStoreWithExpectedAuthority(db, nil, opts...)
+	if db == nil {
+		return nil, errors.New("placement db is required")
+	}
+	if err := db.View(verifyAuthorityBuckets); err != nil {
+		return nil, err
+	}
+	return loadStoreWithExpectedAuthority(
+		db, nil, verifiedAuthoritySchema{db: db}, opts...,
+	)
 }
 
 func loadStoreWithExpectedAuthority(
 	db *bolt.DB,
 	expected os.FileInfo,
+	verified verifiedAuthoritySchema,
 	opts ...Option,
 ) (*Store, error) {
 	if db == nil {
 		return nil, errors.New("placement db is required")
+	}
+	if verified.db != db {
+		_ = db.Close()
+		return nil, errors.New("placement authority schema was not verified")
 	}
 	cache := make(map[string]Placement)
 	var lifecycleCache map[string]lifecycleCapability
 	var revision uint64
 	var metadata topologyMetadata
 	if err := db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bucketName)
-		if b == nil {
-			return errors.New("placements bucket missing")
+		var err error
+		metadata, err = loadTopologyMetadata(tx)
+		if err != nil {
+			return err
 		}
+		b := tx.Bucket(bucketName)
 		if err := b.ForEach(func(k, v []byte) error {
 			p := decodeRecord(string(k), v)
+			if p.attemptRequestSnapshot.Valid() &&
+				p.attemptRequestSnapshot.ProviderUUID() != metadata.ProviderUUID {
+				return fmt.Errorf(
+					"%w: lease %q backend request belongs to %q, store belongs to %q",
+					ErrProviderAuthorityMismatch, string(k),
+					p.attemptRequestSnapshot.ProviderUUID(), metadata.ProviderUUID,
+				)
+			}
 			cache[string(k)] = p
 			if p.revision > revision {
 				revision = p.revision
@@ -1064,14 +1265,12 @@ func loadStoreWithExpectedAuthority(
 		}); err != nil {
 			return err
 		}
-		var err error
 		lifecycleCache, err = loadLifecycleCapabilities(tx)
 		if err != nil {
 			return err
 		}
 		quarantineLifecycleBindings(cache, lifecycleCache)
-		metadata, err = loadTopologyMetadata(tx)
-		return err
+		return nil
 	}); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to load placement store: %w", err)
@@ -1113,16 +1312,17 @@ func loadStoreWithExpectedAuthority(
 		return nil, fmt.Errorf("construct placement runtime authority gate: %w", err)
 	}
 	s := &Store{
-		db:              db,
-		cache:           cache,
-		lifecycleCache:  lifecycleCache,
-		deleteRevisions: make(map[string]uint64),
-		activeSnapshots: make(map[uint64]uint64),
-		now:             time.Now,
-		revision:        revision,
-		authorityEpoch:  1,
-		providerUUID:    metadata.ProviderUUID,
-		backendTopology: slices.Clone(metadata.Topology),
+		db:                   db,
+		cache:                cache,
+		lifecycleCache:       lifecycleCache,
+		deleteRevisions:      make(map[string]uint64),
+		activeSnapshots:      make(map[uint64]uint64),
+		unprojectedPositives: make(map[string]map[uint64]map[inventoryPositiveObservation]struct{}),
+		now:                  time.Now,
+		revision:             revision,
+		authorityEpoch:       1,
+		providerUUID:         metadata.ProviderUUID,
+		backendTopology:      slices.Clone(metadata.Topology),
 		backendTopologySet: func() map[string]struct{} {
 			set := make(map[string]struct{}, len(metadata.Topology))
 			for _, backendName := range metadata.Topology {
@@ -1137,12 +1337,15 @@ func loadStoreWithExpectedAuthority(
 			}
 			return set
 		}(),
-		backendStorageIDs:   backendStorageIDs,
-		topologyFingerprint: metadata.TopologyFingerprint,
-		topologyID:          metadata.TopologyID,
-		baselineFingerprint: metadata.BaselineFingerprint,
-		baselineTopologyID:  metadata.BaselineTopologyID,
-		inventoryTopologyID: metadata.InventoryTopologyID,
+		backendStorageIDs:         backendStorageIDs,
+		topologyFingerprint:       metadata.TopologyFingerprint,
+		topologyID:                metadata.TopologyID,
+		baselineFingerprint:       metadata.BaselineFingerprint,
+		baselineTopologyID:        metadata.BaselineTopologyID,
+		inventoryTopologyID:       metadata.InventoryTopologyID,
+		inventorySweepSequence:    metadata.InventorySweepSequence,
+		pendingInventorySweepID:   metadata.PendingInventorySweepID,
+		inventoryRecoveryRequired: metadata.PendingInventorySweepID != 0,
 		emptyInventoryBackends: func() map[string]struct{} {
 			set := make(map[string]struct{}, len(metadata.EmptyInventoryBackends))
 			for _, backendName := range metadata.EmptyInventoryBackends {
@@ -1197,15 +1400,12 @@ func migrateLegacyConfirmedRevisions(tx *bolt.Tx) error {
 		// decoder after the preflight/epoch proof instead of silently leaving a
 		// previously confirmed owner unusable. Object rows continue through the
 		// current structural decoder so their historical SetAt value is retained.
-		p := Placement{}
-		if len(v) > 0 && v[0] != '{' {
-			if backendName, legacyErr := decodeV013PreflightPlacement(v); legacyErr == nil {
-				p = Placement{Backend: backendName}
-			} else {
-				p = decodeRecord(leaseUUID, v)
+		p := decodeRecord(leaseUUID, v)
+		if p.unusable {
+			legacy, legacyErr := decodeV013PlacementForMigration(v)
+			if legacyErr == nil {
+				p = legacy
 			}
-		} else {
-			p = decodeRecord(leaseUUID, v)
 		}
 		if p.revision > revision {
 			revision = p.revision
@@ -1239,29 +1439,12 @@ func migrateLegacyConfirmedRevisions(tx *bolt.Tx) error {
 	return nil
 }
 
-// decodeRecord parses the current JSON representation or the pre-ENG-335 raw
-// backend-name representation. An empty raw value, malformed JSON object, or
-// JSON object with neither Backend nor Attempt remains present but Unusable.
+// decodeRecord parses only the explicit current schema. Legacy raw names and
+// versionless pre-ENG-335 objects remain present but Unusable outside the
+// stopped preparation transaction.
 func decodeRecord(leaseUUID string, v []byte) Placement {
-	if len(v) > 0 && v[0] != '{' {
-		if json.Valid(v) {
-			return unusableRecord(leaseUUID, errors.New("placement JSON root is not an object"))
-		}
-		if !validLegacyBackendName(v) {
-			return unusableRecord(leaseUUID, errors.New("legacy backend name is not printable UTF-8"))
-		}
-		return Placement{Backend: string(v)}
-	}
-
-	var r record
-	if len(v) == 0 {
-		return unusableRecord(leaseUUID, errors.New("empty value"))
-	}
-	fields, err := decodeUniqueJSONObject(v)
+	r, fields, err := decodeCurrentPlacementRecord(v)
 	if err != nil {
-		return unusableRecord(leaseUUID, fmt.Errorf("invalid placement JSON object: %w", err))
-	}
-	if err := json.Unmarshal(v, &r); err != nil {
 		return unusableRecord(leaseUUID, err)
 	}
 
@@ -1362,6 +1545,30 @@ func decodeRecord(leaseUUID string, v []byte) Placement {
 	return p
 }
 
+func decodeCurrentPlacementRecord(
+	value []byte,
+) (record, map[string]json.RawMessage, error) {
+	if len(value) == 0 {
+		return record{}, nil, errors.New("empty value")
+	}
+	var current record
+	if err := strictjson.DecodeObject(
+		value, maxAuthorityRowValueBytes, &current,
+	); err != nil {
+		return record{}, nil, fmt.Errorf("invalid placement JSON object: %w", err)
+	}
+	if current.Schema != placementRecordSchema {
+		return record{}, nil, fmt.Errorf(
+			"unsupported placement record schema %d", current.Schema,
+		)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(value, &fields); err != nil {
+		return record{}, nil, fmt.Errorf("decode placement fields: %w", err)
+	}
+	return current, fields, nil
+}
+
 func decodeOperationKind(value string) (operation.Kind, error) {
 	if value == "" {
 		return operation.KindInvalid, nil
@@ -1405,7 +1612,7 @@ func decodeBackendRequestSnapshot(
 			"invalid persisted backend request snapshot: request_items is missing",
 		)
 	}
-	snapshot, err := NewBackendRequestSnapshot(tenant, providerUUID, items)
+	snapshot, err := newBackendRequestSnapshot(tenant, providerUUID, items)
 	if err != nil {
 		return BackendRequestSnapshot{}, fmt.Errorf(
 			"invalid persisted backend request snapshot: %w", err,
@@ -1430,7 +1637,7 @@ func decodeCallbackPair(
 	if operationURL == "" && lifecycleURL == "" && !operationID.Valid() {
 		return CallbackPair{}, nil
 	}
-	pair, err := NewCallbackPair(operationID, operationURL, lifecycleURL)
+	pair, err := newCallbackPair(operationID, operationURL, lifecycleURL)
 	if err != nil {
 		return CallbackPair{}, fmt.Errorf("invalid persisted callback pair: %w", err)
 	}
@@ -1460,6 +1667,30 @@ func validLegacyBackendName(v []byte) bool {
 	return true
 }
 
+// decodeV013PlacementForMigration is callable only from the stopped,
+// database-wide preparation transaction. decodeV013PreflightPlacement owns the
+// exact historical raw-vs-object grammar and field allow-list; this helper
+// additionally preserves ENG-335's set_at timestamp while minting the current
+// schema and revision.
+func decodeV013PlacementForMigration(value []byte) (Placement, error) {
+	backendName, err := decodeV013PreflightPlacement(value)
+	if err != nil {
+		return Placement{}, err
+	}
+	placement := Placement{Backend: backendName}
+	if value[0] != '{' {
+		return placement, nil
+	}
+	fields, err := decodeUniqueJSONObject(value)
+	if err != nil {
+		return Placement{}, err
+	}
+	if err := json.Unmarshal(fields["set_at"], &placement.SetAt); err != nil {
+		return Placement{}, fmt.Errorf("decode v0.13 placement set_at: %w", err)
+	}
+	return placement, nil
+}
+
 func unusableRecord(leaseUUID string, err error) Placement {
 	slog.Warn("placement: loaded unparseable record",
 		"lease_uuid", leaseUUID, "error", err)
@@ -1476,6 +1707,7 @@ func encodePlacement(p Placement) ([]byte, error) {
 		operationKind = p.attemptOperationKind.String()
 	}
 	return json.Marshal(record{
+		Schema:                 placementRecordSchema,
 		Backend:                p.Backend,
 		Attempt:                p.Attempt,
 		OperationID:            operationID,
@@ -1506,6 +1738,20 @@ func normalizeBackendNames(names []string) []string {
 	return slices.Sorted(maps.Keys(unique))
 }
 
+func canonicalProjectionBackendNames(names []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			return nil, errors.New("backend name is blank")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, fmt.Errorf("duplicate backend name %q", name)
+		}
+		seen[name] = struct{}{}
+	}
+	return slices.Sorted(maps.Keys(seen)), nil
+}
+
 func equalPlacementIgnoringRevision(a, b Placement) bool {
 	return a.Backend == b.Backend &&
 		a.Attempt == b.Attempt &&
@@ -1531,8 +1777,7 @@ func (s *Store) Lookup(leaseUUID string) Placement {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	p := s.cache[leaseUUID]
-	p.ConflictBackends = slices.Clone(p.ConflictBackends)
+	p := clonePlacement(s.cache[leaseUUID])
 	p.recordRevision = s.newRecordRevision(leaseUUID, p.revision)
 	return p
 }
@@ -1551,41 +1796,190 @@ func (s *Store) List() map[string]Placement {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := maps.Clone(s.cache)
+	out := clonePlacements(s.cache)
 	for leaseUUID, p := range out {
-		p.ConflictBackends = slices.Clone(p.ConflictBackends)
 		p.recordRevision = s.newRecordRevision(leaseUUID, p.revision)
 		out[leaseUUID] = p
 	}
 	return out
 }
 
-// BeginInventorySession registers and returns a typed inventory boundary.
-// Callers must pair it with EndInventorySession even when collection fails.
-func (s *Store) BeginInventorySession() InventoryFence {
+// beginInventorySession durably registers and returns a typed inventory
+// boundary before any backend inventory read can begin. Callers must pair it
+// with endInventorySession even when collection fails.
+func (s *Store) beginInventorySession() (inventoryFence, error) {
 	if err := s.reattestRuntimeAuthority(); err != nil {
-		return InventoryFence{}
+		return inventoryFence{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.topologyID == 0 {
+		return inventoryFence{}, ErrBackendTopologyNotConfigured
+	}
+	if s.inventorySweepSequence == math.MaxUint64 {
+		return inventoryFence{}, errors.New("placement inventory sweep identity exhausted")
+	}
+	nextSweepID := s.inventorySweepSequence + 1
+	metadata := s.topologyMetadataLocked()
+	metadata.InventorySweepSequence = nextSweepID
+	metadata.PendingInventorySweepID = nextSweepID
+	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+		return putTopologyMetadata(tx, metadata)
+	}); err != nil {
+		return inventoryFence{}, mutationFailure("begin placement inventory sweep", err)
+	}
+	inheritedRecovery := s.inventoryRecoveryRequired || s.pendingInventorySweepID != 0
+	if inheritedRecovery {
+		// Superseding a still-pending sweep means it may already have observed a
+		// positive that never reached the durable projection.
+		s.inventoryRecoveryRequired = true
+	}
+	s.inventorySweepSequence = nextSweepID
+	s.pendingInventorySweepID = nextSweepID
 	// A new collection supersedes every process-local inventory fence issued
-	// from an older collection. The durable admission baseline is deliberately
-	// independent and remains usable while the topology is unchanged.
+	// from an older collection.
 	s.advanceAuthorityEpochLocked()
+	s.currentInventoryProjection = nil
 	fence := s.inventoryFenceLocked()
+	fence.recoveryRequired = inheritedRecovery
 	s.activeSnapshots[fence.revision]++
-	return fence
+	return fence, nil
 }
 
-// EndInventorySession releases a typed boundary returned by
-// BeginInventorySession. Invalid or foreign fences are harmless no-ops. An
+// recordUnprojectedPositives installs the process-local exclusion half of an
+// inventory observation before a sweep-owned endpoint receipt returns to its
+// caller. The durable pending sweep marker is already committed by
+// beginInventorySession, so a process restart fails closed even though this
+// lease-local acceleration is intentionally volatile.
+func (s *Store) recordUnprojectedPositives(
+	fence inventoryFence,
+	backendName string,
+	class inventoryPositiveClass,
+	leaseUUIDs []string,
+) error {
+	if len(leaseUUIDs) == 0 {
+		return nil
+	}
+	if class < inventoryPositiveProvision || class > inventoryPositiveUntrusted {
+		return ErrInvalidInventoryEvidence
+	}
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !fence.valid() || fence.issuer != s || fence.epoch != s.authorityEpoch ||
+		fence.sweepID != s.pendingInventorySweepID {
+		return ErrInvalidInventoryFence
+	}
+	if err := s.validateConfiguredBackendLocked(backendName); err != nil {
+		return err
+	}
+	for _, leaseUUID := range leaseUUIDs {
+		if leaseUUID == "" {
+			continue
+		}
+		boundaries := s.unprojectedPositives[leaseUUID]
+		if boundaries == nil {
+			boundaries = make(map[uint64]map[inventoryPositiveObservation]struct{})
+			s.unprojectedPositives[leaseUUID] = boundaries
+		}
+		reporters := boundaries[fence.sweepID]
+		if reporters == nil {
+			reporters = make(map[inventoryPositiveObservation]struct{})
+			boundaries[fence.sweepID] = reporters
+		}
+		reporters[inventoryPositiveObservation{
+			backendName: backendName,
+			class:       class,
+		}] = struct{}{}
+	}
+	return nil
+}
+
+func (s *Store) unprojectedPositiveErrorLocked(leaseUUID string) error {
+	if !s.inventoryRecoveryRequired && len(s.unprojectedPositives[leaseUUID]) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: lease %q", ErrUnprojectedInventoryPositive, leaseUUID)
+}
+
+func (s *Store) leaseSideEffectError(leaseUUID string) error {
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.unprojectedPositiveErrorLocked(leaseUUID)
+}
+
+// placementForDeprovision returns one detached teardown view only when no
+// inventory observation is waiting to change its candidate owner set. The
+// deprovision coordinator calls it after acquiring the lease operation claim,
+// making the Store check the capability-minting boundary rather than leaving
+// this invariant to a handler.
+func (s *Store) placementForDeprovision(leaseUUID string) (Placement, error) {
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return Placement{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := s.unprojectedPositiveErrorLocked(leaseUUID); err != nil {
+		return Placement{}, err
+	}
+	record := s.cache[leaseUUID]
+	record.ConflictBackends = slices.Clone(record.ConflictBackends)
+	record.recordRevision = s.newRecordRevision(leaseUUID, record.revision)
+	return record, nil
+}
+
+type inventorySessionReport struct {
+	evidence    inventory.Snapshot
+	hasPositive bool
+}
+
+// endInventorySession releases a typed boundary returned by
+// beginInventorySession. Invalid or foreign fences are harmless no-ops. An
 // authority-invalidated fence still releases its registered snapshot.
-func (s *Store) EndInventorySession(fence InventoryFence) {
-	if !fence.Valid() || fence.issuer != s {
+func (s *Store) endInventorySession(fence inventoryFence, report inventorySessionReport) {
+	if !fence.valid() || fence.issuer != s {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.pendingInventorySweepID == fence.sweepID {
+		sealed := report.evidence.Present() &&
+			report.evidence.ValidFor(s.inventoryEvidence)
+		if sealed &&
+			len(report.evidence.LeaseUUIDs(s.inventoryEvidence)) != 0 {
+			report.hasPositive = true
+		}
+		canClear := !fence.recoveryRequired && sealed && !report.hasPositive
+		if canClear {
+			metadata := s.topologyMetadataLocked()
+			metadata.PendingInventorySweepID = 0
+			if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+				return putTopologyMetadata(tx, metadata)
+			}); err == nil {
+				s.pendingInventorySweepID = 0
+				s.inventoryRecoveryRequired = false
+				s.clearInventoryPositiveBarriersLocked(fence.sweepID, false, nil)
+			} else {
+				failure := mutationFailure("clear represented inventory sweep", err)
+				slog.Error("placement inventory sweep marker remains recovery-required",
+					"sweep_id", fence.sweepID,
+					"error", failure,
+				)
+				s.inventoryRecoveryRequired = true
+			}
+		} else {
+			// A successful projection clears this exact durable marker first. If
+			// an unrepresented positive remains at End, degraded recordless
+			// admission stays withdrawn until a complete projection accounts for
+			// every reporter.
+			s.inventoryRecoveryRequired = true
+		}
+	}
 	s.endInventorySnapshotLocked(fence.revision)
 }
 
@@ -1614,8 +2008,25 @@ func (s *Store) advanceAuthorityEpochLocked() {
 }
 
 // Caller holds at least s.mu.RLock.
-func (s *Store) inventoryFenceLocked() InventoryFence {
-	return InventoryFence{issuer: s, revision: s.revision, epoch: s.authorityEpoch}
+func (s *Store) inventoryFenceLocked() inventoryFence {
+	return inventoryFence{
+		issuer: s, revision: s.revision, epoch: s.authorityEpoch,
+		sweepID: s.pendingInventorySweepID,
+	}
+}
+
+// inventoryFenceCurrent reports whether no newer inventory session has
+// superseded the process-local authority epoch that minted fence. A
+// successful projection may clear its durable pending marker, so sweepID is
+// intentionally not compared here; beginInventorySession advances epoch
+// before a newer sweep can escape.
+func (s *Store) inventoryFenceCurrent(fence inventoryFence) bool {
+	if s == nil || !fence.valid() || fence.issuer != s {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return fence.epoch == s.authorityEpoch
 }
 
 // Caller holds s.mu.
@@ -1684,7 +2095,7 @@ func (s *Store) newAttemptToken(
 // metadata. Missing,
 // legacy, unusable, and mismatched generations return claimed=false.
 // Contention returns ErrAttemptClaimed so a durable callback outbox retries.
-func (s *Store) ClaimAttempt(
+func (s *Store) claimAttempt(
 	leaseUUID string,
 	operationID operation.OperationID,
 ) (claim AttemptClaim, claimed bool, err error) {
@@ -1780,7 +2191,7 @@ func (s *Store) ClaimAttempt(
 
 // ReleaseAttemptClaim releases only the exact live recovery claim. A stale,
 // foreign, or already-consumed claim returns false without changing state.
-func (s *Store) ReleaseAttemptClaim(claim AttemptClaim) bool {
+func (s *Store) releaseAttemptClaim(claim AttemptClaim) bool {
 	if !claim.Valid() || claim.issuer != s {
 		return false
 	}
@@ -1799,12 +2210,12 @@ func (s *Store) ReleaseAttemptClaim(claim AttemptClaim) bool {
 // the exact confirmed generation reserved by claim. The live claim is consumed
 // for every valid settlement attempt; a failed durable write leaves unresolved
 // authority intact so a later callback can claim and retry it.
-func (s *Store) ConfirmClaimedAttempt(claim AttemptClaim) (bool, error) {
+func (s *Store) confirmClaimedAttempt(claim AttemptClaim) (bool, error) {
 	if !claim.Valid() || claim.issuer != s {
 		return false, ErrInvalidAttemptToken
 	}
 	if err := s.reattestRuntimeAuthority(); err != nil {
-		s.ReleaseAttemptClaim(claim)
+		s.releaseAttemptClaim(claim)
 		return false, err
 	}
 
@@ -1824,12 +2235,12 @@ func (s *Store) ConfirmClaimedAttempt(claim AttemptClaim) (bool, error) {
 // claim. An already-confirmed generation is verified without demoting it. The
 // live claim is consumed for every valid settlement attempt; a failed durable
 // write leaves unresolved authority intact for callback retry.
-func (s *Store) RefuseClaimedAttempt(claim AttemptClaim) (bool, error) {
+func (s *Store) refuseClaimedAttempt(claim AttemptClaim) (bool, error) {
 	if !claim.Valid() || claim.issuer != s {
 		return false, ErrInvalidAttemptToken
 	}
 	if err := s.reattestRuntimeAuthority(); err != nil {
-		s.ReleaseAttemptClaim(claim)
+		s.releaseAttemptClaim(claim)
 		return false, err
 	}
 
@@ -1916,7 +2327,7 @@ func (s *Store) beginRestore(
 // attempt on that same source backend. Restore authorization presents this
 // opaque revision so a concurrent placement owner change cannot redirect the
 // authorized command to a different backend.
-func (s *Store) BeginAuthorizedRestore(
+func (s *Store) beginAuthorizedRestore(
 	baseline AdmissionBaseline,
 	sourceRevision RecordRevision,
 	targetLeaseUUID string,
@@ -1976,6 +2387,12 @@ func (s *Store) beginRestoreWithSourceRevision(
 	// fence and keeps the source immutable for the holder of the first claim.
 	if s.restoreSourceClaimedLocked(targetLeaseUUID) {
 		return RestoreClaim{}, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, targetLeaseUUID)
+	}
+	if err := s.unprojectedPositiveErrorLocked(sourceLeaseUUID); err != nil {
+		return RestoreClaim{}, err
+	}
+	if err := s.unprojectedPositiveErrorLocked(targetLeaseUUID); err != nil {
+		return RestoreClaim{}, err
 	}
 
 	source, exists := s.cache[sourceLeaseUUID]
@@ -2041,14 +2458,14 @@ func (s *Store) beginRestoreWithSourceRevision(
 // attempt after synchronous backend acceptance. If an exact fast callback has
 // already settled the target, it leaves that result untouched and still
 // consumes the source claim successfully.
-func (s *Store) ConfirmRestore(claim RestoreClaim) (bool, error) {
+func (s *Store) confirmRestore(claim RestoreClaim) (bool, error) {
 	return s.settleRestore(claim, restoreSettlementConfirm)
 }
 
 // RefuseRestore consumes the exact live source claim and clears the target
 // attempt after a definitive synchronous refusal. An exact fast callback wins:
 // its already-settled target is never deleted or rewritten.
-func (s *Store) RefuseRestore(claim RestoreClaim) (bool, error) {
+func (s *Store) refuseRestore(claim RestoreClaim) (bool, error) {
 	return s.settleRestore(claim, restoreSettlementRefuse)
 }
 
@@ -2056,7 +2473,7 @@ func (s *Store) RefuseRestore(claim RestoreClaim) (bool, error) {
 // durable target attempt. Call it for an ambiguous synchronous outcome: the
 // exact backend callback or a later matching paired-generation inventory
 // observation owns settlement after dispatch.
-func (s *Store) AbandonRestore(claim RestoreClaim) (bool, error) {
+func (s *Store) abandonRestore(claim RestoreClaim) (bool, error) {
 	return s.settleRestore(claim, restoreSettlementAbandon)
 }
 
@@ -2283,7 +2700,9 @@ func (s *Store) promoteExactAttemptLocked(
 	// generation. Callback recovery after restart needs the kind/source even
 	// when inventory confirmed ownership before the callback arrived.
 	p.revision = next
-	capability := promoteAttemptLifecycle(guard.backendName, guard.operationID)
+	capability := promoteAttemptLifecycle(
+		guard.backendName, guard.operationID, p.attemptRequestSnapshot,
+	)
 	if err := s.putPlacementWithLifecycleLocked(
 		guard.leaseUUID, p, capability, guard.mutation,
 	); err != nil {
@@ -2291,25 +2710,6 @@ func (s *Store) promoteExactAttemptLocked(
 	}
 	s.revision = next
 	return true, nil
-}
-
-// ConfirmAttempt promotes only the exact typed write-ahead attempt represented
-// by token. A stale token returns false without writing; it can never confirm a
-// later attempt even when that attempt targets the same backend.
-func (s *Store) ConfirmAttempt(token AttemptToken) (bool, error) {
-	if err := s.validateAttemptToken(token); err != nil {
-		return false, err
-	}
-	if err := s.reattestRuntimeAuthority(); err != nil {
-		return false, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.attemptClaimedLocked(token.leaseUUID) {
-		return false, fmt.Errorf("%w: lease %q", ErrAttemptClaimed, token.leaseUUID)
-	}
-	return s.confirmAttemptLocked(token)
 }
 
 // Caller holds s.mu.
@@ -2321,25 +2721,6 @@ func (s *Store) confirmAttemptLocked(token AttemptToken) (bool, error) {
 		expectedRevision: token.revision,
 		mutation:         "confirm typed placement attempt",
 	})
-}
-
-// RefuseAttempt clears only the exact typed write-ahead attempt represented by
-// token after a definitive synchronous refusal. Ambiguous outcomes must not
-// call this method. A stale token returns false without writing.
-func (s *Store) RefuseAttempt(token AttemptToken) (bool, error) {
-	if err := s.validateAttemptToken(token); err != nil {
-		return false, err
-	}
-	if err := s.reattestRuntimeAuthority(); err != nil {
-		return false, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.attemptClaimedLocked(token.leaseUUID) {
-		return false, fmt.Errorf("%w: lease %q", ErrAttemptClaimed, token.leaseUUID)
-	}
-	return s.refuseAttemptLocked(token)
 }
 
 // Caller holds s.mu.
@@ -2378,124 +2759,6 @@ func (s *Store) refuseAttemptLocked(token AttemptToken) (bool, error) {
 	return true, nil
 }
 
-// ConfirmOperation promotes a typed attempt identified by durable operation
-// identity. It is the callback-safe counterpart to ConfirmAttempt: callbacks
-// need not retain the process-local AttemptToken, but still cannot settle a
-// legacy, mismatched, or newer same-backend operation. An already-confirmed
-// record with no attempt is idempotent only when its current lifecycle
-// generation exactly matches operationID; caller input can never rotate
-// lifecycle authority.
-func (s *Store) ConfirmOperation(
-	leaseUUID, backendName string,
-	operationID operation.OperationID,
-) (bool, error) {
-	if err := validateTypedAttempt(leaseUUID, backendName, operationID); err != nil {
-		return false, err
-	}
-	if err := s.reattestRuntimeAuthority(); err != nil {
-		return false, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.attemptClaimedLocked(leaseUUID) {
-		return false, fmt.Errorf("%w: lease %q", ErrAttemptClaimed, leaseUUID)
-	}
-	p, exists := s.cache[leaseUUID]
-	if !exists {
-		return false, nil
-	}
-	if p.State() == StateUnusable {
-		return false, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, leaseUUID)
-	}
-	if p.Attempt == "" {
-		if p.Backend != backendName {
-			return false, nil
-		}
-		id, err := lifecycleIDForOperation(operationID)
-		if err != nil {
-			return false, err
-		}
-		capability, capabilityExists := s.lifecycleCache[leaseUUID]
-		authorization := authorizeLifecycleCapability(capability, id)
-		return capabilityExists && authorization.Authorized() &&
-			authorization.Backend() == backendName, nil
-	}
-	if p.Attempt != backendName || p.attemptOperationID != operationID {
-		return false, nil
-	}
-	if p.Backend != "" && p.Backend != backendName {
-		return false, fmt.Errorf("%w: lease %q is confirmed on %q, not %q",
-			ErrBackendConflict, leaseUUID, p.Backend, backendName)
-	}
-
-	return s.promoteExactAttemptLocked(attemptPromotionGuard{
-		leaseUUID:        leaseUUID,
-		backendName:      backendName,
-		operationID:      operationID,
-		expectedRevision: s.newRecordRevision(leaseUUID, p.revision),
-		mutation:         "confirm placement operation",
-	})
-}
-
-// RefuseOperation clears only the typed attempt whose persisted operation
-// identity exactly matches. It never removes an already-confirmed owner.
-func (s *Store) RefuseOperation(
-	leaseUUID, backendName string,
-	operationID operation.OperationID,
-) (bool, error) {
-	if err := validateTypedAttempt(leaseUUID, backendName, operationID); err != nil {
-		return false, err
-	}
-	if err := s.reattestRuntimeAuthority(); err != nil {
-		return false, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.attemptClaimedLocked(leaseUUID) {
-		return false, fmt.Errorf("%w: lease %q", ErrAttemptClaimed, leaseUUID)
-	}
-	p, exists := s.cache[leaseUUID]
-	if !exists || p.Attempt != backendName || p.attemptOperationID != operationID {
-		return false, nil
-	}
-	if p.State() == StateUnusable {
-		return false, fmt.Errorf("%w: lease %q", ErrUnusablePlacement, leaseUUID)
-	}
-	if p.Backend == "" {
-		if err := s.deleteLocked(leaseUUID, "refuse placement operation"); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-
-	next, err := s.nextRevision()
-	if err != nil {
-		return false, err
-	}
-	p.Attempt = ""
-	clearOperationMetadata(&p)
-	p.revision = next
-	capability := clearAttemptLifecycle(
-		s.lifecycleCache[leaseUUID], backendName, operationID,
-	)
-	if err := s.putPlacementWithLifecycleLocked(
-		leaseUUID, p, capability, "refuse placement operation",
-	); err != nil {
-		return false, err
-	}
-	s.revision = next
-	return true, nil
-}
-
-func (s *Store) validateAttemptToken(token AttemptToken) error {
-	if !token.Valid() || token.issuer != s {
-		return ErrInvalidAttemptToken
-	}
-	return nil
-}
-
 // matchAttemptTokenLocked checks every durable token component in one critical
 // section. Caller holds s.mu.
 func (s *Store) matchAttemptTokenLocked(token AttemptToken) (Placement, bool) {
@@ -2516,7 +2779,7 @@ func (s *Store) matchAttemptTokenLocked(token AttemptToken) (Placement, bool) {
 // represented by revision. The target is derived from the capability itself;
 // callers cannot transplant a numerically equal revision to another lease or
 // store. Invalid and foreign revisions are rejected.
-func (s *Store) DeleteRecord(revision RecordRevision) (bool, error) {
+func (s *Store) deleteRecord(revision RecordRevision) (bool, error) {
 	if !revision.Valid() || revision.issuer != s.recordIssuer {
 		return false, ErrInvalidRecordRevision
 	}
@@ -2543,6 +2806,54 @@ func (s *Store) DeleteRecord(revision RecordRevision) (bool, error) {
 	return true, nil
 }
 
+// consumePruneAbsence performs the final proof validation and record deletion
+// in one critical section. A newer inventory session, record mutation,
+// maintenance command, restore use, or attempt recovery therefore invalidates
+// the proof before it can affect durable state.
+func (s *Store) consumePruneAbsence(proof PruneAbsenceProof) (bool, error) {
+	if !proof.Valid() || proof.store != s {
+		return false, ErrInvalidRecordRevision
+	}
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if proof.coordinator != s.operationCoordinator || proof.fence.issuer != s ||
+		proof.fence.epoch != s.authorityEpoch ||
+		proof.projection != s.currentInventoryProjection ||
+		!proof.evidence.ValidFor(s.inventoryEvidence) ||
+		s.activeSnapshots[proof.fence.revision] == 0 ||
+		proof.record.issuer != s.recordIssuer ||
+		s.mutationRevisionLocked(proof.record.leaseUUID) > proof.fence.revision {
+		return false, nil
+	}
+	leaseUUID := proof.record.leaseUUID
+	if s.restoreSourceClaimedLocked(leaseUUID) || s.attemptClaimedLocked(leaseUUID) {
+		return false, nil
+	}
+	var pendingMaintenance map[string]struct{}
+	if err := s.viewRuntimeAuthority(func(tx *bolt.Tx) error {
+		var loadErr error
+		pendingMaintenance, loadErr = pendingMaintenanceLeasesTx(tx)
+		return loadErr
+	}); err != nil {
+		return false, mutationFailure("read pending maintenance fences before prune", err)
+	}
+	if _, pending := pendingMaintenance[leaseUUID]; pending {
+		return false, nil
+	}
+	record, exists := s.cache[leaseUUID]
+	if !exists || record.revision != proof.record.value || record.Attempt != "" {
+		return false, nil
+	}
+	if err := s.deleteLocked(leaseUUID, "consume projected placement absence"); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 type projectionMutation struct {
 	placement Placement
 	encoded   []byte
@@ -2555,39 +2866,61 @@ type projectionLifecycleMutation struct {
 	persist    bool
 }
 
-// ProjectInventory computes a placement projection against fence and persists
+// projectInventory computes a placement projection against fence and persists
 // every material write in one bbolt transaction. When Complete is true, that
 // same transaction also establishes the durable admission baseline for the
 // configured topology, including for empty or idempotent projections. No
 // cache, baseline, or revision-clock change is visible unless the transaction
 // commits. A partial projection never erases an existing matching baseline.
-func (s *Store) ProjectInventory(
-	fence InventoryFence,
-	input InventoryProjection,
-) (ProjectionResult, error) {
+func (s *Store) projectInventory(
+	fence inventoryFence,
+	input inventoryProjection,
+) (projectionResult, error) {
 	if err := s.reattestRuntimeAuthority(); err != nil {
-		return ProjectionResult{}, err
+		return projectionResult{}, err
 	}
 	projection, err := normalizeInventoryProjection(input)
 	if err != nil {
-		return ProjectionResult{}, err
+		return projectionResult{}, err
 	}
-	if !fence.Valid() || fence.issuer != s {
-		return ProjectionResult{}, ErrInvalidInventoryFence
+	if !fence.valid() || fence.issuer != s {
+		return projectionResult{}, ErrInvalidInventoryFence
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if fence.epoch != s.authorityEpoch {
-		return ProjectionResult{}, ErrInvalidInventoryFence
+	if fence.epoch != s.authorityEpoch || fence.sweepID != s.pendingInventorySweepID {
+		return projectionResult{}, ErrInvalidInventoryFence
+	}
+	// One session may be presented more than once by an adapter. Invalidate any
+	// earlier negative proof before inspecting the replacement input so a later
+	// positive or rejected projection cannot leave stale absence executable.
+	s.currentInventoryProjection = nil
+	if err := s.deriveInventoryAuthorityLocked(&projection); err != nil {
+		return projectionResult{}, err
 	}
 	if err := s.validateProjectionBackendsLocked(projection); err != nil {
-		return ProjectionResult{}, err
+		return projectionResult{}, err
+	}
+	if err := s.validateProjectionAggregateLocked(projection); err != nil {
+		return projectionResult{}, err
+	}
+	if err := s.validateRuntimePrincipalObservationsLocked(fence, projection); err != nil {
+		return projectionResult{}, err
+	}
+	var pendingMaintenance map[string]struct{}
+	if err := s.viewRuntimeAuthority(func(tx *bolt.Tx) error {
+		var loadErr error
+		pendingMaintenance, loadErr = pendingMaintenanceLeasesTx(tx)
+		return loadErr
+	}); err != nil {
+		return projectionResult{}, mutationFailure("read pending maintenance fences", err)
 	}
 
-	result := ProjectionResult{Fenced: make(map[string]struct{})}
+	result := projectionResult{Fenced: make(map[string]struct{})}
 	keySet := make(map[string]struct{},
-		len(projection.Placements)+len(projection.Conflicts)+len(projection.UntrustedPositives))
+		len(projection.Placements)+len(projection.Conflicts)+
+			len(projection.UntrustedPositives)+len(projection.retentionPositives))
 	for leaseUUID := range projection.Placements {
 		keySet[leaseUUID] = struct{}{}
 	}
@@ -2597,6 +2930,9 @@ func (s *Store) ProjectInventory(
 	for leaseUUID := range projection.UntrustedPositives {
 		keySet[leaseUUID] = struct{}{}
 	}
+	for leaseUUID := range projection.retentionPositives {
+		keySet[leaseUUID] = struct{}{}
+	}
 	keys := slices.Sorted(maps.Keys(keySet))
 
 	now := s.now().UTC()
@@ -2604,6 +2940,10 @@ func (s *Store) ProjectInventory(
 	mutations := make(map[string]projectionMutation, len(keys))
 	lifecycleMutations := make(map[string]projectionLifecycleMutation, len(keys))
 	for _, leaseUUID := range keys {
+		if _, pending := pendingMaintenance[leaseUUID]; pending {
+			result.markFenced(leaseUUID)
+			continue
+		}
 		if s.restoreSourceClaimedLocked(leaseUUID) || s.attemptClaimedLocked(leaseUUID) {
 			result.markFenced(leaseUUID)
 			continue
@@ -2620,15 +2960,16 @@ func (s *Store) ProjectInventory(
 		case projection.Conflicts[leaseUUID] != nil:
 			candidate = projectConflict(existing, exists, projection.Conflicts[leaseUUID], now)
 
-		case projection.UntrustedPositives[leaseUUID] != nil:
+		case projection.UntrustedPositives[leaseUUID] != nil ||
+			projection.retentionPositives[leaseUUID] != nil:
 			candidate = projectUntrustedPositive(
-				existing, exists, projection.UntrustedPositives[leaseUUID], now,
+				existing, exists, projectionQuarantineBackends(projection, leaseUUID), now,
 			)
 
 		case projection.Placements[leaseUUID] != "":
 			backendName := projection.Placements[leaseUUID]
 			if exists && existing.Conflict &&
-				(!projection.Complete || !existing.CanResolveUntrustedPositive(backendName)) {
+				(!projection.complete || !existing.CanResolveUntrustedPositive(backendName)) {
 				// Inventory is not an operator conflict-resolution capability. Preserve
 				// and enlarge an ordinary or multi-candidate quarantine rather than
 				// allowing one later positive to erase historical evidence.
@@ -2643,11 +2984,20 @@ func (s *Store) ProjectInventory(
 		lifecycleWrite := false
 		if backendName := projection.Placements[leaseUUID]; acceptedPositive {
 			currentCapability, capabilityExists := s.lifecycleCache[leaseUUID]
-			observation, observationPresent := projection.Lifecycles[leaseUUID]
+			observation, observationPresent := projection.lifecycles[leaseUUID]
 			capability, persist, settlesAttempt := projectPositiveLifecycle(
 				currentCapability, capabilityExists, existing, exists, backendName,
 				observation, observationPresent,
 			)
+			if principalObservation, observed := projection.runtimePrincipals[leaseUUID]; observed {
+				var principalWrite bool
+				capability, principalWrite = applyRuntimePrincipalObservation(
+					capability,
+					principalObservation,
+					!exists || existing.Attempt == "" || settlesAttempt,
+				)
+				persist = persist || principalWrite
+			}
 			if exists && existing.Attempt == backendName && !settlesAttempt {
 				// Positive inventory may record the owner, but it cannot discard the
 				// only exact operation identity when lifecycle evidence is missing or
@@ -2672,7 +3022,7 @@ func (s *Store) ProjectInventory(
 				var capabilityErr error
 				capabilityEncoded, capabilityErr = encodeLifecycleCapability(capability)
 				if capabilityErr != nil {
-					return ProjectionResult{}, mutationFailure(
+					return projectionResult{}, mutationFailure(
 						"encode inventory lifecycle projection", capabilityErr,
 					)
 				}
@@ -2693,7 +3043,7 @@ func (s *Store) ProjectInventory(
 				capability.needsPersistence = false
 				capabilityEncoded, capabilityErr := encodeLifecycleCapability(capability)
 				if capabilityErr != nil {
-					return ProjectionResult{}, mutationFailure(
+					return projectionResult{}, mutationFailure(
 						"encode quarantined inventory lifecycle", capabilityErr,
 					)
 				}
@@ -2711,7 +3061,7 @@ func (s *Store) ProjectInventory(
 			continue
 		}
 		if nextRevision == math.MaxUint64 {
-			return ProjectionResult{}, fmt.Errorf("placement revision exhausted")
+			return projectionResult{}, fmt.Errorf("placement revision exhausted")
 		}
 		nextRevision++
 		candidate.revision = nextRevision
@@ -2720,7 +3070,7 @@ func (s *Store) ProjectInventory(
 		}
 		encoded, err := encodePlacement(candidate)
 		if err != nil {
-			return ProjectionResult{}, mutationFailure("encode inventory projection", err)
+			return projectionResult{}, mutationFailure("encode inventory projection", err)
 		}
 		mutations[leaseUUID] = projectionMutation{
 			placement: candidate,
@@ -2729,26 +3079,53 @@ func (s *Store) ProjectInventory(
 		}
 	}
 
-	if len(mutations) == 0 && !projection.Complete {
-		if err := s.verifyBucket(); err != nil {
-			return ProjectionResult{}, mutationFailure("verify inventory projection", err)
-		}
-		return result, nil
-	}
-
 	mutationKeys := slices.Sorted(maps.Keys(mutations))
-	nextMetadata := s.topologyMetadataLocked()
-	if projection.Complete {
-		if nextMetadata.KnownBackendStorageIDs == nil {
-			nextMetadata.KnownBackendStorageIDs = make(map[string]string, len(projection.BackendStorageIdentities))
+	excluded := maps.Clone(projection.causalExclusions)
+	if excluded == nil {
+		excluded = make(map[string]struct{})
+	}
+	for leaseUUID := range result.Fenced {
+		if projection.AbsenceEvidence.LeasePresent(s.inventoryEvidence, leaseUUID) {
+			excluded[leaseUUID] = struct{}{}
 		}
-		for backendName, id := range projection.BackendStorageIdentities {
+	}
+	unresolvedPositives := make(map[string]struct{})
+	for leaseUUID := range excluded {
+		if projectionMutationDurablyQuarantinesPositive(
+			mutations, projection.AbsenceEvidence, s.inventoryEvidence, leaseUUID,
+		) {
+			// The quarantine row and marker clear commit in the same bbolt
+			// transaction below. Unlike a pre-existing same-name owner, this is
+			// exact semantic representation of the rejected observation.
+			continue
+		}
+		if !s.excludedPositiveDurablyRepresentedLocked(
+			fence.sweepID, projection.AbsenceEvidence, leaseUUID,
+		) {
+			unresolvedPositives[leaseUUID] = struct{}{}
+		}
+	}
+	result.unresolvedPositives = unresolvedPositives
+	unresolvedPositive := len(unresolvedPositives) != 0
+	nextMetadata := s.topologyMetadataLocked()
+	if projection.complete {
+		if nextMetadata.KnownBackendStorageIDs == nil {
+			nextMetadata.KnownBackendStorageIDs = make(map[string]string, len(projection.backendStorageIdentities))
+		}
+		for backendName, id := range projection.backendStorageIdentities {
 			nextMetadata.KnownBackendStorageIDs[backendName] = id.String()
 		}
 		nextMetadata.BaselineFingerprint = s.topologyFingerprint
 		nextMetadata.BaselineTopologyID = s.topologyID
 		nextMetadata.InventoryTopologyID = s.topologyID
-		nextMetadata.EmptyInventoryBackends = slices.Clone(projection.EmptyBackends)
+		nextMetadata.EmptyInventoryBackends = slices.Clone(projection.emptyBackends)
+	}
+	if (!s.inventoryRecoveryRequired || projection.complete) && !unresolvedPositive {
+		// Clear only this exact live sweep. When an earlier sweep was abandoned,
+		// an incomplete view cannot prove that its unreported backends do not hold
+		// an unrepresented positive. Routine exact-generation fencing is already
+		// discharged above and does not penalize unrelated leases.
+		nextMetadata.PendingInventorySweepID = 0
 	}
 	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
@@ -2770,14 +3147,12 @@ func (s *Store) ProjectInventory(
 				}
 			}
 		}
-		if projection.Complete {
-			if err := putTopologyMetadata(tx, nextMetadata); err != nil {
-				return err
-			}
+		if err := putTopologyMetadata(tx, nextMetadata); err != nil {
+			return err
 		}
 		return nil
 	}); err != nil {
-		return ProjectionResult{}, mutationFailure("project placement inventory", err)
+		return projectionResult{}, mutationFailure("project placement inventory", err)
 	}
 
 	for _, leaseUUID := range mutationKeys {
@@ -2789,8 +3164,9 @@ func (s *Store) ProjectInventory(
 		delete(s.deleteRevisions, leaseUUID)
 	}
 	s.revision = nextRevision
-	if projection.Complete {
-		for backendName, id := range projection.BackendStorageIdentities {
+	s.pendingInventorySweepID = nextMetadata.PendingInventorySweepID
+	if projection.complete {
+		for backendName, id := range projection.backendStorageIdentities {
 			s.backendStorageIDs[backendName] = id
 		}
 		s.baselineFingerprint = nextMetadata.BaselineFingerprint
@@ -2801,74 +3177,382 @@ func (s *Store) ProjectInventory(
 			s.emptyInventoryBackends[backendName] = struct{}{}
 		}
 	}
+	s.inventoryRecoveryRequired = nextMetadata.PendingInventorySweepID != 0
+	s.clearInventoryPositiveBarriersLocked(
+		fence.sweepID, projection.complete, unresolvedPositives,
+	)
+	s.currentInventoryProjection = &inventoryProjectionMarker{}
+	s.mintPruneAbsenceProofsLocked(&result, fence, projection, pendingMaintenance)
 	return result, nil
 }
 
-func (result *ProjectionResult) markFenced(leaseUUID string) {
+func projectionMutationDurablyQuarantinesPositive(
+	mutations map[string]projectionMutation,
+	snapshot inventory.Snapshot,
+	binding inventory.Binding,
+	leaseUUID string,
+) bool {
+	mutation, present := mutations[leaseUUID]
+	if !present || mutation.placement.State() != StateUnusable ||
+		!snapshot.ValidFor(binding) {
+		return false
+	}
+	candidates := placementCandidateBackends(mutation.placement)
+	reporters := snapshot.LeaseReporters(binding, leaseUUID)
+	if len(reporters) == 0 {
+		return false
+	}
+	for _, backendName := range reporters {
+		if _, represented := candidates[backendName]; !represented {
+			return false
+		}
+	}
+	return true
+}
+
+func placementCandidateBackends(record Placement) map[string]struct{} {
+	candidates := make(map[string]struct{}, len(record.ConflictBackends)+2)
+	for _, backendName := range record.ConflictBackends {
+		if backendName != "" {
+			candidates[backendName] = struct{}{}
+		}
+	}
+	for _, backendName := range []string{record.Backend, record.Attempt} {
+		if backendName != "" {
+			candidates[backendName] = struct{}{}
+		}
+	}
+	return candidates
+}
+
+// excludedPositiveDurablyRepresentedLocked reports whether every positive
+// observation for one excluded lease is already made safe by the current
+// durable aggregate. This is intentionally stricter than backend-name
+// equality: retention and rejected evidence change the meaning of a placement,
+// and a contradictory lifecycle generation or runtime principal must remain
+// recovery-required. A matching trusted provision is redundant when its exact
+// backend and generation are already represented by Backend/Attempt/quarantine.
+// Caller holds s.mu.
+func (s *Store) excludedPositiveDurablyRepresentedLocked(
+	sweepID uint64,
+	snapshot inventory.Snapshot,
+	leaseUUID string,
+) bool {
+	observations := s.unprojectedPositives[leaseUUID][sweepID]
+	if len(observations) == 0 ||
+		!snapshot.ValidFor(s.inventoryEvidence) ||
+		!snapshot.LeasePresent(s.inventoryEvidence, leaseUUID) {
+		return false
+	}
+	record, exists := s.cache[leaseUUID]
+	if exists && record.State() == StateUnusable {
+		candidates := placementCandidateBackends(record)
+		represented := true
+		for _, backendName := range snapshot.LeaseReporters(s.inventoryEvidence, leaseUUID) {
+			if _, present := candidates[backendName]; !present {
+				represented = false
+				break
+			}
+		}
+		if represented {
+			// An existing durable quarantine is semantic representation for
+			// every observation class: it exposes no owner-affine authority and
+			// retains every reported backend as a repair candidate.
+			return true
+		}
+	}
+	reporters := make(map[string]struct{}, len(observations))
+	for observation := range observations {
+		reporters[observation.backendName] = struct{}{}
+		switch observation.class {
+		case inventoryPositiveProvision:
+			if !s.trustedProvisionDurablyRepresentedLocked(
+				snapshot, observation.backendName, leaseUUID,
+			) {
+				return false
+			}
+		case inventoryPositiveRetention, inventoryPositiveUntrusted:
+			return false
+		default:
+			return false
+		}
+	}
+	for _, backendName := range snapshot.LeaseReporters(s.inventoryEvidence, leaseUUID) {
+		if _, recorded := reporters[backendName]; !recorded {
+			return false
+		}
+	}
+	return true
+}
+
+// trustedProvisionDurablyRepresentedLocked is the only ordinary-concurrency
+// discharge rule. Losing this exact inventory row cannot create authority: the
+// placement already records its backend, and the row agrees with either the
+// current lifecycle or the exact durable attempt generation. A contradictory
+// principal would have quarantined current authority and is therefore not
+// redundant.
+// Caller holds s.mu.
+func (s *Store) trustedProvisionDurablyRepresentedLocked(
+	snapshot inventory.Snapshot,
+	backendName string,
+	leaseUUID string,
+) bool {
+	if !snapshot.TrustedReporter(s.inventoryEvidence, backendName, leaseUUID) {
+		return false
+	}
+	record, exists := s.cache[leaseUUID]
+	if !exists {
+		return false
+	}
+	if _, represented := placementCandidateBackends(record)[backendName]; !represented {
+		return false
+	}
+	if record.State() == StateUnusable {
+		// The durable placement already withholds all single-owner authority.
+		return true
+	}
+	row, provisioned := snapshot.Provision(s.inventoryEvidence, backendName, leaseUUID)
+	if !provisioned {
+		return false
+	}
+	capability, exists := s.lifecycleCache[leaseUUID]
+	if !exists {
+		return false
+	}
+	if capability.unusable {
+		return true
+	}
+	generation := sealedLifecycleObservation(row.LifecycleGeneration())
+	var expectedPrincipal runtimePrincipal
+	switch generation.Kind {
+	case LifecycleObservationUnknown:
+		switch {
+		case capability.backend == backendName:
+			expectedPrincipal = capability.principal
+		case capability.attemptBackend == backendName:
+			expectedPrincipal = runtimePrincipal{
+				tenant:       record.attemptRequestSnapshot.Tenant(),
+				providerUUID: record.attemptRequestSnapshot.ProviderUUID(),
+			}
+		default:
+			return false
+		}
+	case LifecycleObservationLegacy:
+		if capability.backend != backendName || capability.id.Valid() {
+			return false
+		}
+		expectedPrincipal = capability.principal
+	case LifecycleObservationTyped:
+		switch {
+		case capability.backend == backendName && capability.id == generation.ID:
+			expectedPrincipal = capability.principal
+		case capability.attemptBackend == backendName && capability.attemptID == generation.ID:
+			expectedPrincipal = runtimePrincipal{
+				tenant:       record.attemptRequestSnapshot.Tenant(),
+				providerUUID: record.attemptRequestSnapshot.ProviderUUID(),
+			}
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+
+	providerUUID := row.ProviderUUID()
+	tenant := row.Tenant()
+	providerPresent := strings.TrimSpace(providerUUID) != ""
+	tenantPresent := strings.TrimSpace(tenant) != ""
+	if !providerPresent && !tenantPresent {
+		return true
+	}
+	// A partial or malformed principal is not equivalent to absence. It may be
+	// a truncated contradiction, so it cannot discharge safety memory.
+	if !providerPresent || !tenantPresent ||
+		!utf8.ValidString(providerUUID) || !utf8.ValidString(tenant) ||
+		providerUUID != s.providerUUID {
+		return false
+	}
+	observedPrincipal := runtimePrincipal{
+		tenant: tenant, providerUUID: providerUUID,
+	}
+	return !expectedPrincipal.valid() || expectedPrincipal == observedPrincipal
+}
+
+// clearInventoryPositiveBarriersLocked retires only lease/backend facts that
+// the Store can now prove durable. A complete successful projection may also
+// retire older facts that every backend now authoritatively reports absent.
+// Semantically unresolved exclusions remain installed; redundant trusted
+// provision observations do not penalize unrelated leases.
+// Caller holds s.mu and invokes this only after the corresponding metadata
+// transaction commits.
+func (s *Store) clearInventoryPositiveBarriersLocked(
+	sweepID uint64,
+	complete bool,
+	unresolved map[string]struct{},
+) {
+	for leaseUUID, boundaries := range s.unprojectedPositives {
+		_, leaseUnresolved := unresolved[leaseUUID]
+		for boundaryID := range boundaries {
+			if boundaryID != sweepID && !complete {
+				continue
+			}
+			if !leaseUnresolved {
+				delete(boundaries, boundaryID)
+			}
+		}
+		if len(boundaries) == 0 {
+			delete(s.unprojectedPositives, leaseUUID)
+		}
+	}
+}
+
+func (result *projectionResult) markFenced(leaseUUID string) {
 	result.Fenced[leaseUUID] = struct{}{}
 }
 
-func normalizeInventoryProjection(input InventoryProjection) (InventoryProjection, error) {
-	projection := InventoryProjection{
-		Complete:                 input.Complete,
-		BackendStorageIdentities: maps.Clone(input.BackendStorageIdentities),
-		EmptyBackends:            slices.Clone(input.EmptyBackends),
-		Placements:               maps.Clone(input.Placements),
-		Lifecycles:               maps.Clone(input.Lifecycles),
-		Conflicts:                make(map[string][]string, len(input.Conflicts)),
-		UntrustedPositives:       make(map[string][]string, len(input.UntrustedPositives)),
+// mintPruneAbsenceProofsLocked turns raw negative inventory observations into
+// per-record capabilities only after the complete projection transaction has
+// succeeded. The proof is deliberately narrower than "this backend answered":
+// it identifies one immutable record revision and every durable candidate
+// owner whose two independent inventories omitted that lease.
+// Caller holds s.mu.
+func (s *Store) mintPruneAbsenceProofsLocked(
+	result *projectionResult,
+	fence inventoryFence,
+	projection inventoryProjection,
+	pendingMaintenance map[string]struct{},
+) {
+	if result == nil || s.operationCoordinator == nil || s.currentInventoryProjection == nil ||
+		s.inventoryRecoveryRequired ||
+		fence.issuer != s || fence.epoch != s.authorityEpoch ||
+		!projection.AbsenceEvidence.ValidFor(s.inventoryEvidence) ||
+		s.activeSnapshots[fence.revision] == 0 {
+		return
 	}
-	if projection.Complete {
-		if input.EmptyBackends == nil {
-			return InventoryProjection{}, fmt.Errorf(
-				"%w: complete projection has no raw empty-backend evidence",
-				ErrInvalidPlacement,
-			)
+
+	proofs := make(map[string]PruneAbsenceProof)
+	for leaseUUID, record := range s.cache {
+		_, projected := projection.Placements[leaseUUID]
+		_, conflicted := projection.Conflicts[leaseUUID]
+		_, untrusted := projection.UntrustedPositives[leaseUUID]
+		_, retained := projection.retentionPositives[leaseUUID]
+		if projection.AbsenceEvidence.LeasePresent(s.inventoryEvidence, leaseUUID) ||
+			projected || conflicted || untrusted || retained || record.Attempt != "" ||
+			record.revision == 0 || s.mutationRevisionLocked(leaseUUID) > fence.revision {
+			continue
 		}
-		canonicalEmpty, err := canonicalOptionalBackendNames(projection.EmptyBackends)
-		if err != nil {
-			return InventoryProjection{}, err
+		if _, pending := pendingMaintenance[leaseUUID]; pending {
+			continue
 		}
-		projection.EmptyBackends = canonicalEmpty
-	} else if input.EmptyBackends != nil {
-		return InventoryProjection{}, fmt.Errorf(
-			"%w: partial projection carries empty-backend evidence",
-			ErrInvalidPlacement,
-		)
+		if s.restoreSourceClaimedLocked(leaseUUID) || s.attemptClaimedLocked(leaseUUID) {
+			continue
+		}
+
+		owners := make(map[string]struct{}, len(record.ConflictBackends)+1)
+		switch {
+		case record.Conflict:
+			if record.ConflictOwnersUnknown || len(record.ConflictBackends) < 2 {
+				continue
+			}
+			for _, backendName := range record.ConflictBackends {
+				if backendName != "" {
+					owners[backendName] = struct{}{}
+				}
+			}
+			if record.Backend != "" {
+				owners[record.Backend] = struct{}{}
+			}
+		case record.State() == StateConfirmed:
+			owners[record.Backend] = struct{}{}
+		default:
+			continue
+		}
+		if len(owners) == 0 {
+			continue
+		}
+		accounted := true
+		for backendName := range owners {
+			storageID := projection.backendStorageIdentities[backendName]
+			if !projection.AbsenceEvidence.OwnerAbsent(
+				s.inventoryEvidence, backendName, storageID, leaseUUID,
+			) {
+				accounted = false
+				break
+			}
+		}
+		if !accounted {
+			continue
+		}
+
+		revision := s.newRecordRevision(leaseUUID, record.revision)
+		proofs[leaseUUID] = PruneAbsenceProof{
+			store: s, coordinator: s.operationCoordinator,
+			fence: fence, projection: s.currentInventoryProjection, record: revision,
+			evidence: projection.AbsenceEvidence,
+		}
 	}
-	for backendName, id := range projection.BackendStorageIdentities {
-		if backendName == "" || !id.Valid() {
-			return InventoryProjection{}, fmt.Errorf(
-				"%w: backend %q", ErrBackendStorageIdentityUnbound, backendName,
-			)
-		}
+	if len(proofs) != 0 {
+		result.pruneAbsences = proofs
+	}
+}
+
+func normalizeInventoryProjection(input inventoryProjection) (inventoryProjection, error) {
+	projection := inventoryProjection{
+		Placements:         maps.Clone(input.Placements),
+		Conflicts:          make(map[string][]string, len(input.Conflicts)),
+		UntrustedPositives: make(map[string][]string, len(input.UntrustedPositives)),
+		retentionPositives: make(map[string][]string, len(input.retentionPositives)),
+		AbsenceEvidence:    input.AbsenceEvidence,
+		lifecycles:         maps.Clone(input.lifecycles),
+		runtimePrincipals:  maps.Clone(input.runtimePrincipals),
+		causalExclusions:   maps.Clone(input.causalExclusions),
 	}
 	for leaseUUID, backendName := range projection.Placements {
 		if err := validateIDs(leaseUUID, backendName); err != nil {
-			return InventoryProjection{}, err
+			return inventoryProjection{}, err
 		}
 	}
-	for leaseUUID, observation := range projection.Lifecycles {
+	for leaseUUID, observation := range projection.lifecycles {
 		if _, active := projection.Placements[leaseUUID]; !active {
-			return InventoryProjection{}, fmt.Errorf(
+			return inventoryProjection{}, fmt.Errorf(
 				"%w: lifecycle observation for lease %q has no positive placement",
 				ErrInvalidPlacement, leaseUUID,
 			)
 		}
 		if err := validateLifecycleObservation(observation); err != nil {
-			return InventoryProjection{}, fmt.Errorf(
+			return inventoryProjection{}, fmt.Errorf(
 				"%w: lifecycle observation for lease %q: %w",
 				ErrInvalidPlacement, leaseUUID, err,
 			)
 		}
 	}
+	for leaseUUID := range projection.runtimePrincipals {
+		if _, active := projection.Placements[leaseUUID]; !active {
+			return inventoryProjection{}, fmt.Errorf(
+				"%w: runtime principal for lease %q has no positive placement",
+				ErrInvalidPlacement, leaseUUID,
+			)
+		}
+		if _, lifecycleObserved := projection.lifecycles[leaseUUID]; !lifecycleObserved {
+			return inventoryProjection{}, fmt.Errorf(
+				"%w: runtime principal for lease %q has no lifecycle evidence",
+				ErrInvalidPlacement, leaseUUID,
+			)
+		}
+	}
 	for leaseUUID, backendNames := range input.Conflicts {
 		if leaseUUID == "" {
-			return InventoryProjection{}, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
+			return inventoryProjection{}, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
 		}
-		normalized := normalizeBackendNames(backendNames)
+		normalized, normalizeErr := canonicalProjectionBackendNames(backendNames)
+		if normalizeErr != nil {
+			return inventoryProjection{}, fmt.Errorf(
+				"%w: conflict for lease %q: %w",
+				ErrInvalidPlacement, leaseUUID, normalizeErr,
+			)
+		}
 		if len(normalized) < 2 {
-			return InventoryProjection{}, fmt.Errorf(
+			return inventoryProjection{}, fmt.Errorf(
 				"%w: conflict for lease %q requires at least two backends",
 				ErrInvalidPlacement, leaseUUID,
 			)
@@ -2877,91 +3561,82 @@ func normalizeInventoryProjection(input InventoryProjection) (InventoryProjectio
 	}
 	for leaseUUID, backendNames := range input.UntrustedPositives {
 		if leaseUUID == "" {
-			return InventoryProjection{}, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
+			return inventoryProjection{}, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
 		}
-		normalized := normalizeBackendNames(backendNames)
+		normalized, normalizeErr := canonicalProjectionBackendNames(backendNames)
+		if normalizeErr != nil {
+			return inventoryProjection{}, fmt.Errorf(
+				"%w: untrusted positive for lease %q: %w",
+				ErrInvalidPlacement, leaseUUID, normalizeErr,
+			)
+		}
 		if len(normalized) == 0 {
-			return InventoryProjection{}, fmt.Errorf(
+			return inventoryProjection{}, fmt.Errorf(
 				"%w: untrusted positive for lease %q requires at least one backend",
 				ErrInvalidPlacement, leaseUUID,
 			)
 		}
 		projection.UntrustedPositives[leaseUUID] = normalized
 	}
+	for leaseUUID, backendNames := range input.retentionPositives {
+		if leaseUUID == "" {
+			return inventoryProjection{}, fmt.Errorf("%w: lease UUID is required", ErrInvalidPlacement)
+		}
+		normalized, normalizeErr := canonicalProjectionBackendNames(backendNames)
+		if normalizeErr != nil {
+			return inventoryProjection{}, fmt.Errorf(
+				"%w: retention positive for lease %q: %w",
+				ErrInvalidPlacement, leaseUUID, normalizeErr,
+			)
+		}
+		if len(normalized) == 0 {
+			return inventoryProjection{}, fmt.Errorf(
+				"%w: retention positive for lease %q requires at least one backend",
+				ErrInvalidPlacement, leaseUUID,
+			)
+		}
+		projection.retentionPositives[leaseUUID] = normalized
+	}
 	for leaseUUID := range projection.Conflicts {
 		if _, overlaps := projection.Placements[leaseUUID]; overlaps {
-			return InventoryProjection{}, projectionOverlapError(leaseUUID)
+			return inventoryProjection{}, projectionOverlapError(leaseUUID)
 		}
 		if _, overlaps := projection.UntrustedPositives[leaseUUID]; overlaps {
-			return InventoryProjection{}, projectionOverlapError(leaseUUID)
+			return inventoryProjection{}, projectionOverlapError(leaseUUID)
+		}
+		if _, overlaps := projection.retentionPositives[leaseUUID]; overlaps {
+			return inventoryProjection{}, projectionOverlapError(leaseUUID)
 		}
 	}
 	for leaseUUID := range projection.UntrustedPositives {
 		if _, overlaps := projection.Placements[leaseUUID]; overlaps {
-			return InventoryProjection{}, projectionOverlapError(leaseUUID)
+			return inventoryProjection{}, projectionOverlapError(leaseUUID)
 		}
 	}
-	if projection.Complete {
-		empty := make(map[string]struct{}, len(projection.EmptyBackends))
-		for _, backendName := range projection.EmptyBackends {
-			empty[backendName] = struct{}{}
-		}
-		for leaseUUID, backendName := range projection.Placements {
-			if _, contradiction := empty[backendName]; contradiction {
-				return InventoryProjection{}, fmt.Errorf(
-					"%w: backend %q is both empty and owner of lease %q",
-					ErrInvalidPlacement,
-					backendName,
-					leaseUUID,
-				)
-			}
-		}
-		for leaseUUID, backendNames := range projection.Conflicts {
-			for _, backendName := range backendNames {
-				if _, contradiction := empty[backendName]; contradiction {
-					return InventoryProjection{}, fmt.Errorf(
-						"%w: backend %q is both empty and a conflict reporter for lease %q",
-						ErrInvalidPlacement,
-						backendName,
-						leaseUUID,
-					)
-				}
-			}
-		}
-		for leaseUUID, backendNames := range projection.UntrustedPositives {
-			for _, backendName := range backendNames {
-				if _, contradiction := empty[backendName]; contradiction {
-					return InventoryProjection{}, fmt.Errorf(
-						"%w: backend %q is both empty and an untrusted positive reporter for lease %q",
-						ErrInvalidPlacement,
-						backendName,
-						leaseUUID,
-					)
-				}
-			}
+	for leaseUUID := range projection.retentionPositives {
+		if _, overlaps := projection.Placements[leaseUUID]; overlaps {
+			return inventoryProjection{}, projectionOverlapError(leaseUUID)
 		}
 	}
 	return projection, nil
 }
 
-func canonicalOptionalBackendNames(names []string) ([]string, error) {
-	canonical := slices.Clone(names)
-	seen := make(map[string]struct{}, len(canonical))
-	for _, name := range canonical {
-		if strings.TrimSpace(name) == "" {
-			return nil, fmt.Errorf("%w: empty-backend name is blank", ErrInvalidPlacement)
+func projectionQuarantineBackends(
+	projection inventoryProjection,
+	leaseUUID string,
+) []string {
+	backends := make(map[string]struct{},
+		len(projection.UntrustedPositives[leaseUUID])+
+			len(projection.retentionPositives[leaseUUID]))
+	for _, candidates := range [][]string{
+		projection.UntrustedPositives[leaseUUID],
+		projection.retentionPositives[leaseUUID],
+	} {
+		for _, backendName := range candidates {
+			backends[backendName] = struct{}{}
 		}
-		if _, duplicate := seen[name]; duplicate {
-			return nil, fmt.Errorf(
-				"%w: duplicate empty-backend name %q",
-				ErrInvalidPlacement,
-				name,
-			)
-		}
-		seen[name] = struct{}{}
 	}
-	slices.Sort(canonical)
-	return canonical, nil
+	return slices.Sorted(maps.Keys(backends))
 }
 
 func validateLifecycleObservation(observation LifecycleObservation) error {
@@ -3125,22 +3800,39 @@ func (s *Store) mutationRevisionLocked(leaseUUID string) uint64 {
 	return s.deleteRevisions[leaseUUID]
 }
 
-// verifyBucket proves the durable store is readable even when an idempotent or
-// fully fenced synchronization has no mutation to commit.
-// Caller holds at least s.mu.RLock.
-func (s *Store) verifyBucket() error {
-	return s.viewRuntimeAuthority(verifyAuthorityBuckets)
-}
-
 func verifyAuthorityBuckets(tx *bolt.Tx) error {
-	if tx.Bucket(bucketName) == nil {
-		return errors.New("placements bucket missing")
+	if err := verifyExactAuthorityBucketSet(tx); err != nil {
+		return err
 	}
-	if tx.Bucket(lifecycleCapabilityBucketName) == nil {
-		return errors.New("placement lifecycle capability bucket missing")
+	placements := tx.Bucket(bucketName)
+	if err := placements.ForEach(func(key, value []byte) error {
+		if value == nil {
+			return fmt.Errorf("placement record %q is a nested bucket", key)
+		}
+		if _, _, err := decodeCurrentPlacementRecord(value); err != nil {
+			return fmt.Errorf("placement record %q is not current schema: %w", key, err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	lifecycles := tx.Bucket(lifecycleCapabilityBucketName)
+	if err := lifecycles.ForEach(func(key, value []byte) error {
+		if value == nil {
+			return fmt.Errorf("placement lifecycle capability %q is a nested bucket", key)
+		}
+		if _, err := decodeLifecycleCapability(value); err != nil {
+			return fmt.Errorf("placement lifecycle capability %q is invalid: %w", key, err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if _, err := loadTopologyMetadata(tx); err != nil {
 		return fmt.Errorf("placement topology metadata: %w", err)
+	}
+	if err := verifyMaintenanceCommandJournal(tx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -3203,6 +3895,9 @@ func (s *Store) deleteDurable(leaseUUID, operation string) error {
 		}
 	}
 	if err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+		if err := rejectPendingMaintenanceTx(tx, leaseUUID); err != nil {
+			return err
+		}
 		placements := tx.Bucket(bucketName)
 		capabilities := tx.Bucket(lifecycleCapabilityBucketName)
 		if placements == nil || capabilities == nil {
@@ -3212,9 +3907,13 @@ func (s *Store) deleteDurable(leaseUUID, operation string) error {
 			return err
 		}
 		if capabilityExists && retainCapability {
-			return capabilities.Put([]byte(leaseUUID), capabilityEncoded)
+			if err := capabilities.Put([]byte(leaseUUID), capabilityEncoded); err != nil {
+				return err
+			}
+		} else if err := capabilities.Delete([]byte(leaseUUID)); err != nil {
+			return err
 		}
-		return capabilities.Delete([]byte(leaseUUID))
+		return reclaimDetachedMaintenanceCommandsForLeaseTx(tx, leaseUUID)
 	}); err != nil {
 		return mutationFailure(operation, err)
 	}

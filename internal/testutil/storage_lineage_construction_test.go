@@ -1,10 +1,9 @@
 package testutil
 
-// This repository-level tripwire keeps the bundled backends on the strict
-// storage-lineage construction path. The legacy shared-store constructors can
-// create a bbolt file and remain available to tests, but production composition
-// roots must use the identity-bound constructors. Marker mutation itself has no
-// pathname-only API: production can initialize only through BoundMarkerPair.
+// This repository-level tripwire prevents the removed unbound shared-store
+// constructors from being reintroduced at a production call site. Tests that
+// need a corrupt or stopped pre-binding journal use package-local fixtures;
+// every external consumer must present verified storage lineage.
 
 import (
 	"go/ast"
@@ -33,11 +32,15 @@ func TestProductionUsesIdentityBoundStoreConstruction(t *testing.T) {
 	var findings []string
 	for _, dir := range []string{"internal", "cmd"} {
 		walkGoFiles(t, filepath.Join(root, dir), root, func(rel string, file *ast.File, fset *token.FileSet) {
-			if rel == "internal/backendidentity/marker.go" || strings.HasPrefix(rel, "internal/backend/shared/") {
+			if rel == "internal/backendidentity/marker.go" {
 				return
 			}
 
-			for _, finding := range forbiddenCallsInFile(file, fset) {
+			localPackagePath := ""
+			if filepath.ToSlash(filepath.Dir(rel)) == "internal/backend/shared" {
+				localPackagePath = sharedPackagePath
+			}
+			for _, finding := range forbiddenCallsInFile(file, fset, localPackagePath) {
 				findings = append(findings, strings.TrimPrefix(finding, root+string(filepath.Separator)))
 			}
 		})
@@ -50,7 +53,7 @@ func TestProductionUsesIdentityBoundStoreConstruction(t *testing.T) {
 	}
 }
 
-func forbiddenCallsInFile(file *ast.File, fset *token.FileSet) []string {
+func forbiddenCallsInFile(file *ast.File, fset *token.FileSet, localPackagePath string) []string {
 	aliases := make(map[string]string)
 	dotImports := make(map[string]struct{})
 	for _, imp := range file.Imports {
@@ -92,6 +95,10 @@ func forbiddenCallsInFile(file *ast.File, fset *token.FileSet) []string {
 			function = fun.Sel.Name
 		case *ast.Ident:
 			function = fun.Name
+			if _, forbidden := forbiddenProductionCalls[localPackagePath][function]; forbidden {
+				packagePath = localPackagePath
+				break
+			}
 			for path := range dotImports {
 				if _, forbidden := forbiddenProductionCalls[path][function]; forbidden {
 					packagePath = path
@@ -112,9 +119,10 @@ func forbiddenCallsInFile(file *ast.File, fset *token.FileSet) []string {
 
 func TestForbiddenProductionCallDetection(t *testing.T) {
 	tests := []struct {
-		name string
-		src  string
-		want int
+		name             string
+		src              string
+		localPackagePath string
+		want             int
 	}{
 		{
 			name: "default import",
@@ -149,7 +157,7 @@ func f() { shared.OpenIdentityBoundCallbackStore(shared.CallbackStoreConfig{}, n
 			if err != nil {
 				t.Fatalf("parse synthetic source: %v", err)
 			}
-			if got := len(forbiddenCallsInFile(file, fset)); got != test.want {
+			if got := len(forbiddenCallsInFile(file, fset, test.localPackagePath)); got != test.want {
 				t.Fatalf("got %d findings, want %d", got, test.want)
 			}
 		})

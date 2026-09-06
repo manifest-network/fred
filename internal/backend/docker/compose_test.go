@@ -7,7 +7,8 @@ import (
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 )
 
-// mockComposeExecutor implements composeExecutor for testing.
+// mockComposeExecutor implements the separate compose read and mutation seams
+// for testing.
 type mockComposeExecutor struct {
 	UpFn   func(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error
 	DownFn func(ctx context.Context, projectName string, timeout time.Duration) error

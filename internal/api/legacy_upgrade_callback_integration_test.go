@@ -6,20 +6,100 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/provisioner"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testsupport/placementstore"
 	"github.com/manifest-network/fred/internal/testutil"
 )
+
+func legacyMaintenanceLifecycleStore(
+	t *testing.T,
+	leaseUUID, backendName string,
+) *placement.Store {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	db, err := bolt.Open(dbPath, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("placements"))
+		if err != nil {
+			return err
+		}
+		value, err := json.Marshal(struct {
+			Backend string    `json:"backend"`
+			SetAt   time.Time `json:"set_at"`
+		}{
+			Backend: backendName,
+			SetAt:   time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC),
+		})
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(leaseUUID), value)
+	}))
+	require.NoError(t, db.Close())
+
+	preparer, err := placement.OpenLegacyUpgradePreparer(dbPath)
+	require.NoError(t, err)
+	chainProof, err := placementstore.LegacyUpgradeChainProof(
+		placementstore.ProviderUUID, leaseUUID,
+	)
+	require.NoError(t, err)
+	backupTarget, err := placement.BindExactBackupTarget(dbPath + ".v013.backup")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, backupTarget.Close()) })
+	inventories := map[string]placement.BackendInventory{
+		backendName: {
+			StorageIdentity:        testAPIBackendStorageID(backendName),
+			Provisions:             []string{leaseUUID},
+			ProvisionProviderUUIDs: map[string]string{leaseUUID: ""},
+			ProvisionItems: map[string][]backend.LeaseItem{
+				leaseUUID: {{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
+			},
+			Retentions: []string{},
+		},
+	}
+	capability, err := preparer.AuthorizePreparation(
+		t.Context(), placementstore.ProviderUUID, []string{backendName}, inventories,
+		chainProof, backupTarget, placement.LegacyPreparationDrainAttestation,
+	)
+	require.NoError(t, err)
+	_, err = preparer.PrepareContext(
+		t.Context(), placementstore.ProviderUUID, []string{backendName}, inventories,
+		chainProof, capability,
+	)
+	require.NoError(t, err)
+	require.NoError(t, preparer.Close())
+	routes, err := placement.NewCallbackRouteFactory("https://fred.example.test")
+	require.NoError(t, err)
+	store, err := placement.OpenStore(
+		dbPath, placementstore.ProviderUUID, placement.WithCallbackRouteFactory(routes),
+	)
+	require.NoError(t, err)
+	require.Equal(t, placement.LifecycleVerdictLegacy,
+		store.CurrentLifecycle(leaseUUID).Verdict(),
+		"the prepared v0.13 authority must survive its first online open",
+	)
+	require.NoError(t, store.Close())
+	store, err = placement.OpenStore(
+		dbPath, placementstore.ProviderUUID, placement.WithCallbackRouteFactory(routes),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	return store
+}
 
 // TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager composes the real
 // first-upgrade boundary. legacyMaintenanceLifecycleStore writes the v0.13
@@ -32,6 +112,7 @@ func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 	const backendName = "backend-a"
 	leaseUUID := testutil.ValidUUID1
 	providerUUID := placementstore.ProviderUUID
+	proofVerifier, proofConsumer := hmacauth.NewCallbackProofBoundary()
 
 	placements := legacyMaintenanceLifecycleStore(t, leaseUUID, backendName)
 	require.Equal(t, placement.LifecycleVerdictLegacy,
@@ -60,10 +141,10 @@ func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 	require.NoError(t, err)
 
 	manager, err := provisioner.NewManager(provisioner.ManagerConfig{
-		ProviderUUID:    providerUUID,
-		CallbackBaseURL: "https://fred.example.test",
-		PlacementStore:  placements,
-		LeaseEventSink:  events,
+		ProviderUUID:          providerUUID,
+		PlacementStore:        placements,
+		LeaseEventSink:        events,
+		CallbackProofConsumer: proofConsumer,
 	}, router, chainClient)
 	require.NoError(t, err)
 
@@ -85,7 +166,7 @@ func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 		}
 	})
 
-	auth := newTestCallbackAuthenticator(t, testCallbackSecret)
+	auth := newTestCallbackAuthenticatorWithVerifier(t, testCallbackSecret, proofVerifier)
 	callbackAPI := &Server{
 		callbackPublisher:     manager,
 		callbackAuthenticator: auth,

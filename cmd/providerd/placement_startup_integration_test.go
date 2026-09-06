@@ -42,6 +42,7 @@ func TestIntegrationPreparedMultiBackendRestartsWithTransientNode(t *testing.T) 
 	cfg := &config.Config{
 		PlacementStoreDBPath: dbPath,
 		ProviderUUID:         startupChainSnapshot{}.ProviderUUID(),
+		CallbackBaseURL:      "https://provider.test",
 		CallbackSecret:       config.Secret("0123456789abcdef0123456789abcdef"),
 		Backends: []config.BackendConfig{
 			{

@@ -14,6 +14,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 const (
@@ -22,8 +23,13 @@ const (
 )
 
 type closeRecoveryStores struct {
-	callbacks *shared.CallbackStore
-	releases  *shared.ReleaseStore
+	callbacks   *shared.CallbackStore
+	releases    *shared.ReleaseStore
+	retentions  *shared.RetentionStore
+	operations  *shared.OperationSettlement
+	restore     *shared.RestoreSettlement
+	maintenance *shared.MaintenanceSettlement
+	close       *shared.CloseSettlement
 }
 
 func openCloseRecoveryBackend(
@@ -60,23 +66,77 @@ func openCloseRecoveryBackend(
 	if volumes != nil {
 		b.volumes = volumes
 	}
-	storageID, err := initializeTestMarkerPair(
-		callbackPath+".storage-identity.json",
-		callbackPath+".storage-identity-anchor.json",
-		b.Name(),
-		daemonID,
+	callbackStore, releaseStore, retentionStore := openBoundCloseStoresForBackendTest(
+		t, b, dir, daemonID,
 	)
+	operationSettlement, err := shared.NewOperationSettlement(callbackStore, releaseStore)
 	require.NoError(t, err)
-	b.storageIdentity = storageID
-
-	callbackStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: callbackPath})
+	restoreSettlement, err := shared.NewRestoreSettlement(operationSettlement, retentionStore)
 	require.NoError(t, err)
-	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: b.cfg.ReleasesDBPath})
+	maintenanceSettlement, err := shared.NewMaintenanceSettlement(callbackStore, releaseStore)
+	require.NoError(t, err)
+	closeSettlement, err := shared.NewCloseSettlement(callbackStore, releaseStore, retentionStore)
 	require.NoError(t, err)
 	b.callbackStore = callbackStore
-	b.operationIntents = callbackStore
+	b.operationSettlement = operationSettlement
 	b.releaseStore = releaseStore
-	return b, closeRecoveryStores{callbacks: callbackStore, releases: releaseStore}
+	b.retentionStore = retentionStore
+	b.operationSettlement = operationSettlement
+	b.restoreSettlement = restoreSettlement
+	b.maintenanceSettlement = maintenanceSettlement
+	b.closeSettlement = closeSettlement
+	ops, err := storageMutationOperationsForTest(b)
+	require.NoError(t, err)
+	// Construct the operation and maintenance executors before any release
+	// fixture is seeded. Otherwise commitOperationSuccessForTest has to bind its
+	// seed-only executor permanently, leaving later recovery unable to classify
+	// the real Docker substrate—a wiring state production cannot create.
+	require.NoError(t, bindBackendTestPhysicalExecutors(
+		b, operationSettlement, maintenanceSettlement,
+	))
+	require.NoError(t, shared.BindCloseSubstrateExecutor(
+		closeSettlement,
+		b.authorizeStorageMutation,
+		b.completeStorageMutation,
+		buildCloseSubstrate(b, ops),
+		runCloseSubstrate,
+		b.classifyClosePhysical,
+	))
+	rebuildCallbackSender(b, testCallbackClient)
+	require.NotNil(t, b.callbackPublisher)
+	retentionFixtureAuthorities.Store(retentionStore, &retentionFixtureAuthority{
+		backend: b, callbacks: callbackStore, releases: releaseStore,
+		operations: operationSettlement, restore: restoreSettlement, close: closeSettlement,
+	})
+	registerExistingOperationTestAuthority(
+		b, callbackStore, releaseStore, retentionStore,
+		operationSettlement, restoreSettlement, closeSettlement,
+	)
+	bindBackendRecoveryCoordinatorForTest(t, b)
+	return b, closeRecoveryStores{
+		callbacks: callbackStore, releases: releaseStore,
+		retentions: retentionStore, operations: operationSettlement, restore: restoreSettlement,
+		maintenance: maintenanceSettlement, close: closeSettlement,
+	}
+}
+
+func completeDestroyedCloseForTest(
+	t *testing.T,
+	b *Backend,
+	settlement *shared.CloseSettlement,
+	claim shared.CloseIntentClaim,
+) {
+	t.Helper()
+	execution, err := settlement.StartCloseExecution(claim)
+	require.NoError(t, err)
+	outcome := settlement.ExecuteClose(context.Background(), execution)
+	destroyed, ok := outcome.(shared.CloseExecutionDestroyed)
+	if pending, pendingOutcome := outcome.(shared.CloseExecutionPending); pendingOutcome {
+		require.FailNowf(t, "close outcome remained pending", "%s", pending.Error())
+	}
+	require.True(t, ok, "close outcome = %T, want destroyed", outcome)
+	_, err = settlement.CompleteClose(destroyed)
+	require.NoError(t, err)
 }
 
 func beginCloseRecoveryIntent(
@@ -87,40 +147,20 @@ func beginCloseRecoveryIntent(
 	callbackURL string,
 ) shared.CloseIntentClaim {
 	t.Helper()
-	items, payload, release := seedCloseRecoveryRelease(t, stores)
-	version, digest, err := closeReleaseFence(release)
-	require.NoError(t, err)
-	lifecycleCallbackURL := ""
-	if callbackURL != "" {
-		lifecycleCallbackURL, err = backend.ResolveLifecycleCallbackURL(callbackURL, "")
-		require.NoError(t, err)
-	}
-	resourceProfiles, err := b.resolveResourceProfiles(items)
-	require.NoError(t, err)
-	spec := shared.CloseIntentSpec{
-		LeaseUUID:             closeRecoveryLeaseUUID,
-		Backend:               b.Name(),
-		BackendStorageID:      b.storageIdentity,
-		Tenant:                "tenant-a",
-		ProviderUUID:          closeRecoveryProviderUUID,
-		Items:                 items,
-		ResourceProfiles:      resourceProfiles,
-		Manifest:              payload,
-		ActiveReleaseVersion:  version,
-		ActiveReleaseDigest:   digest,
-		CleanupOnly:           cleanupOnly,
-		CallbackURL:           callbackURL,
-		LifecycleCallbackURL:  lifecycleCallbackURL,
-		RetainOnClose:         false,
-		LegacyRollbackTargets: nil,
-	}
+	_, _, _ = seedCloseRecoveryReleaseWithCallback(t, stores, callbackURL)
+	var admission shared.CloseIntentAdmission
+	var err error
 	if cleanupOnly {
-		spec.Tenant = ""
-		spec.ProviderUUID = ""
+		request, requestErr := stores.close.NewCleanupCloseRequest(closeRecoveryLeaseUUID)
+		require.NoError(t, requestErr)
+		admission, err = stores.close.BeginCleanupClose(request)
+	} else {
+		request, requestErr := stores.close.NewCloseRequest(closeRecoveryLeaseUUID, false)
+		require.NoError(t, requestErr)
+		admission, err = stores.close.BeginClose(request)
 	}
-	admission, err := stores.callbacks.BeginCloseIntent(spec)
 	require.NoError(t, err)
-	return admission.Claim
+	return admission.Claim()
 }
 
 func seedCloseRecoveryRelease(
@@ -128,23 +168,59 @@ func seedCloseRecoveryRelease(
 	stores closeRecoveryStores,
 ) ([]backend.LeaseItem, []byte, *shared.Release) {
 	t.Helper()
+	return seedCloseRecoveryReleaseWithCallback(t, stores, "")
+}
+
+func seedCloseRecoveryReleaseWithCallback(
+	t *testing.T,
+	stores closeRecoveryStores,
+	callbackURL string,
+) ([]backend.LeaseItem, []byte, *shared.Release) {
+	t.Helper()
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", ServiceName: "app", Quantity: 1,
 	}}
+	return seedCloseRecoveryReleaseWithProfiles(
+		t, stores, callbackURL, items, testResourceProfiles(t, items),
+	)
+}
+
+func seedCloseRecoveryReleaseWithProfiles(
+	t *testing.T,
+	stores closeRecoveryStores,
+	callbackURL string,
+	items []backend.LeaseItem,
+	resourceProfiles []shared.SKUResourceSnapshot,
+) ([]backend.LeaseItem, []byte, *shared.Release) {
+	t.Helper()
+	if callbackURL == "" {
+		callbackURL = testOperationCallbackURL("https://callbacks.invalid/callbacks/provision")
+	}
 	payload := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
-	resourceProfiles := testResourceProfiles(t, items)
-	require.NoError(t, stores.releases.Append(closeRecoveryLeaseUUID, shared.Release{
-		Manifest:         payload,
-		Image:            "stack",
-		Items:            items,
-		ResourceProfiles: resourceProfiles,
-		Status:           "active",
-		CreatedAt:        time.Now(),
-	}))
-	release, err := stores.releases.LatestActive(closeRecoveryLeaseUUID)
+	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
 	require.NoError(t, err)
-	require.NotNil(t, release)
-	return items, payload, release
+	operationID := mustTestOperationIDFromCallbackURL(t, callbackURL)
+	authority, authorityErr := shared.NewReleaseRuntimeAuthority(
+		operationID,
+		"tenant-a",
+		closeRecoveryProviderUUID,
+		callbackURL,
+		lifecycleCallbackURL,
+	)
+	require.NoError(t, authorityErr)
+	seeded := seedProvisionReleaseForLeaseTest(
+		t, stores.callbacks, stores.releases, stores.operations,
+		closeRecoveryLeaseUUID, shared.Release{
+			Manifest:         payload,
+			Image:            "stack",
+			OperationID:      operationID,
+			Items:            items,
+			ResourceProfiles: resourceProfiles,
+			RuntimeAuthority: &authority,
+			Status:           "active",
+			CreatedAt:        time.Now(),
+		})
+	return items, payload, &seeded
 }
 
 func seedCloseRecoveryProjection(
@@ -154,7 +230,7 @@ func seedCloseRecoveryProjection(
 	callbackURL string,
 ) {
 	t.Helper()
-	items, _, _ := seedCloseRecoveryRelease(t, stores)
+	items, _, _ := seedCloseRecoveryReleaseWithCallback(t, stores, callbackURL)
 	lifecycleCallbackURL := ""
 	var err error
 	if callbackURL != "" {
@@ -177,14 +253,14 @@ func seedCloseRecoveryProjection(
 			Message:              "",
 			CallbackURL:          callbackURL,
 			LifecycleCallbackURL: lifecycleCallbackURL,
+			ActiveReleaseVersion: 0,
+			ActiveOperationID:    shared.OperationID{},
 			Items:                items,
 			ResourceProfiles:     testResourceProfiles(t, items),
 			ContainerIDs:         nil,
 			StackManifest:        nil,
 			ServiceContainers:    nil,
 		},
-		ResourceProfiles:      testResourceProfiles(t, items),
-		VolumeCleanupAttempts: 0,
 	}
 	b.provisionsMu.Unlock()
 }
@@ -194,6 +270,7 @@ func closeCloseRecoveryBackend(t *testing.T, b *Backend, stores closeRecoverySto
 	b.stopCancel()
 	require.NoError(t, stores.callbacks.Close())
 	require.NoError(t, stores.releases.Close())
+	require.NoError(t, stores.retentions.Close())
 }
 
 func TestRecoverState_CloseIntentConvergesZeroSurvivorRelease(t *testing.T) {
@@ -220,6 +297,341 @@ func TestRecoverState_CloseIntentConvergesZeroSurvivorRelease(t *testing.T) {
 	_, found = b.provisions[closeRecoveryLeaseUUID]
 	b.provisionsMu.RUnlock()
 	require.False(t, found)
+
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+func TestRecoverState_ClosedLeaseReceiptRemovesLateContainerWithoutRepublishing(t *testing.T) {
+	dir := t.TempDir()
+	visible := false
+	late := true
+	lateContainer := ContainerInfo{
+		ContainerID:  "late-after-close",
+		LeaseUUID:    closeRecoveryLeaseUUID,
+		Tenant:       "tenant-a",
+		ProviderUUID: closeRecoveryProviderUUID,
+		ServiceName:  "app",
+		SKU:          "docker-small",
+	}
+	var removed []string
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			if !visible {
+				return nil, nil
+			}
+			if !late {
+				return nil, nil
+			}
+			return []ContainerInfo{lateContainer}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			removed = append(removed, containerID)
+			late = false
+			return nil
+		},
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
+	claim := beginCloseRecoveryIntent(t, b, stores, false, "")
+	completeDestroyedCloseForTest(t, b, stores.close, claim)
+
+	// A successful close is a permanent UUID retirement, not merely a finite
+	// observation that Docker was empty. Model the Create becoming visible only
+	// after this sweep's strict cleanup read: the newer ordinary inventory still
+	// excludes it from projection, and the next sweep removes it.
+	require.NoError(t, b.recoverState(context.Background()))
+	require.Empty(t, removed)
+	b.provisionsMu.RLock()
+	_, projected := b.provisions[closeRecoveryLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.False(t, projected)
+
+	visible = true
+	require.NoError(t, b.recoverState(context.Background()))
+	require.Equal(t, []string{lateContainer.ContainerID}, removed)
+	b.provisionsMu.RLock()
+	_, projected = b.provisions[closeRecoveryLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.False(t, projected)
+	receipts, err := stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
+	require.NoError(t, err)
+	require.Len(t, receipts, 1)
+	require.Equal(t, closeRecoveryLeaseUUID, receipts[0].LeaseUUID())
+
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+func TestRecoverState_ClosedLeaseReceiptRejectsDivergentPrincipal(t *testing.T) {
+	dir := t.TempDir()
+	visible := false
+	lateContainer := ContainerInfo{
+		ContainerID:  "late-after-close",
+		LeaseUUID:    closeRecoveryLeaseUUID,
+		Tenant:       "different-tenant",
+		ProviderUUID: closeRecoveryProviderUUID,
+		ServiceName:  "app",
+		SKU:          "docker-small",
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			if !visible {
+				return nil, nil
+			}
+			return []ContainerInfo{lateContainer}, nil
+		},
+		RemoveContainerFn: func(context.Context, string) error {
+			t.Fatal("divergent principal must never grant cleanup authority")
+			return nil
+		},
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
+	claim := beginCloseRecoveryIntent(t, b, stores, false, "")
+	completeDestroyedCloseForTest(t, b, stores.close, claim)
+
+	visible = true
+	require.ErrorContains(t, b.recoverState(context.Background()), "divergent principal identity")
+
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+func TestRecoverState_ClosedLeaseRemovalFailureRetriesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	visible := false
+	lateContainer := ContainerInfo{
+		ContainerID:  "late-remove-failure",
+		LeaseUUID:    closeRecoveryLeaseUUID,
+		Tenant:       "tenant-a",
+		ProviderUUID: closeRecoveryProviderUUID,
+		ServiceName:  "app",
+		SKU:          "docker-small",
+	}
+	firstMock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			if !visible {
+				return nil, nil
+			}
+			return []ContainerInfo{lateContainer}, nil
+		},
+		RemoveContainerFn: func(context.Context, string) error {
+			return errors.New("injected late-container removal failure")
+		},
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, firstMock, nil)
+	claim := beginCloseRecoveryIntent(t, b, stores, false, "")
+	completeDestroyedCloseForTest(t, b, stores.close, claim)
+
+	visible = true
+	err := b.recoverState(context.Background())
+	require.ErrorContains(t, err, "injected late-container removal failure")
+	require.ErrorContains(t, err, "backend mutation outcome is ambiguous")
+	b.provisionsMu.RLock()
+	_, projected := b.provisions[closeRecoveryLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.False(t, projected, "failed cleanup must never republish a closed UUID")
+	_, receiptErr := stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
+	require.ErrorIs(t, receiptErr, backendidentity.ErrMutationOutcomeAmbiguous,
+		"an ambiguous physical result must revoke same-process journal reads")
+	closeCloseRecoveryBackend(t, b, stores)
+
+	late := true
+	var removed []string
+	retryMock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			if !late {
+				return nil, nil
+			}
+			return []ContainerInfo{lateContainer}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			removed = append(removed, containerID)
+			late = false
+			return nil
+		},
+	}
+	b, stores = openCloseRecoveryBackend(t, dir, retryMock, nil)
+	receipts, receiptErr := stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
+	require.NoError(t, receiptErr)
+	require.Len(t, receipts, 1, "failed cleanup must retain permanent retry authority")
+	require.NoError(t, b.recoverState(context.Background()))
+	require.Equal(t, []string{lateContainer.ContainerID}, removed)
+	b.provisionsMu.RLock()
+	_, projected = b.provisions[closeRecoveryLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.False(t, projected)
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+func TestRecoverState_ClosedLeasePersistentSurvivorRetriesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	visible := false
+	lateContainer := ContainerInfo{
+		ContainerID:  "late-persistent-survivor",
+		LeaseUUID:    closeRecoveryLeaseUUID,
+		Tenant:       "tenant-a",
+		ProviderUUID: closeRecoveryProviderUUID,
+		ServiceName:  "app",
+		SKU:          "docker-small",
+	}
+	removeCalls := 0
+	firstMock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			if !visible {
+				return nil, nil
+			}
+			return []ContainerInfo{lateContainer}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			require.Equal(t, lateContainer.ContainerID, containerID)
+			removeCalls++
+			return nil // Docker acknowledged removal, but both postchecks disprove it.
+		},
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, firstMock, nil)
+	claim := beginCloseRecoveryIntent(t, b, stores, false, "")
+	completeDestroyedCloseForTest(t, b, stores.close, claim)
+
+	visible = true
+	err := b.recoverState(context.Background())
+	require.ErrorContains(t, err, "closed-lease substrate remained after two cleanup passes")
+	require.Equal(t, 2, removeCalls)
+	receipts, receiptErr := stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
+	require.NoError(t, receiptErr)
+	require.Len(t, receipts, 1, "disproved removal must retain permanent retry authority")
+	b.provisionsMu.RLock()
+	_, projected := b.provisions[closeRecoveryLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.False(t, projected, "a persistent survivor must remain excluded from projection")
+	closeCloseRecoveryBackend(t, b, stores)
+
+	late := true
+	var removed []string
+	retryMock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			if !late {
+				return nil, nil
+			}
+			return []ContainerInfo{lateContainer}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			removed = append(removed, containerID)
+			late = false
+			return nil
+		},
+	}
+	b, stores = openCloseRecoveryBackend(t, dir, retryMock, nil)
+	require.NoError(t, b.recoverState(context.Background()))
+	require.Equal(t, []string{lateContainer.ContainerID}, removed)
+	b.provisionsMu.RLock()
+	_, projected = b.provisions[closeRecoveryLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.False(t, projected)
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+func TestRecoverState_CleanupOnlyOrphanReceiptUsesLeaseAndStorageAuthority(t *testing.T) {
+	dir := t.TempDir()
+	late := false
+	lateContainer := ContainerInfo{
+		ContainerID:  "late-cleanup-only-orphan",
+		LeaseUUID:    closeRecoveryLeaseUUID,
+		Tenant:       "tenant-observed-only-after-close",
+		ProviderUUID: "4d65ee7e-e1ec-49a7-96e4-98a8de99b609",
+		BackendName:  DefaultConfig().Name,
+		SKU:          "docker-small",
+		ServiceName:  "app",
+		Status:       "running",
+	}
+	var removed []string
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			if !late {
+				return nil, nil
+			}
+			return []ContainerInfo{lateContainer}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			removed = append(removed, containerID)
+			late = false
+			return nil
+		},
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
+	claim := beginCloseRecoveryIntent(t, b, stores, true, "")
+	require.Empty(t, claim.Tenant())
+	require.Empty(t, claim.ProviderUUID())
+	completeDestroyedCloseForTest(t, b, stores.close, claim)
+	late = true // the survivor appears only after terminal close settlement
+
+	// This is the intentionally weaker sealed variant: no principal witness
+	// existed at admission. Cleanup is authorized by the exact retired UUID,
+	// reserved managed-container labels, and the attested backend/storage pair.
+	require.NoError(t, b.recoverState(context.Background()))
+	require.Equal(t, []string{lateContainer.ContainerID}, removed)
+	b.provisionsMu.RLock()
+	_, projected := b.provisions[closeRecoveryLeaseUUID]
+	b.provisionsMu.RUnlock()
+	require.False(t, projected)
+
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+func TestAcquireCleanupOnlyCloseDoesNotCarryReleasePrincipalAuthority(t *testing.T) {
+	dir := t.TempDir()
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return nil, nil
+		},
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
+	const callbackURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
+	seedCloseRecoveryReleaseWithCallback(t, stores, callbackURL)
+
+	claim, found, err := b.acquireCloseIntent(
+		context.Background(),
+		closeRecoveryLeaseUUID,
+		false,
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, claim.CleanupOnly())
+	require.Empty(t, claim.Tenant())
+	require.Empty(t, claim.ProviderUUID())
+	require.Empty(t, claim.CallbackURL(), "cleanup-only authority never emits a lifecycle callback")
+
+	closeCloseRecoveryBackend(t, b, stores)
+}
+
+func TestAcquireCleanupOnlyCloseDoesNotImportSubstratePrincipalAuthority(t *testing.T) {
+	dir := t.TempDir()
+	witness := ContainerInfo{
+		ContainerID:   "orphan-principal-witness",
+		Name:          "fred-" + closeRecoveryLeaseUUID + "-app-0",
+		LeaseUUID:     closeRecoveryLeaseUUID,
+		Tenant:        "tenant-from-substrate",
+		ProviderUUID:  closeRecoveryProviderUUID,
+		BackendName:   "docker",
+		SKU:           "docker-small",
+		ServiceName:   "app",
+		InstanceIndex: 0,
+		Status:        "running",
+	}
+	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+			return []ContainerInfo{witness}, nil
+		},
+	}
+	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
+	seedCloseRecoveryRelease(t, stores)
+
+	claim, found, err := b.acquireCloseIntent(
+		context.Background(),
+		closeRecoveryLeaseUUID,
+		false,
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, claim.CleanupOnly())
+	require.Empty(t, claim.Tenant())
+	require.Empty(t, claim.ProviderUUID())
 
 	closeCloseRecoveryBackend(t, b, stores)
 }
@@ -267,7 +679,7 @@ func TestRecoverState_CleanupOnlyFailureKeepsJournalAndPoolAccounting(t *testing
 	claim, found, err := stores.callbacks.GetCloseIntent(closeRecoveryLeaseUUID)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Equal(t, 1, claim.CleanupAttempts())
+	require.Equal(t, 1, claim.ExecutionGeneration().Number())
 	require.Equal(t, 1, b.pool.Stats().AllocationCount,
 		"unprojected substrate remains conservatively reserved while close retries")
 	releases, err := stores.releases.List(closeRecoveryLeaseUUID)
@@ -277,7 +689,7 @@ func TestRecoverState_CleanupOnlyFailureKeepsJournalAndPoolAccounting(t *testing
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
-func TestRecoverState_CloseCleanupAttemptsSurviveBackendRestart(t *testing.T) {
+func TestRecoverState_CloseExecutionGenerationSurvivesBackendRestart(t *testing.T) {
 	dir := t.TempDir()
 	volumeName := canonicalVolumeName(closeRecoveryLeaseUUID, "app", 0)
 	volumeState := newVolumeSet(volumeName)
@@ -296,27 +708,26 @@ func TestRecoverState_CloseCleanupAttemptsSurviveBackendRestart(t *testing.T) {
 	claim, found, err := stores.callbacks.GetCloseIntent(closeRecoveryLeaseUUID)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Equal(t, 1, claim.CleanupAttempts())
+	require.Equal(t, 1, claim.ExecutionGeneration().Number())
 	closeCloseRecoveryBackend(t, b, stores)
 
 	// Reconstruct the backend and both bbolt stores over the same files. The
-	// volatile provision is gone, but the close claim recreates it with attempt
-	// one and the next failed cleanup advances durably to attempt two.
+	// volatile projection is gone, but the close claim retains its Started
+	// generation and recovery advances only after strict inventory proves retry safe.
 	b, stores = openCloseRecoveryBackend(t, dir, newMock(), volumeState.manager())
 	require.NoError(t, b.recoverState(context.Background()))
 	claim, found, err = stores.callbacks.GetCloseIntent(closeRecoveryLeaseUUID)
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Equal(t, 2, claim.CleanupAttempts())
+	require.Equal(t, 2, claim.ExecutionGeneration().Number())
 	b.provisionsMu.RLock()
 	projection := b.provisions[closeRecoveryLeaseUUID]
 	b.provisionsMu.RUnlock()
 	require.NotNil(t, projection)
-	require.Equal(t, 2, projection.VolumeCleanupAttempts)
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
-func TestRecoverState_CloseIntentConvergesAfterReleaseDeleteBeforeOutbox(t *testing.T) {
+func TestRecoverState_AmbiguousDestroyPreservesReleaseAndConvergesAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	volumeName := canonicalVolumeName(closeRecoveryLeaseUUID, "app", 0)
 	volumeState := newVolumeSet(volumeName)
@@ -339,20 +750,17 @@ func TestRecoverState_CloseIntentConvergesAfterReleaseDeleteBeforeOutbox(t *test
 	const operationURL = "https://fred.example/callbacks/provision?operation_id=9a72fbc1-38c8-4f31-87f7-f689979b9324"
 	seedCloseRecoveryProjection(t, b, stores, operationURL)
 
-	// Drive the production finalizer from before admission. It publishes the
-	// close journal, tears down substrate, retires the release, then fails to
-	// atomically replace the journal with its lifecycle outbox entry because the
-	// callback DB became unavailable in the volume-destroy crash hook.
-	require.ErrorContains(t, b.doDeprovision(context.Background(), closeRecoveryLeaseUUID),
-		"resolve durable close intent")
+	// Losing journal access during a physical Step makes the outcome ambiguous.
+	// The close must preserve its exact release fence; it cannot guess that the
+	// substrate was destroyed and advance settlement.
+	require.Error(t, b.doDeprovisionForTest(t, context.Background(), closeRecoveryLeaseUUID))
 	releases, err := stores.releases.List(closeRecoveryLeaseUUID)
 	require.NoError(t, err)
-	require.Empty(t, releases, "release retirement must precede the failed close resolution")
+	require.NotEmpty(t, releases, "ambiguous physical work must preserve release authority")
 	closeCloseRecoveryBackend(t, b, stores)
 
-	// The reconstructed backend sees no release and no containers. The close
-	// claim alone remains sufficient to recreate cleanup authority and atomically
-	// replace itself with the terminal lifecycle outbox entry.
+	// A reconstructed backend independently classifies, retries, and atomically
+	// replaces the close journal with the terminal lifecycle outbox entry.
 	volumeState.destroyFn = nil
 	b, stores = openCloseRecoveryBackend(t, dir, newMock(), volumeState.manager())
 	_, found, err := stores.callbacks.GetCloseIntent(closeRecoveryLeaseUUID)
@@ -448,6 +856,7 @@ func TestRecoverState_SerializesInventorySnapshotWithConcurrentClose(t *testing.
 }
 
 func TestRecoverState_AdmittedSlowCloseDoesNotBlockSnapshotOrLeakRepublishedAllocation(t *testing.T) {
+	type recoveryInventoryContextKey struct{}
 	for _, cleanupOnly := range []bool{false, true} {
 		name := "full close"
 		if cleanupOnly {
@@ -470,24 +879,31 @@ func TestRecoverState_AdmittedSlowCloseDoesNotBlockSnapshotOrLeakRepublishedAllo
 				CreatedAt:     time.Now(),
 			}
 			var (
-				listCalls        atomic.Int32
 				destroyOnce      sync.Once
 				destroyStarted   = make(chan struct{})
 				continueDestroy  = make(chan struct{})
 				inventoryRead    = make(chan struct{})
 				continueRecovery = make(chan struct{})
+				recoveryReadOnce sync.Once
 			)
 			mock := &mockDockerClient{
-				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-					// Close admission takes the first read to freeze any exact
-					// rollback remnants. This fixture has none. The recovery
-					// snapshot is the second read and deliberately blocks.
-					if listCalls.Add(1) == 1 {
+				ListManagedContainersFn: func(ctx context.Context) ([]ContainerInfo, error) {
+					// Identify the recovery inventory by its caller-owned context,
+					// not by a fragile read count: close classification and ownership
+					// attestation may add their own strict inventory reads.
+					if ctx.Value(recoveryInventoryContextKey{}) == nil {
 						return nil, nil
 					}
-					close(inventoryRead)
-					<-continueRecovery
-					return []ContainerInfo{stale}, nil
+					firstRead := false
+					recoveryReadOnce.Do(func() {
+						firstRead = true
+						close(inventoryRead)
+						<-continueRecovery
+					})
+					if firstRead {
+						return []ContainerInfo{stale}, nil
+					}
+					return nil, nil
 				},
 			}
 			volumeState.destroyFn = func(string) error {
@@ -519,7 +935,10 @@ func TestRecoverState_AdmittedSlowCloseDoesNotBlockSnapshotOrLeakRepublishedAllo
 			require.True(t, found, "physical cleanup must start only after journal admission")
 
 			recoverDone := make(chan error, 1)
-			go func() { recoverDone <- b.recoverState(context.Background()) }()
+			recoveryCtx := context.WithValue(
+				context.Background(), recoveryInventoryContextKey{}, true,
+			)
+			go func() { recoverDone <- b.recoverState(recoveryCtx) }()
 			select {
 			case <-inventoryRead:
 				// The close holds no global recovery lock while substrate cleanup is slow.
@@ -556,40 +975,4 @@ func TestRecoverState_AdmittedSlowCloseDoesNotBlockSnapshotOrLeakRepublishedAllo
 			closeCloseRecoveryBackend(t, b, stores)
 		})
 	}
-}
-
-func TestResumeRecoveredClose_SkipsSettledClaimAfterReplacementGenerationWins(t *testing.T) {
-	dir := t.TempDir()
-	var composeDownCalls atomic.Int32
-	b, stores := openCloseRecoveryBackend(t, dir, &mockDockerClient{}, nil)
-	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
-		composeDownCalls.Add(1)
-		return nil
-	}}
-	oldClaim := beginCloseRecoveryIntent(t, b, stores, true, "")
-	require.NoError(t, b.purgeCloseReleaseHistory(oldClaim))
-	require.NoError(t, b.resolveCloseIntent(
-		oldClaim,
-		backend.CallbackStatusDeprovisioned,
-		"",
-		false,
-		nil,
-		nil,
-	))
-
-	// Model a new provision generation admitted after the old close settled but
-	// before a recovery worker resumed the claim it read from its earlier snapshot.
-	seedCloseRecoveryProjection(t, b, stores, "")
-	require.NoError(t, b.resumeRecoveredClose(context.Background(), oldClaim))
-	require.Zero(t, composeDownCalls.Load(),
-		"a stale recovered capability must not mutate the replacement generation")
-	b.provisionsMu.RLock()
-	_, projected := b.provisions[closeRecoveryLeaseUUID]
-	b.provisionsMu.RUnlock()
-	require.True(t, projected)
-	releases, err := stores.releases.List(closeRecoveryLeaseUUID)
-	require.NoError(t, err)
-	require.Len(t, releases, 1)
-
-	closeCloseRecoveryBackend(t, b, stores)
 }

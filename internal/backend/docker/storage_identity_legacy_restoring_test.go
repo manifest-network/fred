@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -183,65 +182,31 @@ func TestIntegrationStorageIdentityAdoptionPreflightAllowsPartiallyReapedV013Row
 }
 
 func TestIntegrationStorageIdentityAdoptionPreflightRejectsMissingNonReapingVolumeReadOnly(t *testing.T) {
-	const (
-		source      = "66666666-6666-4666-8666-666666666666"
-		destination = "66666666-6666-4666-9666-666666666666"
-		operationID = "11111111-1111-4111-8111-111111111111"
+	const source = "66666666-6666-4666-8666-666666666666"
+	cfg := storageIdentityLegacyRetentionTestConfig(t)
+	cfg.VolumeDataPath = t.TempDir()
+	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
+	writeLegacyAuthorityStores(t, cfg)
+
+	missingVolume := "fred-retained-" + source + "-app-0"
+	row := []byte(`{"original_lease_uuid":"` + source +
+		`","tenant":"tenant-a","provider_uuid":"33333333-3333-4333-8333-333333333333",` +
+		`"items":[{"sku":"sku-stateful","quantity":1,"service_name":"app"}],` +
+		`"stack_manifest":{"services":{"app":{"image":"docker.io/library/alpine:3.22"}}},` +
+		`"callback_url":"https://fred.example/callbacks/provision",` +
+		`"retained_volume_names":["` + missingVolume + `"],"status":"` + shared.RetentionStatusActive + `",` +
+		`"generation":0,"created_at":"2026-01-01T02:03:04Z",` +
+		`"restoring_since":"0001-01-01T00:00:00Z","reaping_since":"0001-01-01T00:00:00Z"}`)
+	writeRawLegacyRetentionRow(t, cfg.RetentionDBPath, source, row)
+	before := snapshotStorageIdentityAuthorityFiles(t, cfg)
+
+	verdict, err := preflightStorageIdentityAdoptionWithDependencies(
+		t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{},
 	)
-	for _, test := range []struct {
-		name                 string
-		status               string
-		destinationAuthority string
-		generation           int
-		restoringSince       string
-	}{
-		{
-			name:           "active",
-			status:         shared.RetentionStatusActive,
-			restoringSince: "0001-01-01T00:00:00Z",
-		},
-		{
-			name:   "restoring with complete current authority",
-			status: shared.RetentionStatusRestoring,
-			destinationAuthority: `,"new_lease_uuid":"` + destination + `"` +
-				`,"destination_items":[{"sku":"sku-stateful","quantity":1,"service_name":"app"}]` +
-				`,"destination_resource_profiles":[{"sku":"sku-stateful","cpu_cores":1,"memory_mb":1024,"disk_mb":4096}]` +
-				`,"destination_operation_id":"` + operationID + `"` +
-				`,"destination_callback_url":"https://fred.example/callbacks/provision?operation_id=` + operationID + `"` +
-				`,"destination_lifecycle_callback_url":"https://fred.example/callbacks/provision?lifecycle_id=` + operationID + `"`,
-			generation:     1,
-			restoringSince: "2026-01-02T03:04:05Z",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			cfg := storageIdentityLegacyRetentionTestConfig(t)
-			cfg.VolumeDataPath = t.TempDir()
-			writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-			writeLegacyAuthorityStores(t, cfg)
-
-			missingVolume := "fred-retained-" + source + "-app-0"
-			row := []byte(`{"original_lease_uuid":"` + source +
-				`","tenant":"tenant-a","provider_uuid":"33333333-3333-4333-8333-333333333333",` +
-				`"items":[{"sku":"sku-stateful","quantity":1,"service_name":"app"}],` +
-				`"stack_manifest":{"services":{"app":{"image":"docker.io/library/alpine:3.22"}}},` +
-				`"callback_url":"https://fred.example/callbacks/provision",` +
-				`"retained_volume_names":["` + missingVolume + `"],"status":"` + test.status + `"` +
-				test.destinationAuthority +
-				`,"generation":` + fmt.Sprintf("%d", test.generation) +
-				`,"created_at":"2026-01-01T02:03:04Z","restoring_since":"` + test.restoringSince +
-				`","reaping_since":"0001-01-01T00:00:00Z"}`)
-			writeRawLegacyRetentionRow(t, cfg.RetentionDBPath, source, row)
-			before := snapshotStorageIdentityAuthorityFiles(t, cfg)
-
-			verdict, err := preflightStorageIdentityAdoptionWithDependencies(
-				t.Context(), cfg, storageIdentityPreflightDockerMock(t), &mockVolumeManager{},
-			)
-			require.Error(t, err)
-			assert.Empty(t, verdict)
-			assert.ErrorContains(t, err, "retention "+source+" volume \""+missingVolume+"\" is not present")
-			assertStorageIdentityAuthorityUnchanged(t, cfg, before)
-		})
-	}
+	require.Error(t, err)
+	assert.Empty(t, verdict)
+	assert.ErrorContains(t, err, "retention "+source+" volume \""+missingVolume+"\" is not present")
+	assertStorageIdentityAuthorityUnchanged(t, cfg, before)
 }
 
 func TestIntegrationStorageIdentityAdoptionPreflightRejectsUnexplainedManagedVolumeReadOnly(t *testing.T) {
@@ -446,7 +411,7 @@ func TestIntegrationStorageIdentityAdoptionPreflightDoesNotMisclassifyDivergentV
 	require.Error(t, err)
 	assert.Empty(t, verdict)
 	assert.NotErrorIs(t, err, ErrV013InterruptedDeprovision)
-	assert.ErrorContains(t, err, "legacy active release has no managed container cohort")
+	assert.ErrorContains(t, err, "v0.13 active release has no managed container cohort")
 	assertStorageIdentityAuthorityUnchanged(t, cfg, before)
 }
 

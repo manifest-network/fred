@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -51,11 +53,45 @@ func beginCallbackSenderOperationIntent(
 	spec.LeaseUUID = leaseUUID
 	spec.CallbackURL = callbackURL
 	spec.LifecycleCallbackURL = lifecycleURL
-	spec.Backend = backendName
-	spec.BackendStorageID = storageID
-	admission, err := store.BeginOperationIntent(spec)
+	admission, err := beginTestOperationIntent(t, store, spec, operationIntentTestIdentity{
+		backend: backendName, storageID: storageID,
+	})
 	require.NoError(t, err)
 	return admission
+}
+
+// replayPendingCallbacks is a synchronous full-drain harness for focused tests
+// and benchmarks. Production has one scheduling surface: RunReplayLoop.
+func (s *CallbackSender) replayPendingCallbacks() {
+	if s.store == nil || s.stopCtx.Err() != nil {
+		return
+	}
+	if err := s.attestor.verify(s.stopCtx); err != nil {
+		s.logger.Error("callback replay suppressed by backend identity verification", "error", err)
+		return
+	}
+	leaseUUIDs, err := s.store.callbackLeaseUUIDs()
+	if err != nil {
+		s.logger.Error("callback outbox discovery found durable corruption", "error", err)
+		s.reportStoreError()
+	}
+	jobs := make(chan string, len(leaseUUIDs))
+	for _, leaseUUID := range leaseUUIDs {
+		jobs <- leaseUUID
+	}
+	close(jobs)
+	var workers sync.WaitGroup
+	for range min(callbackReplayWorkerLimit, len(leaseUUIDs)) {
+		workers.Go(func() {
+			for leaseUUID := range jobs {
+				if s.stopCtx.Err() != nil {
+					return
+				}
+				_ = s.replayLeaseWithLimit(leaseUUID, 0)
+			}
+		})
+	}
+	workers.Wait()
 }
 
 func TestCallbackSenderBindsHMACCoveredPayloadToStorageIdentity(t *testing.T) {
@@ -74,16 +110,14 @@ func TestCallbackSenderBindsHMACCoveredPayloadToStorageIdentity(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &received))
 		return callbackHTTPResponse(http.StatusOK), nil
 	})}
-	sender := MustNewEphemeralCallbackSender(CallbackSenderConfig{
-		HTTPClient:      client,
-		Secret:          secret,
-		Logger:          slog.Default(),
-		StopCtx:         context.Background(),
-		Backoff:         &zeroBackoff,
-		StorageIdentity: id,
-		BeforeDelivery:  func(context.Context) error { return nil },
-	})
-	sender.SendOperationCallback(
+	sender := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
+		HTTPClient: client,
+		Secret:     secret,
+		Logger:     slog.Default(),
+
+		Backoff: &zeroBackoff,
+	}, callbackSenderTestStorageIdentity(id))
+	sender.sendOperationCallbackForTest(
 		testLeaseUUID("storage-bound"),
 		"https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
 		"docker-a", backend.CallbackStatusSuccess, "",
@@ -107,7 +141,7 @@ func TestCallbackSenderCopiedOutboxCannotReplayUnderDifferentStorageIdentity(t *
 
 	idA := callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000")
 	idB := callbackStorageID(t, "6ba7b811-9dad-41d1-80b4-00c04fd430c8")
-	store, err := NewCallbackStore(CallbackStoreConfig{
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
 	})
 	require.NoError(t, err)
@@ -118,15 +152,14 @@ func TestCallbackSenderCopiedOutboxCannotReplayUnderDifferentStorageIdentity(t *
 	})}
 	senderA := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store, HTTPClient: failingClient, Secret: "secret", Logger: slog.Default(),
-		StopCtx: context.Background(), Backoff: &zeroBackoff,
-		StorageIdentity: idA, BeforeDelivery: func(context.Context) error { return nil },
-	})
+		Backoff: &zeroBackoff,
+	}, callbackSenderTestStorageIdentity(idA))
 	leaseUUID := testLeaseUUID("copied-outbox")
 	callbackURL := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "docker-a", idA)
-	senderA.SendOperationCallback(
+	senderA.sendOperationCallbackForTest(
 		leaseUUID, callbackURL,
-		"docker-a", backend.CallbackStatusSuccess, "",
+		"docker-a", backend.CallbackStatusFailed, "definitively refused",
 	)
 	pending, err := store.ListPending()
 	require.NoError(t, err)
@@ -140,12 +173,10 @@ func TestCallbackSenderCopiedOutboxCannotReplayUnderDifferentStorageIdentity(t *
 			requests.Add(1)
 			return callbackHTTPResponse(http.StatusOK), nil
 		})},
-		Secret: "secret", Logger: slog.Default(), StopCtx: context.Background(),
-		Backoff: &zeroBackoff, StorageIdentity: idB,
-		BeforeReplay:   func(context.Context) error { return nil },
-		BeforeDelivery: func(context.Context) error { return nil },
-	})
-	senderB.ReplayPendingCallbacks()
+		Secret: "secret", Logger: slog.Default(),
+		Backoff: &zeroBackoff,
+	}, callbackSenderTestStorageIdentity(idB))
+	senderB.replayPendingCallbacks()
 	assert.Zero(t, requests.Load(), "mismatched durable evidence must not reach HTTP")
 	pending, err = store.ListPending()
 	require.NoError(t, err)
@@ -155,34 +186,31 @@ func TestCallbackSenderCopiedOutboxCannotReplayUnderDifferentStorageIdentity(t *
 func TestCallbackSenderBlockingIdentityProbeIsBoundedAndPersistsBeforeDeferring(t *testing.T) {
 	t.Parallel()
 
-	id := callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000")
-	store, err := NewCallbackStore(CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
+	id := stores.storage.ID()
 	var requests atomic.Int32
+	stopCtx := context.Background()
 	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store,
 		HTTPClient: &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			requests.Add(1)
 			return callbackHTTPResponse(http.StatusOK), nil
 		})},
-		Secret: "secret", Logger: slog.Default(), StopCtx: context.Background(),
-		Backoff: &zeroBackoff, StorageIdentity: id,
-		IdentityVerificationTimeout: 20 * time.Millisecond,
-		BeforeDelivery: func(ctx context.Context) error {
+		Secret: "secret", Logger: slog.Default(),
+		Backoff: &zeroBackoff,
+		StorageAttestor: newTestCallbackStorageAttestor(t, store, stopCtx, func(ctx context.Context) error {
 			<-ctx.Done()
 			return ctx.Err()
-		},
-	})
+		}, 20*time.Millisecond),
+	}, callbackSenderTestStorageIdentity(id))
 	leaseUUID := testLeaseUUID("blocked-identity")
 	callbackURL := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "docker-a", id)
 	started := time.Now()
-	sender.SendOperationCallback(
+	sender.sendOperationCallbackForTest(
 		leaseUUID, callbackURL,
-		"docker-a", backend.CallbackStatusSuccess, "",
+		"docker-a", backend.CallbackStatusFailed, "definitively refused",
 	)
 	assert.Less(t, time.Since(started), 500*time.Millisecond)
 	assert.Zero(t, requests.Load())
@@ -195,50 +223,91 @@ func TestCallbackSenderBlockingIdentityProbeIsBoundedAndPersistsBeforeDeferring(
 func TestReplayPendingCallbacks_BlockingIdentityProbeIsBounded(t *testing.T) {
 	t.Parallel()
 
-	store, err := NewCallbackStore(CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
 	probeFinished := make(chan error, 1)
+	stopCtx := context.Background()
 	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store, HTTPClient: http.DefaultClient, Secret: "secret", Logger: slog.Default(),
-		StopCtx: context.Background(), Backoff: &zeroBackoff,
-		IdentityVerificationTimeout: 20 * time.Millisecond,
-		BeforeReplay: func(ctx context.Context) error {
+		Backoff: &zeroBackoff,
+		StorageAttestor: newTestCallbackStorageAttestor(t, store, stopCtx, func(ctx context.Context) error {
 			<-ctx.Done()
 			probeFinished <- ctx.Err()
 			return ctx.Err()
-		},
+		}, 20*time.Millisecond),
 	})
 
 	started := time.Now()
-	sender.ReplayPendingCallbacks()
+	sender.replayPendingCallbacks()
 	assert.Less(t, time.Since(started), 500*time.Millisecond)
 	assert.ErrorIs(t, <-probeFinished, context.DeadlineExceeded)
+}
+
+func TestReplayPendingCallbacks_BlockingAttemptIdentityProbeIsBounded(t *testing.T) {
+	t.Parallel()
+
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
+	leaseUUID := testLeaseUUID("blocked-attempt-identity")
+	require.NoError(t, store.storeValidTest(CallbackEntry{
+		LeaseUUID:        leaseUUID,
+		CallbackURL:      "https://fred.example/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
+		Backend:          "docker",
+		BackendStorageID: stores.storage.ID().String(),
+		DeliveryKind:     CallbackDeliveryKindLifecycle,
+		Status:           backend.CallbackStatusFailed,
+		CreatedAt:        time.Now(),
+	}))
+
+	var probes atomic.Int32
+	var requests atomic.Int32
+	stopCtx := context.Background()
+	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
+		Store: store,
+		HTTPClient: &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return callbackHTTPResponse(http.StatusOK), nil
+		})},
+		Secret: "secret", Logger: slog.Default(),
+		Backoff: &zeroBackoff,
+		StorageAttestor: newTestCallbackStorageAttestor(t, store, stopCtx, func(ctx context.Context) error {
+			if probes.Add(1) == 1 {
+				return nil // replay discovery is healthy
+			}
+			<-ctx.Done() // the per-HTTP-attempt proof stalls
+			return ctx.Err()
+		}, 20*time.Millisecond),
+	})
+
+	started := time.Now()
+	sender.replayPendingCallbacks()
+	assert.Less(t, time.Since(started), 500*time.Millisecond)
+	assert.GreaterOrEqual(t, probes.Load(), int32(2))
+	assert.Zero(t, requests.Load(), "HTTP must wait for a bounded storage proof")
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "a timed-out proof must leave the callback for replay")
 }
 
 func TestCallbackSenderPermanentDriftSuppressesEnqueue(t *testing.T) {
 	t.Parallel()
 
-	store, err := NewCallbackStore(CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
 	spec := testOperationIntentSpec(t, "permanent-drift")
-	_, err = store.BeginOperationIntent(spec)
+	_, err := beginTestOperationIntent(t, store, spec)
 	require.NoError(t, err)
+	storageID := callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000")
+	stopCtx := context.Background()
 	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store, HTTPClient: http.DefaultClient, Secret: "secret", Logger: slog.Default(),
-		StopCtx: context.Background(), Backoff: &zeroBackoff,
-		StorageIdentity: spec.BackendStorageID,
-		BeforeDelivery: func(context.Context) error {
+		Backoff: &zeroBackoff,
+		StorageAttestor: newTestCallbackStorageAttestor(t, store, stopCtx, func(context.Context) error {
 			return fmt.Errorf("%w: marker mismatch", backendidentity.ErrIdentityDrift)
-		},
-	})
-	sender.SendOperationCallback(
-		spec.LeaseUUID, spec.CallbackURL, spec.Backend, backend.CallbackStatusSuccess, "",
+		}, 0),
+	}, callbackSenderTestStorageIdentity(storageID))
+	sender.sendOperationCallbackForTest(
+		spec.LeaseUUID, spec.CallbackURL, "docker-a", backend.CallbackStatusSuccess, "",
 	)
 	pending, err := store.ListPending()
 	require.NoError(t, err)
@@ -252,36 +321,33 @@ func TestCallbackSenderRechecksIdentityAfterWaitingForLeaseFIFO(t *testing.T) {
 	t.Parallel()
 
 	const leaseUUID = "018f47a2-8b1c-7def-8123-456789abcdef"
-	store, err := NewCallbackStore(CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
 
 	var requests atomic.Int32
 	firstVerified := make(chan struct{})
 	var probes atomic.Int32
+	stopCtx := context.Background()
 	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store,
 		HTTPClient: &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			requests.Add(1)
 			return callbackHTTPResponse(http.StatusNoContent), nil
 		})},
-		Secret:  "secret",
-		Logger:  slog.Default(),
-		StopCtx: context.Background(),
+		Secret: "secret",
+		Logger: slog.Default(),
+
 		Backoff: &zeroBackoff,
-		StorageIdentity: callbackStorageID(
-			t, "550e8400-e29b-41d4-a716-446655440000",
-		),
-		BeforeDelivery: func(context.Context) error {
+		StorageAttestor: newTestCallbackStorageAttestor(t, store, stopCtx, func(context.Context) error {
 			if probes.Add(1) == 1 {
 				close(firstVerified)
 				return nil
 			}
 			return fmt.Errorf("%w: volume root changed", backendidentity.ErrIdentityDrift)
-		},
-	})
+		}, 0),
+	}, callbackSenderTestStorageIdentity(
+		callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000"),
+	))
 	callbackURL := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	beginCallbackSenderOperationIntent(
 		t, store, leaseUUID, callbackURL, "docker-a", sender.storageIdentity,
@@ -294,7 +360,7 @@ func TestCallbackSenderRechecksIdentityAfterWaitingForLeaseFIFO(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sender.SendOperationCallback(
+		sender.sendOperationCallbackForTest(
 			leaseUUID, callbackURL,
 			"docker-a", backend.CallbackStatusSuccess, "",
 		)
@@ -327,31 +393,26 @@ func TestCallbackSenderRechecksIdentityAfterWaitingForLeaseFIFO(t *testing.T) {
 func TestCallbackSenderCancellationDuringPostLockIdentityProbeSuppressesEnqueue(t *testing.T) {
 	t.Parallel()
 
-	store, err := NewCallbackStore(CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
 
 	const leaseUUID = "018f47a2-8b1c-7def-8123-456789abcdee"
 	const callbackURL = "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	var requests atomic.Int32
 	secondProbeStarted := make(chan struct{})
 	var probes atomic.Int32
+	stopCtx := context.Background()
 	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store,
 		HTTPClient: &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			requests.Add(1)
 			return callbackHTTPResponse(http.StatusNoContent), nil
 		})},
-		Secret:  "secret",
-		Logger:  slog.Default(),
-		StopCtx: context.Background(),
+		Secret: "secret",
+		Logger: slog.Default(),
+
 		Backoff: &zeroBackoff,
-		StorageIdentity: callbackStorageID(
-			t, "550e8400-e29b-41d4-a716-446655440000",
-		),
-		BeforeDelivery: func(ctx context.Context) error {
+		StorageAttestor: newTestCallbackStorageAttestor(t, store, stopCtx, func(ctx context.Context) error {
 			switch probes.Add(1) {
 			case 1:
 				return nil
@@ -362,8 +423,10 @@ func TestCallbackSenderCancellationDuringPostLockIdentityProbeSuppressesEnqueue(
 			default:
 				panic("unexpected identity probe")
 			}
-		},
-	})
+		}, 0),
+	}, callbackSenderTestStorageIdentity(
+		callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000"),
+	))
 	beginCallbackSenderOperationIntent(
 		t, store, leaseUUID, callbackURL, "docker-a", sender.storageIdentity,
 	)
@@ -373,7 +436,7 @@ func TestCallbackSenderCancellationDuringPostLockIdentityProbeSuppressesEnqueue(
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sender.SendOperationCallbackContext(
+		sender.sendOperationCallbackContextForTest(
 			ownerCtx, leaseUUID, callbackURL, "docker-a",
 			backend.CallbackStatusSuccess, "",
 		)
@@ -411,30 +474,174 @@ func newTestSender(t *testing.T, store *CallbackStore, httpClient *http.Client, 
 		HTTPClient: httpClient,
 		Secret:     secret,
 		Logger:     slog.Default(),
-		StopCtx:    context.Background(),
-		Backoff:    &zeroBackoff,
+
+		Backoff: &zeroBackoff,
 	}
 	if store == nil {
-		return MustNewEphemeralCallbackSender(cfg)
+		return mustNewEphemeralCallbackSenderForTest(t, cfg)
 	}
 	return mustNewDurableCallbackSender(t, cfg)
 }
 
-func mustNewDurableCallbackSender(t *testing.T, cfg CallbackSenderConfig) *CallbackSender {
+func newEphemeralCallbackSenderForTest(
+	cfg CallbackSenderConfig,
+	storageIdentity backendidentity.ID,
+) (*CallbackSender, error) {
+	if cfg.Store != nil {
+		return nil, errors.New("ephemeral callback sender test fixture requires nil store")
+	}
+	return newCallbackSender(cfg, storageIdentity)
+}
+
+func mustNewEphemeralCallbackSenderForTest(
+	t *testing.T,
+	cfg CallbackSenderConfig,
+	options ...callbackSenderTestAuthorityOption,
+) *CallbackSender {
 	t.Helper()
+	stopCtx, identity := callbackSenderTestAuthority(t, options...)
+	cfg.StorageAttestor = newSyntheticCallbackStorageAttestorForTest(t, stopCtx, identity)
+	sender, err := newEphemeralCallbackSenderForTest(cfg, identity)
+	require.NoError(t, err)
+	return sender
+}
+
+func mustNewDurableCallbackSender(
+	t *testing.T,
+	cfg CallbackSenderConfig,
+	options ...callbackSenderTestAuthorityOption,
+) *CallbackSender {
+	t.Helper()
+	stopCtx, identity := callbackSenderTestAuthority(t, options...)
 	if len(cfg.Secret) < hmacauth.MinSecretLength {
 		cfg.Secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 	}
-	if !cfg.StorageIdentity.Valid() {
-		cfg.StorageIdentity = callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000")
+	// Historical outbox tests deliberately use unbound stores to exercise wire
+	// compatibility and corruption in isolation. Production construction rejects
+	// that topology; keep the bypass package-local to tests.
+	if cfg.Store != nil && cfg.Store.binding == nil {
+		cfg.StorageAttestor = newSyntheticCallbackStorageAttestorForTest(t, stopCtx, identity)
+		sender, err := newCallbackSender(cfg, identity)
+		require.NoError(t, err)
+		return sender
 	}
-	if cfg.BeforeDelivery == nil {
-		cfg.BeforeDelivery = func(context.Context) error { return nil }
-	}
-	if cfg.BeforeReplay == nil {
-		cfg.BeforeReplay = func(context.Context) error { return nil }
+	if cfg.StorageAttestor == nil {
+		cfg.StorageAttestor = newTestCallbackStorageAttestor(
+			t, cfg.Store, stopCtx, func(context.Context) error { return nil }, 0,
+		)
 	}
 	return MustNewCallbackSender(cfg)
+}
+
+// callbackSenderTestAuthority keeps synthetic test-only transport fixtures
+// honest without adding independently configurable lifetime or lineage fields
+// to the production CallbackSenderConfig.
+type callbackSenderTestAuthorityConfig struct {
+	stopCtx   context.Context
+	storageID backendidentity.ID
+}
+
+type callbackSenderTestAuthorityOption func(*callbackSenderTestAuthorityConfig)
+
+func callbackSenderTestLifetime(stopCtx context.Context) callbackSenderTestAuthorityOption {
+	return func(config *callbackSenderTestAuthorityConfig) { config.stopCtx = stopCtx }
+}
+
+func callbackSenderTestStorageIdentity(storageID backendidentity.ID) callbackSenderTestAuthorityOption {
+	return func(config *callbackSenderTestAuthorityConfig) { config.storageID = storageID }
+}
+
+func callbackSenderTestAuthority(
+	t testing.TB,
+	options ...callbackSenderTestAuthorityOption,
+) (context.Context, backendidentity.ID) {
+	t.Helper()
+	storageID, err := backendidentity.Parse("550e8400-e29b-41d4-a716-446655440000")
+	require.NoError(t, err)
+	config := callbackSenderTestAuthorityConfig{
+		stopCtx: context.Background(), storageID: storageID,
+	}
+	for _, option := range options {
+		require.NotNil(t, option)
+		option(&config)
+	}
+	require.NotNil(t, config.stopCtx)
+	require.True(t, config.storageID.Valid())
+	return config.stopCtx, config.storageID
+}
+
+func newSyntheticCallbackStorageAttestorForTest(
+	t testing.TB,
+	stopCtx context.Context,
+	storageIdentity ...backendidentity.ID,
+) *CallbackStorageAttestor {
+	t.Helper()
+	storageID, err := backendidentity.Parse("550e8400-e29b-41d4-a716-446655440000")
+	require.NoError(t, err)
+	if len(storageIdentity) > 0 {
+		storageID = storageIdentity[0]
+	}
+	gate := newTestStorageAuthorityGate(t)
+	base := &boltStore{
+		binding:              &openedStoreIdentityBinding{storageID: storageID},
+		ctx:                  context.Background(),
+		backendAuthorityGate: gate,
+	}
+	store := &CallbackStore{boltStore: base}
+	attestor, err := NewCallbackStorageAttestor(
+		store,
+		callbackStorageVerifierForTest{
+			storageID: storageID,
+			gate:      gate,
+			verify:    func(context.Context) error { return nil },
+		},
+		stopCtx,
+	)
+	require.NoError(t, err)
+	return attestor
+}
+
+type callbackStorageVerifierForTest struct {
+	storageID backendidentity.ID
+	gate      *backendidentity.StorageAuthorityGate
+	verify    func(context.Context) error
+}
+
+func (v callbackStorageVerifierForTest) StorageIdentity() backendidentity.ID {
+	return v.storageID
+}
+
+func (v callbackStorageVerifierForTest) StorageAuthorityGate() *backendidentity.StorageAuthorityGate {
+	return v.gate
+}
+
+func (v callbackStorageVerifierForTest) Verify(ctx context.Context) error {
+	return v.verify(ctx)
+}
+
+func newTestCallbackStorageAttestor(
+	t *testing.T,
+	store *CallbackStore,
+	stopCtx context.Context,
+	verify func(context.Context) error,
+	timeout time.Duration,
+) *CallbackStorageAttestor {
+	t.Helper()
+	if verify == nil {
+		verify = func(context.Context) error { return nil }
+	}
+	attestor, err := NewCallbackStorageAttestor(
+		store, callbackStorageVerifierForTest{
+			storageID: store.binding.storageID,
+			gate:      store.backendAuthorityGate,
+			verify:    verify,
+		}, stopCtx,
+	)
+	require.NoError(t, err)
+	if timeout > 0 {
+		attestor.timeout = timeout
+	}
+	return attestor
 }
 
 type callbackRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -452,40 +659,45 @@ func callbackHTTPResponse(status int) *http.Response {
 }
 
 func TestNewCallbackSender_ErrorsOnNilHTTPClient(t *testing.T) {
-	_, err := NewEphemeralCallbackSender(CallbackSenderConfig{
-		Logger:  slog.Default(),
-		StopCtx: context.Background(),
-	})
+	_, err := newEphemeralCallbackSenderForTest(CallbackSenderConfig{
+		Logger: slog.Default(),
+	}, backendidentity.ID{})
 	require.ErrorContains(t, err, "HTTP client")
 }
 
 func TestNewCallbackSender_ErrorsOnNilLogger(t *testing.T) {
-	_, err := NewEphemeralCallbackSender(CallbackSenderConfig{
+	_, err := newEphemeralCallbackSenderForTest(CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
-		StopCtx:    context.Background(),
-	})
+	}, backendidentity.ID{})
 	require.ErrorContains(t, err, "logger")
 }
 
-func TestNewCallbackSender_ErrorsOnNilStopCtx(t *testing.T) {
-	_, err := NewEphemeralCallbackSender(CallbackSenderConfig{
+func TestNewCallbackSender_ErrorsOnMissingAttestorLifecycle(t *testing.T) {
+	_, err := newEphemeralCallbackSenderForTest(CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
 		Logger:     slog.Default(),
-	})
-	require.ErrorContains(t, err, "stop context")
+	}, backendidentity.ID{})
+	require.ErrorContains(t, err, "storage attestor lifecycle")
+}
+
+func TestCallbackSenderConfigHasNoIndependentLifecycle(t *testing.T) {
+	_, exposed := reflect.TypeFor[CallbackSenderConfig]().FieldByName("StopCtx")
+	assert.False(t, exposed,
+		"sender lifetime must be inherited from its exact storage attestor")
 }
 
 func TestNewCallbackSender_RequiresDurableAuthority(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	stopCtx := context.Background()
 	valid := CallbackSenderConfig{
-		Store:           new(CallbackStore),
-		HTTPClient:      http.DefaultClient,
-		Secret:          "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-		StorageIdentity: callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000"),
-		BeforeDelivery:  func(context.Context) error { return nil },
-		BeforeReplay:    func(context.Context) error { return nil },
-		Logger:          slog.Default(),
-		StopCtx:         context.Background(),
+		Store:      stores.callbacks,
+		HTTPClient: http.DefaultClient,
+		Secret:     "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+		Logger:     slog.Default(),
 	}
+	valid.StorageAttestor = newTestCallbackStorageAttestor(
+		t, stores.callbacks, stopCtx, nil, 0,
+	)
 
 	missingStore := valid
 	missingStore.Store = nil
@@ -502,30 +714,75 @@ func TestNewCallbackSender_RequiresDurableAuthority(t *testing.T) {
 	_, err = NewCallbackSender(weakSecret)
 	require.ErrorContains(t, err, "at least 32 bytes")
 
-	missingIdentity := valid
-	missingIdentity.StorageIdentity = backendidentity.ID{}
-	_, err = NewCallbackSender(missingIdentity)
-	require.ErrorContains(t, err, "storage identity")
-
-	missingDeliveryAuthority := valid
-	missingDeliveryAuthority.BeforeDelivery = nil
-	_, err = NewCallbackSender(missingDeliveryAuthority)
-	require.ErrorContains(t, err, "delivery storage re-attestation")
-
-	missingReplayAuthority := valid
-	missingReplayAuthority.BeforeReplay = nil
-	_, err = NewCallbackSender(missingReplayAuthority)
-	require.ErrorContains(t, err, "replay storage re-attestation")
+	missingStorageAuthority := valid
+	missingStorageAuthority.StorageAttestor = nil
+	_, err = NewCallbackSender(missingStorageAuthority)
+	require.ErrorContains(t, err, "storage attestor")
 
 	assert.Panics(t, func() { MustNewCallbackSender(missingStore) },
 		"only the explicitly named Must constructor may panic on invalid wiring")
 }
 
+func TestCallbackStorageAttestorRejectsCrossWiredBackendGateWithCopiedIdentity(t *testing.T) {
+	storesA := openOperationHandoffStores(t, "docker-a")
+	storesB := openOperationHandoffStores(t, "docker-b")
+	verifierBWithCopiedIdentity := callbackStorageVerifierForTest{
+		storageID: storesA.storage.ID(),
+		gate:      storesB.gate,
+		verify: func(context.Context) error {
+			return nil
+		},
+	}
+	// Report A's copied durable identity but B's independent backend-lifetime
+	// withdrawal gate. Matching UUID metadata must not make this verifier an
+	// authority over A's open outbox.
+	_, err := NewCallbackStorageAttestor(
+		storesA.callbacks, verifierBWithCopiedIdentity, context.Background(),
+	)
+	require.ErrorContains(t, err, "another backend authority gate")
+}
+
+func TestCallbackStorageAttestorRejectsCanceledLifetime(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	stopCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := NewCallbackStorageAttestor(
+		stores.callbacks,
+		callbackStorageVerifierForTest{
+			storageID: stores.storage.ID(),
+			gate:      stores.gate,
+			verify:    func(context.Context) error { return nil },
+		},
+		stopCtx,
+	)
+	require.ErrorContains(t, err, "stop context is canceled")
+}
+
+func TestCallbackStorageAttestorRejectsClosedAndReopenedStoreInstance(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	stopCtx := context.Background()
+	attestor := newTestCallbackStorageAttestor(t, stores.callbacks, stopCtx, nil, 0)
+	require.NoError(t, stores.callbacks.Close())
+
+	reopened, err := OpenIdentityBoundCallbackStore(
+		CallbackStoreConfig{DBPath: stores.callbackPath}, stores.storage, stores.gate,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	_, err = NewCallbackSender(CallbackSenderConfig{
+		Store: reopened, StorageAttestor: attestor, HTTPClient: http.DefaultClient,
+		Secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", Logger: slog.Default(),
+	})
+	require.ErrorContains(t, err, "exact callback storage attestor")
+	require.Error(t, attestor.verify(context.Background()),
+		"closing the exact store must revoke its previously minted attestor")
+}
+
 func TestNewCallbackSender_DefaultBackoff(t *testing.T) {
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
 		Logger:     slog.Default(),
-		StopCtx:    context.Background(),
 	})
 	assert.Equal(t, defaultCallbackBackoff, s.backoff)
 	assert.Equal(t, 2*time.Minute, backend.DefaultCallbackApplicationTimeout)
@@ -537,39 +794,39 @@ func TestNewCallbackSender_DefaultBackoff(t *testing.T) {
 
 func TestNewCallbackSender_CustomBackoff(t *testing.T) {
 	custom := [CallbackMaxAttempts]time.Duration{0, 100 * time.Millisecond, 200 * time.Millisecond}
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
 		Logger:     slog.Default(),
-		StopCtx:    context.Background(),
-		Backoff:    &custom,
+
+		Backoff: &custom,
 	})
 	assert.Equal(t, custom, s.backoff)
 }
 
 func TestNewCallbackSender_ErrorsOnNegativeReplayInterval(t *testing.T) {
-	_, err := NewEphemeralCallbackSender(CallbackSenderConfig{
-		HTTPClient:     http.DefaultClient,
-		Logger:         slog.Default(),
-		StopCtx:        context.Background(),
+	_, err := newEphemeralCallbackSenderForTest(CallbackSenderConfig{
+		HTTPClient: http.DefaultClient,
+		Logger:     slog.Default(),
+
 		ReplayInterval: -time.Second,
-	})
+	}, backendidentity.ID{})
 	require.ErrorContains(t, err, "replay interval")
 }
 
 func TestNewCallbackSender_ErrorsOnNegativeDeliveryTimeout(t *testing.T) {
-	_, err := NewEphemeralCallbackSender(CallbackSenderConfig{
-		HTTPClient:      http.DefaultClient,
-		Logger:          slog.Default(),
-		StopCtx:         context.Background(),
+	_, err := newEphemeralCallbackSenderForTest(CallbackSenderConfig{
+		HTTPClient: http.DefaultClient,
+		Logger:     slog.Default(),
+
 		DeliveryTimeout: -time.Nanosecond,
-	})
+	}, backendidentity.ID{})
 	require.ErrorContains(t, err, "delivery timeout")
 }
 
 func TestSendCallback_EmptyURL(t *testing.T) {
 	s := newTestSender(t, nil, http.DefaultClient, "secret")
 	// Should not panic, just log a warning
-	s.SendOperationCallback(testLeaseUUID("lease-1"), "", "test-backend", backend.CallbackStatusSuccess, "")
+	s.sendOperationCallbackForTest(testLeaseUUID("lease-1"), "", "test-backend", backend.CallbackStatusSuccess, "")
 }
 
 func TestCallbackSender_TransportErrorNeverLogsCallbackCapability(t *testing.T) {
@@ -580,18 +837,46 @@ func TestCallbackSender_TransportErrorNeverLogsCallbackCapability(t *testing.T) 
 	client := &http.Client{Transport: callbackRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("transport failed for %s", request.URL.String())
 	})}
-	sender := MustNewEphemeralCallbackSender(CallbackSenderConfig{
+	sender := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: client,
 		Secret:     "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 		Logger:     logger,
-		StopCtx:    context.Background(),
-		Backoff:    &zeroBackoff,
+
+		Backoff: &zeroBackoff,
 	})
 
-	sender.SendOperationCallback(testLeaseUUID("log-redaction"), callbackURL, "docker", backend.CallbackStatusFailed, "failed")
-	sender.SendOperationCallback(
+	sender.sendOperationCallbackForTest(testLeaseUUID("log-redaction"), callbackURL, "docker", backend.CallbackStatusFailed, "failed")
+	sender.sendOperationCallbackForTest(
 		testLeaseUUID("log-redaction-invalid"),
 		"https://fred.example/\x7f/callbacks/provision?operation_id="+capability,
+		"docker", backend.CallbackStatusFailed, "failed",
+	)
+
+	assert.NotContains(t, output.String(), capability)
+	assert.NotContains(t, output.String(), callbackURL)
+}
+
+func TestCallbackSender_ErrorResponseBodyNeverLogsCallbackCapability(t *testing.T) {
+	const capability = "550e8400-e29b-41d4-a716-446655440000"
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + capability
+	var output bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	client := &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Header:     make(http.Header),
+			Body: io.NopCloser(bytes.NewBufferString(
+				"upstream rejected " + callbackURL,
+			)),
+		}, nil
+	})}
+	sender := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
+		HTTPClient: client, Secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+		Logger: logger, Backoff: &zeroBackoff,
+	})
+
+	sender.sendOperationCallbackForTest(
+		testLeaseUUID("response-log-redaction"), callbackURL,
 		"docker", backend.CallbackStatusFailed, "failed",
 	)
 
@@ -616,7 +901,7 @@ func TestSendCallback_SuccessDelivery(t *testing.T) {
 	defer server.Close()
 
 	s := newTestSender(t, nil, server.Client(), secret)
-	s.SendOperationCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, "test-backend", backend.CallbackStatusSuccess, "")
+	s.sendOperationCallbackForTest(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, "test-backend", backend.CallbackStatusSuccess, "")
 
 	assert.Equal(t, testLeaseUUID("lease-1"), received.LeaseUUID)
 	assert.Equal(t, backend.CallbackStatusSuccess, received.Status)
@@ -636,7 +921,7 @@ func TestSendCallback_FailurePayload(t *testing.T) {
 	defer server.Close()
 
 	s := newTestSender(t, nil, server.Client(), "secret")
-	s.SendOperationCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, "test-backend", backend.CallbackStatusFailed, "image pull failed")
+	s.sendOperationCallbackForTest(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, "test-backend", backend.CallbackStatusFailed, "image pull failed")
 
 	assert.Equal(t, backend.CallbackStatusFailed, received.Status)
 	assert.Equal(t, "image pull failed", received.Error)
@@ -651,7 +936,7 @@ func TestSendCallback_DurableSenderPersistsThenReplayRemoves(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -659,15 +944,19 @@ func TestSendCallback_DurableSenderPersistsThenReplayRemoves(t *testing.T) {
 	leaseUUID := testLeaseUUID("lease-1")
 	callbackURL := server.URL + callbackurl.ProvisionPath
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "test-backend", s.storageIdentity)
-	s.SendOperationCallback(leaseUUID, callbackURL, "test-backend", backend.CallbackStatusSuccess, "")
+	s.sendOperationCallbackForTest(
+		leaseUUID, callbackURL, "test-backend",
+		backend.CallbackStatusFailed, "definitively refused",
+	)
 
 	assert.Zero(t, requests.Load(), "durable command paths must not perform callback HTTP inline")
-	assert.Len(t, s.replayWake, 1, "durable publication must wake its replay owner")
+	assert.Zero(t, s.replayWake.pendingCount(),
+		"durable publication must not address a sender before its replay loop subscribes")
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "the outbox row must commit before replay owns delivery")
 
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 	assert.Equal(t, int32(1), requests.Load())
 	pending, err = store.ListPending()
 	require.NoError(t, err)
@@ -681,7 +970,7 @@ func TestSendCallback_DurableFailureCompletionRemainsPendingUntilReplay(t *testi
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -689,7 +978,7 @@ func TestSendCallback_DurableFailureCompletionRemainsPendingUntilReplay(t *testi
 	leaseUUID := testLeaseUUID("lease-1")
 	callbackURL := server.URL + callbackurl.ProvisionPath
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "test-backend", s.storageIdentity)
-	s.SendOperationCallback(leaseUUID, callbackURL, "test-backend", backend.CallbackStatusFailed, "error")
+	s.sendOperationCallbackForTest(leaseUUID, callbackURL, "test-backend", backend.CallbackStatusFailed, "error")
 
 	pending, err := store.ListPending()
 	require.NoError(t, err)
@@ -710,17 +999,17 @@ func TestSendLifecycleCallback_CoalescesOlderPendingLifecycle(t *testing.T) {
 		{"success to failed", backend.CallbackStatusSuccess, backend.CallbackStatusFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+			store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 			require.NoError(t, err)
 			defer store.Close()
 			s := newTestSender(t, store, client, "secret")
 
-			s.SendLifecycleCallback(testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", "docker", tc.firstStatus, "first", false)
+			s.sendLifecycleCallbackForTest(testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", "docker", tc.firstStatus, "first", false)
 			first, err := store.ListPending()
 			require.NoError(t, err)
 			require.Len(t, first, 1)
 
-			s.SendLifecycleCallback(testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", "docker", tc.latestStatus, "latest", false)
+			s.sendLifecycleCallbackForTest(testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", "docker", tc.latestStatus, "latest", false)
 			pending, err := store.ListPending()
 			require.NoError(t, err)
 			require.Len(t, pending, 1)
@@ -728,7 +1017,6 @@ func TestSendLifecycleCallback_CoalescesOlderPendingLifecycle(t *testing.T) {
 			assert.Greater(t, pending[0].Sequence, first[0].Sequence)
 			assert.Equal(t, CallbackDeliveryKindLifecycle, pending[0].DeliveryKind)
 			assert.Equal(t, tc.latestStatus, pending[0].Status)
-			assert.Equal(t, tc.latestStatus != backend.CallbackStatusFailed, pending[0].Success)
 		})
 	}
 }
@@ -745,17 +1033,16 @@ func TestSendLifecycleCallback_DropsLateObservationBehindTerminal(t *testing.T) 
 		}
 		return callbackHTTPResponse(http.StatusServiceUnavailable), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
-	require.NoError(t, err)
-	defer store.Close()
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
 	sender := newTestSender(t, store, client, "secret")
 	leaseUUID := testLeaseUUID("terminal-sender")
 
-	sender.SendLifecycleCallback(
+	sender.sendLifecycleCallbackForTest(
 		leaseUUID, "https://fred.example/terminal/callbacks/provision", "docker",
 		backend.CallbackStatusDeprovisioned, "", false,
 	)
-	sender.SendLifecycleCallback(
+	sender.sendLifecycleCallbackForTest(
 		leaseUUID, "https://fred.example/late/callbacks/provision", "docker",
 		backend.CallbackStatusFailed, "delayed runtime observation", false,
 	)
@@ -775,7 +1062,7 @@ func TestSendLifecycleCallback_RejectsInvalidURL(t *testing.T) {
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	s := newTestSender(t, store, client, "secret")
@@ -786,7 +1073,7 @@ func TestSendLifecycleCallback_RejectsInvalidURL(t *testing.T) {
 		"https://fred.example/callbacks/provision?trace=%ZZ&lifecycle_id=" + id,
 		"https://fred.example/callbacks/provision?trace=x;y&lifecycle_id=" + id,
 	} {
-		s.SendLifecycleCallback(
+		s.sendLifecycleCallbackForTest(
 			fmt.Sprintf("lease-%d", index), callbackURL, "docker",
 			backend.CallbackStatusFailed, "container exited", false,
 		)
@@ -804,7 +1091,7 @@ func TestSendOperationCallback_RejectsInvalidURL(t *testing.T) {
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	s := newTestSender(t, store, client, "secret")
@@ -817,7 +1104,7 @@ func TestSendOperationCallback_RejectsInvalidURL(t *testing.T) {
 		"https://fred.example/callbacks/provision?trace=%ZZ&operation_id=" + id,
 		"https://fred.example/callbacks/provision?trace=x;y&operation_id=" + id,
 	} {
-		s.SendOperationCallback(
+		s.sendOperationCallbackForTest(
 			fmt.Sprintf("lease-%d", index), callbackURL, "docker",
 			backend.CallbackStatusSuccess, "",
 		)
@@ -835,7 +1122,7 @@ func TestSendOperationCallback_AcceptsTypedAndLegacyURLs(t *testing.T) {
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	s := newTestSender(t, store, client, "secret")
@@ -846,13 +1133,13 @@ func TestSendOperationCallback_AcceptsTypedAndLegacyURLs(t *testing.T) {
 	beginCallbackSenderOperationIntent(t, store, typedLeaseUUID, typedURL, "docker", s.storageIdentity)
 	beginCallbackSenderOperationIntent(t, store, legacyLeaseUUID, legacyURL, "docker", s.storageIdentity)
 
-	s.SendOperationCallback(
+	s.sendOperationCallbackForTest(
 		typedLeaseUUID, typedURL,
-		"docker", backend.CallbackStatusSuccess, "",
+		"docker", backend.CallbackStatusFailed, "definitively refused",
 	)
-	s.SendOperationCallback(
+	s.sendOperationCallbackForTest(
 		legacyLeaseUUID, legacyURL,
-		"docker", backend.CallbackStatusSuccess, "",
+		"docker", backend.CallbackStatusFailed, "definitively refused",
 	)
 
 	assert.Zero(t, requests.Load(), "accepted durable callbacks must only publish outbox facts")
@@ -860,7 +1147,7 @@ func TestSendOperationCallback_AcceptsTypedAndLegacyURLs(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pending, 2)
 
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 	assert.Equal(t, int32(2), requests.Load())
 	pending, err = store.ListPending()
 	require.NoError(t, err)
@@ -873,12 +1160,12 @@ func TestSendLifecycleCallback_AcceptsTypedLifecycleURL(t *testing.T) {
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	s := newTestSender(t, store, client, "secret")
 
-	s.SendLifecycleCallback(
+	s.sendLifecycleCallbackForTest(
 		testLeaseUUID("lease-1"),
 		"https://fred.example/callbacks/provision?trace=keep&lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
 		"docker",
@@ -888,12 +1175,13 @@ func TestSendLifecycleCallback_AcceptsTypedLifecycleURL(t *testing.T) {
 	)
 
 	assert.Zero(t, requests.Load(), "accepted durable callbacks must only publish outbox facts")
-	assert.Len(t, s.replayWake, 1, "durable publication must wake its replay owner")
+	assert.Zero(t, s.replayWake.pendingCount(),
+		"durable publication must not address a sender before its replay loop subscribes")
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 	assert.Equal(t, int32(1), requests.Load())
 	pending, err = store.ListPending()
 	require.NoError(t, err)
@@ -906,26 +1194,26 @@ func TestCallbackSender_RejectsStatusOutsideDeliveryKind(t *testing.T) {
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	s := newTestSender(t, store, client, "secret")
 
-	s.SendOperationCallback(
+	s.sendOperationCallbackForTest(
 		"lease-operation",
 		"https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
 		"docker",
 		backend.CallbackStatusDeprovisioned,
 		"",
 	)
-	s.SendOperationCallback(
+	s.sendOperationCallbackForTest(
 		"lease-operation-unknown",
 		"https://fred.example/callbacks/provision",
 		"docker",
 		backend.CallbackStatus("unknown"),
 		"",
 	)
-	s.SendLifecycleCallback(
+	s.sendLifecycleCallbackForTest(
 		"lease-lifecycle-unknown",
 		"https://fred.example/callbacks/provision",
 		"docker",
@@ -933,7 +1221,7 @@ func TestCallbackSender_RejectsStatusOutsideDeliveryKind(t *testing.T) {
 		"",
 		false,
 	)
-	s.SendLifecycleCallback(
+	s.sendLifecycleCallbackForTest(
 		"lease-retained",
 		"https://fred.example/callbacks/provision",
 		"docker",
@@ -955,16 +1243,16 @@ func TestSendOperationCallback_MissingIntentReportsStoreErrorAndSuppressesHTTP(t
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store, HTTPClient: client, Secret: "secret", Logger: slog.Default(),
-		StopCtx: context.Background(), Backoff: &zeroBackoff,
+		Backoff:      &zeroBackoff,
 		OnStoreError: func() { storeErrors.Add(1) },
 	})
 
-	s.SendOperationCallback(
+	s.sendOperationCallbackForTest(
 		testLeaseUUID("missing-intent"), "https://fred.example/callbacks/provision",
 		"docker", backend.CallbackStatusSuccess, "",
 	)
@@ -976,18 +1264,18 @@ func TestSendOperationCallback_MissingIntentReportsStoreErrorAndSuppressesHTTP(t
 	assert.Empty(t, pending)
 }
 
-func TestSendOperationCallback_EphemeralSenderDoesNotRequireDurableIntent(t *testing.T) {
+func TestSendOperationCallback_TransportHarnessDoesNotRequireDurableIntent(t *testing.T) {
 	var requests atomic.Int32
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
 			requests.Add(1)
 			return callbackHTTPResponse(http.StatusNoContent), nil
 		})},
 		Secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", Logger: slog.Default(),
-		StopCtx: context.Background(), Backoff: &zeroBackoff,
+		Backoff: &zeroBackoff,
 	})
 
-	s.SendOperationCallback(
+	s.sendOperationCallbackForTest(
 		testLeaseUUID("ephemeral"), "https://fred.example/callbacks/provision",
 		"docker", backend.CallbackStatusSuccess, "",
 	)
@@ -1002,7 +1290,7 @@ func TestSendOperationCallback_StoreFailureSuppressesDirectDelivery(t *testing.T
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	leaseUUID := testLeaseUUID("lease-1")
 	callbackURL := "https://fred.example/callbacks/provision"
@@ -1012,16 +1300,19 @@ func TestSendOperationCallback_StoreFailureSuppressesDirectDelivery(t *testing.T
 	)
 	require.NoError(t, store.Close())
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:        store,
-		HTTPClient:   client,
-		Secret:       "secret",
-		Logger:       slog.Default(),
-		StopCtx:      context.Background(),
+		Store:      store,
+		HTTPClient: client,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:      &zeroBackoff,
 		OnStoreError: func() { storeErrors.Add(1) },
 	})
 
-	s.SendOperationCallback(leaseUUID, callbackURL, "docker", backend.CallbackStatusSuccess, "")
+	s.sendOperationCallbackForTest(
+		leaseUUID, callbackURL, "docker",
+		backend.CallbackStatusSuccess, "",
+	)
 
 	assert.Zero(t, requests.Load(), "configured persistence failure must fail closed past unknown older entries")
 	assert.Equal(t, int32(1), storeErrors.Load())
@@ -1037,20 +1328,20 @@ func TestReplayPendingCallbacks_ListFailureSuppressesDelivery(t *testing.T) {
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	require.NoError(t, store.Close())
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:        store,
-		HTTPClient:   client,
-		Secret:       "secret",
-		Logger:       slog.Default(),
-		StopCtx:      context.Background(),
+		Store:      store,
+		HTTPClient: client,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:      &zeroBackoff,
 		OnStoreError: func() { storeErrors.Add(1) },
 	})
 
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 
 	assert.Zero(t, requests.Load(), "a failed durable listing must not guess that no older entry exists")
 	assert.Equal(t, int32(1), storeErrors.Load())
@@ -1069,7 +1360,7 @@ func TestReplayPendingCallbacks_CorruptLeaseDoesNotBlockHealthyLease(t *testing.
 		}
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.storeValidTest(CallbackEntry{
@@ -1094,15 +1385,15 @@ func TestReplayPendingCallbacks_CorruptLeaseDoesNotBlockHealthyLease(t *testing.
 	}))
 
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:        store,
-		HTTPClient:   client,
-		Secret:       "secret",
-		Logger:       slog.Default(),
-		StopCtx:      context.Background(),
+		Store:      store,
+		HTTPClient: client,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:      &zeroBackoff,
 		OnStoreError: func() { storeErrors.Add(1) },
 	})
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 
 	assert.Equal(t, int32(1), healthyRequests.Load(),
 		"corruption in another identifiable lease must not poison replay")
@@ -1123,7 +1414,7 @@ func TestReplayPendingCallbacks_SemanticPoisonNeverReachesTransport(t *testing.T
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	leaseUUID := testLeaseUUID("semantic-ssrf-poison")
@@ -1133,11 +1424,10 @@ func TestReplayPendingCallbacks_SemanticPoisonNeverReachesTransport(t *testing.T
 		CallbackURL:  "http://169.254.169.254/latest/meta-data/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
 		DeliveryKind: CallbackDeliveryKindOperation,
 		Sequence:     1,
-		Success:      true,
 		Status:       backend.CallbackStatusSuccess,
 		CreatedAt:    time.Now(),
 	}
-	data, err := json.Marshal(entry)
+	data, err := marshalV2CallbackEntry(entry)
 	require.NoError(t, err)
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
 		bucket, err := tx.Bucket(callbackV2BucketName).CreateBucket([]byte(leaseUUID))
@@ -1149,11 +1439,11 @@ func TestReplayPendingCallbacks_SemanticPoisonNeverReachesTransport(t *testing.T
 	var storeErrors atomic.Int32
 	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store, HTTPClient: client, Secret: "secret", Logger: slog.Default(),
-		StopCtx: context.Background(), Backoff: &zeroBackoff,
+		Backoff:      &zeroBackoff,
 		OnStoreError: func() { storeErrors.Add(1) },
 	})
 
-	sender.ReplayPendingCallbacks()
+	sender.replayPendingCallbacks()
 	assert.Zero(t, requests.Load(), "semantic corruption must be rejected before any outbound request")
 	assert.Positive(t, storeErrors.Load())
 	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
@@ -1171,7 +1461,7 @@ func TestReplayPendingCallbacks_StructuralDiscoveryErrorStillDrainsHealthyLease(
 		}
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.storeValidTest(CallbackEntry{
@@ -1189,15 +1479,15 @@ func TestReplayPendingCallbacks_StructuralDiscoveryErrorStillDrainsHealthyLease(
 	}))
 
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:        store,
-		HTTPClient:   client,
-		Secret:       "secret",
-		Logger:       slog.Default(),
-		StopCtx:      context.Background(),
+		Store:      store,
+		HTTPClient: client,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:      &zeroBackoff,
 		OnStoreError: func() { storeErrors.Add(1) },
 	})
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 
 	assert.Equal(t, int32(1), healthyRequests.Load(),
 		"structural discovery errors must be reported without discarding valid lease jobs")
@@ -1228,14 +1518,14 @@ func TestCallbackSender_DifferentLeasesDoNotShareDeliveryLock(t *testing.T) {
 	blockedDone := make(chan struct{})
 	go func() {
 		defer close(blockedDone)
-		s.SendOperationCallback(testLeaseUUID("blocked-lease"), "https://fred.example/blocked/callbacks/provision", "docker", backend.CallbackStatusSuccess, "")
+		s.sendOperationCallbackForTest(testLeaseUUID("blocked-lease"), "https://fred.example/blocked/callbacks/provision", "docker", backend.CallbackStatusSuccess, "")
 	}()
 	<-blockedStarted
 
 	otherDone := make(chan struct{})
 	go func() {
 		defer close(otherDone)
-		s.SendOperationCallback(testLeaseUUID("other-lease"), "https://fred.example/other/callbacks/provision", "docker", backend.CallbackStatusSuccess, "")
+		s.sendOperationCallbackForTest(testLeaseUUID("other-lease"), "https://fred.example/other/callbacks/provision", "docker", backend.CallbackStatusSuccess, "")
 	}()
 	select {
 	case <-otherDelivered:
@@ -1261,24 +1551,27 @@ func TestCallbackSender_ReplayLoopDeliversPublishedCompletionWithoutRestart(t *t
 		}
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	stopCtx, cancel := context.WithCancel(context.Background())
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:          store,
-		HTTPClient:     client,
-		Secret:         "secret",
-		Logger:         slog.Default(),
-		StopCtx:        stopCtx,
+		Store:      store,
+		HTTPClient: client,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:        &zeroBackoff,
 		ReplayInterval: 5 * time.Millisecond,
-	})
+	}, callbackSenderTestLifetime(stopCtx))
 
 	leaseUUID := testLeaseUUID("lease-1")
 	callbackURL := "https://fred.example/callbacks/provision"
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "docker", s.storageIdentity)
-	s.SendOperationCallback(leaseUUID, callbackURL, "docker", backend.CallbackStatusSuccess, "")
+	s.sendOperationCallbackForTest(
+		leaseUUID, callbackURL, "docker",
+		backend.CallbackStatusFailed, "definitively refused",
+	)
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "the exact completion must be durable before replay")
@@ -1317,7 +1610,7 @@ func TestCallbackSender_NotificationWakesTrackedReplayLoop(t *testing.T) {
 		}
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.storeValidTest(CallbackEntry{
@@ -1329,14 +1622,14 @@ func TestCallbackSender_NotificationWakesTrackedReplayLoop(t *testing.T) {
 	}))
 	stopCtx, cancel := context.WithCancel(context.Background())
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:          store,
-		HTTPClient:     client,
-		Secret:         "secret",
-		Logger:         slog.Default(),
-		StopCtx:        stopCtx,
+		Store:      store,
+		HTTPClient: client,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:        &zeroBackoff,
 		ReplayInterval: time.Hour,
-	})
+	}, callbackSenderTestLifetime(stopCtx))
 
 	loopDone := make(chan struct{})
 	go func() {
@@ -1370,9 +1663,8 @@ func TestCallbackSender_DirectIntentSettlementWakesTrackedReplayLoop(t *testing.
 		deliveredOnce.Do(func() { close(delivered) })
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
-	require.NoError(t, err)
-	defer store.Close()
+	stores := openOperationHandoffStores(t, "docker")
+	store := stores.callbacks
 
 	stopCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1380,14 +1672,14 @@ func TestCallbackSender_DirectIntentSettlementWakesTrackedReplayLoop(t *testing.
 	releaseInitialReplay := make(chan struct{})
 	var replayCalls atomic.Int32
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:          store,
-		HTTPClient:     client,
-		Secret:         "secret",
-		Logger:         slog.Default(),
-		StopCtx:        stopCtx,
+		Store:      store,
+		HTTPClient: client,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:        &zeroBackoff,
 		ReplayInterval: time.Hour,
-		BeforeReplay: func(ctx context.Context) error {
+		StorageAttestor: newTestCallbackStorageAttestor(t, store, stopCtx, func(ctx context.Context) error {
 			if replayCalls.Add(1) != 1 {
 				return nil
 			}
@@ -1398,7 +1690,7 @@ func TestCallbackSender_DirectIntentSettlementWakesTrackedReplayLoop(t *testing.
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-		},
+		}, 0),
 	})
 
 	loopDone := make(chan struct{})
@@ -1417,8 +1709,10 @@ func TestCallbackSender_DirectIntentSettlementWakesTrackedReplayLoop(t *testing.
 	admission := beginCallbackSenderOperationIntent(
 		t, store, leaseUUID, callbackURL, "docker", s.storageIdentity,
 	)
-	_, err = store.ResolveOperationIntent(
-		admission.Claim, backend.CallbackStatusFailed, "definitively refused",
+	claim, created := admission.CreatedClaim()
+	require.True(t, created)
+	_, err := store.ResolveOperationIntent(
+		claim, backend.CallbackStatusFailed, "definitively refused",
 	)
 	require.NoError(t, err)
 	pending, err := store.ListPending()
@@ -1454,17 +1748,257 @@ func TestCallbackSender_DirectIntentSettlementWakesTrackedReplayLoop(t *testing.
 	assert.Zero(t, subscriberCount, "a stopped replay loop must unregister its wake channel")
 }
 
-func TestCallbackSender_CanceledDrainerHandsOffToTrackedPeer(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+func TestCallbackReplayMailbox_CoalescesByLeaseWithoutLosingStrongestFact(t *testing.T) {
+	firstLease := testLeaseUUID("mailbox-first")
+	secondLease := testLeaseUUID("mailbox-second")
+	mailbox := newCallbackReplayMailbox()
+
+	mailbox.publish(newCallbackReplayCommitWake(firstLease))
+	mailbox.publish(newCallbackReplayCommitWake(secondLease))
+	mailbox.publish(newCallbackReplayHandoffWake(firstLease))
+	mailbox.publish(newCallbackReplayCommitWake(firstLease))
+
+	select {
+	case <-mailbox.ready:
+	case <-time.After(time.Second):
+		t.Fatal("typed replay mailbox did not publish readiness")
+	}
+	assert.Empty(t, mailbox.ready, "readiness must coalesce independently of lease facts")
+	wakes := mailbox.take()
+	require.Len(t, wakes, 2, "a full readiness channel must not discard another lease")
+	got := make(map[string]callbackReplayWakeKind, len(wakes))
+	for _, wake := range wakes {
+		got[wake.leaseUUID] = wake.kind
+	}
+	assert.Equal(t, callbackReplayWakeHandoff, got[firstLease],
+		"an ordinary commit must not downgrade a pending ownership handoff")
+	assert.Equal(t, callbackReplayWakeCommit, got[secondLease])
+	assert.Zero(t, mailbox.pendingCount())
+}
+
+func TestCallbackReplayMailbox_PublishRacingTakeDoesNotLoseLease(t *testing.T) {
+	for iteration := range 100 {
+		firstLease := testLeaseUUID(fmt.Sprintf("mailbox-race-first-%03d", iteration))
+		secondLease := testLeaseUUID(fmt.Sprintf("mailbox-race-second-%03d", iteration))
+		mailbox := newCallbackReplayMailbox()
+		mailbox.publish(newCallbackReplayCommitWake(firstLease))
+		<-mailbox.ready
+
+		start := make(chan struct{})
+		taken := make(chan []callbackReplayWake, 1)
+		published := make(chan struct{})
+		go func() {
+			<-start
+			taken <- mailbox.take()
+		}()
+		go func() {
+			<-start
+			mailbox.publish(newCallbackReplayCommitWake(secondLease))
+			close(published)
+		}()
+		close(start)
+		wakes := <-taken
+		<-published
+		for len(mailbox.ready) > 0 {
+			<-mailbox.ready
+			wakes = append(wakes, mailbox.take()...)
+		}
+
+		got := make(map[string]struct{}, len(wakes))
+		for _, wake := range wakes {
+			got[wake.leaseUUID] = struct{}{}
+		}
+		assert.Contains(t, got, firstLease)
+		assert.Contains(t, got, secondLease)
+		assert.Zero(t, mailbox.pendingCount())
+	}
+}
+
+func TestCallbackSender_RunReplayLoopClaimsOneProcessLifetimeOwner(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	stopCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
+		Store: stores.callbacks,
+		HTTPClient: &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return callbackHTTPResponse(http.StatusNoContent), nil
+		})},
+		Secret: "secret", Logger: slog.Default(),
+		Backoff: &zeroBackoff, ReplayInterval: time.Hour,
+	}, callbackSenderTestLifetime(stopCtx))
+
+	copied := *sender
+	returned := make(chan struct{}, 2)
+	for _, runner := range []*CallbackSender{sender, &copied} {
+		go func() {
+			runner.RunReplayLoop()
+			returned <- struct{}{}
+		}()
+	}
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("a duplicate replay-loop invocation did not fail closed")
+	}
+	require.Eventually(t, func() bool {
+		stores.callbacks.replaySubscribersMu.Lock()
+		defer stores.callbacks.replaySubscribersMu.Unlock()
+		return len(stores.callbacks.replaySubscribers) == 1
+	}, time.Second, time.Millisecond, "the one replay owner did not subscribe")
+	select {
+	case <-returned:
+		t.Fatal("both replay-loop invocations returned while the owner context was live")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("the claimed replay owner did not stop after cancellation")
+	}
+}
+
+func TestCallbackReplayQueue_TypedWakeTouchesOnlyItsLease(t *testing.T) {
+	inFlightLease := testLeaseUUID("typed-wake-in-flight")
+	otherLease := testLeaseUUID("typed-wake-other")
+	queue := newCallbackReplayQueue()
+	queue.discover([]string{inFlightLease}, false, false)
+	leaseUUID, ready := queue.next()
+	require.True(t, ready)
+	require.Equal(t, inFlightLease, leaseUUID)
+	queue.dispatched(inFlightLease)
+
+	queue.wake(newCallbackReplayCommitWake(otherLease))
+	assert.NotContains(t, queue.dirty, inFlightLease,
+		"an unrelated commit must not restart an in-flight failed delivery")
+	queue.completed(callbackReplayCompletion{
+		leaseUUID: inFlightLease,
+		outcome:   callbackReplayDeferred,
+	})
+	assert.Contains(t, queue.dormant, inFlightLease)
+
+	queue.wake(newCallbackReplayCommitWake(inFlightLease))
+	assert.Contains(t, queue.dormant, inFlightLease,
+		"an appended suffix cannot overtake and restart its failed durable head")
+	queue.wake(newCallbackReplayHandoffWake(inFlightLease))
+	assert.NotContains(t, queue.dormant, inFlightLease)
+	leaseUUID, ready = queue.next()
+	require.True(t, ready)
+	assert.Equal(t, inFlightLease, leaseUUID,
+		"ownership handoff must promptly retry the exact dormant lease")
+}
+
+func TestCallbackReplayQueue_SameLeaseCommitRechecksInFlightDrain(t *testing.T) {
+	leaseUUID := testLeaseUUID("typed-wake-same-lease")
+	queue := newCallbackReplayQueue()
+	queue.discover([]string{leaseUUID}, false, false)
+	queue.dispatched(leaseUUID)
+
+	queue.wake(newCallbackReplayCommitWake(leaseUUID))
+	assert.Contains(t, queue.dirty, leaseUUID)
+	queue.completed(callbackReplayCompletion{
+		leaseUUID: leaseUUID,
+		outcome:   callbackReplayEmpty,
+	})
+	next, ready := queue.next()
+	require.True(t, ready, "a same-lease commit racing the empty check must be re-read")
+	assert.Equal(t, leaseUUID, next)
+}
+
+func TestCallbackReplayCompletion_CancellationBreaksAFullCoordinatorBacklog(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	completions := make(chan callbackReplayCompletion, callbackReplayWorkerLimit)
+	for i := range callbackReplayWorkerLimit {
+		completions <- callbackReplayCompletion{
+			leaseUUID: testLeaseUUID(fmt.Sprintf("buffered-completion-%02d", i)),
+			outcome:   callbackReplayEmpty,
+		}
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- publishCallbackReplayCompletion(ctx, completions, callbackReplayCompletion{
+			leaseUUID: testLeaseUUID("completion-beyond-buffer"),
+			outcome:   callbackReplayEmpty,
+		})
+	}()
+	select {
+	case <-done:
+		t.Fatal("worker completion unexpectedly bypassed the full coordinator buffer")
+	case <-time.After(10 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case published := <-done:
+		assert.False(t, published, "shutdown must retire the worker without publishing completion")
+	case <-time.After(time.Second):
+		t.Fatal("worker remained blocked behind a stopped replay coordinator")
+	}
+}
+
+func TestCallbackReplay_CancellationBreaksMutationGateWait(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
+	leaseUUID := testLeaseUUID("canceled-mutation-gate-wait")
+	_, err := store.storeValidTestEntry(CallbackEntry{
+		LeaseUUID:        leaseUUID,
+		CallbackURL:      "https://fred.example/callbacks/provision",
+		DeliveryKind:     CallbackDeliveryKindOperation,
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: stores.storage.ID().String(),
+		CreatedAt:        time.Now(),
+	})
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	stopCtx, cancel := context.WithCancel(context.Background())
+	var requests atomic.Int32
+	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
+		Store: store,
+		HTTPClient: &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return callbackHTTPResponse(http.StatusNoContent), nil
+		})},
+		Secret: "secret", Logger: slog.Default(),
+		Backoff: &zeroBackoff, ReplayInterval: time.Hour,
+	}, callbackSenderTestLifetime(stopCtx))
+
+	unlockMutation := store.lockDeliveryLease(leaseUUID)
+	t.Cleanup(unlockMutation)
+	done := make(chan callbackReplayOutcome, 1)
+	go func() { done <- sender.replayLeaseWithLimit(leaseUUID, 1) }()
+	require.Eventually(t, func() bool {
+		store.deliveryLocksMu.Lock()
+		defer store.deliveryLocksMu.Unlock()
+		lock := store.deliveryLocks[leaseUUID]
+		return lock != nil && lock.refs == 2
+	}, time.Second, time.Millisecond, "replay worker did not wait at the held mutation gate")
+
+	cancel()
+	select {
+	case outcome := <-done:
+		assert.Equal(t, callbackReplayDeferred, outcome)
+	case <-time.After(time.Second):
+		t.Fatal("canceled replay worker remained blocked at the mutation gate")
+	}
+	store.drainLocksMu.Lock()
+	_, drainHeld := store.drainLocks[leaseUUID]
+	store.drainLocksMu.Unlock()
+	assert.False(t, drainHeld, "cancellation must release wire-drain ownership")
+	assert.Zero(t, requests.Load(), "a replay blocked at the mutation gate must not reach HTTP")
+}
+
+func TestCallbackSender_CanceledDrainerHandsOffToTrackedPeer(t *testing.T) {
+	stores := openOperationHandoffStores(t, "docker-a")
+	store := stores.callbacks
 	leaseUUID := testLeaseUUID("canceled-drainer-handoff")
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID:    leaseUUID,
-		CallbackURL:  "https://fred.example/callbacks/provision",
-		DeliveryKind: CallbackDeliveryKindOperation,
-		Status:       backend.CallbackStatusSuccess,
-		CreatedAt:    time.Now(),
+	_, err := store.storeValidTestEntry(CallbackEntry{
+		LeaseUUID:        leaseUUID,
+		CallbackURL:      "https://fred.example/callbacks/provision",
+		DeliveryKind:     CallbackDeliveryKindOperation,
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: stores.storage.ID().String(),
+		CreatedAt:        time.Now(),
 	})
 	require.NoError(t, err)
 
@@ -1477,14 +2011,14 @@ func TestCallbackSender_CanceledDrainerHandsOffToTrackedPeer(t *testing.T) {
 	})}
 	ownerCtx, cancelOwner := context.WithCancel(context.Background())
 	owner := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:          store,
-		HTTPClient:     ownerClient,
-		Secret:         "secret",
-		Logger:         slog.Default(),
-		StopCtx:        ownerCtx,
+		Store:      store,
+		HTTPClient: ownerClient,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:        &zeroBackoff,
 		ReplayInterval: time.Hour,
-	})
+	}, callbackSenderTestLifetime(ownerCtx))
 	ownerDone := make(chan struct{})
 	go func() {
 		defer close(ownerDone)
@@ -1503,40 +2037,28 @@ func TestCallbackSender_CanceledDrainerHandsOffToTrackedPeer(t *testing.T) {
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
 	peerCtx, cancelPeer := context.WithCancel(context.Background())
-	secondReplayEntered := make(chan struct{})
-	releaseSecondReplay := make(chan struct{})
-	var releaseSecondOnce sync.Once
-	var peerReplayCalls atomic.Int32
 	peer := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:          store,
-		HTTPClient:     peerClient,
-		Secret:         "secret",
-		Logger:         slog.Default(),
-		StopCtx:        peerCtx,
+		Store:      store,
+		HTTPClient: peerClient,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:        &zeroBackoff,
 		ReplayInterval: time.Hour,
-		BeforeReplay: func(ctx context.Context) error {
-			if peerReplayCalls.Add(1) != 2 {
-				return nil
-			}
-			close(secondReplayEntered)
-			select {
-			case <-releaseSecondReplay:
-				return fmt.Errorf("suppress marker replay for cancellation handoff test")
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		},
-	})
+	}, callbackSenderTestLifetime(peerCtx))
+	// Seed the scheduler state produced when this peer previously discovered the
+	// durable lease but lost drain election to owner. The one-hour periodic retry
+	// makes the canceled owner's typed handoff the only prompt path to delivery.
+	peerQueue := newCallbackReplayQueue()
+	peerQueue.dormant[leaseUUID] = struct{}{}
 	peerDone := make(chan struct{})
 	go func() {
 		defer close(peerDone)
-		peer.RunReplayLoop()
+		peer.runReplayLoop(peerQueue)
 	}()
 	t.Cleanup(func() {
 		cancelOwner()
 		cancelPeer()
-		releaseSecondOnce.Do(func() { close(releaseSecondReplay) })
 		for name, done := range map[string]<-chan struct{}{
 			"owner": ownerDone,
 			"peer":  peerDone,
@@ -1548,16 +2070,11 @@ func TestCallbackSender_CanceledDrainerHandsOffToTrackedPeer(t *testing.T) {
 			}
 		}
 	})
-
-	// A marker can be consumed only after the peer's initial replay has
-	// completed and lost drain election to owner. Hold its second pass in the
-	// identity hook so no unrelated replay can race the cancellation handoff.
-	peer.NotifyPendingCallbacks()
-	select {
-	case <-secondReplayEntered:
-	case <-time.After(time.Second):
-		t.Fatal("peer replay loop did not finish its initial lost election")
-	}
+	require.Eventually(t, func() bool {
+		store.replaySubscribersMu.Lock()
+		defer store.replaySubscribersMu.Unlock()
+		return len(store.replaySubscribers) == 2
+	}, time.Second, time.Millisecond, "both replay owners did not subscribe")
 
 	cancelOwner()
 	select {
@@ -1565,14 +2082,15 @@ func TestCallbackSender_CanceledDrainerHandsOffToTrackedPeer(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled drain owner did not stop")
 	}
-	assert.Len(t, peer.replayWake, 1,
-		"canceled owner must publish one coalesced handoff edge to its peer")
-	releaseSecondOnce.Do(func() { close(releaseSecondReplay) })
 	select {
 	case <-peerDelivered:
 	case <-time.After(time.Second):
 		t.Fatal("peer did not take over callback delivery before the one-hour interval")
 	}
+	require.Eventually(t, func() bool {
+		pending, listErr := store.ListPending()
+		return listErr == nil && len(pending) == 0
+	}, time.Second, time.Millisecond, "peer did not commit precise callback removal")
 
 	cancelPeer()
 	select {
@@ -1610,7 +2128,7 @@ func TestSendCallback_ExactCompletionBlocksNewerLifecycleUntilFIFOCanDrain(t *te
 	}))
 	defer server.Close()
 
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -1618,25 +2136,31 @@ func TestSendCallback_ExactCompletionBlocksNewerLifecycleUntilFIFOCanDrain(t *te
 	leaseUUID := testLeaseUUID("lease-1")
 	exactURL := server.URL + "/exact" + callbackurl.ProvisionPath
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, exactURL, "docker", s.storageIdentity)
-	s.SendOperationCallback(leaseUUID, exactURL, "docker", backend.CallbackStatusSuccess, "")
-	s.SendLifecycleCallback(leaseUUID, server.URL+"/lifecycle"+callbackurl.ProvisionPath, "docker", backend.CallbackStatusFailed, "container exited", false)
+	s.sendOperationCallbackForTest(
+		leaseUUID, exactURL, "docker",
+		backend.CallbackStatusFailed, "definitively refused",
+	)
+	s.sendLifecycleCallbackForTest(
+		leaseUUID, server.URL+"/lifecycle"+callbackurl.ProvisionPath,
+		"docker", backend.CallbackStatusDeprovisioned, "", false,
+	)
 
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 2)
 	assert.Equal(t, server.URL+"/exact"+callbackurl.ProvisionPath, pending[0].CallbackURL)
-	assert.Equal(t, backend.CallbackStatusSuccess, pending[0].Status)
+	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
 	assert.Equal(t, server.URL+"/lifecycle"+callbackurl.ProvisionPath, pending[1].CallbackURL)
-	assert.Equal(t, backend.CallbackStatusFailed, pending[1].Status)
+	assert.Equal(t, backend.CallbackStatusDeprovisioned, pending[1].Status)
 	assert.Less(t, pending[0].Sequence, pending[1].Sequence)
 	assert.Zero(t, lifecycleAttempts.Load(), "new lifecycle callback must not overtake the exact completion")
 
 	exactAvailable.Store(true)
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 	deliveredMu.Lock()
 	assert.Equal(t, []backend.CallbackStatus{
-		backend.CallbackStatusSuccess,
 		backend.CallbackStatusFailed,
+		backend.CallbackStatusDeprovisioned,
 	}, deliveredOrder)
 	deliveredMu.Unlock()
 	pending, err = store.ListPending()
@@ -1660,7 +2184,7 @@ func TestCallbackSender_ConcurrentReplayAndLiveEnqueueRemainFIFO(t *testing.T) {
 		}
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.storeValidTest(CallbackEntry{
@@ -1675,7 +2199,7 @@ func TestCallbackSender_ConcurrentReplayAndLiveEnqueueRemainFIFO(t *testing.T) {
 	replayDone := make(chan struct{})
 	go func() {
 		defer close(replayDone)
-		s.ReplayPendingCallbacks()
+		s.replayPendingCallbacks()
 	}()
 	select {
 	case <-exactStarted:
@@ -1686,7 +2210,7 @@ func TestCallbackSender_ConcurrentReplayAndLiveEnqueueRemainFIFO(t *testing.T) {
 	liveDone := make(chan struct{})
 	go func() {
 		defer close(liveDone)
-		s.SendLifecycleCallback(
+		s.sendLifecycleCallbackForTest(
 			testLeaseUUID("lease-1"),
 			"https://fred.example/lifecycle/callbacks/provision",
 			"docker",
@@ -1744,7 +2268,7 @@ func TestCallbackSender_ConcurrentReplaysShareOneStoreDrainer(t *testing.T) {
 		<-release
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	leaseUUID := testLeaseUUID("shared-drainer")
@@ -1761,7 +2285,7 @@ func TestCallbackSender_ConcurrentReplaysShareOneStoreDrainer(t *testing.T) {
 	firstDone := make(chan struct{})
 	go func() {
 		defer close(firstDone)
-		senderA.ReplayPendingCallbacks()
+		senderA.replayPendingCallbacks()
 	}()
 	select {
 	case <-started:
@@ -1772,7 +2296,7 @@ func TestCallbackSender_ConcurrentReplaysShareOneStoreDrainer(t *testing.T) {
 	secondDone := make(chan struct{})
 	go func() {
 		defer close(secondDone)
-		senderB.ReplayPendingCallbacks()
+		senderB.replayPendingCallbacks()
 	}()
 	select {
 	case <-secondDone:
@@ -1813,7 +2337,7 @@ func TestCallbackSender_InFlightLifecycleReplacementSurvivesPreciseRemoval(t *te
 		}
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	leaseUUID := testLeaseUUID("in-flight-lifecycle-replacement")
@@ -1831,7 +2355,7 @@ func TestCallbackSender_InFlightLifecycleReplacementSurvivesPreciseRemoval(t *te
 	replayDone := make(chan struct{})
 	go func() {
 		defer close(replayDone)
-		sender.ReplayPendingCallbacks()
+		sender.replayPendingCallbacks()
 	}()
 	select {
 	case <-oldStarted:
@@ -1842,7 +2366,7 @@ func TestCallbackSender_InFlightLifecycleReplacementSurvivesPreciseRemoval(t *te
 	enqueueDone := make(chan struct{})
 	go func() {
 		defer close(enqueueDone)
-		sender.SendLifecycleCallback(
+		sender.sendLifecycleCallbackForTest(
 			leaseUUID,
 			"https://fred.example/new/callbacks/provision",
 			"docker",
@@ -1887,7 +2411,7 @@ func TestCallbackSender_CanceledDrainerLeavesRowForReplacementSender(t *testing.
 		<-req.Context().Done()
 		return nil, req.Context().Err()
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	leaseUUID := testLeaseUUID("replace-canceled-drainer")
@@ -1905,14 +2429,14 @@ func TestCallbackSender_CanceledDrainerLeavesRowForReplacementSender(t *testing.
 		HTTPClient: clientA,
 		Secret:     "secret",
 		Logger:     slog.Default(),
-		StopCtx:    stopCtx,
-		Backoff:    &zeroBackoff,
-	})
+
+		Backoff: &zeroBackoff,
+	}, callbackSenderTestLifetime(stopCtx))
 
 	firstDone := make(chan struct{})
 	go func() {
 		defer close(firstDone)
-		senderA.ReplayPendingCallbacks()
+		senderA.replayPendingCallbacks()
 	}()
 	select {
 	case <-started:
@@ -1937,7 +2461,7 @@ func TestCallbackSender_CanceledDrainerLeavesRowForReplacementSender(t *testing.
 		replacementRequests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}, "secret")
-	senderB.ReplayPendingCallbacks()
+	senderB.replayPendingCallbacks()
 	assert.Equal(t, int32(1), replacementRequests.Load())
 	pending, err = store.listPending(leaseUUID)
 	require.NoError(t, err)
@@ -1964,7 +2488,7 @@ func TestCallbackSender_ExpirySkipsBusyLeaseWithoutMutatingDrain(t *testing.T) {
 			return callbackHTTPResponse(http.StatusNotFound), nil
 		}
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	_, err = store.storeValidTestEntry(CallbackEntry{
@@ -1988,7 +2512,7 @@ func TestCallbackSender_ExpirySkipsBusyLeaseWithoutMutatingDrain(t *testing.T) {
 	replayDone := make(chan struct{})
 	go func() {
 		defer close(replayDone)
-		s.ReplayPendingCallbacks()
+		s.replayPendingCallbacks()
 	}()
 	select {
 	case <-exactStarted:
@@ -2001,7 +2525,7 @@ func TestCallbackSender_ExpirySkipsBusyLeaseWithoutMutatingDrain(t *testing.T) {
 	var cleanupErr error
 	go func() {
 		defer close(cleanupDone)
-		removed, cleanupErr = store.RemoveOlderThan(24 * time.Hour)
+		removed, cleanupErr = store.removeOlderThan(24 * time.Hour)
 	}()
 	select {
 	case <-cleanupDone:
@@ -2027,7 +2551,7 @@ func TestCallbackSender_ExpirySkipsBusyLeaseWithoutMutatingDrain(t *testing.T) {
 	assert.Equal(t, CallbackDeliveryKindOperation, pending[0].DeliveryKind)
 	assert.Equal(t, CallbackDeliveryKindLifecycle, pending[1].DeliveryKind)
 
-	removed, err = store.RemoveOlderThan(24 * time.Hour)
+	removed, err = store.removeOlderThan(24 * time.Hour)
 	require.NoError(t, err)
 	assert.Zero(t, removed, "exact operation evidence remains non-expiring after delivery releases the lock")
 	pending, err = store.listPending(testLeaseUUID("lease-1"))
@@ -2044,7 +2568,7 @@ func TestDeliverCallback_Success(t *testing.T) {
 	defer server.Close()
 
 	s := newTestSender(t, nil, server.Client(), "secret")
-	ok := s.DeliverCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, []byte(`{"test":true}`))
+	ok := s.deliverCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, []byte(`{"test":true}`))
 	assert.True(t, ok)
 }
 
@@ -2061,7 +2585,7 @@ func TestDeliverCallback_RetriesOnServerError(t *testing.T) {
 	defer server.Close()
 
 	s := newTestSender(t, nil, server.Client(), "secret")
-	ok := s.DeliverCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, []byte(`{}`))
+	ok := s.deliverCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, []byte(`{}`))
 	assert.True(t, ok)
 	assert.Equal(t, int32(3), attempts.Load())
 }
@@ -2073,7 +2597,7 @@ func TestDeliverCallback_AllRetriesFail(t *testing.T) {
 	defer server.Close()
 
 	s := newTestSender(t, nil, server.Client(), "secret")
-	ok := s.DeliverCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, []byte(`{}`))
+	ok := s.deliverCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, []byte(`{}`))
 	assert.False(t, ok)
 }
 
@@ -2094,15 +2618,15 @@ func TestCallbackSenderRejectsRedirectEvenWhenSuppliedClientFollows(t *testing.T
 
 	client := redirect.Client()
 	require.Nil(t, client.CheckRedirect, "test client must follow redirects by default")
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: client,
 		Secret:     "secret",
 		Logger:     slog.Default(),
-		StopCtx:    context.Background(),
-		Backoff:    &zeroBackoff,
+
+		Backoff: &zeroBackoff,
 	})
 
-	delivered := s.DeliverCallback(
+	delivered := s.deliverCallback(
 		testLeaseUUID("redirect"), redirect.URL, []byte(`{"authority":"signed"}`),
 	)
 
@@ -2130,14 +2654,14 @@ func TestCallbackSenderStripsAmbientCookieJarWithoutMutatingClient(t *testing.T)
 	client.Jar = jar
 	require.NotEmpty(t, client.Jar.Cookies(callbackRequest.URL))
 
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: client,
 		Secret:     "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 		Logger:     slog.Default(),
-		StopCtx:    context.Background(),
-		Backoff:    &zeroBackoff,
+
+		Backoff: &zeroBackoff,
 	})
-	delivered := s.DeliverCallback(
+	delivered := s.deliverCallback(
 		testLeaseUUID("ambient-cookie"), server.URL+callbackurl.ProvisionPath, []byte(`{"authority":"signed"}`),
 	)
 
@@ -2158,19 +2682,19 @@ func TestDeliverCallback_ShutdownAbortsRetry(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	longBackoff := [CallbackMaxAttempts]time.Duration{0, 5 * time.Second, 5 * time.Second}
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: server.Client(),
 		Logger:     slog.Default(),
-		StopCtx:    ctx,
-		Backoff:    &longBackoff,
-	})
+
+		Backoff: &longBackoff,
+	}, callbackSenderTestLifetime(ctx))
 
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		cancel()
 	}()
 
-	ok := s.DeliverCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, []byte(`{}`))
+	ok := s.deliverCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, []byte(`{}`))
 	assert.False(t, ok)
 	assert.LessOrEqual(t, attempts.Load(), int32(2))
 }
@@ -2202,16 +2726,16 @@ func TestDeliverCallback_ConfiguredDeliveryTimeoutOutlivesFormerCaps(t *testing.
 		}
 	})}
 	assert.Zero(t, client.Timeout)
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
-		HTTPClient:      client,
-		Logger:          slog.Default(),
-		StopCtx:         context.Background(),
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
+		HTTPClient: client,
+		Logger:     slog.Default(),
+
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: deliveryTimeout,
 	})
 
 	started := time.Now()
-	ok := s.DeliverCallback(testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", []byte(`{}`))
+	ok := s.deliverCallback(testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", []byte(`{}`))
 
 	assert.True(t, ok)
 	assert.Equal(t, int32(1), attempts.Load())
@@ -2226,15 +2750,15 @@ func TestDeliverCallback_AttemptDeadlineDefersRemainingRetries(t *testing.T) {
 		<-req.Context().Done()
 		return nil, req.Context().Err()
 	})}
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
-		HTTPClient:      client,
-		Logger:          slog.Default(),
-		StopCtx:         context.Background(),
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
+		HTTPClient: client,
+		Logger:     slog.Default(),
+
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: deliveryTimeout,
 	})
 
-	delivered := s.DeliverCallback(
+	delivered := s.deliverCallback(
 		testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", []byte(`{}`),
 	)
 
@@ -2276,17 +2800,17 @@ func TestDeliverCallback_HTTPFailureRetrySharesInlineDeadline(t *testing.T) {
 			return nil, fmt.Errorf("unexpected callback attempt %d", attempt)
 		}
 	})}
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
-		HTTPClient:      client,
-		Logger:          slog.Default(),
-		StopCtx:         stopCtx,
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
+		HTTPClient: client,
+		Logger:     slog.Default(),
+
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: deliveryTimeout,
-	})
+	}, callbackSenderTestLifetime(stopCtx))
 
 	delivered := make(chan bool, 1)
 	go func() {
-		delivered <- s.DeliverCallback(
+		delivered <- s.deliverCallback(
 			testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", []byte(`{}`),
 		)
 	}()
@@ -2332,16 +2856,16 @@ func TestDeliverCallback_StopContextCancelsInFlightRequest(t *testing.T) {
 		requestCanceled <- req.Context().Err()
 		return nil, req.Context().Err()
 	})}
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
-		HTTPClient:      client,
-		Logger:          slog.Default(),
-		StopCtx:         stopCtx,
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
+		HTTPClient: client,
+		Logger:     slog.Default(),
+
 		DeliveryTimeout: time.Minute,
-	})
+	}, callbackSenderTestLifetime(stopCtx))
 
 	delivered := make(chan bool, 1)
 	go func() {
-		delivered <- s.DeliverCallback(
+		delivered <- s.deliverCallback(
 			testLeaseUUID("lease-1"), "https://fred.example/callbacks/provision", []byte(`{}`),
 		)
 	}()
@@ -2370,17 +2894,17 @@ func TestDeliverCallback_StopContextCancelsInFlightRequest(t *testing.T) {
 func TestReplayPendingCallbacks_NilStore(t *testing.T) {
 	s := newTestSender(t, nil, http.DefaultClient, "secret")
 	// Should not panic
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 }
 
 func TestReplayPendingCallbacks_EmptyStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	s := newTestSender(t, store, http.DefaultClient, "secret")
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 }
 
 func TestReplayPendingCallbacks_DeliversAndRemoves(t *testing.T) {
@@ -2397,7 +2921,7 @@ func TestReplayPendingCallbacks_DeliversAndRemoves(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -2405,20 +2929,18 @@ func TestReplayPendingCallbacks_DeliversAndRemoves(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("lease-1"),
 		CallbackURL:  server.URL + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      true,
 		CreatedAt:    time.Now(),
 	}))
 	require.NoError(t, store.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-2"),
 		CallbackURL:  server.URL + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      false,
 		Error:        "pull failed",
 		CreatedAt:    time.Now(),
 	}))
 
 	s := newTestSender(t, store, server.Client(), "secret")
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 
 	receivedMu.Lock()
 	assert.Len(t, received, 2)
@@ -2440,7 +2962,7 @@ func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -2448,20 +2970,18 @@ func TestReplayPendingCallbacks_PartialFailure(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("lease-1"),
 		CallbackURL:  server.URL + "/success" + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      true,
 		CreatedAt:    time.Now(),
 	}))
 	require.NoError(t, store.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-2"),
 		CallbackURL:  server.URL + "/failure" + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      false,
 		Error:        "error",
 		CreatedAt:    time.Now(),
 	}))
 
 	s := newTestSender(t, store, server.Client(), "secret")
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 
 	pending, err := store.ListPending()
 	require.NoError(t, err)
@@ -2490,7 +3010,7 @@ func TestReplayPendingCallbacks_FailureBlocksOnlyItsLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.storeValidTest(CallbackEntry{
@@ -2515,7 +3035,7 @@ func TestReplayPendingCallbacks_FailureBlocksOnlyItsLease(t *testing.T) {
 		CreatedAt:    time.Now(),
 	}))
 
-	newTestSender(t, store, server.Client(), "secret").ReplayPendingCallbacks()
+	newTestSender(t, store, server.Client(), "secret").replayPendingCallbacks()
 
 	assert.Equal(t, int32(CallbackMaxAttempts), blockedAttempts.Load())
 	assert.Zero(t, overtakingLifecycleAttempts.Load(),
@@ -2545,7 +3065,7 @@ func TestReplayPendingCallbacks_BlockedLeaseDoesNotDelayAnotherLease(t *testing.
 		}
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	for _, entry := range []CallbackEntry{
@@ -2570,7 +3090,7 @@ func TestReplayPendingCallbacks_BlockedLeaseDoesNotDelayAnotherLease(t *testing.
 	replayDone := make(chan struct{})
 	go func() {
 		defer close(replayDone)
-		s.ReplayPendingCallbacks()
+		s.replayPendingCallbacks()
 	}()
 
 	select {
@@ -2594,6 +3114,127 @@ func TestReplayPendingCallbacks_BlockedLeaseDoesNotDelayAnotherLease(t *testing.
 	assert.Empty(t, pending)
 }
 
+func TestCallbackSender_FreshCommitBypassesSaturatedReplayBacklog(t *testing.T) {
+	releaseOne := make(chan struct{}, 1)
+	freshDelivered := make(chan struct{})
+	var freshOnce sync.Once
+	var active atomic.Int32
+	client := &http.Client{Transport: callbackRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/fresh"+callbackurl.ProvisionPath {
+			freshOnce.Do(func() { close(freshDelivered) })
+			return callbackHTTPResponse(http.StatusNoContent), nil
+		}
+		active.Add(1)
+		defer active.Add(-1)
+		select {
+		case <-releaseOne:
+			return callbackHTTPResponse(http.StatusNoContent), nil
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+	})}
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "cb.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+	for i := range callbackReplayWorkerLimit * 4 {
+		require.NoError(t, store.storeValidTest(CallbackEntry{
+			LeaseUUID:    testLeaseUUID(fmt.Sprintf("saturated-backlog-%03d", i)),
+			CallbackURL:  "https://fred.example/backlog" + callbackurl.ProvisionPath,
+			DeliveryKind: CallbackDeliveryKindOperation,
+			Status:       backend.CallbackStatusSuccess,
+			CreatedAt:    time.Now(),
+		}))
+	}
+
+	stopCtx, cancel := context.WithCancel(context.Background())
+	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
+		Store: store, HTTPClient: client, Secret: "secret", Logger: slog.Default(),
+		Backoff: &zeroBackoff, ReplayInterval: time.Hour,
+		DeliveryTimeout: time.Minute,
+	}, callbackSenderTestLifetime(stopCtx))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sender.RunReplayLoop()
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("replay scheduler did not stop")
+		}
+	})
+	require.Eventually(t, func() bool {
+		return active.Load() == int32(callbackReplayWorkerLimit)
+	}, time.Second, time.Millisecond, "initial backlog did not saturate every replay worker")
+
+	require.NoError(t, store.storeValidTest(CallbackEntry{
+		LeaseUUID:    testLeaseUUID("fresh-during-saturation"),
+		CallbackURL:  "https://fred.example/fresh" + callbackurl.ProvisionPath,
+		DeliveryKind: CallbackDeliveryKindOperation,
+		Status:       backend.CallbackStatusSuccess,
+		CreatedAt:    time.Now(),
+	}))
+	require.Eventually(t, func() bool { return sender.replayWake.pendingCount() == 0 },
+		time.Second, time.Millisecond, "scheduler did not consume the durable commit wake")
+
+	// Let exactly one saturated worker finish. The next dispatch must be the
+	// newly discovered healthy lease, not the next lexicographic backlog item.
+	releaseOne <- struct{}{}
+	select {
+	case <-freshDelivered:
+	case <-time.After(time.Second):
+		t.Fatal("fresh callback remained behind the saturated outage backlog")
+	}
+}
+
+func TestCallbackSender_DropsExpiredLifecycleHeadBeforeWireDelivery(t *testing.T) {
+	var requests atomic.Int32
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "cb.db"),
+		MaxAge: time.Hour,
+	})
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.storeValidTest(CallbackEntry{
+		LeaseUUID:    testLeaseUUID("expired-lifecycle-head"),
+		CallbackURL:  "https://fred.example/lifecycle" + callbackurl.ProvisionPath,
+		DeliveryKind: CallbackDeliveryKindLifecycle,
+		Status:       backend.CallbackStatusFailed,
+		CreatedAt:    time.Now().Add(-2 * time.Hour),
+	}))
+
+	stopCtx, cancel := context.WithCancel(context.Background())
+	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
+		Store: store,
+		HTTPClient: &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return callbackHTTPResponse(http.StatusNoContent), nil
+		})},
+		Secret: "secret", Logger: slog.Default(),
+		Backoff: &zeroBackoff, ReplayInterval: time.Hour,
+	}, callbackSenderTestLifetime(stopCtx))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sender.RunReplayLoop()
+	}()
+	require.Eventually(t, func() bool {
+		pending, listErr := store.ListPending()
+		return listErr == nil && len(pending) == 0
+	}, time.Second, time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("replay scheduler did not stop")
+	}
+	assert.Zero(t, requests.Load(), "expired observation must never race cleanup onto the wire")
+}
+
 func TestReplayPendingCallbacks_BoundsFanout(t *testing.T) {
 	release := make(chan struct{})
 	var active atomic.Int32
@@ -2610,7 +3251,7 @@ func TestReplayPendingCallbacks_BoundsFanout(t *testing.T) {
 		active.Add(-1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	for i := range callbackReplayWorkerLimit + 1 {
@@ -2626,7 +3267,7 @@ func TestReplayPendingCallbacks_BoundsFanout(t *testing.T) {
 	replayDone := make(chan struct{})
 	go func() {
 		defer close(replayDone)
-		s.ReplayPendingCallbacks()
+		s.replayPendingCallbacks()
 	}()
 
 	require.Eventually(t, func() bool {
@@ -2656,7 +3297,7 @@ func TestReplayPendingCallbacks_RecoversPerLeasePanicAndContinuesWorker(t *testi
 		}
 		panic("synthetic callback transport panic")
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	for i := range callbackReplayWorkerLimit {
@@ -2676,16 +3317,16 @@ func TestReplayPendingCallbacks_RecoversPerLeasePanicAndContinuesWorker(t *testi
 		CreatedAt:    time.Now(),
 	}))
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:         store,
-		HTTPClient:    client,
-		Secret:        "secret",
-		Logger:        slog.Default(),
-		StopCtx:       context.Background(),
+		Store:      store,
+		HTTPClient: client,
+		Secret:     "secret",
+		Logger:     slog.Default(),
+
 		Backoff:       &zeroBackoff,
 		OnReplayPanic: func(any) { replayPanics.Add(1) },
 	})
 
-	assert.NotPanics(t, s.ReplayPendingCallbacks)
+	assert.NotPanics(t, s.replayPendingCallbacks)
 	assert.Equal(t, int32(callbackReplayWorkerLimit), replayPanics.Load())
 	assert.Equal(t, int32(1), healthyDelivered.Load(),
 		"workers must continue consuming unrelated lease jobs after a recovered panic")
@@ -2709,7 +3350,7 @@ func TestReplayPendingCallbacks_CanceledSenderDoesNotWalkQueue(t *testing.T) {
 		requests.Add(1)
 		return callbackHTTPResponse(http.StatusNoContent), nil
 	})}
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	for i := range callbackReplayWorkerLimit * 2 {
@@ -2722,19 +3363,19 @@ func TestReplayPendingCallbacks_CanceledSenderDoesNotWalkQueue(t *testing.T) {
 		}))
 	}
 	stopCtx, cancel := context.WithCancel(context.Background())
-	cancel()
 	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store:      store,
 		HTTPClient: client,
 		Secret:     "secret",
 		Logger:     slog.Default(),
-		StopCtx:    stopCtx,
-		Backoff:    &zeroBackoff,
-	})
+
+		Backoff: &zeroBackoff,
+	}, callbackSenderTestLifetime(stopCtx))
+	cancel()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.ReplayPendingCallbacks()
+		s.replayPendingCallbacks()
 	}()
 
 	select {
@@ -2761,14 +3402,13 @@ func TestReplayPendingCallbacks_StopsLeaseAfterFirstFailureAfterReopen(t *testin
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	createdAt := time.Now()
 	require.NoError(t, store.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-1"),
 		CallbackURL:  server.URL + "/exact" + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      true,
 		Status:       backend.CallbackStatusSuccess,
 		Backend:      "docker",
 		CreatedAt:    createdAt,
@@ -2777,7 +3417,6 @@ func TestReplayPendingCallbacks_StopsLeaseAfterFirstFailureAfterReopen(t *testin
 		LeaseUUID:    testLeaseUUID("lease-1"),
 		CallbackURL:  server.URL + "/lifecycle" + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindLifecycle,
-		Success:      false,
 		Status:       backend.CallbackStatusFailed,
 		Backend:      "docker",
 		Error:        "container exited",
@@ -2785,10 +3424,10 @@ func TestReplayPendingCallbacks_StopsLeaseAfterFirstFailureAfterReopen(t *testin
 	}))
 	require.NoError(t, store.Close())
 
-	store, err = NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err = newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
-	newTestSender(t, store, server.Client(), "secret").ReplayPendingCallbacks()
+	newTestSender(t, store, server.Client(), "secret").replayPendingCallbacks()
 
 	pending, err := store.ListPending()
 	require.NoError(t, err)
@@ -2808,86 +3447,28 @@ func TestReplayPendingCallbacks_LegacyV013EntryRemainsQuarantined(t *testing.T) 
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
-	storeLegacyCallback(t, store, CallbackEntry{
+	storeLegacyCallback(t, store, v013CallbackEntryForTest{
 		LeaseUUID:   testLeaseUUID("lease-v013"),
 		CallbackURL: server.URL + callbackurl.ProvisionPath,
 		Success:     true,
 		CreatedAt:   time.Now(),
 	})
 	require.ErrorIs(t, store.Healthy(), errLegacyCallbackOutboxNotDrained)
-	newTestSender(t, store, server.Client(), "secret").ReplayPendingCallbacks()
+	newTestSender(t, store, server.Client(), "secret").replayPendingCallbacks()
 
 	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, callbackStorageLegacy, pending[0].storageVersion)
+	require.ErrorIs(t, err, errLegacyCallbackOutboxNotDrained)
+	assert.Empty(t, pending, "a current runtime must never materialize a pre-identity callback")
 	assert.Zero(t, requests.Load(),
 		"a current sender must not restamp a pre-identity row with the mounted lineage")
 	require.NoError(t, store.Close())
 
-	reopened, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	reopened, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	assert.Nil(t, reopened)
 	require.ErrorIs(t, err, errLegacyCallbackOutboxNotDrained,
 		"current startup must reject an undeliverable pre-identity queue")
-}
-
-func TestReplayPendingCallbacks_FailedLegacyHeadExpiresThenFreshV2Drains(t *testing.T) {
-	var legacyAttempts atomic.Int32
-	var typedAttempts atomic.Int32
-	client := &http.Client{Transport: callbackRoundTripFunc(func(req *http.Request) (*http.Response, error) {
-		switch req.URL.Path {
-		case "/legacy" + callbackurl.ProvisionPath:
-			legacyAttempts.Add(1)
-			return callbackHTTPResponse(http.StatusServiceUnavailable), nil
-		case "/typed" + callbackurl.ProvisionPath:
-			typedAttempts.Add(1)
-			return callbackHTTPResponse(http.StatusNoContent), nil
-		default:
-			return callbackHTTPResponse(http.StatusNotFound), nil
-		}
-	})}
-
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
-	require.NoError(t, err)
-	defer store.Close()
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID:   testLeaseUUID("lease-1"),
-		CallbackURL: "https://fred.example/legacy/callbacks/provision",
-		CreatedAt:   time.Now().Add(-48 * time.Hour),
-	})
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID:    testLeaseUUID("lease-1"),
-		CallbackURL:  "https://fred.example/typed/callbacks/provision",
-		DeliveryKind: CallbackDeliveryKindOperation,
-		Status:       backend.CallbackStatusSuccess,
-		CreatedAt:    time.Now(),
-	})
-	require.NoError(t, err)
-
-	sender := newTestSender(t, store, client, "secret")
-	sender.ReplayPendingCallbacks()
-	assert.Zero(t, legacyAttempts.Load(),
-		"a pre-identity legacy row is an operator-repair barrier, not deliverable authority")
-	assert.Zero(t, typedAttempts.Load(), "a live legacy head remains a strict FIFO barrier")
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 2)
-
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 1, removed)
-	pending, err = store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, "https://fred.example/typed/callbacks/provision", pending[0].CallbackURL)
-
-	sender.ReplayPendingCallbacks()
-	assert.Equal(t, int32(1), typedAttempts.Load())
-	pending, err = store.ListPending()
-	require.NoError(t, err)
-	assert.Empty(t, pending)
 }
 
 // TestReplayPendingCallbacks_PreservesStatusAndBackend verifies that current
@@ -2907,18 +3488,16 @@ func TestReplayPendingCallbacks_PreservesStatusAndBackend(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
-	// New-writer entry: Status and Backend present. Success encodes "not failed"
-	// so a pre-Status binary rolling back replays this as 'success' rather than
-	// 'failed' (avoiding spurious dashboard failures).
+	// Current v2 rows are isolated from the v0.13 bucket and represent their
+	// outcome exactly once through Status.
 	require.NoError(t, store.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-new"),
 		CallbackURL:  server.URL + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindLifecycle,
-		Success:      true,
 		Status:       backend.CallbackStatusDeprovisioned,
 		Backend:      "docker",
 		CreatedAt:    time.Now(),
@@ -2928,13 +3507,12 @@ func TestReplayPendingCallbacks_PreservesStatusAndBackend(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("lease-legacy"),
 		CallbackURL:  server.URL + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      false,
 		Error:        "image pull failed",
 		CreatedAt:    time.Now(),
 	}))
 
 	s := newTestSender(t, store, server.Client(), "secret")
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 
 	receivedMu.Lock()
 	defer receivedMu.Unlock()
@@ -2962,15 +3540,15 @@ func TestSendCallback_ThreadsRetainedFlag(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
 	s := newTestSender(t, store, server.Client(), "secret")
-	s.SendLifecycleCallback(testLeaseUUID("lease-r"), server.URL+callbackurl.ProvisionPath, "docker", backend.CallbackStatusDeprovisioned, "", true)
+	s.sendLifecycleCallbackForTest(testLeaseUUID("lease-r"), server.URL+callbackurl.ProvisionPath, "docker", backend.CallbackStatusDeprovisioned, "", true)
 
 	// The publisher only commits the row. Replay owns wire delivery.
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 
 	// Wire payload carried the flag.
 	assert.True(t, received.Retained, "retained flag must be threaded into the wire payload")
@@ -2994,7 +3572,7 @@ func TestReplayPendingCallbacks_PreservesRetained(t *testing.T) {
 	defer server.Close()
 
 	dbPath := filepath.Join(t.TempDir(), "cb.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -3002,7 +3580,6 @@ func TestReplayPendingCallbacks_PreservesRetained(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("lease-r"),
 		CallbackURL:  server.URL + callbackurl.ProvisionPath,
 		DeliveryKind: CallbackDeliveryKindLifecycle,
-		Success:      true,
 		Status:       backend.CallbackStatusDeprovisioned,
 		Backend:      "docker",
 		Retained:     true,
@@ -3010,54 +3587,54 @@ func TestReplayPendingCallbacks_PreservesRetained(t *testing.T) {
 	}))
 
 	s := newTestSender(t, store, server.Client(), "secret")
-	s.ReplayPendingCallbacks()
+	s.replayPendingCallbacks()
 
 	assert.Equal(t, testLeaseUUID("lease-r"), received.LeaseUUID)
 	assert.True(t, received.Retained, "replayed callback must preserve the retained flag")
 }
 
-// TestSendCallback_LegacySuccessFieldEncodesNotFailed verifies that when a
-// new binary writes a deprovisioned (or success) callback, the legacy Success
-// field is true so a rollback to a pre-Status binary replays as 'success' on
-// the wire rather than 'failed', preventing the spurious failure events this
-// PR was designed to eliminate.
-func TestSendCallback_LegacySuccessFieldEncodesNotFailed(t *testing.T) {
+// TestSendCallbackV2PersistsOneOutcomeRepresentation pins the current schema:
+// Status is authoritative and the isolated v2 bucket never persists a derived
+// success bit which could contradict it.
+func TestSendCallbackV2PersistsOneOutcomeRepresentation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError) // force persistence; never delivers
 	}))
 	defer server.Close()
 
 	cases := []struct {
-		name        string
-		status      backend.CallbackStatus
-		wantSuccess bool
+		name   string
+		status backend.CallbackStatus
 	}{
-		{"success", backend.CallbackStatusSuccess, true},
-		{"failed", backend.CallbackStatusFailed, false},
-		{"deprovisioned rolls back as success", backend.CallbackStatusDeprovisioned, true},
+		{"success", backend.CallbackStatusSuccess},
+		{"failed", backend.CallbackStatusFailed},
+		{"deprovisioned", backend.CallbackStatusDeprovisioned},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "cb.db")
-			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+			store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 			require.NoError(t, err)
 			defer store.Close()
 
 			s := newTestSender(t, store, server.Client(), "secret")
-			if tc.status == backend.CallbackStatusDeprovisioned {
-				s.SendLifecycleCallback(testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath, "docker", tc.status, "", false)
-			} else {
-				leaseUUID := testLeaseUUID("lease-1")
-				callbackURL := server.URL + callbackurl.ProvisionPath
-				beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "docker", s.storageIdentity)
-				s.SendOperationCallback(leaseUUID, callbackURL, "docker", tc.status, "")
-			}
+			s.sendLifecycleCallbackForTest(
+				testLeaseUUID("lease-1"), server.URL+callbackurl.ProvisionPath,
+				"docker", tc.status, "", false,
+			)
 
 			pending, err := store.ListPending()
 			require.NoError(t, err)
 			require.Len(t, pending, 1)
-			assert.Equal(t, tc.wantSuccess, pending[0].Success)
 			assert.Equal(t, tc.status, pending[0].Status)
+			require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
+				lease := tx.Bucket(callbackV2BucketName).Bucket([]byte(pending[0].LeaseUUID))
+				require.NotNil(t, lease)
+				data := lease.Get([]byte(pending[0].storageKey))
+				require.NotNil(t, data)
+				assert.False(t, bytes.Contains(data, []byte(`"success":`)))
+				return nil
+			}))
 		})
 	}
 }
@@ -3071,10 +3648,10 @@ func TestReportDelivery_NilHook(t *testing.T) {
 
 func TestReportDelivery_WithHook(t *testing.T) {
 	var outcomes []string
-	s := MustNewEphemeralCallbackSender(CallbackSenderConfig{
+	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
 		Logger:     slog.Default(),
-		StopCtx:    context.Background(),
+
 		OnDelivery: func(outcome string) { outcomes = append(outcomes, outcome) },
 	})
 
@@ -3082,4 +3659,109 @@ func TestReportDelivery_WithHook(t *testing.T) {
 	s.reportDelivery("failure")
 
 	assert.Equal(t, []string{"success", "failure"}, outcomes)
+}
+
+type endlessCallbackResponseBody struct {
+	readBytes atomic.Int64
+	closed    atomic.Bool
+}
+
+func (body *endlessCallbackResponseBody) Read(p []byte) (int, error) {
+	for index := range p {
+		p[index] = 'x'
+	}
+	body.readBytes.Add(int64(len(p)))
+	return len(p), nil
+}
+
+func (body *endlessCallbackResponseBody) Close() error {
+	body.closed.Store(true)
+	return nil
+}
+
+func TestTrySendCallbackBoundsUnusedResponseBody(t *testing.T) {
+	body := &endlessCallbackResponseBody{}
+	client := &http.Client{Transport: callbackRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    req,
+		}, nil
+	})}
+	sender := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
+		HTTPClient: client,
+		Logger:     slog.Default(),
+	})
+
+	outcome := sender.trySendCallback(
+		context.Background(), testLeaseUUID("bounded-response"),
+		"https://fred.example/callbacks/provision", []byte(`{}`),
+	)
+
+	assert.Equal(t, callbackAttemptDelivered, outcome)
+	assert.LessOrEqual(t, body.readBytes.Load(), callbackResponseDrainLimit+1)
+	assert.True(t, body.closed.Load(), "oversized response body must be closed after the bounded prefix")
+}
+
+func TestReplayPendingCallbacks_StoreErrorHookPanicIsContained(t *testing.T) {
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "cb.db"),
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+	var hookCalls atomic.Int32
+	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
+		Store: store, HTTPClient: http.DefaultClient, Secret: "secret",
+		Logger: slog.Default(), Backoff: &zeroBackoff,
+		OnStoreError: func() {
+			hookCalls.Add(1)
+			panic("store observer panic")
+		},
+	})
+
+	assert.NotPanics(t, sender.replayPendingCallbacks)
+	assert.NotPanics(t, sender.replayPendingCallbacks,
+		"one bad observer invocation must not disable a future level-triggered replay")
+	assert.Equal(t, int32(2), hookCalls.Load())
+}
+
+func TestReplayPendingCallbacks_DeliveryHookPanicPreservesFailedHead(t *testing.T) {
+	var attempts atomic.Int32
+	client := &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts.Add(1)
+		return callbackHTTPResponse(http.StatusServiceUnavailable), nil
+	})}
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "cb.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.storeValidTest(CallbackEntry{
+		LeaseUUID:    testLeaseUUID("delivery-hook-panic"),
+		CallbackURL:  "https://fred.example/callbacks/provision",
+		DeliveryKind: CallbackDeliveryKindOperation,
+		Status:       backend.CallbackStatusSuccess,
+		CreatedAt:    time.Now(),
+	}))
+	var hookCalls atomic.Int32
+	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
+		Store: store, HTTPClient: client, Secret: "secret", Logger: slog.Default(),
+		Backoff: &zeroBackoff,
+		OnDelivery: func(string) {
+			hookCalls.Add(1)
+			panic("delivery observer panic")
+		},
+	})
+
+	assert.NotPanics(t, sender.replayPendingCallbacks)
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "observer panic cannot discard a failed durable delivery")
+	assert.Equal(t, int32(CallbackMaxAttempts), attempts.Load())
+
+	assert.NotPanics(t, sender.replayPendingCallbacks,
+		"the durable head must remain eligible for a future replay")
+	assert.Equal(t, int32(2), hookCalls.Load())
+	assert.Equal(t, int32(2*CallbackMaxAttempts), attempts.Load())
 }

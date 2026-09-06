@@ -19,6 +19,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 type maintenanceInventory struct {
@@ -74,10 +75,13 @@ type maintenanceRecoveryHarness struct {
 	leaseUUID     string
 	releasePath   string
 	callbackPath  string
+	retentionPath string
 	releases      *shared.ReleaseStore
 	callbacks     *shared.CallbackStore
+	retentions    *shared.RetentionStore
+	operations    *shared.OperationSettlement
 	source        shared.Release
-	sourceClaim   shared.ReleaseClaim
+	sourceClaim   shared.MaintenanceSourceClaim
 	intent        shared.MaintenanceIntentClaim
 	appendClaim   shared.MaintenanceAppendClaim
 	target        shared.MaintenanceReleaseClaim
@@ -86,6 +90,18 @@ type maintenanceRecoveryHarness struct {
 
 func newMaintenanceRecoveryHarness(t *testing.T) *maintenanceRecoveryHarness {
 	return newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentRestart)
+}
+
+// newMaintenanceRecoveryHarnessWithPriorLifecycleCallback queues the older
+// observation while the lease is still in its Ready mutation phase, then
+// admits maintenance. Runtime observation authority intentionally cannot be
+// manufactured after the maintenance head exists.
+func newMaintenanceRecoveryHarnessWithPriorLifecycleCallback(
+	t *testing.T,
+) *maintenanceRecoveryHarness {
+	return newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
+		t, shared.MaintenanceIntentRestart, false, "", true,
+	)
 }
 
 func newMaintenanceRecoveryHarnessForKind(
@@ -126,6 +142,18 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallback(
 	legacy bool,
 	targetCallbackURL string,
 ) *maintenanceRecoveryHarness {
+	return newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
+		t, kind, legacy, targetCallbackURL, false,
+	)
+}
+
+func newMaintenanceRecoveryHarnessForAuthorityAtCallbackOptions(
+	t *testing.T,
+	kind shared.MaintenanceIntentKind,
+	legacy bool,
+	targetCallbackURL string,
+	queuePriorLifecycle bool,
+) *maintenanceRecoveryHarness {
 	t.Helper()
 	dir := t.TempDir()
 	inventory := &maintenanceInventory{}
@@ -140,12 +168,51 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallback(
 	leaseUUID := uuid.NewString()
 	releasePath := filepath.Join(dir, "releases.db")
 	callbackPath := filepath.Join(dir, "callbacks.db")
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: releasePath})
+	retentionPath := filepath.Join(dir, "retention.db")
+	b.cfg.CallbackDBPath = callbackPath
+	b.cfg.ReleasesDBPath = releasePath
+	b.cfg.RetentionDBPath = retentionPath
+	dockerClient, volumes := fullStorageClientsForTest(b)
+	storage, err := (testDockerStorageIdentity{}).resolve(
+		context.Background(), b.cfg, dockerClient, volumes,
+	)
 	require.NoError(t, err)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: callbackPath})
+	gate, err := backendidentity.NewStorageAuthorityGate(func(error) {})
+	require.NoError(t, err)
+	releases, err := shared.OpenIdentityBoundReleaseStore(
+		shared.ReleaseStoreConfig{DBPath: releasePath}, storage, gate,
+	)
+	require.NoError(t, err)
+	callbacks, err := shared.OpenIdentityBoundCallbackStore(
+		shared.CallbackStoreConfig{DBPath: callbackPath}, storage, gate,
+	)
+	require.NoError(t, err)
+	retentions, err := shared.OpenIdentityBoundRetentionStore(
+		shared.RetentionStoreConfig{DBPath: retentionPath}, storage, gate,
+	)
 	require.NoError(t, err)
 	b.releaseStore = releases
 	b.callbackStore = callbacks
+	b.retentionStore = retentions
+	operations, err := shared.NewOperationSettlement(callbacks, releases)
+	require.NoError(t, err)
+	b.operationSettlement = operations
+	b.restoreSettlement, err = shared.NewRestoreSettlement(operations, retentions)
+	require.NoError(t, err)
+	b.maintenanceSettlement, err = shared.NewMaintenanceSettlement(callbacks, releases)
+	require.NoError(t, err)
+	b.closeSettlement, err = shared.NewCloseSettlement(callbacks, releases, retentions)
+	require.NoError(t, err)
+	b.releaseCapacityPlanner = b.operationSettlement
+	b.storageIdentity = storage.ID()
+	b.storageAuthority = storage
+	b.storeAuthorityGate = gate
+	b.storageVerifier = testDockerRuntimeStorageVerifier{id: storage.ID()}
+	require.NoError(t, bindBackendTestPhysicalExecutors(
+		b, operations, b.maintenanceSettlement,
+	))
+	bindBackendRecoveryCoordinatorForTest(t, b)
+	rebuildCallbackSender(b, testCallbackClient)
 
 	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
 	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "web"}}
@@ -175,8 +242,37 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallback(
 			callbackURL, lifecycleCallbackURL,
 		)
 	}
-	require.NoError(t, releases.AppendActive(leaseUUID, source))
-	source, sourceClaim, err := releases.ClaimLatestActive(leaseUUID)
+	if legacy {
+		legacySource := source
+		legacySource.Items = nil
+		legacySource.ResourceProfiles = nil
+		legacySource.LegacyRuntimeAuthority = nil
+		seedUpgradedV013ReleaseForBackendTest(
+			t, b, leaseUUID, legacySource, items, profiles,
+			*source.LegacyRuntimeAuthority,
+		)
+		releases = b.releaseStore
+		var ok bool
+		operations, ok = concreteOperationSettlementForTest(b.operationSettlement)
+		require.True(t, ok)
+	} else {
+		seedProvisionReleaseForLeaseTest(
+			t, callbacks, releases, operations, leaseUUID, source,
+		)
+	}
+	if queuePriorLifecycle {
+		require.False(t, legacy, "typed lifecycle authority is required by this fixture")
+		runtimeProof, proofErr := releases.ProveRuntimeGeneration(leaseUUID)
+		require.NoError(t, proofErr)
+		runtimePermit, permitErr := b.callbackPublisher.AuthorizeRuntimeObservationContext(
+			context.Background(), runtimeProof,
+		)
+		require.NoError(t, permitErr)
+		require.NoError(t, b.callbackPublisher.PublishLifecycleFailureContext(
+			context.Background(), runtimePermit, "earlier observation",
+		))
+	}
+	source, sourceClaim, err := b.maintenanceSettlement.ClaimLatestActive(leaseUUID)
 	require.NoError(t, err)
 	target := source
 	target.Version = 0
@@ -194,52 +290,67 @@ func newMaintenanceRecoveryHarnessForAuthorityAtCallback(
 		require.NoError(t, authorityErr)
 		target.LegacyRuntimeAuthority = &targetAuthority
 	}
-	admission, err := callbacks.BeginMaintenanceIntent(shared.MaintenanceIntentSpec{
-		Kind:             kind,
-		SourceRelease:    sourceClaim,
-		TargetRelease:    target,
-		Backend:          b.Name(),
-		BackendStorageID: b.storageIdentity,
-	})
+	payload := []byte(nil)
+	if kind != shared.MaintenanceIntentRestart {
+		payload = target.Manifest
+	}
+	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
+		mustParseMaintenanceID(t, uuid.NewString()), kind, leaseUUID,
+		mustDockerReleaseRuntimeIdentity(t, target).LifecycleCallbackURL(),
+		payload,
+	)
 	require.NoError(t, err)
-	appendClaim, err := callbacks.StartMaintenanceAppend(admission)
+	candidate, err := b.maintenanceSettlement.NewMaintenanceIntentCandidate(request, sourceClaim, target)
+	require.NoError(t, err)
+	admission, err := b.maintenanceSettlement.BeginMaintenanceIntent(candidate)
+	require.NoError(t, err)
+	appendClaim, err := b.maintenanceSettlement.StartMaintenanceAppend(
+		createdTestMaintenanceDispatch(t, admission),
+	)
 	require.NoError(t, err)
 	intent := appendClaim.Intent()
 
 	harness := &maintenanceRecoveryHarness{
-		t:            t,
-		b:            b,
-		inventory:    inventory,
-		leaseUUID:    leaseUUID,
-		releasePath:  releasePath,
-		callbackPath: callbackPath,
-		releases:     releases,
-		callbacks:    callbacks,
-		source:       source,
-		sourceClaim:  sourceClaim,
-		intent:       intent,
-		appendClaim:  appendClaim,
+		t:             t,
+		b:             b,
+		inventory:     inventory,
+		leaseUUID:     leaseUUID,
+		releasePath:   releasePath,
+		callbackPath:  callbackPath,
+		retentionPath: retentionPath,
+		releases:      releases,
+		callbacks:     callbacks,
+		retentions:    retentions,
+		operations:    operations,
+		source:        source,
+		sourceClaim:   sourceClaim,
+		intent:        intent,
+		appendClaim:   appendClaim,
 	}
 	t.Cleanup(func() {
 		b.stopCancel()
 		require.NoError(t, harness.callbacks.Close())
 		require.NoError(t, harness.releases.Close())
+		require.NoError(t, harness.retentions.Close())
 	})
 	return harness
 }
 
 func (h *maintenanceRecoveryHarness) appendTarget(bind bool) {
 	h.t.Helper()
-	target, err := h.releases.AppendMaintenance(h.appendClaim)
+	target, err := h.b.maintenanceSettlement.AppendMaintenance(h.appendClaim)
 	require.NoError(h.t, err)
 	h.target = target
-	targetRelease, _, found, err := h.releases.FindMaintenanceRelease(h.leaseUUID, h.intent.MaintenanceID())
+	targetRelease, _, found, err := h.b.maintenanceSettlement.FindMaintenanceRelease(
+		h.leaseUUID, h.intent.MaintenanceID(),
+	)
 	require.NoError(h.t, err)
 	require.True(h.t, found)
 	h.targetRelease = targetRelease
 	if bind {
-		h.intent, err = h.callbacks.BindMaintenanceIntentTarget(h.intent, target)
+		h.target, err = h.b.maintenanceSettlement.BindMaintenanceIntentTarget(target)
 		require.NoError(h.t, err)
+		h.intent = h.target.Intent()
 	}
 }
 
@@ -247,13 +358,45 @@ func (h *maintenanceRecoveryHarness) reopen() {
 	h.t.Helper()
 	require.NoError(h.t, h.callbacks.Close())
 	require.NoError(h.t, h.releases.Close())
-	var err error
-	h.releases, err = shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: h.releasePath})
+	require.NoError(h.t, h.retentions.Close())
+	dockerClient, volumes := fullStorageClientsForTest(h.b)
+	storage, err := (testDockerStorageIdentity{}).resolve(
+		context.Background(), h.b.cfg, dockerClient, volumes,
+	)
 	require.NoError(h.t, err)
-	h.callbacks, err = shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: h.callbackPath})
+	h.releases, err = shared.OpenIdentityBoundReleaseStore(
+		shared.ReleaseStoreConfig{DBPath: h.releasePath}, storage, h.b.storeAuthorityGate,
+	)
+	require.NoError(h.t, err)
+	h.callbacks, err = shared.OpenIdentityBoundCallbackStore(
+		shared.CallbackStoreConfig{DBPath: h.callbackPath}, storage, h.b.storeAuthorityGate,
+	)
+	require.NoError(h.t, err)
+	h.retentions, err = shared.OpenIdentityBoundRetentionStore(
+		shared.RetentionStoreConfig{DBPath: h.retentionPath}, storage, h.b.storeAuthorityGate,
+	)
 	require.NoError(h.t, err)
 	h.b.releaseStore = h.releases
 	h.b.callbackStore = h.callbacks
+	h.b.retentionStore = h.retentions
+	h.operations, err = shared.NewOperationSettlement(h.callbacks, h.releases)
+	require.NoError(h.t, err)
+	h.b.operationSettlement = h.operations
+	h.b.restoreSettlement, err = shared.NewRestoreSettlement(h.operations, h.retentions)
+	require.NoError(h.t, err)
+	h.b.maintenanceSettlement, err = shared.NewMaintenanceSettlement(h.callbacks, h.releases)
+	require.NoError(h.t, err)
+	h.b.closeSettlement, err = shared.NewCloseSettlement(h.callbacks, h.releases, h.retentions)
+	require.NoError(h.t, err)
+	h.b.releaseCapacityPlanner = h.b.operationSettlement
+	h.b.storageIdentity = storage.ID()
+	h.b.storageAuthority = storage
+	h.b.storageVerifier = testDockerRuntimeStorageVerifier{id: storage.ID()}
+	require.NoError(h.t, bindBackendTestPhysicalExecutors(
+		h.b, h.operations, h.b.maintenanceSettlement,
+	))
+	bindBackendRecoveryCoordinatorForTest(h.t, h.b)
+	rebuildCallbackSender(h.b, testCallbackClient)
 }
 
 func (h *maintenanceRecoveryHarness) containersFor(release shared.Release, count int, status string, health HealthStatus) []ContainerInfo {
@@ -287,7 +430,7 @@ func (h *maintenanceRecoveryHarness) containersFor(release shared.Release, count
 
 func (h *maintenanceRecoveryHarness) assertSettled(status backend.CallbackStatus) {
 	h.t.Helper()
-	intents, err := h.callbacks.ListMaintenanceIntents()
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 	require.NoError(h.t, err)
 	assert.Empty(h.t, intents)
 	pending, err := h.callbacks.ListPending()
@@ -299,7 +442,7 @@ func (h *maintenanceRecoveryHarness) assertSettled(status backend.CallbackStatus
 
 func (h *maintenanceRecoveryHarness) assertCommittedRuntimeFailureSettled() {
 	h.t.Helper()
-	intents, err := h.callbacks.ListMaintenanceIntents()
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 	require.NoError(h.t, err)
 	assert.Empty(h.t, intents)
 	pending, err := h.callbacks.ListPending()
@@ -326,29 +469,35 @@ func TestRecoverMaintenanceIntentAcrossEveryDurableCrashBoundary(t *testing.T) {
 		assert.Empty(t, active.MaintenanceID)
 	})
 
-	for _, bind := range []bool{false, true} {
-		name := "append before bind"
-		if bind {
-			name = "bound deploying target"
-		}
-		t.Run(name+" exact cohort commits success", func(t *testing.T) {
-			h := newMaintenanceRecoveryHarness(t)
-			h.appendTarget(bind)
-			h.inventory.containers = h.containersFor(h.targetRelease, 2, "running", HealthStatusNone)
-			h.reopen()
-			require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
-			h.assertSettled(backend.CallbackStatusSuccess)
-			active, err := h.releases.LatestActive(h.leaseUUID)
-			require.NoError(t, err)
-			require.NotNil(t, active)
-			assert.Equal(t, h.intent.MaintenanceID(), active.MaintenanceID)
-		})
-	}
+	t.Run("append before bind resolves failure without physical authority", func(t *testing.T) {
+		h := newMaintenanceRecoveryHarness(t)
+		h.appendTarget(false)
+		h.inventory.containers = h.containersFor(h.source, 2, "running", HealthStatusNone)
+		h.reopen()
+		require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+		h.assertSettled(backend.CallbackStatusFailed)
+	})
+
+	t.Run("started deploying target exact cohort commits success", func(t *testing.T) {
+		h := newMaintenanceRecoveryHarness(t)
+		h.appendTarget(true)
+		_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+		require.NoError(t, err)
+		h.inventory.containers = h.containersFor(h.targetRelease, 2, "running", HealthStatusNone)
+		h.reopen()
+		require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+		h.assertSettled(backend.CallbackStatusSuccess)
+		active, err := h.releases.LatestActive(h.leaseUUID)
+		require.NoError(t, err)
+		require.NotNil(t, active)
+		assert.Equal(t, h.intent.MaintenanceID(), active.MaintenanceID)
+	})
 
 	t.Run("active target with zero survivors preserves success then reports runtime failure", func(t *testing.T) {
 		h := newMaintenanceRecoveryHarness(t)
 		h.appendTarget(true)
-		require.NoError(t, h.releases.ActivateMaintenance(h.target))
+		_, err := activateMaintenanceForTest(t, h.b.maintenanceSettlement, h.target)
+		require.NoError(t, err)
 		h.reopen()
 		require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
 		h.assertCommittedRuntimeFailureSettled()
@@ -359,6 +508,78 @@ func TestRecoverMaintenanceIntentAcrossEveryDurableCrashBoundary(t *testing.T) {
 	})
 }
 
+func TestRecoverStartedMaintenanceDefersYoungNonterminalInventory(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		source bool
+	}{
+		{name: "empty"},
+		{name: "source only", source: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newMaintenanceRecoveryHarness(t)
+			h.appendTarget(true)
+			_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+			require.NoError(t, err)
+			if test.source {
+				h.inventory.containers = h.containersFor(
+					h.source, 2, "running", HealthStatusNone,
+				)
+			}
+			h.reopen()
+
+			require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+			intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
+			require.NoError(t, err)
+			require.Len(t, intents, 1)
+			pending, err := h.callbacks.ListPending()
+			require.NoError(t, err)
+			assert.Empty(t, pending)
+			assert.Empty(t, h.inventory.removed)
+
+			// A target which becomes visible on the next level-triggered pass is
+			// committed, rather than being deleted by the first incomplete view.
+			h.inventory.containers = h.containersFor(
+				h.targetRelease, 2, "running", HealthStatusNone,
+			)
+			require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+			h.assertSettled(backend.CallbackStatusSuccess)
+		})
+	}
+}
+
+func TestFailedMaintenanceReceiptRemovesLateExactTarget(t *testing.T) {
+	h := newMaintenanceRecoveryHarness(t)
+	h.appendTarget(true)
+	_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+	require.NoError(t, err)
+	h.b.cfg.ProvisionTimeout = time.Nanosecond
+	source := h.containersFor(h.source, 2, "running", HealthStatusNone)
+	h.inventory.containers = slices.Clone(source)
+	h.reopen()
+
+	require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+	h.assertSettled(backend.CallbackStatusFailed)
+	receipts, err := h.b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	require.NoError(t, err)
+	require.Len(t, receipts, 1)
+	acknowledgePendingCallbacksForTest(t, h.callbacks)
+
+	late := h.containersFor(h.targetRelease, 1, "running", HealthStatusNone)
+	h.inventory.containers = append(h.inventory.containers, late...)
+	require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
+	assert.Equal(t, []string{late[0].ContainerID}, h.inventory.removed)
+	remaining, err := h.inventory.list(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, source, remaining)
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
+	require.NoError(t, err)
+	assert.Empty(t, intents)
+	pending, err := h.callbacks.ListPending()
+	require.NoError(t, err)
+	assert.Empty(t, pending)
+}
+
 func TestRecoverLegacyMaintenanceTargetAcrossColdRestart(t *testing.T) {
 	for _, kind := range []shared.MaintenanceIntentKind{
 		shared.MaintenanceIntentRestart,
@@ -367,7 +588,9 @@ func TestRecoverLegacyMaintenanceTargetAcrossColdRestart(t *testing.T) {
 	} {
 		t.Run(string(kind), func(t *testing.T) {
 			h := newLegacyMaintenanceRecoveryHarnessForKind(t, kind)
-			h.appendTarget(false)
+			h.appendTarget(true)
+			_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+			require.NoError(t, err)
 			h.inventory.containers = h.containersFor(
 				h.targetRelease, 2, "running", HealthStatusNone,
 			)
@@ -379,7 +602,7 @@ func TestRecoverLegacyMaintenanceTargetAcrossColdRestart(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, active)
 			assert.Equal(t, h.intent.MaintenanceID(), active.MaintenanceID)
-			assert.Empty(t, active.OperationID)
+			assert.True(t, active.OperationID.IsZero())
 			assert.Nil(t, active.RuntimeAuthority)
 			require.NotNil(t, active.LegacyRuntimeAuthority)
 			assert.Equal(t, shared.ReleaseAuthorityLegacy,
@@ -393,7 +616,9 @@ func TestRecoverLegacyMaintenanceCallbackBaseAcrossColdRestart(t *testing.T) {
 	h := newLegacyMaintenanceRecoveryHarnessForKindAtCallback(
 		t, shared.MaintenanceIntentRestart, movedCallbackURL,
 	)
-	h.appendTarget(false)
+	h.appendTarget(true)
+	_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+	require.NoError(t, err)
 	h.inventory.containers = h.containersFor(
 		h.targetRelease, 2, "running", HealthStatusNone,
 	)
@@ -418,7 +643,7 @@ func TestRecoverLegacyMaintenanceCallbackBaseAcrossColdRestart(t *testing.T) {
 	assert.Equal(t, movedCallbackURL, activeAuthority.CallbackURL())
 	assert.Equal(t, movedCallbackURL, activeAuthority.LifecycleCallbackURL())
 	assert.Equal(t, h.intent.MaintenanceID(), active.MaintenanceID)
-	assert.Empty(t, active.OperationID)
+	assert.True(t, active.OperationID.IsZero())
 	assert.Nil(t, active.RuntimeAuthority)
 
 	h.b.provisionsMu.RLock()
@@ -443,9 +668,12 @@ func mustDockerReleaseRuntimeIdentity(
 func TestRecoverMaintenancePreservesUpdateImagePullFailurePolicy(t *testing.T) {
 	h := newMaintenanceRecoveryHarnessForKind(t, shared.MaintenanceIntentUpdate)
 	h.appendTarget(true)
-	require.NoError(t, h.releases.FailMaintenance(
-		h.target, backend.ReasonImagePullFailed, backend.MsgImagePullFailed,
-	))
+	_, err := failMaintenanceForTest(
+		t, h.b.maintenanceSettlement, h.target,
+		backend.ReasonImagePullFailed, backend.MsgImagePullFailed, false,
+	)
+
+	require.NoError(t, err)
 	h.inventory.containers = h.containersFor(h.source, 2, "running", HealthStatusNone)
 	h.reopen()
 
@@ -455,7 +683,9 @@ func TestRecoverMaintenancePreservesUpdateImagePullFailurePolicy(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 	assert.Equal(t, backend.MsgImagePullFailed, pending[0].Error)
-	projected, found := h.b.provisionStore.Get(h.leaseUUID)
+	h.b.provisionsMu.RLock()
+	projected, found := h.b.provisions[h.leaseUUID]
+	h.b.provisionsMu.RUnlock()
 	require.True(t, found)
 	assert.Equal(t, backend.ProvisionStatusFailed, projected.Status)
 	assert.Equal(t, backend.ReasonImagePullFailed, projected.Reason)
@@ -465,7 +695,7 @@ func TestRecoverMaintenancePreservesUpdateImagePullFailurePolicy(t *testing.T) {
 }
 
 func TestRecoverMaintenanceSettlesWhileLeaseCallbackDeliveryIsSlow(t *testing.T) {
-	h := newMaintenanceRecoveryHarness(t)
+	h := newMaintenanceRecoveryHarnessWithPriorLifecycleCallback(t)
 	h.inventory.containers = h.containersFor(h.source, 2, "running", HealthStatusNone)
 	requestStarted := make(chan struct{})
 	releaseRequest := make(chan struct{})
@@ -486,32 +716,26 @@ func TestRecoverMaintenanceSettlesWhileLeaseCallbackDeliveryIsSlow(t *testing.T)
 			return nil, req.Context().Err()
 		}
 	})}
+	attestor := callbackStorageAttestorForTest(
+		t, h.callbacks, stopCtx, allowTestCallbackDelivery,
+	)
 	sender, err := shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:           h.callbacks,
+		StorageAttestor: attestor,
 		HTTPClient:      client,
 		Secret:          durableCallbackTestSecret,
-		StorageIdentity: h.b.storageIdentity,
-		BeforeDelivery:  allowTestCallbackDelivery,
-		BeforeReplay:    allowTestCallbackDelivery,
 		Logger:          h.b.logger,
-		StopCtx:         stopCtx,
+
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: time.Second,
 	})
 	require.NoError(t, err)
-	sender.SendLifecycleCallback(
-		h.leaseUUID,
-		h.intent.LifecycleCallbackURL(),
-		h.b.Name(),
-		backend.CallbackStatusFailed,
-		"earlier observation",
-		false,
-	)
 	replayDone := make(chan struct{})
 	go func() {
 		defer close(replayDone)
-		sender.ReplayPendingCallbacks()
+		sender.RunReplayLoop()
 	}()
+	sender.NotifyPendingCallbacks()
 	select {
 	case <-requestStarted:
 	case <-time.After(time.Second):
@@ -526,7 +750,7 @@ func TestRecoverMaintenanceSettlesWhileLeaseCallbackDeliveryIsSlow(t *testing.T)
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("maintenance recovery blocked behind callback HTTP")
 	}
-	intents, err := h.callbacks.ListMaintenanceIntents()
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 	require.NoError(t, err)
 	assert.Empty(t, intents, "settlement must consume the WAL without waiting for callback HTTP")
 	pending, err := h.callbacks.ListPending()
@@ -538,6 +762,11 @@ func TestRecoverMaintenanceSettlesWhileLeaseCallbackDeliveryIsSlow(t *testing.T)
 	assert.Less(t, pending[0].Sequence, pending[1].Sequence)
 
 	close(releaseRequest)
+	require.Eventually(t, func() bool {
+		remaining, listErr := h.callbacks.ListPending()
+		return listErr == nil && len(remaining) == 0
+	}, time.Second, time.Millisecond)
+	cancel()
 	select {
 	case <-replayDone:
 	case <-time.After(time.Second):
@@ -548,9 +777,11 @@ func TestRecoverMaintenanceSettlesWhileLeaseCallbackDeliveryIsSlow(t *testing.T)
 	assert.Empty(t, pending)
 }
 
-func TestRecoverMaintenanceBindsTargetWhileLeaseCallbackDeliveryIsSlow(t *testing.T) {
-	h := newMaintenanceRecoveryHarness(t)
-	h.appendTarget(false)
+func TestRecoverMaintenanceSuccessWhileLeaseCallbackDeliveryIsSlow(t *testing.T) {
+	h := newMaintenanceRecoveryHarnessWithPriorLifecycleCallback(t)
+	h.appendTarget(true)
+	_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+	require.NoError(t, err)
 	h.inventory.containers = h.containersFor(h.targetRelease, 2, "running", HealthStatusNone)
 	requestStarted := make(chan struct{})
 	releaseRequest := make(chan struct{})
@@ -571,32 +802,26 @@ func TestRecoverMaintenanceBindsTargetWhileLeaseCallbackDeliveryIsSlow(t *testin
 			return nil, req.Context().Err()
 		}
 	})}
+	attestor := callbackStorageAttestorForTest(
+		t, h.callbacks, stopCtx, allowTestCallbackDelivery,
+	)
 	sender, err := shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:           h.callbacks,
+		StorageAttestor: attestor,
 		HTTPClient:      client,
 		Secret:          durableCallbackTestSecret,
-		StorageIdentity: h.b.storageIdentity,
-		BeforeDelivery:  allowTestCallbackDelivery,
-		BeforeReplay:    allowTestCallbackDelivery,
 		Logger:          h.b.logger,
-		StopCtx:         stopCtx,
+
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: time.Second,
 	})
 	require.NoError(t, err)
-	sender.SendLifecycleCallback(
-		h.leaseUUID,
-		h.intent.LifecycleCallbackURL(),
-		h.b.Name(),
-		backend.CallbackStatusFailed,
-		"earlier observation",
-		false,
-	)
 	replayDone := make(chan struct{})
 	go func() {
 		defer close(replayDone)
-		sender.ReplayPendingCallbacks()
+		sender.RunReplayLoop()
 	}()
+	sender.NotifyPendingCallbacks()
 	select {
 	case <-requestStarted:
 	case <-time.After(time.Second):
@@ -611,15 +836,20 @@ func TestRecoverMaintenanceBindsTargetWhileLeaseCallbackDeliveryIsSlow(t *testin
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("maintenance target binding blocked behind callback HTTP")
 	}
-	stored, found, err := h.callbacks.GetMaintenanceIntent(h.leaseUUID)
+	stored, found, err := h.b.maintenanceSettlement.GetMaintenanceIntent(h.leaseUUID)
 	require.NoError(t, err)
 	assert.False(t, found, "successful binding and settlement must consume the WAL")
 	assert.False(t, stored.Valid())
-	targetRelease, _, found, err := h.releases.FindMaintenanceRelease(
-		h.leaseUUID, h.intent.MaintenanceID(),
-	)
+	history, err := h.releases.List(h.leaseUUID)
 	require.NoError(t, err)
-	require.True(t, found)
+	var targetRelease shared.Release
+	for _, release := range history {
+		if release.MaintenanceID == h.intent.MaintenanceID() {
+			targetRelease = release
+			break
+		}
+	}
+	require.Equal(t, h.intent.MaintenanceID(), targetRelease.MaintenanceID)
 	assert.Equal(t, "active", targetRelease.Status)
 	pending, err := h.callbacks.ListPending()
 	require.NoError(t, err)
@@ -630,6 +860,11 @@ func TestRecoverMaintenanceBindsTargetWhileLeaseCallbackDeliveryIsSlow(t *testin
 	assert.Less(t, pending[0].Sequence, pending[1].Sequence)
 
 	close(releaseRequest)
+	require.Eventually(t, func() bool {
+		remaining, listErr := h.callbacks.ListPending()
+		return listErr == nil && len(remaining) == 0
+	}, time.Second, time.Millisecond)
+	cancel()
 	select {
 	case <-replayDone:
 	case <-time.After(time.Second):
@@ -647,6 +882,9 @@ func TestRecoverMaintenanceBindsTargetWhileLeaseCallbackDeliveryIsSlow(t *testin
 func TestRecoverMaintenancePartialTargetRemovesOnlyExactGeneration(t *testing.T) {
 	h := newMaintenanceRecoveryHarness(t)
 	h.appendTarget(true)
+	_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+	require.NoError(t, err)
+	h.b.cfg.ProvisionTimeout = time.Nanosecond
 	sourceSurvivor := h.containersFor(h.source, 1, "running", HealthStatusNone)
 	targetSurvivor := h.containersFor(h.targetRelease, 1, "running", HealthStatusNone)
 	h.inventory.containers = append(sourceSurvivor, targetSurvivor...)
@@ -668,6 +906,9 @@ func TestRecoverMaintenancePartialTargetRemovesOnlyExactGeneration(t *testing.T)
 func TestRecoverMaintenancePreservesWALWhenSourceReadinessIsIndeterminate(t *testing.T) {
 	h := newMaintenanceRecoveryHarness(t)
 	h.appendTarget(true)
+	_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+	require.NoError(t, err)
+	h.b.cfg.ProvisionTimeout = time.Nanosecond
 	source := h.containersFor(h.source, 2, "running", HealthStatusNone)
 	target := h.containersFor(h.targetRelease, 1, "running", HealthStatusNone)
 	h.inventory.containers = append(slices.Clone(source), target...)
@@ -676,20 +917,21 @@ func TestRecoverMaintenancePreservesWALWhenSourceReadinessIsIndeterminate(t *tes
 	}
 	h.reopen()
 
-	require.ErrorContains(t, h.b.recoverMaintenanceIntents(t.Context()), "source readiness is indeterminate")
-	intents, err := h.callbacks.ListMaintenanceIntents()
+	require.ErrorContains(t, h.b.recoverMaintenanceIntents(t.Context()), "source inspect transport failed")
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 	require.NoError(t, err)
 	require.Len(t, intents, 1)
 	pending, err := h.callbacks.ListPending()
 	require.NoError(t, err)
 	assert.Empty(t, pending)
 	assert.Equal(t, []string{target[0].ContainerID}, h.inventory.removed)
-	release, _, found, err := h.releases.FindMaintenanceRelease(
+	release, _, found, err := h.b.maintenanceSettlement.FindMaintenanceRelease(
 		h.leaseUUID, h.intent.MaintenanceID(),
 	)
 	require.NoError(t, err)
 	require.True(t, found)
-	assert.Equal(t, "failed", release.Status)
+	assert.Equal(t, "deploying", release.Status,
+		"an indeterminate post-cleanup classification must not mint terminal failure authority")
 
 	h.inventory.inspectErrFor = nil
 	require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
@@ -711,15 +953,24 @@ func TestRecoverMaintenanceFailsClosedOnUnreadableOrDivergentTarget(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			h := newMaintenanceRecoveryHarness(t)
 			h.appendTarget(true)
-			h.inventory.containers = h.containersFor(h.targetRelease, 1, "running", HealthStatusNone)
+			_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+			require.NoError(t, err)
+			h.b.cfg.ProvisionTimeout = time.Nanosecond
+			count := 1
+			if test.name == "inspect unreadable" {
+				count = 2
+			}
+			h.inventory.containers = h.containersFor(h.targetRelease, count, "running", HealthStatusNone)
 			test.mutate(h)
 			h.reopen()
 			require.Error(t, h.b.recoverMaintenanceIntents(t.Context()))
-			intents, err := h.callbacks.ListMaintenanceIntents()
+			intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 			require.NoError(t, err)
 			require.Len(t, intents, 1)
 			assert.Empty(t, h.inventory.removed)
-			release, _, found, err := h.releases.FindMaintenanceRelease(h.leaseUUID, h.intent.MaintenanceID())
+			release, _, found, err := h.b.maintenanceSettlement.FindMaintenanceRelease(
+				h.leaseUUID, h.intent.MaintenanceID(),
+			)
 			require.NoError(t, err)
 			require.True(t, found)
 			assert.Equal(t, "deploying", release.Status)
@@ -741,34 +992,32 @@ func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 		Status:               backend.ProvisionStatusReady,
 		CallbackURL:          h.source.RuntimeAuthority.CallbackURL(),
 		LifecycleCallbackURL: h.source.RuntimeAuthority.LifecycleCallbackURL(),
+		ActiveOperationID:    h.source.OperationID,
 		Items:                slices.Clone(h.source.Items),
+		ResourceProfiles:     shared.CloneSKUResourceSnapshot(h.source.ResourceProfiles),
 		StackManifest:        h.targetReleaseStack(),
-	}, ResourceProfiles: shared.CloneSKUResourceSnapshot(h.source.ResourceProfiles)}
+	}}
 
 	workerRelease := make(chan struct{})
-	ack := make(chan error, 1)
-	require.NoError(t, h.b.routeToLeaseBlocking(t.Context(), h.leaseUUID, leasesm.RestartRequestedMsg{
-		Cancel:               func() {},
-		CallbackURL:          h.intent.CallbackURL(),
-		LifecycleCallbackURL: h.intent.LifecycleCallbackURL(),
-		Maintenance:          h.intent,
-		Ack:                  ack,
-		Work: func() leasesm.ReplaceResult {
-			<-workerRelease
-			return leasesm.ReplaceResult{
-				Err: errors.New("simulated terminal settlement drop"),
-				Failure: leasesm.ReplaceFailureInfo{
-					Operation: "restart", CallbackErr: "restart interrupted",
-					LastError: "restart interrupted", PreserveMaintenance: true,
-				},
-			}
-		},
-	}))
-	require.NoError(t, <-ack)
+	workerStarted := make(chan struct{}, 1)
+	cleanup := registerMaintenanceExecutionForTest(
+		t, h.b.maintenanceSettlement, h.target,
+		maintenanceSeedAmbiguous, workerStarted, workerRelease,
+	)
+	defer cleanup()
+	command, reply, err := leasesm.NewRestartCommand(t.Context(), h.target)
+	require.NoError(t, err)
+	require.NoError(t, h.b.routeToLeaseBlocking(t.Context(), h.leaseUUID, command))
+	require.NoError(t, <-reply.Result())
+	select {
+	case <-workerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("construction-bound maintenance worker did not start")
+	}
 	require.True(t, h.b.actorOwnsMaintenance(h.leaseUUID, h.intent.MaintenanceID()))
 
 	require.NoError(t, h.b.RefreshState(t.Context()))
-	intents, err := h.callbacks.ListMaintenanceIntents()
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 	require.NoError(t, err)
 	require.Len(t, intents, 1)
 	assert.Empty(t, h.inventory.removed)
@@ -781,10 +1030,13 @@ func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 	require.Eventually(t, func() bool {
 		return !h.b.actorOwnsMaintenance(h.leaseUUID, h.intent.MaintenanceID())
 	}, time.Second, time.Millisecond)
+	h.b.cfg.ProvisionTimeout = time.Nanosecond
 	require.NoError(t, h.b.RefreshState(t.Context()))
 	h.assertSettled(backend.CallbackStatusFailed)
-	require.Equal(t, backend.ProvisionStatusReady, h.b.actors[h.leaseUUID].State())
-	projected, found := h.b.provisionStore.Get(h.leaseUUID)
+	require.Equal(t, backend.ProvisionStatusReady, h.b.actorFor(h.leaseUUID).State())
+	h.b.provisionsMu.RLock()
+	projected, found := h.b.provisions[h.leaseUUID]
+	h.b.provisionsMu.RUnlock()
 	require.True(t, found)
 	require.Equal(t, backend.ProvisionStatusReady, projected.Status)
 
@@ -794,92 +1046,35 @@ func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 	pending, err := h.callbacks.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
-	require.NoError(t, h.callbacks.RemoveEntry(pending[0]))
+	acknowledgePendingCallbacksForTest(t, h.callbacks)
 
 	// A subsequent exact maintenance command is then admitted by the same actor
 	// without a process restart.
-	_, sourceClaim, err := h.releases.ClaimLatestActive(h.leaseUUID)
+	_, sourceClaim, err := h.b.maintenanceSettlement.ClaimLatestActive(h.leaseUUID)
 	require.NoError(t, err)
 	template := h.intent.TargetRelease()
 	template.Version = 0
-	template.MaintenanceID = ""
+	template.MaintenanceID = shared.MaintenanceID{}
 	template.Status = "deploying"
 	template.CreatedAt = time.Now()
-	nextIntent, _, err := h.b.admitMaintenance(shared.MaintenanceIntentRestart, sourceClaim, template)
+	nextID := mustParseMaintenanceID(t, uuid.NewString())
+	nextRequest, err := h.b.maintenanceSettlement.NewMaintenanceRequestAuthority(
+		nextID, shared.MaintenanceIntentRestart, h.leaseUUID,
+		h.intent.LifecycleCallbackURL(), nil,
+	)
 	require.NoError(t, err)
-	nextAck := make(chan error, 1)
-	require.NoError(t, h.b.routeToLeaseBlocking(t.Context(), h.leaseUUID, leasesm.RestartRequestedMsg{
-		Cancel:               func() {},
-		CallbackURL:          nextIntent.CallbackURL(),
-		LifecycleCallbackURL: nextIntent.LifecycleCallbackURL(),
-		Maintenance:          nextIntent,
-		Ack:                  nextAck,
-		Work: func() leasesm.ReplaceResult {
-			return leasesm.ReplaceResult{Err: errors.New("test cleanup"), Failure: leasesm.ReplaceFailureInfo{
-				Operation: "restart", PreserveMaintenance: true,
-			}}
-		},
-	}))
-	require.NoError(t, <-nextAck)
-}
-
-func TestRecoverCommittedMaintenancePromotesTargetProfilesThroughLiveActor(t *testing.T) {
-	h := newMaintenanceRecoveryHarness(t)
-	h.appendTarget(true)
-	h.inventory.containers = h.containersFor(h.targetRelease, 2, "running", HealthStatusNone)
-	staleProfiles := shared.CloneSKUResourceSnapshot(h.source.ResourceProfiles)
-	staleProfiles[0].CPUCores += 99
-	h.b.provisions[h.leaseUUID] = &provision{
-		ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:            h.leaseUUID,
-			Tenant:               h.source.RuntimeAuthority.Tenant(),
-			ProviderUUID:         h.source.RuntimeAuthority.ProviderUUID(),
-			Status:               backend.ProvisionStatusReady,
-			CallbackURL:          h.source.RuntimeAuthority.CallbackURL(),
-			LifecycleCallbackURL: h.source.RuntimeAuthority.LifecycleCallbackURL(),
-			Items:                slices.Clone(h.source.Items),
-			StackManifest:        h.targetReleaseStack(),
-		},
-		ResourceProfiles: staleProfiles,
-	}
-
-	workerRelease := make(chan struct{})
-	ack := make(chan error, 1)
-	require.NoError(t, h.b.routeToLeaseBlocking(t.Context(), h.leaseUUID, leasesm.RestartRequestedMsg{
-		Cancel:               func() {},
-		CallbackURL:          h.intent.CallbackURL(),
-		LifecycleCallbackURL: h.intent.LifecycleCallbackURL(),
-		Maintenance:          h.intent,
-		Ack:                  ack,
-		Work: func() leasesm.ReplaceResult {
-			<-workerRelease
-			return leasesm.ReplaceResult{
-				Err: errors.New("ambiguous activation acknowledgement"),
-				Failure: leasesm.ReplaceFailureInfo{
-					Operation: "restart", CallbackErr: "restart failed",
-					LastError: "ambiguous activation acknowledgement", PreserveMaintenance: true,
-				},
-			}
-		},
-	}))
-	require.NoError(t, <-ack)
-	require.NoError(t, h.releases.ActivateMaintenance(h.target))
-	close(workerRelease)
-	require.Eventually(t, func() bool {
-		return !h.b.actorOwnsMaintenance(h.leaseUUID, h.intent.MaintenanceID()) &&
-			h.b.actors[h.leaseUUID].State() == backend.ProvisionStatusFailed
-	}, time.Second, time.Millisecond)
-
-	require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
-	h.assertSettled(backend.CallbackStatusSuccess)
-	require.Equal(t, backend.ProvisionStatusReady, h.b.actors[h.leaseUUID].State())
-	h.b.provisionsMu.RLock()
-	projected := h.b.provisions[h.leaseUUID]
-	require.NotNil(t, projected)
-	assert.Equal(t, h.targetRelease.ResourceProfiles, projected.ResourceProfiles)
-	assert.Equal(t, h.targetRelease.ResourceProfiles, projected.ProvisionState.ResourceProfiles)
-	assert.Equal(t, h.targetRelease.Items, projected.Items)
-	h.b.provisionsMu.RUnlock()
+	nextAdmission, err := h.b.admitMaintenance(nextRequest, sourceClaim, template)
+	require.NoError(t, err)
+	require.True(t, nextAdmission.created())
+	nextCleanup := registerMaintenanceExecutionForTest(
+		t, h.b.maintenanceSettlement, nextAdmission.target,
+		maintenanceSeedAmbiguous, nil, nil,
+	)
+	defer nextCleanup()
+	command, reply, err = leasesm.NewRestartCommand(t.Context(), nextAdmission.target)
+	require.NoError(t, err)
+	require.NoError(t, h.b.routeToLeaseBlocking(t.Context(), h.leaseUUID, command))
+	require.NoError(t, <-reply.Result())
 }
 
 func (h *maintenanceRecoveryHarness) targetReleaseStack() *manifest.StackManifest {
@@ -901,6 +1096,9 @@ func TestRecoverMaintenanceDoesNotActivateUnreadyExactCohort(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			h := newMaintenanceRecoveryHarness(t)
 			h.appendTarget(true)
+			_, err := h.b.maintenanceSettlement.StartMaintenanceExecution(h.target)
+			require.NoError(t, err)
+			h.b.cfg.ProvisionTimeout = time.Nanosecond
 			h.inventory.containers = h.containersFor(h.targetRelease, 2, test.status, test.health)
 			h.reopen()
 			require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
@@ -917,13 +1115,14 @@ func TestRecoverMaintenanceDoesNotActivateUnreadyExactCohort(t *testing.T) {
 func TestRecoverActiveMaintenancePreservesWALOnIndeterminateReadiness(t *testing.T) {
 	h := newMaintenanceRecoveryHarness(t)
 	h.appendTarget(true)
-	require.NoError(t, h.releases.ActivateMaintenance(h.target))
+	_, err := activateMaintenanceForTest(t, h.b.maintenanceSettlement, h.target)
+	require.NoError(t, err)
 	h.inventory.containers = h.containersFor(h.targetRelease, 2, "running", HealthStatusNone)
 	h.inventory.inspectErr = errors.New("docker inspect transport failed")
 	h.reopen()
 
 	require.ErrorContains(t, h.b.recoverMaintenanceIntents(t.Context()), "readiness is indeterminate")
-	intents, err := h.callbacks.ListMaintenanceIntents()
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 	require.NoError(t, err)
 	require.Len(t, intents, 1)
 	pending, err := h.callbacks.ListPending()

@@ -4,14 +4,12 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
@@ -41,47 +39,40 @@ func TestStart_PendingCallbackReplayDoesNotWaitForDelivery(t *testing.T) {
 		CloseFn: func() error { return nil },
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
-	dbPath := filepath.Join(t.TempDir(), "callbacks.db")
-	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: dbPath,
-	})
-	require.NoError(t, err)
-	b.cfg.CallbackDBPath = dbPath
-	for name, profile := range b.cfg.SKUProfiles {
-		profile.DiskMB = 0
-		b.cfg.SKUProfiles[name] = profile
-	}
-	id, err := initializeTestMarkerPair(
-		dbPath+".storage-identity.json",
-		dbPath+".storage-identity-anchor.json",
-		b.cfg.Name,
-		"test-daemon",
+	store := b.callbackStore
+	attestor := callbackStorageAttestorForTest(
+		t, store, b.stopCtx, b.VerifyStorageIdentity,
 	)
-	require.NoError(t, err)
-	b.storageIdentity = id
-	b.callbackStore = store
 	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
 		Store:           store,
+		StorageAttestor: attestor,
 		HTTPClient:      client,
 		Secret:          durableCallbackTestSecret,
-		StorageIdentity: id,
-		BeforeDelivery:  b.VerifyStorageIdentity,
-		BeforeReplay:    b.VerifyStorageIdentity,
 		Logger:          slog.Default(),
-		StopCtx:         b.stopCtx,
+
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: 2 * time.Second,
 	})
-	_, err = store.StoreEntry(shared.CallbackEntry{
-		LeaseUUID:        "550e8400-e29b-41d4-a716-446655440000",
-		CallbackURL:      "https://fred.example/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
-		DeliveryKind:     shared.CallbackDeliveryKindLifecycle,
-		Success:          false,
-		Status:           backend.CallbackStatusFailed,
-		BackendStorageID: id.String(),
-		CreatedAt:        time.Now(),
-	})
+	operations, ok := b.operationSettlement.(*shared.OperationSettlement)
+	require.True(t, ok)
+	maintenance, err := shared.NewMaintenanceSettlement(store, b.releaseStore)
 	require.NoError(t, err)
+	b.callbackPublisher = mustNewCallbackPublisherForTest(t, shared.CallbackPublisherConfig{
+		OperationSettlement:   operations,
+		MaintenanceSettlement: maintenance,
+		StorageAttestor:       attestor,
+		Logger:                slog.Default(),
+	})
+	spec := dockerOperationIntentSpec(t, b.storageIdentity)
+	candidate, err := operations.NewOperationIntentCandidate(spec)
+	require.NoError(t, err)
+	admission, err := operations.BeginOperationIntent(candidate)
+	require.NoError(t, err)
+	claim := createdDockerOperationClaim(t, admission)
+	proof := commitPreEffectOperationFailureForTest(t, operations, claim)
+	require.NoError(t, b.callbackPublisher.PublishOperationFailureContext(
+		context.Background(), proof, "test failure",
+	))
 
 	var stopOnce sync.Once
 	var stopErr error

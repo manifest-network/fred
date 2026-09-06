@@ -12,7 +12,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 )
 
-const releaseRuntimeAuthorityOperationID = OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+var releaseRuntimeAuthorityOperationID = mustSharedOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 
 func validReleaseRuntimeAuthority() *ReleaseRuntimeAuthority {
 	authority, err := NewReleaseRuntimeAuthority(
@@ -43,12 +43,12 @@ func validRuntimeAuthorityRelease() Release {
 }
 
 func TestReleaseStoreRuntimeAuthorityIsCompleteAndDeepCloned(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 	release := validRuntimeAuthorityRelease()
-	require.NoError(t, store.AppendActive(leaseUUID, release))
+	require.NoError(t, store.appendActive(leaseUUID, release))
 
 	release.RuntimeAuthority.tenant = "mutated-caller"
 	first, err := store.LatestActive(leaseUUID)
@@ -70,9 +70,9 @@ func TestReleaseStoreRejectsPartialOrMismatchedRuntimeAuthority(t *testing.T) {
 		mutate func(*Release)
 	}{
 		{name: "typed release without authority", mutate: func(r *Release) { r.RuntimeAuthority = nil }},
-		{name: "legacy release with authority", mutate: func(r *Release) { r.OperationID = "" }},
+		{name: "legacy release with authority", mutate: func(r *Release) { r.OperationID = OperationID{} }},
 		{name: "different authority token", mutate: func(r *Release) {
-			r.RuntimeAuthority.operationID = "9a72fbc1-38c8-4f31-87f7-f689979b9324"
+			r.RuntimeAuthority.operationID = mustSharedOperationID("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 		}},
 		{name: "invalid authority value", mutate: func(r *Release) {
 			r.RuntimeAuthority = &ReleaseRuntimeAuthority{}
@@ -80,12 +80,12 @@ func TestReleaseStoreRejectsPartialOrMismatchedRuntimeAuthority(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
+			store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, store.Close()) })
 			release := validRuntimeAuthorityRelease()
 			tt.mutate(&release)
-			require.Error(t, store.AppendActive("550e8400-e29b-41d4-a716-446655440000", release))
+			require.Error(t, store.appendActive("550e8400-e29b-41d4-a716-446655440000", release))
 		})
 	}
 }
@@ -145,6 +145,7 @@ func TestLegacyRuntimeAuthorityRequiresCanonicalProviderAndTokenlessCallbacks(t 
 func TestLegacyRuntimeAuthorityJSONRejectsNoncanonicalProvider(t *testing.T) {
 	var authority LegacyRuntimeAuthority
 	err := json.Unmarshal([]byte(`{
+		"schema_version":1,
 		"tenant":"tenant-a",
 		"provider_uuid":"provider-a",
 		"callback_url":"https://fred.example/callbacks/provision?route=v013",
@@ -155,7 +156,7 @@ func TestLegacyRuntimeAuthorityJSONRejectsNoncanonicalProvider(t *testing.T) {
 }
 
 func TestReleaseStoreRejectsInvalidLegacyRuntimeAuthority(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	items := []backend.LeaseItem{{SKU: "sku-a", ServiceName: "app", Quantity: 1}}
@@ -169,7 +170,7 @@ func TestReleaseStoreRejectsInvalidLegacyRuntimeAuthority(t *testing.T) {
 		CreatedAt:              time.Now(),
 	}
 
-	err = store.AppendActive("550e8400-e29b-41d4-a716-446655440000", release)
+	err = store.appendActive("550e8400-e29b-41d4-a716-446655440000", release)
 	require.ErrorContains(t, err, "legacy runtime authority is invalid")
 
 	release.LegacyRuntimeAuthority = &LegacyRuntimeAuthority{
@@ -179,23 +180,23 @@ func TestReleaseStoreRejectsInvalidLegacyRuntimeAuthority(t *testing.T) {
 		lifecycleCallbackURL: "https://fred.example/callbacks/provision?route=v013",
 		valid:                true,
 	}
-	err = store.AppendActive("550e8400-e29b-41d4-a716-446655440000", release)
+	err = store.appendActive("550e8400-e29b-41d4-a716-446655440000", release)
 	require.ErrorContains(t, err, "provider UUID is not canonical")
 }
 
 func TestReleaseHistoryWriteCeilingRollsBackAppend(t *testing.T) {
-	store, err := NewReleaseStore(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
+	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: t.TempDir() + "/releases.db"})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
-	require.NoError(t, store.AppendActive(leaseUUID, validRuntimeAuthorityRelease()))
+	require.NoError(t, store.appendActive(leaseUUID, validRuntimeAuthorityRelease()))
 	before, err := store.List(leaseUUID)
 	require.NoError(t, err)
 
 	oversized := validRuntimeAuthorityRelease()
 	oversized.Status = "failed"
 	oversized.Error = strings.Repeat("x", maxAuthoritativeRecordBytes)
-	err = store.Append(leaseUUID, oversized)
+	err = store.append(leaseUUID, oversized)
 	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
 	after, readErr := store.List(leaseUUID)
 	require.NoError(t, readErr)

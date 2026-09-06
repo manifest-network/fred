@@ -4,13 +4,12 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 
-	"github.com/google/uuid"
-
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/provisioner/callbackid"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/uuidv4"
 )
 
 // QueryParameter is the callback query parameter carrying an ID. Backends
@@ -38,17 +37,21 @@ var (
 //
 // IDs are comparable and safe to use as map keys.
 type ID struct {
-	value callbackid.UUIDv4
+	value uuidv4.Value
 }
 
 var _ encoding.TextMarshaler = ID{}
+var _ fmt.Formatter = ID{}
 var _ fmt.Stringer = ID{}
+var _ slog.LogValuer = ID{}
+
+const diagnosticFingerprintDomain = "fred-lifecycle-id-diagnostic-v1"
 
 // ParseID parses the canonical lowercase, hyphenated UUIDv4 representation
 // used by lifecycle callback URLs. Alternative UUID forms, uppercase text,
 // non-v4 UUIDs, and the nil UUID are rejected.
 func ParseID(text string) (ID, error) {
-	parsed, err := callbackid.Parse(text, ErrInvalidID)
+	parsed, err := uuidv4.Parse(text, ErrInvalidID)
 	if err != nil {
 		return ID{}, err
 	}
@@ -72,15 +75,34 @@ func (id ID) Valid() bool {
 	return id.value.Valid()
 }
 
-// String returns the canonical lifecycle identity for structured logging. The
+// String returns the canonical lifecycle identity for explicit wire use. The
 // zero value is rendered as an explicit marker rather than the nil UUID.
 func (id ID) String() string {
 	return id.value.String()
 }
 
+// Fingerprint returns a stable, non-reversible diagnostic correlation value.
+// Lifecycle IDs are callback capabilities and must not be copied into logs.
+func (id ID) Fingerprint() string {
+	return id.value.DiagnosticFingerprint(diagnosticFingerprintDomain, "life_")
+}
+
+// LogValue makes directly logging a typed lifecycle capability safe by
+// construction while explicit wire/persistence paths retain canonical text.
+func (id ID) LogValue() slog.Value {
+	return slog.StringValue(id.Fingerprint())
+}
+
+// Format makes generic fmt output diagnostic-only. Canonical lifecycle
+// authority is available only through the explicit String/MarshalText wire
+// paths, so wrapping the typed ID in an error cannot disclose it accidentally.
+func (id ID) Format(state fmt.State, _ rune) {
+	_, _ = state.Write([]byte(id.Fingerprint()))
+}
+
 // MarshalText returns the canonical lowercase, hyphenated UUIDv4 wire value.
 func (id ID) MarshalText() ([]byte, error) {
-	return id.value.MarshalText(ErrInvalidID)
+	return id.value.EncodeText(ErrInvalidID)
 }
 
 // ParseQuery parses the optional callback lifecycle ID. The boolean reports
@@ -88,20 +110,12 @@ func (id ID) MarshalText() ([]byte, error) {
 // callbacks emitted by legacy backends. A present parameter must have exactly
 // one canonical UUIDv4 value.
 func ParseQuery(values url.Values) (id ID, present bool, err error) {
-	return callbackid.ParseQuery(values, QueryParameter, ErrAmbiguousQuery, ParseID)
+	return uuidv4.ParseQuery(values, QueryParameter, ErrAmbiguousQuery, ParseID)
 }
 
 // SetQuery writes id using its canonical UUID representation. Existing values
 // for QueryParameter are replaced; unrelated values are retained. The
 // destination is not mutated on error.
 func SetQuery(values url.Values, id ID) error {
-	return callbackid.SetQuery(values, QueryParameter, ErrNilQuery, id.MarshalText)
-}
-
-func newID(value uuid.UUID) ID {
-	id := ID{value: callbackid.FromUUID(value)}
-	if !id.Valid() {
-		return ID{}
-	}
-	return id
+	return uuidv4.SetQuery(values, QueryParameter, ErrNilQuery, id.MarshalText)
 }

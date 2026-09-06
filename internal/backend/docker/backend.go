@@ -30,31 +30,46 @@ import (
 	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
-// dockerClient abstracts the Docker API surface used by Backend,
-// enabling unit tests to substitute a lightweight mock.
-type dockerClient interface {
+// dockerReadClient is the only Docker API surface retained by Backend. Tenant
+// substrate mutation methods deliberately do not appear here: production code
+// holding b.docker cannot bypass the storage-authority choke point by accident.
+type dockerReadClient interface {
 	Ping(ctx context.Context) error
 	DaemonInfo(ctx context.Context) (DaemonSecurityInfo, error)
 	Close() error
-	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
 	InspectImage(ctx context.Context, imageName string) (*ImageInfo, error)
+	InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error)
+	ContainerLogs(ctx context.Context, containerID string, tail int) (string, error)
+	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
+	ListManagedContainersStrict(ctx context.Context) ([]ContainerInfo, error)
+	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
+	ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error)
+}
+
+// dockerMutationSink is captured only by settlement-bound Guards. Keeping it
+// separate from dockerReadClient makes every unguarded write through b.docker a
+// compile error while retaining one composite construction/test seam.
+type dockerMutationSink interface {
+	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
 	ResolveImageUser(ctx context.Context, imageName string, userOverride string) (uid, gid int, err error)
 	CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	RenameContainer(ctx context.Context, containerID string, newName string) error
 	RemoveContainer(ctx context.Context, containerID string) error
-	InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error)
-	ContainerLogs(ctx context.Context, containerID string, tail int) (string, error)
-	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
-	ListManagedContainersStrict(ctx context.Context) ([]ContainerInfo, error)
 	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error
-	ListManagedNetworks(ctx context.Context) ([]networktypes.Inspect, error)
 	DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (uid, gid int, err error)
 	DetectWritablePaths(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
 	ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
-	ContainerEvents(ctx context.Context) (<-chan ContainerEvent, <-chan error)
+}
+
+// dockerClient is the construction boundary implemented by DockerClient and
+// the package test double. Backend immediately projects it into separate read
+// and mutation capabilities.
+type dockerClient interface {
+	dockerReadClient
+	dockerMutationSink
 }
 
 // ContainerEvent represents a container lifecycle event from the Docker daemon.
@@ -69,28 +84,72 @@ type ContainerEvent struct {
 // narrow makes the pre-substrate refusal boundary directly testable with tiny
 // synthetic limits instead of manufacturing a 32 MiB history.
 type releaseHistoryCapacityPlanner interface {
-	CheckAppendActiveCapacity(string, shared.Release) error
-	CheckRecordLegacyMigrationCapacity(
-		string,
-		[]byte,
-		[]backend.LeaseItem,
-		[]shared.SKUResourceSnapshot,
-		shared.LegacyRuntimeAuthority,
-		time.Time,
-	) error
+	CheckOperationReleaseCapacity(shared.OperationReleaseCandidate) error
+}
+
+// operationSettlementService is the phase-safe callback/release handoff used
+// by Docker. Tests may wrap it to inject commit failures without regaining any
+// raw status-selected or caller-spliced mutation API.
+type operationSettlementService interface {
+	NewOperationIntentProbe(string, string) (shared.OperationIntentProbe, error)
+	ProbeOperationIntent(shared.OperationIntentProbe) (shared.OperationIntentAdmissionDisposition, error)
+	NewOperationIntentCandidate(shared.OperationIntentSpec) (shared.OperationIntentCandidate, error)
+	BeginOperationIntent(shared.OperationIntentCandidate) (shared.OperationIntentAdmission, error)
+	ListOperationIntents() ([]shared.OperationIntentClaim, error)
+	ListOperationRecoveryStates() ([]shared.OperationRecoveryState, error)
+	ListFailedOperationReceipts() ([]shared.FailedOperationReceipt, error)
+	LookupOperationRecovery(shared.OperationIntentProbe) (shared.OperationRecoveryState, error)
+	PrepareOperationRelease(shared.OperationIntentClaim) (shared.OperationReleaseCandidate, error)
+	CheckOperationReleaseCapacity(shared.OperationReleaseCandidate) error
+	RefuseOperationExecution(shared.OperationReleaseCandidate) (shared.OperationExecutionFailure, error)
+	StartOperationExecution(shared.OperationReleaseCandidate) (shared.OperationExecutionClaim, error)
+	ExecuteOperation(context.Context, shared.OperationExecutionClaim) shared.OperationExecutionOutcome
+	RecoverOperationExecution(context.Context, shared.LeaseRecoveryScope, shared.OperationIntentClaim) (shared.OperationExecutionOutcome, error)
+	CleanupRecoveredOperation(context.Context, shared.LeaseRecoveryScope, shared.OperationIntentClaim) (shared.OperationExecutionOutcome, error)
+	CleanupFailedOperationReceipt(context.Context, shared.LeaseRecoveryScope, shared.FailedOperationReceipt) error
+	CommitOperationSuccess(shared.OperationExecutionSuccess) (shared.OperationReleaseCommitted, error)
+	CommitOperationFailure(shared.OperationExecutionFailure) (shared.OperationReleaseUncommitted, error)
+	ProveCommittedOperation(shared.OperationIntentClaim) (shared.OperationReleaseCommitted, error)
+}
+
+// releaseBackfillService is the pair-bound authority for enriching an active
+// Release during recovery or lazy v0.13 adoption. It deliberately has no
+// operation-settlement methods: a backfill is a release CAS, not an operation
+// outcome, even though both serialize through the same per-lease journal gate.
+type releaseBackfillService interface {
+	BackfillActiveResourceProfilesContext(context.Context, string, int, []backend.LeaseItem, []shared.SKUResourceSnapshot) error
+	BackfillLegacyActiveAuthorityContext(context.Context, string, shared.Release, []backend.LeaseItem, []shared.SKUResourceSnapshot) error
+	BackfillLegacyRuntimeAuthorityContext(context.Context, string, shared.Release, shared.LegacyRuntimeAuthority) error
+}
+
+// callbackPublicationService is the semantic publication boundary consumed by
+// Docker. Production supplies the construction-validated CallbackPublisher;
+// tests may decorate it to inject a transport-independent journal failure
+// without regaining raw callback mutation authority.
+type callbackPublicationService interface {
+	PublishOperationSuccessContext(context.Context, shared.OperationReleaseCommitted) error
+	PublishOperationFailureContext(context.Context, shared.OperationReleaseUncommitted, string) error
+	AuthorizeRuntimeObservationContext(context.Context, shared.RuntimeGenerationProof) (shared.RuntimeObservationPermit, error)
+	PublishLifecycleFailureContext(context.Context, shared.RuntimeObservationPermit, string) error
+	PublishMaintenanceSuccessContext(context.Context, shared.MaintenanceReleaseActive) error
+	PublishMaintenanceFailureContext(context.Context, shared.MaintenanceReleaseFailure, string) error
+	TryPublishMaintenanceSuccessContext(context.Context, shared.MaintenanceReleaseActive) (bool, error)
+	TryPublishMaintenanceFailureContext(context.Context, shared.MaintenanceReleaseFailure, string) (bool, error)
+	TryPublishMaintenanceRuntimeFailureContext(context.Context, shared.MaintenanceReleaseActive, string) (bool, error)
 }
 
 // Backend implements the backend.Backend interface for Docker containers.
 type Backend struct {
 	cfg     Config
-	docker  dockerClient
-	compose composeExecutor
-	// mutations is the sole capability for tenant-substrate writes. Raw clients
-	// remain private implementation details used for reads and identity probes.
-	mutations storageMutationAdapters
-	pool      *shared.ResourcePool
-	volumes   volumeManager
-	logger    *slog.Logger
+	docker  dockerReadClient
+	compose composeReader
+	pool    *shared.ResourcePool
+	volumes volumeReader
+	logger  *slog.Logger
+	// backgroundMaintenance exposes only complete convergence workflows. Raw
+	// Docker, Compose, and volume writers are captured by its constructor and
+	// cannot be recovered from Backend or targeted by request handlers.
+	backgroundMaintenance *backgroundMaintenanceCoordinator
 
 	storageIdentity  backendidentity.ID
 	storageAuthority backendidentity.VerifiedStorage
@@ -176,8 +235,9 @@ type Backend struct {
 	// read side around their evidence reads and durable mutations; restore rollback
 	// holds it through operation settlement, source-authority handback, pool release,
 	// and projection removal. Slow destructive work holds neither side because a
-	// durable close/Restoring record bridges that work. Provision and maintenance
-	// concurrency use their separate baseline/intent fences.
+	// durable close/Restoring record bridges that work. Provision briefly holds
+	// the read side from operation-intent admission through initial projection
+	// publication; maintenance concurrency uses its separate intent fence.
 	recoverySnapshotMu sync.RWMutex
 
 	// retentionAccountingMu serializes refreshRetentionAccounting's
@@ -186,8 +246,7 @@ type Backend struct {
 	retentionAccountingMu sync.Mutex
 
 	// callbackStore persists pending callbacks in bbolt
-	callbackStore    *shared.CallbackStore
-	operationIntents operationIntentJournal
+	callbackStore *shared.CallbackStore
 	// commandFence closes the admission-to-reservation window against an
 	// overlapping teardown for the same lease. It is keyed and zero-value ready;
 	// idle per-lease mutexes are removed after their final waiter releases.
@@ -197,7 +256,16 @@ type Backend struct {
 	diagnosticsStore *shared.DiagnosticsStore
 
 	// releaseStore persists release history in bbolt
-	releaseStore *shared.ReleaseStore
+	releaseStore          *shared.ReleaseStore
+	operationSettlement   operationSettlementService
+	releaseBackfiller     releaseBackfillService
+	maintenanceSettlement *shared.MaintenanceSettlement
+	restoreSettlement     *shared.RestoreSettlement
+	closeSettlement       *shared.CloseSettlement
+	// recoveryCoordinator is the only issuer of post-crash classifier and
+	// cleanup authority. Its callback holds the command fence and actor
+	// quiescence for the complete recovery action.
+	recoveryCoordinator *shared.RecoveryCoordinator
 	// releaseCapacityPlanner is explicitly wired to releaseStore in production.
 	// Tests may provide the narrower capability to pin definitive refusal before
 	// any Docker/volume mutation without changing the production 32 MiB contract.
@@ -206,22 +274,15 @@ type Backend struct {
 	// retentionStore persists soft-deleted leases awaiting restore or reaping
 	retentionStore *shared.RetentionStore
 
-	// orphanStreaks counts consecutive retention sweeps an ACTIVE record's volumes
-	// were all absent (ENG-370). Two invariants protect it:
-	//   1. Single-writer confinement: touched ONLY by reconcileOrphanedRetentions,
-	//      reachable only via runRetentionSweep on the single StartCleanupLoop
-	//      goroutine (boot-eager retention work runs before that goroutine starts
-	//      and never touches it) — so no mutex is needed. Do not add a second writer.
-	//   2. In-memory by design: a restart resets it so a cold boot can never prune
-	//      on its first sweep (the boot-before-mount fail-safe). Do not persist it.
-	// Separately, the prune itself relies on DeleteIfActive's in-txn CAS as the
-	// load-bearing guard against a concurrent restore (ClaimForRestoreWithAuthority
-	// active→restoring on a request goroutine) — do not "simplify" it into an
-	// unconditional Delete.
-	orphanStreaks map[string]int
+	// orphanPruner is the construction-bound owner of complete volume inventory,
+	// consecutive absence state, ACTIVE candidate selection, and exact deletion.
+	// No caller can supply a lease key or an absence proof to its Sweep method.
+	orphanPruner *shared.RetentionOrphanPruner
 
-	// callbackSender handles callback delivery with retry and HMAC
-	callbackSender *shared.CallbackSender
+	// callbackPublisher owns typed settlement and durable outbox publication;
+	// callbackSender owns only HMAC transport and replay.
+	callbackPublisher callbackPublicationService
+	callbackSender    *shared.CallbackSender
 
 	// volumeOwnerCache caches detected volume UID/GID per image ID
 	// (content-addressable sha256 digest). Zero-value ready; no init needed.
@@ -240,8 +301,9 @@ type Backend struct {
 	recoveryDockerReadTimeout time.Duration
 	// startupRecoveryTimeout bounds the complete startup convergence pass. It is
 	// intentionally independent of the caller's short readiness context because
-	// legacy migrations may legitimately outlive that context, but it must still
-	// be finite if a daemon accepts requests and then stops responding.
+	// stopped v0.13 adoption and fleet recovery may legitimately outlive that
+	// context, but it must still be finite if a daemon accepts requests and then
+	// stops responding.
 	startupRecoveryTimeout time.Duration
 	// startupPhaseTimeout bounds each best-effort cleanup/reconciliation phase
 	// inside the overall startup budget so fleet-sized loops cannot consume one
@@ -265,15 +327,18 @@ type Backend struct {
 	// the prior sync.Map design allowed.
 	actorsMu sync.Mutex
 	actors   map[string]*leasesm.LeaseActor // leaseUUID → *leasesm.LeaseActor
+	// actorRecoveryClaims reserves a lease key while startup/sweep recovery
+	// holds an exclusive typed quiescence capability. It covers both an existing
+	// actor and the important absent-actor case without constructing a dormant
+	// actor goroutine. Guarded by actorsMu with the registry itself.
+	actorRecoveryClaims map[string]*leaseActorRecoveryClaimState
 
 	// inspector / gatherer / provisionStore are the substrate-agnostic
 	// seams the lease state machine consumes via leaseActor.cfg. Wired
 	// at backend construction (NewBackend and the test helpers
 	// newBackendForTest / newBackendForProvisionTest) and remain stable
-	// for the backend's lifetime. PR5 will inject these directly into
-	// the actor instead of routing through Backend; for PR4 the Backend
-	// is the canonical owner so test helpers can override them via the
-	// same mock surface that already exists.
+	// for the backend's lifetime. Backend is their composition root; actors
+	// receive these narrow interfaces and never recover Docker capabilities.
 	inspector      leasesm.InstanceInspector
 	gatherer       leasesm.DiagnosticsGatherer
 	provisionStore leasesm.LeaseProvisionStore
@@ -288,48 +353,20 @@ var ErrShutdownDrainTimeout = errors.New("docker backend workers did not drain b
 
 const defaultShutdownDrainTimeout = 90 * time.Second
 
-// provision wraps the substrate-agnostic leasesm.ProvisionState with
-// Docker-private state. The lease state machine reasons about the
-// embedded ProvisionState exclusively; substrate-private fields
-// (currently VolumeCleanupAttempts) live alongside it on this wrapper
-// so the lifecycle is structural — allocating a fresh *provision
-// resets every Docker-private counter, and deleting from b.provisions
-// drops the Docker-private state at the same time.
+// provision wraps the substrate-agnostic leasesm.ProvisionState. Keeping one
+// wrapper type lets Docker publish a single projection shape without exposing
+// substrate capabilities to the shared lease state machine.
 //
 // Promoted-field access keeps existing call sites working: `p.LeaseUUID`,
 // `p.Status`, etc. resolve to the embedded ProvisionState fields via Go's
 // embedding rules. Sites that need the *ProvisionState pointer (e.g., the
 // backendProvisionStore adapter passing it to a LeaseProvisionStore.UpdateFn
 // closure) take &p.ProvisionState.
-//
-// History: prior to ENG-148 follow-up (commit superseding fde8633), this
-// was a type alias plus a parallel `b.volumeCleanupAttempts map[string]int`
-// guarded by b.provisionsMu. The parallel-map pattern required every
-// site that created or deleted a provisions entry to also handle the
-// parallel map under the same lock; provision.go's re-provision path
-// missed that invariant, leaking stale attempt counts across
-// re-provisions and causing premature give-ups on subsequent
-// Deprovision. The wrapper-struct pattern makes that bug class
-// structurally impossible.
 type provision struct {
 	leasesm.ProvisionState
-
-	// ResourceProfiles is the immutable resource authority used to admit and
-	// create this live lease. It stays Docker-private because the substrate-
-	// agnostic lifecycle state machine never interprets SKU capacities.
-	ResourceProfiles []shared.SKUResourceSnapshot
-
-	// VolumeCleanupAttempts tracks how many times Deprovision has
-	// retried volume cleanup for this lease before either succeeding
-	// or hitting maxVolumeCleanupAttempts and giving up. Docker-private
-	// because volume cleanup is Docker-specific — K3s would implement
-	// deprovision retry differently.
-	VolumeCleanupAttempts int
 }
 
-// shortID, diagnosticSnapshot, and containerLogKeys moved to
-// internal/backend/shared/leasesm at PR5b-2 BC-3 dedupe (task #19).
-// Docker callers now reach the canonical leasesm.{ShortID,
+// Docker callers use the canonical leasesm.{ShortID,
 // DiagnosticSnapshot, ContainerLogKeys} versions; the docker-side
 // duplicates that previously lived here have been removed.
 
@@ -344,18 +381,10 @@ const (
 	// an infinite retry loop. Truncating here keeps full diagnostics in
 	// LastError (for ListProvisions) while ensuring callbacks succeed.
 	callbackMaxErrorLen = 256
-
-	// maxVolumeCleanupAttempts is the maximum number of times Deprovision will
-	// retry volume destruction before giving up and removing the provision from
-	// the map. This prevents infinite retries when volumes cannot be removed
-	// (e.g., permission denied on files created by the container process).
-	// Stuck volumes require manual cleanup.
-	maxVolumeCleanupAttempts = 3
 )
 
-// errMsgContainerExited / errMsgInternal moved to
-// internal/backend/shared/leasesm at PR5b-2 D — both strings are
-// on-chain callback payloads per the callback-error-sanitization
+// errMsgContainerExited / errMsgInternal live in leasesm because both strings
+// are on-chain callback payloads per the callback-error-sanitization
 // invariant; divergence between docker/ and leasesm/ copies could emit
 // different on-chain strings for the same failure. The canonical
 // constants live in leasesm/lease_sm.go (unexported sources) with
@@ -643,6 +672,23 @@ func (verifier productionDockerStorageIdentityVerifier) Verify(ctx context.Conte
 	return verifier.backend.verifyStorageIdentity(ctx, verifier.authority)
 }
 
+type dockerCallbackStorageVerifier struct {
+	verifier dockerStorageIdentityVerifier
+	gate     *backendidentity.StorageAuthorityGate
+}
+
+func (verifier dockerCallbackStorageVerifier) StorageIdentity() backendidentity.ID {
+	return verifier.verifier.StorageIdentity()
+}
+
+func (verifier dockerCallbackStorageVerifier) StorageAuthorityGate() *backendidentity.StorageAuthorityGate {
+	return verifier.gate
+}
+
+func (verifier dockerCallbackStorageVerifier) Verify(ctx context.Context) error {
+	return verifier.verifier.Verify(ctx)
+}
+
 type existingDockerStorageIdentity struct{}
 
 // newBackendWithConstructionTimeout is the shared implementation behind New's
@@ -666,7 +712,11 @@ func (existingDockerStorageIdentity) resolve(
 	docker dockerClient,
 	volumes volumeManager,
 ) (backendidentity.VerifiedStorage, error) {
-	probe := &Backend{cfg: cfg, docker: docker, volumes: volumes}
+	probe := &Backend{
+		cfg:     cfg,
+		docker:  projectDockerRead(docker),
+		volumes: projectVolumeRead(volumes),
+	}
 	if err := probe.loadStorageIdentity(ctx); err != nil {
 		return backendidentity.VerifiedStorage{}, err
 	}
@@ -787,18 +837,6 @@ var ErrV013InterruptedDeprovision = errors.New("v0.13 lineage contains an interr
 // shape is compatible with more than one v0.13 close boundary, so neither
 // replay nor automatic journal repair is safe.
 var ErrV013UnresolvedClose = errors.New("v0.13 lineage contains an unresolved close boundary")
-
-// ErrV013InterruptedMigration identifies one of v0.13's durable
-// stop/rename/Compose migration crash boundaries. The read-only preflight can
-// diagnose these shapes, but it never manufactures the missing release or
-// callback authority needed to seal them.
-var ErrV013InterruptedMigration = errors.New("v0.13 lineage contains an interrupted legacy migration")
-
-// ErrV013OrphanRollbackRemnant identifies an exact stopped `-prev` container
-// whose release, retention, and volume authority are all absent. It is not
-// automatically ignored: terminal chain/provider evidence is required before
-// an operator may remove the remnant and rerun preflight.
-var ErrV013OrphanRollbackRemnant = errors.New("v0.13 lineage contains an orphan rollback remnant")
 
 type dockerStorageIdentityProof struct {
 	paths         *dockerStorageInitializationPaths
@@ -1303,65 +1341,16 @@ func verifyStorageIdentityInitializationEvidence(
 		managedVolumeCountsByLease[managedVolumeLeaseUUID(volumeName)]++
 	}
 	for _, leaseUUID := range slices.Sorted(maps.Keys(containersByLease)) {
-		cohort := containersByLease[leaseUUID]
 		if _, active := releases.ActiveLeaseUUIDs[leaseUUID]; active ||
 			retentionsByLease[leaseUUID] != nil ||
 			managedVolumeCountsByLease[leaseUUID] != 0 {
 			continue
 		}
-		orphanProof, err := proveStoppedV013RollbackCohort(cohort, cfg.Name)
-		if err != nil {
-			return fmt.Errorf(
-				"lease %s has managed containers but no release, retention, or managed-volume authority and is not an exact stopped v0.13 rollback cohort: %w",
-				leaseUUID,
-				err,
-			)
-		}
-		encodedContainerIDs, err := json.Marshal(orphanProof.containerIDs)
-		if err != nil {
-			return fmt.Errorf(
-				"%w: encode immutable IDs for stopped -prev cohort %s: %w",
-				ErrV013OrphanRollbackRemnant,
-				leaseUUID,
-				err,
-			)
-		}
-		if len(cfg.Name) == 0 || len(cfg.Name) > maxDiagnosticBackendNameBytes {
-			return fmt.Errorf(
-				"%w: lease %s has an exact stopped -prev cohort but its backend identity is outside the 1..%d-byte diagnostic bound",
-				ErrV013OrphanRollbackRemnant,
-				leaseUUID,
-				maxDiagnosticBackendNameBytes,
-			)
-		}
-		encodedBackendName, err := json.Marshal(cfg.Name)
-		if err != nil {
-			return fmt.Errorf(
-				"%w: encode backend identity for stopped -prev cohort %s: %w",
-				ErrV013OrphanRollbackRemnant,
-				leaseUUID,
-				err,
-			)
-		}
-		encodedProviderUUID, err := json.Marshal(orphanProof.providerUUID)
-		if err != nil {
-			return fmt.Errorf(
-				"%w: encode provider identity for stopped -prev cohort %s: %w",
-				ErrV013OrphanRollbackRemnant,
-				leaseUUID,
-				err,
-			)
-		}
 		return fmt.Errorf(
-			"%w: lease %s backend=%s provider=%s has only one exact dense, identity-coherent, non-running -prev cohort and no active release, retention, or managed-volume authority; immutable_container_ids=%s. This local classification is necessary but not sufficient: do not ignore or delete any ID until placement-preflight -prove-terminal-orphan positively proves the same provider's exact lease terminal and its v0.13 placement absent. Then back up the stopped lineage, re-inspect and remove only these exact immutable IDs, rerun both read-only preflights, and take a fresh cutover backup; if terminal ownership cannot be proved, restore the complete matching v0.13 lineage instead",
-			ErrV013OrphanRollbackRemnant,
+			"managed stack lease %q has containers but no release, retention, or managed-volume authority",
 			leaseUUID,
-			encodedBackendName,
-			encodedProviderUUID,
-			encodedContainerIDs,
 		)
 	}
-	interruptedMigrationLeases := make(map[string]struct{})
 	for _, leaseUUID := range slices.Sorted(maps.Keys(releases.ActiveReleases)) {
 		release := releases.ActiveReleases[leaseUUID]
 		cohort := containersByLease[leaseUUID]
@@ -1392,88 +1381,16 @@ func verifyStorageIdentityInitializationEvidence(
 				)
 			}
 		}
-		legacyCallbackCohort := make([]ContainerInfo, 0, len(cohort))
-		for _, container := range cohort {
-			if container.ServiceName == "" {
-				legacyCallbackCohort = append(legacyCallbackCohort, container)
-			}
+		authorityItems := slices.Clone(release.Items)
+		var authorityErr error
+		if len(authorityItems) == 0 {
+			authorityItems, authorityErr = deriveV013ActiveReleaseItems(&release, cohort)
 		}
-		if len(legacyCallbackCohort) > 0 {
-			if _, _, callbackErr := resolveLegacyContainerCallbackURLs(legacyCallbackCohort); callbackErr != nil {
-				return fmt.Errorf(
-					"validate v0.13 migration callback cohort for active release %s: %w",
-					leaseUUID,
-					callbackErr,
-				)
-			}
-		}
-		crashClass, crashItems, crashErr := inspectV013MigrationCrashCohort(&release, cohort)
-		if crashErr != nil {
-			return fmt.Errorf(
-				"inspect interrupted v0.13 migration cohort for active release %s: %w",
-				leaseUUID,
-				crashErr,
-			)
-		}
-		if crashClass != v013MigrationCrashNone &&
-			containsV013MigrationGeneratedStack(cohort) {
-			switch crashClass {
-			case v013MigrationCrashBeforeRelease:
-				authoritylessStack := slices.DeleteFunc(
-					slices.Clone(cohort),
-					func(container ContainerInfo) bool {
-						return !isV013MigrationGeneratedStackContainer(container)
-					},
-				)
-				containerIDs, idErr := sortedImmutableContainerIDs(authoritylessStack)
-				if idErr != nil {
-					return fmt.Errorf(
-						"%w: active release %s has an exact pre-RecordMigration authorityless stack generation, but its immutable-ID diagnostic is unsafe: %w",
-						ErrV013InterruptedMigration,
-						leaseUUID,
-						idErr,
-					)
-				}
-				encodedContainerIDs, idErr := json.Marshal(containerIDs)
-				if idErr != nil {
-					return fmt.Errorf(
-						"%w: encode immutable IDs for pre-RecordMigration stack generation %s: %w",
-						ErrV013InterruptedMigration,
-						leaseUUID,
-						idErr,
-					)
-				}
-				return fmt.Errorf(
-					"%w: active release %s is the exact pre-RecordMigration shape: a complete dense rollback cohort and a semantically equal complete stack generation whose v0.13 labels omit backend/provider/callback authority; immutable_stack_container_ids=%s. The initializer will not inherit those fields. Keep a full stopped backup, re-inspect each exact immutable stack container ID, stop and remove only IDs that still match this authorityless generation, leave every -prev container, bind, and volume intact, and rerun the read-only preflight. After it passes, take a fresh complete backup, seal with adopt, and start the upgraded backend; startup migration then resumes from the proven rollback-only cohort",
-					ErrV013InterruptedMigration,
-					leaseUUID,
-					encodedContainerIDs,
-				)
-			case v013MigrationCrashAfterRelease:
-				return fmt.Errorf(
-					"%w: active release %s is the exact post-RecordMigration shape: a committed authorityless stack generation plus a partial or complete rollback-remnant cohort; desired quantity and settlement authority cannot be reconstructed from remnants. Restore a known-good complete pre-migration snapshot or use a dedicated proof-bearing repair tool; do not remove a generation, infer quantity, or seal this lineage",
-					ErrV013InterruptedMigration,
-					leaseUUID,
-				)
-			default:
-				return fmt.Errorf("%w: active release %s has an unsupported migration crash class",
-					ErrV013InterruptedMigration, leaseUUID)
-			}
-		}
-		authorityItems := crashItems
-		switch {
-		case len(release.Items) > 0:
-			authorityItems = slices.Clone(release.Items)
-		case crashClass == v013MigrationCrashNone:
-			authorityItems, crashErr = deriveLegacyActiveReleaseItems(&release, cohort)
-		case len(authorityItems) == 0:
-			crashErr = errors.New("interrupted v0.13 migration produced no workload authority")
-		}
-		if crashErr != nil {
+		if authorityErr != nil {
 			return fmt.Errorf(
 				"validate managed cohort for active v0.13 release %s: %w",
 				leaseUUID,
-				crashErr,
+				authorityErr,
 			)
 		}
 		authorityProfiles, profileErr := resolveResourceProfilesForConfig(cfg, authorityItems)
@@ -1485,8 +1402,9 @@ func verifyStorageIdentityInitializationEvidence(
 			)
 		}
 		var legacyRuntimeAuthority *shared.LegacyRuntimeAuthority
-		if crashClass == v013MigrationCrashNone {
-			callbackURL, lifecycleCallbackURL, callbackErr := resolveLegacyContainerCallbackURLs(cohort)
+		if release.OperationID.IsZero() && release.RuntimeAuthority == nil &&
+			release.LegacyRuntimeAuthority == nil {
+			callbackURL, lifecycleCallbackURL, callbackErr := resolveV013ContainerCallbackURLs(cohort)
 			if callbackErr != nil {
 				return fmt.Errorf(
 					"resolve startup runtime authority for active v0.13 release %s: %w",
@@ -1513,26 +1431,14 @@ func verifyStorageIdentityInitializationEvidence(
 		var capacityErr error
 		switch {
 		case len(release.Items) == 0:
-			authorityClass := shared.LegacyActiveAuthorityWorkload
-			if crashClass != v013MigrationCrashNone {
-				authorityClass = shared.LegacyActiveAuthorityMigration
-			}
 			if legacyRuntimeAuthority != nil {
 				capacityErr = releases.CheckLegacyActiveAuthorityAndRuntimeCapacity(
-					leaseUUID,
-					release,
-					authorityItems,
-					authorityProfiles,
-					authorityClass,
+					leaseUUID, release, authorityItems, authorityProfiles,
 					*legacyRuntimeAuthority,
 				)
 			} else {
 				capacityErr = releases.CheckLegacyActiveAuthorityCapacity(
-					leaseUUID,
-					release,
-					authorityItems,
-					authorityProfiles,
-					authorityClass,
+					leaseUUID, release, authorityItems, authorityProfiles,
 				)
 			}
 		case len(release.ResourceProfiles) == 0:
@@ -1549,18 +1455,8 @@ func verifyStorageIdentityInitializationEvidence(
 				capacityErr,
 			)
 		}
-		if crashClass != v013MigrationCrashNone {
-			interruptedMigrationLeases[leaseUUID] = struct{}{}
-		}
 	}
-	volumeEvidenceContainers := slices.DeleteFunc(
-		slices.Clone(containers),
-		func(container ContainerInfo) bool {
-			_, interrupted := interruptedMigrationLeases[container.LeaseUUID]
-			return interrupted && isLegacyRollbackRemnant(container)
-		},
-	)
-	evidenceVolumes, err := storageIdentityContainerVolumeEvidence(cfg, volumeEvidenceContainers)
+	evidenceVolumes, err := storageIdentityContainerVolumeEvidence(cfg, containers)
 	if err != nil {
 		return err
 	}
@@ -1733,8 +1629,8 @@ func legacyReleaseMatchesInterruptedDeprovisionRetention(
 		retention.StackManifest == nil {
 		return false, nil
 	}
-	if release.OperationID != "" || len(release.Items) != 0 ||
-		len(release.ResourceProfiles) != 0 || release.LegacyMigration {
+	if !release.OperationID.IsZero() || len(release.Items) != 0 ||
+		len(release.ResourceProfiles) != 0 {
 		return false, nil
 	}
 	releaseManifest, err := manifest.ParsePayload(release.Manifest)
@@ -1890,144 +1786,6 @@ func reapingLeaseUUIDFromVolumeName(volumeName string) (string, bool) {
 	return managedVolumeLeaseUUID(managedName), true
 }
 
-type stoppedV013RollbackCohortProof struct {
-	providerUUID string
-	containerIDs []string
-}
-
-func proveStoppedV013RollbackCohort(
-	containers []ContainerInfo,
-	expectedBackend string,
-) (stoppedV013RollbackCohortProof, error) {
-	if len(containers) == 0 {
-		return stoppedV013RollbackCohortProof{}, errors.New("rollback cohort is empty")
-	}
-	containerIDs, err := sortedImmutableContainerIDs(containers)
-	if err != nil {
-		return stoppedV013RollbackCohortProof{}, fmt.Errorf("immutable IDs: %w", err)
-	}
-	identity := containers[0]
-	if !backend.IsCanonicalLeaseUUID(identity.LeaseUUID) ||
-		!backend.IsCanonicalLeaseUUID(identity.ProviderUUID) ||
-		strings.TrimSpace(identity.Tenant) == "" ||
-		strings.TrimSpace(identity.SKU) == "" ||
-		strings.TrimSpace(identity.Image) == "" ||
-		identity.BackendName != expectedBackend {
-		return stoppedV013RollbackCohortProof{}, errors.New(
-			"rollback cohort has incomplete or foreign lease/backend/provider/tenant/SKU/image identity",
-		)
-	}
-	if _, _, err := resolveLegacyContainerCallbackURLs(containers); err != nil {
-		return stoppedV013RollbackCohortProof{}, fmt.Errorf("callback identity: %w", err)
-	}
-	seenIndexes := make(map[int]string, len(containers))
-	for _, container := range containers {
-		if !isLegacyRollbackRemnant(container) {
-			return stoppedV013RollbackCohortProof{}, fmt.Errorf(
-				"container %q is not an exact v0.13 rollback name",
-				container.ContainerID,
-			)
-		}
-		if !isDockerNonRunningStatus(container.Status) {
-			return stoppedV013RollbackCohortProof{}, fmt.Errorf(
-				"container %q is not in an explicit non-running Docker state (state %q)",
-				container.ContainerID,
-				container.Status,
-			)
-		}
-		if container.LeaseUUID != identity.LeaseUUID ||
-			container.BackendName != identity.BackendName ||
-			container.ProviderUUID != identity.ProviderUUID ||
-			container.Tenant != identity.Tenant ||
-			container.SKU != identity.SKU ||
-			container.Image != identity.Image ||
-			container.CustomDomain != identity.CustomDomain {
-			return stoppedV013RollbackCohortProof{}, fmt.Errorf(
-				"container %q has divergent lease/backend/provider/tenant/SKU/image/domain identity",
-				container.ContainerID,
-			)
-		}
-		if container.InstanceIndex < 0 {
-			return stoppedV013RollbackCohortProof{}, fmt.Errorf(
-				"container %q has negative instance index %d",
-				container.ContainerID,
-				container.InstanceIndex,
-			)
-		}
-		if prior, duplicate := seenIndexes[container.InstanceIndex]; duplicate {
-			return stoppedV013RollbackCohortProof{}, fmt.Errorf(
-				"containers %q and %q duplicate instance index %d",
-				prior,
-				container.ContainerID,
-				container.InstanceIndex,
-			)
-		}
-		seenIndexes[container.InstanceIndex] = container.ContainerID
-	}
-	for index := range len(containers) {
-		if _, exists := seenIndexes[index]; !exists {
-			return stoppedV013RollbackCohortProof{}, fmt.Errorf(
-				"rollback cohort has sparse indexes; index %d is absent",
-				index,
-			)
-		}
-	}
-	return stoppedV013RollbackCohortProof{
-		providerUUID: identity.ProviderUUID,
-		containerIDs: containerIDs,
-	}, nil
-}
-
-const (
-	maxDiagnosticContainerIDBytes = 128
-	maxDiagnosticBackendNameBytes = 512
-)
-
-// sortedImmutableContainerIDs renders only exact Docker object handles for an
-// operator cleanup. Names are intentionally excluded because they can be
-// reused. Both the cohort cardinality and every opaque identifier are bounded
-// before they enter an error line or runbook transcript.
-func sortedImmutableContainerIDs(containers []ContainerInfo) ([]string, error) {
-	if len(containers) == 0 {
-		return nil, errors.New("immutable container cohort is empty")
-	}
-	if len(containers) > backend.MaxOperationQuantity {
-		return nil, fmt.Errorf(
-			"immutable container cohort contains %d containers, safe bound is %d",
-			len(containers),
-			backend.MaxOperationQuantity,
-		)
-	}
-	containerIDs := make([]string, 0, len(containers))
-	seen := make(map[string]struct{}, len(containers))
-	for _, container := range containers {
-		containerID := container.ContainerID
-		if len(containerID) == 0 || len(containerID) > maxDiagnosticContainerIDBytes {
-			return nil, fmt.Errorf(
-				"container ID length %d is outside 1..%d bytes",
-				len(containerID),
-				maxDiagnosticContainerIDBytes,
-			)
-		}
-		for _, character := range containerID {
-			if (character >= 'a' && character <= 'z') ||
-				(character >= 'A' && character <= 'Z') ||
-				(character >= '0' && character <= '9') ||
-				character == '-' || character == '_' || character == '.' || character == ':' {
-				continue
-			}
-			return nil, fmt.Errorf("container ID contains unsafe character %U", character)
-		}
-		if _, duplicate := seen[containerID]; duplicate {
-			return nil, fmt.Errorf("duplicate immutable container ID %q", containerID)
-		}
-		seen[containerID] = struct{}{}
-		containerIDs = append(containerIDs, containerID)
-	}
-	slices.Sort(containerIDs)
-	return containerIDs, nil
-}
-
 func dockerStorageInitializationProfile(
 	cfg Config,
 	paths *dockerStorageInitializationPaths,
@@ -2110,20 +1868,9 @@ func storageIdentityContainerVolumeEvidence(
 					container.ContainerID)
 			}
 			source := mount.Source
-			interruptedMigrationAlternate := false
 			if err := requireExistingPathUnderRoot(cfg.VolumeDataPath, source); err != nil {
-				// v0.13 can stop+rename a legacy container and then rename its
-				// volume parent before crashing. Docker retains the old bind source
-				// string on the stopped `-prev` container even though the bytes now
-				// live at the deterministic app-aware name. Admit only that exact
-				// one-component substitution after proving the alternate exists.
-				alternate, ok := interruptedMigrationMountSource(cfg, container, mount)
-				if !ok {
-					return nil, fmt.Errorf("managed container %s mount %q is not owned by configured volume root: %w",
-						container.ContainerID, source, err)
-				}
-				source = alternate
-				interruptedMigrationAlternate = true
+				return nil, fmt.Errorf("managed container %s mount %q is not owned by configured volume root: %w",
+					container.ContainerID, source, err)
 			}
 			relative, relErr := filepath.Rel(cfg.VolumeDataPath, source)
 			if relErr != nil || relative == "." || relative == ".." ||
@@ -2147,20 +1894,6 @@ func storageIdentityContainerVolumeEvidence(
 				container.ServiceName,
 				container.InstanceIndex,
 			)
-			switch {
-			case interruptedMigrationAlternate:
-				expectedName = canonicalVolumeName(
-					container.LeaseUUID,
-					manifest.DefaultServiceName,
-					container.InstanceIndex,
-				)
-			case container.ServiceName == "":
-				expectedName = fmt.Sprintf(
-					"fred-%s-%d",
-					container.LeaseUUID,
-					container.InstanceIndex,
-				)
-			}
 			expectedManagedName, expectedErr := parseManagedVolumeName(expectedName)
 			if expectedErr != nil {
 				return nil, fmt.Errorf(
@@ -2260,47 +1993,6 @@ func requireManagedVolumeMountSource(
 func managedVolumeMountSubtreeMatches(relative, targetSubtree string) bool {
 	return relative == targetSubtree ||
 		relative == filepath.Join(writablePathSubdir, targetSubtree)
-}
-
-func interruptedMigrationMountSource(
-	cfg Config,
-	container ContainerInfo,
-	mount ContainerMount,
-) (string, bool) {
-	if !isLegacyRollbackRemnant(container) || cfg.VolumeDataPath == "" {
-		return "", false
-	}
-	relative, err := filepath.Rel(cfg.VolumeDataPath, mount.Source)
-	if err != nil || relative == "." || relative == ".." || filepath.IsAbs(relative) ||
-		strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-	parts := strings.Split(relative, string(filepath.Separator))
-	oldName := fmt.Sprintf("fred-%s-%d", container.LeaseUUID, container.InstanceIndex)
-	if len(parts) == 0 || parts[0] != oldName {
-		return "", false
-	}
-	if _, err := os.Lstat(filepath.Join(cfg.VolumeDataPath, oldName)); !errors.Is(err, os.ErrNotExist) {
-		// The v0.13 boundary renamed the whole parent. An existing parent,
-		// dangling symlink, permission error, or I/O error is a different and
-		// therefore unproved shape even if the app-aware target also exists.
-		return "", false
-	}
-	sanitizedTarget := sanitizeVolumePath(mount.Target)
-	if sanitizedTarget == "" ||
-		!managedVolumeMountSubtreeMatches(filepath.Join(parts[1:]...), sanitizedTarget) {
-		return "", false
-	}
-	parts[0] = canonicalVolumeName(
-		container.LeaseUUID,
-		manifest.DefaultServiceName,
-		container.InstanceIndex,
-	)
-	alternate := filepath.Join(append([]string{cfg.VolumeDataPath}, parts...)...)
-	if err := requireExistingPathUnderRoot(cfg.VolumeDataPath, alternate); err != nil {
-		return "", false
-	}
-	return alternate, true
 }
 
 func requireExistingPathUnderRoot(rootPath, candidatePath string) error {
@@ -2492,6 +2184,51 @@ func newBackend(
 		_ = docker.Close()
 		return nil, fmt.Errorf("failed to open retention store: %w", err)
 	}
+	operationSettlement, err := shared.NewOperationSettlement(cbStore, releaseStore)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind operation journals: %w", err)
+	}
+	releaseBackfiller, err := shared.NewReleaseBackfiller(cbStore, releaseStore)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind release backfill authority: %w", err)
+	}
+	maintenanceSettlement, err := shared.NewMaintenanceSettlement(cbStore, releaseStore)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind maintenance journals: %w", err)
+	}
+	restoreSettlement, err := shared.NewRestoreSettlement(operationSettlement, retentionStore)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind restore journals: %w", err)
+	}
+	closeSettlement, err := shared.NewCloseSettlement(cbStore, releaseStore, retentionStore)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind close journals: %w", err)
+	}
 
 	composeSvc, err := newComposeService(cfg.DockerHost)
 	if err != nil {
@@ -2505,21 +2242,24 @@ func newBackend(
 
 	b := &Backend{
 		cfg:                             cfg,
-		docker:                          docker,
-		compose:                         composeSvc,
+		docker:                          projectDockerRead(docker),
+		compose:                         projectComposeRead(composeSvc),
 		pool:                            pool,
-		volumes:                         volumes,
+		volumes:                         projectVolumeRead(volumes),
 		logger:                          logger.With("backend", cfg.Name),
 		partitionSource:                 partitionSource,
 		provisions:                      make(map[string]*provision),
 		actors:                          make(map[string]*leasesm.LeaseActor),
 		callbackStore:                   cbStore,
-		operationIntents:                cbStore,
 		diagnosticsStore:                diagStore,
 		releaseStore:                    releaseStore,
-		releaseCapacityPlanner:          releaseStore,
+		operationSettlement:             operationSettlement,
+		releaseBackfiller:               releaseBackfiller,
+		maintenanceSettlement:           maintenanceSettlement,
+		restoreSettlement:               restoreSettlement,
+		closeSettlement:                 closeSettlement,
+		releaseCapacityPlanner:          operationSettlement,
 		retentionStore:                  retentionStore,
-		orphanStreaks:                   make(map[string]int),
 		storageIdentity:                 storage.ID(),
 		storageAuthority:                storage,
 		storeAuthorityGate:              storeAuthorityGate,
@@ -2538,17 +2278,107 @@ func newBackend(
 	}
 
 	b.storageVerifier = productionDockerStorageIdentityVerifier{backend: b, authority: storage}
-	b.mutations = storageMutationAdapters{backend: b}
+	b.orphanPruner, err = newRetentionOrphanPruner(b)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind retention orphan pruner: %w", err)
+	}
+	mutationOperations := newStorageMutationOperations(b, docker, composeSvc, volumes)
+	b.backgroundMaintenance, err = newBackgroundMaintenanceCoordinator(b, mutationOperations)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind background substrate maintenance: %w", err)
+	}
+	err = shared.BindOperationSubstrateExecutor(
+		operationSettlement,
+		b.authorizeStorageMutation,
+		b.completeStorageMutation,
+		buildOperationSubstrate(b, mutationOperations),
+		runOperationSubstrate,
+		b.classifyOperationPhysical,
+	)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind operation substrate mutation authority: %w", err)
+	}
+	err = shared.BindMaintenanceSubstrateExecutor(
+		maintenanceSettlement,
+		b.authorizeStorageMutation,
+		b.completeStorageMutation,
+		buildMaintenanceSubstrate(b, mutationOperations),
+		runMaintenanceSubstrate,
+		b.classifyMaintenancePhysical,
+	)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind maintenance substrate mutation authority: %w", err)
+	}
+	err = shared.BindCloseSubstrateExecutor(
+		closeSettlement,
+		b.authorizeStorageMutation,
+		b.completeStorageMutation,
+		buildCloseSubstrate(b, mutationOperations),
+		runCloseSubstrate,
+		b.classifyClosePhysical,
+	)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind close substrate mutation authority: %w", err)
+	}
+	b.recoveryCoordinator, err = shared.NewRecoveryCoordinator(shared.RecoveryCoordinatorConfig{
+		Operations: operationSettlement, Maintenance: maintenanceSettlement,
+		Close: closeSettlement, ExcludeLease: b.withRecoveryLeaseExclusion,
+		ValidateActorClose: b.validateActorCloseScope,
+	})
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind lease recovery authority: %w", err)
+	}
+	callbackStorageAttestor, err := shared.NewCallbackStorageAttestor(
+		cbStore,
+		dockerCallbackStorageVerifier{verifier: b.storageVerifier, gate: b.storeAuthorityGate},
+		b.stopCtx,
+	)
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("bind callback storage attestor: %w", err)
+	}
 
 	callbackSender, err := shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:           cbStore,
+		StorageAttestor: callbackStorageAttestor,
 		HTTPClient:      httpClient,
 		Secret:          string(cfg.CallbackSecret),
 		Logger:          b.logger,
-		StopCtx:         b.stopCtx,
-		BeforeReplay:    b.VerifyStorageIdentity,
-		BeforeDelivery:  b.VerifyStorageIdentity,
-		StorageIdentity: storage.ID(),
+
 		OnDelivery: func(outcome string) {
 			callbackDeliveryTotal.WithLabelValues(outcome).Inc()
 		},
@@ -2568,6 +2398,24 @@ func newBackend(
 		return nil, fmt.Errorf("configure durable callback sender: %w", err)
 	}
 	b.callbackSender = callbackSender
+	callbackPublisher, err := shared.NewCallbackPublisher(shared.CallbackPublisherConfig{
+		OperationSettlement:   operationSettlement,
+		MaintenanceSettlement: maintenanceSettlement,
+		StorageAttestor:       callbackStorageAttestor,
+		Logger:                b.logger,
+		OnStoreError: func() {
+			callbackStoreErrorsTotal.Inc()
+		},
+	})
+	if err != nil {
+		_ = cbStore.Close()
+		_ = diagStore.Close()
+		_ = releaseStore.Close()
+		_ = retentionStore.Close()
+		_ = docker.Close()
+		return nil, fmt.Errorf("configure callback publisher: %w", err)
+	}
+	b.callbackPublisher = callbackPublisher
 
 	// Wire the substrate-agnostic seams the lease state machine consumes.
 	// Each adapter is a thin pass-through to the existing Docker-specific
@@ -2617,6 +2465,18 @@ func (b *Backend) Start(ctx context.Context) error {
 		return fmt.Errorf("volume manager validation failed: %w", err)
 	}
 
+	// The active pre-Compose migrator was intentionally removed after the
+	// controlled production inventory proved that no deployed workload uses
+	// that layout. Reject an absent service identity before any startup mutation:
+	// silently inferring topology or relabeling a container would manufacture
+	// authority that neither the v0.13 release journal nor Docker can prove.
+	topologyCtx, cancelTopology := b.recoveryDockerReadContext(ctx)
+	_, topologyErr := b.docker.ListManagedContainersStrict(topologyCtx)
+	cancelTopology()
+	if topologyErr != nil {
+		return fmt.Errorf("validate supported managed-container topology: %w", topologyErr)
+	}
+
 	// Every mutating/convergent startup phase shares one generous but finite
 	// backend-lifecycle budget, including the interrupted-volume recovery that
 	// must run before Docker inventory is safe to inspect. It is deliberately
@@ -2641,7 +2501,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	// configured container stop grace. Both remain children of startupCtx, so the
 	// documented aggregate startup deadline cannot be reset or exceeded here.
 	recoveryCtx, cancelRecovery := startupVolumeMutationContext(startupCtx)
-	err := b.mutationAdapter().recoverInterruptedVolumeMutations(recoveryCtx)
+	err := b.recoverInterruptedVolumeMutations(recoveryCtx)
 	cancelRecovery()
 	if err != nil {
 		return fmt.Errorf("recover interrupted managed-volume mutations: %w", err)
@@ -2667,51 +2527,39 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Check daemon capabilities for hardening configuration
 	b.checkDaemonCapabilities(initialCtx)
 
-	// Recover state under a generous but finite backend-lifecycle budget, NOT
-	// the caller's short startup ctx: recoverState can
-	// drive legacy migration whose health-wait takes up to MigrationReadyTimeout
-	// (90s) and which spawns background `-prev` grace-cleanup goroutines that
-	// outlive Start's return. main cancels the 30s startup ctx the instant Start
-	// returns, so binding recovery/migration to it caps the ready-wait and leaks
-	// `-prev` containers (ENG-592). This matches the retention steps below, which
-	// run under startupCtx. The fast connectivity/capability checks above keep
-	// the caller's ctx (also capped internally) so an unreachable daemon fails
-	// fast, while a daemon that wedges later cannot block Start for process life.
-	if err := b.recoverState(startupCtx); err != nil {
+	// Recover state under a generous but finite backend-lifecycle budget rather
+	// than the caller's short readiness context. main cancels that context as
+	// soon as Start returns, while a bounded fleet rebuild may legitimately take
+	// longer. The fast connectivity/capability checks above retain the caller's
+	// deadline so an unreachable daemon still fails fast.
+	stateRecoveryCtx, cancelStateRecovery := b.startupStateRecoveryContext(startupCtx)
+	err = b.recoverState(stateRecoveryCtx)
+	cancelStateRecovery()
+	if err != nil {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
-	// Classify restore substrate before retention reconciliation is allowed to
-	// tear down, rename, or finalize any source record. Ambiguous partial/mixed
-	// evidence must remain byte-for-byte available for operator recovery.
-	preflightCtx, cancelPreflight := b.startupPhaseContext(startupCtx)
-	err = b.preflightOperationIntentRecovery(preflightCtx)
-	cancelPreflight()
+	// Pending operation recovery is the sole owner of the write-ahead window.
+	// Run it before retention reconciliation: a Restoring finalizer must not read
+	// one empty/transitional Docker snapshot as rollback authority while an exact
+	// daemon-side Create accepted by the old process can still become visible.
+	// Any uncertainty keeps the Pending row and fails startup before a finalizer
+	// can tear down, rename, or hand source ownership back.
+	operationCtx, cancelOperations := b.startupOperationRecoveryContext(startupCtx)
+	err = b.recoverOperationIntents(operationCtx)
+	cancelOperations()
 	if err != nil {
 		callbackStoreErrorsTotal.Inc()
-		return fmt.Errorf("preflight interrupted operations: %w", err)
+		return fmt.Errorf("recover interrupted operations: %w", err)
 	}
 
-	// Reconcile crash-interrupted soft-deletes and restores. MUST run AFTER
-	// recoverState (so b.provisions reflects live containers) and BEFORE
-	// cleanupOrphanedVolumes (so any mid-rename canonical volume is moved back
-	// into the fred-retained- namespace before the orphan reaper sees it).
+	// Reconcile crash-interrupted soft-deletes and restores only after every
+	// Pending operation has become typed terminal evidence. MUST run AFTER
+	// recoverState so b.provisions reflects live containers.
 	retentionCtx, cancelRetention := b.startupPhaseContext(startupCtx)
 	retentionReconcileErr := b.reconcileRetentions(retentionCtx)
 	cancelRetention()
 	if retentionReconcileErr != nil {
 		b.logger.Warn("retention reconciliation failed", "error", retentionReconcileErr)
-	}
-
-	// Resolve the write-ahead window only after ordinary state and any
-	// crash-interrupted restore have converged, but before quota/orphan/reaping
-	// cleanup can rename or erase evidence. Partial or mixed substrate keeps the
-	// intent durable and fails startup/readiness closed.
-	operationCtx, cancelOperations := b.startupPhaseContext(startupCtx)
-	err = b.recoverOperationIntents(operationCtx, retentionReconcileErr)
-	cancelOperations()
-	if err != nil {
-		callbackStoreErrorsTotal.Inc()
-		return fmt.Errorf("recover interrupted operations: %w", err)
 	}
 
 	// Backfill per-volume quotas onto existing volumes. Volumes provisioned
@@ -2722,25 +2570,13 @@ func (b *Backend) Start(ctx context.Context) error {
 	// may be uncapped would violate the resource authority recovered above. Runs
 	// after reconcileRetentions so the fred-retained- namespace matches the
 	// retention records (ENG-454).
-	// Uses b.stopCtx like the recovery steps above: a one-time legacy migration
-	// in recoverState can push these startup steps past the caller's short ctx
+	// Uses the aggregate startup context rather than the caller's short readiness
 	// deadline (ENG-592).
 	quotaCtx, cancelQuotas := b.startupPhaseContext(startupCtx)
 	err = b.reconcileVolumeQuotas(quotaCtx)
 	cancelQuotas()
 	if err != nil {
 		return fmt.Errorf("reconcile startup volume quotas: %w", err)
-	}
-
-	// Clean up orphaned volumes (created but no matching provision).
-	// Must run after recoverState so the provision map is populated. On
-	// b.stopCtx (see reconcileVolumeQuotas above) so a slow migration doesn't
-	// leave this running under an already-expired startup ctx (ENG-592).
-	orphanCtx, cancelOrphans := b.startupPhaseContext(startupCtx)
-	err = b.cleanupOrphanedVolumes(orphanCtx)
-	cancelOrphans()
-	if err != nil {
-		return fmt.Errorf("orphaned volume cleanup failed: %w", err)
 	}
 
 	// Boot-eager reap: destroy volumes that expired while fred was offline.
@@ -2793,9 +2629,10 @@ func (b *Backend) Start(ctx context.Context) error {
 
 	// Sample actor inbox depth and stuck-seconds on a ticker for the
 	// fred_docker_backend_lease_actor_* observability gauges. Prime the durable
-	// close gauges synchronously so an already-pending startup finalizer is
-	// visible before the first periodic sample.
+	// close and aggregate-capacity gauges synchronously so durable startup state
+	// is visible before the first periodic sample.
 	b.sampleCloseIntentMetrics(time.Now())
+	b.sampleLeaseMutationCapacityMetrics()
 	b.wg.Go(b.actorMetricsSampleLoop)
 
 	b.logger.Info("Docker backend started",
@@ -3240,51 +3077,79 @@ func (b *Backend) Health(ctx context.Context) error {
 	return nil
 }
 
-// sendOperationCallback resolves the exact operation callback URL from the
-// provisions map and delegates to sendOperationCallbackWithURL. Use this when
-// the provision is still in the map.
-func (b *Backend) sendOperationCallback(leaseUUID string, status backend.CallbackStatus, errMsg string) {
-	b.provisionsMu.RLock()
-	var callbackURL string
-	if prov, ok := b.provisions[leaseUUID]; ok {
-		callbackURL = prov.CallbackURL
+// sendOperationSuccessWithURL dispatches an exact requested-operation success
+// with the proof returned by the active Release commit.
+func (b *Backend) sendOperationSuccessWithURL(
+	committed shared.OperationReleaseCommitted,
+) {
+	if err := b.callbackPublisher.PublishOperationSuccessContext(b.stopCtx, committed); err != nil {
+		b.logger.Error("failed to publish operation success", "error", err,
+			"lease_uuid", committed.LeaseUUID())
 	}
-	b.provisionsMu.RUnlock()
-
-	b.sendOperationCallbackWithURL(leaseUUID, callbackURL, status, errMsg)
 }
 
-// sendOperationCallbackWithURL dispatches an exact requested-operation
-// completion using a caller-provided URL.
-func (b *Backend) sendOperationCallbackWithURL(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string) {
+// sendOperationFailure dispatches a definitive requested-operation failure
+// whose callback route and generation are sealed by the store-issued proof.
+func (b *Backend) sendOperationFailure(proof shared.OperationReleaseUncommitted, errMsg string) {
 	// Truncate error to fit the on-chain rejection reason limit.
 	if len(errMsg) > callbackMaxErrorLen {
 		errMsg = errMsg[:callbackMaxErrorLen-3] + "..."
 	}
 
-	b.callbackSender.SendOperationCallback(leaseUUID, callbackURL, b.Name(), status, errMsg)
+	if err := b.callbackPublisher.PublishOperationFailureContext(b.stopCtx, proof, errMsg); err != nil {
+		b.logger.Error("failed to publish operation failure", "error", err,
+			"lease_uuid", proof.LeaseUUID())
+	}
 }
 
-// sendLifecycleCallbackWithURL dispatches a typed, observation-only
-// lifecycle callback. retained is true only for successful retained teardown.
-func (b *Backend) sendLifecycleCallbackWithURL(leaseUUID, callbackURL string, status backend.CallbackStatus, errMsg string, retained bool) {
+// sendLifecycleFailure dispatches an observation only after the callback and
+// release journal pair has upgraded the actor's release-only proof into a
+// phase-qualified publication permit. Callback route and backend lineage come
+// only from that exact active release; a pending operation, maintenance, or
+// close aggregate head cannot produce the permit accepted by publication.
+func (b *Backend) sendLifecycleFailure(
+	runtime shared.RuntimeGenerationProof,
+	errMsg string,
+) {
 	// Truncate error to fit the on-chain rejection reason limit.
 	if len(errMsg) > callbackMaxErrorLen {
 		errMsg = errMsg[:callbackMaxErrorLen-3] + "..."
 	}
 
-	b.callbackSender.SendLifecycleCallback(leaseUUID, callbackURL, b.Name(), status, errMsg, retained)
+	permit, err := b.callbackPublisher.AuthorizeRuntimeObservationContext(b.stopCtx, runtime)
+	if err != nil {
+		b.logger.Error("failed to authorize lifecycle failure", "error", err,
+			"lease_uuid", runtime.LeaseUUID())
+		return
+	}
+	if err := b.callbackPublisher.PublishLifecycleFailureContext(b.stopCtx, permit, errMsg); err != nil {
+		b.logger.Error("failed to publish lifecycle failure", "error", err,
+			"lease_uuid", runtime.LeaseUUID())
+	}
 }
 
 // removeProvision removes a provision reservation. Used when pre-flight
-// validation fails after the slot was reserved. Because Docker-private
-// state (VolumeCleanupAttempts) is a field on the *provision wrapper,
-// the single map delete also drops every per-lease counter — no parallel
-// cleanup required.
+// validation fails after the slot was reserved.
 func (b *Backend) removeProvision(leaseUUID string) {
 	b.provisionsMu.Lock()
-	delete(b.provisions, leaseUUID)
+	b.deleteProvisionLocked(leaseUUID)
 	b.provisionsMu.Unlock()
+}
+
+// deleteProvisionLocked is the single production deletion primitive for the
+// live projection. The caller must hold provisionsMu. Keeping the Ready gauge
+// transition inside the same critical section makes deletion linearizable with
+// both actor status changes and recovery's baseline publication.
+func (b *Backend) deleteProvisionLocked(leaseUUID string) bool {
+	p, ok := b.provisions[leaseUUID]
+	if !ok {
+		return false
+	}
+	if p.Status == backend.ProvisionStatusReady {
+		activeProvisions.Dec()
+	}
+	delete(b.provisions, leaseUUID)
+	return true
 }
 
 // shutdownAwareContext returns a context that cancels on either:

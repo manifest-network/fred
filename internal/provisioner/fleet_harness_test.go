@@ -126,6 +126,9 @@ type fakeBackendServer struct {
 	retentionCalls    int
 	provisionCalls    map[string]int
 	provisionRequests map[string]backend.ProvisionRequest
+	provisionHook     func(context.Context, backend.ProvisionRequest) error
+	provisionStatus   int
+	provisionBody     string
 	lifecycleByLease  map[string]backend.LifecycleGenerationObservation
 	restoreCalls      map[string]int
 	restoreRequests   map[string]backend.RestoreRequest
@@ -134,7 +137,7 @@ type fakeBackendServer struct {
 	customDomainCalls map[string]int
 }
 
-func newFakeBackendServer(t *testing.T, name string) *fakeBackendServer {
+func newFakeBackendServer(t testing.TB, name string) *fakeBackendServer {
 	t.Helper()
 
 	f := &fakeBackendServer{
@@ -407,9 +410,23 @@ func (f *fakeBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 	f.mu.Lock()
 	f.provisionCalls[req.LeaseUUID]++
 	f.provisionRequests[req.LeaseUUID] = req
+	hook := f.provisionHook
+	status, body := f.provisionStatus, f.provisionBody
 	f.mu.Unlock()
+	if status != 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+		return
+	}
 
-	if err := f.mock.Provision(r.Context(), req); err != nil {
+	var err error
+	if hook != nil {
+		err = hook(r.Context(), req)
+	} else {
+		err = f.mock.Provision(r.Context(), req)
+	}
+	if err != nil {
 		if errors.Is(err, backend.ErrAlreadyProvisioned) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
@@ -426,6 +443,37 @@ func (f *fakeBackendServer) handleProvision(w http.ResponseWriter, r *http.Reque
 		backend.ObserveLifecycleGeneration(req.CallbackURL, req.LifecycleCallbackURL),
 	)
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (f *fakeBackendServer) setProvisionHook(
+	hook func(context.Context, backend.ProvisionRequest) error,
+) {
+	f.mu.Lock()
+	f.provisionHook = hook
+	f.mu.Unlock()
+}
+
+func (f *fakeBackendServer) setProvisionResponse(status int, body string) {
+	f.mu.Lock()
+	f.provisionStatus = status
+	f.provisionBody = body
+	f.mu.Unlock()
+}
+
+func provisionResponseBackendForTest(
+	t testing.TB,
+	backendName string,
+	status int,
+	body string,
+) (*fakeBackendServer, *backend.HTTPClient) {
+	t.Helper()
+	server := newFakeBackendServer(t, backendName)
+	server.setProvisionResponse(status, body)
+	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
+		Name: backendName, BaseURL: server.srv.URL, Secret: fleetSecret,
+		Timeout: time.Second,
+	})
+	return server, client
 }
 
 func (f *fakeBackendServer) handleRestore(w http.ResponseWriter, r *http.Request) {
@@ -693,6 +741,8 @@ type fleet struct {
 	placement     *placement.Store
 	payloads      *payload.Store
 	tracker       *fleetReconcilerTracker
+	coordinator   *placement.OperationCoordinator
+	execution     *placement.ExecutionCoordinator
 	providerUUID  string
 	placementPath string
 	placementAge  time.Duration
@@ -716,10 +766,6 @@ type fleet struct {
 type fleetReconcilerTracker struct {
 	*testOperationRegistry
 	payloads *payload.Store
-}
-
-func (tracker *fleetReconcilerTracker) ReconcilerOperations() ReconcilerOperations {
-	return tracker.Operations()
 }
 
 func (tracker *fleetReconcilerTracker) HasPayload(leaseUUID string) (bool, error) {
@@ -801,14 +847,21 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 	age := opts.placementAge
 	f.placementAge = age
 	f.placementPath = filepath.Join(t.TempDir(), "placements.db")
+	callbackRoutes, err := placement.NewCallbackRouteFactory("http://fred.invalid")
+	require.NoError(t, err)
 	ps, err := placementstore.NewStore(
 		f.placementPath,
 		placement.WithClock(func() time.Time { return time.Now().Add(-age) }),
+		placement.WithCallbackRouteFactory(callbackRoutes),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ps.Close() })
-	configureTestPlacementTopology(t, ps, backendTopologyNames(router))
+	armTestPlacementTopology(t, ps, backendTopologyNames(router))
 	f.placement = ps
+	f.coordinator, err = f.tracker.bindPlacementStore(ps)
+	require.NoError(t, err)
+	f.execution = bindTestBackendRuntime(t, f.coordinator, router)
+	f.tracker.callbackStore = ps
 
 	f.chain = &chaintest.MockClient{
 		GetPendingLeasesFunc: func(_ context.Context, _ string) ([]billingtypes.Lease, error) {
@@ -861,38 +914,56 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 	}
 	f.acknowledger = ack
 
+	reconciliation := bindTestReconciliationCoordinator(
+		t, f.placement, f.execution, f.chain, payloads, nil,
+	)
+	require.True(t, f.placement.CurrentAdmissionBaseline().Valid(),
+		"fleet baseline must survive reconciliation coordinator construction")
 	reconcilerConfig := ReconcilerConfig{
-		ProviderUUID:           f.providerUUID,
-		CallbackBaseURL:        "http://fred.invalid",
 		Interval:               opts.interval,
 		MaxReprovisionAttempts: 3,
+		Coordinator:            reconciliation,
 	}
 	f.reconcilerCfg = reconcilerConfig
-	rec, err := NewReconciler(reconcilerConfig, f.chain, ack, router, f.tracker, f.placement)
+	rec, err := newTestReconciler(t, reconcilerConfig, f.chain, ack, router, f.tracker, f.placement)
 	require.NoError(t, err)
+	require.True(t, f.placement.CurrentAdmissionBaseline().Valid(),
+		"fleet baseline must survive reconciler construction")
 	f.reconciler = rec
 
 	return f
 }
 
 // restartReconciler closes and reopens the durable placement database, then
-// constructs a fresh reconciler over the same chain, router, payloads, and
-// operation registry. It models a fred process restart without restarting the
-// backend nodes.
+// constructs a fresh reconciler and process-local Registry over the same
+// chain, router, and payloads. It models a fred process restart without
+// restarting the backend nodes.
 func (f *fleet) restartReconciler() {
 	f.t.Helper()
 	require.NotNil(f.t, f.placement)
 	require.NoError(f.t, f.placement.Close())
 
+	callbackRoutes, err := placement.NewCallbackRouteFactory("http://fred.invalid")
+	require.NoError(f.t, err)
 	store, err := placementstore.NewStore(
 		f.placementPath,
 		placement.WithClock(func() time.Time { return time.Now().Add(-f.placementAge) }),
+		placement.WithCallbackRouteFactory(callbackRoutes),
 	)
 	require.NoError(f.t, err)
 	f.t.Cleanup(func() { _ = store.Close() })
 	f.placement = store
+	f.tracker.testOperationRegistry = newTestOperationRegistry()
+	f.coordinator, err = f.tracker.bindPlacementStore(store)
+	require.NoError(f.t, err)
+	f.execution = bindTestBackendRuntime(f.t, f.coordinator, f.router)
+	f.tracker.callbackStore = store
+	f.reconcilerCfg.Coordinator = bindTestReconciliationCoordinator(
+		f.t, f.placement, f.execution, f.chain, f.payloads, nil,
+	)
 
-	reconciler, err := NewReconciler(
+	reconciler, err := newTestReconciler(
+		f.t,
 		f.reconcilerCfg,
 		f.chain,
 		f.acknowledger,

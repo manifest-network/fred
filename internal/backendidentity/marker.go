@@ -101,7 +101,7 @@ func LoadVerifiedMarkerPair(
 	if err != nil {
 		return VerifiedStorage{}, err
 	}
-	return VerifiedStorage{id: id}, nil
+	return VerifiedStorage{id: id, backendName: backendName}, nil
 }
 
 // LoadMarkerPair loads a previously sealed marker pair. It never creates,

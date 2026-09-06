@@ -82,38 +82,38 @@ func TestHandleProvisionCallback_RejectsInvalidLifecycleCapability(t *testing.T)
 		{
 			name:      "duplicate different lifecycle IDs",
 			query:     "lifecycle_id=" + canonicalTestLifecycleID + "&lifecycle_id=" + otherLifecycleID,
-			wantError: "lifecycle_id must be a single canonical UUIDv4",
+			wantError: "invalid request body",
 		},
 		{
 			name:      "duplicate identical lifecycle IDs",
 			query:     "lifecycle_id=" + canonicalTestLifecycleID + "&lifecycle_id=" + canonicalTestLifecycleID,
-			wantError: "lifecycle_id must be a single canonical UUIDv4",
+			wantError: "invalid request body",
 		},
 		{
 			name:      "encoded duplicate lifecycle key",
 			query:     "lifecycle_id=" + canonicalTestLifecycleID + "&lifecycle%5Fid=" + otherLifecycleID,
-			wantError: "lifecycle_id must be a single canonical UUIDv4",
+			wantError: "invalid request body",
 		},
 		{
 			name:      "malformed lifecycle ID",
 			query:     "lifecycle_id=not-a-uuid",
-			wantError: "lifecycle_id must be a single canonical UUIDv4",
+			wantError: "invalid request body",
 		},
 		{
 			name:      "non-v4 lifecycle ID",
 			query:     "lifecycle_id=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-			wantError: "lifecycle_id must be a single canonical UUIDv4",
+			wantError: "invalid request body",
 		},
 		{
 			name:      "uppercase lifecycle ID",
 			query:     "lifecycle_id=123E4567-E89B-42D3-A456-426614174000",
-			wantError: "lifecycle_id must be a single canonical UUIDv4",
+			wantError: "invalid request body",
 		},
 		{
 			name: "operation and lifecycle capabilities together",
 			query: "operation_id=" + otherLifecycleID +
 				"&lifecycle_id=" + canonicalTestLifecycleID,
-			wantError: "callback URL must carry exactly one capability kind",
+			wantError: "invalid request body",
 		},
 	}
 
@@ -163,7 +163,7 @@ func TestHandleProvisionCallback_RejectsMalformedRawCapabilityQuery(t *testing.T
 	server.handleProvisionCallback(recorder, req)
 
 	assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
-	assertErrorBody(t, recorder, "callback query is malformed")
+	assertErrorBody(t, recorder, "invalid request body")
 	assert.False(t, publisher.called)
 }
 
@@ -178,13 +178,13 @@ func TestHandleProvisionCallback_RejectsStatusAuthorityMismatchBeforePublication
 			name:       "operation capability cannot carry teardown observation",
 			requestURI: "/callbacks/provision?operation_id=" + canonicalTestLifecycleID,
 			body:       `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"deprovisioned"}`,
-			wantError:  "deprovisioned status requires lifecycle or legacy callback authority",
+			wantError:  "invalid request body",
 		},
 		{
 			name:       "retained requires terminal teardown",
 			requestURI: "/callbacks/provision?lifecycle_id=" + canonicalTestLifecycleID,
 			body:       `{"lease_uuid":"` + testutil.ValidUUID1 + `","status":"failed","retained":true}`,
-			wantError:  "retained requires deprovisioned status",
+			wantError:  "invalid request body",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {

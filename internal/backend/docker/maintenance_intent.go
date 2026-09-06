@@ -15,53 +15,99 @@ import (
 
 const interruptedMaintenanceFailure = "backend interrupted maintenance before completion"
 
+// maintenanceAdmission keeps replay acknowledgements structurally separate
+// from the mutation capabilities returned only for a newly-created command.
+// Existing, completed, and superseded requests can therefore never reach
+// release append, actor routing, or Compose by accidentally using zero claims.
+type maintenanceAdmission struct {
+	disposition shared.MaintenanceIntentAdmissionDisposition
+	intent      shared.MaintenanceIntentClaim
+	target      shared.MaintenanceReleaseClaim
+}
+
+func (admission maintenanceAdmission) created() bool {
+	return admission.disposition == shared.MaintenanceIntentAdmissionCreated
+}
+
+// maintenanceReplayResult keeps replay-only dispositions out of the mutation
+// path. A superseded update is a definitive invalid-state refusal: its backend
+// work remains deduplicated, and the provider must not persist its older
+// payload over a later accepted generation.
+func maintenanceReplayResult(
+	disposition shared.MaintenanceIntentAdmissionDisposition,
+) (replayed bool, err error) {
+	switch disposition {
+	case shared.MaintenanceIntentAdmissionExisting,
+		shared.MaintenanceIntentAdmissionCompleted:
+		return true, nil
+	case shared.MaintenanceIntentAdmissionCompletedSuperseded:
+		return true, fmt.Errorf(
+			"%w: completed update was superseded by a later update generation",
+			backend.ErrInvalidState,
+		)
+	case shared.MaintenanceIntentAdmissionNone,
+		shared.MaintenanceIntentAdmissionCreated:
+		return false, nil
+	default:
+		return true, errors.New("unknown maintenance replay disposition")
+	}
+}
+
 func (b *Backend) admitMaintenance(
-	kind shared.MaintenanceIntentKind,
-	source shared.ReleaseClaim,
+	request shared.MaintenanceRequestAuthority,
+	source shared.MaintenanceSourceClaim,
 	target shared.Release,
-) (shared.MaintenanceIntentClaim, shared.MaintenanceReleaseClaim, error) {
+) (maintenanceAdmission, error) {
 	if b.callbackStore == nil || b.releaseStore == nil {
-		return shared.MaintenanceIntentClaim{}, shared.MaintenanceReleaseClaim{},
+		return maintenanceAdmission{},
 			errors.New("durable callback and release stores are required for maintenance")
 	}
-	admission, err := b.callbackStore.BeginMaintenanceIntent(shared.MaintenanceIntentSpec{
-		Kind:             kind,
-		SourceRelease:    source,
-		TargetRelease:    target,
-		Backend:          b.Name(),
-		BackendStorageID: b.storageIdentity,
-	})
+	candidate, err := b.maintenanceSettlement.NewMaintenanceIntentCandidate(request, source, target)
 	if err != nil {
-		return shared.MaintenanceIntentClaim{}, shared.MaintenanceReleaseClaim{},
-			fmt.Errorf("publish durable %s maintenance intent: %w", kind, err)
+		return maintenanceAdmission{},
+			fmt.Errorf("construct %s maintenance authority: %w", request.Kind(), err)
 	}
-	if err := b.releaseStore.CheckAppendMaintenanceCapacity(admission); err != nil {
-		if cancelErr := b.callbackStore.CancelMaintenanceIntent(admission); cancelErr != nil {
-			return shared.MaintenanceIntentClaim{}, shared.MaintenanceReleaseClaim{},
+	admission, err := b.maintenanceSettlement.BeginMaintenanceIntent(candidate)
+	if err != nil {
+		return maintenanceAdmission{},
+			fmt.Errorf("publish durable %s maintenance intent: %w", request.Kind(), err)
+	}
+	if replayed, replayErr := maintenanceReplayResult(admission.Disposition()); replayed {
+		return maintenanceAdmission{disposition: admission.Disposition()}, replayErr
+	}
+	dispatch, created := admission.CreatedDispatch()
+	if !created {
+		return maintenanceAdmission{}, errors.New("maintenance admission returned no authority")
+	}
+	if err := b.maintenanceSettlement.CheckAppendMaintenanceCapacity(dispatch); err != nil {
+		if cancelErr := b.maintenanceSettlement.CancelMaintenanceIntent(dispatch); cancelErr != nil {
+			return maintenanceAdmission{},
 				fmt.Errorf("%s maintenance refused but intent cancellation failed: %w",
-					kind, errors.Join(err, cancelErr))
+					request.Kind(), errors.Join(err, cancelErr))
 		}
-		return shared.MaintenanceIntentClaim{}, shared.MaintenanceReleaseClaim{}, err
+		return maintenanceAdmission{}, err
 	}
-	appendClaim, err := b.callbackStore.StartMaintenanceAppend(admission)
+	appendClaim, err := b.maintenanceSettlement.StartMaintenanceAppend(dispatch)
 	if err != nil {
-		return shared.MaintenanceIntentClaim{}, shared.MaintenanceReleaseClaim{},
-			fmt.Errorf("start %s maintenance append (intent preserved): %w", kind, err)
+		return maintenanceAdmission{},
+			fmt.Errorf("start %s maintenance append (intent preserved): %w", request.Kind(), err)
 	}
-	intent := appendClaim.Intent()
-	targetClaim, err := b.releaseStore.AppendMaintenance(appendClaim)
+	targetClaim, err := b.maintenanceSettlement.AppendMaintenance(appendClaim)
 	if err != nil {
 		// The stores are independent. An append error after Begin is not proof
 		// that the release transaction did not commit, so preserve the intent.
-		return shared.MaintenanceIntentClaim{}, shared.MaintenanceReleaseClaim{},
-			fmt.Errorf("append %s maintenance release (intent preserved): %w", kind, err)
+		return maintenanceAdmission{},
+			fmt.Errorf("append %s maintenance release (intent preserved): %w", request.Kind(), err)
 	}
-	bound, err := b.callbackStore.BindMaintenanceIntentTarget(intent, targetClaim)
+	boundTarget, err := b.maintenanceSettlement.BindMaintenanceIntentTarget(targetClaim)
 	if err != nil {
-		return shared.MaintenanceIntentClaim{}, shared.MaintenanceReleaseClaim{},
-			fmt.Errorf("bind %s maintenance release (intent preserved): %w", kind, err)
+		return maintenanceAdmission{},
+			fmt.Errorf("bind %s maintenance release (intent preserved): %w", request.Kind(), err)
 	}
-	return bound, targetClaim, nil
+	return maintenanceAdmission{
+		disposition: shared.MaintenanceIntentAdmissionCreated,
+		intent:      boundTarget.Intent(), target: boundTarget,
+	}, nil
 }
 
 func (b *Backend) failUnacceptedMaintenance(
@@ -70,12 +116,17 @@ func (b *Backend) failUnacceptedMaintenance(
 	cause error,
 ) error {
 	reason := replaceOpReason(string(intent.Kind()))
-	if err := b.releaseStore.FailMaintenance(target, reason, string(intent.Kind())+" failed"); err != nil {
+	refused, refuseErr := b.maintenanceSettlement.RefuseMaintenanceExecution(target)
+	if refuseErr != nil {
+		return fmt.Errorf("maintenance routing outcome is not a pre-effect refusal: %w", errors.Join(cause, refuseErr))
+	}
+	failed, err := b.maintenanceSettlement.FailMaintenance(refused, reason, string(intent.Kind())+" failed")
+	if err != nil {
 		return fmt.Errorf("maintenance routing failed and exact release settlement is ambiguous: %w",
 			errors.Join(cause, err))
 	}
-	if err := b.resolveMaintenanceIntent(
-		intent, backend.CallbackStatusFailed, interruptedMaintenanceFailure,
+	if err := b.resolveMaintenanceFailure(
+		failed, interruptedMaintenanceFailure,
 	); err != nil {
 		return fmt.Errorf("maintenance routing failed and callback settlement is pending: %w",
 			errors.Join(cause, err))
@@ -83,34 +134,44 @@ func (b *Backend) failUnacceptedMaintenance(
 	return cause
 }
 
-func (b *Backend) resolveMaintenanceIntent(
-	intent shared.MaintenanceIntentClaim,
-	status backend.CallbackStatus,
-	errMsg string,
+func (b *Backend) resolveMaintenanceSuccess(
+	active shared.MaintenanceReleaseActive,
 ) error {
-	if _, err := b.callbackStore.ResolveMaintenanceIntent(intent, status, errMsg); err != nil {
-		return err
-	}
-	if b.callbackSender != nil {
-		b.callbackSender.NotifyPendingCallbacks()
-	}
-	return nil
+	return b.callbackPublisher.PublishMaintenanceSuccessContext(b.stopCtx, active)
 }
 
-func (b *Backend) tryResolveMaintenanceIntent(
-	intent shared.MaintenanceIntentClaim,
-	status backend.CallbackStatus,
+func (b *Backend) resolveMaintenanceFailure(
+	failed shared.MaintenanceReleaseFailure,
 	errMsg string,
 ) error {
-	_, acquired, err := b.callbackStore.TryResolveMaintenanceIntent(intent, status, errMsg)
+	return b.callbackPublisher.PublishMaintenanceFailureContext(b.stopCtx, failed, errMsg)
+}
+
+func (b *Backend) tryResolveMaintenanceSuccess(
+	ctx context.Context,
+	active shared.MaintenanceReleaseActive,
+) error {
+	acquired, err := b.callbackPublisher.TryPublishMaintenanceSuccessContext(ctx, active)
 	if err != nil {
 		return err
 	}
 	if !acquired {
 		return errors.New("maintenance callback journal is busy; retry exact settlement")
 	}
-	if b.callbackSender != nil {
-		b.callbackSender.NotifyPendingCallbacks()
+	return nil
+}
+
+func (b *Backend) tryResolveMaintenanceFailure(
+	ctx context.Context,
+	failed shared.MaintenanceReleaseFailure,
+	errMsg string,
+) error {
+	acquired, err := b.callbackPublisher.TryPublishMaintenanceFailureContext(ctx, failed, errMsg)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return errors.New("maintenance callback journal is busy; retry exact settlement")
 	}
 	return nil
 }
@@ -122,29 +183,36 @@ func (b *Backend) settleMaintenanceBeforeClose(leaseUUID string) error {
 	if b.callbackStore == nil || b.releaseStore == nil {
 		return nil
 	}
-	intent, found, err := b.callbackStore.GetMaintenanceIntent(leaseUUID)
+	intent, found, err := b.maintenanceSettlement.GetMaintenanceIntent(leaseUUID)
 	if err != nil || !found {
 		return err
 	}
-	release, target, targetFound, err := b.releaseStore.FindMaintenanceRelease(
+	release, target, targetFound, err := b.maintenanceSettlement.FindMaintenanceRelease(
 		leaseUUID, intent.MaintenanceID(),
 	)
 	if err != nil {
 		return fmt.Errorf("inspect maintenance before close: %w", err)
 	}
 	if targetFound {
-		if _, bound := intent.TargetReleaseClaim(); !bound {
-			intent, err = b.callbackStore.BindMaintenanceIntentTarget(intent, target)
-			if err != nil {
-				return fmt.Errorf("bind maintenance before close: %w", err)
-			}
+		target, err = b.maintenanceSettlement.BindMaintenanceIntentTarget(target)
+		if err != nil {
+			return fmt.Errorf("bind maintenance before close: %w", err)
 		}
+		intent = target.Intent()
 		if release.Status == "active" {
-			return b.resolveMaintenanceIntent(intent, backend.CallbackStatusSuccess, "")
+			active, err := b.maintenanceSettlement.ProveMaintenanceActive(intent)
+			if err != nil {
+				return err
+			}
+			return b.resolveMaintenanceSuccess(active)
 		}
 		if release.Status == "deploying" {
-			if err := b.releaseStore.FailMaintenance(
-				target, replaceOpReason(string(intent.Kind())), string(intent.Kind())+" failed",
+			refused, refuseErr := b.maintenanceSettlement.RefuseMaintenanceExecution(target)
+			if refuseErr != nil {
+				return fmt.Errorf("preempted maintenance has crossed its physical boundary: %w", refuseErr)
+			}
+			if _, err := b.maintenanceSettlement.FailMaintenance(
+				refused, replaceOpReason(string(intent.Kind())), string(intent.Kind())+" failed",
 			); err != nil {
 				return fmt.Errorf("fail preempted maintenance release: %w", err)
 			}
@@ -160,10 +228,13 @@ func (b *Backend) settleMaintenanceBeforeClose(leaseUUID string) error {
 // cohort. It never re-runs Compose. The exact MaintenanceID shared by the WAL,
 // Release and target labels is the only cleanup/activation authority.
 func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
-	if b.callbackStore == nil || b.releaseStore == nil {
+	if b.callbackStore == nil || b.releaseStore == nil || b.recoveryCoordinator == nil {
 		return nil
 	}
-	intents, err := b.callbackStore.ListMaintenanceIntents()
+	if err := b.recoverFailedMaintenanceReceipts(ctx); err != nil {
+		return err
+	}
+	intents, err := b.maintenanceSettlement.ListMaintenanceIntents()
 	if err != nil {
 		return fmt.Errorf("list maintenance intents: %w", err)
 	}
@@ -175,230 +246,295 @@ func (b *Backend) recoverMaintenanceIntents(ctx context.Context) error {
 			)
 		}
 
-		unlock := b.commandFence.Lock(snapshot.LeaseUUID())
-		recoveryErr := func() error {
-			intent, found, readErr := b.callbackStore.GetMaintenanceIntent(snapshot.LeaseUUID())
-			if readErr != nil || !found {
-				return readErr
-			}
-			if intent.Backend() != b.Name() || intent.BackendStorageID() != b.storageIdentity {
-				return fmt.Errorf("maintenance authority changed before recovery")
-			}
+		_, recoveryErr := b.recoveryCoordinator.WithLease(
+			ctx, snapshot.LeaseUUID(),
+			func(recoveryScope shared.LeaseRecoveryScope) error {
+				intent, found, readErr := b.maintenanceSettlement.GetMaintenanceIntent(snapshot.LeaseUUID())
+				if readErr != nil || !found {
+					return readErr
+				}
+				if intent.Backend() != b.Name() || intent.BackendStorageID() != b.storageIdentity {
+					return fmt.Errorf("maintenance authority changed before recovery")
+				}
 
-			// Admission holds commandFence through the actor ack. Therefore a live
-			// replacement observed here as Restarting/Updating owns all substrate
-			// movement; recovery must neither classify its in-progress snapshot nor
-			// race it to target cleanup.
-			if b.actorOwnsMaintenance(intent.LeaseUUID(), intent.MaintenanceID()) {
-				return nil
-			}
-
-			targetRelease, targetClaim, targetFound, findErr := b.releaseStore.FindMaintenanceRelease(
-				intent.LeaseUUID(), intent.MaintenanceID(),
-			)
-			if findErr != nil {
-				return fmt.Errorf("find exact maintenance release: %w", findErr)
-			}
-			if targetFound {
-				if bound, ok := intent.TargetReleaseClaim(); ok {
-					if bound.Version() != targetClaim.Version() || bound.Digest() != targetClaim.Digest() {
-						return errors.New("bound maintenance target differs from exact release")
-					}
-				} else {
+				targetRelease, targetClaim, targetFound, findErr := b.maintenanceSettlement.FindMaintenanceRelease(
+					intent.LeaseUUID(), intent.MaintenanceID(),
+				)
+				if findErr != nil {
+					return fmt.Errorf("find exact maintenance release: %w", findErr)
+				}
+				if targetFound {
 					var acquired bool
-					intent, acquired, findErr = b.callbackStore.TryBindMaintenanceIntentTarget(intent, targetClaim)
+					targetClaim, acquired, findErr = b.maintenanceSettlement.TryBindMaintenanceIntentTarget(targetClaim)
 					if findErr != nil {
 						return fmt.Errorf("bind recovered maintenance target: %w", findErr)
 					}
 					if !acquired {
 						return errors.New("maintenance callback journal is busy; retry exact target binding")
 					}
+					intent = targetClaim.Intent()
 				}
-			}
 
-			switch {
-			case targetFound && targetRelease.Status == "active":
-				containers, listErr := b.listManagedContainersStrictForRecovery(ctx)
-				if listErr != nil {
-					return fmt.Errorf("strict committed maintenance inventory: %w", listErr)
-				}
-				targetContainers, leaseContainers, selectErr := maintenanceTargetContainers(intent, containers)
-				if selectErr != nil {
-					return selectErr
-				}
-				cohortHealthy := len(targetContainers) == len(leaseContainers) &&
-					validateRecoveredReleaseCohort(&targetRelease, targetContainers) == nil
-				runtimeDiverged := !cohortHealthy
-				if cohortHealthy {
-					readiness, readinessErr := b.classifyRecoveredMaintenanceReadiness(
-						ctx, targetRelease, targetContainers,
+				switch {
+				case targetFound && targetRelease.Status == "active":
+					active, proofErr := b.maintenanceSettlement.ProveMaintenanceActive(intent)
+					if proofErr != nil {
+						return fmt.Errorf("prove committed maintenance target: %w", proofErr)
+					}
+					containers, listErr := b.listManagedContainersStrictForRecovery(ctx)
+					if listErr != nil {
+						return fmt.Errorf("strict committed maintenance inventory: %w", listErr)
+					}
+					targetContainers, leaseContainers, selectErr := maintenanceTargetContainers(intent, containers)
+					if selectErr != nil {
+						return selectErr
+					}
+					cohortHealthy := len(targetContainers) == len(leaseContainers) &&
+						validateRecoveredReleaseCohort(&targetRelease, targetContainers) == nil
+					runtimeDiverged := !cohortHealthy
+					if cohortHealthy {
+						readiness, readinessErr := b.classifyRecoveredMaintenanceReadiness(
+							ctx, targetRelease, targetContainers,
+						)
+						if readinessErr != nil {
+							// The Release proves substrate commit, but not current runtime
+							// health. Preserve the WAL and actor projection until a bounded
+							// read can classify healthy versus definitively divergent.
+							return fmt.Errorf("committed maintenance readiness is indeterminate: %w", readinessErr)
+						}
+						runtimeDiverged = readiness == maintenanceReadinessUnready
+					}
+					if runtimeDiverged {
+						if _, divergenceErr := b.convergeMaintenanceRuntimeFailure(
+							ctx, active, targetRelease, targetContainers,
+						); divergenceErr != nil {
+							return fmt.Errorf("converge committed maintenance runtime loss: %w", divergenceErr)
+						}
+						acquired, settleErr := b.callbackPublisher.TryPublishMaintenanceRuntimeFailureContext(
+							ctx, active, leasesm.ErrMsgCohortDiverged,
+						)
+						if settleErr != nil {
+							return fmt.Errorf("atomically settle committed maintenance runtime loss: %w", settleErr)
+						}
+						if !acquired {
+							return errors.New("maintenance callback journal is busy; retry committed runtime-loss settlement")
+						}
+						return nil
+					}
+					_, convergeErr := b.convergeMaintenanceSuccess(
+						ctx, active, targetRelease, targetContainers,
 					)
-					if readinessErr != nil {
-						// The Release proves substrate commit, but not current runtime
-						// health. Preserve the WAL and actor projection until a bounded
-						// read can classify healthy versus definitively divergent.
-						return fmt.Errorf("committed maintenance readiness is indeterminate: %w", readinessErr)
+					if convergeErr != nil {
+						return convergeErr
 					}
-					runtimeDiverged = readiness == maintenanceReadinessUnready
-				}
-				if runtimeDiverged {
-					if _, divergenceErr := b.convergeMaintenanceRuntimeFailure(
-						ctx, intent, targetRelease, targetContainers,
-					); divergenceErr != nil {
-						return fmt.Errorf("converge committed maintenance runtime loss: %w", divergenceErr)
-					}
-					acquired, settleErr := b.callbackStore.TryResolveMaintenanceIntentWithRuntimeFailure(
-						intent, leasesm.ErrMsgCohortDiverged,
-					)
-					if settleErr != nil {
-						return fmt.Errorf("atomically settle committed maintenance runtime loss: %w", settleErr)
-					}
-					if !acquired {
-						return errors.New("maintenance callback journal is busy; retry committed runtime-loss settlement")
-					}
-					if b.callbackSender != nil {
-						b.callbackSender.NotifyPendingCallbacks()
+					if findErr = b.tryResolveMaintenanceSuccess(ctx, active); findErr != nil {
+						return fmt.Errorf("settle committed maintenance success: %w", findErr)
 					}
 					return nil
-				}
-				_, convergeErr := b.convergeMaintenanceSuccess(
-					ctx, intent, targetRelease, targetContainers,
-				)
-				if convergeErr != nil {
-					return convergeErr
-				}
-				if findErr = b.tryResolveMaintenanceIntent(intent, backend.CallbackStatusSuccess, ""); findErr != nil {
-					return fmt.Errorf("settle committed maintenance success: %w", findErr)
-				}
-				return nil
 
-			case targetFound && (targetRelease.Status == "deploying" || targetRelease.Status == "failed"):
-				if verifyErr := b.verifyMaintenanceSourceActive(intent); verifyErr != nil {
-					return verifyErr
-				}
-				containers, listErr := b.listManagedContainersStrictForRecovery(ctx)
-				if listErr != nil {
-					return fmt.Errorf("strict maintenance inventory: %w", listErr)
-				}
-				targetContainers, leaseContainers, selectErr := maintenanceTargetContainers(intent, containers)
-				if selectErr != nil {
-					return selectErr
-				}
-				cohortErr := validateRecoveredReleaseCohort(&targetRelease, targetContainers)
-				if targetRelease.Status == "deploying" &&
-					len(targetContainers) == len(leaseContainers) && cohortErr == nil {
-					readiness, readinessErr := b.classifyRecoveredMaintenanceReadiness(
-						ctx, targetRelease, targetContainers,
+				case targetFound && (targetRelease.Status == "deploying" || targetRelease.Status == "failed"):
+					if verifyErr := b.verifyMaintenanceSourceActive(intent); verifyErr != nil {
+						return verifyErr
+					}
+					containers, listErr := b.listManagedContainersStrictForRecovery(ctx)
+					if listErr != nil {
+						return fmt.Errorf("strict maintenance inventory: %w", listErr)
+					}
+					targetContainers, leaseContainers, selectErr := maintenanceTargetContainers(intent, containers)
+					if selectErr != nil {
+						return selectErr
+					}
+					cohortErr := validateRecoveredReleaseCohort(&targetRelease, targetContainers)
+					if targetRelease.Status == "deploying" &&
+						len(targetContainers) == len(leaseContainers) && cohortErr == nil {
+						readiness, readinessErr := b.classifyRecoveredMaintenanceReadiness(
+							ctx, targetRelease, targetContainers,
+						)
+						if readinessErr != nil {
+							return fmt.Errorf("maintenance target readiness is indeterminate: %w", readinessErr)
+						}
+						if readiness != maintenanceReadinessReady {
+							cohortErr = errors.New("maintenance target is definitively unready")
+						}
+					}
+					if targetRelease.Status == "deploying" &&
+						len(targetContainers) == len(leaseContainers) && cohortErr == nil {
+						physical, physicalErr := b.maintenanceSettlement.RecoverMaintenanceExecution(
+							ctx, recoveryScope, intent,
+						)
+						if physicalErr != nil {
+							return fmt.Errorf("classify recovered maintenance target: %w", physicalErr)
+						}
+						ready, ok := physical.(shared.MaintenanceExecutionSuccess)
+						if !ok {
+							if failed, failedOK := physical.(shared.MaintenanceExecutionFailure); failedOK {
+								return fmt.Errorf(
+									"recovered maintenance target is not exactly Ready (%T, source_recovered=%t)",
+									physical, failed.SourceRecovered(),
+								)
+							}
+							return fmt.Errorf("recovered maintenance target is not exactly Ready (%T)", physical)
+						}
+						active, activateErr := b.maintenanceSettlement.ActivateMaintenance(ready)
+						if activateErr != nil {
+							return fmt.Errorf("activate recovered maintenance target: %w", activateErr)
+						}
+						if _, convergeErr := b.convergeMaintenanceSuccess(
+							ctx, active, targetRelease, targetContainers,
+						); convergeErr != nil {
+							return convergeErr
+						}
+						resolveErr := b.tryResolveMaintenanceSuccess(ctx, active)
+						if resolveErr != nil {
+							// Activation is irrevocably committed. Preserve the intent and let
+							// the next periodic recovery retry only exact callback settlement.
+							return fmt.Errorf("maintenance active but success settlement remains pending: %w", resolveErr)
+						}
+						return nil
+					}
+					if targetRelease.Status == "deploying" &&
+						intent.ExecutionPhase() == shared.MaintenanceExecutionStarted &&
+						time.Now().Before(b.maintenanceRecoveryDeadline(intent.CreatedAt())) {
+						// StartMaintenanceExecution proves Compose may have accepted work.
+						// Empty, source-only, partial, and merely-starting inventories are
+						// therefore observations to retry, not failure authority. Startup
+						// remains bounded because we defer this lease to the level-triggered
+						// recovery loop instead of sleeping out the visibility window.
+						return nil
+					}
+
+					physical, cleanupErr := b.maintenanceSettlement.CleanupRecoveredMaintenance(
+						ctx, recoveryScope, intent,
 					)
-					if readinessErr != nil {
-						return fmt.Errorf("maintenance target readiness is indeterminate: %w", readinessErr)
+					if cleanupErr != nil {
+						return fmt.Errorf("clean exact maintenance target: %w", cleanupErr)
 					}
-					if readiness != maintenanceReadinessReady {
-						cohortErr = errors.New("maintenance target is definitively unready")
+					failure, ok := physical.(shared.MaintenanceExecutionFailure)
+					if !ok {
+						if ambiguous, isAmbiguous := physical.(shared.MaintenanceExecutionAmbiguous); isAmbiguous {
+							return fmt.Errorf("maintenance cleanup remains ambiguous: %w", ambiguous.Cause())
+						}
+						return fmt.Errorf("maintenance cleanup lacks definitive failure evidence (%T)", physical)
 					}
-				}
-				if targetRelease.Status == "deploying" &&
-					len(targetContainers) == len(leaseContainers) && cohortErr == nil {
-					if activateErr := b.releaseStore.ActivateMaintenance(targetClaim); activateErr != nil {
-						return fmt.Errorf("activate recovered maintenance target: %w", activateErr)
+					if targetRelease.Status == "deploying" {
+						if _, failErr := b.maintenanceSettlement.FailMaintenance(
+							failure, maintenanceFailureReason(intent.Kind()), string(intent.Kind())+" interrupted",
+						); failErr != nil {
+							return fmt.Errorf("fail interrupted maintenance target: %w", failErr)
+						}
 					}
-					if _, convergeErr := b.convergeMaintenanceSuccess(
-						ctx, intent, targetRelease, targetContainers,
+					failed, proofErr := b.maintenanceSettlement.ProveMaintenanceFailure(intent)
+					if proofErr != nil {
+						return fmt.Errorf("prove failed maintenance target: %w", proofErr)
+					}
+					after, listErr := b.listManagedContainersStrictForRecovery(ctx)
+					if listErr != nil {
+						return fmt.Errorf("strict source inventory after maintenance cleanup: %w", listErr)
+					}
+					sourceRelease, sourceContainers, sourceReady, readyErr := b.maintenanceSourceState(ctx, intent, after)
+					if readyErr != nil {
+						return readyErr
+					}
+					failureInfo := recoveredMaintenanceFailureInfo(intent, &targetRelease)
+					if intent.Kind() == shared.MaintenanceIntentUpdate &&
+						targetRelease.Reason == backend.ReasonImagePullFailed {
+						// Live Update deliberately lands Failed on a pre-substrate image
+						// pull refusal even though its untouched source is still healthy.
+						// Preserve that exact terminal policy across this crash boundary.
+						sourceReady = false
+					}
+					if convergeErr := b.convergeMaintenanceFailure(
+						ctx, intent, sourceRelease, sourceContainers, sourceReady, failureInfo,
 					); convergeErr != nil {
 						return convergeErr
 					}
-					resolveErr := b.tryResolveMaintenanceIntent(
-						intent, backend.CallbackStatusSuccess, "",
-					)
-					if resolveErr != nil {
-						// Activation is irrevocably committed. Preserve the intent and let
-						// the next periodic recovery retry only exact callback settlement.
-						return fmt.Errorf("maintenance active but success settlement remains pending: %w", resolveErr)
+					findErr = b.tryResolveMaintenanceFailure(ctx, failed, failureInfo.CallbackError())
+					if findErr != nil {
+						return fmt.Errorf("settle interrupted maintenance failure: %w", findErr)
 					}
 					return nil
-				}
 
-				if cleanupErr := b.removeExactMaintenanceTargets(
-					ctx, intent, targetRelease, targetContainers,
-				); cleanupErr != nil {
-					return cleanupErr
-				}
-				if targetRelease.Status == "deploying" {
-					if failErr := b.releaseStore.FailMaintenance(
-						targetClaim, maintenanceFailureReason(intent.Kind()), string(intent.Kind())+" interrupted",
-					); failErr != nil {
-						return fmt.Errorf("fail interrupted maintenance target: %w", failErr)
+				case !targetFound:
+					if verifyErr := b.verifyMaintenanceSourceActive(intent); verifyErr != nil {
+						return verifyErr
 					}
-				}
-				after, listErr := b.listManagedContainersStrictForRecovery(ctx)
-				if listErr != nil {
-					return fmt.Errorf("strict source inventory after maintenance cleanup: %w", listErr)
-				}
-				sourceRelease, sourceContainers, sourceReady, readyErr := b.maintenanceSourceState(ctx, intent, after)
-				if readyErr != nil {
-					return readyErr
-				}
-				failureInfo := recoveredMaintenanceFailureInfo(intent, &targetRelease)
-				if intent.Kind() == shared.MaintenanceIntentUpdate &&
-					targetRelease.Reason == backend.ReasonImagePullFailed {
-					// Live Update deliberately lands Failed on a pre-substrate image
-					// pull refusal even though its untouched source is still healthy.
-					// Preserve that exact terminal policy across this crash boundary.
-					sourceReady = false
-				}
-				if convergeErr := b.convergeMaintenanceFailure(
-					ctx, intent, sourceRelease, sourceContainers, sourceReady, failureInfo,
-				); convergeErr != nil {
-					return convergeErr
-				}
-				findErr = b.tryResolveMaintenanceIntent(
-					intent, backend.CallbackStatusFailed, failureInfo.CallbackErr,
-				)
-				if findErr != nil {
-					return fmt.Errorf("settle interrupted maintenance failure: %w", findErr)
-				}
-				return nil
-
-			case !targetFound:
-				if verifyErr := b.verifyMaintenanceSourceActive(intent); verifyErr != nil {
-					return verifyErr
-				}
-				containers, listErr := b.listManagedContainersStrictForRecovery(ctx)
-				if listErr != nil {
-					return fmt.Errorf("strict maintenance inventory: %w", listErr)
-				}
-				for _, container := range containers {
-					if container.MaintenanceID == intent.MaintenanceID() {
-						return fmt.Errorf(
-							"maintenance target %s has substrate but no durable target release",
-							intent.MaintenanceID(),
-						)
+					containers, listErr := b.listManagedContainersStrictForRecovery(ctx)
+					if listErr != nil {
+						return fmt.Errorf("strict maintenance inventory: %w", listErr)
 					}
+					for _, container := range containers {
+						if container.MaintenanceID == intent.MaintenanceID() {
+							return fmt.Errorf(
+								"maintenance target %s has substrate but no durable target release",
+								intent.MaintenanceID(),
+							)
+						}
+					}
+					sourceRelease, sourceContainers, sourceReady, readyErr := b.maintenanceSourceState(ctx, intent, containers)
+					if readyErr != nil {
+						return readyErr
+					}
+					if convergeErr := b.convergeMaintenanceFailure(
+						ctx, intent, sourceRelease, sourceContainers, sourceReady,
+						recoveredMaintenanceFailureInfo(intent, nil),
+					); convergeErr != nil {
+						return convergeErr
+					}
+					failed, proofErr := b.maintenanceSettlement.ProveMaintenanceFailure(intent)
+					if proofErr != nil {
+						return fmt.Errorf("prove absent maintenance target: %w", proofErr)
+					}
+					findErr = b.tryResolveMaintenanceFailure(ctx, failed, interruptedMaintenanceFailure)
+					if findErr != nil {
+						return fmt.Errorf("settle pre-append maintenance failure: %w", findErr)
+					}
+					return nil
+				default:
+					return fmt.Errorf("maintenance target has unsupported status %q", targetRelease.Status)
 				}
-				sourceRelease, sourceContainers, sourceReady, readyErr := b.maintenanceSourceState(ctx, intent, containers)
-				if readyErr != nil {
-					return readyErr
-				}
-				if convergeErr := b.convergeMaintenanceFailure(
-					ctx, intent, sourceRelease, sourceContainers, sourceReady,
-					recoveredMaintenanceFailureInfo(intent, nil),
-				); convergeErr != nil {
-					return convergeErr
-				}
-				findErr = b.tryResolveMaintenanceIntent(
-					intent, backend.CallbackStatusFailed, interruptedMaintenanceFailure,
-				)
-				if findErr != nil {
-					return fmt.Errorf("settle pre-append maintenance failure: %w", findErr)
-				}
-				return nil
-			default:
-				return fmt.Errorf("maintenance target has unsupported status %q", targetRelease.Status)
-			}
-		}()
-		unlock()
+			},
+		)
 		if recoveryErr != nil {
 			return fmt.Errorf("recover maintenance for lease %q: %w", snapshot.LeaseUUID(), recoveryErr)
+		}
+	}
+	return nil
+}
+
+func (b *Backend) maintenanceRecoveryDeadline(createdAt time.Time) time.Time {
+	timeout := b.cfg.ProvisionTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	if createdAt.IsZero() {
+		return time.Time{}
+	}
+	return createdAt.Add(timeout)
+}
+
+func (b *Backend) recoverFailedMaintenanceReceipts(ctx context.Context) error {
+	receipts, err := b.maintenanceSettlement.ListFailedMaintenanceReceipts()
+	if err != nil {
+		return fmt.Errorf("list failed maintenance receipts: %w", err)
+	}
+	for _, receipt := range receipts {
+		if receipt.Backend() != b.Name() || receipt.BackendStorageID() != b.storageIdentity {
+			return fmt.Errorf(
+				"failed maintenance receipt for lease %q belongs to backend %q storage %s",
+				receipt.LeaseUUID(), receipt.Backend(), receipt.BackendStorageID(),
+			)
+		}
+		_, cleanupErr := b.recoveryCoordinator.WithLease(
+			ctx, receipt.LeaseUUID(),
+			func(scope shared.LeaseRecoveryScope) error {
+				return b.maintenanceSettlement.CleanupFailedMaintenanceReceipt(
+					ctx, scope, receipt,
+				)
+			},
+		)
+		if cleanupErr != nil {
+			return fmt.Errorf("clean late failed maintenance for lease %q: %w",
+				receipt.LeaseUUID(), cleanupErr)
 		}
 	}
 	return nil
@@ -411,89 +547,17 @@ func (b *Backend) actorOwnsMaintenance(leaseUUID string, id shared.MaintenanceID
 	return actor != nil && actor.OwnsMaintenance(id)
 }
 
-// routeToExistingLeaseBlocking is the recovery-only counterpart to
-// routeToLeaseBlocking. It deliberately never constructs an actor: cold
-// recovery needs only durable projection rebuild, while a live stale actor must
-// be converged before the MaintenanceIntent can be consumed.
-func (b *Backend) routeToExistingLeaseBlocking(
-	ctx context.Context,
-	leaseUUID string,
-	msg leasesm.LeaseMessage,
-) (bool, error) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		if b.stopCtx.Err() != nil {
-			return false, errors.New("backend shutting down")
-		}
-
-		b.actorsMu.Lock()
-		actor := b.actors[leaseUUID]
-		if actor == nil {
-			b.actorsMu.Unlock()
-			return false, nil
-		}
-		enqueued := actor.TryEnqueue(msg)
-		b.actorsMu.Unlock()
-		if enqueued {
-			return true, nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-b.stopCtx.Done():
-			return false, errors.New("backend shutting down")
-		case <-time.After(routeToLeaseRetryInterval):
-		}
-	}
-}
-
 func (b *Backend) convergeMaintenanceSuccess(
 	ctx context.Context,
-	intent shared.MaintenanceIntentClaim,
+	active shared.MaintenanceReleaseActive,
 	target shared.Release,
 	containers []ContainerInfo,
 ) (bool, error) {
-	projection := maintenanceRecoveryProjection(containers)
-	reply := make(chan error, 1)
-	msg, err := leasesm.NewMaintenanceRecoveredSuccessMsg(intent, projection, reply)
-	if err != nil {
-		return false, err
-	}
-	routed, err := b.routeToExistingLeaseBlocking(ctx, intent.LeaseUUID(), msg)
-	if err != nil {
-		return routed, err
-	}
-	if !routed {
-		return b.applyMaintenanceProjectionWithoutActor(
-			intent, target, containers, backend.ProvisionStatusReady, nil,
-		)
-	}
-	if err := b.waitForReply(ctx, reply); err != nil {
-		return true, fmt.Errorf("apply committed maintenance projection: %w", err)
-	}
-	return true, nil
-}
-
-func maintenanceRecoveryProjection(containers []ContainerInfo) leasesm.MaintenanceRecoveryProjection {
-	containerIDs := make([]string, 0, len(containers))
-	serviceContainers := make(map[string][]string)
-	for _, container := range containers {
-		containerIDs = append(containerIDs, container.ContainerID)
-		serviceContainers[container.ServiceName] = append(
-			serviceContainers[container.ServiceName], container.ContainerID,
-		)
-	}
-	slices.Sort(containerIDs)
-	for service := range serviceContainers {
-		slices.Sort(serviceContainers[service])
-	}
-	return leasesm.MaintenanceRecoveryProjection{
-		ContainerIDs:      containerIDs,
-		ServiceContainers: serviceContainers,
-	}
+	intent := active.Intent()
+	_ = ctx
+	return b.applyMaintenanceProjectionWithoutActor(
+		intent, target, containers, backend.ProvisionStatusReady, nil,
+	)
 }
 
 func (b *Backend) convergeMaintenanceFailure(
@@ -504,10 +568,9 @@ func (b *Backend) convergeMaintenanceFailure(
 	sourceReady bool,
 	info leasesm.ReplaceFailureInfo,
 ) error {
-	info.OldStopped = sourceReady
-	projection := maintenanceRecoveryProjection(containers)
+	info = info.WithOldStopped(sourceReady)
 	_, err := b.convergeMaintenanceFailureWithInfo(
-		ctx, intent, source, containers, projection, sourceReady, info,
+		ctx, intent, source, containers, sourceReady, info,
 	)
 	return err
 }
@@ -516,56 +579,45 @@ func recoveredMaintenanceFailureInfo(
 	intent shared.MaintenanceIntentClaim,
 	target *shared.Release,
 ) leasesm.ReplaceFailureInfo {
-	info := leasesm.ReplaceFailureInfo{
-		Operation:   string(intent.Kind()),
+	details := leasesm.ReplaceFailureDetails{
 		CallbackErr: interruptedMaintenanceFailure,
 		Reason:      maintenanceFailureReason(intent.Kind()),
 		LastError:   interruptedMaintenanceFailure,
 	}
 	if target == nil || target.Status != "failed" {
+		info, _ := leasesm.NewMaintenanceRecoveryFailureInfo(intent, details)
 		return info
 	}
 	if target.Reason != "" {
-		info.Reason = target.Reason
+		details.Reason = target.Reason
 	}
 	if target.Message != "" {
-		info.CallbackErr = target.Message
-		info.LastError = target.Message
+		details.CallbackErr = target.Message
+		details.LastError = target.Message
 	}
+	info, _ := leasesm.NewMaintenanceRecoveryFailureInfo(intent, details)
 	return info
 }
 
 func (b *Backend) convergeMaintenanceRuntimeFailure(
 	ctx context.Context,
-	intent shared.MaintenanceIntentClaim,
+	active shared.MaintenanceReleaseActive,
 	target shared.Release,
 	containers []ContainerInfo,
 ) (bool, error) {
-	projection := maintenanceRecoveryProjection(containers)
-	reply := make(chan error, 1)
-	msg, err := leasesm.NewMaintenanceRecoveredRuntimeFailureMsg(intent, projection, reply)
-	if err != nil {
-		return false, err
+	intent := active.Intent()
+	_ = ctx
+	failure, failureErr := leasesm.NewMaintenanceRecoveryFailureInfo(intent, leasesm.ReplaceFailureDetails{
+		CallbackErr: leasesm.ErrMsgCohortDiverged,
+		Reason:      backend.ReasonInternal,
+		LastError:   leasesm.ErrMsgCohortDiverged,
+	})
+	if failureErr != nil {
+		return false, failureErr
 	}
-	routed, err := b.routeToExistingLeaseBlocking(ctx, intent.LeaseUUID(), msg)
-	if err != nil {
-		return routed, err
-	}
-	if !routed {
-		failure := leasesm.ReplaceFailureInfo{
-			Operation:   string(intent.Kind()),
-			CallbackErr: leasesm.ErrMsgCohortDiverged,
-			Reason:      backend.ReasonInternal,
-			LastError:   leasesm.ErrMsgCohortDiverged,
-		}
-		return b.applyMaintenanceProjectionWithoutActor(
-			intent, target, containers, backend.ProvisionStatusFailed, &failure,
-		)
-	}
-	if err := b.waitForReply(ctx, reply); err != nil {
-		return true, fmt.Errorf("apply committed maintenance runtime failure: %w", err)
-	}
-	return true, nil
+	return b.applyMaintenanceProjectionWithoutActor(
+		intent, target, containers, backend.ProvisionStatusFailed, &failure,
+	)
 }
 
 func (b *Backend) convergeMaintenanceFailureWithInfo(
@@ -573,44 +625,17 @@ func (b *Backend) convergeMaintenanceFailureWithInfo(
 	intent shared.MaintenanceIntentClaim,
 	release shared.Release,
 	containers []ContainerInfo,
-	projection leasesm.MaintenanceRecoveryProjection,
 	sourceReady bool,
 	info leasesm.ReplaceFailureInfo,
 ) (bool, error) {
-	reply := make(chan error, 1)
-	var (
-		msg leasesm.LeaseMessage
-		err error
-	)
+	_ = ctx
+	status := backend.ProvisionStatusFailed
 	if sourceReady {
-		msg, err = leasesm.NewMaintenanceRecoveredFailureReadyMsg(
-			intent, projection, info, reply,
-		)
-	} else {
-		msg, err = leasesm.NewMaintenanceRecoveredFailureFailedMsg(
-			intent, projection, info, reply,
-		)
+		status = backend.ProvisionStatusReady
 	}
-	if err != nil {
-		return false, err
-	}
-	routed, err := b.routeToExistingLeaseBlocking(ctx, intent.LeaseUUID(), msg)
-	if err != nil {
-		return routed, err
-	}
-	if !routed {
-		status := backend.ProvisionStatusFailed
-		if sourceReady {
-			status = backend.ProvisionStatusReady
-		}
-		return b.applyMaintenanceProjectionWithoutActor(
-			intent, release, containers, status, &info,
-		)
-	}
-	if err := b.waitForReply(ctx, reply); err != nil {
-		return true, fmt.Errorf("apply interrupted maintenance projection: %w", err)
-	}
-	return true, nil
+	return b.applyMaintenanceProjectionWithoutActor(
+		intent, release, containers, status, &info,
+	)
 }
 
 // applyMaintenanceProjectionWithoutActor closes the live dropped-terminal
@@ -679,7 +704,8 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 	provision.LifecycleCallbackURL = authority.LifecycleCallbackURL()
 	provision.Items = slices.Clone(release.Items)
 	provision.ResourceProfiles = shared.CloneSKUResourceSnapshot(release.ResourceProfiles)
-	provision.ProvisionState.ResourceProfiles = shared.CloneSKUResourceSnapshot(release.ResourceProfiles)
+	provision.ActiveReleaseVersion = release.Version
+	provision.ActiveOperationID = authority.OperationID()
 	provision.StackManifest = stack
 	provision.ContainerIDs = containerIDs
 	provision.ServiceContainers = serviceContainers
@@ -689,9 +715,9 @@ func (b *Backend) applyMaintenanceProjectionWithoutActor(
 		provision.Reason = ""
 		provision.Message = ""
 	} else {
-		provision.LastError = failure.LastError
-		provision.Reason = failure.Reason
-		provision.Message = failure.CallbackErr
+		provision.LastError = failure.LastError()
+		provision.Reason = failure.Reason()
+		provision.Message = failure.CallbackError()
 	}
 	return true, nil
 }
@@ -701,7 +727,7 @@ func (b *Backend) maintenanceSourceState(
 	intent shared.MaintenanceIntentClaim,
 	containers []ContainerInfo,
 ) (shared.Release, []ContainerInfo, bool, error) {
-	source, current, err := b.releaseStore.ClaimLatestActive(intent.LeaseUUID())
+	source, current, err := b.maintenanceSettlement.ClaimLatestActive(intent.LeaseUUID())
 	if err != nil {
 		return shared.Release{}, nil, false, fmt.Errorf("inspect exact maintenance source: %w", err)
 	}
@@ -712,7 +738,6 @@ func (b *Backend) maintenanceSourceState(
 	leaseContainers := make([]ContainerInfo, 0, len(containers))
 	for _, container := range containers {
 		if container.LeaseUUID == intent.LeaseUUID() &&
-			!isLegacyRollbackRemnant(container) &&
 			container.MaintenanceID == source.MaintenanceID {
 			leaseContainers = append(leaseContainers, container)
 		}
@@ -796,40 +821,6 @@ func (b *Backend) classifyRecoveredMaintenanceReadiness(
 	return maintenanceReadinessReady, nil
 }
 
-// verifyRecoveredMaintenanceReadiness is the live rollback readiness gate.
-// Unlike cold/periodic WAL classification above, the caller owns a bounded
-// mutation context and must wait through the normal startup contract before it
-// may claim that Compose restored the source generation.
-func (b *Backend) verifyRecoveredMaintenanceReadiness(
-	ctx context.Context,
-	release shared.Release,
-	containers []ContainerInfo,
-) error {
-	stack, err := manifest.ParsePayload(release.Manifest)
-	if err != nil {
-		return fmt.Errorf("parse maintenance release manifest: %w", err)
-	}
-	byService := make(map[string][]string, len(stack.Services))
-	for _, container := range containers {
-		if container.Status != "running" {
-			return fmt.Errorf("maintenance container %q is %s", container.ContainerID, container.Status)
-		}
-		if container.Health == HealthStatusUnhealthy {
-			return fmt.Errorf("maintenance container %q is unhealthy", container.ContainerID)
-		}
-		byService[container.ServiceName] = append(byService[container.ServiceName], container.ContainerID)
-	}
-	for serviceName, service := range stack.Services {
-		if err := b.verifyStartup(
-			ctx, service, byService[serviceName],
-			b.logger.With("maintenance_id", release.MaintenanceID, "service", serviceName),
-		); err != nil {
-			return fmt.Errorf("verify maintenance service %q: %w", serviceName, err)
-		}
-	}
-	return nil
-}
-
 func maintenanceFailureReason(kind shared.MaintenanceIntentKind) backend.Reason {
 	if kind == shared.MaintenanceIntentUpdate {
 		return backend.ReasonUpdateFailed
@@ -838,7 +829,7 @@ func maintenanceFailureReason(kind shared.MaintenanceIntentKind) backend.Reason 
 }
 
 func (b *Backend) verifyMaintenanceSourceActive(intent shared.MaintenanceIntentClaim) error {
-	_, current, err := b.releaseStore.ClaimLatestActive(intent.LeaseUUID())
+	_, current, err := b.maintenanceSettlement.ClaimLatestActive(intent.LeaseUUID())
 	if err != nil {
 		return fmt.Errorf("verify maintenance source release: %w", err)
 	}
@@ -862,7 +853,7 @@ func maintenanceTargetContainers(
 				intent.MaintenanceID(), container.LeaseUUID,
 			)
 		}
-		if container.LeaseUUID != intent.LeaseUUID() || isLegacyRollbackRemnant(container) {
+		if container.LeaseUUID != intent.LeaseUUID() {
 			continue
 		}
 		lease = append(lease, container)
@@ -884,49 +875,25 @@ func compareContainerIdentity(left, right ContainerInfo) int {
 	return 0
 }
 
-func (b *Backend) removeExactMaintenanceTargets(
-	ctx context.Context,
-	intent shared.MaintenanceIntentClaim,
-	target shared.Release,
-	candidates []ContainerInfo,
-) error {
-	for _, candidate := range candidates {
-		if err := b.validateMaintenanceTargetContainer(intent, target, candidate); err != nil {
-			return fmt.Errorf("refuse ambiguous maintenance cleanup: %w", err)
-		}
-		inspected, err := b.inspectContainerForRecovery(ctx, candidate.ContainerID)
-		if err != nil {
-			return fmt.Errorf("inspect exact maintenance target %q before removal: %w", candidate.ContainerID, err)
-		}
-		if inspected.ContainerID != candidate.ContainerID {
-			return fmt.Errorf("maintenance target inspect changed container ID %q to %q", candidate.ContainerID, inspected.ContainerID)
-		}
-		if err := b.validateMaintenanceTargetContainer(intent, target, *inspected); err != nil {
-			return fmt.Errorf("refuse changed maintenance target %q: %w", candidate.ContainerID, err)
-		}
-		if err := b.mutationAdapter().removeContainer(ctx, candidate.ContainerID); err != nil {
-			return fmt.Errorf("remove exact maintenance target %q: %w", candidate.ContainerID, err)
-		}
-	}
-	after, err := b.listManagedContainersStrictForRecovery(ctx)
-	if err != nil {
-		return fmt.Errorf("confirm maintenance target cleanup: %w", err)
-	}
-	for _, container := range after {
-		if container.MaintenanceID == intent.MaintenanceID() {
-			return fmt.Errorf("maintenance target %q remains after cleanup", container.ContainerID)
-		}
-	}
-	return nil
-}
-
 func (b *Backend) validateMaintenanceTargetContainer(
 	intent shared.MaintenanceIntentClaim,
 	target shared.Release,
 	container ContainerInfo,
 ) error {
-	if container.ContainerID == "" || container.LeaseUUID != intent.LeaseUUID() ||
-		container.MaintenanceID != intent.MaintenanceID() || container.BackendName != b.Name() {
+	return validateMaintenanceGenerationContainer(
+		intent.LeaseUUID(), intent.MaintenanceID(), b.Name(), target, container,
+	)
+}
+
+func validateMaintenanceGenerationContainer(
+	leaseUUID string,
+	maintenanceID shared.MaintenanceID,
+	backendName string,
+	target shared.Release,
+	container ContainerInfo,
+) error {
+	if container.ContainerID == "" || container.LeaseUUID != leaseUUID ||
+		container.MaintenanceID != maintenanceID || container.BackendName != backendName {
 		return fmt.Errorf("container %q lacks exact maintenance identity", container.ContainerID)
 	}
 	authority, ok := runtimeIdentityForRelease(&target)

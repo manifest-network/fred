@@ -5,8 +5,10 @@ package docker
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -19,11 +21,14 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/provisioner"
+	providermaintenance "github.com/manifest-network/fred/internal/provisioner/maintenance"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -31,8 +36,13 @@ import (
 )
 
 // integrationAcknowledger wraps a chain client as an Acknowledger for integration tests.
+type integrationChainClient interface {
+	provisioner.ReconcilerChainClient
+	AcknowledgeLeases(context.Context, []string) (uint64, []string, error)
+}
+
 type integrationAcknowledger struct {
-	chainClient provisioner.ReconcilerChainClient
+	chainClient integrationChainClient
 }
 
 func (a *integrationAcknowledger) Acknowledge(ctx context.Context, leaseUUID string) (bool, string, error) {
@@ -47,11 +57,20 @@ func (a *integrationAcknowledger) Acknowledge(ctx context.Context, leaseUUID str
 	return n > 0, hash, nil
 }
 
+type integrationProviderControlPlane struct {
+	provisioner.ReconcilerChainClient
+	placement.CallbackAcknowledger
+}
+
 // testReconcilerTracker adapts the shared operation registry and payload store
 // to the reconciler's narrow production runtime port.
 type testReconcilerTracker struct {
-	operations *operation.Registry
-	store      *payload.Store
+	callbacks        *placement.AuthenticatedCallbackCoordinator
+	callbackVerifier hmacauth.CallbackProofVerifier
+	callbackURL      string
+	backendStorageID backendidentity.ID
+	placementStore   *placement.Store
+	store            *payload.Store
 }
 
 // integrationIdentityBackend models the production HTTP client's
@@ -59,6 +78,54 @@ type testReconcilerTracker struct {
 // in-process Docker transport seam.
 type integrationIdentityBackend struct {
 	*Backend
+}
+
+// integrationPayloadPersister is the narrow production Manager.OverwritePayload
+// boundary used by the maintenance service. Keeping the adapter here ensures
+// the integration test cannot manually reorder backend acceptance and payload
+// durability.
+type integrationPayloadPersister struct {
+	store *payload.Store
+}
+
+func (persister integrationPayloadPersister) OverwritePayload(
+	leaseUUID string,
+	value []byte,
+) error {
+	return persister.store.Put(leaseUUID, value)
+}
+
+// loseAcceptedUpdateResponseBackend models the provider losing the HTTP
+// response after docker-backend has durably accepted the command. The real
+// backend, including its aggregate WAL and worker, remains underneath.
+type loseAcceptedUpdateResponseBackend struct {
+	backend.Backend
+	mu       sync.Mutex
+	loseNext bool
+	calls    int
+}
+
+func (wrapped *loseAcceptedUpdateResponseBackend) Update(
+	ctx context.Context,
+	request backend.UpdateRequest,
+) error {
+	if err := wrapped.Backend.Update(ctx, request); err != nil {
+		return err
+	}
+	wrapped.mu.Lock()
+	defer wrapped.mu.Unlock()
+	wrapped.calls++
+	if wrapped.loseNext {
+		wrapped.loseNext = false
+		return errors.New("injected lost backend response after durable update acceptance")
+	}
+	return nil
+}
+
+func (wrapped *loseAcceptedUpdateResponseBackend) updateCount() int {
+	wrapped.mu.Lock()
+	defer wrapped.mu.Unlock()
+	return wrapped.calls
 }
 
 func (b integrationIdentityBackend) ListProvisionsWithIdentity(
@@ -75,10 +142,6 @@ func (b integrationIdentityBackend) ListRetentionsWithIdentity(
 	return retentions, b.StorageIdentity(), err
 }
 
-func (t *testReconcilerTracker) ReconcilerOperations() provisioner.ReconcilerOperations {
-	return t.operations
-}
-
 func (t *testReconcilerTracker) HasPayload(leaseUUID string) (bool, error) {
 	return t.store.Has(leaseUUID)
 }
@@ -92,18 +155,48 @@ func (t *testReconcilerTracker) PayloadStore() *payload.Store {
 // intentionally not wired through Manager's callback application service, so
 // the harness must perform the same claim-and-finish transition explicitly.
 func (t *testReconcilerTracker) finishProvisionCallback(leaseUUID string) bool {
-	operations := t.operations
-	record, exists := operations.Lookup(leaseUUID)
-	if !exists {
+	if t == nil || t.callbacks == nil || t.placementStore == nil ||
+		!t.callbackVerifier.Valid() || t.callbackURL == "" {
 		return false
 	}
-	claimed := operations.TryClaimCallback(leaseUUID, record.ID)
-	return claimed.Claimed() && operations.FinishSettlement(claimed.Claim())
+	operationID := t.placementStore.Lookup(leaseUUID).AttemptOperationID()
+	if !operationID.Valid() {
+		return false
+	}
+	endpoint, err := url.Parse(t.callbackURL)
+	if err != nil || endpoint.Path == "" {
+		return false
+	}
+	uri := endpoint.EscapedPath() + "?" + url.Values{
+		backend.CallbackOperationIDQueryParameter: []string{operationID.String()},
+	}.Encode()
+	callback := backend.CallbackPayload{
+		LeaseUUID:        leaseUUID,
+		Status:           backend.CallbackStatusSuccess,
+		BackendStorageID: t.backendStorageID.String(),
+	}
+	body, err := json.Marshal(callback)
+	if err != nil {
+		return false
+	}
+	now := time.Now()
+	signature := hmacauth.SignWithTime(testCallbackSecret, http.MethodPost, uri, body, now)
+	proof, err := t.callbackVerifier.VerifyRoutedWithTime(
+		testCallbackSecret, http.MethodPost, uri, body, signature,
+		t.backendStorageID.String(), endpoint.EscapedPath(),
+		5*time.Minute, time.Minute, now,
+	)
+	if err != nil {
+		return false
+	}
+	result, err := t.callbacks.Apply(context.Background(), proof)
+	return err == nil && result.OperationOutcome() == placement.CallbackOperationSucceeded
 }
 
 // reconcilerTestEnv holds all components for a full-stack reconciler integration test.
 type reconcilerTestEnv struct {
 	backend        *Backend
+	router         *backend.Router
 	reconciler     *provisioner.Reconciler
 	tracker        *testReconcilerTracker
 	placementStore *placement.Store
@@ -111,6 +204,7 @@ type reconcilerTestEnv struct {
 	callbackCh     <-chan backend.CallbackPayload
 	callbackURL    string
 	providerUUID   string
+	placementPath  string
 }
 
 // installExactLeaseLookupFallback makes the integration chain double obey the
@@ -152,21 +246,29 @@ func installExactLeaseLookupFallback(chainClient *chaintest.MockClient, provider
 // configureEmptyPlacement replaces the test store's removable seed topology
 // with the exact backend identity and complete empty inventory that the
 // production startup path verifies before admitting lifecycle work.
-func configureEmptyPlacement(t *testing.T, store *placement.Store, b *Backend) {
+func configureEmptyPlacement(
+	t *testing.T,
+	store *placement.Store,
+	reconciliation *placement.ReconciliationCoordinator,
+	b *Backend,
+) {
 	t.Helper()
-	require.NoError(t, store.ConfigureBackendTopologyWithStorageIdentities(
+	require.NoError(t, placementstore.ConfigureBackendTopologyWithStorageIdentities(store,
 		[]string{b.Name()},
 		map[string]backendidentity.ID{b.Name(): b.StorageIdentity()},
 	))
-	fence := store.BeginInventorySession()
-	_, err := store.ProjectInventory(fence, placement.InventoryProjection{
-		Complete:      true,
-		EmptyBackends: []string{b.Name()},
-		BackendStorageIdentities: map[string]backendidentity.ID{
-			b.Name(): b.StorageIdentity(),
-		},
-	})
-	store.EndInventorySession(fence)
+	sweep, err := reconciliation.BeginSweep()
+	require.NoError(t, err)
+	defer sweep.End()
+	provisionReceipt, err := sweep.CollectProvisionInventory(t.Context(), b.Name())
+	require.NoError(t, err)
+	retentionReceipt, err := sweep.CollectRetentionInventory(t.Context(), b.Name())
+	require.NoError(t, err)
+	disposition, err := sweep.RecordBackendInventory(provisionReceipt, retentionReceipt)
+	require.NoError(t, err)
+	require.Equal(t, placement.BackendInventoryAuthoritative, disposition)
+	require.NoError(t, sweep.SealInventory())
+	_, err = sweep.Project(placement.ReconciliationProjection{})
 	require.NoError(t, err)
 }
 
@@ -204,37 +306,49 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 	t.Cleanup(func() { _ = store.Close() })
 
 	// Create in-flight tracker + reconciler tracker adapter
-	tracker := &testReconcilerTracker{
-		operations: operation.NewRegistry(),
-		store:      store,
-	}
+	tracker := &testReconcilerTracker{store: store}
+	placementPath := filepath.Join(t.TempDir(), "placements.db")
+	callbackRoutes, err := placement.NewCallbackRouteFactory(callbackServer.URL)
+	require.NoError(t, err)
 	placementStore, err := placementstore.NewStoreForProvider(
-		filepath.Join(t.TempDir(), "placements.db"), providerUUID,
+		placementPath, providerUUID, placement.WithCallbackRouteFactory(callbackRoutes),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = placementStore.Close() })
-	configureEmptyPlacement(t, placementStore, b)
-
 	// Create a simple acknowledger that delegates to chainClient for integration tests
 	integrationAck := &integrationAcknowledger{chainClient: chainClient}
+	coordinator, err := placementStore.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution, err := coordinator.BindBackendRuntime(router, integrationProviderControlPlane{
+		ReconcilerChainClient: chainClient,
+		CallbackAcknowledger:  integrationAck,
+	})
+	require.NoError(t, err)
+	callbackVerifier, callbackConsumer := hmacauth.NewCallbackProofBoundary()
+	callbackCoordinator, err := execution.AuthenticatedCallbackCoordinator(callbackConsumer)
+	require.NoError(t, err)
+	tracker.callbacks = callbackCoordinator
+	tracker.callbackVerifier = callbackVerifier
+	tracker.callbackURL = callbackServer.URL
+	tracker.backendStorageID = b.StorageIdentity()
+	tracker.placementStore = placementStore
+	reconciliation, err := execution.ReconciliationCoordinator(tracker.store, nil)
+	require.NoError(t, err)
+	configureEmptyPlacement(t, placementStore, reconciliation, b)
 
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
-			ProviderUUID:           providerUUID,
-			CallbackBaseURL:        callbackServer.URL,
 			Interval:               1 * time.Hour, // manual RunOnce only
 			MaxReprovisionAttempts: 3,
+			Coordinator:            reconciliation,
 		},
-		chainClient,
-		integrationAck,
-		router,
 		tracker,
-		placementStore,
 	)
 	require.NoError(t, err)
 
 	return &reconcilerTestEnv{
 		backend:        b,
+		router:         router,
 		reconciler:     reconciler,
 		tracker:        tracker,
 		placementStore: placementStore,
@@ -242,7 +356,61 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 		callbackCh:     callbackCh,
 		callbackURL:    callbackServer.URL,
 		providerUUID:   providerUUID,
+		placementPath:  placementPath,
 	}
+}
+
+func newIntegrationMaintenanceService(
+	t *testing.T,
+	env *reconcilerTestEnv,
+	authority *placement.Store,
+	router *backend.Router,
+) *providermaintenance.Service {
+	t.Helper()
+	coordinator, err := authority.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution, err := coordinator.BindBackendRuntime(router, integrationProviderControlPlane{
+		ReconcilerChainClient: env.chainClient,
+		CallbackAcknowledger:  &integrationAcknowledger{chainClient: env.chainClient},
+	})
+	require.NoError(t, err)
+	maintenanceCoordinator, err := execution.MaintenanceCoordinator(
+		integrationPayloadPersister{store: env.tracker.store},
+	)
+	require.NoError(t, err)
+	service, err := providermaintenance.NewService(providermaintenance.Config{
+		Coordinator: maintenanceCoordinator,
+	})
+	require.NoError(t, err)
+	return service
+}
+
+func newIntegrationReconcilerAfterProviderRestart(
+	t *testing.T,
+	env *reconcilerTestEnv,
+	authority *placement.Store,
+	tracker *testReconcilerTracker,
+) *provisioner.Reconciler {
+	t.Helper()
+	coordinator, err := authority.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution, err := coordinator.BindBackendRuntime(env.router, integrationProviderControlPlane{
+		ReconcilerChainClient: env.chainClient,
+		CallbackAcknowledger:  &integrationAcknowledger{chainClient: env.chainClient},
+	})
+	require.NoError(t, err)
+	reconciliation, err := execution.ReconciliationCoordinator(tracker.store, nil)
+	require.NoError(t, err)
+	reconciler, err := provisioner.NewReconciler(
+		provisioner.ReconcilerConfig{
+			Interval:               time.Hour,
+			MaxReprovisionAttempts: 3,
+			Coordinator:            reconciliation,
+		},
+		tracker,
+	)
+	require.NoError(t, err)
+	return reconciler
 }
 
 // makeLease creates a billingtypes.Lease with a payload MetaHash.
@@ -259,6 +427,19 @@ func makeLease(leaseUUID, tenant, providerUUID, sku string, quantity uint64, met
 		},
 		MetaHash: metaHash,
 	}
+}
+
+func countMaintenanceRelease(
+	releases []shared.Release,
+	id shared.MaintenanceID,
+) int {
+	count := 0
+	for _, release := range releases {
+		if release.MaintenanceID == id {
+			count++
+		}
+	}
+	return count
 }
 
 func TestIntegration_Reconciler_ContainerDied_ReProvisions(t *testing.T) {
@@ -861,31 +1042,45 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	t.Cleanup(func() { _ = store.Close() })
 
 	tracker := &testReconcilerTracker{
-		operations: operation.NewRegistry(),
-		store:      store,
+		store: store,
 	}
 	providerUUID := testProviderUUID
+	callbackRoutes, err := placement.NewCallbackRouteFactory(callbackServer.URL)
+	require.NoError(t, err)
 	placementStore, err := placementstore.NewStoreForProvider(
 		filepath.Join(t.TempDir(), "placements.db"), providerUUID,
+		placement.WithCallbackRouteFactory(callbackRoutes),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = placementStore.Close() })
-	configureEmptyPlacement(t, placementStore, b)
 
 	installExactLeaseLookupFallback(mockChain, providerUUID)
 	integrationAck2 := &integrationAcknowledger{chainClient: mockChain}
+	coordinator, err := placementStore.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution, err := coordinator.BindBackendRuntime(router, integrationProviderControlPlane{
+		ReconcilerChainClient: mockChain,
+		CallbackAcknowledger:  integrationAck2,
+	})
+	require.NoError(t, err)
+	callbackVerifier, callbackConsumer := hmacauth.NewCallbackProofBoundary()
+	callbackCoordinator, err := execution.AuthenticatedCallbackCoordinator(callbackConsumer)
+	require.NoError(t, err)
+	tracker.callbacks = callbackCoordinator
+	tracker.callbackVerifier = callbackVerifier
+	tracker.callbackURL = callbackServer.URL
+	tracker.backendStorageID = b.StorageIdentity()
+	tracker.placementStore = placementStore
+	reconciliation, err := execution.ReconciliationCoordinator(tracker.store, nil)
+	require.NoError(t, err)
+	configureEmptyPlacement(t, placementStore, reconciliation, b)
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
-			ProviderUUID:           providerUUID,
-			CallbackBaseURL:        callbackServer.URL,
 			Interval:               1 * time.Hour,
 			MaxReprovisionAttempts: 3,
+			Coordinator:            reconciliation,
 		},
-		mockChain,
-		integrationAck2,
-		router,
 		tracker,
-		placementStore,
 	)
 	require.NoError(t, err)
 
@@ -1129,11 +1324,16 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, placementStore.Close()) })
-	configureEmptyPlacement(t, placementStore, b)
+	require.NoError(t, placementstore.ConfigureBackendTopologyWithStorageIdentities(
+		placementStore,
+		[]string{b.Name()},
+		map[string]backendidentity.ID{b.Name(): b.StorageIdentity()},
+	))
+	_, callbackProofConsumer := hmacauth.NewCallbackProofBoundary()
 	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
-		ProviderUUID:    testProviderUUID,
-		CallbackBaseURL: callbackServer.URL,
-		PlacementStore:  placementStore,
+		ProviderUUID:          testProviderUUID,
+		PlacementStore:        placementStore,
+		CallbackProofConsumer: callbackProofConsumer,
 	}, router, mockChain)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1299,22 +1499,47 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	mu.Unlock()
 	require.NoError(t, env.reconciler.RunOnce(ctx))
 
-	// --- tenant /update: exactly what the API handler does, in the same order ---
+	// --- tenant /update through the provider application boundary ---
 	lifecycleAuthorization := env.placementStore.CurrentLifecycle(leaseUUID)
 	require.Equal(t, placement.LifecycleVerdictAuthorized, lifecycleAuthorization.Verdict())
-	maintenanceCallbackURL, err := provisioner.BuildCallbackURLForLifecycle(
-		env.callbackURL, lifecycleAuthorization.ID(),
+	callbackRoutes, err := placement.NewCallbackRouteFactory(env.callbackURL)
+	require.NoError(t, err)
+	maintenanceOperationID, err := operation.ParseID(lifecycleAuthorization.ID().String())
+	require.NoError(t, err)
+	maintenanceCallbacks, err := callbackRoutes.ForOperation(maintenanceOperationID)
+	require.NoError(t, err)
+	maintenanceCallbackURL := maintenanceCallbacks.LifecycleURL()
+	maintenanceID := newTestMaintenanceID(t)
+	lostResponseBackend := &loseAcceptedUpdateResponseBackend{
+		Backend:  integrationIdentityBackend{Backend: env.backend},
+		loseNext: true,
+	}
+	lostResponseRouter, err := backend.NewRouter(backend.RouterConfig{
+		Backends: []backend.BackendEntry{{Backend: lostResponseBackend, IsDefault: true}},
+	})
+	require.NoError(t, err)
+	maintenanceService := newIntegrationMaintenanceService(
+		t, env, env.placementStore, lostResponseRouter,
+	)
+	maintenanceCommand := providermaintenance.Command{
+		ID: maintenanceID, LeaseUUID: leaseUUID, Tenant: tenant,
+		Kind: providermaintenance.KindUpdate, Payload: payloadV2,
+	}
+
+	firstUpdate := maintenanceService.Execute(ctx, maintenanceCommand)
+	require.Equal(t, providermaintenance.OutcomeServiceUnavailable, firstUpdate.Outcome(),
+		"a lost response is ambiguous even though docker-backend accepted the command")
+	assert.Equal(t, 1, lostResponseBackend.updateCount())
+	storedPayload, err := env.tracker.store.Get(leaseUUID)
+	require.NoError(t, err)
+	assert.Equal(t, payloadV1, storedPayload,
+		"the provider must not overwrite desired state until acceptance is recoverable")
+	providerRecord, found, err := env.placementStore.LookupMaintenanceCommand(
+		leaseUUID, maintenanceID,
 	)
 	require.NoError(t, err)
-	require.NoError(t, env.backend.Update(ctx, backend.UpdateRequest{
-		LeaseUUID:   leaseUUID,
-		CallbackURL: maintenanceCallbackURL,
-		Payload:     payloadV2,
-		PayloadHash: hex.EncodeToString(payload.ComputeHash(payloadV2)),
-	}))
-	// Persist AFTER the backend accepts — the durable half that ENG-619 added.
-	require.NoError(t, env.tracker.store.Put(leaseUUID, payloadV2))
-
+	require.True(t, found)
+	assert.Equal(t, placement.MaintenanceOutcomePending, providerRecord.Outcome())
 	select {
 	case cb := <-env.callbackCh:
 		require.Equal(t, leaseUUID, cb.LeaseUUID)
@@ -1324,6 +1549,73 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	}
 
 	waitForProvisionStatus(t, env.backend, leaseUUID, backend.ProvisionStatusReady, 60*time.Second)
+	requestAuthority, err := env.backend.maintenanceSettlement.NewMaintenanceRequestAuthority(
+		maintenanceID, shared.MaintenanceIntentUpdate, leaseUUID,
+		maintenanceCallbackURL, payloadV2,
+	)
+	require.NoError(t, err)
+	disposition, err := env.backend.maintenanceSettlement.ProbeMaintenanceIntent(requestAuthority)
+	require.NoError(t, err)
+	assert.Equal(t, shared.MaintenanceIntentAdmissionCompleted, disposition,
+		"the real backend WAL must recognize the completed exact command")
+	releases, err := env.backend.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countMaintenanceRelease(releases, maintenanceID),
+		"one accepted command must append exactly one replacement generation")
+
+	// Simulate a provider process restart: close/reopen placement authority and
+	// construct a fresh volatile registry. Constructor rehydration must recover
+	// the Pending command without needing the old process.
+	require.NoError(t, env.placementStore.Close())
+	reopenedPlacement, err := placement.OpenStore(env.placementPath, env.providerUUID)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopenedPlacement.Close() })
+	recoveredMaintenance := newIntegrationMaintenanceService(
+		t, env, reopenedPlacement, env.router,
+	)
+	require.NoError(t, recoveredMaintenance.RecoverPending(ctx))
+	storedPayload, err = env.tracker.store.Get(leaseUUID)
+	require.NoError(t, err)
+	assert.Equal(t, payloadV2, storedPayload,
+		"exact backend replay must authorize the provider payload commit")
+	providerRecord, found, err = reopenedPlacement.LookupMaintenanceCommand(
+		leaseUUID, maintenanceID,
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, placement.MaintenanceOutcomeAccepted, providerRecord.Outcome())
+	releases, err = env.backend.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countMaintenanceRelease(releases, maintenanceID),
+		"recovery must consume the backend receipt without another logical mutation")
+	assert.Equal(t, providermaintenance.OutcomeAccepted,
+		recoveredMaintenance.Execute(ctx, maintenanceCommand).Outcome(),
+		"the API-facing exact retry must replay the provider's terminal receipt")
+	releases, err = env.backend.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countMaintenanceRelease(releases, maintenanceID))
+	select {
+	case callback := <-env.callbackCh:
+		t.Fatalf("terminal provider replay emitted a backend callback without a worker: %+v", callback)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// Rebuild the reconciler over the reopened placement authority and the same
+	// fresh registry, matching the provider process topology after restart.
+	restartedTracker := &testReconcilerTracker{
+		callbacks:        env.tracker.callbacks,
+		callbackVerifier: env.tracker.callbackVerifier,
+		callbackURL:      env.tracker.callbackURL,
+		backendStorageID: env.tracker.backendStorageID,
+		placementStore:   reopenedPlacement,
+		store:            env.tracker.store,
+	}
+	env.placementStore = reopenedPlacement
+	env.tracker = restartedTracker
+	env.reconciler = newIntegrationReconcilerAfterProviderRestart(
+		t, env, reopenedPlacement, restartedTracker,
+	)
+
 	containers = inspectProvisionContainers(t, leaseUUID)
 	require.NotEmpty(t, containers)
 	require.Equal(t, updatedImage, containers[0].Image, "update should have replaced the running image")

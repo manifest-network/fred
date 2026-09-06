@@ -23,17 +23,7 @@ import (
 type SKUProfile = shared.SKUProfile
 type TenantQuotaConfig = shared.TenantQuotaConfig
 
-// Recover-time migration defaults. Shared by [DefaultConfig] and the
-// `cmp.Or` guards in [Backend.executeLegacyMigration] so a deployment
-// that constructs a [Config] without going through [DefaultConfig] (or
-// supplies an explicit 0 via YAML) still gets a sane safety window
-// instead of an immediately-canceled context or instant `-prev`
-// removal.
-const (
-	defaultContainerStopTimeout  = 30 * time.Second
-	defaultMigrationReadyTimeout = 90 * time.Second
-	defaultMigrationGracePeriod  = time.Minute
-)
+const defaultContainerStopTimeout = 30 * time.Second
 
 // DefaultMaxRequestBodySize caps inbound HTTP request bodies for the docker
 // backend. It is deliberately larger than providerd's
@@ -129,7 +119,9 @@ type Config struct {
 	// ContainerCreateTimeout is the timeout for creating containers.
 	ContainerCreateTimeout time.Duration `yaml:"container_create_timeout"`
 
-	// ContainerStartTimeout is the timeout for starting containers.
+	// ContainerStartTimeout is the timeout for starting containers and the
+	// maximum cold-recovery stabilization window for an exact inert provision
+	// cohort, capped by the remaining provision deadline.
 	ContainerStartTimeout time.Duration `yaml:"container_start_timeout"`
 
 	// ContainerStopTimeout is the grace period for stopping containers.
@@ -317,18 +309,6 @@ type Config struct {
 	// with max_partitions > 0 ever persist a non-empty partition.
 	RetentionTenantBudgets map[string]RetentionTenantBudget `yaml:"retention_tenant_budgets"`
 
-	// MigrationGracePeriod is how long the renamed `-prev` legacy container
-	// lingers after a successful recover-time migration before forced
-	// removal. Preserves rollback potential if the operator interrupts fred
-	// in the migration window to inspect. Defaults to 1m.
-	MigrationGracePeriod time.Duration `yaml:"migration_grace_period"`
-
-	// MigrationReadyTimeout caps how long the recover-time migration waits
-	// for the new stack-form container to reach `healthy` (or `running`
-	// when no health check is declared) before declaring the migration
-	// failed for that lease. Defaults to 90s.
-	MigrationReadyTimeout time.Duration `yaml:"migration_ready_timeout"`
-
 	// Ingress configures optional reverse proxy integration.
 	// When enabled, containers with routable TCP ports get proxy labels
 	// pointing Traefik at the per-tenant network for HTTPS auto-discovery.
@@ -478,8 +458,6 @@ func DefaultConfig() Config {
 		RetentionMaxAge:              90 * 24 * time.Hour,
 		RetentionReapInterval:        time.Hour,
 		RetentionOrphanConfirmations: 3,
-		MigrationGracePeriod:         defaultMigrationGracePeriod,
-		MigrationReadyTimeout:        defaultMigrationReadyTimeout,
 		AllowedRegistries: []string{
 			"docker.io",
 			"ghcr.io",
@@ -615,16 +593,6 @@ func (c *Config) Validate() error {
 	// hand Docker an already-expired stop grace period.
 	if c.ContainerStopTimeout < 0 {
 		return fmt.Errorf("container_stop_timeout must be non-negative (zero uses the default)")
-	}
-
-	// Recover-time migration uses zero as its default sentinel as well. Reject
-	// explicit negative values here rather than letting context.WithTimeout
-	// turn a configuration typo into an immediate, repeatedly resumed failure.
-	if c.MigrationReadyTimeout < 0 {
-		return fmt.Errorf("migration_ready_timeout must be non-negative (zero uses the default)")
-	}
-	if c.MigrationGracePeriod < 0 {
-		return fmt.Errorf("migration_grace_period must be non-negative (zero uses the default)")
 	}
 
 	if c.ReconcileInterval <= 0 {

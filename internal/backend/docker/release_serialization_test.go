@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -28,7 +27,7 @@ const (
 // release/actor ordering contract. actorsMu is an intentional test barrier:
 // the first command has durably appended its release but cannot yet ask the
 // actor for admission. A second command must remain behind commandFence rather
-// than append an unowned generation which the first worker's ActivateLatest
+// than append an unowned generation which the first worker's typed activation
 // would later activate.
 func TestMaintenanceReleasePreludeSerializedThroughActorAcceptance(t *testing.T) {
 	tests := []struct {
@@ -39,24 +38,32 @@ func TestMaintenanceReleasePreludeSerializedThroughActorAcceptance(t *testing.T)
 		{
 			name: "update then restart",
 			first: func(b *Backend) error {
-				return b.Update(context.Background(), backend.UpdateRequest{
-					LeaseUUID: maintenanceSerializationLeaseUUID,
-					Payload:   validManifestJSON("docker.io/library/nginx:1.27"),
+				return b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+					LeaseUUID:   maintenanceSerializationLeaseUUID,
+					CallbackURL: maintenanceSerializationCallbackURL(b),
+					Payload:     validManifestJSON("docker.io/library/nginx:1.27"),
 				})
 			},
 			second: func(b *Backend) error {
-				return b.Restart(context.Background(), backend.RestartRequest{LeaseUUID: maintenanceSerializationLeaseUUID})
+				return b.Restart(context.Background(), backend.RestartRequest{
+					MaintenanceID: newTestMaintenanceID(t), LeaseUUID: maintenanceSerializationLeaseUUID,
+					CallbackURL: maintenanceSerializationCallbackURL(b),
+				})
 			},
 		},
 		{
 			name: "restart then update",
 			first: func(b *Backend) error {
-				return b.Restart(context.Background(), backend.RestartRequest{LeaseUUID: maintenanceSerializationLeaseUUID})
+				return b.Restart(context.Background(), backend.RestartRequest{
+					MaintenanceID: newTestMaintenanceID(t), LeaseUUID: maintenanceSerializationLeaseUUID,
+					CallbackURL: maintenanceSerializationCallbackURL(b),
+				})
 			},
 			second: func(b *Backend) error {
-				return b.Update(context.Background(), backend.UpdateRequest{
-					LeaseUUID: maintenanceSerializationLeaseUUID,
-					Payload:   validManifestJSON("docker.io/library/nginx:1.27"),
+				return b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+					LeaseUUID:   maintenanceSerializationLeaseUUID,
+					CallbackURL: maintenanceSerializationCallbackURL(b),
+					Payload:     validManifestJSON("docker.io/library/nginx:1.27"),
 				})
 			},
 		},
@@ -194,9 +201,10 @@ func TestMaintenanceReleaseFenceWaitsForAckAfterCallerCancellation(t *testing.T)
 	defer cancel()
 	updateDone := make(chan error, 1)
 	go func() {
-		updateDone <- b.Update(ctx, backend.UpdateRequest{
-			LeaseUUID: maintenanceSerializationLeaseUUID,
-			Payload:   validManifestJSON("docker.io/library/nginx:1.27"),
+		updateDone <- b.Update(ctx, backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+			LeaseUUID:   maintenanceSerializationLeaseUUID,
+			CallbackURL: maintenanceSerializationCallbackURL(b),
+			Payload:     validManifestJSON("docker.io/library/nginx:1.27"),
 		})
 	}()
 	require.Eventually(t, func() bool {
@@ -244,6 +252,12 @@ func TestMaintenanceReleaseFenceWaitsForAckAfterCallerCancellation(t *testing.T)
 	}
 }
 
+func maintenanceSerializationCallbackURL(b *Backend) string {
+	b.provisionsMu.RLock()
+	defer b.provisionsMu.RUnlock()
+	return b.provisions[maintenanceSerializationLeaseUUID].LifecycleCallbackURL
+}
+
 // seedMaintenanceSerializationStores gives the ordering tests the same typed,
 // durable source authority that a live provision/restore commits before any
 // maintenance command can be admitted.
@@ -254,19 +268,14 @@ func seedMaintenanceSerializationStores(
 	items []backend.LeaseItem,
 ) *shared.ReleaseStore {
 	t.Helper()
-	releases := attachReleaseStore(t, b)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, callbacks.Close()) })
-	b.callbackStore = callbacks
+	attachBoundOperationHandoffStores(t, b)
+	releases := b.releaseStore
 
 	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
 	profiles := testResourceProfiles(t, items)
 	manifestBytes, err := json.Marshal(stack)
 	require.NoError(t, err)
-	require.NoError(t, releases.AppendActive(maintenanceSerializationLeaseUUID, shared.Release{
+	seedProvisionReleaseForBackendTest(t, b, maintenanceSerializationLeaseUUID, shared.Release{
 		Manifest:         manifestBytes,
 		Image:            "stack",
 		OperationID:      operationID,
@@ -278,7 +287,7 @@ func seedMaintenanceSerializationStores(
 		),
 		Status:    "active",
 		CreatedAt: time.Now(),
-	}))
+	})
 
 	b.provisionsMu.Lock()
 	provision := b.provisions[maintenanceSerializationLeaseUUID]
@@ -306,8 +315,8 @@ func TestRestoreFinalizerRejectsUpdate(t *testing.T) {
 		newLease: {ProvisionState: leasesm.ProvisionState{
 			LeaseUUID: newLease, Tenant: "tenant-a", ProviderUUID: "provider-a",
 			SKU: "docker-small", Status: backend.ProvisionStatusReady,
-			StackManifest: stack, Items: items,
-		}, ResourceProfiles: profiles},
+			StackManifest: stack, Items: items, ResourceProfiles: profiles,
+		}},
 	})
 	releases := attachReleaseStore(t, b)
 	retentions := attachRetentionStore(t, b)
@@ -319,9 +328,10 @@ func TestRestoreFinalizerRejectsUpdate(t *testing.T) {
 	}
 	putRestoringRetention(t, retentions, record)
 
-	err = b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID: newLease,
-		Payload:   validManifestJSON("docker.io/library/nginx:1.27"),
+	err = b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		LeaseUUID:   newLease,
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		Payload:     validManifestJSON("docker.io/library/nginx:1.27"),
 	})
 	require.ErrorIs(t, err, backend.ErrInvalidState)
 
@@ -336,8 +346,6 @@ func TestRestoreFinalizerRejectsUpdate(t *testing.T) {
 
 func TestFailedRestoreDoesNotSettleResidualReleaseHistory(t *testing.T) {
 	const leaseUUID = "0192f1a0-2222-7abc-8def-000000000103"
-	stack, err := manifest.ParsePayload(validManifestJSON("docker.io/library/nginx:1.27"))
-	require.NoError(t, err)
 	mock := &mockDockerClient{
 		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
 			return nil, errors.New("injected restore image inspection failure")
@@ -348,25 +356,50 @@ func TestFailedRestoreDoesNotSettleResidualReleaseHistory(t *testing.T) {
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
 	}}
-	require.NoError(t, releases.Append(leaseUUID, shared.Release{
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	authority, err := shared.NewReleaseRuntimeAuthority(
+		operationID, "tenant-a", nominalDockerProviderUUID, callbackURL, lifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+	profiles := testResourceProfiles(t, items)
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
 		Manifest:         validManifestJSON("docker.io/library/nginx:1.25"),
 		Image:            "stack",
+		OperationID:      operationID,
 		Items:            items,
-		ResourceProfiles: testResourceProfiles(t, items),
+		ResourceProfiles: profiles,
+		RuntimeAuthority: &authority,
 		Status:           "active",
 		CreatedAt:        time.Now(),
-	}))
-
-	result := b.doReplaceContainers(context.Background(), replaceContainersOp{
-		LeaseUUID:         leaseUUID,
-		Stack:             stack,
-		Items:             items,
-		ResourceProfiles:  testResourceProfiles(t, items),
-		Operation:         "restore",
-		NoComposeRollback: true,
-		Logger:            b.logger,
 	})
-	require.Error(t, result.Err)
+	_, restoreCallbackURL, restoreLifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	operationCandidate, err := b.operationSettlement.NewOperationIntentCandidate(shared.OperationIntentSpec{
+		Kind:                 shared.OperationIntentRestore,
+		LeaseUUID:            leaseUUID,
+		CallbackURL:          restoreCallbackURL,
+		LifecycleCallbackURL: restoreLifecycleCallbackURL,
+		Tenant:               "tenant-a",
+		ProviderUUID:         nominalDockerProviderUUID,
+		Items:                items,
+		ResourceProfiles:     profiles,
+		EffectiveItems:       items,
+		Manifest:             validManifestJSON("docker.io/library/nginx:1.27"),
+		SourceLeaseUUID:      "0192f1a0-1111-7abc-8def-000000000102",
+		SourceGeneration:     1,
+	})
+	require.NoError(t, err)
+	operationAdmission, err := b.operationSettlement.BeginOperationIntent(operationCandidate)
+	require.NoError(t, err)
+	operationClaim := createdDockerOperationClaim(t, operationAdmission)
+	candidate, err := b.operationSettlement.PrepareOperationRelease(operationClaim)
+	require.NoError(t, err)
+	execution, err := b.operationSettlement.StartOperationExecution(candidate)
+	require.NoError(t, err)
+	outcome := b.operationSettlement.ExecuteOperation(context.Background(), execution)
+	failure, ok := outcome.(shared.OperationExecutionFailure)
+	require.True(t, ok, "restore result = %T, want definitive pre-effect failure", outcome)
+	_, err = b.operationSettlement.CommitOperationFailure(failure)
+	require.NoError(t, err)
 
 	got, err := releases.List(leaseUUID)
 	require.NoError(t, err)

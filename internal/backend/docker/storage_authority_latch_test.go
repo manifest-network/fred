@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
@@ -40,7 +39,6 @@ func newStorageAuthorityLatchTestBackend(t *testing.T) (*Backend, Config) {
 	require.NoError(t, err)
 	require.NotNil(t, b.TerminalStorageAuthorityFailure(),
 		"the production constructor must expose terminal authority withdrawal to the daemon")
-	b.operationIntents = b.callbackStore
 	t.Cleanup(func() { _ = b.Stop() })
 	return b, cfg
 }
@@ -73,24 +71,39 @@ func TestSiblingAuthoritativeStoreFailureBlocksCallbackSettlement(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			b, cfg := newStorageAuthorityLatchTestBackend(t)
 			spec := dockerOperationIntentSpec(t, b.storageIdentity)
-			admission, err := b.callbackStore.BeginOperationIntent(spec)
+			operations, ok := concreteOperationSettlementForTest(b.operationSettlement)
+			require.True(t, ok, "fixture must retain the production operation settlement")
+			candidate, err := operations.NewOperationIntentCandidate(spec)
 			require.NoError(t, err)
+			admission, err := operations.BeginOperationIntent(candidate)
+			require.NoError(t, err)
+			operationClaim := createdDockerOperationClaim(t, admission)
+			uncommitted := commitPreEffectOperationFailureForTest(
+				t, operations, operationClaim,
+			)
 
 			var callbackRequests atomic.Int32
+			attestor := callbackStorageAttestorForTest(
+				t, b.callbackStore, b.stopCtx, b.VerifyStorageIdentity,
+			)
 			b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
-				Store: b.callbackStore,
+				Store:           b.callbackStore,
+				StorageAttestor: attestor,
 				HTTPClient: &http.Client{Transport: dockerReplayRoundTripFunc(func(*http.Request) (*http.Response, error) {
 					callbackRequests.Add(1)
 					return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 				})},
-				Secret:          durableCallbackTestSecret,
-				Logger:          b.logger,
-				StopCtx:         b.stopCtx,
-				BeforeDelivery:  b.VerifyStorageIdentity,
-				BeforeReplay:    b.VerifyStorageIdentity,
-				StorageIdentity: b.storageIdentity,
+				Secret: durableCallbackTestSecret,
+				Logger: b.logger,
+
 				Backoff:         &zeroBackoff,
 				DeliveryTimeout: time.Second,
+			})
+			b.callbackPublisher = mustNewCallbackPublisherForTest(t, shared.CallbackPublisherConfig{
+				OperationSettlement:   operations,
+				MaintenanceSettlement: b.maintenanceSettlement,
+				StorageAttestor:       attestor,
+				Logger:                b.logger,
 			})
 
 			storePath := test.path(cfg)
@@ -120,14 +133,12 @@ func TestSiblingAuthoritativeStoreFailureBlocksCallbackSettlement(t *testing.T) 
 			// fail before entering the callback journal transaction, even though
 			// stopCtx is already canceled and a daemon probe would only report
 			// context.Canceled.
-			_, err = b.operationIntents.ResolveOperationIntent(
-				admission.Claim, backend.CallbackStatusFailed, "late terminal failure",
-			)
+			err = b.resolvePreEffectOperationRefusal(operationClaim, "late terminal failure")
 			require.Error(t, err)
 			assert.EqualError(t, err, latched.Error())
-			b.sendOperationCallbackWithURL(
-				spec.LeaseUUID, spec.CallbackURL, backend.CallbackStatusFailed, "late terminal failure",
-			)
+			require.Error(t, b.callbackPublisher.PublishOperationFailureContext(
+				context.Background(), uncommitted, "late terminal failure",
+			))
 			assert.Zero(t, callbackRequests.Load())
 
 			// Reopen the callback journal without the process-local latch and prove
@@ -140,10 +151,22 @@ func TestSiblingAuthoritativeStoreFailureBlocksCallbackSettlement(t *testing.T) 
 			)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = reopened.Close() })
-			intents, err := reopened.ListOperationIntents()
+			require.NoError(t, b.releaseStore.Close())
+			releasePath := cfg.ReleasesDBPath
+			if test.name == "release journal" {
+				releasePath += ".withdrawn"
+			}
+			reopenedReleases, err := shared.OpenIdentityBoundReleaseStore(
+				shared.ReleaseStoreConfig{DBPath: releasePath}, b.storageAuthority, restartGate,
+			)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = reopenedReleases.Close() })
+			reopenedOperations, err := shared.NewOperationSettlement(reopened, reopenedReleases)
+			require.NoError(t, err)
+			intents, err := reopenedOperations.ListOperationIntents()
 			require.NoError(t, err)
 			require.Len(t, intents, 1)
-			assert.Equal(t, admission.Claim.OperationID(), intents[0].OperationID())
+			assert.Equal(t, operationClaim.OperationID(), intents[0].OperationID())
 			pending, err := reopened.ListPending()
 			require.NoError(t, err)
 			assert.Empty(t, pending)

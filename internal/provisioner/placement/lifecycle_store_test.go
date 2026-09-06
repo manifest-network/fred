@@ -36,7 +36,7 @@ func requireLifecycleVerdict(
 	want LifecycleVerdict,
 ) LifecycleAuthorization {
 	t.Helper()
-	result := s.AuthorizeLifecycle(leaseUUID, id)
+	result := s.authorizeLifecycle(leaseUUID, id)
 	require.Equal(t, want, result.Verdict())
 	return result
 }
@@ -83,7 +83,7 @@ func TestStore_InitialLegacyOwnerAdoptsTokenlessThenRotatesOnExactOperation(t *t
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
 	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictLegacy)
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictStale)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictAuthorized)
@@ -214,7 +214,7 @@ func TestStore_RecreatedLifecycleBucketCannotDowngradeTypedPlacements(t *testing
 	operationID := requireOperationID(t, "8111")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictAuthorized)
@@ -251,7 +251,7 @@ func TestStore_RecreatedInitializationBucketsCannotAdoptMixedRevisionEpoch(t *te
 	typedOperation := requireOperationID(t, "8112")
 	typedID := lifecycleIDFromOperation(t, typedOperation)
 	token := requireTypedAttempt(t, s, "typed", "backend-a", typedOperation)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	require.NoError(t, s.Close())
@@ -338,7 +338,7 @@ func TestStore_LifecycleAttemptPromotionRotationAndReopen(t *testing.T) {
 
 	firstOperation := requireOperationID(t, "8201")
 	firstID := lifecycleIDFromOperation(t, firstOperation)
-	first, applied, err := s.BeginNewAttempt(
+	first, applied, err := s.beginNewAttempt(
 		scope, "lease", "backend-a", firstOperation, PayloadFingerprint{},
 		testBackendRequestSnapshot(t), testCallbackPair(firstOperation))
 
@@ -346,7 +346,7 @@ func TestStore_LifecycleAttemptPromotionRotationAndReopen(t *testing.T) {
 	require.True(t, applied)
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictMissing)
 
-	confirmed, err := s.ConfirmAttempt(first)
+	confirmed, err := confirmAttemptForTest(s, first)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	firstAuthorization := requireLifecycleVerdict(
@@ -365,7 +365,7 @@ func TestStore_LifecycleAttemptPromotionRotationAndReopen(t *testing.T) {
 	secondOperation := requireOperationID(t, "8202")
 	secondID := lifecycleIDFromOperation(t, secondOperation)
 	current := reopened.Lookup("lease")
-	second, applied, err := reopened.BeginOwnedAttempt(
+	second, applied, err := reopened.beginOwnedAttempt(
 		reopened.CurrentAdmissionBaseline(), current.RecordRevision(), "backend-a", secondOperation,
 		PayloadFingerprint{}, testBackendRequestSnapshot(t), testCallbackPair(secondOperation))
 
@@ -377,7 +377,7 @@ func TestStore_LifecycleAttemptPromotionRotationAndReopen(t *testing.T) {
 	requireLifecycleVerdict(t, reopened, "lease", firstID, LifecycleVerdictAuthorized)
 	requireLifecycleVerdict(t, reopened, "lease", secondID, LifecycleVerdictStale)
 
-	confirmed, err = reopened.ConfirmAttempt(second)
+	confirmed, err = confirmAttemptForTest(reopened, second)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, reopened, "lease", firstID, LifecycleVerdictStale)
@@ -392,7 +392,7 @@ func TestStore_PendingLifecycleAttemptSurvivesReopenAndPromotesExactly(t *testin
 	scope := requireAdmissionScope(t, s, baseline, "backend-a")
 	operationID := requireOperationID(t, "8251")
 	id := lifecycleIDFromOperation(t, operationID)
-	_, applied, err := s.BeginNewAttempt(
+	_, applied, err := s.beginNewAttempt(
 		scope, "lease", "backend-a", operationID, PayloadFingerprint{},
 		testBackendRequestSnapshot(t), testCallbackPair(operationID))
 
@@ -405,7 +405,7 @@ func TestStore_PendingLifecycleAttemptSurvivesReopenAndPromotesExactly(t *testin
 	t.Cleanup(func() { _ = reopened.Close() })
 	require.NoError(t, configureBackendTopologyForTest(reopened, []string{"backend-a"}))
 	requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictMissing)
-	confirmed, err := reopened.ConfirmOperation("lease", "backend-a", operationID)
+	confirmed, err := confirmOperationForTest(reopened, "lease", "backend-a", operationID)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	result := requireLifecycleVerdict(
@@ -414,33 +414,33 @@ func TestStore_PendingLifecycleAttemptSurvivesReopenAndPromotesExactly(t *testin
 	assert.Equal(t, "backend-a", result.Backend())
 }
 
-func TestStore_ConfirmOperationPromotesAttemptAndRequiresExactCurrentGeneration(t *testing.T) {
+func TestStore_ClaimedOperationPromotesAttemptAndRequiresExactCurrentGeneration(t *testing.T) {
 	s := newTestStore(t)
 	requireAdmissionBaseline(t, s, "backend-a")
 	firstOperation := requireOperationID(t, "8301")
 	firstID := lifecycleIDFromOperation(t, firstOperation)
 	first := requireTypedAttempt(t, s, "lease", "backend-a", firstOperation)
-	confirmed, err := s.ConfirmAttempt(first)
+	confirmed, err := confirmAttemptForTest(s, first)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
 	secondOperation := requireOperationID(t, "8302")
 	secondID := lifecycleIDFromOperation(t, secondOperation)
 	requireTypedAttempt(t, s, "lease", "backend-a", secondOperation)
-	confirmed, err = s.ConfirmOperation("lease", "backend-a", secondOperation)
+	confirmed, err = confirmOperationForTest(s, "lease", "backend-a", secondOperation)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, s, "lease", secondID, LifecycleVerdictAuthorized)
 
 	placementRevision := s.Lookup("lease").Revision()
-	confirmed, err = s.ConfirmOperation("lease", "backend-a", secondOperation)
+	confirmed, err = confirmOperationForTest(s, "lease", "backend-a", secondOperation)
 	require.NoError(t, err)
 	require.True(t, confirmed, "the exact current generation is idempotent")
 	assert.Equal(t, placementRevision, s.Lookup("lease").Revision())
 
 	maintenanceOperation := requireOperationID(t, "8303")
 	maintenanceID := lifecycleIDFromOperation(t, maintenanceOperation)
-	confirmed, err = s.ConfirmOperation("lease", "backend-a", maintenanceOperation)
+	confirmed, err = confirmOperationForTest(s, "lease", "backend-a", maintenanceOperation)
 	require.NoError(t, err)
 	require.False(t, confirmed,
 		"caller input without a matching attempt or current capability cannot rotate authority")
@@ -462,7 +462,7 @@ func TestStore_RestoreLifecyclePromotionAndRefusal(t *testing.T) {
 	require.NoError(t, err)
 	requireLifecycleVerdict(t, s, "target", id, LifecycleVerdictMissing)
 
-	confirmed, err := s.ConfirmRestore(claim)
+	confirmed, err := s.confirmRestore(claim)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	authorized := requireLifecycleVerdict(
@@ -478,7 +478,7 @@ func TestStore_RestoreLifecyclePromotionAndRefusal(t *testing.T) {
 		testCallbackPair(refusedOperation),
 	)
 	require.NoError(t, err)
-	refused, err := s.RefuseRestore(refusedClaim)
+	refused, err := s.refuseRestore(refusedClaim)
 	require.NoError(t, err)
 	require.True(t, refused)
 	assert.Equal(t, StateAbsent, s.Lookup("refused-target").State())
@@ -493,7 +493,7 @@ func TestStore_InventoryPromotesMarkedAttemptButPreservesMissingCapabilityAttemp
 	requireTypedAttempt(t, s, "typed", "backend-a", typedOperation)
 	projectInventoryForTest(t, s, InventoryProjection{
 		Placements: map[string]string{"typed": "backend-a"},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"typed": {Kind: LifecycleObservationTyped, ID: typedID},
 		},
 	})
@@ -503,10 +503,10 @@ func TestStore_InventoryPromotesMarkedAttemptButPreservesMissingCapabilityAttemp
 	missingOperation := requireOperationID(t, "8502")
 	missingID := lifecycleIDFromOperation(t, missingOperation)
 	writeRawRecords(t, dbPath, map[string][]byte{
-		"missing-capability": []byte(`{"attempt":"backend-a","operation_id":"` +
+		"missing-capability": []byte(`{"schema":1,"attempt":"backend-a","operation_id":"` +
 			missingOperation.String() + `","operation_kind":"provision","callback_url":"https://provider.test/callbacks/provision?operation_id=` +
 			missingOperation.String() + `","lifecycle_callback_url":"https://provider.test/callbacks/provision?lifecycle_id=` +
-			missingOperation.String() + `","tenant":"tenant-test","provider_uuid":"provider-test",` +
+			missingOperation.String() + `","tenant":"tenant-test","provider_uuid":"` + freshTestProviderUUID + `",` +
 			`"request_items":[{"sku":"sku-test","quantity":1,"service_name":"app"}],` +
 			`"set_at":"2026-08-27T12:00:00Z","revision":1}`),
 	})
@@ -515,9 +515,9 @@ func TestStore_InventoryPromotesMarkedAttemptButPreservesMissingCapabilityAttemp
 	t.Cleanup(func() { _ = missingStore.Close() })
 	require.NoError(t, configureBackendTopologyForTest(missingStore, []string{"backend-a"}))
 	fence := missingStore.BeginInventorySession()
-	_, err = missingStore.ProjectInventory(fence, InventoryProjection{
+	_, err = projectInventoryAtFenceForTest(t, missingStore, fence, InventoryProjection{
 		Placements: map[string]string{"missing-capability": "backend-a"},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"missing-capability": {
 				Kind: LifecycleObservationTyped,
 				ID:   missingID,
@@ -551,7 +551,7 @@ func TestStore_InventoryEstablishesAuthorityOnlyFromExplicitBackendObservation(t
 			"unknown":  "backend-a",
 			"retained": "backend-a",
 		},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"legacy":  {Kind: LifecycleObservationLegacy},
 			"typed":   {Kind: LifecycleObservationTyped, ID: typedID},
 			"unknown": {Kind: LifecycleObservationUnknown},
@@ -581,7 +581,7 @@ func TestStore_InventoryAttemptRequiresExactObservedGenerationAcrossReopen(t *te
 	require.NoError(t, configureBackendTopologyForTest(reopened, []string{"backend-a"}))
 	projectInventoryForTest(t, reopened, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-a"},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"lease": {Kind: LifecycleObservationUnknown},
 		},
 	})
@@ -595,7 +595,7 @@ func TestStore_InventoryAttemptRequiresExactObservedGenerationAcrossReopen(t *te
 
 	projectInventoryForTest(t, reopened, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-a"},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"lease": {Kind: LifecycleObservationTyped, ID: id},
 		},
 	})
@@ -617,7 +617,7 @@ func TestStore_InventoryOlderObservedGenerationPreservesCurrentAndAttempt(t *tes
 	currentOperation := requireOperationID(t, "8505")
 	currentID := lifecycleIDFromOperation(t, currentOperation)
 	current := requireTypedAttempt(t, s, "lease", "backend-a", currentOperation)
-	confirmed, err := s.ConfirmAttempt(current)
+	confirmed, err := confirmAttemptForTest(s, current)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -626,7 +626,7 @@ func TestStore_InventoryOlderObservedGenerationPreservesCurrentAndAttempt(t *tes
 	requireTypedAttempt(t, s, "lease", "backend-a", pendingOperation)
 	projectInventoryForTest(t, s, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-a"},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"lease": {Kind: LifecycleObservationTyped, ID: currentID},
 		},
 	})
@@ -638,7 +638,7 @@ func TestStore_InventoryOlderObservedGenerationPreservesCurrentAndAttempt(t *tes
 	requireLifecycleVerdict(t, s, "lease", currentID, LifecycleVerdictAuthorized)
 	requireLifecycleVerdict(t, s, "lease", pendingID, LifecycleVerdictStale)
 
-	settled, err := s.ConfirmOperation("lease", "backend-a", pendingOperation)
+	settled, err := confirmOperationForTest(s, "lease", "backend-a", pendingOperation)
 	require.NoError(t, err)
 	require.True(t, settled)
 	requireLifecycleVerdict(t, s, "lease", pendingID, LifecycleVerdictAuthorized)
@@ -652,14 +652,14 @@ func TestStore_InventoryGenerationMismatchQuarantinesWithoutErasingEvidence(t *t
 	currentOperation := requireOperationID(t, "8507")
 	currentID := lifecycleIDFromOperation(t, currentOperation)
 	current := requireTypedAttempt(t, s, "lease", "backend-a", currentOperation)
-	confirmed, err := s.ConfirmAttempt(current)
+	confirmed, err := confirmAttemptForTest(s, current)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	otherID := requireLifecycleID(t, "8508")
 
 	projectInventoryForTest(t, s, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-a"},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"lease": {Kind: LifecycleObservationTyped, ID: otherID},
 		},
 	})
@@ -689,7 +689,7 @@ func TestStore_RetentionOnlyProjectionCannotReactivateDetachedLifecycle(t *testi
 	operationID := requireOperationID(t, "8509")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireDeleteRecord(t, s, "lease")
@@ -698,9 +698,7 @@ func TestStore_RetentionOnlyProjectionCannotReactivateDetachedLifecycle(t *testi
 	// A retention contributes placement affinity but no live lifecycle
 	// observation. Recreating a confirmed route must not turn the detached
 	// capability back into runtime status authority.
-	projectInventoryForTest(t, s, InventoryProjection{
-		Placements: map[string]string{"lease": "backend-a"},
-	})
+	projectRetentionOnlyInventoryForTest(t, s, "lease", "backend-a")
 	assert.Equal(t, StateConfirmed, s.Lookup("lease").State(),
 		"retained data remains routable for restore")
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictUnusable)
@@ -718,7 +716,7 @@ func TestStore_InventoryPersistsAttemptMarkerMismatchQuarantineAcrossReopen(t *t
 	oldOperation := requireOperationID(t, "8511")
 	oldID := lifecycleIDFromOperation(t, oldOperation)
 	oldAttempt := requireTypedAttempt(t, s, "lease", "backend-a", oldOperation)
-	confirmed, err := s.ConfirmAttempt(oldAttempt)
+	confirmed, err := confirmAttemptForTest(s, oldAttempt)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -773,7 +771,7 @@ func TestStore_OutstandingAttemptWithoutPlacementRemainsUnusableAcrossReopen(t *
 	currentOperation := requireOperationID(t, "8518")
 	currentID := lifecycleIDFromOperation(t, currentOperation)
 	currentAttempt := requireTypedAttempt(t, s, "lease", "backend-a", currentOperation)
-	confirmed, err := s.ConfirmAttempt(currentAttempt)
+	confirmed, err := confirmAttemptForTest(s, currentAttempt)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	pendingOperation := requireOperationID(t, "8519")
@@ -824,7 +822,7 @@ func TestStore_InventoryPersistsBackendBindingMismatchQuarantineAcrossReopen(t *
 	operationID := requireOperationID(t, "8513")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	require.NoError(t, s.Close())
@@ -871,7 +869,7 @@ func TestStore_ConflictBackendMismatchQuarantinePersistsAcrossReopen(t *testing.
 	operationID := requireOperationID(t, "8515")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireConflictPlacement(t, s, "lease", "backend-a", "backend-b")
@@ -925,7 +923,7 @@ func TestStore_InventoryPreservesRawCorruptLifecycleEvidence(t *testing.T) {
 	operationID := requireOperationID(t, "8514")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	require.NoError(t, s.Close())
@@ -967,7 +965,7 @@ func TestStore_ExactRecoveryRepairsRawCorruptionAfterInventoryPreservesAttempt(t
 	oldOperationID := requireOperationID(t, "8515")
 	oldID := lifecycleIDFromOperation(t, oldOperationID)
 	oldToken := requireTypedAttempt(t, s, "lease", "backend-a", oldOperationID)
-	confirmed, err := s.ConfirmAttempt(oldToken)
+	confirmed, err := confirmAttemptForTest(s, oldToken)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -1003,12 +1001,12 @@ func TestStore_ExactRecoveryRepairsRawCorruptionAfterInventoryPreservesAttempt(t
 		return nil
 	}))
 
-	recovery, claimed, err := reopened.ClaimAttempt("lease", newOperationID)
+	recovery, claimed, err := reopened.claimAttempt("lease", newOperationID)
 	require.NoError(t, err)
 	require.True(t, claimed)
 	assert.True(t, recovery.HasSameBackendOwner(),
 		"positive inventory is retained as owner evidence without consuming the attempt")
-	repaired, err := reopened.ConfirmClaimedAttempt(recovery)
+	repaired, err := reopened.confirmClaimedAttempt(recovery)
 	require.NoError(t, err)
 	require.True(t, repaired)
 	requireLifecycleVerdict(t, reopened, "lease", newID, LifecycleVerdictAuthorized)
@@ -1030,7 +1028,7 @@ func TestStore_LifecycleCapabilitySurvivesPlacementDeleteAndPrunesOnExactRetirem
 	operationID := requireOperationID(t, "8601")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -1051,13 +1049,13 @@ func TestStore_LifecycleCapabilitySurvivesPlacementDeleteAndPrunesOnExactRetirem
 	require.NoError(t, err)
 	requireLifecycleVerdict(t, reopened, "lease", id, LifecycleVerdictTeardownOnly)
 
-	retired, err := reopened.RetireLifecycle("lease", id)
+	retired, err := reopened.retireLifecycle("lease", id)
 	require.NoError(t, err)
 	assert.True(t, retired.Retired())
 	assert.True(t, retired.RetiredNow())
 	assert.Equal(t, "backend-a", retired.Backend())
 	assert.Equal(t, LifecycleVerdictMissing, reopened.CurrentLifecycle("lease").Verdict())
-	retired, err = reopened.RetireLifecycle("lease", id)
+	retired, err = reopened.retireLifecycle("lease", id)
 	require.NoError(t, err)
 	assert.Equal(t, LifecycleVerdictMissing, retired.Verdict())
 	assert.False(t, retired.RetiredNow(), "a duplicate cannot cross the durable delete boundary")
@@ -1075,7 +1073,7 @@ func TestStore_ActiveInventoryRecreationPreservesExactTypedLifecycle(t *testing.
 	operationID := requireOperationID(t, "8621")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -1083,14 +1081,14 @@ func TestStore_ActiveInventoryRecreationPreservesExactTypedLifecycle(t *testing.
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictTeardownOnly)
 	projectInventoryForTest(t, s, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-a"},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"lease": {Kind: LifecycleObservationTyped, ID: id},
 		},
 	})
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictAuthorized)
 	requireLifecycleVerdict(t, s, "lease", lifecycle.ID{}, LifecycleVerdictStale)
 
-	retired, err := s.RetireLifecycle("lease", id)
+	retired, err := s.retireLifecycle("lease", id)
 	require.NoError(t, err)
 	require.True(t, retired.Retired())
 	requireDeleteRecord(t, s, "lease")
@@ -1108,7 +1106,7 @@ func TestStore_ConflictInventoryKeepsMatchingRetainedTypedLifecycleGated(t *test
 	operationID := requireOperationID(t, "8622")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -1121,7 +1119,7 @@ func TestStore_ConflictInventoryKeepsMatchingRetainedTypedLifecycleGated(t *test
 
 	projectInventoryForTest(t, s, InventoryProjection{
 		Placements: map[string]string{"lease": "backend-a"},
-		Lifecycles: map[string]LifecycleObservation{
+		lifecycles: map[string]LifecycleObservation{
 			"lease": {Kind: LifecycleObservationTyped, ID: id},
 		},
 	})
@@ -1159,7 +1157,7 @@ func TestStore_ConflictInventoryAfterReopenCannotResolveTypedLifecycle(t *testin
 			operationID := requireOperationID(t, "8623")
 			id := lifecycleIDFromOperation(t, operationID)
 			token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-			confirmed, err := s.ConfirmAttempt(token)
+			confirmed, err := confirmAttemptForTest(s, token)
 			require.NoError(t, err)
 			require.True(t, confirmed)
 			requireConflictPlacement(t, s, "lease", "backend-a", "backend-b")
@@ -1180,7 +1178,7 @@ func TestStore_ConflictInventoryAfterReopenCannotResolveTypedLifecycle(t *testin
 
 			projectInventoryForTest(t, reopened, InventoryProjection{
 				Placements: map[string]string{"lease": test.observedBackend},
-				Lifecycles: map[string]LifecycleObservation{
+				lifecycles: map[string]LifecycleObservation{
 					"lease": {Kind: LifecycleObservationTyped, ID: id},
 				},
 			})
@@ -1222,7 +1220,7 @@ func TestStore_MatchingInventoryRepairsUnusablePlacementWithoutLosingTypedLifecy
 		{
 			name: "structurally empty",
 			record: []byte(
-				`{"backend":"","set_at":"2026-08-28T12:00:00Z","revision":7}`,
+				`{"schema":1,"backend":"","set_at":"2026-08-28T12:00:00Z","revision":7}`,
 			),
 			wantRevision: 7,
 			wantSetAt:    true,
@@ -1238,7 +1236,7 @@ func TestStore_MatchingInventoryRepairsUnusablePlacementWithoutLosingTypedLifecy
 			operationID := requireOperationID(t, "8624")
 			id := lifecycleIDFromOperation(t, operationID)
 			token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-			confirmed, err := s.ConfirmAttempt(token)
+			confirmed, err := confirmAttemptForTest(s, token)
 			require.NoError(t, err)
 			require.True(t, confirmed)
 			require.NoError(t, s.Close())
@@ -1265,7 +1263,7 @@ func TestStore_MatchingInventoryRepairsUnusablePlacementWithoutLosingTypedLifecy
 
 			projectInventoryForTest(t, reopened, InventoryProjection{
 				Placements: map[string]string{"lease": "backend-a"},
-				Lifecycles: map[string]LifecycleObservation{
+				lifecycles: map[string]LifecycleObservation{
 					"lease": {Kind: LifecycleObservationTyped, ID: id},
 				},
 			})
@@ -1291,7 +1289,7 @@ func TestStore_UnreadablePlacementWithOutstandingAttemptRemainsFailClosed(t *tes
 	currentOperation := requireOperationID(t, "8625")
 	currentID := lifecycleIDFromOperation(t, currentOperation)
 	current := requireTypedAttempt(t, s, "lease", "backend-a", currentOperation)
-	confirmed, err := s.ConfirmAttempt(current)
+	confirmed, err := confirmAttemptForTest(s, current)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -1356,7 +1354,7 @@ func TestStore_RefusedRecreationRetainsPriorLifecycleWithoutWedge(t *testing.T) 
 	firstOperation := requireOperationID(t, "8631")
 	firstID := lifecycleIDFromOperation(t, firstOperation)
 	first := requireTypedAttempt(t, s, "lease", "backend-a", firstOperation)
-	confirmed, err := s.ConfirmAttempt(first)
+	confirmed, err := confirmAttemptForTest(s, first)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireDeleteRecord(t, s, "lease")
@@ -1368,7 +1366,7 @@ func TestStore_RefusedRecreationRetainsPriorLifecycleWithoutWedge(t *testing.T) 
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictTeardownOnly)
 	assert.Equal(t, LifecycleVerdictTeardownOnly, s.CurrentLifecycle("lease").Verdict(),
 		"an attempt-only record must not restore runtime authority to the retained owner")
-	refused, err := s.RefuseAttempt(second)
+	refused, err := refuseAttemptForTest(s, second)
 	require.NoError(t, err)
 	require.True(t, refused)
 	assert.Equal(t, StateAbsent, s.Lookup("lease").State())
@@ -1381,7 +1379,7 @@ func TestStore_DetachedRetirementPreservesConcurrentNewAttemptMarker(t *testing.
 	firstOperation := requireOperationID(t, "8634")
 	firstID := lifecycleIDFromOperation(t, firstOperation)
 	first := requireTypedAttempt(t, s, "lease", "backend-a", firstOperation)
-	confirmed, err := s.ConfirmAttempt(first)
+	confirmed, err := confirmAttemptForTest(s, first)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireDeleteRecord(t, s, "lease")
@@ -1391,13 +1389,13 @@ func TestStore_DetachedRetirementPreservesConcurrentNewAttemptMarker(t *testing.
 	second := requireTypedAttempt(t, s, "lease", "backend-a", secondOperation)
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictTeardownOnly)
 
-	retired, err := s.RetireLifecycle("lease", firstID)
+	retired, err := s.retireLifecycle("lease", firstID)
 	require.NoError(t, err)
 	require.True(t, retired.RetiredNow())
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictRetired)
 	requireLifecycleVerdict(t, s, "lease", secondID, LifecycleVerdictStale)
 
-	confirmed, err = s.ConfirmAttempt(second)
+	confirmed, err = confirmAttemptForTest(s, second)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictStale)
@@ -1413,7 +1411,7 @@ func TestStore_ReopenPrunesDetachedRetiredButRetainsOutstandingTeardown(t *testi
 	activeOperation := requireOperationID(t, "8636")
 	activeID := lifecycleIDFromOperation(t, activeOperation)
 	active := requireTypedAttempt(t, s, "active", "backend-a", activeOperation)
-	confirmed, err := s.ConfirmAttempt(active)
+	confirmed, err := confirmAttemptForTest(s, active)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireDeleteRecord(t, s, "active")
@@ -1421,10 +1419,10 @@ func TestStore_ReopenPrunesDetachedRetiredButRetainsOutstandingTeardown(t *testi
 	retiredOperation := requireOperationID(t, "8637")
 	retiredID := lifecycleIDFromOperation(t, retiredOperation)
 	retiredToken := requireTypedAttempt(t, s, "retired", "backend-a", retiredOperation)
-	confirmed, err = s.ConfirmAttempt(retiredToken)
+	confirmed, err = confirmAttemptForTest(s, retiredToken)
 	require.NoError(t, err)
 	require.True(t, confirmed)
-	retired, err := s.RetireLifecycle("retired", retiredID)
+	retired, err := s.retireLifecycle("retired", retiredID)
 	require.NoError(t, err)
 	require.True(t, retired.RetiredNow())
 	require.NoError(t, s.Close())
@@ -1458,7 +1456,7 @@ func TestStore_ZeroIDCannotConsumeTypedTeardownCapability(t *testing.T) {
 	operationID := requireOperationID(t, "8633")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -1472,7 +1470,7 @@ func TestStore_ZeroIDCannotConsumeTypedTeardownCapability(t *testing.T) {
 	)
 	assert.Equal(t, LifecycleVerdictTeardownOnly, s.CurrentLifecycle("lease").Verdict())
 
-	retired, err := s.RetireLifecycle("lease", lifecycle.ID{})
+	retired, err := s.retireLifecycle("lease", lifecycle.ID{})
 	require.NoError(t, err)
 	assert.Equal(t, LifecycleVerdictStale, retired.Verdict())
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictTeardownOnly)
@@ -1499,7 +1497,7 @@ func TestStore_DetachedLegacyTeardownRetirementDeletesCapability(t *testing.T) {
 	requireLifecycleVerdict(
 		t, reopened, "legacy", lifecycle.ID{}, LifecycleVerdictTeardownOnly,
 	)
-	retired, err := reopened.RetireLifecycle("legacy", lifecycle.ID{})
+	retired, err := reopened.retireLifecycle("legacy", lifecycle.ID{})
 	require.NoError(t, err)
 	require.True(t, retired.RetiredNow())
 	assert.Equal(t, "backend-a", retired.Backend())
@@ -1520,10 +1518,10 @@ func TestStore_NewAttemptSupersedesRetiredCapabilityAfterPlacementDeletion(t *te
 	firstOperation := requireOperationID(t, "8641")
 	firstID := lifecycleIDFromOperation(t, firstOperation)
 	first := requireTypedAttempt(t, s, "lease", "backend-a", firstOperation)
-	confirmed, err := s.ConfirmAttempt(first)
+	confirmed, err := confirmAttemptForTest(s, first)
 	require.NoError(t, err)
 	require.True(t, confirmed)
-	retired, err := s.RetireLifecycle("lease", firstID)
+	retired, err := s.retireLifecycle("lease", firstID)
 	require.NoError(t, err)
 	require.True(t, retired.Retired())
 	requireDeleteRecord(t, s, "lease")
@@ -1534,7 +1532,7 @@ func TestStore_NewAttemptSupersedesRetiredCapabilityAfterPlacementDeletion(t *te
 	second := requireTypedAttempt(t, s, "lease", "backend-a", secondOperation)
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictMissing)
 	requireLifecycleVerdict(t, s, "lease", secondID, LifecycleVerdictMissing)
-	confirmed, err = s.ConfirmAttempt(second)
+	confirmed, err = confirmAttemptForTest(s, second)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictStale)
@@ -1547,7 +1545,7 @@ func TestStore_LifecycleCapabilityWithdrawsAuthorityDuringPlacementConflict(t *t
 	operationID := requireOperationID(t, "8651")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictAuthorized)
@@ -1556,7 +1554,7 @@ func TestStore_LifecycleCapabilityWithdrawsAuthorityDuringPlacementConflict(t *t
 	requireLifecycleVerdict(t, s, "lease", id, LifecycleVerdictUnusable)
 	assert.Equal(t, LifecycleVerdictUnusable, s.CurrentLifecycle("lease").Verdict())
 
-	retired, err := s.RetireLifecycle("lease", id)
+	retired, err := s.retireLifecycle("lease", id)
 	require.NoError(t, err)
 	assert.Equal(t, LifecycleVerdictUnusable, retired.Verdict())
 	assert.False(t, s.lifecycleCache["lease"].retired,
@@ -1582,7 +1580,7 @@ func TestStore_LifecyclePromotionIsAtomicWithPlacement(t *testing.T) {
 	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
 		return tx.DeleteBucket(lifecycleCapabilityBucketName)
 	}))
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.Error(t, err)
 	assert.False(t, confirmed)
 	after := s.Lookup("lease")
@@ -1609,7 +1607,7 @@ func TestStore_LifecycleAttemptCreationIsAtomicWithPlacement(t *testing.T) {
 	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
 		return tx.DeleteBucket(lifecycleCapabilityBucketName)
 	}))
-	token, applied, err := s.BeginNewAttempt(
+	token, applied, err := s.beginNewAttempt(
 		scope, "lease", "backend-a", operationID, PayloadFingerprint{},
 		testBackendRequestSnapshot(t), testCallbackPair(operationID))
 
@@ -1632,7 +1630,7 @@ func TestStore_LifecycleRetireRacesAreSerialized(t *testing.T) {
 	operationID := requireOperationID(t, "8801")
 	id := lifecycleIDFromOperation(t, operationID)
 	token := requireTypedAttempt(t, s, "lease", "backend-a", operationID)
-	confirmed, err := s.ConfirmAttempt(token)
+	confirmed, err := confirmAttemptForTest(s, token)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
@@ -1640,7 +1638,7 @@ func TestStore_LifecycleRetireRacesAreSerialized(t *testing.T) {
 	errors := make(chan error, 2)
 	for range 2 {
 		go func() {
-			result, retireErr := s.RetireLifecycle("lease", id)
+			result, retireErr := s.retireLifecycle("lease", id)
 			results <- result
 			errors <- retireErr
 		}()
@@ -1657,18 +1655,18 @@ func TestStore_RetiringCurrentLifecyclePreservesNewAttemptMarker(t *testing.T) {
 	firstOperation := requireOperationID(t, "8901")
 	firstID := lifecycleIDFromOperation(t, firstOperation)
 	first := requireTypedAttempt(t, s, "lease", "backend-a", firstOperation)
-	confirmed, err := s.ConfirmAttempt(first)
+	confirmed, err := confirmAttemptForTest(s, first)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
 	secondOperation := requireOperationID(t, "8902")
 	secondID := lifecycleIDFromOperation(t, secondOperation)
 	second := requireTypedAttempt(t, s, "lease", "backend-a", secondOperation)
-	retired, err := s.RetireLifecycle("lease", firstID)
+	retired, err := s.retireLifecycle("lease", firstID)
 	require.NoError(t, err)
 	require.True(t, retired.Retired())
 
-	confirmed, err = s.ConfirmAttempt(second)
+	confirmed, err = confirmAttemptForTest(s, second)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, s, "lease", firstID, LifecycleVerdictStale)
@@ -1734,7 +1732,7 @@ func TestStore_MalformedLifecycleCapabilitiesAreIsolatedPerLeaseOnReopen(t *test
 			healthy := requireTypedAttempt(
 				t, s, "healthy", "backend-a", healthyOperation,
 			)
-			confirmed, confirmErr := s.ConfirmAttempt(healthy)
+			confirmed, confirmErr := confirmAttemptForTest(s, healthy)
 			require.NoError(t, confirmErr)
 			require.True(t, confirmed)
 			requireConfirmedPlacement(t, s, "lease", "backend-a")
@@ -1778,12 +1776,38 @@ func TestStore_MalformedLifecycleCapabilitiesAreIsolatedPerLeaseOnReopen(t *test
 	}
 }
 
-func TestDecodeLifecycleCapabilityAllowsUnknownFields(t *testing.T) {
-	capability, err := decodeLifecycleCapability([]byte(
-		`{"backend":"backend-a","future":{"nested":true}}`,
-	))
-	require.NoError(t, err)
-	assert.Equal(t, "backend-a", capability.backend)
+func TestDecodeLifecycleCapabilityRejectsUnknownOrUnsupportedRows(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		encoded string
+		want    string
+	}{
+		{
+			name:    "missing schema",
+			encoded: `{"backend":"backend-a"}`,
+			want:    "unsupported lifecycle capability schema 0",
+		},
+		{
+			name:    "future schema",
+			encoded: `{"schema":2,"backend":"backend-a"}`,
+			want:    "unsupported lifecycle capability schema 2",
+		},
+		{
+			name:    "unknown field",
+			encoded: `{"schema":1,"backend":"backend-a","future":{"nested":true}}`,
+			want:    "unknown field",
+		},
+		{
+			name:    "trailing value",
+			encoded: `{"schema":1,"backend":"backend-a"} {}`,
+			want:    "unexpected data after JSON value",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := decodeLifecycleCapability([]byte(test.encoded))
+			require.ErrorContains(t, err, test.want)
+		})
+	}
 }
 
 func TestStore_RevisionedConfirmedMissingCapabilityIsIsolatedAndNeverBackfilled(t *testing.T) {
@@ -1795,14 +1819,14 @@ func TestStore_RevisionedConfirmedMissingCapabilityIsIsolatedAndNeverBackfilled(
 	healthyOperation := requireOperationID(t, "8961")
 	healthyID := lifecycleIDFromOperation(t, healthyOperation)
 	healthy := requireTypedAttempt(t, s, "healthy", "backend-a", healthyOperation)
-	confirmed, err := s.ConfirmAttempt(healthy)
+	confirmed, err := confirmAttemptForTest(s, healthy)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 
 	missing := requireTypedAttempt(
 		t, s, "missing", "backend-a", requireOperationID(t, "8962"),
 	)
-	confirmed, err = s.ConfirmAttempt(missing)
+	confirmed, err = confirmAttemptForTest(s, missing)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	require.NoError(t, s.Close())
@@ -1846,7 +1870,7 @@ func TestStore_RevisionedConfirmedMissingCapabilityIsIsolatedAndNeverBackfilled(
 		t, repair, "missing", lifecycleIDFromOperation(t, refusedOperation),
 		LifecycleVerdictUnusable,
 	)
-	refusedNow, err := repair.RefuseAttempt(refused)
+	refusedNow, err := refuseAttemptForTest(repair, refused)
 	require.NoError(t, err)
 	require.True(t, refusedNow)
 	requireLifecycleVerdict(
@@ -1859,7 +1883,7 @@ func TestStore_RevisionedConfirmedMissingCapabilityIsIsolatedAndNeverBackfilled(
 		t, repair, "missing", "backend-a", repairOperation,
 	)
 	requireLifecycleVerdict(t, repair, "missing", repairID, LifecycleVerdictUnusable)
-	confirmed, err = repair.ConfirmAttempt(repairToken)
+	confirmed, err = confirmAttemptForTest(repair, repairToken)
 	require.NoError(t, err)
 	require.True(t, confirmed)
 	requireLifecycleVerdict(t, repair, "missing", repairID, LifecycleVerdictAuthorized)

@@ -20,7 +20,7 @@ func TestRetentionAccounting_ImmutableSnapshotSurvivesSKUResizeAndRemoval(t *tes
 	snapshot, err := shared.BuildSKUResourceSnapshot(entry.Items, b.cfg.GetSKUProfile)
 	require.NoError(t, err)
 	entry.ResourceProfiles = snapshot
-	require.NoError(t, store.Put(entry))
+	require.NoError(t, putRetentionForTest(t, store, entry))
 
 	// Repricing the current config cannot resize an already-retained footprint.
 	withMicroSKU(b, 1)
@@ -42,7 +42,7 @@ func TestReapingAccounting_ImmutableSnapshotSurvivesSKURemoval(t *testing.T) {
 	snapshot, err := shared.BuildSKUResourceSnapshot(entry.Items, b.cfg.GetSKUProfile)
 	require.NoError(t, err)
 	entry.ResourceProfiles = snapshot
-	require.NoError(t, store.Put(entry))
+	require.NoError(t, putRetentionForTest(t, store, entry))
 	delete(b.cfg.SKUProfiles, "docker-micro")
 
 	require.NoError(t, b.refreshRetentionAccountingChecked())
@@ -55,7 +55,7 @@ func TestRetentionAccounting_AggregateOverflowKeepsLastProjection(t *testing.T) 
 
 	for _, leaseUUID := range []string{"lease-overflow-a", "lease-overflow-b"} {
 		items := []backend.LeaseItem{{SKU: "huge", ServiceName: "app", Quantity: 1}}
-		require.NoError(t, store.Put(shared.RetentionEntry{
+		require.NoError(t, putRetentionForTest(t, store, shared.RetentionEntry{
 			OriginalLeaseUUID: leaseUUID,
 			Tenant:            "tenant-a",
 			ProviderUUID:      "provider-a",
@@ -195,7 +195,7 @@ func TestRetentionCap_MixedLeaseSelectsOnlyDurableSnapshotRows(t *testing.T) {
 func TestRetentionCap_RetainedScratchCountsPhysicallyButNotTowardPolicyCaps(t *testing.T) {
 	b, store := newBackendWithRetention(t)
 	const (
-		leaseUUID = "lease-retained-scratch"
+		leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 		tenant    = "tenant-a"
 		partition = "partition-a"
 	)
@@ -230,7 +230,7 @@ func TestRetentionCap_RetainedScratchCountsPhysicallyButNotTowardPolicyCaps(t *t
 	require.Empty(t, unresolved)
 	require.Zero(t, capMB, "scratch is not durable retention entitlement")
 
-	require.NoError(t, store.Put(entry))
+	require.NoError(t, putRetentionForTest(t, store, entry))
 	require.NoError(t, b.refreshRetentionAccountingChecked())
 	require.Equal(t, int64(73), b.pool.Stats().RetainedDiskMB,
 		"the exact retained scratch path must remain physically reserved")

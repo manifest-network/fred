@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,23 +137,27 @@ func TestResolveMaintenanceCallbackURLs(t *testing.T) {
 
 func TestRestart_NotProvisioned(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID: "nonexistent",
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "21638ef8-1401-4f14-a355-1ae02afeb35b",
 	})
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 }
 
 func TestRestart_InvalidState_Provisioning(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusProvisioning},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID: "lease-1",
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
 	})
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 	assert.Contains(t, err.Error(), "provisioning")
@@ -162,42 +165,48 @@ func TestRestart_InvalidState_Provisioning(t *testing.T) {
 
 func TestRestart_InvalidState_Restarting(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusRestarting},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID: "lease-1",
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
 	})
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 }
 
 func TestRestart_InvalidState_Updating(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusUpdating},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID: "lease-1",
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
 	})
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 }
 
 func TestRestart_NoManifest(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusReady}, // No stored manifest
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID: "lease-1",
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
 	})
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 	assert.Contains(t, err.Error(), "no stored manifest")
@@ -207,94 +216,106 @@ func TestRestart_NoManifest(t *testing.T) {
 
 func TestUpdate_NotProvisioned(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID: "nonexistent",
-		Payload:   validManifestJSON("nginx:latest"),
+	err := b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "21638ef8-1401-4f14-a355-1ae02afeb35b",
+		Payload:     validManifestJSON("nginx:latest"),
 	})
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 }
 
 func TestUpdate_InvalidState_Provisioning(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusProvisioning,
 			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID: "lease-1",
-		Payload:   validManifestJSON("nginx:latest"),
+	err := b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
+		Payload:     validManifestJSON("nginx:latest"),
 	})
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 }
 
 func TestUpdate_InvalidState_Restarting(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusRestarting,
 			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID: "lease-1",
-		Payload:   validManifestJSON("nginx:latest"),
+	err := b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
+		Payload:     validManifestJSON("nginx:latest"),
 	})
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 }
 
 func TestUpdate_InvalidState_Updating(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusUpdating,
 			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 
-	err := b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID: "lease-1",
-		Payload:   validManifestJSON("nginx:latest"),
+	err := b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
+		Payload:     validManifestJSON("nginx:latest"),
 	})
 	assert.ErrorIs(t, err, backend.ErrInvalidState)
 }
 
 func TestUpdate_ImageNotAllowed(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusReady,
 			SKU:    "docker-small"},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 	// AllowedRegistries defaults to ["docker.io"] in DefaultConfig
 
-	err := b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID: "lease-1",
-		Payload:   validManifestJSON("evil.registry.com/malware:latest"),
+	err := b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
+		Payload:     validManifestJSON("evil.registry.com/malware:latest"),
 	})
 	assert.ErrorIs(t, err, backend.ErrValidation)
 }
 
 func TestUpdate_RejectsFixedHostPort(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusReady,
 			SKU:    "docker-small",
 			Items:  []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
+	attachBoundMaintenanceCallbackStore(t, b)
 
 	// A tenant must not be able to introduce a squatted fixed host port via
 	// an update (ENG-605), just as at provision time.
-	err := b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID: "lease-1",
-		Payload:   []byte(`{"image":"docker.io/library/nginx:latest","ports":{"8080/tcp":{"host_port":8080}}}`),
+	err := b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
+		Payload:     []byte(`{"image":"docker.io/library/nginx:latest","ports":{"8080/tcp":{"host_port":8080}}}`),
 	})
 	require.ErrorIs(t, err, backend.ErrInvalidManifest)
 	assert.Contains(t, err.Error(), "host_port")
@@ -305,82 +326,82 @@ func TestUpdate_RejectsFixedHostPort(t *testing.T) {
 func TestGetReleases_NotProvisioned(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, nil)
 
-	releases, err := b.GetReleases(context.Background(), "nonexistent")
+	releases, err := b.GetReleases(context.Background(), "21638ef8-1401-4f14-a355-1ae02afeb35b")
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned)
 	assert.Nil(t, releases)
 }
 
 func TestGetReleases_NilReleaseStore(t *testing.T) {
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusReady},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
 	b.releaseStore = nil
 
-	releases, err := b.GetReleases(context.Background(), "lease-1")
+	releases, err := b.GetReleases(context.Background(), "11638ef8-1401-4f14-a355-1ae02afeb35b")
 	assert.NoError(t, err)
 	assert.Nil(t, releases)
 }
 
 func TestGetReleases_WithReleases(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "releases.db")
-	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	defer releaseStore.Close()
-
-	// Seed some releases
-	now := time.Now()
-	require.NoError(t, releaseStore.Append("lease-1", shared.Release{
-		Manifest:  []byte(`{"image":"nginx:1.25"}`),
-		Image:     "nginx:1.25",
-		Status:    "superseded",
-		CreatedAt: now.Add(-1 * time.Hour),
-	}))
-	require.NoError(t, releaseStore.Append("lease-1", shared.Release{
-		Manifest:  []byte(`{"image":"nginx:1.26"}`),
-		Image:     "nginx:1.26",
-		Status:    "active",
-		CreatedAt: now,
-	}))
-
+	const leaseUUID = "11638ef8-1401-4f14-a355-1ae02afeb35b"
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Status: backend.ProvisionStatusReady},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
-	b.releaseStore = releaseStore
+	attachBoundOperationHandoffStores(t, b)
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
+	profiles := testResourceProfiles(t, items)
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	authority := mustTestReleaseRuntimeAuthority(
+		t, operationID, "tenant-a", nominalDockerProviderUUID, callbackURL, lifecycleCallbackURL,
+	)
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
+		Manifest: validStackManifestJSON(map[string]string{"app": "nginx:1.25"}),
+		Image:    "nginx:1.25", OperationID: operationID, Items: items,
+		ResourceProfiles: profiles, RuntimeAuthority: authority,
+	})
+	activateMaintenanceReleaseForTest(t, b.maintenanceSettlement, leaseUUID,
+		shared.MaintenanceIntentUpdate, shared.Release{
+			Manifest: validStackManifestJSON(map[string]string{"app": "nginx:1.26"}),
+			Image:    "nginx:1.26", OperationID: operationID, Items: items,
+			ResourceProfiles: profiles, RuntimeAuthority: authority,
+		})
 
-	releases, err := b.GetReleases(context.Background(), "lease-1")
+	releases, err := b.GetReleases(context.Background(), leaseUUID)
 	require.NoError(t, err)
 	require.Len(t, releases, 2)
 
 	assert.Equal(t, 1, releases[0].Version)
-	assert.Equal(t, "nginx:1.25", releases[0].Image)
+	assert.Equal(t, "stack", releases[0].Image)
+	assert.Contains(t, string(releases[0].Manifest), "nginx:1.25")
 	assert.Equal(t, "superseded", releases[0].Status)
 
 	assert.Equal(t, 2, releases[1].Version)
 	assert.Equal(t, "nginx:1.26", releases[1].Image)
+	assert.Contains(t, string(releases[1].Manifest), "nginx:1.26")
 	assert.Equal(t, "active", releases[1].Status)
 }
 
 func TestGetReleases_EmptyHistory(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "releases.db")
-	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
+	releaseStore, err := newBoundReleaseStoreForTest(t, shared.ReleaseStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer releaseStore.Close()
 
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status: backend.ProvisionStatusReady},
 		},
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
 	b.releaseStore = releaseStore
 
-	releases, err := b.GetReleases(context.Background(), "lease-1")
+	releases, err := b.GetReleases(context.Background(), "11638ef8-1401-4f14-a355-1ae02afeb35b")
 	require.NoError(t, err)
 	assert.Empty(t, releases)
 }
@@ -394,7 +415,7 @@ func TestRecoverState_RestartingPreserved(t *testing.T) {
 		},
 	}
 	existing := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Tenant:    "tenant-a",
 			Status:    backend.ProvisionStatusRestarting,
 			CreatedAt: time.Now()},
@@ -405,7 +426,7 @@ func TestRecoverState_RestartingPreserved(t *testing.T) {
 	err := b.recoverState(context.Background())
 	require.NoError(t, err)
 
-	prov := b.provisions["lease-1"]
+	prov := b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"]
 	require.NotNil(t, prov)
 	assert.Equal(t, backend.ProvisionStatusRestarting, prov.Status,
 		"restarting provision should be preserved through recoverState")
@@ -418,7 +439,7 @@ func TestRecoverState_UpdatingPreserved(t *testing.T) {
 		},
 	}
 	existing := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Tenant:    "tenant-a",
 			Status:    backend.ProvisionStatusUpdating,
 			CreatedAt: time.Now()},
@@ -429,7 +450,7 @@ func TestRecoverState_UpdatingPreserved(t *testing.T) {
 	err := b.recoverState(context.Background())
 	require.NoError(t, err)
 
-	prov := b.provisions["lease-1"]
+	prov := b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"]
 	require.NotNil(t, prov)
 	assert.Equal(t, backend.ProvisionStatusUpdating, prov.Status,
 		"updating provision should be preserved through recoverState")
@@ -438,45 +459,53 @@ func TestRecoverState_UpdatingPreserved(t *testing.T) {
 // --- Deprovision cleans up releases ---
 
 func TestDeprovision_CleansUpReleases(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "releases.db")
-	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	defer releaseStore.Close()
-
-	// Seed a release
-	require.NoError(t, releaseStore.Append("lease-1", shared.Release{
-		Manifest:  []byte(`{"image":"nginx:1.25"}`),
-		Image:     "nginx:1.25",
-		Status:    "active",
-		CreatedAt: time.Now(),
-	}))
-
+	const (
+		leaseUUID    = "11638ef8-1401-4f14-a355-1ae02afeb35b"
+		providerUUID = "22222222-2222-4222-8222-222222222222"
+	)
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{LeaseUUID: "lease-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: leaseUUID,
 			Tenant:       "tenant-a",
-			ProviderUUID: "prov-1",
+			ProviderUUID: providerUUID,
 			SKU:          "docker-small",
 			Status:       backend.ProvisionStatusReady,
 			ContainerIDs: []string{"c1"},
-			Quantity:     1},
+			Quantity:     1,
+			Items:        items},
 		},
 	}
 
 	mock := &mockDockerClient{
+		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
 		RemoveContainerFn: func(ctx context.Context, containerID string) error {
 			return nil
 		},
 	}
 
 	b := newBackendForTest(mock, provisions)
-	b.releaseStore = releaseStore
+	attachBoundOperationHandoffStores(t, b)
+	releaseStore := b.releaseStore
+	profiles := testResourceProfiles(t, items)
+	b.provisions[leaseUUID].ResourceProfiles = profiles
+	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
+	b.provisions[leaseUUID].CallbackURL = callbackURL
+	b.provisions[leaseUUID].LifecycleCallbackURL = lifecycleCallbackURL
+	authority := mustTestReleaseRuntimeAuthority(
+		t, operationID, "tenant-a", providerUUID, callbackURL, lifecycleCallbackURL,
+	)
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
+		Manifest: validStackManifestJSON(map[string]string{"app": "nginx:1.25"}),
+		Image:    "nginx:1.25", OperationID: operationID, Items: items,
+		ResourceProfiles: profiles, RuntimeAuthority: authority,
+	})
 	b.pool.TryAllocate("lease-1-0", "docker-small", "tenant-a")
 
-	err = b.Deprovision(context.Background(), "lease-1")
+	err := b.Deprovision(context.Background(), leaseUUID)
 	require.NoError(t, err)
 
 	// Verify releases were cleaned up
-	releases, err := releaseStore.List("lease-1")
+	releases, err := releaseStore.List(leaseUUID)
 	require.NoError(t, err)
 	assert.Empty(t, releases)
 }
@@ -484,11 +513,6 @@ func TestDeprovision_CleansUpReleases(t *testing.T) {
 // --- Initial release recorded on Provision success ---
 
 func TestProvision_RecordsInitialRelease(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "releases.db")
-	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	defer releaseStore.Close()
-
 	mock := &mockDockerClient{
 		PullImageFn: func(ctx context.Context, imageName string, timeout time.Duration) error {
 			return nil
@@ -518,14 +542,20 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.compose = composeMock
-	b.releaseStore = releaseStore
+	installStackStrictCohortInventory(t, mock, composeMock)
+	releaseStore := b.releaseStore
 	rebuildCallbackSender(b, callbackServer.Client())
+	b.wg.Go(b.callbackSender.RunReplayLoop)
+	t.Cleanup(func() {
+		b.stopCancel()
+		b.wg.Wait()
+	})
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
 
-	req := newProvisionRequest("lease-1", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
-	req.CallbackURL = callbackServer.URL + "/callbacks/provision"
+	req := newProvisionRequest("11638ef8-1401-4f14-a355-1ae02afeb35b", "tenant-a", "docker-small", 1, validManifestJSON("nginx:latest"))
+	req.CallbackURL = testOperationCallbackURL(callbackServer.URL + "/callbacks/provision")
 
-	err = b.Provision(context.Background(), req)
+	err := b.Provision(context.Background(), req)
 	require.NoError(t, err)
 
 	select {
@@ -538,7 +568,7 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 	// Post-Task-15 the Image field carries the marker "stack" (the
 	// per-service images live inside Manifest payload, which we
 	// verify contains the original image string).
-	releases, err := releaseStore.List("lease-1")
+	releases, err := releaseStore.List("11638ef8-1401-4f14-a355-1ae02afeb35b")
 	require.NoError(t, err)
 	require.Len(t, releases, 1)
 	assert.Equal(t, 1, releases[0].Version)
@@ -547,14 +577,17 @@ func TestProvision_RecordsInitialRelease(t *testing.T) {
 	assert.Equal(t, "active", releases[0].Status)
 	assert.Contains(t, string(releases[0].Manifest), "nginx:latest",
 		"Manifest payload must carry the original tenant-submitted JSON, which includes the per-service image")
-	assert.Equal(t, req.Items, releases[0].Items)
+	expectedItems := append([]backend.LeaseItem(nil), req.Items...)
+	expectedItems[0].ServiceName = manifest.DefaultServiceName
+	assert.Equal(t, expectedItems, releases[0].Items,
+		"the durable release records the normalized service identity emitted to Docker")
 }
 
 func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *testing.T) {
 	for _, operation := range []string{"restart", "update"} {
 		t.Run(operation, func(t *testing.T) {
 			leaseUUID := uuid.NewString()
-			operationID := shared.OperationID(uuid.NewString())
+			operationID := mustDockerOperationID(uuid.NewString())
 			providerUUID := uuid.NewString()
 			oldCallbackURL := "https://old.example/callbacks/provision?operation_id=" + operationID.String()
 			oldLifecycleURL := "https://old.example/callbacks/provision?lifecycle_id=" + operationID.String()
@@ -577,6 +610,9 @@ func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *tes
 			}
 			var strictContainers []ContainerInfo
 			mock := &mockDockerClient{
+				PullImageFn: func(context.Context, string, time.Duration) error {
+					return nil
+				},
 				InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
 					return &ContainerInfo{ContainerID: "new", Status: "running"}, nil
 				},
@@ -587,15 +623,9 @@ func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *tes
 			b := newBackendForTest(mock, provisions)
 			defer b.stopCancel()
 
-			store, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-				DBPath: filepath.Join(t.TempDir(), "activate-failure.db"),
-			})
-			require.NoError(t, err)
-			callbackStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-				DBPath: filepath.Join(t.TempDir(), "activate-failure-callbacks.db"),
-			})
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, callbackStore.Close()) })
+			attachBoundOperationHandoffStores(t, b)
+			store := b.releaseStore
+			settlement := b.maintenanceSettlement
 
 			sourceAuthority := mustTestReleaseRuntimeAuthority(
 				t, operationID, "tenant-a", providerUUID, oldCallbackURL, oldLifecycleURL,
@@ -603,41 +633,41 @@ func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *tes
 			targetAuthority := mustTestReleaseRuntimeAuthority(
 				t, operationID, "tenant-a", providerUUID, newCallbackURL, newLifecycleURL,
 			)
-			require.NoError(t, store.AppendActive(leaseUUID, shared.Release{
+			seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
 				Manifest: []byte(`{"services":{"app":{"image":"docker.io/library/nginx:1.26"}}}`),
 				Image:    "stack", OperationID: operationID, Items: items,
 				ResourceProfiles: resourceProfiles, RuntimeAuthority: sourceAuthority,
 				Status: "active", CreatedAt: time.Now().Add(-time.Minute),
-			}))
-			active, sourceClaim, err := store.ClaimLatestActive(leaseUUID)
+			})
+			active, sourceClaim, err := settlement.ClaimLatestActive(leaseUUID)
 			require.NoError(t, err)
-			source, err := newReplaceSourceSnapshot(active)
-			require.NoError(t, err)
+			b.provisionsMu.Lock()
+			b.provisions[leaseUUID].ActiveReleaseVersion = active.Version
+			b.provisions[leaseUUID].ActiveOperationID = active.OperationID
+			b.provisionsMu.Unlock()
 			kind := shared.MaintenanceIntentRestart
 			if operation == "update" {
 				kind = shared.MaintenanceIntentUpdate
 			}
-			admission, err := callbackStore.BeginMaintenanceIntent(shared.MaintenanceIntentSpec{
-				Kind:          kind,
-				SourceRelease: sourceClaim,
-				TargetRelease: shared.Release{
-					Manifest: []byte(`{"services":{"app":{"image":"docker.io/library/nginx:1.27"}}}`),
-					Image:    "stack", OperationID: operationID, Items: items,
-					ResourceProfiles: resourceProfiles, RuntimeAuthority: targetAuthority,
-					Status: "deploying", CreatedAt: time.Now(),
-				},
-				Backend:          b.Name(),
-				BackendStorageID: b.storageIdentity,
-			})
+			targetTemplate := shared.Release{
+				Manifest: []byte(`{"services":{"app":{"image":"docker.io/library/nginx:1.27"}}}`),
+				Image:    "stack", OperationID: operationID, Items: items,
+				ResourceProfiles: resourceProfiles, RuntimeAuthority: targetAuthority,
+				Status: "deploying", CreatedAt: time.Now(),
+			}
+			admission, err := settlement.BeginMaintenanceIntent(newTestMaintenanceIntentSpec(
+				t, settlement, newTestMaintenanceID(t), kind, sourceClaim, targetTemplate,
+			))
 			require.NoError(t, err)
-			appendClaim, err := callbackStore.StartMaintenanceAppend(admission)
-			require.NoError(t, err)
-			targetClaim, err := store.AppendMaintenance(appendClaim)
-			require.NoError(t, err)
-			maintenance, err := callbackStore.BindMaintenanceIntentTarget(
-				appendClaim.Intent(), targetClaim,
+			appendClaim, err := settlement.StartMaintenanceAppend(
+				createdTestMaintenanceDispatch(t, admission),
 			)
 			require.NoError(t, err)
+			targetClaim, err := settlement.AppendMaintenance(appendClaim)
+			require.NoError(t, err)
+			targetClaim, err = settlement.BindMaintenanceIntentTarget(targetClaim)
+			require.NoError(t, err)
+			maintenance := targetClaim.Intent()
 			strictContainers = []ContainerInfo{{
 				ContainerID:          "new",
 				LeaseUUID:            leaseUUID,
@@ -652,15 +682,16 @@ func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *tes
 				Image:                "docker.io/library/nginx:1.27",
 				Status:               "running",
 			}}
-			require.NoError(t, store.Close(), "inject exact activation persistence failure")
-
 			upCalls := 0
 			var projects []*composetypes.Project
-			b.releaseStore = store
+			upStarted := make(chan struct{})
+			releaseUp := make(chan struct{})
 			b.compose = &mockComposeExecutor{
 				UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
 					upCalls++
 					projects = append(projects, project)
+					close(upStarted)
+					<-releaseUp
 					return nil
 				},
 				PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
@@ -672,24 +703,28 @@ func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *tes
 				},
 			}
 			b.cfg.StartupVerifyDuration = time.Millisecond
-			result := b.doReplaceContainers(context.Background(), replaceContainersOp{
-				LeaseUUID: leaseUUID, Stack: stack, Items: items,
-				ResourceProfiles:     resourceProfiles,
-				Operation:            operation,
-				CallbackURL:          newCallbackURL,
-				LifecycleCallbackURL: newLifecycleURL,
-				Maintenance:          maintenance,
-				TargetRelease:        targetClaim,
-				Source:               source,
-				TargetMaintenanceID:  maintenance.MaintenanceID(),
-				Logger:               b.logger,
-			})
-			require.Error(t, result.Err)
-			assert.Contains(t, result.Err.Error(), "activate successful "+operation+" release")
-			assert.False(t, result.Restored,
-				"an ambiguous activation outcome must preserve the exact target substrate for recovery")
-			assert.True(t, result.Failure.PreserveMaintenance)
-			assert.Empty(t, result.Success.ContainerIDs, "release activation failure must not report replace success")
+			var command leasesm.ActorCommand
+			var reply leasesm.ActorReply
+			if operation == "restart" {
+				command, reply, err = leasesm.NewRestartCommand(t.Context(), targetClaim)
+			} else {
+				command, reply, err = leasesm.NewUpdateCommand(t.Context(), targetClaim)
+			}
+			require.NoError(t, err)
+			require.True(t, b.routeToLease(leaseUUID, command))
+			require.NoError(t, <-reply.Result())
+			select {
+			case <-upStarted:
+			case <-time.After(time.Second):
+				t.Fatal("maintenance substrate did not enter Compose")
+			}
+			require.NoError(t, store.Close(), "inject exact activation persistence failure after substrate entry")
+			close(releaseUp)
+			require.Eventually(t, func() bool {
+				return !b.actorOwnsMaintenance(leaseUUID, maintenance.MaintenanceID())
+			}, time.Second, time.Millisecond)
+			assert.NotEqual(t, backend.ProvisionStatusReady, b.actorFor(leaseUUID).State(),
+				"a failed activation must not publish a successful actor terminal")
 			assert.Equal(t, 1, upCalls, "recovery, not an unsafe rollback, owns an ambiguous activation outcome")
 			require.Len(t, projects, 1)
 			assert.Equal(t,
@@ -697,7 +732,22 @@ func TestDoReplace_ActivationPersistenceFailurePreservesTargetForRecovery(t *tes
 				projects[0].Services["app"].Labels[LabelLifecycleCallbackURL],
 				"replacement cohort must receive the pending route",
 			)
-			_, found, err := callbackStore.GetMaintenanceIntent(leaseUUID)
+			// The injected handle is intentionally unusable after Close. Reopen the
+			// same identity-bound release journal, as a backend restart would, and
+			// prove the non-terminal intent/target pair survived for recovery.
+			reopenedReleases, err := shared.OpenIdentityBoundReleaseStore(
+				shared.ReleaseStoreConfig{DBPath: b.cfg.ReleasesDBPath},
+				b.storageAuthority,
+				b.storeAuthorityGate,
+			)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, reopenedReleases.Close()) }()
+			reopenedSettlement, err := shared.NewMaintenanceSettlement(
+				b.callbackStore,
+				reopenedReleases,
+			)
+			require.NoError(t, err)
+			_, found, err := reopenedSettlement.GetMaintenanceIntent(leaseUUID)
 			require.NoError(t, err)
 			assert.True(t, found, "the WAL must remain for exact restart recovery")
 		})
@@ -723,8 +773,8 @@ func TestRestart_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 	oldOperationURL := "https://old.example/callbacks/provision?operation_id=" + lifecycleID
 	oldLifecycleURL := "https://old.example/callbacks/provision?lifecycle_id=" + lifecycleID
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:            "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:            "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status:               backend.ProvisionStatusReady,
 			CallbackURL:          oldOperationURL,
 			LifecycleCallbackURL: oldLifecycleURL,
@@ -737,16 +787,16 @@ func TestRestart_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 	// error path that previously triggered restartRollback.
 	b.stopCancel()
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID:   "lease-1",
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
 		CallbackURL: "https://new.example/callbacks/provision?lifecycle_id=" + lifecycleID,
 	})
 	require.Error(t, err)
 
 	b.provisionsMu.RLock()
-	status := b.provisions["lease-1"].Status
-	callbackURL := b.provisions["lease-1"].CallbackURL
-	lifecycleCallbackURL := b.provisions["lease-1"].LifecycleCallbackURL
+	status := b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].Status
+	callbackURL := b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].CallbackURL
+	lifecycleCallbackURL := b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status,
 		"routing failure must leave Status unchanged (no speculative write)")
@@ -757,15 +807,12 @@ func TestRestart_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 }
 
 func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) {
-	var callbackRequestURI string
-	callbackReceived := make(chan struct{})
+	callbackRequests := make(chan string, 4)
 	callbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callbackRequestURI = r.URL.RequestURI()
 		w.WriteHeader(http.StatusOK)
 		select {
-		case <-callbackReceived:
+		case callbackRequests <- r.URL.RequestURI():
 		default:
-			close(callbackReceived)
 		}
 	}))
 	defer callbackServer.Close()
@@ -794,9 +841,10 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 			CallbackURL:          oldOperationURL,
 			LifecycleCallbackURL: oldLifecycleURL,
 			Items:                items,
+			ResourceProfiles:     resourceProfiles,
 			ContainerIDs:         []string{"old-container"},
 			StackManifest:        stack,
-		}, ResourceProfiles: resourceProfiles},
+		}},
 	}
 	dockerMock := &mockDockerClient{
 		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
@@ -817,22 +865,15 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 				MaintenanceID:        replacementMaintenanceID,
 				Image:                "docker.io/library/nginx:latest",
 				Status:               "running",
+				CreatedAt:            time.Now().Add(-time.Minute),
 			}}, nil
 		},
 	}
 	b := newBackendForTest(dockerMock, provisions)
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
-	dir := t.TempDir()
-	releaseStore, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(dir, "typed-base-move-releases.db"),
-	})
-	require.NoError(t, err)
-	callbackStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(dir, "typed-base-move-callbacks.db"),
-	})
-	require.NoError(t, err)
-	defer callbackStore.Close()
-	defer releaseStore.Close()
+	attachBoundOperationHandoffStores(t, b)
+	releaseStore := b.releaseStore
+	callbackStore := b.callbackStore
 	defer func() {
 		b.stopCancel()
 		b.wg.Wait()
@@ -844,30 +885,30 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 	manifestBytes, err := json.Marshal(stack)
 	require.NoError(t, err)
 	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
-		shared.OperationID(lifecycleID),
+		mustDockerOperationID(lifecycleID),
 		"tenant-a",
 		providerUUID,
 		oldOperationURL,
 		oldLifecycleURL,
 	)
 	require.NoError(t, err)
-	require.NoError(t, releaseStore.AppendActive(leaseUUID, shared.Release{
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
 		Manifest:         manifestBytes,
 		Image:            "stack",
-		OperationID:      shared.OperationID(lifecycleID),
+		OperationID:      mustDockerOperationID(lifecycleID),
 		Items:            items,
 		ResourceProfiles: resourceProfiles,
 		RuntimeAuthority: &oldAuthority,
 		Status:           "active",
 		CreatedAt:        time.Now(),
-	}))
+	})
 
 	projectReady := make(chan *composetypes.Project, 1)
 	releaseWorker := make(chan struct{})
 	b.compose = &mockComposeExecutor{
 		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
-			replacementMaintenanceID = shared.MaintenanceID(
-				project.Services[manifest.DefaultServiceName].Labels[LabelMaintenanceID],
+			replacementMaintenanceID = mustParseMaintenanceID(
+				t, project.Services[manifest.DefaultServiceName].Labels[LabelMaintenanceID],
 			)
 			projectReady <- project
 			<-releaseWorker
@@ -880,7 +921,7 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 		},
 	}
 
-	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{
+	require.NoError(t, b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
 		LeaseUUID:   leaseUUID,
 		CallbackURL: newLifecycleURL,
 	}))
@@ -911,13 +952,20 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 			b.provisions[leaseUUID].CallbackURL == newOperationURL &&
 			b.provisions[leaseUUID].LifecycleCallbackURL == newLifecycleURL
 	}, 2*time.Second, 5*time.Millisecond)
-	select {
-	case <-callbackReceived:
-	case <-time.After(2 * time.Second):
-		t.Fatal("restart completion callback was not delivered")
+	wantCallbackRequestURI := "/new/callbacks/provision?lifecycle_id=" + lifecycleID
+	callbackDeadline := time.NewTimer(2 * time.Second)
+	defer callbackDeadline.Stop()
+	callbackDelivered := false
+	for !callbackDelivered {
+		select {
+		case callbackRequestURI := <-callbackRequests:
+			if callbackRequestURI == wantCallbackRequestURI {
+				callbackDelivered = true
+			}
+		case <-callbackDeadline.C:
+			t.Fatal("restart completion callback was not delivered")
+		}
 	}
-	assert.Equal(t, "/new/callbacks/provision?lifecycle_id="+lifecycleID, callbackRequestURI,
-		"restart completion must use the relocated lifecycle route")
 
 	active, err := releaseStore.LatestActive(leaseUUID)
 	require.NoError(t, err)
@@ -942,7 +990,7 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 		MaintenanceID:        replacementMaintenanceID,
 		Image:                "docker.io/library/nginx:latest",
 		Status:               "running",
-		CreatedAt:            time.Now(),
+		CreatedAt:            time.Now().Add(-time.Minute),
 	}
 	cold := newBackendForTest(&mockDockerClient{
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
@@ -966,69 +1014,6 @@ func TestRestart_RotatesCallbackBaseWithoutRotatingTypedAuthority(t *testing.T) 
 	assert.Equal(t, newLifecycleURL, recovered.LifecycleCallbackURL)
 }
 
-func TestRecoverIgnoresUnacceptedDeployingRuntimeRoute(t *testing.T) {
-	const (
-		leaseUUID    = "550e8400-e29b-41d4-a716-446655440000"
-		operationID  = shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
-		providerUUID = "22222222-2222-4222-8222-222222222222"
-	)
-	oldOperationURL := "https://old.example/callbacks/provision?operation_id=" + operationID.String()
-	oldLifecycleURL := "https://old.example/callbacks/provision?lifecycle_id=" + operationID.String()
-	newOperationURL := "https://new.example/callbacks/provision?operation_id=" + operationID.String()
-	newLifecycleURL := "https://new.example/callbacks/provision?lifecycle_id=" + operationID.String()
-	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
-	profiles := testResourceProfiles(t, items)
-	manifestBytes := validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"})
-	oldAuthority, err := shared.NewReleaseRuntimeAuthority(
-		operationID, "tenant-a", providerUUID, oldOperationURL, oldLifecycleURL,
-	)
-	require.NoError(t, err)
-	newAuthority, err := shared.NewReleaseRuntimeAuthority(
-		operationID, "tenant-a", providerUUID, newOperationURL, newLifecycleURL,
-	)
-	require.NoError(t, err)
-	store, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "unaccepted-deploying.db"),
-	})
-	require.NoError(t, err)
-	defer store.Close()
-	require.NoError(t, store.AppendActive(leaseUUID, shared.Release{
-		Manifest: manifestBytes, Image: "stack", OperationID: operationID,
-		Items: items, ResourceProfiles: profiles, RuntimeAuthority: &oldAuthority,
-		Status: "active", CreatedAt: time.Now().Add(-time.Minute),
-	}))
-	require.NoError(t, store.Append(leaseUUID, shared.Release{
-		Manifest: manifestBytes, Image: "stack", OperationID: operationID,
-		Items: items, ResourceProfiles: profiles, RuntimeAuthority: &newAuthority,
-		Status: "deploying", CreatedAt: time.Now(),
-	}))
-	container := ContainerInfo{
-		ContainerID: "old-container", LeaseUUID: leaseUUID,
-		Tenant: "tenant-a", ProviderUUID: providerUUID,
-		SKU: "docker-small", ServiceName: "app", InstanceIndex: 0,
-		CallbackURL: oldOperationURL, LifecycleCallbackURL: oldLifecycleURL,
-		Image: "docker.io/library/nginx:1.27", Status: "running", CreatedAt: time.Now(),
-	}
-	b := newBackendForTest(&mockDockerClient{
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{container}, nil
-		},
-		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
-			copy := container
-			return &copy, nil
-		},
-	}, nil)
-	defer b.stopCancel()
-	b.releaseStore = store
-	require.NoError(t, b.recoverState(context.Background()))
-	b.provisionsMu.RLock()
-	recovered := b.provisions[leaseUUID]
-	b.provisionsMu.RUnlock()
-	require.NotNil(t, recovered)
-	assert.Equal(t, oldOperationURL, recovered.CallbackURL)
-	assert.Equal(t, oldLifecycleURL, recovered.LifecycleCallbackURL)
-}
-
 func TestRestart_RejectsLifecycleAuthorityMismatchWithoutMutation(t *testing.T) {
 	const (
 		currentID = "550e8400-e29b-41d4-a716-446655440000"
@@ -1037,8 +1022,8 @@ func TestRestart_RejectsLifecycleAuthorityMismatchWithoutMutation(t *testing.T) 
 	oldOperationURL := "https://old.example/callbacks/provision?operation_id=" + currentID
 	oldLifecycleURL := "https://old.example/callbacks/provision?lifecycle_id=" + currentID
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:            "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:            "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status:               backend.ProvisionStatusReady,
 			CallbackURL:          oldOperationURL,
 			LifecycleCallbackURL: oldLifecycleURL,
@@ -1047,17 +1032,17 @@ func TestRestart_RejectsLifecycleAuthorityMismatchWithoutMutation(t *testing.T) 
 	}
 	b := newBackendForTest(&mockDockerClient{}, provisions)
 
-	err := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID:   "lease-1",
+	err := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
 		CallbackURL: "https://new.example/callbacks/provision?lifecycle_id=" + otherID,
 	})
 	require.ErrorIs(t, err, backend.ErrValidation)
 
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusReady, b.provisions["lease-1"].Status)
-	assert.Equal(t, oldOperationURL, b.provisions["lease-1"].CallbackURL)
-	assert.Equal(t, oldLifecycleURL, b.provisions["lease-1"].LifecycleCallbackURL)
+	assert.Equal(t, backend.ProvisionStatusReady, b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].Status)
+	assert.Equal(t, oldOperationURL, b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].CallbackURL)
+	assert.Equal(t, oldLifecycleURL, b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].LifecycleCallbackURL)
 }
 
 // blockingDiagGatherer pins a lease in Failing for the duration of a test by
@@ -1076,26 +1061,14 @@ func (blockingDiagGatherer) GatherDiagnostics(ctx context.Context, _ string, _ *
 // capability that Restart and Update construct before routing in production.
 // Keeping the fixture on the real stores prevents these tests from weakening
 // LeaseActor validation with a test-only escape hatch.
-func newActorMaintenanceClaim(
+func newActorMaintenanceTarget(
 	t *testing.T,
 	b *Backend,
 	leaseUUID string,
 	kind shared.MaintenanceIntentKind,
-) shared.MaintenanceIntentClaim {
+) shared.MaintenanceReleaseClaim {
 	t.Helper()
-	dir := t.TempDir()
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(dir, "actor-maintenance-releases.db"),
-	})
-	require.NoError(t, err)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(dir, "actor-maintenance-callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, callbacks.Close())
-		require.NoError(t, releases.Close())
-	})
+	attachBoundOperationHandoffStores(t, b)
 
 	operationID, callbackURL, lifecycleCallbackURL := newTestRestoreCallbackAuthority(t)
 	items := []backend.LeaseItem{{
@@ -1125,29 +1098,49 @@ func newActorMaintenanceClaim(
 		Status:           "active",
 		CreatedAt:        time.Now(),
 	}
-	require.NoError(t, releases.AppendActive(leaseUUID, source))
-	_, sourceClaim, err := releases.ClaimLatestActive(leaseUUID)
-	require.NoError(t, err)
+	settlement := b.maintenanceSettlement
+	active, sourceClaim, err := settlement.ClaimLatestActive(leaseUUID)
+	if err != nil {
+		seedProvisionReleaseForBackendTest(t, b, leaseUUID, source)
+		_, sourceClaim, err = settlement.ClaimLatestActive(leaseUUID)
+		require.NoError(t, err)
+	} else {
+		// An observation test may already have installed the exact runtime
+		// generation needed to authorize a container-death event. Reuse that
+		// store-issued source rather than manufacturing a second active
+		// generation merely to route the following maintenance command.
+		source = active
+		identity, ok := source.RuntimeIdentity()
+		require.True(t, ok)
+		lifecycleCallbackURL = identity.LifecycleCallbackURL()
+	}
 	target := source
 	target.Version = 0
 	target.Status = "deploying"
 	target.CreatedAt = time.Now()
+	requestPayload := []byte(nil)
+	if kind != shared.MaintenanceIntentRestart {
+		requestPayload = manifestBytes
+	}
+	request, err := settlement.NewMaintenanceRequestAuthority(
+		newTestMaintenanceID(t), kind, leaseUUID, lifecycleCallbackURL,
+		requestPayload,
+	)
+	require.NoError(t, err)
 
-	admission, err := callbacks.BeginMaintenanceIntent(shared.MaintenanceIntentSpec{
-		Kind:             kind,
-		SourceRelease:    sourceClaim,
-		TargetRelease:    target,
-		Backend:          b.Name(),
-		BackendStorageID: b.storageIdentity,
-	})
+	candidate, err := settlement.NewMaintenanceIntentCandidate(request, sourceClaim, target)
 	require.NoError(t, err)
-	appendClaim, err := callbacks.StartMaintenanceAppend(admission)
+	admission, err := settlement.BeginMaintenanceIntent(candidate)
 	require.NoError(t, err)
-	targetClaim, err := releases.AppendMaintenance(appendClaim)
+	appendClaim, err := settlement.StartMaintenanceAppend(
+		createdTestMaintenanceDispatch(t, admission),
+	)
 	require.NoError(t, err)
-	claim, err := callbacks.BindMaintenanceIntentTarget(appendClaim.Intent(), targetClaim)
+	targetClaim, err := settlement.AppendMaintenance(appendClaim)
 	require.NoError(t, err)
-	return claim
+	targetClaim, err = settlement.BindMaintenanceIntentTarget(targetClaim)
+	require.NoError(t, err)
+	return targetClaim
 }
 
 // TestContainerDiedThenRestart_Succeeds is the ENG-230 §6.3(c) matrix case:
@@ -1175,16 +1168,19 @@ func TestContainerDiedThenRestart_Succeeds(t *testing.T) {
 	}
 	provisions := map[string]*provision{
 		leaseUUID: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:     leaseUUID,
-			Tenant:        "tenant-a",
-			Status:        backend.ProvisionStatusReady,
-			ContainerIDs:  []string{"c1"},
-			CallbackURL:   callbackServer.URL + "/callbacks/provision",
-			StackManifest: &manifest.StackManifest{},
+			LeaseUUID:    leaseUUID,
+			Tenant:       "tenant-a",
+			Status:       backend.ProvisionStatusReady,
+			ContainerIDs: []string{"c1"},
+			CallbackURL:  callbackServer.URL + "/callbacks/provision",
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+				manifest.DefaultServiceName: {Image: "busybox"},
+			}},
 		}},
 	}
 	b := newBackendForTest(mock, provisions)
 	defer b.stopCancel()
+	installReadyRuntimeProofForTest(t, b, leaseUUID)
 	// Inject the blocking gatherer BEFORE the actor is created (first
 	// routeToLease below) so the diag goroutine spawned by onEnterFailing
 	// can't fire diagGatheredMsg and flip Failing→Failed before the restart.
@@ -1214,35 +1210,28 @@ func TestContainerDiedThenRestart_Succeeds(t *testing.T) {
 	// 2) Restart: route directly to the actor. (The b.Restart prelude
 	// fast-fails a Failing lease, but the SM permits Failing→Restarting —
 	// exactly the serial-ordering path this test exercises.)
-	var workerCount atomic.Int64
 	workerRelease := make(chan struct{})
-	ack := make(chan error, 1)
-	maintenance := newActorMaintenanceClaim(t, b, leaseUUID, shared.MaintenanceIntentRestart)
-	require.True(t, b.routeToLease(leaseUUID, leasesm.RestartRequestedMsg{
-		Cancel:               func() {},
-		CallbackURL:          maintenance.CallbackURL(),
-		LifecycleCallbackURL: maintenance.LifecycleCallbackURL(),
-		Maintenance:          maintenance,
-		Work: func() leasesm.ReplaceResult {
-			workerCount.Add(1)
-			<-workerRelease
-			// A benign success result — the gauge correctness must come from
-			// the REAL death→restart ordering driven through the SM above (the
-			// death Dec'd the gauge; the success path must re-Inc because the
-			// actor observed the lease was non-Ready (Failing) at replace-start
-			// via replaceWasActive), NOT from any worker-result field. Leaving
-			// the result zero-valued deliberately avoids re-introducing a field
-			// that could mask the drift.
-			return leasesm.ReplaceResult{Success: leasesm.ReplaceSuccessResult{}}
-		},
-		Ack: ack,
-	}))
+	workerStarted := make(chan struct{}, 1)
+	target := newActorMaintenanceTarget(t, b, leaseUUID, shared.MaintenanceIntentRestart)
+	cleanup := registerMaintenanceExecutionForTest(
+		t, b.maintenanceSettlement, target,
+		maintenanceSeedTargetReady, workerStarted, workerRelease,
+	)
+	defer cleanup()
+	command, reply, err := leasesm.NewRestartCommand(t.Context(), target)
+	require.NoError(t, err)
+	require.True(t, b.routeToLease(leaseUUID, command))
 
 	select {
-	case err := <-ack:
+	case err := <-reply.Result():
 		require.NoError(t, err, "Failing→Restarting must be accepted by the SM (Permit, not Ignore)")
 	case <-time.After(2 * time.Second):
 		t.Fatal("no ack from handleRestartRequested")
+	}
+	select {
+	case <-workerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("construction-bound maintenance worker did not start")
 	}
 
 	b.provisionsMu.RLock()
@@ -1257,7 +1246,11 @@ func TestContainerDiedThenRestart_Succeeds(t *testing.T) {
 	require.Eventually(t, func() bool { return b.actorFor(leaseUUID).State() == backend.ProvisionStatusReady },
 		2*time.Second, 5*time.Millisecond,
 		"lease must reach Ready after the restart worker completes")
-	require.Equal(t, int64(1), workerCount.Load(), "exactly one replace worker must be spawned")
+	select {
+	case <-workerStarted:
+		t.Fatal("more than one maintenance worker was spawned")
+	default:
+	}
 	assert.Equal(t, activeBefore, testutil.ToFloat64(activeProvisions),
 		"activeProvisions must net to its pre-death value: the Ready→Failing Dec must be "+
 			"balanced by a re-Inc when the restart returns the lease to Ready (gauge-drift fix)")
@@ -1270,8 +1263,8 @@ func TestUpdate_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 	oldOperationURL := "https://old.example/callbacks/provision?operation_id=" + lifecycleID
 	oldLifecycleURL := "https://old.example/callbacks/provision?lifecycle_id=" + lifecycleID
 	provisions := map[string]*provision{
-		"lease-1": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:            "lease-1",
+		"11638ef8-1401-4f14-a355-1ae02afeb35b": {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID:            "11638ef8-1401-4f14-a355-1ae02afeb35b",
 			Status:               backend.ProvisionStatusReady,
 			SKU:                  "docker-small",
 			CallbackURL:          oldOperationURL,
@@ -1282,17 +1275,17 @@ func TestUpdate_RoutingFailureLeavesStatusUnchanged(t *testing.T) {
 	b := newBackendForTest(&mockDockerClient{}, provisions)
 	b.stopCancel()
 
-	err := b.Update(context.Background(), backend.UpdateRequest{
-		LeaseUUID:   "lease-1",
+	err := b.Update(context.Background(), backend.UpdateRequest{MaintenanceID: newTestMaintenanceID(t),
+		LeaseUUID:   "11638ef8-1401-4f14-a355-1ae02afeb35b",
 		CallbackURL: "https://new.example/callbacks/provision?lifecycle_id=" + lifecycleID,
 		Payload:     validManifestJSON("nginx:latest"),
 	})
 	require.Error(t, err)
 
 	b.provisionsMu.RLock()
-	status := b.provisions["lease-1"].Status
-	callbackURL := b.provisions["lease-1"].CallbackURL
-	lifecycleCallbackURL := b.provisions["lease-1"].LifecycleCallbackURL
+	status := b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].Status
+	callbackURL := b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].CallbackURL
+	lifecycleCallbackURL := b.provisions["11638ef8-1401-4f14-a355-1ae02afeb35b"].LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 	assert.Equal(t, backend.ProvisionStatusReady, status,
 		"routing failure must leave Status unchanged (no speculative write)")
@@ -1331,13 +1324,17 @@ func newPreflightBackend(t *testing.T, mock *mockDockerClient, source backend.Pr
 	srv := preflightCallbackServer(t)
 	provisions := map[string]*provision{
 		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID:     durableCallbackTestLeaseUUID,
-			Tenant:        "tenant-a",
-			Status:        source,
-			ContainerIDs:  []string{"c1"},
-			CallbackURL:   srv.URL + "/callbacks/provision",
-			StackManifest: &manifest.StackManifest{},
-			Items:         []backend.LeaseItem{{SKU: "docker-small"}},
+			LeaseUUID:    durableCallbackTestLeaseUUID,
+			Tenant:       "tenant-a",
+			Status:       source,
+			ContainerIDs: []string{"c1"},
+			CallbackURL:  srv.URL + "/callbacks/provision",
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+				manifest.DefaultServiceName: {Image: "busybox"},
+			}},
+			Items: []backend.LeaseItem{{
+				SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
+			}},
 		}},
 	}
 	b := newBackendForTest(mock, provisions)
@@ -1345,36 +1342,39 @@ func newPreflightBackend(t *testing.T, mock *mockDockerClient, source backend.Pr
 	return b
 }
 
-// restartPreflightResult builds a doRestart-preflight-shaped ReplaceResult
-// (no container touched). recoveredIfActive sets the §9.7 flag.
-func restartPreflightResult(recoveredIfActive bool) leasesm.ReplaceResult {
-	return leasesm.ReplaceResult{
-		CallbackErr:             "restart failed",
-		Err:                     fmt.Errorf("SKU preflight failed (test)"),
-		RecoveredIfSourceActive: recoveredIfActive,
-		Failure: leasesm.ReplaceFailureInfo{
-			Operation:   "restart",
-			CallbackErr: "restart failed",
-			LastError:   "SKU preflight failed (test)",
-		},
-	}
-}
-
-// routeRestartStub routes a restart whose Work returns the given preflight
-// result directly to the fixture lease's actor and requires the SM accepts it.
-func routeRestartStub(t *testing.T, b *Backend, result leasesm.ReplaceResult) {
+// routeRestartFailure routes a typed maintenance failure directly to the
+// fixture actor. Terminal status and operation kind come from the exact failed
+// target proof rather than caller-writable result fields.
+func routeRestartFailure(
+	t *testing.T,
+	b *Backend,
+	restored, recoverFromSource, oldStopped bool,
+) {
 	t.Helper()
-	ack := make(chan error, 1)
-	maintenance := newActorMaintenanceClaim(t, b, durableCallbackTestLeaseUUID, shared.MaintenanceIntentRestart)
-	require.True(t, b.routeToLease(durableCallbackTestLeaseUUID, leasesm.RestartRequestedMsg{
-		Cancel:               func() {},
-		Work:                 func() leasesm.ReplaceResult { return result },
-		Ack:                  ack,
-		CallbackURL:          maintenance.CallbackURL(),
-		LifecycleCallbackURL: maintenance.LifecycleCallbackURL(),
-		Maintenance:          maintenance,
-	}))
-	require.NoError(t, <-ack, "restart must be accepted by the SM")
+	target := newActorMaintenanceTarget(t, b, durableCallbackTestLeaseUUID, shared.MaintenanceIntentRestart)
+	b.provisionsMu.RLock()
+	status := b.provisions[durableCallbackTestLeaseUUID].Status
+	b.provisionsMu.RUnlock()
+	// The construction-bound classifier, rather than a caller-authored result,
+	// decides whether the exact source cohort was recovered. `oldStopped` is
+	// retained in this helper's call shape only to keep the historical gauge
+	// matrix readable; physical evidence supersedes that writable flag.
+	_ = oldStopped
+	kind := maintenanceSeedAbsent
+	if restored || (recoverFromSource && status == backend.ProvisionStatusReady) {
+		kind = maintenanceSeedSourceReady
+	}
+	cleanup := registerMaintenanceExecutionForTest(
+		t, b.maintenanceSettlement, target, kind, nil, nil,
+	)
+	// Actor acknowledgement means the command was accepted, not that its
+	// asynchronous worker has crossed and classified the substrate boundary.
+	// Keep the exact physical-evidence plan alive for the worker's lifetime.
+	t.Cleanup(cleanup)
+	command, reply, err := leasesm.NewRestartCommand(t.Context(), target)
+	require.NoError(t, err)
+	require.True(t, b.routeToLease(durableCallbackTestLeaseUUID, command))
+	require.NoError(t, <-reply.Result(), "restart must be accepted by the SM")
 }
 
 // awaitSettled waits for the fixture lease to settle at (status, failCount).
@@ -1394,7 +1394,7 @@ func awaitSettled(t *testing.T, b *Backend, status backend.ProvisionStatus, fail
 func TestRestartPreflight_FromReady_Recovers(t *testing.T) {
 	b := newPreflightBackend(t, &mockDockerClient{}, backend.ProvisionStatusReady)
 	activeBefore := testutil.ToFloat64(activeProvisions)
-	routeRestartStub(t, b, restartPreflightResult(true))
+	routeRestartFailure(t, b, false, true, false)
 	awaitSettled(t, b, backend.ProvisionStatusReady, 1,
 		"restart preflight from Ready (wasActive=true) must recover→Ready")
 	// Gauge (FIX #1c): the lease was active (Ready) at replace-start and ends
@@ -1407,7 +1407,7 @@ func TestRestartPreflight_FromReady_Recovers(t *testing.T) {
 // stays Failed.
 func TestRestartPreflight_FromFailed_StaysFailed(t *testing.T) {
 	b := newPreflightBackend(t, &mockDockerClient{}, backend.ProvisionStatusFailed)
-	routeRestartStub(t, b, restartPreflightResult(true))
+	routeRestartFailure(t, b, false, true, false)
 	awaitSettled(t, b, backend.ProvisionStatusFailed, 1,
 		"restart preflight from Failed (wasActive=false) must stay Failed")
 }
@@ -1418,28 +1418,15 @@ func TestRestartPreflight_FromFailed_StaysFailed(t *testing.T) {
 func TestUpdatePreflight_StaysFailed(t *testing.T) {
 	b := newPreflightBackend(t, &mockDockerClient{}, backend.ProvisionStatusReady)
 	activeBefore := testutil.ToFloat64(activeProvisions)
-	ack := make(chan error, 1)
-	maintenance := newActorMaintenanceClaim(t, b, durableCallbackTestLeaseUUID, shared.MaintenanceIntentUpdate)
-	require.True(t, b.routeToLease(durableCallbackTestLeaseUUID, leasesm.UpdateRequestedMsg{
-		Cancel:               func() {},
-		CallbackURL:          maintenance.CallbackURL(),
-		LifecycleCallbackURL: maintenance.LifecycleCallbackURL(),
-		Maintenance:          maintenance,
-		Work: func() leasesm.ReplaceResult {
-			return leasesm.ReplaceResult{
-				CallbackErr: "image pull failed",
-				Err:         fmt.Errorf("image pull failed (test)"),
-				Restored:    false, // update preflight: unconditionally failed, NO flag
-				Failure: leasesm.ReplaceFailureInfo{
-					Operation:   "update",
-					CallbackErr: "image pull failed",
-					LastError:   "image pull failed (test)",
-				},
-			}
-		},
-		Ack: ack,
-	}))
-	require.NoError(t, <-ack, "update must be accepted by the SM")
+	target := newActorMaintenanceTarget(t, b, durableCallbackTestLeaseUUID, shared.MaintenanceIntentUpdate)
+	cleanup := registerMaintenanceExecutionForTest(
+		t, b.maintenanceSettlement, target, maintenanceSeedAbsent, nil, nil,
+	)
+	defer cleanup()
+	command, reply, err := leasesm.NewUpdateCommand(t.Context(), target)
+	require.NoError(t, err)
+	require.True(t, b.routeToLease(durableCallbackTestLeaseUUID, command))
+	require.NoError(t, <-reply.Result(), "update must be accepted by the SM")
 	awaitSettled(t, b, backend.ProvisionStatusFailed, 1,
 		"update preflight must stay Failed regardless of source (no flag; intentional asymmetry)")
 	// Gauge (FIX #1a): the lease was active (Ready) at replace-start and ends
@@ -1458,17 +1445,7 @@ func TestUpdatePreflight_StaysFailed(t *testing.T) {
 func TestRestartRecovered_FromFailed_IncsGauge(t *testing.T) {
 	b := newPreflightBackend(t, &mockDockerClient{}, backend.ProvisionStatusFailed)
 	activeBefore := testutil.ToFloat64(activeProvisions)
-	routeRestartStub(t, b, leasesm.ReplaceResult{
-		CallbackErr: "restart failed",
-		Err:         fmt.Errorf("replace failed but rolled back to previous (test)"),
-		Restored:    true, // post-replace rollback restored the old containers; NO preflight flag
-		Failure: leasesm.ReplaceFailureInfo{
-			Operation:   "restart",
-			OldStopped:  true,
-			CallbackErr: "restart failed",
-			LastError:   "replace failed but rolled back to previous (test)",
-		},
-	})
+	routeRestartFailure(t, b, true, false, true)
 	awaitSettled(t, b, backend.ProvisionStatusReady, 1,
 		"recovered-from-Failed (rollback restored Ready) must settle Ready with FailCount=1")
 	// Gauge (FIX #1b): the lease was NOT active (Failed) at replace-start and
@@ -1494,6 +1471,7 @@ func TestContainerDiedThenRestartPreflight_EndsFailed(t *testing.T) {
 		},
 	}
 	b := newPreflightBackend(t, mock, backend.ProvisionStatusReady)
+	installReadyRuntimeProofForTest(t, b, durableCallbackTestLeaseUUID)
 	// Pin the lease in Failing (block the diag goroutine) so the restart is
 	// processed from SM source = Failing, not Failed.
 	b.gatherer = blockingDiagGatherer{}
@@ -1504,7 +1482,7 @@ func TestContainerDiedThenRestartPreflight_EndsFailed(t *testing.T) {
 		"container death must drive the lease to Failing")
 	b.provisionsMu.RUnlock()
 
-	routeRestartStub(t, b, restartPreflightResult(true))
+	routeRestartFailure(t, b, false, true, false)
 	awaitSettled(t, b, backend.ProvisionStatusFailed, 2,
 		"death-then-restart + preflight (source Failing) must end FAILED, not wrongly recovered to Ready")
 }
@@ -1538,22 +1516,8 @@ func TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed(t *testing.T) {
 	)
 	manifestBytes, err := json.Marshal(stack)
 	require.NoError(t, err)
-	dir := t.TempDir()
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{
-		DBPath: filepath.Join(dir, "releases.db"),
-	})
-	require.NoError(t, err)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(dir, "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, callbacks.Close())
-		require.NoError(t, releases.Close())
-	})
-	b.releaseStore = releases
-	b.callbackStore = callbacks
-	require.NoError(t, releases.AppendActive(leaseUUID, shared.Release{
+	attachBoundOperationHandoffStores(t, b)
+	seedProvisionReleaseForBackendTest(t, b, leaseUUID, shared.Release{
 		Manifest:         manifestBytes,
 		Image:            "stack",
 		OperationID:      operationID,
@@ -1562,12 +1526,15 @@ func TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed(t *testing.T) {
 		RuntimeAuthority: authority,
 		Status:           "active",
 		CreatedAt:        time.Now(),
-	}))
-	active, sourceClaim, err := releases.ClaimLatestActive(leaseUUID)
+	})
+	active, sourceClaim, err := b.maintenanceSettlement.ClaimLatestActive(leaseUUID)
 	require.NoError(t, err)
-	source, err := newReplaceSourceSnapshot(active)
+	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
+		mustParseMaintenanceID(t, uuid.NewString()), shared.MaintenanceIntentUpdate,
+		leaseUUID, lifecycleCallbackURL, manifestBytes,
+	)
 	require.NoError(t, err)
-	maintenance, target, err := b.admitMaintenance(shared.MaintenanceIntentUpdate, sourceClaim, shared.Release{
+	admission, err := b.admitMaintenance(request, sourceClaim, shared.Release{
 		Manifest:         manifestBytes,
 		Image:            "stack",
 		OperationID:      operationID,
@@ -1578,19 +1545,33 @@ func TestDoUpdate_PreflightFailure_ReasonIsImagePullFailed(t *testing.T) {
 		CreatedAt:        time.Now(),
 	})
 	require.NoError(t, err)
-
-	result := b.doUpdate(context.Background(), leaseUUID, stack,
-		resourceProfiles,
-		items,
-		callbackURL, lifecycleCallbackURL,
-		maintenance, target, source,
-		b.logger)
-
-	require.Error(t, result.Err, "image pull failure must fail doUpdate preflight")
-	assert.Equal(t, backend.ReasonImagePullFailed, result.Failure.Reason,
-		"doUpdate image-pull preflight must author ReasonImagePullFailed (specific), not ReasonUpdateFailed (generic)")
-	assert.NotEqual(t, backend.ReasonUpdateFailed, result.Failure.Reason,
-		"must NOT fall back to the generic update-failed reason for an image-pull preflight failure")
-	assert.Equal(t, backend.MsgImagePullFailed, result.Failure.CallbackErr,
-		"CallbackErr must be the curated MsgImagePullFailed const so the (reason,message) pair cannot drift")
+	require.True(t, admission.created())
+	b.provisionsMu.Lock()
+	b.provisions[leaseUUID] = &provision{ProvisionState: leasesm.ProvisionState{
+		LeaseUUID: leaseUUID, Tenant: "tenant-a",
+		ProviderUUID: "22222222-2222-4222-8222-222222222222",
+		Status:       backend.ProvisionStatusReady, CallbackURL: callbackURL,
+		LifecycleCallbackURL: lifecycleCallbackURL, ActiveOperationID: operationID,
+		ActiveReleaseVersion: active.Version, Items: slices.Clone(items),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(resourceProfiles), StackManifest: stack,
+	}}
+	b.provisionsMu.Unlock()
+	command, reply, err := leasesm.NewUpdateCommand(t.Context(), admission.target)
+	require.NoError(t, err)
+	require.True(t, b.routeToLease(leaseUUID, command))
+	require.NoError(t, <-reply.Result())
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		return b.provisions[leaseUUID].Status == backend.ProvisionStatusFailed
+	}, 2*time.Second, time.Millisecond)
+	b.provisionsMu.RLock()
+	result := b.provisions[leaseUUID].ProvisionState
+	b.provisionsMu.RUnlock()
+	assert.Equal(t, backend.ReasonImagePullFailed, result.Reason,
+		"construction-bound update image pull must retain the specific failure reason")
+	assert.NotEqual(t, backend.ReasonUpdateFailed, result.Reason,
+		"image pull refusal must not be misclassified as a generic update failure")
+	assert.Equal(t, backend.MsgImagePullFailed, result.Message,
+		"callback message and typed reason must be derived from the same physical error")
 }

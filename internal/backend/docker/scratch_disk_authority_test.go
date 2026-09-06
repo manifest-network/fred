@@ -63,22 +63,28 @@ func TestSetupVolBindsUsesPinnedScratchAfterConfigDrift(t *testing.T) {
 		createdSizeMB = sizeMB
 		return filepath.Join(hostRoot, id), true, nil
 	}}
+	installTestStorageMutationAdapters(b)
 
 	items := []backend.LeaseItem{{SKU: "diskless", ServiceName: "app", Quantity: 1}}
 	resourceProfiles := []shared.SKUResourceSnapshot{{
 		SKU: "diskless", CPUCores: 0.5, MemoryMB: 384, ScratchDiskMB: 73,
 	}}
-	_, created, err := b.setupVolBinds(
-		context.Background(),
-		"lease-a",
-		items,
-		resourceProfiles,
-		map[string]*imageSetup{"app": {WritablePaths: []string{"/var/cache/app"}}},
-		map[string]*manifest.Manifest{"app": {Image: "example.invalid/app:1"}},
-		b.logger,
-	)
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
+	type bindResult struct {
+		created []string
+		err     error
+	}
+	result := runSubjectStorageMutationForTest(t, b, leaseUUID, func(mutations *storageMutations) bindResult {
+		_, created, err := b.setupVolBinds(
+			mutations, context.Background(), leaseUUID, items, resourceProfiles,
+			map[string]*imageSetup{"app": {WritablePaths: []string{"/var/cache/app"}}},
+			map[string]*manifest.Manifest{"app": {Image: "example.invalid/app:1"}}, b.logger,
+		)
+		return bindResult{created: created, err: err}
+	})
+	created, err := result.created, result.err
 	require.NoError(t, err)
-	require.Equal(t, canonicalVolumeName("lease-a", "app", 0), createdID)
+	require.Equal(t, canonicalVolumeName(leaseUUID, "app", 0), createdID)
 	require.Equal(t, int64(73), createdSizeMB)
 	require.Equal(t, []string{createdID}, created)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"testing"
 	"time"
 
@@ -21,15 +22,20 @@ type kindedMockVolumeManager struct {
 	kind string
 }
 
+const (
+	quotaRollbackSourceLease      = "0192f1a0-1111-4abc-8def-000000000801"
+	quotaRollbackDestinationLease = "0192f1a0-2222-4abc-8def-000000000802"
+)
+
 func (m *kindedMockVolumeManager) Kind() string { return m.kind }
 
 func quotaRollbackEntry() shared.RetentionEntry {
 	const oldDiskMB = int64(100)
 	return shared.RetentionEntry{
-		OriginalLeaseUUID: "source",
-		NewLeaseUUID:      "destination",
+		OriginalLeaseUUID: quotaRollbackSourceLease,
+		NewLeaseUUID:      quotaRollbackDestinationLease,
 		Tenant:            "tenant-a",
-		ProviderUUID:      "provider-a",
+		ProviderUUID:      nominalDockerProviderUUID,
 		Items: []backend.LeaseItem{{
 			SKU: "old-tier", ServiceName: "app", Quantity: 1,
 		}},
@@ -37,7 +43,7 @@ func quotaRollbackEntry() shared.RetentionEntry {
 			SKU: "old-tier", CPUCores: 1, MemoryMB: 512, DiskMB: oldDiskMB,
 		}},
 		RetainedVolumeNames: []string{
-			retainedName(canonicalVolumeName("source", "app", 0)),
+			retainedName(canonicalVolumeName(quotaRollbackSourceLease, "app", 0)),
 		},
 		Status:     shared.RetentionStatusRestoring,
 		Generation: 7,
@@ -47,8 +53,8 @@ func quotaRollbackEntry() shared.RetentionEntry {
 
 func quotaRollbackProvision() map[string]*provision {
 	return map[string]*provision{
-		"destination": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "destination",
+		quotaRollbackDestinationLease: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: quotaRollbackDestinationLease,
 			Tenant:    "tenant-a",
 			Status:    backend.ProvisionStatusProvisioning,
 			Items: []backend.LeaseItem{{
@@ -71,7 +77,7 @@ func TestRollbackRestoreAdoption_ReappliesImmutableSourceQuota_AllVolumeBackends
 			}
 
 			var steps []string
-			retained := retainedName(canonicalVolumeName("source", "app", 0))
+			retained := retainedName(canonicalVolumeName(quotaRollbackSourceLease, "app", 0))
 			b.volumes = &kindedMockVolumeManager{
 				kind: kind,
 				mockVolumeManager: &mockVolumeManager{
@@ -101,21 +107,21 @@ func TestRollbackRestoreAdoption_ReappliesImmutableSourceQuota_AllVolumeBackends
 			b.cfg.SKUProfiles["old-tier"] = SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 999}
 
 			ok := b.rollbackRestoreAdoption(
-				context.Background(), "destination", nil, &rec, true, slog.Default(),
+				context.Background(), quotaRollbackDestinationLease, nil, &rec, true, slog.Default(),
 			)
 			require.True(t, ok)
 			assert.Equal(t, []string{
-				"rename:fred-destination-app-0:" + retained,
+				"rename:" + canonicalVolumeName(quotaRollbackDestinationLease, "app", 0) + ":" + retained,
 				"usage:" + retained,
 				"quota:" + retained + ":100",
 			}, steps, "re-quarantine, fit proof, then quota restore is the required order")
 
-			stored, err := rs.Get("source")
+			stored, err := rs.Get(quotaRollbackSourceLease)
 			require.NoError(t, err)
 			require.NotNil(t, stored)
 			assert.Equal(t, shared.RetentionStatusActive, stored.Status)
-			assert.Equal(t, 8, stored.Generation)
-			_, provisionExists := b.provisions["destination"]
+			assert.Equal(t, rec.Generation+1, stored.Generation)
+			_, provisionExists := b.provisions[quotaRollbackDestinationLease]
 			assert.False(t, provisionExists)
 		})
 	}
@@ -189,20 +195,20 @@ func TestRollbackRestoreAdoption_QuotaProofFailureFailsClosed(t *testing.T) {
 			require.NoError(t, b.pool.TryAllocate(allocationID, "docker-large", "tenant-a"))
 
 			ok := b.rollbackRestoreAdoption(
-				context.Background(), "destination", []string{allocationID}, &rec, true, slog.Default(),
+				context.Background(), quotaRollbackDestinationLease, []string{allocationID}, &rec, true, slog.Default(),
 			)
 			assert.False(t, ok)
 			assert.Equal(t, tc.wantEnsureCalls, ensureCalls)
 
-			stored, err := rs.Get("source")
+			stored, err := rs.Get(quotaRollbackSourceLease)
 			require.NoError(t, err)
 			require.NotNil(t, stored)
 			assert.Equal(t, shared.RetentionStatusRestoring, stored.Status,
 				"source ownership must not become active under an unproven old quota")
-			assert.Equal(t, 7, stored.Generation)
+			assert.Equal(t, rec.Generation, stored.Generation)
 			assert.Equal(t, 1, b.pool.Stats().AllocationCount,
 				"destination reservation must keep all bytes counted while rollback is parked")
-			_, provisionExists := b.provisions["destination"]
+			_, provisionExists := b.provisions[quotaRollbackDestinationLease]
 			assert.False(t, provisionExists,
 				"a prelude failure has no actor transition; removing only its guard lets reconciliation retry")
 		})
@@ -242,12 +248,13 @@ func TestReconcileRestoring_QuotaRestoreRetriesBeforeSourceReactivation(t *testi
 
 	rec := quotaRollbackEntry()
 	rec = *putRestoringRetention(t, rs, rec)
-	const allocationID = "destination-app-0"
+	const allocationID = quotaRollbackDestinationLease + "-app-0"
 	require.NoError(t, b.pool.TryAllocate(allocationID, "docker-small", "tenant-a"))
+	recordRestoreOperationOutcome(t, b, rec, backend.CallbackStatusFailed)
 
 	err := b.reconcileRestoring(context.Background(), rec)
 	require.ErrorContains(t, err, "quotas")
-	stored, getErr := rs.Get("source")
+	stored, getErr := rs.Get(quotaRollbackSourceLease)
 	require.NoError(t, getErr)
 	require.NotNil(t, stored)
 	assert.Equal(t, shared.RetentionStatusRestoring, stored.Status)
@@ -255,11 +262,11 @@ func TestReconcileRestoring_QuotaRestoreRetriesBeforeSourceReactivation(t *testi
 
 	quotaWorks = true
 	require.NoError(t, b.reconcileRestoring(context.Background(), *stored))
-	stored, getErr = rs.Get("source")
+	stored, getErr = rs.Get(quotaRollbackSourceLease)
 	require.NoError(t, getErr)
 	require.NotNil(t, stored)
 	assert.Equal(t, shared.RetentionStatusActive, stored.Status)
-	assert.Equal(t, 8, stored.Generation)
+	assert.Equal(t, rec.Generation+1, stored.Generation)
 	assert.Equal(t, 2, quotaAttempts, "the next sweep retries the idempotent quota restore")
 	assert.Zero(t, b.pool.Stats().AllocationCount,
 		"live capacity hands off only after source ownership and old quota are durable")
@@ -282,13 +289,17 @@ func TestRollbackRestoreAdoption_PostCASRefreshFailureKeepsMakeBeforeBreakAccoun
 
 	rec := quotaRollbackEntry()
 	rec = *putRestoringRetention(t, rs, rec)
-	// This unrelated legacy record makes the checked full-store projection fail
-	// only after the source CAS. The rollback must still be safe for its own bytes.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
-		OriginalLeaseUUID: "unresolved-existing",
+	unresolvedLeaseUUID := "0192f1a0-1111-4abc-8def-000000000802"
+	// This independently valid, deliberately enormous retention row makes the
+	// aggregate checked projection overflow only after the source CAS. The
+	// rollback must still be safe for its own bytes.
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
+		OriginalLeaseUUID: unresolvedLeaseUUID,
 		Tenant:            "other-tenant",
-		Items: []backend.LeaseItem{{
-			SKU: "removed-sku", ServiceName: "app", Quantity: 1,
+		ProviderUUID:      nominalDockerProviderUUID,
+		Items:             []backend.LeaseItem{{SKU: "oversized-tier", ServiceName: "app", Quantity: 1}},
+		ResourceProfiles: []shared.SKUResourceSnapshot{{
+			SKU: "oversized-tier", CPUCores: 1, MemoryMB: 1, DiskMB: math.MaxInt64 - 99,
 		}},
 		Status:    shared.RetentionStatusActive,
 		CreatedAt: time.Now(),
@@ -298,9 +309,9 @@ func TestRollbackRestoreAdoption_PostCASRefreshFailureKeepsMakeBeforeBreakAccoun
 	require.Positive(t, b.pool.Stats().AllocatedDiskMB)
 
 	require.True(t, b.rollbackRestoreAdoption(
-		context.Background(), "destination", []string{allocationID}, &rec, true, slog.Default(),
+		context.Background(), quotaRollbackDestinationLease, []string{allocationID}, &rec, true, slog.Default(),
 	))
-	stored, err := rs.Get("source")
+	stored, err := rs.Get(quotaRollbackSourceLease)
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.Equal(t, shared.RetentionStatusActive, stored.Status,
@@ -312,7 +323,12 @@ func TestRollbackRestoreAdoption_PostCASRefreshFailureKeepsMakeBeforeBreakAccoun
 
 	// Once the unrelated bad row is repaired/removed, the ordinary projection
 	// path converges to the same exact value without any special pending state.
-	require.NoError(t, rs.Delete("unresolved-existing"))
+	reaping, begun, err := rs.BeginReaping(activeRetentionCandidateForTest(t, rs, unresolvedLeaseUUID))
+	require.NoError(t, err)
+	require.True(t, begun)
+	deleted, err := rs.DeleteReaped(reaping)
+	require.NoError(t, err)
+	require.True(t, deleted)
 	require.NoError(t, b.refreshRetentionAccountingChecked())
 	assert.Equal(t, int64(100), b.pool.Stats().RetainedDiskMB)
 }

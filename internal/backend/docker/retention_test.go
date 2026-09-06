@@ -20,7 +20,7 @@ func TestListRetentions_AllStatuses(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 
 	active := retentionEntryFixture("la", "tenant-a", time.Now())
-	require.NoError(t, rs.Put(active))
+	require.NoError(t, putRetentionForTest(t, rs, active))
 
 	restoring := retentionEntryFixture("lr", "tenant-a", time.Now())
 	restoring.Status = shared.RetentionStatusRestoring
@@ -28,15 +28,19 @@ func TestListRetentions_AllStatuses(t *testing.T) {
 
 	reaping := retentionEntryFixture("lp", "tenant-a", time.Now())
 	reaping.Status = shared.RetentionStatusReaping
-	require.NoError(t, rs.Put(reaping))
+	require.NoError(t, putRetentionForTest(t, rs, reaping))
 
 	got, err := b.ListRetentions(context.Background())
 	require.NoError(t, err)
 	ids := make([]string, 0, len(got))
 	for _, r := range got {
 		ids = append(ids, r.LeaseUUID)
-		assert.Equal(t, "prov-1", r.ProviderUUID)
+		assert.Equal(t, nominalDockerProviderUUID, r.ProviderUUID)
 		assert.Equal(t, "tenant-a", r.Tenant)
 	}
-	assert.ElementsMatch(t, []string{"la", "lr", "lp"}, ids) // all statuses, like the old List()
+	assert.ElementsMatch(t, []string{
+		canonicalRetentionFixtureUUID("la"),
+		canonicalRetentionFixtureUUID("lr"),
+		canonicalRetentionFixtureUUID("lp"),
+	}, ids) // all statuses, like the old List()
 }

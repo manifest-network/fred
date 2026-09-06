@@ -118,6 +118,15 @@ func TestZFSVolumeManagerListReturnsOnlyBindReadyDirectories(t *testing.T) {
 	assert.Equal(t, []string{name}, got)
 }
 
+func TestZFSVolumeManagerProofInventoryIncludesUnmountedDataset(t *testing.T) {
+	mgr, name, _ := interruptedCreateZFSManager(t, "failed")
+
+	got, err := mgr.ListForProof(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, []string{name}, got,
+		"destructive proof must not lose a dataset merely because it has no bind-ready directory")
+}
+
 func TestZFSVolumeManagerRejectsInvalidNameAtEveryDatasetBoundary(t *testing.T) {
 	t.Parallel()
 

@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"fmt"
 	"slices"
 
@@ -129,6 +130,7 @@ func (b *Backend) resolveResourceProfiles(
 // configuration is resolved once and compare-and-swap backfilled before the
 // value is returned, so later config changes cannot reprice the lease again.
 func (b *Backend) activeResourceProfiles(
+	ctx context.Context,
 	leaseUUID string,
 	items []backend.LeaseItem,
 ) ([]shared.SKUResourceSnapshot, error) {
@@ -154,8 +156,8 @@ func (b *Backend) activeResourceProfiles(
 		return nil, fmt.Errorf("resolve legacy active release resource profiles: %w", err)
 	}
 	if active != nil && slices.Equal(active.Items, items) {
-		if err := b.releaseStore.BackfillActiveResourceProfiles(
-			leaseUUID, active.Version, active.Items, resourceProfiles,
+		if err := b.releaseBackfiller.BackfillActiveResourceProfilesContext(
+			ctx, leaseUUID, active.Version, active.Items, resourceProfiles,
 		); err != nil {
 			return nil, fmt.Errorf("freeze legacy active release resource profiles: %w", err)
 		}

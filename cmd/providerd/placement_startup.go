@@ -79,7 +79,15 @@ func preparePlacementBackends(
 		return nil, nil, err
 	}
 
-	store, err := placement.OpenStore(cfg.PlacementStoreDBPath, cfg.ProviderUUID)
+	callbackRoutes, err := placement.NewCallbackRouteFactory(cfg.CallbackBaseURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind callback route factory: %w", err)
+	}
+	store, err := placement.OpenStore(
+		cfg.PlacementStoreDBPath,
+		cfg.ProviderUUID,
+		placement.WithCallbackRouteFactory(callbackRoutes),
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open prepared placement authority: %w", err)
 	}
@@ -192,19 +200,9 @@ func newProductionBackendClient(
 	if err != nil {
 		return nil, fmt.Errorf("backend %q: resolve HMAC secret: %w", backendConfig.Name, err)
 	}
-	var tlsClientConfig *tls.Config
-	if backendConfig.TLSCAFile != "" || backendConfig.TLSClientCertFile != "" ||
-		backendConfig.TLSClientKeyFile != "" || backendConfig.TLSSkipVerify {
-		var err error
-		tlsClientConfig, err = tlsconfig.ClientConfig(
-			backendConfig.TLSCAFile,
-			backendConfig.TLSSkipVerify,
-			backendConfig.TLSClientCertFile,
-			backendConfig.TLSClientKeyFile,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("backend %q: build TLS client config: %w", backendConfig.Name, err)
-		}
+	tlsClientConfig, err := productionBackendTLSConfig(backendConfig)
+	if err != nil {
+		return nil, fmt.Errorf("backend %q: build TLS client config: %w", backendConfig.Name, err)
 	}
 	client, err := backend.NewIdentityBoundHTTPClient(backend.HTTPClientConfig{
 		Name:                    backendConfig.Name,
@@ -221,6 +219,20 @@ func newProductionBackendClient(
 		return nil, fmt.Errorf("backend %q: create identity-bound client: %w", backendConfig.Name, err)
 	}
 	return client, nil
+}
+
+// productionBackendTLSConfig applies the same TLS floor whether peer trust
+// comes from an explicitly configured private CA or the host's system roots.
+// A nil config would silently fall back to net/http's lower default floor on
+// the system-roots path and make transport security depend on which optional
+// fields happened to be present.
+func productionBackendTLSConfig(backendConfig config.BackendConfig) (*tls.Config, error) {
+	return tlsconfig.ClientConfig(
+		backendConfig.TLSCAFile,
+		backendConfig.TLSSkipVerify,
+		backendConfig.TLSClientCertFile,
+		backendConfig.TLSClientKeyFile,
+	)
 }
 
 func attestPinnedBackendIdentities(

@@ -2,11 +2,9 @@ package docker
 
 import (
 	"context"
-	"fmt"
 	"hash/crc32"
 	"log/slog"
 	"math"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,8 +13,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 type volumeCleanupContextKey struct{}
@@ -367,8 +363,8 @@ func TestNewVolumeManager_UnsupportedFilesystem(t *testing.T) {
 // if the mount is not up when it runs, the same path exists, empty, on the root
 // filesystem. Booting there enumerates zero volumes and is indistinguishable from a fresh
 // node, which is how reconcileOrphanedRetentions comes to prune live retention records and
-// the next boot's orphan sweep destroys the data behind them. Refusing to start is the
-// right answer: a missing mount needs an operator, not a sweep.
+// discard their exact accounting/finalizer authority. Refusing to start is the right
+// answer: a missing mount needs an operator, not a sweep.
 func TestNewVolumeManager_ConfiguredFilesystemMustMatchReality(t *testing.T) {
 	// The configured value is chosen to disagree with whatever the temp dir REALLY is, rather
 	// than assuming it is tmpfs: on a host whose /tmp is XFS, hardcoding "xfs" would describe
@@ -442,41 +438,6 @@ func TestVolumeRootWatch_EmptyOnTheSameDeviceIsStillEmpty(t *testing.T) {
 	require.NoError(t, err, "same device, genuinely empty — the reaper must be able to finish")
 	assert.Empty(t, ids)
 }
-
-func TestCleanupOrphanedVolumes_ListFailure(t *testing.T) {
-	vm := &mockVolumeManager{
-		ListFn: func() ([]string, error) {
-			return nil, fmt.Errorf("I/O error")
-		},
-	}
-
-	cfg := DefaultConfig()
-	cfg.NetworkIsolation = ptrBool(false)
-	pool := shared.NewResourcePool(cfg.TotalCPUCores, cfg.TotalMemoryMB, cfg.TotalDiskMB, cfg.GetSKUProfile, nil)
-	stopCtx, stopCancel := context.WithCancel(context.Background())
-	defer stopCancel()
-
-	b := &Backend{
-		cfg:        cfg,
-		pool:       pool,
-		volumes:    vm,
-		logger:     slog.Default(),
-		provisions: make(map[string]*provision),
-		stopCtx:    stopCtx,
-		stopCancel: stopCancel,
-	}
-	b.callbackSender = shared.MustNewEphemeralCallbackSender(shared.CallbackSenderConfig{
-		HTTPClient: http.DefaultClient,
-		Logger:     b.logger,
-		StopCtx:    b.stopCtx,
-	})
-
-	err := b.cleanupOrphanedVolumes(context.Background())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "list volumes")
-}
-
-// --- XFS project ID collision resolution tests ---
 
 func newTestXFSManager(t *testing.T) *xfsVolumeManager {
 	t.Helper()

@@ -4,19 +4,27 @@
 // # Architecture
 //
 // Manager owns process lifetime and wires narrow consumer-owned ports. HandlerSet
-// adapts internal messages to application inputs; handlers do not own lifecycle
-// policy. Chain and payload messages run through Watermill. Authenticated backend
-// callbacks are applied synchronously so the backend's durable per-lease FIFO is
-// preserved through settlement and event delivery. ProvisionOrchestrator owns
-// provision admission and backend dispatch, CallbackService owns callback
-// settlement policy, and the restore package owns atomic source/target restore
-// admission and dispatch.
+// adapts internal messages to opaque application inputs; handlers do not own
+// lifecycle policy. Chain and payload messages run through Watermill.
+// Authenticated backend callbacks are applied synchronously so the backend's
+// durable per-lease FIFO is preserved through settlement and event delivery.
+// The transport-facing orchestrator, callback, restore, and maintenance services
+// retain only purpose-specific application capabilities and closed result types;
+// they cannot choose a backend, manufacture a callback route, or select a durable
+// settlement outcome.
 //
 // The operation.Registry is the only process-local source of lifecycle operation
 // state. It issues typed OperationID values and opaque initiation, lease, token,
 // and settlement capabilities, enforcing Preparing -> Calling -> Active ordering
-// without exposing raw identifiers as mutation authority. Manager owns this
-// registry directly; lifecycle consumers receive narrow capability ports.
+// without exposing raw identifiers as mutation authority. The placement Store
+// privately constructs the Registry and consumes its one-shot settlement
+// authority into OperationCoordinator. Construction atomically binds that
+// aggregate to exactly one backend runtime and one provider control plane through
+// ExecutionCoordinator; no backend-only intermediate is published.
+// Purpose-specific placement coordinators then own complete provision, restore,
+// maintenance, callback, timeout, and reconciliation sequences. After
+// composition, Manager retains operation.RuntimeController, which can observe and drain work
+// but cannot claim, initiate, route, dispatch, or settle it.
 //
 // The placement store is the durable authority for write-ahead attempts,
 // confirmed owners, conflict quarantine, and inventory revisions. Consumer ports
@@ -56,10 +64,27 @@
 // topology baseline, live-routes within the configured topology, and persists an
 // exact write-ahead attempt before backend dispatch.
 //
+// Each inventory pass uses one ReconciliationSweep that binds a Store fence, an
+// operation.ReconciliationBoundary, and an inventory session. Projection is a
+// one-shot transition to ProjectedReconciliationSweep. Only that value can mint
+// an ObservedReconciliationAction or ObservedOrphanAction, after a bounded exact
+// chain read under a lease claim. Live and orphan mutation methods derive the
+// lease and backend from those opaque capabilities, so callers cannot splice
+// observations, revisions, claims, or targets from different sweeps.
+//
 // The existing stateless FSM dependency is used inside backend-local per-lease
 // actors. It is deliberately not used as a fleet-wide distributed state machine:
 // backend inventory and chain state are observations that must be rejoined after
 // process loss, not edge events that can be replayed reliably.
+//
+// Tokenless v0.13 compatibility exists only at explicit migration and callback
+// boundaries. Offline adoption may preserve an already-distributed tokenless
+// route as LegacyRuntimeAuthority, and authenticated callback ingress may observe
+// it only for the matching migrated owner. New provision/restore authority uses
+// distinct typed operation and lifecycle UUIDv4 identities, while every new
+// maintenance command has its own typed UUIDv4 identity. Ordinary runtime code
+// never mints tokenless authority; maintenance on a legacy owner can only
+// preserve the already-adopted legacy authority class.
 //
 // # PayloadStore
 //

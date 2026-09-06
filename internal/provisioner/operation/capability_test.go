@@ -89,7 +89,11 @@ func TestSettlementClaimRequiresTokenNonceAndPurpose(t *testing.T) {
 		SettlementTerminal,
 		SettlementDeprovision,
 	} {
-		claim := newSettlementClaim(token, 9, kind)
+		actor := settlementCallback
+		if kind == SettlementDeprovision {
+			actor = settlementDeprovision
+		}
+		claim := newSettlementClaim(token, 9, kind, actor)
 		assert.True(t, claim.Valid())
 	}
 
@@ -106,7 +110,7 @@ func TestSettlementClaimRequiresTokenNonceAndPurpose(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.False(t, newSettlementClaim(tt.token, tt.nonce, tt.kind).Valid())
+			assert.False(t, newSettlementClaim(tt.token, tt.nonce, tt.kind, settlementCallback).Valid())
 		})
 	}
 }
@@ -124,12 +128,12 @@ func TestCapabilitiesAreBoundToRegistryAndNonce(t *testing.T) {
 	leaseClaimB := newLeaseClaim(registryA, "lease-1", 2)
 	assert.NotEqual(t, leaseClaimA, leaseClaimB)
 
-	settlementClaimA := newSettlementClaim(tokenA, 1, SettlementTerminal)
-	settlementClaimB := newSettlementClaim(tokenA, 2, SettlementTerminal)
+	settlementClaimA := newSettlementClaim(tokenA, 1, SettlementTerminal, settlementCallback)
+	settlementClaimB := newSettlementClaim(tokenA, 2, SettlementTerminal, settlementCallback)
 	assert.NotEqual(t, settlementClaimA, settlementClaimB)
 
-	terminalClaim := newSettlementClaim(tokenA, 1, SettlementTerminal)
-	deprovisionClaim := newSettlementClaim(tokenA, 1, SettlementDeprovision)
+	terminalClaim := newSettlementClaim(tokenA, 1, SettlementTerminal, settlementCallback)
+	deprovisionClaim := newSettlementClaim(tokenA, 1, SettlementDeprovision, settlementDeprovision)
 	assert.NotEqual(t, terminalClaim, deprovisionClaim)
 }
 
@@ -138,7 +142,7 @@ func TestCapabilitiesAreComparable(t *testing.T) {
 	snapshot := newTrackerSnapshot(registry, 0)
 	token := newOperationToken(registry, "lease-1", deterministicOperationID(1))
 	leaseClaim := newLeaseClaim(registry, "lease-1", 1)
-	settlementClaim := newSettlementClaim(token, 1, SettlementTerminal)
+	settlementClaim := newSettlementClaim(token, 1, SettlementTerminal, settlementCallback)
 
 	assert.Contains(t, map[TrackerSnapshot]struct{}{snapshot: {}}, snapshot)
 	assert.Contains(t, map[operationToken]struct{}{token: {}}, token)

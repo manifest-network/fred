@@ -1,6 +1,8 @@
 package shared
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -35,7 +37,6 @@ func validTestCallbackEntry(entry CallbackEntry) CallbackEntry {
 			entry.Status = "failed"
 		}
 	}
-	entry.Success = entry.Status != "failed"
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
 	}
@@ -66,7 +67,7 @@ func (s *CallbackStore) storeRawTestEntry(entry CallbackEntry) (CallbackEntry, e
 }
 
 func TestCallbackStorePublicAPIRejectsRawCausalCompletion(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
 	})
 	require.NoError(t, err)
@@ -82,8 +83,8 @@ func TestCallbackStorePublicAPIRejectsRawCausalCompletion(t *testing.T) {
 			DeliveryKind: kind,
 		})
 
-		require.ErrorIs(t, store.Store(entry), ErrCallbackIntentRequired)
-		_, err = store.StoreEntry(entry)
+		require.ErrorIs(t, store.store(entry), ErrCallbackIntentRequired)
+		_, err = store.storeEntry(entry)
 		require.ErrorIs(t, err, ErrCallbackIntentRequired)
 	}
 	pending, err := store.ListPending()
@@ -94,7 +95,7 @@ func TestCallbackStorePublicAPIRejectsRawCausalCompletion(t *testing.T) {
 func TestCallbackStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test_callbacks.db")
 
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -103,7 +104,6 @@ func TestCallbackStore(t *testing.T) {
 			LeaseUUID:    testLeaseUUID("lease-1"),
 			CallbackURL:  "http://localhost/cb/callbacks/provision",
 			DeliveryKind: CallbackDeliveryKindOperation,
-			Success:      true,
 			CreatedAt:    time.Now(),
 		}
 		err := store.storeValidTest(entry)
@@ -114,14 +114,14 @@ func TestCallbackStore(t *testing.T) {
 		require.Len(t, pending, 1)
 		assert.Equal(t, testLeaseUUID("lease-1"), pending[0].LeaseUUID)
 		assert.Equal(t, "http://localhost/cb/callbacks/provision", pending[0].CallbackURL)
-		assert.True(t, pending[0].Success)
+		assert.Equal(t, backend.CallbackStatusSuccess, pending[0].Status)
 	})
 
 	t.Run("remove after delivery", func(t *testing.T) {
 		pending, err := store.ListPending()
 		require.NoError(t, err)
 		require.Len(t, pending, 1)
-		require.NoError(t, store.RemoveEntry(pending[0]))
+		require.NoError(t, store.removeEntry(pending[0]))
 
 		pending, err = store.ListPending()
 		require.NoError(t, err)
@@ -133,7 +133,6 @@ func TestCallbackStore(t *testing.T) {
 			LeaseUUID:    testLeaseUUID("lease-2"),
 			CallbackURL:  "http://localhost/cb/callbacks/provision",
 			DeliveryKind: CallbackDeliveryKindOperation,
-			Success:      false,
 			Error:        "container crashed",
 			CreatedAt:    time.Now(),
 		}
@@ -143,7 +142,7 @@ func TestCallbackStore(t *testing.T) {
 		pending, err := store.ListPending()
 		require.NoError(t, err)
 		require.Len(t, pending, 1)
-		assert.False(t, pending[0].Success)
+		assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
 		assert.Equal(t, "container crashed", pending[0].Error)
 	})
 
@@ -152,7 +151,6 @@ func TestCallbackStore(t *testing.T) {
 			LeaseUUID:    testLeaseUUID("lease-2"),
 			CallbackURL:  "http://localhost/cb2/callbacks/provision",
 			DeliveryKind: CallbackDeliveryKindOperation,
-			Success:      true,
 			CreatedAt:    time.Now(),
 		}
 		err := store.storeValidTest(entry)
@@ -164,7 +162,7 @@ func TestCallbackStore(t *testing.T) {
 		assert.NotEqual(t, pending[0].DeliveryID, pending[1].DeliveryID)
 		byURL := map[string]bool{}
 		for _, callback := range pending {
-			byURL[callback.CallbackURL] = callback.Success
+			byURL[callback.CallbackURL] = callback.Status != backend.CallbackStatusFailed
 		}
 		assert.Equal(t, map[string]bool{
 			"http://localhost/cb/callbacks/provision":  false,
@@ -172,7 +170,7 @@ func TestCallbackStore(t *testing.T) {
 		}, byURL)
 
 		for _, callback := range pending {
-			require.NoError(t, store.RemoveEntry(callback))
+			require.NoError(t, store.removeEntry(callback))
 		}
 	})
 }
@@ -181,14 +179,13 @@ func TestCallbackStore_Persistence(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "persist_callbacks.db")
 
 	// Write an entry
-	store1, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store1, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	err = store1.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-persist"),
 		CallbackURL:  "http://localhost/persist/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      false,
 		Error:        "some error",
 		CreatedAt:    time.Now(),
 	})
@@ -196,7 +193,7 @@ func TestCallbackStore_Persistence(t *testing.T) {
 	require.NoError(t, store1.Close())
 
 	// Reopen and verify entry survived
-	store2, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store2, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store2.Close()
 
@@ -220,7 +217,7 @@ func TestCallbackStore_Persistence(t *testing.T) {
 }
 
 func TestCallbackStoreRejectsEntryLargerThanDurableReaderLimit(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "bounded-callback.db"),
 	})
 	require.NoError(t, err)
@@ -255,7 +252,7 @@ func TestCallbackStoreRejectsEntryLargerThanDurableReaderLimit(t *testing.T) {
 }
 
 func TestCallbackStore_V2SchemaNestsDeliveriesByLease(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "nested.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "nested.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -288,21 +285,26 @@ func TestCallbackStore_V2SchemaNestsDeliveriesByLease(t *testing.T) {
 		leaseB := root.Bucket([]byte(testLeaseUUID("lease-b")))
 		require.NotNil(t, leaseA)
 		require.NotNil(t, leaseB)
-		assert.NotNil(t, leaseA.Get(callbackSequenceKey(first.Sequence)))
+		firstRaw := leaseA.Get(callbackSequenceKey(first.Sequence))
+		require.NotNil(t, firstRaw)
+		var persisted storedV2CallbackEntry
+		require.NoError(t, json.Unmarshal(firstRaw, &persisted))
+		assert.Equal(t, callbackV2EntryVersion, persisted.Version)
+		assert.Equal(t, first.DeliveryID, persisted.DeliveryID)
 		assert.NotNil(t, leaseB.Get(callbackSequenceKey(second.Sequence)))
 		return nil
 	}))
 }
 
 func TestCallbackStore_EmptyPath(t *testing.T) {
-	_, err := NewCallbackStore(CallbackStoreConfig{})
+	_, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{})
 	assert.Error(t, err)
 }
 
 func TestCallbackStore_Healthy(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "healthy_callbacks.db")
 
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -311,11 +313,11 @@ func TestCallbackStore_Healthy(t *testing.T) {
 }
 
 func TestCallbackStore_HealthyReportsDurableQueueCorruption(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "healthy_callbacks.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "healthy_callbacks.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
-		leaseBucket, err := tx.Bucket(callbackV2BucketName).CreateBucket([]byte("corrupt-lease"))
+		leaseBucket, err := tx.Bucket(callbackV2BucketName).CreateBucket([]byte(testLeaseUUID("corrupt-lease")))
 		if err != nil {
 			return err
 		}
@@ -330,7 +332,7 @@ func TestCallbackStore_HealthyReportsDurableQueueCorruption(t *testing.T) {
 func TestCallbackStore_CloseIdempotent(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "idempotent_callbacks.db")
 
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	// Close twice — should not panic
@@ -342,42 +344,112 @@ func TestCallbackStore_InitialCleanup(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "initial_cleanup.db")
 
 	// Create store without expiry, insert old entries
-	store1, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store1, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	require.NoError(t, store1.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-old"),
 		CallbackURL:  "http://example.com/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindLifecycle,
-		Success:      true,
 		CreatedAt:    time.Now().Add(-48 * time.Hour),
 	}))
 	require.NoError(t, store1.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-fresh"),
 		CallbackURL:  "http://example.com/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindLifecycle,
-		Success:      true,
 		CreatedAt:    time.Now(),
 	}))
 	require.NoError(t, store1.Close())
 
 	// Reopen WITH expiry — initial cleanup should remove the old entry
-	store2, err := NewCallbackStore(CallbackStoreConfig{
+	store2, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
 		DBPath: dbPath,
 		MaxAge: 24 * time.Hour,
 	})
 	require.NoError(t, err)
 	defer store2.Close()
 
-	pending, err := store2.ListPending()
+	require.Eventually(t, func() bool {
+		pending, listErr := store2.ListPending()
+		return listErr == nil && len(pending) == 1 &&
+			pending[0].LeaseUUID == testLeaseUUID("lease-fresh")
+	}, time.Second, time.Millisecond, "asynchronous initial cleanup did not remove the expired callback")
+}
+
+func TestCallbackStore_StartMaintenanceDoesNotWaitForInitialCleanup(t *testing.T) {
+	base, err := openBoltStore(boltStoreConfig{
+		DBPath:     filepath.Join(t.TempDir(), "async-initial-cleanup.db"),
+		BucketName: callbackBucketName,
+		MaxAge:     24 * time.Hour,
+		Label:      "callback",
+	})
 	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, testLeaseUUID("lease-fresh"), pending[0].LeaseUUID)
+	store, err := finishCallbackStoreOpen(
+		CallbackStoreConfig{MaxAge: 24 * time.Hour},
+		base,
+		initializeUnboundCallbackSchemaForTest,
+	)
+	require.NoError(t, err)
+	defer store.Close()
+	leaseUUID := testLeaseUUID("async-initial-cleanup")
+	require.NoError(t, store.storeValidTest(CallbackEntry{
+		LeaseUUID: leaseUUID, DeliveryKind: CallbackDeliveryKindLifecycle,
+		CreatedAt: time.Now().Add(-48 * time.Hour),
+	}))
+
+	// Occupy bbolt's writer slot so the initial expiry transaction cannot
+	// complete. StartMaintenance must still return because readiness does not own
+	// the fleet-sized cleanup pass.
+	writer, err := store.db.Begin(true)
+	require.NoError(t, err)
+	defer func() { _ = writer.Rollback() }()
+	startDone := make(chan struct{})
+	go func() {
+		store.StartMaintenance()
+		close(startDone)
+	}()
+	select {
+	case <-startDone:
+	case <-time.After(time.Second):
+		t.Fatal("StartMaintenance waited for the initial cleanup transaction")
+	}
+	require.Eventually(t, func() bool {
+		store.deliveryLocksMu.Lock()
+		defer store.deliveryLocksMu.Unlock()
+		return store.deliveryLocks[leaseUUID] != nil
+	}, time.Second, time.Millisecond, "initial cleanup did not start in the tracked goroutine")
+	require.NoError(t, writer.Rollback())
+	require.Eventually(t, func() bool {
+		pending, listErr := store.listPending(leaseUUID)
+		return listErr == nil && len(pending) == 0
+	}, time.Second, time.Millisecond, "initial cleanup did not resume after the writer was released")
+}
+
+func TestCallbackStore_RemoveOlderThanContextHonorsPreCanceledOwner(t *testing.T) {
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "canceled-cleanup.db"),
+	})
+	require.NoError(t, err)
+	defer store.Close()
+	leaseUUID := testLeaseUUID("canceled-cleanup")
+	require.NoError(t, store.storeValidTest(CallbackEntry{
+		LeaseUUID: leaseUUID, DeliveryKind: CallbackDeliveryKindLifecycle,
+		CreatedAt: time.Now().Add(-48 * time.Hour),
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	removed, err := store.removeOlderThanContext(ctx, 24*time.Hour)
+	require.NoError(t, err)
+	assert.Zero(t, removed)
+	pending, err := store.listPending(leaseUUID)
+	require.NoError(t, err)
+	assert.Len(t, pending, 1)
 }
 
 func TestCallbackStore_RemoveOlderThan(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_ttl.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -386,14 +458,12 @@ func TestCallbackStore_RemoveOlderThan(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("old-1"),
 		CallbackURL:  "http://example.com/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindLifecycle,
-		Success:      true,
 		CreatedAt:    time.Now().Add(-48 * time.Hour),
 	}))
 	require.NoError(t, store.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("old-2"),
 		CallbackURL:  "http://example.com/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindLifecycle,
-		Success:      false,
 		Error:        "some error",
 		CreatedAt:    time.Now().Add(-25 * time.Hour),
 	}))
@@ -401,11 +471,10 @@ func TestCallbackStore_RemoveOlderThan(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("fresh"),
 		CallbackURL:  "http://example.com/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      true,
 		CreatedAt:    time.Now(),
 	}))
 
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	removed, err := store.removeOlderThan(24 * time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 2, removed)
 
@@ -417,18 +486,18 @@ func TestCallbackStore_RemoveOlderThan(t *testing.T) {
 
 func TestCallbackStore_RemoveOlderThan_EmptyStore(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_empty_ttl.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	removed, err := store.removeOlderThan(24 * time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 0, removed)
 }
 
 func TestCallbackStore_RemoveOlderThan_AllFresh(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_allfresh.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -436,18 +505,16 @@ func TestCallbackStore_RemoveOlderThan_AllFresh(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("lease-1"),
 		CallbackURL:  "http://example.com/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      true,
 		CreatedAt:    time.Now(),
 	}))
 	require.NoError(t, store.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-2"),
 		CallbackURL:  "http://example.com/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      true,
 		CreatedAt:    time.Now().Add(-1 * time.Hour),
 	}))
 
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	removed, err := store.removeOlderThan(24 * time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 0, removed)
 
@@ -456,35 +523,8 @@ func TestCallbackStore_RemoveOlderThan_AllFresh(t *testing.T) {
 	assert.Len(t, pending, 2)
 }
 
-func TestCallbackStore_RemoveOlderThan_ExpiresOldHeadAndKeepsFreshSuffix(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
-	require.NoError(t, err)
-	defer store.Close()
-
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID:   testLeaseUUID("lease-1"),
-		CallbackURL: "https://fred.example/legacy-old/callbacks/provision",
-		CreatedAt:   time.Now().Add(-48 * time.Hour),
-	})
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID:    testLeaseUUID("lease-1"),
-		CallbackURL:  "https://fred.example/lifecycle/callbacks/provision",
-		DeliveryKind: CallbackDeliveryKindLifecycle,
-		CreatedAt:    time.Now(),
-	})
-	require.NoError(t, err)
-
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 1, removed)
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, CallbackDeliveryKindLifecycle, pending[0].DeliveryKind)
-}
-
 func TestCallbackStore_RemoveOlderThan_OperationCompletionIsPermanentBarrier(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -501,7 +541,7 @@ func TestCallbackStore_RemoveOlderThan_OperationCompletionIsPermanentBarrier(t *
 		require.NoError(t, err)
 	}
 
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	removed, err := store.removeOlderThan(24 * time.Hour)
 	require.NoError(t, err)
 	assert.Zero(t, removed,
 		"TTL must not discard the only exact evidence that can settle a durable placement attempt")
@@ -513,61 +553,8 @@ func TestCallbackStore_RemoveOlderThan_OperationCompletionIsPermanentBarrier(t *
 		"FIFO suffix cannot overtake the non-expiring operation head")
 }
 
-func TestCallbackStore_RemoveOlderThan_ExpiresLegacyHead(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
-	require.NoError(t, err)
-	defer store.Close()
-
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID:   testLeaseUUID("legacy-lease"),
-		CallbackURL: "https://fred.example/legacy/callbacks/provision",
-		CreatedAt:   time.Now().Add(-48 * time.Hour),
-	})
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID:    testLeaseUUID("legacy-lease"),
-		CallbackURL:  "https://fred.example/typed-after-legacy/callbacks/provision",
-		DeliveryKind: CallbackDeliveryKindLifecycle,
-		CreatedAt:    time.Now(),
-	})
-	require.NoError(t, err)
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 1, removed)
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, "https://fred.example/typed-after-legacy/callbacks/provision", pending[0].CallbackURL)
-}
-
-func TestCallbackStore_RemoveOlderThan_ExpiresAgedLegacyAndV2SameLease(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
-	require.NoError(t, err)
-	defer store.Close()
-
-	createdAt := time.Now().Add(-48 * time.Hour)
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID:   testLeaseUUID("lease-1"),
-		CallbackURL: "https://fred.example/legacy/callbacks/provision",
-		CreatedAt:   createdAt,
-	})
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID:    testLeaseUUID("lease-1"),
-		CallbackURL:  "https://fred.example/typed/callbacks/provision",
-		DeliveryKind: CallbackDeliveryKindLifecycle,
-		CreatedAt:    createdAt,
-	})
-	require.NoError(t, err)
-
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 2, removed)
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	assert.Empty(t, pending)
-}
-
 func TestCallbackStore_RemoveOlderThan_QuarantinesMalformedLeaseWithoutBlockingOthers(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -591,7 +578,7 @@ func TestCallbackStore_RemoveOlderThan_QuarantinesMalformedLeaseWithoutBlockingO
 			Put([]byte(corruptDeliveryID), []byte("{"))
 	}))
 
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
+	removed, err := store.removeOlderThan(24 * time.Hour)
 	require.ErrorContains(t, err, "failed to decode callback entry")
 	assert.Equal(t, 1, removed, "an unrelated valid lease must still expire")
 	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
@@ -610,7 +597,7 @@ func TestCallbackStore_RemoveOlderThan_QuarantinesMalformedLeaseWithoutBlockingO
 
 func TestCallbackStore_DistinctDeliveriesForSameLease(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "cb_distinct_deliveries.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -618,7 +605,6 @@ func TestCallbackStore_DistinctDeliveriesForSameLease(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("lease-1"),
 		CallbackURL:  "http://example.com/v1/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      true,
 		CreatedAt:    time.Now(),
 	})
 	require.NoError(t, err)
@@ -627,7 +613,6 @@ func TestCallbackStore_DistinctDeliveriesForSameLease(t *testing.T) {
 		LeaseUUID:    testLeaseUUID("lease-1"),
 		CallbackURL:  "http://example.com/v2/callbacks/provision",
 		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      false,
 		Error:        "updated error",
 		CreatedAt:    time.Now().Add(time.Second),
 	})
@@ -642,20 +627,20 @@ func TestCallbackStore_DistinctDeliveriesForSameLease(t *testing.T) {
 	assert.Equal(t, first.DeliveryID, pending[0].DeliveryID)
 	assert.Equal(t, second.DeliveryID, pending[1].DeliveryID)
 
-	require.NoError(t, store.RemoveEntry(pending[0]))
+	require.NoError(t, store.removeEntry(pending[0]))
 	pending, err = store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
 	assert.Equal(t, second.DeliveryID, pending[0].DeliveryID)
 
-	require.NoError(t, store.RemoveEntry(pending[0]))
+	require.NoError(t, store.removeEntry(pending[0]))
 	pending, err = store.ListPending()
 	require.NoError(t, err)
 	assert.Empty(t, pending)
 }
 
 func TestCallbackStore_LifecycleEnqueueCoalescesOnlyOlderTypedLifecycle(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -676,14 +661,6 @@ func TestCallbackStore_LifecycleEnqueueCoalescesOnlyOlderTypedLifecycle(t *testi
 		CreatedAt:    baseTime.Add(time.Hour),
 	})
 	require.NoError(t, err)
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID:   testLeaseUUID("lease-1"),
-		CallbackURL: "http://example.com/protected-legacy/callbacks/provision",
-		Success:     true,
-		Status:      "success",
-		CreatedAt:   baseTime.Add(2 * time.Hour),
-	})
-
 	require.NoError(t, store.storeValidTest(CallbackEntry{
 		LeaseUUID:    testLeaseUUID("lease-2"),
 		CallbackURL:  "http://example.com/other-lease/callbacks/provision",
@@ -703,11 +680,10 @@ func TestCallbackStore_LifecycleEnqueueCoalescesOnlyOlderTypedLifecycle(t *testi
 
 	pending, err := store.listPending(testLeaseUUID("lease-1"))
 	require.NoError(t, err)
-	require.Len(t, pending, 3)
-	assert.Empty(t, pending[0].DeliveryID, "legacy entries remain protected from lifecycle coalescing")
-	assert.Equal(t, exact.DeliveryID, pending[1].DeliveryID,
+	require.Len(t, pending, 2)
+	assert.Equal(t, exact.DeliveryID, pending[0].DeliveryID,
 		"an exact operation completion must never be coalesced")
-	assert.Equal(t, latestLifecycle.DeliveryID, pending[2].DeliveryID)
+	assert.Equal(t, latestLifecycle.DeliveryID, pending[1].DeliveryID)
 	assert.Less(t, exact.Sequence, latestLifecycle.Sequence,
 		"durable sequence, not CreatedAt, defines FIFO order")
 	for _, entry := range pending {
@@ -716,11 +692,11 @@ func TestCallbackStore_LifecycleEnqueueCoalescesOnlyOlderTypedLifecycle(t *testi
 
 	allPending, err := store.ListPending()
 	require.NoError(t, err)
-	assert.Len(t, allPending, 4, "another lease's lifecycle observation must remain independent")
+	assert.Len(t, allPending, 3, "another lease's lifecycle observation must remain independent")
 }
 
 func TestCallbackStore_LifecycleEnqueueCoalescesAdjacentKeys(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -747,7 +723,7 @@ func TestCallbackStore_LifecycleEnqueueCoalescesAdjacentKeys(t *testing.T) {
 			if bucketErr != nil {
 				return bucketErr
 			}
-			data, marshalErr := json.Marshal(entry)
+			data, marshalErr := marshalV2CallbackEntry(entry)
 			if marshalErr != nil {
 				return marshalErr
 			}
@@ -778,7 +754,7 @@ func TestCallbackStore_LifecycleEnqueueCoalescesAdjacentKeys(t *testing.T) {
 }
 
 func TestCallbackStore_RequiresTypedKindAndAssignsSequence(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -824,7 +800,7 @@ func TestCallbackStore_SequenceDefinesFIFOWithEqualOrReversedCreatedAt(t *testin
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+			store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 			require.NoError(t, err)
 			defer store.Close()
 
@@ -854,7 +830,7 @@ func TestCallbackStore_SequenceDefinesFIFOWithEqualOrReversedCreatedAt(t *testin
 }
 
 func TestCallbackStore_SequenceExhaustionRollsBackLifecycleReplacement(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -886,48 +862,8 @@ func TestCallbackStore_SequenceExhaustionRollsBackLifecycleReplacement(t *testin
 	assert.Equal(t, previous.DeliveryID, pending[0].DeliveryID)
 }
 
-func TestCallbackStore_ReadsLegacyBucketAndRemovesPrecisely(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "cb_legacy_and_v2.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-
-	createdAt := time.Now()
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID:   testLeaseUUID("lease-1"),
-		CallbackURL: "http://example.com/legacy/callbacks/provision",
-		Success:     false,
-		CreatedAt:   createdAt,
-	})
-	require.NoError(t, store.storeValidTest(CallbackEntry{
-		LeaseUUID:    testLeaseUUID("lease-1"),
-		CallbackURL:  "http://example.com/v2/callbacks/provision",
-		DeliveryKind: CallbackDeliveryKindOperation,
-		Success:      true,
-		CreatedAt:    createdAt.Add(time.Second),
-	}))
-	require.ErrorIs(t, store.Healthy(), errLegacyCallbackOutboxNotDrained)
-
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 2)
-	assert.Empty(t, pending[0].DeliveryID, "v0.13 entries do not carry a delivery ID")
-	assert.NotEmpty(t, pending[1].DeliveryID)
-
-	require.NoError(t, store.RemoveEntry(pending[0]))
-	require.NoError(t, store.Healthy(), "draining the old bucket restores current health")
-	require.NoError(t, store.Close())
-
-	store, err = NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
-	require.NoError(t, err, "a drained legacy schema upgrades while preserving v2 rows")
-	defer store.Close()
-	pending, err = store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, "http://example.com/v2/callbacks/provision", pending[0].CallbackURL)
-}
-
 func TestCallbackStore_RejectsDuplicateDeliveryIDWithinLease(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -948,7 +884,7 @@ func TestCallbackStore_RejectsDuplicateDeliveryIDWithinLease(t *testing.T) {
 		CreatedAt:    time.Now(),
 	})
 	require.ErrorContains(t, err, "already exists")
-	require.ErrorContains(t, store.RemoveEntry(CallbackEntry{DeliveryID: deliveryID}), "no durable lease capability",
+	require.ErrorContains(t, store.removeEntry(CallbackEntry{DeliveryID: deliveryID}), "no durable lease capability",
 		"a public identity without StoreEntry/ListPending's storage capability must not authorize deletion")
 
 	pending, err := store.ListPending()
@@ -959,7 +895,7 @@ func TestCallbackStore_RejectsDuplicateDeliveryIDWithinLease(t *testing.T) {
 }
 
 func TestCallbackStore_SameDeliveryIDAcrossLeasesRemovesPrecisely(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -981,7 +917,7 @@ func TestCallbackStore_SameDeliveryIDAcrossLeasesRemovesPrecisely(t *testing.T) 
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.RemoveEntry(first))
+	require.NoError(t, store.removeEntry(first))
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
@@ -991,7 +927,7 @@ func TestCallbackStore_SameDeliveryIDAcrossLeasesRemovesPrecisely(t *testing.T) 
 }
 
 func TestCallbackStore_RemoveEntryRejectsStaleCapabilityAfterValueReplacement(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -1006,14 +942,14 @@ func TestCallbackStore_RemoveEntryRejectsStaleCapabilityAfterValueReplacement(t 
 	require.NoError(t, err)
 	replacement := first
 	replacement.CallbackURL = "http://example.com/replaced/callbacks/provision"
-	replacementData, err := json.Marshal(replacement)
+	replacementData, err := marshalV2CallbackEntry(replacement)
 	require.NoError(t, err)
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(callbackV2BucketName).Bucket([]byte(first.LeaseUUID)).
 			Put(callbackSequenceKey(first.Sequence), replacementData)
 	}))
 
-	require.ErrorContains(t, store.RemoveEntry(first), "changed before precise removal",
+	require.ErrorContains(t, store.removeEntry(first), "changed before precise removal",
 		"a stale storage capability must not delete changed durable bytes at the same path")
 	pending, err := store.ListPending()
 	require.NoError(t, err)
@@ -1023,7 +959,7 @@ func TestCallbackStore_RemoveEntryRejectsStaleCapabilityAfterValueReplacement(t 
 }
 
 func TestCallbackStore_RemoveEntryRejectsMutatedDeliveryIdentity(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -1040,14 +976,14 @@ func TestCallbackStore_RemoveEntryRejectsMutatedDeliveryIdentity(t *testing.T) {
 	}
 	stored.DeliveryID = mutatedID
 
-	require.ErrorContains(t, store.RemoveEntry(stored), "does not match durable identity")
+	require.ErrorContains(t, store.removeEntry(stored), "does not match durable identity")
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "mutating the public identity must not retain deletion authority")
 }
 
 func TestCallbackStore_ListPendingRejectsMismatchedV2Sequence(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -1057,12 +993,11 @@ func TestCallbackStore_ListPendingRejectsMismatchedV2Sequence(t *testing.T) {
 		CallbackURL:      "http://example.com/callbacks/provision",
 		DeliveryKind:     CallbackDeliveryKindOperation,
 		Sequence:         1,
-		Success:          true,
 		Status:           "success",
 		BackendStorageID: "550e8400-e29b-41d4-a716-446655440000",
 		CreatedAt:        time.Now(),
 	}
-	data, err := json.Marshal(entry)
+	data, err := marshalV2CallbackEntry(entry)
 	require.NoError(t, err)
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
 		leaseBucket, createErr := tx.Bucket(callbackV2BucketName).CreateBucket([]byte(testLeaseUUID("lease-1")))
@@ -1084,7 +1019,6 @@ func TestCallbackStore_RejectsInvalidV2SemanticsBeforeWrite(t *testing.T) {
 		LeaseUUID:        testLeaseUUID("semantic-validation"),
 		CallbackURL:      "https://fred.example/callbacks/provision?operation_id=" + callbackID,
 		DeliveryKind:     CallbackDeliveryKindOperation,
-		Success:          true,
 		Status:           "success",
 		BackendStorageID: callbackID,
 		CreatedAt:        now,
@@ -1118,7 +1052,6 @@ func TestCallbackStore_RejectsInvalidV2SemanticsBeforeWrite(t *testing.T) {
 		}, "lifecycle URL must not contain operation_id"},
 		{"operation deprovisioned status", func(entry *CallbackEntry) { entry.Status = "deprovisioned" }, "invalid status"},
 		{"retained operation", func(entry *CallbackEntry) { entry.Retained = true }, "cannot be retained"},
-		{"success flag conflicts with status", func(entry *CallbackEntry) { entry.Success = false }, "conflicts with status"},
 		{"zero creation time", func(entry *CallbackEntry) { entry.CreatedAt = time.Time{} }, "Unix epoch"},
 		{"pre-epoch creation time", func(entry *CallbackEntry) { entry.CreatedAt = time.Unix(-1, 0) }, "Unix epoch"},
 		{"future creation time", func(entry *CallbackEntry) {
@@ -1126,7 +1059,7 @@ func TestCallbackStore_RejectsInvalidV2SemanticsBeforeWrite(t *testing.T) {
 		}, "future clock-skew allowance"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+			store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 			require.NoError(t, err)
 			defer store.Close()
 			entry := valid
@@ -1139,7 +1072,7 @@ func TestCallbackStore_RejectsInvalidV2SemanticsBeforeWrite(t *testing.T) {
 		})
 	}
 
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "skew.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "skew.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	valid.CreatedAt = time.Now().Add(callbackCreatedAtFutureSkew / 2)
@@ -1149,21 +1082,21 @@ func TestCallbackStore_RejectsInvalidV2SemanticsBeforeWrite(t *testing.T) {
 
 func TestCallbackStore_V2AcceptsTokenlessURLForMigratedV013Workload(t *testing.T) {
 	const callbackID = "550e8400-e29b-41d4-a716-446655440000"
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	leaseUUID := testLeaseUUID("tokenless-v2-rollout")
 	for _, entry := range []CallbackEntry{
 		{
 			LeaseUUID: leaseUUID, CallbackURL: "https://fred.example/callbacks/provision",
-			DeliveryKind: CallbackDeliveryKindOperation,
-			Success:      true, Status: backend.CallbackStatusSuccess,
+			DeliveryKind:     CallbackDeliveryKindOperation,
+			Status:           backend.CallbackStatusSuccess,
 			BackendStorageID: callbackID, CreatedAt: time.Now(),
 		},
 		{
 			LeaseUUID: leaseUUID, CallbackURL: "https://fred.example/callbacks/provision",
-			DeliveryKind: CallbackDeliveryKindLifecycle,
-			Success:      false, Status: backend.CallbackStatusFailed,
+			DeliveryKind:     CallbackDeliveryKindLifecycle,
+			Status:           backend.CallbackStatusFailed,
 			BackendStorageID: callbackID, CreatedAt: time.Now(),
 		},
 	} {
@@ -1190,7 +1123,6 @@ func TestCallbackStore_DurableSemanticPoisonFailsClosed(t *testing.T) {
 		CallbackURL:      "https://fred.example/callbacks/provision?operation_id=" + deliveryID,
 		DeliveryKind:     CallbackDeliveryKindOperation,
 		Sequence:         1,
-		Success:          true,
 		Status:           "success",
 		BackendStorageID: deliveryID,
 		CreatedAt:        time.Now(),
@@ -1203,47 +1135,70 @@ func TestCallbackStore_DurableSemanticPoisonFailsClosed(t *testing.T) {
 		{"link-local destination", func() []byte {
 			entry := base
 			entry.CallbackURL = "http://169.254.169.254/latest/meta-data/callbacks/provision?operation_id=" + deliveryID
-			data, err := json.Marshal(entry)
+			data, err := marshalV2CallbackEntry(entry)
 			require.NoError(t, err)
 			return data
 		}, "routable unicast"},
 		{"wrong callback class", func() []byte {
 			entry := base
 			entry.CallbackURL = "https://fred.example/callbacks/provision?lifecycle_id=" + deliveryID
-			data, err := json.Marshal(entry)
+			data, err := marshalV2CallbackEntry(entry)
 			require.NoError(t, err)
 			return data
 		}, "operation URL must not contain lifecycle_id"},
 		{"port-only destination", func() []byte {
 			entry := base
 			entry.CallbackURL = "https://:443/callbacks/provision?operation_id=" + deliveryID
-			data, err := json.Marshal(entry)
+			data, err := marshalV2CallbackEntry(entry)
 			require.NoError(t, err)
 			return data
 		}, "non-empty, non-dot hostname"},
 		{"unstable path destination", func() []byte {
 			entry := base
 			entry.CallbackURL = "https://fred.example/api/../callbacks/provision?operation_id=" + deliveryID
-			data, err := json.Marshal(entry)
+			data, err := marshalV2CallbackEntry(entry)
 			require.NoError(t, err)
 			return data
 		}, "dot, parent"},
 		{"missing storage identity", func() []byte {
 			entry := base
 			entry.BackendStorageID = ""
-			data, err := json.Marshal(entry)
+			data, err := marshalV2CallbackEntry(entry)
 			require.NoError(t, err)
 			return data
 		}, "storage identity is required"},
+		{"missing schema version", func() []byte {
+			data, err := json.Marshal(base)
+			require.NoError(t, err)
+			return data
+		}, "unsupported callback entry version 0"},
+		{"future schema version", func() []byte {
+			data, err := json.Marshal(storedV2CallbackEntry{
+				Version:       callbackV2EntryVersion + 1,
+				CallbackEntry: base,
+			})
+			require.NoError(t, err)
+			return data
+		}, "unsupported callback entry version 2"},
+		{"unknown schema field", func() []byte {
+			data, err := marshalV2CallbackEntry(base)
+			require.NoError(t, err)
+			return append(bytes.TrimSuffix(data, []byte("}")), []byte(`,"future_authority":true}`)...)
+		}, "unknown field"},
+		{"removed derived success field", func() []byte {
+			data, err := marshalV2CallbackEntry(base)
+			require.NoError(t, err)
+			return append(bytes.TrimSuffix(data, []byte("}")), []byte(`,"success":true}`)...)
+		}, `unknown field "success"`},
 		{"duplicate authority field", func() []byte {
 			return []byte(fmt.Sprintf(
-				`{"delivery_id":%q,"lease_uuid":%q,"callback_url":"https://fred.example/callbacks/provision","callback_url":"http://169.254.169.254/latest/meta-data/callbacks/provision","delivery_kind":"operation","sequence":1,"success":true,"status":"success","created_at":%q}`,
+				`{"version":1,"delivery_id":%q,"lease_uuid":%q,"callback_url":"https://fred.example/callbacks/provision","callback_url":"http://169.254.169.254/latest/meta-data/callbacks/provision","delivery_kind":"operation","sequence":1,"status":"success","created_at":%q}`,
 				deliveryID, leaseUUID, base.CreatedAt.Format(time.RFC3339Nano),
 			))
 		}, `duplicate field "callback_url"`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
+			store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 			require.NoError(t, err)
 			defer store.Close()
 			raw := test.raw()
@@ -1269,7 +1224,7 @@ func TestCallbackStore_DurableSemanticPoisonFailsClosed(t *testing.T) {
 
 func TestCallbackStore_DurableRowsSurviveWallClockRollback(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "callbacks.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	const operationID = "550e8400-e29b-41d4-a716-446655440000"
@@ -1278,7 +1233,6 @@ func TestCallbackStore_DurableRowsSurviveWallClockRollback(t *testing.T) {
 		LeaseUUID:        v2LeaseUUID,
 		CallbackURL:      "https://fred.example/callbacks/provision?operation_id=" + operationID,
 		DeliveryKind:     CallbackDeliveryKindOperation,
-		Success:          true,
 		Status:           backend.CallbackStatusSuccess,
 		Backend:          "docker-a",
 		BackendStorageID: "550e8400-e29b-41d4-a716-446655440000",
@@ -1290,12 +1244,12 @@ func TestCallbackStore_DurableRowsSurviveWallClockRollback(t *testing.T) {
 	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(callbackV2BucketName).Bucket([]byte(v2LeaseUUID))
 		key := callbackSequenceKey(stored.Sequence)
-		var entry CallbackEntry
-		if unmarshalErr := json.Unmarshal(bucket.Get(key), &entry); unmarshalErr != nil {
+		var storedEntry storedV2CallbackEntry
+		if unmarshalErr := json.Unmarshal(bucket.Get(key), &storedEntry); unmarshalErr != nil {
 			return unmarshalErr
 		}
-		entry.CreatedAt = futureCreatedAt
-		data, marshalErr := json.Marshal(entry)
+		storedEntry.CreatedAt = futureCreatedAt
+		data, marshalErr := json.Marshal(storedEntry)
 		if marshalErr != nil {
 			return marshalErr
 		}
@@ -1303,7 +1257,7 @@ func TestCallbackStore_DurableRowsSurviveWallClockRollback(t *testing.T) {
 	}))
 	require.NoError(t, store.Close())
 
-	store, err = NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err = newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	pending, err := store.ListPending()
@@ -1315,91 +1269,8 @@ func TestCallbackStore_DurableRowsSurviveWallClockRollback(t *testing.T) {
 	require.NoError(t, store.Healthy())
 }
 
-func TestCallbackStore_ReadsLegitimateV013RowsWithSeparateCompatibilityRules(t *testing.T) {
-	const callbackID = "550e8400-e29b-41d4-a716-446655440000"
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "legacy.db")})
-	require.NoError(t, err)
-	defer store.Close()
-	legacyRows := []CallbackEntry{
-		{LeaseUUID: "legacy-arbitrary-id", CallbackURL: "http://fred.internal/callbacks/provision", CreatedAt: time.Now()},
-		{
-			LeaseUUID:   "legacy-operation-route",
-			CallbackURL: "http://fred.internal/callbacks/provision?operation_id=" + callbackID,
-			Success:     true,
-			Status:      "success",
-			CreatedAt:   time.Now(),
-		},
-		{
-			LeaseUUID:   "legacy-lifecycle-route",
-			CallbackURL: "http://fred.internal/callbacks/provision?lifecycle_id=" + callbackID,
-			Success:     true,
-			Status:      "deprovisioned",
-			Retained:    true,
-			CreatedAt:   time.Now(),
-		},
-	}
-	for _, entry := range legacyRows {
-		storeLegacyCallback(t, store, entry)
-	}
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, len(legacyRows))
-	for _, entry := range pending {
-		assert.Equal(t, callbackStorageLegacy, entry.storageVersion)
-	}
-}
-
-func TestCallbackStore_RemoveOlderThan_PreservesOldSuffixBehindFreshHead(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "ttl-prefix.db")})
-	require.NoError(t, err)
-	defer store.Close()
-	leaseUUID := testLeaseUUID("clock-regression")
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID: leaseUUID, CallbackURL: "https://fred.example/legacy-fresh/callbacks/provision", CreatedAt: time.Now(),
-	})
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID: leaseUUID, DeliveryKind: CallbackDeliveryKindLifecycle, CreatedAt: time.Now().Add(-48 * time.Hour),
-	})
-	require.NoError(t, err)
-
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Zero(t, removed, "wall-clock age must not delete a FIFO suffix behind a live head")
-	pending, err := store.listPending(leaseUUID)
-	require.NoError(t, err)
-	assert.Len(t, pending, 2)
-}
-
-func TestCallbackStore_RemoveOlderThan_LegacyHeadParticipatesInContiguousPrefix(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "legacy-prefix.db")})
-	require.NoError(t, err)
-	defer store.Close()
-	leaseUUID := testLeaseUUID("legacy-prefix")
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID: leaseUUID, CallbackURL: "https://fred.example/legacy/callbacks/provision", CreatedAt: time.Now().Add(-48 * time.Hour),
-	})
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID: leaseUUID, DeliveryKind: CallbackDeliveryKindOperation, CreatedAt: time.Now(),
-	})
-	require.NoError(t, err)
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID: leaseUUID, DeliveryKind: CallbackDeliveryKindLifecycle, CreatedAt: time.Now().Add(-48 * time.Hour),
-	})
-	require.NoError(t, err)
-
-	removed, err := store.RemoveOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Equal(t, 1, removed, "only the expired legacy head is a removable FIFO prefix")
-	pending, err := store.listPending(leaseUUID)
-	require.NoError(t, err)
-	require.Len(t, pending, 2)
-	assert.False(t, pending[0].CreatedAt.Before(time.Now().Add(-24*time.Hour)))
-	assert.True(t, pending[1].CreatedAt.Before(time.Now().Add(-24*time.Hour)),
-		"expired suffix stays behind the fresh sequenced head")
-}
-
 func TestCallbackStore_RemoveOlderThan_HoldsOnlyCurrentLeaseLock(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "ttl-locks.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "ttl-locks.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	const (
@@ -1419,7 +1290,7 @@ func TestCallbackStore_RemoveOlderThan_HoldsOnlyCurrentLeaseLock(t *testing.T) {
 	var cleanupErr error
 	go func() {
 		defer close(cleanupDone)
-		removed, cleanupErr = store.RemoveOlderThan(24 * time.Hour)
+		removed, cleanupErr = store.removeOlderThan(24 * time.Hour)
 	}()
 	require.Eventually(t, func() bool {
 		store.deliveryLocksMu.Lock()
@@ -1445,12 +1316,12 @@ func TestCallbackStore_RemoveOlderThan_HoldsOnlyCurrentLeaseLock(t *testing.T) {
 	assert.Equal(t, 2, removed)
 }
 
-func TestCallbackStore_RemoveOlderThanRenotifiesAfterLostDrainElection(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "ttl-renotify.db")})
+func TestCallbackStore_RemoveOlderThanSkipsBusyMutationAndRenotifies(t *testing.T) {
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "ttl-renotify.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	leaseUUID := testLeaseUUID("ttl-renotify")
-	wake := make(chan struct{}, 1)
+	wake := newCallbackReplayMailbox()
 	unsubscribe := store.subscribeReplayWake(wake)
 	defer unsubscribe()
 
@@ -1463,77 +1334,58 @@ func TestCallbackStore_RemoveOlderThanRenotifiesAfterLostDrainElection(t *testin
 	})
 	require.NoError(t, err)
 	select {
-	case <-wake:
+	case <-wake.ready:
+		wakes := wake.take()
+		require.Len(t, wakes, 1)
+		assert.Equal(t, leaseUUID, wakes[0].leaseUUID)
+		assert.Equal(t, callbackReplayWakeCommit, wakes[0].kind)
 	case <-time.After(time.Second):
 		t.Fatal("old callback publication did not notify replay")
 	}
 
-	// Hold the mutation lock so cleanup can acquire drain ownership but cannot
-	// inspect the FIFO yet. A live append can then commit under the same modeled
-	// ownership and publish the wake that a real replay loop loses to cleanup.
+	// Cleanup is optional maintenance and must not wait behind an active
+	// publisher. It releases the drain election and republishes a level-triggered
+	// wake so delivery is not stranded if the original commit edge was consumed.
 	unlockMutation := store.lockDeliveryLease(leaseUUID)
-	mutationReleased := false
-	defer func() {
-		if !mutationReleased {
-			unlockMutation()
-		}
-	}()
 	cleanupDone := make(chan struct{})
 	var removed int
 	var cleanupErr error
 	go func() {
 		defer close(cleanupDone)
-		removed, cleanupErr = store.RemoveOlderThan(24 * time.Hour)
+		removed, cleanupErr = store.removeOlderThan(24 * time.Hour)
 	}()
-	require.Eventually(t, func() bool {
-		store.drainLocksMu.Lock()
-		defer store.drainLocksMu.Unlock()
-		lock := store.drainLocks[leaseUUID]
-		return lock != nil && lock.refs > 0
-	}, time.Second, time.Millisecond, "cleanup did not acquire drain ownership")
-
-	_, err = store.storeEntryLocked(validTestCallbackEntry(CallbackEntry{
-		LeaseUUID:    leaseUUID,
-		DeliveryKind: CallbackDeliveryKindOperation,
-		Status:       backend.CallbackStatusFailed,
-		Error:        "fresh observation",
-		CreatedAt:    time.Now(),
-	}))
-	require.NoError(t, err)
-	select {
-	case <-wake:
-	case <-time.After(time.Second):
-		t.Fatal("fresh callback commit did not notify replay")
-	}
-	_, acquired := store.tryLockDrainLease(leaseUUID)
-	require.False(t, acquired, "replay must lose drain election while TTL cleanup owns it")
-
-	unlockMutation()
-	mutationReleased = true
 	select {
 	case <-cleanupDone:
 	case <-time.After(time.Second):
-		t.Fatal("cleanup did not finish after mutation ownership was released")
+		t.Fatal("cleanup waited behind a busy mutation gate")
 	}
 	require.NoError(t, cleanupErr)
-	assert.Equal(t, 1, removed)
+	assert.Zero(t, removed)
 
 	select {
-	case <-wake:
+	case <-wake.ready:
+		wakes := wake.take()
+		require.Len(t, wakes, 1)
+		assert.Equal(t, leaseUUID, wakes[0].leaseUUID)
+		assert.Equal(t, callbackReplayWakeHandoff, wakes[0].kind)
 	case <-time.After(time.Second):
-		t.Fatal("cleanup handoff did not re-notify replay after releasing drain ownership")
+		t.Fatal("cleanup handoff did not re-notify replay after skipping the busy lease")
 	}
 	unlockDrain, acquired := store.tryLockDrainLease(leaseUUID)
 	require.True(t, acquired, "re-notified replay must be able to acquire drain ownership")
 	unlockDrain()
+
+	unlockMutation()
+	removed, err = store.removeOlderThan(24 * time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed)
 	pending, err := store.listPending(leaseUUID)
 	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, "fresh observation", pending[0].Error)
+	assert.Empty(t, pending)
 }
 
 func TestRunCallbackLeaseCleanup_UnlocksAfterPanic(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "ttl-panic.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "ttl-panic.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	leaseUUID := testLeaseUUID("ttl-panic")
@@ -1561,7 +1413,7 @@ func TestRunCallbackLeaseCleanup_UnlocksAfterPanic(t *testing.T) {
 }
 
 func TestCallbackStore_TerminalLifecycleIsSticky(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "terminal.db")})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "terminal.db")})
 	require.NoError(t, err)
 	defer store.Close()
 	leaseUUID := testLeaseUUID("terminal")
@@ -1594,56 +1446,30 @@ func TestCallbackStore_TerminalLifecycleIsSticky(t *testing.T) {
 	assert.Equal(t, replacement.DeliveryID, pending[0].DeliveryID)
 }
 
-func TestCallbackStore_LegacyTerminalLifecycleIsSticky(t *testing.T) {
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "legacy-terminal.db")})
+func TestCallbackStore_ListPendingFailsClosedOnMalformedRecord(t *testing.T) {
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	defer store.Close()
-	leaseUUID := testLeaseUUID("legacy-terminal")
-	storeLegacyCallback(t, store, CallbackEntry{
-		LeaseUUID: leaseUUID, CallbackURL: "https://fred.example/legacy/callbacks/provision", Success: true,
-		Status: "deprovisioned", CreatedAt: time.Now(),
-	})
-	_, err = store.storeValidTestEntry(CallbackEntry{
-		LeaseUUID: leaseUUID, DeliveryKind: CallbackDeliveryKindLifecycle, Status: "failed",
-	})
-	require.ErrorIs(t, err, errTerminalLifecyclePending)
-	pending, err := store.listPending(leaseUUID)
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, callbackStorageLegacy, pending[0].storageVersion)
-}
+	require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
+		leaseBucket, createErr := tx.Bucket(callbackV2BucketName).
+			CreateBucket([]byte("corrupt-lease"))
+		if createErr != nil {
+			return createErr
+		}
+		return leaseBucket.Put(
+			[]byte("123e4567-e89b-42d3-a456-426614174099"), []byte("{"))
+	}))
 
-func TestCallbackStore_ListPendingFailsClosedOnMalformedRecord(t *testing.T) {
-	for _, version := range []callbackStorageVersion{callbackStorageLegacy, callbackStorageV2} {
-		t.Run(fmt.Sprintf("version-%d", version), func(t *testing.T) {
-			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
-			require.NoError(t, err)
-			defer store.Close()
-			require.NoError(t, store.db.Update(func(tx *bolt.Tx) error {
-				if version == callbackStorageLegacy {
-					return tx.Bucket(callbackBucketName).Put([]byte("corrupt-lease"), []byte("{"))
-				}
-				leaseBucket, createErr := tx.Bucket(callbackV2BucketName).
-					CreateBucket([]byte("corrupt-lease"))
-				if createErr != nil {
-					return createErr
-				}
-				return leaseBucket.Put(
-					[]byte("123e4567-e89b-42d3-a456-426614174099"), []byte("{"))
-			}))
-
-			pending, err := store.ListPending()
-			require.ErrorContains(t, err, "failed to decode callback entry")
-			assert.Empty(t, pending, "corruption must be a delivery barrier, not a skipped record")
-		})
-	}
+	pending, err := store.ListPending()
+	require.ErrorContains(t, err, "failed to decode callback entry")
+	assert.Empty(t, pending, "corruption must be a delivery barrier, not a skipped record")
 }
 
 func TestInspectPendingCallbacksReadOnlyCountsLegacyAndTypedRowsWithoutMutation(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "callbacks.db")
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
-	storeLegacyCallback(t, store, CallbackEntry{
+	storeLegacyCallback(t, store, v013CallbackEntryForTest{
 		LeaseUUID: testLeaseUUID("inspect-legacy"),
 		CreatedAt: time.Now(),
 	})
@@ -1662,6 +1488,10 @@ func TestInspectPendingCallbacksReadOnlyCountsLegacyAndTypedRowsWithoutMutation(
 	assert.True(t, inspection.LegacySchema)
 	assert.True(t, inspection.UpgradedSchema)
 	assert.Equal(t, 2, inspection.Pending)
+	assert.Zero(t, inspection.LeaseMutationUUIDSlots)
+	assert.Equal(t, maxLeaseMutationUUIDSlotsGlobal, inspection.LeaseMutationUUIDSlotLimit)
+	assert.Zero(t, inspection.CallbackReceiptReservations)
+	assert.Equal(t, maxCallbackReceiptReservationsGlobal, inspection.CallbackReceiptReservationLimit)
 	after, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
 	assert.Equal(t, before, after)
@@ -1699,7 +1529,7 @@ func TestInspectCallbackStoreReadOnlyRejectsEveryPartialCurrentSchema(t *testing
 		missingBucket := append([]byte(nil), missingBucket...)
 		t.Run(string(missingBucket), func(t *testing.T) {
 			dbPath := filepath.Join(t.TempDir(), "callbacks.db")
-			store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+			store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 			require.NoError(t, err)
 			require.NoError(t, store.Close())
 			db, err := bolt.Open(dbPath, 0o600, nil)
@@ -1712,13 +1542,64 @@ func TestInspectCallbackStoreReadOnlyRejectsEveryPartialCurrentSchema(t *testing
 			require.NoError(t, err)
 
 			inspection, err := InspectCallbackStoreReadOnly(dbPath)
-			assert.ErrorContains(t, err, "partial upgraded schema")
+			assert.ErrorContains(t, err, "partial aggregate schema")
 			assert.Equal(t, CallbackStoreInspection{}, inspection)
 			after, readErr := os.ReadFile(dbPath)
 			require.NoError(t, readErr)
 			assert.Equal(t, before, after)
 		})
 	}
+}
+
+func TestInspectCallbackStoreReadOnlyRejectsUnshippedMultiBucketSchema(t *testing.T) {
+	for _, staleBucket := range callbackUnshippedSchemaBuckets() {
+		staleBucket := append([]byte(nil), staleBucket...)
+		t.Run(string(staleBucket), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "callbacks.db")
+			store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
+			require.NoError(t, err)
+			require.NoError(t, store.Close())
+			db, err := bolt.Open(dbPath, 0o600, nil)
+			require.NoError(t, err)
+			require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+				_, createErr := tx.CreateBucket(staleBucket)
+				return createErr
+			}))
+			require.NoError(t, db.Close())
+
+			inspection, err := InspectCallbackStoreReadOnly(dbPath)
+			assert.ErrorContains(t, err, "unshipped")
+			assert.Equal(t, CallbackStoreInspection{}, inspection)
+		})
+	}
+}
+
+func TestCallbackStoreRejectsUnknownTopLevelAuthorityBucket(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "callbacks.db")
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	db, err := bolt.Open(dbPath, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		_, createErr := tx.CreateBucket([]byte("future_callback_authority"))
+		return createErr
+	}))
+	require.NoError(t, db.Close())
+	before, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+
+	inspection, err := InspectCallbackStoreReadOnly(dbPath)
+	require.ErrorContains(t, err, "unsupported top-level bucket")
+	assert.Equal(t, CallbackStoreInspection{}, inspection)
+	afterInspection, err := os.ReadFile(dbPath)
+	require.NoError(t, err)
+	assert.Equal(t, before, afterInspection, "read-only inspection must not mutate future authority")
+
+	reopened, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
+	require.ErrorContains(t, err, "unsupported top-level bucket")
+	assert.Nil(t, reopened)
 }
 
 func TestCallbackStore_UpgradesDrainedV013SchemaWithoutInventingRows(t *testing.T) {
@@ -1731,7 +1612,7 @@ func TestCallbackStore_UpgradesDrainedV013SchemaWithoutInventingRows(t *testing.
 	}))
 	require.NoError(t, db.Close())
 
-	store, err := NewCallbackStore(CallbackStoreConfig{DBPath: dbPath})
+	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	pending, err := store.ListPending()
 	require.NoError(t, err)
@@ -1742,13 +1623,26 @@ func TestCallbackStore_UpgradesDrainedV013SchemaWithoutInventingRows(t *testing.
 	inspection, err := InspectCallbackStoreReadOnly(dbPath)
 	require.NoError(t, err)
 	assert.Equal(t, CallbackStoreInspection{
-		Exists:         true,
-		LegacySchema:   true,
-		UpgradedSchema: true,
+		Exists:                          true,
+		LegacySchema:                    true,
+		UpgradedSchema:                  true,
+		LeaseMutationUUIDSlotLimit:      maxLeaseMutationUUIDSlotsGlobal,
+		CallbackReceiptReservationLimit: maxCallbackReceiptReservationsGlobal,
 	}, inspection)
 }
 
-func storeLegacyCallback(t *testing.T, store *CallbackStore, entry CallbackEntry) {
+// v013CallbackEntryForTest is the deployed queue shape. It remains test-only:
+// current runtime code counts these rows for stopped-upgrade diagnostics but
+// never decodes or delivers them.
+type v013CallbackEntryForTest struct {
+	LeaseUUID   string    `json:"lease_uuid"`
+	CallbackURL string    `json:"callback_url"`
+	Success     bool      `json:"success"`
+	Error       string    `json:"error,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+func storeLegacyCallback(t *testing.T, store *CallbackStore, entry v013CallbackEntryForTest) {
 	t.Helper()
 	data, err := json.Marshal(entry)
 	require.NoError(t, err)

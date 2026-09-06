@@ -94,6 +94,14 @@ func NewStoreForProvider(
 	providerUUID string,
 	opts ...placement.Option,
 ) (*placement.Store, error) {
+	callbackRoutes, err := placement.NewCallbackRouteFactory("https://provider.test/callback")
+	if err != nil {
+		return nil, err
+	}
+	// Every runtime-capable fixture has one Store-owned callback issuer. An
+	// explicit test option follows this default and therefore remains able to
+	// select a scenario-specific origin without introducing a second issuer.
+	opts = append([]placement.Option{placement.WithCallbackRouteFactory(callbackRoutes)}, opts...)
 	store, err := placement.OpenStore(dbPath, providerUUID, opts...)
 	if err == nil {
 		return store, nil
@@ -153,4 +161,25 @@ func NewStoreForProvider(
 		return nil, err
 	}
 	return placement.OpenStore(dbPath, providerUUID, opts...)
+}
+
+// ConfigureBackendTopologyWithStorageIdentities converts concise fixture
+// identities into concrete empty provision and retention observations. The
+// production Store no longer exposes an identity-only topology mutation.
+func ConfigureBackendTopologyWithStorageIdentities(
+	store *placement.Store,
+	names []string,
+	identities map[string]backendidentity.ID,
+) error {
+	observations := make(map[string]placement.CompleteBackendObservation, len(names))
+	for _, backendName := range names {
+		observation, err := placement.NewCompleteBackendObservation(
+			identities[backendName], []backend.ProvisionInfo{}, []backend.RetainedLease{},
+		)
+		if err != nil {
+			return err
+		}
+		observations[backendName] = observation
+	}
+	return store.ConfigureBackendTopologyWithCompleteObservations(names, observations)
 }

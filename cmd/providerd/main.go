@@ -22,10 +22,12 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner"
-	"github.com/manifest-network/fred/internal/provisioner/operation"
+	maintenanceapp "github.com/manifest-network/fred/internal/provisioner/maintenance"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 	restoreapp "github.com/manifest-network/fred/internal/provisioner/restore"
 	"github.com/manifest-network/fred/internal/scheduler"
 	"github.com/manifest-network/fred/internal/watcher"
@@ -174,6 +176,7 @@ func run(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("build backend callback HMAC keyring: %w", err)
 		}
 	}
+	callbackProofVerifier, callbackProofConsumer := hmacauth.NewCallbackProofBoundary()
 
 	// Initialize signer pool (derives sub-keys on first boot if mnemonic available)
 	signerPool, err := chain.NewSignerPool(chain.SignerPoolConfig{
@@ -349,12 +352,12 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Create provision manager
 	provisionMgr, err := provisioner.NewManager(provisioner.ManagerConfig{
-		ProviderUUID:    cfg.ProviderUUID,
-		CallbackBaseURL: cfg.CallbackBaseURL,
-		PayloadStore:    payloadStore,
-		PlacementStore:  placementStore,
-		LeaseEventSink:  eventBroker,
-		AckLaneCount:    signerPool.LaneCount(),
+		ProviderUUID:          cfg.ProviderUUID,
+		PayloadStore:          payloadStore,
+		PlacementStore:        placementStore,
+		LeaseEventSink:        eventBroker,
+		AckLaneCount:          signerPool.LaneCount(),
+		CallbackProofConsumer: callbackProofConsumer,
 	}, backendRouter, chainClient)
 	if err != nil {
 		return fmt.Errorf("failed to create provision manager: %w", err)
@@ -363,18 +366,21 @@ func run(cmd *cobra.Command, args []string) error {
 	// Restore is one application workflow with one typed capability graph. The
 	// same operation ID is held by the registry, persisted in the placement
 	// attempt, and carried on the backend callback URL.
-	restoreService, err := restoreapp.NewService(restoreapp.Config{
-		ProviderUUID: cfg.ProviderUUID,
-		CallbackURL: func(operationID operation.OperationID) (string, error) {
-			return provisioner.BuildCallbackURLForOperation(cfg.CallbackBaseURL, operationID)
-		},
-		Leases: chainClient,
-		Backends: restoreapp.BackendResolverFunc(func(name string) restoreapp.RestoreBackend {
-			return backendRouter.GetBackendByName(name)
+	restoreCoordinator, err := provisionMgr.RestoreCoordinator(
+		placement.RestoreStartObserver(func(leaseUUID, _ string) {
+			eventBroker.Publish(backend.LeaseStatusEvent{
+				LeaseUUID: leaseUUID,
+				Status:    backend.ProvisionStatusRestarting,
+				Timestamp: time.Now(),
+			})
 		}),
-		Operations: provisionMgr.RestoreOperations(),
-		Authority:  placementStore,
-		Events:     eventBroker,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to bind restore execution coordinator: %w", err)
+	}
+	restoreService, err := restoreapp.NewService(restoreapp.Config{
+		Coordinator: restoreCoordinator,
+		Events:      eventBroker,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create restore service: %w", err)
@@ -399,9 +405,20 @@ func run(cmd *cobra.Command, args []string) error {
 	// no durable record of — the ENG-619 outcome the guard exists to prevent.
 	// Keep an absent payload store as a true nil interface; a typed nil
 	// *payload.Store would pass != nil checks and panic.
-	var payloadPersister api.PayloadPersister
+	var maintenancePayloads placement.MaintenancePayloadPersister
 	if payloadStore != nil {
-		payloadPersister = provisionMgr
+		maintenancePayloads = provisionMgr
+	}
+	maintenanceCoordinator, err := provisionMgr.MaintenanceCoordinator(maintenancePayloads)
+	if err != nil {
+		return fmt.Errorf("failed to create maintenance coordinator: %w", err)
+	}
+	maintenanceService, err := maintenanceapp.NewService(maintenanceapp.Config{
+		Coordinator: maintenanceCoordinator,
+		Events:      eventBroker,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create maintenance service: %w", err)
 	}
 
 	// The health probe goes straight to the store rather than through the
@@ -437,18 +454,17 @@ func run(cmd *cobra.Command, args []string) error {
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
 	}, api.ServerDeps{
-		ChainClient:        chainClient,
-		BackendRouter:      backendRouter,
-		CallbackPublisher:  provisionMgr,
-		PayloadPublisher:   provisionMgr,
-		PayloadPersister:   payloadPersister,
-		PayloadStoreHealth: payloadStoreHealth,
-		StatusChecker:      provisionMgr,
-		PlacementLookup:    placementStore,
-		LifecycleCallbacks: placementStore,
-		MaintenanceClaims:  provisionMgr.MaintenanceClaims(),
-		RestoreService:     restoreService,
-		EventBroker:        eventBroker,
+		ChainClient:           chainClient,
+		BackendRouter:         backendRouter,
+		CallbackPublisher:     provisionMgr,
+		PayloadPublisher:      provisionMgr,
+		PayloadStoreHealth:    payloadStoreHealth,
+		StatusChecker:         provisionMgr,
+		PlacementLookup:       placementStore,
+		MaintenanceService:    maintenanceService,
+		RestoreService:        restoreService,
+		EventBroker:           eventBroker,
+		CallbackProofVerifier: callbackProofVerifier,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create API server: %w", err)
@@ -466,12 +482,22 @@ func run(cmd *cobra.Command, args []string) error {
 	})
 
 	// Create reconciler for level-triggered state reconciliation
+	reconciliationCoordinator, err := provisionMgr.ReconciliationCoordinator(
+		placement.ProvisionStartObserver(func(leaseUUID, _ string) {
+			eventBroker.Publish(backend.LeaseStatusEvent{
+				LeaseUUID: leaseUUID,
+				Status:    backend.ProvisionStatusProvisioning,
+				Timestamp: time.Now(),
+			})
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to bind reconciliation coordinator: %w", err)
+	}
 	reconciler, err := provisioner.NewReconciler(provisioner.ReconcilerConfig{
-		ProviderUUID:    cfg.ProviderUUID,
-		CallbackBaseURL: cfg.CallbackBaseURL,
-		Interval:        cfg.ReconciliationInterval,
-		StartEvents:     provisionMgr,
-	}, chainClient, provisionMgr.AckBatcher(), backendRouter, provisionMgr, placementStore)
+		Interval:    cfg.ReconciliationInterval,
+		Coordinator: reconciliationCoordinator,
+	}, provisionMgr)
 	if err != nil {
 		return fmt.Errorf("failed to create reconciler: %w", err)
 	}
@@ -485,7 +511,11 @@ func run(cmd *cobra.Command, args []string) error {
 	// Each component is wrapped with panic recovery via safeGo() to prevent
 	// silent crashes and convert panics to errors.
 	var wg sync.WaitGroup
-	errChan := make(chan error, 8)
+	// Every long-lived component can report at most one terminal error. Keep
+	// room for all nine (including optional sub-signer maintenance) because the
+	// first error starts shutdown and no goroutine may block its WaitGroup.Done
+	// while trying to report another concurrent failure.
+	errChan := make(chan error, 9)
 
 	// Start API server FIRST and wait for it to be listening.
 	// This is critical because startup reconciliation may trigger backend callbacks
@@ -518,6 +548,13 @@ func run(cmd *cobra.Command, args []string) error {
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("timeout waiting for provision manager to start")
 	}
+
+	// Durable maintenance claims were rehydrated during construction, before
+	// any public or reconciliation work became reachable. Resume their backend
+	// commands in the background so a down pinned node delays only its own lease.
+	safeGo(&wg, errChan, "maintenance recovery", func() error {
+		return maintenanceService.Start(ctx, cfg.ReconciliationInterval)
+	})
 
 	// Perform startup operations sequentially to avoid same-block transaction conflicts
 	// WithdrawOnce waits for block inclusion before returning, ensuring the next tx is in a different block

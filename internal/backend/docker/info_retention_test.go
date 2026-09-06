@@ -14,36 +14,35 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
+const (
+	infoPartitionRetentionLeaseUUID = "0192f1a0-1111-4abc-8def-000000000601"
+	infoRetentionLeaseUUID          = "0192f1a0-1111-4abc-8def-000000000602"
+)
+
 // newBackendWithRetention returns a test backend wired with a real on-disk
 // RetentionStore (no provisions in the map). The store is a genuine DI seam, not
 // a test-only hook: production attaches the same store in NewBackend.
 func newBackendWithRetention(t *testing.T) (*Backend, *shared.RetentionStore) {
 	t.Helper()
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = rs.Close() })
-
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
-	b.retentionStore = rs
-	attachReleaseStore(t, b)
-	return b, rs
+	require.NotNil(t, b.retentionStore)
+	return b, b.retentionStore
 }
 
 // retentionEntryFixture builds an active retention record for a stack lease.
 func retentionEntryFixture(leaseUUID, tenant string, createdAt time.Time) shared.RetentionEntry {
+	leaseUUID = canonicalRetentionFixtureUUID(leaseUUID)
 	return shared.RetentionEntry{
 		OriginalLeaseUUID: leaseUUID,
 		Tenant:            tenant,
-		ProviderUUID:      "prov-1",
+		ProviderUUID:      nominalDockerProviderUUID,
 		Items: []backend.LeaseItem{
 			{SKU: "docker-micro", Quantity: 2, ServiceName: "web"},
 		},
 		StackManifest: &manifest.StackManifest{
 			Services: map[string]*manifest.Manifest{"web": {Image: "nginx:1.25"}},
 		},
-		RetainedVolumeNames: []string{"fred-retained-lease-web-0"},
+		RetainedVolumeNames: []string{retainedName(canonicalVolumeName(leaseUUID, "web", 0))},
 		Status:              shared.RetentionStatusActive,
 		CreatedAt:           createdAt,
 	}
@@ -54,11 +53,11 @@ func retentionEntryFixture(leaseUUID, tenant string, createdAt time.Time) shared
 // responses. A non-partitioned record (Partition "") leaves the field empty.
 func TestGetProvision_RetainedIncludesPartition(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
-	e := retentionEntryFixture("lease-p", "tenant-a", time.Now().Add(-time.Hour))
+	e := retentionEntryFixture(infoPartitionRetentionLeaseUUID, "tenant-a", time.Now().Add(-time.Hour))
 	e.Partition = "cust-a"
-	require.NoError(t, rs.Put(e))
+	require.NoError(t, putRetentionForTest(t, rs, e))
 
-	info, err := b.GetProvision(context.Background(), "lease-p")
+	info, err := b.GetProvision(context.Background(), infoPartitionRetentionLeaseUUID)
 	require.NoError(t, err)
 	require.Equal(t, backend.ProvisionStatusRetained, info.Status)
 	require.Equal(t, "cust-a", info.Partition)
@@ -70,16 +69,19 @@ func TestGetProvision_RetainedIncludesPartition(t *testing.T) {
 func TestGetProvision_Retained_Active(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
 	createdAt := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-r", "tenant-a", createdAt)))
-
-	info, err := b.GetProvision(context.Background(), "lease-r")
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture(infoRetentionLeaseUUID, "tenant-a", createdAt)))
+	persisted, err := rs.Get(infoRetentionLeaseUUID)
 	require.NoError(t, err)
-	assert.Equal(t, "lease-r", info.LeaseUUID)
+	require.NotNil(t, persisted)
+
+	info, err := b.GetProvision(context.Background(), infoRetentionLeaseUUID)
+	require.NoError(t, err)
+	assert.Equal(t, infoRetentionLeaseUUID, info.LeaseUUID)
 	assert.Equal(t, backend.ProvisionStatusRetained, info.Status)
-	assert.Equal(t, "prov-1", info.ProviderUUID)
+	assert.Equal(t, nominalDockerProviderUUID, info.ProviderUUID)
 	assert.Equal(t, "tenant-a", info.Tenant, "Tenant must be populated for the authz fallback")
 	assert.Equal(t, b.cfg.Name, info.BackendName)
-	assert.WithinDuration(t, createdAt.Add(b.cfg.RetentionMaxAge), info.RetainedUntil, time.Second)
+	assert.WithinDuration(t, persisted.CreatedAt.Add(b.cfg.RetentionMaxAge), info.RetainedUntil, time.Second)
 	require.Len(t, info.Items, 1)
 	assert.Equal(t, "web", info.Items[0].ServiceName)
 	assert.Equal(t, "docker-micro", info.Items[0].SKU)
@@ -91,11 +93,11 @@ func TestGetProvision_Retained_Active(t *testing.T) {
 // not a 404.
 func TestGetProvision_Retained_Restoring(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
-	entry := retentionEntryFixture("lease-r", "tenant-a", time.Now())
+	entry := retentionEntryFixture(infoRetentionLeaseUUID, "tenant-a", time.Now())
 	entry.Status = shared.RetentionStatusRestoring
 	putRestoringRetention(t, rs, entry)
 
-	info, err := b.GetProvision(context.Background(), "lease-r")
+	info, err := b.GetProvision(context.Background(), infoRetentionLeaseUUID)
 	require.NoError(t, err)
 	assert.Equal(t, backend.ProvisionStatusRetained, info.Status)
 }
@@ -109,11 +111,11 @@ func TestGetProvision_Retained_Restoring(t *testing.T) {
 // it must fall through to ErrNotProvisioned. (ENG-376)
 func TestStatusAudit_GetProvision_ReapingNotReported(t *testing.T) {
 	b, rs := newBackendWithRetention(t)
-	entry := retentionEntryFixture("lease-r", "tenant-a", time.Now())
+	entry := retentionEntryFixture(infoRetentionLeaseUUID, "tenant-a", time.Now())
 	entry.Status = shared.RetentionStatusReaping
-	require.NoError(t, rs.Put(entry))
+	require.NoError(t, putRetentionForTest(t, rs, entry))
 
-	_, err := b.GetProvision(context.Background(), "lease-r")
+	_, err := b.GetProvision(context.Background(), infoRetentionLeaseUUID)
 	assert.ErrorIs(t, err, backend.ErrNotProvisioned,
 		"a reaping record must not be reported as retained; it falls through")
 }
@@ -142,16 +144,16 @@ func TestGetProvision_RetentionPrecedesDiagnostics(t *testing.T) {
 
 	// Seed a stale Failed diagnostics entry...
 	require.NoError(t, diagStore.Store(shared.DiagnosticEntry{
-		LeaseUUID:    "lease-r",
+		LeaseUUID:    infoRetentionLeaseUUID,
 		ProviderUUID: "prov-1",
 		Error:        "old failure before close",
 		FailCount:    3,
 		CreatedAt:    time.Now().Add(-48 * time.Hour),
 	}))
 	// ...and an active retention record for the same lease.
-	require.NoError(t, rs.Put(retentionEntryFixture("lease-r", "tenant-a", time.Now())))
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture(infoRetentionLeaseUUID, "tenant-a", time.Now())))
 
-	info, err := b.GetProvision(context.Background(), "lease-r")
+	info, err := b.GetProvision(context.Background(), infoRetentionLeaseUUID)
 	require.NoError(t, err)
 	assert.Equal(t, backend.ProvisionStatusRetained, info.Status,
 		"retention must take precedence over the stale Failed diagnostics entry")

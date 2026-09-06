@@ -2,8 +2,8 @@ package docker
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
@@ -28,74 +28,89 @@ import (
 // (which carries the caller's ctx); the docker substrate honors this
 // per the LeaseActorConfig.DoDeprovisionFn contract.
 func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
-	return leasesm.NewLeaseActor(func(a *leasesm.LeaseActor) leasesm.LeaseActorConfig {
-		return leasesm.LeaseActorConfig{
-			LeaseUUID:      leaseUUID,
-			Logger:         b.logger,
-			StopCtx:        b.stopCtx,
-			WG:             &b.wg,
-			Inspector:      b.inspector,
-			Diag:           b.gatherer,
-			CallbackSender: b.callbackSender,
-			ProvisionStore: b.provisionStore,
-			Metrics:        dockerSMMetrics{},
-			// OnTerminated closes over `a` so the registry-delete check
-			// preserves its "only delete if I'm still the registered
-			// actor for this UUID" semantics — equivalent to the
-			// removeFromRegistry `reg == a` guard in the original
-			// docker-side implementation. Without this check, a fresh
-			// actor stored for the same UUID after our exit started
-			// could be clobbered.
-			OnTerminated: func(uuid string) {
-				b.actorsMu.Lock()
-				defer b.actorsMu.Unlock()
-				if reg, ok := b.actors[uuid]; ok && reg == a {
-					delete(b.actors, uuid)
-				}
-			},
-			PersistDiagnosticsFn: func(entry shared.DiagnosticEntry, containerIDs []string, keys map[string]string) {
-				b.persistDiagnostics(entry, containerIDs, keys)
-			},
-			PersistDiagnosticsWithLogsFn: func(entry shared.DiagnosticEntry, logs map[string]string) {
-				b.persistDiagnosticsWithLogs(entry, logs)
-			},
-			SendOperationCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
-				// Provision/restore operation completions never carry the
-				// deprovision retain-success flag.
-				b.sendOperationCallbackWithURL(uuid, url, status, errMsg)
-			},
-			SendLifecycleCallbackFn: func(uuid, url string, status backend.CallbackStatus, errMsg string) {
-				if url == "" {
-					b.provisionsMu.RLock()
-					var completionURL string
-					if provision, exists := b.provisions[uuid]; exists {
-						completionURL = provision.CallbackURL
-					}
-					b.provisionsMu.RUnlock()
-					resolved, err := backend.ResolveLifecycleCallbackURL(completionURL, "")
-					if err != nil {
-						b.logger.Error("cannot derive lifecycle callback URL; suppressing observational callback",
-							"lease_uuid", uuid, "error", err)
-						return
-					}
-					url = resolved
-				}
-				b.sendLifecycleCallbackWithURL(uuid, url, status, errMsg, false)
-			},
-			SendMaintenanceCallbackFn: func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string) {
-				if b.callbackSender == nil {
-					b.logger.Error("cannot settle maintenance callback without durable sender",
-						"lease_uuid", claim.LeaseUUID())
-					return
-				}
-				if err := b.callbackSender.SendMaintenanceCallback(claim, status, errMsg); err != nil {
-					b.logger.Error("failed to settle maintenance callback; durable intent retained for recovery",
-						"lease_uuid", claim.LeaseUUID(), "maintenance_id", claim.MaintenanceID(), "error", err)
-				}
-			},
-			DoDeprovisionFn: func(ctx context.Context, leaseUUID string) error {
-				return b.doDeprovision(ctx, leaseUUID)
-			},
+	if b.recoveryCoordinator == nil {
+		// Lightweight unit fixtures may construct actors before installing durable
+		// settlements. Production always binds the complete coordinator in New.
+		coordinator, err := shared.NewRecoveryCoordinator(shared.RecoveryCoordinatorConfig{
+			ExcludeLease: b.withRecoveryLeaseExclusion,
+		})
+		if err != nil {
+			panic(fmt.Sprintf("construct recovery coordinator for lease actor %q: %v", leaseUUID, err))
 		}
+		b.recoveryCoordinator = coordinator
+	}
+	actor, err := leasesm.NewLeaseActor(leasesm.LeaseActorConfig{
+		LeaseUUID:         leaseUUID,
+		Logger:            b.logger,
+		StopCtx:           b.stopCtx,
+		WG:                &b.wg,
+		Inspector:         b.inspector,
+		Diag:              b.gatherer,
+		ProvisionStore:    b.provisionStore,
+		Metrics:           dockerSMMetrics{},
+		ProvisionWorkFn:   b.executeProvisionWork,
+		RestoreWorkFn:     b.executeRestoreWork,
+		MaintenanceWorkFn: b.executeMaintenanceWork,
+		// OnTerminated closes over `a` so the registry-delete check
+		// preserves its "only delete if I'm still the registered
+		// actor for this UUID" semantics — equivalent to the
+		// removeFromRegistry `reg == a` guard in the original
+		// docker-side implementation. Without this check, a fresh
+		// actor stored for the same UUID after our exit started
+		// could be clobbered.
+		OnTerminated: func(uuid string, terminated *leasesm.LeaseActor) {
+			b.actorsMu.Lock()
+			defer b.actorsMu.Unlock()
+			if reg, ok := b.actors[uuid]; ok && reg == terminated {
+				delete(b.actors, uuid)
+			}
+		},
+		PersistDiagnosticsFn: func(entry shared.DiagnosticEntry, containerIDs []string, keys map[string]string) {
+			b.persistDiagnostics(entry, containerIDs, keys)
+		},
+		PersistDiagnosticsWithLogsFn: func(entry shared.DiagnosticEntry, logs map[string]string) {
+			b.persistDiagnosticsWithLogs(entry, logs)
+		},
+		SendOperationSuccessFn: func(
+			committed shared.OperationReleaseCommitted,
+		) {
+			b.sendOperationSuccessWithURL(committed)
+		},
+		SendOperationFailureFn: func(
+			proof shared.OperationReleaseUncommitted,
+			errMsg string,
+		) {
+			b.sendOperationFailure(proof, errMsg)
+		},
+		SendLifecycleFailureFn: func(runtime shared.RuntimeGenerationProof, errMsg string) {
+			b.sendLifecycleFailure(runtime, errMsg)
+		},
+		SendMaintenanceSuccessFn: func(
+			active shared.MaintenanceReleaseActive,
+		) {
+			if err := b.resolveMaintenanceSuccess(active); err != nil {
+				b.logger.Error("failed to settle maintenance success; durable intent retained for recovery",
+					"lease_uuid", active.LeaseUUID(), "maintenance_id", active.MaintenanceID(), "error", err)
+			}
+		},
+		SendMaintenanceFailureFn: func(
+			failed shared.MaintenanceReleaseFailure,
+			errMsg string,
+		) {
+			if err := b.resolveMaintenanceFailure(failed, errMsg); err != nil {
+				b.logger.Error("failed to settle maintenance failure; durable intent retained for recovery",
+					"lease_uuid", failed.LeaseUUID(), "maintenance_id", failed.MaintenanceID(), "error", err)
+			}
+		},
+		RecoveryLineage: b.recoveryCoordinator.Lineage(),
+		DoDeprovisionFn: func(ctx context.Context, scope leasesm.ActorCloseScope) error {
+			return b.doDeprovision(ctx, scope)
+		},
+	}, func(actor *leasesm.LeaseActor) {
+		b.actors[leaseUUID] = actor
 	})
+	if err != nil {
+		panic(fmt.Sprintf("construct lease actor %q: %v", leaseUUID, err))
+	}
+	return actor
 }

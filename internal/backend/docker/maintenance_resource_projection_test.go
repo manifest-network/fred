@@ -13,7 +13,8 @@ import (
 func TestRecoverMaintenanceWarmActorProjectsTargetResourceProfilesIdempotently(t *testing.T) {
 	h := newMaintenanceRecoveryHarness(t)
 	h.appendTarget(true)
-	require.NoError(t, h.releases.ActivateMaintenance(h.target))
+	_, err := activateMaintenanceForTest(t, h.b.maintenanceSettlement, h.target)
+	require.NoError(t, err)
 	target, err := h.releases.LatestActive(h.leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, target)
@@ -38,37 +39,31 @@ func TestRecoverMaintenanceWarmActorProjectsTargetResourceProfilesIdempotently(t
 			Status:               backend.ProvisionStatusReady,
 			CallbackURL:          h.source.RuntimeAuthority.CallbackURL(),
 			LifecycleCallbackURL: h.source.RuntimeAuthority.LifecycleCallbackURL(),
+			ActiveOperationID:    h.source.OperationID,
 			Items:                append([]backend.LeaseItem(nil), h.source.Items...),
 			ResourceProfiles:     shared.CloneSKUResourceSnapshot(sourceProfiles),
 			ContainerIDs:         []string{"source-container"},
 			StackManifest:        h.targetReleaseStack(),
 			ServiceContainers:    map[string][]string{"web": {"source-container"}},
 		},
-		ResourceProfiles: shared.CloneSKUResourceSnapshot(sourceProfiles),
 	}
 	actor := h.b.actorFor(h.leaseUUID)
 	require.Equal(t, backend.ProvisionStatusReady, actor.State())
 
-	// Model the crash boundary after actor projection but before intent→outbox
-	// settlement. The first convergence must update both the actor-owned state
-	// and Docker's directly-read wrapper field.
-	routed, err := h.b.convergeMaintenanceSuccess(
-		t.Context(), h.intent, *target, targetContainers,
-	)
-	require.NoError(t, err)
-	require.True(t, routed)
-	assertMaintenanceResourceProfiles(t, h.b, h.leaseUUID, target.ResourceProfiles)
-	intents, err := h.callbacks.ListMaintenanceIntents()
+	// Model the crash boundary after substrate activation but before
+	// intent→outbox settlement. Recovery owns the actor's quiescence claim,
+	// retires that stale generation, and publishes the target projection
+	// directly; it never re-enters the excluded actor.
+	intents, err := h.b.maintenanceSettlement.ListMaintenanceIntents()
 	require.NoError(t, err)
 	require.Len(t, intents, 1)
 
-	// Recovery replays the same typed projection before atomically consuming the
-	// still-live WAL. The actor is already Ready, so this exercises the dedicated
-	// same-state repair path without regressing either resource-profile view.
 	require.NoError(t, h.b.recoverMaintenanceIntents(t.Context()))
 	h.assertSettled(backend.CallbackStatusSuccess)
 	assertMaintenanceResourceProfiles(t, h.b, h.leaseUUID, target.ResourceProfiles)
-	require.Equal(t, backend.ProvisionStatusReady, actor.State())
+	freshActor := h.b.actorFor(h.leaseUUID)
+	require.NotSame(t, actor, freshActor)
+	require.Equal(t, backend.ProvisionStatusReady, freshActor.State())
 }
 
 func assertMaintenanceResourceProfiles(
@@ -80,12 +75,7 @@ func assertMaintenanceResourceProfiles(
 	t.Helper()
 	b.provisionsMu.RLock()
 	direct := shared.CloneSKUResourceSnapshot(b.provisions[leaseUUID].ResourceProfiles)
-	embedded := shared.CloneSKUResourceSnapshot(b.provisions[leaseUUID].ProvisionState.ResourceProfiles)
 	b.provisionsMu.RUnlock()
 	require.Equal(t, want, direct)
-	require.Equal(t, want, embedded)
 
-	projected, found := b.provisionStore.Get(leaseUUID)
-	require.True(t, found)
-	require.Equal(t, want, projected.ResourceProfiles)
 }

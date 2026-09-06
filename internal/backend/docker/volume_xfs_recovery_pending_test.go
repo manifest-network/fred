@@ -25,7 +25,7 @@ func TestVolumeRecoveryPendingPreventsHiddenDeleteStageReaperBypass(t *testing.T
 	name := retainedName(canonicalVolumeName(leaseUUID, "app", 0))
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	rs := attachRetentionStore(t, b)
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID: leaseUUID,
 		Tenant:            "tenant-a",
 		Status:            shared.RetentionStatusReaping,
@@ -51,20 +51,22 @@ func TestVolumeRecoveryPendingPreventsHiddenDeleteStageReaperBypass(t *testing.T
 		},
 	}
 
-	assert.False(t, b.destroyReapingVolumes(t.Context(), b.newManagedVolumeIndex(), leaseUUID))
+	proof := reapingProofForTest(t, b.retentionStore, leaseUUID)
+	assert.False(t, b.destroyReapingVolumes(t.Context(), b.newManagedVolumeIndex(), proof))
 	require.ErrorIs(t, b.terminalStorageAuthorityError(), ErrVolumeMutationRecoveryPending)
 	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
 	record, err := rs.Get(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, record)
-	assert.Equal(t, shared.RetentionStatusReaping, record.Status)
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous,
+		"the same backend generation must not consume any journal after an ambiguous physical effect")
+	assert.Nil(t, record)
 
-	assert.False(t, b.destroyReapingVolumes(t.Context(), b.newManagedVolumeIndex(), leaseUUID),
+	assert.False(t, b.destroyReapingVolumes(t.Context(), b.newManagedVolumeIndex(), proof),
 		"a stopped Backend must not re-infer completion from a now-empty visible namespace")
 	assert.Equal(t, int32(1), listCalls.Load(), "the terminal gate must run before the second inventory")
 	record, err = rs.Get(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, record, "the restart recovery vehicle/accounting record must survive")
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	assert.Nil(t, record,
+		"the latched generation must not turn an unreadable finalizer into evidence that it disappeared")
 }
 
 func TestVolumeRecoveryPendingPreservesCloseFinalizersAndRejectsLiveRetry(t *testing.T) {
@@ -79,16 +81,12 @@ func TestVolumeRecoveryPendingPreservesCloseFinalizersAndRejectsLiveRetry(t *tes
 		return ErrVolumeMutationRecoveryPending
 	}}
 
-	err := b.doDeprovision(t.Context(), closeDeprovisionLeaseUUID)
+	err := b.doDeprovisionForTest(t, t.Context(), closeDeprovisionLeaseUUID)
 	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending)
 	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
-	claim, found, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
-	require.NoError(t, readErr)
-	require.True(t, found, "the exact close recovery capability must survive")
-	assert.Zero(t, claim.CleanupAttempts(), "a recovery-required outcome is not an exhaustible ordinary retry")
-	releases, readErr := stores.releases.List(closeDeprovisionLeaseUUID)
-	require.NoError(t, readErr)
-	require.NotEmpty(t, releases, "the active release must survive until fresh-process recovery")
+	_, _, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.ErrorIs(t, readErr, ErrVolumeMutationRecoveryPending,
+		"the recovery-required substrate outcome must revoke authoritative reads in this backend lifetime")
 	b.provisionsMu.RLock()
 	projected := b.provisions[closeDeprovisionLeaseUUID]
 	b.provisionsMu.RUnlock()
@@ -99,6 +97,25 @@ func TestVolumeRecoveryPendingPreservesCloseFinalizersAndRejectsLiveRetry(t *tes
 	require.ErrorIs(t, err, ErrVolumeMutationRecoveryPending,
 		"the stopped instance must reject a retry before it can infer from the partial namespace")
 	assert.Equal(t, int32(1), destroyCalls.Load())
+	storageID := b.storageIdentity
+
+	closeCloseRecoveryBackend(t, b, stores)
+
+	// Only a fresh Backend generation may re-attest the storage identity and
+	// recover the exact durable finalizers after an ambiguous raw mutation.
+	b, stores = openCloseRecoveryBackend(t, dir, &mockDockerClient{}, nil)
+	require.Equal(t, storageID, b.storageIdentity, "restart must re-attest the same storage generation")
+	claim, found, readErr := stores.callbacks.GetCloseIntent(closeDeprovisionLeaseUUID)
+	require.NoError(t, readErr)
+	require.True(t, found, "the exact close recovery capability must survive restart")
+	assert.Equal(t, 1, claim.ExecutionGeneration().Number(),
+		"an ambiguous raw mutation must preserve the exact durable Started generation")
+	releases, readErr := stores.releases.List(closeDeprovisionLeaseUUID)
+	require.NoError(t, readErr)
+	require.NotEmpty(t, releases, "the active release must survive until fresh-process recovery")
+	pending, readErr := stores.callbacks.ListPending()
+	require.NoError(t, readErr)
+	require.Empty(t, pending, "an unclassified close outcome cannot publish a terminal callback")
 
 	closeCloseRecoveryBackend(t, b, stores)
 }

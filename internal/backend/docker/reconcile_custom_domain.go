@@ -2,9 +2,13 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/maintenanceid"
 )
 
 // ReconcileCustomDomain reapplies the per-LeaseItem custom_domain values from
@@ -76,6 +80,8 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 		return nil
 	}
 	overrides := b.computeCustomDomainOverrides(prov, items, dnsReady)
+	currentCallbackURL := prov.CallbackURL
+	currentLifecycleCallbackURL := prov.LifecycleCallbackURL
 	b.provisionsMu.RUnlock()
 
 	if len(overrides) == 0 {
@@ -90,7 +96,28 @@ func (b *Backend) ReconcileCustomDomain(ctx context.Context, leaseUUID string, i
 	// routeReplaceRestart re-reads and validates the provision's persisted
 	// lifecycle route. Passing no request URL prevents this autonomous path from
 	// accidentally treating a lifecycle_id URL as a fresh operation callback.
-	return b.routeReplaceRestart(ctx, leaseUUID, "", overrides)
+	_, lifecycleCallbackURL, err := resolveMaintenanceCallbackURLs(
+		currentCallbackURL, currentLifecycleCallbackURL, "",
+	)
+	if err != nil {
+		return fmt.Errorf("resolve custom-domain lifecycle authority: %w", err)
+	}
+	payload, err := json.Marshal(overrides)
+	if err != nil {
+		return fmt.Errorf("encode custom-domain maintenance request: %w", err)
+	}
+	id, err := maintenanceid.New()
+	if err != nil {
+		return fmt.Errorf("allocate custom-domain maintenance identity: %w", err)
+	}
+	request, err := b.maintenanceSettlement.NewMaintenanceRequestAuthority(
+		id, shared.MaintenanceIntentCustomDomain, leaseUUID,
+		lifecycleCallbackURL, payload,
+	)
+	if err != nil {
+		return fmt.Errorf("construct custom-domain maintenance authority: %w", err)
+	}
+	return b.routeReplaceRestart(ctx, request, overrides)
 }
 
 // matchedDomain pairs a chain item's desired custom_domain with the matched

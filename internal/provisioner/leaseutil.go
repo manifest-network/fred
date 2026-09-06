@@ -55,20 +55,6 @@ func validationErrorToRejectReason(err error) string {
 	}
 }
 
-// isTerminalAcknowledgeError returns true if the error indicates the lease
-// cannot be acknowledged and retrying won't help. This includes cases where
-// the lease is already acknowledged (not in PENDING state).
-func isTerminalAcknowledgeError(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Check against specific billing module errors using errors.Is().
-	// ErrLeaseNotPending: lease is already ACTIVE or in another terminal state.
-	// ErrLeaseNotFound: lease doesn't exist (may have been deleted).
-	return errors.Is(err, billingtypes.ErrLeaseNotPending) ||
-		errors.Is(err, billingtypes.ErrLeaseNotFound)
-}
-
 // ExtractRoutingSKU returns a SKU UUID from the lease for backend routing.
 //
 // Why this exists: A lease may contain multiple items with different SKUs,

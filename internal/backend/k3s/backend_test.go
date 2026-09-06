@@ -74,9 +74,32 @@ func newBackendForTest(t *testing.T, fredURL string) *Backend {
 	require.NoError(t, err)
 	bindK3sTestStorageIdentity(t, b)
 
-	rebuildCallbackSender(b)
+	rebuildCallbackSender(t, b)
 	t.Cleanup(func() { _ = b.Stop() })
 	return b
+}
+
+func concreteK3sOperationSettlement(b *Backend) *shared.OperationSettlement {
+	settlement, ok := b.operationSettlement.(*shared.OperationSettlement)
+	if !ok {
+		panic("test requires the concrete production operation settlement")
+	}
+	return settlement
+}
+
+func commitK3sOperationRefusal(
+	t *testing.T,
+	b *Backend,
+	claim shared.OperationIntentClaim,
+) shared.OperationReleaseUncommitted {
+	t.Helper()
+	candidate, err := b.operationSettlement.PrepareOperationRelease(claim)
+	require.NoError(t, err)
+	failure, err := b.operationSettlement.RefuseOperationExecution(candidate)
+	require.NoError(t, err)
+	uncommitted, err := b.operationSettlement.CommitOperationFailure(failure)
+	require.NoError(t, err)
+	return uncommitted
 }
 
 // rebuildCallbackSender swaps b.callbackSender for one configured with
@@ -84,20 +107,44 @@ func newBackendForTest(t *testing.T, fredURL string) *Backend {
 // us replace a production field without production carrying a seam for
 // it; the client is a local here, because a *Backend field only tests
 // read would be test scaffolding in a production struct (ENG-765).
-func rebuildCallbackSender(b *Backend) {
+func rebuildCallbackSender(t *testing.T, b *Backend) {
+	t.Helper()
 	httpClient := &http.Client{}
+	attestor := shared.MustNewCallbackStorageAttestor(
+		b.callbackStore,
+		k3sCallbackStorageVerifier{verifier: b.storageVerifier, gate: b.storeAuthorityGate},
+		b.stopCtx,
+	)
 	b.callbackSender = shared.MustNewCallbackSender(shared.CallbackSenderConfig{
 		Store:           b.callbackStore,
+		StorageAttestor: attestor,
 		HTTPClient:      httpClient,
 		Secret:          string(b.cfg.CallbackSecret),
-		StorageIdentity: b.storageIdentity,
-		BeforeDelivery:  b.VerifyStorageIdentity,
-		BeforeReplay:    b.VerifyStorageIdentity,
 		Logger:          b.logger,
-		StopCtx:         b.stopCtx,
+
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: testCallbackDeliveryTimeout,
 	})
+	maintenanceSettlement, err := shared.NewMaintenanceSettlement(b.callbackStore, b.releaseStore)
+	if err != nil {
+		panic(err)
+	}
+	b.callbackPublisher = mustNewCallbackPublisherForTest(t, shared.CallbackPublisherConfig{
+		OperationSettlement:   concreteK3sOperationSettlement(b),
+		MaintenanceSettlement: maintenanceSettlement,
+		StorageAttestor:       attestor,
+		Logger:                b.logger,
+	})
+}
+
+func mustNewCallbackPublisherForTest(
+	t *testing.T,
+	cfg shared.CallbackPublisherConfig,
+) *shared.CallbackPublisher {
+	t.Helper()
+	publisher, err := shared.NewCallbackPublisher(cfg)
+	require.NoError(t, err)
+	return publisher
 }
 
 // startK3sCallbackReplayForTest opts a fixture into the same tracked delivery
@@ -202,19 +249,19 @@ func seedK3sProvisionIntentForTest(
 	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
 	require.NoError(t, err)
 	items := []backend.LeaseItem{{SKU: "k3s-small", ServiceName: "app", Quantity: 1}}
-	_, err = b.callbackStore.BeginOperationIntent(shared.OperationIntentSpec{
+	candidate, err := b.operationSettlement.NewOperationIntentCandidate(shared.OperationIntentSpec{
 		Kind:                 shared.OperationIntentProvision,
 		LeaseUUID:            leaseUUID,
 		CallbackURL:          callbackURL,
 		LifecycleCallbackURL: lifecycleURL,
-		Backend:              b.cfg.Name,
-		BackendStorageID:     b.storageIdentity,
 		Tenant:               "manifest1test",
 		ProviderUUID:         testK3sProviderUUID,
 		Items:                items,
 		ResourceProfiles:     testK3sResourceProfiles(t, b, items),
 		Manifest:             []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`),
 	})
+	require.NoError(t, err)
+	_, err = b.operationSettlement.BeginOperationIntent(candidate)
 	require.NoError(t, err)
 	return callbackURL
 }
@@ -435,7 +482,7 @@ func TestProvision_AllowsRetryAfterFailure(t *testing.T) {
 	_ = awaitCallback(t, ch)
 	require.Eventually(t, func() bool {
 		pending, pendingErr := b.callbackStore.ListPending()
-		intents, intentErr := b.callbackStore.ListOperationIntents()
+		intents, intentErr := b.operationSettlement.ListOperationIntents()
 		return pendingErr == nil && intentErr == nil && len(pending) == 0 && len(intents) == 0
 	}, time.Second, time.Millisecond,
 		"the first synchronous 2xx must precisely remove its completion before a new generation")
@@ -526,18 +573,16 @@ func TestDeprovision_PreservesPendingExactCallback(t *testing.T) {
 	// delivery hasn't succeeded yet". Bypasses Provision so goroutine timing
 	// stays out of the test without manufacturing causal evidence directly.
 	callbackURL := seedK3sProvisionIntentForTest(t, b, leaseUUID, fred.URL)
-	intents, err := b.callbackStore.ListOperationIntents()
+	intents, err := b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
 	require.Len(t, intents, 1)
-	entry, err := b.callbackStore.ResolveOperationIntent(
-		intents[0], backend.CallbackStatusFailed, "not implemented",
-	)
-	require.NoError(t, err)
-	require.Equal(t, callbackURL, entry.CallbackURL)
+	require.NoError(t, b.resolvePreEffectOperationRefusal(intents[0], "not implemented"))
 
 	pending, err := b.callbackStore.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "precondition: callback store has the seeded entry")
+	entry := pending[0]
+	require.Equal(t, callbackURL, entry.CallbackURL)
 
 	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 

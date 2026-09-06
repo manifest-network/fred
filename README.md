@@ -62,6 +62,16 @@ A Go daemon for Manifest Network providers that manages the complete lease lifec
       +---------------+     +---------------+     +---------------+
 ```
 
+Inside the provider, construction binds the durable placement Store, the
+process-local operation Registry, one backend router, and one validated callback
+factory exactly once. Purpose-specific placement applications own complete
+provision, restore, maintenance, callback, timeout, deprovision, and
+reconciliation sequences; Watermill and HTTP handlers supply opaque intents and
+consume closed results rather than assembling claims or selecting outcomes.
+The Registry exposes only its one-shot settlement-authority binder; after
+composition, `Manager` retains an `operation.RuntimeController` for status and
+graceful drain, not Registry mutation authority.
+
 ### Event Fan-Out
 
 The Event Subscriber uses a fan-out pattern where each consumer (Event Bridge, Watcher, etc.) gets its own channel and receives **all** events independently. This ensures that:
@@ -179,6 +189,11 @@ All required fields are validated at startup. The daemon will fail to start with
 ### Backend Configuration
 
 Backends are services that handle the actual resource provisioning. Backend and callback URLs must be absolute HTTP(S) URLs. Provider `production_mode: true` requires HTTPS in both directions and verifies backend peers using the configured private CA (or system roots); bundled backends must also enable production mode so callback peer verification cannot be disabled. HTTP is development-only because request HMAC does not authenticate backend responses and callback HMAC does not provide transport confidentiality.
+
+The currently deployed and production-validated execution envelope is
+`docker-backend` on XFS. K3s is a non-functional scaffold, and Docker's Btrfs
+and ZFS volume implementations have automated coverage but are experimental and
+not deployed; use XFS for production. See [Deployment](DEPLOYMENT.md#filesystem-setup).
 
 Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing (use `default: true` for fallback). When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318). Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.
 
@@ -303,11 +318,15 @@ journals. Existing v0.13 Docker storage instead uses the stopped-and-drained
 `adopt` cutover in [Deployment](DEPLOYMENT.md#upgrading-from-v0130).
 
 Bundled Docker and k3s backends require a positive `callback_max_age` (default
-`24h`). The age applies to legacy callbacks and typed lifecycle observations;
+`24h`). The age applies to typed lifecycle observations;
 exact operation and maintenance completions never expire because they may be the
 only evidence that can settle Fred's durable write-ahead attempt or an exact
 replacement. Operation/maintenance intents and Docker close intents likewise do
-not age out. Strict per-lease FIFO means an undeliverable exact completion remains
+not age out. An operation row transitions atomically from Pending to Succeeded or
+Failed when its callback is enqueued and remains after that delivery succeeds;
+the outbox row and durable terminal decision have deliberately separate
+lifetimes. A later authorized lease transition may atomically supersede or
+retire the terminal history. Strict per-lease FIFO means an undeliverable exact completion remains
 a permanent ordering barrier until it is delivered or repaired. Zero or negative
 values are rejected at startup.
 
@@ -408,8 +427,8 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080
 | `GET` | `/v1/leases/{uuid}/logs` | ADR-036 | No | Any | Idempotent read |
 | `GET` | `/v1/leases/{uuid}/releases` | ADR-036 | No | Any | Idempotent read |
 | `POST` | `/v1/leases/{uuid}/data` | ADR-036 | No | Pending | Has own idempotency (409 on duplicate) |
-| `POST` | `/v1/leases/{uuid}/restart` | ADR-036 | Yes | Active | Mutating — replaying would restart again |
-| `POST` | `/v1/leases/{uuid}/update` | ADR-036 | Yes | Active | Mutating — replaying would redeploy again |
+| `POST` | `/v1/leases/{uuid}/restart` | ADR-036 + `Idempotency-Key` | Yes | Active | Durable, lease-scoped idempotent maintenance command |
+| `POST` | `/v1/leases/{uuid}/update` | ADR-036 + `Idempotency-Key` | Yes | Active | Durable, lease-scoped idempotent maintenance command |
 | `POST` | `/v1/leases/{uuid}/restore` | ADR-036 | Yes | Pending | Restore a soft-deleted lease's data into this fresh lease |
 | `GET` | `/v1/leases/{uuid}/events` | ADR-036 | No | Any | WebSocket stream of lease status events |
 
@@ -607,7 +626,9 @@ Returns connection details for an active lease from the backend. Requires ADR-03
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
 - `500 Internal Server Error` - The backend failed while reading connection details
-- `503 Service Unavailable` - A required authentication or routing service is unavailable, or durable placement is unusable or unresolved
+- `503 Service Unavailable` - A required authentication or routing service is
+  unavailable, durable placement is unusable or unresolved, or the bounded
+  provider/backend idempotency journal refused admission before side effects
 
 ### Get Lease Status
 
@@ -635,7 +656,7 @@ Returns the current provisioning status of a lease. Useful for checking if provi
 **Fields:**
 - `tenant` - Tenant address from the authenticated token
 - `provider_uuid` - Provider UUID
-- `state` - Chain lease state (PENDING, ACTIVE, CLOSED, EXPIRED)
+- `state` - Chain lease state (`PENDING`, `ACTIVE`, `CLOSED`, `REJECTED`, or `EXPIRED`). `UNSPECIFIED` and unrecognized future values are non-actionable safety states: reconciliation preserves backend state and retries rather than inferring cleanup authority.
 - `requires_payload` - True if lease has meta_hash (expects payload upload)
 - `meta_hash_hex` - Expected payload hash in hex (omitted if no meta_hash)
 - `payload_received` - True if payload has been uploaded
@@ -774,9 +795,31 @@ Upload deployment configuration for a lease that was created with a `meta_hash`.
 ```
 POST /v1/leases/{lease_uuid}/restart
 Authorization: Bearer <token>
+Idempotency-Key: <canonical UUIDv4>
 ```
 
 Restart containers for a lease without changing the manifest. Containers are stopped, removed, and recreated with the same configuration. Volumes are preserved. Allowed from `ready` or `failed` state.
+
+The idempotency key is scoped to this lease. Retrying the exact same key and
+command returns the same durable result without starting another replacement;
+reusing the key for a different command or update payload returns `409`. A
+different key also returns `409` while an earlier command is unresolved. Fred
+keeps terminal provider receipts for the lifetime of the lease's placement or
+lifecycle authority, and pending commands until they are definitively settled.
+Removing the lease's final placement or lifecycle authority atomically reclaims
+its terminal receipts in the same database transaction. The provider and
+backend therefore agree permanently whether a live-lease key names
+completed work; divergent reuse remains a conflict, and an arbitrarily late
+retry cannot restart work or move the provider's desired payload backward.
+Clients must generate a fresh UUIDv4 for each new logical command and reuse it
+only for retries. A live lease that reaches the 1,024-receipt safety ceiling is
+refused before dispatch rather than forgetting an identity.
+
+Fred derives tenant, provider, backend/storage, and callback authority from its
+prepared placement store; the request supplies none of those routing facts.
+For an upgraded v0.13 owner, the first complete identity-bearing fleet inventory
+must establish that durable runtime principal before restart/update is enabled.
+Once established, an unrelated backend outage does not revoke it.
 
 **Response:** `202 Accepted`
 ```json
@@ -787,17 +830,22 @@ Restart containers for a lease without changing the manifest. Containers are sto
 
 **Response Codes:**
 - `202 Accepted` - Restart initiated
+- `400 Bad Request` - Missing, repeated, or non-canonical UUIDv4 `Idempotency-Key`
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
-- `409 Conflict` - Lease is in a state that cannot be restarted (e.g., already restarting or updating)
-- `503 Service Unavailable` - A required authentication or routing service is unavailable, or durable placement is unusable or unresolved
+- `409 Conflict` - The key conflicts with a prior command, another command is
+  pending, or the lease is in a state that cannot be restarted
+- `503 Service Unavailable` - The backend request was not sent (for example an
+  open circuit), authentication/routing authority is temporarily unavailable,
+  or a bounded idempotency journal refused admission before side effects
 
 ### Update Lease
 
 ```
 POST /v1/leases/{lease_uuid}/update
 Authorization: Bearer <token>
+Idempotency-Key: <canonical UUIDv4>
 Content-Type: application/json
 
 {
@@ -807,7 +855,7 @@ Content-Type: application/json
 
 Deploy a new manifest for a lease, replacing containers with a new image/configuration. The old containers are stopped, new ones are created from the updated manifest, and old containers are cleaned up after verification. On failure, the operation rolls back to the previous containers. Volumes are preserved.
 
-A successful update is also **persisted** to the payload store, replacing the manifest the lease was created with. This is what makes an update survive a reprovision: the reconciler replays whatever is stored, so an update applied only to the running containers would be silently undone by the next reboot, crash-restart or host failure (ENG-619). The payload is written *after* the backend accepts it, so a rejected update never enters the store; if that write fails the endpoint answers `500` rather than `202`, because a `202` would promise a durability fred does not have. Retrying re-applies and re-persists.
+A successful update is also **persisted** to the payload store, replacing the manifest the lease was created with. This is what makes an update survive a reprovision: the reconciler replays whatever is stored, so an update applied only to the running containers would be silently undone by the next reboot, crash-restart or host failure (ENG-619). The payload is written *after* the backend accepts it, so a rejected update never enters the store; if that write fails the endpoint answers `500` rather than `202`, because a `202` would promise a durability fred does not have. Fred retains the pending command and automatically retries the exact typed backend request and payload persistence; a tenant retry with the same `Idempotency-Key` joins that recovery.
 
 Because the on-chain `meta_hash` is set once at lease creation and cannot currently be updated, an updated payload no longer matches it. Fred records each stored payload's own SHA-256 and verifies against that on reprovision; `meta_hash` is still used for payloads stored before this behavior existed. See ENG-643 for the on-chain update handshake that restores `meta_hash` as the authoritative reference.
 
@@ -820,14 +868,18 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
 
 **Response Codes:**
 - `202 Accepted` - Update initiated and persisted
-- `400 Bad Request` - Invalid payload or manifest validation error
+- `400 Bad Request` - Missing/invalid `Idempotency-Key`, payload, or manifest
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - Lease not provisioned
-- `409 Conflict` - Lease is in a state that cannot be updated (e.g., currently restarting)
-- `500 Internal Server Error` - The backend update failed (including an open circuit), no payload store is configured, or the accepted update could not be persisted
-- `502 Bad Gateway` - The backend rejected the update with an unusable or off-contract error response
-- `503 Service Unavailable` - A required authentication or routing service is unavailable, or durable placement is unusable or unresolved
+- `409 Conflict` - The key conflicts with a prior command, another command is
+  pending, or the lease is in a state that cannot be updated
+- `500 Internal Server Error` - An accepted update could not yet be persisted
+  to the provider payload store; the durable pending command remains recoverable
+- `503 Service Unavailable` - The backend request was not sent (for example an
+  open circuit), no payload store is configured, routing/authority is
+  temporarily unavailable, or the bounded provider/backend idempotency journal
+  refused admission before side effects
 
 ### Restore Lease
 
@@ -877,12 +929,22 @@ the destination after adoption. While it exists, Provision and Restore of that
 destination are rejected. A pre-commit failure hands the source back only after
 teardown/re-quarantine, source-quota proof, and exact
 failed-operation settlement; an accepted worker failure may therefore stay
-`restoring` until the actor's Failed callback is durable. Conversely, an exact
+`restoring` until the actor's Failed operation outcome and callback are durable.
+If the later source handback must retry, that exact terminal row—not absence—owns
+the rollback decision; a missing row fails closed. Reconciliation also holds a
+typed exclusive quiescence capability from the exact lease actor across its
+decision and substrate work, so queued messages, handlers, workers, terminal
+handoff, and actor replacement cannot race rollback. Conversely, an exact
 active destination Release is proof the restore committed even if containers
 later fail or disappear. With zero survivors, recovery keeps that Release,
 reconstructs a conservative Failed destination plus its capacity, and retains
 the source finalizer as tenant/provider identity rather than rolling data back.
-Once the exact restore intent settles, a plain, identity-preserving Restart may
+An exact Succeeded operation plus that immutable finalizer also reconstructs a
+missing active Release; Failed plus an exact committed Release is contradictory
+authority and fails closed.
+Once no Pending or contradictory Failed restore operation remains (an
+authorized successor may already have retired Succeeded history), a plain,
+identity-preserving Restart may
 repair it; Update and custom-domain redeploys remain fenced until that Restart
 reaches Ready and reconciliation consumes the finalizer. Close instead hands it
 off to a complete durable close intent before teardown.
@@ -900,9 +962,9 @@ off to a complete durable close intent before teardown.
 - `401 Unauthorized` - Invalid signature or token
 - `403 Forbidden` - Lease does not belong to this tenant
 - `404 Not Found` - No retained data found for `from_lease_uuid` (the source is absent, expired, cross-tenant, or its configured backend reports that it is not retained)
-- `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING`, is already provisioned, has an unresolved durable provision/restore attempt, or is not in a restorable state
-- `422 Unprocessable Entity` - The retained data exceeds a requested smaller tier's `disk_mb` cap, or the backend otherwise refuses the restore with a well-formed error envelope; the response relays the backend's bounded `error` message
-- `500 Internal Server Error` - The restore returned an unexpected or ambiguous backend result, such as a transport error, timeout, or generic 5xx; the durable target attempt is retained until positive evidence confirms it or an operator safely repairs it
+- `409 Conflict` - Source or target lifecycle work is already in progress, or the target is not `PENDING`, has an unresolved durable provision/restore attempt, or is not in a restorable state
+- `422 Unprocessable Entity` - The retained data exceeds a requested smaller tier's `disk_mb` cap; the response relays the backend's bounded, recognized refusal detail
+- `500 Internal Server Error` - The restore returned an unexpected or ambiguous backend result, such as a transport error, timeout, generic 5xx, coded already-provisioned response, or unknown refusal code; the durable target attempt is retained until positive evidence confirms it or an operator safely repairs it
 - `502 Bad Gateway` - The backend rejected the restore with an unusable or off-contract error response
 - `503 Service Unavailable` - Insufficient resources, an open backend circuit, unavailable placement routing/recording/tracking, or a source placement that is unusable, unresolved, or names a backend Fred no longer knows
 
@@ -1062,9 +1124,8 @@ without starting them, and run each Docker backend's mandatory read-only
 `-preflight-storage-identity-adoption` proof before taking the cutover backup or
 sealing storage identity. Then rotate to unique per-backend keys and restart
 every upgraded backend before the new providerd. Stack-form v0.13 Docker
-workloads stay in place; older service-name-less cohorts incur bounded
-per-lease downtime while startup stops/renames the original generation and
-recreates its `app` service through Compose. New backends recover the old operationless callback shape already
+workloads stay in place; service-name-less pre-stack cohorts are unsupported and
+must be resolved before sealing. New backends recover the old operationless callback shape already
 embedded in migrated workloads, preserve its tokenless lifecycle route, and
 report a non-secret `legacy` generation in internal inventory. Mandatory offline
 preparation migrates the corresponding owner as legacy before the new provider
@@ -1103,16 +1164,10 @@ matching complete snapshot retains the same lineage, so fence the original
 before starting its restored copy. The preflight's only successful stdout is
 `ready_for_v0_13_storage_identity_adoption`; it fails closed on unresolved
 v0.13 restore/deprovision crash windows instead of inventing missing authority.
-If it reports `ErrV013OrphanRollbackRemnant`, preserve its sorted
-`immutable_container_ids`; mutable names are never cleanup authority. The
-separate read-only terminal-orphan mode of `placement-preflight`, invoked with
-`-prove-terminal-orphan <lease-uuid>` and `-expected-backend <name>`, must
-positively prove that the same lease is present and terminal in that same
-provider's complete height-pinned snapshot and absent from a pristine stopped
-v0.13 placement database. Require its printed provider UUID to equal the Docker
-diagnostic. That verdict is necessary but not sufficient: follow the exact-ID
-inspection/removal procedure, then rerun both proofs and require the Docker
-adoption preflight itself to pass before backing up or sealing.
+Only complete stack-form v0.13 cohorts are supported. A service-name-less
+pre-stack container, `-prev` remnant, authorityless migration generation, or
+partial topology is rejected before mutation; the upgraded backend has no
+in-place converter for those shapes.
 See [Deployment](DEPLOYMENT.md#upgrading-from-v0130) for the complete cutover,
 repair, and rollback procedure.
 
@@ -1133,6 +1188,10 @@ the event but cannot resurrect authority; retention status remains queryable.
 A stale, missing,
 or retired ID is a 200 no-op. Tokenless callbacks are accepted only for durable
 owners migrated from v0.13.0 and retain the same observation-only limits.
+This is an explicit compatibility boundary: stopped adoption represents the old
+route as a distinct `LegacyRuntimeAuthority`, callback ingress matches it to that
+owner, and no current provision, restore, maintenance, or reconciliation path
+can mint a tokenless operation or lifecycle authority.
 Response bodies are not guaranteed for this path, so callers should treat the HTTP status
 code as the source of truth.
 
@@ -1325,6 +1384,7 @@ Restart containers for a lease without changing the manifest (async).
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
   "callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000"
 }
 ```
@@ -1348,9 +1408,9 @@ Deploy a new manifest for a lease, replacing containers (async).
 ```json
 {
   "lease_uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "maintenance_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
   "callback_url": "http://fred.example.com:8080/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
-  "payload": "<base64-encoded-manifest>",
-  "payload_hash": "sha256-hex-string"
+  "payload": "<base64-encoded-manifest>"
 }
 ```
 
@@ -1610,71 +1670,104 @@ internal/
 │   ├── client.go       # HTTP client for backends (with circuit breaker)
 │   ├── router.go       # SKU-based routing
 │   ├── mock.go         # In-memory mock for unit tests
-│   ├── shared/         # Cross-backend primitives (callback sender, bbolt store, registry, diagnostics)
+│   ├── shared/         # Cross-backend durable journals, typed settlements, callback sender, and diagnostics
 │   ├── docker/         # Docker container backend implementation (actor-per-lease)
 │   └── k3s/            # K3s container backend implementation
+├── backendidentity/    # Durable backend storage identity and bound HTTP routes
+├── callbackurl/        # Validated operation/lifecycle callback URL construction
 ├── chain/              # gRPC client, WebSocket subscriber, signer
 │   └── chaintest/      # Test-only mock chain client (not imported by providerd)
 ├── config/             # Configuration loading and validation
+├── fsidentity/         # Descriptor-bound filesystem identity checks
+├── maintenanceid/      # Canonical UUIDv4 maintenance-command identity
 ├── metrics/            # Prometheus metrics definitions
+├── operationid/        # Canonical UUIDv4 provision/restore operation identity
+├── placementprobe/     # Read-only backend identity/inventory proof client
 ├── provisioner/        # Provision lifecycle application and runtime composition
 │   ├── manager.go      # Composition root, callback admission, and runtime ownership
 │   ├── handler_set.go  # Internal message adapters to application services
-│   ├── orchestrator.go # Provision admission and backend dispatch
-│   ├── callback_service.go # Exact-operation callback authorization and settlement policy
-│   ├── restore/        # Atomic source/target restore application service
-│   ├── operation/      # Typed operation IDs, opaque capabilities, and process-local registry
+│   ├── orchestrator.go # Thin construction-bound handler event capability
+│   ├── callback_service.go # Authenticated callback consequence adapter
+│   ├── maintenance/    # Durable restart/update application service
+│   ├── restore/        # HTTP-neutral adapter to the atomic restore application
+│   ├── operation/      # Opaque capabilities, one-shot Registry, observe/drain facet
 │   ├── reconciler.go   # Level-triggered reconciliation runtime
 │   ├── reconcile_inventory.go # Read-only chain/backend inventory collection
 │   ├── reconcile_plan.go # Pure evidence-to-action decision table
 │   ├── reconcile_projection.go # Atomic durable inventory projection
-│   ├── inflight.go     # Manager status/drain facade over operation.Registry
+│   ├── inflight.go     # Manager status/drain facade over RuntimeController
 │   ├── handlers.go     # Shared transport helpers and lease item extraction
 │   ├── ack_batcher.go  # Batches lease acknowledgments
 │   ├── timeout_checker.go # Detects callback timeouts
 │   ├── leaseutil.go    # Lease helper utilities
 │   ├── topics.go       # Internal event topics and stable metric labels
 │   ├── payload/        # Lease-lifetime deployment payload storage (bbolt)
-│   ├── placement/      # Durable attempts, ownership, conflicts, and inventory authority
+│   ├── placement/      # Durable authority plus construction-bound purpose applications
 │   ├── bridge.go       # Chain events -> Watermill
 │   └── interfaces.go   # Narrow consumer-owned routing, chain, and placement ports
 ├── scheduler/          # Periodic withdrawal and credit monitoring
+├── strictjson/         # Duplicate/unknown-field rejecting authoritative decoders
 ├── testutil/           # Test fixtures and helpers
 ├── tlsconfig/          # TLS config builders for the providerd<->backend hop (mTLS, identity pinning)
 ├── util/               # Shared utility functions
+├── uuidv4/             # Shared zero-invalid canonical UUIDv4 representation
 └── watcher/            # Cross-provider event detection
 ```
 
 ## Reconciliation
 
-Fred uses **level-triggered reconciliation** to ensure consistency between chain state and backend state. This provides crash recovery without requiring durable event queues.
+Fred uses **level-triggered reconciliation** to ensure consistency between chain
+state and backend state. It does not require a durable queue of chain events:
+reconciliation can recover missed edges from current state. Accepted backend
+effects are different and remain protected by durable attempts, mutation
+journals, receipts, and callback outboxes.
 
 ### How It Works
 
 Instead of replaying missed events (edge-triggered), reconciliation queries current state. Before reading provisions, the reconciler calls `RefreshState` on each backend. That call synchronizes an in-process backend; the standard HTTP client deliberately implements it as a no-op because a remote backend owns its own projection. In the normal separate-process deployment, Docker substrate/WAL recovery runs at docker-backend startup and on its own `reconcile_interval` (default `5m`), independently of providerd's `reconciliation_interval`.
 
+One `ReconciliationSweep` binds the inventory collector session, durable Store
+fence, and process-local operation boundary for a pass. Projection consumes that
+combination once. Its projected value can mint live or terminal-orphan action
+capabilities only after a bounded exact chain re-read under the matching lease
+claim; execution derives the lease and backend from the capability. The
+reconciler therefore cannot combine an observation from one sweep with another
+Store revision, Registry claim, backend target, or caller-selected settlement.
+This is a level-triggered evidence join, not a hand-rolled distributed FSM; the
+existing FSM dependency remains confined to backend-local, per-lease actors.
+
+Chain inventory is completed before `BeginSweep` because it cannot reveal a
+backend owner. The sweep then writes a durable pending marker immediately before
+backend inventory reads. A successful endpoint read returns only an opaque,
+one-shot receipt after positive lease observations are barred from concurrent
+mutation. The sweep consumes one backend's provision and retention receipts
+together and owns the identity, refresh, and cross-endpoint classification; a
+single successful half can only be rejected as untrusted. Outstanding receipts
+cannot be sealed or projected. A newer sweep invalidates older unclaimed action
+capabilities, while an action already holding its lease claim is captured as
+in-flight by the newer causal boundary.
+
 ```
-Chain State (leases)     Backend State (provisions)
-        │                          │
-        └──────────┬───────────────┘
-                   │
-                   ▼
-         RefreshState interface call
-       (remote HTTP backends: no-op)
-                   │
-                   ▼
-            Reconciler compares
-                   │
-        ┌──────────┼──────────┬──────────┐
-        ▼          ▼          ▼          ▼
-    PENDING     ACTIVE      ACTIVE     CLOSED
-    + not      + not       + failed   + still
-    provisioned provisioned provision  provisioned
-        │          │          │          │
-        ▼          ▼          ▼          ▼
-     Start      Anomaly:  Re-provision Deprovision
-   provisioning  log &    (with limit)  (orphan
-                provision               cleanup)
+Chain state       Backend inventory       Durable placement/attempts
+     │                    │                            │
+     └────────────────────┼────────────────────────────┘
+                          ▼
+             one typed ReconciliationSweep
+       (inventory session + Store fence + Registry boundary)
+                          │
+                          ▼
+                one-shot durable projection
+                          │
+                          ▼
+          bounded exact chain re-read under lease claim
+                          │
+                          ▼
+               opaque action capability
+                          │
+          ┌───────────────┼────────────────┐
+          ▼               ▼                ▼
+       provision       acknowledge      exact teardown
+    (write-ahead)       or reject       (positive proof)
 ```
 
 ### Reconciliation Triggers
@@ -1693,10 +1786,11 @@ Chain State (leases)     Backend State (provisions)
 | ACTIVE | Provisioned + ready | Healthy - no action |
 | ACTIVE | Provisioned + restarting | In-flight restart - no action |
 | ACTIVE | Provisioned + updating | In-flight update - no action |
-| ACTIVE | Provisioned + failed | Anomaly: re-provision (with attempt limit) |
+| ACTIVE | Provisioned + failed | Anomaly: re-provision below the attempt limit; otherwise close on-chain and deprovision |
 | ACTIVE | Not provisioned | Anomaly: provision |
-| CLOSED/EXPIRED | Provisioned | Orphan: deprovision |
-| Not found | Provisioned | Orphan: deprovision |
+| CLOSED/REJECTED/EXPIRED | Provisioned | Orphan candidate: bounded exact chain re-read, then deprovision only if still terminal |
+| Not found in the PENDING/ACTIVE sweep | Provisioned | Orphan candidate: exact chain re-read; absence, query failure, `UNSPECIFIED`, or a future state defers cleanup |
+| UNSPECIFIED or unknown future state | Any | **Defer — no action; never infer terminality** |
 | PENDING/ACTIVE | Placement conflict/unusable, or unresolved attempt | **Defer — no action this sweep** |
 | PENDING/ACTIVE | Positive membership from a rejected inventory endpoint (`untrusted_positive`) | **Durably quarantine — do not treat the rejected payload as ownership or its removal as absence** |
 | PENDING/ACTIVE | Positive report disagrees with confirmed placement | **Defer — no action this sweep** |

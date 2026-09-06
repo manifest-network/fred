@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,9 +19,12 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
+	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/provisioner"
+	"github.com/manifest-network/fred/internal/provisioner/callbackwire"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testsupport/placementstore"
@@ -32,26 +36,142 @@ type callbackOrderingSink struct {
 	events []backend.LeaseStatusEvent
 }
 
-func callbackTestStorageReattestation(context.Context) error { return nil }
+type apiCallbackStorageVerifier struct {
+	storageID backendidentity.ID
+	gate      *backendidentity.StorageAuthorityGate
+}
+
+type apiCallbackOperationMutation struct {
+	run func(context.Context) error
+}
+
+type apiAmbiguousProvisionBackend struct{ backend.Backend }
+
+func (apiAmbiguousProvisionBackend) Provision(
+	context.Context,
+	backend.ProvisionRequest,
+) error {
+	return errors.New("ambiguous provision transport outcome")
+}
+
+func bindAPICallbackOperationExecutor(
+	t *testing.T,
+	settlement *shared.OperationSettlement,
+) {
+	t.Helper()
+	err := shared.BindOperationSubstrateExecutor(
+		settlement,
+		func(ctx context.Context, _ string) (context.Context, func(), error) {
+			return ctx, func() {}, nil
+		},
+		func(context.Context, string, error) error { return nil },
+		func(
+			runner substratemutation.Runner,
+			_ shared.OperationPhysicalSubject,
+		) apiCallbackOperationMutation {
+			return apiCallbackOperationMutation{run: func(ctx context.Context) error {
+				return runner.Step(ctx, "API callback operation", func(context.Context) error {
+					return nil
+				})
+			}}
+		},
+		func(
+			ctx context.Context,
+			mutation apiCallbackOperationMutation,
+			_ shared.OperationPhysicalSubject,
+		) error {
+			return mutation.run(ctx)
+		},
+		func(
+			_ context.Context,
+			subject shared.OperationPhysicalSubject,
+		) (shared.OperationPhysicalEvidence, error) {
+			return shared.NewOperationTargetReady(
+				subject,
+				[]string{"app-0"},
+				map[string][]string{"app": {"app-0"}},
+			)
+		},
+	)
+	require.NoError(t, err)
+}
+
+func (v apiCallbackStorageVerifier) StorageIdentity() backendidentity.ID { return v.storageID }
+
+func (v apiCallbackStorageVerifier) StorageAuthorityGate() *backendidentity.StorageAuthorityGate {
+	return v.gate
+}
+
+func (apiCallbackStorageVerifier) Verify(context.Context) error { return nil }
+
+func newAPICallbackStorageAttestor(
+	t *testing.T,
+	journals apiCallbackJournals,
+	stopCtx context.Context,
+) *shared.CallbackStorageAttestor {
+	t.Helper()
+	attestor, err := shared.NewCallbackStorageAttestor(
+		journals.callbacks,
+		apiCallbackStorageVerifier{storageID: journals.storageID, gate: journals.gate},
+		stopCtx,
+	)
+	require.NoError(t, err)
+	return attestor
+}
+
+func newAPICallbackPublisher(
+	t *testing.T,
+	journals apiCallbackJournals,
+	secret string,
+	stopCtx context.Context,
+	httpClient *http.Client,
+) (*shared.CallbackSender, *shared.CallbackPublisher) {
+	t.Helper()
+	zeroBackoff := [shared.CallbackMaxAttempts]time.Duration{}
+	attestor := newAPICallbackStorageAttestor(t, journals, stopCtx)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sender := shared.MustNewCallbackSender(shared.CallbackSenderConfig{
+		Store:           journals.callbacks,
+		StorageAttestor: attestor,
+		HTTPClient:      httpClient,
+		Secret:          secret,
+		Logger:          logger,
+		Backoff:         &zeroBackoff,
+		DeliveryTimeout: 3 * time.Second,
+	})
+	publisher := mustNewCallbackPublisherForTest(t, shared.CallbackPublisherConfig{
+		OperationSettlement:   journals.operations,
+		MaintenanceSettlement: journals.maintenance,
+		StorageAttestor:       attestor,
+		Logger:                logger,
+	})
+	return sender, publisher
+}
+
+func mustNewCallbackPublisherForTest(
+	t *testing.T,
+	cfg shared.CallbackPublisherConfig,
+) *shared.CallbackPublisher {
+	t.Helper()
+	publisher, err := shared.NewCallbackPublisher(cfg)
+	require.NoError(t, err)
+	return publisher
+}
 
 func beginAPICallbackOperationIntent(
 	t *testing.T,
-	store *shared.CallbackStore,
+	settlement *shared.OperationSettlement,
 	leaseUUID string,
 	callbackURL string,
-	backendName string,
-	storageID backendidentity.ID,
 ) shared.OperationIntentAdmission {
 	t.Helper()
 	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
 	require.NoError(t, err)
-	admission, err := store.BeginOperationIntent(shared.OperationIntentSpec{
+	candidate, err := settlement.NewOperationIntentCandidate(shared.OperationIntentSpec{
 		Kind:                 shared.OperationIntentProvision,
 		LeaseUUID:            leaseUUID,
 		CallbackURL:          callbackURL,
 		LifecycleCallbackURL: lifecycleURL,
-		Backend:              backendName,
-		BackendStorageID:     storageID,
 		Tenant:               "tenant-1",
 		ProviderUUID:         placementstore.ProviderUUID,
 		Items: []backend.LeaseItem{{
@@ -63,7 +183,105 @@ func beginAPICallbackOperationIntent(
 		Manifest: []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`),
 	})
 	require.NoError(t, err)
+	admission, err := settlement.BeginOperationIntent(candidate)
+	require.NoError(t, err)
 	return admission
+}
+
+func commitAPICallbackOperationRefusal(
+	t *testing.T,
+	settlement *shared.OperationSettlement,
+	claim shared.OperationIntentClaim,
+) shared.OperationReleaseUncommitted {
+	t.Helper()
+	candidate, err := settlement.PrepareOperationRelease(claim)
+	require.NoError(t, err)
+	failure, err := settlement.RefuseOperationExecution(candidate)
+	require.NoError(t, err)
+	uncommitted, err := settlement.CommitOperationFailure(failure)
+	require.NoError(t, err)
+	return uncommitted
+}
+
+type apiCallbackJournals struct {
+	callbacks   *shared.CallbackStore
+	releases    *shared.ReleaseStore
+	operations  *shared.OperationSettlement
+	maintenance *shared.MaintenanceSettlement
+	storageID   backendidentity.ID
+	gate        *backendidentity.StorageAuthorityGate
+}
+
+func (journals apiCallbackJournals) Close() error {
+	return errors.Join(journals.callbacks.Close(), journals.releases.Close())
+}
+
+func openBoundAPICallbackStore(
+	t *testing.T,
+	dbPath string,
+	backendName string,
+) apiCallbackJournals {
+	t.Helper()
+	boundPath, err := shared.BindAuthoritativeStorePath(dbPath)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, boundPath.Close()) }()
+	releasePath := dbPath + ".releases.db"
+	boundReleases, err := shared.BindAuthoritativeStorePath(releasePath)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, boundReleases.Close()) }()
+	pair, err := backendidentity.BindMarkerPair(
+		dbPath+".storage-identity.json",
+		dbPath+".storage-identity-anchor.json",
+	)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, pair.Close()) }()
+	storage, err := pair.InitializeWithStores(
+		backendName,
+		"api-callback-ordering-"+backendName,
+		backendidentity.MarkerPairStoreHooks{
+			Profile: backendidentity.InitializationProfileFresh,
+			Prepare: func(
+				pending backendidentity.PendingStorage,
+				profile backendidentity.InitializationProfile,
+			) error {
+				if err := shared.PrepareBoundCallbackStoreStorage(boundPath, pending, profile); err != nil {
+					return err
+				}
+				return shared.PrepareBoundReleaseStoreStorage(boundReleases, pending, profile)
+			},
+			Check: func(pending backendidentity.PendingStorage) error {
+				if err := shared.CheckBoundCallbackStoreStorage(boundPath, pending); err != nil {
+					return err
+				}
+				return shared.CheckBoundReleaseStoreStorage(boundReleases, pending)
+			},
+			Verify: func(verified backendidentity.VerifiedStorage) error {
+				if err := shared.VerifyBoundCallbackStoreStorage(boundPath, verified); err != nil {
+					return err
+				}
+				return shared.VerifyBoundReleaseStoreStorage(boundReleases, verified)
+			},
+		},
+	)
+	require.NoError(t, err)
+	gate, err := backendidentity.NewStorageAuthorityGate(func(error) {})
+	require.NoError(t, err)
+	store, err := shared.OpenIdentityBoundCallbackStore(
+		shared.CallbackStoreConfig{DBPath: dbPath}, storage, gate,
+	)
+	require.NoError(t, err)
+	releases, err := shared.OpenIdentityBoundReleaseStore(
+		shared.ReleaseStoreConfig{DBPath: releasePath}, storage, gate,
+	)
+	require.NoError(t, err)
+	operations, err := shared.NewOperationSettlement(store, releases)
+	require.NoError(t, err)
+	maintenance, err := shared.NewMaintenanceSettlement(store, releases)
+	require.NoError(t, err)
+	return apiCallbackJournals{
+		callbacks: store, releases: releases, operations: operations,
+		maintenance: maintenance, storageID: storage.ID(), gate: gate,
+	}
 }
 
 type callbackOrderingPublisher struct {
@@ -73,12 +291,13 @@ type callbackOrderingPublisher struct {
 
 func (publisher *callbackOrderingPublisher) PublishCallback(
 	ctx context.Context,
-	callback backend.CallbackPayload,
+	proof hmacauth.VerifiedRequest,
 ) error {
-	if callback.LifecycleID != "" {
+	callback, _ := callbackwire.DecodeVerified(proof)
+	if callback.Selector() == callbackwire.SelectorLifecycle {
 		publisher.lifecycleRequests.Add(1)
 	}
-	return publisher.next.PublishCallback(ctx, callback)
+	return publisher.next.PublishCallback(ctx, proof)
 }
 
 type callbackDeadlinePublisher struct {
@@ -120,7 +339,7 @@ func (transport *callbackObservingRoundTripper) RoundTrip(req *http.Request) (*h
 
 func (publisher *callbackDeadlinePublisher) PublishCallback(
 	ctx context.Context,
-	_ backend.CallbackPayload,
+	_ hmacauth.VerifiedRequest,
 ) error {
 	publisher.calls.Add(1)
 	<-ctx.Done()
@@ -154,7 +373,14 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 		providerUUID = placementstore.ProviderUUID
 		secret       = "callback-ordering-secret-at-least-32-bytes"
 	)
+	proofVerifier, proofConsumer := hmacauth.NewCallbackProofBoundary()
 	leaseUUID := testutil.ValidUUID1
+	callbackJournals := openBoundAPICallbackStore(
+		t, filepath.Join(t.TempDir(), "callbacks.db"), backendName,
+	)
+	callbackStore := callbackJournals.callbacks
+	callbackStorageID := callbackJournals.storageID
+	t.Cleanup(func() { require.NoError(t, callbackJournals.Close()) })
 
 	ackReached := make(chan struct{})
 	releaseAck := make(chan struct{})
@@ -170,8 +396,21 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 			return []billingtypes.Lease{{
 				Uuid:         leaseUUID,
 				ProviderUuid: providerUUID,
+				Tenant:       "tenant-1",
 				State:        billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{{
+					SkuUuid: "sku-1", ServiceName: "app", Quantity: 1,
+				}},
 			}}, nil
+		},
+		GetLeaseFunc: func(context.Context, string) (*billingtypes.Lease, error) {
+			return &billingtypes.Lease{
+				Uuid: leaseUUID, ProviderUuid: providerUUID, Tenant: "tenant-1",
+				State: billingtypes.LEASE_STATE_PENDING,
+				Items: []billingtypes.LeaseItem{{
+					SkuUuid: "sku-1", ServiceName: "app", Quantity: 1,
+				}},
+			}, nil
 		},
 		AcknowledgeLeasesFunc: func(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
 			ackReachedOnce.Do(func() { close(ackReached) })
@@ -184,33 +423,60 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 		},
 	}
 
-	mockBackend := backend.NewMockBackend(backend.MockBackendConfig{Name: backendName})
+	mockBackend := apiAmbiguousProvisionBackend{Backend: backend.NewMockBackend(
+		backend.MockBackendConfig{Name: backendName},
+	)}
 	router, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{{
 		Backend:   mockBackend,
 		IsDefault: true,
 	}}})
 	require.NoError(t, err)
 
-	placementStore, err := placementstore.NewStore(filepath.Join(t.TempDir(), "placements.db"))
+	apiAddr := freePort(t)
+	callbackRoutes, err := placement.NewCallbackRouteFactory("http://" + apiAddr)
+	require.NoError(t, err)
+	placementPath := filepath.Join(t.TempDir(), "placements.db")
+	placementStore, err := placementstore.NewStore(
+		placementPath, placement.WithCallbackRouteFactory(callbackRoutes),
+	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, placementStore.Close()) })
-	configureAPIPlacementTopology(t, placementStore, []string{backendName})
-	fence := placementStore.BeginInventorySession()
-	_, err = placementStore.ProjectInventory(fence, placement.InventoryProjection{
-		Complete:                 true,
-		BackendStorageIdentities: testAPIBackendStorageIDs(backendName),
-		EmptyBackends:            []string{backendName},
-	})
-	placementStore.EndInventorySession(fence)
+	require.NoError(t, placementstore.ConfigureBackendTopologyWithStorageIdentities(placementStore,
+		[]string{backendName}, map[string]backendidentity.ID{backendName: callbackStorageID},
+	))
+	seedCoordinator, err := placementStore.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	seedExecution, seedInventoryRuntime := bindAPIInventoryRuntime(
+		t, seedCoordinator, router, chainClient,
+	)
+	seedReconciliation, err := seedExecution.ReconciliationCoordinator(nil, nil)
+	require.NoError(t, err)
+	registerAPIReconciliationInventory(t, seedReconciliation, seedInventoryRuntime)
+	projectAPIPlacementInventory(t, seedReconciliation, []string{backendName},
+		map[string]backendidentity.ID{backendName: callbackStorageID},
+		placement.ReconciliationProjection{})
+	seedProvision, err := seedExecution.ProvisionCoordinator(nil)
+	require.NoError(t, err)
+	request, err := placement.NewProvisionEventRequest(leaseUUID, "tenant-1")
+	require.NoError(t, err)
+	result := seedProvision.ExecuteCurrentLease(context.Background(), request)
+	require.Equal(t, placement.ProvisionEventUncertain, result.Disposition())
+	require.Error(t, result.Err())
+	operationID := placementStore.Lookup(leaseUUID).AttemptOperationID()
+	require.True(t, operationID.Valid())
+	require.NoError(t, placementStore.Close())
+	placementStore, err = placementstore.NewStore(
+		placementPath, placement.WithCallbackRouteFactory(callbackRoutes),
+	)
 	require.NoError(t, err)
 
 	eventSink := &callbackOrderingSink{}
 	manager, err := provisioner.NewManager(provisioner.ManagerConfig{
-		ProviderUUID:     providerUUID,
-		CallbackBaseURL:  "http://fred.invalid",
-		PlacementStore:   placementStore,
-		LeaseEventSink:   eventSink,
-		AckBatchInterval: time.Millisecond,
+		ProviderUUID:          providerUUID,
+		PlacementStore:        placementStore,
+		LeaseEventSink:        eventSink,
+		AckBatchInterval:      time.Millisecond,
+		CallbackProofConsumer: proofConsumer,
 	}, router, chainClient)
 	require.NoError(t, err)
 
@@ -232,41 +498,7 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 		require.NoError(t, manager.Close())
 	})
 
-	claimResult := manager.MaintenanceClaims().TryClaimLeaseNow(leaseUUID)
-	require.True(t, claimResult.Acquired())
-	claim := claimResult.Claim()
-	tracked := manager.RestoreOperations().TryInitiateClaimed(claim, operation.TrackSpec{
-		LeaseUUID: leaseUUID,
-		Tenant:    "tenant-1",
-		Backend:   backendName,
-		Kind:      operation.KindProvision,
-	})
-	require.True(t, tracked.Started())
-	initiation := tracked.Capability()
-	require.True(t, manager.RestoreOperations().BeginCall(initiation))
-	require.Equal(t, operation.InitiationActivated, manager.RestoreOperations().Activate(initiation))
-	require.True(t, manager.MaintenanceClaims().ReleaseLease(claim))
-	operationID := initiation.ID()
-	scope, err := placementStore.ScopeAdmission(
-		placementStore.CurrentAdmissionBaseline(), []string{backendName},
-	)
-	require.NoError(t, err)
-	callbackPair, err := placement.NewCallbackPair(
-		operationID,
-		"https://provider.test/callbacks/provision?operation_id="+operationID.String(),
-		"https://provider.test/callbacks/provision?lifecycle_id="+operationID.String(),
-	)
-	require.NoError(t, err)
-	_, begun, err := placementStore.BeginNewAttempt(
-		scope, leaseUUID, backendName, operationID,
-		placement.PayloadFingerprint{}, testAPIBackendRequestSnapshot(t), callbackPair,
-	)
-	require.NoError(t, err)
-	require.True(t, begun)
-	manager.PublishProvisionStarting(leaseUUID)
-
 	callbackPublisher := &callbackOrderingPublisher{next: manager}
-	apiAddr := freePort(t)
 	callbackServer, err := NewServer(ServerConfig{
 		Addr:                       apiAddr,
 		ProviderUUID:               providerUUID,
@@ -280,9 +512,10 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 		CallbackApplicationTimeout: 2 * time.Second,
 		CallbackSecret:             secret,
 	}, ServerDeps{
-		ChainClient:       chainClient,
-		CallbackPublisher: callbackPublisher,
-		StatusChecker:     manager,
+		ChainClient:           chainClient,
+		CallbackPublisher:     callbackPublisher,
+		StatusChecker:         manager,
+		CallbackProofVerifier: proofVerifier,
 	})
 	require.NoError(t, err)
 	_, err = callbackServer.StartBackground()
@@ -290,50 +523,44 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 	t.Cleanup(func() {
 		require.NoError(t, callbackServer.Shutdown(context.Background()))
 	})
-	callbackBaseURL := "http://" + apiAddr
-
-	exactURL, err := provisioner.BuildCallbackURLForOperation(callbackBaseURL, operationID)
+	callbackPair, err := callbackRoutes.ForOperation(operationID)
 	require.NoError(t, err)
-	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(exactURL, "")
-	require.NoError(t, err)
-
-	callbackStore, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, callbackStore.Close()) })
+	exactURL := callbackPair.OperationURL()
 
 	senderCtx, cancelSender := context.WithCancel(context.Background())
 	t.Cleanup(cancelSender)
-	zeroBackoff := [shared.CallbackMaxAttempts]time.Duration{}
-	sender := shared.MustNewCallbackSender(shared.CallbackSenderConfig{
-		Store:           callbackStore,
-		HTTPClient:      &http.Client{},
-		Secret:          secret,
-		BeforeDelivery:  callbackTestStorageReattestation,
-		BeforeReplay:    callbackTestStorageReattestation,
-		StorageIdentity: testAPIBackendStorageID(backendName),
-		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
-		StopCtx:         senderCtx,
-		Backoff:         &zeroBackoff,
-		DeliveryTimeout: 3 * time.Second,
-	})
-	beginAPICallbackOperationIntent(
-		t, callbackStore, leaseUUID, exactURL, backendName,
-		testAPIBackendStorageID(backendName),
+	sender, durablePublisher := newAPICallbackPublisher(
+		t, callbackJournals, secret, senderCtx, &http.Client{},
 	)
+	bindAPICallbackOperationExecutor(t, callbackJournals.operations)
+	admission := beginAPICallbackOperationIntent(
+		t, callbackJournals.operations, leaseUUID, exactURL,
+	)
+	operationClaim, created := admission.CreatedClaim()
+	require.True(t, created)
+	releaseCandidate, err := callbackJournals.operations.PrepareOperationRelease(operationClaim)
+	require.NoError(t, err)
+	execution, err := callbackJournals.operations.StartOperationExecution(releaseCandidate)
+	require.NoError(t, err)
+	outcome := callbackJournals.operations.ExecuteOperation(t.Context(), execution)
+	success, ok := outcome.(shared.OperationExecutionSuccess)
+	require.True(t, ok)
+	committed, err := callbackJournals.operations.CommitOperationSuccess(success)
+	require.NoError(t, err)
 
 	// Durable Send methods only persist and notify. Queue both callbacks before
 	// starting the tracked delivery owner so this test observes the outbox FIFO,
 	// not goroutine scheduling or a Send return.
-	sender.SendOperationCallback(
-		leaseUUID, exactURL, backendName,
-		backend.CallbackStatusSuccess, "",
+	require.NoError(t, durablePublisher.PublishOperationSuccessContext(context.Background(), committed))
+	runtimeProof, err := callbackJournals.releases.ProveRuntimeGeneration(leaseUUID)
+	require.NoError(t, err)
+	runtimePermit, err := durablePublisher.AuthorizeRuntimeObservationContext(
+		context.Background(), runtimeProof,
 	)
-	sender.SendLifecycleCallback(
-		leaseUUID, lifecycleURL, backendName,
-		backend.CallbackStatusFailed, "container exited", false,
-	)
+	require.NoError(t, err)
+	require.NoError(t, durablePublisher.PublishLifecycleFailureContext(
+		context.Background(), runtimePermit, "container exited",
+	))
 	pending, err := callbackStore.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 2)
@@ -369,10 +596,18 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 
 	releaseAcknowledgement()
 	require.Eventually(t, func() bool {
-		return callbackPublisher.lifecycleRequests.Load() == 1 &&
-			len(eventSink.snapshot()) == 3
+		return callbackPublisher.lifecycleRequests.Load() == 1
 	}, 5*time.Second, time.Millisecond,
 		"lifecycle callback did not reach Fred after exact callback application")
+	require.Eventually(t, func() bool {
+		pending, listErr := callbackStore.ListPending()
+		return listErr == nil && len(pending) == 0
+	}, 5*time.Second, time.Millisecond,
+		"replay loop did not finish applying the lifecycle callback")
+	require.Eventually(t, func() bool {
+		return len(eventSink.snapshot()) == 2
+	}, 5*time.Second, time.Millisecond,
+		"lifecycle callback reached Fred but did not publish its lease event")
 	require.Eventually(t, func() bool {
 		pending, listErr := callbackStore.ListPending()
 		return listErr == nil && len(pending) == 0
@@ -381,13 +616,11 @@ func TestCallbackOrdering_ExactCompletionPrecedesLifecycleObservation(t *testing
 	stopReplay()
 
 	events := eventSink.snapshot()
-	require.Len(t, events, 3)
-	assert.Equal(t, backend.ProvisionStatusProvisioning, events[0].Status)
-	assert.Equal(t, backend.ProvisionStatusReady, events[1].Status)
-	assert.Equal(t, backend.ProvisionStatusFailed, events[2].Status)
-	assert.Equal(t, "container exited", events[2].Error)
+	require.Len(t, events, 2)
+	assert.Equal(t, backend.ProvisionStatusReady, events[0].Status)
+	assert.Equal(t, backend.ProvisionStatusFailed, events[1].Status)
+	assert.Equal(t, "container exited", events[1].Error)
 	assert.False(t, events[1].Timestamp.Before(events[0].Timestamp))
-	assert.False(t, events[2].Timestamp.Before(events[1].Timestamp))
 	assert.Equal(t, int32(1), callbackPublisher.lifecycleRequests.Load())
 
 	pending, err = callbackStore.ListPending()
@@ -413,84 +646,122 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 		secretA      = "callback-restart-A-secret-at-least-32-bytes"
 		secretB      = "callback-restart-B-secret-at-least-32-bytes"
 	)
+	proofVerifier, proofConsumer := hmacauth.NewCallbackProofBoundary()
 	leaseA := testutil.ValidUUID1
 	leaseB := testutil.ValidUUID2
-	operationA, err := operation.ParseID("123e4567-e89b-42d3-a456-426614174090")
-	require.NoError(t, err)
-	operationB, err := operation.ParseID("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
-	require.NoError(t, err)
 	placementPath := filepath.Join(t.TempDir(), "placements.db")
 	outboxAPath := filepath.Join(t.TempDir(), "callbacks-a.db")
 	outboxBPath := filepath.Join(t.TempDir(), "callbacks-b.db")
+	journalsA1 := openBoundAPICallbackStore(t, outboxAPath, backendA)
+	journalsB1 := openBoundAPICallbackStore(t, outboxBPath, backendB)
+	storageIDA := journalsA1.storageID
+	storageIDB := journalsB1.storageID
 	apiAddr := freePort(t)
-	exactURLA, err := provisioner.BuildCallbackURLForOperation("http://"+apiAddr, operationA)
-	require.NoError(t, err)
-	exactURLB, err := provisioner.BuildCallbackURLForOperation("http://"+apiAddr, operationB)
+	callbackRoutes, err := placement.NewCallbackRouteFactory("http://" + apiAddr)
 	require.NoError(t, err)
 
 	// Fred #1 has made the write-ahead placement mutation. Its process-local
 	// Registry is intentionally absent from the durable state we reopen below.
-	placementStore1, err := placementstore.NewStore(placementPath)
+	placementStore1, err := placementstore.NewStore(
+		placementPath, placement.WithCallbackRouteFactory(callbackRoutes),
+	)
 	require.NoError(t, err)
 	backendNames := []string{backendA, backendB}
-	configureAPIPlacementTopology(t, placementStore1, backendNames)
-	fence := placementStore1.BeginInventorySession()
-	_, err = placementStore1.ProjectInventory(fence, placement.InventoryProjection{
-		Complete:                 true,
-		BackendStorageIdentities: testAPIBackendStorageIDs(backendNames...),
-		EmptyBackends:            backendNames,
-	})
-	placementStore1.EndInventorySession(fence)
+	require.NoError(t, placementstore.ConfigureBackendTopologyWithStorageIdentities(placementStore1,
+		backendNames,
+		map[string]backendidentity.ID{backendA: storageIDA, backendB: storageIDB},
+	))
+	seedCoordinator, err := placementStore1.BindOperationCoordinator(nil)
 	require.NoError(t, err)
-	scopeA, err := placementStore1.ScopeAdmission(
-		placementStore1.CurrentAdmissionBaseline(), []string{backendA},
+	seedBackendA := apiAmbiguousProvisionBackend{Backend: backend.NewMockBackend(
+		backend.MockBackendConfig{Name: backendA},
+	)}
+	seedBackendB := apiAmbiguousProvisionBackend{Backend: backend.NewMockBackend(
+		backend.MockBackendConfig{Name: backendB},
+	)}
+	seedRouter, err := backend.NewRouter(backend.RouterConfig{Backends: []backend.BackendEntry{
+		{Backend: seedBackendA, Match: backend.MatchCriteria{SKUs: []string{"sku-a"}}, IsDefault: true},
+		{Backend: seedBackendB, Match: backend.MatchCriteria{SKUs: []string{"sku-b"}}},
+	}})
+	require.NoError(t, err)
+	seedChain := &chaintest.MockClient{GetLeaseFunc: func(
+		_ context.Context, leaseUUID string,
+	) (*billingtypes.Lease, error) {
+		sku := "sku-a"
+		if leaseUUID == leaseB {
+			sku = "sku-b"
+		}
+		return &billingtypes.Lease{
+			Uuid: leaseUUID, Tenant: "tenant-1", ProviderUuid: providerUUID,
+			State: billingtypes.LEASE_STATE_PENDING,
+			Items: []billingtypes.LeaseItem{{
+				SkuUuid: sku, ServiceName: "app", Quantity: 1,
+			}},
+		}, nil
+	}}
+	seedExecution, seedInventoryRuntime := bindAPIInventoryRuntime(
+		t, seedCoordinator, seedRouter, seedChain,
 	)
+	seedReconciliation, err := seedExecution.ReconciliationCoordinator(nil, nil)
 	require.NoError(t, err)
-	_, begun, err := placementStore1.BeginNewAttempt(
-		scopeA, leaseA, backendA, operationA,
-		placement.PayloadFingerprint{}, testAPIBackendRequestSnapshot(t),
-		testAPICallbackPair(t, operationA),
-	)
+	registerAPIReconciliationInventory(t, seedReconciliation, seedInventoryRuntime)
+	projectAPIPlacementInventory(t, seedReconciliation, backendNames,
+		map[string]backendidentity.ID{backendA: storageIDA, backendB: storageIDB},
+		placement.ReconciliationProjection{})
+	seedProvision, err := seedExecution.ProvisionCoordinator(nil)
 	require.NoError(t, err)
-	require.True(t, begun)
-	scopeB, err := placementStore1.ScopeAdmission(
-		placementStore1.CurrentAdmissionBaseline(), []string{backendB},
-	)
+	for _, leaseUUID := range []string{leaseA, leaseB} {
+		request, requestErr := placement.NewProvisionEventRequest(leaseUUID, "tenant-1")
+		require.NoError(t, requestErr)
+		result := seedProvision.ExecuteCurrentLease(context.Background(), request)
+		require.Equal(t, placement.ProvisionEventUncertain, result.Disposition())
+		require.Error(t, result.Err())
+	}
+	operationA := placementStore1.Lookup(leaseA).AttemptOperationID()
+	operationB := placementStore1.Lookup(leaseB).AttemptOperationID()
+	require.True(t, operationA.Valid())
+	require.True(t, operationB.Valid())
+	callbackPairA, err := callbackRoutes.ForOperation(operationA)
 	require.NoError(t, err)
-	_, begun, err = placementStore1.BeginNewAttempt(
-		scopeB, leaseB, backendB, operationB,
-		placement.PayloadFingerprint{}, testAPIBackendRequestSnapshot(t),
-		testAPICallbackPair(t, operationB),
-	)
+	callbackPairB, err := callbackRoutes.ForOperation(operationB)
 	require.NoError(t, err)
-	require.True(t, begun)
+	exactURLA := callbackPairA.OperationURL()
+	exactURLB := callbackPairB.OperationURL()
 	require.NoError(t, placementStore1.Close())
 
 	// Each backend process durably records its exact failure, then exits without
 	// an HTTP attempt. These are the backend halves of two ambiguous transport
 	// windows; only A will authenticate successfully after restart.
-	outboxA1, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: outboxAPath})
-	require.NoError(t, err)
+	_, publisherA1 := newAPICallbackPublisher(
+		t, journalsA1, secretA, context.Background(), http.DefaultClient,
+	)
 	intentA := beginAPICallbackOperationIntent(
-		t, outboxA1, leaseA, exactURLA, backendA, testAPIBackendStorageID(backendA),
+		t, journalsA1.operations, leaseA, exactURLA,
 	)
-	_, err = outboxA1.ResolveOperationIntent(
-		intentA.Claim, backend.CallbackStatusFailed, "remote provision failed after dispatch",
+	claimA, created := intentA.CreatedClaim()
+	require.True(t, created)
+	uncommittedA := commitAPICallbackOperationRefusal(t, journalsA1.operations, claimA)
+	require.NoError(t, publisherA1.PublishOperationFailureContext(
+		context.Background(), uncommittedA, "remote provision failed after dispatch",
+	))
+	require.NoError(t, journalsA1.Close())
+	_, publisherB1 := newAPICallbackPublisher(
+		t, journalsB1, secretB, context.Background(), http.DefaultClient,
 	)
-	require.NoError(t, err)
-	require.NoError(t, outboxA1.Close())
-	outboxB1, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: outboxBPath})
-	require.NoError(t, err)
 	intentB := beginAPICallbackOperationIntent(
-		t, outboxB1, leaseB, exactURLB, backendB, testAPIBackendStorageID(backendB),
+		t, journalsB1.operations, leaseB, exactURLB,
 	)
-	_, err = outboxB1.ResolveOperationIntent(
-		intentB.Claim, backend.CallbackStatusFailed, "remote provision failed after dispatch",
-	)
-	require.NoError(t, err)
-	require.NoError(t, outboxB1.Close())
+	claimB, created := intentB.CreatedClaim()
+	require.True(t, created)
+	uncommittedB := commitAPICallbackOperationRefusal(t, journalsB1.operations, claimB)
+	require.NoError(t, publisherB1.PublishOperationFailureContext(
+		context.Background(), uncommittedB, "remote provision failed after dispatch",
+	))
+	require.NoError(t, journalsB1.Close())
 
-	placementStore2, err := placementstore.NewStore(placementPath)
+	placementStore2, err := placementstore.NewStore(
+		placementPath, placement.WithCallbackRouteFactory(callbackRoutes),
+	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, placementStore2.Close()) })
 	require.Equal(t, operationA, placementStore2.Lookup(leaseA).AttemptOperationID())
@@ -503,7 +774,7 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 		},
 		GetLeaseFunc: func(_ context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
-				Uuid: leaseUUID, ProviderUuid: providerUUID,
+				Uuid: leaseUUID, Tenant: "tenant-1", ProviderUuid: providerUUID,
 				State: billingtypes.LEASE_STATE_PENDING,
 			}, nil
 		},
@@ -518,9 +789,9 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 	}})
 	require.NoError(t, err)
 	manager, err := provisioner.NewManager(provisioner.ManagerConfig{
-		ProviderUUID:    providerUUID,
-		CallbackBaseURL: "http://fred.invalid",
-		PlacementStore:  placementStore2,
+		ProviderUUID:          providerUUID,
+		PlacementStore:        placementStore2,
+		CallbackProofConsumer: proofConsumer,
 	}, router, chainClient)
 	require.NoError(t, err)
 	managerCtx, cancelManager := context.WithCancel(context.Background())
@@ -548,11 +819,12 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 		ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second,
 		RequestTimeout: time.Second, CallbackApplicationTimeout: 2 * time.Second,
 		CallbackHMACSecrets: map[backendidentity.ID]string{
-			testAPIBackendStorageID(backendA): secretA,
-			testAPIBackendStorageID(backendB): secretB,
+			storageIDA: secretA,
+			storageIDB: secretB,
 		},
 	}, ServerDeps{
 		ChainClient: chainClient, CallbackPublisher: manager, StatusChecker: manager,
+		CallbackProofVerifier: proofVerifier,
 	})
 	require.NoError(t, err)
 	_, err = callbackServer.StartBackground()
@@ -562,28 +834,38 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 	// Backend B first reopens its outbox with A's key. The HMAC-covered B identity
 	// selects B's keyring slot, so A's key must receive 401, leave the row queued,
 	// and leave B's durable attempt untouched.
-	outboxB2, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: outboxBPath})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, outboxB2.Close()) })
+	journalsB2 := openBoundAPICallbackStore(t, outboxBPath, backendB)
+	outboxB2 := journalsB2.callbacks
+	require.Equal(t, storageIDB, journalsB2.storageID)
+	t.Cleanup(func() { require.NoError(t, journalsB2.Close()) })
 	zeroBackoff := [shared.CallbackMaxAttempts]time.Duration{}
 	wrongKeyResults := make(chan callbackHTTPObservation, shared.CallbackMaxAttempts)
+	wrongKeyCtx, cancelWrongKey := context.WithCancel(context.Background())
 	wrongKeySender := shared.MustNewCallbackSender(shared.CallbackSenderConfig{
-		Store: outboxB2,
+		Store: outboxB2, StorageAttestor: newAPICallbackStorageAttestor(t, journalsB2, wrongKeyCtx),
 		HTTPClient: &http.Client{Transport: &callbackObservingRoundTripper{
 			base: http.DefaultTransport, observations: wrongKeyResults,
 		}},
-		Secret:          secretA,
-		BeforeDelivery:  callbackTestStorageReattestation,
-		BeforeReplay:    callbackTestStorageReattestation,
-		StorageIdentity: testAPIBackendStorageID(backendB),
-		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
-		StopCtx:         t.Context(), Backoff: &zeroBackoff, DeliveryTimeout: 3 * time.Second,
+		Secret:  secretA,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Backoff: &zeroBackoff, DeliveryTimeout: 3 * time.Second,
 	})
-	wrongKeySender.ReplayPendingCallbacks()
+	wrongKeyDone := make(chan struct{})
+	go func() {
+		defer close(wrongKeyDone)
+		wrongKeySender.RunReplayLoop()
+	}()
+	wrongKeySender.NotifyPendingCallbacks()
 	for range shared.CallbackMaxAttempts {
 		result := <-wrongKeyResults
 		require.NoError(t, result.err)
 		assert.Equal(t, http.StatusUnauthorized, result.statusCode)
+	}
+	cancelWrongKey()
+	select {
+	case <-wrongKeyDone:
+	case <-time.After(time.Second):
+		t.Fatal("wrong-key replay loop did not stop")
 	}
 	pendingB, err := outboxB2.ListPending()
 	require.NoError(t, err)
@@ -593,18 +875,33 @@ func TestCallbackOutboxReplay_SettlesDurableAttemptAcrossBothProcessRestarts(t *
 
 	// Backend A now reopens its durable outbox and replays through Fred's real
 	// production keyring into the fresh Registry plus reopened placement store.
-	outboxA2, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: outboxAPath})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, outboxA2.Close()) })
+	journalsA2 := openBoundAPICallbackStore(t, outboxAPath, backendA)
+	outboxA2 := journalsA2.callbacks
+	require.Equal(t, storageIDA, journalsA2.storageID)
+	t.Cleanup(func() { require.NoError(t, journalsA2.Close()) })
+	senderACtx, cancelSenderA := context.WithCancel(context.Background())
 	senderA := shared.MustNewCallbackSender(shared.CallbackSenderConfig{
-		Store: outboxA2, HTTPClient: &http.Client{}, Secret: secretA,
-		BeforeDelivery:  callbackTestStorageReattestation,
-		BeforeReplay:    callbackTestStorageReattestation,
-		StorageIdentity: testAPIBackendStorageID(backendA),
-		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
-		StopCtx:         t.Context(), Backoff: &zeroBackoff, DeliveryTimeout: 3 * time.Second,
+		Store: outboxA2, StorageAttestor: newAPICallbackStorageAttestor(t, journalsA2, senderACtx),
+		HTTPClient: &http.Client{}, Secret: secretA,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Backoff: &zeroBackoff, DeliveryTimeout: 3 * time.Second,
 	})
-	senderA.ReplayPendingCallbacks()
+	senderADone := make(chan struct{})
+	go func() {
+		defer close(senderADone)
+		senderA.RunReplayLoop()
+	}()
+	senderA.NotifyPendingCallbacks()
+	require.Eventually(t, func() bool {
+		remaining, listErr := outboxA2.ListPending()
+		return listErr == nil && len(remaining) == 0
+	}, 5*time.Second, time.Millisecond)
+	cancelSenderA()
+	select {
+	case <-senderADone:
+	case <-time.After(time.Second):
+		t.Fatal("successful replay loop did not stop")
+	}
 
 	pending, err := outboxA2.ListPending()
 	require.NoError(t, err)
@@ -626,6 +923,7 @@ func TestCallbackOrdering_ProviderDeadlineKeepsDurableHead(t *testing.T) {
 	const secret = "callback-deadline-secret-at-least-32-bytes"
 	leaseUUID := testutil.ValidUUID1
 	publisher := &callbackDeadlinePublisher{}
+	proofVerifier, _ := hmacauth.NewCallbackProofBoundary()
 	apiAddr := freePort(t)
 	server, err := NewServer(ServerConfig{
 		Addr:                       apiAddr,
@@ -640,52 +938,67 @@ func TestCallbackOrdering_ProviderDeadlineKeepsDurableHead(t *testing.T) {
 		CallbackApplicationTimeout: 40 * time.Millisecond,
 		CallbackSecret:             secret,
 	}, ServerDeps{
-		ChainClient:       &chaintest.MockClient{},
-		CallbackPublisher: publisher,
+		ChainClient:           &chaintest.MockClient{},
+		CallbackPublisher:     publisher,
+		CallbackProofVerifier: proofVerifier,
 	})
 	require.NoError(t, err)
 	_, err = server.StartBackground()
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, server.Shutdown(context.Background())) })
 
-	store, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	journals := openBoundAPICallbackStore(
+		t, filepath.Join(t.TempDir(), "callbacks.db"), "docker-api-test",
+	)
+	store := journals.callbacks
+	t.Cleanup(func() { require.NoError(t, journals.Close()) })
 
 	zeroBackoff := [shared.CallbackMaxAttempts]time.Duration{}
 	const deliveryTimeout = 250 * time.Millisecond
 	observations := make(chan callbackHTTPObservation, shared.CallbackMaxAttempts)
+	senderCtx, cancelSender := context.WithCancel(context.Background())
+	attestor := newAPICallbackStorageAttestor(t, journals, senderCtx)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sender := shared.MustNewCallbackSender(shared.CallbackSenderConfig{
-		Store: store,
+		Store: store, StorageAttestor: attestor,
 		HTTPClient: &http.Client{Transport: &callbackObservingRoundTripper{
 			base:         http.DefaultTransport,
 			observations: observations,
 		}},
 		Secret:          secret,
-		BeforeDelivery:  callbackTestStorageReattestation,
-		BeforeReplay:    callbackTestStorageReattestation,
-		StorageIdentity: testAPIBackendStorageID("docker"),
-		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
-		StopCtx:         t.Context(),
+		Logger:          logger,
 		Backoff:         &zeroBackoff,
 		DeliveryTimeout: deliveryTimeout,
 	})
-	callbackURL, err := provisioner.BuildCallbackURL("http://" + apiAddr)
+	durablePublisher := mustNewCallbackPublisherForTest(t, shared.CallbackPublisherConfig{
+		OperationSettlement:   journals.operations,
+		MaintenanceSettlement: journals.maintenance,
+		StorageAttestor:       attestor,
+		Logger:                logger,
+	})
+	callbackOperationID, err := operation.ParseID("550e8400-e29b-41d4-a716-446655440000")
 	require.NoError(t, err)
-	sender.SendLifecycleCallback(
-		leaseUUID,
-		callbackURL,
-		"docker",
-		backend.CallbackStatusFailed,
-		"container exited",
-		false,
-	)
+	callbackRoutes, err := placement.NewCallbackRouteFactory("http://" + apiAddr)
+	require.NoError(t, err)
+	callbackPair, err := callbackRoutes.ForOperation(callbackOperationID)
+	require.NoError(t, err)
+	callbackURL := callbackPair.OperationURL()
+	admission := beginAPICallbackOperationIntent(t, journals.operations, leaseUUID, callbackURL)
+	claim, created := admission.CreatedClaim()
+	require.True(t, created)
+	uncommitted := commitAPICallbackOperationRefusal(t, journals.operations, claim)
+	require.NoError(t, durablePublisher.PublishOperationFailureContext(
+		context.Background(), uncommitted, "container exited",
+	))
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "durable Send must return after persistence, before HTTP delivery")
-	sender.ReplayPendingCallbacks()
+	replayDone := make(chan struct{})
+	go func() {
+		defer close(replayDone)
+		sender.RunReplayLoop()
+	}()
+	sender.NotifyPendingCallbacks()
 	for attempt := 1; attempt <= shared.CallbackMaxAttempts; attempt++ {
 		select {
 		case observation := <-observations:
@@ -703,6 +1016,12 @@ func TestCallbackOrdering_ProviderDeadlineKeepsDurableHead(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("callback attempt %d did not return an observable HTTP response", attempt)
 		}
+	}
+	cancelSender()
+	select {
+	case <-replayDone:
+	case <-time.After(time.Second):
+		t.Fatal("deadline replay loop did not stop")
 	}
 
 	require.Eventually(t, func() bool {

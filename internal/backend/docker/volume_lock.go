@@ -17,10 +17,8 @@ package docker
 // volumeOp.destroyOne — take the same stripe, and the destroy re-reads the live claim
 // while holding it. That is what makes a destroy's decision and its delete one step.
 //
-// Everything funnels through createManagedVolume so the lock cannot be forgotten at a
-// future call site; the forbidigo rule in .golangci.yml (pattern `volumes\.Create`,
-// excluded only for this file) is what keeps that true, exactly as its sibling rule does
-// for the destroy capability.
+// Everything funnels through createManagedVolume, whose required Mutations capability
+// proves a durable workflow was Started before this lock can reach the opaque writer.
 
 import (
 	"context"
@@ -53,9 +51,14 @@ func (b *Backend) volumeNameMu(name string) *sync.Mutex {
 // finishes first — and this then creates a fresh directory, which is the correct outcome
 // once the control plane has said nobody owned the old one — or it finds the claim this
 // lease published at its reservation and refuses.
-func (b *Backend) createManagedVolume(ctx context.Context, volumeID string, sizeMB int64) (string, bool, error) {
+func (b *Backend) createManagedVolume(
+	mutations *storageMutations,
+	ctx context.Context,
+	volumeID string,
+	sizeMB int64,
+) (string, bool, error) {
 	mu := b.volumeNameMu(volumeID)
 	mu.Lock()
 	defer mu.Unlock()
-	return b.mutationAdapter().createVolume(ctx, volumeID, sizeMB)
+	return mutations.createVolume(ctx, volumeID, sizeMB)
 }

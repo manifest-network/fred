@@ -278,7 +278,7 @@ func (pair *BoundMarkerPair) InitializeWithStores(
 		); err != nil {
 			return VerifiedStorage{}, err
 		}
-		return VerifiedStorage{id: primaryID}, nil
+		return VerifiedStorage{id: primaryID, backendName: backendName}, nil
 	case primaryAbsent && anchorAbsent:
 		id, err := New()
 		if err != nil {
@@ -347,7 +347,7 @@ func (pair *BoundMarkerPair) InitializeWithStores(
 		); err != nil {
 			return VerifiedStorage{}, err
 		}
-		return VerifiedStorage{id: primaryID}, nil
+		return VerifiedStorage{id: primaryID, backendName: backendName}, nil
 	case primaryAbsent || anchorAbsent:
 		return VerifiedStorage{}, fmt.Errorf("%w: one member of the durable marker pair is missing",
 			ErrMarkerBindingMismatch)
@@ -400,7 +400,7 @@ func (pair *BoundMarkerPair) completePendingInitialization(
 	if err := pair.recoverAndVerifyCommitted(backendName, substrateID, id, hooks.Verify); err != nil {
 		return VerifiedStorage{}, err
 	}
-	return VerifiedStorage{id: id}, nil
+	return VerifiedStorage{id: id, backendName: backendName}, nil
 }
 
 func (pair *BoundMarkerPair) recoverAndVerifyCommitted(
@@ -417,7 +417,7 @@ func (pair *BoundMarkerPair) recoverAndVerifyCommitted(
 	if err := pair.verifyMarkerPair(backendName, substrateID, expected); err != nil {
 		return fmt.Errorf("re-attest committed backend storage identity: %w", err)
 	}
-	if err := verify(VerifiedStorage{id: expected}); err != nil {
+	if err := verify(VerifiedStorage{id: expected, backendName: backendName}); err != nil {
 		return fmt.Errorf("verify identity-bound stores: %w", err)
 	}
 	if err := pair.verifyMarkerPair(backendName, substrateID, expected); err != nil {

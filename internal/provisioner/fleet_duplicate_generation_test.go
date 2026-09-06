@@ -34,14 +34,10 @@ func TestFleet_DuplicateResponseCannotAuthorizeUninstalledLifecycleGeneration(t 
 			"550e8400-e29b-41d4-a716-446655440010",
 		)
 
-		orchestrator, err := NewProvisionOrchestrator(
-			f.providerUUID,
-			"http://fred.invalid",
-			f.router,
-			f.tracker.Operations(),
-			f.placement,
-			nil,
-		)
+		setTestProviderControlPlane(t, f.execution, f.chain, nil)
+		provision, err := f.execution.ProvisionCoordinator(nil)
+		require.NoError(t, err)
+		orchestrator, err := NewProvisionOrchestrator(provision)
 		require.NoError(t, err)
 		leaseRecord, err := f.chain.GetLease(t.Context(), leaseUUID)
 		require.NoError(t, err)
@@ -83,15 +79,11 @@ func TestFleet_DuplicateResponseCannotAuthorizeUninstalledLifecycleGeneration(t 
 			"550e8400-e29b-41d4-a716-446655440020",
 		)
 
+		setTestProviderControlPlane(t, f.execution, f.chain, nil)
+		restoreCoordinator, err := f.execution.RestoreCoordinator(nil)
+		require.NoError(t, err)
 		service, err := restoreapp.NewService(restoreapp.Config{
-			ProviderUUID: f.providerUUID,
-			CallbackURL: func(id operation.OperationID) (string, error) {
-				return BuildCallbackURLForOperation("http://fred.invalid", id)
-			},
-			Leases:     f.chain,
-			Backends:   restoreapp.BackendResolverFunc(f.resolveRestoreBackend),
-			Operations: f.tracker.Operations(),
-			Authority:  f.placement,
+			Coordinator: restoreCoordinator,
 		})
 		require.NoError(t, err)
 
@@ -100,7 +92,7 @@ func TestFleet_DuplicateResponseCannotAuthorizeUninstalledLifecycleGeneration(t 
 			Tenant:          "tenant-1",
 			SourceLeaseUUID: sourceUUID,
 		})
-		require.Equal(t, restoreapp.OutcomeAlreadyProvisioned, result.Outcome)
+		require.Equal(t, restoreapp.OutcomeInternalFailure, result.Outcome)
 		require.Equal(t, 1, owner.restoreCount(target))
 		request, ok := owner.restoreRequest(target)
 		require.True(t, ok)
@@ -121,17 +113,17 @@ func seedFleetTypedGeneration(
 	t.Helper()
 	operationID, err := operation.ParseID(operationText)
 	require.NoError(t, err)
-	callbackURL, err := BuildCallbackURLForOperation("http://old-fred.invalid", operationID)
+	routes, err := placement.NewCallbackRouteFactory("http://old-fred.invalid")
 	require.NoError(t, err)
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
+	callbacks, err := routes.ForOperation(operationID)
 	require.NoError(t, err)
 	owner.seedProvisionWithCallbacks(
 		t,
 		leaseUUID,
 		providerUUID,
 		backend.ProvisionStatusReady,
-		callbackURL,
-		lifecycleCallbackURL,
+		callbacks.OperationURL(),
+		callbacks.LifecycleURL(),
 	)
 	id, err := lifecycle.FromOperationID(operationID)
 	require.NoError(t, err)
@@ -165,11 +157,10 @@ func assertDuplicateGenerationFenced(
 	require.Equal(t, owner.name, record.Attempt,
 		"the rejected fresh generation must remain an unresolved exact attempt")
 	require.Equal(t, freshID.String(), record.AttemptOperationID().String())
-	require.Equal(t, placement.LifecycleVerdictAuthorized,
-		f.placement.AuthorizeLifecycle(leaseUUID, oldID).Verdict())
-	require.Equal(t, placement.LifecycleVerdictStale,
-		f.placement.AuthorizeLifecycle(leaseUUID, freshID).Verdict(),
-		"a 409 plus positive inventory must not authorize a generation the backend never installed")
+	currentLifecycle := f.placement.CurrentLifecycle(leaseUUID)
+	require.Equal(t, placement.LifecycleVerdictTeardownOnly, currentLifecycle.Verdict(),
+		"an unresolved replacement operation must prevent copying the old route onto new commands")
+	require.Equal(t, owner.name, currentLifecycle.Backend())
 
 	installed := owner.lifecycleObservation(leaseUUID)
 	require.NotNil(t, installed)
@@ -183,8 +174,8 @@ func assertDuplicateGenerationFenced(
 	require.Equal(t, owner.name, record.Backend)
 	require.Equal(t, owner.name, record.Attempt)
 	require.Equal(t, freshID.String(), record.AttemptOperationID().String())
-	require.Equal(t, placement.LifecycleVerdictAuthorized,
-		f.placement.AuthorizeLifecycle(leaseUUID, oldID).Verdict())
-	require.Equal(t, placement.LifecycleVerdictStale,
-		f.placement.AuthorizeLifecycle(leaseUUID, freshID).Verdict())
+	currentLifecycle = f.placement.CurrentLifecycle(leaseUUID)
+	require.Equal(t, placement.LifecycleVerdictTeardownOnly, currentLifecycle.Verdict())
+	require.Equal(t, owner.name, currentLifecycle.Backend())
+	require.NotEqual(t, freshID, currentLifecycle.ID())
 }

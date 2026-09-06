@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 func TestStorageIdentityContainerVolumeEvidenceRequiresExactContainerIdentity(t *testing.T) {
@@ -30,7 +29,10 @@ func TestStorageIdentityContainerVolumeEvidenceRequiresExactContainerIdentity(t 
 		wantError   bool
 	}{
 		{name: "current", volumeName: canonicalVolumeName(leaseA, "web", 2), serviceName: "web", index: 2},
-		{name: "legacy v0.13", volumeName: "fred-" + leaseA + "-2", index: 2},
+		{
+			name: "legacy v0.13 form is not exact current identity", volumeName: "fred-" + leaseA + "-2",
+			serviceName: "app", index: 2, wantError: true,
+		},
 		{name: "foreign lease", volumeName: canonicalVolumeName(leaseB, "web", 2), serviceName: "web", index: 2, wantError: true},
 		{name: "wrong service", volumeName: canonicalVolumeName(leaseA, "worker", 2), serviceName: "web", index: 2, wantError: true},
 		{name: "wrong index", volumeName: canonicalVolumeName(leaseA, "web", 1), serviceName: "web", index: 2, wantError: true},
@@ -242,7 +244,7 @@ func TestStorageIdentityProofRejectsUnattestedManagedVolumeBeforePublication(t *
 	}
 }
 
-func TestAttestManagedVolumeInventoryRejectsNonDirectoryNamespaceEntries(t *testing.T) {
+func TestAttestManagedVolumeInventoryPreservesNonVolumeNamespaceEntries(t *testing.T) {
 	const leaseUUID = "11111111-1111-4111-8111-111111111111"
 	for _, test := range []struct {
 		name  string
@@ -266,13 +268,16 @@ func TestAttestManagedVolumeInventoryRejectsNonDirectoryNamespaceEntries(t *test
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			name := canonicalVolumeName(leaseUUID, "app", 0)
-			test.plant(t, filepath.Join(root, name))
+			artifact := filepath.Join(root, name)
+			test.plant(t, artifact)
 			manager := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
 
 			inventory, err := attestManagedVolumeInventory(t.Context(), manager)
-			require.Error(t, err)
+			require.NoError(t, err)
 			assert.Empty(t, inventory)
-			assert.ErrorContains(t, err, "not a real directory")
+			_, statErr := os.Lstat(artifact)
+			require.NoError(t, statErr,
+				"an unattributed non-volume artifact must be preserved, not consumed as storage")
 		})
 	}
 }
@@ -386,17 +391,15 @@ func TestStorageIdentityAdoptionRejectsCrossLeaseContainerVolumeEvidence(t *test
 	cfg.VolumeDataPath = t.TempDir()
 	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
 	writeLegacyAuthorityStores(t, cfg)
-	releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: cfg.ReleasesDBPath})
-	require.NoError(t, err)
-	require.NoError(t, releases.Append(leaseA, shared.Release{
-		Manifest:  []byte(`{"image":"docker.io/library/alpine:3.22"}`),
-		Image:     "docker.io/library/alpine:3.22",
+	writeRawV013ReleaseHistory(t, cfg.ReleasesDBPath, leaseA, []v013ReleaseWire{{
+		Version:   1,
+		Manifest:  []byte(`{"services":{"app":{"image":"docker.io/library/alpine:3.22"}}}`),
+		Image:     "stack",
 		Status:    "active",
 		CreatedAt: time.Unix(1_700_000_000, 0),
-	}))
-	require.NoError(t, releases.Close())
+	}})
 
-	foreignVolume := fmt.Sprintf("fred-%s-0", leaseB)
+	foreignVolume := canonicalVolumeName(leaseB, "app", 0)
 	foreignSource := filepath.Join(cfg.VolumeDataPath, foreignVolume, "data")
 	require.NoError(t, os.MkdirAll(foreignSource, 0o700))
 	dockerClient := &mockDockerClient{
@@ -406,9 +409,9 @@ func TestStorageIdentityAdoptionRejectsCrossLeaseContainerVolumeEvidence(t *test
 		},
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			return []ContainerInfo{{
-				ContainerID: "container-a", Name: "fred-" + leaseA + "-0",
+				ContainerID: "container-a", Name: canonicalVolumeName(leaseA, "app", 0),
 				LeaseUUID: leaseA, Tenant: "tenant-a", ProviderUUID: providerUUID,
-				BackendName: "docker", SKU: "sku-stateful", InstanceIndex: 0,
+				BackendName: "docker", SKU: "sku-stateful", ServiceName: "app", InstanceIndex: 0,
 				CallbackURL: "https://fred.example/callbacks/provision",
 				Image:       "docker.io/library/alpine:3.22", Status: "exited",
 				Mounts: []ContainerMount{{Type: "bind", Source: foreignSource, Target: "/data"}},

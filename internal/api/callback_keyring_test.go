@@ -31,10 +31,11 @@ func callbackKeyringID(t *testing.T, value string) backendidentity.ID {
 
 func testCallbackKeyring(t *testing.T) *CallbackKeyringAuthenticator {
 	t.Helper()
+	verifier, _ := hmacauth.NewCallbackProofBoundary()
 	keyring, err := NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{
 		callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,
 		callbackKeyringID(t, callbackKeyringStorageB): callbackKeyringSecretB,
-	})
+	}, verifier)
 	require.NoError(t, err)
 	return keyring
 }
@@ -144,7 +145,7 @@ func TestCallbackKeyringAuthenticatorRejectsAmbiguousCallbackJSON(t *testing.T) 
 		{
 			name: "malformed object",
 			body: `{"lease_uuid":`,
-			want: "decode callback field",
+			want: "decode field",
 		},
 		{
 			name: "trailing object",
@@ -168,21 +169,28 @@ func TestCallbackKeyringAuthenticatorConstructionIsClosed(t *testing.T) {
 	t.Parallel()
 	idA := callbackKeyringID(t, callbackKeyringStorageA)
 	idB := callbackKeyringID(t, callbackKeyringStorageB)
+	verifier, _ := hmacauth.NewCallbackProofBoundary()
+	keyring, err := NewCallbackKeyringAuthenticator(
+		map[backendidentity.ID]string{idA: callbackKeyringSecretA},
+		hmacauth.CallbackProofVerifier{},
+	)
+	require.ErrorContains(t, err, "proof verifier is required")
+	assert.Nil(t, keyring)
 
-	_, err := NewCallbackKeyringAuthenticator(nil)
+	_, err = NewCallbackKeyringAuthenticator(nil, verifier)
 	require.ErrorContains(t, err, "keyring is required")
-	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{{}: callbackKeyringSecretA})
+	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{{}: callbackKeyringSecretA}, verifier)
 	require.ErrorContains(t, err, "invalid backend storage identity")
-	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{idA: "short"})
+	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{idA: "short"}, verifier)
 	require.ErrorContains(t, err, "at least")
 	_, err = NewCallbackKeyringAuthenticator(map[backendidentity.ID]string{
 		idA: callbackKeyringSecretA,
 		idB: callbackKeyringSecretA,
-	})
+	}, verifier)
 	require.ErrorContains(t, err, "duplicates storage")
 
 	configured := map[backendidentity.ID]string{idA: callbackKeyringSecretA}
-	keyring, err := NewCallbackKeyringAuthenticator(configured)
+	keyring, err = NewCallbackKeyringAuthenticator(configured, verifier)
 	require.NoError(t, err)
 	configured[idA] = callbackKeyringSecretB
 	body := []byte(`{"lease_uuid":"d144291f-a36f-47a4-8ccf-48afe590e29d","status":"success","backend_storage_id":"` + callbackKeyringStorageA + `"}`)
@@ -202,23 +210,30 @@ func TestNewServerRejectsAmbiguousCallbackAuthenticationModes(t *testing.T) {
 	require.ErrorContains(t, err, "cannot be combined")
 }
 
+func TestNewServerRejectsCallbackAuthenticationWithoutProofVerifier(t *testing.T) {
+	server, err := NewServer(ServerConfig{CallbackSecret: testCallbackSecret}, ServerDeps{})
+	assert.Nil(t, server)
+	require.ErrorContains(t, err, "proof verifier is required")
+}
+
 func TestNewServerConstructsStorageIdentityKeyring(t *testing.T) {
 	t.Parallel()
+	verifier, _ := hmacauth.NewCallbackProofBoundary()
 	server, err := NewServer(ServerConfig{
 		CallbackHMACSecrets: map[backendidentity.ID]string{
 			callbackKeyringID(t, callbackKeyringStorageA): callbackKeyringSecretA,
 			callbackKeyringID(t, callbackKeyringStorageB): callbackKeyringSecretB,
 		},
-	}, ServerDeps{})
+	}, ServerDeps{CallbackProofVerifier: verifier})
 	require.NoError(t, err)
 	require.IsType(t, &CallbackKeyringAuthenticator{}, server.callbackAuthenticator)
 
 	bodyForB := []byte(`{"lease_uuid":"d144291f-a36f-47a4-8ccf-48afe590e29d","status":"success","backend_storage_id":"` + callbackKeyringStorageB + `"}`)
-	_, err = server.callbackAuthenticator.VerifyCallbackRequest(
+	_, err = server.callbackAuthenticator.VerifyCallbackEvidence(
 		signedKeyringCallbackRequest(bodyForB, callbackKeyringSecretB),
 	)
 	require.NoError(t, err)
-	_, err = server.callbackAuthenticator.VerifyCallbackRequest(
+	_, err = server.callbackAuthenticator.VerifyCallbackEvidence(
 		signedKeyringCallbackRequest(bodyForB, callbackKeyringSecretA),
 	)
 	require.Error(t, err, "backend A's key must not authenticate storage B through server wiring")

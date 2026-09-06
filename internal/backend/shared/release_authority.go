@@ -50,7 +50,7 @@ func (release Release) RuntimeIdentity() (ReleaseRuntimeIdentity, bool) {
 		}, true
 	}
 	if authority := release.LegacyRuntimeAuthority; authority != nil {
-		if !authority.valid || release.OperationID != "" {
+		if !authority.valid || !release.OperationID.IsZero() {
 			return ReleaseRuntimeIdentity{}, false
 		}
 		return ReleaseRuntimeIdentity{

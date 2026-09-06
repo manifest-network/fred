@@ -7,8 +7,34 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
+
+func beginCloseRecoveryIntentWithProfiles(
+	t *testing.T,
+	stores closeRecoveryStores,
+	cleanupOnly bool,
+	profiles []shared.SKUResourceSnapshot,
+) shared.CloseIntentClaim {
+	t.Helper()
+	items := []backend.LeaseItem{{
+		SKU: "docker-small", ServiceName: "app", Quantity: 1,
+	}}
+	_, _, _ = seedCloseRecoveryReleaseWithProfiles(t, stores, "", items, profiles)
+	if cleanupOnly {
+		request, err := stores.close.NewCleanupCloseRequest(closeRecoveryLeaseUUID)
+		require.NoError(t, err)
+		admission, err := stores.close.BeginCleanupClose(request)
+		require.NoError(t, err)
+		return admission.Claim()
+	}
+	request, err := stores.close.NewCloseRequest(closeRecoveryLeaseUUID, false)
+	require.NoError(t, err)
+	admission, err := stores.close.BeginClose(request)
+	require.NoError(t, err)
+	return admission.Claim()
+}
 
 func TestRecoverState_CloseIntentUsesImmutableResourcesAfterConfigChange(t *testing.T) {
 	tests := []struct {
@@ -51,13 +77,11 @@ func TestRecoverState_CloseIntentUsesImmutableResourcesAfterConfigChange(t *test
 
 			// Commit a nonzero immutable authority, then mutate the live config before
 			// rebuilding the backend projection. Recovery must not consult the latter.
-			b.cfg.SKUProfiles["docker-small"] = SKUProfile{
-				CPUCores: 1.5, MemoryMB: 768, DiskMB: 4096,
-			}
-			claim := beginCloseRecoveryIntent(t, b, stores, tt.cleanupOnly, "")
-			require.Equal(t, []shared.SKUResourceSnapshot{{
+			profiles := []shared.SKUResourceSnapshot{{
 				SKU: "docker-small", CPUCores: 1.5, MemoryMB: 768, DiskMB: 4096,
-			}}, claim.ResourceProfiles())
+			}}
+			claim := beginCloseRecoveryIntentWithProfiles(t, stores, tt.cleanupOnly, profiles)
+			require.Equal(t, profiles, claim.ResourceProfiles())
 			tt.mutate(b)
 
 			require.NoError(t, b.recoverState(context.Background()))
@@ -86,9 +110,10 @@ func TestRecoverState_CloseIntentUsesPinnedScratchAfterConfigRemoval(t *testing.
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) { return nil, nil },
 	}
 	b, stores := openCloseRecoveryBackend(t, dir, mock, volumeState.manager())
-	b.cfg.ContainerTmpfsSizeMB = 73
-
-	claim := beginCloseRecoveryIntent(t, b, stores, false, "")
+	profiles := []shared.SKUResourceSnapshot{{
+		SKU: "docker-small", CPUCores: 0.5, MemoryMB: 512, ScratchDiskMB: 73,
+	}}
+	claim := beginCloseRecoveryIntentWithProfiles(t, stores, false, profiles)
 	require.Equal(t, int64(73), claim.ResourceProfiles()[0].ScratchDiskMB)
 	require.Zero(t, claim.ResourceProfiles()[0].DiskMB)
 

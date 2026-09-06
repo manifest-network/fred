@@ -7,7 +7,13 @@
 > When Fred receives a flat manifest:
 >
 > - **At provision time:** the manifest is silently auto-wrapped into a 1-service stack under the synthetic service name `app`. The submitting tenant sees no behavioural difference except a `manifest deprecation: tenant submitted flat single-service manifest; auto-wrapped as 1-service stack` warning in operator logs.
-> - **At fred startup:** any pre-existing containers from leases provisioned under the legacy single-service execution path (Fred releases before this migration) are migrated in-place to the stack-shape naming convention. Migration is per-lease atomic and crash-resumable across most boundaries; see the CHANGELOG's *Migration → Troubleshooting* section (the *Stuck `-prev` containers …* subsection) for the one narrow non-resumable window and the operator remediation.
+> - **At fred startup:** Fred does not infer or rewrite a pre-stack container
+>   cohort. The supported v0.13 upgrade input is already in complete stack form,
+>   including stable service names and volume ownership. Service-name-less
+>   cohorts, `-prev` remnants, partial generations, or otherwise ambiguous
+>   runtime identity fail startup before mutation. Resolve those discrepancies
+>   during the stopped preflight described in [DEPLOYMENT.md](../DEPLOYMENT.md);
+>   do not rely on startup to migrate them in place.
 >
 > The flat format will be removed in a future major release. Until then, both formats remain valid wire input.
 
@@ -535,6 +541,9 @@ Submits a new manifest for an already-provisioned lease. The body is a JSON obje
 **Requirements:**
 - Lease must be in `ACTIVE` state.
 - Bearer token authentication with replay protection.
+- Exactly one canonical UUIDv4 `Idempotency-Key` header. Reuse the same value
+  only when retrying this exact payload; use a fresh UUID for a new logical
+  update.
 - Returns `202 Accepted` on success.
 
 ## Duration Format

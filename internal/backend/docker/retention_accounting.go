@@ -601,8 +601,9 @@ func resolveTenantRetentionBudget(cfg Config, tenant string) retentionBudget {
 // boundPartition applies the write-time distinct-partition bound for an
 // allowlisted (aggregator) tenant. It is COLLAPSE-ONLY and can never fail the
 // close: every uncertainty degrades to the "" default whole-tenant bucket. The
-// snapshot is the tenant's ListByTenant output (snapErr its read error), shared
-// with the eviction passes so no extra store read is taken.
+// snapshot is the DTO half of ListTenantRetentionCandidates (snapErr its read
+// error), whose exact Active candidates are shared with the eviction passes so
+// no extra store read is taken.
 //
 // Distinct non-"" partitions are counted over ACTIVE + RESTORING records; reaping
 // is excluded so a stuck destroy-retry loop cannot starve legitimate new labels.
@@ -822,7 +823,7 @@ func (b *Backend) shouldRefuseRetentionWithResourceProfiles(
 // passing an unfiltered one would have silently defeated it (ENG-658). The op makes the
 // check travel with the names. Returns the destroy report so the caller can tell
 // "bytes gone" from "bytes still there", which is what gates releasing the reservation.
-func (b *Backend) destroyOnRefuseToRetain(ctx context.Context, op *volumeOp, canonical []string, leaseUUID, tenant, partition, scope string, logger *slog.Logger) destroyReport {
+func (b *Backend) destroyOnRefuseToRetain(mutations volumeDestroyMutationCapability, ctx context.Context, op *volumeOp, canonical []string, leaseUUID, tenant, partition, scope string, logger *slog.Logger) destroyReport {
 	var capMB int64
 	switch scope {
 	case refuseScopeGlobal:
@@ -839,5 +840,5 @@ func (b *Backend) destroyOnRefuseToRetain(ctx context.Context, op *volumeOp, can
 		retentionRefusedTotal.Inc() // deployed L0-global-only meaning preserved
 	}
 	retentionRefusedByScopeTotal.WithLabelValues(scope).Inc()
-	return op.destroy(ctx, destroySiteRetentionRefused, canonical...)
+	return op.destroy(mutations, ctx, destroySiteRetentionRefused, canonical...)
 }

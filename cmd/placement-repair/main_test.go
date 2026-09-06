@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
@@ -37,6 +38,178 @@ const (
 	repairCommandBackend        = "backend-a"
 )
 
+type repairAttemptBackend struct {
+	callErr error
+}
+
+func (*repairAttemptBackend) Name() string { return repairCommandBackend }
+func (candidate *repairAttemptBackend) Provision(
+	context.Context,
+	backend.ProvisionRequest,
+) error {
+	return candidate.callErr
+}
+func (*repairAttemptBackend) GetProvision(context.Context, string) (*backend.ProvisionInfo, error) {
+	return nil, backend.ErrNotProvisioned
+}
+func (*repairAttemptBackend) GetInfo(context.Context, string) (*backend.LeaseInfo, error) {
+	return nil, nil
+}
+func (*repairAttemptBackend) Deprovision(context.Context, string) error { return nil }
+func (*repairAttemptBackend) ListProvisions(context.Context) ([]backend.ProvisionInfo, error) {
+	return nil, nil
+}
+func (*repairAttemptBackend) LookupProvisions(
+	context.Context,
+	[]string,
+) ([]backend.ProvisionInfo, error) {
+	return nil, nil
+}
+func (*repairAttemptBackend) Health(context.Context) error       { return nil }
+func (*repairAttemptBackend) RefreshState(context.Context) error { return nil }
+func (*repairAttemptBackend) GetLogs(
+	context.Context,
+	string,
+	int,
+) (map[string]string, error) {
+	return nil, nil
+}
+func (*repairAttemptBackend) Restart(context.Context, backend.RestartRequest) error { return nil }
+func (*repairAttemptBackend) Update(context.Context, backend.UpdateRequest) error   { return nil }
+func (*repairAttemptBackend) ReconcileCustomDomain(
+	context.Context,
+	string,
+	[]backend.LeaseItem,
+) error {
+	return nil
+}
+func (*repairAttemptBackend) Restore(context.Context, backend.RestoreRequest) error { return nil }
+func (*repairAttemptBackend) GetReleases(context.Context, string) ([]backend.ReleaseInfo, error) {
+	return nil, nil
+}
+func (*repairAttemptBackend) GetLoadStats(context.Context) (*backend.LoadStats, error) {
+	return &backend.LoadStats{}, nil
+}
+func (*repairAttemptBackend) ListRetentions(context.Context) ([]backend.RetainedLease, error) {
+	return nil, nil
+}
+
+type repairAttemptRuntime struct {
+	backend backend.Backend
+}
+
+func (runtime repairAttemptRuntime) Route(string) backend.Backend { return runtime.backend }
+func (runtime repairAttemptRuntime) RouteForProvision(
+	context.Context,
+	string,
+	map[string]int,
+) backend.Backend {
+	return runtime.backend
+}
+func (runtime repairAttemptRuntime) RouteForProvisionAmong(
+	_ context.Context,
+	_ string,
+	eligible map[string]struct{},
+	_ map[string]int,
+) backend.Backend {
+	if _, ok := eligible[repairCommandBackend]; !ok {
+		return nil
+	}
+	return runtime.backend
+}
+func (runtime repairAttemptRuntime) GetBackendByName(name string) backend.Backend {
+	if name != repairCommandBackend {
+		return nil
+	}
+	return runtime.backend
+}
+func (runtime repairAttemptRuntime) Backends() []backend.Backend {
+	return []backend.Backend{runtime.backend}
+}
+
+type repairInventoryBackend struct {
+	backend.Backend
+	mu         sync.Mutex
+	storageID  backendidentity.ID
+	provisions []backend.ProvisionInfo
+	retentions []backend.RetainedLease
+}
+
+func (client *repairInventoryBackend) stage(
+	storageID backendidentity.ID,
+	provisions []backend.ProvisionInfo,
+	retentions []backend.RetainedLease,
+) {
+	client.mu.Lock()
+	client.storageID = storageID
+	client.provisions = append([]backend.ProvisionInfo(nil), provisions...)
+	client.retentions = append([]backend.RetainedLease(nil), retentions...)
+	client.mu.Unlock()
+}
+
+func (client *repairInventoryBackend) ListProvisionsWithIdentity(
+	context.Context,
+) ([]backend.ProvisionInfo, backendidentity.ID, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return append([]backend.ProvisionInfo(nil), client.provisions...), client.storageID, nil
+}
+
+func (client *repairInventoryBackend) ListRetentionsWithIdentity(
+	context.Context,
+) ([]backend.RetainedLease, backendidentity.ID, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return append([]backend.RetainedLease(nil), client.retentions...), client.storageID, nil
+}
+
+var repairReconciliationInventories sync.Map
+
+type repairAttemptLeaseReader struct{}
+
+func (repairAttemptLeaseReader) GetLease(
+	_ context.Context,
+	leaseUUID string,
+) (*billingtypes.Lease, error) {
+	return &billingtypes.Lease{
+		Uuid: leaseUUID, Tenant: "tenant-a", ProviderUuid: repairCommandProviderUUID,
+		State: billingtypes.LEASE_STATE_PENDING,
+		Items: []billingtypes.LeaseItem{{
+			SkuUuid: "sku-a", Quantity: 1, ServiceName: "app",
+		}},
+	}, nil
+}
+
+func (repairAttemptLeaseReader) GetPendingLeases(
+	context.Context, string,
+) ([]billingtypes.Lease, error) {
+	return nil, nil
+}
+
+func (repairAttemptLeaseReader) GetActiveLeasesByProvider(
+	context.Context, string,
+) ([]billingtypes.Lease, error) {
+	return nil, nil
+}
+
+func (repairAttemptLeaseReader) RejectLeases(
+	context.Context, []string, string,
+) (uint64, []string, error) {
+	return 0, nil, nil
+}
+
+func (repairAttemptLeaseReader) CloseLeases(
+	context.Context, []string, string,
+) (uint64, []string, error) {
+	return 0, nil, nil
+}
+
+func (repairAttemptLeaseReader) Acknowledge(
+	context.Context, string,
+) (bool, string, error) {
+	return true, "", nil
+}
+
 func repairBackendStorageID(t *testing.T, backendName string) backendidentity.ID {
 	t.Helper()
 	encoded := map[string]string{
@@ -48,29 +221,11 @@ func repairBackendStorageID(t *testing.T, backendName string) backendidentity.ID
 	return id
 }
 
-func repairBackendRequestSnapshot(t *testing.T) placement.BackendRequestSnapshot {
+func repairCallbackRouteFactory(t *testing.T) *placement.CallbackRouteFactory {
 	t.Helper()
-	snapshot, err := placement.NewBackendRequestSnapshot(
-		"tenant-a",
-		repairCommandProviderUUID,
-		[]backend.LeaseItem{{SKU: "sku-a", Quantity: 1, ServiceName: "app"}},
-	)
+	factory, err := placement.NewCallbackRouteFactory("https://provider.test")
 	require.NoError(t, err)
-	return snapshot
-}
-
-func repairCallbackPair(
-	t *testing.T,
-	id operation.OperationID,
-) placement.CallbackPair {
-	t.Helper()
-	pair, err := placement.NewCallbackPair(
-		id,
-		"https://provider.test/callbacks/provision?operation_id="+id.String(),
-		"https://provider.test/callbacks/provision?lifecycle_id="+id.String(),
-	)
-	require.NoError(t, err)
-	return pair
+	return factory
 }
 
 type repairFreshChainSnapshot struct{}
@@ -491,12 +646,12 @@ func TestRun_DryRunClosesWithoutChangingDatabaseBytes(t *testing.T) {
 	configPath := writeRepairConfig(t, dbPath, server.URL, repairCommandBackend)
 
 	var stdout bytes.Buffer
-	err = run(t.Context(), repairArgs(configPath), &stdout, &bytes.Buffer{})
+	err = run(t.Context(), repairArgs(t, configPath, dbPath), &stdout, &bytes.Buffer{})
 	require.NoError(t, err)
 	assert.Contains(t, stdout.String(), "DRY RUN ONLY")
 	assert.NotContains(t, stdout.String(), "PASS:")
 	assert.Contains(t, stdout.String(), `on backend "backend-a"`)
-	assert.Contains(t, stdout.String(), repairConfirmation())
+	assert.Contains(t, stdout.String(), repairConfirmation(t, dbPath))
 	assert.Contains(t, stdout.String(), "Inventory evidence does not prove")
 
 	after, err := os.ReadFile(dbPath)
@@ -526,7 +681,7 @@ func TestRun_ApplyRequiresExactConfirmationAndDrainAttestation(t *testing.T) {
 		},
 		{
 			name:        "wrong drain attestation",
-			confirm:     repairConfirmation(),
+			confirm:     repairConfirmation(t, dbPath),
 			attestation: "I think it is drained",
 			want:        "-attest-drained must exactly equal",
 		},
@@ -534,7 +689,7 @@ func TestRun_ApplyRequiresExactConfirmationAndDrainAttestation(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			backupPath := filepath.Join(t.TempDir(), "placements.pre-repair.bak")
-			args := append(repairArgs(configPath),
+			args := append(repairArgs(t, configPath, dbPath),
 				"-apply", "-backup", backupPath,
 				"-confirm", test.confirm, "-attest-drained", test.attestation,
 			)
@@ -545,11 +700,10 @@ func TestRun_ApplyRequiresExactConfirmationAndDrainAttestation(t *testing.T) {
 		})
 	}
 
+	operationID := repairAttemptOperationID(t, dbPath)
 	repair, err := placement.OpenAttemptRepair(dbPath, repairCommandProviderUUID)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = repair.Close() })
-	operationID, err := operation.ParseID(repairCommandOperation)
-	require.NoError(t, err)
 	_, err = repair.MatchAttempt(repairCommandLease, repairCommandBackend, operationID)
 	require.NoError(t, err, "failed confirmation must leave the exact attempt intact")
 }
@@ -565,8 +719,8 @@ func TestRun_ApplyRequiresNewExactBackupBeforeMutation(t *testing.T) {
 		defer server.Close()
 		configPath := writeRepairConfig(t, dbPath, server.URL, repairCommandBackend)
 
-		args := append(repairArgs(configPath),
-			"-apply", "-confirm", repairConfirmation(),
+		args := append(repairArgs(t, configPath, dbPath),
+			"-apply", "-confirm", repairConfirmation(t, dbPath),
 			"-attest-drained", drainedAttestation,
 		)
 		err = run(t.Context(), args, &bytes.Buffer{}, &bytes.Buffer{})
@@ -587,9 +741,9 @@ func TestRun_ApplyRequiresNewExactBackupBeforeMutation(t *testing.T) {
 		const sentinel = "existing operator artifact"
 		require.NoError(t, os.WriteFile(backupPath, []byte(sentinel), 0o600))
 
-		args := append(repairArgs(configPath),
+		args := append(repairArgs(t, configPath, dbPath),
 			"-apply", "-backup", backupPath,
-			"-confirm", repairConfirmation(),
+			"-confirm", repairConfirmation(t, dbPath),
 			"-attest-drained", drainedAttestation,
 		)
 		var stdout bytes.Buffer
@@ -616,9 +770,9 @@ func TestRun_ExpiredEvidenceAfterBackupNeverMutates(t *testing.T) {
 		defer server.Close()
 		configPath := writeRepairConfig(t, dbPath, server.URL, repairCommandBackend)
 		backupPath := filepath.Join(t.TempDir(), "placements.expired-proof.bak")
-		args := append(repairArgs(configPath),
+		args := append(repairArgs(t, configPath, dbPath),
 			"-apply", "-backup", backupPath,
-			"-confirm", repairConfirmation(),
+			"-confirm", repairConfirmation(t, dbPath),
 			"-attest-drained", drainedAttestation,
 		)
 		ctx, cancel := context.WithCancel(t.Context())
@@ -642,10 +796,9 @@ func TestRun_ExpiredEvidenceAfterBackupNeverMutates(t *testing.T) {
 		assert.Empty(t, stdout.String())
 		assertExpiredProofBackupAndSourceBytes(t, dbPath, backupPath, before)
 
+		operationID := repairAttemptOperationID(t, dbPath)
 		repair, openErr := placement.OpenAttemptRepair(dbPath, repairCommandProviderUUID)
 		require.NoError(t, openErr)
-		operationID, parseErr := operation.ParseID(repairCommandOperation)
-		require.NoError(t, parseErr)
 		_, matchErr := repair.MatchAttempt(
 			repairCommandLease, repairCommandBackend, operationID,
 		)
@@ -745,7 +898,7 @@ func TestRun_RequiresExactConfiguredAndDurableBackendTopology(t *testing.T) {
 		repairCommandBackend, "backend-omitted-from-durable-topology")
 
 	var stdout bytes.Buffer
-	err = run(t.Context(), repairArgs(configPath), &stdout, &bytes.Buffer{})
+	err = run(t.Context(), repairArgs(t, configPath, dbPath), &stdout, &bytes.Buffer{})
 	require.ErrorContains(t, err, "does not exactly match durable topology")
 	assert.Empty(t, stdout.String())
 	after, readErr := os.ReadFile(dbPath)
@@ -773,7 +926,7 @@ func TestRun_RequiresConfiguredProviderToMatchDurableAuthorityBeforeProbe(t *tes
 		{name: "inspect", args: []string{
 			"-config", configPath, "-inspect", "-lease", repairCommandLease,
 		}},
-		{name: "mutation", args: repairArgs(configPath)},
+		{name: "mutation", args: repairArgs(t, configPath, dbPath)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -797,7 +950,7 @@ func TestRun_RejectsInvalidConfiguredProviderBeforeOpeningRepair(t *testing.T) {
 	)
 
 	var stdout bytes.Buffer
-	err = run(t.Context(), repairArgs(configPath), &stdout, &bytes.Buffer{})
+	err = run(t.Context(), repairArgs(t, configPath, dbPath), &stdout, &bytes.Buffer{})
 	require.ErrorContains(t, err, "provider_uuid is not a valid UUID format")
 	assert.Empty(t, stdout.String())
 	after, readErr := os.ReadFile(dbPath)
@@ -819,7 +972,7 @@ func TestRun_RejectsNonCanonicalConfiguredProviderBeforeOpeningRepair(t *testing
 			)
 
 			var stdout bytes.Buffer
-			err = run(t.Context(), repairArgs(configPath), &stdout, &bytes.Buffer{})
+			err = run(t.Context(), repairArgs(t, configPath, dbPath), &stdout, &bytes.Buffer{})
 			require.ErrorIs(t, err, placement.ErrProviderAuthorityMismatch)
 			assert.ErrorContains(t, err, "configured provider UUID")
 			assert.Empty(t, stdout.String())
@@ -943,9 +1096,9 @@ func TestRun_ApplyRefusesPositiveOrIncompleteInventory(t *testing.T) {
 			configPath := writeRepairConfig(t, dbPath, server.URL, repairCommandBackend)
 			backupPath := filepath.Join(t.TempDir(), "placements.pre-repair.bak")
 
-			args := append(repairArgs(configPath),
+			args := append(repairArgs(t, configPath, dbPath),
 				"-apply", "-backup", backupPath,
-				"-confirm", repairConfirmation(),
+				"-confirm", repairConfirmation(t, dbPath),
 				"-attest-drained", drainedAttestation,
 			)
 			var stdout bytes.Buffer
@@ -978,9 +1131,9 @@ func TestRun_ApplySyncsClosesAndPreservesConfirmedOwnerBeforePass(t *testing.T) 
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
 	backupPath := filepath.Join(t.TempDir(), "placements\nPASS: forged-attempt-repair-verdict.bak")
-	args := append(repairArgs(configPath),
+	args := append(repairArgs(t, configPath, dbPath),
 		"-apply", "-backup", backupPath,
-		"-confirm", repairConfirmation(),
+		"-confirm", repairConfirmation(t, dbPath),
 		"-attest-drained", drainedAttestation,
 	)
 
@@ -1018,9 +1171,9 @@ func TestRun_PostCommitVerdictFailureReportsCommittedAndRequiresInspection(t *te
 	defer server.Close()
 	configPath := writeRepairConfig(t, dbPath, server.URL, repairCommandBackend)
 	backupPath := filepath.Join(t.TempDir(), "placements.pre-repair.bak")
-	args := append(repairArgs(configPath),
+	args := append(repairArgs(t, configPath, dbPath),
 		"-apply", "-backup", backupPath,
-		"-confirm", repairConfirmation(),
+		"-confirm", repairConfirmation(t, dbPath),
 		"-attest-drained", drainedAttestation,
 	)
 
@@ -1063,9 +1216,9 @@ func TestRun_PublishedBackupFailureNeverAttemptsRepairMutation(t *testing.T) {
 		return fmt.Errorf("%w: %w", placement.ErrExactBackupPublished, cause)
 	}
 
-	err = runWithDependencies(t.Context(), append(repairArgs(configPath),
+	err = runWithDependencies(t.Context(), append(repairArgs(t, configPath, dbPath),
 		"-apply", "-backup", backupPath,
-		"-confirm", repairConfirmation(),
+		"-confirm", repairConfirmation(t, dbPath),
 		"-attest-drained", drainedAttestation,
 	), &bytes.Buffer{}, &bytes.Buffer{}, dependencies)
 	require.ErrorIs(t, err, placement.ErrExactBackupPublished)
@@ -1112,9 +1265,9 @@ func TestRun_FinalProbeFailureAfterBackupIsCategoricallyUncommitted(t *testing.T
 	configPath := writeRepairConfig(t, dbPath, server.URL, repairCommandBackend)
 	backupPath := filepath.Join(t.TempDir(), "placements.pre-repair.bak")
 
-	err = run(t.Context(), append(repairArgs(configPath),
+	err = run(t.Context(), append(repairArgs(t, configPath, dbPath),
 		"-apply", "-backup", backupPath,
-		"-confirm", repairConfirmation(),
+		"-confirm", repairConfirmation(t, dbPath),
 		"-attest-drained", drainedAttestation,
 	), &bytes.Buffer{}, &bytes.Buffer{})
 	require.ErrorIs(t, err, placement.ErrExactBackupPublished)
@@ -1130,10 +1283,9 @@ func TestRun_FinalProbeFailureAfterBackupIsCategoricallyUncommitted(t *testing.T
 	backup, readErr := os.ReadFile(backupPath)
 	require.NoError(t, readErr)
 	assert.Equal(t, before, backup)
+	operationID := repairAttemptOperationID(t, dbPath)
 	repair, openErr := placement.OpenAttemptRepair(dbPath, repairCommandProviderUUID)
 	require.NoError(t, openErr)
-	operationID, parseErr := operation.ParseID(repairCommandOperation)
-	require.NoError(t, parseErr)
 	_, matchErr := repair.MatchAttempt(
 		repairCommandLease,
 		repairCommandBackend,
@@ -1165,9 +1317,9 @@ func TestRun_ReopenedSemanticFailureIsCategoricallyCommitted(t *testing.T) {
 		}, nil
 	}
 
-	err := runWithDependencies(t.Context(), append(repairArgs(configPath),
+	err := runWithDependencies(t.Context(), append(repairArgs(t, configPath, dbPath),
 		"-apply", "-backup", backupPath,
-		"-confirm", repairConfirmation(),
+		"-confirm", repairConfirmation(t, dbPath),
 		"-attest-drained", drainedAttestation,
 	), &bytes.Buffer{}, &bytes.Buffer{}, dependencies)
 	require.ErrorIs(t, err, errRepairCommitted)
@@ -1223,7 +1375,7 @@ func TestRun_HoldsExclusiveLockThroughFreshInventoryCollection(t *testing.T) {
 
 	runResult := make(chan error, 1)
 	go func() {
-		runResult <- run(context.Background(), repairArgs(configPath), &bytes.Buffer{}, &bytes.Buffer{})
+		runResult <- run(context.Background(), repairArgs(t, configPath, dbPath), &bytes.Buffer{}, &bytes.Buffer{})
 	}()
 	select {
 	case <-started:
@@ -1260,7 +1412,7 @@ func TestRun_ListAndInspectAreReadOnlyAndExposeExactRepairFacts(t *testing.T) {
 	assert.Equal(t, repairCommandLease, listed.Placements[0].LeaseUUID)
 	assert.Equal(t, "attempting", listed.Placements[0].State)
 	assert.Equal(t, repairCommandBackend, listed.Placements[0].Attempt)
-	assert.Equal(t, repairCommandOperation, listed.Placements[0].OperationID)
+	assert.Equal(t, repairAttemptOperationID(t, dbPath).String(), listed.Placements[0].OperationID)
 	assert.NotZero(t, listed.Placements[0].Revision)
 	assert.False(t, listed.Placements[0].UntrustedPositive)
 	assert.Contains(t, listOutput.String(), `"untrusted_positive":false`)
@@ -1436,63 +1588,75 @@ func createRepairCommandDatabase(t *testing.T, confirmed bool) string {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	store := initializeRepairPlacementStore(t, dbPath, []string{repairCommandBackend})
-	baseline := store.CurrentAdmissionBaseline()
-	require.True(t, baseline.Valid())
-	scope, err := store.ScopeAdmission(baseline, []string{repairCommandBackend})
+	coordinator, err := store.BindOperationCoordinator(nil)
 	require.NoError(t, err)
+	client := &repairAttemptBackend{callErr: context.DeadlineExceeded}
+	inventoryClient := &repairInventoryBackend{
+		Backend: client, storageID: repairBackendStorageID(t, repairCommandBackend),
+	}
+	execution, err := coordinator.BindBackendRuntime(
+		repairAttemptRuntime{backend: inventoryClient}, repairAttemptLeaseReader{},
+	)
+	require.NoError(t, err)
+	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
+	require.NoError(t, err)
+	repairReconciliationInventories.Store(reconciliation, map[string]*repairInventoryBackend{
+		repairCommandBackend: inventoryClient,
+	})
+	t.Cleanup(func() { repairReconciliationInventories.Delete(reconciliation) })
 
 	if confirmed {
-		ownerID, parseErr := operation.ParseID(repairCommandOwnerOperation)
-		require.NoError(t, parseErr)
-		ownerAttempt, applied, beginErr := store.BeginNewAttempt(
-			scope, repairCommandLease, repairCommandBackend, ownerID,
-			placement.PayloadFingerprint{}, repairBackendRequestSnapshot(t),
-			repairCallbackPair(t, ownerID),
+		projectRepairInventoryWithRows(
+			t, reconciliation, []string{repairCommandBackend},
+			placement.ReconciliationProjection{
+				Placements: map[string]string{repairCommandLease: repairCommandBackend},
+			},
+			map[string][]backend.ProvisionInfo{
+				repairCommandBackend: {{
+					LeaseUUID: repairCommandLease, BackendName: repairCommandBackend,
+					ProviderUUID: repairCommandProviderUUID, Tenant: "tenant-a",
+					LifecycleGeneration: &backend.LifecycleGenerationObservation{
+						Kind: backend.LifecycleGenerationTyped,
+						ID:   repairCommandOwnerOperation,
+					},
+				}},
+			},
 		)
-		require.NoError(t, beginErr)
-		require.True(t, applied)
-		applied, confirmErr := store.ConfirmAttempt(ownerAttempt)
-		require.NoError(t, confirmErr)
-		require.True(t, applied)
+		require.Equal(t, placement.StateConfirmed, store.Lookup(repairCommandLease).State())
 	}
 
-	operationID, err := operation.ParseID(repairCommandOperation)
-	require.NoError(t, err)
-	if confirmed {
-		current := store.Lookup(repairCommandLease)
-		_, applied, beginErr := store.BeginOwnedAttempt(
-			baseline, current.RecordRevision(), repairCommandBackend, operationID,
-			placement.PayloadFingerprint{}, repairBackendRequestSnapshot(t),
-			repairCallbackPair(t, operationID),
-		)
-		require.NoError(t, beginErr)
-		require.True(t, applied)
-	} else {
-		_, applied, beginErr := store.BeginNewAttempt(
-			scope, repairCommandLease, repairCommandBackend, operationID,
-			placement.PayloadFingerprint{}, repairBackendRequestSnapshot(t),
-			repairCallbackPair(t, operationID),
-		)
-		require.NoError(t, beginErr)
-		require.True(t, applied)
-	}
+	seedRepairAttempt(t, store, execution)
 	require.NoError(t, store.Close())
 	return dbPath
+}
+
+func seedRepairAttempt(
+	t *testing.T,
+	store *placement.Store,
+	execution *placement.ExecutionCoordinator,
+) operation.OperationID {
+	t.Helper()
+	provision, err := execution.ProvisionCoordinator(nil)
+	require.NoError(t, err)
+	request, err := placement.NewProvisionEventRequest(repairCommandLease, "tenant-a")
+	require.NoError(t, err)
+	result := provision.ExecuteCurrentLease(t.Context(), request)
+	require.Equal(t, placement.ProvisionEventUncertain, result.Disposition())
+	require.ErrorIs(t, result.Err(), context.DeadlineExceeded)
+	id := store.Lookup(repairCommandLease).AttemptOperationID()
+	require.True(t, id.Valid())
+	return id
 }
 
 func createConflictRepairCommandDatabase(t *testing.T) string {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	store := initializeRepairPlacementStore(t, dbPath, []string{"backend-a", "backend-b"})
-	fence := store.BeginInventorySession()
-	var err error
-	_, err = store.ProjectInventory(fence, placement.InventoryProjection{
+	projectRepairInventory(t, store, []string{"backend-a", "backend-b"}, placement.ReconciliationProjection{
 		Conflicts: map[string][]string{
 			repairCommandLease: {"backend-a", "backend-b"},
 		},
 	})
-	store.EndInventorySession(fence)
-	require.NoError(t, err)
 	require.NoError(t, store.Close())
 	return dbPath
 }
@@ -1500,18 +1664,134 @@ func createConflictRepairCommandDatabase(t *testing.T) string {
 func createUntrustedPositiveRepairCommandDatabase(t *testing.T) string {
 	t.Helper()
 	dbPath := createRepairCommandDatabase(t, true)
-	store, err := placement.OpenStore(dbPath, repairCommandProviderUUID)
+	store, err := placement.OpenStore(
+		dbPath, repairCommandProviderUUID,
+		placement.WithCallbackRouteFactory(repairCallbackRouteFactory(t)),
+	)
 	require.NoError(t, err)
-	fence := store.BeginInventorySession()
-	_, err = store.ProjectInventory(fence, placement.InventoryProjection{
+	projectRepairInventory(t, store, []string{repairCommandBackend}, placement.ReconciliationProjection{
 		UntrustedPositives: map[string][]string{
 			repairCommandLease: {repairCommandBackend},
 		},
 	})
-	store.EndInventorySession(fence)
-	require.NoError(t, err)
 	require.NoError(t, store.Close())
 	return dbPath
+}
+
+func projectRepairInventory(
+	t *testing.T,
+	store *placement.Store,
+	backendNames []string,
+	projection placement.ReconciliationProjection,
+) *placement.ProjectedReconciliationSweep {
+	reconciliation := newRepairReconciliation(t, store, backendNames)
+	return projectRepairInventoryWithRows(t, reconciliation, backendNames, projection, nil)
+}
+
+func projectRepairInventoryWithRows(
+	t *testing.T,
+	reconciliation *placement.ReconciliationCoordinator,
+	backendNames []string,
+	projection placement.ReconciliationProjection,
+	provisionRows map[string][]backend.ProvisionInfo,
+) *placement.ProjectedReconciliationSweep {
+	t.Helper()
+	sweep, err := reconciliation.BeginSweep()
+	require.NoError(t, err)
+	t.Cleanup(sweep.End)
+	reported := make(map[string][]string, len(backendNames))
+	for leaseUUID, backendName := range projection.Placements {
+		reported[backendName] = append(reported[backendName], leaseUUID)
+	}
+	for leaseUUID, candidates := range projection.Conflicts {
+		for _, backendName := range candidates {
+			reported[backendName] = append(reported[backendName], leaseUUID)
+		}
+	}
+	untrustedByBackend := make(map[string][]string)
+	for leaseUUID, candidates := range projection.UntrustedPositives {
+		for _, backendName := range candidates {
+			untrustedByBackend[backendName] = append(untrustedByBackend[backendName], leaseUUID)
+		}
+	}
+	value, ok := repairReconciliationInventories.Load(reconciliation)
+	require.True(t, ok)
+	inventories := value.(map[string]*repairInventoryBackend)
+	for _, backendName := range backendNames {
+		storageID := repairBackendStorageID(t, backendName)
+		rows := provisionRows[backendName]
+		if rows == nil {
+			rows = make([]backend.ProvisionInfo, 0,
+				len(reported[backendName])+len(untrustedByBackend[backendName]))
+			for _, leaseUUID := range reported[backendName] {
+				rows = append(rows, backend.ProvisionInfo{
+					LeaseUUID: leaseUUID, BackendName: backendName,
+				})
+			}
+		}
+		wantDisposition := placement.BackendInventoryAuthoritative
+		if leaseUUIDs := untrustedByBackend[backendName]; len(leaseUUIDs) != 0 {
+			for _, leaseUUID := range leaseUUIDs {
+				rows = append(rows, backend.ProvisionInfo{
+					LeaseUUID: leaseUUID, BackendName: backendName,
+				})
+			}
+			storageID = backendidentity.ID{}
+			wantDisposition = placement.BackendInventoryUntrusted
+		}
+		client := inventories[backendName]
+		require.NotNil(t, client)
+		client.stage(storageID, rows, nil)
+		provisionReceipt, collectErr := sweep.CollectProvisionInventory(t.Context(), backendName)
+		require.NoError(t, collectErr)
+		retentionReceipt, collectErr := sweep.CollectRetentionInventory(t.Context(), backendName)
+		require.NoError(t, collectErr)
+		disposition, collectErr := sweep.RecordBackendInventory(
+			provisionReceipt, retentionReceipt,
+		)
+		require.NoError(t, collectErr)
+		require.Equal(t, wantDisposition, disposition)
+	}
+	require.NoError(t, sweep.SealInventory())
+	result, err := sweep.Project(placement.ReconciliationProjection{
+		Placements:         projection.Placements,
+		Conflicts:          projection.Conflicts,
+		UntrustedPositives: projection.UntrustedPositives,
+	})
+	require.NoError(t, err)
+	return result
+}
+
+func newRepairReconciliation(
+	t *testing.T,
+	store *placement.Store,
+	backendNames []string,
+) *placement.ReconciliationCoordinator {
+	t.Helper()
+	entries := make([]backend.BackendEntry, 0, len(backendNames))
+	inventories := make(map[string]*repairInventoryBackend, len(backendNames))
+	for index, backendName := range backendNames {
+		client := &repairInventoryBackend{
+			Backend:   backend.NewMockBackend(backend.MockBackendConfig{Name: backendName}),
+			storageID: repairBackendStorageID(t, backendName),
+		}
+		inventories[backendName] = client
+		entries = append(entries, backend.BackendEntry{
+			Backend:   client,
+			IsDefault: index == 0,
+		})
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: entries})
+	require.NoError(t, err)
+	coordinator, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution, err := coordinator.BindBackendRuntime(router, repairAttemptLeaseReader{})
+	require.NoError(t, err)
+	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
+	require.NoError(t, err)
+	repairReconciliationInventories.Store(reconciliation, inventories)
+	t.Cleanup(func() { repairReconciliationInventories.Delete(reconciliation) })
+	return reconciliation
 }
 
 func initializeRepairPlacementStore(
@@ -1548,7 +1828,10 @@ func initializeRepairPlacementStore(
 	)
 	require.NoError(t, err)
 	require.NoError(t, placement.InitializeFreshStoreContext(t.Context(), plan))
-	store, err := placement.OpenStore(dbPath, repairCommandProviderUUID)
+	store, err := placement.OpenStore(
+		dbPath, repairCommandProviderUUID,
+		placement.WithCallbackRouteFactory(repairCallbackRouteFactory(t)),
+	)
 	require.NoError(t, err)
 	return store
 }
@@ -1588,19 +1871,32 @@ func conflictRepairConfirmation(
 	return confirmation
 }
 
-func repairArgs(configPath string) []string {
+func repairAttemptOperationID(t *testing.T, dbPath string) operation.OperationID {
+	t.Helper()
+	store, err := placement.OpenStore(dbPath, repairCommandProviderUUID)
+	require.NoError(t, err)
+	id := store.Lookup(repairCommandLease).AttemptOperationID()
+	require.True(t, id.Valid())
+	require.NoError(t, store.Close())
+	return id
+}
+
+func repairArgs(t *testing.T, configPath, dbPath string) []string {
+	t.Helper()
 	return []string{
 		"-config", configPath,
 		"-lease", repairCommandLease,
 		"-backend", repairCommandBackend,
-		"-operation-id", repairCommandOperation,
+		"-operation-id", repairAttemptOperationID(t, dbPath).String(),
 		"-timeout", "5s",
 	}
 }
 
-func repairConfirmation() string {
+func repairConfirmation(t *testing.T, dbPath string) string {
+	t.Helper()
 	return fmt.Sprintf("refuse-attempt:%s:%s:%s",
-		repairCommandLease, repairCommandBackend, repairCommandOperation)
+		repairCommandLease, repairCommandBackend,
+		repairAttemptOperationID(t, dbPath).String())
 }
 
 func newRepairInventoryServer(

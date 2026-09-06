@@ -74,16 +74,18 @@ func TestReconcileVolumeQuotas_ReAppliesActiveAndRetained(t *testing.T) {
 		{SKU: "ephemeral", Quantity: 1, ServiceName: "cache"},
 	}
 	b.provisions[liveLease] = &provision{
-		ProvisionState: leasesm.ProvisionState{LeaseUUID: liveLease, Items: liveItems},
-		ResourceProfiles: []shared.SKUResourceSnapshot{
-			{SKU: "ephemeral", CPUCores: 1, MemoryMB: 512, ScratchDiskMB: tmpfsMB},
-			{SKU: "stateful", CPUCores: 1, MemoryMB: 512, DiskMB: 100},
+		ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: liveLease, Items: liveItems,
+			ResourceProfiles: []shared.SKUResourceSnapshot{
+				{SKU: "ephemeral", CPUCores: 1, MemoryMB: 512, ScratchDiskMB: tmpfsMB},
+				{SKU: "stateful", CPUCores: 1, MemoryMB: 512, DiskMB: 100},
+			},
 		},
 	}
 	// Retained active: db-0 is retained; sidecar-0's derived name is NOT in
 	// RetainedVolumeNames (stateless in that lease) → must skip even though it's
 	// on disk.
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID: retainedLease, Tenant: "t1", ProviderUUID: "p1",
 		Items: []backend.LeaseItem{
 			{SKU: "stateful2", Quantity: 1, ServiceName: "db"},
@@ -318,18 +320,23 @@ func TestReconcileVolumeQuotas_ConcreteManagerFailuresReachReadinessGate(t *test
 	}
 }
 
+// A backend that cannot re-apply the quota attached to durable tenant bytes is
+// not ready: accepting work would let admission account a limit the substrate
+// did not actually enforce. Exercise the real Start boundary rather than the
+// quota helper alone so this safety gate cannot silently become best-effort.
 func TestStart_QuotaReconciliationFailureFailsReadiness(t *testing.T) {
-	b, rs := newBackendWithRetention(t)
+	b, _ := newBackendWithRetention(t)
 	mock, ok := b.docker.(*mockDockerClient)
 	require.True(t, ok)
 	mock.PingFn = func(context.Context) error { return nil }
 	bindTestStorageIdentity(t, b, mock)
+	rs := attachRetentionStore(t, b)
 	t.Cleanup(b.stopCancel)
 
 	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 	volumeName := retainedName(canonicalVolumeName(leaseUUID, "app", 0))
 	items := []backend.LeaseItem{{SKU: "stateful", Quantity: 1, ServiceName: "app"}}
-	require.NoError(t, rs.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 		OriginalLeaseUUID:   leaseUUID,
 		Tenant:              "tenant-a",
 		ProviderUUID:        nominalDockerProviderUUID,
@@ -352,6 +359,11 @@ func TestStart_QuotaReconciliationFailureFailsReadiness(t *testing.T) {
 			return quotaErr
 		},
 	}
+	// The orphan pruner intentionally captures its complete inventory at
+	// construction. Rebind it after installing this fixture's volume manager so
+	// Start observes one coherent substrate instead of the manager NewBackend
+	// originally owned.
+	bindRetentionOrphanPrunerForTest(t, b)
 
 	err := b.Start(context.Background())
 	require.ErrorIs(t, err, quotaErr)
@@ -397,8 +409,9 @@ func TestReconcileVolumeQuotas_UsesPinnedProfilesAfterConfigDrift(t *testing.T) 
 				{SKU: "live-scratch", CPUCores: 0.25, MemoryMB: 128, ScratchDiskMB: 64},
 			}
 			b.provisions[liveLease] = &provision{
-				ProvisionState:   leasesm.ProvisionState{LeaseUUID: liveLease, Items: liveItems},
-				ResourceProfiles: liveProfiles,
+				ProvisionState: leasesm.ProvisionState{
+					LeaseUUID: liveLease, Items: liveItems, ResourceProfiles: liveProfiles,
+				},
 			}
 
 			retainedItems := []backend.LeaseItem{
@@ -409,7 +422,7 @@ func TestReconcileVolumeQuotas_UsesPinnedProfilesAfterConfigDrift(t *testing.T) 
 				{SKU: "retained", CPUCores: 2, MemoryMB: 1024, DiskMB: 250},
 				{SKU: "retained-scratch", CPUCores: 0.25, MemoryMB: 128, ScratchDiskMB: 72},
 			}
-			require.NoError(t, rs.Put(shared.RetentionEntry{
+			require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
 				OriginalLeaseUUID: retainedLease,
 				Tenant:            "tenant-a",
 				ProviderUUID:      "provider-a",

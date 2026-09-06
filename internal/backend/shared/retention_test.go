@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,14 +20,14 @@ import (
 func newTestRetentionStore(t *testing.T) *RetentionStore {
 	t.Helper()
 	dir := t.TempDir()
-	s, err := NewRetentionStore(RetentionStoreConfig{DBPath: dir + "/retention.db"})
+	s, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: dir + "/retention.db"})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
 func testRestoreCallbackAuthority() (OperationID, string, string) {
-	const id = OperationID("11111111-1111-4111-8111-111111111111")
+	id := mustSharedOperationID("11111111-1111-4111-8111-111111111111")
 	return id,
 		"https://fred.example/callbacks/provision?operation_id=" + id.String(),
 		"https://fred.example/callbacks/provision?lifecycle_id=" + id.String()
@@ -96,7 +97,7 @@ func claimForRestoreForTest(
 		items = source.Items
 	}
 	operationID, callbackURL, lifecycleCallbackURL := testRestoreCallbackAuthority()
-	return store.ClaimForRestoreWithAuthority(
+	return store.claimForRestoreWithAuthorityForTest(
 		originalLease,
 		destinationLease,
 		maxAge,
@@ -121,7 +122,7 @@ func revertToActiveForTest(
 	if source != nil {
 		items = source.Items
 	}
-	return store.RevertToActiveWithResourceProfiles(
+	return store.revertToActiveWithResourceProfilesForTest(
 		originalLease,
 		destinationLease,
 		expectGeneration,
@@ -139,7 +140,7 @@ func TestRetentionStore_CRUD(t *testing.T) {
 	assert.Nil(t, got)
 
 	e := sampleEntry("lease-1")
-	require.NoError(t, s.Put(e))
+	require.NoError(t, s.putForTest(e))
 
 	// Get existing
 	got, err = s.Get("lease-1")
@@ -151,13 +152,13 @@ func TestRetentionStore_CRUD(t *testing.T) {
 	assert.Equal(t, []string{"vol-a", "vol-b"}, got.RetainedVolumeNames)
 
 	// Delete
-	require.NoError(t, s.Delete("lease-1"))
+	require.NoError(t, s.deleteForTest("lease-1"))
 	got, err = s.Get("lease-1")
 	require.NoError(t, err)
 	assert.Nil(t, got)
 
 	// Idempotent delete (no error if absent)
-	require.NoError(t, s.Delete("lease-1"))
+	require.NoError(t, s.deleteForTest("lease-1"))
 }
 
 // TestRetentionStore_ClaimForRestoreWithAuthority covers the atomic
@@ -172,7 +173,7 @@ func TestRetentionStore_ClaimForRestoreWithAuthority(t *testing.T) {
 	// Successful claim: active → restoring
 	e := sampleEntry("lease-1")
 	e.Generation = 0
-	require.NoError(t, s.Put(e))
+	require.NoError(t, s.putForTest(e))
 
 	claimed, err := claimForRestoreForTest(s, "lease-1", "new-lease-42", 0)
 	require.NoError(t, err)
@@ -195,20 +196,20 @@ func TestRetentionStore_ClaimForRestoreWithAuthority(t *testing.T) {
 	// Active but older than maxAge → ErrNoRetention (about to be reaped)
 	old := sampleEntry("lease-old")
 	old.CreatedAt = time.Now().Add(-100 * 24 * time.Hour) // 100 days ago
-	require.NoError(t, s.Put(old))
+	require.NoError(t, s.putForTest(old))
 	_, err = claimForRestoreForTest(s, "lease-old", "new-lease-x", 90*24*time.Hour)
 	assert.ErrorIs(t, err, ErrNoRetention)
 }
 
 func TestRetentionStore_ClaimForRestoreWithAuthority_PersistsAndClearsAtomically(t *testing.T) {
 	dbPath := t.TempDir() + "/retention.db"
-	store, err := NewRetentionStore(RetentionStoreConfig{DBPath: dbPath})
+	store, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 
 	source := sampleEntry("source")
 	source.Items[0].ServiceName = "app"
 	source.ResourceProfiles = sampleResourceProfiles()
-	require.NoError(t, store.Put(source))
+	require.NoError(t, store.putForTest(source))
 	destinationItems := []backend.LeaseItem{{
 		SKU: "destination-sku", Quantity: 2, ServiceName: "app",
 	}}
@@ -217,7 +218,7 @@ func TestRetentionStore_ClaimForRestoreWithAuthority_PersistsAndClearsAtomically
 	}}
 	operationID, callbackURL, lifecycleCallbackURL := testRestoreCallbackAuthority()
 
-	claimed, err := store.ClaimForRestoreWithAuthority(
+	claimed, err := store.claimForRestoreWithAuthorityForTest(
 		"source", "destination", 0, destinationItems, destinationProfiles,
 		operationID, callbackURL, lifecycleCallbackURL,
 	)
@@ -229,7 +230,7 @@ func TestRetentionStore_ClaimForRestoreWithAuthority_PersistsAndClearsAtomically
 	destinationProfiles[0].DiskMB = 1
 	require.NoError(t, store.Close())
 
-	store, err = NewRetentionStore(RetentionStoreConfig{DBPath: dbPath})
+	store, err = newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
 	reopened, err := store.Get("source")
@@ -241,7 +242,7 @@ func TestRetentionStore_ClaimForRestoreWithAuthority_PersistsAndClearsAtomically
 	assert.Equal(t, callbackURL, reopened.DestinationCallbackURL)
 	assert.Equal(t, lifecycleCallbackURL, reopened.DestinationLifecycleCallbackURL)
 
-	ok, err := store.RevertToActiveWithResourceProfiles(
+	ok, err := store.revertToActiveWithResourceProfilesForTest(
 		"source", "destination", reopened.Generation, source.ResourceProfiles,
 	)
 	require.NoError(t, err)
@@ -252,7 +253,7 @@ func TestRetentionStore_ClaimForRestoreWithAuthority_PersistsAndClearsAtomically
 	assert.Equal(t, RetentionStatusActive, reverted.Status)
 	assert.Empty(t, reverted.DestinationItems)
 	assert.Empty(t, reverted.DestinationResourceProfiles)
-	assert.Empty(t, reverted.DestinationOperationID)
+	assert.True(t, reverted.DestinationOperationID.IsZero())
 	assert.Empty(t, reverted.DestinationCallbackURL)
 	assert.Empty(t, reverted.DestinationLifecycleCallbackURL)
 }
@@ -261,10 +262,10 @@ func TestRetentionStore_ClaimForRestoreWithAuthority_RejectsMismatchedShapeWitho
 	store := newTestRetentionStore(t)
 	source := sampleEntry("source")
 	source.Items[0].ServiceName = "app"
-	require.NoError(t, store.Put(source))
+	require.NoError(t, store.putForTest(source))
 	operationID, callbackURL, lifecycleCallbackURL := testRestoreCallbackAuthority()
 
-	_, err := store.ClaimForRestoreWithAuthority(
+	_, err := store.claimForRestoreWithAuthorityForTest(
 		"source",
 		"destination",
 		0,
@@ -286,7 +287,7 @@ func TestRetentionStore_UpdateRestoringDestinationCallbacks_PreservesExactAuthor
 	source := sampleEntry("source")
 	source.Items[0].ServiceName = "app"
 	source.ResourceProfiles = sampleResourceProfiles()
-	require.NoError(t, store.Put(source))
+	require.NoError(t, store.putForTest(source))
 	destinationItems := []backend.LeaseItem{{
 		SKU: "destination-sku", Quantity: 2, ServiceName: "app",
 	}}
@@ -294,7 +295,7 @@ func TestRetentionStore_UpdateRestoringDestinationCallbacks_PreservesExactAuthor
 		SKU: "destination-sku", CPUCores: 2, MemoryMB: 2048, DiskMB: 4096,
 	}}
 	operationID, callbackURL, lifecycleCallbackURL := testRestoreCallbackAuthority()
-	claimed, err := store.ClaimForRestoreWithAuthority(
+	claimed, err := store.claimForRestoreWithAuthorityForTest(
 		"source", "destination", 0,
 		destinationItems, destinationProfiles,
 		operationID, callbackURL, lifecycleCallbackURL,
@@ -303,7 +304,7 @@ func TestRetentionStore_UpdateRestoringDestinationCallbacks_PreservesExactAuthor
 
 	movedCallbackURL := "https://moved.example/callbacks/provision?operation_id=" + operationID.String()
 	movedLifecycleURL := "https://moved.example/callbacks/provision?lifecycle_id=" + operationID.String()
-	updated, err := store.UpdateRestoringDestinationCallbacks(
+	updated, err := store.updateRestoringDestinationCallbacksForTest(
 		"source", "destination", claimed.Generation,
 		movedCallbackURL, movedLifecycleURL,
 	)
@@ -316,7 +317,7 @@ func TestRetentionStore_UpdateRestoringDestinationCallbacks_PreservesExactAuthor
 	assert.Equal(t, movedCallbackURL, stored.DestinationCallbackURL)
 	assert.Equal(t, movedLifecycleURL, stored.DestinationLifecycleCallbackURL)
 
-	updated, err = store.UpdateRestoringDestinationCallbacks(
+	updated, err = store.updateRestoringDestinationCallbacksForTest(
 		"source", "destination", claimed.Generation-1,
 		movedCallbackURL, movedLifecycleURL,
 	)
@@ -325,8 +326,8 @@ func TestRetentionStore_UpdateRestoringDestinationCallbacks_PreservesExactAuthor
 
 	before, err := store.getRaw("source")
 	require.NoError(t, err)
-	const differentID = OperationID("22222222-2222-4222-8222-222222222222")
-	updated, err = store.UpdateRestoringDestinationCallbacks(
+	differentID := mustSharedOperationID("22222222-2222-4222-8222-222222222222")
+	updated, err = store.updateRestoringDestinationCallbacksForTest(
 		"source", "destination", claimed.Generation,
 		"https://other.example/callbacks/provision?operation_id="+differentID.String(),
 		"https://other.example/callbacks/provision?lifecycle_id="+differentID.String(),
@@ -343,11 +344,11 @@ func TestRetentionStore_ClaimForRestoreWithAuthority_RejectsOperationIDCallbackM
 	source := sampleEntry("source")
 	source.Items[0].ServiceName = "app"
 	source.ResourceProfiles = sampleResourceProfiles()
-	require.NoError(t, store.Put(source))
+	require.NoError(t, store.putForTest(source))
 	operationID, _, _ := testRestoreCallbackAuthority()
-	const callbackID = OperationID("22222222-2222-4222-8222-222222222222")
+	callbackID := mustSharedOperationID("22222222-2222-4222-8222-222222222222")
 
-	_, err := store.ClaimForRestoreWithAuthority(
+	_, err := store.claimForRestoreWithAuthorityForTest(
 		"source", "destination", 0,
 		[]backend.LeaseItem{{SKU: "destination-sku", Quantity: 2, ServiceName: "app"}},
 		[]SKUResourceSnapshot{{SKU: "destination-sku", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}},
@@ -364,7 +365,7 @@ func TestRetentionStore_ClaimForRestoreWithAuthority_RejectsOperationIDCallbackM
 }
 
 func TestRetentionStore_RestoringRowsRequireCompleteAuthority(t *testing.T) {
-	const differentID = OperationID("22222222-2222-4222-8222-222222222222")
+	differentID := mustSharedOperationID("22222222-2222-4222-8222-222222222222")
 	tests := map[string]struct {
 		mutate  func(*RetentionEntry)
 		wantErr string
@@ -394,11 +395,7 @@ func TestRetentionStore_RestoringRowsRequireCompleteAuthority(t *testing.T) {
 			wantErr: "exact destination items and resource profiles",
 		},
 		"empty operation ID": {
-			mutate:  func(entry *RetentionEntry) { entry.DestinationOperationID = "" },
-			wantErr: "canonical UUIDv4",
-		},
-		"non-canonical operation ID": {
-			mutate:  func(entry *RetentionEntry) { entry.DestinationOperationID = "NOT-A-UUID" },
+			mutate:  func(entry *RetentionEntry) { entry.DestinationOperationID = OperationID{} },
 			wantErr: "canonical UUIDv4",
 		},
 		"missing operation callback": {
@@ -426,12 +423,12 @@ func TestRetentionStore_RestoringRowsRequireCompleteAuthority(t *testing.T) {
 			store := newTestRetentionStore(t)
 			source := sampleEntry("source")
 			source.ResourceProfiles = sampleResourceProfiles()
-			require.NoError(t, store.Put(source))
+			require.NoError(t, store.putForTest(source))
 			claimed, err := claimForRestoreForTest(store, "source", "destination", 0)
 			require.NoError(t, err)
 			test.mutate(claimed)
 
-			err = store.Put(*claimed)
+			err = store.putForTest(*claimed)
 			require.ErrorContains(t, err, test.wantErr)
 		})
 	}
@@ -441,11 +438,11 @@ func TestRetentionStore_ReadsRejectIncompleteRestoringAuthority(t *testing.T) {
 	store := newTestRetentionStore(t)
 	source := sampleEntry("source")
 	source.ResourceProfiles = sampleResourceProfiles()
-	require.NoError(t, store.Put(source))
+	require.NoError(t, store.putForTest(source))
 	claimed, err := claimForRestoreForTest(store, "source", "destination", 0)
 	require.NoError(t, err)
 	claimed.DestinationLifecycleCallbackURL = ""
-	corrupt, err := json.Marshal(claimed)
+	corrupt, err := marshalRetentionEntry(*claimed)
 	require.NoError(t, err)
 	putRawRecord(t, store, "source", corrupt)
 
@@ -453,6 +450,29 @@ func TestRetentionStore_ReadsRejectIncompleteRestoringAuthority(t *testing.T) {
 	require.ErrorContains(t, err, "exact operation/lifecycle callback pair")
 	_, err = store.List()
 	require.ErrorContains(t, err, "exact operation/lifecycle callback pair")
+}
+
+func TestRetentionStore_ReadsRejectNonCanonicalDurableOperationID(t *testing.T) {
+	store := newTestRetentionStore(t)
+	source := sampleEntry("source")
+	source.ResourceProfiles = sampleResourceProfiles()
+	require.NoError(t, store.putForTest(source))
+	claimed, err := claimForRestoreForTest(store, "source", "destination", 0)
+	require.NoError(t, err)
+	encoded, err := marshalRetentionEntry(*claimed)
+	require.NoError(t, err)
+	encoded = []byte(strings.Replace(
+		string(encoded),
+		`"destination_operation_id":"`+claimed.DestinationOperationID.String()+`"`,
+		`"destination_operation_id":"NOT-A-UUID"`,
+		1,
+	))
+	putRawRecord(t, store, "source", encoded)
+
+	_, err = store.Get("source")
+	require.ErrorContains(t, err, "canonical UUIDv4")
+	_, err = store.List()
+	require.ErrorContains(t, err, "canonical UUIDv4")
 }
 
 // TestRetentionStore_RevertToActiveWithResourceProfiles_CAS verifies the exact
@@ -463,7 +483,7 @@ func TestRetentionStore_RevertToActiveWithResourceProfiles_CAS(t *testing.T) {
 	// Setup: claim a restoring record at Generation=5.
 	e := sampleEntry("lease-cas")
 	e.Generation = 4
-	require.NoError(t, s.Put(e))
+	require.NoError(t, s.putForTest(e))
 	claimed, err := claimForRestoreForTest(s, "lease-cas", "new-lease-x", 0)
 	require.NoError(t, err)
 	require.Equal(t, 5, claimed.Generation)
@@ -494,7 +514,7 @@ func TestRetentionStore_RevertToActiveWithResourceProfiles_CAS(t *testing.T) {
 	// Active record (not restoring) → false
 	e2 := sampleEntry("lease-active")
 	e2.Generation = 3
-	require.NoError(t, s.Put(e2))
+	require.NoError(t, s.putForTest(e2))
 	ok, err = revertToActiveForTest(s, "lease-active", "new-lease-x", 3)
 	require.NoError(t, err)
 	assert.False(t, ok, "non-restoring record must not be reverted")
@@ -505,12 +525,12 @@ func TestRetentionStore_RevertToActiveWithResourceProfiles_AtomicLegacyBackfill(
 	legacy := sampleEntry("legacy-source")
 	legacy.Generation = 4
 	legacy.ResourceProfiles = nil
-	require.NoError(t, s.Put(legacy))
+	require.NoError(t, s.putForTest(legacy))
 	_, err := claimForRestoreForTest(s, "legacy-source", "destination", 0)
 	require.NoError(t, err)
 
 	profiles := sampleResourceProfiles()
-	ok, err := s.RevertToActiveWithResourceProfiles(
+	ok, err := s.revertToActiveWithResourceProfilesForTest(
 		"legacy-source", "different-destination", 5, profiles,
 	)
 	require.NoError(t, err)
@@ -521,7 +541,7 @@ func TestRetentionStore_RevertToActiveWithResourceProfiles_AtomicLegacyBackfill(
 	assert.Equal(t, RetentionStatusRestoring, unchanged.Status)
 	assert.Empty(t, unchanged.ResourceProfiles)
 
-	ok, err = s.RevertToActiveWithResourceProfiles(
+	ok, err = s.revertToActiveWithResourceProfilesForTest(
 		"legacy-source", "destination", 5, profiles,
 	)
 	require.NoError(t, err)
@@ -538,12 +558,12 @@ func TestRetentionStore_RevertToActiveWithResourceProfiles_AtomicLegacyBackfill(
 	modern := sampleEntry("modern-source")
 	modern.Generation = 8
 	modern.ResourceProfiles = profiles
-	require.NoError(t, s.Put(modern))
+	require.NoError(t, s.putForTest(modern))
 	_, err = claimForRestoreForTest(s, "modern-source", "modern-destination", 0)
 	require.NoError(t, err)
 	mismatched := sampleResourceProfiles()
 	mismatched[0].DiskMB++
-	ok, err = s.RevertToActiveWithResourceProfiles(
+	ok, err = s.revertToActiveWithResourceProfilesForTest(
 		"modern-source", "modern-destination", 9, mismatched,
 	)
 	require.ErrorContains(t, err, "differ from durable")
@@ -560,7 +580,7 @@ func TestRetentionStore_DeleteIfRestoring_CAS(t *testing.T) {
 	s := newTestRetentionStore(t)
 	e := sampleEntry("lease-source")
 	e.Generation = 4
-	require.NoError(t, s.Put(e))
+	require.NoError(t, s.putForTest(e))
 	_, err := claimForRestoreForTest(s, "lease-source", "lease-destination", 0)
 	require.NoError(t, err)
 
@@ -573,7 +593,7 @@ func TestRetentionStore_DeleteIfRestoring_CAS(t *testing.T) {
 		{name: "stale generation", destination: "lease-destination", generation: 4},
 	} {
 		t.Run(attempt.name, func(t *testing.T) {
-			deleted, err := s.DeleteIfRestoring("lease-source", attempt.destination, attempt.generation)
+			deleted, err := s.deleteIfRestoringForTest("lease-source", attempt.destination, attempt.generation)
 			require.NoError(t, err)
 			assert.False(t, deleted)
 			got, getErr := s.Get("lease-source")
@@ -582,7 +602,7 @@ func TestRetentionStore_DeleteIfRestoring_CAS(t *testing.T) {
 		})
 	}
 
-	deleted, err := s.DeleteIfRestoring("lease-source", "lease-destination", 5)
+	deleted, err := s.deleteIfRestoringForTest("lease-source", "lease-destination", 5)
 	require.NoError(t, err)
 	require.True(t, deleted)
 	got, err := s.Get("lease-source")
@@ -592,7 +612,7 @@ func TestRetentionStore_DeleteIfRestoring_CAS(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, restoring, "the derived status index must be updated with the delete")
 
-	deleted, err = s.DeleteIfRestoring("lease-source", "lease-destination", 5)
+	deleted, err = s.deleteIfRestoringForTest("lease-source", "lease-destination", 5)
 	require.NoError(t, err)
 	assert.False(t, deleted, "absent exact delete is idempotent")
 }
@@ -607,19 +627,19 @@ func TestRetentionStore_ListExpired_ActiveOnly(t *testing.T) {
 	// Active + expired
 	e1 := sampleEntry("lease-exp-active")
 	e1.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, s.Put(e1))
+	require.NoError(t, s.putForTest(e1))
 
 	// Restoring + expired (should NOT appear)
 	e2 := sampleEntry("lease-exp-restoring")
 	e2.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, s.Put(e2))
+	require.NoError(t, s.putForTest(e2))
 	_, err := claimForRestoreForTest(s, "lease-exp-restoring", "lease-exp-destination", 0)
 	require.NoError(t, err)
 
 	// Active + fresh (should NOT appear)
 	e3 := sampleEntry("lease-fresh-active")
 	e3.CreatedAt = time.Now()
-	require.NoError(t, s.Put(e3))
+	require.NoError(t, s.putForTest(e3))
 
 	expired, err := s.ListExpired(maxAge)
 	require.NoError(t, err)
@@ -633,15 +653,15 @@ func TestRetentionStore_ListByTenant(t *testing.T) {
 
 	e1 := sampleEntry("lease-t1-a")
 	e1.Tenant = "tenant-1"
-	require.NoError(t, s.Put(e1))
+	require.NoError(t, s.putForTest(e1))
 
 	e2 := sampleEntry("lease-t1-b")
 	e2.Tenant = "tenant-1"
-	require.NoError(t, s.Put(e2))
+	require.NoError(t, s.putForTest(e2))
 
 	e3 := sampleEntry("lease-t2-a")
 	e3.Tenant = "tenant-2"
-	require.NoError(t, s.Put(e3))
+	require.NoError(t, s.putForTest(e3))
 
 	t1, err := s.ListByTenant("tenant-1")
 	require.NoError(t, err)
@@ -662,13 +682,13 @@ func TestRetentionStore_Persistence(t *testing.T) {
 	dbPath := dir + "/retention.db"
 
 	// Open, write, close
-	s1, err := NewRetentionStore(RetentionStoreConfig{DBPath: dbPath})
+	s1, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
-	require.NoError(t, s1.Put(sampleEntry("lease-persist")))
+	require.NoError(t, s1.putForTest(sampleEntry("lease-persist")))
 	require.NoError(t, s1.Close())
 
 	// Reopen and read
-	s2, err := NewRetentionStore(RetentionStoreConfig{DBPath: dbPath})
+	s2, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: dbPath})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s2.Close() })
 
@@ -681,7 +701,7 @@ func TestRetentionStore_Persistence(t *testing.T) {
 
 // TestRetentionStore_EmptyPath verifies that an empty DBPath returns an error.
 func TestRetentionStore_EmptyPath(t *testing.T) {
-	_, err := NewRetentionStore(RetentionStoreConfig{DBPath: ""})
+	_, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: ""})
 	require.Error(t, err)
 }
 
@@ -689,17 +709,17 @@ func TestRetentionStore_EmptyPath(t *testing.T) {
 func TestRetentionStore_ListRestoring(t *testing.T) {
 	s := newTestRetentionStore(t)
 
-	require.NoError(t, s.Put(sampleEntry("lease-r1")))
+	require.NoError(t, s.putForTest(sampleEntry("lease-r1")))
 	_, err := claimForRestoreForTest(s, "lease-r1", "destination-r1", 0)
 	require.NoError(t, err)
 
-	require.NoError(t, s.Put(sampleEntry("lease-r2")))
+	require.NoError(t, s.putForTest(sampleEntry("lease-r2")))
 	_, err = claimForRestoreForTest(s, "lease-r2", "destination-r2", 0)
 	require.NoError(t, err)
 
 	e3 := sampleEntry("lease-a1")
 	e3.Status = RetentionStatusActive
-	require.NoError(t, s.Put(e3))
+	require.NoError(t, s.putForTest(e3))
 
 	restoring, err := s.ListRestoring()
 	require.NoError(t, err)
@@ -717,9 +737,9 @@ func TestRetentionStore_ListRestoring(t *testing.T) {
 // names, stamps ReapingSince, and refuses non-active records (ok=false, untouched).
 func TestMarkReapingIfActive(t *testing.T) {
 	s := newTestRetentionStore(t)
-	require.NoError(t, s.Put(sampleEntry("lease-a"))) // active, vols [vol-a vol-b]
+	require.NoError(t, s.putForTest(sampleEntry("lease-a"))) // active, vols [vol-a vol-b]
 
-	names, ok, err := s.MarkReapingIfActive("lease-a")
+	names, ok, err := s.markReapingIfActiveForTest("lease-a")
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.ElementsMatch(t, []string{"vol-a", "vol-b"}, names)
@@ -731,12 +751,12 @@ func TestMarkReapingIfActive(t *testing.T) {
 	assert.False(t, got.ReapingSince.IsZero(), "ReapingSince must be stamped")
 
 	// Second call: already reaping → ok=false, no error.
-	_, ok, err = s.MarkReapingIfActive("lease-a")
+	_, ok, err = s.markReapingIfActiveForTest("lease-a")
 	require.NoError(t, err)
 	assert.False(t, ok)
 
 	// Absent key → ok=false, no error.
-	_, ok, err = s.MarkReapingIfActive("nonexistent")
+	_, ok, err = s.markReapingIfActiveForTest("nonexistent")
 	require.NoError(t, err)
 	assert.False(t, ok)
 }
@@ -749,9 +769,9 @@ func TestMarkReapingIfExpired(t *testing.T) {
 
 	expired := sampleEntry("lease-exp")
 	expired.CreatedAt = time.Now().Add(-2 * time.Hour)
-	require.NoError(t, s.Put(expired))
+	require.NoError(t, s.putForTest(expired))
 
-	names, ok, err := s.MarkReapingIfExpired("lease-exp", maxAge)
+	names, ok, err := s.markReapingIfExpiredForTest("lease-exp", maxAge)
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.ElementsMatch(t, []string{"vol-a", "vol-b"}, names)
@@ -762,13 +782,13 @@ func TestMarkReapingIfExpired(t *testing.T) {
 
 	// Fresh record → not reaped.
 	fresh := sampleEntry("lease-fresh") // CreatedAt = now
-	require.NoError(t, s.Put(fresh))
-	_, ok, err = s.MarkReapingIfExpired("lease-fresh", maxAge)
+	require.NoError(t, s.putForTest(fresh))
+	_, ok, err = s.markReapingIfExpiredForTest("lease-fresh", maxAge)
 	require.NoError(t, err)
 	assert.False(t, ok)
 
 	// maxAge<=0 → no-op.
-	_, ok, err = s.MarkReapingIfExpired("lease-exp", 0)
+	_, ok, err = s.markReapingIfExpiredForTest("lease-exp", 0)
 	require.NoError(t, err)
 	assert.False(t, ok)
 }
@@ -776,11 +796,11 @@ func TestMarkReapingIfExpired(t *testing.T) {
 // TestListReaping returns only reaping records.
 func TestListReaping(t *testing.T) {
 	s := newTestRetentionStore(t)
-	require.NoError(t, s.Put(sampleEntry("active-1"))) // active
+	require.NoError(t, s.putForTest(sampleEntry("active-1"))) // active
 	reaping := sampleEntry("reaping-1")
 	reaping.Status = RetentionStatusReaping
-	require.NoError(t, s.Put(reaping))
-	require.NoError(t, s.Put(sampleEntry("restoring-1")))
+	require.NoError(t, s.putForTest(reaping))
+	require.NoError(t, s.putForTest(sampleEntry("restoring-1")))
 	_, err := claimForRestoreForTest(s, "restoring-1", "restoring-destination", 0)
 	require.NoError(t, err)
 
@@ -798,7 +818,7 @@ func TestPutReaping(t *testing.T) {
 
 	base := sampleEntry("lease-x")
 	base.RetainedVolumeNames = []string{"fred-lease-x-app-0"}
-	ok, err := s.PutReaping(base)
+	ok, err := s.putReapingForTest(base)
 	require.NoError(t, err)
 	assert.True(t, ok)
 	got, err := s.Get("lease-x")
@@ -810,7 +830,7 @@ func TestPutReaping(t *testing.T) {
 	// Re-leak with an extra volume → union, ReapingSince preserved.
 	base2 := sampleEntry("lease-x")
 	base2.RetainedVolumeNames = []string{"fred-lease-x-app-0", "fred-lease-x-app-1"}
-	ok, err = s.PutReaping(base2)
+	ok, err = s.putReapingForTest(base2)
 	require.NoError(t, err)
 	assert.True(t, ok)
 	got, err = s.Get("lease-x")
@@ -819,8 +839,8 @@ func TestPutReaping(t *testing.T) {
 	assert.Equal(t, first, got.ReapingSince, "ReapingSince preserved across re-leak")
 
 	// Refuse to clobber an ACTIVE record.
-	require.NoError(t, s.Put(sampleEntry("lease-active")))
-	ok, err = s.PutReaping(sampleEntry("lease-active"))
+	require.NoError(t, s.putForTest(sampleEntry("lease-active")))
+	ok, err = s.putReapingForTest(sampleEntry("lease-active"))
 	require.NoError(t, err)
 	assert.False(t, ok)
 	got, err = s.Get("lease-active")
@@ -837,7 +857,7 @@ func TestPutReaping_ReLeakPreservesStoredAccounting(t *testing.T) {
 
 	first := sampleEntry("lease-y") // Items [{sku-1, qty 2}], Tenant tenant-a, ProviderUUID provider-1
 	first.RetainedVolumeNames = []string{"vol-a", "vol-b"}
-	ok, err := s.PutReaping(first)
+	ok, err := s.putReapingForTest(first)
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -847,7 +867,7 @@ func TestPutReaping_ReLeakPreservesStoredAccounting(t *testing.T) {
 		OriginalLeaseUUID:   "lease-y",
 		RetainedVolumeNames: []string{"vol-c"},
 	}
-	ok, err = s.PutReaping(partial)
+	ok, err = s.putReapingForTest(partial)
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -868,7 +888,7 @@ func TestPutReaping_ResourceProfilesAreExactAndRetrySafe(t *testing.T) {
 		base.ResourceProfiles = []SKUResourceSnapshot{{
 			SKU: "other", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
 		}}
-		ok, err := s.PutReaping(base)
+		ok, err := s.putReapingForTest(base)
 		require.ErrorContains(t, err, "unreferenced SKU")
 		assert.False(t, ok)
 	})
@@ -877,7 +897,7 @@ func TestPutReaping_ResourceProfilesAreExactAndRetrySafe(t *testing.T) {
 		s := newTestRetentionStore(t)
 		first := sampleEntry("reaping-preserve")
 		first.ResourceProfiles = sampleResourceProfiles()
-		ok, err := s.PutReaping(first)
+		ok, err := s.putReapingForTest(first)
 		require.NoError(t, err)
 		require.True(t, ok)
 
@@ -885,7 +905,7 @@ func TestPutReaping_ResourceProfilesAreExactAndRetrySafe(t *testing.T) {
 			OriginalLeaseUUID:   first.OriginalLeaseUUID,
 			RetainedVolumeNames: []string{"vol-c"},
 		}
-		ok, err = s.PutReaping(partial)
+		ok, err = s.putReapingForTest(partial)
 		require.NoError(t, err)
 		require.True(t, ok)
 		got, err := s.Get(first.OriginalLeaseUUID)
@@ -896,13 +916,13 @@ func TestPutReaping_ResourceProfilesAreExactAndRetrySafe(t *testing.T) {
 	t.Run("new exact retry upgrades legacy tombstone", func(t *testing.T) {
 		s := newTestRetentionStore(t)
 		legacy := sampleEntry("reaping-upgrade")
-		ok, err := s.PutReaping(legacy)
+		ok, err := s.putReapingForTest(legacy)
 		require.NoError(t, err)
 		require.True(t, ok)
 
 		retry := sampleEntry(legacy.OriginalLeaseUUID)
 		retry.ResourceProfiles = sampleResourceProfiles()
-		ok, err = s.PutReaping(retry)
+		ok, err = s.putReapingForTest(retry)
 		require.NoError(t, err)
 		require.True(t, ok)
 		got, err := s.Get(legacy.OriginalLeaseUUID)
@@ -914,7 +934,7 @@ func TestPutReaping_ResourceProfilesAreExactAndRetrySafe(t *testing.T) {
 		s := newTestRetentionStore(t)
 		first := sampleEntry("reaping-divergent")
 		first.ResourceProfiles = sampleResourceProfiles()
-		ok, err := s.PutReaping(first)
+		ok, err := s.putReapingForTest(first)
 		require.NoError(t, err)
 		require.True(t, ok)
 		before, err := s.getRaw(first.OriginalLeaseUUID)
@@ -923,7 +943,7 @@ func TestPutReaping_ResourceProfilesAreExactAndRetrySafe(t *testing.T) {
 		retry := sampleEntry(first.OriginalLeaseUUID)
 		retry.ResourceProfiles = sampleResourceProfiles()
 		retry.ResourceProfiles[0].DiskMB++
-		ok, err = s.PutReaping(retry)
+		ok, err = s.putReapingForTest(retry)
 		require.ErrorContains(t, err, "differs from stored immutable snapshot")
 		assert.False(t, ok)
 		after, readErr := s.getRaw(first.OriginalLeaseUUID)
@@ -951,7 +971,7 @@ func TestPutActiveMerged_AbsentWritesFresh(t *testing.T) {
 		CreatedAt:           createdAt,
 	}
 
-	ok, err := s.PutActiveMerged(base)
+	ok, err := s.putActiveMergedForTest(base)
 	require.NoError(t, err)
 	assert.True(t, ok, "absent key must be written fresh (ok=true)")
 
@@ -972,7 +992,7 @@ func TestPutActiveMerged_ActiveMergesAndPreservesCreatedAtGen(t *testing.T) {
 	s := newTestRetentionStore(t)
 
 	past := time.Now().Add(-30 * 24 * time.Hour).Round(time.Millisecond)
-	require.NoError(t, s.Put(RetentionEntry{
+	require.NoError(t, s.putForTest(RetentionEntry{
 		OriginalLeaseUUID:   "lease-1",
 		Tenant:              "tenant-a",
 		Status:              RetentionStatusActive,
@@ -991,7 +1011,7 @@ func TestPutActiveMerged_ActiveMergesAndPreservesCreatedAtGen(t *testing.T) {
 		Generation:          0,
 		CreatedAt:           time.Now(),
 	}
-	ok, err := s.PutActiveMerged(base)
+	ok, err := s.putActiveMergedForTest(base)
 	require.NoError(t, err)
 	assert.True(t, ok)
 
@@ -1008,7 +1028,7 @@ func TestPutActiveMerged_ResourceProfilesPersistUpgradeAndPreserve(t *testing.T)
 		s := newTestRetentionStore(t)
 		base := sampleEntry("lease-fresh-exact")
 		base.ResourceProfiles = sampleResourceProfiles()
-		ok, err := s.PutActiveMerged(base)
+		ok, err := s.putActiveMergedForTest(base)
 		require.NoError(t, err)
 		require.True(t, ok)
 
@@ -1023,11 +1043,11 @@ func TestPutActiveMerged_ResourceProfilesPersistUpgradeAndPreserve(t *testing.T)
 		s := newTestRetentionStore(t)
 		legacy := sampleEntry("lease-upgrade")
 		require.Empty(t, legacy.ResourceProfiles)
-		require.NoError(t, s.Put(legacy))
+		require.NoError(t, s.putForTest(legacy))
 
 		retry := sampleEntry(legacy.OriginalLeaseUUID)
 		retry.ResourceProfiles = sampleResourceProfiles()
-		ok, err := s.PutActiveMerged(retry)
+		ok, err := s.putActiveMergedForTest(retry)
 		require.NoError(t, err)
 		require.True(t, ok)
 		got, err := s.Get(legacy.OriginalLeaseUUID)
@@ -1039,11 +1059,11 @@ func TestPutActiveMerged_ResourceProfilesPersistUpgradeAndPreserve(t *testing.T)
 		s := newTestRetentionStore(t)
 		stored := sampleEntry("lease-preserve")
 		stored.ResourceProfiles = sampleResourceProfiles()
-		require.NoError(t, s.Put(stored))
+		require.NoError(t, s.putForTest(stored))
 
 		retry := sampleEntry(stored.OriginalLeaseUUID)
 		require.Empty(t, retry.ResourceProfiles)
-		ok, err := s.PutActiveMerged(retry)
+		ok, err := s.putActiveMergedForTest(retry)
 		require.NoError(t, err)
 		require.True(t, ok)
 		got, err := s.Get(stored.OriginalLeaseUUID)
@@ -1057,14 +1077,14 @@ func TestPutActiveMerged_RejectsResourceProfileDivergenceAndMalformedSnapshots(t
 		s := newTestRetentionStore(t)
 		stored := sampleEntry("lease-divergent")
 		stored.ResourceProfiles = sampleResourceProfiles()
-		require.NoError(t, s.Put(stored))
+		require.NoError(t, s.putForTest(stored))
 		before, err := s.getRaw(stored.OriginalLeaseUUID)
 		require.NoError(t, err)
 
 		retry := sampleEntry(stored.OriginalLeaseUUID)
 		retry.ResourceProfiles = sampleResourceProfiles()
 		retry.ResourceProfiles[0].DiskMB++
-		ok, err := s.PutActiveMerged(retry)
+		ok, err := s.putActiveMergedForTest(retry)
 		require.ErrorContains(t, err, "differs from stored immutable snapshot")
 		assert.False(t, ok)
 		after, readErr := s.getRaw(stored.OriginalLeaseUUID)
@@ -1078,7 +1098,7 @@ func TestPutActiveMerged_RejectsResourceProfileDivergenceAndMalformedSnapshots(t
 		base.ResourceProfiles = []SKUResourceSnapshot{{
 			SKU: "different", CPUCores: 1, MemoryMB: 512, DiskMB: 1024,
 		}}
-		ok, err := s.PutActiveMerged(base)
+		ok, err := s.putActiveMergedForTest(base)
 		require.ErrorContains(t, err, "unreferenced SKU")
 		assert.False(t, ok)
 		got, readErr := s.Get(base.OriginalLeaseUUID)
@@ -1092,7 +1112,7 @@ func TestPutActiveMerged_RejectsResourceProfileDivergenceAndMalformedSnapshots(t
 		stored.ResourceProfiles = []SKUResourceSnapshot{{
 			SKU: "sku-1", CPUCores: 1, MemoryMB: 0, DiskMB: 1024,
 		}}
-		raw, err := json.Marshal(stored)
+		raw, err := marshalRetentionEntry(stored)
 		require.NoError(t, err)
 		require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket(retentionBucketName).Put([]byte(stored.OriginalLeaseUUID), raw)
@@ -1102,7 +1122,7 @@ func TestPutActiveMerged_RejectsResourceProfileDivergenceAndMalformedSnapshots(t
 
 		retry := sampleEntry(stored.OriginalLeaseUUID)
 		retry.ResourceProfiles = sampleResourceProfiles()
-		ok, err := s.PutActiveMerged(retry)
+		ok, err := s.putActiveMergedForTest(retry)
 		require.ErrorContains(t, err, "stored snapshot")
 		assert.False(t, ok)
 		after, readErr := s.getRaw(stored.OriginalLeaseUUID)
@@ -1113,11 +1133,11 @@ func TestPutActiveMerged_RejectsResourceProfileDivergenceAndMalformedSnapshots(t
 
 func TestRetentionEntry_LegacyJSONOmitsResourceProfiles(t *testing.T) {
 	raw := []byte(`{"original_lease_uuid":"legacy","items":[{"sku":"sku-1","quantity":1}]}`)
-	var entry RetentionEntry
-	require.NoError(t, json.Unmarshal(raw, &entry))
+	entry, err := decodeLegacyRetentionEntry(raw)
+	require.NoError(t, err)
 	assert.Empty(t, entry.ResourceProfiles)
 
-	encoded, err := json.Marshal(entry)
+	encoded, err := marshalRetentionEntry(entry)
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), "resource_profiles")
 }
@@ -1127,15 +1147,15 @@ func TestRetentionStorePutAndReadsValidateNonemptyResourceProfiles(t *testing.T)
 	invalidQuantity := sampleEntry("invalid-profile-quantity")
 	invalidQuantity.Items[0].Quantity = 0
 	invalidQuantity.ResourceProfiles = sampleResourceProfiles()
-	require.ErrorContains(t, s.Put(invalidQuantity), "quantity 0 out of range")
+	require.ErrorContains(t, s.putForTest(invalidQuantity), "quantity 0 out of range")
 
 	invalid := sampleEntry("invalid-profile")
 	invalid.ResourceProfiles = []SKUResourceSnapshot{{
 		SKU: "sku-1", CPUCores: 1, MemoryMB: 0, DiskMB: 1024,
 	}}
-	require.ErrorContains(t, s.Put(invalid), "memory_mb must be positive")
+	require.ErrorContains(t, s.putForTest(invalid), "memory_mb must be positive")
 
-	raw, err := json.Marshal(invalid)
+	raw, err := marshalRetentionEntry(invalid)
 	require.NoError(t, err)
 	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(retentionBucketName).Put([]byte(invalid.OriginalLeaseUUID), raw)
@@ -1158,7 +1178,7 @@ func TestPutActiveMerged_ActivePreservesStoredManifestWhenBaseNil(t *testing.T) 
 	s := newTestRetentionStore(t)
 
 	past := time.Now().Add(-10 * 24 * time.Hour).Round(time.Millisecond)
-	require.NoError(t, s.Put(RetentionEntry{
+	require.NoError(t, s.putForTest(RetentionEntry{
 		OriginalLeaseUUID: "lease-1",
 		Tenant:            "tenant-a",
 		Status:            RetentionStatusActive,
@@ -1182,7 +1202,7 @@ func TestPutActiveMerged_ActivePreservesStoredManifestWhenBaseNil(t *testing.T) 
 		Generation:          0,
 		CreatedAt:           time.Now(),
 	}
-	ok, err := s.PutActiveMerged(base)
+	ok, err := s.putActiveMergedForTest(base)
 	require.NoError(t, err)
 	assert.True(t, ok)
 
@@ -1207,7 +1227,7 @@ func TestPutActiveMerged_RestoringRefuses(t *testing.T) {
 	stored.RetainedVolumeNames = []string{"a"}
 	stored.Generation = 4
 	stored.CreatedAt = time.Now().Add(-time.Hour).Round(time.Millisecond)
-	require.NoError(t, s.Put(stored))
+	require.NoError(t, s.putForTest(stored))
 	_, err := claimForRestoreForTest(s, "lease-1", "new-lease", 0)
 	require.NoError(t, err)
 
@@ -1222,7 +1242,7 @@ func TestPutActiveMerged_RestoringRefuses(t *testing.T) {
 		Generation:          0,
 		CreatedAt:           time.Now(),
 	}
-	ok, err := s.PutActiveMerged(base)
+	ok, err := s.putActiveMergedForTest(base)
 	require.NoError(t, err, "refusing a restoring record is not an error")
 	assert.False(t, ok, "a restoring record must not be overwritten (ok=false)")
 
@@ -1245,7 +1265,7 @@ func TestPutActiveMerged_RestoringRefuses(t *testing.T) {
 func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
 	s := newTestRetentionStore(t)
 	for iter := 0; iter < 200; iter++ {
-		require.NoError(t, s.Put(sampleEntry("lease-c"))) // reset to active each round
+		require.NoError(t, s.putForTest(sampleEntry("lease-c"))) // reset to active each round
 
 		var (
 			wg       sync.WaitGroup
@@ -1256,7 +1276,7 @@ func TestMarkReaping_VsClaimForRestore_Concurrent(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, reapOK, reapErr = s.MarkReapingIfActive("lease-c")
+			_, reapOK, reapErr = s.markReapingIfActiveForTest("lease-c")
 		}()
 		go func() {
 			defer wg.Done()
@@ -1288,7 +1308,7 @@ func TestStatusAudit_ClaimForRestoreWithAuthority_RejectsReaping(t *testing.T) {
 	s := newTestRetentionStore(t)
 	r := sampleEntry("lease-r")
 	r.Status = RetentionStatusReaping
-	require.NoError(t, s.Put(r))
+	require.NoError(t, s.putForTest(r))
 	_, err := claimForRestoreForTest(s, "lease-r", "new", time.Hour)
 	require.Error(t, err, "ClaimForRestoreWithAuthority must reject a reaping record")
 }
@@ -1299,7 +1319,7 @@ func TestStatusAudit_ListExpired_ExcludesReaping(t *testing.T) {
 	r := sampleEntry("lease-r")
 	r.Status = RetentionStatusReaping
 	r.CreatedAt = time.Now().Add(-2 * time.Hour)
-	require.NoError(t, s.Put(r))
+	require.NoError(t, s.putForTest(r))
 	got, err := s.ListExpired(time.Hour)
 	require.NoError(t, err)
 	assert.Empty(t, got, "ListExpired returns active-only")
@@ -1326,17 +1346,17 @@ func (s *RetentionStore) indexSnapshot() (map[string][]string, map[string][]stri
 func TestRetentionIndex_RebuildOnOpen(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/retention.db"
-	s1, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	s1, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: path})
 	require.NoError(t, err)
 	a := sampleEntry("lease-a") // tenant-a, active
 	b := sampleEntry("lease-b")
 	b.Tenant = "tenant-b"
 	b.Status = RetentionStatusReaping
-	require.NoError(t, s1.Put(a))
-	require.NoError(t, s1.Put(b))
+	require.NoError(t, s1.putForTest(a))
+	require.NoError(t, s1.putForTest(b))
 	require.NoError(t, s1.Close())
 
-	s2, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	s2, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: path})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s2.Close() })
 
@@ -1353,16 +1373,16 @@ func TestRetentionIndex_RebuildOnOpen(t *testing.T) {
 func TestRetentionIndex_RebuildFailsClosedOnMalformedRecord(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/retention.db"
-	s1, err := NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	s1, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: path})
 	require.NoError(t, err)
-	require.NoError(t, s1.Put(sampleEntry("good")))
+	require.NoError(t, s1.putForTest(sampleEntry("good")))
 	// Write garbage bytes directly under a key (white-box).
 	require.NoError(t, s1.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(retentionBucketName).Put([]byte("bad"), []byte("{not json"))
 	}))
 	require.NoError(t, s1.Close())
 
-	_, err = NewRetentionStore(RetentionStoreConfig{DBPath: path})
+	_, err = newUnboundRetentionStoreForTest(RetentionStoreConfig{DBPath: path})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "retention index")
 	// The malformed-record error must name the offending bucket key so an operator can find
@@ -1414,7 +1434,7 @@ func assertIndexConsistent(t *testing.T, s *RetentionStore) {
 func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
 	s := newTestRetentionStore(t)
 
-	ok, err := s.PutActiveMerged(sampleEntry("u1"))
+	ok, err := s.putActiveMergedForTest(sampleEntry("u1"))
 	require.NoError(t, err)
 	require.True(t, ok)
 	assertIndexConsistent(t, s)
@@ -1430,12 +1450,12 @@ func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
 	require.True(t, swapped)
 	assertIndexConsistent(t, s)
 
-	_, ok, err = s.MarkReapingIfActive("u1") // active -> reaping
+	_, ok, err = s.markReapingIfActiveForTest("u1") // active -> reaping
 	require.NoError(t, err)
 	require.True(t, ok)
 	assertIndexConsistent(t, s)
 
-	okr, err := s.PutReaping(sampleEntry("u2")) // fresh-insert reaping
+	okr, err := s.putReapingForTest(sampleEntry("u2")) // fresh-insert reaping
 	require.NoError(t, err)
 	require.True(t, okr)
 	assertIndexConsistent(t, s)
@@ -1443,25 +1463,25 @@ func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
 	// Refused write must not change the index: PutReaping over an active record returns
 	// ok=false and writes nothing, so the index must be unchanged afterward. Seed the active
 	// record with PutActiveMerged (any index-maintaining mutator works here).
-	okSeed, err := s.PutActiveMerged(sampleEntry("u3"))
+	okSeed, err := s.putActiveMergedForTest(sampleEntry("u3"))
 	require.NoError(t, err)
 	require.True(t, okSeed)
-	okr, err = s.PutReaping(sampleEntry("u3"))
+	okr, err = s.putReapingForTest(sampleEntry("u3"))
 	require.NoError(t, err)
 	require.False(t, okr)
 	assertIndexConsistent(t, s) // sole equality oracle — do NOT compare two raw indexSnapshot maps with assert.Equal (order-randomized)
 
 	// DeleteIfActive on a non-active record is a no-op (u1 is reaping) → index unchanged.
-	_, deleted, err := s.DeleteIfActive("u1")
+	_, deleted, err := s.deleteIfActiveForTest("u1")
 	require.NoError(t, err)
 	require.False(t, deleted)
 	assertIndexConsistent(t, s)
 
 	// DeleteIfActive on a fresh active record removes it from both partitions.
-	okSeed, err = s.PutActiveMerged(sampleEntry("u4"))
+	okSeed, err = s.putActiveMergedForTest(sampleEntry("u4"))
 	require.NoError(t, err)
 	require.True(t, okSeed)
-	_, deleted, err = s.DeleteIfActive("u4")
+	_, deleted, err = s.deleteIfActiveForTest("u4")
 	require.NoError(t, err)
 	require.True(t, deleted)
 	assertIndexConsistent(t, s)
@@ -1469,10 +1489,10 @@ func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
 	// MarkReapingIfExpired: active+expired → reaping.
 	expired := sampleEntry("u5")
 	expired.CreatedAt = time.Now().Add(-48 * time.Hour)
-	okSeed, err = s.PutActiveMerged(expired)
+	okSeed, err = s.putActiveMergedForTest(expired)
 	require.NoError(t, err)
 	require.True(t, okSeed)
-	_, okExp, err := s.MarkReapingIfExpired("u5", time.Hour)
+	_, okExp, err := s.markReapingIfExpiredForTest("u5", time.Hour)
 	require.NoError(t, err)
 	require.True(t, okExp)
 	assertIndexConsistent(t, s)
@@ -1482,13 +1502,13 @@ func TestRetentionIndex_ReIndexRebuildsAndFiresHook(t *testing.T) {
 	dir := t.TempDir()
 	var gotTrigger string
 	var gotCount int
-	s, err := NewRetentionStore(RetentionStoreConfig{
+	s, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{
 		DBPath:    dir + "/retention.db",
 		OnReindex: func(count int, _ time.Duration, trigger string) { gotCount, gotTrigger = count, trigger },
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
-	require.NoError(t, s.Put(sampleEntry("u1")))
+	require.NoError(t, s.putForTest(sampleEntry("u1")))
 	require.NoError(t, s.ReIndex())
 	assert.Equal(t, "manual", gotTrigger)
 	assert.Equal(t, 1, gotCount)
@@ -1499,24 +1519,24 @@ func TestRetentionIndex_ReIndexRebuildsAndFiresHook(t *testing.T) {
 func TestRetentionIndex_PutOverwriteAndDeleteStayConsistent(t *testing.T) {
 	s := newTestRetentionStore(t)
 	e := sampleEntry("u1")
-	require.NoError(t, s.Put(e))
+	require.NoError(t, s.putForTest(e))
 	assertIndexConsistent(t, s)
 
 	e2 := e
 	e2.Status = RetentionStatusReaping
-	require.NoError(t, s.Put(e2)) // overwrite same UUID, different status
+	require.NoError(t, s.putForTest(e2)) // overwrite same UUID, different status
 	_, byStatus := s.indexSnapshot()
 	assert.NotContains(t, byStatus[RetentionStatusActive], "u1")
 	assert.ElementsMatch(t, []string{"u1"}, byStatus[RetentionStatusReaping])
 	assertIndexConsistent(t, s)
 
-	require.NoError(t, s.Delete("u1"))
+	require.NoError(t, s.deleteForTest("u1"))
 	assertIndexConsistent(t, s)
 	byTenant, byStatus := s.indexSnapshot()
 	assert.Empty(t, byTenant)
 	assert.Empty(t, byStatus)
 
-	require.NoError(t, s.Delete("nope")) // absent → no-op
+	require.NoError(t, s.deleteForTest("nope")) // absent → no-op
 	assertIndexConsistent(t, s)
 }
 
@@ -1528,13 +1548,13 @@ func TestRetentionIndex_ListByIndexEquivalence(t *testing.T) {
 			e.Tenant = "tenant-b"
 		}
 		if st == RetentionStatusRestoring {
-			require.NoError(t, s.Put(e))
+			require.NoError(t, s.putForTest(e))
 			_, err := claimForRestoreForTest(s, e.OriginalLeaseUUID, "destination-"+e.OriginalLeaseUUID, 0)
 			require.NoError(t, err)
 			continue
 		}
 		e.Status = st
-		require.NoError(t, s.Put(e))
+		require.NoError(t, s.putForTest(e))
 	}
 	byT, err := s.ListByTenant("tenant-a")
 	require.NoError(t, err)
@@ -1550,7 +1570,7 @@ func TestRetentionIndex_ListByIndexEquivalence(t *testing.T) {
 
 func TestRetentionIndex_ReadDropsStaleIndexEntry(t *testing.T) {
 	s := newTestRetentionStore(t)
-	require.NoError(t, s.Put(sampleEntry("u1"))) // active
+	require.NoError(t, s.putForTest(sampleEntry("u1"))) // active
 
 	// Force a stale index entry: claim → revert leaves on-disk status=active, but seed
 	// byStatus[restoring] with u1 to simulate an index snapshot lagging a revert.
@@ -1565,8 +1585,8 @@ func TestRetentionIndex_ReadDropsStaleIndexEntry(t *testing.T) {
 
 func TestRetentionStore_Keys(t *testing.T) {
 	s := newTestRetentionStore(t)
-	require.NoError(t, s.Put(sampleEntry("u1")))
-	require.NoError(t, s.Put(sampleEntry("u2")))
+	require.NoError(t, s.putForTest(sampleEntry("u1")))
+	require.NoError(t, s.putForTest(sampleEntry("u2")))
 	keys, err := s.Keys()
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"u1", "u2"}, keys)
@@ -1575,7 +1595,7 @@ func TestRetentionStore_Keys(t *testing.T) {
 func TestRetentionStore_KeysPage(t *testing.T) {
 	s := newTestRetentionStore(t)
 	for _, k := range []string{"c", "a", "e", "b", "d"} { // inserted out of order
-		require.NoError(t, s.Put(sampleEntry(k)))
+		require.NoError(t, s.putForTest(sampleEntry(k)))
 	}
 
 	t.Run("passthrough when limit<=0 returns all in key order", func(t *testing.T) {
@@ -1634,7 +1654,7 @@ func TestRetentionStore_KeysPage(t *testing.T) {
 func TestRetentionIndex_ConcurrentReadersWriters(t *testing.T) {
 	s := newTestRetentionStore(t)
 	for i := 0; i < 50; i++ {
-		require.NoError(t, s.Put(sampleEntry(fmt.Sprintf("u%d", i))))
+		require.NoError(t, s.putForTest(sampleEntry(fmt.Sprintf("u%d", i))))
 	}
 
 	stop := make(chan struct{})
@@ -1660,7 +1680,7 @@ func TestRetentionIndex_ConcurrentReadersWriters(t *testing.T) {
 			if claimed, err := claimForRestoreForTest(s, id, "n", time.Hour); err == nil {
 				_, _ = revertToActiveForTest(s, id, "n", claimed.Generation)
 			}
-			_, _, _ = s.MarkReapingIfActive(id)
+			_, _, _ = s.markReapingIfActiveForTest(id)
 		}
 	}()
 
@@ -1721,9 +1741,13 @@ func TestRetentionIndex_RebuildKeysOnBucketKey(t *testing.T) {
 	s := newTestRetentionStore(t)
 
 	// White-box: write a record under key "K1" whose VALUE has an empty (mismatched) UUID.
-	val := `{"original_lease_uuid":"","tenant":"t-mismatch","status":"active","retained_volume_names":["v"]}`
+	val, err := marshalRetentionEntry(RetentionEntry{
+		Tenant: "t-mismatch", Status: RetentionStatusActive,
+		RetainedVolumeNames: []string{"v"},
+	})
+	require.NoError(t, err)
 	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(retentionBucketName).Put([]byte("K1"), []byte(val))
+		return tx.Bucket(retentionBucketName).Put([]byte("K1"), val)
 	}))
 	require.NoError(t, s.ReIndex())
 
@@ -1742,14 +1766,18 @@ func TestRetentionIndex_MutatorKeysOnBucketKey(t *testing.T) {
 	s := newTestRetentionStore(t)
 
 	// White-box: an active record under key "K1" whose VALUE UUID is empty (mismatched).
-	val := `{"original_lease_uuid":"","tenant":"t","status":"active","retained_volume_names":["v"]}`
+	val, err := marshalRetentionEntry(RetentionEntry{
+		Tenant: "t", Status: RetentionStatusActive,
+		RetainedVolumeNames: []string{"v"},
+	})
+	require.NoError(t, err)
 	require.NoError(t, s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(retentionBucketName).Put([]byte("K1"), []byte(val))
+		return tx.Bucket(retentionBucketName).Put([]byte("K1"), val)
 	}))
 	require.NoError(t, s.ReIndex()) // index keyed on the bucket key "K1"
 
 	// Runtime status transition active -> reaping via a mutator keyed on "K1".
-	_, transitioned, err := s.MarkReapingIfActive("K1")
+	_, transitioned, err := s.markReapingIfActiveForTest("K1")
 	require.NoError(t, err)
 	require.True(t, transitioned)
 
@@ -1774,7 +1802,7 @@ func TestRetentionIndex_ReIndexConcurrentWithWriter(t *testing.T) {
 	// A wide base set makes each ReIndex scan slow enough that a concurrent Put reliably commits
 	// inside the scan→swap window on the buggy (scan-outside-lock) path.
 	for i := 0; i < 1000; i++ {
-		require.NoError(t, s.Put(sampleEntry(fmt.Sprintf("base%d", i))))
+		require.NoError(t, s.putForTest(sampleEntry(fmt.Sprintf("base%d", i))))
 	}
 
 	errCh := make(chan error, 16)
@@ -1799,7 +1827,7 @@ func TestRetentionIndex_ReIndexConcurrentWithWriter(t *testing.T) {
 				return
 			default:
 			}
-			if err := s.Put(sampleEntry(fmt.Sprintf("w%d", i))); err != nil {
+			if err := s.putForTest(sampleEntry(fmt.Sprintf("w%d", i))); err != nil {
 				fail(err)
 				return
 			}
@@ -1850,14 +1878,14 @@ func putRawRecord(t *testing.T, s *RetentionStore, key string, raw []byte) {
 // are indistinguishable from a pre-partition binary's records.
 func TestPartition_EmptyOmittedFromStoredBytes(t *testing.T) {
 	s := newTestRetentionStore(t)
-	require.NoError(t, s.Put(sampleEntry("orig-1")))
+	require.NoError(t, s.putForTest(sampleEntry("orig-1")))
 	raw, err := s.getRaw("orig-1")
 	require.NoError(t, err)
 	require.NotContains(t, string(raw), `"partition"`)
 
 	// Same pin for the close path's actual write primitive.
 	merged := sampleEntry("orig-2")
-	ok, err := s.PutActiveMerged(merged)
+	ok, err := s.putActiveMergedForTest(merged)
 	require.NoError(t, err)
 	require.True(t, ok)
 	raw, err = s.getRaw("orig-2")
@@ -1869,7 +1897,7 @@ func TestPartition_EmptyOmittedFromStoredBytes(t *testing.T) {
 // decodes Partition=="" — the default whole-tenant bucket.
 func TestPartition_LegacyRecordDecodesToDefaultBucket(t *testing.T) {
 	s := newTestRetentionStore(t)
-	require.NoError(t, s.Put(sampleEntry("orig-legacy")))
+	require.NoError(t, s.putForTest(sampleEntry("orig-legacy")))
 	got, err := s.Get("orig-legacy")
 	require.NoError(t, err)
 	require.Equal(t, "", got.Partition)
@@ -1881,7 +1909,7 @@ func TestPartition_RoundTripsThroughLifecycleMethods(t *testing.T) {
 	s := newTestRetentionStore(t)
 	e := sampleEntry("orig-rt")
 	e.Partition = "cust-a"
-	require.NoError(t, s.Put(e))
+	require.NoError(t, s.putForTest(e))
 
 	claimed, err := claimForRestoreForTest(s, "orig-rt", "new-lease", 0)
 	require.NoError(t, err)
@@ -1892,7 +1920,7 @@ func TestPartition_RoundTripsThroughLifecycleMethods(t *testing.T) {
 	got, err := s.Get("orig-rt")
 	require.NoError(t, err)
 	require.Equal(t, "cust-a", got.Partition)
-	_, ok, err = s.MarkReapingIfActive("orig-rt")
+	_, ok, err = s.markReapingIfActiveForTest("orig-rt")
 	require.NoError(t, err)
 	require.True(t, ok)
 	got, err = s.Get("orig-rt")
@@ -1901,7 +1929,7 @@ func TestPartition_RoundTripsThroughLifecycleMethods(t *testing.T) {
 	// PutReaping re-leak branch preserves stored wholesale.
 	releak := sampleEntry("orig-rt")
 	releak.Partition = "" // a degraded give-up caller passes no label
-	ok, err = s.PutReaping(releak)
+	ok, err = s.putReapingForTest(releak)
 	require.NoError(t, err)
 	require.True(t, ok)
 	got, err = s.Get("orig-rt")
@@ -1913,8 +1941,8 @@ func TestPartition_RoundTripsThroughLifecycleMethods(t *testing.T) {
 	rt2 := sampleEntry("orig-rt2")
 	rt2.Partition = "cust-b"
 	rt2.CreatedAt = time.Now().Add(-100 * 24 * time.Hour)
-	require.NoError(t, s.Put(rt2))
-	_, ok, err = s.MarkReapingIfExpired("orig-rt2", time.Hour)
+	require.NoError(t, s.putForTest(rt2))
+	_, ok, err = s.markReapingIfExpiredForTest("orig-rt2", time.Hour)
 	require.NoError(t, err)
 	require.True(t, ok)
 	got, err = s.Get("orig-rt2")
@@ -1929,17 +1957,18 @@ func TestPartition_OldBinaryRewriteDropsLabel(t *testing.T) {
 	s := newTestRetentionStore(t)
 	e := sampleEntry("orig-drop")
 	e.Partition = "cust-a"
-	require.NoError(t, s.Put(e))
+	require.NoError(t, s.putForTest(e))
 
 	raw, err := s.getRaw("orig-drop")
 	require.NoError(t, err)
-	var m map[string]any
-	require.NoError(t, json.Unmarshal(raw, &m))
-	require.Contains(t, m, "partition")
-	delete(m, "partition")
-	legacy, err := json.Marshal(m)
+	var envelope map[string]any
+	require.NoError(t, json.Unmarshal(raw, &envelope))
+	entry := envelope["entry"].(map[string]any)
+	require.Contains(t, entry, "partition")
+	delete(entry, "partition")
+	omitted, err := json.Marshal(envelope)
 	require.NoError(t, err)
-	putRawRecord(t, s, "orig-drop", legacy) // raw bucket write, mirroring the :1068+ idiom
+	putRawRecord(t, s, "orig-drop", omitted)
 
 	got, err := s.Get("orig-drop")
 	require.NoError(t, err)
@@ -1954,14 +1983,14 @@ func TestPutActiveMerged_PreservesPartitionOnNilManifestRetry(t *testing.T) {
 	s := newTestRetentionStore(t)
 	first := sampleEntry("orig-guard")
 	first.Partition = "cust-a"
-	ok, err := s.PutActiveMerged(first)
+	ok, err := s.putActiveMergedForTest(first)
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	retry := sampleEntry("orig-guard")
 	retry.StackManifest = nil // hydration failed on the retry
 	retry.Partition = ""      // extractor had no input → collapsed
-	ok, err = s.PutActiveMerged(retry)
+	ok, err = s.putActiveMergedForTest(retry)
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -1978,13 +2007,13 @@ func TestPutActiveMerged_RestampsPartitionWhenManifestPresent(t *testing.T) {
 	s := newTestRetentionStore(t)
 	first := sampleEntry("orig-restamp")
 	first.Partition = "cust-a"
-	ok, err := s.PutActiveMerged(first)
+	ok, err := s.putActiveMergedForTest(first)
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	retry := sampleEntry("orig-restamp") // sampleEntry sets a non-nil StackManifest
 	retry.Partition = ""                 // successful re-extraction yielded default
-	ok, err = s.PutActiveMerged(retry)
+	ok, err = s.putActiveMergedForTest(retry)
 	require.NoError(t, err)
 	require.True(t, ok)
 

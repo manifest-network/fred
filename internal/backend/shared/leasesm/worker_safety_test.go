@@ -30,12 +30,15 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 		StopCtx:            ctx,
 		ProvisionStore:     store,
 		WorkerDrainTimeout: 25 * time.Millisecond,
-		DoDeprovisionFn: func(_ context.Context, leaseUUID string) error {
+		DoDeprovisionFn: func(_ context.Context, scope ActorCloseScope) error {
+			leaseUUID := scope.LeaseUUID()
 			deprovisionCalls.Add(1)
 			store.remove(leaseUUID)
 			return nil
 		},
 	})
+	require.NoError(t, actor.sm.requestProvision(context.Background()),
+		"test must model an admitted worker-owning Provisioning state, not a reservation")
 
 	// Model a Docker mutation that ignores cancellation and remains capable of
 	// publishing a later Compose Up. The barrier, not context cancellation, is
@@ -44,7 +47,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	actor.workers.Add()
 
 	reply := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(DeprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 	select {
 	case err := <-reply:
 		require.ErrorIs(t, err, ErrWorkerDrainTimeout)
@@ -65,7 +68,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	// Deprovisioning wedge.
 	actor.workers.Done()
 	retryReply := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(DeprovisionMsg{Ctx: context.Background(), Reply: retryReply}))
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: retryReply}))
 	select {
 	case err := <-retryReply:
 		require.NoError(t, err)
@@ -84,7 +87,8 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 	actor := newTestActor(t, "lease-1", testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
-		DoDeprovisionFn: func(_ context.Context, leaseUUID string) error {
+		DoDeprovisionFn: func(_ context.Context, scope ActorCloseScope) error {
+			leaseUUID := scope.LeaseUUID()
 			assert.Equal(t, "lease-1", leaseUUID)
 			deprovisionCalls.Add(1)
 			return nil
@@ -92,7 +96,7 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 	})
 
 	reply := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(DeprovisionMsg{Ctx: context.Background(), Reply: reply}))
+	require.True(t, actor.tryEnqueue(deprovisionMsg{Ctx: context.Background(), Reply: reply}))
 	select {
 	case err := <-reply:
 		require.NoError(t, err)
@@ -104,12 +108,16 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 }
 
 func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
+	runtime := newTestRuntimeGenerationProof(t, leaseUUID)
 	store := newMockProvisionStore()
-	store.put("lease-1", &ProvisionState{
-		LeaseUUID:            "lease-1",
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID:            leaseUUID,
 		Status:               backend.ProvisionStatusReady,
 		FailCount:            4,
 		LifecycleCallbackURL: "https://fred.example/callbacks/lifecycle",
+		ActiveReleaseVersion: runtime.Version(),
+		ActiveOperationID:    runtime.OperationID(),
 		ContainerIDs:         []string{"survivor-a", "survivor-b"},
 	})
 
@@ -118,10 +126,9 @@ func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
 	var inspectCalls atomic.Int64
 	var diagnosticCalls atomic.Int64
 	var callbackCalls atomic.Int64
-	var gotCallbackURL string
 	var gotCallbackStatus backend.CallbackStatus
 	var gotCallbackError string
-	actor := newTestActor(t, "lease-1", testActorOpts{
+	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 		Metrics:        metrics,
@@ -131,13 +138,12 @@ func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
 		}},
 		PersistDiagnosticsFn: func(entry shared.DiagnosticEntry, ids []string, _ map[string]string) {
 			diagnosticCalls.Add(1)
-			assert.Equal(t, "lease-1", entry.LeaseUUID)
+			assert.Equal(t, leaseUUID, entry.LeaseUUID)
 			assert.ElementsMatch(t, []string{"survivor-a", "survivor-b"}, ids)
 		},
-		SendLifecycleCallbackFn: func(_ string, callbackURL string, status backend.CallbackStatus, errMsg string) {
+		SendLifecycleFailureFn: func(_ shared.RuntimeGenerationProof, errMsg string) {
 			callbackCalls.Add(1)
-			gotCallbackURL = callbackURL
-			gotCallbackStatus = status
+			gotCallbackStatus = backend.CallbackStatusFailed
 			gotCallbackError = errMsg
 		},
 	})
@@ -146,16 +152,12 @@ func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
 		<-actor.Done()
 	})
 
-	reply := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(CohortDivergedMsg{Ctx: context.Background(), Reply: reply}))
-	select {
-	case err := <-reply:
-		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("cohort-divergence transition did not acknowledge completion")
-	}
+	observation, reply, err := NewCohortDivergedObservation(context.Background(), runtime)
+	require.NoError(t, err)
+	require.True(t, actor.TryEnqueueObservation(observation))
+	require.NoError(t, reply.Wait(context.Background()))
 
-	got, exists := store.Get("lease-1")
+	got, exists := store.Get(leaseUUID)
 	require.True(t, exists)
 	assert.Equal(t, backend.ProvisionStatusFailed, got.Status)
 	assert.Equal(t, 5, got.FailCount)
@@ -167,25 +169,77 @@ func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
 	assert.Equal(t, int64(0), inspectCalls.Load())
 	assert.Equal(t, int64(1), diagnosticCalls.Load())
 	assert.Equal(t, int64(1), callbackCalls.Load())
-	assert.Equal(t, int64(1), metrics.activeProvisionsDec.Load())
-	assert.Equal(t, "https://fred.example/callbacks/lifecycle", gotCallbackURL)
 	assert.Equal(t, backend.CallbackStatusFailed, gotCallbackStatus)
 	assert.Equal(t, errMsgCohortDiverged, gotCallbackError)
 
 	// A repeated recovery observation after the lease is already Failed is an
 	// SM Ignore: no count inflation, duplicate callback, or gauge movement.
-	secondReply := make(chan error, 1)
-	require.True(t, actor.TryEnqueue(CohortDivergedMsg{Ctx: context.Background(), Reply: secondReply}))
-	select {
-	case err := <-secondReply:
-		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("idempotent cohort-divergence observation did not acknowledge")
-	}
-	got, exists = store.Get("lease-1")
+	second, secondReply, err := NewCohortDivergedObservation(context.Background(), runtime)
+	require.NoError(t, err)
+	require.True(t, actor.TryEnqueueObservation(second))
+	require.NoError(t, secondReply.Wait(context.Background()))
+	got, exists = store.Get(leaseUUID)
 	require.True(t, exists)
 	assert.Equal(t, 5, got.FailCount)
 	assert.Equal(t, int64(1), diagnosticCalls.Load())
 	assert.Equal(t, int64(1), callbackCalls.Load())
-	assert.Equal(t, int64(1), metrics.activeProvisionsDec.Load())
+}
+
+// TestCohortObservationCapturedBeforeInventoryCannotFailReplacementGeneration
+// models the recovery ordering that matters: authority is captured first, an
+// inventory read reports divergence for that old cohort, and a maintenance
+// generation becomes active before the observation reaches the actor. The
+// observation's durable re-attestation must supersede it even though
+// maintenance deliberately preserves the original operation ID.
+func TestCohortObservationCapturedBeforeInventoryCannotFailReplacementGeneration(t *testing.T) {
+	leaseUUID := testActorLeaseUUID
+	intent := newTestMaintenanceClaim(t, leaseUUID, shared.MaintenanceIntentUpdate)
+	value, ok := maintenanceAuthorities.Load(intent.MaintenanceID())
+	require.True(t, ok)
+	authority := value.(testMaintenanceAuthority)
+
+	// This proof is captured before the simulated inventory read.
+	oldRuntime, err := authority.releases.ProveRuntimeGeneration(leaseUUID)
+	require.NoError(t, err)
+	observation, reply, err := NewCohortDivergedObservation(context.Background(), oldRuntime)
+	require.NoError(t, err)
+
+	// The inventory result now belongs to the old generation. Before routing it,
+	// maintenance commits a replacement which keeps the same operation ID but
+	// advances the exact Release version and digest.
+	_ = testMaintenanceSuccess(t, intent, ReplaceSuccessProjection{})
+	newRuntime, err := authority.releases.ProveRuntimeGeneration(leaseUUID)
+	require.NoError(t, err)
+	require.NotEqual(t, oldRuntime.Version(), newRuntime.Version())
+	require.Equal(t, oldRuntime.OperationID(), newRuntime.OperationID(),
+		"maintenance is intentionally within one operation lineage")
+
+	store := newMockProvisionStore()
+	store.put(leaseUUID, &ProvisionState{
+		LeaseUUID:            leaseUUID,
+		Status:               backend.ProvisionStatusReady,
+		FailCount:            2,
+		ContainerIDs:         []string{"replacement-container"},
+		ActiveReleaseVersion: newRuntime.Version(),
+		ActiveOperationID:    newRuntime.OperationID(),
+	})
+	var callbackCalls atomic.Int64
+	actor := newTestActorNoSpawn(t, leaseUUID, testActorOpts{
+		ProvisionStore: store,
+		SendLifecycleFailureFn: func(shared.RuntimeGenerationProof, string) {
+			callbackCalls.Add(1)
+		},
+	})
+
+	assert.False(t, observation.Current(store),
+		"routing must re-attest the pre-inventory proof after replacement")
+	actor.handle(observation.message())
+	require.NoError(t, reply.Wait(context.Background()))
+
+	got, exists := store.Get(leaseUUID)
+	require.True(t, exists)
+	assert.Equal(t, backend.ProvisionStatusReady, got.Status)
+	assert.Equal(t, 2, got.FailCount)
+	assert.Equal(t, []string{"replacement-container"}, got.ContainerIDs)
+	assert.Zero(t, callbackCalls.Load())
 }

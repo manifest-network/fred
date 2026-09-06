@@ -20,26 +20,33 @@ import (
 // after its initial Ready check; Restart could then win while stale rollback
 // moved the newly-live volume back to the source namespace.
 func TestReconcileRestoring_FailedRollbackExcludesRestartAdmission(t *testing.T) {
-	const sourceLease = "restore-source"
-	const destinationLease = "restore-destination"
+	const sourceLease = "0192f1a0-1111-4abc-8def-000000000701"
+	const destinationLease = "0192f1a0-2222-4abc-8def-000000000702"
 	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
 	stack := restoreStackManifest()
 	b := newBackendForProvisionTest(t, &mockDockerClient{}, map[string]*provision{
 		destinationLease: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: destinationLease, Tenant: "tenant-a", ProviderUUID: "provider-a",
+			LeaseUUID: destinationLease, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status: backend.ProvisionStatusFailed, Quantity: 1, Items: items, StackManifest: stack,
 		}},
 	})
+	// This test isolates command-fence exclusion, so model the successful XFS
+	// quota proof that must precede restoring->active handback. The noop volume
+	// backend cannot measure usage and now correctly leaves the finalizer intact.
+	b.volumes = &mockVolumeManager{
+		UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
+	}
 	retentions := attachRetentionStore(t, b)
 	profiles, err := shared.BuildSKUResourceSnapshot(items, b.cfg.GetSKUProfile)
 	require.NoError(t, err)
 	record := shared.RetentionEntry{
 		OriginalLeaseUUID: sourceLease, NewLeaseUUID: destinationLease,
-		Tenant: "tenant-a", ProviderUUID: "provider-a",
+		Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 		Items: items, ResourceProfiles: profiles, StackManifest: stack,
 		Status: shared.RetentionStatusRestoring, Generation: 3, CreatedAt: time.Now(),
 	}
-	putRestoringRetention(t, retentions, record)
+	record = *putRestoringRetention(t, retentions, record)
+	recordRestoreOperationOutcome(t, b, record, backend.CallbackStatusFailed)
 
 	teardownEntered := make(chan struct{})
 	allowTeardown := make(chan struct{})
@@ -60,7 +67,10 @@ func TestReconcileRestoring_FailedRollbackExcludesRestartAdmission(t *testing.T)
 	restartDone := make(chan error, 1)
 	go func() {
 		close(restartStarted)
-		restartDone <- b.Restart(context.Background(), backend.RestartRequest{LeaseUUID: destinationLease})
+		restartDone <- b.Restart(context.Background(), backend.RestartRequest{
+			MaintenanceID: newTestMaintenanceID(t), LeaseUUID: destinationLease,
+			CallbackURL: testMaintenanceLifecycleCallbackURL,
+		})
 	}()
 	<-restartStarted
 	select {

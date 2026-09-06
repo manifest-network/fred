@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -57,7 +56,7 @@ func TestRetentionAccountingInvariant_TeethDetectsSkippedRefresh(t *testing.T) {
 	assertRetentionAccountingConsistent(t, b, "baseline: empty store")
 
 	// Mutate the store WITHOUT refreshing. docker-micro qty 2 → 2 × 512 = 1024 MB.
-	require.NoError(t, rs.Put(retentionEntryFixture("drifted", "t1", time.Now())))
+	require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("drifted", "t1", time.Now())))
 
 	activeMB, _, _, err := b.computeRetainedDiskMB()
 	require.NoError(t, err)
@@ -91,8 +90,8 @@ func TestRetentionAccountingInvariant_TeethDetectsSkippedRefresh(t *testing.T) {
 // asserted in isolation — they are exercised via runRetentionSweep, which owns
 // the trailing refresh.
 func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
-	// A fake volume backend whose Destroy/Rename/List all succeed, so reap/evict
-	// fully reap (delete) their records and restore rollbacks re-quarantine.
+	// A fake volume backend whose Destroy/Rename/List all succeed. Reapers may
+	// physically delete records; cap eviction only hands them to the reaper.
 	newVols := func() *fakeVolumeBackend { return &fakeVolumeBackend{} }
 
 	cases := []struct {
@@ -105,10 +104,12 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 			name: "reapExpiredRetentions",
 			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
 				b.volumes = newVols()
-				b.cfg.RetentionMaxAge = time.Hour
-				// Expired record → reaped (destroyed + deleted); fresh record survives.
-				require.NoError(t, rs.Put(retentionEntryFixture("expired", "t1", time.Now().Add(-2*time.Hour))))
-				require.NoError(t, rs.Put(retentionEntryFixture("fresh", "t1", time.Now())))
+				b.cfg.RetentionMaxAge = 500 * time.Millisecond
+				// Retention timestamps are store-minted. Let the first record age,
+				// then publish the fresh survivor through the same settlement path.
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("expired", "t1", time.Now().Add(-2*time.Hour))))
+				time.Sleep(550 * time.Millisecond)
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("fresh", "t1", time.Now())))
 
 				n, err := b.reapExpiredRetentions(context.Background())
 				require.NoError(t, err)
@@ -122,30 +123,32 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
 				b.volumes = newVols()
 				// Three active records for one tenant; cap = 2 → the two oldest are
-				// evicted (active→reaping→destroyed+deleted), leaving one active.
+				// handed to the reaper, leaving one active and two reaping.
 				base := time.Now().Add(-3 * time.Hour)
-				require.NoError(t, rs.Put(retentionEntryFixture("old1", "t1", base)))
-				require.NoError(t, rs.Put(retentionEntryFixture("old2", "t1", base.Add(time.Hour))))
-				require.NoError(t, rs.Put(retentionEntryFixture("newest", "t1", base.Add(2*time.Hour))))
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("old1", "t1", base)))
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("old2", "t1", base.Add(time.Hour))))
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("newest", "t1", base.Add(2*time.Hour))))
 
 				require.NoError(t, b.evictRetentionsToCap(context.Background(), "t1", retentionBudget{CountCap: 2}, "", retentionTenantSnapshot(t, rs, "t1"), ""))
-				// One active record remains → 2 × 512 = 1024 MB.
-				require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
+				// All three physical footprints remain counted until the reaper acts.
+				require.Equal(t, int64(3072), b.pool.Stats().RetainedDiskMB)
 			},
 		},
 		{
 			name: "runRetentionSweep",
 			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
 				b.volumes = newVols()
-				b.cfg.RetentionMaxAge = time.Hour
+				b.cfg.RetentionMaxAge = 500 * time.Millisecond
+				bindRetentionOrphanPrunerForTest(t, b)
 				// Composite sweep: reap expired + retry a reaping tombstone + refresh.
 				// A fresh active record survives; both the expired and the reaping
 				// record are destroyed and deleted.
-				require.NoError(t, rs.Put(retentionEntryFixture("survives", "t1", time.Now())))
-				require.NoError(t, rs.Put(retentionEntryFixture("expired", "t1", time.Now().Add(-2*time.Hour))))
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("expired", "t1", time.Now().Add(-2*time.Hour))))
 				reaping := retentionEntryFixture("tombstone", "t1", time.Now())
 				reaping.Status = shared.RetentionStatusReaping
-				require.NoError(t, rs.Put(reaping))
+				require.NoError(t, putRetentionForTest(t, rs, reaping))
+				time.Sleep(550 * time.Millisecond)
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("survives", "t1", time.Now())))
 
 				require.NoError(t, b.runRetentionSweep(context.Background()))
 				// Only the survivor remains active → 1024 MB, reaping cleared to 0.
@@ -162,7 +165,8 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 					// fakeVolumeBackend's intentionally unsupported Usage method.
 					UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 				}
-				const origLease, newLease = "orig-r", "new-r"
+				origLease := canonicalRetentionFixtureUUID("orig-r")
+				newLease := canonicalRetentionFixtureUUID("new-r")
 				entry := shared.RetentionEntry{
 					OriginalLeaseUUID:   origLease,
 					NewLeaseUUID:        newLease,
@@ -170,12 +174,18 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 					Status:              shared.RetentionStatusRestoring,
 					Generation:          1,
 					Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
-					RetainedVolumeNames: []string{"fred-retained-orig-r-web-0"},
+					RetainedVolumeNames: []string{retainedName(canonicalVolumeName(origLease, "web", 0))},
 				}
 				entry = *putRestoringRetention(t, rs, entry)
+				recordRestoreOperationOutcome(t, b, entry, backend.CallbackStatusFailed)
 				// New-lease live allocation (no live provision → orphaned arm reverts it).
-				require.NoError(t, b.pool.TryAllocate(newLease+"-web-0", "docker-micro", "t1"))
+				require.NoError(t, b.pool.TryAllocate(entry.NewLeaseUUID+"-web-0", "docker-micro", "t1"))
 				require.Equal(t, int64(0), b.pool.Stats().RetainedDiskMB, "pre: record restoring → not counted")
+				volumes := newVolumeSet(
+					canonicalVolumeName(entry.NewLeaseUUID, "web", 0),
+				).manager()
+				volumes.UsageFn = func(context.Context, string) (int64, error) { return 0, nil }
+				b.volumes = volumes
 
 				b.reconcileRestoring(context.Background(), entry)
 				// Record reverted to active → 1 × 512 = 512 MB retained, live released.
@@ -189,7 +199,8 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				b.volumes = &mockVolumeManager{
 					UsageFn: func(context.Context, string) (int64, error) { return 0, nil },
 				}
-				const origLease, newLease = "orig-rb", "new-rb"
+				origLease := canonicalRetentionFixtureUUID("orig-rb")
+				newLease := canonicalRetentionFixtureUUID("new-rb")
 				rec := shared.RetentionEntry{
 					OriginalLeaseUUID:   origLease,
 					NewLeaseUUID:        newLease,
@@ -197,11 +208,16 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 					Status:              shared.RetentionStatusRestoring,
 					Generation:          1,
 					Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "web"}},
-					RetainedVolumeNames: []string{"fred-retained-orig-rb-web-0"},
+					RetainedVolumeNames: []string{retainedName(canonicalVolumeName(origLease, "web", 0))},
 				}
 				rec = *putRestoringRetention(t, rs, rec)
-				allocID := newLease + "-web-0"
+				allocID := rec.NewLeaseUUID + "-web-0"
 				require.NoError(t, b.pool.TryAllocate(allocID, "docker-micro", "t1"))
+				volumes := newVolumeSet(
+					canonicalVolumeName(rec.NewLeaseUUID, "web", 0),
+				).manager()
+				volumes.UsageFn = func(context.Context, string) (int64, error) { return 0, nil }
+				b.volumes = volumes
 
 				b.rollbackRestoreAdoption(context.Background(), newLease, []string{allocID}, &rec, false, slog.Default())
 				// Record reverted to active → 512 MB retained, live released.
@@ -217,7 +233,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				b.docker = &mockDockerClient{
 					ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) { return nil, nil },
 				}
-				require.NoError(t, rs.Put(retentionEntryFixture("recovered", "t1", time.Now())))
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("recovered", "t1", time.Now())))
 
 				require.NoError(t, b.recoverState(context.Background()))
 				// One active record → 2 × 512 = 1024 MB rebuilt into the pool.
@@ -240,8 +256,9 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				budget := retentionBudget{CountCap: 10, PerPartCount: 2, MaxPartitions: 4}
 				require.NoError(t, b.evictRetentionsToCap(context.Background(), "agg", budget, "A",
 					retentionTenantSnapshot(t, rs, "agg"), ""))
-				// A evicted to 1 (a3 survives), B untouched → 2 active × 512 = 1024 MB.
-				require.Equal(t, int64(1024), b.pool.Stats().RetainedDiskMB)
+				// A has one active and two reaping; B remains active. All four
+				// footprints remain counted until the periodic reaper acts.
+				require.Equal(t, int64(2048), b.pool.Stats().RetainedDiskMB)
 			},
 		},
 		{
@@ -263,7 +280,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				)
 				require.True(t, refuse)
 				require.Equal(t, refuseScopeTenant, scope)
-				rep := b.destroyOnRefuseToRetain(context.Background(), b.volumeOp("incoming", slog.Default()),
+				rep := b.destroyOnRefuseToRetain(volumeDestroyCapabilityForTest(b), context.Background(), b.volumeOp("incoming", slog.Default()),
 					[]string{"fred-incoming-app-0"}, "incoming", "agg", "", scope, slog.Default())
 				require.NoError(t, rep.err())
 				require.False(t, rep.leftOnDisk())
@@ -283,21 +300,24 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				putActivePart(t, rs, "held-2", "agg", "", time.Now().Add(-time.Hour))
 				// A restore of held-1 is in flight into the incoming lease, so
 				// fred-incoming-app-0 is held-1's data wearing the incoming lease's name.
-				putRestoringRetention(t, rs, shared.RetentionEntry{
-					OriginalLeaseUUID:   "held-1",
+				originalLease := canonicalRetentionFixtureUUID("held-1")
+				destinationLease := canonicalRetentionFixtureUUID("incoming")
+				restoring := putRestoringRetention(t, rs, shared.RetentionEntry{
+					OriginalLeaseUUID:   originalLease,
 					Tenant:              "agg",
-					NewLeaseUUID:        "incoming",
+					NewLeaseUUID:        destinationLease,
 					Status:              shared.RetentionStatusRestoring,
 					Items:               []backend.LeaseItem{{SKU: "docker-micro", Quantity: 1, ServiceName: "app"}},
-					RetainedVolumeNames: []string{retainedName(canonicalVolumeName("held-1", "app", 0))},
+					RetainedVolumeNames: []string{retainedName(canonicalVolumeName(originalLease, "app", 0))},
 					CreatedAt:           time.Now().Add(-2 * time.Hour),
 				})
 				b.refreshRetentionAccounting()
 
-				rep := b.destroyOnRefuseToRetain(context.Background(), b.volumeOp("incoming", slog.Default()),
-					[]string{"fred-incoming-app-0"}, "incoming", "agg", "", refuseScopeTenant, slog.Default())
+				incomingVolume := canonicalVolumeName(restoring.NewLeaseUUID, "app", 0)
+				rep := b.destroyOnRefuseToRetain(volumeDestroyCapabilityForTest(b), context.Background(), b.volumeOp(restoring.NewLeaseUUID, slog.Default()),
+					[]string{incomingVolume}, restoring.NewLeaseUUID, "agg", "", refuseScopeTenant, slog.Default())
 				require.NoError(t, rep.err(), "a refusal is not an error — another lease owns those bytes")
-				require.Equal(t, []string{"fred-incoming-app-0"}, rep.Claimed)
+				require.Equal(t, []string{incomingVolume}, rep.Claimed)
 				require.True(t, rep.leftOnDisk(), "so the caller must keep the footprint counted")
 			},
 		},
@@ -324,6 +344,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 // refreshRetentionAccounting's "close, reap, evict" doc list) and needs the full
 // httptest/callback wiring the table above avoids, so it is a standalone case.
 func TestRetentionAccountingInvariant_AfterDeprovisionRetainClose(t *testing.T) {
+	leaseUUID := canonicalRetentionFixtureUUID("lease-close")
 	callbackDone := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -334,21 +355,15 @@ func TestRetentionAccountingInvariant_AfterDeprovisionRetainClose(t *testing.T) 
 	}))
 	defer server.Close()
 
-	rs, err := shared.NewRetentionStore(shared.RetentionStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "retention.db"),
-	})
-	require.NoError(t, err)
-	defer rs.Close()
-
 	// docker-micro at 512 MB; qty=2 → footprint F = 1024 MB.
 	items := []backend.LeaseItem{{SKU: "docker-micro", Quantity: 2, ServiceName: "web"}}
-	canonical0 := canonicalVolumeName("lease-close", "web", 0)
-	canonical1 := canonicalVolumeName("lease-close", "web", 1)
+	canonical0 := canonicalVolumeName(leaseUUID, "web", 0)
+	canonical1 := canonicalVolumeName(leaseUUID, "web", 1)
 
 	mock := &mockDockerClient{RemoveContainerFn: func(_ context.Context, _ string) error { return nil }}
 	b := newBackendForProvisionTest(t, mock, map[string]*provision{
-		"lease-close": {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: "lease-close", Tenant: "tenant-a", ProviderUUID: "prov-1",
+		leaseUUID: {ProvisionState: leasesm.ProvisionState{
+			LeaseUUID: leaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 			Status:        backend.ProvisionStatusReady,
 			ContainerIDs:  []string{"c1"},
 			CallbackURL:   server.URL + "/callbacks/provision",
@@ -358,26 +373,18 @@ func TestRetentionAccountingInvariant_AfterDeprovisionRetainClose(t *testing.T) 
 	})
 
 	withMicroSKU(b, 512) // align the pool resolver (defaultTestSKUProfiles: 512) and computeRetainedDiskMB
-	b.retentionStore = rs
 	b.cfg.RetainOnClose = true
 	b.cfg.CallbackSecret = "test-secret-that-is-long-enough-32chars"
 	rebuildCallbackSender(b, server.Client())
+	seedProvisionReleaseFromProjectionForBackendTest(t, b, leaseUUID)
 
-	require.NoError(t, b.pool.TryAllocate("lease-close-web-0", "docker-micro", "tenant-a"))
-	require.NoError(t, b.pool.TryAllocate("lease-close-web-1", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-0", "docker-micro", "tenant-a"))
+	require.NoError(t, b.pool.TryAllocate(leaseUUID+"-web-1", "docker-micro", "tenant-a"))
 	require.Equal(t, int64(1024), b.pool.Stats().AllocatedDiskMB, "pre: live F=1024 MB")
 
-	b.volumes = &mockVolumeManager{
-		ListFn:         func() ([]string, error) { return []string{canonical0, canonical1}, nil },
-		RenameVolumeFn: func(_, _ string) error { return nil },
-	}
+	b.volumes = newVolumeSet(canonical0, canonical1).manager()
 
-	require.NoError(t, b.Deprovision(context.Background(), "lease-close"))
-	select {
-	case <-callbackDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for deprovisioned callback")
-	}
+	require.NoError(t, b.Deprovision(context.Background(), leaseUUID))
 
 	// After a successful retain-close hand-off: live released, F counted as
 	// retained, and the invariant holds (cache == recompute-from-store).

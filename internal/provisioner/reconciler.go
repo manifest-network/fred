@@ -3,7 +3,6 @@ package provisioner
 import (
 	"cmp"
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,7 +21,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/metrics"
-	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/util"
@@ -67,6 +65,11 @@ const chainConfirmTimeout = 10 * time.Second
 // loop regains control.
 const chainInventoryTimeout = 30 * time.Second
 
+// placementCleanupTimeout is one wall-clock budget for the complete placement
+// cleanup pass. Individual exact reads remain bounded too, but a fleet of
+// stalled candidates cannot multiply that bound by its size.
+const placementCleanupTimeout = 10 * time.Second
+
 // errLeaseAlreadyInFlight indicates the lease is already being provisioned.
 // This is not a real error - the caller should not treat it as a failure.
 var errLeaseAlreadyInFlight = errors.New("lease already in-flight")
@@ -83,18 +86,13 @@ var errTrackerSnapshotStale = errors.New("in-flight operation changed after inve
 // field is an opaque, safe-zero capability issued by the operation or placement
 // authority; raw numeric revisions cannot authorize a backend side effect.
 type reconcileActionAuthority struct {
-	leaseClaim       operation.LeaseClaim
-	baseline         placement.AdmissionBaseline
-	recordlessScope  placement.AdmissionScope
-	allowRecordless  bool
-	eligibleBackends map[string]struct{}
-	ownedPlacement   placement.RecordRevision
-	ownedBackend     string
+	action placement.ObservedReconciliationAction
 }
 
-// errPayloadNotAvailable indicates the payload required for provisioning is
-// not in the store. This is a permanent failure — the lease cannot be
-// re-provisioned and should be closed.
+// errPayloadNotAvailable indicates that the payload required for provisioning
+// is not currently available from the durable payload store. Absence is not
+// tenant-invalidity evidence: reconciliation preserves the lease and retries
+// after an upload or database repair.
 var errPayloadNotAvailable = errors.New("payload not available")
 
 // ReconcilerPayloads is the payload capability consumed by reconciliation.
@@ -105,63 +103,26 @@ type ReconcilerPayloads interface {
 	PayloadStore() *payload.Store
 }
 
-// ReconcilerRuntime is the production composition boundary. A runtime exposes
-// only the reconciler's lifecycle port plus payload reads; it cannot hand the
-// reconciler the concrete registry or a second implementation of lifecycle
-// state.
-type ReconcilerRuntime interface {
-	ReconcilerPayloads
-	ReconcilerOperations() ReconcilerOperations
-}
-
-// ReconcilerChainClient defines the chain operations needed by the reconciler.
-type ReconcilerChainClient interface {
-	// GetLease returns a lease by UUID regardless of state, or (nil, nil) when
-	// the chain has no record of it. The sweep's two list queries are filtered
-	// to PENDING/ACTIVE, so this is the only way to tell a terminal lease from
-	// one the chain never knew — the distinction every destructive pass rests
-	// on (ENG-654, see classifyLease).
-	GetLease(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error)
-	GetPendingLeases(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
-	GetActiveLeasesByProvider(ctx context.Context, providerUUID string) ([]billingtypes.Lease, error)
-	AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error)
-	RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
-	CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error)
-}
+// ReconcilerChainClient is retained as the public name used by backend
+// integration fixtures. Reconciliation construction accepts this capability
+// only once, when minting placement.ReconciliationCoordinator.
+type ReconcilerChainClient = placement.ReconciliationChain
 
 // Reconciler performs level-triggered reconciliation between chain state and backend state.
 // It ensures consistency by comparing current state rather than replaying events.
 type Reconciler struct {
-	providerUUID       string
-	callbackBaseURL    string
-	chainClient        ReconcilerChainClient
-	acknowledger       Acknowledger // Routes acks through the batcher for parallel signing
-	backendRouter      BackendRouter
-	payloads           ReconcilerPayloads
-	operations         ReconcilerOperations
-	placementAuthority ReconcilerPlacement
-	startEvents        ProvisionStartEventSink
+	payloads        ReconcilerPayloads
+	coordinator     *placement.ReconciliationCoordinator
+	attemptRecovery *attemptRecoveryCoordinator
+	placementPruner *placementPruner
 
 	interval               time.Duration
 	maxWorkers             int           // Maximum concurrent workers for lease processing
 	maxReprovisionAttempts int           // Max re-provision attempts before rejecting
 	chainInventoryBudget   time.Duration // Whole-list timeout; fixed in production, shortened by tests.
+	placementCleanupBudget time.Duration // Whole-pass timeout; fixed in production, shortened by tests.
 	reconciling            atomic.Bool   // Non-blocking flag to prevent concurrent reconciliation
 	placementSweepSeen     atomic.Bool   // True while a durable baseline matches the configured backend topology.
-	// placementAbsenceUntrusted narrows exceptions to the process-wide absence
-	// proof. A positive observation excluded from placement sync because its
-	// outbound operation straddled the inventory boundary must remain untrusted
-	// for that lease until a later durable observation or complete inventory
-	// settles it. ReconcileAll is serialized, and workers only read this map after
-	// the sweep has finished updating it.
-	// Each marker retains the backend(s) whose positive observation was excluded.
-	// A later partial sweep may retire a single-backend marker only when that same
-	// backend freshly reports the lease and matches the durable confirmed record.
-	placementAbsenceUntrusted map[string]map[string]struct{}
-	// ambiguousPlacements quarantines leases positively reported by multiple
-	// backends. It persists across partial sweeps so an already-armed absence
-	// latch cannot turn a temporarily hidden conflict into a third provision.
-	ambiguousPlacements map[string][]string
 }
 
 // DefaultMaxReprovisionAttempts is the default number of re-provision attempts
@@ -170,12 +131,10 @@ const DefaultMaxReprovisionAttempts = 3
 
 // ReconcilerConfig configures the reconciler.
 type ReconcilerConfig struct {
-	ProviderUUID           string
-	CallbackBaseURL        string
 	Interval               time.Duration // How often to run periodic reconciliation
 	MaxWorkers             int           // Maximum concurrent workers (default: 10)
 	MaxReprovisionAttempts int           // Max re-provision attempts before rejecting (default: 3)
-	StartEvents            ProvisionStartEventSink
+	Coordinator            *placement.ReconciliationCoordinator
 }
 
 // NewReconciler creates the production reconciler. Placement authority and the
@@ -184,108 +143,42 @@ type ReconcilerConfig struct {
 // unrecorded or unfenced backend mutation is invalid.
 func NewReconciler(
 	cfg ReconcilerConfig,
-	chainClient ReconcilerChainClient,
-	acknowledger Acknowledger,
-	backendRouter BackendRouter,
-	runtime ReconcilerRuntime,
-	placementStore ReconcilerPlacement,
+	payloads ReconcilerPayloads,
 ) (*Reconciler, error) {
-	if util.IsNilInterface(runtime) {
-		return nil, errors.New("reconciler runtime is required")
+	if util.IsNilInterface(payloads) {
+		return nil, errors.New("reconciler payloads are required")
 	}
-	if util.IsNilInterface(placementStore) {
-		return nil, errors.New("placement authority store is required")
+	coordinator := cfg.Coordinator
+	if coordinator == nil || !coordinator.Valid() {
+		return nil, errors.New("router-bound reconciliation coordinator is required")
 	}
-	operations := runtime.ReconcilerOperations()
-	if util.IsNilInterface(operations) {
-		return nil, errors.New("reconciler operations are required")
+	reconciliation := coordinator
+	attemptRecovery := newAttemptRecoveryCoordinator(reconciliation)
+	_, recoveryAuthority, err := reconciliation.BindRecovery()
+	if err != nil {
+		return nil, fmt.Errorf("bind reconciler recovery authority: %w", err)
 	}
-	if util.IsNilInterface(chainClient) {
-		return nil, errors.New("chain client is required")
-	}
-	if util.IsNilInterface(acknowledger) {
-		return nil, errors.New("acknowledger is required")
-	}
-	if util.IsNilInterface(backendRouter) {
-		return nil, errors.New("backend router is required")
-	}
-	if cfg.ProviderUUID == "" {
-		return nil, errors.New("provider UUID is required")
-	}
-	if cfg.CallbackBaseURL == "" {
-		return nil, errors.New("callback base URL is required")
-	}
-	if _, err := parseCallbackBaseURL(cfg.CallbackBaseURL); err != nil {
-		return nil, err
-	}
-	if err := placementStore.VerifyProviderUUID(cfg.ProviderUUID); err != nil {
-		return nil, fmt.Errorf("verify reconciler placement provider authority: %w", err)
-	}
-
+	attemptRecovery.recovery = recoveryAuthority
 	// Apply defaults using cmp.Or (returns first non-zero value).
 	interval := cmp.Or(cfg.Interval, 5*time.Minute)
 	maxWorkers := cmp.Or(max(cfg.MaxWorkers, 0), DefaultReconcileWorkers)
 	maxReprovision := cmp.Or(max(cfg.MaxReprovisionAttempts, 0), DefaultMaxReprovisionAttempts)
-	startEvents := cfg.StartEvents
-	if util.IsNilInterface(startEvents) {
-		startEvents = nil
-	}
-
 	reconciler := &Reconciler{
-		providerUUID:              cfg.ProviderUUID,
-		callbackBaseURL:           cfg.CallbackBaseURL,
-		chainClient:               chainClient,
-		acknowledger:              acknowledger,
-		backendRouter:             backendRouter,
-		payloads:                  runtime,
-		operations:                operations,
-		placementAuthority:        placementStore,
-		startEvents:               startEvents,
-		interval:                  interval,
-		maxWorkers:                maxWorkers,
-		maxReprovisionAttempts:    maxReprovision,
-		chainInventoryBudget:      chainInventoryTimeout,
-		placementAbsenceUntrusted: make(map[string]map[string]struct{}),
-		ambiguousPlacements:       make(map[string][]string),
+		payloads:               payloads,
+		coordinator:            reconciliation,
+		attemptRecovery:        attemptRecovery,
+		interval:               interval,
+		maxWorkers:             maxWorkers,
+		maxReprovisionAttempts: maxReprovision,
+		chainInventoryBudget:   chainInventoryTimeout,
+		placementCleanupBudget: placementCleanupTimeout,
 	}
-	// Reconciler is also exported as a standalone runtime. It independently
-	// verifies the provider- and identity-bearing topology committed by the
-	// composition root; configuration alone is never authority to change either.
-	if err := placementStore.VerifyBackendTopology(backendTopologyNames(backendRouter)); err != nil {
-		return nil, fmt.Errorf("verify reconciler backend topology: %w", err)
-	}
-	reconciler.placementSweepSeen.Store(placementStore.CurrentAdmissionBaseline().Valid())
+	reconciler.placementPruner = newPlacementPruner(
+		reconciliation, reconciler.attemptRecovery,
+		interval, maxWorkers,
+	)
+	reconciler.placementSweepSeen.Store(reconciliation.AdmissionReady())
 	return reconciler, nil
-}
-
-func (r *Reconciler) isInFlight(leaseUUID string) bool {
-	return r.operations.Contains(leaseUUID)
-}
-
-// claimLeaseAction acquires the exact process-local capability that fences one
-// reconciliation side effect against lifecycle events. A claim is evaluated
-// against the inventory-start boundary: an operation that began, completed, or
-// merely held a claim after that boundary makes the observation stale. Holding
-// the returned release function then prevents a delayed event from starting
-// until the caller's backend or placement mutation is complete.
-func (r *Reconciler) claimLeaseAction(
-	leaseUUID string,
-	operationSnapshot operation.TrackerSnapshot,
-) (release func(), acquired bool) {
-	if !operationSnapshot.Valid() {
-		return nil, false
-	}
-	result := r.operations.TryClaimLease(leaseUUID, operationSnapshot)
-	if !result.Acquired() {
-		return nil, false
-	}
-	claim := result.Claim()
-	return func() {
-		if !r.operations.ReleaseLease(claim) {
-			slog.Error("failed to release reconciler lease action claim",
-				"lease_uuid", leaseUUID)
-		}
-	}, true
 }
 
 func (r *Reconciler) payloadStore() *payload.Store {
@@ -343,28 +236,34 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		}
 	}()
 
-	slog.Info("starting reconciliation", "provider_uuid", r.providerUUID)
+	slog.Info("starting reconciliation", "provider_uuid", r.coordinator.ProviderUUID())
 	// Sweep completeness describes current observability only. Beginning the
 	// typed inventory session invalidates older projection proofs, while the
 	// separately persisted topology baseline remains valid through a transient
 	// backend outage.
 	metrics.ReconcilerSweepComplete.Set(0)
 
-	// Capture both operation boundaries before the first chain/backend read.
-	// Every lifecycle decision below must be based on state no older than this
-	// boundary; an operation that starts or finishes afterward is deferred by its
-	// placement revision, registry tombstone, or live action claim.
-	inventoryFence := r.placementAuthority.BeginInventorySession()
-	defer r.placementAuthority.EndInventorySession(inventoryFence)
-	inFlightAtSnapshot := make(map[string]struct{})
-	operationSnapshot := r.operations.Snapshot()
-	for _, leaseUUID := range r.operations.LeaseUUIDs() {
-		inFlightAtSnapshot[leaseUUID] = struct{}{}
+	// Chain reads carry no backend ownership evidence. Finish them before
+	// registering the durable inventory marker so a transient chain failure
+	// cannot manufacture an interrupted backend sweep and withdraw admission
+	// until every backend is reachable again.
+	pendingLeases, activeLeases, err := r.collectChainLeaseInventory(ctx)
+	if err != nil {
+		return err
 	}
+
+	// Capture the Store fence, operation boundary, and collector epoch as one
+	// opaque capability immediately before the first backend read. No later
+	// phase can combine backend facts from different reconciliation sweeps.
+	sweep, err := r.coordinator.BeginSweep()
+	if err != nil {
+		return fmt.Errorf("begin reconciliation sweep: %w", err)
+	}
+	defer sweep.End()
 
 	// Collection is read-only. Its facts become authority only after the atomic
 	// placement projection below commits successfully.
-	inventory, err := r.collectInventory(ctx)
+	inventory, err := r.collectInventory(ctx, sweep, pendingLeases, activeLeases)
 	if err != nil {
 		return err
 	}
@@ -400,11 +299,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		"complete", retentionsAnswered.complete(),
 		"unanswered", retentionsAnswered.unanswered(),
 	)
-	inventoryComplete := inventory.complete()
 	projection, err := r.projectPlacementInventory(ctx, reconcileProjectionInput{
-		inventory:          inventory,
-		inventoryFence:     inventoryFence,
-		inFlightAtSnapshot: inFlightAtSnapshot,
+		inventory: inventory,
+		sweep:     sweep,
 	})
 	if err != nil {
 		return err
@@ -418,30 +315,25 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// crossed the durable placement boundary. Provision inventory alone is not
 	// enough: retained data also pins ownership, and an unpersisted projection
 	// cannot safely authorize lifecycle work or advance the success heartbeat.
-	cycleComplete := inventoryComplete && placementSyncOK
+	cycleComplete := projection.projected != nil &&
+		projection.projected.Complete() && placementSyncOK
 	if cycleComplete {
 		metrics.ReconcilerSweepComplete.Set(1)
 	} else {
 		metrics.ReconcilerSweepComplete.Set(0)
 	}
-	admissionBaseline := r.placementAuthority.CurrentAdmissionBaseline()
+	admissionBaseline := placement.AdmissionBaseline{}
+	if projection.projected != nil {
+		admissionBaseline = projection.projected.AdmissionBaseline()
+	}
 	r.placementSweepSeen.Store(admissionBaseline.Valid())
 	// A degraded sweep may place genuinely new work only on a backend that
 	// answered both inventories. This is an immutable per-sweep hard boundary;
 	// routing fallback is not allowed to escape it.
 	eligibleBackends := make(map[string]struct{})
-	for backendName, provisionsOK := range snapshot.answered {
-		if provisionsOK && retentionsAnswered.heard(backendName) {
+	if projection.projected != nil {
+		for _, backendName := range projection.projected.EligibleBackends() {
 			eligibleBackends[backendName] = struct{}{}
-		}
-	}
-	var recordlessScope placement.AdmissionScope
-	if admissionBaseline.Valid() {
-		recordlessScope, err = r.placementAuthority.ScopeAdmission(
-			admissionBaseline, slices.Sorted(maps.Keys(eligibleBackends)),
-		)
-		if err != nil {
-			return fmt.Errorf("scope recordless placement admission: %w", err)
 		}
 	}
 	// Reuse one immutable placement snapshot across the dispatch loop. Lookup is
@@ -538,9 +430,9 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 		// missing from processedLeases becomes an orphan candidate, and one
 		// missing from chainLeases makes cleanupOrphanedPayloads delete a live
 		// lease's payload — after which the NEXT sweep sees
-		// errPayloadNotAvailable, classifies it as permanent, and closes a
-		// healthy ACTIVE lease on chain. Skip the goroutine body; leave the maps
-		// alone.
+		// errPayloadNotAvailable. That condition is deliberately retriable, but
+		// deleting the only local request authority would still strand a healthy
+		// ACTIVE lease indefinitely. Skip the goroutine body; leave the maps alone.
 		g.Go(func() error {
 			// Recover any panic inside this per-lease worker so ONE bad lease
 			// doesn't crash fred. Log with full context, bump the
@@ -559,28 +451,29 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 			}()
 
 			placementRecord := placementRecords[leaseUUID]
-			deferForSnapshotBoundary := func(reason, operationID string) {
+			deferForSnapshotBoundary := func(reason string) {
 				deferred.Add(1)
 				metrics.ReconcilerDeferredLeasesTotal.Inc()
 				slog.Debug("reconcile: deferring lease whose operation crossed the fleet snapshot boundary",
 					"lease_uuid", leaseUUID,
 					"reason", reason,
-					"operation_id", operationID,
 					"placement_revision", placementRecord.Revision(),
 				)
 			}
-			if _, wasInFlight := inFlightAtSnapshot[leaseUUID]; wasInFlight {
+			if sweep.WasInFlight(leaseUUID) {
 				if lease.State == billingtypes.LEASE_STATE_PENDING && isProvisioned &&
 					provision.Status == backend.ProvisionStatusReady {
 					metrics.ReconcilerInflightSkipsTotal.Inc()
 				}
-				deferForSnapshotBoundary("in_flight_at_inventory_start", "")
+				deferForSnapshotBoundary("in_flight_at_inventory_start")
+				return nil
+			}
+			if projection.projected == nil {
+				deferForSnapshotBoundary("inventory_projection_unavailable")
 				return nil
 			}
 			if metadata := placementRecord.AttemptMetadata(); metadata.Valid() {
-				result := r.redeliverPlacementAttempt(
-					gctx, leaseUUID, placementRecord, metadata, operationSnapshot,
-				)
+				result := r.attemptRecovery.Redeliver(gctx, leaseUUID, projection.projected)
 				switch result.outcome {
 				case attemptRedeliveryAccepted:
 					if lease.State == billingtypes.LEASE_STATE_PENDING {
@@ -597,16 +490,15 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 					slog.Warn("reconcile: exact durable operation redelivery deferred",
 						"lease_uuid", leaseUUID,
 						"backend", placementRecord.Attempt,
-						"operation_id", metadata.OperationID(),
+						"operation_fingerprint", metadata.OperationID(),
 						"operation_kind", metadata.Kind(),
 						"error", result.err,
 					)
 				}
 				return nil
 			}
-			_, absenceUntrustedForLease := r.placementAbsenceUntrusted[leaseUUID]
-			if absenceUntrustedForLease {
-				deferForSnapshotBoundary("placement_observation_excluded", "")
+			if r.coordinator.AbsenceUntrusted(leaseUUID) {
+				deferForSnapshotBoundary("placement_observation_excluded")
 				return nil
 			}
 			allowRecordless := cycleComplete ||
@@ -649,46 +541,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 			// lease claim is the final process-local guard for every lifecycle action;
 			// provisioning starts its operation under that exact claim, then consumes
 			// the atomic placement projection proof before any backend side effect.
-			currentPlacement := r.placementFor(leaseUUID)
-			if currentPlacement.Revision() != placementRecord.Revision() ||
-				currentPlacement.State() != placementRecord.State() {
-				deferForSnapshotBoundary("placement_changed_after_sync", "")
-				return nil
-			}
-			authority := reconcileActionAuthority{
-				baseline:        admissionBaseline,
-				recordlessScope: recordlessScope,
-				allowRecordless: allowRecordless,
-			}
-			if !cycleComplete {
-				authority.eligibleBackends = maps.Clone(eligibleBackends)
-			}
-			if currentPlacement.State() == placement.StateConfirmed {
-				authority.ownedPlacement = currentPlacement.RecordRevision()
-				authority.ownedBackend = currentPlacement.Backend
-			}
-			if current, inFlight := r.operations.Lookup(leaseUUID); inFlight {
-				deferForSnapshotBoundary("operation_started_after_inventory", current.ID.String())
-				return nil
-			}
-			claimResult := r.operations.TryClaimLease(leaseUUID, operationSnapshot)
-			if !claimResult.Acquired() {
-				reason := "operation_started_before_action_claim"
-				if claimResult.Outcome() == operation.LeaseClaimSnapshotStale {
-					reason = "operation_completed_after_inventory"
-				}
-				deferForSnapshotBoundary(reason, "")
-				return nil
-			}
-			authority.leaseClaim = claimResult.Claim()
-			defer r.operations.ReleaseLease(authority.leaseClaim)
-
-			// The list queries are only inventory candidates. Re-read the exact
-			// lease after acquiring its lifecycle claim so a close/reject/expiry
-			// cannot cross the final chain-read -> backend-dispatch boundary. Bound
-			// the point query so an unresponsive chain node defers this lease rather
-			// than holding the claim and wedging every later sweep.
-			currentLease, err := r.getLeaseBounded(gctx, leaseUUID)
+			observed, disposition, err := projection.projected.ObserveLiveAction(gctx, leaseUUID)
 			if err != nil {
 				deferred.Add(1)
 				leaseErrors.Add(1)
@@ -699,24 +552,18 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 				)
 				return nil
 			}
-			if currentLease == nil || currentLease.Uuid != leaseUUID ||
-				(currentLease.State != billingtypes.LEASE_STATE_PENDING &&
-					currentLease.State != billingtypes.LEASE_STATE_ACTIVE) {
+			if disposition != placement.ReconciliationObservationReady || !observed.Valid() {
 				deferred.Add(1)
 				metrics.ReconcilerDeferredLeasesTotal.Inc()
 				slog.Debug("reconcile: lease changed after inventory; skipping lifecycle action",
 					"lease_uuid", leaseUUID,
-					"lease_state", leaseState(currentLease),
+					"observation_disposition", disposition,
 				)
 				return nil
 			}
-			lease = *currentLease
-			if !cycleComplete && lease.State != billingtypes.LEASE_STATE_PENDING {
-				// Degraded recordless admission is PENDING-only. Recompute that
-				// permission from the authoritative read under the lifecycle claim,
-				// not from the earlier list snapshot.
-				authority.allowRecordless = false
-			}
+			defer r.coordinator.ReleaseAction(observed)
+			lease = observed.Lease()
+			authority := reconcileActionAuthority{action: observed}
 
 			r.processLease(gctx, leaseUUID, lease, provision, isProvisioned,
 				authority, &provisioned,
@@ -756,7 +603,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	og, ogctx := errgroup.WithContext(ctx)
 	og.SetLimit(r.maxWorkers)
 
-	for leaseUUID, provision := range allProvisions {
+	for leaseUUID := range allProvisions {
 		og.Go(func() error {
 			// Recover any panic inside processOrphan. Same rationale as
 			// the processLease recover above.
@@ -771,7 +618,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 					leaseErrors.Add(1)
 				}
 			}()
-			r.processOrphan(ogctx, leaseUUID, provision, operationSnapshot, &orphans, &leaseErrors)
+			r.processOrphan(ogctx, leaseUUID, projection.projected, &orphans, &leaseErrors)
 			return nil // Don't fail fast - continue processing other orphans
 		})
 	}
@@ -841,8 +688,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	// which fail independently.
 	orphanedPayloads := r.cleanupOrphanedPayloads(ctx, chainLeases)
 	prunedPlacements := r.cleanupOrphanedPlacements(
-		ctx, chainLeases, backendLeases, snapshot.answered, retentionsAnswered,
-		startTime, inFlightAtSnapshot, operationSnapshot,
+		ctx, chainLeases, projection.projected, startTime,
 	)
 
 	logFunc := slog.Info
@@ -866,14 +712,85 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	return nil
 }
 
+// provisionStartDisposition is the reconciler-local projection of one complete
+// provision transaction. Its zero value is invalid: callers cannot accidentally
+// treat an uninitialized result as a successful dispatch.
+type provisionStartDisposition uint8
+
+const (
+	provisionStartInvalid provisionStartDisposition = iota
+	provisionStartAccepted
+	provisionStartUncertain
+	provisionStartValidationRefused
+)
+
+// provisionStartResult carries the causal distinction that an error tree
+// cannot express. In particular, only a sealed transport refusal can mint
+// provisionStartValidationRefused; a legacy Backend returning an error that
+// happens to wrap backend.ErrValidation remains uncertain.
+type provisionStartResult struct {
+	disposition provisionStartDisposition
+	err         error
+}
+
+func acceptedProvisionStart() provisionStartResult {
+	return provisionStartResult{disposition: provisionStartAccepted}
+}
+
+func uncertainProvisionStart(err error) provisionStartResult {
+	if err == nil {
+		err = errors.New("provision start failed without a cause")
+	}
+	return provisionStartResult{disposition: provisionStartUncertain, err: err}
+}
+
+// failedProvisionStart projects a placement-minted dispatch result. Because
+// DispatchResult's causal fields are private to placement, no caller in this
+// broader package can manufacture terminal validation authority from an error.
+func failedProvisionStart(settlement placement.DispatchResult) provisionStartResult {
+	err := settlement.CallErr()
+	if err == nil {
+		err = settlement.Err()
+	}
+	if err == nil {
+		err = errors.New("provision dispatch failed without a cause")
+	}
+	if settlement.ProvisionRefusal() != backend.ProvisionRefusalValidation {
+		return uncertainProvisionStart(err)
+	}
+	return provisionStartResult{disposition: provisionStartValidationRefused, err: err}
+}
+
+func (result provisionStartResult) valid() bool {
+	switch result.disposition {
+	case provisionStartAccepted:
+		return result.err == nil
+	case provisionStartUncertain, provisionStartValidationRefused:
+		return result.err != nil
+	default:
+		return false
+	}
+}
+
+func (result provisionStartResult) Err() error {
+	if !result.valid() {
+		return errors.New("invalid provision start result")
+	}
+	return result.err
+}
+
+func (result provisionStartResult) validationRefused() bool {
+	return result.valid() && result.disposition == provisionStartValidationRefused
+}
+
 // startProvisioning initiates provisioning for a lease without a payload.
-// Returns errLeaseAlreadyInFlight if the lease is already being provisioned by
-// the event-driven path (this is not a real error, just a signal to skip).
+// Its typed result preserves whether the transport itself proved a validation
+// refusal; arbitrary errors are never upgraded into that authority.
 func (r *Reconciler) startProvisioning(
 	ctx context.Context,
 	lease billingtypes.Lease,
 	authority reconcileActionAuthority,
-) error {
+) provisionStartResult {
 	return r.doStartProvisioning(ctx, lease, false, authority)
 }
 
@@ -883,7 +800,7 @@ func (r *Reconciler) startProvisioningWithPayload(
 	ctx context.Context,
 	lease billingtypes.Lease,
 	authority reconcileActionAuthority,
-) error {
+) provisionStartResult {
 	return r.doStartProvisioning(ctx, lease, true, authority)
 }
 
@@ -893,105 +810,17 @@ func (r *Reconciler) doStartProvisioning(
 	lease billingtypes.Lease,
 	withPayload bool,
 	authority reconcileActionAuthority,
-) error {
+) provisionStartResult {
 	if len(lease.MetaHash) != 0 && !withPayload {
-		return fmt.Errorf(
+		return uncertainProvisionStart(fmt.Errorf(
 			"%w: payload-bearing lease %s reached payloadless reconciliation",
 			errPayloadNotAvailable, lease.Uuid,
-		)
+		))
 	}
-	// Extract SKU for routing
-	sku := ExtractRoutingSKU(&lease)
-
-	// Route to appropriate backend, honoring existing placement for restored/placed leases (ENG-333)
-	if !authority.ownedPlacement.Valid() &&
-		(!authority.allowRecordless || !authority.recordlessScope.Valid()) {
-		return errPlacementSnapshotStale
+	if !authority.action.Valid() || authority.action.Lease().Uuid != lease.Uuid {
+		return uncertainProvisionStart(errTrackerSnapshotStale)
 	}
-	inFlightByBackend := r.operations.CountsByBackend()
-	var backendClient backend.Backend
-	var err error
-	if authority.ownedPlacement.Valid() {
-		backendClient = r.backendRouter.GetBackendByName(authority.ownedBackend)
-		if backendClient == nil {
-			err = fmt.Errorf("%w: lease %s is placed on %q",
-				ErrPlacementUnresolvable, lease.Uuid, authority.ownedBackend)
-		}
-	} else {
-		backendClient, err = routeForProvisionHonoringPlacementAmong(
-			ctx, r.backendRouter, r.placementAuthority, lease.Uuid, sku,
-			authority.eligibleBackends, inFlightByBackend,
-		)
-	}
-	if err != nil {
-		// ErrPlacementUnresolvable reaches handleProvisionError, whose default
-		// branch treats it as transient: flag the sweep and retry next cycle.
-		// It must never reach the reject/close branches — a paused or renamed
-		// backend would then terminate healthy leases on chain (ENG-498).
-		return err
-	}
-	if backendClient == nil {
-		return fmt.Errorf("no backend available")
-	}
-	if !authority.ownedPlacement.Valid() &&
-		!authority.recordlessScope.Allows(backendClient.Name()) {
-		return fmt.Errorf("%w: router selected %q outside the scoped healthy set",
-			placement.ErrBackendOutsideAdmissionScope, backendClient.Name())
-	}
-
-	// Register the operation under the exact lease-action capability acquired
-	// after inventory. That makes it impossible to lose the claim-to-operation
-	// transition to an event-driven request for the same lease.
-	items := ExtractLeaseItems(&lease)
-	if !authority.leaseClaim.Valid() || !authority.baseline.Valid() {
-		return errTrackerSnapshotStale
-	}
-	initiated := r.operations.TryInitiateClaimed(authority.leaseClaim, operation.TrackSpec{
-		LeaseUUID: lease.Uuid,
-		Tenant:    lease.Tenant,
-		Items:     items,
-		Backend:   backendClient.Name(),
-		Kind:      operation.KindProvision,
-	})
-	if !initiated.Started() {
-		metrics.ReconciliationConflictsTotal.Inc()
-		if initiated.Outcome() == operation.TrackInvalid {
-			return errTrackerSnapshotStale
-		}
-		return errLeaseAlreadyInFlight
-	}
-	operationInitiation := initiated.Capability()
-	untrack := func() {
-		r.operations.AbortInitiation(operationInitiation)
-	}
-
-	callbackURL, err := BuildCallbackURLForOperation(r.callbackBaseURL, operationInitiation.ID())
-	if err != nil {
-		untrack()
-		return fmt.Errorf("build callback URL for lease %s: %w", lease.Uuid, err)
-	}
-	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
-	if err != nil {
-		untrack()
-		return fmt.Errorf("build lifecycle callback URL for lease %s: %w", lease.Uuid, err)
-	}
-	callbackPair, err := placement.NewCallbackPair(
-		operationInitiation.ID(), callbackURL, lifecycleCallbackURL,
-	)
-	if err != nil {
-		untrack()
-		return fmt.Errorf("bind exact callback destinations for lease %s: %w", lease.Uuid, err)
-	}
-
-	// Build provision request.
-	req := backend.ProvisionRequest{
-		LeaseUUID:            lease.Uuid,
-		Tenant:               lease.Tenant,
-		ProviderUUID:         r.providerUUID,
-		Items:                items,
-		CallbackURL:          callbackURL,
-		LifecycleCallbackURL: lifecycleCallbackURL,
-	}
+	var requestPayload []byte
 	attemptPayloadFingerprint := placement.PayloadFingerprint{}
 
 	// Get the payload from the store WITHOUT removing it yet.
@@ -1002,8 +831,9 @@ func (r *Reconciler) doStartProvisioning(
 		payloadStore := r.payloadStore()
 		if payloadStore == nil {
 			if len(lease.MetaHash) > 0 {
-				untrack()
-				return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, lease.Uuid)
+				return uncertainProvisionStart(fmt.Errorf(
+					"%w: lease %s", errPayloadNotAvailable, lease.Uuid,
+				))
 			}
 		} else {
 			// Read the payload and its recorded hash from ONE snapshot. Two reads
@@ -1014,22 +844,24 @@ func (r *Reconciler) doStartProvisioning(
 			// reconciler re-provisions it while the backend still accepts /update
 			// for it, and nothing serializes the two.
 			recordedHash, getErr := []byte(nil), error(nil)
-			req.Payload, recordedHash, getErr = payloadStore.GetWithHash(lease.Uuid)
+			requestPayload, recordedHash, getErr = payloadStore.GetWithHash(lease.Uuid)
 			if getErr != nil {
 				// Database error, or a recorded hash that is not a SHA-256 — do NOT
 				// treat either as "payload missing". Abort this provision attempt so
 				// a transient disk issue doesn't cause us to close an active lease.
-				untrack()
-				return fmt.Errorf("failed to read payload for lease %s: %w", lease.Uuid, getErr)
+				return uncertainProvisionStart(fmt.Errorf(
+					"failed to read payload for lease %s: %w", lease.Uuid, getErr,
+				))
 			}
-			if req.Payload == nil && len(lease.MetaHash) > 0 {
+			if requestPayload == nil && len(lease.MetaHash) > 0 {
 				// Payload is required (lease has MetaHash) but not in the store.
 				// This can happen if the payload DB was lost or fred restarted
 				// without its data. We cannot re-provision without the manifest.
-				untrack()
-				return fmt.Errorf("%w: lease %s", errPayloadNotAvailable, lease.Uuid)
+				return uncertainProvisionStart(fmt.Errorf(
+					"%w: lease %s", errPayloadNotAvailable, lease.Uuid,
+				))
 			}
-			if req.Payload != nil {
+			if requestPayload != nil {
 				// Re-verify the payload before provisioning to catch corruption.
 				//
 				// Verify against the hash recorded when the payload was written, not
@@ -1039,7 +871,7 @@ func (r *Reconciler) doStartProvisioning(
 				// replaces the stored manifest without changing it (ENG-619).
 				// Checking an updated payload against MetaHash would read a
 				// successful update as corruption, delete the payload, and then
-				// close the ACTIVE lease on-chain via errPayloadNotAvailable.
+				// strand the ACTIVE lease behind errPayloadNotAvailable.
 				//
 				// A payload with no recorded hash was written by a build that
 				// predates the hash bucket; MetaHash remains the right reference for
@@ -1053,177 +885,110 @@ func (r *Reconciler) doStartProvisioning(
 					verifiedAgainst = "meta_hash"
 				}
 				if len(expectedHash) == 0 {
-					computed := payload.ComputeHash(req.Payload)
+					computed := payload.ComputeHash(requestPayload)
 					expectedHash = computed
 					verifiedAgainst = "computed_hash"
 				}
 
-				if err := payload.VerifyHash(req.Payload, expectedHash); err != nil {
+				if err := payload.VerifyHash(requestPayload, expectedHash); err != nil {
 					// Payload is corrupted - delete it and fail
 					payloadStore.Delete(lease.Uuid)
-					untrack()
 					slog.Error("reconcile: payload hash mismatch - possible corruption",
 						"lease_uuid", lease.Uuid,
 						"verified_against", verifiedAgainst,
 						"error", err,
 					)
-					return err
+					return uncertainProvisionStart(err)
 				}
 				// The hash sent to the backend describes the payload actually being
 				// sent, which after an update is no longer MetaHash.
-				req.PayloadHash = hex.EncodeToString(expectedHash)
-				attemptPayloadFingerprint, err = placement.NewPayloadFingerprint(expectedHash)
-				if err != nil {
-					untrack()
-					return fmt.Errorf("bind exact provision payload fingerprint: %w", err)
+				var fingerprintErr error
+				attemptPayloadFingerprint, fingerprintErr = placement.NewPayloadFingerprint(expectedHash)
+				if fingerprintErr != nil {
+					return uncertainProvisionStart(fmt.Errorf(
+						"bind exact provision payload fingerprint: %w", fingerprintErr,
+					))
 				}
 			}
 		}
 	}
-	requestSnapshot, err := placement.NewBackendRequestSnapshot(
-		req.Tenant, req.ProviderUUID, req.Items,
+	result := r.coordinator.Provision(
+		ctx, authority.action, requestPayload, attemptPayloadFingerprint,
 	)
-	if err != nil {
-		untrack()
-		return fmt.Errorf("bind exact backend request for lease %s: %w", lease.Uuid, err)
-	}
-
-	// Persist the target immediately before the external side effect. All local
-	// payload reads and validation above intentionally happen first so a local
-	// preflight failure never manufactures an attempt for a request not sent.
-	var attemptToken placement.AttemptToken
-	var attemptSet bool
-	switch {
-	case authority.ownedPlacement.Valid():
-		attemptToken, attemptSet, err = r.placementAuthority.BeginOwnedAttempt(
-			authority.baseline, authority.ownedPlacement,
-			authority.ownedBackend, operationInitiation.ID(),
-			attemptPayloadFingerprint, requestSnapshot, callbackPair,
-		)
-	case authority.allowRecordless:
-		attemptToken, attemptSet, err = r.placementAuthority.BeginNewAttempt(
-			authority.recordlessScope,
-			lease.Uuid, backendClient.Name(), operationInitiation.ID(),
-			attemptPayloadFingerprint, requestSnapshot, callbackPair,
-		)
-	default:
-		attemptSet = false
-	}
-	if err != nil {
-		untrack()
-		if errors.Is(err, placement.ErrAttemptConflict) {
-			return errLeaseAlreadyInFlight
+	if result.Err() != nil {
+		switch {
+		case errors.Is(result.Err(), placement.ErrReconciliationBoundaryStale):
+			return uncertainProvisionStart(errTrackerSnapshotStale)
+		case errors.Is(result.Err(), placement.ErrReconciliationOperationBusy),
+			errors.Is(result.Err(), placement.ErrAttemptConflict):
+			metrics.ReconciliationConflictsTotal.Inc()
+			return uncertainProvisionStart(errLeaseAlreadyInFlight)
+		default:
+			return uncertainProvisionStart(result.Err())
 		}
-		return fmt.Errorf("record provision attempt for lease %s: %w", lease.Uuid, err)
 	}
-	if !attemptSet {
-		untrack()
-		return errPlacementSnapshotStale
+	settlement := result.Dispatch()
+	provisionErr := settlement.CallErr()
+	if provisionErr == nil && settlement.Err() != nil {
+		provisionErr = settlement.Err()
 	}
-	if !r.operations.BeginCall(operationInitiation) {
-		refused, refuseErr := r.placementAuthority.RefuseAttempt(attemptToken)
-		untrack()
-		if refuseErr != nil {
-			return fmt.Errorf("refuse unsent placement attempt for lease %s: %w",
-				lease.Uuid, refuseErr)
-		}
-		if !refused {
-			return errPlacementSnapshotStale
-		}
-		return errTrackerSnapshotStale
-	}
-	publishProvisionStartingBestEffort(r.startEvents, lease.Uuid, backendClient.Name())
-
-	provisionErr := invokeBackendProvision(ctx, backendClient, req)
-	outcome := classifyProvisionOutcome(provisionErr)
 	if errors.Is(provisionErr, backend.ErrInsufficientResources) {
 		metrics.BackendInsufficientResourcesTotal.WithLabelValues(
-			backendClient.Name(), capacityVerdictLabel(provisionErr),
+			result.BackendName(), capacityVerdictLabel(settlement.ProvisionRefusal()),
 		).Inc()
 	}
-	var completion operation.InitiationCompletion
-	if outcome == provisionOutcomeAccepted {
-		completion = r.operations.Activate(operationInitiation)
-	} else {
-		completion = r.operations.AbortInitiation(operationInitiation)
-	}
-	switch completion {
-	case operation.InitiationSettling, operation.InitiationFinished:
+	if settlement.Superseded() {
 		// The exact callback owns every terminal side effect. In particular,
 		// a synchronous error arriving after an inline Ready/Failed verdict
 		// cannot clear its placement or trigger chain error handling.
 		slog.Info("reconcile: inline provision callback superseded synchronous backend result",
 			"lease_uuid", lease.Uuid,
-			"backend", backendClient.Name(),
-			"outcome", outcome,
+			"backend", result.BackendName(),
+			"call_accepted", settlement.CallAccepted(),
+			"call_definitively_refused", settlement.CallDefinitivelyRefused(),
+			"call_not_dispatched", settlement.CallNotDispatched(),
+			"call_ambiguous", settlement.CallAmbiguous(),
 		)
-		return nil
-	case operation.InitiationActivated:
-		if outcome != provisionOutcomeAccepted {
-			return errTrackerSnapshotStale
-		}
-	case operation.InitiationAborted:
-		if outcome == provisionOutcomeAccepted {
-			return errTrackerSnapshotStale
-		}
-	default:
-		return errTrackerSnapshotStale
+		return acceptedProvisionStart()
 	}
-
-	var settleErr error
-	var settled bool
-	switch outcome {
-	case provisionOutcomeAccepted:
-		settled, settleErr = r.placementAuthority.ConfirmAttempt(attemptToken)
-	case provisionOutcomeDefinitiveFailure:
-		settled, settleErr = r.placementAuthority.RefuseAttempt(attemptToken)
-	case provisionOutcomeAmbiguous:
-		// Unknown backend outcomes deliberately retain the durable attempt.
-		settled = true
-	}
-	if settleErr == nil && !settled && outcome == provisionOutcomeAccepted {
-		// A backend may deliver its callback before the initiating HTTP request
-		// returns. In that ordering the callback has already consumed the exact
-		// operation and confirmed placement, so this process-local token is
-		// expected to be stale and the positive durable fact wins.
-		current := r.placementAuthority.Lookup(lease.Uuid)
-		settled = current.State() == placement.StateConfirmed &&
-			current.Backend == backendClient.Name() && current.Attempt == ""
-	}
-	if settleErr == nil && !settled {
-		settleErr = errors.New("placement attempt is no longer current")
+	settleErr := settlement.Err()
+	if settlement.Disposition() == placement.DispatchInvalid && settleErr == nil {
+		settleErr = errors.New("invalid provision dispatch disposition")
 	}
 	if settleErr != nil {
 		slog.Warn("reconcile: failed to settle provision placement",
 			"lease_uuid", lease.Uuid,
-			"backend", backendClient.Name(),
-			"outcome", outcome,
+			"backend", result.BackendName(),
+			"call_accepted", settlement.CallAccepted(),
+			"call_definitively_refused", settlement.CallDefinitivelyRefused(),
+			"call_not_dispatched", settlement.CallNotDispatched(),
+			"call_ambiguous", settlement.CallAmbiguous(),
 			"error", settleErr,
 		)
 	}
 
-	switch outcome {
-	case provisionOutcomeAccepted:
+	if settlement.CallAccepted() {
 		if settleErr != nil {
 			// The backend accepted the operation. Keep the registry operation and durable
 			// Attempt so neither event retries nor a degraded sweep can substitute
 			// another backend; callback/SetBatch will repair confirmation.
-			return fmt.Errorf("confirm accepted provision placement for lease %s: %w", lease.Uuid, settleErr)
+			return uncertainProvisionStart(fmt.Errorf(
+				"confirm accepted provision placement for lease %s: %w", lease.Uuid, settleErr,
+			))
 		}
-	case provisionOutcomeDefinitiveFailure, provisionOutcomeAmbiguous:
+	} else {
 		// A definitive failure cleared Attempt when persistence succeeded. An
 		// ambiguous result keeps it. Either way the durable record, rather than
 		// the ephemeral registry, gates the next call; releasing the operation lets the
 		// reconciler consume a later authoritative inventory snapshot.
-		if outcome == provisionOutcomeAmbiguous {
+		if settlement.CallAmbiguous() {
 			slog.Warn("reconcile: provision returned an ambiguous outcome; retaining exact durable attempt",
 				"lease_uuid", lease.Uuid,
-				"backend", backendClient.Name(),
-				"operation_id", operationInitiation.ID(),
+				"backend", result.BackendName(),
 				"error", provisionErr,
 			)
 		}
-		return provisionErr
+		return failedProvisionStart(settlement)
 	}
 
 	// Note: Payload is NOT deleted here. Cleanup happens later — when the
@@ -1238,25 +1003,30 @@ func (r *Reconciler) doStartProvisioning(
 		slog.Info("reconcile: started provisioning with payload",
 			"lease_uuid", lease.Uuid,
 			"tenant", lease.Tenant,
-			"sku", sku,
-			"backend", backendClient.Name(),
-			"payload_size", len(req.Payload),
+			"sku", ExtractRoutingSKU(&lease),
+			"backend", result.BackendName(),
+			"payload_size", len(requestPayload),
 		)
 	} else {
 		slog.Info("reconcile: started provisioning",
 			"lease_uuid", lease.Uuid,
 			"tenant", lease.Tenant,
-			"sku", sku,
-			"backend", backendClient.Name(),
+			"sku", ExtractRoutingSKU(&lease),
+			"backend", result.BackendName(),
 		)
 	}
 
-	return nil
+	return acceptedProvisionStart()
 }
 
-// acknowledgeLease acknowledges a lease via the batcher for parallel signing.
-func (r *Reconciler) acknowledgeLease(ctx context.Context, leaseUUID string) error {
-	acknowledged, txHash, err := r.acknowledger.Acknowledge(ctx, leaseUUID)
+// acknowledgeLease acknowledges the exact lease carried by the projected
+// action through the control plane bound to this coordinator.
+func (r *Reconciler) acknowledgeLease(
+	ctx context.Context,
+	action placement.ObservedReconciliationAction,
+) error {
+	leaseUUID := action.Lease().Uuid
+	acknowledged, txHash, err := r.coordinator.AcknowledgeObserved(ctx, action)
 	if err != nil {
 		return err
 	}
@@ -1271,8 +1041,15 @@ func (r *Reconciler) acknowledgeLease(ctx context.Context, leaseUUID string) err
 }
 
 // rejectLease rejects a PENDING lease on chain with a reason.
-func (r *Reconciler) rejectLease(ctx context.Context, leaseUUID, reason string) error {
-	rejected, txHashes, err := r.chainClient.RejectLeases(ctx, []string{leaseUUID}, truncateRejectReason(reason))
+func (r *Reconciler) rejectLease(
+	ctx context.Context,
+	action placement.ObservedReconciliationAction,
+	reason string,
+) error {
+	leaseUUID := action.Lease().Uuid
+	rejected, txHashes, err := r.coordinator.RejectObserved(
+		ctx, action, truncateRejectReason(reason),
+	)
 	if err != nil {
 		return err
 	}
@@ -1296,8 +1073,13 @@ func (r *Reconciler) rejectLease(ctx context.Context, leaseUUID, reason string) 
 }
 
 // closeLease closes an ACTIVE lease on chain with a reason.
-func (r *Reconciler) closeLease(ctx context.Context, leaseUUID, reason string) error {
-	closed, txHashes, err := r.chainClient.CloseLeases(ctx, []string{leaseUUID}, reason)
+func (r *Reconciler) closeLease(
+	ctx context.Context,
+	action placement.ObservedReconciliationAction,
+	reason string,
+) error {
+	leaseUUID := action.Lease().Uuid
+	closed, txHashes, err := r.coordinator.CloseObserved(ctx, action, reason)
 	if err != nil {
 		return err
 	}
@@ -1373,30 +1155,24 @@ func ambiguousReportedOwners(reports ...map[string]map[string]struct{}) map[stri
 	return ambiguous
 }
 
-// updatePlacementAmbiguities merges this sweep's conflicts into the
-// process-local quarantine. Only a complete view of both inventory endpoints
-// can prove an older conflict has resolved. ReconcileAll is serialized by
-// reconciling, so this map needs no independent lock.
-func (r *Reconciler) updatePlacementAmbiguities(current map[string][]string, complete bool) map[string][]string {
-	if r.ambiguousPlacements == nil {
-		r.ambiguousPlacements = make(map[string][]string)
-	}
-	if complete {
-		for leaseUUID := range r.ambiguousPlacements {
-			if _, stillAmbiguous := current[leaseUUID]; !stillAmbiguous {
-				delete(r.ambiguousPlacements, leaseUUID)
-			}
+func placementConflicts(records map[string]placement.Placement) map[string][]string {
+	conflicts := make(map[string][]string)
+	for leaseUUID, record := range records {
+		if !record.Conflict {
+			continue
 		}
+		owners := slices.Clone(record.ConflictBackends)
+		if record.Backend != "" {
+			owners = append(owners, record.Backend)
+		}
+		if record.Attempt != "" {
+			owners = append(owners, record.Attempt)
+		}
+		slices.Sort(owners)
+		owners = slices.Compact(owners)
+		conflicts[leaseUUID] = owners
 	}
-	for leaseUUID, owners := range current {
-		r.ambiguousPlacements[leaseUUID] = slices.Clone(owners)
-	}
-
-	out := make(map[string][]string, len(r.ambiguousPlacements))
-	for leaseUUID, owners := range r.ambiguousPlacements {
-		out[leaseUUID] = slices.Clone(owners)
-	}
-	return out
+	return conflicts
 }
 
 // heard reports whether this sweep has a usable report from the named backend.
@@ -1455,6 +1231,13 @@ func (a answeredSet) unanswered() []string {
 type fleetSnapshot struct {
 	// provisions is the union over answering backends, keyed by lease UUID.
 	provisions map[string]backend.ProvisionInfo
+	// provisionsByBackend retains each endpoint response before the union loses
+	// duplicate identities. It is the exact row set sealed into inventory
+	// evidence, including lifecycle generations and runtime principals.
+	provisionsByBackend map[string][]backend.ProvisionInfo
+	// collectedByBackend retains the opaque, exact-sweep response consumed by
+	// the typed inventory session after cross-endpoint validation.
+	collectedByBackend map[string]placement.BackendProvisionInventory
 	// reportedByBackend retains the per-backend membership that the union above
 	// intentionally flattens. Placement attempts use it to distinguish "the
 	// attempted backend answered without this lease" from "some other backend
@@ -1491,106 +1274,85 @@ type fleetSnapshot struct {
 //     the ACTIVE-but-not-provisioned row would re-provision it onto a healthy
 //     peer, laying an empty volume over live tenant data. That is exactly what
 //     the caller's deferral guard prevents.
-func (r *Reconciler) fetchFleetSnapshot(ctx context.Context) fleetSnapshot {
-	backends := r.backendRouter.Backends()
+func (r *Reconciler) fetchFleetSnapshot(
+	ctx context.Context,
+	sweep *placement.ReconciliationSweep,
+) fleetSnapshot {
+	backendNames, namesErr := r.coordinator.BackendNames()
+	if namesErr != nil {
+		slog.Error("reconciler cannot enumerate bound backends", "error", namesErr)
+		return fleetSnapshot{
+			provisions:          make(map[string]backend.ProvisionInfo),
+			provisionsByBackend: make(map[string][]backend.ProvisionInfo),
+			collectedByBackend:  make(map[string]placement.BackendProvisionInventory),
+			reportedByBackend:   make(map[string]map[string]struct{}),
+			storageIdentities:   make(map[string]backendidentity.ID),
+			answered:            make(answeredSet),
+			complete:            false,
+		}
+	}
 
 	g, gctx := errgroup.WithContext(ctx)
-	if len(backends) > 0 {
-		g.SetLimit(len(backends)) // Query all backends concurrently
+	if len(backendNames) > 0 {
+		g.SetLimit(len(backendNames)) // Query all backends concurrently
 	}
 
 	var mu sync.Mutex
 	snap := fleetSnapshot{
-		provisions:        make(map[string]backend.ProvisionInfo),
-		reportedByBackend: make(map[string]map[string]struct{}, len(backends)),
-		storageIdentities: make(map[string]backendidentity.ID, len(backends)),
-		answered:          make(answeredSet, len(backends)),
-		complete:          true,
+		provisions:          make(map[string]backend.ProvisionInfo),
+		provisionsByBackend: make(map[string][]backend.ProvisionInfo, len(backendNames)),
+		collectedByBackend:  make(map[string]placement.BackendProvisionInventory, len(backendNames)),
+		reportedByBackend:   make(map[string]map[string]struct{}, len(backendNames)),
+		storageIdentities:   make(map[string]backendidentity.ID, len(backendNames)),
+		answered:            make(answeredSet, len(backendNames)),
+		complete:            true,
 	}
 
-	for _, b := range backends {
-		g.Go(func() (goErr error) {
-			// Recover any panic from backend.RefreshState / ListProvisions (or
-			// the HTTP/JSON path implementing them). We do NOT surface it as an
-			// errgroup error: returning non-nil would trip errgroup's fail-fast
-			// and cancel sibling fetches via gctx, turning one bad backend into
-			// a fleet-wide failure — the very coupling this function exists to
-			// remove. A panicking backend is simply one that did not answer.
-			defer func() {
-				if rec := recover(); rec != nil {
-					slog.Error("reconciler fetch panic — recovering to keep fred alive",
-						"backend", b.Name(),
-						"panic", rec,
-						"stack", string(debug.Stack()),
-					)
-					metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions").Inc()
-					mu.Lock()
-					snap.markUnanswered(b.Name())
-					mu.Unlock()
-					metrics.ReconcilerBackendFetchTotal.WithLabelValues(b.Name(), metrics.FetchOutcomePanic).Inc()
-					goErr = nil // Don't cancel siblings via errgroup.
-				}
-			}()
-			// Ensure backend state is fresh before reading provisions. A failed refresh
-			// does not discard stale positive entries, but it does make this backend
-			// non-authoritative for negative evidence: stale absence cannot clear an
-			// attempt or arm the complete-sweep trust latch.
-			refreshErr := b.RefreshState(gctx)
-			if refreshErr != nil {
-				slog.Warn("failed to refresh backend state",
-					"backend", b.Name(), "error", refreshErr,
-				)
-				// Continue — stale positive state is still conservative and useful.
-			}
-
-			identityBackend, supportsIdentity := b.(backend.IdentityInventoryBackend)
-			if !supportsIdentity {
-				slog.Error("backend does not implement identity-bearing inventory",
-					"backend", b.Name())
-				mu.Lock()
-				snap.markUnanswered(b.Name())
-				mu.Unlock()
-				metrics.ReconcilerBackendFetchTotal.WithLabelValues(b.Name(), metrics.FetchOutcomeError).Inc()
-				return nil
-			}
-			provisions, storageID, err := identityBackend.ListProvisionsWithIdentity(gctx)
+	for _, backendName := range backendNames {
+		g.Go(func() error {
+			inventory, err := sweep.CollectProvisionInventory(gctx, backendName)
 			if err != nil {
 				slog.Error("failed to list provisions from backend",
-					"backend", b.Name(),
+					"backend", backendName,
 					"error", err,
 				)
 				mu.Lock()
-				snap.markUnanswered(b.Name())
+				snap.markUnanswered(backendName)
 				mu.Unlock()
-				// An open circuit breaker is reported distinctly: it means fred
-				// short-circuited without dialing, which reads very differently
-				// in an incident from a backend that was actually contacted.
 				outcome := metrics.FetchOutcomeError
 				if errors.Is(err, backend.ErrCircuitOpen) {
 					outcome = metrics.FetchOutcomeCircuitOpen
 				}
-				metrics.ReconcilerBackendFetchTotal.WithLabelValues(b.Name(), outcome).Inc()
-				return nil // Don't cancel other backends
+				metrics.ReconcilerBackendFetchTotal.WithLabelValues(backendName, outcome).Inc()
+				return nil
+			}
+			refreshErr := inventory.RefreshErr()
+			if refreshErr != nil {
+				slog.Warn("failed to refresh backend state",
+					"backend", backendName, "error", refreshErr,
+				)
 			}
 
+			provisions := inventory.Provisions()
 			mu.Lock()
 			// The immutable storage identity is useful even when RefreshState
 			// failed. The caller pairs it with the independent retention identity
 			// before preserving stale positive affinity; answered remains false so
 			// this response can never authorize negative evidence or completeness.
-			snap.storageIdentities[b.Name()] = storageID
+			snap.storageIdentities[backendName] = inventory.StorageID()
 			if refreshErr == nil {
-				snap.answered[b.Name()] = true
+				snap.answered[backendName] = true
 			} else {
-				snap.markUnanswered(b.Name())
+				snap.markUnanswered(backendName)
 			}
 			reported := make(map[string]struct{}, len(provisions))
 			for _, p := range provisions {
-				p.BackendName = b.Name()
 				snap.provisions[p.LeaseUUID] = p
 				reported[p.LeaseUUID] = struct{}{}
 			}
-			snap.reportedByBackend[b.Name()] = reported
+			snap.provisionsByBackend[backendName] = provisions
+			snap.collectedByBackend[backendName] = inventory
+			snap.reportedByBackend[backendName] = reported
 			mu.Unlock()
 			fetchOutcome := metrics.FetchOutcomeOK
 			if refreshErr != nil {
@@ -1599,10 +1361,10 @@ func (r *Reconciler) fetchFleetSnapshot(ctx context.Context) fleetSnapshot {
 					fetchOutcome = metrics.FetchOutcomeCircuitOpen
 				}
 			}
-			metrics.ReconcilerBackendFetchTotal.WithLabelValues(b.Name(), fetchOutcome).Inc()
+			metrics.ReconcilerBackendFetchTotal.WithLabelValues(backendName, fetchOutcome).Inc()
 
 			slog.Debug("fetched backend provisions",
-				"backend", b.Name(),
+				"backend", backendName,
 				"count", len(provisions),
 			)
 			return nil
@@ -1612,11 +1374,6 @@ func (r *Reconciler) fetchFleetSnapshot(ctx context.Context) fleetSnapshot {
 	_ = g.Wait() // closures never return non-nil; outcomes are recorded in snap
 
 	return snap
-}
-
-// placementFor returns the complete durable placement record.
-func (r *Reconciler) placementFor(leaseUUID string) placement.Placement {
-	return r.placementAuthority.Lookup(leaseUUID)
 }
 
 // markUnanswered records that a backend did not report this sweep. Callers must
@@ -1775,7 +1532,7 @@ func (r *Reconciler) getLeaseBounded(
 	qctx, cancel := context.WithTimeout(ctx, chainConfirmTimeout)
 	defer cancel()
 
-	return r.chainClient.GetLease(qctx, leaseUUID)
+	return r.coordinator.ReadLease(qctx, leaseUUID)
 }
 
 // queryLeaseLiveness performs the bounded point read shared by destructive
@@ -1867,82 +1624,83 @@ func (r *Reconciler) confirmTerminal(ctx context.Context, pass, leaseUUID string
 // useful conservatively, but placement backfill waits for a complete snapshot.
 func (r *Reconciler) fetchAllRetentions(
 	ctx context.Context,
-) (map[string]string, answeredSet, map[string]map[string]struct{}, map[string]backendidentity.ID) {
-	backends := r.backendRouter.Backends()
+	sweep *placement.ReconciliationSweep,
+) (map[string]string, answeredSet, map[string]map[string]struct{}, map[string]backendidentity.ID, map[string]placement.BackendRetentionInventory) {
+	backendNames, namesErr := r.coordinator.BackendNames()
+	if namesErr != nil {
+		slog.Error("reconciler cannot enumerate retention backends", "error", namesErr)
+		return map[string]string{}, answeredSet{}, map[string]map[string]struct{}{}, map[string]backendidentity.ID{}, map[string]placement.BackendRetentionInventory{}
+	}
 
 	var mu sync.Mutex
 	out := make(map[string]string)
-	answered := make(answeredSet, len(backends))
-	reportedByBackend := make(map[string]map[string]struct{}, len(backends))
-	storageIdentities := make(map[string]backendidentity.ID, len(backends))
+	answered := make(answeredSet, len(backendNames))
+	reportedByBackend := make(map[string]map[string]struct{}, len(backendNames))
+	storageIdentities := make(map[string]backendidentity.ID, len(backendNames))
+	collected := make(map[string]placement.BackendRetentionInventory, len(backendNames))
 
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(len(backends))
-	for _, b := range backends {
-		g.Go(func() (goErr error) {
-			defer func() {
-				if rec := recover(); rec != nil {
-					slog.Error("reconciler retentions fetch panic — recovering",
-						"backend", b.Name(), "panic", rec, "stack", string(debug.Stack()))
-					metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_retentions").Inc()
-					mu.Lock()
-					answered[b.Name()] = false
-					mu.Unlock()
-					goErr = nil
-				}
-			}()
-			// No RefreshState needed: ListRetentions reads the backend's persistent
-			// retention store (always current), unlike ListProvisions' in-memory state.
-			identityBackend, supportsIdentity := b.(backend.IdentityInventoryBackend)
-			if !supportsIdentity {
-				slog.Error("backend does not implement identity-bearing retention inventory",
-					"backend", b.Name())
-				mu.Lock()
-				answered[b.Name()] = false
-				mu.Unlock()
-				return nil
-			}
-			retentions, storageID, err := identityBackend.ListRetentionsWithIdentity(gctx)
+	if len(backendNames) > 0 {
+		g.SetLimit(len(backendNames))
+	}
+	for _, backendName := range backendNames {
+		g.Go(func() error {
+			inventory, err := sweep.CollectRetentionInventory(gctx, backendName)
 			if err != nil {
 				slog.Warn("failed to list retentions from backend",
-					"backend", b.Name(), "error", err)
+					"backend", backendName, "error", err)
 				mu.Lock()
-				answered[b.Name()] = false
+				answered[backendName] = false
 				mu.Unlock()
 				return nil // collect from other backends; don't cancel
 			}
+			retentions := inventory.Retentions()
 			reported := make(map[string]struct{}, len(retentions))
 			for _, ret := range retentions {
 				reported[ret.LeaseUUID] = struct{}{}
 			}
 			mu.Lock()
-			answered[b.Name()] = true
-			storageIdentities[b.Name()] = storageID
-			reportedByBackend[b.Name()] = reported
+			answered[backendName] = true
+			storageIdentities[backendName] = inventory.StorageID()
+			collected[backendName] = inventory
+			reportedByBackend[backendName] = reported
 			for _, ret := range retentions {
-				out[ret.LeaseUUID] = b.Name()
+				out[ret.LeaseUUID] = backendName
 			}
 			mu.Unlock()
-			slog.Debug("fetched backend retentions", "backend", b.Name(), "count", len(retentions))
+			slog.Debug("fetched backend retentions", "backend", backendName, "count", len(retentions))
 			return nil
 		})
 	}
 	_ = g.Wait() // closures never return non-nil; outcomes are recorded in answered
 
-	return out, answered, reportedByBackend, storageIdentities
+	return out, answered, reportedByBackend, storageIdentities, collected
 }
 
-// handleProvisionError handles errors from provisioning attempts during reconciliation.
-// It determines the appropriate action based on error type and lease state:
+// handleProvisionResult handles non-successful provisioning attempts during
+// reconciliation. Retry/defer policy may inspect diagnostic errors, but the
+// only result authorized to terminate a lease is the typed validation refusal
+// minted from the sealed backend transport outcome.
+//
+// It determines the appropriate action based on result and error type:
 //   - errLeaseAlreadyInFlight: skip (not a real error)
 //   - backend.ErrAlreadyProvisioned: transient (an unvalidated HTTP 409 is ambiguous)
 //   - errPayloadNotAvailable: transient; retain the lease and retry after repair/upload
-//   - backend.ErrValidation: reject (PENDING) or close (ACTIVE) the lease
+//   - provisionStartValidationRefused: reject (PENDING) or close (ACTIVE)
 //   - backend.ErrMalformedErrorBody: transient (backend answered off-contract) — flag for retry, never terminate
 //   - ErrPlacementUnresolvable: transient (backend absent from config) — flag for retry, never terminate
 //   - backend.ErrCircuitOpen: transient (breaker auto-recovers) — flag for retry, never terminate
 //   - other errors: log and flag for retry next cycle
-func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseUUID string, lease billingtypes.Lease, hadError *bool) {
+func (r *Reconciler) handleProvisionResult(
+	ctx context.Context,
+	result provisionStartResult,
+	leaseUUID string,
+	lease billingtypes.Lease,
+	action placement.ObservedReconciliationAction,
+	hadError *bool,
+) {
+	err := result.Err()
+	placementRecord := action.Placement()
 	if errors.Is(err, errLeaseAlreadyInFlight) {
 		slog.Debug("reconcile: lease already in-flight, skipping", "lease_uuid", leaseUUID)
 		return
@@ -1969,11 +1727,10 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		// than an accident of ordering. A backend is typically absent because it
 		// was paused, renamed or is mid-redeploy — closing paying leases for that
 		// would turn a maintenance window into permanent data loss (ENG-498).
-		p := r.placementFor(leaseUUID)
 		slog.Error("reconcile: refusing to provision, lease is placed on a backend the router does not know",
 			"lease_uuid", leaseUUID,
 			"tenant", lease.Tenant,
-			"placement_backend", p.Backend,
+			"placement_backend", placementRecord.Backend,
 			"error", err,
 		)
 		*hadError = true
@@ -2030,12 +1787,7 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		return
 	}
 
-	// Determine the termination reason for permanent errors
-	var reason string
-	switch {
-	case errors.Is(err, backend.ErrValidation):
-		reason = validationErrorToRejectReason(err)
-	default:
+	if !result.validationRefused() {
 		// Transient error — log and retry next cycle
 		slog.Error("reconcile: provisioning failed",
 			"lease_uuid", leaseUUID,
@@ -2045,6 +1797,7 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 		*hadError = true
 		return
 	}
+	reason := validationErrorToRejectReason(err)
 
 	// Permanent error — terminate the lease
 	isPending := lease.State == billingtypes.LEASE_STATE_PENDING
@@ -2055,7 +1808,7 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 			"reason", reason,
 			"error", err,
 		)
-		if rejectErr := r.rejectLease(ctx, leaseUUID, reason); rejectErr != nil {
+		if rejectErr := r.rejectLease(ctx, action, reason); rejectErr != nil {
 			slog.Error("reconcile: failed to reject lease",
 				"lease_uuid", leaseUUID,
 				"error", rejectErr,
@@ -2069,7 +1822,7 @@ func (r *Reconciler) handleProvisionError(ctx context.Context, err error, leaseU
 			"reason", reason,
 			"error", err,
 		)
-		if closeErr := r.closeLease(ctx, leaseUUID, reason); closeErr != nil {
+		if closeErr := r.closeLease(ctx, action, reason); closeErr != nil {
 			slog.Error("reconcile: failed to close lease",
 				"lease_uuid", leaseUUID,
 				"error", closeErr,
@@ -2102,7 +1855,8 @@ func (r *Reconciler) processLease(
 			leaseErrors.Add(1)
 		}
 	}()
-	handleStartError := func(err error) {
+	handleStartResult := func(result provisionStartResult) {
+		err := result.Err()
 		if errors.Is(err, errPlacementSnapshotStale) || errors.Is(err, errTrackerSnapshotStale) {
 			deferred.Add(1)
 			metrics.ReconcilerDeferredLeasesTotal.Inc()
@@ -2111,7 +1865,7 @@ func (r *Reconciler) processLease(
 			)
 			return
 		}
-		r.handleProvisionError(ctx, err, leaseUUID, lease, &hadError)
+		r.handleProvisionResult(ctx, result, leaseUUID, lease, authority.action, &hadError)
 	}
 
 	payload := payloadEvidenceUnknown
@@ -2135,7 +1889,10 @@ func (r *Reconciler) processLease(
 		}
 	}
 
-	inFlight := r.isInFlight(leaseUUID)
+	// ObserveLiveAction acquired the exact lease claim after rejecting every
+	// operation that crossed the sweep boundary, so a competing in-flight
+	// lifecycle operation is unrepresentable in this scope.
+	inFlight := false
 	plan := planLease(leaseFacts{
 		authority:       lifecycleAuthorityDurable,
 		chain:           lease.State,
@@ -2187,20 +1944,20 @@ func (r *Reconciler) processLease(
 				"reason", plan.reason,
 			)
 		}
-		var err error
+		var result provisionStartResult
 		if plan.withPayload {
-			err = r.startProvisioningWithPayload(ctx, lease, authority)
+			result = r.startProvisioningWithPayload(ctx, lease, authority)
 		} else {
-			err = r.startProvisioning(ctx, lease, authority)
+			result = r.startProvisioning(ctx, lease, authority)
 		}
-		if err != nil {
-			handleStartError(err)
+		if result.Err() != nil {
+			handleStartResult(result)
 		} else if lease.State == billingtypes.LEASE_STATE_PENDING {
 			provisioned.Add(1)
 		}
 
 	case reconcileActionAcknowledge:
-		if err := r.acknowledgeLease(ctx, leaseUUID); err != nil {
+		if err := r.acknowledgeLease(ctx, authority.action); err != nil {
 			slog.Error("reconcile: failed to acknowledge lease",
 				"lease_uuid", leaseUUID,
 				"error", err,
@@ -2215,7 +1972,7 @@ func (r *Reconciler) processLease(
 			"lease_uuid", leaseUUID,
 			"tenant", lease.Tenant,
 		)
-		if err := r.rejectLease(ctx, leaseUUID, plan.reason); err != nil {
+		if err := r.rejectLease(ctx, authority.action, plan.reason); err != nil {
 			slog.Error("reconcile: failed to reject lease",
 				"lease_uuid", leaseUUID,
 				"error", err,
@@ -2231,7 +1988,7 @@ func (r *Reconciler) processLease(
 			"fail_count", provision.FailCount,
 			"max_attempts", r.maxReprovisionAttempts,
 		)
-		if err := r.closeLease(ctx, leaseUUID, fmt.Sprintf("provision failed %d times", provision.FailCount)); err != nil {
+		if err := r.closeLease(ctx, authority.action, fmt.Sprintf("provision failed %d times", provision.FailCount)); err != nil {
 			slog.Error("reconcile: failed to close exhausted lease",
 				"lease_uuid", leaseUUID,
 				"error", err,
@@ -2239,32 +1996,15 @@ func (r *Reconciler) processLease(
 			hadError = true
 			return
 		}
-		if b := r.backendRouter.GetBackendByName(provision.BackendName); b != nil {
-			if err := b.Deprovision(ctx, leaseUUID); err != nil {
-				slog.Warn("reconcile: failed to deprovision after closing exhausted lease",
-					"lease_uuid", leaseUUID,
-					"error", err,
-				)
-			}
+		if err := r.coordinator.DeprovisionObserved(ctx, authority.action); err != nil {
+			slog.Warn("reconcile: failed to deprovision after closing exhausted lease",
+				"lease_uuid", leaseUUID,
+				"error", err,
+			)
 		}
 
 	case reconcileActionReconcileCustomDomain:
-		b := r.backendRouter.GetBackendByName(provision.BackendName)
-		if b == nil {
-			// Backend is no longer configured. Same condition the orphan
-			// path treats as MANUAL CLEANUP REQUIRED — surface it loudly
-			// here too so a misconfigured/removed backend doesn't silently
-			// disable custom-domain reconciliation for active leases.
-			slog.Error("reconcile: custom_domain reconcile skipped - backend no longer configured",
-				"lease_uuid", leaseUUID,
-				"tenant", lease.Tenant,
-				"backend", provision.BackendName,
-			)
-			hadError = true
-			break
-		}
-		latestItems := ExtractLeaseItems(&lease)
-		if err := b.ReconcileCustomDomain(ctx, leaseUUID, latestItems); err != nil {
+		if err := r.coordinator.ReconcileObservedCustomDomain(ctx, authority.action); err != nil {
 			slog.Warn("reconcile: custom_domain reconcile failed; will retry next tick",
 				"lease_uuid", leaseUUID,
 				"backend", provision.BackendName,
@@ -2279,8 +2019,7 @@ func (r *Reconciler) processLease(
 func (r *Reconciler) processOrphan(
 	ctx context.Context,
 	leaseUUID string,
-	provision backend.ProvisionInfo,
-	operationSnapshot operation.TrackerSnapshot,
+	projected *placement.ProjectedReconciliationSweep,
 	orphans, leaseErrors *atomic.Int32,
 ) {
 	// Check context before doing any work to respect cancellation
@@ -2288,69 +2027,50 @@ func (r *Reconciler) processOrphan(
 		return
 	}
 
-	// Skip provisions that belong to a different provider
-	if provision.ProviderUUID != "" && provision.ProviderUUID != r.providerUUID {
-		slog.Debug("reconcile: skipping provision owned by different provider",
-			"lease_uuid", leaseUUID,
-			"provision_provider", provision.ProviderUUID,
-			"our_provider", r.providerUUID,
-		)
-		return
-	}
-
-	// Acquire the same lease capability used by provisioning and close handlers.
-	// The inventory-bound claim combines the old in-flight check with a causal
-	// fence: an operation that starts and finishes between inventory and this
-	// point is still visible as a stale snapshot, while an operation that starts
-	// after this point is blocked until teardown returns. This closes both sides
-	// of the check-then-Deprovision race (ENG-594).
-	release, acquired := r.claimLeaseAction(leaseUUID, operationSnapshot)
-	if !acquired {
-		metrics.ReconcilerInflightSkipsTotal.Inc()
-		slog.Debug("reconcile: skipping orphan whose lifecycle crossed the inventory boundary",
-			"lease_uuid", leaseUUID,
-		)
-		return
-	}
-	defer release()
-
-	// Confirm against the chain that this lease is really finished (ENG-654).
-	//
-	// Membership of chainLeases is not enough to justify a deprovision. It is
-	// derived from two non-atomic, state-filtered list queries, so "absent" means
-	// either terminal or never-known, and the in-flight guard above only covers
-	// the window while the main flow still owns the lease — not the one after it
-	// untracks. This re-read is the positive evidence, and it runs BEFORE the
-	// backend lookup so a live lease never trips the MANUAL CLEANUP error below.
-	if !r.confirmTerminal(ctx, metrics.CleanupPassOrphan, leaseUUID) {
-		return
-	}
-	// Look up the backend that originally provisioned this resource.
-	// We must use the same backend for deprovisioning - falling back to a
-	// different backend would fail since it doesn't have the resource.
-	b := r.backendRouter.GetBackendByName(provision.BackendName)
-	if b == nil {
-		// Backend is no longer configured. This orphan requires manual cleanup.
-		// Do NOT fall back to default backend - it can't deprovision resources
-		// from a different backend system.
-		slog.Error("reconcile: orphan provision on unconfigured backend - MANUAL CLEANUP REQUIRED",
-			"lease_uuid", leaseUUID,
-			"backend", provision.BackendName,
-		)
+	// The composite sweep derives the backend from its sealed provision row,
+	// claims the exact Registry boundary, and performs the positive terminal
+	// chain reread before returning any executable orphan authority.
+	action, disposition, err := projected.ObserveTerminalOrphan(ctx, leaseUUID)
+	if err != nil {
+		metrics.ReconcilerCleanupSkipsTotal.
+			WithLabelValues(metrics.CleanupPassOrphan, metrics.CleanupSkipChainError).Inc()
+		slog.Error("reconcile: failed to confirm orphan terminality",
+			"lease_uuid", leaseUUID, "error", err)
 		leaseErrors.Add(1)
 		return
 	}
-
+	var cleanupReason string
+	switch disposition {
+	case placement.ReconciliationObservationChainLive:
+		cleanupReason = metrics.CleanupSkipChainLive
+	case placement.ReconciliationObservationChainUnknownState:
+		cleanupReason = metrics.CleanupSkipChainUnknownState
+	}
+	if cleanupReason != "" {
+		metrics.ReconcilerCleanupSkipsTotal.
+			WithLabelValues(metrics.CleanupPassOrphan, cleanupReason).Inc()
+		slog.Info("reconcile: skipping orphan without positive terminal chain authority",
+			"lease_uuid", leaseUUID, "reason", cleanupReason)
+		return
+	}
+	if disposition != placement.ReconciliationObservationReady || !action.Valid() {
+		metrics.ReconcilerInflightSkipsTotal.Inc()
+		slog.Debug("reconcile: skipping orphan without composite terminal authority",
+			"lease_uuid", leaseUUID, "observation_disposition", disposition,
+		)
+		return
+	}
+	defer r.coordinator.ReleaseOrphanAction(action)
 	orphans.Add(1)
 	slog.Warn("reconcile: orphan provision found, deprovisioning",
 		"lease_uuid", leaseUUID,
-		"backend", provision.BackendName,
+		"backend", action.BackendName(),
 	)
 
-	if err := b.Deprovision(ctx, leaseUUID); err != nil {
+	if err := r.coordinator.DeprovisionOrphan(ctx, action); err != nil {
 		slog.Error("reconcile: failed to deprovision orphan",
 			"lease_uuid", leaseUUID,
-			"backend", b.Name(),
+			"backend", action.BackendName(),
 			"error", err,
 		)
 		leaseErrors.Add(1)
@@ -2397,8 +2117,8 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 			// list queries, so it means terminal OR never-known OR created
 			// moments ago. Re-read the lease before deleting (ENG-654): a
 			// payload deleted out from under a live lease makes the NEXT sweep
-			// see errPayloadNotAvailable, classify it permanent, and close a
-			// healthy ACTIVE lease on chain.
+			// see errPayloadNotAvailable and remain unable to reconstruct the
+			// tenant's exact request.
 			if !r.confirmTerminal(ctx, metrics.CleanupPassPayload, leaseUUID) {
 				continue
 			}
@@ -2436,206 +2156,28 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 // It deletes a placement only when ALL of these hold, so it never races a
 // concurrent StartProvisioning Set nor wipes valid placement on a backend
 // outage:
-//   - every durable candidate owner answered both /provisions and /retentions
-//     this sweep. For a confirmed/attempting record those candidates are Backend
-//     and Attempt; for a conflict they are every ConflictBackend. Another
-//     backend's silence says nothing about the candidate (ENG-654). A removed
-//     candidate, a legacy conflict with unknown owners, or a structurally
-//     unusable record therefore cannot be auto-pruned: the record is the only
-//     pointer to where the data may live (ENG-635);
-//   - the lease is absent from backendLeases (provisions ∪ retentions);
+//   - ReconciliationSweep.Project minted opaque absence proof for this exact Store,
+//     coordinator, inventory session, lease, and record revision. Minting
+//     requires every durable candidate owner to have answered both /provisions
+//     and /retentions and the lease to be absent from the raw positive union;
 //   - the lease is not in-flight (a just-Set placement the backends haven't
 //     reported yet — the exact race the old additive-only code avoided);
-//   - the lease is absent from the non-atomic PENDING/ACTIVE snapshot, then an
-//     exact bounded GetLease under the lifecycle claim positively reports one
-//     of CLOSED, REJECTED, or EXPIRED. Snapshot absence, nil, query failure, and
-//     unknown future states are never terminal evidence.
+//   - the joined coordinator validates the exact Registry lease claim, then an
+//     exact bounded GetLease positively reports one of CLOSED, REJECTED, or
+//     EXPIRED before the Store atomically consumes the still-current proof.
+//     Snapshot absence, nil, mismatched UUID, query failure, and unknown future
+//     states are never terminal evidence.
 //
 // Returns the number of placements pruned.
 func (r *Reconciler) cleanupOrphanedPlacements(
 	ctx context.Context,
 	chainLeases map[string]billingtypes.Lease,
-	backendLeases map[string]struct{},
-	provisionsAnswered answeredSet,
-	retentionsAnswered answeredSet,
+	projected *placement.ProjectedReconciliationSweep,
 	now time.Time,
-	inFlightAtSnapshot map[string]struct{},
-	operationSnapshot operation.TrackerSnapshot,
 ) int {
-	cleaned := 0
-	for leaseUUID, record := range r.placementAuthority.List() {
-		if ctx.Err() != nil {
-			break
-		}
-		// A live lease's ambiguous effect is handled by exact same-operation
-		// redelivery in the main pass. For a lease absent from that PENDING/ACTIVE
-		// snapshot, exact terminal convergence first proves its current chain state
-		// and idempotently tears down only the durable candidate backend(s). Every
-		// uncertainty preserves the Attempt; inventory silence alone never clears it.
-		if record.Attempt != "" {
-			if _, listedLive := chainLeases[leaseUUID]; !listedLive {
-				metadata := record.AttemptMetadata()
-				if metadata.Valid() {
-					settled, settleErr := r.convergeTerminalPlacementAttempt(
-						ctx, leaseUUID, record, metadata, operationSnapshot,
-					)
-					if settled {
-						continue
-					}
-					if settleErr != nil {
-						slog.Warn("reconcile: terminal durable operation remains unresolved",
-							"lease_uuid", leaseUUID,
-							"backend", record.Backend,
-							"attempt", record.Attempt,
-							"operation_id", metadata.OperationID(),
-							"operation_kind", metadata.Kind(),
-							"error", settleErr,
-						)
-					}
-				}
-			}
-			metrics.ReconcilerCleanupSkipsTotal.
-				WithLabelValues(metrics.CleanupPassPlacement, metrics.CleanupSkipAttemptPending).Inc()
-			slog.Debug("reconcile: keeping placement with unresolved backend attempt",
-				"lease_uuid", leaseUUID,
-				"backend", record.Backend,
-				"attempt", record.Attempt,
-				"operation_id", record.AttemptOperationID().String(),
-			)
-			continue
-		}
-		// An operation already in flight at the inventory boundary may finish
-		// before this late cleanup pass; its typed snapshot tombstone keeps that
-		// boundary visible even after the active record disappears.
-		if _, wasInFlight := inFlightAtSnapshot[leaseUUID]; wasInFlight {
-			slog.Debug("reconcile: keeping placement whose operation was in flight when inventory began",
-				"lease_uuid", leaseUUID)
-			continue
-		}
-		// Every durable candidate must have answered both inventories. A conflict
-		// with an unknown/incomplete candidate set and a generic unusable record can
-		// never satisfy that proof merely because today's configured fleet answered:
-		// an owner removed from configuration is exactly the one we must preserve.
-		owners := make([]string, 0, 1+len(record.ConflictBackends))
-		addOwner := func(owner string) {
-			if owner == "" || slices.Contains(owners, owner) {
-				return
-			}
-			owners = append(owners, owner)
-		}
-		addOwner(record.Backend)
-		ownersAccountable := true
-		switch {
-		case record.Conflict:
-			if record.ConflictOwnersUnknown || len(record.ConflictBackends) < 2 {
-				ownersAccountable = false
-			} else {
-				for _, owner := range record.ConflictBackends {
-					addOwner(owner)
-				}
-			}
-		case record.State() == placement.StateUnusable:
-			ownersAccountable = false
-		}
-		ownersAnswered := ownersAccountable && len(owners) > 0
-		for _, owner := range owners {
-			if !provisionsAnswered.heard(owner) || !retentionsAnswered.heard(owner) {
-				ownersAnswered = false
-				break
-			}
-		}
-		if !ownersAnswered {
-			metrics.ReconcilerCleanupSkipsTotal.
-				WithLabelValues(metrics.CleanupPassPlacement, metrics.CleanupSkipBackendSilent).Inc()
-			slog.Debug("reconcile: keeping placement, a possible owner did not report this sweep",
-				"lease_uuid", leaseUUID,
-				"backend", record.Backend,
-				"attempt", record.Attempt,
-				"conflict_backends", record.ConflictBackends,
-				"conflict_owners_unknown", record.ConflictOwnersUnknown,
-				"state", record.State().String(),
-			)
-			continue
-		}
-		// Data still lives on a backend (active provision or retained) → keep.
-		if _, onBackend := backendLeases[leaseUUID]; onBackend {
-			continue
-		}
-		// A provision Set this placement moments ago; backends/chain may not
-		// reflect it yet → keep (the documented additive-only race).
-		if r.isInFlight(leaseUUID) {
-			continue
-		}
-		// Keep if the lease is still PENDING/ACTIVE on chain (the reconciler's
-		// main loop owns re-provisioning those; pruning would race it).
-		if lease, exists := chainLeases[leaseUUID]; exists &&
-			(lease.State == billingtypes.LEASE_STATE_PENDING || lease.State == billingtypes.LEASE_STATE_ACTIVE) {
-			continue
-		}
-		// ENG-335: keep a placement that was set within the grace window. A lease
-		// that provisioned entirely during a slow reconcile sweep is absent from
-		// this sweep's (stale) snapshot of chain + backends, yet is live; pruning
-		// it here strands its volume at close. The placement is a derived index —
-		// keeping a young one is harmless (processOrphan GCs the real resource and
-		// a closed lease is never restored) — so we never prune within 2× the
-		// reconcile interval, comfortably longer than one sweep.
-		grace := 2 * r.interval
-		if !record.SetAt.IsZero() && grace > 0 && now.Sub(record.SetAt) < grace {
-			// Log the raw timestamps rather than a derived age: now is the
-			// sweep-start time, so a placement Set during this sweep has
-			// set_at > sweep_start (a negative "age") — the timestamps make
-			// that case self-explanatory instead of printing a confusing
-			// negative duration.
-			slog.Debug("reconcile: keeping placement within grace window",
-				"lease_uuid", leaseUUID, "set_at", record.SetAt, "sweep_start", now, "grace", grace)
-			continue
-		}
-		// A terminal candidate, absent from all backends and not in-flight, is
-		// still only a snapshot conclusion. Claim the lease at the inventory boundary
-		// before deleting: a lifecycle operation that crossed the boundary makes
-		// this candidate stale, and a delayed event cannot start while the claim
-		// is held. Re-read the placement under that fence before the final CAS.
-		release, acquired := r.claimLeaseAction(leaseUUID, operationSnapshot)
-		if !acquired {
-			continue
-		}
-		current := r.placementFor(leaseUUID)
-		if current.Revision() != record.Revision() || current.State() != record.State() {
-			release()
-			continue
-		}
-		// The PENDING and ACTIVE inventory reads are non-atomic and state-filtered;
-		// omission cannot authorize deleting the last durable routing record. Make
-		// the same bounded, allowlisted terminal check used by payload/resource
-		// cleanup while the lifecycle claim prevents a local operation crossing it.
-		if !r.confirmTerminal(ctx, metrics.CleanupPassPlacement, leaseUUID) {
-			release()
-			continue
-		}
-
-		// New production records and unambiguous v0.13 owners migrated at open
-		// carry an opaque revision. A remaining invalid revision therefore names
-		// ambiguous or corrupt legacy evidence and cannot authorize deletion.
-		if !record.RecordRevision().Valid() {
-			release()
-			continue
-		}
-		deleted, err := r.placementAuthority.DeleteRecord(record.RecordRevision())
-		release()
-		if err != nil {
-			slog.Error("reconcile: failed to prune orphaned placement",
-				"lease_uuid", leaseUUID, "error", err)
-			continue
-		}
-		if !deleted {
-			slog.Debug("reconcile: placement changed while pruning; keeping newer record",
-				"lease_uuid", leaseUUID)
-			continue
-		}
-		cleaned++
-		slog.Info("reconcile: pruned orphaned placement", "lease_uuid", leaseUUID)
-	}
-	return cleaned
+	return r.placementPruner.cleanup(
+		ctx, chainLeases, projected, now, r.placementCleanupBudget,
+	)
 }
 
 // Start begins periodic reconciliation.

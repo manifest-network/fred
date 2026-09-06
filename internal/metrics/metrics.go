@@ -181,6 +181,18 @@ var (
 		Help:      "Panics recovered from best-effort lifecycle event sinks, by event",
 	}, []string{"event"})
 
+	// BackendInvocationPanicsTotal counts panics recovered at providerd's
+	// construction-bound backend execution boundary. Operation is selected from
+	// the constants below; backend and lease identifiers remain in logs to keep
+	// cardinality bounded. A mutation panic is classified as ambiguous because
+	// the side effect may already have crossed the process boundary.
+	BackendInvocationPanicsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "provisioner",
+		Name:      "backend_invocation_panics_total",
+		Help:      "Panics recovered from backend invocations, by bounded operation",
+	}, []string{"operation"})
+
 	// The fred_background_* panic counters live in the `background`
 	// subpackage: they are the only collectors written by more than one fred
 	// binary, and importing this package to reach them is what made every
@@ -812,8 +824,13 @@ const (
 // so it shares those metrics and is differentiated by this label rather than a
 // separate metric name (ENG-358).
 const (
-	OperationProvision = "provision"
-	OperationRestore   = "restore"
+	OperationProvision             = "provision"
+	OperationRestore               = "restore"
+	OperationDeprovision           = "deprovision"
+	OperationRestart               = "restart"
+	OperationUpdate                = "update"
+	OperationGetProvision          = "get_provision"
+	OperationReconcileCustomDomain = "reconcile_custom_domain"
 )
 
 // Capacity verdict constants are the complete bounded vocabulary for the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -17,20 +18,19 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
-	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 type resolveFailingOperationIntentJournal struct {
-	operationIntentJournal
+	callbackPublicationService
 	err error
 }
 
-func (j resolveFailingOperationIntentJournal) ResolveOperationIntent(
-	shared.OperationIntentClaim,
-	backend.CallbackStatus,
+func (j resolveFailingOperationIntentJournal) PublishOperationFailureContext(
+	context.Context,
+	shared.OperationReleaseUncommitted,
 	string,
-) (shared.CallbackEntry, error) {
-	return shared.CallbackEntry{}, j.err
+) error {
+	return j.err
 }
 
 func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlementAndConfigDrift(t *testing.T) {
@@ -62,8 +62,6 @@ func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlement
 			)
 			dir := t.TempDir()
 			retentionPath := filepath.Join(dir, "retention.db")
-			releasePath := filepath.Join(dir, "release.db")
-			callbackPath := filepath.Join(dir, "callback.db")
 
 			sourceItems := []backend.LeaseItem{{
 				SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
@@ -79,9 +77,12 @@ func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlement
 			manifestBytes, err := json.Marshal(stack)
 			require.NoError(t, err)
 
-			retentions, err := shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: retentionPath})
+			retentions, err := newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{DBPath: retentionPath})
 			require.NoError(t, err)
-			require.NoError(t, retentions.Put(shared.RetentionEntry{
+			storeSet := retentionFixtureAuthorityForTest(t, retentions)
+			callbacks := storeSet.callbacks
+			releases := storeSet.releases
+			require.NoError(t, putRetentionForTest(t, retentions, shared.RetentionEntry{
 				OriginalLeaseUUID: sourceLease,
 				Tenant:            "tenant-a",
 				ProviderUUID:      providerUUID,
@@ -92,20 +93,15 @@ func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlement
 				CreatedAt:         time.Now(),
 			}))
 
-			callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: callbackPath})
-			require.NoError(t, err)
-			storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
-			require.NoError(t, err)
+			storageID := storeSet.storage.ID()
 			callbackURL := "https://fred.example/callbacks/provision?operation_id=" + operationID
 			lifecycleURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
 			require.NoError(t, err)
-			admission, err := callbacks.BeginOperationIntent(shared.OperationIntentSpec{
+			spec := shared.OperationIntentSpec{
 				Kind:                 shared.OperationIntentRestore,
 				LeaseUUID:            destinationLease,
 				CallbackURL:          callbackURL,
 				LifecycleCallbackURL: lifecycleURL,
-				Backend:              "docker",
-				BackendStorageID:     storageID,
 				Tenant:               "tenant-a",
 				ProviderUUID:         providerUUID,
 				Items:                destinationItems,
@@ -114,17 +110,16 @@ func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlement
 				Manifest:             manifestBytes,
 				SourceLeaseUUID:      sourceLease,
 				SourceGeneration:     1,
-			})
+			}
+			admission, err := beginDockerTestOperationIntent(t, callbacks, spec, storageID)
 			require.NoError(t, err)
-			claimed, err := retentions.ClaimForRestoreWithAuthority(
+			operationClaim := createdDockerOperationClaim(t, admission)
+			claimed, err := claimRetentionForTest(t, retentions,
 				sourceLease, destinationLease, 0, destinationItems, destinationProfiles,
-				admission.Claim.OperationID(), callbackURL, lifecycleURL,
+				operationClaim.OperationID(), callbackURL, lifecycleURL,
 			)
 			require.NoError(t, err)
 
-			releases, err := shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: releasePath})
-			require.NoError(t, err)
-			require.NoError(t, releases.Close(), "inject ownership Release failure")
 			live := &provision{ //exhaustruct:enforce
 				ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
 					LeaseUUID:            destinationLease,
@@ -140,32 +135,36 @@ func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlement
 					Message:              "",
 					CallbackURL:          callbackURL,
 					LifecycleCallbackURL: lifecycleURL,
+					ActiveReleaseVersion: 0,
+					ActiveOperationID:    mustDockerOperationID(operationID),
 					Items:                destinationItems,
 					ResourceProfiles:     shared.CloneSKUResourceSnapshot(destinationProfiles),
 					ContainerIDs:         []string{"container-1"},
 					StackManifest:        stack,
 					ServiceContainers:    map[string][]string{"app": {"container-1"}},
 				},
-				ResourceProfiles:      destinationProfiles,
-				VolumeCleanupAttempts: 0,
 			}
 			beforeCrash := newBackendForTest(&mockDockerClient{}, map[string]*provision{destinationLease: live})
-			beforeCrash.retentionStore = retentions
-			beforeCrash.releaseStore = releases
-			require.Error(t, beforeCrash.finalizeRestoredLeaseStrict(destinationLease, claimed, destinationItems))
-			_, err = callbacks.ResolveOperationIntent(
-				admission.Claim, backend.CallbackStatusSuccess, "",
-			)
-			require.NoError(t, err, "the operation may settle even though its ownership finalizer remains")
-			intents, err := callbacks.ListOperationIntents()
+			bindBackendToRetentionFixtureStore(t, beforeCrash, retentions)
+			releaseCandidate, err := storeSet.operations.PrepareOperationRelease(operationClaim)
 			require.NoError(t, err)
-			assert.Empty(t, intents)
+			_, err = storeSet.operations.StartOperationExecution(releaseCandidate)
+			require.NoError(t, err)
+			require.NoError(t, releases.Close(), "inject ownership Release failure")
+			require.Error(t, beforeCrash.finalizeRestoredLeaseStrict(
+				t.Context(), destinationLease, claimed, destinationItems,
+			))
+			intents, err := listOperationIntentsForCallbackTest(t, callbacks)
+			require.NoError(t, err)
+			require.Len(t, intents, 1,
+				"success is impossible until the exact ownership Release commits")
 			require.NoError(t, retentions.Close())
 			require.NoError(t, callbacks.Close())
 			beforeCrash.stopCancel()
 
 			container := ContainerInfo{
 				ContainerID:          "container-1",
+				BackendName:          "docker",
 				LeaseUUID:            destinationLease,
 				Tenant:               "tenant-a",
 				ProviderUUID:         providerUUID,
@@ -184,23 +183,20 @@ func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlement
 				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 					return []ContainerInfo{container}, nil
 				},
+				InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
+					observed := container
+					return &observed, nil
+				},
 			}, nil)
 			t.Cleanup(afterCrash.stopCancel)
 			mutateConfig.fn(&afterCrash.cfg)
 
-			retentions, err = shared.NewRetentionStore(shared.RetentionStoreConfig{DBPath: retentionPath})
+			retentions, err = newBoundRetentionStoreForTest(t, shared.RetentionStoreConfig{DBPath: retentionPath})
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = retentions.Close() })
-			releases, err = shared.NewReleaseStore(shared.ReleaseStoreConfig{DBPath: releasePath})
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = releases.Close() })
-			callbacks, err = shared.NewCallbackStore(shared.CallbackStoreConfig{DBPath: callbackPath})
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = callbacks.Close() })
-			afterCrash.retentionStore = retentions
-			afterCrash.releaseStore = releases
-			afterCrash.callbackStore = callbacks
-			afterCrash.operationIntents = callbacks
+			storeSet = retentionFixtureAuthorityForTest(t, retentions)
+			releases = storeSet.releases
+			bindBackendToRetentionFixtureStore(t, afterCrash, retentions)
 
 			require.NoError(t, afterCrash.recoverState(context.Background()))
 			afterCrash.provisionsMu.RLock()
@@ -215,6 +211,7 @@ func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlement
 			assert.Equal(t, int64(1536), allocation.MemoryMB)
 			assert.Equal(t, int64(3072), allocation.DiskMB)
 
+			require.NoError(t, afterCrash.recoverOperationIntents(context.Background()))
 			require.NoError(t, afterCrash.reconcileRetentions(context.Background()))
 			remaining, err := retentions.Get(sourceLease)
 			require.NoError(t, err)
@@ -229,6 +226,11 @@ func TestRestoreDestinationAuthority_RecoversAfterReleaseFailureIntentSettlement
 }
 
 func TestRestoreRejectsNonActiveSourceBeforeIntentOrProjection(t *testing.T) {
+	const (
+		sourceLease      = "33333333-3333-4333-8333-333333333333"
+		destinationLease = "44444444-4444-4444-8444-444444444444"
+		otherDestination = "55555555-5555-4555-8555-555555555555"
+	)
 	for _, status := range []string{
 		shared.RetentionStatusRestoring,
 		shared.RetentionStatusReaping,
@@ -237,8 +239,8 @@ func TestRestoreRejectsNonActiveSourceBeforeIntentOrProjection(t *testing.T) {
 			b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
 			retentions := attachRetentionStore(t, b)
 			source := shared.RetentionEntry{
-				OriginalLeaseUUID: "source",
-				NewLeaseUUID:      "some-other-destination",
+				OriginalLeaseUUID: sourceLease,
+				NewLeaseUUID:      otherDestination,
 				Tenant:            "tenant-a",
 				ProviderUUID:      "prov-1",
 				Items: []backend.LeaseItem{{
@@ -250,28 +252,32 @@ func TestRestoreRejectsNonActiveSourceBeforeIntentOrProjection(t *testing.T) {
 				CreatedAt:     time.Now(),
 			}
 			if status == shared.RetentionStatusRestoring {
-				putRestoringRetention(t, retentions, source)
+				source = *putRestoringRetention(t, retentions, source)
 			} else {
-				require.NoError(t, retentions.Put(source))
+				require.NoError(t, putRetentionForTest(t, retentions, source))
+				stored, getErr := retentions.Get(sourceLease)
+				require.NoError(t, getErr)
+				require.NotNil(t, stored)
+				source = *stored
 			}
-			b.operationIntents = fixedOperationIntentProbeJournal{
+			b.operationSettlement = fixedOperationIntentProbeJournal{
 				disposition: shared.OperationIntentAdmissionNone,
 			}
 
 			err := b.Restore(context.Background(), restoreRequest(
-				"new-destination", "source", "http://localhost/callbacks/provision",
+				destinationLease, sourceLease, "http://localhost/callbacks/provision",
 			))
 			require.ErrorIs(t, err, backend.ErrInvalidState)
 			assert.NotContains(t, err.Error(), "unexpected BeginOperationIntent")
 			b.provisionsMu.RLock()
-			_, projected := b.provisions["new-destination"]
+			_, projected := b.provisions[destinationLease]
 			b.provisionsMu.RUnlock()
 			assert.False(t, projected)
-			stored, getErr := retentions.Get("source")
+			stored, getErr := retentions.Get(sourceLease)
 			require.NoError(t, getErr)
 			require.NotNil(t, stored)
 			assert.Equal(t, status, stored.Status)
-			assert.Equal(t, 7, stored.Generation)
+			assert.Equal(t, source.Generation, stored.Generation)
 		})
 	}
 }
@@ -307,22 +313,34 @@ func TestPendingRestoreFinalizerBlocksDestinationReuseUntilHandback(t *testing.T
 		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 0, ServiceName: "app"}},
 		Payload:      []byte(`{}`),
 	})
-	require.ErrorIs(t, provisionErr, backend.ErrInvalidState)
+	require.ErrorIs(t, provisionErr, shared.ErrOperationIntentConflict)
 
 	restoreErr := b.Restore(context.Background(), restoreRequest(
 		destination, differentSource, "http://localhost/callbacks/provision",
 	))
-	require.ErrorIs(t, restoreErr, backend.ErrInvalidState)
-	restartErr := b.Restart(context.Background(), backend.RestartRequest{LeaseUUID: destination})
+	require.ErrorIs(t, restoreErr, shared.ErrOperationIntentConflict)
+	restartErr := b.Restart(context.Background(), backend.RestartRequest{
+		MaintenanceID: newTestMaintenanceID(t), LeaseUUID: destination,
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+	})
 	require.ErrorIs(t, restartErr, backend.ErrInvalidState)
-	updateErr := b.Update(context.Background(), backend.UpdateRequest{LeaseUUID: destination})
+	updateErr := b.Update(context.Background(), backend.UpdateRequest{
+		MaintenanceID: newTestMaintenanceID(t), LeaseUUID: destination,
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+	})
 	require.ErrorIs(t, updateErr, backend.ErrInvalidState)
 
-	ok, err := retentions.RevertToActiveWithResourceProfiles(
-		sourceLease, destination, claimed.Generation, claimed.ResourceProfiles,
-	)
+	proof, err := retentions.ProveRestoringSnapshot(*claimed)
 	require.NoError(t, err)
-	require.True(t, ok)
+	claims, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	require.NoError(t, b.resolvePreEffectOperationRefusal(
+		claims[0], "test restore abandoned before effects",
+	))
+	acknowledgePendingCallbacksForTest(t, b.callbackStore)
+	_, err = retentions.RollbackRestoring(proof, claimed.ResourceProfiles)
+	require.NoError(t, err)
 	assert.NoError(t, b.ensureRestoreDestinationUnowned(destination))
 
 	// The same deliberately-invalid requests now pass the finalizer guard and
@@ -342,9 +360,15 @@ func TestPendingRestoreFinalizerBlocksDestinationReuseUntilHandback(t *testing.T
 		destination, differentSource, "http://localhost/callbacks/provision",
 	))
 	require.ErrorIs(t, restoreErr, backend.ErrNotRetained)
-	restartErr = b.Restart(context.Background(), backend.RestartRequest{LeaseUUID: destination})
+	restartErr = b.Restart(context.Background(), backend.RestartRequest{
+		MaintenanceID: newTestMaintenanceID(t), LeaseUUID: destination,
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+	})
 	require.ErrorIs(t, restartErr, backend.ErrNotProvisioned)
-	updateErr = b.Update(context.Background(), backend.UpdateRequest{LeaseUUID: destination})
+	updateErr = b.Update(context.Background(), backend.UpdateRequest{
+		MaintenanceID: newTestMaintenanceID(t), LeaseUUID: destination,
+		CallbackURL: testMaintenanceLifecycleCallbackURL,
+	})
 	require.ErrorIs(t, updateErr, backend.ErrNotProvisioned)
 }
 
@@ -366,7 +390,7 @@ func TestRecoverState_PendingRestoreCleanupCountsAllocationWithoutRestartablePro
 	destinationProfiles := []shared.SKUResourceSnapshot{{
 		SKU: "removed-destination", CPUCores: 1.25, MemoryMB: 768, DiskMB: 2048,
 	}}
-	require.NoError(t, retentions.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, retentions, shared.RetentionEntry{
 		OriginalLeaseUUID: sourceLease,
 		Tenant:            "tenant-a",
 		ProviderUUID:      "provider-a",
@@ -377,7 +401,7 @@ func TestRecoverState_PendingRestoreCleanupCountsAllocationWithoutRestartablePro
 		CreatedAt:         time.Now(),
 	}))
 	operationID, callbackURL, lifecycleURL := restoreDestinationAuthority(t)
-	_, err := retentions.ClaimForRestoreWithAuthority(
+	_, err := claimRetentionForTest(t, retentions,
 		sourceLease, destinationLease, 0, destinationItems, destinationProfiles,
 		operationID, callbackURL, lifecycleURL,
 	)
@@ -392,8 +416,8 @@ func TestRecoverState_PendingRestoreCleanupCountsAllocationWithoutRestartablePro
 	require.NotNil(t, allocation, "durable destination authority must keep the pending footprint counted")
 	assert.Equal(t, int64(2048), allocation.DiskMB)
 
-	restartErr := b.Restart(context.Background(), backend.RestartRequest{
-		LeaseUUID: destinationLease,
+	restartErr := b.Restart(context.Background(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+		LeaseUUID: destinationLease, CallbackURL: testMaintenanceLifecycleCallbackURL,
 	})
 	require.ErrorIs(t, restartErr, backend.ErrInvalidState)
 }
@@ -451,7 +475,7 @@ func TestRestore_CanceledWhileWaitingForRecoverySnapshotHasNoSideEffects(t *test
 	unlock()
 	require.ErrorIs(t, waitForAsyncTestResult(t, restoreDone, "canceled Restore"), context.Canceled)
 
-	intents, err := b.operationIntents.ListOperationIntents()
+	intents, err := b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
 	assert.Empty(t, intents)
 	b.provisionsMu.RLock()
@@ -471,7 +495,7 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 		destinationLease = "0192f1a0-2222-7abc-8def-000000000212"
 		stableLease      = "0192f1a0-3333-7abc-8def-000000000213"
 	)
-	const stableOperationID = shared.OperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
+	stableOperationID := mustDockerOperationID("9a72fbc2-38c8-4f31-87f7-f689979b9324")
 	stableCallbackURL := "https://stable.example/callbacks/provision?operation_id=" + stableOperationID.String()
 	stableLifecycleURL, err := backend.ResolveLifecycleCallbackURL(stableCallbackURL, "")
 	require.NoError(t, err)
@@ -497,7 +521,10 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	var firstRecovery = true
 	var blockRollbackRecovery bool
 	var staleRestoreContainer ContainerInfo
+	var staleRestorePresent bool
+	var removedStaleRestore int
 	var inventoryMu sync.Mutex
+	var b *Backend
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			inventoryMu.Lock()
@@ -509,24 +536,58 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 				return []ContainerInfo{stableContainer}, nil
 			}
 			if blockRollbackRecovery {
+				containers := []ContainerInfo{stableContainer}
+				if staleRestorePresent {
+					containers = append(containers, staleRestoreContainer)
+				}
+				// Failed-operation cleanup deliberately runs before recoverState
+				// opens its publication snapshot. Let those strict observations
+				// see and remove the exact late generation. Park only the later
+				// ordinary inventory while the snapshot write lock is held.
+				publicationSnapshotHeld := !b.recoverySnapshotMu.TryLock()
+				if !publicationSnapshotHeld {
+					b.recoverySnapshotMu.Unlock()
+					inventoryMu.Unlock()
+					return containers, nil
+				}
 				blockRollbackRecovery = false
-				container := staleRestoreContainer
 				inventoryMu.Unlock()
 				close(rollbackInventoryEntered)
 				<-releaseRollbackInventory
-				return []ContainerInfo{stableContainer, container}, nil
+				return containers, nil
 			}
 			inventoryMu.Unlock()
-			return nil, nil
+			return []ContainerInfo{stableContainer}, nil
+		},
+		RemoveContainerFn: func(_ context.Context, containerID string) error {
+			inventoryMu.Lock()
+			defer inventoryMu.Unlock()
+			if containerID != staleRestoreContainer.ContainerID || !staleRestorePresent {
+				return fmt.Errorf("unexpected targeted removal of container %q", containerID)
+			}
+			staleRestorePresent = false
+			removedStaleRestore++
+			return nil
 		},
 		PullImageFn: func(context.Context, string, time.Duration) error {
 			return nil
 		},
-		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
-			return &ContainerInfo{Status: "running"}, nil
+		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+			inventoryMu.Lock()
+			defer inventoryMu.Unlock()
+			switch containerID {
+			case stableContainer.ContainerID:
+				observed := stableContainer
+				return &observed, nil
+			case staleRestoreContainer.ContainerID:
+				observed := staleRestoreContainer
+				return &observed, nil
+			default:
+				return nil, fmt.Errorf("unexpected inspect of container %q", containerID)
+			}
 		},
 	}
-	b := newBackendForProvisionTest(t, mock, nil)
+	b = newBackendForProvisionTest(t, mock, nil)
 	retentions := attachRetentionStore(t, b)
 	t.Cleanup(func() {
 		b.stopCancel()
@@ -539,12 +600,15 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 		stableCallbackURL, stableLifecycleURL,
 	)
 	require.NoError(t, err)
-	require.NoError(t, b.releaseStore.AppendActive(stableLease, shared.Release{
+	operations, ok := b.operationSettlement.(*shared.OperationSettlement)
+	require.True(t, ok)
+	seedProvisionReleaseForLeaseTest(t, b.callbackStore, b.releaseStore, operations, stableLease, shared.Release{
 		Manifest: validManifestJSON("nginx:latest"), Image: "stack", OperationID: stableOperationID,
 		Items: stableItems, ResourceProfiles: stableProfiles, RuntimeAuthority: &stableAuthority,
 		Status: "active", CreatedAt: stableContainer.CreatedAt,
-	}))
+	})
 	b.cfg.StartupVerifyDuration = time.Millisecond
+	b.cfg.ProvisionTimeout = time.Millisecond
 	b.compose = &mockComposeExecutor{
 		UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
 			return errors.New("compose up boom")
@@ -580,9 +644,10 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	}
 
 	operationAdmitted := make(chan struct{})
-	b.operationIntents = &stagedRecoveryOperationIntentJournal{
-		delegate:          b.operationIntents,
-		operationAdmitted: operationAdmitted,
+	b.operationSettlement = &stagedRecoveryOperationIntentJournal{
+		operationSettlementService: b.operationSettlement,
+		delegate:                   b.operationSettlement,
+		operationAdmitted:          operationAdmitted,
 	}
 	recoverErr := make(chan error, 1)
 	go func() { recoverErr <- b.recoverState(context.Background()) }()
@@ -608,7 +673,8 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	require.NoError(t, err)
 	staleRestoreContainer = ContainerInfo{
 		ContainerID: "transient-restore-container", Name: "fred-" + destinationLease + "-app-0",
-		LeaseUUID: destinationLease, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+		BackendName: b.cfg.Name,
+		LeaseUUID:   destinationLease, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 		SKU: restoreReq.Items[0].SKU, ServiceName: manifest.DefaultServiceName, InstanceIndex: 0,
 		Image: "nginx:latest", CallbackURL: restoreReq.CallbackURL,
 		LifecycleCallbackURL: restoreLifecycleURL, Status: "running",
@@ -644,19 +710,21 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	assert.Equal(t, backend.ProvisionStatusReady, stable.Status)
 	assert.NotNil(t, b.pool.GetAllocation(stableLease+"-app-0"))
 
-	// Drive the accepted operation through its real actor failure and the
-	// production restoring reconciler. The rollback handoff is also protected by
-	// recoverySnapshotMu, so the final state contains neither half of a transient
-	// destination generation.
+	// Drive the accepted operation through its real actor handoff. A failed
+	// Compose call is ambiguous until the live operation-recovery lane obtains
+	// actor quiescence and performs a second strict absence observation; ordinary
+	// state recovery cannot mint that causal proof.
 	require.Eventually(t, func() bool {
-		b.provisionsMu.RLock()
-		provision := b.provisions[destinationLease]
-		failed := provision != nil && provision.Status == backend.ProvisionStatusFailed
-		b.provisionsMu.RUnlock()
-		claims, listErr := b.operationIntents.ListOperationIntents()
-		return listErr == nil && failed && len(claims) == 0 &&
-			!b.leaseActorProcessingOrQueued(destinationLease)
-	}, 5*time.Second, 10*time.Millisecond, "accepted restore must settle Failed before rollback")
+		actorClaim := b.tryClaimLeaseActorQuiescence(destinationLease)
+		if actorClaim != nil {
+			actorClaim.Release()
+		}
+		return actorClaim != nil
+	}, 5*time.Second, 10*time.Millisecond, "accepted restore actor must become quiescent")
+	require.NoError(t, b.recoverLiveOperationIntents(context.Background()))
+	claims, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	assert.Empty(t, claims, "operation recovery must durably settle the failed restore")
 	entry, err := retentions.Get(sourceLease)
 	require.NoError(t, err)
 	require.NotNil(t, entry)
@@ -670,14 +738,22 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	// resurrects the destination allocation (the absent→transient→absent ABA).
 	inventoryMu.Lock()
 	blockRollbackRecovery = true
+	staleRestorePresent = true
 	inventoryMu.Unlock()
 	rollbackRecoveryDone := make(chan error, 1)
 	go func() { rollbackRecoveryDone <- b.recoverState(context.Background()) }()
 	select {
 	case <-rollbackInventoryEntered:
+	case recoveryErr := <-rollbackRecoveryDone:
+		t.Fatalf("rollback recovery returned before opening its publication snapshot: %v", recoveryErr)
 	case <-time.After(3 * time.Second):
 		t.Fatal("rollback recovery did not inventory the transient restore container")
 	}
+	inventoryMu.Lock()
+	assert.False(t, staleRestorePresent,
+		"durably failed restore substrate must be removed before ordinary recovery can publish it")
+	assert.Equal(t, 1, removedStaleRestore)
+	inventoryMu.Unlock()
 	reconcileDone := make(chan error, 1)
 	rollbackHandoffMu.Lock()
 	observeRollbackHandoff = true
@@ -734,7 +810,7 @@ func TestRecoverState_ActiveRestoreReleaseWithNoSurvivorsRemainsRepairableAcross
 		SKU: "destination-tier", CPUCores: 1.25, MemoryMB: 768, DiskMB: 2048,
 	}}
 	stack := restoreStackManifest()
-	require.NoError(t, retentions.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, retentions, shared.RetentionEntry{
 		OriginalLeaseUUID: sourceLease,
 		Tenant:            "tenant-a",
 		ProviderUUID:      providerUUID,
@@ -745,25 +821,12 @@ func TestRecoverState_ActiveRestoreReleaseWithNoSurvivorsRemainsRepairableAcross
 		CreatedAt:         time.Now(),
 	}))
 	operationID, callbackURL, lifecycleURL := restoreDestinationAuthority(t)
-	_, err := retentions.ClaimForRestoreWithAuthority(
+	_, err := claimRetentionForTest(t, retentions,
 		sourceLease, destinationLease, 0, destinationItems, destinationProfiles,
 		operationID, callbackURL, lifecycleURL,
 	)
 	require.NoError(t, err)
-	manifestBytes, err := json.Marshal(stack)
-	require.NoError(t, err)
-	require.NoError(t, releases.Append(destinationLease, shared.Release{
-		Manifest:         manifestBytes,
-		Image:            "stack",
-		OperationID:      operationID,
-		Items:            destinationItems,
-		ResourceProfiles: destinationProfiles,
-		RuntimeAuthority: mustTestReleaseRuntimeAuthority(
-			t, operationID, "tenant-a", providerUUID, callbackURL, lifecycleURL,
-		),
-		Status:    "active",
-		CreatedAt: time.Now(),
-	}))
+	commitPendingOperationReleaseForTest(t, b.operationSettlement, destinationLease)
 
 	require.NoError(t, b.RefreshState(context.Background()),
 		"an exact lingering restore finalizer must explain the empty active-release cohort")
@@ -814,12 +877,13 @@ func TestUnacceptedRestoreSettlementFailureRetainsPeriodicRollbackAuthority(t *t
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
 	bindTestStorageIdentity(t, b, mock)
+	operations, ok := concreteOperationSettlementForTest(b.operationSettlement)
+	require.True(t, ok)
+	b.operationSettlement = operations
+	b.releaseCapacityPlanner = operations
 	retentions := attachRetentionStore(t, b)
 	attachReleaseStore(t, b)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
+	callbacks := b.callbackStore
 	t.Cleanup(func() { require.NoError(t, callbacks.Close()) })
 	b.callbackStore = callbacks
 
@@ -837,7 +901,7 @@ func TestUnacceptedRestoreSettlementFailureRetainsPeriodicRollbackAuthority(t *t
 	}}
 	retainedVolume := retainedName(canonicalVolumeName(sourceLease, manifest.DefaultServiceName, 0))
 	stack := restoreStackManifest()
-	require.NoError(t, retentions.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, retentions, shared.RetentionEntry{
 		OriginalLeaseUUID:   sourceLease,
 		Tenant:              "tenant-a",
 		ProviderUUID:        providerUUID,
@@ -848,34 +912,24 @@ func TestUnacceptedRestoreSettlementFailureRetainsPeriodicRollbackAuthority(t *t
 		Status:              shared.RetentionStatusActive,
 		CreatedAt:           time.Now(),
 	}))
-	manifestBytes, err := json.Marshal(stack)
-	require.NoError(t, err)
-	storageID := b.storageIdentity
 	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + operationID
 	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
 	require.NoError(t, err)
-	claimed, err := retentions.ClaimForRestoreWithAuthority(
+	claimed, err := claimRetentionForTest(t, retentions,
 		sourceLease, destinationLease, 0, destinationItems, destinationProfiles,
-		shared.OperationID(operationID), callbackURL, lifecycleURL,
+		mustDockerOperationID(operationID), callbackURL, lifecycleURL,
 	)
 	require.NoError(t, err)
-	admission, err := callbacks.BeginOperationIntent(shared.OperationIntentSpec{
-		Kind:                 shared.OperationIntentRestore,
-		LeaseUUID:            destinationLease,
-		CallbackURL:          callbackURL,
-		LifecycleCallbackURL: lifecycleURL,
-		Backend:              b.Name(),
-		BackendStorageID:     storageID,
-		Tenant:               "tenant-a",
-		ProviderUUID:         providerUUID,
-		Items:                destinationItems,
-		ResourceProfiles:     destinationProfiles,
-		EffectiveItems:       destinationItems,
-		Manifest:             manifestBytes,
-		SourceLeaseUUID:      sourceLease,
-		SourceGeneration:     claimed.Generation,
-	})
+	claims, err := b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
+	var operationClaim shared.OperationIntentClaim
+	for _, claim := range claims {
+		if claim.LeaseUUID() == destinationLease && claim.OperationID() == mustDockerOperationID(operationID) {
+			operationClaim = claim
+			break
+		}
+	}
+	require.True(t, operationClaim.Valid(), "restore claim must remain recoverable from the durable journal")
 
 	b.provisionsMu.Lock()
 	b.provisions[destinationLease] = &provision{ //exhaustruct:enforce
@@ -893,14 +947,14 @@ func TestUnacceptedRestoreSettlementFailureRetainsPeriodicRollbackAuthority(t *t
 			Message:              "",
 			CallbackURL:          callbackURL,
 			LifecycleCallbackURL: lifecycleURL,
+			ActiveReleaseVersion: 0,
+			ActiveOperationID:    mustDockerOperationID(operationID),
 			Items:                destinationItems,
 			ResourceProfiles:     shared.CloneSKUResourceSnapshot(destinationProfiles),
 			ContainerIDs:         nil,
 			StackManifest:        stack,
 			ServiceContainers:    nil,
 		},
-		ResourceProfiles:      destinationProfiles,
-		VolumeCleanupAttempts: 0,
 	}
 	b.provisionsMu.Unlock()
 	allocationID := destinationLease + "-app-0"
@@ -916,17 +970,17 @@ func TestUnacceptedRestoreSettlementFailureRetainsPeriodicRollbackAuthority(t *t
 		EnsureQuotaFn:  func(context.Context, string, int64) error { return nil },
 	}
 	settlementErr := errors.New("callback bbolt unavailable")
-	b.operationIntents = resolveFailingOperationIntentJournal{
-		operationIntentJournal: callbacks,
-		err:                    settlementErr,
+	workingPublisher := b.callbackPublisher
+	b.callbackPublisher = resolveFailingOperationIntentJournal{
+		callbackPublicationService: b.callbackPublisher,
+		err:                        settlementErr,
 	}
 
 	err = b.rollbackUnacceptedRestoreAdoption(
-		context.Background(),
 		destinationLease,
 		[]string{allocationID},
 		claimed,
-		admission.Claim,
+		operationClaim,
 		errors.New("actor rejected restore"),
 		b.logger,
 	)
@@ -941,18 +995,19 @@ func TestUnacceptedRestoreSettlementFailureRetainsPeriodicRollbackAuthority(t *t
 	_, projected := b.provisions[destinationLease]
 	b.provisionsMu.RUnlock()
 	assert.False(t, projected, "dead Provisioning state must not block the retry sweep")
-	intents, err := callbacks.ListOperationIntents()
+	intents, err := listOperationIntentsForCallbackTest(t, callbacks)
 	require.NoError(t, err)
 	require.Len(t, intents, 1)
 
-	b.operationIntents = callbacks
+	b.callbackPublisher = workingPublisher
+	require.NoError(t, b.recoverLiveOperationIntents(context.Background()))
 	require.NoError(t, b.reconcileRestoring(context.Background(), *stored))
 	stored, err = retentions.Get(sourceLease)
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.Equal(t, shared.RetentionStatusActive, stored.Status)
 	assert.Nil(t, b.pool.GetAllocation(allocationID))
-	intents, err = callbacks.ListOperationIntents()
+	intents, err = listOperationIntentsForCallbackTest(t, callbacks)
 	require.NoError(t, err)
 	assert.Empty(t, intents)
 	pending, err := callbacks.ListPending()
@@ -963,7 +1018,7 @@ func TestUnacceptedRestoreSettlementFailureRetainsPeriodicRollbackAuthority(t *t
 
 func restoreDestinationAuthority(t *testing.T) (shared.OperationID, string, string) {
 	t.Helper()
-	operationID := shared.OperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
+	operationID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c8")
 	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + operationID.String()
 	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
 	require.NoError(t, err)
@@ -998,22 +1053,21 @@ func newCommittedRestoreCallbackFixture(t *testing.T) committedRestoreCallbackFi
 	}
 	b := newBackendForProvisionTest(t, dockerClient, nil)
 	bindTestStorageIdentity(t, b, dockerClient)
+	operations, ok := concreteOperationSettlementForTest(b.operationSettlement)
+	require.True(t, ok)
+	b.operationSettlement = operations
+	b.releaseCapacityPlanner = operations
 	retentions := attachRetentionStore(t, b)
 	releases := attachReleaseStore(t, b)
-	callbacks, err := shared.NewCallbackStore(shared.CallbackStoreConfig{
-		DBPath: b.cfg.CallbackDBPath,
-	})
-	require.NoError(t, err)
+	callbacks := b.callbackStore
 	t.Cleanup(func() { _ = callbacks.Close() })
-	b.callbackStore = callbacks
-	b.operationIntents = callbacks
 
 	items := []backend.LeaseItem{{
 		SKU: "docker-small", Quantity: 1, ServiceName: manifest.DefaultServiceName,
 	}}
 	resourceProfiles := testResourceProfiles(t, items)
 	stack := restoreStackManifest()
-	require.NoError(t, retentions.Put(shared.RetentionEntry{
+	require.NoError(t, putRetentionForTest(t, retentions, shared.RetentionEntry{
 		OriginalLeaseUUID: sourceLease,
 		Tenant:            "tenant-a",
 		ProviderUUID:      providerUUID,
@@ -1024,28 +1078,15 @@ func newCommittedRestoreCallbackFixture(t *testing.T) committedRestoreCallbackFi
 		CreatedAt:         time.Now(),
 	}))
 	operationID, callbackURL, lifecycleCallbackURL := restoreDestinationAuthority(t)
-	_, err = retentions.ClaimForRestoreWithAuthority(
+	_, err := claimRetentionForTest(t, retentions,
 		sourceLease, destinationLease, 0,
 		items, resourceProfiles,
 		operationID, callbackURL, lifecycleCallbackURL,
 	)
 	require.NoError(t, err)
-	manifestBytes, err := json.Marshal(stack)
-	require.NoError(t, err)
-	runtimeAuthority, err := shared.NewReleaseRuntimeAuthority(
-		operationID, "tenant-a", providerUUID, callbackURL, lifecycleCallbackURL,
-	)
-	require.NoError(t, err)
-	require.NoError(t, releases.Append(destinationLease, shared.Release{
-		Manifest:         manifestBytes,
-		Image:            "stack",
-		OperationID:      operationID,
-		Items:            items,
-		ResourceProfiles: resourceProfiles,
-		RuntimeAuthority: &runtimeAuthority,
-		Status:           "active",
-		CreatedAt:        time.Now(),
-	}))
+	committed := commitPendingOperationReleaseForTest(t, b.operationSettlement, destinationLease)
+	require.NoError(t, b.callbackPublisher.PublishOperationSuccessContext(context.Background(), committed))
+	acknowledgePendingCallbacksForTest(t, callbacks)
 
 	return committedRestoreCallbackFixture{
 		backend:              b,
@@ -1084,14 +1125,14 @@ func (f committedRestoreCallbackFixture) projectDestination(
 			Message:              "",
 			CallbackURL:          callbackURL,
 			LifecycleCallbackURL: lifecycleCallbackURL,
+			ActiveReleaseVersion: 0,
+			ActiveOperationID:    f.operationID,
 			Items:                f.items,
 			ResourceProfiles:     shared.CloneSKUResourceSnapshot(f.resourceProfiles),
 			ContainerIDs:         nil,
 			StackManifest:        f.stack,
 			ServiceContainers:    map[string][]string{},
 		},
-		ResourceProfiles:      f.resourceProfiles,
-		VolumeCleanupAttempts: 0,
 	}
 }
 
@@ -1116,16 +1157,22 @@ func TestCommittedRestoreClose_KeepsFinalizerRouteUntilMovedCloseJournalHandoff(
 		movedLifecycleURL,
 	)
 	require.NoError(t, err)
-	require.NoError(t, fixture.releases.AppendActive(fixture.destinationLease, shared.Release{
-		Manifest:         manifestBytes,
-		Image:            "stack",
-		OperationID:      fixture.operationID,
-		Items:            fixture.items,
-		ResourceProfiles: fixture.resourceProfiles,
-		RuntimeAuthority: &movedAuthority,
-		Status:           "active",
-		CreatedAt:        time.Now(),
-	}))
+	maintenanceActive := activateMaintenanceReleaseForTest(
+		t, fixture.backend.maintenanceSettlement, fixture.destinationLease,
+		shared.MaintenanceIntentUpdate, shared.Release{
+			Manifest:         manifestBytes,
+			Image:            "stack",
+			OperationID:      fixture.operationID,
+			Items:            fixture.items,
+			ResourceProfiles: fixture.resourceProfiles,
+			RuntimeAuthority: &movedAuthority,
+			Status:           "active",
+			CreatedAt:        time.Now(),
+		})
+	require.NoError(t, fixture.backend.callbackPublisher.PublishMaintenanceSuccessContext(
+		context.Background(), maintenanceActive,
+	))
+	acknowledgePendingCallbacksForTest(t, fixture.callbacks)
 
 	unlock := fixture.backend.commandFence.Lock(fixture.destinationLease)
 	require.NoError(t, fixture.backend.ensureCommittedRestoreDestinationForClose(fixture.destinationLease))
@@ -1139,12 +1186,6 @@ func TestCommittedRestoreClose_KeepsFinalizerRouteUntilMovedCloseJournalHandoff(
 		context.Background(),
 		fixture.destinationLease,
 		true,
-		"tenant-a",
-		fixture.providerUUID,
-		fixture.items,
-		fixture.stack,
-		movedCallbackURL,
-		movedLifecycleURL,
 	)
 	require.NoError(t, err)
 	require.True(t, found)

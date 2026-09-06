@@ -23,14 +23,15 @@ import (
 )
 
 // retainedVolumePrefix is the namespace soft-deleted volumes are renamed into.
-// It keeps the leading "fred-" so listVolumeIDs still enumerates the dir, but the
-// distinct "retained" token makes cleanupOrphanedVolumes' expected-set match miss it.
+// It keeps the leading "fred-" so complete managed-volume inventories include it,
+// while the distinct "retained" token separates durable retained data from a live mount.
 const retainedVolumePrefix = "fred-retained-"
 
 // canonicalVolumeName is the live volume name a provision/restore mounts.
-// Every managed volume name in the backend is built here — setupVolBinds, the close
-// path, the legacy migration, and the owner table (volume_destroy.go) all call it rather
-// than repeating the format string, which is how the orphan reaper's copy came to drift.
+// Every managed volume name in the backend is built here — setupVolBinds, the
+// close path, restore, and the owner table (volume_destroy.go) all call it
+// rather than repeating the format string, which is how the orphan reaper's
+// copy came to drift.
 func canonicalVolumeName(leaseUUID, serviceName string, idx int) string {
 	return fmt.Sprintf("fred-%s-%s-%d", leaseUUID, serviceName, idx)
 }
@@ -71,22 +72,38 @@ func leaseVolumePrefix(leaseUUID string) string {
 // returns nil (idempotent success). It logs and RETURNS the error so callers
 // can decide whether the failure is fatal to their step (e.g. the restoring-arm
 // rollback must NOT advance the record if a re-quarantine rename actually
-// failed, or the still-canonical volume would be reaped). reconcileRetentions'
-// active arm tolerates the error because cleanupOrphanedVolumes independently
-// protects retention-record canonicals.
-func (b *Backend) renameIfPresent(ctx context.Context, oldName, newName string) error {
-	if err := b.mutationAdapter().renameVolume(ctx, oldName, newName); err != nil {
+// failed, or the still-canonical volume would remain exposed). reconcileRetentions'
+// active arm tolerates the error because the exact active record continues to claim
+// both its retained name and canonical counterpart; the next sweep retries the rename.
+func (b *Backend) renameIfPresentUsing(
+	ctx context.Context,
+	renameVolume backgroundVolumeRename,
+	oldName, newName string,
+) error {
+	if renameVolume == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
+	if err := renameVolume(ctx, oldName, newName); err != nil {
 		b.logger.Warn("reconcile rename skipped", "old", oldName, "new", newName, "error", err)
 		return err
 	}
 	return nil
 }
 
-// reconcileRetentions repairs crash-interrupted soft-deletes/restores. MUST run
-// AFTER recoverState (so b.provisions reflects live containers) and BEFORE
-// cleanupOrphanedVolumes (so a mid-rename canonical dir is moved back into the
-// fred-retained- namespace before the orphan reaper could destroy it).
-func (b *Backend) reconcileRetentions(ctx context.Context) error {
+// reconcileRetentions repairs crash-interrupted soft-deletes/restores. It runs
+// after recoverState so b.provisions reflects live containers. Unattributed managed
+// volumes are never destroyed by inference; exact retention records remain the only
+// authority for these rename/finalization steps.
+func (b *Backend) reconcileRetentionsUsing(
+	ctx context.Context,
+	renameVolume backgroundVolumeRename,
+	teardown teardownMutationCapability,
+	destroyVolumes volumeDestroyMutationCapability,
+	ensureQuota backgroundVolumeQuota,
+) error {
+	if renameVolume == nil || teardown == nil || destroyVolumes == nil || ensureQuota == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
 	if b.retentionStore == nil {
 		return nil
 	}
@@ -95,9 +112,6 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 		return err
 	}
 	var reconcileErrs []error
-	// One enumeration for the whole boot walk; the reaping arm below is its only user, and
-	// it is resolved lazily so a store with no reaping records pays nothing.
-	//
 	// This walk is longer-lived than a sweep — the restoring arm runs compose teardowns and
 	// re-quarantine RENAMES — so it is worth stating why a snapshot survives it. The
 	// dangerous shape would be a rename that moves a volume INTO a reaping lease's namespace
@@ -108,16 +122,15 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 	// OriginalLeaseUUID, so it holds exactly one record per lease. Every other staleness is
 	// self-correcting: a volume that appeared is simply not destroyed this pass, and one that
 	// vanished makes its destroy an idempotent no-op.
-	idx := b.newManagedVolumeIndex()
 	for _, e := range all {
 		switch e.Status {
 		case shared.RetentionStatusActive:
 			// Crash after Put before rename: a canonical volume may still be on disk.
-			// On rename failure we log and keep going — cleanupOrphanedVolumes
-			// independently protects this record's canonical from the reaper.
+			// On rename failure we log and keep going: the active retention record
+			// continues to claim its canonical counterpart and a later sweep retries.
 			for _, retained := range e.RetainedVolumeNames {
 				canonical := canonicalFromRetained(retained)
-				if rerr := b.renameIfPresent(ctx, canonical, retained); rerr != nil {
+				if rerr := b.renameIfPresentUsing(ctx, renameVolume, canonical, retained); rerr != nil {
 					b.logger.Warn("reconcile: re-quarantine of active canonical failed (cleanup protection covers it)",
 						"lease_uuid", e.OriginalLeaseUUID, "canonical", canonical, "error", rerr)
 					reconcileErrs = append(reconcileErrs, fmt.Errorf(
@@ -127,22 +140,169 @@ func (b *Backend) reconcileRetentions(ctx context.Context) error {
 				}
 			}
 		case shared.RetentionStatusRestoring:
-			if rerr := b.reconcileRestoring(ctx, e); rerr != nil {
+			if rerr := b.reconcileRestoringWithAuthorityUsing(
+				ctx, e, renameVolume, teardown, destroyVolumes, ensureQuota,
+			); rerr != nil {
 				reconcileErrs = append(reconcileErrs, rerr)
 			}
-		case shared.RetentionStatusReaping:
-			// Finalizer retry at boot: re-attempt destroy of any record stranded
-			// reaping by a prior crash/destroy-failure; delete it when confirmed gone.
-			b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID)
+		}
+	}
+	// A reaping DTO is deliberately insufficient to resume destruction. Select
+	// exact tombstone proofs after the potentially long restoring walk, then
+	// carry each unchanged proof through physical cleanup and finalizer delete.
+	reaping, proofErr := b.retentionStore.ListReapingProofs()
+	if proofErr != nil {
+		reconcileErrs = append(reconcileErrs, fmt.Errorf("list reaping authority: %w", proofErr))
+	} else {
+		idx := b.newManagedVolumeIndex()
+		for _, proof := range reaping {
+			b.destroyReapingVolumesUsing(ctx, idx, proof, destroyVolumes)
 		}
 	}
 	return errors.Join(reconcileErrs...)
 }
 
-// reconcileRestoring finalizes or rolls back an interrupted/failed restore,
-// conservatively (defers to an in-flight restore; generation-CAS rollback).
-func (b *Backend) reconcileRestoring(ctx context.Context, e shared.RetentionEntry) error {
-	return b.reconcileRestoringWithAuthority(ctx, e)
+// restoreRecoveryPlan is a closed set of decisions. In particular, destructive
+// rollback is represented only by the two types carrying durable failed or
+// still-pending authority; a missing row can never be converted into one.
+type restoreRecoveryPlan interface{ restoreRecoveryPlan() }
+
+// The two plan families are distinct capabilities: code that can commit a
+// destination cannot be passed to the destructive rollback path, and vice
+// versa. The unexported markers keep both sets closed to this package.
+type restoreCommitPlan interface {
+	restoreRecoveryPlan
+	restoreCommitPlan()
+}
+
+type restoreRollbackPlan interface {
+	restoreRecoveryPlan
+	restoreRollbackPlan()
+}
+
+type restoreCommitPending struct {
+	claim            shared.OperationIntentClaim
+	releaseCommitted bool
+}
+type restoreCommitFromRelease struct{}
+type restoreAwaitOperation struct{ claim shared.OperationIntentClaim }
+type restoreRollbackFailed struct{ outcome shared.OperationFailed }
+
+func (restoreCommitPending) restoreRecoveryPlan()     {}
+func (restoreCommitFromRelease) restoreRecoveryPlan() {}
+func (restoreAwaitOperation) restoreRecoveryPlan()    {}
+func (restoreRollbackFailed) restoreRecoveryPlan()    {}
+
+func (restoreCommitPending) restoreCommitPlan()     {}
+func (restoreCommitFromRelease) restoreCommitPlan() {}
+func (restoreRollbackFailed) restoreRollbackPlan()  {}
+
+func (b *Backend) planRestoreRecovery(
+	e shared.RetentionEntry,
+	operation shared.OperationRecoveryState,
+	releaseCommitted bool,
+) (restoreRecoveryPlan, error) {
+	switch state := operation.(type) {
+	case nil:
+		if releaseCommitted {
+			return restoreCommitFromRelease{}, nil
+		}
+		return nil, fmt.Errorf("restore destination %q has neither operation outcome nor committed release",
+			e.NewLeaseUUID)
+	case shared.OperationSucceeded:
+		if !releaseCommitted {
+			return nil, fmt.Errorf(
+				"restore destination %q has successful operation outcome without its exact active Release",
+				e.NewLeaseUUID,
+			)
+		}
+		return restoreCommitFromRelease{}, nil
+	case shared.OperationFailed:
+		if releaseCommitted {
+			return nil, fmt.Errorf(
+				"restore destination %q has contradictory committed Release and failed operation outcome",
+				e.NewLeaseUUID,
+			)
+		}
+		return restoreRollbackFailed{outcome: state}, nil
+	case shared.OperationIntentClaim:
+		if releaseCommitted {
+			return restoreCommitPending{claim: state, releaseCommitted: true}, nil
+		}
+		// The operation coordinator is the sole owner of uncommitted Pending
+		// substrate. It applies the visibility window, performs any exact cleanup,
+		// and publishes a sealed Succeeded or Failed outcome. Retention recovery
+		// must not independently reinterpret one inventory snapshot as rollback
+		// authority while an accepted Docker Create can still become visible.
+		return restoreAwaitOperation{claim: state}, nil
+	default:
+		return nil, fmt.Errorf("restore destination %q has unknown durable operation state %T",
+			e.NewLeaseUUID, operation)
+	}
+}
+
+func (b *Backend) commitRecoveredRestore(
+	ctx context.Context,
+	recoveryScope shared.LeaseRecoveryScope,
+	e shared.RetentionEntry,
+	live bool,
+	status backend.ProvisionStatus,
+	liveItems []backend.LeaseItem,
+	plan restoreCommitPlan,
+) error {
+	liveReady := live && status == backend.ProvisionStatusReady
+	var operationRelease *shared.OperationReleaseCandidate
+	switch decision := plan.(type) {
+	case restoreCommitPending:
+		candidate, err := b.operationSettlement.PrepareOperationRelease(decision.claim)
+		if err != nil {
+			return fmt.Errorf("prepare pending restore release authority: %w", err)
+		}
+		operationRelease = &candidate
+	case restoreCommitFromRelease:
+		// The exact active Release is already the commit authority.
+	default:
+		return fmt.Errorf("restore commit cannot execute plan %T", plan)
+	}
+	// Validate a surviving Ready generation before any repair write. A terminal
+	// Success proves the operation outcome, but it does not authorize a newer or
+	// divergent live manifest; the finalizer and exact live projection must agree
+	// before either can become an active Release.
+	if liveReady {
+		if _, err := b.ensureRestoredReleaseStrict(
+			ctx, recoveryScope, e.NewLeaseUUID, &e, liveItems, operationRelease,
+		); err != nil {
+			return fmt.Errorf("validate Ready restore destination %q: %w", e.NewLeaseUUID, err)
+		}
+	}
+	switch decision := plan.(type) {
+	case restoreCommitPending:
+		if !decision.releaseCommitted && (!live || status != backend.ProvisionStatusReady) {
+			return fmt.Errorf("pending restore destination %q lacks Ready commit evidence", e.NewLeaseUUID)
+		}
+	case restoreCommitFromRelease:
+		// The exact active Release is already the irreversible commit.
+	default:
+		return fmt.Errorf("restore commit cannot execute plan %T", plan)
+	}
+	if decision, ok := plan.(restoreCommitPending); ok {
+		committed, err := b.operationSettlement.ProveCommittedOperation(decision.claim)
+		if err != nil {
+			return fmt.Errorf("prove committed restore operation for %q: %w", e.NewLeaseUUID, err)
+		}
+		if b.callbackPublisher == nil {
+			return errors.New("callback publisher is required")
+		}
+		if err := b.callbackPublisher.PublishOperationSuccessContext(ctx, committed); err != nil {
+			return fmt.Errorf("settle committed restore operation for %q: %w", e.NewLeaseUUID, err)
+		}
+	}
+	if liveReady {
+		if err := b.deleteRestoreFinalizerStrict(e.NewLeaseUUID, &e); err != nil {
+			return fmt.Errorf("delete committed restore finalizer for %q: %w", e.NewLeaseUUID, err)
+		}
+	}
+	return nil
 }
 
 // ensureRestoreDestinationUnowned rejects a new lease generation while a
@@ -201,26 +361,45 @@ func (b *Backend) ensureRestoreDestinationRestartAvailable(destinationLease stri
 			backend.ErrInvalidState, destinationLease,
 		)
 	}
-	intent, err := b.currentRestoreIntent(*source)
+	operation, err := b.currentRestoreOperation(*source)
 	if err != nil {
+		if errors.Is(err, shared.ErrOperationIntentMissing) {
+			// The exact Release is already the irreversible ownership proof;
+			// a later durable maintenance/close successor may have retired the
+			// historical operation row.
+			return nil
+		}
 		return fmt.Errorf(
 			"%w: read restore operation settlement for %q: %w",
 			backend.ErrInvalidState, destinationLease, err,
 		)
 	}
-	if intent != nil {
+	if _, pending := operation.(shared.OperationIntentClaim); pending {
 		return fmt.Errorf(
 			"%w: destination lease %q restore operation is not settled",
+			backend.ErrInvalidState, destinationLease,
+		)
+	}
+	if _, failed := operation.(shared.OperationFailed); failed {
+		return fmt.Errorf(
+			"%w: destination lease %q has contradictory committed and failed restore outcomes",
 			backend.ErrInvalidState, destinationLease,
 		)
 	}
 	return nil
 }
 
-func (b *Backend) reconcileRestoringWithAuthority(
+func (b *Backend) reconcileRestoringWithAuthorityUsing(
 	ctx context.Context,
 	e shared.RetentionEntry,
+	renameVolume backgroundVolumeRename,
+	teardown teardownMutationCapability,
+	destroyVolumes volumeDestroyMutationCapability,
+	ensureQuota backgroundVolumeQuota,
 ) error {
+	if renameVolume == nil || teardown == nil || destroyVolumes == nil || ensureQuota == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
 	if e.Status != shared.RetentionStatusRestoring ||
 		e.OriginalLeaseUUID == "" ||
 		e.NewLeaseUUID == "" ||
@@ -231,263 +410,237 @@ func (b *Backend) reconcileRestoringWithAuthority(
 			e.OriginalLeaseUUID, e.NewLeaseUUID, e.Status, e.Generation,
 		)
 	}
-	// The entire decision and mutation are one per-destination critical section,
-	// not just the Ready finalizer. In particular, a sweep that snapshots Failed
-	// must not tear down/re-quarantine outside the fence while Restart makes the
-	// same destination Ready: that stale rollback could move a live volume after
-	// success ownership was finalized. CommandFence is a ref-counted keyed
-	// registry, so a slow Docker teardown blocks only this exact lease.
-	unlockCommand := b.commandFence.Lock(e.NewLeaseUUID)
-	defer unlockCommand()
+	if b.recoveryCoordinator == nil {
+		return errors.New("restore recovery coordinator is required")
+	}
+	acquired, recoveryErr := b.recoveryCoordinator.WithLease(
+		ctx, e.NewLeaseUUID,
+		func(recoveryScope shared.LeaseRecoveryScope) error {
 
-	// The row passed by reconcileRetentions came from a batch snapshot taken
-	// before this per-destination fence. Re-establish exact durable authority
-	// before any release write, teardown, rename, callback settlement, or source
-	// handback. A worker or an earlier sweep may already have consumed it while
-	// this goroutine waited for the command fence.
-	current, err := b.retentionStore.Get(e.OriginalLeaseUUID)
-	if err != nil {
-		return fmt.Errorf("re-read restore source finalizer %q: %w", e.OriginalLeaseUUID, err)
-	}
-	if current == nil || current.Status != shared.RetentionStatusRestoring ||
-		current.NewLeaseUUID != e.NewLeaseUUID || current.Generation != e.Generation {
-		return nil
-	}
-	e = *current
-
-	intent, err := b.currentRestoreIntent(e)
-	if err != nil {
-		return fmt.Errorf("read exact restore intent for destination %q: %w", e.NewLeaseUUID, err)
-	}
-
-	b.provisionsMu.RLock()
-	p, live := b.provisions[e.NewLeaseUUID]
-	var status backend.ProvisionStatus
-	var recordedIDs []string
-	var liveItems []backend.LeaseItem
-	if live {
-		status = p.Status
-		liveItems = slices.Clone(p.Items)
-		// Snapshot (not alias) under the lock, mirroring doDeprovision. Usually EMPTY
-		// here — Restore reserves the provision with no ContainerIDs and only the
-		// success paths fill them in — which is precisely why the teardown below
-		// re-discovers rather than trusting this (ENG-647). It is non-empty for a
-		// provision recoverState rebuilt from live containers, so it is still worth
-		// passing.
-		recordedIDs = slices.Clone(p.ContainerIDs)
-	}
-	b.provisionsMu.RUnlock()
-	// Restore terminal handlers publish Ready/Failed before synchronously
-	// persisting their callback. Check actor activity only after both the journal
-	// and provision snapshots: false now proves that a handler which published
-	// either terminal status has finished its callback attempt. InboxDepth also
-	// covers an accepted message that has been enqueued but not started yet.
-	if b.leaseActorProcessingOrQueued(e.NewLeaseUUID) {
-		return nil
-	}
-
-	if live && status == backend.ProvisionStatusReady {
-		// A Ready projection is exact live ownership evidence. Commit (or verify)
-		// its active Release, settle an operation whose actor-side callback
-		// persistence failed, and only then consume the source finalizer. If either
-		// write fails, the finalizer remains a level-triggered retry owner.
-		if err := b.ensureRestoredReleaseStrict(e.NewLeaseUUID, &e, liveItems); err != nil {
-			return fmt.Errorf("finalize Ready restore destination %q: %w", e.NewLeaseUUID, err)
-		}
-		if intent != nil {
-			if _, err := b.callbackStore.ResolveOperationIntent(
-				*intent, backend.CallbackStatusSuccess, "",
-			); err != nil {
-				return fmt.Errorf("settle committed restore intent for %q: %w", e.NewLeaseUUID, err)
+			// The row passed by reconcileRetentions came from a batch snapshot taken
+			// before this per-destination fence and actor-quiescence claim. Re-establish
+			// exact durable authority
+			// before any release write, teardown, rename, callback settlement, or source
+			// handback. A worker or an earlier sweep may already have consumed it while
+			// this goroutine waited for the command fence.
+			current, err := b.retentionStore.Get(e.OriginalLeaseUUID)
+			if err != nil {
+				return fmt.Errorf("re-read restore source finalizer %q: %w", e.OriginalLeaseUUID, err)
 			}
-		}
-		if err := b.deleteRestoreFinalizerStrict(e.NewLeaseUUID, &e); err != nil {
-			return fmt.Errorf("delete committed restore finalizer for %q: %w", e.NewLeaseUUID, err)
-		}
-		return nil
-	}
-	if live && status != backend.ProvisionStatusFailed {
-		// A non-terminal projection may have a worker in the gap after writing its
-		// Release but before enqueueing the actor's terminal message. The actor can
-		// be momentarily idle in that gap, so status—not Release existence—is the
-		// authoritative defer signal.
-		return nil
-	}
-
-	committed, err := b.restoreDestinationCommitted(e)
-	if err != nil {
-		return fmt.Errorf("validate restore commit for destination %q: %w", e.NewLeaseUUID, err)
-	}
-	if committed {
-		// The active Release is the write-ahead commit marker. Containers may have
-		// failed or disappeared after that commit; that is a destination runtime
-		// failure, never authority to hand the adopted bytes back to the source.
-		// Keep the source finalizer while the destination is non-Ready because it is
-		// the durable tenant/provider identity needed to reconstruct Failed safely
-		// across repeated restarts. A successful Restart/Update (or Close) later
-		// consumes it through finalizeRestoredLeaseStrict.
-		if intent != nil {
-			if _, err := b.callbackStore.ResolveOperationIntent(
-				*intent, backend.CallbackStatusSuccess, "",
-			); err != nil {
-				return fmt.Errorf("settle committed restore intent for %q: %w", e.NewLeaseUUID, err)
+			if current == nil || current.Status != shared.RetentionStatusRestoring ||
+				current.NewLeaseUUID != e.NewLeaseUUID || current.Generation != e.Generation {
+				return nil
 			}
-		}
-		return nil
-	}
+			e = *current
 
-	// Orphaned (crash/failed): tear down any orphaned project, re-quarantine the
-	// adopted volumes back to the retained namespace, then CAS the record to active.
-	//
-	// The teardown is a PRECONDITION for everything below it, not a best-effort
-	// courtesy, so a failure ends the pass (ENG-647). Two reasons, both fatal:
-	//   - The re-quarantine renames move the volume dirs back into the retained
-	//     namespace, and a surviving container holds them by INODE, so it would go on
-	//     writing into data the record then advertises as frozen.
-	//   - Reverting the record and dropping the provision would strand the containers
-	//     where nothing can see them: processOrphan only walks ListProvisions (which
-	//     ranges b.provisions, the map we would have just deleted from), and
-	//     cleanupOrphanedVolumes enumerates fred's bind-mount tree, never Docker's
-	//     anonymous-volume store. Their anonymous volumes then accumulate forever
-	//     (ENG-372).
-	// So: no partial rollback. Leave the record restoring, keep the provision and its
-	// pool allocation, and let the next sweep/boot retry — the same shape as the
-	// re-quarantine failure below, and the same finalizer contract the Ready arm above
-	// honors via finalizeRestoredLease (ENG-523). The wait is safe: a restoring record
-	// is not reapable (ListExpired/MarkReapingIfExpired both require ACTIVE) and
-	// cleanupOrphanedVolumes protects its canonicals. It is NOT time-bounded, though —
-	// that same expiry exemption means the tenant cannot re-request the restore
-	// (ClaimForRestoreWithAuthority refuses a restoring record) until a sweep gets a clean teardown,
-	// so a sustained failure here is an operator signal, not a self-healing state.
-	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-	if _, derr := b.teardownLeaseContainers(ctx, e.NewLeaseUUID, recordedIDs, stopTimeout,
-		teardownOpRestoreReconcile, b.logger.With("lease_uuid", e.NewLeaseUUID)); derr != nil {
-		b.logger.Warn("reconcile: teardown failed; leaving record restoring for the next sweep",
-			"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID, "error", derr)
-		return fmt.Errorf("reconcile restoring retention %q teardown: %w", e.OriginalLeaseUUID, derr)
-	}
-	// Re-quarantine each adopted volume. A REAL rename failure (not a benign
-	// no-op) means the volume may still be canonical-named: we must NOT advance
-	// the record to active or drop the provision, or cleanupOrphanedVolumes (and
-	// future sweeps) could destroy still-live data. Leave the record restoring so
-	// the next startup retries; the provision stays so its expected-set entry
-	// keeps protecting the data in the interim.
-	failed := false
-	for _, retained := range e.RetainedVolumeNames {
-		newCanonical := retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)
-		if rerr := b.renameIfPresent(ctx, newCanonical, retained); rerr != nil {
-			failed = true
-		}
-	}
-	if failed {
-		b.logger.Warn("reconcile: re-quarantine rename failed; leaving record restoring for next startup",
-			"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID)
-		return fmt.Errorf("reconcile restoring retention %q: re-quarantine remains incomplete",
-			e.OriginalLeaseUUID)
-	}
-	// Restore's Create path applies the destination tier's quota to each adopted
-	// volume. A failed promotion therefore leaves a larger physical quota than
-	// the immutable source record accounts for. Restore the exact source quota
-	// before handing authority back to that record; if usage no longer fits, or
-	// either measurement/application is uncertain, keep both the restoring
-	// finalizer and the live reservation. That is over-counted but cannot admit
-	// unaccounted bytes.
-	resourceProfiles, err := b.restoreRetainedVolumeQuotas(ctx, &e)
-	if err != nil {
-		b.logger.Error("reconcile: unable to restore source volume quotas; leaving record restoring",
-			"lease_uuid", e.OriginalLeaseUUID,
-			"new_lease_uuid", e.NewLeaseUUID,
-			"error", err,
-		)
-		return fmt.Errorf("reconcile restoring retention %q quotas: %w", e.OriginalLeaseUUID, err)
-	}
-	// Once teardown, re-quarantine, and source-quota proof are complete, this
-	// destination can no longer succeed. Settle its exact failed operation before
-	// handing the durable row back to Active. A callback-store failure therefore
-	// leaves Restoring + the live reservation as a level-triggered retry vehicle;
-	// moving this after the CAS would strand an Existing intent until restart.
-	// Keep operation settlement, Restoring→Active handback, pool release, and
-	// projection removal indivisible from recovery publication. Physical teardown
-	// and re-quarantine above need no snapshot lock because the Restoring row is
-	// still durable authority throughout them.
-	b.recoverySnapshotMu.RLock()
-	defer b.recoverySnapshotMu.RUnlock()
-	if err := b.settleRolledBackRestoreIntent(e, intent); err != nil {
-		return fmt.Errorf("settle rolled-back restore intent for %q: %w", e.NewLeaseUUID, err)
-	}
-	// Derive the destination allocation ids using the same
-	// {newLease}-{svc}-{idx} scheme Restore used for TryAllocateAdoptAll.
-	var liveIDs []string
-	for _, item := range e.Items {
-		for i := range item.Quantity {
-			liveIDs = append(liveIDs, fmt.Sprintf("%s-%s-%d", e.NewLeaseUUID, item.ServiceName, i))
-		}
-	}
-	ok, err := b.revertRestoreSourceWithAccounting(&e, e.NewLeaseUUID, resourceProfiles, liveIDs)
-	if err != nil {
-		b.logger.Error("reconcile: revert restoring->active failed", "lease_uuid", e.OriginalLeaseUUID, "error", err)
-		return fmt.Errorf("reconcile restoring retention %q finalizer: %w", e.OriginalLeaseUUID, err)
-	}
-	if ok {
-		b.removeProvision(e.NewLeaseUUID)
-		return nil
-	}
-	return fmt.Errorf("reconcile restoring retention %q lost generation %d authority",
-		e.OriginalLeaseUUID, e.Generation)
-}
+			b.provisionsMu.RLock()
+			p, live := b.provisions[e.NewLeaseUUID]
+			var status backend.ProvisionStatus
+			var recordedIDs []string
+			var liveItems []backend.LeaseItem
+			if live {
+				status = p.Status
+				liveItems = slices.Clone(p.Items)
+				// Snapshot (not alias) under the lock, mirroring doDeprovision. Usually EMPTY
+				// here — Restore reserves the provision with no ContainerIDs and only the
+				// success paths fill them in — which is precisely why the teardown below
+				// re-discovers rather than trusting this (ENG-647). It is non-empty for a
+				// provision recoverState rebuilt from live containers, so it is still worth
+				// passing.
+				recordedIDs = slices.Clone(p.ContainerIDs)
+			}
+			b.provisionsMu.RUnlock()
 
-// settleRolledBackRestoreIntent retries failure settlement when a prior
-// pre-acceptance Resolve failed. Its caller has already proved teardown,
-// re-quarantine, and source quotas, so the operation is definitively failed and
-// no worker can later publish the destination Ready. It runs before the source
-// handback CAS so a callback-store failure leaves the Restoring row available
-// for the next level-triggered sweep. An absent matching fence is the common
-// no-op path.
-func (b *Backend) settleRolledBackRestoreIntent(
-	e shared.RetentionEntry,
-	intent *shared.OperationIntentClaim,
-) error {
-	if intent == nil {
+			committed, err := b.restoreDestinationCommitted(e)
+			if err != nil {
+				return fmt.Errorf("validate restore commit for destination %q: %w", e.NewLeaseUUID, err)
+			}
+			operation, operationErr := b.currentRestoreOperation(e)
+			if operationErr != nil && !errors.Is(operationErr, shared.ErrOperationIntentMissing) {
+				return fmt.Errorf("read exact restore operation for destination %q: %w",
+					e.NewLeaseUUID, operationErr)
+			}
+			if operationErr != nil && !committed {
+				return fmt.Errorf("read exact restore operation for uncommitted destination %q: %w",
+					e.NewLeaseUUID, operationErr)
+			}
+			plan, err := b.planRestoreRecovery(e, operation, committed)
+			if err != nil {
+				return err
+			}
+			var rollbackPlan restoreRollbackPlan
+			switch decision := plan.(type) {
+			case restoreCommitPending:
+				if err := b.commitRecoveredRestore(
+					ctx, recoveryScope, e, live, status, liveItems, decision,
+				); err != nil {
+					return err
+				}
+				return nil
+			case restoreCommitFromRelease:
+				if err := b.commitRecoveredRestore(
+					ctx, recoveryScope, e, live, status, liveItems, decision,
+				); err != nil {
+					return err
+				}
+				return nil
+			case restoreAwaitOperation:
+				// Pending substrate remains owned by operation recovery. This pass
+				// cannot mint rollback authority from another inventory observation.
+				return nil
+			case restoreRollbackFailed:
+				rollbackPlan = decision
+				// Continue into the single ordered destructive handler below. No other
+				// durable state can construct one of these plan types.
+			default:
+				return fmt.Errorf("restore destination %q produced unknown recovery plan %T",
+					e.NewLeaseUUID, plan)
+			}
+
+			// Orphaned (crash/failed): tear down any orphaned project, re-quarantine the
+			// adopted volumes back to the retained namespace, then CAS the record to active.
+			//
+			// The teardown is a PRECONDITION for everything below it, not a best-effort
+			// courtesy, so a failure ends the pass (ENG-647). Two reasons, both fatal:
+			//   - The re-quarantine renames move the volume dirs back into the retained
+			//     namespace, and a surviving container holds them by INODE, so it would go on
+			//     writing into data the record then advertises as frozen.
+			//   - Reverting the record and dropping the provision would strand the containers
+			//     where no durable recovery owner can see them: processOrphan only walks
+			//     ListProvisions (which ranges b.provisions, the map we would have just
+			//     deleted from). Docker's anonymous-volume store is not a managed-volume
+			//     inventory, so their anonymous volumes would accumulate forever (ENG-372).
+			// So: no partial rollback. Leave the record restoring, keep the provision and its
+			// pool allocation, and let the next sweep/boot retry — the same shape as the
+			// re-quarantine failure below, and the same finalizer contract the Ready arm above
+			// honors via finalizeRestoredLease (ENG-523). The wait is safe: a restoring record
+			// is not reapable (ListExpired/BeginExpiredReaping both require Active), and its
+			// exact restoring record claims the adopted canonical names. It is NOT time-bounded, though —
+			// that same expiry exemption means the tenant cannot re-request the restore
+			// (RestoreSettlement.ClaimForRestore refuses a Restoring record) until a sweep gets a clean teardown,
+			// so a sustained failure here is an operator signal, not a self-healing state.
+			stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
+			if _, derr := b.teardownLeaseContainersUsing(teardown, ctx, e.NewLeaseUUID, recordedIDs, stopTimeout,
+				teardownOpRestoreReconcile, b.logger.With("lease_uuid", e.NewLeaseUUID)); derr != nil {
+				b.logger.Warn("reconcile: teardown failed; leaving record restoring for the next sweep",
+					"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID, "error", derr)
+				return fmt.Errorf("reconcile restoring retention %q teardown: %w", e.OriginalLeaseUUID, derr)
+			}
+			// Re-quarantine each adopted volume. A REAL rename failure (not a benign
+			// no-op) means the volume may still be canonical-named: we must NOT advance
+			// the record to active or drop the provision: doing either would discard the
+			// exact recovery/finalizer authority for still-live data. Leave the record
+			// restoring so the next sweep retries, and keep the provision projection.
+			failed := false
+			for _, retained := range e.RetainedVolumeNames {
+				newCanonical := retainedToNewCanonical(retained, e.OriginalLeaseUUID, e.NewLeaseUUID)
+				if rerr := b.renameIfPresentUsing(ctx, renameVolume, newCanonical, retained); rerr != nil {
+					failed = true
+				}
+			}
+			if failed {
+				b.logger.Warn("reconcile: re-quarantine rename failed; leaving record restoring for next startup",
+					"lease_uuid", e.OriginalLeaseUUID, "new_lease_uuid", e.NewLeaseUUID)
+				return fmt.Errorf("reconcile restoring retention %q: re-quarantine remains incomplete",
+					e.OriginalLeaseUUID)
+			}
+			// Restore's Create path applies the destination tier's quota to each adopted
+			// volume. A failed promotion therefore leaves a larger physical quota than
+			// the immutable source record accounts for. Restore the exact source quota
+			// before handing authority back to that record; if usage no longer fits, or
+			// either measurement/application is uncertain, keep both the restoring
+			// finalizer and the live reservation. That is over-counted but cannot admit
+			// unaccounted bytes.
+			resourceProfiles, err := b.restoreRetainedVolumeQuotasUsing(ctx, &e, ensureQuota)
+			if err != nil {
+				b.logger.Error("reconcile: unable to restore source volume quotas; leaving record restoring",
+					"lease_uuid", e.OriginalLeaseUUID,
+					"new_lease_uuid", e.NewLeaseUUID,
+					"error", err,
+				)
+				return fmt.Errorf("reconcile restoring retention %q quotas: %w", e.OriginalLeaseUUID, err)
+			}
+			// Once teardown, re-quarantine, and source-quota proof are complete, this
+			// destination can no longer succeed. Settle its exact failed operation before
+			// handing the durable row back to Active. A callback-store failure therefore
+			// leaves Restoring + the live reservation as a level-triggered retry vehicle.
+			// If the subsequent handback CAS fails, the durable OperationFailed state
+			// makes the next pass select the same rollback plan without consulting stale
+			// projection state.
+			//
+			// Keep operation settlement, Restoring→Active handback, pool release, and
+			// projection removal indivisible from recovery publication. Physical teardown
+			// and re-quarantine above need no snapshot lock because the Restoring row is
+			// still durable authority throughout them.
+			b.recoverySnapshotMu.RLock()
+			defer b.recoverySnapshotMu.RUnlock()
+			if err := b.settleRolledBackRestoreOperation(e, rollbackPlan); err != nil {
+				return fmt.Errorf("settle rolled-back restore intent for %q: %w", e.NewLeaseUUID, err)
+			}
+			// Derive the destination allocation ids using the same
+			// {newLease}-{svc}-{idx} scheme Restore used for TryAllocateAdoptAll.
+			var liveIDs []string
+			for _, item := range e.Items {
+				for i := range item.Quantity {
+					liveIDs = append(liveIDs, fmt.Sprintf("%s-%s-%d", e.NewLeaseUUID, item.ServiceName, i))
+				}
+			}
+			ok, err := b.revertRestoreSourceWithAccounting(&e, e.NewLeaseUUID, resourceProfiles, liveIDs)
+			if err != nil {
+				b.logger.Error("reconcile: revert restoring->active failed", "lease_uuid", e.OriginalLeaseUUID, "error", err)
+				return fmt.Errorf("reconcile restoring retention %q finalizer: %w", e.OriginalLeaseUUID, err)
+			}
+			if !ok {
+				return fmt.Errorf("reconcile restoring retention %q lost generation %d authority",
+					e.OriginalLeaseUUID, e.Generation)
+			}
+			b.removeProvision(e.NewLeaseUUID)
+			return nil
+		},
+	)
+	if recoveryErr != nil {
+		return recoveryErr
+	}
+	if !acquired {
 		return nil
-	}
-	if b.callbackStore == nil {
-		return errors.New("callback store is required to settle rolled-back restore intent")
-	}
-	if intent.SourceGeneration() != e.Generation {
-		return fmt.Errorf(
-			"pending restore intent generation %d differs from rolled-back source generation %d",
-			intent.SourceGeneration(), e.Generation,
-		)
-	}
-	if _, err := b.callbackStore.ResolveOperationIntent(
-		*intent, backend.CallbackStatusFailed, interruptedOperationFailure,
-	); err != nil {
-		return fmt.Errorf("resolve interrupted restore intent: %w", err)
 	}
 	return nil
 }
 
-func (b *Backend) leaseActorProcessingOrQueued(leaseUUID string) bool {
-	b.actorsMu.Lock()
-	defer b.actorsMu.Unlock()
-	actor, exists := b.actors[leaseUUID]
-	return exists && (actor.CurrentMessageStart() != 0 || actor.InboxDepth() != 0)
+// settleRolledBackRestoreOperation accepts only the sealed OperationFailed
+// outcome selected by the operation coordinator. Retention recovery cannot
+// turn a Pending row or an inventory observation into destructive authority.
+func (b *Backend) settleRolledBackRestoreOperation(
+	e shared.RetentionEntry,
+	plan restoreRollbackPlan,
+) error {
+	failed, ok := plan.(restoreRollbackFailed)
+	if !ok {
+		return fmt.Errorf("restore rollback cannot settle plan %T", plan)
+	}
+	if failed.outcome.SourceGeneration() != e.Generation {
+		return fmt.Errorf(
+			"failed restore outcome generation %d differs from source generation %d",
+			failed.outcome.SourceGeneration(), e.Generation,
+		)
+	}
+	return nil
 }
 
-// currentRestoreIntent re-reads operation authority while the caller holds the
-// destination command fence. Batch snapshots are not admissible here: a restore
-// can create or settle its intent while a retention sweep waits for that fence.
-// Any claim that touches only one side (or a different generation) is conflicting
-// durable authority and therefore fails closed.
-func (b *Backend) currentRestoreIntent(e shared.RetentionEntry) (*shared.OperationIntentClaim, error) {
-	if b.callbackStore == nil {
-		return nil, nil
+// currentRestoreOperation re-reads the sealed pending/succeeded/failed state
+// while the caller holds both destination fences. Batch snapshots are not
+// admissible here: a restore can transition its durable state while a retention
+// sweep waits. Any pending claim that touches only one side (or a different
+// generation) is conflicting authority and therefore fails closed.
+func (b *Backend) currentRestoreOperation(e shared.RetentionEntry) (shared.OperationRecoveryState, error) {
+	if b.operationSettlement == nil {
+		return nil, errors.New("operation settlement is required to recover a restore operation")
 	}
-	claims, err := b.callbackStore.ListOperationIntents()
+	claims, err := b.operationSettlement.ListOperationIntents()
 	if err != nil {
 		return nil, err
 	}
-	var exact *shared.OperationIntentClaim
+	var exactPending bool
 	for i := range claims {
 		claim := claims[i]
 		touchesSource := claim.SourceLeaseUUID() == e.OriginalLeaseUUID
@@ -503,21 +656,48 @@ func (b *Backend) currentRestoreIntent(e shared.RetentionEntry) (*shared.Operati
 				claim.Kind(), claim.LeaseUUID(), e.OriginalLeaseUUID, e.NewLeaseUUID, e.Generation,
 			)
 		}
-		if exact != nil {
+		if exactPending {
 			return nil, fmt.Errorf("multiple operation intents own restore destination %q", e.NewLeaseUUID)
 		}
-		if err := b.validateRestoreIntentAuthority(claim, e); err != nil {
+		if err := b.validateRestoreOperationAuthority(claim, e); err != nil {
 			return nil, err
 		}
-		exact = &claim
+		exactPending = true
 	}
-	return exact, nil
+	probe, err := b.operationSettlement.NewOperationIntentProbe(
+		e.NewLeaseUUID, e.DestinationCallbackURL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("construct restore operation recovery probe: %w", err)
+	}
+	state, err := b.operationSettlement.LookupOperationRecovery(probe)
+	if err != nil {
+		return nil, err
+	}
+	switch state.(type) {
+	case shared.OperationIntentClaim:
+	case shared.OperationSucceeded:
+	case shared.OperationFailed:
+	default:
+		return nil, fmt.Errorf("restore destination %q has unknown operation state %T",
+			e.NewLeaseUUID, state)
+	}
+	if err := b.validateRestoreOperationAuthority(state, e); err != nil {
+		return nil, err
+	}
+	return state, nil
 }
 
-func (b *Backend) validateRestoreIntentAuthority(
-	claim shared.OperationIntentClaim,
+func (b *Backend) validateRestoreOperationAuthority(
+	claim shared.OperationRecoveryState,
 	e shared.RetentionEntry,
 ) error {
+	if claim.Kind() != shared.OperationIntentRestore ||
+		claim.LeaseUUID() != e.NewLeaseUUID ||
+		claim.SourceLeaseUUID() != e.OriginalLeaseUUID ||
+		claim.SourceGeneration() != e.Generation {
+		return errors.New("restore operation state differs from source/destination generation authority")
+	}
 	if claim.Backend() != b.Name() || claim.BackendStorageID() != b.storageIdentity {
 		return fmt.Errorf(
 			"restore intent belongs to backend %q storage %s, not backend %q storage %s",
@@ -538,7 +718,7 @@ func (b *Backend) validateRestoreIntentAuthority(
 			return errors.New("restore intent callback pair differs from source finalizer authority")
 		}
 	}
-	if e.DestinationOperationID != "" && claim.OperationID() != e.DestinationOperationID {
+	if !e.DestinationOperationID.IsZero() && claim.OperationID() != e.DestinationOperationID {
 		return errors.New("restore intent operation ID differs from source finalizer authority")
 	}
 	if e.StackManifest == nil {
@@ -604,8 +784,8 @@ func restoreReleaseMatchesAuthority(
 		return false, fmt.Errorf("marshal restore destination manifest: %w", err)
 	}
 	switch {
-	case e.DestinationOperationID == "":
-		if active.OperationID != "" || active.RuntimeAuthority != nil {
+	case e.DestinationOperationID.IsZero():
+		if !active.OperationID.IsZero() || active.RuntimeAuthority != nil {
 			return false, errors.New("legacy restore finalizer cannot own a typed destination release")
 		}
 	case !e.DestinationOperationID.Valid() || !active.OperationID.Valid() ||
@@ -642,10 +822,8 @@ func releaseRuntimeAuthorityMatchesRetention(
 
 // maxRetentionEvictionsPerClose is the per-pass batch rail: a cap reduction
 // (a budget edit/removal, a config rollback) can otherwise schedule hundreds of
-// SYNCHRONOUS volume destroys inside one close. Bounded eviction converges over
-// subsequent closes while the count cap temporarily overshoots — the
-// established ceilings-not-gates posture (count caps are DoS ceilings, not
-// exact allocation gates).
+// durable Active-to-Reaping transitions inside one close. Bounded eviction
+// converges over subsequent closes while the count cap temporarily overshoots.
 const maxRetentionEvictionsPerClose = 32
 
 const (
@@ -667,34 +845,36 @@ const (
 // without this exclusion the cap eviction could destroy the lease's own
 // in-progress record = data loss.
 //
-// The snapshot is the caller's ListByTenant output (shared with boundPartition),
-// never re-read here: the close path takes exactly one tenant snapshot. Each
-// successfully-marked record is pruned from the in-memory snapshot between passes
-// so an L2 eviction also counts toward L1; the disk gate re-reads the store
-// afterwards, so it sees the post-eviction state. refreshRetentionAccounting runs
-// only when a pass engaged.
+// The snapshot is the Active-candidate half of the caller's single
+// ListTenantRetentionCandidates view (the read DTO half is shared with
+// boundPartition), never re-read here. Each
+// successfully-marked record is pruned from the in-memory snapshot between
+// passes so an L2 eviction also counts toward L1. This function never mutates
+// another lease's substrate: it only hands durable Reaping ownership to the
+// periodic retention reaper. refreshRetentionAccounting runs only when a pass
+// engaged, so the still-physical Reaping footprint remains counted.
 func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budget retentionBudget,
-	partition string, snapshot []shared.RetentionEntry, excludeLease string) error {
+	partition string, snapshot []shared.ActiveRetentionCandidate, excludeLease string) error {
 	if b.retentionStore == nil || tenant == "" || (budget.CountCap <= 0 && budget.PerPartCount <= 0) {
 		return nil
 	}
-	var active []shared.RetentionEntry
-	for _, e := range snapshot {
+	var active []shared.ActiveRetentionCandidate
+	for _, candidate := range snapshot {
+		e := candidate.Entry()
 		if e.OriginalLeaseUUID == excludeLease {
 			continue // never evict the closing lease's own record
 		}
-		if e.Status == shared.RetentionStatusActive {
-			active = append(active, e)
-		}
+		active = append(active, candidate)
 	}
 	// Deterministic total order: oldest-first, equal CreatedAt broken by
 	// ascending UUID. Given the same store state the evicted set is a pure
 	// function — previously equal-timestamp order was unspecified.
 	sort.SliceStable(active, func(i, j int) bool {
-		if !active[i].CreatedAt.Equal(active[j].CreatedAt) {
-			return active[i].CreatedAt.Before(active[j].CreatedAt)
+		left, right := active[i].Entry(), active[j].Entry()
+		if !left.CreatedAt.Equal(right.CreatedAt) {
+			return left.CreatedAt.Before(right.CreatedAt)
 		}
-		return active[i].OriginalLeaseUUID < active[j].OriginalLeaseUUID
+		return left.OriginalLeaseUUID < right.OriginalLeaseUUID
 	})
 
 	// attempted becomes true once either pass ENGAGES (commits evictions). Refresh
@@ -709,10 +889,11 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 		}
 	}()
 	if budget.PerPartCount > 0 && partition != "" { // the "" default bucket is never L2-capped (I6)
-		var part []shared.RetentionEntry
-		for _, e := range active {
+		var part []shared.ActiveRetentionCandidate
+		for _, candidate := range active {
+			e := candidate.Entry()
 			if e.Partition == partition {
-				part = append(part, e)
+				part = append(part, candidate)
 			}
 		}
 		marked, passRan, err := b.evictOldest(ctx, part, evictLevelPartition, budget.PerPartCount)
@@ -726,9 +907,10 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 			// is the standard in-place filter; pruned[i] is only ever written at an
 			// index already read from active.
 			pruned := active[:0]
-			for _, e := range active {
+			for _, candidate := range active {
+				e := candidate.Entry()
 				if _, gone := marked[e.OriginalLeaseUUID]; !gone {
-					pruned = append(pruned, e)
+					pruned = append(pruned, candidate)
 				}
 			}
 			active = pruned
@@ -744,23 +926,12 @@ func (b *Backend) evictRetentionsToCap(ctx context.Context, tenant string, budge
 	return nil
 }
 
-// evictOldest marks-reaping and destroys the oldest records of `ordered`
-// (already sorted oldest-first) down to the level's cap, bounded by the
-// per-close batch rail. Per-record protocol: MarkReapingIfActive is the atomic
-// active→reaping CAS (TOCTOU-safe — a record concurrently claimed for restore
-// returns ok=false and is skipped, no compensation; under-evict is the safe
-// direction). The record is the finalizer tombstone: removed from the active cap
-// set immediately (making room) but still counted in the admission pool until
-// its volumes are confirmed gone. The eviction counter fires AFTER the ok-guard
-// and independent of the destroy outcome — an increment means "evicted from the
-// active set (marked reaping)", not "destroyed" — so a concurrently
-// restore-claimed record (ok=false, skipped) is never counted (ENG-407) — then
-// destroyReapingVolumes runs the finalizer (ENG-376). L1 evictions bump
-// retentionEvictedTotal (its deployed per-tenant meaning); L2 bump
-// retentionPartitionEvictedTotal. capValue is the configured cap for the level,
-// carried into the WARN. Returns the marked UUIDs (so the caller can prune its
-// snapshot between passes) and whether the pass engaged at all.
-func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEntry, level string, capValue int) (map[string]struct{}, bool, error) {
+// evictOldest transfers the oldest Active records to durable Reaping ownership.
+// It deliberately performs no physical destroy: close execution is bound to one
+// exact ClosePhysicalSubject and cannot safely mutate another lease's substrate.
+// The periodic retention reaper consumes the Reaping proof and performs that
+// lease's separately fenced physical cleanup.
+func (b *Backend) evictOldest(_ context.Context, ordered []shared.ActiveRetentionCandidate, level string, capValue int) (map[string]struct{}, bool, error) {
 	keep := capValue - 1 // count caps make room for one more: keep = cap-1
 	toEvict := len(ordered) - keep
 	if toEvict <= 0 {
@@ -772,13 +943,9 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 		toEvict = maxRetentionEvictionsPerClose
 	}
 	marked := make(map[string]struct{}, toEvict)
-	// ONE enumeration for the whole batch. This loop runs synchronously inside a lease
-	// close and evicts up to maxRetentionEvictionsPerClose records, so a per-record
-	// os.ReadDir of the volume root would put O(batch x volumes) directory work on a
-	// tenant-facing path.
-	idx := b.newManagedVolumeIndex()
 	for i := 0; i < toEvict; i++ {
-		e := ordered[i]
+		candidate := ordered[i]
+		e := candidate.Entry()
 		b.logger.Warn("evicting tenant's oldest retained lease to honor cap",
 			"tenant", e.Tenant, "lease_uuid", e.OriginalLeaseUUID, "level", level, "cap", capValue,
 			"partition", shared.TruncatePartitionRaw(e.Partition))
@@ -786,7 +953,7 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 		// own from disk (destroyReapingVolumes), so they are deliberately discarded. The
 		// CAS itself is what matters here — active→reaping must be atomic so the record is
 		// never deleted before its volumes are confirmed gone.
-		_, ok, merr := b.retentionStore.MarkReapingIfActive(e.OriginalLeaseUUID)
+		_, ok, merr := b.retentionStore.BeginReaping(candidate)
 		if merr != nil {
 			return marked, true, merr
 		}
@@ -799,7 +966,6 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 			retentionPartitionEvictedTotal.Inc()
 		}
 		marked[e.OriginalLeaseUUID] = struct{}{}
-		b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID)
 	}
 	return marked, true, nil
 }
@@ -816,9 +982,9 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 // computeReapingDiskMB sums into the admission projection. It does NOT carry the authority
 // to destroy anything. The set of volumes to remove is re-derived here on every pass, from
 // the two sources that actually know: the lease's namespace on disk
-// (fred-{lease}-* and fred-retained-{lease}-*) intersected with the ownership table, which
-// is the same "destroy only what nothing claims" question cleanupOrphanedVolumes asks
-// globally — this is that question scoped to one lease.
+// (fred-{lease}-* and fred-retained-{lease}-*) intersected with the ownership table.
+// Crucially, the exact reaping tombstone scopes both the lease and destructive authority;
+// there is no inference-driven global orphan destroyer.
 //
 // Deriving rather than replaying a stored list is what makes the accounting survive a
 // degraded store. When the writer could not resolve ownership it used to record NOTHING,
@@ -830,12 +996,12 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 // everywhere else — level-triggered reconciliation, deriving the work from current state
 // rather than replaying a list captured when the state was last legible.
 //
-// It subsumes the ENG-659 hazard instead of mitigating it. A tombstone is persisted in
-// bbolt and outlives the process, so a provider upgrading from a pre-ENG-647 build carries
-// records written before the write-time guard existed — records that can name another
-// lease's adopted data (while a restore of A into B is in flight, A's data wears B's
-// canonical names). Those stored names are now never consulted at all, by any producer or
-// any vintage, so there is nothing left to re-check.
+// The operation journal now prevents the ENG-659 collision by construction. Every current
+// Reaping row descends from a completed close, whose permanent per-lease mutation head
+// prevents a restore operation from later acquiring that lease as its destination. In the
+// other order, the pending restore operation prevents close admission. The finalizer still
+// checks the owner table because a live provision or unreadable authority must always win
+// over destructive cleanup.
 //
 // Every destroy still goes through volumeOp.destroy (volume_destroy.go), which resolves
 // ownership from the live provision map plus the retention store and re-checks the live
@@ -845,12 +1011,17 @@ func (b *Backend) evictOldest(ctx context.Context, ordered []shared.RetentionEnt
 // all-gone means Delete.
 //
 // Fail-safe on an unprovable claim set OR an unreadable volume root: destroy NOTHING this
-// pass and KEEP the record, mirroring cleanupOrphanedVolumes' "skip orphan destruction
-// this run" (recover.go). We cannot tell this record's own leak from another lease's
+// pass and KEEP the record. We cannot tell this record's own leak from another lease's
 // adopted data, and only one of those two mistakes is reversible. Waiting costs nothing:
 // the record IS the retry vehicle, so the next sweep re-attempts without a reboot. The
 // record is dropped only on the positive fact that the footprint is gone.
-func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeIndex, orig string) bool {
+func (b *Backend) destroyReapingVolumesUsing(
+	ctx context.Context,
+	idx *managedVolumeIndex,
+	reapingProof shared.ReapingRetentionProof,
+	destroyVolumes volumeDestroyMutationCapability,
+) bool {
+	orig := reapingProof.Entry().OriginalLeaseUUID
 	logger := b.logger.With("lease_uuid", orig)
 	if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 		// A prior raw mutation retained typed recovery evidence and withdrew this
@@ -862,6 +1033,11 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeI
 		logger.Error("reaping: backend storage recovery is pending; keeping the record", "error", authorityErr)
 		return false
 	}
+	if !reapingProof.Valid() || orig == "" {
+		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
+		logger.Error("reaping: exact tombstone authority is unavailable; keeping the record")
+		return false
+	}
 	// owner "" — a tombstone is a scheduled destroy, not an assertion of ownership, so it
 	// is entitled to exactly the volumes NOTHING claims. That also refuses a name a LIVE
 	// provision holds, which is reachable when a tombstoned lease is later re-provisioned
@@ -869,7 +1045,7 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeI
 	// otherwise reap the fresh volume out from under it).
 	op := b.volumeOp("", logger)
 
-	names, derr := idx.footprint(orig)
+	names, derr := idx.footprint(ctx, orig)
 	if derr != nil {
 		// Cannot enumerate the volume root, so "no volumes" and "cannot see the volumes"
 		// are indistinguishable — and one of those two readings deletes the record that is
@@ -885,14 +1061,17 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeI
 		// the footprint really is gone and the record has nothing left to account for. This
 		// is also the terminal state of a legacy stateless record, which never named a
 		// volume in the first place.
-		if delErr := b.retentionStore.Delete(orig); delErr != nil {
+		if deleted, delErr := b.retentionStore.DeleteReaped(reapingProof); delErr != nil {
 			logger.Warn("reaping: footprint already gone but record delete failed; next sweep retries", "error", delErr)
+			return false
+		} else if !deleted {
+			logger.Warn("reaping: exact tombstone disappeared before delete; next sweep reclassifies")
 			return false
 		}
 		return true
 	}
 
-	rep := op.destroy(ctx, destroySiteReaping, names...)
+	rep := op.destroy(destroyVolumes, ctx, destroySiteReaping, names...)
 
 	if len(rep.Unproven) > 0 {
 		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
@@ -900,32 +1079,11 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeI
 			"lease_uuid", orig, "error", rep.err())
 		return false
 	}
-	// Count the refusal by HOW it resolves, not merely that it happened — the deployed
-	// stuck-reaping alert triages on this label, and the two paths need different
-	// operator action. Still one increment per reason per attempt (never per volume), so
-	// the series stays summable with the rest of reapSkipReasons.
-	var restoreHeld, ownerHeld bool
-	for _, name := range rep.Claimed {
-		switch rep.ClaimedBy[name].kind {
-		case claimAdopted, claimRestoreSrc:
-			// An in-flight restore adopted another lease's retained data under this name.
-			// Destroying it is unrecoverable loss and kills that lease's restore.
-			// reconcileRestoring re-quarantines it back to fred-retained-* once its
-			// rollback can complete, after which the name is absent and the destroy is
-			// the idempotent no-op that finally drops the record.
-			restoreHeld = true
-		default:
-			// A live provision (or another lease's retained record) holds it: the
-			// tombstone outlived its lease and the reconciler re-provisioned it. Nothing
-			// to unblock — this clears when that lease is next closed cleanly, and the
-			// record is correctly kept in the meantime.
-			ownerHeld = true
-		}
-	}
-	if restoreHeld {
-		retentionReapSkipsTotal.WithLabelValues(reapSkipRestoreClaimed).Inc()
-	}
-	if ownerHeld {
+	// A restore cannot acquire destination authority for a lease that has crossed its
+	// permanent close boundary, so a reaping namespace and restore adoption are mutually
+	// exclusive by construction. The only reachable positive claim is a live lease that
+	// the reconciler re-provisioned after this tombstone was written.
+	if len(rep.Claimed) > 0 {
 		retentionReapSkipsTotal.WithLabelValues(reapSkipOwnerClaimed).Inc()
 	}
 	skipped := len(rep.Claimed)
@@ -939,24 +1097,15 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeI
 	}
 	if skipped > 0 {
 		// Deliberate, not a failure — no retentionLeakedTotal (see the metric's doc). The
-		// record is NOT deleted: its name list IS the destroy list, so a listed name still
-		// on disk means dropping the record would drop both the retry vehicle and the
-		// reaping projection that counts those bytes — an under-count, the exact ENG-376
-		// invariant. Nor is the list narrowed to the skipped names: Destroy no-ops on an
-		// already-gone name, so re-attempting the whole list next sweep is free and avoids
-		// a CAS-less rewrite of a tombstone another path may be racing.
-		//
-		// The message follows the same split as the counters above, for the same reason:
-		// the two holds resolve differently, and telling an operator to wait for a
-		// rollback that does not exist is how a live lease's data gets reclaimed by hand.
-		msg := "reaping: record kept (restore-claimed volume(s) left on disk); the restore's rollback resolves it"
-		switch {
-		case restoreHeld && ownerHeld:
-			msg = "reaping: record kept (volume(s) held by both an in-flight restore and a live provision); nothing to reclaim"
-		case ownerHeld:
-			msg = "reaping: record kept (volume(s) held by a live provision); this clears when that lease is next closed cleanly — do NOT reclaim by hand"
-		}
-		b.logger.Warn(msg, "lease_uuid", orig, "skipped", skipped, "names", len(names))
+		// record is NOT deleted: a claimed name still on disk means dropping the record
+		// would drop both the retry vehicle and the reaping projection that counts those
+		// bytes — an under-count, the exact ENG-376 invariant. The next sweep re-derives
+		// the footprint, so no mutable destroy list is needed.
+		b.logger.Warn(
+			"reaping: record kept (volume(s) held by a live provision); "+
+				"this clears when that lease is next closed cleanly — do NOT reclaim by hand",
+			"lease_uuid", orig, "skipped", skipped, "names", len(names),
+		)
 		return false
 	}
 	// CONFIRM BEFORE DROPPING THE RECORD. Every destroy above reported success, but a
@@ -973,7 +1122,7 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeI
 	// the op's cached index — reusing the snapshot we are trying to check would confirm
 	// nothing.
 	confirm := b.newManagedVolumeIndex()
-	switch remaining, verr := confirm.footprint(orig); {
+	switch remaining, verr := confirm.footprint(ctx, orig); {
 	case verr != nil:
 		retentionReapSkipsTotal.WithLabelValues(reapSkipClaimUnreadable).Inc()
 		logger.Error("reaping: destroys reported success but the footprint could not be re-confirmed; "+
@@ -986,8 +1135,11 @@ func (b *Backend) destroyReapingVolumes(ctx context.Context, idx *managedVolumeI
 		return false
 	}
 
-	if derr := b.retentionStore.Delete(orig); derr != nil {
+	if deleted, derr := b.retentionStore.DeleteReaped(reapingProof); derr != nil {
 		logger.Warn("reaping: destroy ok but record delete failed; next sweep retries", "error", derr)
+		return false
+	} else if !deleted {
+		logger.Warn("reaping: exact tombstone disappeared before delete; next sweep reclassifies")
 		return false
 	}
 	return true
@@ -1044,9 +1196,9 @@ func (b *Backend) newManagedVolumeIndex() *managedVolumeIndex {
 // stored-list design could not know which, so recordGiveUpLeak used to write BOTH spellings
 // of every name and rely on the destroy being an idempotent no-op for whichever did not
 // exist — a workaround for not being able to look. Looking is simpler and exact.
-func (i *managedVolumeIndex) footprint(orig string) ([]string, error) {
+func (i *managedVolumeIndex) footprint(ctx context.Context, orig string) ([]string, error) {
 	if !i.resolved {
-		i.all, i.err = i.b.volumes.List()
+		i.all, i.err = i.b.volumes.ListForProof(ctx)
 		i.resolved = true
 	}
 	if i.err != nil {
@@ -1063,145 +1215,45 @@ func (i *managedVolumeIndex) footprint(orig string) ([]string, error) {
 	return names, nil
 }
 
-// volumeRootUnverifiable reports whether a volume-root probe means the orphan
-// reconcile must skip this pass (fail-safe). exists/statErr come from pathExists:
-// an absent root (false,nil) OR any stat error (false,err — permission denied,
-// EIO, …) is unverifiable. Deliberately NOT an os.IsNotExist-only check: an
-// unreadable root is as uncertain as a missing one (kubelet #72257 hazard).
-func volumeRootUnverifiable(exists bool, statErr error) bool {
-	return statErr != nil || !exists
-}
-
-// allVolumesAbsent reports whether none of the retained names — nor their
-// canonical (not-yet-renamed) form — is present on disk. A deprovision give-up
-// leaves the volume under its canonical fred-{lease}-* name while the record
-// lists the fred-retained-* names; checking both keeps the pruner from deleting a
-// record whose data is still on disk, which a later boot would then destroy
-// (ENG-501). An empty name set is vacuously absent (covers legacy zero-volume
-// records).
-func allVolumesAbsent(names []string, present map[string]bool) bool {
-	for _, n := range names {
-		if present[n] || present[canonicalFromRetained(n)] {
-			return false
-		}
+// newRetentionOrphanPruner binds a complete physical inventory to the durable
+// retention store once. Sweep callers receive no row selector or absence proof.
+func newRetentionOrphanPruner(b *Backend) (*shared.RetentionOrphanPruner, error) {
+	inventory, err := shared.BindRetentionOrphanVolumeInventory(b.volumes.ListForProof)
+	if err != nil {
+		return nil, err
 	}
-	return true
+	return shared.NewRetentionOrphanPruner(
+		b.retentionStore,
+		b.cfg.RetentionOrphanConfirmations,
+		b.cfg.VolumeDataPath != "",
+		inventory,
+	)
 }
 
-// reconcileOrphanedRetentions prunes ACTIVE retention records whose every
-// RetainedVolumeName has been absent from the node for >= N consecutive periodic
-// sweeps (ENG-370 — records orphaned when their backing volumes vanish out-of-band).
-//
-// Fail-safe by construction: any uncertainty skips the whole pass and resets the
-// in-memory confirmation streaks, because the gated action is DELETION — discarding
-// a record throws away the only restore handle for a volume that may merely be
-// transiently unlisted (a missing volume root makes listVolumeIDs return
-// empty-with-no-error; an unreadable root is caught by the G2 gate below). Streaks
-// are in-memory so a cold restart can never prune on
-// its first sweep (boot-before-mount fail-safe). Returns the number pruned.
-//
-// No ctx: the prune does no context-bound IO (volumes are already gone, so there is
-// nothing to Destroy), unlike reapExpiredRetentions which Destroys under ctx.
-func (b *Backend) reconcileOrphanedRetentions() (int, error) {
+func (b *Backend) reconcileOrphanedRetentionsUsing(ctx context.Context) (int, error) {
 	if b.retentionStore == nil {
 		return 0, nil
 	}
-	n := b.cfg.RetentionOrphanConfirmations
-	if n <= 0 {
-		// Kill-switch (0 = disabled). DEBUG-level (not INFO): the sweep cadence is
-		// configurable, so an INFO every sweep would be sustained noise when pruning is
-		// intentionally disabled. The retentionOrphanSkipsTotal{reason="disabled"} counter
-		// is the always-on, queryable "feature is off" signal.
-		b.logger.Debug("orphan retention reconcile disabled (retention_orphan_confirmations=0)")
+	if b.orphanPruner == nil {
+		return 0, errors.New("retention orphan pruning requires a construction-bound pruner")
+	}
+	result, err := b.orphanPruner.Sweep(ctx)
+	switch result.SkipReason {
+	case shared.RetentionOrphanSkipDisabled:
 		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipDisabled).Inc()
-		return 0, nil
-	}
-
-	// G2 — warm-view gate. A configured-but-absent/unreadable volume root makes the
-	// volume enumeration untrustworthy. Skip + reset streaks. An unconfigured root
-	// (noop manager) is allowed through here; the per-record verifiability check below
-	// handles it.
-	rootConfigured := b.cfg.VolumeDataPath != ""
-	if rootConfigured {
-		exists, statErr := pathExists(b.cfg.VolumeDataPath)
-		if volumeRootUnverifiable(exists, statErr) {
-			b.logger.Warn("orphan retention reconcile skipped: volume data root absent or unreadable (fail-safe)",
-				"path", b.cfg.VolumeDataPath, "error", statErr)
-			b.orphanStreaks = map[string]int{}
-			retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRootUnverifiable).Inc()
-			return 0, nil
-		}
-	}
-
-	// G1 — a failed enumeration is uncertainty, not "no volumes". Skip + reset.
-	// No local log: returning err lets the cleanup loop (StartCleanupLoop) log it
-	// once per failing sweep rather than twice — matching the sibling
-	// reapExpiredRetentions, which bare-returns store errors. (A persistent failure
-	// therefore logs once per tick, i.e. hourly; the metric is the precise alerting
-	// signal.)
-	existing, err := b.volumes.List()
-	if err != nil {
-		b.orphanStreaks = map[string]int{}
+	case shared.RetentionOrphanSkipInventoryError:
 		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipListError).Inc()
-		return 0, err
-	}
-	present := make(map[string]bool, len(existing))
-	for _, v := range existing {
-		present[v] = true
-	}
-
-	recs, err := b.retentionStore.List()
-	if err != nil {
-		b.orphanStreaks = map[string]int{}
+	case shared.RetentionOrphanSkipStoreError:
 		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipStoreError).Inc()
-		return 0, err
 	}
-
-	next := make(map[string]int, len(b.orphanStreaks))
-	var pruned int
-	for _, e := range recs {
-		if e.Status != shared.RetentionStatusActive {
-			continue // never touch a restoring record (volumes renamed away → would look absent)
-		}
-		if !allVolumesAbsent(e.RetainedVolumeNames, present) {
-			continue // a volume is present → not orphaned → streak resets (omit from next)
-		}
-		if !rootConfigured && len(e.RetainedVolumeNames) > 0 {
-			continue // unverifiable without a configured root → never prune
-		}
-		streak := b.orphanStreaks[e.OriginalLeaseUUID] + 1
-		if streak < n {
-			next[e.OriginalLeaseUUID] = streak // not yet confirmed; carry forward
-			continue
-		}
-		// Confirmed across >= n consecutive sweeps. Prune via the ACTIVE-only CAS so a
-		// concurrent restore (active→restoring) is never clobbered. Volumes are already
-		// gone — nothing to Destroy.
-		_, deleted, derr := b.retentionStore.DeleteIfActive(e.OriginalLeaseUUID)
-		switch {
-		case derr != nil:
-			b.logger.Error("orphan retention reconcile: delete failed", "lease_uuid", e.OriginalLeaseUUID, "error", derr)
-			next[e.OriginalLeaseUUID] = streak // keep streak; retry next sweep
-		case !deleted:
-			// deleted=false: record no longer ACTIVE-and-present — concurrently restore-claimed
-			// (active→restoring) OR already removed (e.g. cap-eviction). Benign either way; the
-			// other path owns it. Drop the streak (omit from next); don't prune.
-			retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRaced).Inc()
-		default:
-			pruned++
-			retentionOrphansPrunedTotal.Inc()
-			// Per-record at DEBUG: the first cleanup can prune a large backlog (~14k on
-			// dev) in a single sweep, so an aggregate INFO below carries the signal
-			// without flooding the log; the metric is the precise per-record count.
-			b.logger.Debug("pruned orphaned retention record (all retained volumes confirmed absent)",
-				"lease_uuid", e.OriginalLeaseUUID, "confirmations", streak)
-		}
+	if result.Raced > 0 {
+		retentionOrphanSkipsTotal.WithLabelValues(orphanSkipRaced).Add(float64(result.Raced))
 	}
-	b.orphanStreaks = next
-	if pruned > 0 {
-		b.logger.Info("pruned orphaned retention records (backing volumes confirmed absent)", "count", pruned)
+	if result.Pruned > 0 {
+		retentionOrphansPrunedTotal.Add(float64(result.Pruned))
+		b.logger.Info("pruned orphaned retention records (backing volumes confirmed absent)", "count", result.Pruned)
 	}
-	return pruned, nil
+	return result.Pruned, err
 }
 
 // reapExpiredRetentions hard-deletes retained volumes past RetentionMaxAge.
@@ -1209,22 +1261,29 @@ func (b *Backend) reconcileOrphanedRetentions() (int, error) {
 // record removed). Each expired active record is atomically transitioned to
 // reaping before its volumes are destroyed, so a destroy failure leaves the
 // record as a counted finalizer tombstone rather than creating an under-count.
-func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
+func (b *Backend) reapExpiredRetentionsUsing(
+	ctx context.Context,
+	destroyVolumes volumeDestroyMutationCapability,
+) (int, error) {
+	if destroyVolumes == nil {
+		return 0, errBackgroundMaintenanceUnavailable
+	}
 	if b.retentionStore == nil || b.cfg.RetentionMaxAge <= 0 {
 		return 0, nil
 	}
-	candidates, err := b.retentionStore.ListExpired(b.cfg.RetentionMaxAge)
+	candidates, err := b.retentionStore.ListExpiredCandidates(b.cfg.RetentionMaxAge)
 	if err != nil {
 		return 0, err
 	}
 	var n int
 	idx := b.newManagedVolumeIndex() // one enumeration for the whole reap pass
-	for _, e := range candidates {
-		// Atomic active→reaping (the record is NEVER deleted before its volumes are
+	for _, candidate := range candidates {
+		e := candidate.Entry()
+		// Consume the exact listed Active candidate (the record is NEVER deleted before its volumes are
 		// confirmed gone, so a destroy failure cannot drop a still-on-disk footprint).
 		// Stored names discarded — the finalizer derives the footprint from disk. Only the
-		// atomic transition matters here (see MarkReapingIfActive above).
-		_, ok, merr := b.retentionStore.MarkReapingIfExpired(e.OriginalLeaseUUID, b.cfg.RetentionMaxAge)
+		// atomic transition matters here (see BeginReaping above).
+		reapingProof, ok, merr := b.retentionStore.BeginExpiredReaping(candidate, b.cfg.RetentionMaxAge)
 		if merr != nil {
 			b.logger.Error("reap: store error", "lease_uuid", e.OriginalLeaseUUID, "error", merr)
 			continue
@@ -1232,7 +1291,7 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 		if !ok {
 			continue // concurrently claimed/changed since the snapshot — skip
 		}
-		if b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID) {
+		if b.destroyReapingVolumesUsing(ctx, idx, reapingProof, destroyVolumes) {
 			n++
 		}
 	}
@@ -1247,17 +1306,23 @@ func (b *Backend) reapExpiredRetentions(ctx context.Context) (int, error) {
 // refreshRetentionAccounting itself — the CALLER owns the refresh (runRetentionSweep
 // refreshes at the end; the boot path refreshes via reapExpiredRetentions/recoverState).
 // A new caller MUST refresh after invoking this. (ENG-376)
-func (b *Backend) retryReapingRecords(ctx context.Context) error {
+func (b *Backend) retryReapingRecordsUsing(
+	ctx context.Context,
+	destroyVolumes volumeDestroyMutationCapability,
+) error {
+	if destroyVolumes == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
 	if b.retentionStore == nil {
 		return nil
 	}
-	recs, err := b.retentionStore.ListReaping()
+	proofs, err := b.retentionStore.ListReapingProofs()
 	if err != nil {
 		return err
 	}
 	idx := b.newManagedVolumeIndex() // one enumeration for the whole retry pass
-	for _, e := range recs {
-		b.destroyReapingVolumes(ctx, idx, e.OriginalLeaseUUID)
+	for _, proof := range proofs {
+		b.destroyReapingVolumesUsing(ctx, idx, proof, destroyVolumes)
 	}
 	return nil
 }
@@ -1289,12 +1354,21 @@ func (b *Backend) retryReapingRecords(ctx context.Context) error {
 // view by a sibling — none of them share derived state — so "run anyway" strictly adds
 // information and can never add a destroy. That is the same direction the rest of this
 // file takes: destroy only on a positive fact, never on an error or an empty list.
-func (b *Backend) runRetentionSweep(ctx context.Context) error {
+func (b *Backend) runRetentionSweepUsing(
+	ctx context.Context,
+	renameVolume backgroundVolumeRename,
+	teardown teardownMutationCapability,
+	destroyVolumes volumeDestroyMutationCapability,
+	ensureQuota backgroundVolumeQuota,
+) error {
+	if renameVolume == nil || teardown == nil || destroyVolumes == nil || ensureQuota == nil {
+		return errBackgroundMaintenanceUnavailable
+	}
 	if err := b.requireStorageIdentity(ctx); err != nil {
 		return fmt.Errorf("backend storage identity verification failed: %w", err)
 	}
 	var errs []error
-	if _, err := b.reapExpiredRetentions(ctx); err != nil {
+	if _, err := b.reapExpiredRetentionsUsing(ctx, destroyVolumes); err != nil {
 		errs = append(errs, fmt.Errorf("reap expired: %w", err))
 	}
 	// A nil store means no record can exist, so the remaining stages have nothing to read.
@@ -1303,7 +1377,7 @@ func (b *Backend) runRetentionSweep(ctx context.Context) error {
 	// reaper off entirely when the store is nil — but the guard is what makes that a
 	// belt-and-braces fact rather than a dependency.)
 	if b.retentionStore != nil {
-		if err := b.retryReapingRecords(ctx); err != nil {
+		if err := b.retryReapingRecordsUsing(ctx, destroyVolumes); err != nil {
 			errs = append(errs, fmt.Errorf("retry reaping: %w", err))
 		}
 		if recs, err := b.retentionStore.ListRestoring(); err != nil {
@@ -1311,10 +1385,17 @@ func (b *Backend) runRetentionSweep(ctx context.Context) error {
 		} else {
 			for _, e := range recs {
 				// A per-record failure deliberately parks the finalizer for the
-				// next sweep and remains a logged operational delay. Startup uses
-				// reconcileRetentions and propagates the same error when a durable
-				// restore intent needs exact classification.
-				_ = b.reconcileRestoring(ctx, e)
+				// next sweep, but it is still part of this sweep's outcome. Keep
+				// reconciling independent records and join every exact failure so
+				// monitoring cannot report success while a restore is wedged.
+				if err := b.reconcileRestoringWithAuthorityUsing(
+					ctx, e, renameVolume, teardown, destroyVolumes, ensureQuota,
+				); err != nil {
+					errs = append(errs, fmt.Errorf(
+						"reconcile restoring source %q destination %q: %w",
+						e.OriginalLeaseUUID, e.NewLeaseUUID, err,
+					))
+				}
 			}
 		}
 		// ENG-370: prune orphaned records BEFORE ENG-360's accounting refresh so the
@@ -1322,7 +1403,7 @@ func (b *Backend) runRetentionSweep(ctx context.Context) error {
 		// when the prune returns a fail-safe error (the prune mutated nothing in that
 		// case, but the reaper above may have, and refresh is keep-last-value on a store
 		// read error).
-		if _, err := b.reconcileOrphanedRetentions(); err != nil {
+		if _, err := b.reconcileOrphanedRetentionsUsing(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("reconcile orphans: %w", err))
 		}
 	}
@@ -1411,7 +1492,7 @@ func itemsShapeMatch(a, b []backend.LeaseItem) error {
 // untouched — no rollback. The retained volumes are from a closed lease with
 // no running container, so the footprint is static (no TOCTOU on size); a
 // concurrent reaper flipping the record active→reaping is handled by the
-// later atomic ClaimForRestoreWithAuthority (loser → ErrNotRestorable). Do NOT cache the
+// later atomic RestoreSettlement.ClaimForRestore (loser → ErrNotRestorable). Do NOT cache the
 // Usage result or move this gate after the claim.
 //
 // For each service: a clear promote/same-tier (new ≥ old, both resolvable)
@@ -1553,23 +1634,6 @@ func releaseAll(pool *shared.ResourcePool, ids []string) {
 	}
 }
 
-// adoptRetainedVolumes renames each retained volume (fred-retained-<orig>-…)
-// to its new-lease canonical name (fred-<newLease>-…). It is driven off the
-// record's RetainedVolumeNames (the ACTUAL on-disk volumes enumerated at
-// soft-delete), NOT a Items×Quantity re-derivation: a stateless service (no
-// managed volume) has no retained name, so deriving from Items would attempt a
-// rename of a volume that never existed and fail the whole restore. Returns the
-// first error; the caller fully rolls back on failure.
-func (b *Backend) adoptRetainedVolumes(ctx context.Context, newLease string, rec *shared.RetentionEntry) error {
-	for _, retained := range rec.RetainedVolumeNames {
-		newCanonical := retainedToNewCanonical(retained, rec.OriginalLeaseUUID, newLease)
-		if err := b.mutationAdapter().renameVolume(ctx, retained, newCanonical); err != nil {
-			return fmt.Errorf("adopt volume %s -> %s: %w", retained, newCanonical, err)
-		}
-	}
-	return nil
-}
-
 // Restore adopts a soft-deleted lease's retained volumes into a NEW lease and
 // brings up its stack from the retained manifest (ENG-325). The new lease is
 // reserved at Provisioning and driven through the existing replace machinery via
@@ -1587,7 +1651,8 @@ func (b *Backend) adoptRetainedVolumes(ctx context.Context, newLease string, rec
 // Synchronous errors (validation, already-provisioned, insufficient resources,
 // not-retained, not-restorable) are returned to the caller; asynchronous outcomes
 // flow via the lease callback.
-func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error {
+func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) error {
+	req := newRestoreOperationInput(request)
 	if err := b.requireMutationAdmission(ctx, "restore"); err != nil {
 		return fmt.Errorf("backend storage identity verification failed: %w", err)
 	}
@@ -1639,9 +1704,9 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// retained record's Items were normalized to defaultServiceName ("app") at
 	// Provision time. Without normalizing here the shape check below would
 	// deterministically mismatch ("app" vs ""), making restore impossible for
-	// every single-service lease. Mutates req.Items in place (shared backing
-	// array), exactly like restart_update.go's preflight.
-	if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: req.Items}); err != nil {
+	// every single-service lease. The private request type owns its backing array,
+	// so normalization cannot mutate the caller's DTO while preparing async work.
+	if err := req.normalizeItems(); err != nil {
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
 	restoreQuantity, err := backend.ValidateOperationQuantities(req.Items)
@@ -1750,13 +1815,21 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	if !proceed {
 		return nil
 	}
-	if intent == nil {
+	if !intent.Valid() {
 		return errors.New("created restore operation intent returned no claim")
 	}
-	if err := b.checkOperationReleaseCapacity(*intent); err != nil {
+	err = b.checkOperationReleaseCapacity(intent)
+	if err != nil {
 		return b.refuseOperationIntent(intent, fmt.Errorf(
 			"%w: reserve restore success release: %w",
 			backend.ErrInsufficientResources,
+			err,
+		))
+	}
+	restoreClaimCandidate, err := b.restoreSettlement.PrepareRestoreClaim(intent)
+	if err != nil {
+		return b.refuseOperationIntent(intent, fmt.Errorf(
+			"prepare restore source claim: %w",
 			err,
 		))
 	}
@@ -1784,14 +1857,14 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			Message:              "",
 			CallbackURL:          req.CallbackURL,
 			LifecycleCallbackURL: req.LifecycleCallbackURL,
+			ActiveReleaseVersion: 0,
+			ActiveOperationID:    shared.OperationID{},
 			Items:                slices.Clone(req.Items),
 			ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
 			ContainerIDs:         make([]string, 0),
 			StackManifest:        rec.StackManifest,
 			ServiceContainers:    nil,
 		},
-		resourceProfiles:      shared.CloneSKUResourceSnapshot(resourceProfiles),
-		volumeCleanupAttempts: 0,
 	}.materialize()
 	b.provisionsMu.Unlock()
 
@@ -1801,7 +1874,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// already-committed retained footprint — while CPU/mem/tenant are gated per
 	// instance. TryAllocateAdoptAll does the whole reservation under a single pool
 	// lock: the gate is EXACT (no per-volume double-count of the retained bytes
-	// still in the projection until ClaimForRestoreWithAuthority), ATOMIC (no concurrent
+	// still in the projection until RestoreSettlement.ClaimForRestore), ATOMIC (no concurrent
 	// provision/restore can slip disk in between the check and the reservations),
 	// and CONSISTENT (the pool computes the new total from its own resolver, so it
 	// cannot under-gate against the reservation). A fitting multi-volume promote is
@@ -1848,16 +1921,9 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 
 	// (d) ATOMIC claim active->restoring (closes the prelude-vs-reaper race).
 	// Nothing renamed yet.
-	claimed, err := b.retentionStore.ClaimForRestoreWithAuthorityAt(
-		req.FromLeaseUUID,
-		req.LeaseUUID,
+	claimedProof, err := b.restoreSettlement.ClaimForRestore(
+		restoreClaimCandidate,
 		b.cfg.RetentionMaxAge,
-		req.Items,
-		resourceProfiles,
-		intent.OperationID(),
-		req.CallbackURL,
-		req.LifecycleCallbackURL,
-		intent.CreatedAt(),
 	)
 	if err != nil {
 		releaseAll(b.pool, allocatedIDs)
@@ -1872,6 +1938,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 			return b.refuseOperationIntent(intent, fmt.Errorf("claim retention: %w", err))
 		}
 	}
+	claimed := claimedProof.Entry()
 	b.recoverySnapshotMu.RUnlock()
 	recoverySnapshotHeld = false
 
@@ -1880,48 +1947,27 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 	// keeps the gauge/projection consistent without an under-count window.
 	b.refreshRetentionAccounting()
 
-	// (e) Adopt: rename retained->canonical. On failure, full rollback. The
-	// worker never ran, so no actor terminal transition is coming — drop the
-	// reservation (dropProvision=true). Timed as the restore "adopt" phase: it
-	// is the only re-deploy work outside the async worker (doReplaceContainers),
-	// so it must be measured here, in the synchronous prelude, to rule the
-	// rename in/out as a contributor to restore latency.
-	adoptStart := time.Now()
-	if err := b.adoptRetainedVolumes(ctx, req.LeaseUUID, claimed); err != nil {
+	// (e) Hand off before adopting any volume. The construction-bound restore
+	// handler first durably advances the exact operation to Started, then derives
+	// every rename from that opaque subject. An actor rejection therefore has no
+	// physical side effect to unwind.
+	opCtx, opCancel := b.shutdownAwareContext()
+	command, ack, commandErr := leasesm.NewRestoreCommand(opCtx, intent)
+	if commandErr != nil {
+		opCancel()
 		return b.rollbackUnacceptedRestoreAdoption(
-			ctx,
-			req.LeaseUUID,
-			allocatedIDs,
-			claimed,
-			*intent,
-			fmt.Errorf("adopt retained volumes: %w", err),
-			logger,
+			req.LeaseUUID, allocatedIDs, &claimed, intent, commandErr, logger,
 		)
 	}
-	replacePhaseDurationSeconds.WithLabelValues("restore", phaseAdopt).Observe(time.Since(adoptStart).Seconds())
-
-	// (f) Hand off to the actor; doRestore's terminal defer owns
-	// success/failure/panic.
-	opCtx, opCancel := b.shutdownAwareContext()
-	work := func() leasesm.ReplaceResult {
-		return b.doRestore(opCtx, req.LeaseUUID, claimed, req.Items, resourceProfiles, logger)
-	}
-	ack := make(chan error, 1)
-	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, leasesm.RestoreRequestedMsg{
-		Cancel:               opCancel,
-		Work:                 work,
-		Ack:                  ack,
-		CallbackURL:          req.CallbackURL,
-		LifecycleCallbackURL: req.LifecycleCallbackURL,
-	}); routeErr != nil {
+	if routeErr := b.routeToLeaseBlocking(ctx, req.LeaseUUID, command); routeErr != nil {
 		opCancel()
 		// Worker never ran; no actor transition will flip Status — drop the
 		// reservation (dropProvision=true).
 		return b.rollbackUnacceptedRestoreAdoption(
-			ctx, req.LeaseUUID, allocatedIDs, claimed, *intent, routeErr, logger,
+			req.LeaseUUID, allocatedIDs, &claimed, intent, routeErr, logger,
 		)
 	}
-	acceptance, err := b.awaitAsyncAcceptance(ctx, ack)
+	acceptance, err := b.awaitAsyncAcceptance(ctx, ack.Result())
 	switch acceptance {
 	case asyncAcceptanceAccepted:
 		return nil
@@ -1932,7 +1978,7 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 		// An explicit actor rejection proves it never fired evRestoreRequested,
 		// so no terminal transition owns the reservation.
 		return b.rollbackUnacceptedRestoreAdoption(
-			ctx, req.LeaseUUID, allocatedIDs, claimed, *intent, err, logger,
+			req.LeaseUUID, allocatedIDs, &claimed, intent, err, logger,
 		)
 	default:
 		return fmt.Errorf("invalid restore acceptance state %d", acceptance)
@@ -1958,62 +2004,6 @@ func (b *Backend) Restore(ctx context.Context, req backend.RestoreRequest) error
 // operation completion. The same Failed projection is fenced from maintenance
 // by the Restoring row until reconciliation settles any surviving intent and
 // hands capacity back make-before-break.
-func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.RetentionEntry,
-	newItems []backend.LeaseItem, resourceProfiles []shared.SKUResourceSnapshot, logger *slog.Logger) (resultRet leasesm.ReplaceResult) {
-	restoreStart := time.Now()
-	defer func() {
-		// N2: a panic leaves resultRet.Err==nil; force the failure path so we never
-		// delete the record while the lease is not Ready. Convert panic -> Failed.
-		if r := recover(); r != nil {
-			logger.Error("restore worker panicked", "recover", r)
-			// Count the outcome BEFORE the fallible rollback so a panic inside
-			// rollbackRestoreAdoption can't bypass the increment (the success branch
-			// likewise counts before its fallible Delete).
-			restoresTotal.WithLabelValues("failure").Inc()
-			b.prepareAcceptedRestoreAdoptionRollback(ctx, leaseUUID, rec, logger)
-			// Mirror spawnReplaceWorker's own panic recovery (lease_actor.go) and the
-			// normal doReplace* failure shape: populate top-level CallbackErr AND
-			// Failure.{Operation,CallbackErr,LastError} so the actor's evReplaceFailed
-			// carries a non-empty ReplaceFailureInfo (otherwise the tenant callback is
-			// empty/unhelpful).
-			msg := fmt.Sprintf("restore panic: %v", r)
-			resultRet = leasesm.ReplaceResult{
-				Err:         errors.New(msg),
-				Restored:    false,
-				CallbackErr: leasesm.ErrMsgInternal,
-				Failure: leasesm.ReplaceFailureInfo{
-					Operation:   "restore",
-					Reason:      backend.ReasonInternal,
-					CallbackErr: leasesm.ErrMsgInternal,
-					LastError:   msg,
-				},
-			}
-			return
-		}
-		if resultRet.Err == nil {
-			// Record the restore re-deploy worker latency on success only (mirrors
-			// the loadtest's success-only rs_restore_duration). The synchronous adopt
-			// phase ran before this worker; restore_duration_seconds covers the
-			// async re-deploy worker span, which is the ~3-4x cost ENG-357 targets.
-			restoreDurationSeconds.Observe(time.Since(restoreStart).Seconds())
-			restoresTotal.WithLabelValues("success").Inc()
-			// Record the new lease's active release, then finalize the restore. The
-			// restoring retention record is the adopted volume's finalizer, so it is
-			// dropped only once the release is durably recorded (ENG-523).
-			b.finalizeRestoredLease(leaseUUID, rec, newItems, logger)
-			b.refreshRetentionAccounting()
-			return
-		}
-		// Count the outcome before the fallible rollback (see the panic branch).
-		restoresTotal.WithLabelValues("failure").Inc()
-		b.prepareAcceptedRestoreAdoptionRollback(ctx, leaseUUID, rec, logger)
-	}()
-	return b.doReplaceContainers(ctx, replaceContainersOp{
-		LeaseUUID: leaseUUID, Stack: rec.StackManifest, Items: newItems, ResourceProfiles: resourceProfiles,
-		Operation: "restore", NoComposeRollback: true, Logger: logger,
-		OnSuccess: func(p *leasesm.ProvisionState) { p.StackManifest = rec.StackManifest },
-	})
-}
 
 // finalizeRestoredLease records the NEW lease's active release, then — and only
 // then — drops the restoring retention record. recoverState rehydrates
@@ -2023,8 +2013,8 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 // active (mirrors provision.go's on-success Append).
 //
 // The retention record is the adopted volume's FINALIZER (Kubernetes-style): while
-// it exists (restoring), cleanupOrphanedVolumes protects the adopted canonical
-// volume (recover.go's restoring arm) and reconcileRestoring finalizes it once the
+// it exists (restoring), the ownership table claims the adopted canonical volume and
+// reconcileRestoring finalizes it once the
 // lease is confirmed Ready. Dropping the finalizer BEFORE the release is durably
 // recorded would leave the lease with NEITHER record, so a later boot's orphan
 // reaper — which keys on the release record (leaseHasActiveRelease) — would destroy
@@ -2040,24 +2030,31 @@ func (b *Backend) doRestore(ctx context.Context, leaseUUID string, rec *shared.R
 // restoring record can no longer re-quarantine a healthy lease's volumes — which is
 // what previously forced the unconditional Delete here. (ENG-433 / ENG-523)
 func (b *Backend) finalizeRestoredLease(
+	ctx context.Context,
 	leaseUUID string,
 	rec *shared.RetentionEntry,
 	effectiveItems []backend.LeaseItem,
+	operationRelease *shared.OperationReleaseCandidate,
 	logger *slog.Logger,
-) {
-	if err := b.ensureRestoredReleaseStrict(leaseUUID, rec, effectiveItems); err != nil {
+) shared.OperationReleaseCommitted {
+	committed, err := b.ensureRestoredReleaseStrict(
+		ctx, shared.LeaseRecoveryScope{}, leaseUUID, rec, effectiveItems, operationRelease,
+	)
+	if err != nil {
 		// Keep the finalizer: the adopted volume stays protected until a later
 		// reconcileRestoring sweep or an Update durably records the release and drops the
 		// record. Tradeoff while it lingers (only under a sustained release-store outage):
 		// the ORIGINAL lease UUID reports Retained (info.go maps restoring→retained) even
 		// though the restore is done, and a Restore-retry from the original is rejected
-		// (ClaimForRestoreWithAuthority needs Active). Both self-heal once the store recovers and the
+		// (RestoreSettlement.ClaimForRestore needs Active). Both self-heal once the store recovers and the
 		// record is dropped; restoreFinalizerPendingTotal makes each initial kept-
 		// pending event observable. Reconciliation retries do not re-increment it.
 		restoreFinalizerPendingTotal.Inc()
 		logger.Warn("restore ok but destination Release is not durable; keeping retention record as the adopted volume's finalizer (ENG-523)",
 			"lease_uuid", leaseUUID, "original_lease_uuid", rec.OriginalLeaseUUID, "error", err)
+		return shared.OperationReleaseCommitted{}
 	}
+	return committed
 }
 
 // finalizeRestoredLeaseStrict is the exact, idempotent commit used when a
@@ -2066,11 +2063,14 @@ func (b *Backend) finalizeRestoredLease(
 // finalizer deletion are durable. Any error leaves the source record in place,
 // so callers can fail closed without guessing which lease owns the bytes.
 func (b *Backend) finalizeRestoredLeaseStrict(
+	ctx context.Context,
 	leaseUUID string,
 	rec *shared.RetentionEntry,
 	effectiveItems []backend.LeaseItem,
 ) error {
-	if err := b.ensureRestoredReleaseStrict(leaseUUID, rec, effectiveItems); err != nil {
+	if _, err := b.ensureRestoredReleaseStrict(
+		ctx, shared.LeaseRecoveryScope{}, leaseUUID, rec, effectiveItems, nil,
+	); err != nil {
 		return err
 	}
 	return b.deleteRestoreFinalizerStrict(leaseUUID, rec)
@@ -2081,75 +2081,78 @@ func (b *Backend) finalizeRestoredLeaseStrict(
 // settle the exact operation second, and only then delete the finalizer; every
 // crash boundary therefore leaves a level-triggered retry owner.
 func (b *Backend) ensureRestoredReleaseStrict(
+	ctx context.Context,
+	recoveryScope shared.LeaseRecoveryScope,
 	leaseUUID string,
 	rec *shared.RetentionEntry,
 	effectiveItems []backend.LeaseItem,
-) error {
+	operationRelease *shared.OperationReleaseCandidate,
+) (shared.OperationReleaseCommitted, error) {
 	if rec == nil {
-		return fmt.Errorf("restore source finalizer is required")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("restore source finalizer is required")
 	}
 	if leaseUUID == "" || rec.OriginalLeaseUUID == "" {
-		return fmt.Errorf("restore source and destination lease UUIDs are required")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("restore source and destination lease UUIDs are required")
 	}
 	if rec.Status != shared.RetentionStatusRestoring || rec.NewLeaseUUID != leaseUUID {
-		return fmt.Errorf(
+		return shared.OperationReleaseCommitted{}, fmt.Errorf(
 			"restore source finalizer does not own destination %q (status=%q new_lease_uuid=%q)",
 			leaseUUID, rec.Status, rec.NewLeaseUUID,
 		)
 	}
 	if rec.OriginalLeaseUUID == leaseUUID {
-		return fmt.Errorf("restore source and destination lease UUIDs must differ")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("restore source and destination lease UUIDs must differ")
 	}
 	if rec.Generation <= 0 {
-		return fmt.Errorf("restore source finalizer generation must be positive")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("restore source finalizer generation must be positive")
 	}
 	if rec.StackManifest == nil {
-		return fmt.Errorf("restored manifest is required")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("restored manifest is required")
 	}
 	if _, err := backend.ValidateOperationQuantities(rec.Items); err != nil {
-		return fmt.Errorf("validate restore source items: %w", err)
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restore source items: %w", err)
 	}
 	if _, err := backend.ValidateOperationQuantities(effectiveItems); err != nil {
-		return fmt.Errorf("validate restored effective items: %w", err)
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restored effective items: %w", err)
 	}
 	if len(rec.DestinationItems) > 0 || len(rec.DestinationResourceProfiles) > 0 {
 		if _, err := backend.ValidateOperationQuantities(rec.DestinationItems); err != nil {
-			return fmt.Errorf("validate restore destination authority items: %w", err)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restore destination authority items: %w", err)
 		}
 		if err := itemsShapeMatch(rec.Items, rec.DestinationItems); err != nil {
-			return fmt.Errorf("validate restored item shape: %w", err)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restored item shape: %w", err)
 		}
 		if err := validateDockerResourceProfiles(
 			rec.DestinationItems,
 			rec.DestinationResourceProfiles,
 		); err != nil {
-			return fmt.Errorf("validate restore destination authority resource profiles: %w", err)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restore destination authority resource profiles: %w", err)
 		}
 		if err := manifest.ValidateStackAgainstItems(rec.StackManifest, rec.DestinationItems); err != nil {
-			return fmt.Errorf("validate restored manifest topology: %w", err)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restored manifest topology: %w", err)
 		}
 	}
 	if b.releaseStore == nil {
-		return fmt.Errorf("release store is required")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("release store is required")
 	}
 	if b.retentionStore == nil {
-		return fmt.Errorf("retention store is required")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("retention store is required")
 	}
 	b.provisionsMu.RLock()
 	provision, exists := b.provisions[leaseUUID]
 	if !exists || !slices.Equal(provision.Items, effectiveItems) {
 		b.provisionsMu.RUnlock()
-		return fmt.Errorf("restored live provision does not match finalizer items")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("restored live provision does not match finalizer items")
 	}
 	if provision.Tenant != rec.Tenant || provision.ProviderUUID != rec.ProviderUUID {
 		b.provisionsMu.RUnlock()
-		return fmt.Errorf(
+		return shared.OperationReleaseCommitted{}, fmt.Errorf(
 			"restored live provision identity does not match finalizer tenant/provider",
 		)
 	}
 	if provision.StackManifest == nil {
 		b.provisionsMu.RUnlock()
-		return fmt.Errorf("restored live provision manifest is required")
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("restored live provision manifest is required")
 	}
 	liveItems := slices.Clone(provision.Items)
 	liveManifestBytes, marshalLiveErr := json.Marshal(provision.StackManifest)
@@ -2157,16 +2160,16 @@ func (b *Backend) ensureRestoredReleaseStrict(
 	liveResourceProfiles := shared.CloneSKUResourceSnapshot(provision.ResourceProfiles)
 	b.provisionsMu.RUnlock()
 	if marshalLiveErr != nil {
-		return fmt.Errorf("marshal restored live provision manifest: %w", marshalLiveErr)
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("marshal restored live provision manifest: %w", marshalLiveErr)
 	}
 	if err := itemsShapeMatch(rec.Items, liveItems); err != nil {
-		return fmt.Errorf("validate restored live item shape: %w", err)
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restored live item shape: %w", err)
 	}
 	if err := manifest.ValidateStackAgainstItems(liveManifest, liveItems); err != nil {
-		return fmt.Errorf("validate restored live manifest topology: %w", err)
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restored live manifest topology: %w", err)
 	}
 	if err := validateDockerResourceProfiles(liveItems, liveResourceProfiles); err != nil {
-		return fmt.Errorf("validate restored resource profiles: %w", err)
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restored resource profiles: %w", err)
 	}
 
 	// A newer successful maintenance operation may already have durably published
@@ -2174,18 +2177,18 @@ func (b *Backend) ensureRestoredReleaseStrict(
 	// Release is sufficient ownership authority. Otherwise append only from the
 	// destination snapshot atomically bound into the source retention claim —
 	// never from live state or mutable SKU configuration. This is the crash-safe
-	// bridge when the restore succeeded, its first Release append failed, and the
-	// operation intent has already been consumed.
+	// bridge when the restore succeeded and its first Release append failed. The
+	// durable successful operation outcome authorizes this branch independently.
 	existing, err := b.releaseStore.LatestActive(leaseUUID)
 	if err != nil {
-		return fmt.Errorf("read restored active release: %w", err)
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("read restored active release: %w", err)
 	}
 	existingOwnsLive := existing != nil &&
 		existing.OperationID == rec.DestinationOperationID &&
 		bytes.Equal(existing.Manifest, liveManifestBytes) &&
 		slices.Equal(existing.Items, liveItems) &&
 		slices.Equal(existing.ResourceProfiles, liveResourceProfiles) &&
-		((rec.DestinationOperationID == "" && existing.RuntimeAuthority == nil) ||
+		((rec.DestinationOperationID.IsZero() && existing.RuntimeAuthority == nil) ||
 			(rec.DestinationOperationID.Valid() && existing.RuntimeAuthority != nil &&
 				existing.OperationID == rec.DestinationOperationID &&
 				releaseRuntimeAuthorityMatchesRetention(existing.RuntimeAuthority, *rec)))
@@ -2193,57 +2196,57 @@ func (b *Backend) ensureRestoredReleaseStrict(
 		authorityItems := slices.Clone(rec.DestinationItems)
 		authorityProfiles := shared.CloneSKUResourceSnapshot(rec.DestinationResourceProfiles)
 		if len(authorityItems) == 0 || len(authorityProfiles) == 0 {
-			return fmt.Errorf("restore source finalizer has no exact destination authority and no active release owns the live generation")
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("restore source finalizer has no exact destination authority and no active release owns the live generation")
 		}
 		if _, err := backend.ValidateOperationQuantities(authorityItems); err != nil {
-			return fmt.Errorf("validate restore destination authority items: %w", err)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restore destination authority items: %w", err)
 		}
 		if err := itemsShapeMatch(rec.Items, authorityItems); err != nil {
-			return fmt.Errorf("validate restore destination authority shape: %w", err)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restore destination authority shape: %w", err)
 		}
 		if err := validateDockerResourceProfiles(authorityItems, authorityProfiles); err != nil {
-			return fmt.Errorf("validate restore destination authority resource profiles: %w", err)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restore destination authority resource profiles: %w", err)
 		}
 		if err := manifest.ValidateStackAgainstItems(rec.StackManifest, authorityItems); err != nil {
-			return fmt.Errorf("validate restore destination authority manifest topology: %w", err)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("validate restore destination authority manifest topology: %w", err)
 		}
 		authorityManifestBytes, marshalErr := json.Marshal(rec.StackManifest)
 		if marshalErr != nil {
-			return fmt.Errorf("marshal restore destination authority manifest: %w", marshalErr)
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("marshal restore destination authority manifest: %w", marshalErr)
 		}
 		if !slices.Equal(effectiveItems, authorityItems) || !slices.Equal(liveItems, authorityItems) {
-			return fmt.Errorf("restored live provision items do not match durable destination authority")
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("restored live provision items do not match durable destination authority")
 		}
 		if !slices.Equal(liveResourceProfiles, authorityProfiles) {
-			return fmt.Errorf("restored live provision resource profiles do not match durable destination authority")
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("restored live provision resource profiles do not match durable destination authority")
 		}
 		if !bytes.Equal(liveManifestBytes, authorityManifestBytes) {
-			return fmt.Errorf("restored live provision manifest does not match durable destination authority")
+			return shared.OperationReleaseCommitted{}, fmt.Errorf("restored live provision manifest does not match durable destination authority")
 		}
-		runtimeAuthority, authorityErr := releaseRuntimeAuthorityForOperation(
-			rec.DestinationOperationID,
-			rec.Tenant,
-			rec.ProviderUUID,
-			rec.DestinationCallbackURL,
-			rec.DestinationLifecycleCallbackURL,
-		)
-		if authorityErr != nil {
-			return fmt.Errorf("construct restore destination runtime authority: %w", authorityErr)
-		}
-		if err := b.releaseStore.AppendActive(leaseUUID, shared.Release{
-			Manifest:         authorityManifestBytes,
-			Image:            "stack",
-			OperationID:      rec.DestinationOperationID,
-			Items:            authorityItems,
-			ResourceProfiles: authorityProfiles,
-			RuntimeAuthority: runtimeAuthority,
-			Status:           "active",
-			CreatedAt:        rec.RestoringSince,
-		}); err != nil {
-			return fmt.Errorf("record restored active release: %w", err)
+		if operationRelease == nil {
+			return shared.OperationReleaseCommitted{}, errors.New(
+				"restore destination has no sealed operation release authority",
+			)
 		}
 	}
-	return nil
+	if operationRelease == nil {
+		return shared.OperationReleaseCommitted{}, nil
+	}
+	physical, err := b.operationSettlement.RecoverOperationExecution(
+		ctx, recoveryScope, operationRelease.Intent(),
+	)
+	if err != nil {
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("classify restored active release: %w", err)
+	}
+	ready, ok := physical.(shared.OperationExecutionSuccess)
+	if !ok {
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("restored operation is not exactly Ready (%T)", physical)
+	}
+	committed, err := b.operationSettlement.CommitOperationSuccess(ready)
+	if err != nil {
+		return shared.OperationReleaseCommitted{}, fmt.Errorf("record restored active release: %w", err)
+	}
+	return committed, nil
 }
 
 func (b *Backend) deleteRestoreFinalizerStrict(
@@ -2253,28 +2256,22 @@ func (b *Backend) deleteRestoreFinalizerStrict(
 	if rec == nil {
 		return fmt.Errorf("restore source finalizer is required")
 	}
-	deleted, err := b.retentionStore.DeleteIfRestoring(
-		rec.OriginalLeaseUUID,
-		leaseUUID,
-		rec.Generation,
-	)
+	if rec.NewLeaseUUID != leaseUUID {
+		return fmt.Errorf("restore source finalizer belongs to destination %q", rec.NewLeaseUUID)
+	}
+	proof, err := b.retentionStore.ProveRestoringSnapshot(*rec)
+	if err != nil {
+		if errors.Is(err, shared.ErrNoRetention) {
+			return nil
+		}
+		return fmt.Errorf("prove exact restore source finalizer: %w", err)
+	}
+	deleted, err := b.retentionStore.DeleteRestoring(proof)
 	if err != nil {
 		return fmt.Errorf("delete restore source finalizer: %w", err)
 	}
 	if !deleted {
-		// Another idempotent finalizer may have won after the exact active
-		// release became durable. Absence is therefore success; any surviving
-		// record is a changed authority that this stale snapshot must not consume.
-		current, readErr := b.retentionStore.Get(rec.OriginalLeaseUUID)
-		if readErr != nil {
-			return fmt.Errorf("verify restore source finalizer after lost delete authority: %w", readErr)
-		}
-		if current != nil {
-			return fmt.Errorf(
-				"restore source finalizer changed before delete (status=%q new_lease_uuid=%q generation=%d)",
-				current.Status, current.NewLeaseUUID, current.Generation,
-			)
-		}
+		return errors.New("exact restore source finalizer was not deleted")
 	}
 	return nil
 }
@@ -2290,17 +2287,21 @@ type retainedQuotaTarget struct {
 //
 // A promote restore raises the physical quota through volumeManager.Create.
 // Merely renaming the volume back does not undo that change on btrfs, XFS, or
-// ZFS. RevertToActiveWithResourceProfiles would then publish the smaller immutable source footprint
+// ZFS. RollbackRestoring would then publish the smaller immutable source footprint
 // while the filesystem still permits growth to the larger destination cap.
 // This helper closes that under-accounting window by requiring three proofs:
 // the durable snapshot maps every retained volume to one exact old cap, current
 // usage fits that cap, and the volume manager successfully reapplies it. The
 // caller must leave the record Restoring and its live allocation counted on any
 // error.
-func (b *Backend) restoreRetainedVolumeQuotas(
+func (b *Backend) restoreRetainedVolumeQuotasUsing(
 	ctx context.Context,
 	rec *shared.RetentionEntry,
+	ensureQuota backgroundVolumeQuota,
 ) ([]shared.SKUResourceSnapshot, error) {
+	if ensureQuota == nil {
+		return nil, errBackgroundMaintenanceUnavailable
+	}
 	if rec == nil {
 		return nil, errors.New("restore source retention record is required")
 	}
@@ -2414,7 +2415,7 @@ func (b *Backend) restoreRetainedVolumeQuotas(
 	}
 
 	for _, target := range targets {
-		if err := b.mutationAdapter().ensureVolumeQuota(ctx, target.name, target.diskMB); err != nil {
+		if err := ensureQuota(ctx, target.name, target.diskMB); err != nil {
 			b.logger.Error("restore rollback cannot apply immutable source quota",
 				"lease_uuid", rec.OriginalLeaseUUID,
 				"volume", target.name,
@@ -2465,10 +2466,17 @@ func (b *Backend) revertRestoreSourceWithAccounting(
 		return false, fmt.Errorf("reserve restore rollback retained accounting: %w", err)
 	}
 
-	ok, commitErr := b.retentionStore.RevertToActiveWithResourceProfiles(
-		rec.OriginalLeaseUUID, newLeaseUUID, rec.Generation, resourceProfiles,
-	)
-	if commitErr != nil || !ok {
+	if rec.NewLeaseUUID != newLeaseUUID {
+		return false, fmt.Errorf("restore finalizer belongs to destination %q", rec.NewLeaseUUID)
+	}
+	proof, proofErr := b.retentionStore.ProveRestoringSnapshot(*rec)
+	var commitErr error
+	if proofErr != nil {
+		commitErr = fmt.Errorf("prove exact restore rollback authority: %w", proofErr)
+	} else {
+		_, commitErr = b.retentionStore.RollbackRestoring(proof, resourceProfiles)
+	}
+	if commitErr != nil {
 		// The durable owner did not change, so undo only our conservative add.
 		// No projection writer can interleave while retentionAccountingMu is held.
 		if rollbackErr := b.pool.SetRetainedDisk(previousRetainedMB); rollbackErr != nil {
@@ -2476,7 +2484,7 @@ func (b *Backend) revertRestoreSourceWithAccounting(
 				"restore prior retained accounting after failed ownership CAS: %w", rollbackErr,
 			))
 		}
-		return ok, commitErr
+		return false, commitErr
 	}
 
 	if refreshErr := b.refreshRetentionAccountingCheckedLocked(); refreshErr != nil {
@@ -2514,102 +2522,14 @@ func (b *Backend) revertRestoreSourceWithAccounting(
 // A REAL re-quarantine rename failure (not a benign no-op) means an adopted
 // volume may still be canonical-named under the new lease, so the on-disk state
 // no longer matches the record. Mirroring reconcileRestoring, we then LEAVE the
-// record restoring (do NOT RevertToActiveWithResourceProfiles, do NOT removeProvision) and return:
-// the next reconcile sweep retries the re-quarantine safely, and meanwhile the
-// provision's expected-set entry (cleanupOrphanedVolumes' restoring arm) protects
-// the canonical volume from the orphan reaper. Reverting here would make that
-// still-live data eligible for cleanup/reaping.
+// record restoring (do NOT RollbackRestoring, do NOT removeProvision) and return:
+// the next reconcile sweep retries the re-quarantine safely, and meanwhile the exact
+// restoring record and provision continue to claim the canonical volume. Reverting
+// here would discard the authority needed to distinguish that still-live data.
 //
 // Make-before-break (ENG-376 site 4): every failure leaves the live allocation
-// counted. reconcileRestoring's orphaned arm resumes preparation and performs
-// the exact retained-accounting handoff only after journal settlement succeeds.
-func (b *Backend) prepareRestoreAdoptionRollback(ctx context.Context, leaseUUID string,
-	rec *shared.RetentionEntry, dropProvision bool, logger *slog.Logger,
-) ([]shared.SKUResourceSnapshot, bool) {
-	stopTimeout := cmp.Or(b.cfg.ContainerStopTimeout, 30*time.Second)
-	b.provisionsMu.RLock()
-	var recordedIDs []string
-	if p, ok := b.provisions[leaseUUID]; ok {
-		recordedIDs = slices.Clone(p.ContainerIDs)
-	}
-	b.provisionsMu.RUnlock()
-	// Label the two arms apart. They are the same call but not the same event: the worker
-	// arm BLOCKS on a failed teardown (below), while the prelude arm discards the error
-	// and completes the rollback, so counting both as restore_rollback would make the
-	// wedge case unqueryable and put "nothing is wrong" samples in the alerting series
-	// (ENG-647). The prelude callers are themselves entered on caller-context
-	// cancellation and then hand that same dead context to the teardown, so a failure
-	// there is routinely just a canceled request, not a leak.
-	teardownOp := teardownOpRestoreRollback
-	if dropProvision {
-		teardownOp = teardownOpRestorePrelude
-	}
-	if _, derr := b.teardownLeaseContainers(ctx, leaseUUID, recordedIDs, stopTimeout,
-		teardownOp, logger); derr != nil && !dropProvision {
-		// Same precondition as reconcileRestoring's orphaned arm: a surviving container
-		// holds the adopted volumes by inode, so re-quarantining them now would let it
-		// write into data the record calls frozen (ENG-647). Leave the record restoring
-		// with the live allocation counted; the reconcile sweep retries the whole
-		// rollback, and doRestore's caller still gets its errored ReplaceResult, so the
-		// actor's evReplaceFailed → Failed transition and its callback are unaffected.
-		//
-		// dropProvision==true is deliberately EXEMPT. It means the worker never ran
-		// (adopt/route/ack failure in the synchronous prelude), so no compose Up
-		// happened and there is nothing to strand — a Down error there is a wedged
-		// daemon, not a leak. Bailing would leave a Provisioning provision behind a
-		// restoring record, which reconcileRestoring's in-flight guard then defers on
-		// forever: a wedge only a restart clears. Dropping the reservation is the only
-		// way that lease ever becomes clean again.
-		logger.Warn("restore rollback: teardown failed; leaving record restoring for the reconcile sweep",
-			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID, "error", derr)
-		return nil, false
-	}
-	failed := false
-	for _, retained := range rec.RetainedVolumeNames {
-		newCanonical := retainedToNewCanonical(retained, rec.OriginalLeaseUUID, leaseUUID)
-		if rerr := b.renameIfPresent(ctx, newCanonical, retained); rerr != nil {
-			failed = true
-		}
-	}
-	if failed {
-		// Re-quarantine rename failed: the bytes remain on disk under the new-lease
-		// canonical name and the record stays 'restoring' for the next reconcile
-		// sweep. KEEP the live allocation counted (do NOT releaseAll) — releasing
-		// while the bytes persist and the restoring record is excluded from the
-		// retained projection would under-count → over-admit. The dead lease's live
-		// allocation is reclaimed when it is deprovisioned / on recover.
-		logger.Warn("restore rollback: re-quarantine rename failed; leaving record restoring + live counted for reconcile sweep",
-			"lease_uuid", rec.OriginalLeaseUUID, "new_lease_uuid", leaseUUID)
-		if dropProvision {
-			// The actor rejected (or was never reached), so Provisioning has no
-			// legitimate writer left. Remove this Backend-owned reservation marker;
-			// the restoring record protects both canonical and retained names, and
-			// its exact destination authority lets recovery preserve accounting.
-			b.removeProvision(leaseUUID)
-		}
-		return nil, false
-	}
-	resourceProfiles, quotaErr := b.restoreRetainedVolumeQuotas(ctx, rec)
-	if quotaErr != nil {
-		// The names are safely back in the retained namespace, but publishing the
-		// source record would under-account a promoted quota. Preserve the live
-		// reservation. A synchronous prelude has no actor transition coming, so
-		// remove only its in-memory Provisioning guard to let the periodic restoring
-		// reconciler retry this exact quota proof; the pool allocation remains held
-		// until that retry durably reactivates the source.
-		logger.Error("restore rollback: unable to restore source volume quotas; leaving record restoring + live counted",
-			"lease_uuid", rec.OriginalLeaseUUID,
-			"new_lease_uuid", leaseUUID,
-			"error", quotaErr,
-		)
-		if dropProvision {
-			b.removeProvision(leaseUUID)
-		}
-		return nil, false
-	}
-	return resourceProfiles, true
-}
-
+// counted. reconcileRestoring's orphaned arm resumes preparation, settles the
+// operation journal, and then performs the exact retained-accounting handoff.
 // completeRestoreAdoptionRollback performs the make-before-break ownership
 // handback after prepareRestoreAdoptionRollback proved that no destination
 // container or promoted quota remains. Callers that own a pre-actor restore
@@ -2652,25 +2572,6 @@ func (b *Backend) completeRestoreAdoptionRollback(
 	return true
 }
 
-// prepareAcceptedRestoreAdoptionRollback performs physical and quota rollback
-// for a restore whose worker crossed the actor acceptance boundary. It
-// deliberately does not hand the source back to Active or release the live
-// allocation: the actor has not yet durably settled its Failed callback. Its
-// Failed transition leaves the provision projection in place, after which the
-// level-triggered retention sweep settles any surviving intent and performs the
-// exact make-before-break handback. This keeps the Restoring row as retry
-// authority if callback persistence fails.
-func (b *Backend) prepareAcceptedRestoreAdoptionRollback(
-	ctx context.Context,
-	leaseUUID string,
-	rec *shared.RetentionEntry,
-	logger *slog.Logger,
-) {
-	_, _ = b.prepareRestoreAdoptionRollback(
-		ctx, leaseUUID, rec, false, logger,
-	)
-}
-
 // rollbackUnacceptedRestoreAdoption compensates a synchronous Restore failure
 // for which no actor worker can publish Ready. It intentionally settles the
 // exact failed operation after physical/quota cleanup but before the source
@@ -2678,7 +2579,6 @@ func (b *Backend) prepareAcceptedRestoreAdoptionRollback(
 // remain a level-triggered retry owner; only the dead Provisioning projection is
 // removed so the periodic reconciler can enter its orphaned rollback arm.
 func (b *Backend) rollbackUnacceptedRestoreAdoption(
-	ctx context.Context,
 	leaseUUID string,
 	allocatedIDs []string,
 	rec *shared.RetentionEntry,
@@ -2692,11 +2592,23 @@ func (b *Backend) rollbackUnacceptedRestoreAdoption(
 	if intent.Kind() != shared.OperationIntentRestore {
 		return fmt.Errorf("unaccepted restore rollback received %s intent", intent.Kind())
 	}
-	resourceProfiles, prepared := b.prepareRestoreAdoptionRollback(
-		ctx, leaseUUID, rec, true, logger,
-	)
-	if !prepared {
-		return fmt.Errorf("restore failed; durable source cleanup remains pending: %w", cause)
+	// Actor rejection occurs before StartOperationExecution. The restore handler
+	// therefore cannot have renamed a volume, changed a quota, or invoked Compose.
+	// Rolling back by touching Docker here would manufacture a substrate effect
+	// outside the Started protocol. Reconstruct only the immutable accounting
+	// snapshot needed for the durable source handback.
+	resourceProfiles := shared.CloneSKUResourceSnapshot(rec.ResourceProfiles)
+	if len(resourceProfiles) == 0 {
+		var resolveErr error
+		resourceProfiles, resolveErr = b.resolveResourceProfiles(rec.Items)
+		if resolveErr != nil {
+			b.removeProvision(leaseUUID)
+			return fmt.Errorf("restore failed; resolve source accounting for refusal: %w", resolveErr)
+		}
+	}
+	if err := validateDockerResourceProfiles(rec.Items, resourceProfiles); err != nil {
+		b.removeProvision(leaseUUID)
+		return fmt.Errorf("restore failed; validate source accounting for refusal: %w", err)
 	}
 	// Physical cleanup above is bridged by the Restoring row. From exact
 	// operation settlement through source-authority handback, pool release, and

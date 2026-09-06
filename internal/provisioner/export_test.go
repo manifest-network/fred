@@ -1,43 +1,72 @@
 package provisioner
 
-// export_test.go holds scaffolding that exists ONLY for this package's
-// tests. It compiles into the test binary and never into providerd,
-// which is the point: provisioner's production files must not carry code
-// whose only caller is a test (ENG-354).
+// export_test.go holds scaffolding that exists ONLY for this package's tests.
+// It compiles into the test binary and never into providerd.
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"sync"
+	"time"
+
 	"github.com/ThreeDotsLabs/watermill/message"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backendidentity"
-	"github.com/manifest-network/fred/internal/util"
+	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
-var defaultCallbackTestStorageIdentity = func() backendidentity.ID {
-	id, err := backendidentity.Parse("6ba7b811-9dad-41d1-80b4-00c04fd430c8")
-	if err != nil {
-		panic(err)
-	}
-	return id
-}()
+const callbackTestHMACSecret = "callback-test-secret-0123456789abcdef"
 
-type callbackTestStorageIdentityAuthority struct{}
+var (
+	callbackTestProofVerifier, callbackTestProofConsumer = hmacauth.NewCallbackProofBoundary()
+	callbackTestCoordinators                             sync.Map
+)
 
-func (callbackTestStorageIdentityAuthority) ExpectedBackendStorageIdentity(
-	string,
-) (backendidentity.ID, bool) {
-	return defaultCallbackTestStorageIdentity, true
+// callbackServiceTestConfig mirrors the production construction boundary.
+type callbackServiceTestConfig struct {
+	Coordinator         *placement.OperationCoordinator
+	Chain               CallbackChain
+	Acknowledger        Acknowledger
+	Payloads            CallbackPayloadStore
+	Events              CallbackEventSink
+	Backends            CallbackBackendCatalog
+	DeprovisionObserver CallbackDeprovisionObserver
 }
 
-// newCallbackServiceForTest permits deliberately partial protocol fixtures.
-// Production binaries can call only NewCallbackService, whose composition is
-// safe by construction. Partial test fixtures receive a concrete, valid
-// storage-identity authority; they do not toggle production verification.
-func newCallbackServiceForTest(cfg CallbackServiceConfig) (*CallbackService, error) {
-	if util.IsNilInterface(cfg.StorageIdentities) {
-		cfg.StorageIdentities = callbackTestStorageIdentityAuthority{}
+func newCallbackServiceForTest(cfg callbackServiceTestConfig) (*CallbackService, error) {
+	if cfg.Chain == nil {
+		cfg.Chain = &callbackChainStub{}
 	}
-	return newCallbackService(cfg)
+	if cfg.Acknowledger == nil {
+		cfg.Acknowledger = callbackAcknowledgerFunc(func(
+			context.Context, string,
+		) (bool, string, error) {
+			return true, "", nil
+		})
+	}
+	var coordinator *placement.AuthenticatedCallbackCoordinator
+	var err error
+	if cfg.Coordinator != nil {
+		coordinator, err = authenticatedCallbackCoordinatorForTest(
+			cfg.Coordinator,
+			cfg.Chain, cfg.Acknowledger,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	service, err := NewCallbackService(CallbackServiceConfig{
+		Coordinator: coordinator,
+		Payloads:    cfg.Payloads, Events: cfg.Events, Backends: cfg.Backends,
+		DeprovisionObserver: cfg.DeprovisionObserver,
+	})
+	if err == nil && cfg.Coordinator != nil {
+		callbackTestCoordinators.Store(service, cfg.Coordinator)
+	}
+	return service, err
 }
 
 // HandleBackendCallback preserves the old message-shaped test surface without
@@ -51,52 +80,56 @@ func (h *HandlerSet) HandleBackendCallback(msg *message.Message) (err error) {
 		return nil
 	}
 	if callback.BackendStorageID == "" {
-		callback.BackendStorageID = defaultCallbackTestStorageIdentity.String()
+		backendName := "test-backend"
+		if service, serviceOK := h.callbacks.(*CallbackService); serviceOK {
+			if raw, exists := callbackTestCoordinators.Load(service); exists {
+				metadata, tracked := raw.(*placement.OperationCoordinator).Lookup(callback.LeaseUUID)
+				if tracked {
+					backendName = metadata.Backend()
+				}
+			} else if callback.Backend != "" {
+				backendName = callback.Backend
+			}
+		}
+		callback.BackendStorageID = testBackendStorageID(backendName).String()
 	}
-	return h.handleBackendCallbackPayload(msg.Context(), callback)
+	proof, err := callbackProofForTest(callback)
+	if err != nil {
+		return err
+	}
+	return h.HandleBackendCallbackEvidence(msg.Context(), proof)
+}
+
+func callbackProofForTest(callback backend.CallbackPayload) (hmacauth.VerifiedRequest, error) {
+	query := make(url.Values)
+	if callback.OperationID != "" {
+		query.Set(backend.CallbackOperationIDQueryParameter, callback.OperationID)
+	}
+	if callback.LifecycleID != "" {
+		query.Set("lifecycle_id", callback.LifecycleID)
+	}
+	callback.OperationID = ""
+	callback.LifecycleID = ""
+	body, err := json.Marshal(callback)
+	if err != nil {
+		return hmacauth.VerifiedRequest{}, err
+	}
+	uri := "/callbacks/provision"
+	if encoded := query.Encode(); encoded != "" {
+		uri += "?" + encoded
+	}
+	now := time.Now()
+	signature := hmacauth.SignWithTime(callbackTestHMACSecret, http.MethodPost, uri, body, now)
+	return callbackTestProofVerifier.VerifyRoutedWithTime(
+		callbackTestHMACSecret, http.MethodPost, uri, body, signature,
+		callback.BackendStorageID, "/callbacks/provision",
+		5*time.Minute, time.Minute, now,
+	)
 }
 
 // handlersOf builds a HandlerSet from the same dependencies Manager holds.
-//
-// NewManager registers the chain and payload methods with Watermill and keeps
-// the callback method as its production synchronous ingress function. Older
-// manager tests that invoke an adapter directly rebuild the set here, through
-// the production constructors. Production callback ordering and direct event
-// delivery are covered through Manager.PublishCallback instead; this helper's
-// callback event sink intentionally retains the Watermill-shaped test fixture.
-//
-// Call this ONCE per test and reuse the result. HandlerSet carries mutable
-// state (awaitingPayload, which HandleLeaseCreated fills and the payload
-// and callback handlers drain, feeding the leases-awaiting-payload gauge),
-// so a fresh set per call would silently drop it between handler
-// invocations in a test that spans more than one.
+// Call this once per test and reuse the result because HandlerSet carries
+// mutable payload-waiting state.
 func handlersOf(m *Manager) *HandlerSet {
-	callbacks, err := newCallbackServiceForTest(CallbackServiceConfig{
-		Operations:         m.operations,
-		Chain:              m.chainClient,
-		Acknowledger:       m.ackBatcher,
-		Placement:          m.placementStore,
-		LifecycleAuthority: m.placementStore,
-		Payloads:           m.payloadStore,
-		Events: callbackEventSinkFunc(func(
-			leaseUUID string, status backend.ProvisionStatus, failure string,
-		) {
-			publishLeaseStatusEvent(m.publisher, leaseUUID, status, failure)
-		}),
-		Backends: m.router,
-		DeprovisionObserver: callbackDeprovisionObserverFunc(
-			m.orchestrator.forgetDeprovisionCandidate,
-		),
-	})
-	if err != nil {
-		panic(err)
-	}
-	return NewHandlerSet(HandlerDeps{
-		ChainClient:     m.chainClient,
-		Orchestrator:    m.orchestrator,
-		EventOperations: m.operations,
-		PayloadStore:    m.payloadStore,
-		Publisher:       m.publisher,
-		Callbacks:       callbacks,
-	})
+	return m.handlers
 }

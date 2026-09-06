@@ -430,21 +430,6 @@ startup_verify_duration: 5s
 # containers and sends failure callbacks. Default: 5m.
 reconcile_interval: 5m
 
-# --- Advanced: recover-time migration knobs ----------------------------------
-# On restart, fred may migrate legacy single-container leases to the current
-# stack form. These tune that one-time, per-lease migration window. The
-# defaults are sane; only set these if you know you need to.
-#
-# Cap on how long the migration waits for the new stack-form container to
-# become healthy (or running, if it declares no health check) before declaring
-# the migration failed for that lease. Default: 90s.
-# migration_ready_timeout: 90s
-#
-# How long the renamed "-prev" legacy container lingers after a successful
-# migration before forced removal (preserves rollback if you interrupt fred to
-# inspect during the window). Default: 1m.
-# migration_grace_period: 1m
-
 # =============================================================================
 # INGRESS (optional)
 # =============================================================================

@@ -42,6 +42,8 @@ func TestProvisionToInfoReportsPersistedLifecycleGenerationWithoutURL(t *testing
 	const id = "550e8400-e29b-41d4-a716-446655440000"
 	prov := &provision{ProvisionState: leasesm.ProvisionState{
 		LeaseUUID:            "lease-1",
+		Tenant:               "tenant-a",
+		ProviderUUID:         "provider-a",
 		Status:               backend.ProvisionStatusReady,
 		CallbackURL:          "https://secret.internal/callbacks/provision?operation_id=" + id,
 		LifecycleCallbackURL: "https://secret.internal/callbacks/provision?lifecycle_id=" + id,
@@ -52,6 +54,9 @@ func TestProvisionToInfoReportsPersistedLifecycleGenerationWithoutURL(t *testing
 		Kind: backend.LifecycleGenerationTyped,
 		ID:   id,
 	}, info.LifecycleGeneration)
+	assert.Equal(t, "tenant-a", info.Tenant,
+		"identity-bearing inventory must carry the runtime principal")
+	assert.Equal(t, "provider-a", info.ProviderUUID)
 	encoded, err := json.Marshal(info.LifecycleGeneration)
 	assert.NoError(t, err)
 	assert.NotContains(t, string(encoded), "secret.internal")

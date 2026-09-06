@@ -2,8 +2,10 @@ package docker
 
 import (
 	"context"
+	"slices"
 	"strings"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 )
@@ -61,7 +63,7 @@ func dockerStatusToPhase(status string) leasesm.Phase {
 // leasesm.InstanceInspector interface. The Docker-shaped ContainerInfo
 // is translated to InstanceState at the seam.
 type dockerInstanceInspector struct {
-	docker dockerClient
+	docker dockerReadClient
 }
 
 // InspectInstance implements leasesm.InstanceInspector.
@@ -100,34 +102,78 @@ type backendProvisionStore struct {
 	backend *Backend
 }
 
-// Get implements leasesm.LeaseProvisionStore. Returns a SHALLOW
-// value-copy snapshot of the embedded ProvisionState — slices/maps
-// alias the underlying record (no deep copy). Caller does NOT hold
-// any lock after Get returns. Docker-private wrapper fields
-// (VolumeCleanupAttempts) are NOT exposed through this seam — the SM
-// has no business reading them.
-func (s *backendProvisionStore) Get(leaseUUID string) (*leasesm.ProvisionState, bool) {
+func (s *backendProvisionStore) LookupStatus(leaseUUID string) (backend.ProvisionStatus, bool) {
 	s.backend.provisionsMu.RLock()
 	defer s.backend.provisionsMu.RUnlock()
 	p, ok := s.backend.provisions[leaseUUID]
 	if !ok {
-		return nil, false
+		return backend.ProvisionStatusUnknown, false
 	}
-	snap := p.ProvisionState
-	// ResourceProfiles is temporarily mirrored on Docker's wrapper for
-	// construction compatibility. The actor seam always observes the wrapper's
-	// authoritative value until all literal sites migrate to ProvisionState.
-	snap.ResourceProfiles = shared.CloneSKUResourceSnapshot(p.ResourceProfiles)
-	return &snap, true
+	return p.Status, true
+}
+
+func (s *backendProvisionStore) Exists(leaseUUID string) bool {
+	s.backend.provisionsMu.RLock()
+	defer s.backend.provisionsMu.RUnlock()
+	_, ok := s.backend.provisions[leaseUUID]
+	return ok
+}
+
+func classifyReadyProjection(
+	p *provision,
+	proof shared.RuntimeGenerationProof,
+	instanceID string,
+) leasesm.ObservationGenerationState {
+	if p == nil {
+		return leasesm.ObservationGenerationAbsent
+	}
+	if !proof.Valid() || p.LeaseUUID != proof.LeaseUUID() ||
+		p.ActiveReleaseVersion <= 0 || p.ActiveReleaseVersion != proof.Version() {
+		return leasesm.ObservationGenerationSuperseded
+	}
+	switch proof.AuthorityClass() {
+	case shared.ReleaseAuthorityTyped:
+		if !p.ActiveOperationID.Valid() || p.ActiveOperationID != proof.OperationID() {
+			return leasesm.ObservationGenerationSuperseded
+		}
+	case shared.ReleaseAuthorityLegacy:
+		if !p.ActiveOperationID.IsZero() || !proof.OperationID().IsZero() {
+			return leasesm.ObservationGenerationSuperseded
+		}
+	default:
+		return leasesm.ObservationGenerationSuperseded
+	}
+	if p.Status != backend.ProvisionStatusReady {
+		return leasesm.ObservationGenerationAdvanced
+	}
+	if instanceID != "" && !slices.Contains(p.ContainerIDs, instanceID) {
+		return leasesm.ObservationGenerationAdvanced
+	}
+	return leasesm.ObservationGenerationCurrent
+}
+
+func (s *backendProvisionStore) ClassifyReadyRuntime(
+	proof shared.RuntimeGenerationProof,
+) leasesm.ObservationGenerationState {
+	s.backend.provisionsMu.RLock()
+	defer s.backend.provisionsMu.RUnlock()
+	return classifyReadyProjection(s.backend.provisions[proof.LeaseUUID()], proof, "")
+}
+
+func (s *backendProvisionStore) ClassifyReadyInstance(
+	proof shared.RuntimeGenerationProof,
+	instanceID string,
+) leasesm.ObservationGenerationState {
+	s.backend.provisionsMu.RLock()
+	defer s.backend.provisionsMu.RUnlock()
+	return classifyReadyProjection(s.backend.provisions[proof.LeaseUUID()], proof, instanceID)
 }
 
 // UpdateFn implements leasesm.LeaseProvisionStore. Runs fn under one
 // Lock acquisition on b.provisionsMu, passing a pointer to the embedded
 // ProvisionState. Mutations made by fn persist on the underlying
 // record. Returns true when the lease existed and fn was applied.
-// Docker-private wrapper fields (VolumeCleanupAttempts) are NOT
-// reachable through fn — only the substrate-agnostic ProvisionState
-// fields the SM consumes.
+// Only the substrate-agnostic ProvisionState fields are reachable through fn.
 func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.ProvisionState)) bool {
 	s.backend.provisionsMu.Lock()
 	defer s.backend.provisionsMu.Unlock()
@@ -135,19 +181,27 @@ func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.Prov
 	if !ok {
 		return false
 	}
-	p.ProvisionState.ResourceProfiles = shared.CloneSKUResourceSnapshot(p.ResourceProfiles)
+	wasReady := p.Status == backend.ProvisionStatusReady
 	fn(&p.ProvisionState)
-	p.ResourceProfiles = shared.CloneSKUResourceSnapshot(p.ProvisionState.ResourceProfiles)
+	isReady := p.Status == backend.ProvisionStatusReady
+	// Readiness is a property of the projection mutation, so its gauge delta is
+	// committed in the same critical section. This makes every live transition
+	// linearizable with recoverState's baseline Set and prevents a Set/delta
+	// interleaving from manufacturing a negative or stale gauge.
+	switch {
+	case !wasReady && isReady:
+		activeProvisions.Inc()
+	case wasReady && !isReady:
+		activeProvisions.Dec()
+	}
 	return true
 }
 
 // Delete implements leasesm.LeaseProvisionStore. Removes the lease's live
-// record under the same provisionsMu as Get/UpdateFn, so a concurrent Get
+// record under the same provisionsMu as LookupStatus/Exists/UpdateFn, so a concurrent Exists
 // probe (e.g. handleDeprovision's terminated check) observes the removal.
 func (s *backendProvisionStore) Delete(leaseUUID string) bool {
 	s.backend.provisionsMu.Lock()
 	defer s.backend.provisionsMu.Unlock()
-	_, ok := s.backend.provisions[leaseUUID]
-	delete(s.backend.provisions, leaseUUID)
-	return ok
+	return s.backend.deleteProvisionLocked(leaseUUID)
 }

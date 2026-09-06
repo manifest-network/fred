@@ -45,16 +45,51 @@ func newVolumeCleanupContext(parent context.Context) (context.Context, context.C
 	return newDetachedBoundedContext(parent, volumeCleanupTimeout)
 }
 
-// volumeManager manages quota-enforced host directories for container volumes.
-//
-// It deliberately does NOT include Destroy. Every concrete manager implements it, but
-// exposing it here would put an irreversible RemoveAll on tenant data one method call
-// away from any code holding b.volumes — which is how six call sites came to derive
-// their own destroy sets, three of them from a name that does not prove ownership.
-// Destruction is reached only through volumeOp.destroy (volume_destroy.go), which asks
-// who owns the bytes first; leaving the method off this interface is what turns
-// forgetting to ask into a compile error rather than a review comment. (ENG-658)
-type volumeManager interface {
+// volumeReader is the only volume-manager surface retained by Backend. It has
+// no tenant-substrate mutation methods, so an ordinary b.volumes call cannot
+// create, rename, requota, recover, or destroy storage.
+type volumeReader interface {
+	// List returns the IDs of mounted managed volumes in the data directory.
+	// It is an informational view; destructive decisions use ListForProof.
+	List() ([]string, error)
+
+	// ListForProof returns the complete managed-volume substrate inventory under
+	// a caller-owned deadline. For directory-backed managers this is the same
+	// namespace as List. ZFS additionally inventories child datasets so an
+	// unmounted or externally-mounted dataset cannot disappear from the proof
+	// merely because its expected directory is absent.
+	ListForProof(context.Context) ([]string, error)
+
+	// AttestManagedVolume proves that name is backed by this manager's exact
+	// quota substrate, not merely by a directory with a syntactically valid
+	// managed name. The typed name keeps unvalidated path and dataset strings
+	// out of the proof boundary; the context bounds any filesystem CLI probe.
+	AttestManagedVolume(context.Context, managedVolumeName) error
+
+	// RequireNoInterruptedVolumeMutations is the read-only publication boundary
+	// for first-time storage-lineage initialization and post-recovery startup.
+	RequireNoInterruptedVolumeMutations(context.Context) error
+
+	// Validate checks filesystem support and permissions, and rebuilds local
+	// manager indexes from on-disk volumes. Called at startup.
+	Validate() error
+
+	// HostPath returns the conventional absolute mount path for a managed name.
+	HostPath(name string) string
+
+	// Usage returns the volume's current data footprint in bytes.
+	Usage(ctx context.Context, id string) (int64, error)
+
+	// Kind returns the backend filesystem name.
+	Kind() string
+}
+
+// volumeMutationSink is captured only by settlement-bound Guards. Destruction
+// remains part of this aggregate-only sink; volumeOp must first establish exact
+// ownership before asking the aggregate to invoke it. (ENG-658)
+type volumeMutationSink interface {
+	volumeDestroyer
+
 	// Create creates a quota-enforced directory for a container.
 	// Idempotent: if the volume already exists, updates the quota and returns
 	// the existing path. Returns the host path, whether the volume was newly
@@ -71,33 +106,6 @@ type volumeManager interface {
 	// Used by the startup backfill (reconcileVolumeQuotas).
 	EnsureQuota(ctx context.Context, id string, sizeMB int64) error
 
-	// List returns the IDs of all managed volumes in the data directory.
-	// Used for orphan detection at startup.
-	List() ([]string, error)
-
-	// ListForProof returns the complete managed-volume substrate inventory under
-	// a caller-owned deadline. For directory-backed managers this is the same
-	// namespace as List. ZFS additionally inventories child datasets so an
-	// unmounted or externally-mounted dataset cannot disappear from the proof
-	// merely because its expected directory is absent.
-	ListForProof(context.Context) ([]string, error)
-
-	// AttestManagedVolume proves that name is backed by this manager's exact
-	// quota substrate, not merely by a directory with a syntactically valid
-	// managed name. The typed name keeps unvalidated path and dataset strings
-	// out of the proof boundary; the context bounds any filesystem CLI probe.
-	// It is read-only and is used before storage identity publication and
-	// backend startup, as well as before reusing an existing volume.
-	AttestManagedVolume(context.Context, managedVolumeName) error
-
-	// RequireNoInterruptedVolumeMutations is the read-only publication boundary
-	// for first-time storage-lineage initialization and post-recovery startup. It
-	// rejects manager-private mutation evidence (for example an XFS create/delete
-	// stage or an exact but unmounted ZFS child) without repairing or deleting it.
-	// Explicit adoption calls this while the old daemon is stopped, so a proof
-	// command can never mutate the lineage it is measuring.
-	RequireNoInterruptedVolumeMutations(context.Context) error
-
 	// RecoverInterruptedVolumeMutations resolves manager-private mutation evidence
 	// after the identity-bound stores have been opened exclusively but before
 	// ordinary operation-intent recovery. Implementations may only act on strictly
@@ -105,10 +113,6 @@ type volumeManager interface {
 	// cleanup. The storage mutation adapter surrounds this method with before/after
 	// lineage verification.
 	RecoverInterruptedVolumeMutations(context.Context) error
-
-	// Validate checks filesystem support and permissions, and rebuilds any
-	// internal state (e.g. active project IDs) from on-disk volumes. Called at startup.
-	Validate() error
 
 	// RenameVolume atomically renames a managed volume from oldName to
 	// newName, preserving data and per-volume metadata (xfs project ID,
@@ -122,26 +126,13 @@ type volumeManager interface {
 	// fred-{leaseUUID}-{service}-{idx} naming convention without copying
 	// data.
 	RenameVolume(ctx context.Context, oldName, newName string) error
+}
 
-	// HostPath returns the absolute on-host path for a managed volume of
-	// the given name. The volume need not yet exist — this lets callers
-	// compute paths for not-yet-renamed or about-to-be-created volumes.
-	// The path returned is the conventional mount point under the
-	// configured volume_data_path; the actual mount target may differ on
-	// zfs if mountpoint properties were overridden, but production code
-	// expects default inheritance.
-	HostPath(name string) string
-
-	// Usage returns the volume's current data footprint in BYTES. Backends
-	// without a usage primitive (noop) return an error wrapping
-	// errors.ErrUnsupported (Go 1.21+); callers detect it with
-	// errors.Is(err, errors.ErrUnsupported). Used by the restore demote
-	// fit-gate (checkDemoteFit) to refuse a tier-down that would not fit.
-	Usage(ctx context.Context, id string) (int64, error)
-
-	// Kind returns the backend filesystem name ("btrfs", "xfs", "zfs",
-	// "noop") for metric labeling and logging.
-	Kind() string
+// volumeManager is the concrete construction/test seam. Backend immediately
+// projects it into volumeReader plus its aggregate-only mutation sink.
+type volumeManager interface {
+	volumeReader
+	volumeMutationSink
 }
 
 type identityRootPinner interface {
@@ -325,7 +316,7 @@ const volumePrefix = "fred-"
 // absent volume as evidence a retention record is orphaned, so an empty enumeration makes
 // allVolumesAbsent vacuously true for EVERY active record; after the confirmation streak it
 // prunes them, and once the filesystem is mounted again those volumes have no record naming
-// them — so the next boot's orphan sweep destroys retained tenant data. (ENG-687)
+// them. That loses both admission accounting and the exact retained-data finalizer. (ENG-687)
 //
 // Before a storage lineage is sealed, the watch can learn a provisional baseline: the first
 // enumeration that actually finds volumes records the device backing the root, and from then
@@ -403,20 +394,19 @@ func (w *volumeRootWatch) verify(dataPath string) error {
 
 // list enumerates dataPath and refuses to report emptiness it cannot vouch for.
 func (w *volumeRootWatch) list(dataPath string) ([]string, error) {
-	return w.listMatching(dataPath, false)
+	return w.listMatching(dataPath)
 }
 
-// listForProof inventories every entry in fred's reserved managed namespace,
-// regardless of filesystem type. Runtime List deliberately returns only real
-// directories because its consumers may derive deletion candidates; a lineage
-// proof has the opposite requirement and must surface a canonical-looking
-// symlink, regular file, or malformed fred-* collision so the typed parser and
-// concrete attester can reject it rather than seal an incomplete view.
+// listForProof inventories every directory that can be a manager-owned volume.
+// A regular file or symlink in the reserved namespace is not a substrate this
+// manager can attest or mutate; it is left untouched and blocks only a future
+// same-name create. Treating such an unattributed artifact as a volume would let
+// one stray directory entry deny startup for every unrelated lease.
 func (w *volumeRootWatch) listForProof(dataPath string) ([]string, error) {
-	return w.listMatching(dataPath, true)
+	return w.listMatching(dataPath)
 }
 
-func (w *volumeRootWatch) listMatching(dataPath string, includeNonDirectories bool) ([]string, error) {
+func (w *volumeRootWatch) listMatching(dataPath string) ([]string, error) {
 	// The lock spans the OBSERVATION as well as the update, not just the update. Two
 	// concurrent readings can otherwise be applied out of order — the older one landing last
 	// and installing a baseline that was already superseded — which is the same
@@ -425,7 +415,7 @@ func (w *volumeRootWatch) listMatching(dataPath string, includeNonDirectories bo
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	ids, identity, err := listVolumeEntriesWithRootIdentity(dataPath, includeNonDirectories)
+	ids, identity, err := listVolumeEntriesWithRootIdentity(dataPath)
 	if err != nil {
 		return nil, err
 	}
@@ -527,13 +517,10 @@ func statVolumeRootIdentity(dataPath string) (volumeRootIdentity, error) {
 // in-place path replacement on the same filesystem; both values come from the
 // same descriptor used for enumeration.
 func listVolumeIDsWithRootIdentity(dataPath string) ([]string, volumeRootIdentity, error) {
-	return listVolumeEntriesWithRootIdentity(dataPath, false)
+	return listVolumeEntriesWithRootIdentity(dataPath)
 }
 
-func listVolumeEntriesWithRootIdentity(
-	dataPath string,
-	includeNonDirectories bool,
-) ([]string, volumeRootIdentity, error) {
+func listVolumeEntriesWithRootIdentity(dataPath string) ([]string, volumeRootIdentity, error) {
 	f, err := os.Open(dataPath) //nolint:gosec // G304: dataPath is the operator-configured volume_data_path, validated at construction — never tenant-reachable (volume names are appended by callers, not by this open)
 	if err != nil {
 		return nil, volumeRootIdentity{}, fmt.Errorf("open volume data directory %s: %w", dataPath, err)
@@ -555,26 +542,11 @@ func listVolumeEntriesWithRootIdentity(
 	}
 	var ids []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), volumePrefix) && (includeNonDirectories || e.IsDir()) {
+		if strings.HasPrefix(e.Name(), volumePrefix) && e.IsDir() {
 			ids = append(ids, e.Name())
 		}
 	}
 	return ids, volumeRootIdentity{dev: st.Dev, ino: st.Ino}, nil
-}
-
-// pathExists reports whether p exists on the filesystem. Distinct from
-// `_, err := os.Stat(p); err == nil` because it surfaces non-ENOENT stat
-// errors (permission denied, I/O failure) to the caller rather than
-// silently treating them as "doesn't exist".
-func pathExists(p string) (bool, error) {
-	_, err := os.Stat(p)
-	if err == nil {
-		return true, nil
-	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	return false, err
 }
 
 // sanitizeVolumePath converts a container volume path to a safe subdirectory name.

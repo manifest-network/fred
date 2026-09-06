@@ -66,7 +66,8 @@ type ID struct {
 // from marker verification, not manufacture authority from an arbitrary UUID.
 // The zero value is invalid.
 type VerifiedStorage struct {
-	id ID
+	id          ID
+	backendName string
 }
 
 // PendingStorage is authority to prepare the authoritative stores for one
@@ -133,9 +134,20 @@ func (storage VerifiedStorage) ID() ID {
 	return storage.id
 }
 
+// BackendName returns the configured backend identity sealed into the same
+// committed marker pair as ID. Keeping the two facts in one unforgeable
+// capability lets authority-bearing journals derive their durable lineage
+// instead of accepting independently caller-selected names and storage IDs.
+func (storage VerifiedStorage) BackendName() string {
+	if !storage.Valid() {
+		return ""
+	}
+	return storage.backendName
+}
+
 // Valid reports whether storage contains a verified, non-zero identity.
 func (storage VerifiedStorage) Valid() bool {
-	return storage.id.Valid()
+	return storage.id.Valid() && storage.backendName != ""
 }
 
 // ID returns the immutable storage identity recorded by the durable pending

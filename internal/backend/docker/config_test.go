@@ -254,16 +254,6 @@ func TestConfig_Validate_PositiveValues(t *testing.T) {
 			wantErr: "container_stop_timeout must be non-negative",
 		},
 		{
-			name:    "negative migration_ready_timeout",
-			mutate:  func(c *Config) { c.MigrationReadyTimeout = -1 },
-			wantErr: "migration_ready_timeout must be non-negative",
-		},
-		{
-			name:    "negative migration_grace_period",
-			mutate:  func(c *Config) { c.MigrationGracePeriod = -1 },
-			wantErr: "migration_grace_period must be non-negative",
-		},
-		{
 			name:    "zero reconcile_interval",
 			mutate:  func(c *Config) { c.ReconcileInterval = 0 },
 			wantErr: "reconcile_interval must be positive",
@@ -681,16 +671,6 @@ func TestConfig_DefaultConfig_Validates(t *testing.T) {
 	cfg.VolumeDataPath = "/data/volumes"
 	cfg.VolumeMountPath = "/data"
 	require.NoError(t, cfg.Validate())
-}
-
-// TestConfig_DefaultConfig_MigrationDefaults locks in the single source of
-// truth shared by DefaultConfig and the cmp.Or fallbacks inside
-// executeLegacyMigration: changes to either side must update the const so the
-// configured default and the safety-net default never diverge.
-func TestConfig_DefaultConfig_MigrationDefaults(t *testing.T) {
-	cfg := DefaultConfig()
-	assert.Equal(t, defaultMigrationReadyTimeout, cfg.MigrationReadyTimeout)
-	assert.Equal(t, defaultMigrationGracePeriod, cfg.MigrationGracePeriod)
 }
 
 func TestConfig_RetentionDefaults(t *testing.T) {

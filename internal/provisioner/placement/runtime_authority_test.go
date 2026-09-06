@@ -40,7 +40,7 @@ func TestRuntimeAuthorityCommitOutcomeUnknownIsSticky(t *testing.T) {
 		s.CurrentLifecycle("lease-after-unknown-commit").Verdict())
 
 	operationID := requireOperationID(t, "99001")
-	token, applied, err := s.BeginNewAttempt(
+	token, applied, err := s.beginNewAttempt(
 		scope, "lease-after-unknown-commit", "backend-a", operationID,
 		PayloadFingerprint{}, testBackendRequestSnapshot(t), testCallbackPair(operationID),
 	)
