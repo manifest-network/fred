@@ -7,7 +7,7 @@ require (
 	cosmossdk.io/math v1.5.3
 	github.com/ThreeDotsLabs/watermill v1.5.1
 	github.com/cenkalti/backoff/v4 v4.3.0
-	github.com/compose-spec/compose-go/v2 v2.14.0
+	github.com/compose-spec/compose-go/v2 v2.15.0
 	github.com/cosmos/cosmos-sdk v0.50.14
 	github.com/distribution/reference v0.6.0
 	github.com/docker/cli v29.6.2+incompatible
@@ -24,11 +24,11 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/qmuntal/stateless v1.8.0
 	github.com/rs/cors v1.11.1
-	github.com/sirupsen/logrus v1.9.4
+	github.com/sirupsen/logrus v1.10.1
 	github.com/sony/gobreaker v1.0.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.1
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
@@ -249,7 +249,6 @@ require (
 	github.com/petermattis/goid v0.0.0-20240813172612-4fcff4a6cae7 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
-	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9 // indirect
@@ -314,7 +313,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.6 // indirect
 	golang.org/x/arch v0.17.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
