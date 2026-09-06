@@ -1627,6 +1627,8 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	)
 	recoveredMaintenance := newIntegrationMaintenanceService(t, env, restartedExecution)
 	require.NoError(t, recoveredMaintenance.RecoverPending(ctx))
+	assert.Equal(t, 2, lostResponseBackend.updateCount(),
+		"restart recovery must replay the exact command through the backend boundary")
 	storedPayload, err = env.tracker.store.Get(leaseUUID)
 	require.NoError(t, err)
 	assert.Equal(t, payloadV2, storedPayload,
