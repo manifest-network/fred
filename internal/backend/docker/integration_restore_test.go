@@ -235,14 +235,16 @@ func TestIntegration_Docker_RetainGraceReap(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
-		LeaseUUID:    leaseUUID,
-		Tenant:       "test-tenant",
-		ProviderUUID: testProviderUUID,
-		Items:        []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
-		CallbackURL:  callbackServer.URL,
-		Payload:      payload,
+		LeaseUUID:            leaseUUID,
+		Tenant:               "test-tenant",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: "docker-small", Quantity: 1}},
+		CallbackURL:          callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL,
+		Payload:              payload,
 	})
 	require.NoError(t, err)
 

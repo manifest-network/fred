@@ -626,22 +626,22 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	sourceRetainedVolume := retainedName(canonicalVolumeName(
 		sourceLease, manifest.DefaultServiceName, 0,
 	))
-	b.volumes = &mockVolumeManager{
-		RenameVolumeFn: func(string, string) error { return nil },
-		UsageFn: func(context.Context, string) (int64, error) {
-			signalRestorePreSnapshotRead.Do(func() { close(restorePreSnapshotReadReached) })
-			return 0, nil
-		},
-		EnsureQuotaFn: func(_ context.Context, name string, _ int64) error {
-			rollbackHandoffMu.Lock()
-			observe := observeRollbackHandoff
-			rollbackHandoffMu.Unlock()
-			if observe && name == sourceRetainedVolume {
-				signalRollbackHandoff.Do(func() { close(rollbackHandoffReached) })
-			}
-			return nil
-		},
+	volumeState := newVolumeSet(sourceRetainedVolume)
+	volumeManager := volumeState.manager()
+	volumeManager.UsageFn = func(context.Context, string) (int64, error) {
+		signalRestorePreSnapshotRead.Do(func() { close(restorePreSnapshotReadReached) })
+		return 0, nil
 	}
+	volumeManager.EnsureQuotaFn = func(_ context.Context, name string, _ int64) error {
+		rollbackHandoffMu.Lock()
+		observe := observeRollbackHandoff
+		rollbackHandoffMu.Unlock()
+		if observe && name == sourceRetainedVolume {
+			signalRollbackHandoff.Do(func() { close(rollbackHandoffReached) })
+		}
+		return nil
+	}
+	b.volumes = volumeManager
 
 	operationAdmitted := make(chan struct{})
 	b.operationSettlement = &stagedRecoveryOperationIntentJournal{
@@ -721,7 +721,15 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 		}
 		return actorClaim != nil
 	}, 5*time.Second, 10*time.Millisecond, "accepted restore actor must become quiescent")
+	volumeNames, err := volumeState.list()
+	require.NoError(t, err)
+	require.Equal(t, []string{sourceRetainedVolume}, volumeNames,
+		"the quiescent failed restore must preserve the source-retained volume")
 	require.NoError(t, b.recoverLiveOperationIntents(context.Background()))
+	volumeNames, err = volumeState.list()
+	require.NoError(t, err)
+	require.Equal(t, []string{sourceRetainedVolume}, volumeNames,
+		"operation recovery must leave the source-retained volume intact")
 	claims, err := b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
 	assert.Empty(t, claims, "operation recovery must durably settle the failed restore")

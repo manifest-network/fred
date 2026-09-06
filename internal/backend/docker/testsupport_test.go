@@ -2841,12 +2841,20 @@ func (v *volumeSet) destroy(_ context.Context, id string) error {
 func (v *volumeSet) rename(oldName, newName string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if !v.present[oldName] {
-		return fmt.Errorf("volume %q is absent", oldName)
+	oldPresent := v.present[oldName]
+	newPresent := v.present[newName]
+	switch {
+	case oldPresent && !newPresent:
+		delete(v.present, oldName)
+		v.present[newName] = true
+		return nil
+	case !oldPresent && newPresent:
+		return nil // idempotent retry: the previous rename already completed
+	case oldPresent && newPresent:
+		return fmt.Errorf("both old volume %q and new volume %q are present", oldName, newName)
+	default:
+		return fmt.Errorf("neither old volume %q nor new volume %q is present", oldName, newName)
 	}
-	delete(v.present, oldName)
-	v.present[newName] = true
-	return nil
 }
 
 // names returns the volumes destroyed so far, in call order.

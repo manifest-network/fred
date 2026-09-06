@@ -172,18 +172,27 @@ func backdateReleaseRecords(t *testing.T, dbPath, leaseUUID string, age time.Dur
 		if data == nil {
 			return fmt.Errorf("no release record for lease %s (provision should have written one)", leaseUUID)
 		}
-		var releases []shared.Release
-		if err := json.Unmarshal(data, &releases); err != nil {
+		// Authoritative release histories are schema-framed. Preserve that frame
+		// while changing only the timestamps under test; decoding the row as the
+		// pre-v0.14 bare array would silently manufacture a legacy journal.
+		var history struct {
+			SchemaVersion uint8            `json:"schema_version"`
+			Releases      []shared.Release `json:"releases"`
+		}
+		if err := json.Unmarshal(data, &history); err != nil {
 			return err
 		}
-		if len(releases) == 0 {
+		if history.SchemaVersion == 0 {
+			return fmt.Errorf("release history for lease %s has no schema version", leaseUUID)
+		}
+		if len(history.Releases) == 0 {
 			return fmt.Errorf("empty release history for lease %s", leaseUUID)
 		}
 		backdated := time.Now().Add(-age)
-		for i := range releases {
-			releases[i].CreatedAt = backdated
+		for i := range history.Releases {
+			history.Releases[i].CreatedAt = backdated
 		}
-		encoded, err := json.Marshal(releases)
+		encoded, err := json.Marshal(history)
 		if err != nil {
 			return err
 		}

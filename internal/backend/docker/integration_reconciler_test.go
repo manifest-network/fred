@@ -243,20 +243,14 @@ func installExactLeaseLookupFallback(chainClient *chaintest.MockClient, provider
 	}
 }
 
-// configureEmptyPlacement replaces the test store's removable seed topology
-// with the exact backend identity and complete empty inventory that the
-// production startup path verifies before admitting lifecycle work.
+// configureEmptyPlacement projects the actual backend's complete empty
+// inventory after configureBackendTopologyForTest has bound its identity.
 func configureEmptyPlacement(
 	t *testing.T,
-	store *placement.Store,
 	reconciliation *placement.ReconciliationCoordinator,
 	b *Backend,
 ) {
 	t.Helper()
-	require.NoError(t, placementstore.ConfigureBackendTopologyWithStorageIdentities(store,
-		[]string{b.Name()},
-		map[string]backendidentity.ID{b.Name(): b.StorageIdentity()},
-	))
 	sweep, err := reconciliation.BeginSweep()
 	require.NoError(t, err)
 	defer sweep.End()
@@ -270,6 +264,28 @@ func configureEmptyPlacement(
 	require.NoError(t, sweep.SealInventory())
 	_, err = sweep.Project(placement.ReconciliationProjection{})
 	require.NoError(t, err)
+}
+
+// configureBackendTopologyForTest obtains the same complete inventory
+// observation that production startup requires before binding runtime
+// components. This replaces the removable seed topology in a fixture store
+// atomically with the identity and inventory of the actual backend.
+func configureBackendTopologyForTest(t *testing.T, store *placement.Store, b *Backend) {
+	t.Helper()
+	ctx := t.Context()
+	provisions, err := b.ListProvisions(ctx)
+	require.NoError(t, err)
+	retentions, err := b.ListRetentions(ctx)
+	require.NoError(t, err)
+	observation, err := placement.NewCompleteBackendObservation(
+		b.StorageIdentity(), provisions, retentions,
+	)
+	require.NoError(t, err)
+	require.NoError(t, store.ConfigureBackendTopologyWithCompleteObservations(
+		[]string{b.Name()}, map[string]placement.CompleteBackendObservation{
+			b.Name(): observation,
+		},
+	))
 }
 
 // testReconcilerSetup creates a full-stack test environment:
@@ -315,6 +331,9 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = placementStore.Close() })
+	// BindBackendRuntime verifies the durable topology during construction, so
+	// replace the fixture seed with the actual backend identity first.
+	configureBackendTopologyForTest(t, placementStore, b)
 	// Create a simple acknowledger that delegates to chainClient for integration tests
 	integrationAck := &integrationAcknowledger{chainClient: chainClient}
 	coordinator, err := placementStore.BindOperationCoordinator(nil)
@@ -334,7 +353,7 @@ func testReconcilerSetup(t *testing.T, chainClient *chaintest.MockClient, extraC
 	tracker.placementStore = placementStore
 	reconciliation, err := execution.ReconciliationCoordinator(tracker.store, nil)
 	require.NoError(t, err)
-	configureEmptyPlacement(t, placementStore, reconciliation, b)
+	configureEmptyPlacement(t, reconciliation, b)
 
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
@@ -1053,6 +1072,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = placementStore.Close() })
+	configureBackendTopologyForTest(t, placementStore, b)
 
 	installExactLeaseLookupFallback(mockChain, providerUUID)
 	integrationAck2 := &integrationAcknowledger{chainClient: mockChain}
@@ -1073,7 +1093,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 	tracker.placementStore = placementStore
 	reconciliation, err := execution.ReconciliationCoordinator(tracker.store, nil)
 	require.NoError(t, err)
-	configureEmptyPlacement(t, placementStore, reconciliation, b)
+	configureEmptyPlacement(t, reconciliation, b)
 	reconciler, err := provisioner.NewReconciler(
 		provisioner.ReconcilerConfig{
 			Interval:               1 * time.Hour,
@@ -1324,11 +1344,7 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, placementStore.Close()) })
-	require.NoError(t, placementstore.ConfigureBackendTopologyWithStorageIdentities(
-		placementStore,
-		[]string{b.Name()},
-		map[string]backendidentity.ID{b.Name(): b.StorageIdentity()},
-	))
+	configureBackendTopologyForTest(t, placementStore, b)
 	_, callbackProofConsumer := hmacauth.NewCallbackProofBoundary()
 	mgr, err := provisioner.NewManager(provisioner.ManagerConfig{
 		ProviderUUID:          testProviderUUID,
@@ -1375,9 +1391,11 @@ func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
 	// placement, mirroring a post-restart close of an already-active lease.
 	payload, err := json.Marshal(manifest.Manifest{Image: "redis:7", Command: []string{"sleep", "3600"}})
 	require.NoError(t, err)
+	callbacks := newIntegrationCallbackAuthority(t, callbackURL)
 	require.NoError(t, b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID: leaseUUID, Tenant: tenant, ProviderUUID: providerUUID,
-		Items: []backend.LeaseItem{{SKU: sku, Quantity: 1}}, CallbackURL: callbackURL, Payload: payload,
+		Items: []backend.LeaseItem{{SKU: sku, Quantity: 1}}, CallbackURL: callbacks.operationURL,
+		LifecycleCallbackURL: callbacks.lifecycleURL, Payload: payload,
 	}))
 	require.Equal(t, backend.CallbackStatusSuccess, waitForCallback(t, callbackCh, leaseUUID, 3*time.Minute).Status)
 

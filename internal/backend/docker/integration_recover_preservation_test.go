@@ -121,14 +121,17 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 	failedInfo := getProvisionInfo(t, b, leaseUUID)
 	require.Equal(t, backend.ProvisionStatusFailed, failedInfo.Status)
 
-	// 4. Remove the exited container out-of-band via the backend's own Docker
-	// client — NOT via Deprovision — so the tracked Failed lease now has no
-	// container left anywhere. This is the pre-ENG-567 danger zone: the
-	// allowlist saw Failed + VolumeCleanupAttempts==0 (no Deprovision ever
-	// ran) and dropped the pool key here.
-	mutator, ok := b.docker.(dockerMutationSink)
-	require.True(t, ok, "the integration backend must retain its Docker mutation capability")
-	require.NoError(t, mutator.RemoveContainer(ctx, containerID))
+	// 4. Remove the exited container out-of-band through an independent Docker
+	// client — NOT via the backend or Deprovision — so the tracked Failed lease
+	// now has no container left anywhere. Keeping this mutation outside Backend
+	// also preserves its construction-time split between read authority and
+	// mutation capabilities. This is the pre-ENG-567 danger zone: the allowlist
+	// saw Failed + VolumeCleanupAttempts==0 (no Deprovision ever ran) and dropped
+	// the pool key here.
+	externalDocker, err := NewDockerClient("", "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = externalDocker.Close() })
+	require.NoError(t, externalDocker.RemoveContainer(ctx, containerID))
 
 	// 5. Run recoverState again with the container gone.
 	require.NoError(t, b.RefreshState(ctx))

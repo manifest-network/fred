@@ -92,8 +92,9 @@ func writeNonSparse(t *testing.T, path string, mib int64) {
 //
 // CallbackSecret is set to testCallbackSecret (and the sender rebuilt) so
 // startCallbackServer's HMAC verification passes; StartupVerifyDuration=10ms
-// avoids the 5s default wait per subtest. A parent-level t.Cleanup drains the
-// async restore workers (stopCancel + wg.Wait) before setupXFSLoopback unmounts.
+// avoids the 5s default wait per subtest. Each subtest starts replay only after
+// seeding its retention row, then drains its own async restore workers before
+// the shared XFS mount is torn down.
 func newRestoreQuotaBackend(t *testing.T, mgr volumeManager) (*Backend, <-chan backend.CallbackPayload, string) {
 	t.Helper()
 	mock := &mockDockerClient{
@@ -114,14 +115,31 @@ func newRestoreQuotaBackend(t *testing.T, mgr volumeManager) (*Backend, <-chan b
 	b.compose = happyComposeMock(t, mock, &mu, &down, nil)
 	rebuildCallbackSender(b, testCallbackClient) // pick up testCallbackSecret so callback HMAC verifies
 	attachRetentionStore(t, b)
-	stopReplay := startRestoreCallbackReplay(t, b)
 	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 100}
 	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: 20}
 	server, ch := startCallbackServer(t)
-	// Drain async restore workers before setupXFSLoopback's cleanup unmounts the
-	// loopback. Registered after the mount cleanup, so LIFO runs this first.
-	t.Cleanup(stopReplay)
 	return b, ch, server.URL
+}
+
+// integrationRestoreRequest gives each restore its own canonical operation
+// authority and the lifecycle authority derived from the same operation. The
+// operation URL is retained in the request so retries of that request keep
+// the exact same operation identity.
+func integrationRestoreRequest(
+	t *testing.T,
+	newLease, fromLease, targetSKU, callbackBaseURL string,
+) backend.RestoreRequest {
+	t.Helper()
+	authority := newIntegrationCallbackAuthority(t, callbackBaseURL)
+	return backend.RestoreRequest{
+		LeaseUUID:            newLease,
+		FromLeaseUUID:        fromLease,
+		Tenant:               "tenant-a",
+		ProviderUUID:         testProviderUUID,
+		Items:                []backend.LeaseItem{{SKU: targetSKU, Quantity: 1, ServiceName: manifest.DefaultServiceName}},
+		CallbackURL:          authority.operationURL,
+		LifecycleCallbackURL: authority.lifecycleURL,
+	}
 }
 
 // seedRetainedForRestore physically creates a retained volume on the real mount
@@ -139,13 +157,14 @@ func seedRetainedForRestore(t *testing.T, b *Backend, mgr volumeManager, orig, o
 	writeNonSparse(t, filepath.Join(hostPath, "data.bin"), dataMiB)
 	require.NoError(t, mgr.RenameVolume(context.Background(), canon, retainedName(canon)))
 	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retainedName(canon)) })
+	callbacks := newIntegrationCallbackAuthority(t, "http://unused/callbacks/provision")
 	require.NoError(t, putRetentionForTest(t, b.retentionStore, shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		Tenant:              "tenant-a",
 		ProviderUUID:        testProviderUUID,
 		Items:               []backend.LeaseItem{{SKU: oldSKU, ServiceName: manifest.DefaultServiceName, Quantity: 1}},
 		StackManifest:       restoreStackManifest(),
-		CallbackURL:         "http://unused/callbacks/provision",
+		CallbackURL:         callbacks.lifecycleURL,
 		RetainedVolumeNames: []string{retainedName(canon)},
 		Status:              shared.RetentionStatusActive,
 		Generation:          1,
@@ -169,20 +188,22 @@ func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 	mount := setupXFSLoopback(t) // root-gated; skips if root/mkfs.xfs/xfs_quota/loop absent
 	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
-	b, callbackCh, callbackURL := newRestoreQuotaBackend(t, mgr)
 
 	// (a) demote: retained test-large(100)+5 MiB, restore at test-medium(20).
 	//     Gate passes (5 <= 20); Create re-applies bhard=20 MiB; a 25 MiB write
 	//     must be quota-rejected.
 	t.Run("demote_enforces", func(t *testing.T) {
+		b, callbackCh, callbackURL := newRestoreQuotaBackend(t, mgr)
 		orig, newLease := newIntegrationLeaseUUID(), newIntegrationLeaseUUID()
 		seedRetainedForRestore(t, b, mgr, orig, "test-large", 100, 5)
 		newCanon := canonicalVolumeName(newLease, manifest.DefaultServiceName, 0)
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(context.Background(), newCanon) })
+		// Register replay cleanup last so it drains the restore worker before
+		// either physical volume cleanup runs (testing cleanups are LIFO).
+		stopReplay := startRestoreCallbackReplay(t, b)
+		t.Cleanup(stopReplay)
 
-		req := restoreRequest(newLease, orig, callbackURL)
-		req.ProviderUUID = testProviderUUID
-		req.Items = []backend.LeaseItem{{SKU: "test-medium", ServiceName: manifest.DefaultServiceName, Quantity: 1}}
+		req := integrationRestoreRequest(t, newLease, orig, "test-medium", callbackURL)
 		require.NoError(t, b.Restore(context.Background(), req))
 
 		cb := waitForCallback(t, callbackCh, newLease, 30*time.Second)
@@ -207,6 +228,7 @@ func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 	//     Baseline proves 25 MiB does not fit the old 20 MiB cap; after the
 	//     promote, Create raises bhard=100 MiB and the same write succeeds.
 	t.Run("promote_enforces", func(t *testing.T) {
+		b, callbackCh, callbackURL := newRestoreQuotaBackend(t, mgr)
 		orig, newLease := newIntegrationLeaseUUID(), newIntegrationLeaseUUID()
 		seedRetainedForRestore(t, b, mgr, orig, "test-medium", 20, 5)
 
@@ -221,10 +243,10 @@ func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 
 		newCanon := canonicalVolumeName(newLease, manifest.DefaultServiceName, 0)
 		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(context.Background(), newCanon) })
+		stopReplay := startRestoreCallbackReplay(t, b)
+		t.Cleanup(stopReplay)
 
-		req := restoreRequest(newLease, orig, callbackURL)
-		req.ProviderUUID = testProviderUUID
-		req.Items = []backend.LeaseItem{{SKU: "test-large", ServiceName: manifest.DefaultServiceName, Quantity: 1}}
+		req := integrationRestoreRequest(t, newLease, orig, "test-large", callbackURL)
 		require.NoError(t, b.Restore(context.Background(), req))
 
 		cb := waitForCallback(t, callbackCh, newLease, 30*time.Second)
@@ -244,12 +266,13 @@ func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 	//     "measured_exceeds" reason too: an unmeasurable Usage() returns the SAME
 	//     sentinel, so the sentinel alone would not prove the gate measured 25 > 20.
 	t.Run("demote_refused", func(t *testing.T) {
+		b, _, callbackURL := newRestoreQuotaBackend(t, mgr)
 		orig, newLease := newIntegrationLeaseUUID(), newIntegrationLeaseUUID()
 		seedRetainedForRestore(t, b, mgr, orig, "test-large", 100, 25)
+		stopReplay := startRestoreCallbackReplay(t, b)
+		t.Cleanup(stopReplay)
 
-		req := restoreRequest(newLease, orig, callbackURL)
-		req.ProviderUUID = testProviderUUID
-		req.Items = []backend.LeaseItem{{SKU: "test-medium", ServiceName: manifest.DefaultServiceName, Quantity: 1}}
+		req := integrationRestoreRequest(t, newLease, orig, "test-medium", callbackURL)
 
 		var err error
 		assertDemoteRefused(t, mgr.Kind(), "measured_exceeds", func() {
