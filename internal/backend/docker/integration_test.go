@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -24,8 +23,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/hmacauth"
+	"github.com/manifest-network/fred/internal/provisioner/operation"
+	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
 const (
@@ -176,11 +178,24 @@ func cleanupTestNetworks(t *testing.T, docker *DockerClient, backendName string)
 	}
 }
 
-// startCallbackServer creates an httptest server that receives HMAC-signed callbacks
-// and sends them to the returned channel.
-func startCallbackServer(t *testing.T) (*httptest.Server, <-chan backend.CallbackPayload) {
+// integrationCallbackDelivery keeps a callback's decoded observation coupled
+// to the exact authenticated wire identity that delivered it. Embedding the
+// payload preserves ergonomic read-only assertions without allowing tests to
+// reconstruct a different route or signature for settlement.
+type integrationCallbackDelivery struct {
+	backend.CallbackPayload
+	method     string
+	requestURI string
+	body       []byte
+	signature  string
+}
+
+func startProjectedCallbackServer[T any](
+	t *testing.T,
+	project func(integrationCallbackDelivery) T,
+) (*httptest.Server, <-chan T) {
 	t.Helper()
-	ch := make(chan backend.CallbackPayload, 10)
+	ch := make(chan T, 10)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -210,16 +225,35 @@ func startCallbackServer(t *testing.T) (*httptest.Server, <-chan backend.Callbac
 			return
 		}
 
-		ch <- payload
+		ch <- project(integrationCallbackDelivery{
+			CallbackPayload: payload,
+			method:          r.Method,
+			requestURI:      r.URL.RequestURI(),
+			body:            append([]byte(nil), body...),
+			signature:       sig,
+		})
 		w.WriteHeader(http.StatusOK)
 	}))
-	// Callback-authority helpers treat server.URL as their base destination.
-	// Make that base a structurally valid Fred callback route; Close and Client
-	// do not depend on the URL field.
-	server.URL += "/callbacks/provision"
-
 	t.Cleanup(server.Close)
 	return server, ch
+}
+
+// startCallbackServer creates an httptest server that receives HMAC-signed
+// callbacks and exposes their decoded observation.
+func startCallbackServer(t *testing.T) (*httptest.Server, <-chan backend.CallbackPayload) {
+	t.Helper()
+	return startProjectedCallbackServer(t, func(delivery integrationCallbackDelivery) backend.CallbackPayload {
+		return delivery.CallbackPayload
+	})
+}
+
+// startCallbackDeliveryServer additionally preserves the actual signed wire
+// request for tests that apply the callback to providerd's typed coordinator.
+func startCallbackDeliveryServer(t *testing.T) (*httptest.Server, <-chan integrationCallbackDelivery) {
+	t.Helper()
+	return startProjectedCallbackServer(t, func(delivery integrationCallbackDelivery) integrationCallbackDelivery {
+		return delivery
+	})
 }
 
 // integrationCallbackAuthority gives a provision request the same exact,
@@ -236,12 +270,15 @@ func newIntegrationCallbackAuthority(
 	callbackBaseURL string,
 ) integrationCallbackAuthority {
 	t.Helper()
-	operationURL := callbackBaseURL + "?operation_id=" + uuid.NewString()
-	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(operationURL, "")
+	routes, err := placement.NewCallbackRouteFactory(callbackBaseURL)
+	require.NoError(t, err)
+	operationID, err := operation.ParseID(uuid.NewString())
+	require.NoError(t, err)
+	pair, err := routes.ForOperation(operationID)
 	require.NoError(t, err)
 	return integrationCallbackAuthority{
-		operationURL: operationURL,
-		lifecycleURL: lifecycleURL,
+		operationURL: pair.OperationURL(),
+		lifecycleURL: pair.LifecycleURL(),
 	}
 }
 
@@ -262,6 +299,79 @@ func waitForCallback(t *testing.T, ch <-chan backend.CallbackPayload, leaseUUID 
 			t.Fatalf("timeout waiting for callback for lease %s", leaseUUID)
 		}
 	}
+}
+
+// claimLeaseActorRecoveryQuiescence returns the same opaque registry and actor
+// capability used by production recovery. Unlike a snapshot of the actor map,
+// it also reserves an absent key, so a concurrent recovery pass cannot retire
+// the actor between the quiescence observation and the caller's assertions.
+func claimLeaseActorRecoveryQuiescence(
+	t *testing.T,
+	b *Backend,
+	leaseUUID string,
+	timeout time.Duration,
+) *leaseActorRecoveryClaim {
+	t.Helper()
+	var claim *leaseActorRecoveryClaim
+	require.Eventually(t, func() bool {
+		claim = b.tryClaimLeaseActorQuiescence(leaseUUID)
+		return claim != nil
+	}, timeout, 5*time.Millisecond, "lease actor did not become recovery-quiescent")
+	return claim
+}
+
+// recoverStartedProvisionFailure proves the operation-scoped ambiguity
+// contract before waiting for the production periodic recovery lane. The
+// command fence and actor recovery claim are the causal barrier: a missing
+// callback and durable Started intent cannot be observed ahead of the worker's
+// terminal handoff or consumed concurrently by the scheduler.
+func recoverStartedProvisionFailure(
+	t *testing.T,
+	b *Backend,
+	callbackCh <-chan backend.CallbackPayload,
+	leaseUUID string,
+	callbackURL string,
+) backend.CallbackPayload {
+	t.Helper()
+	// Provision has returned after admission, while the mutation worker remains
+	// asynchronous. Reserve this exact lease from periodic recovery before
+	// waiting for that worker's terminal handoff.
+	unlockCommand := b.commandFence.Lock(leaseUUID)
+	defer unlockCommand()
+	quiescence := claimLeaseActorRecoveryQuiescence(t, b, leaseUUID, provisionFlowTimeout)
+	defer quiescence.Release()
+
+	intents, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "the ambiguous operation must retain exact recovery evidence")
+	intent := intents[0]
+	require.Equal(t, leaseUUID, intent.LeaseUUID())
+	require.Equal(t, callbackURL, intent.CallbackURL())
+	require.Equal(t, shared.OperationExecutionStarted, intent.ExecutionPhase())
+	require.NoError(t, b.terminalStorageAuthorityError(),
+		"operation-local ambiguity must not withdraw the whole backend")
+	select {
+	case callback := <-callbackCh:
+		t.Fatalf("unexpected callback before exact recovery: %+v", callback)
+	default:
+	}
+
+	// Release both capabilities and let the backend's ordinary scheduler observe
+	// the durable operation. The computed visibility deadline bounds how long
+	// that production lane may conservatively defer an ambiguous Started intent;
+	// unit coverage pins the precise before/after-deadline classification.
+	deadline := provisionIntentRecoveryDeadline(intent.CreatedAt(), time.Now(), b.cfg.ProvisionTimeout)
+	wait := time.Until(deadline) + 2*b.cfg.ReconcileInterval + 30*time.Second
+	if wait < 30*time.Second {
+		wait = 30 * time.Second
+	}
+	quiescence.Release()
+	unlockCommand()
+	callback := waitForCallback(t, callbackCh, leaseUUID, wait)
+	intents, err = b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Empty(t, intents, "exact recovery must settle the durable operation intent")
+	return callback
 }
 
 func TestIntegration_Docker_ProvisionLifecycle(t *testing.T) {
@@ -840,6 +950,11 @@ func TestIntegration_Docker_ImmediateExit(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ContainerReadonlyRootfs = ptrBool(false) // busybox "false" needs no tmpfs
+		// A startup failure after Compose has run is deliberately ambiguous until
+		// the operation visibility horizon expires. Keep that production policy
+		// bounded in this integration fixture.
+		cfg.ProvisionTimeout = 5 * time.Second
+		cfg.ReconcileInterval = time.Second
 	})
 
 	ctx := context.Background()
@@ -865,15 +980,12 @@ func TestIntegration_Docker_ImmediateExit(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Wait for failure callback (doProvision startup verify detects exit)
-	select {
-	case cb := <-callbackCh:
-		assert.Equal(t, leaseUUID, cb.LeaseUUID)
-		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
-		assert.Contains(t, cb.Error, "exited", "error should mention container exited")
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for failure callback")
-	}
+	// The worker detects the exit and cleans up, then exact recovery proves
+	// exact absence after the visibility horizon and publishes the failure.
+	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
+	assert.Equal(t, leaseUUID, cb.LeaseUUID)
+	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	assert.NotEmpty(t, cb.Error)
 }
 
 func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
@@ -882,6 +994,7 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ProvisionTimeout = 15 * time.Second // short, to avoid slow test
+		cfg.ReconcileInterval = time.Second
 	})
 
 	ctx := context.Background()
@@ -913,18 +1026,10 @@ func TestIntegration_Docker_HealthCheckTimeout(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Wait for failure callback
-	select {
-	case cb := <-callbackCh:
-		assert.Equal(t, leaseUUID, cb.LeaseUUID)
-		assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
-		assert.True(t,
-			strings.Contains(cb.Error, "unhealthy") || strings.Contains(cb.Error, "healthy"),
-			"error should mention health: %s", cb.Error,
-		)
-	case <-time.After(2 * time.Minute):
-		t.Fatal("timeout waiting for failure callback")
-	}
+	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
+	assert.Equal(t, leaseUUID, cb.LeaseUUID)
+	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
+	assert.NotEmpty(t, cb.Error)
 }
 
 func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
@@ -1199,7 +1304,7 @@ func TestIntegration_Docker_UnknownSKU_Rejected(t *testing.T) {
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
-	callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999/callbacks/provision")
+	callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999")
 
 	err = b.Provision(ctx, backend.ProvisionRequest{
 		LeaseUUID:            leaseUUID,
@@ -1247,7 +1352,7 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 		}
 		payload, err := json.Marshal(appManifest)
 		require.NoError(t, err)
-		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999/callbacks/provision")
+		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999")
 
 		err = b.Provision(ctx, backend.ProvisionRequest{
 			LeaseUUID:            leaseUUID,
@@ -1276,7 +1381,7 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 		}
 		payload, err := json.Marshal(appManifest)
 		require.NoError(t, err)
-		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999/callbacks/provision")
+		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999")
 
 		err = b.Provision(ctx, backend.ProvisionRequest{
 			LeaseUUID:            leaseUUID,
@@ -1297,7 +1402,7 @@ func TestIntegration_Docker_InvalidManifest_Rejected(t *testing.T) {
 
 	t.Run("garbage_payload", func(t *testing.T) {
 		leaseUUID := newIntegrationLeaseUUID()
-		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999/callbacks/provision")
+		callbacks := newIntegrationCallbackAuthority(t, "http://localhost:9999")
 
 		err := b.Provision(ctx, backend.ProvisionRequest{
 			LeaseUUID:            leaseUUID,
@@ -1356,9 +1461,40 @@ func TestIntegration_Docker_DuplicateProvision_Rejected(t *testing.T) {
 	case <-time.After(2 * time.Minute):
 		t.Fatal("timeout waiting for first provision callback")
 	}
+	// The callback server publishes before writing HTTP 200. Wait until the
+	// sender has consumed that response and removed the exact durable outbox row
+	// before taking the replay baseline.
+	require.Eventually(t, func() bool {
+		pending, listErr := b.callbackStore.ListPending()
+		return listErr == nil && len(pending) == 0
+	}, 10*time.Second, 10*time.Millisecond, "initial callback outbox row was not acknowledged")
 
-	// Second provision with same lease UUID should be rejected
-	err = b.Provision(ctx, req)
+	// An exact replay of req is idempotent: once the original actor is quiescent,
+	// it must neither append a release nor create another durable callback.
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
+	releasesBeforeReplay, err := b.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	require.NoError(t, b.Provision(ctx, req))
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
+	releasesAfterReplay, err := b.releaseStore.List(leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, releasesBeforeReplay, releasesAfterReplay)
+	pendingAfterReplay, err := b.callbackStore.ListPending()
+	require.NoError(t, err)
+	require.Empty(t, pendingAfterReplay, "exact operation replay must not append an outbox row")
+	select {
+	case callback := <-callbackCh:
+		t.Fatalf("exact operation replay emitted another callback: %+v", callback)
+	default:
+	}
+
+	// A distinct operation authority for the same live lease is the conflicting
+	// duplicate that must be rejected.
+	duplicateCallbacks := newIntegrationCallbackAuthority(t, callbackServer.URL)
+	duplicateReq := req
+	duplicateReq.CallbackURL = duplicateCallbacks.operationURL
+	duplicateReq.LifecycleCallbackURL = duplicateCallbacks.lifecycleURL
+	err = b.Provision(ctx, duplicateReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backend.ErrAlreadyProvisioned,
 		"duplicate provision should return ErrAlreadyProvisioned")
@@ -2738,6 +2874,7 @@ func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.ProvisionTimeout = 15 * time.Second
+		cfg.ReconcileInterval = time.Second
 	})
 
 	ctx := context.Background()
@@ -2776,7 +2913,7 @@ func TestIntegration_Stack_HealthCheckFailure(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	cb := waitForCallback(t, callbackCh, leaseUUID, 30*time.Second)
+	cb := recoverStartedProvisionFailure(t, b, callbackCh, leaseUUID, callbacks.operationURL)
 	assert.Equal(t, backend.CallbackStatusFailed, cb.Status)
 }
 

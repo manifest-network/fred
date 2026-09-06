@@ -95,7 +95,7 @@ func writeNonSparse(t *testing.T, path string, mib int64) {
 // avoids the 5s default wait per subtest. Each subtest starts replay only after
 // seeding its retention row, then drains its own async restore workers before
 // the shared XFS mount is torn down.
-func newRestoreQuotaBackend(t *testing.T, mgr volumeManager) (*Backend, <-chan backend.CallbackPayload, string) {
+func newRestoreQuotaBackend(t *testing.T, mgr *xfsVolumeManager) (*Backend, <-chan backend.CallbackPayload, string) {
 	t.Helper()
 	mock := &mockDockerClient{
 		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
@@ -109,6 +109,10 @@ func newRestoreQuotaBackend(t *testing.T, mgr volumeManager) (*Backend, <-chan b
 	b := newBackendForProvisionTest(t, mock, nil)
 	b.cfg.CallbackSecret = testCallbackSecret
 	b.cfg.StartupVerifyDuration = 10 * time.Millisecond
+	// Keep the mutation subject and physical volume manager derived from the
+	// same concrete XFS fixture. The storage guard rejects a manager/config pair
+	// whose root cannot be proven identical.
+	b.cfg.VolumeDataPath = mgr.dataPath
 	b.volumes = mgr
 	var mu sync.Mutex
 	var down []string
@@ -157,7 +161,7 @@ func seedRetainedForRestore(t *testing.T, b *Backend, mgr volumeManager, orig, o
 	writeNonSparse(t, filepath.Join(hostPath, "data.bin"), dataMiB)
 	require.NoError(t, mgr.RenameVolume(context.Background(), canon, retainedName(canon)))
 	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retainedName(canon)) })
-	callbacks := newIntegrationCallbackAuthority(t, "http://unused/callbacks/provision")
+	callbacks := newIntegrationCallbackAuthority(t, "http://unused")
 	require.NoError(t, putRetentionForTest(t, b.retentionStore, shared.RetentionEntry{
 		OriginalLeaseUUID:   orig,
 		Tenant:              "tenant-a",
@@ -186,8 +190,10 @@ func seedRetainedForRestore(t *testing.T, b *Backend, mgr volumeManager, orig, o
 // preallocation can transiently inflate "used"; assert on bhard instead).
 func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 	mount := setupXFSLoopback(t) // root-gated; skips if root/mkfs.xfs/xfs_quota/loop absent
-	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
+	volumeMgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
+	mgr, ok := volumeMgr.(*xfsVolumeManager)
+	require.True(t, ok, "an XFS mount must construct the XFS volume manager")
 
 	// (a) demote: retained test-large(100)+5 MiB, restore at test-medium(20).
 	//     Gate passes (5 <= 20); Create re-applies bhard=20 MiB; a 25 MiB write

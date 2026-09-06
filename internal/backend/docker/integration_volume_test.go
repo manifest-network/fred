@@ -28,7 +28,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
-	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 // setupBtrfsLoopback creates a btrfs filesystem on a loopback file and mounts it.
@@ -419,14 +418,29 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	replayReq.CallbackURL = replayCallbacks.operationURL
 	replayReq.LifecycleCallbackURL = replayCallbacks.lifecycleURL
 	require.NoError(t, b.Provision(ctx, replayReq))
+	// This is specifically a cold-recovery test. Hold the production per-lease
+	// command fence so the live periodic lane cannot consume the durable intent
+	// after the worker becomes quiescent but before the backend is stopped.
+	unlockRecovery := b.commandFence.Lock(leaseUUID)
+	defer unlockRecovery()
 
-	select {
-	case <-b.stopCtx.Done():
-	case <-time.After(30 * time.Second):
-		t.Fatal("timeout waiting for the re-provision to fail closed on the symlinked volume leaf")
-	}
-	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous,
-		"a failed replacement after predecessor teardown must retain its intent for cold recovery")
+	// The symlink refusal happens after the operation crossed its durable
+	// side-effect boundary. That ambiguity belongs to this exact operation; it
+	// must retain its Started intent without withdrawing storage authority from
+	// unrelated operations on the backend. The typed quiescence claim proves
+	// that the worker and terminal handoff completed and reserves this actor
+	// generation until the stopped-process snapshot is complete.
+	quiescence := claimLeaseActorRecoveryQuiescence(t, b, leaseUUID, 30*time.Second)
+	defer quiescence.Release()
+	require.NoError(t, b.terminalStorageAuthorityError(),
+		"operation-local ambiguity must not withdraw the whole backend")
+	intents, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "the exact failed replacement must retain durable recovery evidence")
+	require.Equal(t, leaseUUID, intents[0].LeaseUUID())
+	require.Equal(t, replayCallbacks.operationURL, intents[0].CallbackURL())
+	require.Equal(t, shared.OperationExecutionStarted, intents[0].ExecutionPhase(),
+		"a post-dispatch refusal must remain Started until exact cold-recovery evidence exists")
 
 	// 5. The refusal must be attributable, and must have happened at the guard.
 	assert.Equal(t, float64(1), testutil.ToFloat64(volumeBindSymlinkRejectedTotal)-before,
@@ -450,25 +464,40 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 		"the planted symlink must still be there: the guard rejects, it never unlinks")
 
 	// The replacement tore down the predecessor before bind validation failed, so
-	// the exact candidate intent cannot be settled in this process. Its terminal
-	// storage-authority latch suppresses callbacks until a fresh process reopens
-	// the journals and classifies the now-quiescent substrate.
+	// the exact candidate intent cannot settle until recovery observes the
+	// quiescent substrate after its visibility horizon. Durable Started evidence,
+	// rather than a process-wide storage latch, suppresses a premature callback.
 	select {
 	case callback := <-replayCh:
 		t.Fatalf("unexpected callback before cold recovery: %+v", callback)
-	case <-time.After(500 * time.Millisecond):
+	default:
 	}
 	cfg := b.cfg
+	// Stop needs to retire the actor, which consumes its admission gate. Release
+	// the actor half first; the still-held command fence continues to exclude the
+	// periodic recovery lane until shutdown has completed.
+	quiescence.Release()
 	require.NoError(t, b.Stop())
+	unlockRecovery()
+	// The original process exercised the full live ambiguity path. Give only the
+	// cold-recovery fixture an already-expired positive horizon so restart can
+	// classify exact absence immediately without a timing sleep.
+	cfg.ProvisionTimeout = time.Nanosecond
 	restarted, err := New(cfg, slog.Default())
 	require.NoError(t, err)
-	intents, err := listOperationIntentsForCallbackTest(t, restarted.callbackStore)
+	intents, err = listOperationIntentsForCallbackTest(t, restarted.callbackStore)
 	require.NoError(t, err)
 	require.Len(t, intents, 1, "the failed replacement intent must survive the stopped backend")
+	require.Equal(t, leaseUUID, intents[0].LeaseUUID())
+	require.Equal(t, replayCallbacks.operationURL, intents[0].CallbackURL())
+	require.Equal(t, shared.OperationExecutionStarted, intents[0].ExecutionPhase())
 	require.NoError(t, restarted.Start(ctx))
 	t.Cleanup(func() { _ = restarted.Stop() })
 	failure := waitForCallback(t, replayCh, leaseUUID, 30*time.Second)
 	require.Equal(t, backend.CallbackStatusFailed, failure.Status)
+	intents, err = restarted.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Empty(t, intents, "cold recovery must settle the retained operation evidence")
 	recovered, err := restarted.GetProvision(ctx, leaseUUID)
 	require.NoError(t, err)
 	require.Equal(t, backend.ProvisionStatusFailed, recovered.Status,
