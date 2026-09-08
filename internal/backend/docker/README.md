@@ -298,7 +298,7 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 | ImagePullTimeout | `image_pull_timeout` | duration | `5m` | Timeout for pulling images |
 | StorageAttestationTimeout | `storage_attestation_timeout` | duration | `30s` (also when zero) | Full construction-time managed-volume proof budget; post-recovery inventory proof uses `max(2m, storage_attestation_timeout)`. Negative values are rejected. |
 | ContainerCreateTimeout | `container_create_timeout` | duration | `30s` | Timeout for creating containers |
-| ContainerStartTimeout | `container_start_timeout` | duration | `30s` | Timeout for starting containers. Interrupted provision recovery uses the durable `provision_timeout` horizon instead. |
+| ContainerStartTimeout | `container_start_timeout` | duration | `30s` | Timeout for starting containers. Interrupted provision/restore recovery uses the durable `provision_timeout` horizon instead. |
 | ProvisionTimeout | `provision_timeout` | duration | `10m` | Maximum time for the entire provisioning operation. Validated as positive — must be `> 0`. |
 | ReconcileInterval | `reconcile_interval` | duration | `5m` | How often to reconcile state with Docker |
 | StartupVerifyDuration | `startup_verify_duration` | duration | `5s` | Grace period after start before verifying containers are still running |
@@ -768,7 +768,7 @@ The edges above are the complete set of allowed transitions; any event not liste
   re-detects current failures; sustained growth flags churn, recovery contention,
   a wedged actor, or chronic burst.
 - `fred_docker_backend_pending_close_intents` and `fred_docker_backend_oldest_close_intent_age_seconds` — unlabeled aggregate count and oldest age for the non-expiring destructive-close journal. A brief non-zero value is normal while a close runs; sustained age means a finalizer dependency is unavailable. Use the lease-scoped recovery log to identify the row without introducing an unbounded lease label.
-- `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` — exact provision intents classified past their durable admission deadline. Cleanup remains periodic and retryable; there is no container-start recovery timer.
+- `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` — exact provision/restore intents classified past their durable admission deadline. Both kinds share this configured horizon. Cleanup remains periodic and retryable; there is no container-start recovery timer.
 - `fred_docker_backend_operation_intent_recovery_cleanup_retries_total` — Deferred exact operation cleanup (`provision`/`restore`); intent and reservation remain for periodic retry.
 - `fred_docker_backend_terminal_substrate_pending_containers` — Last late-container count for permanent `closed`/`failed_operation` receipts; nonzero withholds this backend’s pool capacity/readiness until strict absence.
 - `fred_docker_backend_terminal_substrate_cleanup_retries_total` — Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain.
@@ -799,9 +799,10 @@ The bounds are nested and aggregate where cardinality matters:
 - `Start` shares the shorter of its caller context and 30 seconds across initial
   identity/connectivity reads, then uses the backend lifecycle context with one
   finite overall crash-recovery budget. Production derives it as the saturating
-  sum of every sequential phase's local maximum (51m10s with defaults), so a
-  future/skewed operation admission still receives a fresh operation window
-  after every earlier phase consumes its cap.
+  sum of every sequential phase's local maximum (51m10s with defaults), reserving
+  the shared operation-classification and cleanup phase even if every earlier
+  phase consumes its cap. Transitional operations are deferred to periodic
+  sweeps, not waited out during startup.
 - Within that overall budget, interrupted-volume recovery uses a fixed
   two-minute child deadline. Its complete clean-inventory proof uses
   `max(2m, storage_attestation_timeout)`; `container_stop_timeout` cannot
@@ -864,7 +865,7 @@ and retention reaping. Unattributed managed volumes are preserved for explicit
 operator attribution; there is no inference-driven cleanup phase or separate preflight
 owner that can consume an operation's empty destination. Periodic `recoverState`
 retries operations, maintenance, close convergence, and exact late-container
-cleanup. A provision intent carries one absolute recovery horizon derived
+cleanup. Provision and restore intents share one absolute recovery horizon derived
 from durable admission time and the configured `provision_timeout`. Exact-empty
 or transitional cohorts before that deadline remain Pending and are observed
 again by the periodic sweep; they do not block startup. A future admission
@@ -881,7 +882,7 @@ atomically records the terminal operation outcome and callback before source
 handback; the durable Failed state drives any handback retry.
 
 `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}`
-counts expired provision classifications;
+counts expired provision/restore classifications;
 `fred_docker_backend_operation_intent_recovery_cleanup_retries_total{kind}`
 counts deferred operation cleanup. Permanent closed/failed receipts also exclude
 late substrate from ordinary projection. If those compact receipts cannot account
@@ -1324,9 +1325,10 @@ Docker daemon reachability check. Also probes the callback, diagnostics, release
 
 Late containers covered by permanent closed/failed receipts also make this
 backend unready while their resource footprint cannot be accounted. The pool
-reports zero available capacity, but the daemon remains running and retries
-exact cleanup. This clears only after strict inventory proves absence. The
-diagnostic `unaccounted_managed_volumes` gauge does not itself gate health or
+reports zero available capacity and withholds routable load statistics, but the
+daemon remains running and retries exact cleanup. This clears only after strict
+inventory proves absence. The diagnostic `unaccounted_managed_volumes` gauge
+does not itself gate health or
 authorize cleanup; a sustained value calls for operator attribution.
 
 **Response (`200`):**
@@ -1342,6 +1344,13 @@ Returns `503` if the Docker daemon is unreachable **or** any of those stores is 
 ### `GET /stats` (unauthenticated)
 
 Resource pool usage.
+
+Returns `503` while an accounting hold makes the known resource ledger
+incomplete. The in-process load-statistics path refuses the same snapshot, so
+multi-backend routing can select a healthy peer with usable statistics. Known
+allocations remain visible through `/metrics`; they are not inflated to model
+an unknown footprint. If no candidate has usable statistics, the router's
+existing fallback still applies, but the held pool refuses new allocations.
 
 Disk values are effective physical admission values. A stateful instance
 contributes its durable `disk_mb`; a diskless instance contributes its immutable

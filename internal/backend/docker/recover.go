@@ -1741,32 +1741,22 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if _, pending := pendingIntentLeases[uuid]; pending {
 			// A durable operation/maintenance intent closes the admission-to-
 			// projection-publication window that the volatile status alone cannot
-			// represent. In particular, re-provisioning a Failed lease records its
-			// candidate intent before synchronously tearing down the predecessor,
-			// while the predecessor intentionally remains Failed and authoritative.
-			// Replacing that pointer from a concurrent inventory refresh would make
-			// the exact post-teardown compare-and-swap report an ambiguous outcome
-			// even though no competing command exists. Keep both the live projection
-			// and (via the conservative pool rebuild below) its current allocation generation until
-			// the intent owner publishes the candidate atomically.
+			// represent, and preserves unresolved execution afterward. An accepted
+			// re-provision is Provisioning, while predecessor container identity and
+			// runtime authority can remain necessary for recovery. Preserve the exact
+			// actor-owned projection and its allocation generation instead of
+			// rebuilding them from predecessor inventory before settlement.
 			final[uuid] = existing
 			continue
 		}
 		if _, hasContainers := building[uuid]; hasContainers {
 			// By-design (ENG-414): only the in-flight statuses below are preserved
-			// here. Ready and Failing/Failed deliberately fall through to the container-derived
-			// (materialized) value, so a crashed-then-running lease recovers to Ready
-			// (locked by TestRecoverState_FailCountAntiRegression).
-			// recoverState cannot distinguish that legitimate recovery from the narrow
-			// race where the actor set Failing/Failed (via an event-loop die) AFTER our
-			// pre-merge ListManagedContainers snapshot still showed the container
-			// running — so an actor-set Failing/Failed can be momentarily overwritten
-			// with Ready. This is accepted: it self-heals (the in-flight diag goroutine
-			// completes → evDiagGathered → Failed and rewrites Status; or, once the dead
-			// container is GC'd, the no-containers branch below drops the phantom-Ready
-			// entry) and emits NO duplicate failure callback — Failing and Failed both
-			// Ignore(evContainerDied) (lease_sm.go) and the SM's internal state
-			// (NewStateMachine, not external storage) is unaffected by this map swap.
+			// here. Stable Ready and Failing/Failed entries may use the container-
+			// derived value, so a crashed-then-running lease recovers to Ready
+			// (TestRecoverState_FailCountAntiRegression). Actor transitions after the
+			// inventory baseline are excluded by changedProjectionLeases above; the
+			// second baseline comparison and actor-quiescence claim below also defer
+			// changes during publication hand-off and active actor ownership.
 			switch existing.Status {
 			case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
 				// In-flight re-provision: the rebuilt containers belong to the

@@ -734,7 +734,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Late containers covered by permanent closed/failed receipts are retried
   without terminating the backend on ordinary removal errors. Unaccounted
   survivors hold capacity and readiness until a later strict inventory proves
-  cleanup; deprovision and recovery remain available. Interrupted operation
+  cleanup; `/stats` returns `503` and in-process load reads refuse incomplete
+  accounting, allowing multi-backend routing to prefer healthy peers.
+  Deprovision and recovery remain available. Interrupted operation
   cleanup retains its exact intent and reservation for periodic retry. Storage
   identity drift still fails closed. (ENG-632)
 - Reprovision enters `provisioning` and clears the previous error at the actor's
@@ -746,26 +748,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   reads. Removed the redundant alternative cold-recovery wait algorithm,
   obsolete metric labels, and test-only production mutation helpers. (ENG-632)
 
-- Docker cold-start recovery now re-observes an exact interrupted provision
-  cohort in-process instead of turning every transitional container into a
-  permanent backend restart loop. Running health checks and restarting
-  containers may converge only within the budget derived from durable admission
-  time and the recovery process's configured `provision_timeout`; exact-empty,
-  `created`/paused, and other transitional cohorts share that horizon and defer
-  to later sweeps without blocking startup. Any failed sibling makes the operation
-  terminal immediately. Expiry proceeds only after exact candidate and any
-  predecessor authority is validated (and legacy predecessor identity is
+- Docker cold-start and periodic recovery each take a bounded observation of
+  an exact interrupted provision or restore cohort instead of waiting out its
+  operation deadline or turning transitional containers into a backend restart loop.
+  The recovery horizon derives from durable admission time and the recovery
+  process's configured `provision_timeout`; exact-empty cohorts, running health
+  checks, `restarting`, `created`/paused, and other transitional cohorts share that
+  horizon and defer to later sweeps without blocking startup. A failed sibling
+  enters exact failed-operation cleanup immediately. Expiry proceeds only after
+  exact candidate and any predecessor authority is validated (and legacy
+  predecessor identity is
   durably frozen) before lease-wide teardown and atomic failed-callback
   settlement; cancellation or Docker uncertainty keeps the intent and
   substrate. A persisted future admission timestamp after clock rollback is
   independently capped to one live observation window. Timeout exhaustion is
   observable via
-  `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason}`.
+  `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}`;
+  there is no separate container-start recovery timer.
   (ENG-632)
-- Interrupted restores with exact partial, failed, paused, or other
-  non-terminal substrate now enter the existing destination-fenced rollback
-  sequence instead of permanently failing every startup (or mistaking paused
-  containers for success). The exact destination Release remains the commit
+- Interrupted restores preserve young exact-empty or transitional cohorts under
+  the same recovery horizon as provisions, rather than permanently failing
+  startup or mistaking paused containers for success. Exact partial/failed
+  cohorts or an exhausted horizon enter the existing destination-fenced rollback
+  sequence. The exact destination Release remains the commit
   boundary and can never be rolled back. A durable Succeeded operation plus its
   immutable source finalizer reconstructs that Release if its earlier append did
   not complete; Failed plus an exact committed Release fails closed as
@@ -873,9 +878,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   proof gets one Docker read budget. Recovery Docker reads remain 30-second
   bounded. Cold-start diagnostics and orphan network cleanup
   now share one budget across the whole fleet rather than multiplying a timeout
-  per container/network. The aggregate reserves a fresh operation-intent window
-  after all preceding phases, including for a future/skewed durable admission
-  timestamp. Exhaustion fails or defers the phase with durable
+  per container/network. The aggregate reserves the shared operation-classification
+  and cleanup phase after all preceding phases; transitional work is deferred to
+  later sweeps without blocking startup. Exhaustion fails or defers the phase with durable
   operation, maintenance, and close evidence intact for the next launch. Local
   filesystem deadlines are cooperative: one blocking kernel call cannot be
   forcibly interrupted and a very large recursive removal can cross the

@@ -134,7 +134,7 @@ The dependency signal did not disappear, it moved: the per-check map is still in
 | `fred_docker_backend_volume_destroy_refused_total{reason="claimed"}` sustained | An exact destroy path keeps meeting a volume another lease owns — normally an in-flight restore that is not converging, since a healthy restore clears its own claim on commit or rollback. Never data loss: the refusal is the guard working | Read with `restore_finalizer_pending_total` and `retention_reaping_leases`; the WARN log names the volume and its owning lease. [Reclaiming retained-data / stuck-reaping volumes](#reclaiming-retained-data--stuck-reaping-volumes) |
 | `fred_docker_backend_teardown_fallback_total{outcome="failed",operation=~"restore_reconcile\|deprovision"}` rising | Container teardown could not prove absence; exact durable authority and accounting remain held for retry | [Stuck teardown](#stuck-teardown-docker-backend) |
 | `fred_docker_backend_teardown_fallback_total{outcome="failed",operation="provision_cleanup"}` rising | Candidate cleanup remains incomplete. The exact operation intent, pool reservation, and volume claims remain. A live worker with an ambiguous side effect can still fail-stop; cold/live recovery retries ordinary cleanup failures without re-latching the process | [Stuck teardown](#stuck-teardown-docker-backend) |
-| `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` rising | An exact interrupted provision exceeded its durable admission horizon and entered failed-operation cleanup; there is no separate container-start recovery window | Correlate with lease-scoped warnings and cleanup retry counters. A pending cleanup retains authority and reservation for the next sweep |
+| `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` rising | An exact interrupted provision or restore exceeded its durable admission horizon and entered failed-operation cleanup; both use the configured provision timeout, with no separate container-start recovery window | Correlate with lease-scoped warnings and cleanup retry counters. A pending cleanup retains authority and reservation for the next sweep |
 | `fred_docker_backend_operation_intent_recovery_cleanup_retries_total` rising | Deferred exact operation cleanup (`provision`/`restore`); intent and reservation remain for periodic retry | Correlate lease-scoped recovery/observation warnings. Restore the failed substrate or journal dependency; never erase authority to clear the signal. Diagnostic volume counts may be transient during create/rename; investigate a sustained value |
 | `fred_docker_backend_terminal_substrate_cleanup_retries_total` rising | Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain | Correlate lease-scoped recovery/observation warnings. Restore the failed substrate or journal dependency; never erase authority to clear the signal. Diagnostic volume counts may be transient during create/rename; investigate a sustained value |
 | `fred_docker_backend_unaccounted_managed_volumes` > 0 | Attested managed volumes absent from current live, admitted-operation, and all retention projections; diagnostic only, never deletion or admission authority | Correlate lease-scoped recovery/observation warnings. Restore the failed substrate or journal dependency; never erase authority to clear the signal. Diagnostic volume counts may be transient during create/rename; investigate a sustained value |
@@ -205,24 +205,30 @@ On a **blocking** operation this is not data loss and not an over-admission — 
 Failed cleanup is not, by itself, loss of storage authority. Recovery keeps
 its exact durable intent or terminal receipt and retries. Unknown late-container
 footprints withhold capacity through pool-owned accounting holds, so the daemon
-can remain alive without advertising unsafe capacity. Verified identity drift
-still terminates the affected backend. The obsolete `restore_prelude` and
+can remain alive without advertising unsafe capacity. While held, `/stats`
+returns `503` and in-process load reads refuse the incomplete ledger; routing
+prefers healthy peers with usable statistics. Known allocations remain visible
+in backend metrics. Verified identity drift still terminates the affected
+backend. The obsolete `restore_prelude` and
 `restore_rollback` paths/metric labels are no longer emitted.
 
-Cold recovery does not require repeated process restarts merely because that
-exact provision cohort is transitional. It re-inspects running health checks
-and `restarting` containers in-process for no longer than the remaining budget
-computed from durable admission time and the recovery process's current
-`provision_timeout`. A `created` or paused non-progressing cohort gets up to the
-current `container_start_timeout`, capped by the same operation deadline, in
-case Docker accepted a start immediately before the crash. A failed sibling,
-or expiration of either bound, makes the exact provision a normal failed
-cleanup; shutdown, inventory errors, and identity contradictions still
-preserve the WAL and fail closed. Restore intents do not use this
-provision-only terminalization rule. Each timeout is counted by
-`fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason}`;
-`reason` is `container_start_timeout` or `provision_timeout`, and a failed
-cleanup may count again on its next startup retry.
+Cold and periodic recovery each take a bounded observation rather than waiting
+for a transitional provision or restore to finish. Exact-empty cohorts, running
+health checks, and `restarting`, `created`, or paused containers remain Pending until
+the horizon derived from durable admission time and the current
+`provision_timeout`; later sweeps re-observe them without blocking startup.
+There is no separate `container_start_timeout` recovery window. An exact Ready
+cohort settles successfully; a failed sibling or exhausted horizon enters exact
+failed-operation cleanup. Cancellation, inventory uncertainty, or ordinary
+cleanup failure preserves the intent and reservation for retry; verified
+storage-authority loss remains fail-closed. Restore shares the recovery horizon,
+but its rollback additionally requires exact source/destination authority and
+an actor-quiescence capability; a committed destination Release cannot be rolled
+back.
+
+`fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}`
+counts expired provision/restore classifications and may increase again on
+later sweeps while cleanup remains pending.
 
 Operation settlement does not delete its write-ahead row. The same bbolt
 transaction changes the exact Pending row to Succeeded or Failed and enqueues

@@ -613,18 +613,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.backend.Stats()
+	load, err := stats.RoutingLoadStats()
+	if err != nil {
+		s.errorResponse(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 
 	s.writeJSON(w, http.StatusOK, StatsResponse{
-		TotalCPUCores:     stats.TotalCPU,
+		TotalCPUCores:     load.TotalCPUCores,
 		TotalMemoryMB:     stats.TotalMemoryMB,
 		TotalDiskMB:       stats.TotalDiskMB,
-		AllocatedCPUCores: stats.AllocatedCPU,
+		AllocatedCPUCores: load.AllocatedCPUCores,
 		AllocatedMemoryMB: stats.AllocatedMemoryMB,
 		AllocatedDiskMB:   stats.AllocatedDiskMB,
 		AvailableCPUCores: stats.AvailableCPU(),
 		AvailableMemoryMB: stats.AvailableMemoryMB(),
 		AvailableDiskMB:   stats.AvailableDiskMB(),
-		ActiveContainers:  stats.AllocationCount,
+		ActiveContainers:  load.ActiveContainers,
 	})
 }
 

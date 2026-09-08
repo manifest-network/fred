@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -95,19 +96,22 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 	newVols := func() *fakeVolumeBackend { return &fakeVolumeBackend{} }
 
 	cases := []struct {
-		name string
+		name         string
+		virtualClock bool
 		// run seeds state and drives the real transition. b already has
 		// withMicroSKU(512) applied and an empty retention store.
 		run func(t *testing.T, b *Backend, rs *shared.RetentionStore)
 	}{
 		{
-			name: "reapExpiredRetentions",
+			name:         "reapExpiredRetentions",
+			virtualClock: true,
 			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
 				b.volumes = newVols()
 				b.cfg.RetentionMaxAge = 500 * time.Millisecond
-				// Retention timestamps are store-minted. Let the first record age,
-				// then publish the fresh survivor through the same settlement path.
-				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("expired", "t1", time.Now().Add(-2*time.Hour))))
+				// Retention timestamps are store-minted. Virtual time freezes
+				// while the fixture completes its remaining durable close steps,
+				// so the fresh survivor cannot expire during setup under -race.
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("expired", "t1", time.Now())))
 				time.Sleep(550 * time.Millisecond)
 				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("fresh", "t1", time.Now())))
 
@@ -135,7 +139,8 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 			},
 		},
 		{
-			name: "runRetentionSweep",
+			name:         "runRetentionSweep",
+			virtualClock: true,
 			run: func(t *testing.T, b *Backend, rs *shared.RetentionStore) {
 				b.volumes = newVols()
 				b.cfg.RetentionMaxAge = 500 * time.Millisecond
@@ -143,7 +148,7 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 				// Composite sweep: reap expired + retry a reaping tombstone + refresh.
 				// A fresh active record survives; both the expired and the reaping
 				// record are destroyed and deleted.
-				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("expired", "t1", time.Now().Add(-2*time.Hour))))
+				require.NoError(t, putRetentionForTest(t, rs, retentionEntryFixture("expired", "t1", time.Now())))
 				reaping := retentionEntryFixture("tombstone", "t1", time.Now())
 				reaping.Status = shared.RetentionStatusReaping
 				require.NoError(t, putRetentionForTest(t, rs, reaping))
@@ -325,14 +330,21 @@ func TestRetentionAccountingInvariant_HoldsAfterTransition(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			b, rs := newBackendWithRetention(t)
-			withMicroSKU(b, 512) // align the pool resolver (defaultTestSKUProfiles: 512) and computeRetainedDiskMB
+			run := func(t *testing.T) {
+				b, rs := newBackendWithRetention(t)
+				withMicroSKU(b, 512) // align the pool resolver (defaultTestSKUProfiles: 512) and computeRetainedDiskMB
 
-			tc.run(t, b, rs)
+				tc.run(t, b, rs)
 
-			assertRetentionAccountingConsistent(t, b, "invariant must hold after "+tc.name)
-			assert.Positive(t, b.pool.Stats().RetainedDiskMB,
-				"case must leave a non-trivial retained footprint (not a vacuous 0 == 0 check)")
+				assertRetentionAccountingConsistent(t, b, "invariant must hold after "+tc.name)
+				assert.Positive(t, b.pool.Stats().RetainedDiskMB,
+					"case must leave a non-trivial retained footprint (not a vacuous 0 == 0 check)")
+			}
+			if tc.virtualClock {
+				synctest.Test(t, run)
+			} else {
+				run(t)
+			}
 		})
 	}
 }

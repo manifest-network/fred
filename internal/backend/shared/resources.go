@@ -671,6 +671,22 @@ type ResourceStats struct {
 	AccountingHeld    bool
 }
 
+// RoutingLoadStats projects a complete resource ledger into the load signal
+// used for provision routing. An unaccounted footprint invalidates that
+// projection: returning a deceptively low allocation would keep routing new
+// leases to a backend whose pool correctly refuses them. Stats remains
+// available for diagnostics without fabricating usage for that footprint.
+func (s ResourceStats) RoutingLoadStats() (*backend.LoadStats, error) {
+	if s.AccountingHeld {
+		return nil, ErrResourceAccountingIncomplete
+	}
+	return &backend.LoadStats{
+		TotalCPUCores:     s.TotalCPU,
+		AllocatedCPUCores: s.AllocatedCPU,
+		ActiveContainers:  s.AllocationCount,
+	}, nil
+}
+
 // AvailableCPU returns available CPU cores.
 func (s ResourceStats) AvailableCPU() float64 {
 	if s.AccountingHeld {

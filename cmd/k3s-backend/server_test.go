@@ -1469,6 +1469,27 @@ func TestHandleStats(t *testing.T) {
 	assert.Equal(t, 2, got.ActiveContainers)
 }
 
+func TestHandleStats_AccountingHeld(t *testing.T) {
+	mb := &mockBackend{
+		StatsFunc: func() shared.ResourceStats {
+			return shared.ResourceStats{
+				TotalCPU: 8, AllocatedCPU: 1, AllocationCount: 1,
+				AccountingHeld: true,
+			}
+		},
+	}
+	w := httptest.NewRecorder()
+	newMockHandler(mb).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/stats", nil))
+
+	// A partial known ledger must not advertise a lightly loaded backend to
+	// routing while an unaccounted substrate footprint still holds admission.
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	var got ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, shared.ErrResourceAccountingIncomplete.Error(), got.Error)
+	assert.NotContains(t, w.Body.String(), "total_cpu_cores")
+}
+
 // --- validateCallbackURL standalone --------------------------------------
 
 func TestValidateCallbackURL(t *testing.T) {

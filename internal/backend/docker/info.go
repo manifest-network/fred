@@ -404,10 +404,5 @@ var _ backend.Backend = (*Backend)(nil)
 // source the HTTP GET /stats endpoint serves — so the in-process docker backend
 // exposes the same load signal as the HTTP path.
 func (b *Backend) GetLoadStats(_ context.Context) (*backend.LoadStats, error) {
-	stats := b.Stats()
-	return &backend.LoadStats{
-		TotalCPUCores:     stats.TotalCPU,
-		AllocatedCPUCores: stats.AllocatedCPU,
-		ActiveContainers:  stats.AllocationCount,
-	}, nil
+	return b.Stats().RoutingLoadStats()
 }

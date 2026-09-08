@@ -30,6 +30,9 @@ func TestResourceAccountingHoldExcludesAllAllocationPathsWithoutReplacingLedger(
 	require.Zero(t, pool.Stats().AvailableCPU())
 	require.Zero(t, pool.Stats().AvailableMemoryMB())
 	require.Zero(t, pool.Stats().AvailableDiskMB())
+	load, err := pool.Stats().RoutingLoadStats()
+	require.ErrorIs(t, err, ErrResourceAccountingIncomplete)
+	require.Nil(t, load, "an incomplete ledger must not issue a routable load snapshot")
 
 	first.Release()
 	copyOfFirst.Release()
@@ -39,4 +42,9 @@ func TestResourceAccountingHoldExcludesAllAllocationPathsWithoutReplacingLedger(
 	second.Release()
 	require.False(t, pool.Stats().AccountingHeld)
 	require.NoError(t, pool.TryAllocate("new", "small", "tenant"))
+	load, err = pool.Stats().RoutingLoadStats()
+	require.NoError(t, err)
+	require.Equal(t, float64(8), load.TotalCPUCores)
+	require.Equal(t, profile.CPUCores, load.AllocatedCPUCores)
+	require.Equal(t, 1, load.ActiveContainers)
 }

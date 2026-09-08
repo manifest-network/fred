@@ -544,9 +544,10 @@ Docker call receives its own 30-second child budget, while the complete
 cold-start diagnostic scan and complete orphan-network scan each share one
 separate 30-second aggregate budget. Per-call recovery bounds can therefore
 accumulate with fleet size, but the finite `Start` parent remains the hard
-aggregate ceiling. Its sum reserves a fresh operation-recovery window even when
-every preceding phase consumes its cap; one wedged daemon call cannot block
-indefinitely.
+aggregate ceiling. Its sum reserves the shared operation-classification and
+cleanup phase even when every preceding phase consumes its cap. Transitional
+operations are deferred to periodic sweeps, not waited out during startup;
+one wedged daemon call cannot block indefinitely.
 
 The separate Docker storage-identity preflight and initializer share one
 `-storage-identity-operation-timeout` deadline (default `10m`) across
@@ -1226,12 +1227,14 @@ ordinary callback labels or release cohorts, and excludes close-owned cohorts
 whose disappearance is intentional. During startup, operation-intent preflight
 and settlement run later, after ordinary projection and restore authority have
 been reconstructed before quota reconciliation or any exact finalizer can consume evidence. An exact
-ready container set reconstructs the active release and Succeeded operation;
-exact absence produces an interrupted-operation failure. An identity-exact but
-incomplete or terminal provision cohort is failed only after its candidate
-containers are removed; an identity-exact partial, failed, paused, or other
-non-terminal restore cohort enters its destination-fenced rollback. Partial or
-mixed callback identities, unavailable SKUs, unreadable retention state, and
+ready container set reconstructs the active release and Succeeded operation.
+An exact-empty or transitional provision or restore cohort remains Pending
+before its durable admission horizon and is re-observed by periodic sweeps without
+blocking startup. A terminal sibling or exhausted horizon enters failed-operation
+cleanup; settlement requires exact candidate absence. Restore cleanup additionally
+requires destination-fenced rollback authority; a committed destination Release
+cannot be rolled back. Partial or mixed callback identities, unavailable SKUs,
+unreadable retention state, and
 other identity, topology, or read uncertainty preserve the Pending row and fail
 startup closed. A pre-existing terminal row is an immutable recovery decision;
 without a committed Release, its absence where a restore finalizer names that
@@ -1770,7 +1773,7 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_deprovisions_total` | counter | — | Deprovision operations |
 | `fred_docker_backend_active_provisions` | gauge | — | Active provisions |
 | `fred_docker_backend_provision_duration_seconds` | histogram | — | End-to-end provision time |
-| `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total` | counter | `reason` | Exact provision intents classified past their durable admission deadline (`reason="provision_timeout"`). Cleanup uncertainty retains the intent and reservation for periodic retry; there is no separate container-start recovery timer |
+| `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total` | counter | `reason` | Exact provision/restore intents classified past their durable admission deadline (`reason="provision_timeout"`, shared by both kinds). Cleanup uncertainty retains the intent and reservation for periodic retry; there is no separate container-start recovery timer |
 | `fred_docker_backend_operation_intent_recovery_cleanup_retries_total` | counter | kind | Deferred exact operation cleanup (`provision`/`restore`); intent and reservation remain for periodic retry |
 | `fred_docker_backend_terminal_substrate_pending_containers` | gauge | receipt | Last late-container count for permanent `closed`/`failed_operation` receipts; nonzero withholds this backend’s pool capacity/readiness until strict absence |
 | `fred_docker_backend_terminal_substrate_cleanup_retries_total` | counter | receipt | Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain |

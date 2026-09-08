@@ -325,9 +325,10 @@ Docker/storage-lineage attestation. `Start` shares at most 30 seconds across its
 initial identity, ping, and capability reads, then uses a backend-lifecycle
 aggregate budget for crash convergence. Production derives
 that aggregate as the saturating sum of every sequential phase's local maximum
-(51m10s with default settings), so a future/skewed operation admission still
-receives a fresh operation-recovery window after every earlier phase consumes
-its cap. Within that overall budget, interrupted-volume recovery receives a
+(51m10s with default settings), reserving the shared operation-classification
+and cleanup phase even if every earlier phase consumes its cap. Transitional
+operations are deferred to periodic sweeps, not waited out during startup.
+Within that overall budget, interrupted-volume recovery receives a
 fixed two-minute child deadline; its full clean-inventory proof receives
 `max(2m, storage_attestation_timeout)`. Increase the attestation setting for a
 large managed-volume fleet; it does not widen individual Docker requests or
