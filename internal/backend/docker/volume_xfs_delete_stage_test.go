@@ -602,6 +602,18 @@ func TestXFSDeleteRecoveryHonorsEarlierParentDeadline(t *testing.T) {
 	assert.ErrorIs(t, statErr, os.ErrNotExist, "an expired parent budget must not start a fresh quota subprocess")
 }
 
+// xfsEntryDeadlineContext lets a filesystem-step fixture exhaust the parent
+// deadline at the exact syscall boundary under test. Setup and quota-process
+// scheduling consume no arbitrary wall-clock allowance.
+type xfsEntryDeadlineContext struct{ context.Context }
+
+func (c xfsEntryDeadlineContext) Err() error {
+	if errors.Is(context.Cause(c.Context), context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return c.Context.Err()
+}
+
 func TestXFSDeleteRecoveryDeadlineStopsBetweenEntriesBeforeQuotaClear(t *testing.T) {
 	dataPath := t.TempDir()
 	mgr := newXfsManagerForTest(dataPath)
@@ -613,8 +625,9 @@ func TestXFSDeleteRecoveryDeadlineStopsBetweenEntriesBeforeQuotaClear(t *testing
 	require.NoError(t, os.WriteFile(filepath.Join(volumePath, "a"), []byte("a"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(volumePath, "b"), []byte("b"), 0o600))
 	logPath := installXFSQuotaFixture(t, "")
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
+	parent, expire := context.WithCancelCause(t.Context())
+	defer expire(nil)
+	ctx := xfsEntryDeadlineContext{parent}
 	removeCalls := 0
 
 	err := mgr.cleanupXFSDeleteStageWith(
@@ -622,7 +635,7 @@ func TestXFSDeleteRecoveryDeadlineStopsBetweenEntriesBeforeQuotaClear(t *testing
 		stage,
 		func(*os.Root, string) error {
 			removeCalls++
-			<-ctx.Done()
+			expire(context.DeadlineExceeded)
 			return nil
 		},
 		removeFromXFSRoot,

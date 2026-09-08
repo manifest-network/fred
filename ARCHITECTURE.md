@@ -700,6 +700,16 @@ and their success/failure projections
 are likewise private or opaque and can be constructed only from the matching
 operation or maintenance proof.
 
+Provision commands additionally require a pool-issued `ProvisionAdmission`
+bound to their exact operation and immutable resource profiles. Admission
+reserves the conservative predecessor/candidate envelope atomically before any
+teardown, including retries with no committed predecessor release. The actor
+consumes it into `ProvisionResourceExecution`; rejected commands abort their own
+unconsumed admission even if the caller stopped waiting. Matching terminal
+proofs narrow or release the reservation, while ambiguity retains accounting
+for durable recovery. Recovery uses the same conservative envelope rule, so a
+restart cannot expose downgrade capacity while predecessor bytes may remain.
+
 **State machine:**
 
 Built on [`qmuntal/stateless`](https://github.com/qmuntal/stateless), actor states

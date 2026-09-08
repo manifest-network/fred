@@ -608,9 +608,14 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 		Status: "active", CreatedAt: stableContainer.CreatedAt,
 	})
 	b.cfg.StartupVerifyDuration = time.Millisecond
-	b.cfg.ProvisionTimeout = time.Millisecond
+	// Admission and the real actor worker must not race the recovery deadline
+	// this test will exercise later. Stage the expired recovery policy only
+	// after proving the failed Compose call and exclusive actor quiescence.
+	b.cfg.ProvisionTimeout = time.Minute
+	composeUpReached := make(chan error, 1)
 	b.compose = &mockComposeExecutor{
-		UpFn: func(context.Context, *composetypes.Project, composeUpOpts) error {
+		UpFn: func(ctx context.Context, _ *composetypes.Project, _ composeUpOpts) error {
+			composeUpReached <- ctx.Err()
 			return errors.New("compose up boom")
 		},
 		DownFn: func(context.Context, string, time.Duration) error {
@@ -714,23 +719,37 @@ func TestRecoverState_RestoreAdmissionAndRollbackCannotABA(t *testing.T) {
 	// Compose call is ambiguous until the live operation-recovery lane obtains
 	// actor quiescence and performs a second strict absence observation; ordinary
 	// state recovery cannot mint that causal proof.
+	require.NoError(t, waitForAsyncTestResult(t, composeUpReached, "restore Compose.Up entry"),
+		"the intended post-effect failure must occur before the worker deadline")
+	var actorClaim *leaseActorRecoveryClaim
 	require.Eventually(t, func() bool {
-		actorClaim := b.tryClaimLeaseActorQuiescence(destinationLease)
-		if actorClaim != nil {
-			actorClaim.Release()
-		}
+		actorClaim = b.tryClaimLeaseActorQuiescence(destinationLease)
 		return actorClaim != nil
 	}, 5*time.Second, 10*time.Millisecond, "accepted restore actor must become quiescent")
+	defer actorClaim.Release()
+	claims, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Len(t, claims, 1, "ambiguous Compose failure must preserve the exact pending operation")
+	require.Equal(t, destinationLease, claims[0].LeaseUUID())
+	require.Equal(t, shared.OperationIntentRestore, claims[0].Kind())
+	require.Equal(t, shared.OperationExecutionStarted, claims[0].ExecutionPhase(),
+		"the test must not recover a pre-effect refusal")
+	require.Positive(t, time.Since(claims[0].CreatedAt()))
 	volumeNames, err := volumeState.list()
 	require.NoError(t, err)
-	require.Equal(t, []string{sourceRetainedVolume}, volumeNames,
-		"the quiescent failed restore must preserve the source-retained volume")
+	require.Equal(t, []string{canonicalVolumeName(destinationLease, manifest.DefaultServiceName, 0)}, volumeNames,
+		"the ambiguous post-adoption failure must preserve the destination footprint for exact recovery")
+	// The durable timestamp has already aged and the exclusive actor claim
+	// excludes every worker/config reader. Recovery can now observe an expired
+	// visibility window without using a tiny live-worker timeout as a scheduler.
+	b.cfg.ProvisionTimeout = time.Nanosecond
+	actorClaim.Release()
 	require.NoError(t, b.recoverLiveOperationIntents(context.Background()))
 	volumeNames, err = volumeState.list()
 	require.NoError(t, err)
 	require.Equal(t, []string{sourceRetainedVolume}, volumeNames,
 		"operation recovery must leave the source-retained volume intact")
-	claims, err := b.operationSettlement.ListOperationIntents()
+	claims, err = b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
 	assert.Empty(t, claims, "operation recovery must durably settle the failed restore")
 	entry, err := retentions.Get(sourceLease)

@@ -360,8 +360,12 @@ func operationFailureDetails(err error) (string, backend.Reason) {
 
 func (b *Backend) executeProvisionWork(
 	ctx context.Context,
-	claim shared.OperationIntentClaim,
+	admission shared.ProvisionResourceExecution,
 ) leasesm.ProvisionWorkOutcome {
+	claim := admission.Operation()
+	if !admission.Valid() {
+		return mustProvisionAmbiguous(errors.New("provision execution requires consumed resource admission"), claim)
+	}
 	candidate, err := b.operationSettlement.PrepareOperationRelease(claim)
 	if err != nil {
 		return mustProvisionAmbiguous(err, claim)
@@ -376,6 +380,9 @@ func (b *Backend) executeProvisionWork(
 		if err != nil {
 			return mustProvisionAmbiguous(err, claim)
 		}
+		if err := admission.CompleteSuccess(committed); err != nil {
+			return mustProvisionAmbiguous(err, claim)
+		}
 		result, err := leasesm.NewProvisionWorkSuccess(committed)
 		if err != nil {
 			return mustProvisionAmbiguous(err, claim)
@@ -384,6 +391,9 @@ func (b *Backend) executeProvisionWork(
 	case shared.OperationExecutionFailure:
 		proof, err := b.operationSettlement.CommitOperationFailure(outcome)
 		if err != nil {
+			return mustProvisionAmbiguous(err, claim)
+		}
+		if err := admission.CompleteFailure(proof); err != nil {
 			return mustProvisionAmbiguous(err, claim)
 		}
 		cause := outcome.Cause()

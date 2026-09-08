@@ -7,6 +7,8 @@ import (
 	"math"
 
 	"github.com/google/uuid"
+
+	"github.com/manifest-network/fred/internal/operationid"
 )
 
 var errOperationIDSequenceExhausted = errors.New("operation ID sequence exhausted")
@@ -21,7 +23,7 @@ func newRegistryWithObserver(
 ) *Registry {
 	registry := newRegistryBase(claimSeed, observer)
 	// Deterministic allocation exists only for package tests. Production
-	// constructors install randomOperationID above so an ID observed by one
+	// constructors install randomOperationID so an ID observed by one
 	// backend reveals nothing about another backend's current or future ID.
 	registry.operationIDSource = func() (OperationID, error) {
 		if operationSeed == math.MaxUint64 {
@@ -43,5 +45,9 @@ func deterministicOperationID(sequence uint64) OperationID {
 	copy(value[:], digest[:len(value)])
 	value[6] = (value[6] & 0x0f) | 0x40
 	value[8] = (value[8] & 0x3f) | 0x80
-	return newOperationID(value)
+	id, err := operationid.Parse(value.String())
+	if err != nil {
+		panic(err)
+	}
+	return id
 }

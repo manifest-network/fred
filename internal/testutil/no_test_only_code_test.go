@@ -137,6 +137,12 @@ var exemptDecls = map[string]string{
 	"internal/backend/mock.go:SetProvisionStatus": "driven by internal/provisioner's fleet harness",
 	"internal/backend/mock.go:Clear":              "driven by internal/provisioner's fleet harness",
 	"internal/backend/mock.go:SetGetLoadStatsErr": "driven by cmd/mock-backend's tests",
+	// This closed, validated API result supports consumer-side maintenance
+	// service fakes without exposing mutable Result fields or weakening the API
+	// port to an unsealed interface. Results are diagnostic output, not durable
+	// settlement or mutation capabilities; cross-package fixtures cannot use an
+	// export_test.go constructor from the service package.
+	"internal/provisioner/maintenance/service.go:NewResult": "validated diagnostic result constructor for API-boundary fakes; grants no mutation authority",
 }
 
 func TestNoTestOnlyCodeInProductionFiles(t *testing.T) {

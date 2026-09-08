@@ -43,14 +43,15 @@ func TestActorBoundaryDoesNotExportWritableMessageOrResultShapes(t *testing.T) {
 }
 
 func TestActorCommandConstructorsRejectMissingOrWrongCapabilities(t *testing.T) {
-	provision := newTestOperationFixture(t, "11111111-1111-4111-8111-111111111111", shared.OperationIntentProvision).claim
-	restore := newTestOperationFixture(t, "22222222-2222-4222-8222-222222222222", shared.OperationIntentRestore).claim
+	provision := newTestOperationFixture(t, "11111111-1111-4111-8111-111111111111", shared.OperationIntentProvision).admission
 
 	_, _, err := NewProvisionCommand(nil, provision) //nolint:staticcheck // Deliberately verify nil-context rejection.
 	require.Error(t, err)
-	_, _, err = NewProvisionCommand(context.Background(), restore)
+	// Restore claims cannot construct a provision command: its distinct
+	// admission type is issued only by the provision capacity boundary.
+	_, _, err = NewProvisionCommand(context.Background(), shared.ProvisionAdmission{})
 	require.Error(t, err)
-	_, _, err = NewRestoreCommand(context.Background(), provision)
+	_, _, err = NewRestoreCommand(context.Background(), provision.Operation())
 	require.Error(t, err)
 	_, _, err = NewRestoreCommand(context.Background(), shared.OperationIntentClaim{})
 	require.Error(t, err)

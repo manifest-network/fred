@@ -111,7 +111,10 @@ func (b *Backend) recoverFailedOperationSubstrate(
 	if err != nil {
 		return failedOperationRecoveryFence{}, err
 	}
-	if len(receipts) == 0 {
+	// Successful close can retire every failed receipt while its already-issued
+	// accounting hold still owns a physical cohort. Keep observing that compact
+	// scope, without reusing it as destructive authority.
+	if len(receipts) == 0 && b.failedSubstrateCapacityHold == nil {
 		return fence, nil
 	}
 
@@ -124,7 +127,8 @@ func (b *Backend) recoverFailedOperationSubstrate(
 		if matchErr != nil {
 			return failedOperationRecoveryFence{}, matchErr
 		}
-		b.observeTerminalSubstrate(terminalReceiptFailed, len(targets))
+		b.retainFailedSubstrate(containers, targets)
+		b.releaseAbsentFailedSubstrate(containers)
 		if len(targets) == 0 {
 			return fence, nil
 		}
@@ -247,20 +251,6 @@ func (f failedOperationRecoveryFence) targets(
 		}
 	}
 	return targets, nil
-}
-
-func (f failedOperationRecoveryFence) targetContainerIDs(
-	containers []ContainerInfo,
-) (map[string]struct{}, error) {
-	targets, err := f.targets(containers)
-	if err != nil {
-		return nil, err
-	}
-	ids := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
-		ids[target.containerID] = struct{}{}
-	}
-	return ids, nil
 }
 
 func (b *Backend) probeOperationIntent(

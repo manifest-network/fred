@@ -155,7 +155,7 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	if err != nil {
 		return fmt.Errorf("%w: snapshot resource profiles: %w", backend.ErrValidation, err)
 	}
-	resourcesBySKU, err := resourceSnapshotMap(req.Items, resourceProfiles)
+	_, err = resourceSnapshotMap(req.Items, resourceProfiles)
 	if err != nil {
 		return fmt.Errorf("%w: validate resource profiles: %w", backend.ErrValidation, err)
 	}
@@ -293,22 +293,6 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	b.recoverySnapshotMu.RUnlock()
 	recoveryBridgeHeld = false
 
-	// Allocation IDs are always service-aware now:
-	// {leaseUUID}-{serviceName}-{instanceIndex}. The legacy {leaseUUID}-{idx}
-	// scheme is unsupported by the live path.
-	allocatedIDs := make([]string, 0, totalQuantity)
-	replacementAllocations := make([]shared.ResolvedAdoptInstance, 0, totalQuantity)
-	for _, item := range req.Items {
-		for i := range item.Quantity {
-			instanceID := fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i)
-			allocatedIDs = append(allocatedIDs, instanceID)
-			replacementAllocations = append(replacementAllocations, shared.ResolvedAdoptInstance{
-				ID:        instanceID,
-				Resources: resourcesBySKU[item.SKU],
-			})
-		}
-	}
-
 	if oldProvision != nil {
 		predecessorUnchanged := func() bool {
 			b.provisionsMu.RLock()
@@ -415,29 +399,23 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 			))
 		}
 
-		// The actor publishes Provisioning before acknowledging the command.
-		// Physical teardown and reservation replacement belong to the Started
-		// executor, which retains the predecessor authority throughout them.
-	} else {
-		for i, allocation := range replacementAllocations {
-			if err := b.pool.TryAllocateResolved(
-				allocation.ID, req.Tenant, allocation.Resources,
-			); err != nil {
-				for _, id := range allocatedIDs[:i] {
-					b.pool.Release(id)
-				}
-				b.removeProvision(req.LeaseUUID)
-				return b.refuseOperationIntent(intent,
-					fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err))
-			}
+	}
+	// One atomic, claim-bound reservation covers both fresh and replacement
+	// work. Its conservative envelope retains predecessor capacity until exact
+	// terminal settlement; a hold or capacity refusal happens before any teardown.
+	admission, err := b.operationSettlement.ReserveProvisionResources(b.pool, intent)
+	if err != nil {
+		if oldProvision == nil {
+			b.removeProvision(req.LeaseUUID)
 		}
+		return b.refuseOperationIntent(intent, fmt.Errorf("%w: %w", backend.ErrInsufficientResources, err))
 	}
 
 	rollbackUnacceptedProvision := func(cause error) error {
+		if abortErr := admission.Abort(); abortErr != nil {
+			return errors.Join(cause, abortErr)
+		}
 		if oldProvision == nil {
-			for _, id := range allocatedIDs {
-				b.pool.Release(id)
-			}
 			b.removeProvision(req.LeaseUUID)
 			return b.refuseOperationIntent(intent, cause)
 		}
@@ -466,7 +444,7 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	// worker is left as a zombie and recoverState reconciles on next
 	// start.
 	provCtx, provCancel := b.shutdownAwareContext()
-	command, ack, commandErr := leasesm.NewProvisionCommand(provCtx, intent)
+	command, ack, commandErr := leasesm.NewProvisionCommand(provCtx, admission)
 	if commandErr != nil {
 		provCancel()
 		return rollbackUnacceptedProvision(commandErr)
@@ -1013,11 +991,6 @@ func (b *Backend) doProvisionPhysical(
 			logger.Error("stack provision failed", "lease_uuid", req.LeaseUUID, "error", err)
 			provisionsTotal.WithLabelValues("failure").Inc()
 			if !mutations.effectEntered() {
-				for _, item := range req.Items {
-					for i := range item.Quantity {
-						b.pool.Release(fmt.Sprintf("%s-%s-%d", req.LeaseUUID, item.ServiceName, i))
-					}
-				}
 				errRet = &physicalOperationError{callback: callbackErr, reason: failReason, cause: err}
 				updateResourceMetrics(b.pool.Stats())
 				return
@@ -1203,16 +1176,6 @@ func (b *Backend) prepareProvisionProjection(
 	previous := recoveredFromProvision(current)
 	recorded := slices.Clone(current.ContainerIDs)
 	b.provisionsMu.RUnlock()
-	previousIDs, _, err := resolvedProvisionAllocations(
-		req.LeaseUUID, previous.Items, previous.ResourceProfiles,
-	)
-	if err != nil {
-		return fmt.Errorf("resolve predecessor reservations: %w", err)
-	}
-	_, replacement, err := resolvedProvisionAllocations(req.LeaseUUID, req.Items, profiles)
-	if err != nil {
-		return fmt.Errorf("resolve replacement reservations: %w", err)
-	}
 	remaining, err := b.teardownLeaseContainersWith(
 		mutations, ctx, req.LeaseUUID, recorded, 10*time.Second,
 		teardownOpProvisionCleanup, logger,
@@ -1227,11 +1190,7 @@ func (b *Backend) prepareProvisionProjection(
 	if current == nil || current.Tenant != previous.Tenant || current.ProviderUUID != previous.ProviderUUID {
 		return errors.New("failed predecessor projection changed during Started teardown")
 	}
-	if err := b.pool.ReplaceResolvedAll(previousIDs, replacement, req.Tenant); err != nil {
-		return fmt.Errorf("replace failed predecessor reservations: %w", err)
-	}
 	current.SKU = req.Items[0].SKU
-	current.Quantity = len(previousIDs)
 	if quantity, quantityErr := backend.ValidateOperationQuantities(req.Items); quantityErr == nil {
 		current.Quantity = quantity
 	}

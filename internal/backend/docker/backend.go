@@ -100,6 +100,7 @@ type operationSettlementService interface {
 	ListFailedOperationReceipts() ([]shared.FailedOperationReceipt, error)
 	LookupOperationRecovery(shared.OperationIntentProbe) (shared.OperationRecoveryState, error)
 	PrepareOperationRelease(shared.OperationIntentClaim) (shared.OperationReleaseCandidate, error)
+	ReserveProvisionResources(*shared.ResourcePool, shared.OperationIntentClaim) (shared.ProvisionAdmission, error)
 	CheckOperationReleaseCapacity(shared.OperationReleaseCandidate) error
 	RefuseOperationExecution(shared.OperationReleaseCandidate) (shared.OperationExecutionFailure, error)
 	StartOperationExecution(shared.OperationReleaseCandidate) (shared.OperationExecutionClaim, error)
@@ -154,7 +155,7 @@ type Backend struct {
 	// retain resource profiles. Recovery owns these independent pool holds until
 	// strict inventory proves the corresponding unaccounted footprint absent.
 	closedSubstrateCapacityHold *shared.ResourceAccountingHold
-	failedSubstrateCapacityHold *shared.ResourceAccountingHold
+	failedSubstrateCapacityHold *failedSubstrateAccountingHold
 
 	storageIdentity  backendidentity.ID
 	storageAuthority backendidentity.VerifiedStorage

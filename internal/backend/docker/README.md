@@ -680,6 +680,14 @@ When a provision has `status=failed` (e.g., a container crashed and was detected
   never retain an actor pointer.
 - **Worker ownership** — every worker goroutine (provision, restart, update, diag) is spawned by the actor and tracked by its per-actor `workers` barrier (a channel-signaled reference counter; see `work_barrier.go`). Normal actor exit waits for `workers.Zero()` before registry deletion and inbox drain. The wait is bounded: a stuck worker aborts a preempting state transition (so deprovision cannot tear down underneath it), while shutdown eventually returns `ErrShutdownDrainTimeout`, leaves dependencies open, and makes the process exit non-zero. The barrier's channel-based wait means a wedged worker adds no leaked waiter on top of itself.
 - **Typed recovery quiescence** — restore reconciliation must acquire an opaque `QuiescenceClaim` from the exact registry actor before reading mutable recovery inputs. One activity count overlaps queued/handling messages, worker execution, and worker-to-terminal-message handoff. The claim holds admission and activity gates and pins the actor against retirement/replacement until release; routing refuses without blocking while it is held. A missing claim defers that lease. Recovery never composes racy inbox-depth and worker-idleness snapshots into authority.
+- **Provision capacity ownership** — fresh provisions and retries both require
+  an operation-bound `ProvisionAdmission`. The pool reserves the conservative
+  predecessor/candidate envelope before actor dispatch or teardown; the actor
+  consumes it into one worker's `ProvisionResourceExecution`. Rejection aborts
+  an unconsumed admission, matching terminal evidence finalizes accounting, and
+  ambiguity keeps the reservation for durable recovery. An absent active release
+  never bypasses admission, and a downgrade never exposes predecessor capacity
+  before cleanup. Recovery uses the same envelope calculation.
 - **Drain-with-handle** — on exit, any message in the inbox is processed via `handle()` (not just closed-and-dropped). Terminal events delivered during the shutdown window still drive their SM transition. Silent drops are gone.
 - **Non-blocking routing** — both command and exact-generation observation
   routers use a non-blocking inbox send under the registry mutex. A wedged actor
@@ -890,6 +898,14 @@ for a survivor's resources, the pool withholds new capacity and Health returns
 unready until a strict later inventory proves absence. The daemon and cleanup
 loops continue running. This is distinct from verified storage-identity drift,
 which remains a terminal safety failure.
+
+The hold is backend-wide: any operation needing a new or replacement allocation
+from this backend's pool is refused, not just work for the late container's lease.
+It does not gate other backend instances. Successful close can
+replace failed-operation history with a stronger permanent closed receipt; an
+existing failed-family hold still remembers the observed callback cohort until
+strict absence. This compact observation scope grants no deletion authority and
+cannot release another receipt family's hold.
 
 ### Durable close finalization
 

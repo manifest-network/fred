@@ -52,6 +52,9 @@
 // A trusted retention in a partial sweep may reaffirm an already confirmed
 // same-backend owner, so an unrelated outage cannot revoke restore affinity;
 // it cannot create an owner or clear an unresolved attempt or conflict.
+// This same semantic rule discharges causally excluded retention evidence:
+// preserving an unchanged owner does not require a redundant projection write
+// and cannot leave unrelated healthy-backend admission waiting on that write.
 //
 // # Required authority
 //

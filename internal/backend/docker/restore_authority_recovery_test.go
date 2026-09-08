@@ -87,7 +87,7 @@ func TestRestoreRecoveryRejectsDivergentDurableAuthorityWithoutMutation(t *testi
 				require.True(t, ok)
 				b.restoreSettlement, recoveryErr = shared.NewRestoreSettlement(operations, retentions)
 				require.NoError(t, recoveryErr)
-				recoveryErr = b.reconcileRetentions(t.Context())
+				recoveryErr = reconcileRestoreAuthorityForTest(t, b)
 				require.NoError(t, retentions.Close())
 			}
 			require.Error(t, recoveryErr,
@@ -129,7 +129,7 @@ func TestRestoreRecoveryValidatesOperationSemanticAuthorityBeforePlanning(t *tes
 		t.Run(test.name, func(t *testing.T) {
 			b, _, calls := newRestoreAuthorityRecoveryFixture(t, test.mutate)
 			before := restoreAuthorityJournalBytes(t, b)
-			err := b.reconcileRetentions(t.Context())
+			err := reconcileRestoreAuthorityForTest(t, b)
 			if test.wantErr == "" {
 				require.NoError(t, err, "a consistent pending restore must await operation recovery")
 			} else {
@@ -140,6 +140,57 @@ func TestRestoreRecoveryValidatesOperationSemanticAuthorityBeforePlanning(t *tes
 			assert.Equal(t, restoreAuthoritySubstrateCalls{}, *calls)
 		})
 	}
+}
+
+// A busy recovery fence is a successful deferral, not evidence that validation
+// ran. Observe the first journal read inside the fence and retry unentered passes so
+// the rejection assertions cannot depend on winning a scheduler race.
+func reconcileRestoreAuthorityForTest(t *testing.T, b *Backend) error {
+	t.Helper()
+	entered := observeRestoreRecoveryEntryForTest(t, b)
+	var recoveryErr error
+	require.Eventually(t, func() bool {
+		recoveryErr = b.reconcileRetentions(t.Context())
+		return entered() || recoveryErr != nil
+	}, 5*time.Second, time.Millisecond, "restore authority recovery must enter its fenced validation")
+	return recoveryErr
+}
+
+func observeRestoreRecoveryEntryForTest(t *testing.T, b *Backend) func() bool {
+	t.Helper()
+	observer := &restoreAuthorityReadObserver{operationSettlementService: b.operationSettlement}
+	b.operationSettlement = observer
+	return func() bool { return observer.entered }
+}
+
+type restoreAuthorityReadObserver struct {
+	operationSettlementService
+	entered bool
+}
+
+func (o *restoreAuthorityReadObserver) ListOperationIntents() ([]shared.OperationIntentClaim, error) {
+	o.entered = true
+	return o.operationSettlementService.ListOperationIntents()
+}
+
+func (o *restoreAuthorityReadObserver) wrappedOperationSettlementForTest() operationSettlementService {
+	return o.operationSettlementService
+}
+
+func TestRestoreAuthorityValidationDistinguishesBusyDeferralFromExecutedValidation(t *testing.T) {
+	b, _, calls := newRestoreAuthorityRecoveryFixture(t, func(spec *shared.OperationIntentSpec) {
+		spec.HealthCheckServices = []string{"app"}
+	})
+	before := restoreAuthorityJournalBytes(t, b)
+	entered := observeRestoreRecoveryEntryForTest(t, b)
+	unlock := b.commandFence.Lock(restoreAuthorityDestination)
+	t.Cleanup(unlock)
+	require.NoError(t, b.reconcileRetentions(t.Context()), "busy live work is a normal deferral")
+	assert.False(t, entered(), "a deferred sweep has not validated the mismatched authority")
+	unlock()
+	require.ErrorContains(t, reconcileRestoreAuthorityForTest(t, b), "health-check authority differs")
+	assert.Equal(t, before, restoreAuthorityJournalBytes(t, b))
+	assert.Equal(t, restoreAuthoritySubstrateCalls{}, *calls)
 }
 
 func newRestoreAuthorityRecoveryFixture(

@@ -466,7 +466,7 @@ type testActorOpts struct {
 	Diag                         DiagnosticsGatherer
 	ProvisionStore               LeaseProvisionStore
 	Metrics                      SMMetrics
-	ProvisionWorkFn              func(context.Context, shared.OperationIntentClaim) ProvisionWorkOutcome
+	ProvisionWorkFn              func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
 	RestoreWorkFn                func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
 	MaintenanceWorkFn            func(context.Context, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome
 	OnTerminated                 func(uuid string)
@@ -546,8 +546,8 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 		opts.Metrics = mockSMMetrics{}
 	}
 	if opts.ProvisionWorkFn == nil {
-		opts.ProvisionWorkFn = func(_ context.Context, claim shared.OperationIntentClaim) ProvisionWorkOutcome {
-			outcome, _ := NewProvisionWorkAmbiguous(errors.New("test provision work not configured"), claim)
+		opts.ProvisionWorkFn = func(_ context.Context, execution shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			outcome, _ := NewProvisionWorkAmbiguous(errors.New("test provision work not configured"), execution.Operation())
 			return outcome
 		}
 	}
@@ -680,8 +680,8 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 		opts.Metrics = mockSMMetrics{}
 	}
 	if opts.ProvisionWorkFn == nil {
-		opts.ProvisionWorkFn = func(_ context.Context, claim shared.OperationIntentClaim) ProvisionWorkOutcome {
-			outcome, _ := NewProvisionWorkAmbiguous(errors.New("test provision work not configured"), claim)
+		opts.ProvisionWorkFn = func(_ context.Context, execution shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			outcome, _ := NewProvisionWorkAmbiguous(errors.New("test provision work not configured"), execution.Operation())
 			return outcome
 		}
 	}
@@ -1000,6 +1000,7 @@ func (v leaseSMCallbackStorageVerifier) Verify(context.Context) error { return n
 
 type testOperationFixture struct {
 	claim      shared.OperationIntentClaim
+	admission  shared.ProvisionAdmission
 	candidate  shared.OperationReleaseCandidate
 	settlement *shared.OperationSettlement
 	releases   *shared.ReleaseStore
@@ -1039,10 +1040,18 @@ func newTestOperationFixture(
 	require.NoError(t, err)
 	claim, ok := admission.CreatedClaim()
 	require.True(t, ok)
+	var provisionAdmission shared.ProvisionAdmission
+	if kind == shared.OperationIntentProvision {
+		pool := shared.NewResourcePool(8, 8192, 16384, func(string) (shared.SKUProfile, error) {
+			return shared.SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+		}, nil)
+		provisionAdmission, err = settlement.ReserveProvisionResources(pool, claim)
+		require.NoError(t, err)
+	}
 	releaseCandidate, err := settlement.PrepareOperationRelease(claim)
 	require.NoError(t, err)
 	return testOperationFixture{
-		claim: claim, candidate: releaseCandidate,
+		claim: claim, admission: provisionAdmission, candidate: releaseCandidate,
 		settlement: settlement, releases: releases,
 	}
 }
@@ -1054,6 +1063,12 @@ func newTestOperationSuccess(
 ) (shared.OperationIntentClaim, shared.OperationReleaseCommitted, *shared.ReleaseStore) {
 	t.Helper()
 	fixture := newTestOperationFixture(t, leaseUUID, kind)
+	committed := commitTestOperationSuccess(t, fixture)
+	return fixture.claim, committed, fixture.releases
+}
+
+func commitTestOperationSuccess(t *testing.T, fixture testOperationFixture) shared.OperationReleaseCommitted {
+	t.Helper()
 	settlement := fixture.settlement
 	bindLeaseSMOperationExecutor(t, settlement)
 	execution, err := settlement.StartOperationExecution(fixture.candidate)
@@ -1063,21 +1078,20 @@ func newTestOperationSuccess(
 	require.True(t, ok)
 	committed, err := settlement.CommitOperationSuccess(success)
 	require.NoError(t, err)
-	return fixture.claim, committed, fixture.releases
+	return committed
 }
 
-func newTestOperationFailure(
+func newTestProvisionFailure(
 	t *testing.T,
 	leaseUUID string,
-	kind shared.OperationIntentKind,
-) (shared.OperationIntentClaim, shared.OperationReleaseUncommitted) {
+) (shared.ProvisionAdmission, shared.OperationReleaseUncommitted) {
 	t.Helper()
-	fixture := newTestOperationFixture(t, leaseUUID, kind)
+	fixture := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision)
 	refused, err := fixture.settlement.RefuseOperationExecution(fixture.candidate)
 	require.NoError(t, err)
 	failure, err := fixture.settlement.CommitOperationFailure(refused)
 	require.NoError(t, err)
-	return fixture.claim, failure
+	return fixture.admission, failure
 }
 
 func newTestRuntimeGenerationProof(
@@ -1093,7 +1107,7 @@ func newTestRuntimeGenerationProof(
 	return proof
 }
 
-func testProvisionSuccess(t *testing.T, leaseUUID string, projection ProvisionSuccessProjection) (shared.OperationIntentClaim, ProvisionSuccessResult) {
+func testProvisionSuccess(t *testing.T, leaseUUID string, projection ProvisionSuccessProjection) (shared.ProvisionAdmission, ProvisionSuccessResult) {
 	t.Helper()
 	if len(projection.ContainerIDs) == 0 {
 		projection.ContainerIDs = []string{"container-a"}
@@ -1101,10 +1115,11 @@ func testProvisionSuccess(t *testing.T, leaseUUID string, projection ProvisionSu
 	if projection.ServiceContainers == nil {
 		projection.ServiceContainers = map[string][]string{"app": append([]string(nil), projection.ContainerIDs...)}
 	}
-	claim, committed, _ := newTestOperationSuccess(t, leaseUUID, shared.OperationIntentProvision)
+	fixture := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision)
+	committed := commitTestOperationSuccess(t, fixture)
 	result, err := NewProvisionSuccessResult(projection, committed)
 	require.NoError(t, err)
-	return claim, result
+	return fixture.admission, result
 }
 
 func testRestoreSuccess(t *testing.T, leaseUUID string, projection ReplaceSuccessProjection) (shared.OperationIntentClaim, ReplaceResult) {

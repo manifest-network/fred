@@ -212,6 +212,15 @@ in backend metrics. Verified identity drift still terminates the affected
 backend. The obsolete `restore_prelude` and
 `restore_rollback` paths/metric labels are no longer emitted.
 
+These accounting holds apply to the backend's entire resource pool: fresh or
+replacement resource admission is refused while a footprint remains unknown.
+Other backend instances are not gated by this process-local hold. Successful close may
+retire earlier failed-operation history without clearing an existing
+`failed_operation` hold or gauge. Recovery retains only that cohort's callback
+identities for observation until strict inventory proves absence; those saved
+identities cannot authorize deletion. Closed and failed-family holds release
+independently.
+
 Cold and periodic recovery each take a bounded observation rather than waiting
 for a transitional provision or restore to finish. Exact-empty cohorts, running
 health checks, and `restarting`, `created`, or paused containers remain Pending until
@@ -575,7 +584,7 @@ remain unresolved and fail closed.
 
 - `fred_reconciler_backend_fetch_total{backend="X",outcome!="ok"}` rising, with
   `outcome` distinguishing `error` (contacted and failed), `circuit_open` (fred
-  short-circuited without dialing), and `panic` (a bug — file an issue)
+  short-circuited without dialing)
 - `fred_reconciler_sweep_complete` at 0
 - `fred_provisioner_reconciler_deferred_leases_total` rising
 - `fred_reconciler_runs_total{outcome="degraded"}` incrementing each cycle

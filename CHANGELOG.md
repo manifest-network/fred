@@ -724,6 +724,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Provision retries now require the same pool-issued capacity admission as
+  fresh provisions, including retries after a failure that committed no
+  release. Replacement admission reserves a conservative predecessor/candidate
+  envelope before teardown; refusals preserve the predecessor and ambiguous
+  execution preserves accounting for recovery. (ENG-632)
+- Failed-operation capacity holds continue observing their exact callback
+  cohort after successful close retires operation history. Only strict
+  substrate absence releases the hold; retained observation scope never grants
+  cleanup authority. Partial retained-owner reaffirmation and causal inventory
+  completion now use the same durable representation rule, preventing a peer
+  outage plus in-flight work from pausing unrelated healthy leases. (ENG-632)
+- Restore-authority and recovery concurrency regressions now distinguish a
+  busy-fence deferral from actual validation and synchronize on worker progress;
+  the XFS delete deadline test expires at the intended mutation boundary.
+  Added the missing `storage_attestation_timeout` example and removed obsolete
+  fetch-outcome documentation and a test-only operation ID wrapper. (ENG-632)
 - A transient outage of another backend no longer quarantines an already
   confirmed retained owner on a healthy backend. Partial retention evidence
   may preserve that exact owner, but cannot create authority or clear an

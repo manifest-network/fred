@@ -3196,6 +3196,15 @@ func TestRecoverOperationIntent_LegacyPredecessorFreezesAuthorityBeforeTeardown(
 	b.cfg.ProvisionTimeout = time.Nanosecond
 
 	require.NoError(t, b.recoverState(context.Background()))
+	beforeBackfill, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
+	require.NoError(t, readErr)
+	require.NotNil(t, beforeBackfill)
+	require.Nil(t, beforeBackfill.LegacyRuntimeAuthority,
+		"accounting the immutable predecessor must not manufacture teardown authority")
+	require.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-0"))
+	require.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-1"))
+	require.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-replacement-0"),
+		"before exact settlement, the envelope must reserve both complete immutable cohorts")
 	require.NoError(t, b.recoverOperationIntents(context.Background()))
 	active, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
 	require.NoError(t, readErr)

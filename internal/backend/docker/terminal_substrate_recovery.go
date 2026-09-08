@@ -16,22 +16,14 @@ const (
 	terminalReceiptFailed terminalReceiptKind = "failed_operation"
 )
 
-// observeTerminalSubstrate publishes exclusion and accounting together. A
+// observeClosedSubstrate publishes exclusion and accounting together. A
 // compact terminal receipt cannot size a late container: its release may have
 // been deleted or superseded. Withhold capacity instead of reconstructing a
 // fictitious resource allocation from mutable SKU configuration. Each receipt
 // family owns a separate pool-issued hold, so one empty observation cannot
 // release another family's pending footprint. recoverMu serializes observers.
-func (b *Backend) observeTerminalSubstrate(kind terminalReceiptKind, count int) {
-	var owner **shared.ResourceAccountingHold
-	switch kind {
-	case terminalReceiptClosed:
-		owner = &b.closedSubstrateCapacityHold
-	case terminalReceiptFailed:
-		owner = &b.failedSubstrateCapacityHold
-	default:
-		return
-	}
+func (b *Backend) observeClosedSubstrate(count int) {
+	owner := &b.closedSubstrateCapacityHold
 	if count > 0 && *owner == nil {
 		hold := b.pool.HoldUnaccountedFootprint()
 		*owner = &hold
@@ -39,7 +31,68 @@ func (b *Backend) observeTerminalSubstrate(kind terminalReceiptKind, count int) 
 		(*owner).Release()
 		*owner = nil
 	}
-	terminalSubstratePendingContainers.WithLabelValues(string(kind)).Set(float64(count))
+	terminalSubstratePendingContainers.WithLabelValues(string(terminalReceiptClosed)).Set(float64(count))
+}
+
+// failedSubstrateAccountingHold retains only observation scope, never cleanup
+// authority. A successful close replaces its failed-operation receipts with a
+// stronger permanent closed receipt; that journal transition cannot prove the
+// physical footprint behind an existing capacity hold disappeared. Either
+// callback identity keeps the hold until a strict inventory proves absence,
+// including a partial/contradictory match. Only current durable receipts may
+// authorize mutation in recoverFailedOperationSubstrate.
+type failedSubstrateAccountingHold struct {
+	capacity           shared.ResourceAccountingHold
+	callbackIdentities map[string]struct{}
+}
+
+func (h *failedSubstrateAccountingHold) pendingContainers(containers []ContainerInfo) int {
+	if h == nil {
+		return 0
+	}
+	count := 0
+	for _, container := range containers {
+		_, operationMatch := h.callbackIdentities[container.CallbackURL]
+		_, lifecycleMatch := h.callbackIdentities[container.LifecycleCallbackURL]
+		if operationMatch || lifecycleMatch {
+			count++
+		}
+	}
+	return count
+}
+
+// retainFailedSubstrate may add observation scope from either ordinary or
+// strict inventory, but never releases a hold. Scopes remain owned by the hold
+// even after successful close retires the corresponding operation history.
+func (b *Backend) retainFailedSubstrate(containers []ContainerInfo, targets []failedOperationReceiptTarget) {
+	if len(targets) == 0 {
+		return
+	}
+	if b.failedSubstrateCapacityHold == nil {
+		b.failedSubstrateCapacityHold = &failedSubstrateAccountingHold{
+			capacity:           b.pool.HoldUnaccountedFootprint(),
+			callbackIdentities: make(map[string]struct{}),
+		}
+	}
+	for _, target := range targets {
+		b.failedSubstrateCapacityHold.callbackIdentities[target.receipt.CallbackURL()] = struct{}{}
+		b.failedSubstrateCapacityHold.callbackIdentities[target.receipt.LifecycleCallbackURL()] = struct{}{}
+	}
+	terminalSubstratePendingContainers.WithLabelValues(string(terminalReceiptFailed)).Set(
+		float64(b.failedSubstrateCapacityHold.pendingContainers(containers)),
+	)
+}
+
+// releaseAbsentFailedSubstrate consumes only a fresh strict inventory. Journal
+// receipt absence, callback delivery, and ordinary inventory are not sufficient
+// to release the hold's independent physical observation scope.
+func (b *Backend) releaseAbsentFailedSubstrate(containers []ContainerInfo) {
+	count := b.failedSubstrateCapacityHold.pendingContainers(containers)
+	terminalSubstratePendingContainers.WithLabelValues(string(terminalReceiptFailed)).Set(float64(count))
+	if hold := b.failedSubstrateCapacityHold; hold != nil && count == 0 {
+		hold.capacity.Release()
+		b.failedSubstrateCapacityHold = nil
+	}
 }
 
 // deferTerminalSubstrateCleanup retains the permanent receipt and its pool
@@ -90,7 +143,7 @@ func (b *Backend) recoverClosedLeaseSubstrateUsing(
 		if targetErr != nil {
 			return nil, targetErr
 		}
-		b.observeTerminalSubstrate(terminalReceiptClosed, len(targets))
+		b.observeClosedSubstrate(len(targets))
 		if len(targets) == 0 {
 			return closedLeases, nil
 		}

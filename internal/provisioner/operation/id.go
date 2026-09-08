@@ -4,8 +4,6 @@ import (
 	"errors"
 	"net/url"
 
-	"github.com/google/uuid"
-
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/operationid"
 	"github.com/manifest-network/fred/internal/uuidv4"
@@ -56,16 +54,6 @@ func ParseQuery(values url.Values) (id OperationID, present bool, err error) {
 // destination is not mutated on error.
 func SetQuery(values url.Values, id OperationID) error {
 	return uuidv4.SetQuery(values, QueryParameter, ErrNilQuery, id.MarshalText)
-}
-
-// newOperationID is deliberately package-private. Registry allocation and the
-// validated wire parser are the only paths that may mint an OperationID.
-func newOperationID(value uuid.UUID) OperationID {
-	id, err := operationid.Parse(value.String())
-	if err != nil {
-		return OperationID{}
-	}
-	return id
 }
 
 func randomOperationID() (OperationID, error) {

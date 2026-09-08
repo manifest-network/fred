@@ -27,7 +27,7 @@ func validConstructionTestActorConfig(ctx context.Context, store LeaseProvisionS
 		Diag:           &mockDiagnosticsGatherer{},
 		ProvisionStore: store,
 		Metrics:        mockSMMetrics{},
-		ProvisionWorkFn: func(context.Context, shared.OperationIntentClaim) ProvisionWorkOutcome {
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
 			return nil
 		},
 		RestoreWorkFn: func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome {

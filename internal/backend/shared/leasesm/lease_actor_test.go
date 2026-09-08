@@ -263,19 +263,19 @@ func TestLeaseActor_QuiescenceClaimSpansWorkerTerminalHandoff(t *testing.T) {
 	workerRelease := make(chan struct{})
 	ack := make(chan error, 1)
 	operation, provisionSuccess := testProvisionSuccess(t, leaseUUID, ProvisionSuccessProjection{ContainerIDs: []string{"c1"}})
-	require.True(t, provisionSuccess.operationRelease.MatchesIntent(operation),
+	require.True(t, provisionSuccess.operationRelease.MatchesIntent(operation.Operation()),
 		"test fixture must preserve exact operation lineage")
 	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
-		ProvisionWorkFn: func(context.Context, shared.OperationIntentClaim) ProvisionWorkOutcome {
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
 			close(workerStarted)
 			<-workerRelease
 			return provisionWorkSuccess{result: provisionSuccess}
 		},
 	})
 	require.True(t, actor.tryEnqueue(provisionRequestedMsg{
-		Ctx: context.Background(), Ack: ack, Operation: operation,
+		Ctx: context.Background(), Ack: ack, Admission: operation,
 	}))
 	require.NoError(t, <-ack)
 	<-workerStarted
@@ -620,6 +620,87 @@ func TestLeaseActor_DiagGathered_ShutdownDrain(t *testing.T) {
 	assert.True(t, lifecycleFailure, "autonomous failure must be published")
 }
 
+func TestProvisionAdmission_AbandonedWaiterDoesNotOwnRejectedCapacity(t *testing.T) {
+	for _, retiring := range []bool{false, true} {
+		name := "state-machine rejection"
+		if retiring {
+			name = "retirement drain"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newTestOperationFixture(t, testActorLeaseUUID, shared.OperationIntentProvision)
+			store := newMockProvisionStore()
+			store.put(testActorLeaseUUID, &ProvisionState{
+				LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusReady,
+			})
+			var workerCalls int
+			actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+				ProvisionStore: store,
+				ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+					workerCalls++
+					return nil
+				},
+			})
+			command, reply, err := NewProvisionCommand(t.Context(), fixture.admission)
+			require.NoError(t, err)
+			require.True(t, actor.TryEnqueueCommand(command))
+			waitCtx, abandonWait := context.WithCancel(t.Context())
+			abandonWait()
+			require.ErrorIs(t, reply.Wait(waitCtx), context.Canceled)
+			require.True(t, fixture.admission.Valid(), "unknown acceptance cannot authorize caller rollback")
+
+			// The original caller has returned and will never observe this late
+			// rejection. The queued command owns its own unconsumed rollback.
+			if retiring {
+				actor.retire()
+			} else {
+				actor.handleAcceptedMessage(<-actor.inbox)
+			}
+			require.Zero(t, workerCalls)
+			require.False(t, fixture.admission.Valid(), "command-owned rejection must relinquish its live pool pin")
+			_, err = fixture.admission.Begin()
+			require.Error(t, err, "a rejected command cannot regain execution authority")
+			claims, err := fixture.settlement.ListOperationIntents()
+			require.NoError(t, err)
+			require.Len(t, claims, 1, "durable recovery retains the exact pre-effect intent")
+			assert.Equal(t, fixture.claim.OperationID(), claims[0].OperationID())
+			assert.Equal(t, shared.OperationExecutionBeforeEffects, claims[0].ExecutionPhase())
+		})
+	}
+}
+
+func TestSpawnProvisionWorker_HandsBackCapacityBeforeQuiescence(t *testing.T) {
+	fixture := newTestOperationFixture(t, testActorLeaseUUID, shared.OperationIntentProvision)
+	execution, err := fixture.admission.Begin()
+	require.NoError(t, err)
+	started, finish := make(chan struct{}), make(chan struct{})
+	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+			close(started)
+			<-finish
+			panic("interrupted mutation has no terminal proof")
+		},
+	})
+	// A retiring actor may already have closed terminal admission. Keeping its
+	// activity lock held below isolates the barrier release from the final
+	// activity decrement, making the ownership ordering deterministic.
+	actor.closeTerminalAdmission()
+	actor.spawnProvisionWorker(context.Background(), execution)
+	<-started
+	func() {
+		actor.activityMu.Lock()
+		defer actor.activityMu.Unlock()
+		close(finish)
+		select {
+		case <-actor.workers.Zero():
+			require.False(t, execution.Valid(),
+				"close/recovery must never observe quiescence while a live pin can suppress capacity release")
+		case <-time.After(3 * time.Second):
+			t.Fatal("provision worker did not release its lifetime barrier")
+		}
+	}()
+	actor.cfg.WG.Wait()
+}
+
 // TestSpawnProvisionWorker_PanicRecovery pins the invariant that a
 // panic in the provision worker does NOT crash fred: the recover logs
 // the panic with stack, bumps WorkerPanic("provision"), preserves the
@@ -637,14 +718,14 @@ func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
 	})
 
 	metrics := &countingMetrics{}
-	operation := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision).claim
+	admission := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision).admission
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	actor := newTestActor(t, leaseUUID, testActorOpts{
 		StopCtx:        ctx,
 		ProvisionStore: store,
 		Metrics:        metrics,
-		ProvisionWorkFn: func(context.Context, shared.OperationIntentClaim) ProvisionWorkOutcome {
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
 			panic("synthetic provision panic")
 		},
 	})
@@ -654,7 +735,9 @@ func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
 	// Inject a worker that panics instead of doing real work. The
 	// Recovery must catch the panic and publish only an explicit ambiguous
 	// handoff. A panic cannot prove substrate absence, so Failed is forbidden.
-	actor.spawnProvisionWorker(context.Background(), operation)
+	execution, err := admission.Begin()
+	require.NoError(t, err)
+	actor.spawnProvisionWorker(context.Background(), execution)
 
 	// The worker drains, but the Started operation remains nonterminal.
 	require.Eventually(t, func() bool {
@@ -813,7 +896,7 @@ func TestTerminatedActor_RejectsCallerFacingRequests(t *testing.T) {
 	var maintenanceWorkerSpawned atomic.Bool
 	actor := newTestActorNoSpawn(t, "lease-1", testActorOpts{
 		ProvisionStore: store,
-		ProvisionWorkFn: func(context.Context, shared.OperationIntentClaim) ProvisionWorkOutcome {
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
 			provisionWorkerSpawned.Store(true)
 			return nil
 		},
@@ -906,7 +989,7 @@ func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
 	// No-spawn so we drive handleProvisionRequested synchronously
 	// without racing the run loop's draining of the message we're
 	// about to construct.
-	operation := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision).claim
+	admission := newTestOperationFixture(t, leaseUUID, shared.OperationIntentProvision).admission
 	actor := newTestActorNoSpawn(t, leaseUUID, testActorOpts{ProvisionStore: store})
 	// newLeaseSM initializes the SM from prov.Status, so SM is in
 	// Deprovisioning. terminated stays false because handleDeprovision
@@ -919,7 +1002,7 @@ func TestHandleProvisionRequested_RejectsWhenSMInDeprovisioning(t *testing.T) {
 	actor.workCancel = func() { previousCancelCalled.Store(true) }
 	ack := make(chan error, 1)
 	msg := provisionRequestedMsg{
-		Ctx: context.Background(), Ack: ack, Operation: operation,
+		Ctx: context.Background(), Ack: ack, Admission: admission,
 	}
 	actor.handleProvisionRequested(msg)
 
@@ -947,10 +1030,10 @@ func TestHandleProvisionRequested_AcceptsReservedLeaseExactlyOnce(t *testing.T) 
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int64
-	operation, failure := newTestOperationFailure(t, testActorLeaseUUID, shared.OperationIntentProvision)
+	admission, failure := newTestProvisionFailure(t, testActorLeaseUUID)
 	actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
 		ProvisionStore: store,
-		ProvisionWorkFn: func(context.Context, shared.OperationIntentClaim) ProvisionWorkOutcome {
+		ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
 			if calls.Add(1) == 1 {
 				close(started)
 			}
@@ -964,7 +1047,7 @@ func TestHandleProvisionRequested_AcceptsReservedLeaseExactlyOnce(t *testing.T) 
 	})
 	firstAck := make(chan error, 1)
 	actor.handleProvisionRequested(provisionRequestedMsg{
-		Ctx: context.Background(), Ack: firstAck, Operation: operation,
+		Ctx: context.Background(), Ack: firstAck, Admission: admission,
 	})
 	require.NoError(t, <-firstAck)
 	select {
@@ -975,7 +1058,7 @@ func TestHandleProvisionRequested_AcceptsReservedLeaseExactlyOnce(t *testing.T) 
 
 	secondAck := make(chan error, 1)
 	actor.handleProvisionRequested(provisionRequestedMsg{
-		Ctx: context.Background(), Ack: secondAck, Operation: operation,
+		Ctx: context.Background(), Ack: secondAck, Admission: admission,
 	})
 	require.Error(t, <-secondAck)
 	assert.Equal(t, int64(1), calls.Load(), "running Provisioning must not accept a duplicate worker")
@@ -1862,7 +1945,7 @@ func TestProvisionErrored_AuthorsReasonMessage(t *testing.T) {
 	store.put(leaseUUID, &ProvisionState{LeaseUUID: leaseUUID, Status: backend.ProvisionStatusProvisioning})
 	a := newTestActorNoSpawn(t, leaseUUID, testActorOpts{ProvisionStore: store})
 	require.NoError(t, a.sm.requestProvision(context.Background()))
-	_, failure := newTestOperationFailure(t, leaseUUID, shared.OperationIntentProvision)
+	_, failure := newTestProvisionFailure(t, leaseUUID)
 	require.NoError(t, a.sm.provisionErrored(context.Background(), provisionErrorInfo{
 		callbackErr:      "image pull failed",
 		reason:           backend.ReasonImagePullFailed,

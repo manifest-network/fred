@@ -616,18 +616,20 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// Ordinary recovery inventory can discover a new excluded footprint, but
 	// only the strict identity-bracketed cleanup observation may release a hold.
 	if len(closedTargets) > 0 {
-		b.observeTerminalSubstrate(terminalReceiptClosed, len(closedTargets))
+		b.observeClosedSubstrate(len(closedTargets))
 	}
 	for leaseUUID := range closedReceipts {
 		closedLeaseUUIDs[leaseUUID] = struct{}{}
 	}
-	failedOperationContainerIDs, err := failedOperationFence.targetContainerIDs(containers)
+	failedOperationTargets, err := failedOperationFence.targets(containers)
 	if err != nil {
 		return fmt.Errorf("apply failed-operation recovery fence: %w", err)
 	}
-	if len(failedOperationContainerIDs) > 0 {
-		b.observeTerminalSubstrate(terminalReceiptFailed, len(failedOperationContainerIDs))
+	failedOperationContainerIDs := make(map[string]struct{}, len(failedOperationTargets))
+	for _, target := range failedOperationTargets {
+		failedOperationContainerIDs[target.containerID] = struct{}{}
 	}
+	b.retainFailedSubstrate(containers, failedOperationTargets)
 
 	// A durable close intent is the sole recovery authority once teardown has
 	// been admitted. Load it before any callback-label or exact-release cohort
@@ -1161,6 +1163,30 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		)
 		if allocationErr != nil {
 			return fmt.Errorf("rebuild pending provision allocations for lease %q: %w", leaseUUID, allocationErr)
+		}
+		if predecessor := releasesByLease[leaseUUID]; predecessor != nil {
+			identity, valid := runtimeIdentityForRelease(predecessor)
+			legacySizingOnly := predecessor.OperationID.IsZero() &&
+				predecessor.RuntimeAuthority == nil && predecessor.LegacyRuntimeAuthority == nil
+			if (!valid && !legacySizingOnly) || (valid &&
+				(identity.Tenant() != claim.Tenant() || identity.ProviderUUID() != claim.ProviderUUID())) {
+				return fmt.Errorf("pending provision predecessor for lease %q has divergent resource authority", leaseUUID)
+			}
+			// A normalized v0.13 Release can carry frozen sizing before recovery
+			// has persisted its runtime identity. Reserving that complete cohort is
+			// conservative accounting only, as for legacy survivors above. It does
+			// not grant teardown authority: the strict operation classifier must
+			// still validate the survivor and freeze its identity before cleanup.
+			previous, previousErr := recoveredSnapshotAllocations(
+				leaseUUID, claim.Tenant(), predecessor.Items, predecessor.ResourceProfiles,
+			)
+			if previousErr != nil {
+				return fmt.Errorf("rebuild pending provision predecessor for lease %q: %w", leaseUUID, previousErr)
+			}
+			allocations, allocationErr = shared.ConservativeResourceEnvelope(previous, allocations)
+			if allocationErr != nil {
+				return fmt.Errorf("rebuild pending provision resource envelope for lease %q: %w", leaseUUID, allocationErr)
+			}
 		}
 		durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)
 	}

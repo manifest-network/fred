@@ -22,7 +22,6 @@ func TestResourceAccountingHoldExcludesAllAllocationPathsWithoutReplacingLedger(
 	require.ErrorIs(t, pool.TryAllocateResolved("new", "tenant", resources), ErrResourceAccountingIncomplete)
 	require.ErrorIs(t, pool.TryAllocateAdoptAll([]AdoptInstance{{ID: "new", SKU: "small"}}, "tenant", 256), ErrResourceAccountingIncomplete)
 	require.ErrorIs(t, pool.TryAllocateAdoptAllResolved([]ResolvedAdoptInstance{{ID: "new", Resources: resources}}, "tenant", 256), ErrResourceAccountingIncomplete)
-	require.ErrorIs(t, pool.ReplaceResolvedAll([]string{existing}, []ResolvedAdoptInstance{{ID: "new", Resources: resources}}, "tenant"), ErrResourceAccountingIncomplete)
 	require.Equal(t, before, pool.ListAllocations())
 	require.NoError(t, pool.ResetConservatively(before), "recovery remains available")
 	require.NoError(t, pool.SetRetainedDisk(512), "retained accounting remains available")

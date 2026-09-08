@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/docker/docker/errdefs"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
@@ -161,9 +163,10 @@ func TestFailedReceiptCleanupDefersPreEffectCancellationAndTransientRemoval(t *t
 			}
 			fence, err := b.recoverFailedOperationSubstrate(ctx)
 			require.NoError(t, err)
-			ids, err := fence.targetContainerIDs([]ContainerInfo{late})
+			targets, err := fence.targets([]ContainerInfo{late})
 			require.NoError(t, err)
-			require.Contains(t, ids, late.ContainerID)
+			require.Len(t, targets, 1)
+			require.Equal(t, late.ContainerID, targets[0].containerID)
 			require.NoError(t, b.terminalStorageAuthorityError())
 			require.NoError(t, b.stopCtx.Err())
 			require.True(t, b.pool.Stats().AccountingHeld)
@@ -187,6 +190,130 @@ func TestFailedReceiptCleanupDefersPreEffectCancellationAndTransientRemoval(t *t
 			require.NoError(t, err)
 			require.False(t, b.pool.Stats().AccountingHeld)
 			require.False(t, visible)
+		})
+	}
+}
+
+func TestFailedSubstrateHoldSurvivesCloseReceiptSupersessionUntilStrictAbsence(t *testing.T) {
+	for _, releaseOrder := range []string{"closed_first", "failed_first"} {
+		t.Run(releaseOrder, func(t *testing.T) {
+			var containers []ContainerInfo
+			blocked := false
+			inventoryUnavailable := false
+			removes := 0
+			mock := &mockDockerClient{
+				ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
+					if inventoryUnavailable {
+						return nil, errors.New("strict inventory unavailable")
+					}
+					return slices.Clone(containers), nil
+				},
+				InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
+					for _, container := range containers {
+						if container.ContainerID == id {
+							return &container, nil
+						}
+					}
+					return nil, errdefs.NotFound(errors.New("container absent"))
+				},
+				RemoveContainerFn: func(_ context.Context, id string) error {
+					removes++
+					if blocked {
+						return errors.New("device busy")
+					}
+					containers = slices.DeleteFunc(containers, func(c ContainerInfo) bool { return c.ContainerID == id })
+					return nil
+				},
+			}
+			b, stores := openCloseRecoveryBackend(t, t.TempDir(), mock, nil)
+			t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
+			b.compose.(*mockComposeExecutor).DownFn = func(context.Context, string, time.Duration) error {
+				if blocked {
+					return errors.New("device busy")
+				}
+				containers = nil
+				return nil
+			}
+			spec := dockerOperationIntentSpec(t, b.storageIdentity)
+			_, err := beginDockerTestOperationIntent(t, stores.callbacks, spec, b.storageIdentity)
+			require.NoError(t, err)
+			startPendingOperationForRecoveryTest(t, b)
+			b.cfg.ProvisionTimeout = time.Nanosecond
+			require.NoError(t, b.recoverOperationIntents(t.Context()),
+				"recover a genuinely Started operation through exact physical cleanup")
+
+			late := dockerIntentContainer(spec, "late-failed-before-close", spec.Items[0].SKU, 0)
+			containers = []ContainerInfo{late}
+			blocked = true
+			_, err = b.recoverFailedOperationSubstrate(t.Context())
+			require.NoError(t, err)
+			require.NotNil(t, b.failedSubstrateCapacityHold)
+
+			// Complete a genuine typed close while the accounting observer is not
+			// running. Its permanent closed receipt atomically retires per-operation
+			// history, but it cannot consume the observer's independent pool hold.
+			blocked = false
+			request, err := stores.close.NewCleanupCloseRequest(spec.LeaseUUID)
+			require.NoError(t, err)
+			closeAdmission, err := stores.close.BeginCleanupClose(request)
+			require.NoError(t, err)
+			completeDestroyedCloseForTest(t, b, stores.close, closeAdmission.Claim())
+			receipts, err := stores.operations.ListFailedOperationReceipts()
+			require.NoError(t, err)
+			require.Empty(t, receipts, "the stronger closed receipt supersedes operation history")
+			require.True(t, b.pool.Stats().AccountingHeld)
+
+			// A still-later daemon Create has the same immutable callback identity.
+			// Receipt pruning is not evidence that this physical cohort is absent.
+			late.ContainerID = "late-failed-after-close"
+			containers = []ContainerInfo{late}
+			blocked = true
+			before := removes
+			_, err = b.recoverFailedOperationSubstrate(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, before, removes, "retained observation scope must not issue stale destructive authority")
+			require.NotNil(t, b.failedSubstrateCapacityHold)
+			require.Equal(t, float64(1), testutil.ToFloat64(terminalSubstratePendingContainers.WithLabelValues("failed_operation")))
+
+			// Even one surviving identity must withhold capacity. The observation
+			// scope is deliberately more conservative than a mutation capability.
+			containers[0].LifecycleCallbackURL = ""
+			_, err = b.recoverFailedOperationSubstrate(t.Context())
+			require.NoError(t, err)
+			require.NotNil(t, b.failedSubstrateCapacityHold)
+			containers[0] = late
+			_, err = b.recoverClosedLeaseSubstrate(t.Context())
+			require.NoError(t, err)
+			require.NotNil(t, b.closedSubstrateCapacityHold)
+
+			inventoryUnavailable = true
+			_, err = b.recoverFailedOperationSubstrate(t.Context())
+			require.ErrorContains(t, err, "strict inventory unavailable")
+			require.NotNil(t, b.failedSubstrateCapacityHold)
+			inventoryUnavailable = false
+			if releaseOrder == "failed_first" {
+				// A different generation remains retired by the closed UUID but
+				// is outside the failed operation's exact observation scope.
+				containers[0].CallbackURL = ""
+				containers[0].LifecycleCallbackURL = ""
+				_, err = b.recoverFailedOperationSubstrate(t.Context())
+				require.NoError(t, err)
+				require.Nil(t, b.failedSubstrateCapacityHold)
+				require.NotNil(t, b.closedSubstrateCapacityHold)
+				require.True(t, b.pool.Stats().AccountingHeld, "failed-family absence cannot release closed-family capacity")
+			}
+			blocked = false
+			_, err = b.recoverClosedLeaseSubstrate(t.Context())
+			require.NoError(t, err)
+			require.Nil(t, b.closedSubstrateCapacityHold)
+			if releaseOrder == "closed_first" {
+				require.True(t, b.pool.Stats().AccountingHeld, "closed-family absence cannot release failed-family capacity")
+			}
+			_, err = b.recoverFailedOperationSubstrate(t.Context())
+			require.NoError(t, err)
+			require.Nil(t, b.failedSubstrateCapacityHold)
+			require.False(t, b.pool.Stats().AccountingHeld)
+			require.Equal(t, float64(0), testutil.ToFloat64(terminalSubstratePendingContainers.WithLabelValues("failed_operation")))
 		})
 	}
 }

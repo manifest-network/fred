@@ -410,6 +410,12 @@ provision_timeout: 10m
 # Timeout for pulling container images. Default: 5m.
 image_pull_timeout: 5m
 
+# Budget for the complete initial managed-volume storage-identity proof, not
+# each individual Docker read. Large fleets may need a larger value. The full
+# post-recovery inventory proof uses max(2m, storage_attestation_timeout).
+# Default: 30s (also when zero); negative values are rejected.
+storage_attestation_timeout: 30s
+
 # Timeout for creating containers. Default: 30s.
 container_create_timeout: 30s
 

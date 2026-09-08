@@ -1284,6 +1284,97 @@ func TestCommittedCausalQuarantineKeepsHealthySiblingAdmission(t *testing.T) {
 	require.False(t, fixture.store.inventoryRecoveryRequired)
 }
 
+func TestRepresentedCausalRetentionKeepsHealthySiblingAdmission(t *testing.T) {
+	for _, phase := range []string{"active", "completed", "replaced", "retention endpoint only"} {
+		t.Run(phase, func(t *testing.T) {
+			fixture := newFencedAvailabilityFixture(t)
+			before := fixture.store.Lookup(fencedAvailabilityOwner)
+			lifecycleBefore := fixture.store.CurrentLifecycle(fencedAvailabilityOwner)
+			var provisions int
+			fixture.backendB.provision = func(context.Context, backend.ProvisionRequest) error {
+				provisions++
+				return nil
+			}
+			startOperation := func() func() {
+				registry := fixture.coordinator.coordinator.operations
+				claim := registry.TryClaimLeaseNow(fencedAvailabilityOwner)
+				require.True(t, claim.Acquired())
+				initiation := registry.TryInitiateProvisionClaimed(
+					claim.Claim(), testProvisionInitiation(
+						t, fencedAvailabilityOwner, "tenant-test", "backend-a",
+					),
+				)
+				require.True(t, initiation.Started())
+				return func() {
+					require.Equal(t, operation.InitiationAborted,
+						registry.AbortInitiation(initiation.Capability()))
+					require.True(t, registry.ReleaseLease(claim.Claim()))
+				}
+			}
+
+			// Repeating an idempotent partial projection must not inherit a dirty
+			// sweep marker from the previous pass. The owner operation may still
+			// be active, have completed, or have been replaced after capture.
+			for pass := range 2 {
+				finishOperation := startOperation()
+				sweep, err := fixture.coordinator.BeginSweep()
+				require.NoError(t, err)
+				defer sweep.End()
+				require.True(t, sweep.WasInFlight(fencedAvailabilityOwner))
+				storageA := testBackendStorageID("backend-a")
+				if phase != "retention endpoint only" {
+					require.NoError(t, sweep.RecordProvision("backend-a", storageA, nil))
+				}
+				require.NoError(t, sweep.RecordRetention(
+					"backend-a", storageA, []string{fencedAvailabilityOwner},
+				))
+				storageB := testBackendStorageID("backend-b")
+				require.NoError(t, sweep.RecordProvision("backend-b", storageB, nil))
+				require.NoError(t, sweep.RecordRetention("backend-b", storageB, nil))
+				require.NoError(t, sweep.SealInventory())
+				switch phase {
+				case "completed":
+					finishOperation()
+					finishOperation = nil
+				case "replaced":
+					finishOperation()
+					finishOperation = startOperation()
+				}
+
+				projected, err := sweep.Project(ReconciliationProjection{})
+				require.NoError(t, err)
+				require.False(t, projected.Complete(), "backend-c remains unavailable")
+				require.Equal(t, before, fixture.store.Lookup(fencedAvailabilityOwner),
+					"retention must preserve the exact durable owner without a new revision")
+				require.Equal(t, lifecycleBefore, fixture.store.CurrentLifecycle(fencedAvailabilityOwner),
+					"retention cannot grant or rewrite lifecycle authority")
+				require.False(t, fixture.store.inventoryRecoveryRequired,
+					"unchanged confirmed retention is already durably represented")
+				require.Zero(t, fixture.store.pendingInventorySweepID)
+				require.True(t, fixture.store.CurrentAdmissionBaseline().Valid())
+				require.True(t, projected.AdmissionBaseline().Valid())
+				require.False(t, fixture.coordinator.AbsenceUntrusted(fencedAvailabilityOwner))
+				require.NoError(t, fixture.store.leaseSideEffectError(fencedAvailabilitySibling))
+				action, disposition, err := projected.ObserveLiveAction(t.Context(), fencedAvailabilitySibling)
+				require.NoError(t, err)
+				require.Equal(t, ReconciliationObservationReady, disposition)
+				require.True(t, action.Valid())
+				if pass == 1 {
+					result := fixture.coordinator.Provision(t.Context(), action, nil, PayloadFingerprint{})
+					require.NoError(t, result.Err())
+					require.Equal(t, "backend-b", result.BackendName())
+				}
+				require.True(t, fixture.coordinator.ReleaseAction(action))
+				if finishOperation != nil {
+					finishOperation()
+				}
+				sweep.End()
+			}
+			require.Equal(t, 1, provisions, "the healthy sibling must actually admit new work")
+		})
+	}
+}
+
 func TestIncompleteRetentionIsConstructionBoundQuarantine(t *testing.T) {
 	store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
 	baseline := requireAdmissionBaseline(t, store, "backend-a", "backend-b")
@@ -1410,49 +1501,78 @@ func TestIncompleteRetentionPreservesConfirmedRestoreAffinity(t *testing.T) {
 }
 
 func TestIncompleteRetentionCannotReaffirmUncertainOwnership(t *testing.T) {
-	for _, state := range []string{"other owner", "attempt", "confirmed with attempt", "rejected reporter"} {
+	for _, state := range []string{"recordless", "other owner", "attempt", "confirmed with attempt", "conflict", "rejected reporter"} {
 		t.Run(state, func(t *testing.T) {
-			store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
-			requireAdmissionBaseline(t, store, "backend-a", "backend-b")
-			switch state {
-			case "other owner":
-				requireConfirmedPlacement(t, store, fencedAvailabilityOwner, "backend-b")
-			case "confirmed with attempt", "rejected reporter":
-				requireConfirmedPlacement(t, store, fencedAvailabilityOwner, "backend-a")
+			for _, mode := range []string{"ordinary", "causally excluded"} {
+				t.Run(mode, func(t *testing.T) {
+					store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+					requireAdmissionBaseline(t, store, "backend-a", "backend-b")
+					switch state {
+					case "other owner":
+						requireConfirmedPlacement(t, store, fencedAvailabilityOwner, "backend-b")
+					case "confirmed with attempt", "rejected reporter":
+						requireConfirmedPlacement(t, store, fencedAvailabilityOwner, "backend-a")
+					case "conflict":
+						requireConflictPlacement(t, store, fencedAvailabilityOwner, "backend-a", "backend-b")
+					}
+					if state == "attempt" || state == "confirmed with attempt" {
+						requireTypedAttempt(t, store, fencedAvailabilityOwner, "backend-a", requireOperationID(t, "2113"))
+					}
+					before := store.Lookup(fencedAvailabilityOwner)
+					lifecycleBefore, hadLifecycle := store.lifecycleCache[fencedAvailabilityOwner]
+					base, err := store.BindOperationCoordinator(nil)
+					require.NoError(t, err)
+					execution := bindExecutionForTest(t, base, executionRuntime("backend-a", "backend-b"))
+					coordinator, err := reconciliationCoordinatorWithReaderForTest(t, execution, &reconciliationSweepReader{})
+					require.NoError(t, err)
+					if mode == "causally excluded" {
+						claim := base.operations.TryClaimLeaseNow(fencedAvailabilityOwner)
+						require.True(t, claim.Acquired())
+						initiation := base.operations.TryInitiateProvisionClaimed(
+							claim.Claim(), testProvisionInitiation(t, fencedAvailabilityOwner, "tenant-test", "backend-a"),
+						)
+						require.True(t, initiation.Started())
+						defer func() {
+							require.Equal(t, operation.InitiationAborted, base.operations.AbortInitiation(initiation.Capability()))
+							require.True(t, base.operations.ReleaseLease(claim.Claim()))
+						}()
+					}
+					sweep, err := coordinator.BeginSweep()
+					require.NoError(t, err)
+					defer sweep.End()
+					require.Equal(t, mode == "causally excluded", sweep.WasInFlight(fencedAvailabilityOwner))
+					require.NoError(t, sweep.RecordProvision("backend-a", testBackendStorageID("backend-a"), nil))
+					require.NoError(t, sweep.RecordRetention(
+						"backend-a", testBackendStorageID("backend-a"), []string{fencedAvailabilityOwner},
+					))
+					projection := ReconciliationProjection{}
+					if state == "rejected reporter" {
+						require.NoError(t, sweep.RecordUntrusted("backend-a", []string{fencedAvailabilityOwner}))
+						projection.UntrustedPositives = map[string][]string{fencedAvailabilityOwner: {"backend-a"}}
+					}
+					require.NoError(t, sweep.SealInventory())
+					_, err = sweep.Project(projection)
+					require.NoError(t, err)
+					after := store.Lookup(fencedAvailabilityOwner)
+					require.Equal(t, StateUnusable, after.State())
+					assert.Contains(t, after.ConflictBackends, "backend-a")
+					for _, candidate := range before.ConflictBackends {
+						assert.Contains(t, after.ConflictBackends, candidate)
+					}
+					if before.Backend != "" {
+						assert.Contains(t, after.ConflictBackends, before.Backend)
+					}
+					assert.Equal(t, before.Attempt, after.Attempt)
+					assert.Equal(t, before.attemptOperationID, after.attemptOperationID,
+						"retention alone must never settle an unresolved operation")
+					lifecycleAfter, hasLifecycle := store.lifecycleCache[fencedAvailabilityOwner]
+					assert.Equal(t, hadLifecycle, hasLifecycle)
+					assert.Equal(t, lifecycleBefore, lifecycleAfter,
+						"retention cannot rewrite durable lifecycle authority")
+					assert.False(t, store.CurrentLifecycle(fencedAvailabilityOwner).Authorized(),
+						"quarantine may withdraw, but never grant, current authority")
+				})
 			}
-			if state == "attempt" || state == "confirmed with attempt" {
-				requireTypedAttempt(t, store, fencedAvailabilityOwner, "backend-a", requireOperationID(t, "2113"))
-			}
-			before := store.Lookup(fencedAvailabilityOwner)
-			base, err := store.BindOperationCoordinator(nil)
-			require.NoError(t, err)
-			execution := bindExecutionForTest(t, base, executionRuntime("backend-a", "backend-b"))
-			coordinator, err := reconciliationCoordinatorWithReaderForTest(t, execution, &reconciliationSweepReader{})
-			require.NoError(t, err)
-			sweep, err := coordinator.BeginSweep()
-			require.NoError(t, err)
-			defer sweep.End()
-			require.NoError(t, sweep.RecordProvision("backend-a", testBackendStorageID("backend-a"), nil))
-			require.NoError(t, sweep.RecordRetention(
-				"backend-a", testBackendStorageID("backend-a"), []string{fencedAvailabilityOwner},
-			))
-			projection := ReconciliationProjection{}
-			if state == "rejected reporter" {
-				require.NoError(t, sweep.RecordUntrusted("backend-a", []string{fencedAvailabilityOwner}))
-				projection.UntrustedPositives = map[string][]string{fencedAvailabilityOwner: {"backend-a"}}
-			}
-			require.NoError(t, sweep.SealInventory())
-			_, err = sweep.Project(projection)
-			require.NoError(t, err)
-			after := store.Lookup(fencedAvailabilityOwner)
-			require.Equal(t, StateUnusable, after.State())
-			assert.Contains(t, after.ConflictBackends, "backend-a")
-			if before.Backend != "" {
-				assert.Contains(t, after.ConflictBackends, before.Backend)
-			}
-			assert.Equal(t, before.Attempt, after.Attempt)
-			assert.Equal(t, before.attemptOperationID, after.attemptOperationID,
-				"retention alone must never settle an unresolved operation")
 		})
 	}
 }

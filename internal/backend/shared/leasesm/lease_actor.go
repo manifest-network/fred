@@ -539,12 +539,13 @@ func (diagGatheredMsg) isWorkerTerminalMessage() {}
 type provisionRequestedMsg struct {
 	Ctx       context.Context
 	Ack       chan error
-	Operation shared.OperationIntentClaim
+	Admission shared.ProvisionAdmission
 }
 
 func (provisionRequestedMsg) isleaseMessage()        {}
 func (provisionRequestedMsg) isactorCommandMessage() {}
 func (m provisionRequestedMsg) onPanic(err error) {
+	err = errors.Join(err, m.Admission.Abort())
 	select {
 	case m.Ack <- err:
 	default:
@@ -553,16 +554,16 @@ func (m provisionRequestedMsg) onPanic(err error) {
 
 func NewProvisionCommand(
 	ctx context.Context,
-	operation shared.OperationIntentClaim,
+	admission shared.ProvisionAdmission,
 ) (ActorCommand, ActorReply, error) {
 	if ctx == nil {
 		return ActorCommand{}, ActorReply{}, errors.New("provision context is required")
 	}
-	if !operation.Valid() || operation.Kind() != shared.OperationIntentProvision {
-		return ActorCommand{}, ActorReply{}, errors.New("provision requires an exact pending operation")
+	if !admission.Valid() {
+		return ActorCommand{}, ActorReply{}, errors.New("provision requires exact resource admission")
 	}
 	ack, receiver := newActorReply()
-	return newActorCommand(provisionRequestedMsg{Ctx: ctx, Ack: ack, Operation: operation}), receiver, nil
+	return newActorCommand(provisionRequestedMsg{Ctx: ctx, Ack: ack, Admission: admission}), receiver, nil
 }
 
 // provisionCompletedMsg is sent by the doProvision goroutine on success.
@@ -1429,15 +1430,20 @@ func (a *LeaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 		// removed from the registry (defer ordering). Reject so the
 		// caller rolls back and retries — a fresh actor will be
 		// created on the next routeToLease.
-		msg.Ack <- errActorTerminated
+		msg.onPanic(errActorTerminated)
 		return
 	}
-	if !msg.Operation.Valid() || msg.Operation.LeaseUUID() != a.leaseUUID {
-		msg.Ack <- errors.New("provision operation belongs to another lease")
+	if !msg.Admission.Valid() || msg.Admission.Operation().LeaseUUID() != a.leaseUUID {
+		msg.onPanic(errors.New("provision operation belongs to another lease"))
 		return
 	}
 	if err := a.sm.requestProvision(a.cfg.StopCtx); err != nil {
-		msg.Ack <- err
+		msg.onPanic(err)
+		return
+	}
+	execution, err := msg.Admission.Begin()
+	if err != nil {
+		msg.onPanic(err)
 		return
 	}
 	// The actor creates and owns the exact context passed to work. Callers cannot
@@ -1445,7 +1451,7 @@ func (a *LeaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 	workerCtx, cancel := context.WithCancel(msg.Ctx)
 	a.workCancel = cancel
 	msg.Ack <- nil
-	a.spawnProvisionWorker(workerCtx, msg.Operation)
+	a.spawnProvisionWorker(workerCtx, execution)
 }
 
 // spawnProvisionWorker runs doProvision (supplied as the work closure),
@@ -1458,8 +1464,9 @@ func (a *LeaseActor) handleProvisionRequested(msg provisionRequestedMsg) {
 // have been removed.
 func (a *LeaseActor) spawnProvisionWorker(
 	ctx context.Context,
-	operation shared.OperationIntentClaim,
+	admission shared.ProvisionResourceExecution,
 ) {
+	operation := admission.Operation()
 	a.beginWorkerActivity()
 	a.cfg.WG.Go(func() {
 		// Exactly one sendTerminal call site (the middle defer), driven
@@ -1468,8 +1475,10 @@ func (a *LeaseActor) spawnProvisionWorker(
 		//      terminalMsg to a panic-error variant.
 		//   2. sendTerminal (middle, always runs) — fires whatever
 		//      terminalMsg was set to.
-		//   3. workers.Done (outermost, runs LAST) — releases the
-		//      barrier after sendTerminal has landed the event.
+		//   3. DeferRecovery — relinquishes any remaining live capacity
+		//      ownership without releasing its conservative ledger.
+		//   4. workers.Done (outermost, runs LAST) — releases the
+		//      barrier after the terminal event and capacity handoff.
 		// This structure guarantees at-most-one terminal per worker and
 		// eliminates both the double-send race and any possibility of a
 		// wedged SM if a panic occurs before the normal path sets the
@@ -1477,6 +1486,7 @@ func (a *LeaseActor) spawnProvisionWorker(
 		var terminalMsg workerTerminalMessage
 		var event string
 		defer a.endWorkerActivity()
+		defer admission.DeferRecovery()
 		defer func() {
 			if terminalMsg == nil {
 				// Defensive: should not occur if the normal path runs
@@ -1513,7 +1523,7 @@ func (a *LeaseActor) spawnProvisionWorker(
 				event = "provision_panic"
 			}
 		}()
-		outcome := a.cfg.ProvisionWorkFn(ctx, operation)
+		outcome := a.cfg.ProvisionWorkFn(ctx, admission)
 		if err := validateProvisionWorkOutcome(outcome, operation); err != nil {
 			terminalMsg = operationAmbiguousMsg{
 				kind: string(operation.Kind()), operationID: operation.OperationID(), err: err,

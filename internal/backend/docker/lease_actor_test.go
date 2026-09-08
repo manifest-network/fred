@@ -462,7 +462,7 @@ func TestLeaseActor_FailingWedgeRecovery(t *testing.T) {
 // the previous install-without-run pattern was a synthetic state that
 // can't occur in production (NewLeaseActor unconditionally spawns the
 // run loop). See ENG-148 PR5b-2 deviation E-1.
-func actorBackpressureCommand(t *testing.T, claim shared.OperationIntentClaim) leasesm.ActorCommand {
+func actorBackpressureCommand(t *testing.T, claim shared.ProvisionAdmission) leasesm.ActorCommand {
 	t.Helper()
 	command, _, err := leasesm.NewProvisionCommand(context.Background(), claim)
 	require.NoError(t, err)

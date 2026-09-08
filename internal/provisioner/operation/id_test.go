@@ -31,7 +31,6 @@ func TestOperationIDZeroValueIsInvalid(t *testing.T) {
 	text, err := id.MarshalText()
 	assert.ErrorIs(t, err, ErrInvalidID)
 	assert.Nil(t, text)
-	assert.Equal(t, OperationID{}, newOperationID(uuid.Nil))
 }
 
 func TestParseIDAcceptsOnlyCanonicalUUIDv4(t *testing.T) {

@@ -166,6 +166,13 @@ func callbackStorageAttestorForTest(
 
 type callbackAckRoundTripper func(*http.Request) (*http.Response, error)
 
+func reserveProvisionAdmissionForTest(t *testing.T, b *Backend, claim shared.OperationIntentClaim) shared.ProvisionAdmission {
+	t.Helper()
+	admission, err := b.operationSettlement.ReserveProvisionResources(b.pool, claim)
+	require.NoError(t, err)
+	return admission
+}
+
 func (f callbackAckRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
@@ -2327,7 +2334,7 @@ func installReadyRuntimeProofForTest(
 func actorOperationClaimForTest(
 	t *testing.T,
 	leaseUUID string,
-) shared.OperationIntentClaim {
+) shared.ProvisionAdmission {
 	t.Helper()
 	callbackURL := "https://fred.example/callbacks/provision?operation_id=" + uuid.NewString()
 	lifecycleURL, err := backend.ResolveLifecycleCallbackURL(callbackURL, "")
@@ -2353,7 +2360,12 @@ func actorOperationClaimForTest(
 	require.NoError(t, err)
 	claim, created := admission.CreatedClaim()
 	require.True(t, created)
-	return claim
+	pool := shared.NewResourcePool(8, 8192, 16384, func(string) (shared.SKUProfile, error) {
+		return shared.SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
+	}, nil)
+	resources, err := settlement.ReserveProvisionResources(pool, claim)
+	require.NoError(t, err)
+	return resources
 }
 
 func actorOperationProofsForTest(

@@ -934,6 +934,16 @@ func (p Placement) CanResolveUntrustedPositive(backendName string) bool {
 		p.ConflictBackends[0] == backendName
 }
 
+// representsRetention is the shared semantic rule for preserving a confirmed
+// owner and discharging its redundant inventory evidence. Accepted retention
+// from that sole owner adds no placement or lifecycle authority. An attempt,
+// quarantine, or different reporter is not equivalent to this retained owner.
+// Callers must derive reporters from accepted sealed retention evidence.
+func (p Placement) representsRetention(reporters []string) bool {
+	return p.State() == StateConfirmed && p.Attempt == "" &&
+		len(reporters) == 1 && reporters[0] == p.Backend
+}
+
 // Revision returns the opaque per-record revision used by conditional writes.
 func (p Placement) Revision() uint64 { return p.revision }
 
@@ -2937,8 +2947,7 @@ func (s *Store) projectInventory(
 
 		case projection.retentionPositives[leaseUUID] != nil:
 			reporters := projection.retentionPositives[leaseUUID]
-			if existing.State() == StateConfirmed && existing.Attempt == "" &&
-				len(reporters) == 1 && reporters[0] == existing.Backend {
+			if existing.representsRetention(reporters) {
 				// A trusted retention adds no owner or lifecycle authority to this
 				// exact confirmed record. Reaffirm it under the projection fence;
 				// silence from an unrelated backend cannot revoke restore affinity.
@@ -3076,8 +3085,8 @@ func (s *Store) projectInventory(
 			mutations, projection.AbsenceEvidence, s.inventoryEvidence, leaseUUID,
 		) {
 			// The quarantine row and marker clear commit in the same bbolt
-			// transaction below. Unlike a pre-existing same-name owner, this is
-			// exact semantic representation of the rejected observation.
+			// transaction below. Its candidate set represents the rejected
+			// observation without relying on owner-name equality alone.
 			continue
 		}
 		if !s.excludedPositiveDurablyRepresentedLocked(
@@ -3209,10 +3218,11 @@ func placementCandidateBackends(record Placement) map[string]struct{} {
 // excludedPositiveDurablyRepresentedLocked reports whether every positive
 // observation for one excluded lease is already made safe by the current
 // durable aggregate. This is intentionally stricter than backend-name
-// equality: retention and rejected evidence change the meaning of a placement,
-// and a contradictory lifecycle generation or runtime principal must remain
-// recovery-required. A matching trusted provision is redundant when its exact
-// backend and generation are already represented by Backend/Attempt/quarantine.
+// equality: rejected evidence and contradictory lifecycle generations or
+// runtime principals must remain recovery-required.
+// Accepted retention may preserve its exact confirmed owner; a matching trusted
+// provision is redundant when its exact backend and generation are already
+// represented by Backend/Attempt/quarantine.
 // Caller holds s.mu.
 func (s *Store) excludedPositiveDurablyRepresentedLocked(
 	sweepID uint64,
@@ -3252,7 +3262,13 @@ func (s *Store) excludedPositiveDurablyRepresentedLocked(
 			) {
 				return false
 			}
-		case inventoryPositiveRetention, inventoryPositiveUntrusted:
+		case inventoryPositiveRetention:
+			if !snapshot.RetentionReporter(s.inventoryEvidence, observation.backendName, leaseUUID) ||
+				snapshot.UntrustedReporter(s.inventoryEvidence, observation.backendName, leaseUUID) ||
+				!record.representsRetention(snapshot.RetentionReporters(s.inventoryEvidence, leaseUUID)) {
+				return false
+			}
+		case inventoryPositiveUntrusted:
 			return false
 		default:
 			return false
@@ -3266,9 +3282,9 @@ func (s *Store) excludedPositiveDurablyRepresentedLocked(
 	return true
 }
 
-// trustedProvisionDurablyRepresentedLocked is the only ordinary-concurrency
-// discharge rule. Losing this exact inventory row cannot create authority: the
-// placement already records its backend, and the row agrees with either the
+// trustedProvisionDurablyRepresentedLocked is the provision-specific
+// ordinary-concurrency discharge rule. Losing this exact row cannot create
+// authority: the placement records its backend, and the row agrees with either the
 // current lifecycle or the exact durable attempt generation. A contradictory
 // principal would have quarantined current authority and is therefore not
 // redundant.
@@ -3362,8 +3378,8 @@ func (s *Store) trustedProvisionDurablyRepresentedLocked(
 // clearInventoryPositiveBarriersLocked retires only lease/backend facts that
 // the Store can now prove durable. A complete successful projection may also
 // retire older facts that every backend now authoritatively reports absent.
-// Semantically unresolved exclusions remain installed; redundant trusted
-// provision observations do not penalize unrelated leases.
+// Semantically unresolved exclusions remain installed; redundant accepted
+// observations do not penalize unrelated leases.
 // Caller holds s.mu and invokes this only after the corresponding metadata
 // transaction commits.
 func (s *Store) clearInventoryPositiveBarriersLocked(

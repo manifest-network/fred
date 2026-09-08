@@ -3,7 +3,6 @@ package shared
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"math"
 	"sync"
 
@@ -16,12 +15,13 @@ type SKUResolver func(sku string) (SKUProfile, error)
 
 // ResourceAllocation tracks resources allocated to a single lease.
 type ResourceAllocation struct {
-	LeaseUUID string
-	Tenant    string
-	SKU       string
-	CPUCores  float64
-	MemoryMB  int64
-	DiskMB    int64
+	LeaseUUID   string
+	Tenant      string
+	SKU         string
+	CPUCores    float64
+	MemoryMB    int64
+	DiskMB      int64
+	reservation *provisionReservation
 }
 
 // ResourcePool manages the backend's resource capacity. It provides atomic
@@ -163,59 +163,6 @@ func (p *ResourcePool) TryAllocateResolved(
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.tryAllocateProfileLocked(leaseUUID, resources.SKU, tenant, profile, true)
-}
-
-// ReplaceResolvedAll atomically replaces an existing operation's exact
-// allocation keys with a new immutable snapshot. It is the re-provision
-// boundary: predecessor containers are torn down first, then the pool and the
-// provision projection move generations together without exposing phantom
-// free capacity to another tenant. Any validation/capacity failure restores the
-// complete predecessor accounting byte-for-byte.
-func (p *ResourcePool) ReplaceResolvedAll(
-	oldIDs []string,
-	instances []ResolvedAdoptInstance,
-	tenant string,
-) error {
-	profiles := make([]SKUProfile, len(instances))
-	for i, instance := range instances {
-		profile, err := effectiveAllocationProfile(instance.Resources)
-		if err != nil {
-			return fmt.Errorf("replacement allocation %q: %w", instance.ID, err)
-		}
-		profiles[i] = profile
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	allocationsBefore := maps.Clone(p.allocations)
-	tenantUsageBefore := maps.Clone(p.tenantUsage)
-	allocatedCPUBefore := p.allocatedCPU
-	allocatedMemoryBefore := p.allocatedMemory
-	allocatedDiskBefore := p.allocatedDisk
-	rollback := func() {
-		p.allocations = allocationsBefore
-		p.tenantUsage = tenantUsageBefore
-		p.allocatedCPU = allocatedCPUBefore
-		p.allocatedMemory = allocatedMemoryBefore
-		p.allocatedDisk = allocatedDiskBefore
-	}
-
-	for _, id := range oldIDs {
-		p.releaseLocked(id)
-	}
-	for i, instance := range instances {
-		if err := p.tryAllocateProfileLocked(
-			instance.ID,
-			instance.Resources.SKU,
-			tenant,
-			profiles[i],
-			true,
-		); err != nil {
-			rollback()
-			return fmt.Errorf("replacement allocation %q: %w", instance.ID, err)
-		}
-	}
-	return nil
 }
 
 // AdoptInstance identifies one container instance to reserve on the restore/adopt
@@ -552,7 +499,7 @@ func (p *ResourcePool) Release(leaseUUID string) {
 // releaseLocked is Release's body; the caller MUST hold p.mu.
 func (p *ResourcePool) releaseLocked(leaseUUID string) {
 	alloc, exists := p.allocations[leaseUUID]
-	if !exists {
+	if !exists || alloc.reservation != nil {
 		return
 	}
 
@@ -615,6 +562,7 @@ func (p *ResourcePool) GetAllocation(leaseUUID string) *ResourceAllocation {
 	if !exists {
 		return nil
 	}
+	alloc.reservation = nil
 	return &alloc
 }
 
@@ -812,7 +760,26 @@ func (p *ResourcePool) reset(
 		}
 	}
 	for _, alloc := range allocations {
+		alloc.reservation = nil
 		rebuilt[alloc.LeaseUUID] = alloc
+	}
+	// A live admission owns its complete conservative envelope until its worker
+	// settles or hands authority back to durable recovery. An inventory reset
+	// cannot shrink it while predecessor teardown is still running.
+	pinnedOwners := make(map[string]struct{})
+	for key, alloc := range p.allocations {
+		if alloc.reservation != nil {
+			pinnedOwners[alloc.reservation.operation.LeaseUUID()] = struct{}{}
+			rebuilt[key] = alloc
+		}
+	}
+	for key, alloc := range rebuilt {
+		owner, err := allocationLeaseUUID(key)
+		if err == nil {
+			if _, pinned := pinnedOwners[owner]; pinned && alloc.reservation == nil {
+				delete(rebuilt, key)
+			}
+		}
 	}
 
 	allocatedCPU, allocatedMemory, allocatedDisk, tenantUsage, err := aggregateAllocations(rebuilt)
@@ -889,6 +856,7 @@ func (p *ResourcePool) ListAllocations() []ResourceAllocation {
 
 	result := make([]ResourceAllocation, 0, len(p.allocations))
 	for _, alloc := range p.allocations {
+		alloc.reservation = nil
 		result = append(result, alloc)
 	}
 	return result

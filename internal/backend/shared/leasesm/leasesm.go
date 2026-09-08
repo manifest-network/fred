@@ -331,7 +331,7 @@ type LeaseActorConfig struct {
 	// from one operation together with a caller-selected closure that mutates a
 	// different substrate target before outcome validation. The maintenance
 	// handler dispatches restart/update from target.Intent().Kind().
-	ProvisionWorkFn   func(context.Context, shared.OperationIntentClaim) ProvisionWorkOutcome
+	ProvisionWorkFn   func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
 	RestoreWorkFn     func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
 	MaintenanceWorkFn func(
 		context.Context,

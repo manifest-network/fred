@@ -688,6 +688,15 @@ func (b *Backend) currentRestoreOperation(e shared.RetentionEntry) (shared.Opera
 	return state, nil
 }
 
+// validateRestoreOperationAuthority joins two independently decoded journals.
+// Shared decoders already validate keyed lease identity and callback-token
+// consistency; the bound point probe also checks backend/storage lineage.
+// Malformed shapes must fail at ingestion rather than be manufactured as
+// opaque claims in downstream tests.
+// Keep the complete relation here because the terminal probe has no pending-
+// claim prefilter, unlike the source-first operation-recovery callers. In
+// particular, an individually valid claim may still name another source or
+// generation, or disagree on desired/effective destination metadata.
 func (b *Backend) validateRestoreOperationAuthority(
 	claim shared.OperationRecoveryState,
 	e shared.RetentionEntry,
@@ -1639,14 +1648,18 @@ func releaseAll(pool *shared.ResourcePool, ids []string) {
 // reserved at Provisioning and driven through the existing replace machinery via
 // evRestoreRequested (Provisioning→Restarting→Ready|Failed).
 //
-// The flow is the reviewed Rev 5 design; ordering is load-bearing:
+// Ordering is load-bearing:
 //
 //	(a) validate against the retained record (read-only),
-//	(b) reserve the new-lease provision at Provisioning (reject if live),
-//	(c) allocate pool slots,
+//	(b) under the recovery snapshot fence, commit the exact operation intent,
+//	(c) reserve the new-lease provision and allocate pool slots,
 //	(d) ATOMICALLY claim active→restoring (closes the prelude-vs-reaper race),
-//	(e) adopt: rename retained→canonical (full rollback on failure),
-//	(f) hand off to the actor; doRestore's terminal defer owns success/failure/panic.
+//	(e) hand off to the actor before any substrate mutation,
+//	(f) the Started executor adopts the volumes and brings up the stack.
+//
+// Construction-bound settlement owns terminal outcomes. An ambiguous worker
+// result preserves the exact Started intent, restoring finalizer, and live
+// reservation until operation recovery proves completion or rolls back adoption.
 //
 // Synchronous errors (validation, already-provisioned, insufficient resources,
 // not-retained, not-restorable) are returned to the caller; asynchronous outcomes
@@ -1984,26 +1997,6 @@ func (b *Backend) Restore(ctx context.Context, request backend.RestoreRequest) e
 		return fmt.Errorf("invalid restore acceptance state %d", acceptance)
 	}
 }
-
-// doRestore is the restore worker (runs on the lease actor's replace-worker
-// goroutine). It brings up the new lease's stack from the retained manifest via
-// doReplaceContainers with NoComposeRollback (no prior containers to recover to).
-//
-// Its terminal defer is the SOLE owner of the success/failure/panic outcome for
-// the retention record:
-//   - success (resultRet.Err==nil): delete the retained record (data adopted).
-//   - failure (resultRet.Err!=nil): physically roll back the adoption and leave
-//     the source Restoring until the actor durably records its Failed callback;
-//     the retention sweep then completes the source-authority handback.
-//   - panic: a panic leaves resultRet.Err==nil; force the failure path so we
-//     never delete the record while the lease is not Ready. Convert panic→Failed.
-//
-// In BOTH failure cases the preparation does not drop the provision or live
-// allocation: doRestore returns an errored ReplaceResult, so the actor fires
-// evReplaceFailed, reads CallbackURL from that projection, and persists the
-// operation completion. The same Failed projection is fenced from maintenance
-// by the Restoring row until reconciliation settles any surviving intent and
-// hands capacity back make-before-break.
 
 // finalizeRestoredLease records the NEW lease's active release, then — and only
 // then — drops the restoring retention record. recoverState rehydrates
@@ -2503,36 +2496,9 @@ func (b *Backend) revertRestoreSourceWithAccounting(
 	return true, nil
 }
 
-// prepareRestoreAdoptionRollback is the physical half of the idempotent
-// compensation for an adopted restore. N1: compose.Down the new project FIRST
-// (stop containers on the bind-mounted volumes) BEFORE renaming volumes back —
-// otherwise a still-running container holds the volume's bind mount open. It
-// then re-quarantines each adopted volume and proves/reapplies the source quota.
-// It never changes durable source ownership or releases the live allocation;
-// the accepted and unaccepted wrappers choose the correct settlement owner.
-//
-// dropProvision controls the new-lease reservation:
-//   - true  (synchronous paths: adopt failure, route failure, ack abort): no
-//     actor terminal transition is coming, so the reservation would leak — remove it.
-//   - false (worker failure/panic from doRestore's defer): the actor WILL fire
-//     evReplaceFailed; onEnterFailedFromReplace must read CallbackURL from the
-//     still-present provision to emit the failure callback, then flips it to
-//     Failed. Removing it here would race that transition and drop the callback.
-//
-// A REAL re-quarantine rename failure (not a benign no-op) means an adopted
-// volume may still be canonical-named under the new lease, so the on-disk state
-// no longer matches the record. Mirroring reconcileRestoring, we then LEAVE the
-// record restoring (do NOT RollbackRestoring, do NOT removeProvision) and return:
-// the next reconcile sweep retries the re-quarantine safely, and meanwhile the exact
-// restoring record and provision continue to claim the canonical volume. Reverting
-// here would discard the authority needed to distinguish that still-live data.
-//
-// Make-before-break (ENG-376 site 4): every failure leaves the live allocation
-// counted. reconcileRestoring's orphaned arm resumes preparation, settles the
-// operation journal, and then performs the exact retained-accounting handoff.
 // completeRestoreAdoptionRollback performs the make-before-break ownership
-// handback after prepareRestoreAdoptionRollback proved that no destination
-// container or promoted quota remains. Callers that own a pre-actor restore
+// handback after proving that no destination container or promoted quota
+// remains. Callers that own a pre-actor restore
 // must durably settle its failed operation before entering this function.
 func (b *Backend) completeRestoreAdoptionRollback(
 	leaseUUID string,
