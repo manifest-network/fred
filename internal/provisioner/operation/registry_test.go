@@ -42,7 +42,6 @@ func (spec testOperationSpec) operationSpec() operationSpec {
 		tenant:    spec.Tenant,
 		items:     spec.Items,
 		backend:   spec.Backend,
-		startedAt: spec.StartedAt,
 		kind:      spec.Kind,
 	}
 }
@@ -76,7 +75,15 @@ func tryInitiateForTest(registry *Registry, spec testOperationSpec) InitiationRe
 	}
 	claim := claimResult.Claim()
 	defer registry.releaseLease(claim)
-	return registry.tryInitiateClaimed(claim, spec.operationSpec())
+	result := registry.tryInitiateClaimed(claim, spec.operationSpec())
+	if result.Started() && !spec.StartedAt.IsZero() {
+		registry.mu.Lock()
+		tracked := registry.operations[spec.LeaseUUID]
+		tracked.record.StartedAt = spec.StartedAt
+		registry.operations[spec.LeaseUUID] = tracked
+		registry.mu.Unlock()
+	}
+	return result
 }
 
 func requireStarted(t *testing.T, registry *Registry, spec testOperationSpec) operationToken {
@@ -446,8 +453,6 @@ func TestRegistryDeterministicTestIDsFailClosedAtSequenceExhaustion(t *testing.T
 		assert.Equal(t, TrackInvalid, result.Outcome())
 		assert.False(t, result.Started())
 	}
-	assert.Equal(t, uint64(math.MaxUint64), registry.nextOperationID,
-		"exhaustion must never wrap or reuse the deterministic sequence")
 	assert.Zero(t, registry.count())
 }
 

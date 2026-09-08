@@ -75,9 +75,8 @@ type OrderedEvents interface {
 }
 
 type Config struct {
-	Coordinator     *placement.MaintenanceCoordinator
-	Events          OrderedEvents
-	RecoveryTimeout time.Duration
+	Coordinator *placement.MaintenanceCoordinator
+	Events      OrderedEvents
 }
 
 // Service retains only the high-level application capability. It cannot
@@ -91,7 +90,7 @@ func NewService(cfg Config) (*Service, error) {
 	if cfg.Coordinator == nil || !cfg.Coordinator.Valid() {
 		return nil, errors.New("maintenance service requires a chain/runtime-bound coordinator")
 	}
-	application, err := cfg.Coordinator.Application(cfg.Events, cfg.RecoveryTimeout)
+	application, err := cfg.Coordinator.Application(cfg.Events, 0)
 	if err != nil {
 		return nil, err
 	}

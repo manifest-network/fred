@@ -540,13 +540,6 @@ func (b *Backend) recoverFailedMaintenanceReceipts(ctx context.Context) error {
 	return nil
 }
 
-func (b *Backend) actorOwnsMaintenance(leaseUUID string, id shared.MaintenanceID) bool {
-	b.actorsMu.Lock()
-	actor := b.actors[leaseUUID]
-	b.actorsMu.Unlock()
-	return actor != nil && actor.OwnsMaintenance(id)
-}
-
 func (b *Backend) convergeMaintenanceSuccess(
 	ctx context.Context,
 	active shared.MaintenanceReleaseActive,

@@ -661,23 +661,6 @@ func (inspection ReleaseStoreInspection) CheckLegacyActiveAuthorityAndRuntimeCap
 	)
 }
 
-func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityCapacityWithinLimit(
-	leaseUUID string,
-	expected Release,
-	items []backend.LeaseItem,
-	resourceProfiles []SKUResourceSnapshot,
-	limitBytes int,
-) error {
-	return inspection.checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
-		leaseUUID,
-		expected,
-		items,
-		resourceProfiles,
-		nil,
-		limitBytes,
-	)
-}
-
 func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
 	leaseUUID string,
 	expected Release,

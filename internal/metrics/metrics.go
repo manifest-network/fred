@@ -273,7 +273,7 @@ var (
 	//
 	// Alert on a backend sustaining a non-ok outcome across consecutive sweeps —
 	// a single blip is expected and self-heals. Label values: "ok", "error",
-	// "circuit_open", "panic". circuit_open is separated because it means fred
+	// "circuit_open". circuit_open is separated because it means fred
 	// short-circuited without dialing, which in an incident reads very
 	// differently from a backend that was actually contacted and failed.
 	ReconcilerBackendFetchTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -799,7 +799,6 @@ const (
 	FetchOutcomeOK          = "ok"
 	FetchOutcomeError       = "error"
 	FetchOutcomeCircuitOpen = "circuit_open"
-	FetchOutcomePanic       = "panic"
 )
 
 // Pass and reason constants for the `pass` / `reason` labels on
@@ -869,7 +868,6 @@ const (
 	LifecycleCallbackVerdictMissing      = "missing"
 	LifecycleCallbackVerdictStale        = "stale"
 	LifecycleCallbackVerdictUnusable     = "unusable"
-	LifecycleCallbackVerdictUnavailable  = "unavailable"
 	LifecycleCallbackVerdictUnknown      = "unknown"
 )
 

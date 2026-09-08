@@ -2,16 +2,11 @@ package operation
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"maps"
-	"math"
 	"slices"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 
 	"github.com/manifest-network/fred/internal/backend"
 )
@@ -300,7 +295,6 @@ type Registry struct {
 	countObserver        func(int)
 	operationIDSource    func() (OperationID, error)
 	identity             registryIdentity
-	nextOperationID      uint64
 	nextClaimNonce       uint64
 	mutationRevision     uint64
 	lastSnapshotRevision uint64
@@ -330,29 +324,6 @@ func newRandomRegistryWithObserver(observer func(int)) *Registry {
 	return registry
 }
 
-func newRegistry(operationSeed, claimSeed uint64) *Registry {
-	return newRegistryWithObserver(operationSeed, claimSeed, nil)
-}
-
-func newRegistryWithObserver(
-	operationSeed, claimSeed uint64,
-	observer func(int),
-) *Registry {
-	registry := newRegistryBase(claimSeed, observer)
-	registry.nextOperationID = operationSeed
-	// Deterministic allocation exists only for package tests. Production
-	// constructors install randomOperationID above so an ID observed by one
-	// backend reveals nothing about another backend's current or future ID.
-	registry.operationIDSource = func() (OperationID, error) {
-		if registry.nextOperationID == math.MaxUint64 {
-			return OperationID{}, errOperationIDSequenceExhausted
-		}
-		registry.nextOperationID++
-		return deterministicOperationID(registry.nextOperationID), nil
-	}
-	return registry
-}
-
 func newRegistryBase(
 	claimSeed uint64,
 	observer func(int),
@@ -368,19 +339,6 @@ func newRegistryBase(
 		nextClaimNonce: claimSeed,
 		drained:        drained,
 	}
-}
-
-// deterministicOperationID is used only by package-private deterministic test
-// construction. Production constructors always install randomOperationID.
-func deterministicOperationID(sequence uint64) OperationID {
-	var input [8]byte
-	binary.BigEndian.PutUint64(input[:], sequence)
-	digest := sha256.Sum256(input[:])
-	var value uuid.UUID
-	copy(value[:], digest[:len(value)])
-	value[6] = (value[6] & 0x0f) | 0x40
-	value[8] = (value[8] & 0x3f) | 0x80
-	return newOperationID(value)
 }
 
 // recoverClaimed installs one exact durable operation identity as active under
@@ -469,17 +427,13 @@ func (registry *Registry) installRecordLocked(
 	initiation Initiation,
 ) {
 	registry.armDrainSignalLocked()
-	startedAt := spec.startedAt
-	if startedAt.IsZero() {
-		startedAt = time.Now()
-	}
 	record := Record{
 		LeaseUUID:  spec.leaseUUID,
 		Tenant:     spec.tenant,
 		Items:      slices.Clone(spec.items),
 		Backend:    spec.backend,
 		ID:         token.operationID(),
-		StartedAt:  startedAt,
+		StartedAt:  time.Now(),
 		Kind:       spec.kind,
 		Phase:      phase,
 		Settlement: SettlementUnclaimed,

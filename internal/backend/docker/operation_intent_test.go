@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -313,10 +312,9 @@ func newOperationIntentRecoveryBackend(
 		},
 	}
 	b := newBackendForTest(mock, provisions)
-	// Production uses the configured (normally 30s) start window to stabilize a
-	// created-only cohort and the full provisioning window for an empty inventory.
-	// Unit fixtures keep both state-machine paths short unless a test overrides
-	// them explicitly.
+	// Recovery preserves nonterminal substrate until the durable provisioning
+	// visibility horizon expires. Unit fixtures use a short horizon unless a
+	// test explicitly exercises deferral across periodic sweeps.
 	b.cfg.ContainerStartTimeout = 20 * time.Millisecond
 	b.cfg.ProvisionTimeout = 20 * time.Millisecond
 	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
@@ -724,150 +722,6 @@ func TestRecoverOperationIntent_ReobservesEmptyInventoryBeforeSettlement(t *test
 	}
 }
 
-func TestAwaitOperationIntent_VisibilityReadCannotCreateSuccessAfterDeadline(t *testing.T) {
-	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
-	require.NoError(t, err)
-	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	spec := dockerOperationIntentSpec(t, storageID)
-	admission, err := beginDockerTestOperationIntent(t, store, spec, storageID)
-	require.NoError(t, err)
-	container := dockerIntentContainer(spec, "deadline-container", spec.Items[0].SKU, 0)
-	b := newOperationIntentRecoveryBackend(
-		t, store, storageID, []ContainerInfo{container}, readyIntentProjection(spec, container.ContainerID),
-	)
-	b.cfg.ProvisionTimeout = 20 * time.Millisecond
-	b.cfg.ContainerStartTimeout = 50 * time.Millisecond
-
-	classification, err := b.awaitOperationIntentTerminal(
-		context.Background(), createdDockerOperationClaim(t, admission), operationIntentSubstrate{waitEvidence: operationAwaitLateVisibility{}},
-	)
-	require.NoError(t, err)
-	assert.Equal(t, backend.CallbackStatusFailed, classification.status)
-	assert.True(t, classification.needsTeardown)
-}
-
-func TestAwaitOperationIntents_BatchesFleetInventoryAtScale(t *testing.T) {
-	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
-	require.NoError(t, err)
-	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-
-	const operationCount = 128
-	classified := make([]classifiedOperationIntent, 0, operationCount)
-	for index := 1; index <= operationCount; index++ {
-		spec := dockerOperationIntentSpec(t, storageID)
-		spec.LeaseUUID = fmt.Sprintf("550e8400-e29b-41d4-a716-%012x", index)
-		operationID := mustDockerOperationID(fmt.Sprintf("6ba7b810-9dad-41d1-80b4-%012x", index))
-		spec.CallbackURL = "https://fred.example/callbacks/provision?operation_id=" + operationID.String()
-		spec.LifecycleCallbackURL, err = backend.ResolveLifecycleCallbackURL(spec.CallbackURL, "")
-		require.NoError(t, err)
-		admission, beginErr := beginDockerTestOperationIntent(t, store, spec, storageID)
-		require.NoError(t, beginErr)
-		classified = append(classified, classifiedOperationIntent{
-			claim: createdDockerOperationClaim(t, admission),
-			classification: operationIntentSubstrate{
-				waitEvidence: operationAwaitLateVisibility{},
-			},
-			awaitRecovery: true,
-		})
-	}
-
-	b := newOperationIntentRecoveryBackend(t, store, storageID, nil, nil)
-	b.cfg.ProvisionTimeout = 10 * time.Millisecond
-	b.cfg.ContainerStartTimeout = 20 * time.Millisecond
-	b.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	deadline := time.Now().Add(10 * time.Millisecond)
-	for index := range classified {
-		classified[index].operationDeadline = deadline
-	}
-	listCalls := 0
-	b.docker = &mockDockerClient{ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-		listCalls++
-		return nil, nil
-	}}
-
-	require.NoError(t, b.awaitOperationIntentsTerminal(context.Background(), classified))
-	assert.Equal(t, 1, listCalls,
-		"one cadence must perform one fleet inventory, independent of operation count")
-	for _, entry := range classified {
-		assert.False(t, entry.awaitRecovery)
-		assert.Equal(t, backend.CallbackStatusFailed, entry.classification.status)
-		assert.True(t, entry.classification.needsTeardown)
-	}
-}
-
-func TestAwaitOperationIntents_PreservesIndependentDeadlines(t *testing.T) {
-	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
-	require.NoError(t, err)
-	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-
-	firstSpec := dockerOperationIntentSpec(t, storageID)
-	firstAdmission, err := beginDockerTestOperationIntent(t, store, firstSpec, storageID)
-	require.NoError(t, err)
-	time.Sleep(50 * time.Millisecond)
-	secondSpec := dockerOperationIntentSpec(t, storageID)
-	secondSpec.LeaseUUID = "550e8400-e29b-41d4-a716-446655440001"
-	secondOperationID := mustDockerOperationID("6ba7b810-9dad-41d1-80b4-00c04fd430c9")
-	secondSpec.CallbackURL = "https://fred.example/callbacks/provision?operation_id=" + secondOperationID.String()
-	secondSpec.LifecycleCallbackURL, err = backend.ResolveLifecycleCallbackURL(secondSpec.CallbackURL, "")
-	require.NoError(t, err)
-	secondAdmission, err := beginDockerTestOperationIntent(t, store, secondSpec, storageID)
-	require.NoError(t, err)
-
-	secondContainer := dockerIntentContainer(
-		secondSpec, "second-container", secondSpec.Items[0].SKU, 0,
-	)
-	b := newOperationIntentRecoveryBackend(t, store, storageID, nil, nil)
-	b.cfg.ProvisionTimeout = 80 * time.Millisecond
-	b.cfg.ContainerStartTimeout = 80 * time.Millisecond
-	listCalls := 0
-	b.docker = &mockDockerClient{
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			listCalls++
-			return []ContainerInfo{secondContainer}, nil
-		},
-		InspectContainerFn: func(context.Context, string) (*ContainerInfo, error) {
-			copy := secondContainer
-			return &copy, nil
-		},
-	}
-	classified := []classifiedOperationIntent{
-		{
-			claim: createdDockerOperationClaim(t, firstAdmission),
-			classification: operationIntentSubstrate{
-				waitEvidence: operationAwaitLateVisibility{},
-			},
-			awaitRecovery: true,
-		},
-		{
-			claim: createdDockerOperationClaim(t, secondAdmission),
-			classification: operationIntentSubstrate{
-				waitEvidence: operationAwaitLateVisibility{},
-			},
-			awaitRecovery: true,
-		},
-	}
-	classified[0].operationDeadline = time.Now().Add(30 * time.Millisecond)
-	classified[1].operationDeadline = time.Now().Add(2 * time.Second)
-
-	require.NoError(t, b.awaitOperationIntentsTerminal(context.Background(), classified))
-	assert.Equal(t, 1, listCalls, "the earlier deadline must share its final inventory")
-	assert.Equal(t, backend.CallbackStatusFailed, classified[0].classification.status)
-	assert.Equal(t, backend.CallbackStatusSuccess, classified[1].classification.status,
-		"the older operation timing out must not consume the newer operation's deadline")
-}
-
 func TestRecoverOperationIntent_RetriesTransientSettlementOnNextPass(t *testing.T) {
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)
@@ -1118,7 +972,11 @@ func TestTeardownRecoveredOperationRejectsLateContradictoryAuthority(t *testing.
 			acquired, scopeErr := b.recoveryCoordinator.WithLease(
 				t.Context(), spec.LeaseUUID,
 				func(scope shared.LeaseRecoveryScope) error {
-					err = b.teardownRecoveredOperation(t.Context(), scope, claim, nil)
+					outcome, cleanupErr := b.operationSettlement.CleanupRecoveredOperation(t.Context(), scope, claim)
+					require.NoError(t, cleanupErr)
+					ambiguous, ok := outcome.(shared.OperationExecutionAmbiguous)
+					require.True(t, ok, "contradictory authority must retain an ambiguous outcome")
+					err = ambiguous.Cause()
 					return nil
 				},
 			)

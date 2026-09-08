@@ -285,6 +285,8 @@ func (recovery *AttemptRecoveryCoordinator) Recover(
 		}
 	case observedLeaseUnknown:
 		target = unknownAttemptTarget(observed)
+	case observedLeaseNotFound:
+		target = unknownAttemptTarget{err: exactLeaseObservationError(observed)}
 	default:
 		target = unknownAttemptTarget{err: ErrInvalidAttemptToken}
 	}
@@ -551,7 +553,7 @@ func (pruner *TerminalPruner) PruneTerminalAbsence(
 	defer cancel()
 	observation := pruner.controlPlane.observeLease(queryCtx, leaseUUID, "")
 	switch observed := observation.(type) {
-	case observedLeaseUnauthorized:
+	case observedLeaseUnauthorized, observedLeaseNotFound:
 		return PruneResult{disposition: PruneDispositionChainUnknown}
 	case observedLeaseUnknown:
 		return PruneResult{disposition: PruneDispositionChainError, err: observed.err}

@@ -23,9 +23,9 @@ func TestInitializeStorageIdentityCommittedRerunReattestsClusterBeforeRecovery(t
 
 	stable := &Backend{
 		cfg: cfg,
-		clusterIdentity: func(context.Context) (string, error) {
+		clusterIdentity: clusterIdentityReaderFunc(func(context.Context) (string, error) {
 			return "cluster-a", nil
-		},
+		}),
 	}
 	initialized, err := initializeStorageIdentityForConfigWithProbe(t.Context(), cfg, stable)
 	require.NoError(t, err)
@@ -41,12 +41,12 @@ func TestInitializeStorageIdentityCommittedRerunReattestsClusterBeforeRecovery(t
 	var identityReads atomic.Int64
 	swapped := &Backend{
 		cfg: cfg,
-		clusterIdentity: func(context.Context) (string, error) {
+		clusterIdentity: clusterIdentityReaderFunc(func(context.Context) (string, error) {
 			if identityReads.Add(1) >= 2 {
 				return "cluster-b", nil
 			}
 			return "cluster-a", nil
-		},
+		}),
 	}
 	_, err = initializeStorageIdentityForConfigWithProbe(t.Context(), cfg, swapped)
 	require.ErrorContains(t, err, "K3s cluster identity changed during lineage proof")
@@ -56,9 +56,9 @@ func TestInitializeStorageIdentityCommittedRerunReattestsClusterBeforeRecovery(t
 
 	clean := &Backend{
 		cfg: cfg,
-		clusterIdentity: func(context.Context) (string, error) {
+		clusterIdentity: clusterIdentityReaderFunc(func(context.Context) (string, error) {
 			return "cluster-a", nil
-		},
+		}),
 	}
 	rerun, err := initializeStorageIdentityForConfigWithProbe(t.Context(), cfg, clean)
 	require.NoError(t, err)
@@ -70,14 +70,14 @@ func TestInitializeStorageIdentityCommittedRerunReattestsClusterBeforeRecovery(t
 	identityReads.Store(0)
 	postSealSwap := &Backend{
 		cfg: cfg,
-		clusterIdentity: func(context.Context) (string, error) {
+		clusterIdentity: clusterIdentityReaderFunc(func(context.Context) (string, error) {
 			// Initial, pre-operation, and pre-reread observations still see A;
 			// only the final post-seal barrier observes the replacement cluster.
 			if identityReads.Add(1) >= 4 {
 				return "cluster-b", nil
 			}
 			return "cluster-a", nil
-		},
+		}),
 	}
 	_, err = initializeStorageIdentityForConfigWithProbe(t.Context(), cfg, postSealSwap)
 	require.ErrorContains(t, err, "K3s cluster identity changed during lineage proof")
@@ -97,7 +97,7 @@ func TestInitializeStorageIdentityRejectsSameParentReplacementBeforePublication(
 	var identityReads atomic.Int64
 	probe := &Backend{
 		cfg: cfg,
-		clusterIdentity: func(context.Context) (string, error) {
+		clusterIdentity: clusterIdentityReaderFunc(func(context.Context) (string, error) {
 			// The third read is the final substrate barrier after every empty
 			// journal was inspected and before the pending anchor is published.
 			if identityReads.Add(1) == 3 {
@@ -109,7 +109,7 @@ func TestInitializeStorageIdentityRejectsSameParentReplacementBeforePublication(
 				}
 			}
 			return "cluster-a", nil
-		},
+		}),
 	}
 
 	_, err := initializeStorageIdentityForConfigWithProbe(t.Context(), cfg, probe)
@@ -131,9 +131,9 @@ func TestInitializeStorageIdentityCommittedRerunRejectsCompleteSameParentLineage
 	stableProbe := func(cfg Config) *Backend {
 		return &Backend{
 			cfg: cfg,
-			clusterIdentity: func(context.Context) (string, error) {
+			clusterIdentity: clusterIdentityReaderFunc(func(context.Context) (string, error) {
 				return "cluster-a", nil
-			},
+			}),
 		}
 	}
 
@@ -150,7 +150,7 @@ func TestInitializeStorageIdentityCommittedRerunRejectsCompleteSameParentLineage
 	var identityReads atomic.Int64
 	swappingProbe := &Backend{
 		cfg: lineageA,
-		clusterIdentity: func(context.Context) (string, error) {
+		clusterIdentity: clusterIdentityReaderFunc(func(context.Context) (string, error) {
 			// The committed rerun reads the cluster initially, before its first
 			// marker pass, and between its two marker passes. Swap every authority
 			// entry on that middle observation while retaining the same physical
@@ -161,7 +161,7 @@ func TestInitializeStorageIdentityCommittedRerunRejectsCompleteSameParentLineage
 				}
 			}
 			return "cluster-a", nil
-		},
+		}),
 	}
 
 	observed, err := initializeStorageIdentityForConfigWithProbe(

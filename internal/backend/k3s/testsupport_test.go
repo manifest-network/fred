@@ -59,12 +59,18 @@ func (testK3sStorageIdentity) resolve(_ context.Context, cfg Config) (backendide
 func newBackendWithTestIdentity(cfg Config, logger *slog.Logger) (*Backend, error) {
 	b, err := newBackend(context.Background(), cfg, logger, testK3sStorageIdentity{})
 	if err == nil {
-		b.clusterIdentity = func(context.Context) (string, error) { return "test-kube-system-uid", nil }
+		b.clusterIdentity = clusterIdentityReaderFunc(func(context.Context) (string, error) { return "test-kube-system-uid", nil })
 	}
 	return b, err
 }
 
 func bindK3sTestStorageIdentity(t *testing.T, b *Backend) {
 	t.Helper()
-	b.clusterIdentity = func(context.Context) (string, error) { return "test-kube-system-uid", nil }
+	b.clusterIdentity = clusterIdentityReaderFunc(func(context.Context) (string, error) { return "test-kube-system-uid", nil })
+}
+
+type clusterIdentityReaderFunc func(context.Context) (string, error)
+
+func (read clusterIdentityReaderFunc) CurrentClusterIdentity(ctx context.Context) (string, error) {
+	return read(ctx)
 }

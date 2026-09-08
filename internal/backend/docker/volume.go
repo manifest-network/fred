@@ -49,10 +49,6 @@ func newVolumeCleanupContext(parent context.Context) (context.Context, context.C
 // no tenant-substrate mutation methods, so an ordinary b.volumes call cannot
 // create, rename, requota, recover, or destroy storage.
 type volumeReader interface {
-	// List returns the IDs of mounted managed volumes in the data directory.
-	// It is an informational view; destructive decisions use ListForProof.
-	List() ([]string, error)
-
 	// ListForProof returns the complete managed-volume substrate inventory under
 	// a caller-owned deadline. For directory-backed managers this is the same
 	// namespace as List. ZFS additionally inventories child datasets so an

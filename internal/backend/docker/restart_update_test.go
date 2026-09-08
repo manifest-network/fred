@@ -1196,6 +1196,11 @@ func TestContainerDiedThenRestart_Succeeds(t *testing.T) {
 
 	// 1) Container death: Ready→Failing, onEnterFailing runs to completion.
 	b.handleContainerDeath("c1")
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		return b.provisions[leaseUUID].Status == backend.ProvisionStatusFailing
+	}, time.Second, time.Millisecond)
 
 	b.provisionsMu.RLock()
 	statusAfterDeath := b.provisions[leaseUUID].Status
@@ -1477,6 +1482,11 @@ func TestContainerDiedThenRestartPreflight_EndsFailed(t *testing.T) {
 	b.gatherer = blockingDiagGatherer{}
 
 	b.handleContainerDeath("c1")
+	require.Eventually(t, func() bool {
+		b.provisionsMu.RLock()
+		defer b.provisionsMu.RUnlock()
+		return b.provisions[durableCallbackTestLeaseUUID].Status == backend.ProvisionStatusFailing
+	}, time.Second, time.Millisecond)
 	b.provisionsMu.RLock()
 	require.Equal(t, backend.ProvisionStatusFailing, b.provisions[durableCallbackTestLeaseUUID].Status,
 		"container death must drive the lease to Failing")

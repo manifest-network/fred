@@ -355,14 +355,16 @@ func TestInspectAuthorityFile_PathReplacementCanNeverReturnSafe(t *testing.T) {
 	replacement := writeAuthorityInspectionLegacyDB(t)
 	displaced := filepath.Join(filepath.Dir(path), "displaced.db")
 
-	report, err := inspectAuthorityFile(
-		path,
-		authorityInspectionExpectation(t),
-		authorityInspectionHooks{afterOpen: func() {
-			require.NoError(t, os.Rename(path, displaced))
-			require.NoError(t, os.Rename(replacement, path))
-		}},
-	)
+	authority, err := bindOfflinePlacementAuthority(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, authority.close()) })
+	db, err := authority.openBolt(true)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, os.Rename(path, displaced))
+	require.NoError(t, os.Rename(replacement, path))
+
+	report, err := inspectOpenedAuthorityFile(authority, db, authorityInspectionExpectation(t))
 	require.ErrorContains(t, err, "path or inode changed")
 	assert.Equal(t, AuthorityMixedOrIncomplete, report.Classification)
 	assert.False(t, report.SafeForCutover())

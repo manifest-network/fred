@@ -124,11 +124,13 @@ func (b *Backend) recoverFailedOperationSubstrate(
 		if matchErr != nil {
 			return failedOperationRecoveryFence{}, matchErr
 		}
+		b.observeTerminalSubstrate(terminalReceiptFailed, len(targets))
 		if len(targets) == 0 {
 			return fence, nil
 		}
 		if observation == 2 {
-			return failedOperationRecoveryFence{}, fmt.Errorf("late failed-operation substrate remained after two cleanup passes")
+			return fence, b.deferTerminalSubstrateCleanup(terminalReceiptFailed,
+				fmt.Errorf("late failed-operation substrate remained after two cleanup passes"))
 		}
 		byOperation := make(map[shared.OperationID]shared.FailedOperationReceipt)
 		for _, target := range targets {
@@ -136,31 +138,21 @@ func (b *Backend) recoverFailedOperationSubstrate(
 		}
 		for operationID, receipt := range byOperation {
 			cleanupCtx, cancelCleanup := context.WithTimeout(ctx, 30*time.Second)
-			var cleanupErr error
 			acquired, scopeErr := b.recoveryCoordinator.WithLease(
 				cleanupCtx, receipt.LeaseUUID(),
 				func(scope shared.LeaseRecoveryScope) error {
-					cleanupErr = b.operationSettlement.CleanupFailedOperationReceipt(cleanupCtx, scope, receipt)
-					return cleanupErr
+					return b.operationSettlement.CleanupFailedOperationReceipt(cleanupCtx, scope, receipt)
 				},
 			)
 			cancelCleanup()
-			if scopeErr != nil {
-				cleanupErr = scopeErr
-			}
-			if !acquired && cleanupErr == nil {
+			if !acquired {
 				// A live command or actor owns this exact lease. Keep the receipt
 				// fence and retry on the next level-triggered pass.
-				return fence, nil
+				return fence, b.deferTerminalSubstrateCleanup(terminalReceiptFailed, scopeErr)
 			}
-			if cleanupErr != nil {
-				return failedOperationRecoveryFence{}, b.latchAmbiguousOperationOutcome(
-					fmt.Sprintf(
-						"remove late substrate for failed operation %s",
-						operationID.Fingerprint(),
-					),
-					cleanupErr,
-				)
+			if scopeErr != nil {
+				return fence, b.deferTerminalSubstrateCleanup(terminalReceiptFailed,
+					fmt.Errorf("remove late substrate for failed operation %s: %w", operationID.Fingerprint(), scopeErr))
 			}
 			b.logger.Warn("removed exact late substrate for durably failed operation",
 				"lease_uuid", receipt.LeaseUUID(),
@@ -402,8 +394,6 @@ type recoveredIntentDecision struct {
 	status             backend.CallbackStatus
 	errMsg             string
 	readyProjection    *recoveredOperationReadyPromotion
-	needsTeardown      bool
-	cleanupIDs         []string
 	allocationIDs      []string
 	legacyPredecessor  *shared.Release
 	legacyAuthority    *shared.LegacyRuntimeAuthority
@@ -418,8 +408,6 @@ type recoveredIntentDecision struct {
 type operationIntentWaitEvidence interface {
 	operationIntentWaitEvidence()
 	kind() string
-	requiresFinalInventory() bool
-	usesStartWindow() bool
 }
 
 // operationAwaitLateVisibility means no exact object is visible yet, but a
@@ -428,8 +416,6 @@ type operationAwaitLateVisibility struct{}
 
 func (operationAwaitLateVisibility) operationIntentWaitEvidence() {}
 func (operationAwaitLateVisibility) kind() string                 { return "late_visibility" }
-func (operationAwaitLateVisibility) requiresFinalInventory() bool { return true }
-func (operationAwaitLateVisibility) usesStartWindow() bool        { return false }
 
 // operationAwaitProgress means the exact cohort is visible and has a runtime
 // mechanism (for example a starting health check) that can still converge.
@@ -437,24 +423,19 @@ type operationAwaitProgress struct{}
 
 func (operationAwaitProgress) operationIntentWaitEvidence() {}
 func (operationAwaitProgress) kind() string                 { return "progress" }
-func (operationAwaitProgress) requiresFinalInventory() bool { return false }
-func (operationAwaitProgress) usesStartWindow() bool        { return false }
 
 // operationAwaitInert means the exact cohort is visible but no surviving worker
-// can advance it (created, paused, or an unrecognized Docker state). It earns only
-// the bounded container-start stabilization window before exact cleanup.
+// can advance it (created, paused, or an unrecognized Docker state). Recovery
+// preserves the exact claim until its durable visibility horizon expires.
 type operationAwaitInert struct{}
 
 func (operationAwaitInert) operationIntentWaitEvidence() {}
 func (operationAwaitInert) kind() string                 { return "inert" }
-func (operationAwaitInert) requiresFinalInventory() bool { return false }
-func (operationAwaitInert) usesStartWindow() bool        { return true }
 
 type operationIntentSubstrate struct {
 	status            backend.CallbackStatus
 	errMsg            string
 	hasCurrent        bool
-	needsTeardown     bool
 	waitEvidence      operationIntentWaitEvidence
 	currentIDs        []string
 	serviceContainers map[string][]string
@@ -463,27 +444,15 @@ type operationIntentSubstrate struct {
 	legacyAuthority   *shared.LegacyRuntimeAuthority
 }
 
-func (s operationIntentSubstrate) requiresFinalInventory() bool {
-	return s.waitEvidence != nil && s.waitEvidence.requiresFinalInventory()
-}
-
-func (s operationIntentSubstrate) usesStartWindow() bool {
-	return s.waitEvidence != nil && s.waitEvidence.usesStartWindow()
-}
-
 // classifiedOperationIntent is one durable operation together with the latest
-// complete substrate observation made for it. Awaiting operations stay in this
-// value slice while the batch coordinator polls; there is deliberately no
+// complete substrate observation made for it. Awaiting operations retain their
+// durable claims for the next periodic sweep; there is deliberately no
 // goroutine, timer, or independently fetched fleet inventory per operation.
 type classifiedOperationIntent struct {
 	claim              shared.OperationIntentClaim
 	classification     operationIntentSubstrate
-	awaitRecovery      bool
-	requiredAwait      bool
 	deferred           bool
 	preserveProjection bool
-	operationDeadline  time.Time
-	inertDeadline      time.Time
 }
 
 type operationIntentRecoveryMode uint8
@@ -526,7 +495,7 @@ func (b *Backend) recoverOperationIntents(ctx context.Context) error {
 		return fmt.Errorf("list callback operation intents: %w", err)
 	}
 	// Startup performs one bounded strict observation and defers young empty or
-	// transitional generations. Waiting their full provision/start window here
+	// transitional generations. Waiting their full visibility window here
 	// would prevent the subscriber and periodic recovery scheduler from starting,
 	// turning an otherwise recoverable `created`/`restarting` cohort into a daemon
 	// availability failure. The live lane reclaims the exact same durable claims
@@ -772,42 +741,23 @@ func (b *Backend) recoverOperationIntentClaims(
 		}
 		now := time.Now()
 		deadline := provisionIntentRecoveryDeadline(claim.CreatedAt(), now, timeout)
-		if awaitRecovery && !now.Before(deadline) {
-			classification.needsTeardown = true
-			classification = b.operationIntentRecoveryTimedOut(
-				claim, classification, deadline, operationRecoveryTimeoutProvision,
-			)
-			awaitRecovery = false
+		if awaitRecovery {
+			if now.Before(deadline) {
+				entry.deferred = true
+			} else {
+				classification = b.operationIntentRecoveryTimedOut(
+					claim, classification, deadline, operationRecoveryTimeoutProvision,
+				)
+			}
 		}
 		entry.classification = classification
-		entry.awaitRecovery = awaitRecovery
-		entry.requiredAwait = awaitRecovery
-		entry.operationDeadline = deadline
 	}
 
-	now := time.Now()
-	timeout := b.cfg.ProvisionTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Minute
-	}
 	for index := range classified {
 		entry := &classified[index]
 		if mode == operationIntentRecoveryLive {
 			entry.preserveProjection = true
 		}
-		if !entry.awaitRecovery {
-			continue
-		}
-		entry.operationDeadline = provisionIntentRecoveryDeadline(
-			entry.claim.CreatedAt(), now, timeout,
-		)
-		if now.Before(entry.operationDeadline) {
-			entry.awaitRecovery = false
-			entry.deferred = true
-		}
-	}
-	if err := b.awaitOperationIntentsTerminal(ctx, classified); err != nil {
-		return err
 	}
 
 	decisions := make([]recoveredIntentDecision, 0, len(classified))
@@ -834,10 +784,6 @@ func (b *Backend) recoverOperationIntentClaims(
 				serviceContainers: cloneOperationServiceContainers(classification.serviceContainers),
 				stackManifest:     classification.stackManifest,
 			}
-		}
-		if classification.needsTeardown {
-			decision.needsTeardown = true
-			decision.cleanupIDs = slices.Clone(classification.currentIDs)
 		}
 		decision.legacyPredecessor = classification.legacyPredecessor
 		decision.legacyAuthority = classification.legacyAuthority
@@ -867,8 +813,8 @@ func (b *Backend) recoverOperationIntentClaims(
 		}
 	}
 	// recoverState's projection was built from the first Docker observation. An
-	// exact created/restarting cohort can become Ready during the bounded wait
-	// above, leaving only that in-memory status stale. Every durable and
+	// exact created/restarting cohort can become Ready between its observations,
+	// leaving only that in-memory status stale. Every durable and
 	// projection precondition has now been validated. Re-check every target and
 	// publish fresh pointers as one lock-protected all-or-none batch; never mutate
 	// an actor-visible *provision in place.
@@ -898,22 +844,21 @@ func (b *Backend) recoverOperationIntentClaims(
 	// An operation that did not cross its exact Release commit boundary may be
 	// classified Failed only after every container carrying this operation's
 	// unguessable callback identity is gone. Keep all operation intents durable
-	// while doing the destructive work: if any teardown is incomplete, the
-	// backend-lifetime latch suppresses actor/callback settlement and a fresh
-	// process retries from the same immutable authority.
-	for index := range decisions {
-		decision := &decisions[index]
+	// while doing the destructive work. An incomplete teardown has no settlement
+	// proof: keep its intent and reservation for the next periodic pass. Only
+	// decisions carrying exact physical evidence enter the settlement batch.
+	settleable := make([]recoveredIntentDecision, 0, len(decisions))
+	for _, decision := range decisions {
 		if decision.status != backend.CallbackStatusFailed {
+			settleable = append(settleable, decision)
 			continue
 		}
 		outcome, cleanupErr := b.operationSettlement.CleanupRecoveredOperation(
 			ctx, recoveryScopes[decision.claim.LeaseUUID()], decision.claim,
 		)
 		if cleanupErr != nil {
-			return b.latchAmbiguousOperationOutcome(
-				fmt.Sprintf("recover failed %s %q", decision.claim.Kind(), decision.claim.LeaseUUID()),
-				cleanupErr,
-			)
+			return fmt.Errorf("prepare failed %s recovery for %q: %w",
+				decision.claim.Kind(), decision.claim.LeaseUUID(), cleanupErr)
 		}
 		failure, ok := outcome.(shared.OperationExecutionFailure)
 		if !ok {
@@ -921,13 +866,19 @@ func (b *Backend) recoverOperationIntentClaims(
 			if ambiguous, isAmbiguous := outcome.(shared.OperationExecutionAmbiguous); isAmbiguous && ambiguous.Cause() != nil {
 				cause = ambiguous.Cause()
 			}
-			return b.latchAmbiguousOperationOutcome(
-				fmt.Sprintf("recover failed %s %q", decision.claim.Kind(), decision.claim.LeaseUUID()),
-				cause,
-			)
+			if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
+				return authorityErr
+			}
+			operationIntentRecoveryCleanupRetriesTotal.WithLabelValues(string(decision.claim.Kind())).Inc()
+			b.logger.Warn("operation recovery cleanup remains pending",
+				"lease_uuid", decision.claim.LeaseUUID(),
+				"kind", decision.claim.Kind(), "error", cause)
+			continue
 		}
 		decision.failureOutcome = failure
+		settleable = append(settleable, decision)
 	}
+	decisions = settleable
 
 	rebuildAfterSettlement := false
 	for _, decision := range decisions {
@@ -996,37 +947,6 @@ func (b *Backend) recoverOperationIntentClaims(
 			return errors.New("failed provision recovery requires a deferred rebuild target")
 		}
 		*rebuildRequested = true
-	}
-	return nil
-}
-
-// teardownRecoveredOperation is the destructive half of interrupted-operation
-// failure recovery. Compose Down returning nil is not, by itself, absence
-// evidence: a daemon-side Create accepted by the previous process can become
-// visible after Down took its project snapshot. Require a fresh strict inventory
-// bracketed by storage-identity proofs before consuming the durable intent. If
-// that confirmation observes a late cohort, reclassify every survivor against
-// the immutable operation authority and remove the exact IDs directly. Repeating
-// Compose Down would merely trust the same project-sweep success that the fresh
-// inventory just disproved. A survivor, contradictory generation, or any read
-// uncertainty preserves the intent and withdraws this backend lifetime at the
-// caller.
-func (b *Backend) teardownRecoveredOperation(
-	ctx context.Context,
-	recoveryScope shared.LeaseRecoveryScope,
-	claim shared.OperationIntentClaim,
-	_ []string,
-) error {
-	outcome, err := b.operationSettlement.CleanupRecoveredOperation(ctx, recoveryScope, claim)
-	if err != nil {
-		return err
-	}
-	if _, ok := outcome.(shared.OperationExecutionFailure); !ok {
-		if ambiguous, isAmbiguous := outcome.(shared.OperationExecutionAmbiguous); isAmbiguous && ambiguous.Cause() != nil {
-			return fmt.Errorf("operation cleanup did not prove exact absence (%T): %w",
-				outcome, ambiguous.Cause())
-		}
-		return fmt.Errorf("operation cleanup did not prove exact absence (%T)", outcome)
 	}
 	return nil
 }
@@ -1223,226 +1143,6 @@ func sameStringSet(left, right []string) bool {
 		remaining[value]--
 	}
 	return true
-}
-
-// awaitOperationIntentTerminal gives an exact, self-advancing provision cohort
-// only the unspent budget computed from its durable admission timestamp and the
-// recovery process's current ProvisionTimeout. A persisted wall-clock timestamp
-// carries no monotonic component and may be in the future after clock rollback,
-// so the recovery observation is independently capped to one current
-// ProvisionTimeout from this process's first look.
-//
-// A created cohort cannot advance after the worker that would call
-// ContainerStart has disappeared (Compose emits RestartPolicyNo), but Docker may
-// still be completing a start request accepted just before the crash. Give that
-// shape up to one current ContainerStartTimeout stabilization window, still
-// capped by the provision deadline. Other exact non-terminal states are
-// re-inspected until they become Ready/Failed or that deadline expires. A first
-// empty inventory is not terminal evidence: the old daemon-side Create handler
-// can publish after the client process has disappeared. Empty substrate therefore
-// receives the operation's full remaining ProvisionTimeout and a final fresh
-// strict inventory. ContainerStartTimeout is intentionally not its bound: a
-// daemon-side Create accepted before the crash can become visible after that
-// shorter start window. Every loop re-lists rather than repeatedly inspecting the
-// original snapshot, so a late exact cohort becomes ordinary typed recovery
-// evidence. Caller cancellation and read uncertainty preserve the intent; only a
-// complete exact observation becomes settlement or teardown authority.
-func (b *Backend) awaitOperationIntentsTerminal(
-	ctx context.Context,
-	classified []classifiedOperationIntent,
-) error {
-	timeout := b.cfg.ProvisionTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Minute
-	}
-	startTimeout := b.cfg.ContainerStartTimeout
-	if startTimeout <= 0 {
-		startTimeout = 30 * time.Second
-	}
-	observedAt := time.Now()
-	for index := range classified {
-		entry := &classified[index]
-		if entry.awaitRecovery && entry.operationDeadline.IsZero() {
-			entry.operationDeadline = provisionIntentRecoveryDeadline(
-				entry.claim.CreatedAt(), observedAt, timeout,
-			)
-		}
-	}
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		now := time.Now()
-		var wakeAt time.Time
-		remaining := 0
-		for index := range classified {
-			entry := &classified[index]
-			if !entry.awaitRecovery {
-				continue
-			}
-			deadline, timeoutReason := operationIntentCandidateDeadline(entry, now, startTimeout)
-			// Empty substrate needs one final fresh fleet observation at its
-			// visibility deadline. A visible non-terminal cohort already has complete
-			// identity evidence, so crossing its deadline cannot start a new read that
-			// might manufacture a late success.
-			if !entry.classification.requiresFinalInventory() && !now.Before(deadline) {
-				entry.classification.needsTeardown = true
-				entry.classification = b.operationIntentRecoveryTimedOut(
-					entry.claim, entry.classification, deadline, timeoutReason,
-				)
-				entry.awaitRecovery = false
-				continue
-			}
-			remaining++
-			pollInterval := healthPollInterval
-			if entry.classification.requiresFinalInventory() {
-				// ContainerStartTimeout is a cadence, not the absence proof's bound.
-				pollInterval = min(pollInterval, startTimeout)
-			}
-			candidateWake := now.Add(pollInterval)
-			if deadline.Before(candidateWake) {
-				candidateWake = deadline
-			}
-			if wakeAt.IsZero() || candidateWake.Before(wakeAt) {
-				wakeAt = candidateWake
-			}
-		}
-		if remaining == 0 {
-			return nil
-		}
-
-		if wait := max(time.Until(wakeAt), 0); wait > 0 {
-			timer := time.NewTimer(wait)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
-
-		// Before beginning the shared observation, settle every visible candidate
-		// whose own deadline elapsed. This preserves independent per-operation
-		// deadlines without a goroutine per operation.
-		now = time.Now()
-		remaining = 0
-		for index := range classified {
-			entry := &classified[index]
-			if !entry.awaitRecovery {
-				continue
-			}
-			deadline, timeoutReason := operationIntentCandidateDeadline(entry, now, startTimeout)
-			if !entry.classification.requiresFinalInventory() && !now.Before(deadline) {
-				entry.classification.needsTeardown = true
-				entry.classification = b.operationIntentRecoveryTimedOut(
-					entry.claim, entry.classification, deadline, timeoutReason,
-				)
-				entry.awaitRecovery = false
-				continue
-			}
-			remaining++
-		}
-		if remaining == 0 {
-			continue
-		}
-
-		// One cadence owns exactly one strict fleet list. Index it once, then let
-		// each still-live claim inspect only its own cohort under the aggregate
-		// caller budget. This changes the old O(claims * fleet) list amplification
-		// into O(fleet + exact candidate containers).
-		containers, listErr := b.listManagedContainersStrictForRecovery(ctx)
-		if listErr != nil {
-			return fmt.Errorf("strict managed-container inventory while awaiting operations: %w", listErr)
-		}
-		inventory := operationInventoryByLease(containers)
-		active := make([]int, 0, remaining)
-		for index := range classified {
-			if classified[index].awaitRecovery {
-				active = append(active, index)
-			}
-		}
-		slices.SortFunc(active, func(left, right int) int {
-			return currentOperationIntentDeadline(&classified[left]).Compare(
-				currentOperationIntentDeadline(&classified[right]),
-			)
-		})
-		for _, index := range active {
-			entry := &classified[index]
-			deadline, timeoutReason := operationIntentCandidateDeadline(entry, time.Now(), startTimeout)
-			claimCtx, cancelClaim := b.recoveryDockerReadContext(ctx)
-			next, classifyErr := b.classifyOperationIntent(
-				claimCtx, entry.claim, inventory[entry.claim.LeaseUUID()],
-			)
-			cancelClaim()
-			if classifyErr != nil && !errors.Is(classifyErr, errOperationIntentSubstrateNonterminal) {
-				return fmt.Errorf("%s operation intent for lease %q remains unresolved: %w",
-					entry.claim.Kind(), entry.claim.LeaseUUID(), classifyErr)
-			}
-			entry.classification = next
-			finishedAt := time.Now()
-			if !finishedAt.Before(deadline) {
-				entry.classification.needsTeardown = true
-				entry.classification = b.operationIntentRecoveryTimedOut(
-					entry.claim, entry.classification, deadline, timeoutReason,
-				)
-				entry.awaitRecovery = false
-				continue
-			}
-			if classifyErr == nil && entry.classification.waitEvidence == nil {
-				entry.awaitRecovery = false
-			}
-		}
-	}
-}
-
-// awaitOperationIntentTerminal is the single-claim façade used by focused
-// classifier tests. Production recovery always calls the batch coordinator.
-func (b *Backend) awaitOperationIntentTerminal(
-	ctx context.Context,
-	claim shared.OperationIntentClaim,
-	classification operationIntentSubstrate,
-) (operationIntentSubstrate, error) {
-	classified := []classifiedOperationIntent{{
-		claim: claim, classification: classification, awaitRecovery: true,
-	}}
-	if err := b.awaitOperationIntentsTerminal(ctx, classified); err != nil {
-		return classification, err
-	}
-	return classified[0].classification, nil
-}
-
-func operationIntentCandidateDeadline(
-	entry *classifiedOperationIntent,
-	now time.Time,
-	startTimeout time.Duration,
-) (time.Time, string) {
-	deadline := entry.operationDeadline
-	timeoutReason := operationRecoveryTimeoutProvision
-	switch {
-	case entry.classification.requiresFinalInventory():
-		entry.inertDeadline = time.Time{}
-	case entry.classification.usesStartWindow():
-		if entry.inertDeadline.IsZero() {
-			entry.inertDeadline = now.Add(startTimeout)
-		}
-		if entry.inertDeadline.Before(deadline) {
-			deadline = entry.inertDeadline
-			timeoutReason = operationRecoveryTimeoutStart
-		}
-	default:
-		entry.inertDeadline = time.Time{}
-	}
-	return deadline, timeoutReason
-}
-
-func currentOperationIntentDeadline(entry *classifiedOperationIntent) time.Time {
-	deadline := entry.operationDeadline
-	if entry.classification.usesStartWindow() &&
-		!entry.inertDeadline.IsZero() && entry.inertDeadline.Before(deadline) {
-		return entry.inertDeadline
-	}
-	return deadline
 }
 
 func (b *Backend) operationIntentRecoveryTimedOut(
@@ -1886,7 +1586,6 @@ func (b *Backend) classifyProvisionIntentSubstrate(
 	classification.status = backend.CallbackStatusFailed
 	classification.errMsg = interruptedOperationFailure
 	classification.hasCurrent = len(current) != 0
-	classification.needsTeardown = true
 	classification.currentIDs = append(classification.currentIDs, predecessorIDs...)
 	if legacyAuthority != nil {
 		predecessorCopy := *predecessor
@@ -2300,11 +1999,10 @@ func (b *Backend) classifyOperationIntentSubstrate(
 		// Every observed instance was admitted through the expected-set lookup
 		// above, and duplicates are rejected, so seen cannot exceed expected.
 		return operationIntentSubstrate{
-			status:        backend.CallbackStatusFailed,
-			errMsg:        interruptedOperationFailure,
-			hasCurrent:    true,
-			needsTeardown: true,
-			currentIDs:    currentIDs,
+			status:     backend.CallbackStatusFailed,
+			errMsg:     interruptedOperationFailure,
+			hasCurrent: true,
+			currentIDs: currentIDs,
 		}, nil
 	}
 	switch {
@@ -2318,26 +2016,24 @@ func (b *Backend) classifyOperationIntentSubstrate(
 		}, nil
 	case failed == len(expected):
 		return operationIntentSubstrate{
-			status:        backend.CallbackStatusFailed,
-			errMsg:        interruptedOperationFailure,
-			hasCurrent:    true,
-			needsTeardown: true,
-			currentIDs:    currentIDs,
+			status:     backend.CallbackStatusFailed,
+			errMsg:     interruptedOperationFailure,
+			hasCurrent: true,
+			currentIDs: currentIDs,
 		}, nil
 	case failed != 0:
 		// One exact failed member makes provision success impossible. Waiting for
 		// healthy or restarting siblings cannot change that terminal outcome.
 		return operationIntentSubstrate{
-			status:        backend.CallbackStatusFailed,
-			errMsg:        interruptedOperationFailure,
-			hasCurrent:    true,
-			needsTeardown: true,
-			currentIDs:    currentIDs,
+			status:     backend.CallbackStatusFailed,
+			errMsg:     interruptedOperationFailure,
+			hasCurrent: true,
+			currentIDs: currentIDs,
 		}, nil
 	case nonterminal != 0:
 		// A running container whose health check is still starting is evidence
 		// that the interrupted worker may still converge. Preserve the exact
-		// intent while the bounded in-process recovery loop re-observes it;
+		// intent while subsequent periodic sweeps re-observe it;
 		// tearing the cohort down on the first snapshot would turn an observation
 		// gap into a terminal failure.
 		return operationIntentSubstrate{
@@ -2347,11 +2043,10 @@ func (b *Backend) classifyOperationIntentSubstrate(
 		}, errOperationIntentSubstrateNonterminal
 	case claim.Kind() == shared.OperationIntentProvision && ready+failed == len(expected):
 		return operationIntentSubstrate{
-			status:        backend.CallbackStatusFailed,
-			errMsg:        interruptedOperationFailure,
-			hasCurrent:    true,
-			needsTeardown: true,
-			currentIDs:    currentIDs,
+			status:     backend.CallbackStatusFailed,
+			errMsg:     interruptedOperationFailure,
+			hasCurrent: true,
+			currentIDs: currentIDs,
 		}, nil
 	default:
 		return operationIntentSubstrate{}, fmt.Errorf("mixed ready and failed substrate state")

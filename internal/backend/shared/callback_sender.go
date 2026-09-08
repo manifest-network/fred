@@ -144,15 +144,6 @@ func (mailbox *callbackReplayMailbox) take() []callbackReplayWake {
 	return wakes
 }
 
-func (mailbox *callbackReplayMailbox) pendingCount() int {
-	if mailbox == nil {
-		return 0
-	}
-	mailbox.mu.Lock()
-	defer mailbox.mu.Unlock()
-	return len(mailbox.pending)
-}
-
 // defaultCallbackBackoff defines the default delay before each retry attempt.
 var defaultCallbackBackoff = [CallbackMaxAttempts]time.Duration{0, 1 * time.Second, 5 * time.Second}
 

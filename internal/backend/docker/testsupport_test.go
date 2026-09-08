@@ -2188,11 +2188,16 @@ func (b *Backend) actorFor(leaseUUID string) *leasesm.LeaseActor {
 	return b.actorForLocked(leaseUUID)
 }
 
-// handleContainerDeath synchronously dispatches a container death to the
-// owning lease's actor and waits for processing to complete. Exists as a
-// test helper so direct-call unit tests can keep their synchronous
-// assertion style; production code routes die events with an exact
-// provision-generation claim.
+func (b *Backend) actorOwnsMaintenance(leaseUUID string, id shared.MaintenanceID) bool {
+	b.actorsMu.Lock()
+	actor := b.actors[leaseUUID]
+	b.actorsMu.Unlock()
+	return actor != nil && actor.OwnsMaintenance(id)
+}
+
+// handleContainerDeath routes the same generation-bound observation as the
+// production event path. Tests synchronize on the resulting state, callback,
+// or quiescence claim instead of a test-only message acknowledgement.
 func (b *Backend) handleContainerDeath(containerID string) {
 	leaseUUID, found := b.findLeaseByContainerID(containerID)
 	if !found {
@@ -2202,13 +2207,9 @@ func (b *Backend) handleContainerDeath(containerID string) {
 	if err != nil {
 		return
 	}
-	observation, completion, err := leasesm.NewTrackedContainerDiedObservation(containerID, generation)
+	observation, err := leasesm.NewContainerDiedObservation(containerID, generation)
 	if err != nil || !b.routeActorObservation(observation) {
 		return
-	}
-	select {
-	case <-completion.Done():
-	case <-b.stopCtx.Done():
 	}
 }
 
@@ -2221,17 +2222,6 @@ func mustContainerDiedObservation(
 	observation, err := leasesm.NewContainerDiedObservation(containerID, runtime)
 	require.NoError(t, err)
 	return observation
-}
-
-func mustTrackedContainerDiedObservation(
-	t *testing.T,
-	containerID string,
-	runtime shared.RuntimeGenerationProof,
-) (leasesm.ActorObservation, leasesm.ActorCompletion) {
-	t.Helper()
-	observation, completion, err := leasesm.NewTrackedContainerDiedObservation(containerID, runtime)
-	require.NoError(t, err)
-	return observation, completion
 }
 
 // installReadyRuntimeProofForTest upgrades a compact actor fixture into the

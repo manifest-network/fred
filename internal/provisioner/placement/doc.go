@@ -49,6 +49,9 @@
 // conflict quarantine. Inventory
 // silence, complete or partial, never clears an attempt or conflict because an
 // old request may commit after the list response.
+// A trusted retention in a partial sweep may reaffirm an already confirmed
+// same-backend owner, so an unrelated outage cannot revoke restore affinity;
+// it cannot create an owner or clear an unresolved attempt or conflict.
 //
 // # Required authority
 //

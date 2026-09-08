@@ -341,10 +341,7 @@ func (command MaintenanceCommand) BackendStorageID() backendidentity.ID {
 	return command.backendStorageID
 }
 func (command MaintenanceCommand) LifecycleID() lifecycle.ID { return command.lifecycleID }
-func (command MaintenanceCommand) LegacyLifecycle() bool {
-	return command.Valid() && command.lifecycleLegacy
-}
-func (command MaintenanceCommand) CallbackURL() string { return command.callbackURL }
+func (command MaintenanceCommand) CallbackURL() string       { return command.callbackURL }
 
 func (command MaintenanceCommand) equal(other MaintenanceCommand) bool {
 	return command.id == other.id && command.leaseUUID == other.leaseUUID &&

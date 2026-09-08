@@ -1243,7 +1243,6 @@ func TestCallbackService_LifecycleMetricsClassifyEveryReceivedCallback(t *testin
 				metrics.LifecycleCallbackVerdictMissing,
 				metrics.LifecycleCallbackVerdictStale,
 				metrics.LifecycleCallbackVerdictUnusable,
-				metrics.LifecycleCallbackVerdictUnavailable,
 				metrics.LifecycleCallbackVerdictUnknown,
 			} {
 				total += metric(outcome, verdict, status)

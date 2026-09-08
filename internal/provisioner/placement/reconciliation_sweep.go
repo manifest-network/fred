@@ -12,7 +12,6 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/inventory"
 	"github.com/manifest-network/fred/internal/provisioner/leaseitems"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
@@ -229,34 +228,6 @@ func (sweep *ReconciliationSweep) End() {
 	}
 }
 
-func (sweep *ReconciliationSweep) recordProvision(
-	backendName string,
-	storageID backendidentity.ID,
-	provisions []backend.ProvisionInfo,
-) error {
-	if sweep == nil {
-		return inventory.ErrInvalidSession
-	}
-	sweep.mu.Lock()
-	defer sweep.mu.Unlock()
-	if !sweep.validLocked() || sweep.sealed.Present() || sweep.collecting != 0 {
-		return inventory.ErrInvalidSession
-	}
-	if len(provisions) != 0 {
-		sweep.positive = true
-		leaseUUIDs := make([]string, 0, len(provisions))
-		for _, provision := range provisions {
-			leaseUUIDs = append(leaseUUIDs, provision.LeaseUUID)
-		}
-		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
-			sweep.fence, backendName, inventoryPositiveProvision, leaseUUIDs,
-		); err != nil {
-			return err
-		}
-	}
-	return sweep.collection.RecordProvision(backendName, storageID, provisions)
-}
-
 // BackendInventoryDisposition is the closed outcome of consuming a paired
 // backend response. The zero value is invalid and grants no endpoint or
 // absence authority.
@@ -388,30 +359,6 @@ func (sweep *ReconciliationSweep) RejectProvisionInventory(
 	return nil
 }
 
-func (sweep *ReconciliationSweep) recordRetention(
-	backendName string,
-	storageID backendidentity.ID,
-	leaseUUIDs []string,
-) error {
-	if sweep == nil {
-		return inventory.ErrInvalidSession
-	}
-	sweep.mu.Lock()
-	defer sweep.mu.Unlock()
-	if !sweep.validLocked() || sweep.sealed.Present() || sweep.collecting != 0 {
-		return inventory.ErrInvalidSession
-	}
-	if len(leaseUUIDs) != 0 {
-		sweep.positive = true
-		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
-			sweep.fence, backendName, inventoryPositiveRetention, leaseUUIDs,
-		); err != nil {
-			return err
-		}
-	}
-	return sweep.collection.RecordRetention(backendName, storageID, leaseUUIDs)
-}
-
 // RejectRetentionInventory is the retention counterpart of
 // RejectProvisionInventory.
 func (sweep *ReconciliationSweep) RejectRetentionInventory(
@@ -446,29 +393,6 @@ func retentionLeaseUUIDs(retentions []backend.RetainedLease) []string {
 		leaseUUIDs = append(leaseUUIDs, retention.LeaseUUID)
 	}
 	return leaseUUIDs
-}
-
-func (sweep *ReconciliationSweep) recordUntrusted(
-	backendName string,
-	leaseUUIDs []string,
-) error {
-	if sweep == nil {
-		return inventory.ErrInvalidSession
-	}
-	sweep.mu.Lock()
-	defer sweep.mu.Unlock()
-	if !sweep.validLocked() || sweep.sealed.Present() || sweep.collecting != 0 {
-		return inventory.ErrInvalidSession
-	}
-	if len(leaseUUIDs) != 0 {
-		sweep.positive = true
-		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
-			sweep.fence, backendName, inventoryPositiveUntrusted, leaseUUIDs,
-		); err != nil {
-			return err
-		}
-	}
-	return sweep.collection.RecordUntrusted(backendName, leaseUUIDs)
 }
 
 // SealInventory seals this sweep's exact collection session. The snapshot is
@@ -627,7 +551,9 @@ func (sweep *ReconciliationSweep) Project(
 // incompleteRetentionPositives derives the conservative retention class from
 // the sealed aggregate. Callers choose reconciliation policy for authoritative
 // provision rows, but cannot omit a retention positive or promote it to an
-// owner merely because a peer backend failed to answer this sweep.
+// owner merely because a peer backend failed to answer this sweep. The Store
+// retains this trusted evidence class through its atomic projection so it can
+// reaffirm an existing confirmed owner without manufacturing new authority.
 func (sweep *ReconciliationSweep) incompleteRetentionPositives(
 	projection ReconciliationProjection,
 ) map[string][]string {
@@ -822,7 +748,7 @@ func (projected *ProjectedReconciliationSweep) RecoverAttempt(
 	)
 }
 
-// ReconciliationObservationDisposition reports why no live action capability
+// ReconciliationObservationDisposition reports why no lease action capability
 // was minted. It is detached output and cannot select any transition.
 type ReconciliationObservationDisposition uint8
 
@@ -834,6 +760,8 @@ const (
 	ReconciliationObservationChainLive
 	ReconciliationObservationChainUnknownState
 	ReconciliationObservationReady
+	ReconciliationObservationChainNotFound
+	ReconciliationObservationOperationBusy
 )
 
 // ObservedReconciliationAction binds one exact post-projection record, exact
@@ -925,6 +853,9 @@ func (projected *ProjectedReconciliationSweep) ObserveLiveAction(
 	observation := authority.controlPlane.observeLease(queryCtx, leaseUUID, "")
 	lease, exact := exactLeaseFromObservation(observation)
 	if !exact {
+		if _, absent := observation.(observedLeaseNotFound); absent {
+			return ObservedReconciliationAction{}, ReconciliationObservationChainNotFound, nil
+		}
 		if unknown, ok := observation.(observedLeaseUnknown); ok {
 			return ObservedReconciliationAction{}, ReconciliationObservationChainError, unknown.err
 		}
@@ -1180,7 +1111,7 @@ func (projected *ProjectedReconciliationSweep) ObserveTerminalOrphan(
 			errors.New("invalid orphan observation")
 	}
 	if projected.sweep.operations.WasInFlight(leaseUUID) {
-		return ObservedOrphanAction{}, ReconciliationObservationStale, nil
+		return ObservedOrphanAction{}, ReconciliationObservationOperationBusy, nil
 	}
 	authority := projected.sweep.coordinator
 	if err := authority.coordinator.store.leaseSideEffectError(leaseUUID); err != nil {
@@ -1208,6 +1139,9 @@ func (projected *ProjectedReconciliationSweep) ObserveTerminalOrphan(
 		leaseUUID, projected.sweep.operations,
 	)
 	if !claimResult.Acquired() {
+		if claimResult.Outcome() == operation.LeaseClaimBusy {
+			return ObservedOrphanAction{}, ReconciliationObservationOperationBusy, nil
+		}
 		return ObservedOrphanAction{}, ReconciliationObservationStale, nil
 	}
 	claim := claimResult.Claim()
@@ -1222,6 +1156,9 @@ func (projected *ProjectedReconciliationSweep) ObserveTerminalOrphan(
 	observation := authority.controlPlane.observeLease(queryCtx, leaseUUID, "")
 	lease, exact := exactLeaseFromObservation(observation)
 	if !exact {
+		if _, absent := observation.(observedLeaseNotFound); absent {
+			return ObservedOrphanAction{}, ReconciliationObservationChainNotFound, nil
+		}
 		if unknown, ok := observation.(observedLeaseUnknown); ok {
 			return ObservedOrphanAction{}, ReconciliationObservationChainError, unknown.err
 		}

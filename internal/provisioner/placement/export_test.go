@@ -1,6 +1,8 @@
 package placement
 
 import (
+	"fmt"
+
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/provisioner/inventory"
@@ -15,7 +17,27 @@ func (sweep *ReconciliationSweep) RecordProvision(
 	storageID backendidentity.ID,
 	provisions []backend.ProvisionInfo,
 ) error {
-	return sweep.recordProvision(backendName, storageID, provisions)
+	if sweep == nil {
+		return inventory.ErrInvalidSession
+	}
+	sweep.mu.Lock()
+	defer sweep.mu.Unlock()
+	if !sweep.validLocked() || sweep.sealed.Present() || sweep.collecting != 0 {
+		return inventory.ErrInvalidSession
+	}
+	if len(provisions) != 0 {
+		sweep.positive = true
+		leaseUUIDs := make([]string, 0, len(provisions))
+		for _, provision := range provisions {
+			leaseUUIDs = append(leaseUUIDs, provision.LeaseUUID)
+		}
+		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
+			sweep.fence, backendName, inventoryPositiveProvision, leaseUUIDs,
+		); err != nil {
+			return err
+		}
+	}
+	return sweep.collection.RecordProvision(backendName, storageID, provisions)
 }
 
 func (sweep *ReconciliationSweep) RecordRetention(
@@ -23,14 +45,46 @@ func (sweep *ReconciliationSweep) RecordRetention(
 	storageID backendidentity.ID,
 	leaseUUIDs []string,
 ) error {
-	return sweep.recordRetention(backendName, storageID, leaseUUIDs)
+	if sweep == nil {
+		return inventory.ErrInvalidSession
+	}
+	sweep.mu.Lock()
+	defer sweep.mu.Unlock()
+	if !sweep.validLocked() || sweep.sealed.Present() || sweep.collecting != 0 {
+		return inventory.ErrInvalidSession
+	}
+	if len(leaseUUIDs) != 0 {
+		sweep.positive = true
+		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
+			sweep.fence, backendName, inventoryPositiveRetention, leaseUUIDs,
+		); err != nil {
+			return err
+		}
+	}
+	return sweep.collection.RecordRetention(backendName, storageID, leaseUUIDs)
 }
 
 func (sweep *ReconciliationSweep) RecordUntrusted(
 	backendName string,
 	leaseUUIDs []string,
 ) error {
-	return sweep.recordUntrusted(backendName, leaseUUIDs)
+	if sweep == nil {
+		return inventory.ErrInvalidSession
+	}
+	sweep.mu.Lock()
+	defer sweep.mu.Unlock()
+	if !sweep.validLocked() || sweep.sealed.Present() || sweep.collecting != 0 {
+		return inventory.ErrInvalidSession
+	}
+	if len(leaseUUIDs) != 0 {
+		sweep.positive = true
+		if err := sweep.coordinator.coordinator.store.recordUnprojectedPositives(
+			sweep.fence, backendName, inventoryPositiveUntrusted, leaseUUIDs,
+		); err != nil {
+			return err
+		}
+	}
+	return sweep.collection.RecordUntrusted(backendName, leaseUUIDs)
 }
 
 // White-box placement tests intentionally exercise the package-private
@@ -53,6 +107,35 @@ func (s *Store) BeginInventorySession() inventoryFence {
 
 func (s *Store) EndInventorySession(fence inventoryFence) {
 	s.endInventorySession(fence, inventorySessionReport{})
+}
+
+// deleteRecord permits white-box tests to invalidate an exact record revision
+// without granting production code a deletion path around PruneAbsenceProof.
+func (s *Store) deleteRecord(revision RecordRevision) (bool, error) {
+	if !revision.Valid() || revision.issuer != s.recordIssuer {
+		return false, ErrInvalidRecordRevision
+	}
+	if err := s.reattestRuntimeAuthority(); err != nil {
+		return false, err
+	}
+	leaseUUID := revision.leaseUUID
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.restoreSourceClaimedLocked(leaseUUID) {
+		return false, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, leaseUUID)
+	}
+	if s.attemptClaimedLocked(leaseUUID) {
+		return false, fmt.Errorf("%w: lease %q", ErrAttemptClaimed, leaseUUID)
+	}
+	p, exists := s.cache[leaseUUID]
+	if !exists || p.revision != revision.value {
+		return false, nil
+	}
+	if err := s.deleteLocked(leaseUUID, "delete typed placement record"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) BindInventoryProjector(

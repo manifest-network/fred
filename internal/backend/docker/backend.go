@@ -150,6 +150,11 @@ type Backend struct {
 	// Docker, Compose, and volume writers are captured by its constructor and
 	// cannot be recovered from Backend or targeted by request handlers.
 	backgroundMaintenance *backgroundMaintenanceCoordinator
+	// Terminal receipts exclude late containers from projection but do not
+	// retain resource profiles. Recovery owns these independent pool holds until
+	// strict inventory proves the corresponding unaccounted footprint absent.
+	closedSubstrateCapacityHold *shared.ResourceAccountingHold
+	failedSubstrateCapacityHold *shared.ResourceAccountingHold
 
 	storageIdentity  backendidentity.ID
 	storageAuthority backendidentity.VerifiedStorage
@@ -634,7 +639,7 @@ func New(cfg Config, logger *slog.Logger) (*Backend, error) {
 	return newBackendWithConstructionTimeout(
 		cfg,
 		logger,
-		defaultBackendConstructionTimeout,
+		cfg.storageAttestationBudget(),
 		existingDockerStorageIdentity{},
 	)
 }
@@ -1778,14 +1783,6 @@ func managedVolumeLeaseUUID(volumeName managedVolumeName) string {
 	return managedVolumeEvidenceIdentityFromName(volumeName).leaseUUID
 }
 
-func reapingLeaseUUIDFromVolumeName(volumeName string) (string, bool) {
-	managedName, err := parseManagedVolumeName(volumeName)
-	if err != nil {
-		return "", false
-	}
-	return managedVolumeLeaseUUID(managedName), true
-}
-
 func dockerStorageInitializationProfile(
 	cfg Config,
 	paths *dockerStorageInitializationPaths,
@@ -2506,7 +2503,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("recover interrupted managed-volume mutations: %w", err)
 	}
-	volumeProofCtx, cancelVolumeProof := startupVolumeMutationContext(startupCtx)
+	volumeProofCtx, cancelVolumeProof := context.WithTimeout(startupCtx, b.startupVolumeProofBudget())
 	interruptedErr := b.volumes.RequireNoInterruptedVolumeMutations(volumeProofCtx)
 	var volumeProofErr error
 	if interruptedErr == nil {
@@ -2542,8 +2539,9 @@ func (b *Backend) Start(ctx context.Context) error {
 	// Run it before retention reconciliation: a Restoring finalizer must not read
 	// one empty/transitional Docker snapshot as rollback authority while an exact
 	// daemon-side Create accepted by the old process can still become visible.
-	// Any uncertainty keeps the Pending row and fails startup before a finalizer
-	// can tear down, rename, or hand source ownership back.
+	// Young or cleanup-pending operations retain their exact intent and pool
+	// reservation for periodic convergence. Source finalization cannot overtake
+	// that pending authority; uncertainty does not require stopping the daemon.
 	operationCtx, cancelOperations := b.startupOperationRecoveryContext(startupCtx)
 	err = b.recoverOperationIntents(operationCtx)
 	cancelOperations()
@@ -2553,8 +2551,9 @@ func (b *Backend) Start(ctx context.Context) error {
 	}
 
 	// Reconcile crash-interrupted soft-deletes and restores only after every
-	// Pending operation has become typed terminal evidence. MUST run AFTER
-	// recoverState so b.provisions reflects live containers.
+	// Pending operation has either settled or retained its exclusive durable
+	// authority for retry. MUST run AFTER recoverState so b.provisions reflects
+	// live containers; source finalization cannot overtake a pending operation.
 	retentionCtx, cancelRetention := b.startupPhaseContext(startupCtx)
 	retentionReconcileErr := b.reconcileRetentions(retentionCtx)
 	cancelRetention()
@@ -2578,6 +2577,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("reconcile startup volume quotas: %w", err)
 	}
+	b.observeUnaccountedManagedVolumes(startupCtx)
 
 	// Boot-eager reap: destroy volumes that expired while fred was offline.
 	// The periodic sweep handles ongoing reaping; this catches the gap between
@@ -3053,6 +3053,9 @@ func (b *Backend) Health(ctx context.Context) error {
 	}
 	if err := b.docker.Ping(ctx); err != nil {
 		return err
+	}
+	if b.pool != nil && b.pool.Stats().AccountingHeld {
+		return shared.ErrResourceAccountingIncomplete
 	}
 	if b.callbackStore != nil {
 		if err := b.callbackStore.Healthy(); err != nil {

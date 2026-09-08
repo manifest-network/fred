@@ -139,14 +139,11 @@ func TestLeaseActor_SurvivesHandlerPanic(t *testing.T) {
 		"ActorPanic must be invoked when a handler panics")
 
 	// Second send: must be processed — the actor survived the panic.
-	second, completion, err := NewTrackedContainerDiedObservation("c1", runtime)
+	second, err := NewContainerDiedObservation("c1", runtime)
 	require.NoError(t, err)
 	require.True(t, actor.TryEnqueueObservation(second))
-	select {
-	case <-completion.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor did not process a message after recovering from panic")
-	}
+	require.Eventually(t, func() bool { return inspectCalls.Load() == 2 },
+		2*time.Second, time.Millisecond, "actor did not process a message after recovering from panic")
 }
 
 // TestLeaseActor_DrainsTerminalEventsOnShutdown pins the structural

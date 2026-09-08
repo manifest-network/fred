@@ -790,34 +790,6 @@ func TestBackend_ShutdownDrainsAllActors(t *testing.T) {
 	assert.Equal(t, 0, remaining, "b.actors must be empty after full shutdown drain")
 }
 
-// TestHandleContainerDeath_ShutdownDoesNotHang guards the sync shim's
-// stopCtx branch: once the backend is shutting down, the shim must return
-// promptly instead of blocking on a done channel the actor will never close.
-func TestHandleContainerDeath_ShutdownDoesNotHang(t *testing.T) {
-	mock := &mockDockerClient{}
-
-	b := newBackendForTest(mock, map[string]*provision{
-		durableCallbackTestLeaseUUID: {ProvisionState: leasesm.ProvisionState{LeaseUUID: durableCallbackTestLeaseUUID,
-			ContainerIDs: []string{"c1"},
-			Status:       backend.ProvisionStatusReady},
-		},
-	})
-
-	b.stopCancel()
-
-	returned := make(chan struct{})
-	go func() {
-		b.handleContainerDeath("c1")
-		close(returned)
-	}()
-
-	select {
-	case <-returned:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("handleContainerDeath did not return within 500ms after shutdown")
-	}
-}
-
 // TestHandlerPanic_UnblocksReplyChannel pins the invariant that a panic
 // inside the actor's message-handler dispatch does NOT leave the caller
 // blocked on their reply/ack channel forever. Before the onPanic hook

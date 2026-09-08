@@ -188,8 +188,9 @@ func (r *Reconciler) projectPlacementInventory(
 	// the conservative behavior; a later complete sweep backfills anything
 	// skipped during an outage. On an incomplete sweep ReconciliationSweep owns
 	// the classification: it derives every retention reporter from its sealed
-	// snapshot and projects a lease-local durable quarantine. The reconciler
-	// cannot omit that fact or accidentally promote it to an owner.
+	// snapshot. The Store reaffirms an existing confirmed owner on the same
+	// backend, while new or contradictory affinity becomes a lease-local durable
+	// quarantine. The reconciler cannot omit that fact or promote a new owner.
 	if inventoryComplete {
 		// Active provisions take precedence if a stale retention races a fresh
 		// provision.

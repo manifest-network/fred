@@ -598,9 +598,10 @@ type contextBlockingBackend struct {
 
 type perLeaseBlockingBackend struct {
 	backend.Backend
-	name  string
-	mu    sync.Mutex
-	calls []string
+	name    string
+	mu      sync.Mutex
+	calls   []string
+	entered chan struct{}
 }
 
 func (fake *perLeaseBlockingBackend) Name() string { return fake.name }
@@ -612,6 +613,9 @@ func (fake *perLeaseBlockingBackend) Restart(
 	fake.mu.Lock()
 	fake.calls = append(fake.calls, request.LeaseUUID)
 	fake.mu.Unlock()
+	if fake.entered != nil {
+		fake.entered <- struct{}{}
+	}
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -767,9 +771,6 @@ func TestNewServiceRejectsMissingAndTypedNilRequiredDependencies(t *testing.T) {
 		"coordinator": func(config *Config) { config.Coordinator = nil },
 		"typed-nil coordinator": func(config *Config) {
 			config.Coordinator = typedNilCoordinator
-		},
-		"negative recovery timeout": func(config *Config) {
-			config.RecoveryTimeout = -time.Nanosecond
 		},
 	}
 	for name, invalidate := range tests {
@@ -1346,13 +1347,14 @@ func TestRecoveryTimeoutBoundsContextAwareBackendAndRetainsPendingFence(t *testi
 		t, reopened, chain, fakeRouter{backend: blocking}, nil,
 	)
 	recovered, err := NewService(Config{
-		Coordinator:     coordinator,
-		RecoveryTimeout: 100 * time.Millisecond,
+		Coordinator: coordinator,
 	})
 	require.NoError(t, err)
 
 	recoveryDone := make(chan error, 1)
-	go func() { recoveryDone <- recovered.RecoverPending(t.Context()) }()
+	recoveryCtx, cancelRecovery := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancelRecovery()
+	go func() { recoveryDone <- recovered.RecoverPending(recoveryCtx) }()
 	select {
 	case <-blocking.entered:
 	case <-time.After(time.Second):
@@ -1362,7 +1364,7 @@ func TestRecoveryTimeoutBoundsContextAwareBackendAndRetainsPendingFence(t *testi
 	case recoveryErr := <-recoveryDone:
 		require.ErrorIs(t, recoveryErr, context.DeadlineExceeded)
 	case <-time.After(2 * time.Second):
-		t.Fatal("configured recovery timeout did not bound a context-aware backend")
+		t.Fatal("recovery deadline did not bound a context-aware backend")
 	}
 	assert.Equal(t, 1, blocking.restartCount())
 	record, found, lookupErr := reopened.LookupMaintenanceCommand(testLeaseA, id)
@@ -1527,23 +1529,39 @@ func TestRecoveryAfterRestartRotatesPastRepeatedlyStalledLease(t *testing.T) {
 	path, leaseUUIDs := preparePendingMaintenanceCommands(t, pendingCount)
 	reopened := reopenPlacementAuthority(t, path)
 	t.Cleanup(func() { _ = reopened.Close() })
-	blocking := &perLeaseBlockingBackend{name: "backend-a"}
+	blocking := &perLeaseBlockingBackend{name: "backend-a", entered: make(chan struct{}, 1)}
 	chain := testChain(leaseUUIDs...)
 	service, err := NewService(Config{
 		Coordinator: maintenanceCoordinatorForTest(
 			t, reopened, chain,
 			fakeRouter{backend: blocking}, nil,
 		),
-		RecoveryTimeout: 25 * time.Millisecond,
 	})
 	require.NoError(t, err)
 
 	for pass := range pendingCount {
-		recoveryErr := service.RecoverPending(t.Context())
-		require.ErrorIs(t, recoveryErr, context.DeadlineExceeded)
+		recoveryCtx, cancelRecovery := context.WithCancel(t.Context())
+		t.Cleanup(cancelRecovery)
+		done := make(chan error, 1)
+		go func() { done <- service.RecoverPending(recoveryCtx) }()
+		// Cancel only once the selected command is actually stalled. A tiny
+		// wall-clock deadline could expire during journal reads under load,
+		// before this test exercised the cursor or backend at all.
+		select {
+		case <-blocking.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("recovery did not dispatch the next retained command")
+		}
+		cancelRecovery()
+		select {
+		case recoveryErr := <-done:
+			require.ErrorIs(t, recoveryErr, context.Canceled)
+		case <-time.After(5 * time.Second):
+			t.Fatal("canceled recovery did not release its stalled backend call")
+		}
 		calls := blocking.calledLeases()
 		require.Len(t, calls, pass+1,
-			"one shared lane deadline must permit only one fully stalled call per cadence")
+			"a canceled lane must leave later commands for the next cadence")
 	}
 	assert.ElementsMatch(t, leaseUUIDs, blocking.calledLeases(),
 		"the post-restart cursor must advance past every repeatedly stalled lease")

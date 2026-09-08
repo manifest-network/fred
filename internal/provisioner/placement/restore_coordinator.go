@@ -166,10 +166,10 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 			disposition: RestoreApplicationSourceNotFound,
 			err:         errors.New("restore source is not owned by the authenticated tenant and provider"),
 		}
-	case observedLeaseUnknown:
+	case observedLeaseUnknown, observedLeaseNotFound:
 		return RestoreApplicationResult{
 			disposition: RestoreApplicationSourceUnavailable,
-			err:         fmt.Errorf("read restore source lease: %w", observed.err),
+			err:         fmt.Errorf("read restore source lease: %w", exactLeaseObservationError(observed)),
 		}
 	default:
 		return RestoreApplicationResult{
@@ -233,10 +233,10 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 			disposition: RestoreApplicationInvalid,
 			err:         errors.New("restore request is not authorized for current target lease"),
 		}
-	case observedLeaseUnknown:
+	case observedLeaseUnknown, observedLeaseNotFound:
 		return RestoreApplicationResult{
 			disposition: RestoreApplicationServiceUnavailable,
-			err:         fmt.Errorf("read restore target lease: %w", target.err),
+			err:         fmt.Errorf("read restore target lease: %w", exactLeaseObservationError(target)),
 		}
 	default:
 		return RestoreApplicationResult{

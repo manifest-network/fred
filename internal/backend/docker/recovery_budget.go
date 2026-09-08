@@ -18,6 +18,14 @@ const defaultRecoveryDockerReadTimeout = 30 * time.Second
 // wedged Docker identity read into a process-lifetime startup hang.
 const defaultBackendConstructionTimeout = defaultRecoveryDockerReadTimeout
 
+func (cfg Config) storageAttestationBudget() time.Duration {
+	return cmp.Or(cfg.StorageAttestationTimeout, defaultBackendConstructionTimeout)
+}
+
+func (b *Backend) startupVolumeProofBudget() time.Duration {
+	return max(defaultStartupVolumeMutationTimeout, b.cfg.storageAttestationBudget())
+}
+
 const (
 	// A fleet may require many idempotent recovery and stopped-adoption steps, so
 	// startup gets a generous process-independent budget. Exhaustion is a typed
@@ -59,7 +67,7 @@ func (b *Backend) startupRecoveryBudget() time.Duration {
 	phaseBudget := b.startupPhaseBudget()
 	return saturatingDurationSum(
 		defaultStartupVolumeMutationTimeout, // recover interrupted mutations
-		defaultStartupVolumeMutationTimeout, // prove the clean volume inventory
+		b.startupVolumeProofBudget(),        // prove the clean volume inventory
 		defaultStartupRecoveryTimeout,       // rebuild Docker and durable state
 		b.startupOperationRecoveryBudget(),  // operation-intent convergence
 		phaseBudget,                         // retention reconciliation

@@ -76,18 +76,6 @@ func resolvedProvisionAllocations(
 	return ids, allocations, nil
 }
 
-// replacementProvisionFailureRecovery is an unforgeable-by-callers marker
-// carried only by the Provision admission path after it has torn down a Failed
-// predecessor and published the candidate generation. A candidate can reuse
-// the predecessor's canonical volumes, so ordinary fresh-provision cleanup
-// cannot infer that createdVolumeIDs==0 means no durable bytes remain.
-//
-// On failure the worker retains the candidate intent/reservation and stops the
-// backend. Cold recovery can then use the candidate intent plus the older
-// active Release to rebuild the predecessor without exposing free capacity in
-// the interim.
-type replacementProvisionFailureRecovery struct{}
-
 // Provision starts async provisioning of containers.
 // For multi-unit leases (quantity > 1), multiple containers are created.
 // For multi-SKU leases, containers are created with the appropriate profile for each SKU.
@@ -253,10 +241,9 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 		))
 	}
 
-	// Build the complete candidate reservation before touching the predecessor.
-	// The reservation is also this lease's ownership claim on its canonical
-	// volumes, so every publish carries Items and immutable sizing together.
-	var prevFailCount int
+	// A fresh reservation publishes the canonical-volume ownership claim with
+	// its complete topology and sizing. A failed predecessor remains intact until
+	// its actor accepts the command and the Started executor replaces it.
 	var oldProvision *provision
 	var oldSnapshot recoveredProvision
 	b.provisionsMu.Lock()
@@ -270,37 +257,36 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 		// after dropping provisionsMu comes from this deep snapshot: actors and
 		// cleanup paths intentionally mutate published provisions in place.
 		oldSnapshot = recoveredFromProvision(existing)
-		prevFailCount = oldSnapshot.FailCount
 		oldProvision = existing
 	}
-	candidate := recoveredProvision{ //exhaustruct:enforce
-		ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
-			LeaseUUID:    req.LeaseUUID,
-			Tenant:       req.Tenant,
-			ProviderUUID: req.ProviderUUID,
-			SKU:          "", // set by enrichReserved after validation
-			Status:       backend.ProvisionStatusProvisioning,
-			Quantity:     totalQuantity,
-			CreatedAt:    time.Now(),
-			FailCount:    prevFailCount,
-			LastError:    "",
-			Reason:       "", // fresh reservation, no failure
-			Message:      "",
-			// Both routes are stored at reservation time so any failure or
-			// deprovision racing the validation window resolves the correct
-			// exact or observational capability from the map.
-			CallbackURL:          req.CallbackURL,
-			LifecycleCallbackURL: req.LifecycleCallbackURL,
-			ActiveReleaseVersion: 0,
-			ActiveOperationID:    shared.OperationID{},
-			Items:                slices.Clone(req.Items), // the ownership claim; see above
-			ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
-			ContainerIDs:         make([]string, 0, totalQuantity),
-			StackManifest:        nil, // set by enrichReserved
-			ServiceContainers:    nil,
-		},
-	}.materialize()
 	if oldProvision == nil {
+		candidate := recoveredProvision{ //exhaustruct:enforce
+			ProvisionState: leasesm.ProvisionState{ //exhaustruct:enforce
+				LeaseUUID:    req.LeaseUUID,
+				Tenant:       req.Tenant,
+				ProviderUUID: req.ProviderUUID,
+				SKU:          "", // set by enrichReserved after validation
+				Status:       backend.ProvisionStatusProvisioning,
+				Quantity:     totalQuantity,
+				CreatedAt:    time.Now(),
+				FailCount:    0,
+				LastError:    "",
+				Reason:       "", // fresh reservation, no failure
+				Message:      "",
+				// Both routes are stored at reservation time so any failure or
+				// deprovision racing the validation window resolves the correct
+				// exact or observational capability from the map.
+				CallbackURL:          req.CallbackURL,
+				LifecycleCallbackURL: req.LifecycleCallbackURL,
+				ActiveReleaseVersion: 0,
+				ActiveOperationID:    shared.OperationID{},
+				Items:                slices.Clone(req.Items), // the ownership claim; see above
+				ResourceProfiles:     shared.CloneSKUResourceSnapshot(resourceProfiles),
+				ContainerIDs:         make([]string, 0, totalQuantity),
+				StackManifest:        nil, // set by enrichReserved
+				ServiceContainers:    nil,
+			},
+		}.materialize()
 		b.provisions[req.LeaseUUID] = candidate
 	}
 	b.provisionsMu.Unlock()
@@ -429,42 +415,9 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 			))
 		}
 
-		/* Physical predecessor teardown and reservation replacement now occur in
-		the construction-bound handler after StartOperationExecution.
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		remaining, teardownErr := b.teardownLeaseContainers(
-			cleanupCtx, req.LeaseUUID, classification.currentIDs, 10*time.Second,
-			teardownOpProvisionCleanup, logger,
-		)
-		cleanupCancel()
-		if teardownErr != nil || len(remaining) != 0 {
-			cleanupErr := teardownErr
-			if cleanupErr == nil {
-				cleanupErr = fmt.Errorf("predecessor teardown left %d container(s)", len(remaining))
-			}
-			return b.latchAmbiguousOperationOutcome("replace failed provision predecessor", cleanupErr)
-		}
-
-		b.provisionsMu.Lock()
-		if b.provisions[req.LeaseUUID] != oldProvision ||
-			!provisionMatchesRecovered(oldProvision, oldSnapshot) {
-			b.provisionsMu.Unlock()
-			return b.latchAmbiguousOperationOutcome(
-				"publish replacement provision reservation",
-				errors.New("failed predecessor projection changed during teardown"),
-			)
-		}
-		if replaceErr := b.pool.ReplaceResolvedAll(
-			predecessorAllocationIDs, replacementAllocations, req.Tenant,
-		); replaceErr != nil {
-			b.provisionsMu.Unlock()
-			return b.refuseOperationIntent(intent,
-				fmt.Errorf("%w: %w", backend.ErrInsufficientResources, replaceErr))
-		}
-		b.provisions[req.LeaseUUID] = candidate
-		b.provisionsMu.Unlock()
-		logger.Info("replacing failed provision", "fail_count", prevFailCount)
-		*/
+		// The actor publishes Provisioning before acknowledging the command.
+		// Physical teardown and reservation replacement belong to the Started
+		// executor, which retains the predecessor authority throughout them.
 	} else {
 		for i, allocation := range replacementAllocations {
 			if err := b.pool.TryAllocateResolved(
@@ -527,10 +480,9 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	// enqueued, cancellation is an unknown outcome: preserve the intent,
 	// reservation, and allocation for worker completion or startup recovery.
 	//
-	// The candidate allocation MUST be rolled back if the worker never starts.
-	// A fresh provision drops it; a re-provision atomically restores the
-	// predecessor allocation and Failed projection because its active Release
-	// and reusable volumes remain authoritative after the old cohort teardown.
+	// An explicitly rejected fresh command releases its reservation. A rejected
+	// replacement command has not crossed Started, so its failed predecessor and
+	// allocation remain unchanged.
 	acceptance, err := b.awaitAsyncAcceptance(ctx, ack.Result())
 	switch acceptance {
 	case asyncAcceptanceAccepted:
@@ -1032,7 +984,6 @@ func (b *Backend) doProvisionPhysical(
 	req backend.ProvisionRequest,
 	stack *manifest.StackManifest,
 	resourceProfiles []shared.SKUResourceSnapshot,
-	replacementRecovery *replacementProvisionFailureRecovery,
 	logger *slog.Logger,
 ) (errRet error) {
 	if mutations == nil {
@@ -1084,10 +1035,6 @@ func (b *Backend) doProvisionPhysical(
 			cleanupErr := tdErr
 			if cleanupErr == nil && len(remaining) != 0 {
 				cleanupErr = fmt.Errorf("container teardown left %d container(s)", len(remaining))
-			}
-			if replacementRecovery != nil {
-				cleanupErr = errors.Join(cleanupErr,
-					errors.New("replacement provision requires cold predecessor recovery"))
 			}
 			errRet = errors.Join(&physicalOperationError{callback: callbackErr, reason: failReason, cause: err}, cleanupErr)
 			updateResourceMetrics(b.pool.Stats())

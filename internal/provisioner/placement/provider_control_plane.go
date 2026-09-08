@@ -45,19 +45,21 @@ type CallbackAcknowledger interface {
 }
 
 // exactLeaseObservation is a sealed sum. A mutation decision can consume an
-// exact lease, a positive authority mismatch, or uncertainty. Ledger history
-// is immutable, so NotFound, nil, and wrong-UUID responses are all uncertainty
-// rather than authority to retire durable evidence.
+// exact lease, a positive authority mismatch, an absent response, or a failed
+// read. Ledger history is immutable, so absence never grants authority to
+// retire durable evidence, but it remains distinct from a transient read error.
 type exactLeaseObservation interface {
 	exactLeaseObservation()
 }
 
 type observedExactLease struct{ lease billingtypes.Lease }
 type observedLeaseUnauthorized struct{ lease billingtypes.Lease }
+type observedLeaseNotFound struct{}
 type observedLeaseUnknown struct{ err error }
 
 func (observedExactLease) exactLeaseObservation()        {}
 func (observedLeaseUnauthorized) exactLeaseObservation() {}
+func (observedLeaseNotFound) exactLeaseObservation()     {}
 func (observedLeaseUnknown) exactLeaseObservation()      {}
 
 type boundProviderControlPlane struct {
@@ -125,7 +127,7 @@ func (control *boundProviderControlPlane) observeLease(
 		return observedLeaseUnknown{err: err}
 	}
 	if lease == nil {
-		return observedLeaseUnknown{err: errors.New("exact lease observation returned no result")}
+		return observedLeaseNotFound{}
 	}
 	if lease.Uuid != leaseUUID {
 		return observedLeaseUnknown{
@@ -156,6 +158,8 @@ func exactLeaseObservationError(observation exactLeaseObservation) error {
 		return nil
 	case observedLeaseUnauthorized:
 		return errors.New("lease observation is outside the bound tenant or provider authority")
+	case observedLeaseNotFound:
+		return fmt.Errorf("exact lease observation returned no result: %w", billingtypes.ErrLeaseNotFound)
 	case observedLeaseUnknown:
 		if observation.err != nil {
 			return observation.err

@@ -163,8 +163,8 @@ func (authority *MaintenanceCoordinator) authorizeCurrentLease(
 	switch observation := authority.controlPlane.observeLease(readCtx, leaseUUID, tenant).(type) {
 	case observedLeaseUnauthorized:
 		return MaintenanceAuthorizationRevoked, nil
-	case observedLeaseUnknown:
-		return MaintenanceAuthorizationInvalid, observation.err
+	case observedLeaseUnknown, observedLeaseNotFound:
+		return MaintenanceAuthorizationInvalid, exactLeaseObservationError(observation)
 	case observedExactLease:
 		switch observation.lease.State {
 		case billingtypes.LEASE_STATE_ACTIVE:

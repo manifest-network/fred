@@ -87,7 +87,6 @@ type EventSink interface {
 type Config struct {
 	Coordinator *placement.RestoreCoordinator
 	Events      EventSink
-	Now         func() time.Time
 }
 
 // Service maps the construction-bound restore application's closed result to
@@ -95,7 +94,6 @@ type Config struct {
 type Service struct {
 	coordinator *placement.RestoreCoordinator
 	events      EventSink
-	now         func() time.Time
 }
 
 // NewService validates the capability graph up front. A partially wired
@@ -105,10 +103,6 @@ func NewService(config Config) (*Service, error) {
 		return nil, errors.New("restore chain/runtime-bound coordinator is required")
 	}
 
-	now := config.Now
-	if now == nil {
-		now = time.Now
-	}
 	events := config.Events
 	if util.IsNilInterface(events) {
 		events = nil
@@ -116,7 +110,6 @@ func NewService(config Config) (*Service, error) {
 	return &Service{
 		coordinator: config.Coordinator,
 		events:      events,
-		now:         now,
 	}, nil
 }
 
@@ -171,7 +164,7 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 			backend.LeaseStatusEvent{
 				LeaseUUID: command.TargetLeaseUUID,
 				Status:    backend.ProvisionStatusFailed, Error: "restore did not start",
-				Timestamp: service.now(),
+				Timestamp: time.Now(),
 			})
 	}
 	return result

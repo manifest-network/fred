@@ -788,7 +788,7 @@ func TestRecoverState_DefersProjectionReplacementWhileActorIsActive(t *testing.T
 	original := b.provisions[leaseUUID]
 	allocationID := leaseUUID + "-app-0"
 	require.NoError(t, b.pool.TryAllocate(allocationID, "docker-small", "tenant-a"))
-	observation, completion := mustTrackedContainerDiedObservation(t, "container-1", runtime)
+	observation := mustContainerDiedObservation(t, "container-1", runtime)
 	require.True(t, b.routeActorObservation(observation))
 	<-inspectionStarted
 
@@ -809,11 +809,7 @@ func TestRecoverState_DefersProjectionReplacementWhileActorIsActive(t *testing.T
 		"deferring the projection must preserve the actor-owned pool generation too")
 
 	close(releaseInspection)
-	select {
-	case <-completion.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("observation did not complete")
-	}
+	awaitProvisionWorkerQuiescence(t, b, leaseUUID)
 }
 
 func TestRecoverState_ReadyFromRunningContainers(t *testing.T) {

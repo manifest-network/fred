@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -20,7 +19,6 @@ type operationSpec struct {
 	tenant    string
 	items     []backend.LeaseItem
 	backend   string
-	startedAt time.Time
 	kind      Kind
 }
 

@@ -14,7 +14,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
-	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
 const (
@@ -393,9 +392,10 @@ func TestRecoverState_ClosedLeaseReceiptRejectsDivergentPrincipal(t *testing.T) 
 	closeCloseRecoveryBackend(t, b, stores)
 }
 
-func TestRecoverState_ClosedLeaseRemovalFailureRetriesAfterRestart(t *testing.T) {
+func TestRecoverState_ClosedLeaseRemovalFailureRetriesWithoutRestart(t *testing.T) {
 	dir := t.TempDir()
 	visible := false
+	removalBlocked := true
 	lateContainer := ContainerInfo{
 		ContainerID:  "late-remove-failure",
 		LeaseUUID:    closeRecoveryLeaseUUID,
@@ -405,6 +405,7 @@ func TestRecoverState_ClosedLeaseRemovalFailureRetriesAfterRestart(t *testing.T)
 		SKU:          "docker-small",
 	}
 	firstMock := &mockDockerClient{
+		PingFn: func(context.Context) error { return nil },
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			if !visible {
 				return nil, nil
@@ -412,7 +413,11 @@ func TestRecoverState_ClosedLeaseRemovalFailureRetriesAfterRestart(t *testing.T)
 			return []ContainerInfo{lateContainer}, nil
 		},
 		RemoveContainerFn: func(context.Context, string) error {
-			return errors.New("injected late-container removal failure")
+			if removalBlocked {
+				return errors.New("injected late-container removal failure")
+			}
+			visible = false
+			return nil
 		},
 	}
 	b, stores := openCloseRecoveryBackend(t, dir, firstMock, nil)
@@ -420,16 +425,25 @@ func TestRecoverState_ClosedLeaseRemovalFailureRetriesAfterRestart(t *testing.T)
 	completeDestroyedCloseForTest(t, b, stores.close, claim)
 
 	visible = true
-	err := b.recoverState(context.Background())
-	require.ErrorContains(t, err, "injected late-container removal failure")
-	require.ErrorContains(t, err, "backend mutation outcome is ambiguous")
+	require.NoError(t, b.recoverState(context.Background()))
+	require.NoError(t, b.stopCtx.Err(), "ordinary cleanup failure must not stop the backend")
+	require.NoError(t, b.terminalStorageAuthorityError())
+	require.True(t, b.pool.Stats().AccountingHeld)
+	require.Zero(t, b.pool.Stats().AvailableCPU())
+	require.Zero(t, b.pool.Stats().AvailableMemoryMB())
+	require.Zero(t, b.pool.Stats().AvailableDiskMB())
+	require.ErrorIs(t, b.Health(context.Background()), shared.ErrResourceAccountingIncomplete)
 	b.provisionsMu.RLock()
 	_, projected := b.provisions[closeRecoveryLeaseUUID]
 	b.provisionsMu.RUnlock()
 	require.False(t, projected, "failed cleanup must never republish a closed UUID")
-	_, receiptErr := stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
-	require.ErrorIs(t, receiptErr, backendidentity.ErrMutationOutcomeAmbiguous,
-		"an ambiguous physical result must revoke same-process journal reads")
+	receipts, receiptErr := stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
+	require.NoError(t, receiptErr)
+	require.Len(t, receipts, 1, "retry authority remains readable in the same process")
+	removalBlocked = false
+	require.NoError(t, b.recoverState(context.Background()))
+	require.False(t, b.pool.Stats().AccountingHeld)
+	require.NoError(t, b.Health(context.Background()))
 	closeCloseRecoveryBackend(t, b, stores)
 
 	late := true
@@ -448,7 +462,7 @@ func TestRecoverState_ClosedLeaseRemovalFailureRetriesAfterRestart(t *testing.T)
 		},
 	}
 	b, stores = openCloseRecoveryBackend(t, dir, retryMock, nil)
-	receipts, receiptErr := stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
+	receipts, receiptErr = stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
 	require.NoError(t, receiptErr)
 	require.Len(t, receipts, 1, "failed cleanup must retain permanent retry authority")
 	require.NoError(t, b.recoverState(context.Background()))
@@ -490,8 +504,10 @@ func TestRecoverState_ClosedLeasePersistentSurvivorRetriesAfterRestart(t *testin
 	completeDestroyedCloseForTest(t, b, stores.close, claim)
 
 	visible = true
-	err := b.recoverState(context.Background())
-	require.ErrorContains(t, err, "closed-lease substrate remained after two cleanup passes")
+	require.NoError(t, b.recoverState(context.Background()))
+	require.NoError(t, b.stopCtx.Err())
+	require.True(t, b.pool.Stats().AccountingHeld,
+		"two disproved removes retain the footprint without terminating recovery")
 	require.Equal(t, 2, removeCalls)
 	receipts, receiptErr := stores.callbacks.LookupClosedLeaseReceipts([]string{closeRecoveryLeaseUUID})
 	require.NoError(t, receiptErr)

@@ -9,6 +9,53 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
+type terminalReceiptKind string
+
+const (
+	terminalReceiptClosed terminalReceiptKind = "closed"
+	terminalReceiptFailed terminalReceiptKind = "failed_operation"
+)
+
+// observeTerminalSubstrate publishes exclusion and accounting together. A
+// compact terminal receipt cannot size a late container: its release may have
+// been deleted or superseded. Withhold capacity instead of reconstructing a
+// fictitious resource allocation from mutable SKU configuration. Each receipt
+// family owns a separate pool-issued hold, so one empty observation cannot
+// release another family's pending footprint. recoverMu serializes observers.
+func (b *Backend) observeTerminalSubstrate(kind terminalReceiptKind, count int) {
+	var owner **shared.ResourceAccountingHold
+	switch kind {
+	case terminalReceiptClosed:
+		owner = &b.closedSubstrateCapacityHold
+	case terminalReceiptFailed:
+		owner = &b.failedSubstrateCapacityHold
+	default:
+		return
+	}
+	if count > 0 && *owner == nil {
+		hold := b.pool.HoldUnaccountedFootprint()
+		*owner = &hold
+	} else if count == 0 && *owner != nil {
+		(*owner).Release()
+		*owner = nil
+	}
+	terminalSubstratePendingContainers.WithLabelValues(string(kind)).Set(float64(count))
+}
+
+// deferTerminalSubstrateCleanup retains the permanent receipt and its pool
+// exclusion for the next sweep. Ordinary idempotent removal failure cannot
+// invalidate durable authority. The mutation bracket independently latches
+// actual storage-identity loss, and that stronger failure still propagates.
+func (b *Backend) deferTerminalSubstrateCleanup(kind terminalReceiptKind, cause error) error {
+	if err := b.terminalStorageAuthorityError(); err != nil {
+		return err
+	}
+	terminalSubstrateCleanupRetriesTotal.WithLabelValues(string(kind)).Inc()
+	b.logger.Warn("terminal substrate cleanup remains pending",
+		"receipt", kind, "error", cause)
+	return nil
+}
+
 // recoverClosedLeaseSubstrate enforces permanent UUID retirement at the
 // Docker boundary. Close success is not a one-shot absence assertion: a
 // daemon-side Create accepted before close may surface later. The sealed
@@ -43,21 +90,21 @@ func (b *Backend) recoverClosedLeaseSubstrateUsing(
 		if targetErr != nil {
 			return nil, targetErr
 		}
+		b.observeTerminalSubstrate(terminalReceiptClosed, len(targets))
 		if len(targets) == 0 {
 			return closedLeases, nil
 		}
 		if observation == 2 {
-			return nil, fmt.Errorf("closed-lease substrate remained after two cleanup passes")
+			return closedLeases, b.deferTerminalSubstrateCleanup(terminalReceiptClosed,
+				fmt.Errorf("closed-lease substrate remained after two cleanup passes"))
 		}
 		for _, target := range targets {
 			removeCtx, cancelRemove := context.WithTimeout(ctx, 10*time.Second)
 			removeErr := removeContainer(removeCtx, target.ContainerID)
 			cancelRemove()
 			if removeErr != nil {
-				return nil, b.latchAmbiguousOperationOutcome(
-					fmt.Sprintf("remove late substrate for closed lease %q", target.LeaseUUID),
-					removeErr,
-				)
+				return closedLeases, b.deferTerminalSubstrateCleanup(terminalReceiptClosed,
+					fmt.Errorf("remove late substrate for closed lease %q: %w", target.LeaseUUID, removeErr))
 			}
 			b.logger.Warn("removed late container for permanently closed lease",
 				"lease_uuid", target.LeaseUUID,

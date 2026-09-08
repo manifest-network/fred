@@ -80,7 +80,6 @@ const (
 	destroySiteDeprovisionDestroy = "deprovision_destroy" // doDeprovision's non-retain arm
 	destroySiteDeprovisionReclaim = "deprovision_reclaim" // doDeprovision's writable-path-only reclaim (ENG-406)
 	destroySiteRetentionRefused   = "retention_refused"   // destroyOnRefuseToRetain, a breached retained-disk cap
-	destroySiteProvisionCleanup   = "provision_cleanup"   // doProvision's failure defer
 	destroySiteReaping            = "reaping"             // destroyReapingVolumes, the retention finalizer
 )
 
@@ -103,7 +102,7 @@ const (
 var (
 	destroySites = []string{
 		destroySiteDeprovisionDestroy, destroySiteDeprovisionReclaim, destroySiteRetentionRefused,
-		destroySiteProvisionCleanup, destroySiteReaping,
+		destroySiteReaping,
 	}
 	destroyRefusedReasons = []string{destroyRefusedClaimed, destroyRefusedUnreadable, destroyRefusedNoDestroyer}
 )
@@ -113,20 +112,14 @@ var (
 // job (ENG-647). Kept as constants so the call sites, the pre-init, and the tests
 // cannot drift on a typo.
 //
-// The operations split into three kinds, and the distinction is what an alert must key
-// on. BLOCKING operations keep the lease tracked and retry. FAIL-STOP recovery retains
-// the provision intent, reservation, and claims, suppresses settlement, and requires a
-// fresh Start. The one ADVISORY prelude lets state advance. Mixing them under one label
-// would make the wedge case unqueryable.
+// All current paths retain exact authority and accounting on failed cleanup.
+// Ordinary durable recovery retries in-process. An ambiguous live provision
+// worker can still fail-stop; its next process resumes from the retained intent.
 const (
 	// Blocking.
 	teardownOpRestoreReconcile = "restore_reconcile" // reconcileRestoring's orphaned arm (boot + retention sweep)
-	teardownOpRestoreRollback  = "restore_rollback"  // rollbackRestoreAdoption, worker arm: teardown blocks the rollback
 	teardownOpDeprovision      = "deprovision"       // doDeprovision's close-path teardown
-	// Fail-stop recovery.
-	teardownOpProvisionCleanup = "provision_cleanup" // failed provision retains its WAL and accounting for cold recovery
-	// Advisory.
-	teardownOpRestorePrelude = "restore_prelude" // rollbackRestoreAdoption, dropProvision arm: the rollback completes regardless
+	teardownOpProvisionCleanup = "provision_cleanup" // failed provision retains its WAL and accounting for recovery
 
 	teardownOutcomeRecovered = "recovered" // fallback removed every container it found
 	teardownOutcomeFailed    = "failed"    // a container may still be running (removal or discovery failed)
@@ -137,8 +130,7 @@ const (
 // Down failure — which, on a healthy provider, may be never.
 var (
 	teardownOperations = []string{
-		teardownOpRestoreReconcile, teardownOpRestoreRollback, teardownOpDeprovision,
-		teardownOpRestorePrelude, teardownOpProvisionCleanup,
+		teardownOpRestoreReconcile, teardownOpDeprovision, teardownOpProvisionCleanup,
 	}
 	teardownOutcomes = []string{teardownOutcomeRecovered, teardownOutcomeFailed}
 )
@@ -172,12 +164,10 @@ var capChecks = []string{capCheckEvict, capCheckBreach, capCheckBound, capCheckR
 
 const (
 	operationRecoveryTimeoutProvision = "provision_timeout"
-	operationRecoveryTimeoutStart     = "container_start_timeout"
 )
 
 var operationRecoveryTimeoutReasons = []string{
 	operationRecoveryTimeoutProvision,
-	operationRecoveryTimeoutStart,
 }
 
 var (
@@ -265,6 +255,31 @@ var (
 		Name:      "operation_intent_recovery_timeout_exhaustions_total",
 		Help:      "Bounded cold-recovery timeouts exhausted by interrupted exact provision intents, by timeout; retries are counted again",
 	}, []string{"reason"})
+
+	// Started operation intents retain their full recovery and resource authority
+	// while idempotent cleanup awaits a later pass.
+	operationIntentRecoveryCleanupRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "operation_intent_recovery_cleanup_retries_total",
+		Help:      "Interrupted operation cleanup passes deferred with their exact durable intent and resource reservation retained",
+	}, []string{"kind"})
+
+	// Terminal receipts retain cleanup authority after their resource snapshots
+	// are retired. These metrics expose the associated capacity exclusions.
+	terminalSubstratePendingContainers = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "terminal_substrate_pending_containers",
+		Help:      "Last observed late containers excluded by permanent terminal receipts; nonzero withholds unaccounted resource capacity until a strict absence observation",
+	}, []string{"receipt"})
+
+	terminalSubstrateCleanupRetriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "terminal_substrate_cleanup_retries_total",
+		Help:      "Terminal-receipt cleanup passes deferred for periodic retry, by receipt authority",
+	}, []string{"receipt"})
 
 	// pendingCloseIntents is the aggregate number of non-expiring destructive
 	// close finalizers in callbacks.db. It intentionally carries no lease label:
@@ -389,6 +404,20 @@ var (
 		Name:      "restore_total",
 		Help:      "Total number of restore re-deploy worker attempts by outcome",
 	}, []string{"outcome"})
+
+	unaccountedManagedVolumes = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "unaccounted_managed_volumes",
+		Help:      "Last observed managed volumes absent from provision, admitted-operation, and retention footprints; diagnostic only",
+	})
+
+	unaccountedManagedVolumeObservationFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Name:      "unaccounted_managed_volume_observation_failures_total",
+		Help:      "Failed read-only volume accounting observations; the last volume count is preserved",
+	})
 
 	// volumeQuotaBackfillTotal counts per-volume quota re-application attempts by
 	// the startup reconcile (reconcileVolumeQuotas), which re-tags + re-limits
@@ -881,23 +910,11 @@ var (
 	// running its removals on the errgroup's derived context, so the first failure cancels
 	// its siblings mid-flight.
 	//
-	// outcome="recovered" means the fallback removed everything it found. On an ADVISORY
-	// operation that can be vacuous — the prelude arm has no containers to find, so a
-	// failed Down whose discovery succeeds records "recovered" after removing nothing.
-	//
-	// outcome="failed" means at least one container may STILL be running, but what fred
-	// does about it depends on the operation, so read the two together:
-	//   - BLOCKING (restore_reconcile, restore_rollback, deprovision): fred keeps the
-	//     lease tracked and retries rather than advancing state over it. A sustained rate
-	//     is not data loss — it is capacity and anonymous volumes pinned on the host, and
-	//     a daemon that needs a look.
-	//   - FAIL-STOP (provision_cleanup): fred retains the exact intent, reservation, and
-	//     claims, suppresses its callback, and requires cold recovery before serving.
-	//   - ADVISORY (restore_prelude): the caller discards the error and state advances,
-	//     so no prelude retry owns it. A rate here may mean a leak to classify, or — because
-	//     callers are entered on caller-context cancellation and then pass that same dead
-	//     context to the teardown — merely a canceled restore request with nothing on the
-	//     host at all.
+	// outcome="recovered" means fallback removed every container it found.
+	// outcome="failed" means absence could not be proved. Every current path
+	// preserves exact authority and accounting. Durable recovery retries ordinary
+	// failures; a live worker with ambiguous effects may still fail-stop before
+	// its next process resumes that same intent.
 	teardownFallbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsSubsystem,
@@ -964,6 +981,13 @@ var restoreOutcomes = []string{"success", "failure"}
 var quotaBackfillOutcomes = []string{"applied", "failed"}
 
 func init() {
+	for _, receipt := range []terminalReceiptKind{terminalReceiptClosed, terminalReceiptFailed} {
+		terminalSubstratePendingContainers.WithLabelValues(string(receipt)).Set(0)
+		terminalSubstrateCleanupRetriesTotal.WithLabelValues(string(receipt)).Add(0)
+	}
+	for _, kind := range []shared.OperationIntentKind{shared.OperationIntentProvision, shared.OperationIntentRestore} {
+		operationIntentRecoveryCleanupRetriesTotal.WithLabelValues(string(kind)).Add(0)
+	}
 	for _, reason := range operationRecoveryTimeoutReasons {
 		operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(reason).Add(0)
 	}

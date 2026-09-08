@@ -135,9 +135,7 @@ func main() {
 
 	// Attest the physical substrate before any durable backend store is opened
 	// or any cleanup goroutine can start.
-	identityCtx, identityCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	b, err := docker.NewWithContext(identityCtx, cfg, logger)
-	identityCancel()
+	b, err := docker.New(cfg, logger)
 	if err != nil {
 		logger.Error("failed to create backend", "error", err)
 		os.Exit(1)

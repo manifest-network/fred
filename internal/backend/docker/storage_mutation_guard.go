@@ -850,7 +850,14 @@ func (b *Backend) authorizeStorageMutation(ctx context.Context, operation string
 // transport/filesystem result and any stronger identity-drift cause, including
 // when both happened concurrently.
 func (b *Backend) completeStorageMutation(ctx context.Context, operation string, mutationErr error) error {
-	postcheckErr := b.requireStorageIdentity(ctx)
+	// The effect's expired deadline says nothing about whether storage identity
+	// remains valid. Every live/recovery/background executor gives the mandatory
+	// postcheck its own bounded read, including during shutdown. A successful
+	// attestation preserves the raw call error and its ambiguous outcome; an
+	// independently failed attestation still withdraws this storage authority.
+	postCtx, cancelPostcheck := b.recoveryDockerReadContext(context.WithoutCancel(ctx))
+	defer cancelPostcheck()
+	postcheckErr := b.requireStorageIdentity(postCtx)
 	if postcheckErr != nil {
 		// Latch every failed postcheck, not only a proved permanent identity
 		// contradiction. Once a raw side effect ran, even a timeout leaves its

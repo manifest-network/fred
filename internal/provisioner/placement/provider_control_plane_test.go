@@ -87,8 +87,8 @@ func TestProviderControlPlaneObservationRejectsAmbiguousAndSplicedResults(t *tes
 			want:  observedLeaseUnknown{}, wantErrIs: billingtypes.ErrLeaseNotFound,
 		},
 		{
-			name: "nil without error is unknown",
-			want: observedLeaseUnknown{},
+			name: "nil without error is not found",
+			want: observedLeaseNotFound{}, wantErrIs: billingtypes.ErrLeaseNotFound,
 		},
 		{
 			name: "wrong UUID is unknown",

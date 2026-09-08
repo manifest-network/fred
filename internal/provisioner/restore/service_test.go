@@ -385,7 +385,6 @@ func newFixture(t *testing.T, inventoryReady bool) *fixture {
 	result.service, err = NewService(Config{
 		Coordinator: result.restore,
 		Events:      result.events,
-		Now:         func() time.Time { return time.Unix(123, 0).UTC() },
 	})
 	require.NoError(t, err)
 	return result
@@ -1078,7 +1077,11 @@ func TestServiceSynchronousSettlementModes(t *testing.T) {
 			require.Len(t, events, len(test.wantEvents))
 			for index, status := range test.wantEvents {
 				assert.Equal(t, status, events[index].Status)
-				assert.Equal(t, time.Unix(123, 0).UTC(), events[index].Timestamp)
+				if index == 0 {
+					assert.Equal(t, time.Unix(123, 0).UTC(), events[index].Timestamp)
+				} else {
+					assert.WithinDuration(t, time.Now(), events[index].Timestamp, time.Minute)
+				}
 			}
 			if len(events) == 2 {
 				assert.Equal(t, "restore did not start", events[1].Error)

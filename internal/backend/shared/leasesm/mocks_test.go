@@ -897,9 +897,17 @@ func testMaintenanceSuccess(t *testing.T, intent shared.MaintenanceIntentClaim, 
 	require.True(t, ok)
 	proof, err := authority.settlement.ActivateMaintenance(success)
 	require.NoError(t, err)
-	result, err := NewMaintenanceReplaceSuccess(projection, proof)
+	target, ok := proof.TargetRelease()
+	require.True(t, ok)
+	stack, err := validateCompleteReleaseProjection(target, projection.ContainerIDs, projection.ServiceContainers)
 	require.NoError(t, err)
-	return result
+	result := newReplaceSuccessProjection(projection)
+	result.authorityKind = replaceAuthorityMaintenance
+	result.maintenanceRelease = proof
+	result.maintenance = proof.Intent()
+	result.release = &target
+	result.stackManifest = stack
+	return ReplaceResult{success: result}
 }
 
 func testMaintenanceFailure(t *testing.T, intent shared.MaintenanceIntentClaim, errValue error, restored, recoverFromSource bool, details ReplaceFailureDetails) ReplaceResult {

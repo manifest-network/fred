@@ -72,7 +72,6 @@ func (v composeReadView) PS(ctx context.Context, project string) ([]composeConta
 }
 
 type volumeReadView struct {
-	list                 func() ([]string, error)
 	listForProof         func(context.Context) ([]string, error)
 	attest               func(context.Context, managedVolumeName) error
 	requireNoInterrupted func(context.Context) error
@@ -90,7 +89,7 @@ type pinnedVolumeReadView struct {
 
 func projectVolumeRead(volumes volumeReader) volumeReader {
 	view := volumeReadView{
-		list: volumes.List, listForProof: volumes.ListForProof,
+		listForProof:         volumes.ListForProof,
 		attest:               volumes.AttestManagedVolume,
 		requireNoInterrupted: volumes.RequireNoInterruptedVolumeMutations,
 		validate:             volumes.Validate, hostPath: volumes.HostPath,
@@ -102,7 +101,6 @@ func projectVolumeRead(volumes volumeReader) volumeReader {
 	return view
 }
 
-func (v volumeReadView) List() ([]string, error) { return v.list() }
 func (v volumeReadView) ListForProof(ctx context.Context) ([]string, error) {
 	return v.listForProof(ctx)
 }

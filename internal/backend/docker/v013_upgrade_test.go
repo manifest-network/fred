@@ -173,14 +173,9 @@ func TestRecoveredV013ContainerDeathPublishesTokenlessLifecycleObservation(t *te
 	mock.ContainerLogsFn = func(context.Context, string, int) (string, error) {
 		return "legacy container exited", nil
 	}
-	observation, completion, err := leasesm.NewTrackedContainerDiedObservation("app-0", runtime)
+	observation, err := leasesm.NewContainerDiedObservation("app-0", runtime)
 	require.NoError(t, err)
 	require.True(t, b.routeActorObservation(observation))
-	select {
-	case <-completion.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("legacy container-death observation did not complete")
-	}
 
 	require.Eventually(t, func() bool {
 		pending, listErr := b.callbackStore.ListPending()

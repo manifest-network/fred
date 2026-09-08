@@ -1335,6 +1335,128 @@ func TestIncompleteRetentionIsConstructionBoundQuarantine(t *testing.T) {
 	require.True(t, coordinator.ReleaseAction(action))
 }
 
+func TestIncompleteRetentionPreservesConfirmedRestoreAffinity(t *testing.T) {
+	for _, missing := range []string{"both endpoints", "provisions", "retentions"} {
+		t.Run(missing, func(t *testing.T) {
+			store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+			requireAdmissionBaseline(t, store, "backend-a", "backend-b")
+			projectInventoryForTest(t, store, InventoryProjection{
+				Placements: map[string]string{fencedAvailabilityOwner: "backend-a"},
+			})
+			before := store.Lookup(fencedAvailabilityOwner)
+			require.Equal(t, StateConfirmed, before.State())
+			lifecycleBefore := store.CurrentLifecycle(fencedAvailabilityOwner)
+			var restored []backend.RestoreRequest
+			owner := &executionTestBackend{name: "backend-a", restore: func(
+				_ context.Context, request backend.RestoreRequest,
+			) error {
+				restored = append(restored, request)
+				return nil
+			}}
+			base, err := store.BindOperationCoordinator(nil)
+			require.NoError(t, err)
+			execution := bindExecutionForTest(t, base, newExecutionTestRuntime(
+				owner, &executionTestBackend{name: "backend-b"},
+			))
+			reader := executionLeaseReaderFunc(func(
+				_ context.Context, leaseUUID string,
+			) (*billingtypes.Lease, error) {
+				state := billingtypes.LEASE_STATE_PENDING
+				if leaseUUID == fencedAvailabilityOwner {
+					state = billingtypes.LEASE_STATE_CLOSED
+				}
+				return &billingtypes.Lease{
+					Uuid: leaseUUID, Tenant: "tenant-test", ProviderUuid: freshTestProviderUUID,
+					State: state, Items: []billingtypes.LeaseItem{{SkuUuid: "sku-test", Quantity: 1}},
+				}, nil
+			})
+			coordinator, err := reconciliationCoordinatorWithReaderForTest(t, execution, reader)
+			require.NoError(t, err)
+			sweep, err := coordinator.BeginSweep()
+			require.NoError(t, err)
+			defer sweep.End()
+			require.NoError(t, sweep.RecordProvision("backend-a", testBackendStorageID("backend-a"), nil))
+			require.NoError(t, sweep.RecordRetention(
+				"backend-a", testBackendStorageID("backend-a"), []string{fencedAvailabilityOwner},
+			))
+			switch missing {
+			case "provisions":
+				require.NoError(t, sweep.RecordRetention("backend-b", testBackendStorageID("backend-b"), nil))
+			case "retentions":
+				require.NoError(t, sweep.RecordProvision("backend-b", testBackendStorageID("backend-b"), nil))
+			}
+			require.NoError(t, sweep.SealInventory())
+			projected, err := sweep.Project(ReconciliationProjection{})
+			require.NoError(t, err)
+			require.False(t, projected.Complete())
+			assert.Equal(t, before, store.Lookup(fencedAvailabilityOwner),
+				"a healthy owner's trusted retention must preserve the exact durable record")
+			assert.Equal(t, lifecycleBefore, store.CurrentLifecycle(fencedAvailabilityOwner),
+				"retention evidence cannot rewrite lifecycle authority")
+			require.NoError(t, store.leaseSideEffectError(fencedAvailabilityOwner))
+
+			restore, err := execution.RestoreCoordinator(nil)
+			require.NoError(t, err)
+			request, err := NewRestoreApplicationRequest(
+				fencedAvailabilitySibling, "tenant-test", fencedAvailabilityOwner,
+			)
+			require.NoError(t, err)
+			result := restore.ExecuteApplication(t.Context(), request)
+			require.Equal(t, RestoreApplicationAccepted, result.Disposition(), result.Err())
+			require.Len(t, restored, 1,
+				"the healthy backend must remain available to restore during its peer's outage")
+		})
+	}
+}
+
+func TestIncompleteRetentionCannotReaffirmUncertainOwnership(t *testing.T) {
+	for _, state := range []string{"other owner", "attempt", "confirmed with attempt", "rejected reporter"} {
+		t.Run(state, func(t *testing.T) {
+			store := newTestStore(t, WithCallbackRouteFactory(testCallbackRoutes(t)))
+			requireAdmissionBaseline(t, store, "backend-a", "backend-b")
+			switch state {
+			case "other owner":
+				requireConfirmedPlacement(t, store, fencedAvailabilityOwner, "backend-b")
+			case "confirmed with attempt", "rejected reporter":
+				requireConfirmedPlacement(t, store, fencedAvailabilityOwner, "backend-a")
+			}
+			if state == "attempt" || state == "confirmed with attempt" {
+				requireTypedAttempt(t, store, fencedAvailabilityOwner, "backend-a", requireOperationID(t, "2113"))
+			}
+			before := store.Lookup(fencedAvailabilityOwner)
+			base, err := store.BindOperationCoordinator(nil)
+			require.NoError(t, err)
+			execution := bindExecutionForTest(t, base, executionRuntime("backend-a", "backend-b"))
+			coordinator, err := reconciliationCoordinatorWithReaderForTest(t, execution, &reconciliationSweepReader{})
+			require.NoError(t, err)
+			sweep, err := coordinator.BeginSweep()
+			require.NoError(t, err)
+			defer sweep.End()
+			require.NoError(t, sweep.RecordProvision("backend-a", testBackendStorageID("backend-a"), nil))
+			require.NoError(t, sweep.RecordRetention(
+				"backend-a", testBackendStorageID("backend-a"), []string{fencedAvailabilityOwner},
+			))
+			projection := ReconciliationProjection{}
+			if state == "rejected reporter" {
+				require.NoError(t, sweep.RecordUntrusted("backend-a", []string{fencedAvailabilityOwner}))
+				projection.UntrustedPositives = map[string][]string{fencedAvailabilityOwner: {"backend-a"}}
+			}
+			require.NoError(t, sweep.SealInventory())
+			_, err = sweep.Project(projection)
+			require.NoError(t, err)
+			after := store.Lookup(fencedAvailabilityOwner)
+			require.Equal(t, StateUnusable, after.State())
+			assert.Contains(t, after.ConflictBackends, "backend-a")
+			if before.Backend != "" {
+				assert.Contains(t, after.ConflictBackends, before.Backend)
+			}
+			assert.Equal(t, before.Attempt, after.Attempt)
+			assert.Equal(t, before.attemptOperationID, after.attemptOperationID,
+				"retention alone must never settle an unresolved operation")
+		})
+	}
+}
+
 func TestInheritedInventoryRecoveryBlocksFreshSideEffectsButAllowsExactMaintenanceRecovery(
 	t *testing.T,
 ) {

@@ -86,7 +86,7 @@ type Backend struct {
 	storageIdentity  backendidentity.ID
 	storageAuthority backendidentity.VerifiedStorage
 	storageVerifier  k3sStorageIdentityVerifier
-	clusterIdentity  func(context.Context) (string, error)
+	clusterIdentity  clusterIdentityReader
 	identityVerifyMu sync.Mutex
 	identityDriftErr error
 	// storeAuthorityGate is the backend-wide terminal cause and the commit
@@ -228,8 +228,17 @@ func (verifier k3sCallbackStorageVerifier) Verify(ctx context.Context) error {
 
 type existingK3sStorageIdentity struct{}
 
+// clusterIdentityReader is the substrate read port shared by initial sealing
+// and every runtime re-attestation. Production always binds the configured
+// Kubernetes reader; no optional callback can bypass that dependency.
+type clusterIdentityReader interface {
+	CurrentClusterIdentity(context.Context) (string, error)
+}
+
+type configuredClusterIdentity struct{ cfg Config }
+
 func (existingK3sStorageIdentity) resolve(ctx context.Context, cfg Config) (backendidentity.VerifiedStorage, error) {
-	probe := &Backend{cfg: cfg}
+	probe := &Backend{cfg: cfg, clusterIdentity: configuredClusterIdentity{cfg: cfg}}
 	if err := probe.loadStorageIdentity(ctx); err != nil {
 		return backendidentity.VerifiedStorage{}, err
 	}
@@ -327,7 +336,9 @@ func InitializeStorageIdentityForConfig(
 	if mode != StorageIdentityInitializeNew {
 		return backendidentity.ID{}, fmt.Errorf("K3s storage identity initialization mode must be %q", StorageIdentityInitializeNew)
 	}
-	return initializeStorageIdentityForConfigWithProbe(ctx, cfg, &Backend{cfg: cfg})
+	return initializeStorageIdentityForConfigWithProbe(ctx, cfg, &Backend{
+		cfg: cfg, clusterIdentity: configuredClusterIdentity{cfg: cfg},
+	})
 }
 
 // initializeStorageIdentityForConfigWithProbe contains the durable
@@ -651,6 +662,7 @@ func newBackend(
 
 	b := &Backend{
 		cfg:                 cfg,
+		clusterIdentity:     configuredClusterIdentity{cfg: cfg},
 		logger:              logger.With("backend", cfg.Name),
 		pool:                pool,
 		provisions:          make(map[string]*provision),
@@ -892,10 +904,14 @@ func (b *Backend) storageIdentityAnchorPath() string {
 }
 
 func (b *Backend) currentClusterIdentity(ctx context.Context) (string, error) {
-	if b.clusterIdentity != nil {
-		return b.clusterIdentity(ctx)
+	if b.clusterIdentity == nil {
+		return "", errors.New("K3s cluster identity reader is required")
 	}
-	clientset, err := buildKubeClient(b.cfg)
+	return b.clusterIdentity.CurrentClusterIdentity(ctx)
+}
+
+func (reader configuredClusterIdentity) CurrentClusterIdentity(ctx context.Context) (string, error) {
+	clientset, err := buildKubeClient(reader.cfg)
 	if err != nil {
 		return "", fmt.Errorf("build K3s client for storage identity: %w", err)
 	}

@@ -302,9 +302,9 @@ func (authority *ProvisionCoordinator) ExecuteCurrentLease(
 	case observedLeaseUnauthorized:
 		return newProvisionEventResult(ProvisionEventUncertain, &observed.lease,
 			fmt.Errorf("current lease identity differs from event authority for lease %s", event.leaseUUID))
-	case observedLeaseUnknown:
+	case observedLeaseUnknown, observedLeaseNotFound:
 		return newProvisionEventResult(ProvisionEventUncertain, nil,
-			fmt.Errorf("read current lease %s: %w", event.leaseUUID, observed.err))
+			fmt.Errorf("read current lease %s: %w", event.leaseUUID, exactLeaseObservationError(observed)))
 	case observedExactLease:
 		lease := observed.lease
 		return authority.executeObservedCurrentLease(ctx, event, lease, leaseClaim)

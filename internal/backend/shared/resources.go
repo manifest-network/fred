@@ -48,6 +48,11 @@ type ResourcePool struct {
 	// only live allocations) — the owner re-pushes it after recover.
 	retainedDisk int64
 
+	// Unaccounted physical footprints withhold all remaining capacity until the
+	// exact observer releases its hold. They do not invent allocations from
+	// labels or overwrite the known, immutable resource ledger.
+	accountingHolds map[*resourceAccountingHoldState]struct{}
+
 	// Per-lease tracking
 	allocations map[string]ResourceAllocation
 
@@ -57,6 +62,43 @@ type ResourcePool struct {
 
 	// skuResolver resolves SKU identifiers to profiles
 	skuResolver SKUResolver
+}
+
+var ErrResourceAccountingIncomplete = errors.New("resource capacity is withheld while an unaccounted substrate footprint remains")
+
+// ResourceAccountingHold is pool-issued ownership of one capacity exclusion.
+// Copies share the same idempotent release; one observer cannot release
+// another observer's hold. The zero value grants no release authority.
+type ResourceAccountingHold struct {
+	state *resourceAccountingHoldState
+}
+
+type resourceAccountingHoldState struct{ pool *ResourcePool }
+
+// HoldUnaccountedFootprint atomically excludes new allocations while substrate
+// without an immutable resource snapshot is present. Existing allocations,
+// releases, retained accounting, and conservative recovery remain operable.
+func (p *ResourcePool) HoldUnaccountedFootprint() ResourceAccountingHold {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state := &resourceAccountingHoldState{pool: p}
+	if p.accountingHolds == nil {
+		p.accountingHolds = make(map[*resourceAccountingHoldState]struct{})
+	}
+	p.accountingHolds[state] = struct{}{}
+	return ResourceAccountingHold{state: state}
+}
+
+// Release returns only the capacity exclusion owned by this hold. Call after
+// strict inventory proves that this observer's unaccounted footprint is gone.
+func (h ResourceAccountingHold) Release() {
+	if h.state == nil {
+		return
+	}
+	p := h.state.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.accountingHolds, h.state)
 }
 
 // NewResourcePool creates a new resource pool with the given capacity.
@@ -337,6 +379,9 @@ func (p *ResourcePool) tryAllocateLocked(leaseUUID, sku, tenant string, gateDisk
 // stateful library resolver cannot make the aggregate disk gate and committed
 // reservation disagree.
 func (p *ResourcePool) tryAllocateProfileLocked(leaseUUID, sku, tenant string, profile SKUProfile, gateDisk bool) error {
+	if len(p.accountingHolds) != 0 {
+		return ErrResourceAccountingIncomplete
+	}
 	if _, exists := p.allocations[leaseUUID]; exists {
 		return fmt.Errorf("lease %s already has allocated resources", leaseUUID)
 	}
@@ -587,6 +632,7 @@ func (p *ResourcePool) Stats() ResourceStats {
 		AllocatedDiskMB:   p.allocatedDisk,
 		RetainedDiskMB:    p.retainedDisk,
 		AllocationCount:   len(p.allocations),
+		AccountingHeld:    len(p.accountingHolds) != 0,
 	}
 }
 
@@ -622,16 +668,23 @@ type ResourceStats struct {
 	AllocatedDiskMB   int64
 	RetainedDiskMB    int64
 	AllocationCount   int
+	AccountingHeld    bool
 }
 
 // AvailableCPU returns available CPU cores.
 func (s ResourceStats) AvailableCPU() float64 {
+	if s.AccountingHeld {
+		return 0
+	}
 	return availableCPU(s.TotalCPU, s.AllocatedCPU)
 }
 
 // AvailableMemoryMB returns available memory in MB, clamped to zero when the
 // recovered allocation projection is already at or above configured capacity.
 func (s ResourceStats) AvailableMemoryMB() int64 {
+	if s.AccountingHeld {
+		return 0
+	}
 	return availableInt64(s.TotalMemoryMB, s.AllocatedMemoryMB)
 }
 
@@ -640,6 +693,9 @@ func (s ResourceStats) AvailableMemoryMB() int64 {
 // total_disk_mb shrink or stale retained projection must not surface a negative
 // "available" via the /stats endpoints).
 func (s ResourceStats) AvailableDiskMB() int64 {
+	if s.AccountingHeld {
+		return 0
+	}
 	return availableInt64(s.TotalDiskMB, s.AllocatedDiskMB, s.RetainedDiskMB)
 }
 

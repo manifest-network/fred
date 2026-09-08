@@ -1302,30 +1302,6 @@ func (s *RetentionStore) Get(orig string) (*RetentionEntry, error) {
 	return entry, err
 }
 
-// Delete removes a RetentionEntry by original lease UUID. It is idempotent:
-// no error is returned when the entry is absent. It reads the pre-image in-txn
-// so the index can drop the deleted record's partition membership.
-func (s *RetentionStore) deleteUnsafe(orig string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var oldE *RetentionEntry
-	err := s.update(func(tx *bolt.Tx) error {
-		bkt := tx.Bucket(retentionBucketName)
-		if raw := bkt.Get([]byte(orig)); raw != nil {
-			oldE = &RetentionEntry{}
-			if uerr := unmarshalRetentionEntry(raw, oldE); uerr != nil {
-				return fmt.Errorf("malformed retention record %q: %w", orig, uerr)
-			}
-		}
-		return bkt.Delete([]byte(orig))
-	})
-	if err != nil {
-		return err
-	}
-	s.indexApply(orig, oldE, nil) // oldE=nil when absent → no-op
-	return nil
-}
-
 // deleteIfRestoringUnsafe is retained for package-local historical storage tests.
 // Production finalization consumes RestoringRetentionProof through DeleteRestoring.
 // It removes a restore source finalizer only while the exact destination and

@@ -116,12 +116,15 @@ type Config struct {
 	// ImagePullTimeout is the timeout for pulling images.
 	ImagePullTimeout time.Duration `yaml:"image_pull_timeout"`
 
+	// StorageAttestationTimeout bounds the full startup storage inventory proof,
+	// including all per-volume substrate checks. Zero selects 30s. Large fleets
+	// can widen this without changing per-request Docker or provisioning limits.
+	StorageAttestationTimeout time.Duration `yaml:"storage_attestation_timeout"`
+
 	// ContainerCreateTimeout is the timeout for creating containers.
 	ContainerCreateTimeout time.Duration `yaml:"container_create_timeout"`
 
-	// ContainerStartTimeout is the timeout for starting containers and the
-	// maximum cold-recovery stabilization window for an exact inert provision
-	// cohort, capped by the remaining provision deadline.
+	// ContainerStartTimeout is the timeout for starting containers.
 	ContainerStartTimeout time.Duration `yaml:"container_start_timeout"`
 
 	// ContainerStopTimeout is the grace period for stopping containers.
@@ -578,6 +581,9 @@ func (c *Config) Validate() error {
 
 	if c.ImagePullTimeout <= 0 {
 		return fmt.Errorf("image_pull_timeout must be positive")
+	}
+	if c.StorageAttestationTimeout < 0 {
+		return fmt.Errorf("storage_attestation_timeout must not be negative")
 	}
 
 	if c.ContainerCreateTimeout <= 0 {

@@ -296,8 +296,9 @@ When `tenant_quota` is configured, no single tenant can consume more than the sp
 | Field | YAML Key | Type | Default | Description |
 |---|---|---|---|---|
 | ImagePullTimeout | `image_pull_timeout` | duration | `5m` | Timeout for pulling images |
+| StorageAttestationTimeout | `storage_attestation_timeout` | duration | `30s` (also when zero) | Full construction-time managed-volume proof budget; post-recovery inventory proof uses `max(2m, storage_attestation_timeout)`. Negative values are rejected. |
 | ContainerCreateTimeout | `container_create_timeout` | duration | `30s` | Timeout for creating containers |
-| ContainerStartTimeout | `container_start_timeout` | duration | `30s` | Timeout for starting containers; also the maximum one-shot cold-recovery stabilization window for an exact `created` or paused non-progressing provision cohort, capped by its remaining operation deadline, before it is failed and torn down |
+| ContainerStartTimeout | `container_start_timeout` | duration | `30s` | Timeout for starting containers. Interrupted provision recovery uses the durable `provision_timeout` horizon instead. |
 | ProvisionTimeout | `provision_timeout` | duration | `10m` | Maximum time for the entire provisioning operation. Validated as positive — must be `> 0`. |
 | ReconcileInterval | `reconcile_interval` | duration | `5m` | How often to reconcile state with Docker |
 | StartupVerifyDuration | `startup_verify_duration` | duration | `5s` | Grace period after start before verifying containers are still running |
@@ -767,7 +768,12 @@ The edges above are the complete set of allowed transitions; any event not liste
   re-detects current failures; sustained growth flags churn, recovery contention,
   a wedged actor, or chronic burst.
 - `fred_docker_backend_pending_close_intents` and `fred_docker_backend_oldest_close_intent_age_seconds` — unlabeled aggregate count and oldest age for the non-expiring destructive-close journal. A brief non-zero value is normal while a close runs; sustained age means a finalizer dependency is unavailable. Use the lease-scoped recovery log to identify the row without introducing an unbounded lease label.
-- `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason}` — interrupted exact provisions that exhausted bounded cold recovery. `reason` is `container_start_timeout` when a non-progressing `created`/paused cohort's shorter start-stabilization window wins, or `provision_timeout` when the operation deadline wins (including an inert cohort with less operation time remaining). It can increment again only when a later failure leaves that same complete non-terminal cohort for another startup; correlate it with `teardown_fallback_total{operation="provision_cleanup"}` and the lease-scoped warning.
+- `fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}` — exact provision intents classified past their durable admission deadline. Cleanup remains periodic and retryable; there is no container-start recovery timer.
+- `fred_docker_backend_operation_intent_recovery_cleanup_retries_total` — Deferred exact operation cleanup (`provision`/`restore`); intent and reservation remain for periodic retry.
+- `fred_docker_backend_terminal_substrate_pending_containers` — Last late-container count for permanent `closed`/`failed_operation` receipts; nonzero withholds this backend’s pool capacity/readiness until strict absence.
+- `fred_docker_backend_terminal_substrate_cleanup_retries_total` — Transient late-container cleanup retries; daemon stays alive and exact terminal receipts remain.
+- `fred_docker_backend_unaccounted_managed_volumes` — Attested managed volumes absent from current live, admitted-operation, and all retention projections; diagnostic only, never deletion or admission authority.
+- `fred_docker_backend_unaccounted_managed_volume_observation_failures_total` — Failed diagnostic inventory/footprint observations; last unaccounted-volume gauge is retained, not reset to zero.
 - `fred_docker_backend_reconciliation_total{outcome}` and `fred_docker_backend_reconciliation_last_success_timestamp_seconds` — the runtime signal for `recoverState`, including maintenance-WAL convergence. A valid but semantically indeterminate maintenance row can make a pass report `outcome="error"` and leave last-success stale while `/health` remains green and `callback_store_errors_total` remains unchanged; those latter signals validate structural store access, not every substrate classification. During startup the equivalent failure exits before the periodic loop starts and appears as `failed to recover state` with the lease-scoped nested error.
 - `fred_docker_backend_retention_sweep_total{outcome}` — one increment per periodic retention-sweep pass, `success` or `error`. The sum across outcomes is a liveness heartbeat (it advances every tick regardless of result); `{outcome="error"}` means a sweep stage failed — usually an unenumerable retention store, but the orphan stage reports a failed volume-root enumeration here too, so the joined stage error is what identifies the actual failing dependency. Every stage runs on every pass and the stage errors are joined, so the log line names all of them rather than only the first.
 - `fred_docker_backend_retention_accounting_refresh_failed_total` — the retained-disk projection could not be recomputed and the previous value was kept. Safe (a zeroed projection would over-admit) but it means the five retention gauges and the pool's retained input are stale while this rises.
@@ -784,8 +790,10 @@ recovery pass. Runtime WAL retry cadence is therefore the docker-backend's own
 
 The bounds are nested and aggregate where cardinality matters:
 
-- `New` allows 30 seconds for construction-time substrate/storage-identity
-  attestation. Library callers that need a different construction budget use
+- `New` uses `storage_attestation_timeout` (default `30s`) for the complete
+  construction-time substrate/storage-identity attestation. Large fleets can
+  widen that aggregate without changing individual Docker call limits.
+  Library callers that need a caller-owned construction deadline use
   `NewWithContext`, which adds no fallback deadline; pass a finite context. The
   context is not retained after construction.
 - `Start` shares the shorter of its caller context and 30 seconds across initial
@@ -794,9 +802,10 @@ The bounds are nested and aggregate where cardinality matters:
   sum of every sequential phase's local maximum (51m10s with defaults), so a
   future/skewed operation admission still receives a fresh operation window
   after every earlier phase consumes its cap.
-- Within that overall budget, interrupted-volume recovery and its
-  clean-inventory proof each use a fixed two-minute filesystem-only child
-  deadline; `container_stop_timeout` cannot inflate them.
+- Within that overall budget, interrupted-volume recovery uses a fixed
+  two-minute child deadline. Its complete clean-inventory proof uses
+  `max(2m, storage_attestation_timeout)`; `container_stop_timeout` cannot
+  inflate either deadline.
 - Retention reconciliation, quota reconciliation, and retention reap each use one aggregate
   `max(2m, container_stop_timeout)` budget. State rebuild retains its 30-minute
   cap; operation recovery receives the larger of that ordinary phase budget and
@@ -806,6 +815,11 @@ The bounds are nested and aggregate where cardinality matters:
 - Ordinary recovery Docker list/inspect boundaries are capped at 30 seconds.
   Cold-start diagnostics share one 30-second context across every failed lease,
   and orphan-network cleanup shares one across the whole network set.
+- Post-mutation storage verification receives its own bounded 30-second read
+  context, even after effect cancellation or shutdown. This prevents an expired
+  effect context from manufacturing a failed identity proof. The original
+  effect error is preserved; successful attestation alone never declares the
+  effect successful. An independently failed proof still fails closed.
 
 A timeout fails that recovery boundary closed (and preserves exact operation,
 maintenance, and close authority) instead of wedging a Docker/CLI boundary.
@@ -849,33 +863,32 @@ restore/retention finalizers reconcile, followed by quota backfill,
 and retention reaping. Unattributed managed volumes are preserved for explicit
 operator attribution; there is no inference-driven cleanup phase or separate preflight
 owner that can consume an operation's empty destination. Periodic `recoverState`
-retries maintenance and close convergence; a
-crash-surviving operation intent is a startup boundary rather than a
-providerd-triggered remote refresh. An exact provision cohort in a transitional
-state is re-inspected during that startup rather than requiring supervisor
-restarts. An exact-empty provision or restore receives the full remaining
-`provision_timeout`, including one final bounded inventory read. A visible
-`created`/paused cohort gets at most the recovery process's current
-`container_start_timeout`, capped by the operation deadline, while running
-health checks and restarting substrate get only the budget computed from the
-durable admission time and current `provision_timeout` (and never more than one
-fresh timeout when a persisted timestamp is in the future after clock
-rollback). A terminal sibling or an exhausted bound produces the ordinary
-failed-operation cleanup; an inspection error or shutdown preserves the exact
-Pending row and all substrate evidence. An interrupted restore does not wait out a
-second cold-start budget: after exact source, destination, callback, and topology
-proofs under the destination command fence, recovery must also hold the typed
-exclusive actor-quiescence capability described above. Ready may
-commit while partial, failed, paused, and other non-terminal substrate enters
-the existing teardown → re-quarantine → source-quota → failed-settlement →
-source-handback sequence. Failed settlement atomically records the terminal
-operation outcome and callback; that Failed row drives a handback retry, while an
-absent row fails closed. A committed destination Release always wins and is
-never rolled back. Timeout exhaustion for provision increments
-`fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason}`
-with `reason` equal to whichever of `container_start_timeout` or
-`provision_timeout` expired first; it increments again only if later failure
-leaves the same complete non-terminal cohort for another startup.
+retries operations, maintenance, close convergence, and exact late-container
+cleanup. A provision intent carries one absolute recovery horizon derived
+from durable admission time and the configured `provision_timeout`. Exact-empty
+or transitional cohorts before that deadline remain Pending and are observed
+again by the periodic sweep; they do not block startup. A future admission
+timestamp after clock rollback is capped to one fresh observation window.
+There is no second `container_start_timeout` recovery algorithm.
+
+A terminal sibling or exhausted horizon enters exact failed-operation cleanup.
+An inspection error, pre-effect cancellation, or ordinary removal failure
+preserves the intent, reservation, and substrate for retry. An interrupted
+restore additionally requires the exact source/destination/callback/topology
+proof and typed actor-quiescence capability before rollback. A committed
+destination Release always wins and is never rolled back. Failed settlement
+atomically records the terminal operation outcome and callback before source
+handback; the durable Failed state drives any handback retry.
+
+`fred_docker_backend_operation_intent_recovery_timeout_exhaustions_total{reason="provision_timeout"}`
+counts expired provision classifications;
+`fred_docker_backend_operation_intent_recovery_cleanup_retries_total{kind}`
+counts deferred operation cleanup. Permanent closed/failed receipts also exclude
+late substrate from ordinary projection. If those compact receipts cannot account
+for a survivor's resources, the pool withholds new capacity and Health returns
+unready until a strict later inventory proves absence. The daemon and cleanup
+loops continue running. This is distinct from verified storage-identity drift,
+which remains a terminal safety failure.
 
 ### Durable close finalization
 
@@ -1308,6 +1321,13 @@ Reconciles a lease's custom-domain ingress labels to match the supplied items. B
 ### `GET /health` (unauthenticated)
 
 Docker daemon reachability check. Also probes the callback, diagnostics, release, and retention bbolt stores — a locked, corrupt, or read-only store surfaces as unhealthy instead of the backend reporting healthy while soft-delete/restore silently fail (ENG-448).
+
+Late containers covered by permanent closed/failed receipts also make this
+backend unready while their resource footprint cannot be accounted. The pool
+reports zero available capacity, but the daemon remains running and retries
+exact cleanup. This clears only after strict inventory proves absence. The
+diagnostic `unaccounted_managed_volumes` gauge does not itself gate health or
+authorize cleanup; a sustained value calls for operator attribution.
 
 **Response (`200`):**
 

@@ -308,7 +308,6 @@ func TestCounterVecLabels(t *testing.T) {
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeOK)
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeError)
 		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomeCircuitOpen)
-		ReconcilerBackendFetchTotal.WithLabelValues("docker", FetchOutcomePanic)
 	})
 	assert.NotPanics(t, func() {
 		// Both label sets are closed; every combination the reconciler can emit.
@@ -423,7 +422,6 @@ func TestLifecycleCallbackMetricVocabulary(t *testing.T) {
 		LifecycleCallbackVerdictMissing,
 		LifecycleCallbackVerdictStale,
 		LifecycleCallbackVerdictUnusable,
-		LifecycleCallbackVerdictUnavailable,
 		LifecycleCallbackVerdictUnknown,
 	}
 	for name, values := range map[string][]string{

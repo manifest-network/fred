@@ -17,7 +17,7 @@ import (
 
 func TestActorBoundaryDoesNotExportWritableMessageOrResultShapes(t *testing.T) {
 	for _, value := range []any{
-		ActorCloseScope{}, ActorReply{}, ActorCompletion{}, ActorCommand{}, ActorObservation{}, RecoveryCommand{}, ProvisionSuccessResult{},
+		ActorCloseScope{}, ActorReply{}, ActorCommand{}, ActorObservation{}, RecoveryCommand{}, ProvisionSuccessResult{},
 		ReplaceSuccessResult{}, ReplaceFailureInfo{}, ReplaceResult{},
 	} {
 		typeOf := reflect.TypeOf(value)
@@ -57,8 +57,6 @@ func TestActorCommandConstructorsRejectMissingOrWrongCapabilities(t *testing.T) 
 	_, _, err = NewDeprovisionCommand(nil) //nolint:staticcheck // Deliberately verify nil-context rejection.
 	require.Error(t, err)
 	_, err = NewContainerDiedObservation("", shared.RuntimeGenerationProof{})
-	require.Error(t, err)
-	_, _, err = NewTrackedContainerDiedObservation("", shared.RuntimeGenerationProof{})
 	require.Error(t, err)
 	_, _, err = NewCohortDivergedObservation(nil, shared.RuntimeGenerationProof{}) //nolint:staticcheck // Deliberately verify nil-context rejection.
 	require.Error(t, err)

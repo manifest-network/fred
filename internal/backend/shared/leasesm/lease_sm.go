@@ -263,6 +263,7 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// structural suppression for Provision+Deprovision races, analogous to
 	// Failing's cancel-on-exit mechanism).
 	sm.Configure(backend.ProvisionStatusProvisioning).
+		OnEntryFrom(evProvisionRequested, lsm.onEnterProvisioning).
 		Permit(evProvisionCompleted, backend.ProvisionStatusReady).
 		Permit(evProvisionErrored, backend.ProvisionStatusFailed).
 		Permit(evDeprovisionRequested, backend.ProvisionStatusDeprovisioning).
@@ -656,6 +657,20 @@ func (lsm *leaseSM) onEnterFailing(ctx context.Context, args ...any) error {
 	lsm.actor.cfg.WG.Go(func() {
 		defer lsm.actor.endWorkerActivity()
 		lsm.actor.gatherDiagAsync(diagCtx, containerID, info, runtime)
+	})
+	return nil
+}
+
+// onEnterProvisioning publishes the accepted actor transition before its
+// acknowledgement and worker start. On a retry, the predecessor's runtime and
+// reservation remain available to the Started executor, but its terminal
+// status and diagnostics no longer describe the in-flight operation.
+func (lsm *leaseSM) onEnterProvisioning(_ context.Context, _ ...any) error {
+	lsm.actor.cfg.ProvisionStore.UpdateFn(lsm.actor.leaseUUID, func(p *ProvisionState) {
+		p.Status = backend.ProvisionStatusProvisioning
+		p.LastError = ""
+		p.Reason = ""
+		p.Message = ""
 	})
 	return nil
 }
@@ -1497,30 +1512,6 @@ func newReplaceSuccessProjection(projection ReplaceSuccessProjection) ReplaceSuc
 		containerIDs:      slices.Clone(projection.ContainerIDs),
 		serviceContainers: cloneServiceContainers(projection.ServiceContainers),
 	}
-}
-
-func NewMaintenanceReplaceSuccess(
-	projection ReplaceSuccessProjection,
-	proof shared.MaintenanceReleaseActive,
-) (ReplaceResult, error) {
-	if !proof.Valid() {
-		return ReplaceResult{}, errors.New("maintenance success requires an exact active release proof")
-	}
-	target, ok := proof.TargetRelease()
-	if !ok || target.Version <= 0 {
-		return ReplaceResult{}, errors.New("maintenance success has no exact committed target")
-	}
-	stack, err := validateCompleteReleaseProjection(target, projection.ContainerIDs, projection.ServiceContainers)
-	if err != nil {
-		return ReplaceResult{}, fmt.Errorf("maintenance success projection: %w", err)
-	}
-	success := newReplaceSuccessProjection(projection)
-	success.authorityKind = replaceAuthorityMaintenance
-	success.maintenanceRelease = proof
-	success.maintenance = proof.Intent()
-	success.release = &target
-	success.stackManifest = stack
-	return ReplaceResult{success: success}, nil
 }
 
 // ReplaceFailureInfo carries doReplace* failure data. Used by both

@@ -717,15 +717,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- Removed `migration_grace_period` and `migration_ready_timeout` and the online
+  legacy migration path. The stopped v0.13 storage-identity adoption procedure
+  is required before upgrade; it does not restart existing tenant containers.
+  (ENG-632)
+
 ### Fixed
+
+- A transient outage of another backend no longer quarantines an already
+  confirmed retained owner on a healthy backend. Partial retention evidence
+  may preserve that exact owner, but cannot create authority or clear an
+  attempt/conflict. Chain reads that successfully report no lease now count as
+  `chain_unknown`, not transient chain errors that freeze the reconciler
+  heartbeat. In-flight skip metrics count only actual operation contention.
+  (ENG-632)
+- Late containers covered by permanent closed/failed receipts are retried
+  without terminating the backend on ordinary removal errors. Unaccounted
+  survivors hold capacity and readiness until a later strict inventory proves
+  cleanup; deprovision and recovery remain available. Interrupted operation
+  cleanup retains its exact intent and reservation for periodic retry. Storage
+  identity drift still fails closed. (ENG-632)
+- Reprovision enters `provisioning` and clears the previous error at the actor's
+  state transition, before its asynchronous worker runs. Restore recovery now
+  has boundary regressions for corrupt durable authority and exact source /
+  destination mismatches with no substrate or journal mutation. (ENG-632)
+- `storage_attestation_timeout` (default `30s`) lets large fleets widen the
+  complete startup storage inventory proof without loosening individual Docker
+  reads. Removed the redundant alternative cold-recovery wait algorithm,
+  obsolete metric labels, and test-only production mutation helpers. (ENG-632)
 
 - Docker cold-start recovery now re-observes an exact interrupted provision
   cohort in-process instead of turning every transitional container into a
   permanent backend restart loop. Running health checks and restarting
   containers may converge only within the budget derived from durable admission
-  time and the recovery process's configured `provision_timeout`; an inert
-  `created`/paused cohort gets up to the configured `container_start_timeout`,
-  capped by that operation deadline, and any failed sibling makes the operation
+  time and the recovery process's configured `provision_timeout`; exact-empty,
+  `created`/paused, and other transitional cohorts share that horizon and defer
+  to later sweeps without blocking startup. Any failed sibling makes the operation
   terminal immediately. Expiry proceeds only after exact candidate and any
   predecessor authority is validated (and legacy predecessor identity is
   durably frozen) before lease-wide teardown and atomic failed-callback
@@ -834,12 +861,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Docker construction and startup can no longer wait for process lifetime on a
   wedged Docker/CLI boundary. The default `New` path bounds substrate/storage
   attestation at
-  30 seconds (`NewWithContext` uses an explicit caller deadline without adding
+  `storage_attestation_timeout` (default 30 seconds; `NewWithContext` uses an explicit caller deadline without adding
   a fallback); `Start` has a finite backend-lifecycle recovery budget derived as
   the saturating sum of every sequential phase cap (51m10s with defaults).
-  Interrupted-volume recovery and
-  its clean-inventory proof each receive a fixed two-minute filesystem-only
-  child deadline inside that aggregate. The three ordinary phases each receive
+  Interrupted-volume recovery receives a fixed two-minute child deadline;
+  its full inventory proof receives `max(2m, storage_attestation_timeout)`
+  inside that aggregate. The three ordinary phases each receive
   one `max(2m, container_stop_timeout)` aggregate budget; state rebuild keeps
   its 30-minute cap, operation recovery gets the larger of the ordinary phase
   budget and its configured provision/read/cleanup sum, and the final identity

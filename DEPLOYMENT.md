@@ -319,17 +319,19 @@ manifests or alert rules.
 
 ### Docker startup and recovery budgets
 
-Docker-backend uses finite, nested safety budgets; they are not YAML tuning
-knobs. The production constructor allows 30 seconds for the initial
+Docker-backend uses finite, nested safety budgets. The production constructor
+uses `storage_attestation_timeout` (default `30s`) for the full initial
 Docker/storage-lineage attestation. `Start` shares at most 30 seconds across its
 initial identity, ping, and capability reads, then uses a backend-lifecycle
 aggregate budget for crash convergence. Production derives
 that aggregate as the saturating sum of every sequential phase's local maximum
 (51m10s with default settings), so a future/skewed operation admission still
 receives a fresh operation-recovery window after every earlier phase consumes
-its cap. Within that overall budget, interrupted-volume recovery and its
-clean-inventory proof each receive a fixed two-minute filesystem-only child
-deadline; container stop grace cannot inflate them. The three ordinary phases
+its cap. Within that overall budget, interrupted-volume recovery receives a
+fixed two-minute child deadline; its full clean-inventory proof receives
+`max(2m, storage_attestation_timeout)`. Increase the attestation setting for a
+large managed-volume fleet; it does not widen individual Docker requests or
+container stop grace. The three ordinary phases
 (retention reconciliation, quota reconciliation, and retention reap) each receive one aggregate budget of
 `max(2m, container_stop_timeout)`. State rebuild retains its 30-minute cap;
 operation recovery gets the larger of that ordinary phase budget and its
@@ -338,6 +340,17 @@ read budget. Recovery Docker list/inspect calls are capped at 30 seconds, and
 cold-start diagnostic collection plus orphan-network cleanup each share one
 such aggregate budget rather than receiving a fresh timeout per
 container/network.
+
+Startup intentionally remains fail-closed if a retained v0.13 row lacks immutable
+resource profiles and its SKU has been removed from configuration: Fred cannot
+prove quota/accounting from that row. Preserve the original SKU profile through
+the stopped adoption and first upgraded start; do not substitute guessed limits
+or delete the retention row. Similarly, a directory in the managed `fred-*`
+namespace with an invalid volume name or unverifiable quota substrate must be
+attributed and corrected while stopped. An ordinary file/symlink is not adopted
+as a managed volume; it is preserved. These are evidence/lineage failures, not
+ordinary transient container cleanup failures, and increasing a timeout does
+not resolve them.
 
 Consequently, a wedged Docker API fails startup or defers a best-effort phase
 instead of blocking process lifetime, while a large fleet cannot multiply a

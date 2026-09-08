@@ -16,8 +16,6 @@ import (
 const QueryParameter = backend.CallbackOperationIDQueryParameter
 
 var (
-	errOperationIDSequenceExhausted = errors.New("operation ID sequence exhausted")
-
 	// ErrInvalidID reports a non-canonical or non-v4 operation identity.
 	ErrInvalidID = operationid.ErrInvalid
 

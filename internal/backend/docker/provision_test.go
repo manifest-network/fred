@@ -882,10 +882,13 @@ func TestProvision_ReProvisionFallbackFailureRemainsAmbiguous(t *testing.T) {
 	b.provisionsMu.RLock()
 	projection := recoveredFromProvision(b.provisions[leaseUUID])
 	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusFailed, projection.Status)
+	// Admission publishes the replacement generation as Provisioning. An
+	// ambiguous cleanup result retains its predecessor substrate for recovery,
+	// but cannot restore the predecessor's terminal Failed status.
+	assert.Equal(t, backend.ProvisionStatusProvisioning, projection.Status)
 	assert.Equal(t, 2, projection.FailCount)
 	assert.Equal(t, []string{"old-container"}, projection.ContainerIDs,
-		"failed fallback must retain the exact predecessor projection for recovery")
+		"failed fallback must retain the exact predecessor container identity for recovery")
 }
 
 func TestProvision_ReProvisionUsesLockedPredecessorSnapshot(t *testing.T) {

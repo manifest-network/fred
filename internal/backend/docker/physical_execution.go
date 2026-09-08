@@ -49,7 +49,7 @@ func buildOperationSubstrate(
 					Payload: intent.Manifest(),
 				}
 				return b.doProvisionPhysical(
-					mutations, ctx, req, stack, intent.ResourceProfiles(), nil,
+					mutations, ctx, req, stack, intent.ResourceProfiles(),
 					b.logger.With(
 						"lease_uuid", intent.LeaseUUID(),
 						"operation_fingerprint", intent.OperationID().Fingerprint(),
@@ -162,26 +162,18 @@ func (b *Backend) classifyOperationPhysical(
 
 // operationAbsenceObservationIsTerminal determines whether this strict empty
 // inventory is the final causal observation rather than the first view after a
-// possibly outstanding Docker request. A quiescent actor may already have
-// published the exact generation as Failed; otherwise the durable operation's
-// full visibility window must have elapsed. Live execution cannot exploit the
-// latter to launder an uncertain mutation: Guard returns Ambiguous whenever
-// its workflow or any Step failed, irrespective of classifier evidence.
+// possibly outstanding Docker request. Only the durable operation's full
+// visibility window supplies that bound: a Failed projection is observational
+// state, not proof that the exact operation's worker is quiescent. Live execution
+// cannot exploit that horizon to launder an uncertain mutation: Guard returns
+// Ambiguous whenever its workflow or any Step failed, irrespective of classifier
+// evidence.
 func (b *Backend) operationAbsenceObservationIsTerminal(
 	subject shared.OperationPhysicalSubject,
 ) bool {
 	claim := subject.Intent()
 	if !claim.Valid() {
 		return false
-	}
-	b.provisionsMu.RLock()
-	projection := b.provisions[claim.LeaseUUID()]
-	actorProvedFailure := projection != nil &&
-		projection.Status == backend.ProvisionStatusFailed &&
-		projectionMatchesOperationIntent(projection, claim)
-	b.provisionsMu.RUnlock()
-	if actorProvedFailure {
-		return true
 	}
 	timeout := b.cfg.ProvisionTimeout
 	if timeout <= 0 {

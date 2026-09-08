@@ -71,6 +71,36 @@ func TestStartupPhaseBudget_HonorsConfiguredContainerStopGrace(t *testing.T) {
 		"zero values must select both production defaults")
 }
 
+func TestStorageAttestationBudgetIsConfigurableAndBounded(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		configured   time.Duration
+		construction time.Duration
+		proof        time.Duration
+	}{
+		{name: "default", construction: 30 * time.Second, proof: 2 * time.Minute},
+		{name: "large fleet", configured: 8 * time.Minute, construction: 8 * time.Minute, proof: 8 * time.Minute},
+		{name: "short construction", configured: time.Second, construction: time.Second, proof: 2 * time.Minute},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.StorageAttestationTimeout = test.configured
+			require.NoError(t, cfg.Validate())
+			b := &Backend{cfg: cfg}
+			assert.Equal(t, test.construction, cfg.storageAttestationBudget())
+			assert.Equal(t, test.proof, b.startupVolumeProofBudget())
+			assert.Equal(t, defaultRecoveryDockerReadTimeout, b.recoveryDockerReadBudget(),
+				"fleet size must not inflate an individual Docker call")
+			baseline := &Backend{cfg: cfg}
+			baseline.cfg.StorageAttestationTimeout = 0
+			assert.Equal(t, baseline.startupRecoveryBudget()+test.proof-2*time.Minute, b.startupRecoveryBudget())
+		})
+	}
+	cfg := validConfig()
+	cfg.StorageAttestationTimeout = -time.Nanosecond
+	require.ErrorContains(t, cfg.Validate(), "storage_attestation_timeout")
+}
+
 func TestStartupVolumeMutationContextHasFixedFilesystemOnlyCap(t *testing.T) {
 	started := time.Now()
 	ctx, cancel := startupVolumeMutationContext(context.Background())

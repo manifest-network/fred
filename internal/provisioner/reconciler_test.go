@@ -1836,7 +1836,10 @@ func TestReconciler_ReconcileAll_SkipsOtherProviderOrphans(t *testing.T) {
 	require.NoError(t, err)
 
 	ctx := t.Context()
+	inflightBefore := promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal)
 	assert.NoError(t, reconciler.ReconcileAll(ctx))
+	assert.Equal(t, inflightBefore, promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal),
+		"a foreign provider's workload is not an in-flight operation")
 
 	// Verify only our orphans were deprovisioned (not the other provider's)
 	mockBackend.mu.Lock()
@@ -3779,13 +3782,10 @@ func TestReconciler_DegradedConfirmedOwnerNeedsRetentionEvidenceBeforeReprovisio
 			assert.Equal(t, independentLease, healthy.provisionCalls[0].LeaseUUID)
 			healthy.mu.Unlock()
 			ownedRecord := store.Lookup(ownedLease)
-			if test.positiveRetention && test.peerOutage {
-				assert.Equal(t, placement.StateUnusable, ownedRecord.State(),
-					"partial retention evidence must quarantine only the retained lease")
-				assert.Equal(t, []string{ownerBase.Name()}, ownedRecord.ConflictBackends)
-			} else {
-				assert.Equal(t, placement.StateConfirmed, ownedRecord.State())
-			}
+			assert.Equal(t, placement.StateConfirmed, ownedRecord.State(),
+				"a confirmed owner's retention preserves restore affinity even during a peer outage")
+			assert.False(t, ownedRecord.Conflict)
+			assert.Equal(t, ownerBase.Name(), ownedRecord.Backend)
 			assert.Equal(t, placement.StateConfirmed, store.Lookup(independentLease).State())
 		})
 	}
@@ -4997,6 +4997,7 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 		name       string
 		getLease   func(context.Context, string) (*billingtypes.Lease, error)
 		wantReason string
+		partial    bool
 		why        string
 	}{
 		{
@@ -5008,11 +5009,20 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 			why:        "the sweep's two list queries are not atomic; this lease was created between them",
 		},
 		{
-			name: "chain has no record of the lease",
+			name: "chain client successfully reports no record",
+			getLease: func(_ context.Context, _ string) (*billingtypes.Lease, error) {
+				return nil, nil
+			},
+			wantReason: metrics.CleanupSkipChainUnknown,
+			why:        "a phantom is preserved for manual cleanup without freezing a healthy chain heartbeat",
+		},
+		{
+			name: "a not found shaped error remains an uncertain query",
 			getLease: func(_ context.Context, _ string) (*billingtypes.Lease, error) {
 				return nil, billingtypes.ErrLeaseNotFound
 			},
 			wantReason: metrics.CleanupSkipChainError,
+			partial:    true,
 			why: "NotFound is an uncertain read like every other query error: " +
 				"a wrong or reset chain must not deprovision the fleet",
 		},
@@ -5031,6 +5041,7 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 				return nil, assert.AnError
 			},
 			wantReason: metrics.CleanupSkipChainError,
+			partial:    true,
 			why:        "cleanup gates fail open; retry on the next sweep",
 		},
 	}
@@ -5053,8 +5064,18 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 
 			skips := metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassOrphan, tc.wantReason)
 			before := promtestutil.ToFloat64(skips)
+			inflightBefore := promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal)
+			const previousSuccess = 123.0
+			metrics.ReconcilerLastSuccessTimestamp.Set(previousSuccess)
 			require.NoError(t, reconciler.ReconcileAll(t.Context()))
 			after := promtestutil.ToFloat64(skips)
+			if tc.partial {
+				assert.Equal(t, previousSuccess, promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp))
+			} else {
+				assert.Greater(t, promtestutil.ToFloat64(metrics.ReconcilerLastSuccessTimestamp), previousSuccess)
+			}
+			assert.Equal(t, inflightBefore, promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal),
+				"an unproven orphan is not an in-flight lifecycle operation")
 
 			mockBackend.mu.Lock()
 			defer mockBackend.mu.Unlock()

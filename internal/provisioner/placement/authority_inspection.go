@@ -345,18 +345,6 @@ func MarshalAuthorityReport(report AuthorityReport) ([]byte, error) {
 func InspectAuthorityFile(
 	path string,
 	expectation AuthorityExpectation,
-) (AuthorityReport, error) {
-	return inspectAuthorityFile(path, expectation, authorityInspectionHooks{})
-}
-
-type authorityInspectionHooks struct {
-	afterOpen func()
-}
-
-func inspectAuthorityFile(
-	path string,
-	expectation AuthorityExpectation,
-	hooks authorityInspectionHooks,
 ) (report AuthorityReport, resultErr error) {
 	if !expectation.valid() {
 		return AuthorityReport{}, errors.New("placement authority expectation is invalid")
@@ -402,10 +390,20 @@ func inspectAuthorityFile(
 		}
 		return AuthorityReport{}, fmt.Errorf("open placement authority read-only: %w", err)
 	}
-	if hooks.afterOpen != nil {
-		hooks.afterOpen()
-	}
+	return inspectOpenedAuthorityFile(authority, db, expectation)
+}
 
+// inspectOpenedAuthorityFile consumes the read-only database handle and
+// completes its inspection against the retained physical path binding. The
+// caller retains ownership of the parent-directory handle. Closing the database
+// and verifying the binding before and after close are part of this phase, so
+// a path replacement can never leave a safe report executable by the caller.
+func inspectOpenedAuthorityFile(
+	authority *offlinePlacementAuthority,
+	db *bolt.DB,
+	expectation AuthorityExpectation,
+) (AuthorityReport, error) {
+	assessment := newAuthorityAssessment(expectation)
 	assessment.report.PhysicalCheckCompleted = true
 	if err := verifyBoltPhysicalConsistency(db); err != nil {
 		if errors.Is(err, ErrPhysicalConsistency) {
@@ -430,7 +428,7 @@ func inspectAuthorityFile(
 		}
 	}
 
-	report = assessment.finish(AuthorityMixedOrIncomplete)
+	report := assessment.finish(AuthorityMixedOrIncomplete)
 	statErr := authority.verify()
 	closeErr := db.Close()
 	afterCloseErr := authority.verify()

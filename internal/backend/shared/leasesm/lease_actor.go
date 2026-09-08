@@ -35,10 +35,6 @@ var ErrWorkerDrainTimeout = errors.New("lease mutation worker did not drain befo
 
 type leaseMessage interface {
 	isleaseMessage()
-	// doneChan returns the channel to close when processing finishes, or nil
-	// for fire-and-forget messages. Lifting this out of the handler dispatch
-	// lets shutdown drain pending messages without a per-type switch.
-	doneChan() chan struct{}
 	// onPanic is called by the actor's recover when a message's handler
 	// panics. Messages with reply/ack channels must non-blocking-send an
 	// error here so their caller (Backend.Deprovision / Provision /
@@ -137,15 +133,6 @@ func (r ActorReply) Wait(ctx context.Context) error {
 	}
 }
 
-// ActorCompletion is an optional, receive-only processing barrier for an
-// observation. The zero value is invalid; fire-and-forget observations use a
-// distinct constructor and therefore carry no latent nullable channel.
-type ActorCompletion struct {
-	done <-chan struct{}
-}
-
-func (c ActorCompletion) Done() <-chan struct{} { return c.done }
-
 // ObservationGenerationState is the exhaustive relationship between a queued
 // substrate observation and the current in-memory projection. The distinction
 // between Advanced and Superseded matters: an actor may itself advance fields
@@ -233,20 +220,16 @@ type workerTerminalMessage interface {
 }
 
 // containerDiedMsg signals a container belonging to this lease has died.
-// Construction explicitly chooses fire-and-forget or completion-tracked form.
 type containerDiedMsg struct {
 	ContainerID string
 	Runtime     shared.RuntimeGenerationProof
-	Done        chan struct{}
 }
 
 func (containerDiedMsg) isleaseMessage()            {}
 func (containerDiedMsg) isactorObservationMessage() {}
-func (m containerDiedMsg) doneChan() chan struct{}  { return m.Done }
 func (containerDiedMsg) onStaleGeneration()         {}
 
-// onPanic is a no-op: the caller (if any) unblocks via the done
-// channel which is closed by handle()'s defer regardless of panic.
+// Observations have no waiting caller to notify on handler panic.
 func (containerDiedMsg) onPanic(error) {}
 
 func NewContainerDiedObservation(
@@ -262,20 +245,6 @@ func NewContainerDiedObservation(
 	return newActorObservation(containerDiedMsg{ContainerID: containerID, Runtime: runtime}), nil
 }
 
-func NewTrackedContainerDiedObservation(
-	containerID string,
-	runtime shared.RuntimeGenerationProof,
-) (ActorObservation, ActorCompletion, error) {
-	if containerID == "" {
-		return ActorObservation{}, ActorCompletion{}, errors.New("container death observation requires a container id")
-	}
-	if !runtime.Valid() {
-		return ActorObservation{}, ActorCompletion{}, errors.New("container death observation requires an exact runtime generation")
-	}
-	done := make(chan struct{})
-	return newActorObservation(containerDiedMsg{ContainerID: containerID, Runtime: runtime, Done: done}), ActorCompletion{done: done}, nil
-}
-
 // deprovisionMsg requests that the actor run the deprovision flow. Callers can
 // obtain one only through NewDeprovisionCommand, which owns the reply channel.
 type deprovisionMsg struct {
@@ -283,9 +252,8 @@ type deprovisionMsg struct {
 	Reply chan error
 }
 
-func (deprovisionMsg) isleaseMessage()         {}
-func (deprovisionMsg) isactorCommandMessage()  {}
-func (deprovisionMsg) doneChan() chan struct{} { return nil }
+func (deprovisionMsg) isleaseMessage()        {}
+func (deprovisionMsg) isactorCommandMessage() {}
 func (m deprovisionMsg) onPanic(err error) {
 	// Non-blocking send: Reply is buffered-1, caller receives at most
 	// once. On recover, make sure the caller gets something.
@@ -317,7 +285,6 @@ type cohortDivergedMsg struct {
 
 func (cohortDivergedMsg) isleaseMessage()            {}
 func (cohortDivergedMsg) isactorObservationMessage() {}
-func (cohortDivergedMsg) doneChan() chan struct{}    { return nil }
 func (m cohortDivergedMsg) onStaleGeneration() {
 	select {
 	case m.Reply <- nil:
@@ -382,8 +349,7 @@ type maintenanceRecoveredMsg struct {
 	reply       chan error
 }
 
-func (maintenanceRecoveredMsg) isleaseMessage()         {}
-func (maintenanceRecoveredMsg) doneChan() chan struct{} { return nil }
+func (maintenanceRecoveredMsg) isleaseMessage() {}
 func (m maintenanceRecoveredMsg) onPanic(err error) {
 	select {
 	case m.reply <- err:
@@ -559,7 +525,6 @@ type diagGatheredMsg struct {
 }
 
 func (diagGatheredMsg) isleaseMessage()          {}
-func (diagGatheredMsg) doneChan() chan struct{}  { return nil }
 func (diagGatheredMsg) onPanic(error)            {} // no caller to unblock
 func (diagGatheredMsg) isWorkerTerminalMessage() {}
 
@@ -577,9 +542,8 @@ type provisionRequestedMsg struct {
 	Operation shared.OperationIntentClaim
 }
 
-func (provisionRequestedMsg) isleaseMessage()         {}
-func (provisionRequestedMsg) isactorCommandMessage()  {}
-func (provisionRequestedMsg) doneChan() chan struct{} { return nil }
+func (provisionRequestedMsg) isleaseMessage()        {}
+func (provisionRequestedMsg) isactorCommandMessage() {}
 func (m provisionRequestedMsg) onPanic(err error) {
 	select {
 	case m.Ack <- err:
@@ -610,7 +574,6 @@ type provisionCompletedMsg struct {
 }
 
 func (provisionCompletedMsg) isleaseMessage()          {}
-func (provisionCompletedMsg) doneChan() chan struct{}  { return nil }
 func (provisionCompletedMsg) onPanic(error)            {} // no caller to unblock
 func (provisionCompletedMsg) isWorkerTerminalMessage() {}
 
@@ -631,7 +594,6 @@ type provisionErroredMsg struct {
 }
 
 func (provisionErroredMsg) isleaseMessage()          {}
-func (provisionErroredMsg) doneChan() chan struct{}  { return nil }
 func (provisionErroredMsg) onPanic(error)            {} // no caller to unblock
 func (provisionErroredMsg) isWorkerTerminalMessage() {}
 
@@ -647,7 +609,6 @@ type operationAmbiguousMsg struct {
 }
 
 func (operationAmbiguousMsg) isleaseMessage()          {}
-func (operationAmbiguousMsg) doneChan() chan struct{}  { return nil }
 func (operationAmbiguousMsg) onPanic(error)            {}
 func (operationAmbiguousMsg) isWorkerTerminalMessage() {}
 
@@ -668,9 +629,8 @@ type restartRequestedMsg struct {
 	Maintenance          shared.MaintenanceIntentClaim
 }
 
-func (restartRequestedMsg) isleaseMessage()         {}
-func (restartRequestedMsg) isactorCommandMessage()  {}
-func (restartRequestedMsg) doneChan() chan struct{} { return nil }
+func (restartRequestedMsg) isleaseMessage()        {}
+func (restartRequestedMsg) isactorCommandMessage() {}
 func (m restartRequestedMsg) onPanic(err error) {
 	select {
 	case m.Ack <- err:
@@ -690,9 +650,8 @@ type updateRequestedMsg struct {
 	Maintenance          shared.MaintenanceIntentClaim
 }
 
-func (updateRequestedMsg) isleaseMessage()         {}
-func (updateRequestedMsg) isactorCommandMessage()  {}
-func (updateRequestedMsg) doneChan() chan struct{} { return nil }
+func (updateRequestedMsg) isleaseMessage()        {}
+func (updateRequestedMsg) isactorCommandMessage() {}
 func (m updateRequestedMsg) onPanic(err error) {
 	select {
 	case m.Ack <- err:
@@ -772,9 +731,8 @@ type restoreRequestedMsg struct {
 	Operation            shared.OperationIntentClaim
 }
 
-func (restoreRequestedMsg) isleaseMessage()         {}
-func (restoreRequestedMsg) isactorCommandMessage()  {}
-func (restoreRequestedMsg) doneChan() chan struct{} { return nil }
+func (restoreRequestedMsg) isleaseMessage()        {}
+func (restoreRequestedMsg) isactorCommandMessage() {}
 func (m restoreRequestedMsg) onPanic(err error) {
 	select {
 	case m.Ack <- err:
@@ -813,7 +771,6 @@ type replaceCompletedMsg struct {
 }
 
 func (replaceCompletedMsg) isleaseMessage()          {}
-func (replaceCompletedMsg) doneChan() chan struct{}  { return nil }
 func (replaceCompletedMsg) onPanic(error)            {} // no caller to unblock
 func (replaceCompletedMsg) isWorkerTerminalMessage() {}
 
@@ -823,7 +780,6 @@ type replaceRecoveredMsg struct {
 }
 
 func (replaceRecoveredMsg) isleaseMessage()          {}
-func (replaceRecoveredMsg) doneChan() chan struct{}  { return nil }
 func (replaceRecoveredMsg) onPanic(error)            {} // no caller to unblock
 func (replaceRecoveredMsg) isWorkerTerminalMessage() {}
 
@@ -833,7 +789,6 @@ type replaceFailedMsg struct {
 }
 
 func (replaceFailedMsg) isleaseMessage()          {}
-func (replaceFailedMsg) doneChan() chan struct{}  { return nil }
 func (replaceFailedMsg) onPanic(error)            {} // no caller to unblock
 func (replaceFailedMsg) isWorkerTerminalMessage() {}
 
@@ -1224,19 +1179,11 @@ func (a *LeaseActor) endWorkerActivity() {
 
 func (a *LeaseActor) rejectRetiringMessage(msg leaseMessage) {
 	msg.onPanic(errActorTerminated)
-	if ch := msg.doneChan(); ch != nil {
-		close(ch)
-	}
 }
 
 func (a *LeaseActor) handle(msg leaseMessage) {
 	a.currentMessageStart.Store(time.Now().UnixNano())
 	defer a.currentMessageStart.Store(0)
-	defer func() {
-		if ch := msg.doneChan(); ch != nil {
-			close(ch)
-		}
-	}()
 	// Contain the blast radius of a handler panic to a single message:
 	// log with stack, bump a counter, and let the actor keep processing.
 	// Without this, a panic in an SM entry action or handler kills the

@@ -81,7 +81,8 @@ func TestLegacyUpgradeInventoryBootstrapsDurableRuntimePrincipal(t *testing.T) {
 	assert.Equal(t, freshTestProviderUUID, command.ProviderUUID())
 	assert.Equal(t, "backend-a", command.BackendName())
 	assert.Equal(t, testBackendStorageID("backend-a"), command.BackendStorageID())
-	assert.True(t, command.LegacyLifecycle())
+	require.True(t, command.Valid())
+	assert.True(t, command.lifecycleLegacy)
 	assert.Equal(t,
 		"https://provider.test/proxy/callbacks/provision?trace=a%2Fb",
 		command.CallbackURL(),

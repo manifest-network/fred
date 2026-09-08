@@ -479,14 +479,6 @@ type provisionRecoveryBaseline struct {
 func (b *Backend) snapshotProvisionRecoveryBaseline() map[string]provisionRecoveryBaseline {
 	b.provisionsMu.RLock()
 	defer b.provisionsMu.RUnlock()
-	return b.snapshotProvisionRecoveryBaselineLocked()
-}
-
-// snapshotProvisionRecoveryBaselineLocked is the publication-side form of
-// snapshotProvisionRecoveryBaseline. The caller owns provisionsMu (read or
-// write); keeping that fact in the name makes accidental recursive locking
-// visible at review time.
-func (b *Backend) snapshotProvisionRecoveryBaselineLocked() map[string]provisionRecoveryBaseline {
 	baseline := make(map[string]provisionRecoveryBaseline, len(b.provisions))
 	for leaseUUID, current := range b.provisions {
 		baseline[leaseUUID] = provisionRecoveryBaseline{
@@ -495,6 +487,27 @@ func (b *Backend) snapshotProvisionRecoveryBaselineLocked() map[string]provision
 		}
 	}
 	return baseline
+}
+
+// refreshProvisionRecoveryBaselineLocked advances only snapshots whose live
+// projection changed during inventory collection. The caller holds provisionsMu
+// continuously from comparison through candidate construction: unchanged
+// snapshots remain exact and detached, so cloning them a second time would add
+// fleet-sized allocations under the exclusive lock without new evidence.
+func (b *Backend) refreshProvisionRecoveryBaselineLocked(
+	baseline map[string]provisionRecoveryBaseline,
+	changed map[string]string,
+) {
+	for leaseUUID := range changed {
+		if current := b.provisions[leaseUUID]; current != nil {
+			baseline[leaseUUID] = provisionRecoveryBaseline{
+				pointer: current,
+				value:   recoveredFromProvision(current),
+			}
+		} else {
+			delete(baseline, leaseUUID)
+		}
+	}
 }
 
 // changedProvisionRecoveryLeases is called with provisionsMu held. Pointer
@@ -596,8 +609,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := closedLeaseRecoveryTargets(closedReceipts, containers); err != nil {
+	closedTargets, err := closedLeaseRecoveryTargets(closedReceipts, containers)
+	if err != nil {
 		return err
+	}
+	// Ordinary recovery inventory can discover a new excluded footprint, but
+	// only the strict identity-bracketed cleanup observation may release a hold.
+	if len(closedTargets) > 0 {
+		b.observeTerminalSubstrate(terminalReceiptClosed, len(closedTargets))
 	}
 	for leaseUUID := range closedReceipts {
 		closedLeaseUUIDs[leaseUUID] = struct{}{}
@@ -605,6 +624,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	failedOperationContainerIDs, err := failedOperationFence.targetContainerIDs(containers)
 	if err != nil {
 		return fmt.Errorf("apply failed-operation recovery fence: %w", err)
+	}
+	if len(failedOperationContainerIDs) > 0 {
+		b.observeTerminalSubstrate(terminalReceiptFailed, len(failedOperationContainerIDs))
 	}
 
 	// A durable close intent is the sole recovery authority once teardown has
@@ -1558,6 +1580,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// still converge in this pass. This avoids both stale-generation publication
 	// and fleet-wide starvation from one hot lease.
 	changedProjectionLeases := b.changedProvisionRecoveryLeases(provisionBaseline)
+	b.refreshProvisionRecoveryBaselineLocked(provisionBaseline, changedProjectionLeases)
 	for leaseUUID := range changedIntentLeases {
 		changedProjectionLeases[leaseUUID] = "durable operation generation changed"
 	}
@@ -1785,7 +1808,10 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// authorities in their canonical actorsMu -> provisionsMu order through an
 	// opaque capability. Any lease that changed in the gap, gained a durable
 	// operation, or still has an active actor is preserved for the next sweep.
-	publicationBaseline := b.snapshotProvisionRecoveryBaselineLocked()
+	// The first comparison refreshed only changed snapshots. Candidate building
+	// above mutates detached values, so that baseline still describes the live map
+	// at this hand-off without another deep clone of every tracked lease.
+	publicationBaseline := provisionBaseline
 	b.provisionsMu.Unlock()
 
 	publicationDeferred := make(map[string]struct{})
@@ -2216,6 +2242,7 @@ func (b *Backend) reconcileLoop() {
 // Release but the intent -> callback transaction transiently failed, the
 // durable sealed claim remains sufficient to retry exact settlement here.
 func (b *Backend) reconcileStateAndOperations(ctx context.Context) error {
+	defer b.observeUnaccountedManagedVolumes(ctx)
 	if err := b.recoverState(ctx); err != nil {
 		return err
 	}

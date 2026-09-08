@@ -234,8 +234,9 @@ type inventoryProjection struct {
 	// retentionPositives is derived inside ReconciliationSweep from the sealed
 	// snapshot whenever the fleet observation is incomplete. A retention is a
 	// conservative positive but cannot establish current ownership while any
-	// peer is silent. Keeping this field private prevents callers from omitting
-	// or manufacturing that classification.
+	// peer is silent. Unlike a rejected endpoint, a trusted retention can
+	// reaffirm an already confirmed owner. Keeping this field private prevents
+	// callers from omitting or manufacturing that classification.
 	retentionPositives map[string][]string
 	// AbsenceEvidence is an opaque snapshot minted by the exact topology-bound
 	// inventory collector. Only ReconciliationSweep.Project can consume it;
@@ -2775,37 +2776,6 @@ func (s *Store) matchAttemptTokenLocked(token AttemptToken) (Placement, bool) {
 	return p, true
 }
 
-// DeleteRecord removes only the exact store- and lease-bound placement record
-// represented by revision. The target is derived from the capability itself;
-// callers cannot transplant a numerically equal revision to another lease or
-// store. Invalid and foreign revisions are rejected.
-func (s *Store) deleteRecord(revision RecordRevision) (bool, error) {
-	if !revision.Valid() || revision.issuer != s.recordIssuer {
-		return false, ErrInvalidRecordRevision
-	}
-	if err := s.reattestRuntimeAuthority(); err != nil {
-		return false, err
-	}
-	leaseUUID := revision.leaseUUID
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.restoreSourceClaimedLocked(leaseUUID) {
-		return false, fmt.Errorf("%w: lease %q", ErrRestoreSourceClaimed, leaseUUID)
-	}
-	if s.attemptClaimedLocked(leaseUUID) {
-		return false, fmt.Errorf("%w: lease %q", ErrAttemptClaimed, leaseUUID)
-	}
-	p, exists := s.cache[leaseUUID]
-	if !exists || p.revision != revision.value {
-		return false, nil
-	}
-	if err := s.deleteLocked(leaseUUID, "delete typed placement record"); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // consumePruneAbsence performs the final proof validation and record deletion
 // in one critical section. A newer inventory session, record mutation,
 // maintenance command, restore use, or attempt recovery therefore invalidates
@@ -2960,11 +2930,22 @@ func (s *Store) projectInventory(
 		case projection.Conflicts[leaseUUID] != nil:
 			candidate = projectConflict(existing, exists, projection.Conflicts[leaseUUID], now)
 
-		case projection.UntrustedPositives[leaseUUID] != nil ||
-			projection.retentionPositives[leaseUUID] != nil:
+		case projection.UntrustedPositives[leaseUUID] != nil:
 			candidate = projectUntrustedPositive(
 				existing, exists, projectionQuarantineBackends(projection, leaseUUID), now,
 			)
+
+		case projection.retentionPositives[leaseUUID] != nil:
+			reporters := projection.retentionPositives[leaseUUID]
+			if existing.State() == StateConfirmed && existing.Attempt == "" &&
+				len(reporters) == 1 && reporters[0] == existing.Backend {
+				// A trusted retention adds no owner or lifecycle authority to this
+				// exact confirmed record. Reaffirm it under the projection fence;
+				// silence from an unrelated backend cannot revoke restore affinity.
+				candidate = existing
+			} else {
+				candidate = projectUntrustedPositive(existing, exists, reporters, now)
+			}
 
 		case projection.Placements[leaseUUID] != "":
 			backendName := projection.Placements[leaseUUID]

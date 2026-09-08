@@ -2041,6 +2041,8 @@ func (r *Reconciler) processOrphan(
 	}
 	var cleanupReason string
 	switch disposition {
+	case placement.ReconciliationObservationChainNotFound:
+		cleanupReason = metrics.CleanupSkipChainUnknown
 	case placement.ReconciliationObservationChainLive:
 		cleanupReason = metrics.CleanupSkipChainLive
 	case placement.ReconciliationObservationChainUnknownState:
@@ -2049,12 +2051,19 @@ func (r *Reconciler) processOrphan(
 	if cleanupReason != "" {
 		metrics.ReconcilerCleanupSkipsTotal.
 			WithLabelValues(metrics.CleanupPassOrphan, cleanupReason).Inc()
-		slog.Info("reconcile: skipping orphan without positive terminal chain authority",
-			"lease_uuid", leaseUUID, "reason", cleanupReason)
+		if disposition == placement.ReconciliationObservationChainNotFound {
+			slog.Warn("reconcile: orphan has no chain record; MANUAL CLEANUP MAY BE REQUIRED",
+				"lease_uuid", leaseUUID, "reason", cleanupReason)
+		} else {
+			slog.Info("reconcile: skipping orphan without positive terminal chain authority",
+				"lease_uuid", leaseUUID, "reason", cleanupReason)
+		}
 		return
 	}
 	if disposition != placement.ReconciliationObservationReady || !action.Valid() {
-		metrics.ReconcilerInflightSkipsTotal.Inc()
+		if disposition == placement.ReconciliationObservationOperationBusy {
+			metrics.ReconcilerInflightSkipsTotal.Inc()
+		}
 		slog.Debug("reconcile: skipping orphan without composite terminal authority",
 			"lease_uuid", leaseUUID, "observation_disposition", disposition,
 		)

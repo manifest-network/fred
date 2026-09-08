@@ -427,7 +427,7 @@ func TestStorageMutationGuard_ManagerRenameAmbiguityLatchesBackendAfterSuccessfu
 	}
 }
 
-func TestStorageMutationGuard_CanceledPostcheckLatchesAmbiguity(t *testing.T) {
+func TestStorageMutationGuard_CanceledEffectReceivesIndependentPostcheck(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -463,12 +463,32 @@ func TestStorageMutationGuard_CanceledPostcheckLatchesAmbiguity(t *testing.T) {
 	err = b.mutationAdapter().composeUp(callerCtx, &composetypes.Project{}, composeUpOpts{})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
-	assert.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
-	select {
-	case <-b.stopCtx.Done():
-	default:
-		t.Fatal("a canceled postcheck did not latch the backend lifetime")
-	}
+	assert.NotErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous,
+		"the raw call error cannot manufacture a storage-authority failure")
+	require.NoError(t, b.terminalStorageAuthorityError())
+	require.NoError(t, b.stopCtx.Err())
+}
+
+func TestStorageMutationGuard_IndependentPostcheckFailureStillLatches(t *testing.T) {
+	stopCtx, stop := context.WithCancel(t.Context())
+	t.Cleanup(stop)
+	id, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	b := &Backend{storageIdentity: id, stopCtx: stopCtx, stopCancel: stop,
+		recoveryDockerReadTimeout: 10 * time.Millisecond}
+	installMutationTestVerifier(t, b, func(ctx context.Context) error {
+		require.NoError(t, ctx.Err(), "postcheck starts with an independent budget")
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	callerCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err = b.completeStorageMutation(callerCtx, "test completed effect", context.Canceled)
+	require.ErrorIs(t, err, context.Canceled, "the original effect error remains visible")
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the independent postcheck has a finite bound")
+	require.ErrorIs(t, err, backendidentity.ErrMutationOutcomeAmbiguous)
+	require.ErrorIs(t, b.terminalStorageAuthorityError(), backendidentity.ErrMutationOutcomeAmbiguous)
+	require.ErrorIs(t, b.stopCtx.Err(), context.Canceled)
 }
 
 func TestStorageMutationGuard_BackendStopPreventsMutation(t *testing.T) {
