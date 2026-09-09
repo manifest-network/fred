@@ -14,12 +14,14 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 
@@ -183,11 +185,14 @@ func (f callbackAckRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 // acknowledged the preceding completion.
 func acknowledgePendingCallbacksForTest(t *testing.T, store *shared.CallbackStore) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var delivered atomic.Int32
 	sender, err := shared.NewCallbackSender(shared.CallbackSenderConfig{
 		Store:           store,
 		StorageAttestor: callbackStorageAttestorForTest(t, store, ctx, allowTestCallbackDelivery),
 		HTTPClient: &http.Client{Transport: callbackAckRoundTripper(func(req *http.Request) (*http.Response, error) {
+			delivered.Add(1)
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     make(http.Header),
@@ -206,17 +211,22 @@ func acknowledgePendingCallbacksForTest(t *testing.T, store *shared.CallbackStor
 		defer close(done)
 		sender.RunReplayLoop()
 	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(asyncTestResultTimeout):
+			t.Error("callback replay loop did not stop")
+		}
+	}()
 	sender.NotifyPendingCallbacks()
-	require.Eventually(t, func() bool {
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		pending, listErr := store.ListPending()
-		return listErr == nil && len(pending) == 0
-	}, time.Second, time.Millisecond, "successful transport did not acknowledge pending callbacks")
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("callback replay loop did not stop")
-	}
+		if !assert.NoError(collect, listErr, "read callback acknowledgment state") {
+			return
+		}
+		assert.Empty(collect, pending, "callbacks still pending after %d successful transports", delivered.Load())
+	}, asyncTestResultTimeout, time.Millisecond, "successful transport did not acknowledge pending callbacks")
 }
 
 // newBoundOperationIntentTestStore preserves the compact constructor shape

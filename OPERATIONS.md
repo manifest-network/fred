@@ -1155,6 +1155,14 @@ custom-domain replacement of a v0.13 lineage stays legacy and tokenless;
 authority. Only a later genuine provision or restore issued by providerd rotates
 that lease to typed callback authority.
 
+This compatibility applies to the existing workload, not to new tokenless
+provision or restore requests. Those require a canonical UUIDv4 `operation_id`
+in the completion URL and its matching resolved lifecycle route before durable
+admission, even when restoring legacy retained data. A `400` for a missing
+operation identity means the caller must use the upgraded protocol; do not edit
+journals, relabel containers, or disable HMAC verification to work around it.
+“Tokenless” refers to callback identity, not request authentication.
+
 Before the target append, the row advances from a cancelable admission to an
 append-started phase. Those phases use different opaque capabilities: capacity
 refusal may cancel only the original admission, and every copy of that token is

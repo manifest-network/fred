@@ -46,8 +46,8 @@ var callbackOperationHistoryBucketName = []byte("completed_callback_operation_hi
 type OperationIntentKind string
 
 // OperationID is the opaque operation authority shared by provider and
-// backend layers. Its zero value is the explicit tokenless compatibility value
-// accepted only where v0.13 records or requests are deliberately supported.
+// backend layers. Its zero value is reserved for historical records, legacy
+// observations, and their exact replay; new admission requires a canonical UUIDv4.
 type OperationID = operationid.ID
 
 const (
@@ -237,11 +237,14 @@ type OperationIntentSpec struct {
 // OperationIntentCandidate is a store-minted, immutable admission capability.
 // The semantic spec is detached from caller-owned buffers, while the private
 // issuer and lineage prevent a candidate assembled for one callback journal
-// from authorizing mutation through another. The zero value is invalid.
+// from authorizing mutation through another. Its retained runtime authority
+// requires a canonical UUIDv4 operation callback and makes success and refusal
+// representable before Pending can become durable. The zero value is invalid.
 type OperationIntentCandidate struct {
 	issuer     *CallbackStore
 	settlement *OperationSettlement
 	spec       OperationIntentSpec
+	runtime    ReleaseRuntimeAuthority
 	backend    string
 	storageID  backendidentity.ID
 }
@@ -271,8 +274,18 @@ func newOperationIntentCandidate(
 	if len(spec.EffectiveItems) == 0 {
 		spec.EffectiveItems = slices.Clone(spec.Items)
 	}
+	operationID, err := parseOperationCallbackID(spec.CallbackURL)
+	if err != nil {
+		return OperationIntentCandidate{}, fmt.Errorf("%w: operation callback authority: %w", backend.ErrValidation, err)
+	}
+	runtimeAuthority, err := NewReleaseRuntimeAuthority(
+		operationID, spec.Tenant, spec.ProviderUUID, spec.CallbackURL, spec.LifecycleCallbackURL,
+	)
+	if err != nil {
+		return OperationIntentCandidate{}, fmt.Errorf("%w: operation callback runtime authority: %w", backend.ErrValidation, err)
+	}
 	candidate := OperationIntentCandidate{
-		issuer: issuer, spec: spec, backend: backendName, storageID: storageID,
+		issuer: issuer, spec: spec, runtime: runtimeAuthority, backend: backendName, storageID: storageID,
 	}
 	if err := validateOperationIntentCandidate(candidate); err != nil {
 		return OperationIntentCandidate{}, err
@@ -292,7 +305,11 @@ func cloneOperationIntentSpec(spec OperationIntentSpec) OperationIntentSpec {
 // operationAuthority is the immutable identity shared by pending and terminal
 // states. Private implementations embed it to share the read-only authority API.
 type operationAuthority struct {
-	entry     *operationIntentEntry
+	entry *operationIntentEntry
+	// New admissions retain the runtime capability that makes both terminal
+	// outcomes representable. Typed rows rehydrate it at decoding; historical
+	// tokenless rows remain observable but carry no typed settlement authority.
+	runtime   ReleaseRuntimeAuthority
 	storageID backendidentity.ID
 	digest    [sha256.Size]byte
 }
@@ -744,25 +761,21 @@ func (s *CallbackStore) beginOperationIntent(
 		return OperationIntentAdmission{}, err
 	}
 	spec := cloneOperationIntentSpec(candidate.spec)
-	operationID, err := parseOperationCallbackID(spec.CallbackURL)
-	if err != nil {
-		return OperationIntentAdmission{}, err
-	}
 	id, err := uuid.NewRandom()
 	if err != nil {
 		return OperationIntentAdmission{}, fmt.Errorf("allocate callback operation intent ID: %w", err)
 	}
 	entry := operationIntentEntry{
 		IntentID:             id.String(),
-		OperationID:          operationID,
+		OperationID:          candidate.runtime.OperationID(),
 		Kind:                 spec.Kind,
 		LeaseUUID:            spec.LeaseUUID,
-		CallbackURL:          spec.CallbackURL,
-		LifecycleCallbackURL: spec.LifecycleCallbackURL,
+		CallbackURL:          candidate.runtime.CallbackURL(),
+		LifecycleCallbackURL: candidate.runtime.LifecycleCallbackURL(),
 		Backend:              candidate.backend,
 		BackendStorageID:     candidate.storageID.String(),
-		Tenant:               spec.Tenant,
-		ProviderUUID:         spec.ProviderUUID,
+		Tenant:               candidate.runtime.Tenant(),
+		ProviderUUID:         candidate.runtime.ProviderUUID(),
 		Items:                slices.Clone(spec.Items),
 		ResourceProfiles:     CloneSKUResourceSnapshot(spec.ResourceProfiles),
 		EffectiveItems:       slices.Clone(spec.EffectiveItems),
@@ -900,7 +913,7 @@ func (s *CallbackStore) beginOperationIntent(
 			)
 		}
 		claimCandidate := OperationIntentClaim{operationAuthority: operationAuthority{
-			entry: &entry, storageID: candidate.storageID, digest: sha256.Sum256(data),
+			entry: &entry, runtime: candidate.runtime, storageID: candidate.storageID, digest: sha256.Sum256(data),
 		}}
 		var transition leaseMutationTransition
 		var transitionErr error
@@ -1264,7 +1277,7 @@ func (s *CallbackStore) resolveOperationIntentLocked(
 			return err
 		}
 		terminalClaim := OperationIntentClaim{operationAuthority: operationAuthority{
-			entry: &terminal, storageID: claim.storageID, digest: sha256.Sum256(terminalData),
+			entry: &terminal, runtime: claim.runtime, storageID: claim.storageID, digest: sha256.Sum256(terminalData),
 		}}
 		transition, err := newSettleOperationLeaseMutation(claim, terminalClaim)
 		if err != nil {
@@ -1468,6 +1481,9 @@ func validateOperationIntentCandidate(candidate OperationIntentCandidate) error 
 	if !candidate.storageID.Valid() {
 		return errors.New("callback operation intent candidate has no backend storage authority")
 	}
+	if !candidate.runtime.valid {
+		return errors.New("callback operation intent candidate has no runtime authority")
+	}
 	return validateOperationIntentSpec(candidate.spec)
 }
 
@@ -1609,9 +1625,9 @@ func parseOperationCallbackID(callbackURL string) (OperationID, error) {
 	}
 	ids := values[backend.CallbackOperationIDQueryParameter]
 	if len(ids) == 0 {
-		// Tokenless compatibility is intentional at the request boundary, so an
-		// explicitly recorded tokenless intent remains readable and comparable.
-		// It does not authorize completion when the durable intent is absent.
+		// Historical tokenless rows remain readable and comparable. New admission
+		// separately requires typed runtime authority before it can write a row;
+		// this compatibility parser must not mint that authority.
 		return OperationID{}, nil
 	}
 	if len(ids) != 1 {
@@ -1665,8 +1681,17 @@ func decodeOperationIntent(key, value []byte) (OperationIntentClaim, error) {
 	if err != nil {
 		return OperationIntentClaim{}, fmt.Errorf("decode callback operation intent %q storage identity: %w", key, err)
 	}
+	var runtimeAuthority ReleaseRuntimeAuthority
+	if !entry.OperationID.IsZero() {
+		runtimeAuthority, err = NewReleaseRuntimeAuthority(
+			entry.OperationID, entry.Tenant, entry.ProviderUUID, entry.CallbackURL, entry.LifecycleCallbackURL,
+		)
+		if err != nil {
+			return OperationIntentClaim{}, fmt.Errorf("decode callback operation intent %q runtime authority: %w", key, err)
+		}
+	}
 	return OperationIntentClaim{operationAuthority: operationAuthority{
-		entry: &entry, storageID: storageID, digest: sha256.Sum256(value),
+		entry: &entry, runtime: runtimeAuthority, storageID: storageID, digest: sha256.Sum256(value),
 	}}, nil
 }
 

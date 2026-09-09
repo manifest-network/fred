@@ -342,7 +342,11 @@ Start provisioning a resource asynchronously.
 ```
 
 **Behavior:**
-1. Validate the request
+1. Validate the request, including exactly one canonical UUIDv4 `operation_id`
+   in `callback_url`. Reject tokenless new provision requests with `400` before
+   persisting an operation intent or mutating the substrate. An omitted
+   `lifecycle_callback_url` may be derived from the typed operation URL as
+   described in Callback Protocol; an explicit field must match that pair
 2. Store both callback URLs for this `lease_uuid` byte-for-byte. The complete
    `callback_url`, including its query, settles only this provision operation;
    `lifecycle_callback_url` carries a separate typed lifecycle capability and
@@ -632,6 +636,12 @@ Restore a soft-deleted lease's retained data into a **new** lease (async, callba
 
 `lease_uuid` is the new lease; `from_lease_uuid` is the original retained lease. `items` must shape-match (service name → summed quantity) the retained set. The new lease's `items` MAY specify a **different SKU disk tier** than the source — only the item *shape* (service names + summed quantities) must match, not the resource/disk tier. A **promote** (same-or-larger disk tier) is always allowed and applies the new `disk_mb` cap. A **demote** (smaller disk tier) is allowed only if the retained volume's measured data fits the new tier's `disk_mb` cap; the backend runs a demote-fit check before adopting and otherwise refuses with `422` `code=demote_exceeds_tier` (see below).
 
+Like provision, every new restore requires a `callback_url` with exactly one
+canonical UUIDv4 `operation_id`, even when its retained source came from a
+v0.13 workload. Reject tokenless requests with `400` before operation admission,
+source reservation, or substrate mutation. An omitted lifecycle URL may be
+derived from the typed operation URL; an explicit URL must match exactly.
+
 **Exclusive source reservation is mandatory.** Before accepting the restore or
 performing an irreversible volume adoption, a backend **MUST** durably and
 atomically compare-and-transition the retained source from its restorable state
@@ -847,6 +857,12 @@ remains recoverable after provider restart. Once that evidence is consumed or
 replaced, Fred returns 200 and ignores the callback completely, including status
 publication.
 
+The operation identity is required for every new provision and restore, not
+only requests from the bundled provider. Validate the typed operation/lifecycle
+pair before durable admission. Here, **tokenless** means missing callback
+operation/lifecycle identity, not unauthenticated: request and callback HMAC
+requirements apply to both typed commands and supported legacy observations.
+
 Provision and restore requests also carry a typed
 `lifecycle_callback_url` with `lifecycle_id=<uuid>`. Store it separately and use
 it for subsequent restart/update completion, autonomous container failure, and
@@ -863,17 +879,22 @@ publish only `ready`, `failed`, or `retained` status. Never use it for the
 original provision/restore result, which must go to the operation-scoped
 `callback_url`.
 
-The field may be absent only in callback state inherited from a migrated v0.13
-workload. The bundled Docker backend derives the paired route by replacing
-exactly one `operation_id` with `lifecycle_id` and preserving every unrelated
-raw query component. An operationless v0.13 URL remains tokenless and is
-authorized only for a lease whose durable placement was migrated as legacy.
-External backends should consume the explicit field for every current command
-rather than interpreting either URL.
+At request entry, `lifecycle_callback_url` may be omitted when the completion
+URL carries its required operation identity. The bundled Docker backend derives
+the paired route by replacing exactly one `operation_id` with `lifecycle_id`
+and preserving every unrelated raw query component; a supplied lifecycle URL
+must equal that derived URL byte-for-byte. Persist the resolved pair with the
+admitted operation. Missing lifecycle labels may also be recovered from an existing
+migrated v0.13 workload. Its operationless URL remains tokenless and is
+authorized only for a lease whose durable placement was migrated as legacy;
+this recovery compatibility never authorizes a new tokenless provision or
+restore. External backends should use the shared boundary parser or consume
+the explicit pair, not reconstruct URLs independently.
 
 During the stopped cutover, install and start the upgraded backends before the
-upgraded provider, but never run an old provider against them. A new backend can
-recover the operationless route already embedded by v0.13.0 and continue using
+upgraded provider, but never run an old provider against them: its tokenless new
+provision/restore requests are rejected. A new backend can recover the
+operationless route already embedded by v0.13.0 and continue using
 it after Fred migrates that owner as legacy. Starting a new provider against an
 old backend is not lifecycle-compatible: a v0.13.0 backend ignores
 `lifecycle_callback_url` and later reuses the expired operation-scoped URL,
@@ -1541,6 +1562,10 @@ Before deploying your backend:
       current provider
 - [ ] **Inbound `X-Fred-Signature` verified on all contract endpoints** (401 on missing/invalid; only `/health`, `/stats`, `/metrics` are exempt)
 - [ ] Provision returns 202 and works asynchronously
+- [ ] New provision/restore admission requires a canonical UUIDv4 operation
+      callback identity and its matching resolved lifecycle pair before any
+      operation journal write or substrate mutation; legacy callback recovery
+      cannot bypass this requirement
 - [ ] Exact `callback_url` and typed `lifecycle_callback_url` stored separately per lease; provision/restore completion uses the exact URL, exact maintenance completion uses the lifecycle route without becoming coalescible, and autonomous observations use only the lifecycle URL
 - [ ] Provision/restore resource intent freezes all physical admission inputs,
       including substrate scratch separately from retainable disk

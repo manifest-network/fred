@@ -724,6 +724,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- New provision and restore admission now requires the same validated typed
+  runtime authority used by Release settlement. A callback URL without its
+  operation UUID is rejected before writing a pending intent, preventing an
+  accepted operation that cannot publish either success or refusal. Existing
+  legacy workload callbacks remain supported; current requests may still omit
+  the lifecycle URL when it can be derived from their typed operation URL.
+  (ENG-632)
 - Historical inventory exclusions now retire even when the confirmed owner's
   container has disappeared. One sealed sweep must account for the owner and
   every remembered reporter; complete absence clears only the diagnostic,

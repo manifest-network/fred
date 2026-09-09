@@ -1513,20 +1513,14 @@ func releaseForOperationAuthority(authority operationAuthority) (Release, error)
 	if authority.CreatedAt().IsZero() {
 		return Release{}, errors.New("operation release requires a durable admission timestamp")
 	}
-	runtimeAuthority, err := NewReleaseRuntimeAuthority(
-		authority.OperationID(),
-		authority.Tenant(),
-		authority.ProviderUUID(),
-		authority.CallbackURL(),
-		authority.LifecycleCallbackURL(),
-	)
-	if err != nil {
-		return Release{}, fmt.Errorf("construct operation release runtime authority: %w", err)
+	if !authority.runtime.valid {
+		return Release{}, errors.New("operation release requires typed runtime authority")
 	}
+	runtimeAuthority := authority.runtime
 	release := Release{
 		Manifest:         authority.Manifest(),
 		Image:            "stack",
-		OperationID:      authority.OperationID(),
+		OperationID:      runtimeAuthority.OperationID(),
 		Items:            authority.EffectiveItems(),
 		ResourceProfiles: authority.ResourceProfiles(),
 		RuntimeAuthority: &runtimeAuthority,
@@ -1551,6 +1545,7 @@ func cloneOperationAuthority(authority operationAuthority) operationAuthority {
 	entry.Manifest = bytes.Clone(entry.Manifest)
 	return operationAuthority{
 		entry:     &entry,
+		runtime:   authority.runtime,
 		storageID: authority.storageID,
 		digest:    authority.digest,
 	}

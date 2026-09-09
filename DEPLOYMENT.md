@@ -805,7 +805,8 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
 3. Roll the backend binaries one at a time when the release's backend protocol
    is backward-compatible, then stop the single `providerd` instance and start
    the upgraded binary. Never overlap the old and new `providerd` processes for
-   the same provider and backend fleet.
+   the same provider and backend fleet. This does **not** apply to the v0.13.0
+   boundary below, which requires a stopped, fenced fleet cutover.
 
 `providerd` upgrades are stop/start and include a brief outage. Active-active or
 rolling `providerd` instances for one provider/backend fleet are unsupported:
@@ -1481,6 +1482,18 @@ legacy owner before the new provider starts. Stack-form workloads keep reporting
 lifecycle observations without replacement. An absent or rebuilt placement
 database is never a recovery path for those workloads.
 
+Compatibility preserves existing containers, reads, legacy lifecycle
+observations, and identity-preserving maintenance; it does not admit new
+tokenless work. Every new provision or restore requires exactly one canonical
+UUIDv4 `operation_id` in its completion URL before backend operation admission,
+including restore from a legacy retained source. An old provider or manually
+constructed tokenless request is rejected with `400`; do not reopen new-work
+ingress until the upgraded provider is running. An omitted
+`lifecycle_callback_url` remains valid only when the backend can derive the
+matching typed route from that operation URL. “Tokenless” describes absent
+callback identity, not absent authentication: HMAC verification remains
+required throughout.
+
 Before any action may remove the last container in a complete callback-bearing
 v0.13 cohort,
 docker-backend CAS-persists a separately typed `LegacyRuntimeAuthority` on its
@@ -1493,7 +1506,7 @@ update, or custom-domain replacement stays legacy and tokenless;
 provider callback authority. A callback-base change commits only with the
 replacement Release; failure retains the previous route. The legacy lifecycle
 class rotates to typed only when a later genuine provision or restore supplies
-an operation-scoped callback capability that providerd also persists. A
+an operation-scoped callback capability that providerd also persists. An
 active callbackless pre-label cohort cannot be assigned provider callback
 authority safely and is rejected by the mandatory stopped adoption preflight;
 callbackless historical cleanup/close evidence remains readable but never

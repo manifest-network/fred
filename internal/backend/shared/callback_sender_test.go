@@ -942,7 +942,7 @@ func TestSendCallback_DurableSenderPersistsThenReplayRemoves(t *testing.T) {
 
 	s := newTestSender(t, store, server.Client(), "secret")
 	leaseUUID := testLeaseUUID("lease-1")
-	callbackURL := server.URL + callbackurl.ProvisionPath
+	callbackURL := server.URL + callbackurl.ProvisionPath + "?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "test-backend", s.storageIdentity)
 	s.sendOperationCallbackForTest(
 		leaseUUID, callbackURL, "test-backend",
@@ -976,7 +976,7 @@ func TestSendCallback_DurableFailureCompletionRemainsPendingUntilReplay(t *testi
 
 	s := newTestSender(t, store, server.Client(), "secret")
 	leaseUUID := testLeaseUUID("lease-1")
-	callbackURL := server.URL + callbackurl.ProvisionPath
+	callbackURL := server.URL + callbackurl.ProvisionPath + "?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "test-backend", s.storageIdentity)
 	s.sendOperationCallbackForTest(leaseUUID, callbackURL, "test-backend", backend.CallbackStatusFailed, "error")
 
@@ -1116,7 +1116,7 @@ func TestSendOperationCallback_RejectsInvalidURL(t *testing.T) {
 	assert.Empty(t, pending)
 }
 
-func TestSendOperationCallback_AcceptsTypedAndLegacyURLs(t *testing.T) {
+func TestSendCallback_AcceptsTypedOperationAndLegacyLifecycleURLs(t *testing.T) {
 	var requests atomic.Int32
 	client := &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		requests.Add(1)
@@ -1131,21 +1131,30 @@ func TestSendOperationCallback_AcceptsTypedAndLegacyURLs(t *testing.T) {
 	legacyLeaseUUID := testLeaseUUID("legacy")
 	legacyURL := "https://fred.example/callbacks/provision?trace=keep"
 	beginCallbackSenderOperationIntent(t, store, typedLeaseUUID, typedURL, "docker", s.storageIdentity)
-	beginCallbackSenderOperationIntent(t, store, legacyLeaseUUID, legacyURL, "docker", s.storageIdentity)
 
 	s.sendOperationCallbackForTest(
 		typedLeaseUUID, typedURL,
 		"docker", backend.CallbackStatusFailed, "definitively refused",
 	)
-	s.sendOperationCallbackForTest(
+	// Existing tokenless workloads retain lifecycle observation authority, not
+	// permission to admit another tokenless provision/restore operation.
+	s.sendLifecycleCallbackForTest(
 		legacyLeaseUUID, legacyURL,
-		"docker", backend.CallbackStatusFailed, "definitively refused",
+		"docker", backend.CallbackStatusFailed, "runtime failure", false,
 	)
 
 	assert.Zero(t, requests.Load(), "accepted durable callbacks must only publish outbox facts")
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 2)
+	byLease := make(map[string]CallbackEntry, len(pending))
+	for _, callback := range pending {
+		byLease[callback.LeaseUUID] = callback
+	}
+	assert.Equal(t, typedURL, byLease[typedLeaseUUID].CallbackURL)
+	assert.Equal(t, CallbackDeliveryKindOperation, byLease[typedLeaseUUID].DeliveryKind)
+	assert.Equal(t, legacyURL, byLease[legacyLeaseUUID].CallbackURL)
+	assert.Equal(t, CallbackDeliveryKindLifecycle, byLease[legacyLeaseUUID].DeliveryKind)
 
 	s.replayPendingCallbacks()
 	assert.Equal(t, int32(2), requests.Load())
@@ -1293,7 +1302,7 @@ func TestSendOperationCallback_StoreFailureSuppressesDirectDelivery(t *testing.T
 	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
 	require.NoError(t, err)
 	leaseUUID := testLeaseUUID("lease-1")
-	callbackURL := "https://fred.example/callbacks/provision"
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	beginCallbackSenderOperationIntent(
 		t, store, leaseUUID, callbackURL, "docker",
 		callbackStorageID(t, "550e8400-e29b-41d4-a716-446655440000"),
@@ -1566,7 +1575,7 @@ func TestCallbackSender_ReplayLoopDeliversPublishedCompletionWithoutRestart(t *t
 	}, callbackSenderTestLifetime(stopCtx))
 
 	leaseUUID := testLeaseUUID("lease-1")
-	callbackURL := "https://fred.example/callbacks/provision"
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "docker", s.storageIdentity)
 	s.sendOperationCallbackForTest(
 		leaseUUID, callbackURL, "docker",
@@ -1705,7 +1714,7 @@ func TestCallbackSender_DirectIntentSettlementWakesTrackedReplayLoop(t *testing.
 	}
 
 	leaseUUID := testLeaseUUID("direct-settlement-wake")
-	callbackURL := "https://fred.example/callbacks/provision"
+	callbackURL := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	admission := beginCallbackSenderOperationIntent(
 		t, store, leaseUUID, callbackURL, "docker", s.storageIdentity,
 	)
@@ -2134,7 +2143,7 @@ func TestSendCallback_ExactCompletionBlocksNewerLifecycleUntilFIFOCanDrain(t *te
 
 	s := newTestSender(t, store, http.DefaultClient, "secret")
 	leaseUUID := testLeaseUUID("lease-1")
-	exactURL := server.URL + "/exact" + callbackurl.ProvisionPath
+	exactURL := server.URL + "/exact" + callbackurl.ProvisionPath + "?operation_id=550e8400-e29b-41d4-a716-446655440000"
 	beginCallbackSenderOperationIntent(t, store, leaseUUID, exactURL, "docker", s.storageIdentity)
 	s.sendOperationCallbackForTest(
 		leaseUUID, exactURL, "docker",
@@ -2148,7 +2157,7 @@ func TestSendCallback_ExactCompletionBlocksNewerLifecycleUntilFIFOCanDrain(t *te
 	pending, err := store.ListPending()
 	require.NoError(t, err)
 	require.Len(t, pending, 2)
-	assert.Equal(t, server.URL+"/exact"+callbackurl.ProvisionPath, pending[0].CallbackURL)
+	assert.Equal(t, exactURL, pending[0].CallbackURL)
 	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
 	assert.Equal(t, server.URL+"/lifecycle"+callbackurl.ProvisionPath, pending[1].CallbackURL)
 	assert.Equal(t, backend.CallbackStatusDeprovisioned, pending[1].Status)

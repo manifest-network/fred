@@ -458,8 +458,10 @@ var (
 //
 // The optional explicit form lets current Fred versions make the distinction
 // visible on the wire. It must equal the derived URL exactly. Operationless
-// derivation keeps upgraded backends compatible with v0.13 and rolling
-// deployments whose request shape contains only callback_url.
+// derivation preserves callbacks already embedded in adopted v0.13 workloads;
+// it does not authorize new tokenless provision or restore admission. A current
+// request may omit lifecycle_callback_url when callback_url carries its typed
+// operation identity.
 func ResolveLifecycleCallbackURL(callbackURL, lifecycleCallbackURL string) (string, error) {
 	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
 	if err != nil {
@@ -623,9 +625,9 @@ func resolveOperationCallbackURL(lifecycleCallbackURL string) (string, error) {
 
 // ValidateOperationCallbackURL validates an exact requested-operation route.
 // Current routes carry exactly one canonical UUIDv4 operation_id and no
-// lifecycle_id. A legacy route with neither identity remains valid during the
-// rolling-upgrade window. Duplicate, mixed, or malformed authority is always
-// rejected.
+// lifecycle_id. A legacy route with neither identity remains valid for stored
+// evidence and exact replay lookup; new operation admission separately requires
+// typed runtime authority. Duplicate, mixed, or malformed authority is rejected.
 func ValidateOperationCallbackURL(callbackURL string) error {
 	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
 	if err != nil {
@@ -662,9 +664,9 @@ func ValidateOperationCallbackURL(callbackURL string) error {
 
 // ValidateLifecycleCallbackURL validates an observation-only callback route.
 // Current routes carry exactly one canonical UUIDv4 lifecycle_id and no
-// operation_id. A legacy route with neither identity remains valid during the
-// rolling-upgrade window. Duplicate, mixed, or malformed authority is always
-// rejected.
+// operation_id. A legacy route with neither identity remains valid for the
+// lifecycle of an adopted workload. Duplicate, mixed, or malformed authority
+// is always rejected.
 func ValidateLifecycleCallbackURL(callbackURL string) error {
 	endpoint, err := callbackurl.ParseEndpoint(callbackURL)
 	if err != nil {

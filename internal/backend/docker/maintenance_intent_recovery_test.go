@@ -1027,9 +1027,10 @@ func TestRefreshStateSkipsLiveMaintenanceThenRetriesTerminalSettlement(t *testin
 	// next sweep cleans only the target-ID remnant, proves the full source cohort,
 	// corrects the actor Failed->Ready, then resolves the intent.
 	close(workerRelease)
-	require.Eventually(t, func() bool {
-		return !h.b.actorOwnsMaintenance(h.leaseUUID, h.intent.MaintenanceID())
-	}, time.Second, time.Millisecond)
+	// Clearing the observational worker ID precedes the terminal handler's
+	// activity release. Recovery needs the actual quiescence capability.
+	awaitProvisionWorkerQuiescence(t, h.b, h.leaseUUID)
+	require.False(t, h.b.actorOwnsMaintenance(h.leaseUUID, h.intent.MaintenanceID()))
 	h.b.cfg.ProvisionTimeout = time.Nanosecond
 	require.NoError(t, h.b.RefreshState(t.Context()))
 	h.assertSettled(backend.CallbackStatusFailed)

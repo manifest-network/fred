@@ -1257,8 +1257,8 @@ Start provisioning a resource (async).
 
 **Fields:**
 - `items` - Array of lease items with SKU and quantity. All items belong to the same provider.
-- `callback_url` - Exact operation-completion URL; preserve it byte-for-byte and use it only for this provision result.
-- `lifecycle_callback_url` - Typed URL for exact restart/update/custom-domain completion plus autonomous failure and deprovision observations. Bundled backends keep maintenance completion non-coalescible even though it uses this lifecycle route.
+- `callback_url` - Exact operation-completion URL containing one canonical UUIDv4 `operation_id`; preserve it byte-for-byte and use it only for this provision result. New tokenless provision and restore operations are rejected before durable admission.
+- `lifecycle_callback_url` - Typed URL for exact restart/update/custom-domain completion plus autonomous failure and deprovision observations. If omitted, bundled backends derive it from the typed operation URL; if supplied, it must match that derivation exactly. Bundled backends keep maintenance completion non-coalescible even though it uses this lifecycle route.
 - `payload` - Optional base64-encoded deployment payload (only present if lease has meta_hash)
 - `payload_hash` - Optional hex-encoded SHA-256 hash of payload (only present with payload)
 
@@ -1451,7 +1451,7 @@ Adopt a soft-deleted lease's retained volumes into a new lease and re-deploy its
 ```
 
 **Error Responses:**
-- `400 Bad Request` - Missing `lease_uuid`/`from_lease_uuid`/`callback_url`, equal source and target UUIDs, or items/manifest validation error
+- `400 Bad Request` - Missing `lease_uuid`/`from_lease_uuid`/`callback_url`, missing or invalid operation UUID/callback pair, equal source and target UUIDs, or items/manifest validation error
 - `409 Conflict` - Invalid state for restore, or already provisioned. Both return a JSON `{"error": "..."}` body; the already-provisioned case additionally sets `code: "already_provisioned"`, so the two are distinguished by the presence of that discriminator
 - `422 Unprocessable Entity` - No retained data for the source lease (also returned by backends that don't support retention)
 - `503 Service Unavailable` - Insufficient resources. A synchronous refusal returns `{"error":"...","code":"insufficient_resources"}` so Fred can classify the exact attempt as clearable under the configured transport's trust boundary. A code-less or unknown-code 503 remains ambiguous `ErrInsufficientResources`; a malformed/non-envelope 503 becomes `ErrMalformedErrorBody`. Neither ambiguous class authorizes substitution.

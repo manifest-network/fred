@@ -80,9 +80,19 @@ provision/restore success or failure uses the exact URL. Restart, update, and
 custom-domain completion uses the lifecycle URL but remains an exact,
 non-coalescible maintenance delivery; autonomous container-death and deprovision
 events are coalescible lifecycle observations.
+Every new provision or restore requires exactly one canonical UUIDv4
+`operation_id` in the completion URL, including restore from a legacy retained
+source. A tokenless request is rejected with `400` before its operation intent,
+restore source claim, or substrate mutation. The lifecycle field may be omitted
+at request entry: the backend derives its exact typed pair before admission;
+an explicitly supplied field must match that derivation byte-for-byte.
 On upgrade, containers lacking the newer lifecycle label are recovered by
 replacing only `operation_id` with `lifecycle_id` in a typed exact URL while
 preserving unrelated query fields; an operationless legacy URL stays tokenless.
+That compatibility preserves existing workloads and their lifecycle/maintenance
+routes, not new tokenless provision/restore admission. Tokenless means no typed
+callback identity, not unauthenticated; all callback and request HMAC checks
+still apply.
 
 Every outbound callback is persisted under its own delivery UUID before the
 first attempt. Exact operation/maintenance completions and lifecycle events for
@@ -1100,7 +1110,8 @@ Starts async container provisioning. Pre-flight validation (SKU, manifest, image
   "items": [
     { "sku": "docker-small", "quantity": 2 }
   ],
-  "callback_url": "https://fred-host/api/v1/backend/callback",
+  "callback_url": "https://fred-host/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_callback_url": "https://fred-host/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "<base64-encoded manifest JSON>"
 }
 ```
@@ -1116,7 +1127,8 @@ Starts async container provisioning. Pre-flight validation (SKU, manifest, image
     { "sku": "docker-small", "quantity": 1, "service_name": "web" },
     { "sku": "docker-medium", "quantity": 1, "service_name": "db" }
   ],
-  "callback_url": "https://fred-host/api/v1/backend/callback",
+  "callback_url": "https://fred-host/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_callback_url": "https://fred-host/callbacks/provision?lifecycle_id=550e8400-e29b-41d4-a716-446655440000",
   "payload": "<base64-encoded stack manifest JSON>"
 }
 ```
@@ -1315,6 +1327,11 @@ Re-deploys a lease with a new manifest (image/config change). The `payload` fiel
 
 Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease), the exact operation `callback_url`, and the typed `lifecycle_callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`). `422` is **overloaded**: a **bare** `422` (no `code`) means no retained data exists (`ErrNotRetained`), while `422` with body `{"code":"demote_exceeds_tier"}` means the retained data exceeds the requested smaller SKU tier (`ErrDemoteDataExceedsTier`, see [Restore flow](#restore-flow)). Also `409` for invalid state / already provisioned, `400` (validation), and `503` with `code="insufficient_resources"` for a synchronous capacity refusal. Under the configured transport trust boundary the coded response makes the exact attempt clearable; it is not an HMAC-authenticated backend response. See [Soft-delete & Restore](#soft-delete--restore).
 
+The completion URL must carry a canonical UUIDv4 `operation_id`; a tokenless
+request cannot create an operation intent or reserve the retained source.
+Omitting `lifecycle_callback_url` derives the matching typed route, as for
+provision. Existing legacy retained data does not relax new-target admission.
+
 ### `GET /retentions` (authenticated)
 
 Lists this backend's retained (soft-deleted) leases. Used by the reconciler to route restores to the node physically holding each lease's retained volumes (ENG-333).
@@ -1441,8 +1458,8 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.created_at` | RFC 3339 timestamp | When the container was created |
 | `fred.instance_index` | integer string | 0-based index within a multi-unit lease |
 | `fred.fail_count` | integer string | Number of provision failures for this lease at creation time |
-| `fred.callback_url` | URL string | Exact provision/restore completion URL; may contain an operation capability |
-| `fred.lifecycle_callback_url` | URL string | Typed endpoint for later maintenance, runtime-failure, and deprovision observations; persisted across backend restarts |
+| `fred.callback_url` | URL string | Exact completion URL with an operation capability for new provision/restore; inherited v0.13 lineage remains tokenless |
+| `fred.lifecycle_callback_url` | URL string | Paired endpoint for later maintenance, runtime-failure, and deprovision observations; typed for new provision/restore, tokenless for inherited v0.13 lineage; persisted across backend restarts |
 | `fred.service_name` | service name string | Service name within a stack (stack provisions only) |
 | `fred.backend_name` | backend name string | Name of the backend managing the container; set on every managed container |
 | `fred.fqdn` | FQDN string | Assigned ingress FQDN; set on the ingress / custom-domain path |
