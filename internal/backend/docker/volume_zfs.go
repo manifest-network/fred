@@ -441,17 +441,6 @@ func parseZFSManagedDatasetState(out, expectedDataset, expectedMountpoint string
 	}
 }
 
-func parseZFSDatasetAttestation(out, expectedDataset, expectedMountpoint string) error {
-	mounted, err := parseZFSManagedDatasetState(out, expectedDataset, expectedMountpoint)
-	if err != nil {
-		return err
-	}
-	if !mounted {
-		return fmt.Errorf("zfs dataset %s is not mounted", expectedDataset)
-	}
-	return nil
-}
-
 func (z *zfsVolumeManager) RequireNoInterruptedVolumeMutations(ctx context.Context) error {
 	children, err := z.listManagedChildDatasets(ctx)
 	if err != nil {

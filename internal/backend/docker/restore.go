@@ -737,8 +737,10 @@ func (b *Backend) validateRestoreOperationAuthority(
 		return errors.New("restore intent manifest differs from source finalizer authority")
 	}
 	expectedHealthServices := make([]string, 0, len(e.StackManifest.Services))
+	// Matching the sealed, validated manifest also proves every service is
+	// nonnil; ParsePayload validates the complete map before issuing a claim.
 	for service, serviceManifest := range e.StackManifest.Services {
-		if serviceManifest != nil && serviceManifest.HasActiveHealthCheck() {
+		if serviceManifest.HasActiveHealthCheck() {
 			expectedHealthServices = append(expectedHealthServices, service)
 		}
 	}

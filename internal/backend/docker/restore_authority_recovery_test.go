@@ -16,6 +16,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 const (
@@ -198,6 +199,15 @@ func newRestoreAuthorityRecoveryFixture(
 	mutateSpec func(*shared.OperationIntentSpec),
 ) (*Backend, shared.RetentionEntry, *restoreAuthoritySubstrateCalls) {
 	t.Helper()
+	return newRestoreAuthorityRecoveryFixtureWithStack(t, restoreStackManifest(), mutateSpec)
+}
+
+func newRestoreAuthorityRecoveryFixtureWithStack(
+	t *testing.T,
+	stack *manifest.StackManifest,
+	mutateSpec func(*shared.OperationIntentSpec),
+) (*Backend, shared.RetentionEntry, *restoreAuthoritySubstrateCalls) {
+	t.Helper()
 	calls := &restoreAuthoritySubstrateCalls{}
 	mock := &mockDockerClient{
 		StopContainerFn:   func(context.Context, string, time.Duration) error { calls.containerStop++; return nil },
@@ -215,7 +225,6 @@ func newRestoreAuthorityRecoveryFixture(
 	}
 	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}}
 	profiles := testResourceProfiles(t, items)
-	stack := restoreStackManifest()
 	require.NoError(t, putRetentionForTest(t, b.retentionStore, shared.RetentionEntry{
 		OriginalLeaseUUID: restoreAuthoritySource, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
 		Items: items, ResourceProfiles: profiles, StackManifest: stack,

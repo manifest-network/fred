@@ -1453,7 +1453,7 @@ func validateOperationIntentSpec(spec OperationIntentSpec) error {
 	}
 	// The request boundary may derive an omitted lifecycle URL, but durable
 	// authority must already contain the exact pair used by releases and terminal
-	// receipts. Admission and decoding share this invariant: never persist a
+	// receipts. Admission and decoding share this invariant: never persist an
 	// incomplete callback pair that settlement cannot represent.
 	if resolvedLifecycle != spec.LifecycleCallbackURL {
 		return errors.New("callback operation intent requires an explicit lifecycle callback")

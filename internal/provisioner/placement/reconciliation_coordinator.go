@@ -174,21 +174,18 @@ func (authority *ReconciliationCoordinator) resolveFreshExcludedObservations(
 		if record.State() != StateConfirmed || record.Attempt != "" {
 			continue
 		}
-		if !snapshot.TrustedReporter(binding, record.Backend, leaseUUID) ||
-			snapshot.UntrustedReporter(binding, record.Backend, leaseUUID) {
-			continue
-		}
-		if _, provisioned := snapshot.Provision(binding, record.Backend, leaseUUID); !provisioned {
-			continue
-		}
-		// This successful projection already represents the fresh owner. Every
-		// other remembered reporter must independently prove absence on both
-		// endpoints of its exact storage identity in this same sealed epoch.
-		// Never shrink the marker across sweeps: missing/rejected membership,
-		// retained data, and durable attempts or conflicts remain fenced.
+		// Account for every remembered reporter AND the current durable owner in
+		// this one sealed epoch. The owner may report its provision/retention or
+		// prove exact absence; other reporters must prove absence. This consumes
+		// only stale diagnostics, never placement, lifecycle, attempt, or conflict
+		// authority. A later action still requires its own causal Registry claim.
+		reporters := maps.Clone(marker)
+		reporters[record.Backend] = struct{}{}
 		accounted := true
-		for backendName := range marker {
-			if backendName == record.Backend {
+		for backendName := range reporters {
+			if backendName == record.Backend &&
+				snapshot.TrustedReporter(binding, backendName, leaseUUID) &&
+				!snapshot.UntrustedReporter(binding, backendName, leaseUUID) {
 				continue
 			}
 			storageID, known := authority.coordinator.store.ExpectedBackendStorageIdentity(backendName)

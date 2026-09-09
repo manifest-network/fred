@@ -55,11 +55,15 @@
 // This same semantic rule discharges causally excluded retention evidence:
 // preserving an unchanged owner does not require a redundant projection write
 // and cannot leave unrelated healthy-backend admission waiting on that write.
-// A historical multi-reporter exclusion also clears when one fresh sweep
-// confirms the owner and proves identity-bound absence on both endpoints for
-// every other remembered reporter. Evidence is never accumulated piecemeal
-// across sweeps; an unavailable peer, unresolved attempt, or durable conflict
-// keeps the exclusion fenced.
+// A historical exclusion clears when one fresh sweep accounts for every
+// remembered reporter and the still-confirmed owner: peers must prove
+// identity-bound absence on both endpoints; the owner may instead report its
+// provision or retention. This also retires the diagnostic after container
+// loss without erasing affinity or requiring the container to reappear first.
+// Evidence is never accumulated piecemeal across sweeps; an unavailable peer,
+// unresolved attempt, or durable conflict keeps the exclusion fenced. Clearing
+// the diagnostic grants no lifecycle or mutation authority: a later action
+// still needs its exact chain read and causal Registry claim.
 //
 // # Required authority
 //

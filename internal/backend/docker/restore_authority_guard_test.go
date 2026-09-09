@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -21,6 +23,20 @@ func TestRestoreOperationAuthorityGuardsIndependentIdentity(t *testing.T) {
 		mutate func(*testing.T, *Backend, *shared.RetentionEntry)
 		err    string
 	}{
+		{
+			name: "source lease",
+			mutate: func(_ *testing.T, _ *Backend, entry *shared.RetentionEntry) {
+				entry.OriginalLeaseUUID = restoreAuthorityOtherLease
+			},
+			err: "source/destination generation authority",
+		},
+		{
+			name: "source generation",
+			mutate: func(_ *testing.T, _ *Backend, entry *shared.RetentionEntry) {
+				entry.Generation++
+			},
+			err: "source/destination generation authority",
+		},
 		{
 			name: "destination lease",
 			mutate: func(_ *testing.T, _ *Backend, entry *shared.RetentionEntry) {
@@ -74,6 +90,61 @@ func TestRestoreOperationAuthorityGuardsIndependentIdentity(t *testing.T) {
 			before := restoreAuthorityJournalBytes(t, b)
 			test.mutate(t, receiver, entry)
 			require.ErrorContains(t, receiver.validateRestoreOperationAuthority(claim, *entry), test.err)
+			assert.Equal(t, before, restoreAuthorityJournalBytes(t, b))
+			assert.Equal(t, restoreAuthoritySubstrateCalls{}, *calls)
+		})
+	}
+}
+
+func TestRestoreOperationAuthorityDerivesActiveHealthServices(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		check    *manifest.HealthCheckConfig
+		services []string
+		wantErr  bool
+	}{
+		{
+			name:     "matching active check",
+			check:    &manifest.HealthCheckConfig{Test: []string{"CMD", "true"}},
+			services: []string{"app"},
+		},
+		{
+			name:    "active check omitted from operation",
+			check:   &manifest.HealthCheckConfig{Test: []string{"CMD", "true"}},
+			wantErr: true,
+		},
+		{
+			name:  "matching disabled check",
+			check: &manifest.HealthCheckConfig{Test: []string{"NONE"}},
+		},
+		{
+			name:     "disabled check included in operation",
+			check:    &manifest.HealthCheckConfig{Test: []string{"NONE"}},
+			services: []string{"app"}, wantErr: true,
+		},
+		{name: "no declared check"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := restoreStackManifest()
+			stack.Services["app"].HealthCheck = test.check
+			b, entry, calls := newRestoreAuthorityRecoveryFixtureWithStack(t, stack, func(spec *shared.OperationIntentSpec) {
+				spec.HealthCheckServices = slices.Clone(test.services)
+			})
+			claims, err := b.operationSettlement.ListOperationIntents()
+			require.NoError(t, err)
+			require.Len(t, claims, 1)
+			before := restoreAuthorityJournalBytes(t, b)
+			for _, validate := range []func() error{
+				func() error { return b.validateRestoreOperationAuthority(claims[0], entry) },
+				func() error { _, err := b.currentRestoreOperation(entry); return err },
+			} {
+				err := validate()
+				if test.wantErr {
+					require.ErrorContains(t, err, "health-check authority differs")
+				} else {
+					require.NoError(t, err, "health-service derivation must accept an exact nonempty set as well as no active checks")
+				}
+			}
 			assert.Equal(t, before, restoreAuthorityJournalBytes(t, b))
 			assert.Equal(t, restoreAuthoritySubstrateCalls{}, *calls)
 		})
@@ -141,7 +212,7 @@ func TestRestoreOperationAuthorityRedundantFieldsAreRejectedByRetentionDecoder(t
 	}
 }
 
-func TestRestoreOperationAuthorityKindIsImpliedByDecodedSource(t *testing.T) {
+func TestRestoreOperationAuthorityDecodedShapePreconditions(t *testing.T) {
 	b, entry, _ := newRestoreAuthorityRecoveryFixture(t, nil)
 	claims, err := b.operationSettlement.ListOperationIntents()
 	require.NoError(t, err)
@@ -149,15 +220,46 @@ func TestRestoreOperationAuthorityKindIsImpliedByDecodedSource(t *testing.T) {
 	claim := claims[0]
 	require.NotEmpty(t, entry.OriginalLeaseUUID)
 	require.Positive(t, entry.Generation)
-	// A provision claim cannot reproduce the source metadata required by the
-	// independently decoded restoring row. The shared constructor is also the
-	// schema validator used when operation claims are decoded after a restart.
-	_, err = b.operationSettlement.NewOperationIntentCandidate(shared.OperationIntentSpec{
-		Kind: shared.OperationIntentProvision, LeaseUUID: claim.LeaseUUID(),
+	spec := shared.OperationIntentSpec{
+		Kind: claim.Kind(), LeaseUUID: claim.LeaseUUID(),
 		CallbackURL: claim.CallbackURL(), LifecycleCallbackURL: claim.LifecycleCallbackURL(),
 		Tenant: claim.Tenant(), ProviderUUID: claim.ProviderUUID(),
 		Items: claim.Items(), EffectiveItems: claim.EffectiveItems(), ResourceProfiles: claim.ResourceProfiles(),
 		Manifest: claim.Manifest(), SourceLeaseUUID: entry.OriginalLeaseUUID, SourceGeneration: entry.Generation,
-	})
-	require.ErrorContains(t, err, "provision operation intent cannot carry restore source authority")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*shared.OperationIntentSpec)
+		err    string
+	}{
+		{
+			name:   "provision cannot carry restoring source metadata",
+			mutate: func(spec *shared.OperationIntentSpec) { spec.Kind = shared.OperationIntentProvision },
+			err:    "provision operation intent cannot carry restore source authority",
+		},
+		{
+			name: "referenced nil service",
+			mutate: func(spec *shared.OperationIntentSpec) {
+				spec.Manifest = []byte(`{"services":{"app":null}}`)
+			},
+			err: `service "app" has nil manifest`,
+		},
+		{
+			name: "unreferenced nil service",
+			mutate: func(spec *shared.OperationIntentSpec) {
+				spec.Manifest = []byte(`{"services":{"app":{"image":"nginx:latest"},"extra":null}}`)
+			},
+			err: `service "extra" has nil manifest`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := spec
+			test.mutate(&changed)
+			// Admission and operation-row decoding share this schema validator.
+			// No opaque claim can carry a provision source or even an unreferenced
+			// nil service into the later cross-journal semantic comparison.
+			_, err := b.operationSettlement.NewOperationIntentCandidate(changed)
+			require.ErrorContains(t, err, test.err)
+		})
+	}
 }

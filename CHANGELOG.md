@@ -724,6 +724,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Historical inventory exclusions now retire even when the confirmed owner's
+  container has disappeared. One sealed sweep must account for the owner and
+  every remembered reporter; complete absence clears only the diagnostic,
+  leaving durable affinity and the action's causal claim intact. Retained
+  owners remain subject to the retained-data policy. Regressions prove
+  owner-pinned re-provisioning and preserve outage, attempt, conflict, and
+  concurrent-operation fences. (ENG-632)
+- Restore-authority regression coverage now directly exercises source UUID
+  and source-generation mismatches, plus both positive and negative
+  active-health-service derivation. The validated manifest makes the redundant
+  per-service nil check unnecessary. Removed an unused ZFS attestation wrapper
+  while retaining coverage of the production parser and unmounted-dataset
+  refusal. (ENG-632)
+- Documented the affected-backend scope and operator recovery paths for an
+  unsized legacy predecessor with incomplete operation evidence. A regression
+  pins the existing admission boundary: that predecessor cannot obtain a
+  provision execution capability, and an accounting hold cannot substitute for
+  missing cleanup authority. Recovery still refuses unsafe reconstruction.
+  (ENG-632)
 - A recovered placement exclusion with multiple historical reporters can now
   clear after one fresh sweep confirms the owner and proves exact-storage
   absence from every former peer on both inventory endpoints. Unavailable or

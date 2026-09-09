@@ -1089,6 +1089,52 @@ mutation ingress, preserve the complete marker/store/substrate set, and reopen
 and verify that exact set. Do not delete a pending intent, advance a callback
 queue, or retry from an assumed rollback.
 
+### An unsized legacy predecessor blocks Docker recovery
+
+An `unsized pending provision predecessor` error, or a refusal stating that a
+legacy predecessor has no durable runtime authority and no surviving cohort to
+freeze, means recovery cannot attribute the old generation's complete resource
+and cleanup authority. This is not ordinary young-operation or cleanup-retry
+uncertainty. Startup fails on that backend; a running backend aborts that
+recovery pass before the operation-recovery phase. Other configured backends
+remain independent.
+
+The supported stopped cutover freezes a complete v0.13 cohort before serving
+new requests. Current provision admission also requires the predecessor's
+principal and frozen sizing before it can issue an executable capacity token.
+A Started operation alongside an unbackfilled predecessor therefore indicates
+an unsupported intermediate writer or damaged/mixed-time state, not a normal
+admission window. A candidate-only resource projection plus
+`HoldUnaccountedFootprint` would block new allocations but would not supply
+settlement, close, or quota authority; do not use it to force startup.
+
+Recovery procedure:
+
+1. Stop mutation ingress to the affected backend and preserve its current
+   `callbacks.db`, `releases.db`, `retention.db`, both storage-identity markers,
+   Docker metadata, and managed volumes as one coherent evidence set. Fence
+   every other process that could write the same lineage. Never initialize a
+   replacement database or replay Compose to make the error disappear.
+2. If strict inventory or container inspection failed, repair that read or
+   storage fault without changing durable identity. If the existing exact
+   candidate naturally becomes fully Ready, retry normal startup: the strict
+   classifier can supersede the unsized predecessor with the candidate's
+   complete authority. Do not relabel, recreate, or resize containers to
+   manufacture this evidence; an empty or partial inventory is insufficient.
+3. Otherwise, restore only a verified coherent stopped snapshot containing the
+   entire matching backend lineage and substrate, following the
+   [backup and rollback requirements](DEPLOYMENT.md#upgrading-from-v0130).
+   Check accepted callbacks, provider placement, and chain lifecycle changes
+   since that snapshot before choosing it. In particular, restoring the
+   pre-upgrade files after later accepted operations is not a safe general
+   repair, and mixing journal times is never valid.
+4. If neither exact-Ready evidence nor a causally safe matching snapshot exists,
+   keep the backend fenced and preserve the data. This release has no tool that
+   reconstructs the missing backend predecessor authority. A separately
+   reviewed, proof-bearing forward-repair procedure is required; the provider's
+   `placement-repair` tool cannot repair backend journals. Do not fill in Items,
+   delete the pending intent, or issue cleanup-only close as a workaround.
+
 ### A pending or corrupt Docker maintenance intent
 
 The maintenance-tagged row in `callback_lease_mutation_heads` is the write-ahead

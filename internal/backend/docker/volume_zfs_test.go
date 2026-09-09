@@ -473,7 +473,7 @@ esac
 	}
 }
 
-func TestParseZFSDatasetAttestation(t *testing.T) {
+func TestParseZFSManagedDatasetState(t *testing.T) {
 	t.Parallel()
 
 	const dataset = "tank/fred/fred-550e8400-e29b-41d4-a716-446655440000-app-0"
@@ -481,23 +481,27 @@ func TestParseZFSDatasetAttestation(t *testing.T) {
 	tests := []struct {
 		name      string
 		out       string
+		mounted   bool
 		wantError string
 	}{
-		{name: "exact", out: dataset + "\tyes\t" + mountpoint + "\n"},
+		{name: "exact", out: dataset + "\tyes\t" + mountpoint + "\n", mounted: true},
 		{name: "wrong dataset", out: "tank/fred/foreign\tyes\t" + mountpoint + "\n", wantError: "unexpected dataset"},
-		{name: "unmounted", out: dataset + "\tno\t" + mountpoint + "\n", wantError: "is not mounted"},
+		{name: "unmounted", out: dataset + "\tno\t" + mountpoint + "\n"},
+		{name: "invalid mounted state", out: dataset + "\tunknown\t" + mountpoint + "\n", wantError: "invalid mounted state"},
 		{name: "wrong mountpoint", out: dataset + "\tyes\t/srv/foreign\n", wantError: "does not equal exact managed path"},
 		{name: "extra row", out: dataset + "\tyes\t" + mountpoint + "\nforeign\tyes\t/srv/foreign\n", wantError: "invalid row"},
 		{name: "missing field", out: dataset + "\tyes\n", wantError: "expected 3"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := parseZFSDatasetAttestation(test.out, dataset, mountpoint)
+			mounted, err := parseZFSManagedDatasetState(test.out, dataset, mountpoint)
 			if test.wantError == "" {
 				require.NoError(t, err)
+				assert.Equal(t, test.mounted, mounted)
 				return
 			}
 			require.ErrorContains(t, err, test.wantError)
+			assert.False(t, mounted)
 		})
 	}
 }

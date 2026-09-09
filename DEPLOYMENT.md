@@ -1051,10 +1051,16 @@ and the existing classifier verify the complete Ready candidate with its exact
 callback, topology, image, and principal identity. Empty, partial, failed, or
 older container cohorts do not supply the missing predecessor resource
 authority: recovery refuses before publishing a smaller reservation. This latent
-recovery case is not an alternative to the
-stopped cutover sequence above, which freezes the old cohort before admitting
+recovery case is not an alternative to the stopped cutover sequence above,
+which freezes the old cohort before admitting
 new operations. Preserve the journals and substrate on refusal; do not fill in
-Items by hand or delete the pending intent.
+Items by hand or delete the pending intent. The refusal stops startup on the
+affected backend and aborts its periodic recovery pass; it does not stop the
+other configured backends. An accounting hold alone is not a recovery path:
+it supplies neither settlement/close authority nor a safe predecessor quota
+snapshot. See the [unsized legacy recovery runbook](OPERATIONS.md#an-unsized-legacy-predecessor-blocks-docker-recovery)
+for the exact-Ready and coherent-snapshot recovery paths, including the case
+where neither is available.
 
 Stopped storage-lineage inspection is deliberately bounded independently for
 each authoritative database: at most 100,000 logical records, 256 MiB total
