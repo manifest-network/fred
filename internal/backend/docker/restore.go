@@ -688,21 +688,26 @@ func (b *Backend) currentRestoreOperation(e shared.RetentionEntry) (shared.Opera
 	return state, nil
 }
 
-// validateRestoreOperationAuthority joins two independently decoded journals.
-// Shared decoders already validate keyed lease identity and callback-token
-// consistency; the bound point probe also checks backend/storage lineage.
-// Malformed shapes must fail at ingestion rather than be manufactured as
-// opaque claims in downstream tests.
-// Keep the complete relation here because the terminal probe has no pending-
-// claim prefilter, unlike the source-first operation-recovery callers. In
-// particular, an individually valid claim may still name another source or
-// generation, or disagree on desired/effective destination metadata.
+// validateRestoreOperationAuthority joins a sealed operation state to a
+// Restoring row decoded by RetentionStore. Keep destination and backend/storage
+// checks here: the source-first callers have not performed an exact point probe.
+// The remaining comparisons express cross-journal relations, not row validation:
+//   - Both decoders bind OperationID to CallbackURL and require the exact derived
+//     LifecycleCallbackURL. Comparing CallbackURL therefore compares all three.
+//   - Restoring-row decoding requires a nonempty source and positive generation.
+//     Operation decoding forbids provision source metadata, so matching these
+//     fields also proves restore kind.
+//   - Bound retention construction requires a valid manifest. Even a nil DTO
+//     marshals to JSON null, which the manifest comparison rejects because a
+//     sealed operation requires a valid stack manifest, before Services is read.
+//
+// These ingestion prerequisites are tested separately from the semantic join in
+// restore_authority_guard_test.go; malformed DTOs are not sealed capabilities.
 func (b *Backend) validateRestoreOperationAuthority(
 	claim shared.OperationRecoveryState,
 	e shared.RetentionEntry,
 ) error {
-	if claim.Kind() != shared.OperationIntentRestore ||
-		claim.LeaseUUID() != e.NewLeaseUUID ||
+	if claim.LeaseUUID() != e.NewLeaseUUID ||
 		claim.SourceLeaseUUID() != e.OriginalLeaseUUID ||
 		claim.SourceGeneration() != e.Generation {
 		return errors.New("restore operation state differs from source/destination generation authority")
@@ -721,17 +726,8 @@ func (b *Backend) validateRestoreOperationAuthority(
 		!slices.Equal(claim.ResourceProfiles(), e.DestinationResourceProfiles) {
 		return errors.New("restore intent topology or resource profiles differ from source finalizer authority")
 	}
-	if e.DestinationCallbackURL != "" || e.DestinationLifecycleCallbackURL != "" {
-		if claim.CallbackURL() != e.DestinationCallbackURL ||
-			claim.LifecycleCallbackURL() != e.DestinationLifecycleCallbackURL {
-			return errors.New("restore intent callback pair differs from source finalizer authority")
-		}
-	}
-	if !e.DestinationOperationID.IsZero() && claim.OperationID() != e.DestinationOperationID {
-		return errors.New("restore intent operation ID differs from source finalizer authority")
-	}
-	if e.StackManifest == nil {
-		return errors.New("restore source finalizer has no destination manifest")
+	if claim.CallbackURL() != e.DestinationCallbackURL {
+		return errors.New("restore intent callback pair differs from source finalizer authority")
 	}
 	manifestBytes, err := json.Marshal(e.StackManifest)
 	if err != nil {

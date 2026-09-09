@@ -167,18 +167,37 @@ func (authority *ReconciliationCoordinator) resolveFreshExcludedObservations(
 	authority.absenceMu.Lock()
 	defer authority.absenceMu.Unlock()
 	for leaseUUID, marker := range authority.absenceUntrusted {
-		if _, remainsExcluded := excluded[leaseUUID]; remainsExcluded || len(marker) != 1 {
-			continue
-		}
-		backendName := slices.Collect(maps.Keys(marker))[0]
-		if !snapshot.TrustedReporter(binding, backendName, leaseUUID) {
-			continue
-		}
-		if _, provisioned := snapshot.Provision(binding, backendName, leaseUUID); !provisioned {
+		if _, remainsExcluded := excluded[leaseUUID]; remainsExcluded {
 			continue
 		}
 		record := authority.coordinator.store.Lookup(leaseUUID)
-		if record.State() == StateConfirmed && record.Backend == backendName && record.Attempt == "" {
+		if record.State() != StateConfirmed || record.Attempt != "" {
+			continue
+		}
+		if !snapshot.TrustedReporter(binding, record.Backend, leaseUUID) ||
+			snapshot.UntrustedReporter(binding, record.Backend, leaseUUID) {
+			continue
+		}
+		if _, provisioned := snapshot.Provision(binding, record.Backend, leaseUUID); !provisioned {
+			continue
+		}
+		// This successful projection already represents the fresh owner. Every
+		// other remembered reporter must independently prove absence on both
+		// endpoints of its exact storage identity in this same sealed epoch.
+		// Never shrink the marker across sweeps: missing/rejected membership,
+		// retained data, and durable attempts or conflicts remain fenced.
+		accounted := true
+		for backendName := range marker {
+			if backendName == record.Backend {
+				continue
+			}
+			storageID, known := authority.coordinator.store.ExpectedBackendStorageIdentity(backendName)
+			if !known || !snapshot.OwnerAbsent(binding, backendName, storageID, leaseUUID) {
+				accounted = false
+				break
+			}
+		}
+		if accounted {
 			delete(authority.absenceUntrusted, leaseUUID)
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -1093,6 +1094,9 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	// intent snapshot before any cleanup can run. A same-token committed Release is
 	// excluded: it crossed the success boundary and the release-owned path below is
 	// its stronger runtime authority.
+	strictOperationInventory := sync.OnceValues(func() ([]ContainerInfo, error) {
+		return b.strictIdentityBoundOperationInventory(ctx)
+	})
 	for _, leaseUUID := range slices.Sorted(maps.Keys(operationClaimsByLease)) {
 		claim := operationClaimsByLease[leaseUUID]
 		if claim.Kind() != shared.OperationIntentProvision {
@@ -1172,20 +1176,42 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				(identity.Tenant() != claim.Tenant() || identity.ProviderUUID() != claim.ProviderUUID())) {
 				return fmt.Errorf("pending provision predecessor for lease %q has divergent resource authority", leaseUUID)
 			}
-			// A normalized v0.13 Release can carry frozen sizing before recovery
-			// has persisted its runtime identity. Reserving that complete cohort is
-			// conservative accounting only, as for legacy survivors above. It does
-			// not grant teardown authority: the strict operation classifier must
-			// still validate the survivor and freeze its identity before cleanup.
-			previous, previousErr := recoveredSnapshotAllocations(
-				leaseUUID, claim.Tenant(), predecessor.Items, predecessor.ResourceProfiles,
-			)
-			if previousErr != nil {
-				return fmt.Errorf("rebuild pending provision predecessor for lease %q: %w", leaseUUID, previousErr)
-			}
-			allocations, allocationErr = shared.ConservativeResourceEnvelope(previous, allocations)
-			if allocationErr != nil {
-				return fmt.Errorf("rebuild pending provision resource envelope for lease %q: %w", leaseUUID, allocationErr)
+			if legacySizingOnly && len(predecessor.Items) == 0 {
+				// Stopped v0.13 adoption leaves no sizing until its first ordinary
+				// recovery; a pending operation deliberately prevents that backfill.
+				// Only the existing classifier's exact Ready candidate may supersede
+				// this row without predecessor authority. Empty/partial/failed or
+				// older substrate must refuse before publishing a smaller envelope.
+				// Ordinary recovery may omit malformed/foreign containers, so it
+				// cannot prove there is no older footprint. Lazily share one bounded,
+				// identity-bracketed strict inventory across all unsized predecessors.
+				strictContainers, inventoryErr := strictOperationInventory()
+				if inventoryErr != nil {
+					return fmt.Errorf("read strict inventory for unsized pending provision predecessor: %w", inventoryErr)
+				}
+				classification, classifyErr := b.classifyProvisionIntentSubstrate(ctx, claim, predecessor, strictContainers)
+				if classifyErr != nil {
+					return fmt.Errorf("classify unsized pending provision predecessor for lease %q: %w", leaseUUID, classifyErr)
+				}
+				if classification.status != backend.CallbackStatusSuccess {
+					return fmt.Errorf("unsized pending provision predecessor for lease %q requires an exact ready candidate", leaseUUID)
+				}
+			} else {
+				// A normalized v0.13 Release can carry frozen sizing before recovery
+				// has persisted its runtime identity. Reserving that complete cohort is
+				// conservative accounting only, as for legacy survivors above. It does
+				// not grant teardown authority: the strict operation classifier must
+				// still validate the survivor and freeze its identity before cleanup.
+				previous, previousErr := recoveredSnapshotAllocations(
+					leaseUUID, claim.Tenant(), predecessor.Items, predecessor.ResourceProfiles,
+				)
+				if previousErr != nil {
+					return fmt.Errorf("rebuild pending provision predecessor for lease %q: %w", leaseUUID, previousErr)
+				}
+				allocations, allocationErr = shared.ConservativeResourceEnvelope(previous, allocations)
+				if allocationErr != nil {
+					return fmt.Errorf("rebuild pending provision resource envelope for lease %q: %w", leaseUUID, allocationErr)
+				}
 			}
 		}
 		durableAllocsByLease[leaseUUID] = newDurableRecoveryAllocationCohort(allocations)

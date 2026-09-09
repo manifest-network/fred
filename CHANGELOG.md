@@ -724,6 +724,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A recovered placement exclusion with multiple historical reporters can now
+  clear after one fresh sweep confirms the owner and proves exact-storage
+  absence from every former peer on both inventory endpoints. Unavailable or
+  contradictory peers, attempts, and durable conflicts remain fenced. (ENG-632)
+- Docker recovery can supersede an adopted v0.13 Release that has no frozen
+  Items when strict identity-bound inventory and the existing classifier prove
+  a complete Ready candidate. Unknown predecessor sizing still refuses empty,
+  partial, failed, or older container cohorts before reducing reservations;
+  no teardown authority is inferred from missing metadata. Regression coverage
+  uses the original v0.13
+  on-disk format, not an already-backfilled fixture. (ENG-632)
+- Operation-intent admission and decoding now require the explicit resolved
+  lifecycle callback already required by Release settlement, preventing an
+  incomplete callback pair from becoming an un-settleable pending operation.
+  Restore recovery compares cross-journal authority once and relies on tested
+  decoder guarantees for redundant callback, operation-kind, and manifest
+  checks. The production test-helper guard now rejects stale or ineffective
+  exemptions. (ENG-632)
 - Provision retries now require the same pool-issued capacity admission as
   fresh provisions, including retries after a failure that committed no
   release. Replacement admission reserves a conservative predecessor/candidate

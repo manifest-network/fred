@@ -126,17 +126,16 @@ var testSupportPackages = []string{
 //
 // Scoped to named declarations rather than whole files on purpose: a new
 // test-shaped accessor added next to an exempt one is still caught.
+// The scan also rejects exemptions that name no declaration or match no rule.
 var exemptDecls = map[string]string{
 	// MockBackend is the implementation behind the cmd/mock-backend binary
-	// (Makefile builds and installs it), and these three accessors
+	// (Makefile builds and installs it), and these two accessors
 	// are driven from tests in OTHER packages -- internal/provisioner's
-	// fleet harness calls SetProvisionStatus and Clear, cmd/mock-backend's
-	// own tests call SetGetLoadStatsErr. Go test-package visibility does not
-	// cross package boundaries, so none of them can live in an
+	// fleet harness calls SetProvisionStatus and Clear. Go test-package
+	// visibility does not cross package boundaries, so neither can live in an
 	// internal/backend/*_test.go file.
 	"internal/backend/mock.go:SetProvisionStatus": "driven by internal/provisioner's fleet harness",
 	"internal/backend/mock.go:Clear":              "driven by internal/provisioner's fleet harness",
-	"internal/backend/mock.go:SetGetLoadStatsErr": "driven by cmd/mock-backend's tests",
 	// This closed, validated API result supports consumer-side maintenance
 	// service fakes without exposing mutable Result fields or weakening the API
 	// port to an unsealed interface. Results are diagnostic output, not durable
@@ -149,6 +148,7 @@ func TestNoTestOnlyCodeInProductionFiles(t *testing.T) {
 	root := repoRoot(t)
 
 	var findings []string
+	matchedExemptions := make(map[string]bool)
 	for _, dir := range []string{"internal", "cmd"} {
 		walkGoFiles(t, filepath.Join(root, dir), root, func(rel string, file *ast.File, fset *token.FileSet) {
 			if inTestSupportPackage(rel) {
@@ -156,15 +156,26 @@ func TestNoTestOnlyCodeInProductionFiles(t *testing.T) {
 			}
 			for _, decl := range file.Decls {
 				for _, d := range declsOf(decl) {
-					if _, exempt := exemptDecls[rel+":"+d.name]; exempt {
+					key := rel + ":" + d.name
+					reason := testOnlyReason(d)
+					if _, exempt := exemptDecls[key]; exempt {
+						matchedExemptions[key] = true
+						if reason == "" {
+							t.Errorf("%s exemption does not match a test-only declaration; remove the stale exemption", key)
+						}
 						continue
 					}
-					if reason := testOnlyReason(d); reason != "" {
+					if reason != "" {
 						findings = append(findings, fset.Position(d.pos).String()+": "+d.name+" -- "+reason)
 					}
 				}
 			}
 		})
+	}
+	for key := range exemptDecls {
+		if !matchedExemptions[key] {
+			t.Errorf("%s exemption names no scanned declaration; remove the stale exemption", key)
+		}
 	}
 
 	if len(findings) > 0 {

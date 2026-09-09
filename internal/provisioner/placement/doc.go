@@ -55,6 +55,11 @@
 // This same semantic rule discharges causally excluded retention evidence:
 // preserving an unchanged owner does not require a redundant projection write
 // and cannot leave unrelated healthy-backend admission waiting on that write.
+// A historical multi-reporter exclusion also clears when one fresh sweep
+// confirms the owner and proves identity-bound absence on both endpoints for
+// every other remembered reporter. Evidence is never accumulated piecemeal
+// across sweeps; an unavailable peer, unresolved attempt, or durable conflict
+// keeps the exclusion fenced.
 //
 // # Required authority
 //

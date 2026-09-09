@@ -1045,6 +1045,17 @@ backends and restore the complete pre-cutover backend backup; do not prepare or
 start providerd with the locally inferred row. The Docker daemon `SystemID`
 must remain the same before and after inspection.
 
+If recovery encounters an unbackfilled v0.13 Release alongside a pending new
+provision, it can supersede that row only after strict identity-bound inventory
+and the existing classifier verify the complete Ready candidate with its exact
+callback, topology, image, and principal identity. Empty, partial, failed, or
+older container cohorts do not supply the missing predecessor resource
+authority: recovery refuses before publishing a smaller reservation. This latent
+recovery case is not an alternative to the
+stopped cutover sequence above, which freezes the old cohort before admitting
+new operations. Preserve the journals and substrate on refusal; do not fill in
+Items by hand or delete the pending intent.
+
 Stopped storage-lineage inspection is deliberately bounded independently for
 each authoritative database: at most 100,000 logical records, 256 MiB total
 key-plus-value bytes, and 32 MiB for any one key or value. These are cutover

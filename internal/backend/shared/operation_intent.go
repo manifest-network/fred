@@ -208,7 +208,9 @@ type OperationRecoveryState interface {
 }
 
 // OperationIntentSpec is the immutable evidence needed to classify an
-// accepted asynchronous operation after restart.
+// accepted asynchronous operation after restart. CallbackURL and
+// LifecycleCallbackURL must already contain the exact resolved pair; request
+// defaults are applied before constructing this durable authority.
 type OperationIntentSpec struct {
 	Kind                 OperationIntentKind
 	LeaseUUID            string
@@ -1445,8 +1447,16 @@ func validateOperationIntentSpec(spec OperationIntentSpec) error {
 	if err := validateCallbackDestination(spec.CallbackURL); err != nil {
 		return err
 	}
-	if _, err := backend.ResolveLifecycleCallbackURL(spec.CallbackURL, spec.LifecycleCallbackURL); err != nil {
+	resolvedLifecycle, err := backend.ResolveLifecycleCallbackURL(spec.CallbackURL, spec.LifecycleCallbackURL)
+	if err != nil {
 		return fmt.Errorf("callback operation intent has invalid callback pair: %w", err)
+	}
+	// The request boundary may derive an omitted lifecycle URL, but durable
+	// authority must already contain the exact pair used by releases and terminal
+	// receipts. Admission and decoding share this invariant: never persist a
+	// incomplete callback pair that settlement cannot represent.
+	if resolvedLifecycle != spec.LifecycleCallbackURL {
+		return errors.New("callback operation intent requires an explicit lifecycle callback")
 	}
 	return nil
 }

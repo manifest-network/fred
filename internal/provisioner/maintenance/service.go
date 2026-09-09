@@ -56,6 +56,10 @@ type Result struct {
 func (result Result) Outcome() Outcome { return result.outcome }
 func (result Result) Cause() error     { return result.cause }
 
+// NewResult is a test-only constructor for cross-package API service fakes.
+// This deliberately supported exception preserves the closed, validated Result
+// contract without exposing its fields or weakening the consumer's service port.
+// It grants diagnostic output only, never settlement or mutation authority.
 func NewResult(outcome Outcome, cause error) Result {
 	switch outcome {
 	case OutcomeAccepted, OutcomeNotFound, OutcomeNoLongerActive, OutcomeForbidden,
