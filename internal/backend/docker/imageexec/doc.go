@@ -3,6 +3,8 @@
 // validates its metadata, and materializes its local image-store record before
 // returning an Image. Images and prepared projects cannot be reconstructed from
 // IDs or labels. Their zero values are inert.
+// Runtime construction probes and negotiates the descriptor-capable Docker API
+// before exposing admission or execution capabilities.
 //
 // Admission may pull an immutable manifest. Callers must keep admission and
 // execution inside their existing storage mutation capabilities; an Image proves

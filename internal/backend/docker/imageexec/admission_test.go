@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	dockerimage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
@@ -33,6 +34,9 @@ type fakeSource struct {
 }
 
 func (s *fakeSource) ClientVersion() string { return s.version }
+func (s *fakeSource) ServerVersion(context.Context) (types.Version, error) {
+	return types.Version{APIVersion: s.version}, nil
+}
 
 func (s *fakeSource) ImageInspect(ctx context.Context, ref string, opts ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
 	return s.inspect(ctx, ref, opts...)
@@ -78,7 +82,7 @@ func indexImage() dockerimage.InspectResponse {
 
 func newRuntime(t *testing.T, source *fakeSource) (*imageexec.Admitter, *imageexec.DockerCreator) {
 	t.Helper()
-	admitter, creator, err := imageexec.NewDockerRuntime(source)
+	admitter, creator, err := imageexec.NewDockerRuntime(t.Context(), source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +105,7 @@ func safeRuntime(t *testing.T) (*imageexec.Admitter, *imageexec.DockerCreator, *
 func TestAdmissionRejectsUnavailableCapabilitiesAndEmptyReference(t *testing.T) {
 	var typedNil *fakeSource
 	for _, source := range []imageexec.DockerSource{nil, typedNil} {
-		if _, _, err := imageexec.NewDockerRuntime(source); !errors.Is(err, imageexec.ErrUnavailable) {
+		if _, _, err := imageexec.NewDockerRuntime(t.Context(), source); !errors.Is(err, imageexec.ErrUnavailable) {
 			t.Fatalf("constructor error = %v", err)
 		}
 	}
@@ -147,12 +151,10 @@ func TestAdmissionCopiesClassicMetadataWithoutPulling(t *testing.T) {
 
 func TestAdmissionRejectsUntrustedMetadata(t *testing.T) {
 	tests := []struct {
-		name    string
-		version string
-		change  func(*dockerimage.InspectResponse)
-		want    string
+		name   string
+		change func(*dockerimage.InspectResponse)
+		want   string
 	}{
-		{name: "old API", version: "1.48", want: "API 1.49"},
 		{name: "malformed ID", change: func(r *dockerimage.InspectResponse) { r.ID = "mutable:tag" }, want: "invalid immutable"},
 		{name: "non sha256 ID", change: func(r *dockerimage.InspectResponse) { r.ID = "sha512:" + strings.Repeat("a", 128) }, want: "invalid immutable"},
 		{name: "missing config", change: func(r *dockerimage.InspectResponse) { r.Config = nil }, want: "no runnable"},
@@ -170,10 +172,9 @@ func TestAdmissionRejectsUntrustedMetadata(t *testing.T) {
 		"traefiK.enable", "com.docKer.compose.project", "com.docker.compoſe.project",
 	} {
 		tests = append(tests, struct {
-			name    string
-			version string
-			change  func(*dockerimage.InspectResponse)
-			want    string
+			name   string
+			change func(*dockerimage.InspectResponse)
+			want   string
 		}{name: label, change: func(r *dockerimage.InspectResponse) { r.Config.Labels[label] = "attacker" }, want: "reserved label"})
 	}
 	for _, tt := range tests {
@@ -182,11 +183,7 @@ func TestAdmissionRejectsUntrustedMetadata(t *testing.T) {
 			if tt.change != nil {
 				tt.change(&response)
 			}
-			version := tt.version
-			if version == "" {
-				version = "1.51"
-			}
-			a, _ := newRuntime(t, &fakeSource{version: version, inspect: func(context.Context, string, ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
+			a, _ := newRuntime(t, &fakeSource{version: "1.51", inspect: func(context.Context, string, ...client.ImageInspectOption) (dockerimage.InspectResponse, error) {
 				return response, nil
 			}})
 			i, err := a.Admit(t.Context(), "app:latest")

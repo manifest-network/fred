@@ -12,6 +12,8 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 )
 
 func platformSecurityJSON(id, mediaType string) string {
@@ -54,20 +56,21 @@ func TestImageInspectionHelperMaterializesExactPlatformBeforeCreate(t *testing.T
 	assert.True(t, created)
 }
 
-func TestImageCreationRejectsOldDockerAPI(t *testing.T) {
+func TestImageRuntimeConstructionRejectsOldDockerAPI(t *testing.T) {
 	mutations := 0
 	api, err := client.NewClientWithOpts(client.WithHost("http://docker.invalid"), client.WithVersion("1.47"), client.WithHTTPClient(&http.Client{
 		Transport: dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.Method != http.MethodGet {
 				mutations++
 			}
-			return imageSecurityResponse(http.StatusOK, fmt.Sprintf(`{"Id":%q,"Os":"linux","Architecture":"amd64","Config":{}}`, testImageID)), nil
+			return imageSecurityResponse(http.StatusOK, `{"ApiVersion":"1.51"}`), nil
 		}),
 	}))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = api.Close() })
-	cli := imageSecurityClientFromSDK(t, api)
-	_, err = cli.AdmitImage(t.Context(), "tenant/app:latest")
+	images, creator, err := imageexec.NewDockerRuntime(t.Context(), api)
+	assert.Nil(t, images)
+	assert.Nil(t, creator)
 	require.ErrorContains(t, err, "Docker Engine 28.1+")
 	assert.Zero(t, mutations)
 }

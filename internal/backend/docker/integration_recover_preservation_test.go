@@ -128,7 +128,7 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 	// mutation capabilities. This is the pre-ENG-567 danger zone: the allowlist
 	// saw Failed + VolumeCleanupAttempts==0 (no Deprovision ever ran) and dropped
 	// the pool key here.
-	externalDocker, err := NewDockerClient("", "")
+	externalDocker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = externalDocker.Close() })
 	require.NoError(t, externalDocker.RemoveContainer(ctx, containerID))

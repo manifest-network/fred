@@ -8,8 +8,10 @@ import (
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/platforms"
 	composeapi "github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/versions"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/manifest-network/fred/internal/util"
@@ -24,6 +26,8 @@ const (
 // composition boundary. The runtime retains all raw capabilities privately.
 type DockerSource interface {
 	Source
+	ClientVersion() string
+	ServerVersion(context.Context) (types.Version, error)
 	ContainerCreate(context.Context, *container.Config, *container.HostConfig, *network.NetworkingConfig, *ocispec.Platform, string) (container.CreateResponse, error)
 }
 
@@ -37,10 +41,32 @@ type DockerCreator struct {
 }
 
 // NewDockerRuntime binds admission and direct creation to the same SDK client.
+// It probes the daemon and requires descriptor-capable API negotiation before
+// minting either capability. The context is used only during construction;
+// ownership of the supplied client remains with the caller, including on error.
 // Callers retain the typed capabilities instead of the raw creation operation.
-func NewDockerRuntime(source DockerSource) (*Admitter, *DockerCreator, error) {
+func NewDockerRuntime(ctx context.Context, source DockerSource) (*Admitter, *DockerCreator, error) {
 	if util.IsNilInterface(source) {
 		return nil, nil, ErrUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	// A versioned read forces SDK negotiation and preserves connectivity errors.
+	// Reading ClientVersion alone before the first request returns the SDK's
+	// default, while NegotiateAPIVersion silently discards ping failures.
+	server, err := source.ServerVersion(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("probe Docker image execution API: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	// Older APIs hide descriptors and cannot distinguish a classic config ID
+	// from a containerd index ID. Check the effective client API as well as the
+	// daemon: an explicit client version can disable automatic negotiation.
+	if versions.LessThan(server.APIVersion, "1.49") || versions.LessThan(source.ClientVersion(), "1.49") {
+		return nil, nil, fmt.Errorf("secure image creation requires Docker Engine 28.1+ (API 1.49+); daemon API %s, client API %s", server.APIVersion, source.ClientVersion())
 	}
 	owner := &issuer{source: source}
 	return &Admitter{issuer: owner}, &DockerCreator{issuer: owner, create: source.ContainerCreate}, nil

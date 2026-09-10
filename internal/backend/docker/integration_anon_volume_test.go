@@ -40,7 +40,7 @@ const cleanupTimeout = 30 * time.Second
 // registering Close cleanup and skipping the test if the daemon is unreachable.
 func newIntegrationDockerClient(t *testing.T, ctx context.Context) *DockerClient {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = docker.Close() })
 	if err := docker.Ping(ctx); err != nil {

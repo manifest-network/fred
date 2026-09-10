@@ -1111,7 +1111,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   runnable manifest on the containerd store. Preparing that manifest may require
   a registry request for its exact digest. Original manifest references remain
   intact for recovery and release history. This requires Docker Engine 28.1+
-  (API 1.49+). Manifest validation also reserves Compose labels and matches
+  (API 1.49+), verified during backend construction before storage initialization
+  or recovery. An unsupported daemon or pinned client API now fails startup
+  instead of rejecting every provision on an otherwise healthy backend.
+  Manifest validation also reserves Compose labels and matches
   Unicode case-fold variants of reserved prefixes consistently with the
   published schema. Images
   carrying orchestration metadata, including automatic Compose build labels,

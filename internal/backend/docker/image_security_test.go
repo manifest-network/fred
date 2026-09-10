@@ -31,7 +31,12 @@ func fixtureImageID(seed string) string { return digest.FromString(seed).String(
 func newImageSecurityDockerClient(t *testing.T, handler func(*http.Request) (*http.Response, error)) *DockerClient {
 	t.Helper()
 	cli, err := client.NewClientWithOpts(client.WithHost("http://docker.invalid"), client.WithVersion("1.51"),
-		client.WithHTTPClient(&http.Client{Transport: dockerReplayRoundTripFunc(handler)}))
+		client.WithHTTPClient(&http.Client{Transport: dockerReplayRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(req.URL.Path, "/version") {
+				return imageSecurityResponse(http.StatusOK, `{"ApiVersion":"1.51"}`), nil
+			}
+			return handler(req)
+		})}))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cli.Close() })
 	return imageSecurityClientFromSDK(t, cli)
@@ -39,7 +44,7 @@ func newImageSecurityDockerClient(t *testing.T, handler func(*http.Request) (*ht
 
 func imageSecurityClientFromSDK(t *testing.T, cli *client.Client) *DockerClient {
 	t.Helper()
-	images, creator, err := imageexec.NewDockerRuntime(cli)
+	images, creator, err := imageexec.NewDockerRuntime(t.Context(), cli)
 	require.NoError(t, err)
 	return &DockerClient{client: newDockerSDKView(cli), images: images, creator: creator, backendName: "image-security"}
 }

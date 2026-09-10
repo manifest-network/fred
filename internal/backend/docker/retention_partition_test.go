@@ -45,8 +45,8 @@ func twoServiceManifest(key, v1, v2 string) []byte {
 // b.partitionSource — the field would stay zero (PartitionSourceNone), silently
 // disabling partitioning in production while every test still passes because each
 // test assigns b.partitionSource by hand. This drives the REAL constructor (New
-// defers the Docker daemon connection to Start, so it runs headless) and asserts
-// the parsed source landed on the field.
+// uses a local Docker API fixture) and asserts the parsed source landed on
+// the field.
 func TestNew_PopulatesPartitionSource(t *testing.T) {
 	const srcKey = "com.example.customer"
 	cfg := DefaultConfig()
@@ -69,7 +69,7 @@ func TestNew_PopulatesPartitionSource(t *testing.T) {
 		"agg": {MaxRetainedLeases: 200, MaxRetainedDiskMB: 50000, MaxPartitions: 64},
 	}
 
-	b, err := newBackendWithTestIdentity(cfg, slog.Default())
+	b, err := newBackendWithTestIdentity(t, cfg, slog.Default())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = b.Stop() })
 

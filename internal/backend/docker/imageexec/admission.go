@@ -10,7 +10,6 @@ import (
 
 	"github.com/distribution/reference"
 	dockerimage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 	"github.com/opencontainers/go-digest"
@@ -23,7 +22,6 @@ import (
 // create or start containers. Pulling is restricted here to a selected immutable
 // manifest whose contents have already passed admission.
 type Source interface {
-	ClientVersion() string
 	ImageInspect(context.Context, string, ...client.ImageInspectOption) (dockerimage.InspectResponse, error)
 	ImagePull(context.Context, string, dockerimage.PullOptions) (io.ReadCloser, error)
 }
@@ -115,11 +113,6 @@ func (a *Admitter) inspect(ctx context.Context, imageReference string, platform 
 	response, err := a.issuer.source.ImageInspect(ctx, imageReference, opts...)
 	if err != nil {
 		return inspectedImage{}, err
-	}
-	// Older APIs hide descriptors and cannot distinguish a classic config ID
-	// from a containerd index ID. Never admit ambiguous identity as a leaf.
-	if versions.LessThan(a.issuer.source.ClientVersion(), "1.49") {
-		return inspectedImage{}, fmt.Errorf("secure image creation requires Docker Engine 28.1+ (API 1.49+); negotiated API %s", a.issuer.source.ClientVersion())
 	}
 	if response.Config == nil || response.Os == "" || response.Architecture == "" {
 		return inspectedImage{}, fmt.Errorf("image inspection returned no runnable image config")

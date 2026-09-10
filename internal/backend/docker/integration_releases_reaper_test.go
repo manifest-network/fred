@@ -74,7 +74,7 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, b.Start(ctx))
 
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, docker, cfg.Name)

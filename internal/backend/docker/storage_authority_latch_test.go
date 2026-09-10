@@ -35,7 +35,7 @@ func newStorageAuthorityLatchTestBackend(t *testing.T) (*Backend, Config) {
 	cfg.CallbackSecret = durableCallbackTestSecret
 	cfg.HostAddress = "127.0.0.1"
 
-	b, err := newBackendWithTestIdentity(cfg, slog.Default())
+	b, err := newBackendWithTestIdentity(t, cfg, slog.Default())
 	require.NoError(t, err)
 	require.NotNil(t, b.TerminalStorageAuthorityFailure(),
 		"the production constructor must expose terminal authority withdrawal to the daemon")

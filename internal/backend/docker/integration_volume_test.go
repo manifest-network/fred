@@ -100,7 +100,7 @@ func execInContainer(t *testing.T, containerID string, cmd []string) string {
 // getContainerID returns the Docker container ID for a lease (exactly one expected).
 func getContainerID(t *testing.T, leaseUUID string) string {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -121,7 +121,7 @@ func getContainerID(t *testing.T, leaseUUID string) string {
 // containerHasBindMount checks if a container has a bind mount at the given destination.
 func containerHasBindMount(t *testing.T, containerID, dest string) bool {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -142,7 +142,7 @@ func containerHasBindMount(t *testing.T, containerID, dest string) bool {
 // containerHasTmpfsMount checks if a container has a tmpfs mount at the given destination.
 func containerHasTmpfsMount(t *testing.T, containerID, dest string) bool {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -270,7 +270,7 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 // mount while every destination-only assertion still passes.
 func bindMountSource(t *testing.T, containerID, dest string) string {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -292,7 +292,7 @@ func bindMountSource(t *testing.T, containerID, dest string) string {
 // used to assert ABSENCE — it require.Len(…, 1)s and fails the test outright.
 func containersForLease(t *testing.T, leaseUUID string) int {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 

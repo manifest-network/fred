@@ -44,7 +44,7 @@ func newIntegrationLeaseUUID() string {
 func testBackendWithRealDocker(t *testing.T, cfgFn func(*Config)) *Backend {
 	t.Helper()
 
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -501,7 +501,7 @@ func TestIntegration_Docker_NetworkIsolation(t *testing.T) {
 	}
 
 	// Verify separate tenant networks were created
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -584,7 +584,7 @@ func TestIntegration_Docker_ContainerHardening(t *testing.T) {
 	}
 
 	// Inspect container via Docker API
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -683,7 +683,7 @@ func TestIntegration_Docker_DeprovisionIdempotent(t *testing.T) {
 // time to transition to exited. This helper ensures the transition is complete.
 func waitForContainerExited(t *testing.T, containerID string) {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -731,7 +731,7 @@ func waitForProvisionStatus(t *testing.T, b *Backend, leaseUUID string, expected
 // inspectProvisionContainers lists containers for a lease by label.
 func inspectProvisionContainers(t *testing.T, leaseUUID string) []container.Summary {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -754,7 +754,7 @@ func inspectProvisionContainers(t *testing.T, leaseUUID string) []container.Summ
 // the exact manifest reference used for release comparisons and recovery.
 func requireProvisionContainerImage(t *testing.T, summary container.Summary, reference string) {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -1091,7 +1091,7 @@ func TestIntegration_Docker_ColdStartRecovery(t *testing.T) {
 	require.NoError(t, err)
 
 	// Track Docker client for cleanup
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, docker, cfg.Name)
@@ -1186,7 +1186,7 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 	err = b.Start(ctx)
 	require.NoError(t, err)
 
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, docker, cfg.Name)
@@ -1262,7 +1262,7 @@ func TestIntegration_Docker_ColdStartRecovery_DeadContainer(t *testing.T) {
 // concurrent calls to EnsureTenantNetwork for the same tenant both succeed,
 // even when the second call races with the first's NetworkCreate.
 func TestIntegration_EnsureTenantNetwork_ConcurrentRace(t *testing.T) {
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -1695,7 +1695,7 @@ func TestIntegration_Docker_SameTenantNetwork_Shared(t *testing.T) {
 	}
 
 	// Inspect container networks via Docker API
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 
@@ -3109,7 +3109,7 @@ func TestIntegration_Stack_NetworkIsolation(t *testing.T) {
 	assert.Len(t, containers, 2, "expected 2 containers")
 
 	// Verify tenant network was created
-	docker, err := NewDockerClient("", "")
+	docker, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	defer func() { _ = docker.Close() }()
 

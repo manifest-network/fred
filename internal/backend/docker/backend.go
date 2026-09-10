@@ -1017,7 +1017,7 @@ func PreflightStorageIdentityAdoptionForConfig(
 	if err := verifyConfiguredVolumeMount(cfg); err != nil {
 		return "", err
 	}
-	dockerClient, err := NewDockerClient(cfg.DockerHost, cfg.Name)
+	dockerClient, err := NewDockerClient(ctx, cfg.DockerHost, cfg.Name)
 	if err != nil {
 		return "", fmt.Errorf("create Docker client for storage identity preflight: %w", err)
 	}
@@ -1114,7 +1114,7 @@ func InitializeStorageIdentityForConfig(
 	if err := verifyConfiguredVolumeMount(cfg); err != nil {
 		return backendidentity.ID{}, err
 	}
-	dockerClient, err := NewDockerClient(cfg.DockerHost, cfg.Name)
+	dockerClient, err := NewDockerClient(ctx, cfg.DockerHost, cfg.Name)
 	if err != nil {
 		return backendidentity.ID{}, fmt.Errorf("create Docker client for storage identity: %w", err)
 	}
@@ -2074,7 +2074,7 @@ func newBackend(
 		return nil, fmt.Errorf("retention_partition_source: %w", err) // unreachable post-Validate; belt-and-braces
 	}
 
-	docker, err := NewDockerClient(cfg.DockerHost, cfg.Name)
+	docker, err := NewDockerClient(ctx, cfg.DockerHost, cfg.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}

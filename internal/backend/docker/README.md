@@ -9,7 +9,10 @@ built backend container image supports stateless development only. See the
 [deployment guide](../../../DEPLOYMENT.md#stateful-workloads-disk_mb--0-skus)
 for filesystem, mountpoint, capability, and storage-identity requirements.
 
-Image admission requires Docker Engine **28.1+ (API 1.49+)**. It resolves
+Image admission requires Docker Engine **28.1+ (API 1.49+)**. Runtime construction
+probes the daemon and negotiates this prerequisite before exposing admission or
+execution capabilities, so unsupported APIs fail startup before storage
+initialization or recovery. Image admission resolves
 multi-platform indexes to a single immutable manifest before container creation.
 
 The `imageexec` package owns this boundary. Guarded admission produces an opaque

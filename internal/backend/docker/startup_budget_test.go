@@ -40,9 +40,11 @@ func statelessConstructionTestConfig() Config {
 
 func TestNew_DefaultConstructionPathCancelsStalledIdentityRead(t *testing.T) {
 	const timeout = 20 * time.Millisecond
+	cfg := statelessConstructionTestConfig()
+	cfg.DockerHost = newStorageIdentityDockerServer(t, nil).URL
 	started := time.Now()
 	_, err := newBackendWithConstructionTimeout(
-		statelessConstructionTestConfig(),
+		cfg,
 		slog.Default(),
 		timeout,
 		stalledConstructionIdentityResolver{},

@@ -216,9 +216,11 @@ func newStorageIdentityDockerServerWithDaemonID(
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/_ping" || strings.HasSuffix(r.URL.Path, "/_ping"):
-			w.Header().Set("API-Version", "1.47")
+			w.Header().Set("API-Version", "1.51")
 			_, err := io.WriteString(w, "OK")
 			assert.NoError(t, err)
+		case strings.HasSuffix(r.URL.Path, "/version"):
+			assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{"ApiVersion": "1.51"}))
 		case strings.HasSuffix(r.URL.Path, "/info"):
 			assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
 				"ID":              daemonID(),
@@ -254,7 +256,7 @@ func assertStorageIdentitySurvivesVerifyOnlyRestart(
 	want backendidentity.ID,
 ) {
 	t.Helper()
-	dockerClient, err := NewDockerClient(cfg.DockerHost, cfg.Name)
+	dockerClient, err := NewDockerClient(t.Context(), cfg.DockerHost, cfg.Name)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, dockerClient.Close()) })
 	got, err := (existingDockerStorageIdentity{}).resolve(

@@ -23,7 +23,7 @@ import (
 // responsibility via forceRemove.
 func newTestDockerClient(t *testing.T) *DockerClient {
 	t.Helper()
-	d, err := NewDockerClient("", fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano()))
+	d, err := NewDockerClient(t.Context(), "", fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano()))
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

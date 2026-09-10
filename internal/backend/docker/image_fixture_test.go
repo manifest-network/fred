@@ -6,6 +6,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	dockerimage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
@@ -28,6 +29,9 @@ type ImageInfo struct {
 type mockImageSource struct{ mock *mockDockerClient }
 
 func (s mockImageSource) ClientVersion() string { return "1.51" }
+func (s mockImageSource) ServerVersion(context.Context) (types.Version, error) {
+	return types.Version{APIVersion: "1.51"}, nil
+}
 func (s mockImageSource) ImagePull(context.Context, string, dockerimage.PullOptions) (io.ReadCloser, error) {
 	return nil, fmt.Errorf("unexpected fixture manifest materialization")
 }
@@ -47,7 +51,7 @@ func (s mockImageSource) ImageInspect(ctx context.Context, reference string, _ .
 }
 func (m *mockDockerClient) imageAdmitter() *imageexec.Admitter {
 	m.imageOnce.Do(func() {
-		images, _, err := imageexec.NewDockerRuntime(mockImageSource{mock: m})
+		images, _, err := imageexec.NewDockerRuntime(context.Background(), mockImageSource{mock: m})
 		if err != nil {
 			panic(err)
 		}

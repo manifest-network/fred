@@ -60,7 +60,7 @@ func TestIntegration_Maintenance_ExactReplaySurvivesBackendRestart_XFS(t *testin
 	require.NoError(t, err)
 	require.NoError(t, first.Start(ctx))
 
-	dockerClient, err := NewDockerClient("", "")
+	dockerClient, err := NewDockerClient(t.Context(), "", "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupTestContainers(t, dockerClient, cfg.Name)

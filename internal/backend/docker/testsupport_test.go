@@ -1721,8 +1721,10 @@ func (verifier testDockerRuntimeStorageVerifier) Verify(ctx context.Context) err
 	return nil
 }
 
-func newBackendWithTestIdentity(cfg Config, logger *slog.Logger) (*Backend, error) {
-	b, err := newBackend(context.Background(), cfg, logger, testDockerStorageIdentity{})
+func newBackendWithTestIdentity(t *testing.T, cfg Config, logger *slog.Logger) (*Backend, error) {
+	t.Helper()
+	cfg.DockerHost = newStorageIdentityDockerServer(t, nil).URL
+	b, err := newBackend(t.Context(), cfg, logger, testDockerStorageIdentity{})
 	if err == nil {
 		callbackFixtureBackends.Store(b.callbackStore, b)
 		b.operationSettlement = noopOperationIntentJournal{

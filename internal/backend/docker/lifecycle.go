@@ -137,10 +137,12 @@ type DockerClient struct {
 	backendName string
 }
 
-// NewDockerClient creates a new Docker client. The backendName parameter scopes
+// NewDockerClient connects to Docker and requires the image execution API
+// prerequisite before returning an executable client. The context is used only
+// during construction. The backendName parameter scopes
 // all list/filter/event operations so that multiple backend instances sharing
 // the same Docker daemon do not interfere with each other.
-func NewDockerClient(host string, backendName string) (*DockerClient, error) {
+func NewDockerClient(ctx context.Context, host string, backendName string) (*DockerClient, error) {
 	opts := []client.Opt{
 		client.WithAPIVersionNegotiation(),
 	}
@@ -154,7 +156,7 @@ func NewDockerClient(host string, backendName string) (*DockerClient, error) {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
 
-	images, creator, err := imageexec.NewDockerRuntime(cli)
+	images, creator, err := imageexec.NewDockerRuntime(ctx, cli)
 	if err != nil {
 		_ = cli.Close()
 		return nil, err

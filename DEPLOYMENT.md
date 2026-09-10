@@ -804,7 +804,10 @@ forward-fix; never point v0.13 at it or discard it in favor of a fresh file.
 
 ## Upgrades
 
-Image admission requires Docker Engine **28.1+ (API 1.49+)**. Before upgrading,
+Image admission requires Docker Engine **28.1+ (API 1.49+)**. The backend probes
+the daemon and verifies the negotiated API during construction, before storage
+initialization or recovery; an unsupported API or failed probe prevents startup.
+Before upgrading,
 check image labels against the reserved namespaces in the
 [manifest guide](docs/manifest-guide.md). Existing containers are not rewritten.
 When first recreating a legacy containerd multi-platform image, the backend may
