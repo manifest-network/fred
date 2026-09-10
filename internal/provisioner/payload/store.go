@@ -804,6 +804,14 @@ func (s *Store) Has(leaseUUID string) (bool, error) {
 // This provides backpressure under extreme load. Callers should not hold locks
 // when calling this method.
 func (s *Store) Delete(leaseUUID string) {
+	if err := s.DeleteDurable(leaseUUID); err != nil {
+		slog.Error("failed to delete payload", "lease_uuid", leaseUUID, "error", err)
+	}
+}
+
+// DeleteDurable acknowledges the committed removal. Lifecycle owners use this
+// boundary so a failed cleanup remains retryable instead of reporting success.
+func (s *Store) DeleteDurable(leaseUUID string) error {
 	resultCh := make(chan writeResult, 1)
 
 	op := writeOp{
@@ -815,21 +823,20 @@ func (s *Store) Delete(leaseUUID string) {
 	select {
 	case s.writeCh <- op:
 	case <-s.ctx.Done():
-		slog.Warn("payload store closed, cannot delete", "lease_uuid", leaseUUID)
-		return
+		return errors.New("payload store closed before delete")
 	}
 
 	select {
 	case result := <-resultCh:
 		if result.err != nil {
-			slog.Error("failed to delete payload", "lease_uuid", leaseUUID, "error", result.err)
-			return
+			return fmt.Errorf("delete payload for %s: %w", leaseUUID, result.err)
 		}
 		if result.existed {
 			metrics.PayloadStoredCount.Dec()
 		}
+		return nil
 	case <-s.ctx.Done():
-		slog.Warn("payload store closed during delete", "lease_uuid", leaseUUID)
+		return errors.New("payload store closed during delete")
 	}
 }
 

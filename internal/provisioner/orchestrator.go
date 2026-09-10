@@ -64,18 +64,6 @@ func (events *HandlerEventCoordinator) startFromCurrentLease(
 	return events.orchestrator.coordinator.ExecuteCurrentLease(ctx, request)
 }
 
-func (events *HandlerEventCoordinator) rejectProvisionResult(
-	ctx context.Context,
-	result placement.ProvisionEventResult,
-	reason string,
-) error {
-	if !events.Valid() {
-		return errors.New("handler event coordinator is invalid")
-	}
-	_, _, err := events.orchestrator.coordinator.RejectProvisionResult(ctx, result, reason)
-	return err
-}
-
 func (events *HandlerEventCoordinator) Deprovision(ctx context.Context, leaseUUID string) error {
 	if !events.Valid() {
 		return errors.New("handler event coordinator is invalid")

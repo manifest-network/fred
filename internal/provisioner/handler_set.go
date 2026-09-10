@@ -83,34 +83,6 @@ func NewHandlerSet(deps HandlerDeps) (*HandlerSet, error) {
 	return handler, nil
 }
 
-// rejectOnValidationError rejects a lease on chain after a validation error.
-// Returns nil on success, or an error to trigger Watermill retry on rejection failure.
-func (h *HandlerSet) rejectOnValidationError(
-	ctx context.Context,
-	result placement.ProvisionEventResult,
-) error {
-	lease, ok := result.LeaseForRejection()
-	if !ok {
-		return errors.New("validation refusal omitted authoritative lease")
-	}
-	slog.Warn("provisioning failed with validation error, rejecting lease",
-		"lease_uuid", lease.Uuid,
-		"tenant", lease.Tenant,
-		"error", result.Err(),
-	)
-	reason := validationErrorToRejectReason(result.Err())
-	rejectErr := h.events.rejectProvisionResult(ctx, result, reason)
-	if rejectErr != nil {
-		slog.Error("failed to reject lease after validation error",
-			"lease_uuid", lease.Uuid,
-			"error", rejectErr,
-		)
-		return fmt.Errorf("failed to reject lease %s after validation error: %w", lease.Uuid, rejectErr)
-	}
-	h.publishLeaseEvent(lease.Uuid, backend.ProvisionStatusFailed, reason)
-	return nil
-}
-
 // HandleLeaseCreated processes new lease events.
 func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 	defer func() { recordWatermillMetrics(TopicLeaseCreated, err) }()
@@ -144,8 +116,9 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 			"meta_hash_hex", hash,
 		)
 		return nil
-	case placement.ProvisionEventValidationRefused:
-		return h.rejectOnValidationError(msg.Context(), result)
+	case placement.ProvisionEventRejected:
+		h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusFailed, result.RejectionReason())
+		return nil
 	default:
 		if result.Err() != nil {
 			return result.Err()
@@ -277,7 +250,6 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 			"tenant", event.Tenant,
 			"state", state.String(),
 		)
-		h.payloads.Delete(event.LeaseUUID)
 		return nil
 	case placement.ProvisionEventUncertain, placement.ProvisionEventInvalid:
 		// Absence and unknown/future states are not terminal evidence. A lagging or
@@ -305,24 +277,9 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 			"tenant", event.Tenant,
 		)
 		return result.Err()
-	case placement.ProvisionEventPayloadInvalid:
-		slog.Error("payload hash mismatch - possible corruption, rejecting lease",
-			"lease_uuid", event.LeaseUUID,
-			"error", result.Err(),
-		)
-		rejectErr := h.events.rejectProvisionResult(
-			msg.Context(), result, rejectReasonPayloadCorrupted,
-		)
-		if rejectErr != nil {
-			return fmt.Errorf("failed to reject lease %s after payload corruption: %w",
-				event.LeaseUUID, rejectErr)
-		}
-		h.payloads.Delete(event.LeaseUUID)
-		h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusFailed, rejectReasonPayloadCorrupted)
+	case placement.ProvisionEventRejected:
+		h.publishLeaseEvent(event.LeaseUUID, backend.ProvisionStatusFailed, result.RejectionReason())
 		return nil
-	case placement.ProvisionEventValidationRefused:
-		h.payloads.Delete(event.LeaseUUID)
-		return h.rejectOnValidationError(msg.Context(), result)
 	default:
 		if result.Err() != nil {
 			return result.Err()

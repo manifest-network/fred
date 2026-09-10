@@ -187,15 +187,15 @@ func (authority *MaintenanceCoordinator) authorizeCurrentLease(
 // AuthorizedMaintenanceCommand is chain authority for exactly one still-
 // pending durable command. Only ReauthorizeMaintenanceCommand can mint it.
 type AuthorizedMaintenanceCommand struct {
-	issuer *maintenanceCoordinatorMarker
-	claim  MaintenanceCommandClaim
-	state  *maintenanceAuthorizationState
+	issuer   *maintenanceCoordinatorMarker
+	delivery maintenanceDelivery
+	state    *maintenanceAuthorizationState
 }
 
 type maintenanceAuthorizationState struct{ consumed atomic.Bool }
 
 func (authorization AuthorizedMaintenanceCommand) Valid() bool {
-	return authorization.issuer != nil && authorization.claim.Valid() &&
+	return authorization.issuer != nil && authorization.delivery.valid() &&
 		authorization.state != nil && !authorization.state.consumed.Load()
 }
 
@@ -203,7 +203,7 @@ func (authorization AuthorizedMaintenanceCommand) Command() MaintenanceCommand {
 	if !authorization.Valid() {
 		return MaintenanceCommand{}
 	}
-	return authorization.claim.Command()
+	return authorization.delivery.claim.Command()
 }
 
 // MaintenanceReauthorization either carries current chain authority for the
@@ -214,6 +214,7 @@ type MaintenanceReauthorization struct {
 	authorization AuthorizedMaintenanceCommand
 	outcome       MaintenanceCommandOutcome
 	err           error
+	payload       acceptedMaintenanceUpdate
 }
 
 func (result MaintenanceReauthorization) Authorized() bool {
@@ -231,7 +232,7 @@ func (result MaintenanceReauthorization) Authorization() AuthorizedMaintenanceCo
 
 func (result MaintenanceReauthorization) Settled() bool {
 	return result.issuer != nil && result.err == nil &&
-		result.outcome != MaintenanceOutcomePending && !result.authorization.Valid()
+		result.outcome != MaintenanceOutcomePending && !result.authorization.Valid() && !result.payload.valid()
 }
 
 func (result MaintenanceReauthorization) Outcome() MaintenanceCommandOutcome {
@@ -251,6 +252,21 @@ func (authority *MaintenanceCoordinator) reauthorizeMaintenanceCommand(
 		return MaintenanceReauthorization{err: ErrInvalidMaintenanceCoordinator}
 	}
 	command := claim.Command()
+	work, err := authority.coordinator.store.maintenanceWork(claim)
+	if err != nil {
+		return MaintenanceReauthorization{issuer: authority.marker, err: err}
+	}
+	var delivery maintenanceDelivery
+	switch work := work.(type) {
+	case acceptedMaintenanceUpdate:
+		// Acceptance has already crossed the durable boundary. Completing its
+		// local payload write neither contacts nor reauthorizes the backend.
+		return MaintenanceReauthorization{issuer: authority.marker, payload: work}
+	case maintenanceDelivery:
+		delivery = work
+	default:
+		return MaintenanceReauthorization{err: ErrInvalidMaintenanceCommand}
+	}
 	authorizationOutcome, err := authority.authorizeCurrentLease(
 		ctx, command.LeaseUUID(), command.Tenant(),
 	)
@@ -268,7 +284,7 @@ func (authority *MaintenanceCoordinator) reauthorizeMaintenanceCommand(
 			return MaintenanceReauthorization{
 				issuer: authority.marker,
 				authorization: AuthorizedMaintenanceCommand{
-					issuer: authority.marker, claim: claim,
+					issuer: authority.marker, delivery: delivery,
 					state: &maintenanceAuthorizationState{},
 				},
 			}
@@ -300,15 +316,15 @@ func (authority *MaintenanceCoordinator) reauthorizeMaintenanceCommand(
 // aggregate check immediately before backend dispatch. A claim or decoded
 // record alone cannot be presented for backend-outcome settlement.
 type maintenanceCall struct {
-	issuer *maintenanceCoordinatorMarker
-	claim  MaintenanceCommandClaim
-	state  *maintenanceCallState
+	issuer   *maintenanceCoordinatorMarker
+	delivery maintenanceDelivery
+	state    *maintenanceCallState
 }
 
 type maintenanceCallState struct{ consumed atomic.Bool }
 
 func (call maintenanceCall) valid() bool {
-	return call.issuer != nil && call.claim.Valid() && call.state != nil &&
+	return call.issuer != nil && call.delivery.valid() && call.state != nil &&
 		!call.state.consumed.Load()
 }
 
@@ -317,17 +333,17 @@ func (authority *MaintenanceCoordinator) beginMaintenanceCall(
 ) (maintenanceCall, error) {
 	if !authority.Valid() || !authorization.Valid() ||
 		authorization.issuer != authority.marker ||
-		authorization.claim.issuer != authority.coordinator.store {
+		authorization.delivery.claim.issuer != authority.coordinator.store {
 		return maintenanceCall{}, ErrInvalidMaintenanceCoordinator
 	}
 	if !authorization.state.consumed.CompareAndSwap(false, true) {
 		return maintenanceCall{}, ErrInvalidMaintenanceCoordinator
 	}
-	if err := authority.coordinator.store.reauthorizeMaintenanceCommand(authorization.claim); err != nil {
+	if err := authority.coordinator.store.reauthorizeMaintenanceCommand(authorization.delivery.claim); err != nil {
 		return maintenanceCall{}, err
 	}
 	return maintenanceCall{
-		issuer: authority.marker, claim: authorization.claim,
+		issuer: authority.marker, delivery: authorization.delivery,
 		state: &maintenanceCallState{},
 	}, nil
 }
@@ -340,6 +356,7 @@ type MaintenanceCompletion struct {
 	callErr  error
 	err      error
 	accepted bool
+	detail   string
 }
 
 func (result MaintenanceCompletion) Settled() bool {
@@ -351,6 +368,7 @@ func (result MaintenanceCompletion) Outcome() MaintenanceCommandOutcome {
 	}
 	return result.outcome
 }
+func (result MaintenanceCompletion) Detail() string        { return result.detail }
 func (result MaintenanceCompletion) Err() error            { return result.err }
 func (result MaintenanceCompletion) CallErr() error        { return result.callErr }
 func (result MaintenanceCompletion) BackendAccepted() bool { return result.accepted }
@@ -361,20 +379,22 @@ func (authority *MaintenanceCoordinator) completeMaintenanceCall(
 ) MaintenanceCompletion {
 	callErr := observed.Err()
 	if !authority.Valid() || !call.valid() || call.issuer != authority.marker ||
-		call.claim.issuer != authority.coordinator.store {
+		call.delivery.claim.issuer != authority.coordinator.store {
 		return MaintenanceCompletion{callErr: callErr, err: ErrInvalidMaintenanceCoordinator}
 	}
 	if !call.state.consumed.CompareAndSwap(false, true) {
 		return MaintenanceCompletion{callErr: callErr, err: ErrInvalidMaintenanceCoordinator}
 	}
-	outcome, definitive := classifyMaintenanceCall(observed)
+	settlement, definitive := classifyMaintenanceCall(observed)
+	outcome := settlement.outcome
 	if !definitive {
 		return MaintenanceCompletion{callErr: callErr}
 	}
-	if err := authority.settleMaintenanceCommand(call.claim, outcome); err != nil {
+	receipt, err := authority.coordinator.store.settleMaintenanceDelivery(call.delivery.claim, settlement)
+	if err != nil {
 		return MaintenanceCompletion{callErr: callErr, err: err, accepted: outcome == MaintenanceOutcomeAccepted}
 	}
-	return MaintenanceCompletion{outcome: outcome, callErr: callErr, accepted: outcome == MaintenanceOutcomeAccepted}
+	return MaintenanceCompletion{outcome: receipt.Outcome(), detail: receipt.Detail(), callErr: callErr, accepted: outcome == MaintenanceOutcomeAccepted}
 }
 
 // ExecuteMaintenance is the only backend execution boundary for an authorized
@@ -401,44 +421,68 @@ func (authority *MaintenanceCoordinator) executeMaintenance(
 		return authority.completeMaintenanceCall(call, callOutcome)
 	}
 	if command.Kind() == MaintenanceCommandUpdate {
-		if authority.payloads == nil {
-			call.state.consumed.CompareAndSwap(false, true)
-			return MaintenanceCompletion{
-				accepted: true, err: errors.New("update payload persister is unavailable"),
-			}
+		if !call.state.consumed.CompareAndSwap(false, true) {
+			return MaintenanceCompletion{accepted: true, err: ErrInvalidMaintenanceCommand}
 		}
-		if err := authority.payloads.OverwritePayload(command.LeaseUUID(), command.Payload()); err != nil {
-			call.state.consumed.CompareAndSwap(false, true)
-			return MaintenanceCompletion{
-				accepted: true, err: fmt.Errorf("persist accepted update payload: %w", err),
-			}
+		accepted, err := authority.coordinator.store.acceptMaintenanceUpdate(call.delivery)
+		if err != nil {
+			return MaintenanceCompletion{accepted: true, err: fmt.Errorf("record backend update acceptance: %w", err)}
 		}
+		return authority.completeAcceptedUpdate(accepted)
 	}
 	return authority.completeMaintenanceCall(call, callOutcome)
 }
 
-func classifyMaintenanceCall(observed backend.MaintenanceCallOutcome) (MaintenanceCommandOutcome, bool) {
+func classifyMaintenanceCall(observed backend.MaintenanceCallOutcome) (maintenanceSettlement, bool) {
 	switch {
 	case observed.Accepted():
-		return MaintenanceOutcomeAccepted, true
-	case observed.NotDispatched():
-		return MaintenanceOutcomeBackendUnavailable, true
+		return maintenanceSettlement{outcome: MaintenanceOutcomeAccepted}, true
 	case observed.Refused():
 		switch observed.Refusal() {
 		case backend.MaintenanceRefusalNotProvisioned:
-			return MaintenanceOutcomeNotProvisioned, true
+			return maintenanceSettlement{outcome: MaintenanceOutcomeNotProvisioned}, true
 		case backend.MaintenanceRefusalInvalidState:
-			return MaintenanceOutcomeInvalidState, true
+			return maintenanceSettlement{outcome: MaintenanceOutcomeInvalidState}, true
 		case backend.MaintenanceRefusalValidation:
-			return MaintenanceOutcomeValidationRejected, true
+			return maintenanceSettlement{outcome: MaintenanceOutcomeValidationRejected, detail: observed.RefusalDetail()}, true
 		case backend.MaintenanceRefusalCapacity:
-			return MaintenanceOutcomeCapacityRefused, true
+			return maintenanceSettlement{outcome: MaintenanceOutcomeCapacityRefused}, true
 		default:
-			return MaintenanceOutcomePending, false
+			return maintenanceSettlement{outcome: MaintenanceOutcomePending}, false
 		}
 	default:
-		return MaintenanceOutcomePending, false
+		return maintenanceSettlement{outcome: MaintenanceOutcomePending}, false
 	}
+}
+
+// completeAcceptedUpdate owns the local half of an already accepted update.
+// The application retains its exclusive lease lane until this transaction
+// finishes, including through process reopen. If the receipt write fails,
+// repeating the exact payload write is idempotent and cannot overtake a newer
+// command. No transport result is accepted by this boundary.
+func (authority *MaintenanceCoordinator) completeAcceptedUpdate(accepted acceptedMaintenanceUpdate) MaintenanceCompletion {
+	if !authority.Valid() || !accepted.valid() || accepted.claim.issuer != authority.coordinator.store {
+		return MaintenanceCompletion{err: ErrInvalidMaintenanceCoordinator}
+	}
+	store := authority.coordinator.store
+	store.mu.RLock()
+	err := store.requireMaintenancePhaseLocked(accepted.claim, maintenancePayloadOutstanding)
+	store.mu.RUnlock()
+	if err != nil {
+		return MaintenanceCompletion{accepted: true, err: err}
+	}
+	if authority.payloads == nil {
+		return MaintenanceCompletion{accepted: true, err: errors.New("update payload persister is unavailable")}
+	}
+	command := accepted.claim.command
+	if err := authority.payloads.OverwritePayload(command.LeaseUUID(), command.Payload()); err != nil {
+		return MaintenanceCompletion{accepted: true, err: fmt.Errorf("persist accepted update payload: %w", err)}
+	}
+	commit := maintenancePayloadCommit{issuer: authority, accepted: accepted, consumed: &atomic.Bool{}}
+	if err := store.completeMaintenanceUpdate(commit); err != nil {
+		return MaintenanceCompletion{accepted: true, err: err}
+	}
+	return MaintenanceCompletion{accepted: true, outcome: MaintenanceOutcomeAccepted}
 }
 
 func (authority *MaintenanceCoordinator) settleMaintenanceCommand(

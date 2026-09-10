@@ -404,10 +404,12 @@ func (fixture *fixture) useCausalRestoreResponse(
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(server.Close)
-	client, err := backend.NewIdentityBoundHTTPClient(backend.HTTPClientConfig{
+	policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
 		Name: testBackend, BaseURL: server.URL,
 		Secret: "restore-causal-outcome-test-key-at-least-32-bytes",
-	}, fixture.store)
+	})
+	require.NoError(t, err)
+	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, fixture.store)
 	require.NoError(t, err)
 	fixture.backends[testBackend] = client
 }

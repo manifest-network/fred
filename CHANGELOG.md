@@ -728,6 +728,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Accepted updates now record a distinct durable local-finalization phase.
+  Recovery retries only the exact payload commit, and a blocked backend retry
+  cannot erase an earlier uncertain delivery. (ENG-931)
+- Provision validation rejection and payload cleanup now share the coordinator's
+  lease claim. Failed or uncertain chain rejection preserves payload bytes;
+  cleanup requires acknowledged rejection or a positively terminal chain read
+  and reports durable storage failures for retry. (ENG-937)
+- Update validation refusals preserve their curated tenant-facing diagnostic,
+  including exact retries after a provider restart. Only a definitive transport
+  refusal can supply that diagnostic; uncertain responses remain generic.
+  (ENG-938)
+
+- Writable-path detection now caches by immutable image ID and resolved runtime
+  UID together, preventing one manifest user's paths from being reused for
+  another user of the same image. Cached path slices are isolated from callers.
+  (ENG-936)
+- Contributor startup instructions now point to the complete Docker and mock
+  storage-identity/placement initialization recipes. The backend guide documents
+  curated validation details and generic refusal categories. Integration
+  CI covers shared runtime dependencies, and bounded race-detector shards run
+  on every PR and push to `main`. (ENG-934, ENG-935, ENG-734, ENG-938)
 - New provision and restore admission now requires the same validated typed
   runtime authority used by Release settlement. A callback URL without its
   operation UUID is rejected before writing a pending intent, preventing an
@@ -1095,6 +1116,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-632)
 
 ### Security
+
+- Runtime, placement preflight, and placement repair now construct backend
+  clients from the same validated connection policy. System-root HTTPS requires
+  TLS 1.3 just like custom-CA HTTPS, and downstream client options cannot replace
+  the policy's trust settings. Private CA and mTLS credentials remain supported.
+  (ENG-933)
 
 - Update gRPC to v1.83.2 to fix receive-buffer memory exhaustion from fragmented
   HTTP/2 responses, including the transport used by Fred's chain client. Update

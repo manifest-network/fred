@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -453,20 +452,8 @@ func TestNewProductionBackendClientSignsWithBackendSpecificKey(t *testing.T) {
 	}
 	cfg := &config.Config{Backends: []config.BackendConfig{configuredBackend}}
 	client, err := newProductionBackendClient(
-		configuredBackend, cfg, startupIdentityResolver{"backend-a": id},
+		configuredBackend.Name, cfg, startupIdentityResolver{"backend-a": id},
 	)
 	require.NoError(t, err)
 	require.NoError(t, client.Health(t.Context()))
-}
-
-func TestProductionBackendTLSConfigPinsTLS13WithSystemRoots(t *testing.T) {
-	t.Parallel()
-
-	tlsConfig, err := productionBackendTLSConfig(config.BackendConfig{})
-	require.NoError(t, err)
-	require.NotNil(t, tlsConfig)
-	assert.Equal(t, uint16(tls.VersionTLS13), tlsConfig.MinVersion)
-	assert.Nil(t, tlsConfig.RootCAs, "nil selects the verified host system roots")
-	assert.False(t, tlsConfig.InsecureSkipVerify)
-	assert.Empty(t, tlsConfig.Certificates)
 }

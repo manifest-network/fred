@@ -1,19 +1,25 @@
-package backend
+package backendclient
 
 import (
 	"crypto/tls"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
-type HTTPClientConfig struct {
+// Config describes legacy HTTP fixture servers wrapped by this test helper.
+type Config struct {
 	Name                string
 	BaseURL             string
 	Timeout             time.Duration
 	MaxIdleConns        int // Max idle connections across all hosts (default: 100)
 	MaxIdleConnsPerHost int // Max idle connections per host (default: 10)
 	Secret              string
+
+	// TLSClientConfig is confined to legacy transport unit fixtures.
+	TLSClientConfig *tls.Config
 
 	// Circuit breaker settings
 	CBMaxRequests   uint32        // Max requests in half-open state (default: 1)
@@ -47,8 +53,8 @@ type HTTPClientConfig struct {
 	MalformedErrorBodyTotal *prometheus.CounterVec // labels: backend, operation
 }
 
-func (cfg HTTPClientConfig) options() HTTPClientOptions {
-	return HTTPClientOptions{
+func (cfg Config) options() backend.HTTPClientOptions {
+	return backend.HTTPClientOptions{
 		MaxIdleConns:             cfg.MaxIdleConns,
 		MaxIdleConnsPerHost:      cfg.MaxIdleConnsPerHost,
 		CBMaxRequests:            cfg.CBMaxRequests,
@@ -70,21 +76,4 @@ func (cfg HTTPClientConfig) options() HTTPClientOptions {
 		CircuitBreakerState:      cfg.CircuitBreakerState,
 		MalformedErrorBodyTotal:  cfg.MalformedErrorBodyTotal,
 	}
-}
-
-// newUnboundHTTPClientForTest constructs only this package's transport fixtures.
-// Other packages must pass the validated public connection policy boundary.
-func newUnboundHTTPClientForTest(cfg HTTPClientConfig) *HTTPClient {
-	return newHTTPClient(ConnectionPolicy{state: &connectionPolicy{
-		name: cfg.Name, baseURL: cfg.BaseURL, secret: cfg.Secret, timeout: cfg.Timeout,
-		tlsConfig: &tls.Config{MinVersion: tls.VersionTLS13},
-	}}, cfg.options())
-}
-
-func newIdentityBoundHTTPClientForTest(cfg HTTPClientConfig, resolver BackendStorageIdentityResolver) (*HTTPClient, error) {
-	policy, err := NewConnectionPolicy(ConnectionConfig{Name: cfg.Name, BaseURL: cfg.BaseURL, Secret: cfg.Secret, Timeout: cfg.Timeout})
-	if err != nil {
-		return nil, err
-	}
-	return NewIdentityBoundHTTPClient(policy, cfg.options(), resolver)
 }

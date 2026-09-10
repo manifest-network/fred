@@ -529,10 +529,12 @@ func causalMaintenanceBackendForTest(
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(server.Close)
-	client, err := backend.NewIdentityBoundHTTPClient(backend.HTTPClientConfig{
+	policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
 		Name: "backend-a", BaseURL: server.URL,
 		Secret: "maintenance-causal-outcome-test-key",
-	}, store)
+	})
+	require.NoError(t, err)
+	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, store)
 	require.NoError(t, err)
 	return client, func() int { return int(calls.Load()) }
 }
@@ -1657,18 +1659,18 @@ func TestAcceptedUpdatePersistsPayloadBeforeSettlementAndTerminalReplayIsReadOnl
 
 	second := service.Execute(t.Context(), command)
 	assert.Equal(t, OutcomeAccepted, second.Outcome())
-	assert.Equal(t, 2, backendClient.updateCount(), "retry must repeat the same typed backend command")
+	assert.Equal(t, 1, backendClient.updateCount(), "accepted update retry must finish only local persistence")
 	assert.Equal(t, 1, payloads.writeCount())
 
 	terminal := service.Execute(t.Context(), command)
 	assert.Equal(t, OutcomeAccepted, terminal.Outcome())
-	assert.Equal(t, 2, backendClient.updateCount())
+	assert.Equal(t, 1, backendClient.updateCount())
 	assert.Equal(t, 1, payloads.writeCount(), "terminal receipt replay cannot rewrite payload state")
 	unauthorized := command
 	unauthorized.Tenant = "different-tenant"
 	assert.Equal(t, OutcomeForbidden, service.Execute(t.Context(), unauthorized).Outcome(),
 		"terminal replay must authenticate against the immutable stored tenant")
-	assert.Equal(t, 2, backendClient.updateCount())
+	assert.Equal(t, 1, backendClient.updateCount())
 	assert.Equal(t, 1, payloads.writeCount())
 	divergent := command
 	divergent.Payload = []byte("different")
@@ -1763,8 +1765,8 @@ func TestAcceptedUpdatePayloadPersistenceRecoversAcrossProviderRestart(t *testin
 		t, reopened, secondBackend, secondPayloads, testLeaseA,
 	)
 	require.NoError(t, recovered.RecoverPending(t.Context()))
-	assert.Equal(t, 1, secondBackend.updateCount(),
-		"startup recovery must repeat the exact backend admission after ambiguity")
+	assert.Zero(t, secondBackend.updateCount(),
+		"durable acceptance must recover without contacting the backend")
 	assert.Equal(t, 1, secondPayloads.writeCount(),
 		"an accepted backend replay is not settled until the payload is durable")
 	receipt, found, err := reopened.LookupMaintenanceCommand(testLeaseA, id)

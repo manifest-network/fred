@@ -43,7 +43,7 @@ func TestNewIdentityBoundHTTPClientRejectsTypedNilResolverAndNonOriginBaseURL(t 
 	t.Parallel()
 
 	var typedNil *testStorageIdentityResolver
-	client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+	client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 		Name: "backend-a", BaseURL: "https://backend.example", Secret: testIdentityClientKey,
 	}, typedNil)
 	assert.Nil(t, client)
@@ -59,13 +59,13 @@ func TestNewIdentityBoundHTTPClientRejectsTypedNilResolverAndNonOriginBaseURL(t 
 		"https://:443", "https://.",
 		"https://backend.example:", "https://backend.example:0", "https://backend.example:65536",
 	} {
-		client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+		client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 			Name: "backend-a", BaseURL: rawURL, Secret: testIdentityClientKey,
 		}, resolver)
 		assert.Nil(t, client, rawURL)
 		assert.Error(t, err, rawURL)
 	}
-	client, err = NewIdentityBoundHTTPClient(HTTPClientConfig{
+	client, err = newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 		Name: "backend-a", BaseURL: "https://backend.example", Timeout: -time.Second,
 		Secret: testIdentityClientKey,
 	}, resolver)
@@ -80,7 +80,7 @@ func TestNewIdentityBoundHTTPClientRejectsMissingOrWeakHMACSecret(t *testing.T) 
 		id: mustBackendStorageID(t, testBackendStorageIDA), bound: true,
 	}
 	for _, secret := range []string{"", "short"} {
-		client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+		client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 			Name: "backend-a", BaseURL: "https://backend.example", Secret: secret,
 		}, resolver)
 		assert.Nil(t, client)
@@ -123,7 +123,7 @@ func TestIdentityBoundHTTPClientValidatesEveryResponseIdentity(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+			client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 				Name: "backend-a", BaseURL: server.URL, Secret: testIdentityClientKey,
 			}, &testStorageIdentityResolver{id: expected, bound: true})
 			require.NoError(t, err)
@@ -194,7 +194,7 @@ func TestIdentityBoundHTTPClientClassifiesOnlyHeaderlessServerErrorsAsUnavailabl
 			}))
 			defer server.Close()
 
-			client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+			client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 				Name: "backend-a", BaseURL: server.URL, Secret: testIdentityClientKey,
 			}, &testStorageIdentityResolver{id: expected, bound: true})
 			require.NoError(t, err)
@@ -210,7 +210,7 @@ func TestIdentityBoundHTTPClientClassifiesOnlyHeaderlessServerErrorsAsUnavailabl
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
-	client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+	client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 		Name: "backend-a", BaseURL: server.URL, Secret: testIdentityClientKey,
 	}, &testStorageIdentityResolver{id: expected, bound: true})
 	require.NoError(t, err)
@@ -241,7 +241,7 @@ func TestIdentityBoundHTTPClientUsesExactBoundPathForEverySideEffect(t *testing.
 	}))
 	defer server.Close()
 
-	client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+	client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 		Name: "backend-a", BaseURL: server.URL, Secret: testIdentityClientKey,
 	}, &testStorageIdentityResolver{id: id, bound: true})
 	require.NoError(t, err)
@@ -274,7 +274,7 @@ func TestIdentityBoundHTTPClientRefusesUnboundSideEffectWithoutNetwork(t *testin
 	}))
 	defer server.Close()
 
-	client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+	client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 		Name: "backend-a", BaseURL: server.URL, Secret: testIdentityClientKey,
 	}, &testStorageIdentityResolver{})
 	require.NoError(t, err)
@@ -302,7 +302,7 @@ func TestIdentityBoundHTTPClientClassifiesOldBackendBeforeLegacySideEffect(t *te
 	}))
 	defer server.Close()
 
-	client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+	client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 		Name: "backend-a", BaseURL: server.URL, Secret: testIdentityClientKey,
 	}, &testStorageIdentityResolver{id: id, bound: true})
 	require.NoError(t, err)
@@ -338,7 +338,7 @@ func TestIdentityBoundHTTPClientNeverFollowsBackendRedirects(t *testing.T) {
 			}))
 			defer origin.Close()
 
-			client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+			client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 				Name: "backend-a", BaseURL: origin.URL, Secret: testIdentityClientKey,
 			}, &testStorageIdentityResolver{id: id, bound: true})
 			require.NoError(t, err)

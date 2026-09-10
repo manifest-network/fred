@@ -11,25 +11,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - "internal/backend/docker/**"
-      # Storage-lineage marker and authoritative-store binding changes affect
-      # both bundled backends even when neither backend package is touched.
-      - "internal/backendidentity/**"
-      - "internal/backend/shared/**"
-      # integration_reconciler_test.go drives a real provisioner.Reconciler
-      # against a real Docker backend, so a reconciler change can break this
-      # suite while touching nothing under internal/backend/. Without this
-      # entry those tests only ran nightly — i.e. never on the PR that broke
-      # them, which is the ENG-330 rot mode this workflow exists to prevent.
-      - "internal/provisioner/**"
-      # cmd/k3s-backend/integration_test.go execs the real k3s-backend
-      # binary, which is built from internal/backend/k3s — so a change
-      # confined to that package can break this suite while matching no
-      # other entry here. Same ENG-330 rot mode as the reconciler note
-      # above (found while removing that package's test-only hooks,
-      # ENG-765).
-      - "internal/backend/k3s/**"
-      - "cmd/k3s-backend/**"
+      # Test runtime dependencies structurally: moving a helper into a new
+      # package must not make dependency-only changes skip integration.
+      - "internal/**"
+      - "cmd/**"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -41,25 +26,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "internal/backend/docker/**"
-      # Storage-lineage marker and authoritative-store binding changes affect
-      # both bundled backends even when neither backend package is touched.
-      - "internal/backendidentity/**"
-      - "internal/backend/shared/**"
-      # integration_reconciler_test.go drives a real provisioner.Reconciler
-      # against a real Docker backend, so a reconciler change can break this
-      # suite while touching nothing under internal/backend/. Without this
-      # entry those tests only ran nightly — i.e. never on the PR that broke
-      # them, which is the ENG-330 rot mode this workflow exists to prevent.
-      - "internal/provisioner/**"
-      # cmd/k3s-backend/integration_test.go execs the real k3s-backend
-      # binary, which is built from internal/backend/k3s — so a change
-      # confined to that package can break this suite while matching no
-      # other entry here. Same ENG-330 rot mode as the reconciler note
-      # above (found while removing that package's test-only hooks,
-      # ENG-765).
-      - "internal/backend/k3s/**"
-      - "cmd/k3s-backend/**"
+      # Test runtime dependencies structurally: moving a helper into a new
+      # package must not make dependency-only changes skip integration.
+      - "internal/**"
+      - "cmd/**"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -69,7 +39,7 @@ on:
       # touching any non-.md file still matches a positive pattern and runs.
       - "!**/*.md"
   # Nightly safety net: catches rot from changes outside the path filter
-  # (dependency bumps, shared code) and from GitHub runner-image drift.
+  # and from GitHub runner-image drift.
   schedule:
     - cron: "17 7 * * *"
   workflow_dispatch:

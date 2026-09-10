@@ -469,7 +469,7 @@ func provisionResponseBackendForTest(
 	t.Helper()
 	server := newFakeBackendServer(t, backendName)
 	server.setProvisionResponse(status, body)
-	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backendHTTPClientConfig{
 		Name: backendName, BaseURL: server.srv.URL, Secret: fleetSecret,
 		Timeout: time.Second,
 	})
@@ -809,7 +809,7 @@ func newFleet(t *testing.T, opts fleetOptions) *fleet {
 		f.servers = append(f.servers, srv)
 		f.byName[name] = srv
 
-		client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
+		client := newBackendHTTPClientForTest(t, backendHTTPClientConfig{
 			Name:                name,
 			BaseURL:             srv.srv.URL,
 			Secret:              fleetSecret,

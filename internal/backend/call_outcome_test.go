@@ -74,7 +74,7 @@ func causalOutcomeClientForTest(
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(server.Close)
-	return newHTTPClient(HTTPClientConfig{Name: "causal-test", BaseURL: server.URL})
+	return newUnboundHTTPClientForTest(HTTPClientConfig{Name: "causal-test", BaseURL: server.URL})
 }
 
 func TestHTTPClientMintsProvisionCausalOutcomeAtResponseBoundary(t *testing.T) {
@@ -249,7 +249,7 @@ func TestHTTPClientMintsMaintenanceRefusalCategoryAtResponseBoundary(t *testing.
 func TestHTTPClientMintsNotDispatchedOnlyWhenCircuitPreventsClosure(t *testing.T) {
 	t.Parallel()
 	client := causalOutcomeClientForTest(t, http.StatusInternalServerError, "backend failure")
-	client.cb = newHTTPClient(HTTPClientConfig{
+	client.cb = newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name: "one-failure-circuit", BaseURL: client.baseURL, CBFailureThresh: 1,
 	}).cb
 
@@ -262,7 +262,7 @@ func TestHTTPClientMintsNotDispatchedOnlyWhenCircuitPreventsClosure(t *testing.T
 
 func TestHTTPClientUpgradeGateProofCannotBeSpoofedByTransportError(t *testing.T) {
 	t.Parallel()
-	client := newHTTPClient(HTTPClientConfig{
+	client := newUnboundHTTPClientForTest(HTTPClientConfig{
 		Name: "causal-test", BaseURL: "https://backend.invalid",
 	})
 	client.httpClient.Transport = causalOutcomeRoundTripper(func(
@@ -284,7 +284,7 @@ func TestIdentityBoundHTTPClientMintsNoDispatchAtPrivateUpgradeGate(t *testing.T
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(server.Close)
-	client, err := NewIdentityBoundHTTPClient(HTTPClientConfig{
+	client, err := newIdentityBoundHTTPClientForTest(HTTPClientConfig{
 		Name: "backend-a", BaseURL: server.URL, Secret: testIdentityClientKey,
 	}, &testStorageIdentityResolver{id: id, bound: true})
 	require.NoError(t, err)

@@ -23,7 +23,7 @@
 //   - the `fred_background_*` panic counters, which every binary writes, live in
 //     the background subpackage;
 //   - shared code that must reference no collector at all takes one by
-//     injection, as backend.RouterConfig and backend.HTTPClientConfig do.
+//     injection, as backend.RouterConfig and backend.HTTPClientOptions do.
 //
 // A depguard rule enforces the boundary, and each backend cmd package has a test
 // asserting its /metrics surface carries only its own prefix.

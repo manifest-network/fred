@@ -199,16 +199,16 @@ func TestMaintenanceCommandJournalPreventsABAReplay(t *testing.T) {
 	admission, err := store.beginMaintenanceCommand(first)
 	require.NoError(t, err)
 	assert.True(t, admission.Pending())
-	require.NoError(t, store.settleMaintenanceCommand(admission.Claim(), MaintenanceOutcomeAccepted))
+	require.NoError(t, store.settleMaintenanceCommand(admission.Claim(), MaintenanceOutcomeValidationRejected))
 
 	second := testMaintenanceCommand(t, authority, maintenanceIDB, MaintenanceCommandUpdate, []byte("second"))
 	secondAdmission, err := store.beginMaintenanceCommand(second)
 	require.NoError(t, err)
-	require.NoError(t, store.settleMaintenanceCommand(secondAdmission.Claim(), MaintenanceOutcomeAccepted))
+	require.NoError(t, store.settleMaintenanceCommand(secondAdmission.Claim(), MaintenanceOutcomeValidationRejected))
 
 	lateFirst, err := store.beginMaintenanceCommand(first)
 	require.NoError(t, err)
-	assert.Equal(t, MaintenanceOutcomeAccepted, lateFirst.Outcome())
+	assert.Equal(t, MaintenanceOutcomeValidationRejected, lateFirst.Outcome())
 	assert.False(t, lateFirst.Pending(), "a late A replay after B must never dispatch A again")
 	claims, err := store.pendingMaintenanceCommands()
 	require.NoError(t, err)
@@ -461,7 +461,7 @@ func TestMaintenanceSettlementClampsBackwardWallClock(t *testing.T) {
 	require.NoError(t, store.db.View(func(tx *bolt.Tx) error {
 		_, records, bucketErr := maintenanceCommandBuckets(tx)
 		require.NoError(t, bucketErr)
-		_, outcome, storedCreatedAt, settledAt, decodeErr := decodeMaintenanceCommand(
+		_, outcome, storedCreatedAt, settledAt, _, decodeErr := decodeMaintenanceCommand(
 			records.Get(maintenanceReceiptKey(maintenanceLease, command.Command().ID())),
 		)
 		require.NoError(t, decodeErr)

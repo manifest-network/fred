@@ -9,9 +9,11 @@ import (
 	backendclienttest "github.com/manifest-network/fred/internal/testsupport/backendclient"
 )
 
+type backendHTTPClientConfig = backendclienttest.Config
+
 func newBackendHTTPClientForTest(
 	t testing.TB,
-	config backend.HTTPClientConfig,
+	config backendHTTPClientConfig,
 ) *backend.HTTPClient {
 	t.Helper()
 	client, cleanup, err := backendclienttest.New(

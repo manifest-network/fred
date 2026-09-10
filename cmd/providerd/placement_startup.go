@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,7 +15,6 @@ import (
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/placementprobe"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
-	"github.com/manifest-network/fred/internal/tlsconfig"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -105,7 +103,7 @@ func preparePlacementBackends(
 	entries := make([]backend.BackendEntry, 0, len(cfg.Backends))
 	for _, backendConfig := range cfg.Backends {
 		backendNames = append(backendNames, backendConfig.Name)
-		client, clientErr := newProductionBackendClient(backendConfig, cfg, store)
+		client, clientErr := newProductionBackendClient(backendConfig.Name, cfg, store)
 		if clientErr != nil {
 			return nil, nil, clientErr
 		}
@@ -192,47 +190,24 @@ func preparePlacementBackends(
 }
 
 func newProductionBackendClient(
-	backendConfig config.BackendConfig,
+	backendName string,
 	cfg *config.Config,
 	resolver backend.BackendStorageIdentityResolver,
 ) (*backend.HTTPClient, error) {
-	hmacSecret, err := cfg.ResolveBackendHMACSecret(backendConfig.Name)
+	policy, err := cfg.BackendConnectionPolicy(backendName)
 	if err != nil {
-		return nil, fmt.Errorf("backend %q: resolve HMAC secret: %w", backendConfig.Name, err)
+		return nil, fmt.Errorf("backend %q: compose connection policy: %w", backendName, err)
 	}
-	tlsClientConfig, err := productionBackendTLSConfig(backendConfig)
-	if err != nil {
-		return nil, fmt.Errorf("backend %q: build TLS client config: %w", backendConfig.Name, err)
-	}
-	client, err := backend.NewIdentityBoundHTTPClient(backend.HTTPClientConfig{
-		Name:                    backendConfig.Name,
-		BaseURL:                 backendConfig.URL,
-		Timeout:                 backendConfig.Timeout,
-		Secret:                  string(hmacSecret),
-		TLSClientConfig:         tlsClientConfig,
+	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{
 		RequestDuration:         metrics.BackendRequestDuration,
 		RequestsTotal:           metrics.BackendRequestsTotal,
 		CircuitBreakerState:     metrics.BackendCircuitBreakerState,
 		MalformedErrorBodyTotal: metrics.BackendMalformedErrorBodyTotal,
 	}, resolver)
 	if err != nil {
-		return nil, fmt.Errorf("backend %q: create identity-bound client: %w", backendConfig.Name, err)
+		return nil, fmt.Errorf("backend %q: create identity-bound client: %w", backendName, err)
 	}
 	return client, nil
-}
-
-// productionBackendTLSConfig applies the same TLS floor whether peer trust
-// comes from an explicitly configured private CA or the host's system roots.
-// A nil config would silently fall back to net/http's lower default floor on
-// the system-roots path and make transport security depend on which optional
-// fields happened to be present.
-func productionBackendTLSConfig(backendConfig config.BackendConfig) (*tls.Config, error) {
-	return tlsconfig.ClientConfig(
-		backendConfig.TLSCAFile,
-		backendConfig.TLSSkipVerify,
-		backendConfig.TLSClientCertFile,
-		backendConfig.TLSClientKeyFile,
-	)
 }
 
 func attestPinnedBackendIdentities(

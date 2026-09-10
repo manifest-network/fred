@@ -504,25 +504,21 @@ func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx conte
 	return detectedUID, detectedGID
 }
 
-// detectWritablePathsCached returns auto-detected writable paths for an image,
-// using the cache keyed by image ID. On error, logs a warning and returns nil
-// without caching so the next call retries. Successful results (including
-// empty slices) are cached permanently since image IDs are immutable.
-func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx context.Context, imageName imageexec.Image, uid int) []string {
-	if v, ok := b.writablePathCache.Load(imageName.ID()); ok {
-		if paths, ok := v.([]string); ok {
-			return paths
-		}
+// detectWritablePathsCached reuses detection only for the same immutable image
+// and runtime UID. Errors remain uncached so the next setup can retry.
+func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx context.Context, detection writablePathDetection) []string {
+	if paths, found := b.writablePathCache.load(detection); found {
+		return paths
 	}
 
-	paths, err := mutations.detectWritablePaths(ctx, imageName, uid, candidateWritableParents)
+	paths, err := mutations.detectWritablePaths(ctx, detection)
 	if err != nil {
 		b.logger.Warn("failed to detect writable paths, skipping (not cached)",
-			"image", imageName.Reference(), "error", err)
+			"image", detection.image.Reference(), "uid", detection.uid, "error", err)
 		return nil
 	}
 
-	b.writablePathCache.Store(imageName.ID(), paths)
+	b.writablePathCache.store(detection, paths)
 	return paths
 }
 
@@ -579,7 +575,8 @@ func (b *Backend) inspectImageForSetup(mutations *storageMutations, ctx context.
 	// Skipped when ReadonlyRootfs is disabled since the detection creates a temp
 	// container and the results are only used for writable path mounting.
 	if b.cfg.IsReadonlyRootfs() {
-		result.WritablePaths = b.detectWritablePathsCached(mutations, ctx, admitted, result.VolumeUID)
+		detection := newWritablePathDetection(admitted, result.VolumeUID)
+		result.WritablePaths = b.detectWritablePathsCached(mutations, ctx, detection)
 		result.WritablePaths = filterSubpaths(result.WritablePaths, result.Volumes)
 	}
 

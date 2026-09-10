@@ -33,7 +33,7 @@ func (r resolver) ExpectedBackendStorageIdentity(name string) (backendidentity.I
 // translates the upgraded identity path and response header at the fixture
 // boundary; the client itself never receives unbound mutation authority.
 func New(
-	cfg backend.HTTPClientConfig,
+	cfg Config,
 	identity backendidentity.ID,
 ) (*backend.HTTPClient, func(), error) {
 	if !identity.Valid() {
@@ -94,16 +94,23 @@ func New(
 	}
 	server := httptest.NewServer(proxy)
 
-	clientConfig := cfg
-	clientConfig.BaseURL = server.URL
-	clientConfig.TLSClientConfig = nil
-	if clientConfig.Secret == "" {
-		clientConfig.Secret = fixtureBoundarySecret
+	secret := cfg.Secret
+	if secret == "" {
+		secret = fixtureBoundarySecret
 	}
-	client, err := backend.NewIdentityBoundHTTPClient(clientConfig, resolver{
+	policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
+		Name: cfg.Name, BaseURL: server.URL, Secret: secret, Timeout: cfg.Timeout,
+	})
+	if err != nil {
+		server.Close()
+		transport.CloseIdleConnections()
+		return nil, nil, err
+	}
+	client, err := backend.NewIdentityBoundHTTPClient(policy, cfg.options(), resolver{
 		backendName: cfg.Name,
 		identity:    identity,
 	})
+
 	if err != nil {
 		server.Close()
 		transport.CloseIdleConnections()

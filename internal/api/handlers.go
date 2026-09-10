@@ -1252,7 +1252,7 @@ func (h *Handlers) writeMaintenanceResult(
 	case maintenanceapp.OutcomeBackendInvalidState:
 		writeError(w, "invalid state for "+operationName, http.StatusConflict)
 	case maintenanceapp.OutcomeBackendValidation:
-		writeError(w, "the "+operationName+" request was rejected as invalid", http.StatusBadRequest)
+		writeError(w, tenantDetailText(result.Detail(), "the "+operationName+" request was rejected as invalid"), http.StatusBadRequest)
 	case maintenanceapp.OutcomeServiceUnavailable:
 		slog.Warn("maintenance command deferred", "error", result.Cause(), "lease_uuid", leaseUUID, "kind", operationName)
 		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)

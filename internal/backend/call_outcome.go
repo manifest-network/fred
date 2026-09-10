@@ -278,6 +278,17 @@ func (outcome MaintenanceCallOutcome) Refusal() MaintenanceRefusal {
 	return outcome.refusal
 }
 
+// RefusalDetail exposes only the diagnostic carried by a definitive validation
+// refusal. It grants no settlement authority; ambiguous/custom-backend errors
+// cannot acquire tenant-visible detail by wrapping a public sentinel.
+func (outcome MaintenanceCallOutcome) RefusalDetail() string {
+	if outcome.Refusal() != MaintenanceRefusalValidation {
+		return ""
+	}
+	detail, _ := Detail(outcome.Err())
+	return detail
+}
+
 // ConservativeMaintenanceCallOutcome adapts a legacy/custom backend. It can
 // represent only accepted or ambiguous; it cannot mint a terminal refusal.
 func ConservativeMaintenanceCallOutcome(err error) MaintenanceCallOutcome {

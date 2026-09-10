@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,7 +22,6 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/callbackurl"
 	"github.com/manifest-network/fred/internal/hmacauth"
-	"github.com/manifest-network/fred/internal/httpurl"
 	"github.com/manifest-network/fred/internal/maintenanceid"
 	"github.com/manifest-network/fred/internal/util"
 	"github.com/manifest-network/fred/internal/uuidv4"
@@ -1211,19 +1209,11 @@ const (
 // real fleet.
 const maxListPages = 100_000
 
-// HTTPClientConfig configures an HTTP backend client.
-type HTTPClientConfig struct {
-	Name                string
-	BaseURL             string
-	Timeout             time.Duration
+// HTTPClientOptions tunes resource limits, circuit breaking, and telemetry.
+// Connection authority is supplied separately as an opaque ConnectionPolicy.
+type HTTPClientOptions struct {
 	MaxIdleConns        int // Max idle connections across all hosts (default: 100)
 	MaxIdleConnsPerHost int // Max idle connections per host (default: 10)
-	Secret              string
-
-	// TLSClientConfig, when non-nil, is applied to the backend HTTP transport
-	// (private-CA trust and/or a client certificate for mTLS). Built by the
-	// caller from per-backend config so this package performs no file I/O.
-	TLSClientConfig *tls.Config
 
 	// Circuit breaker settings
 	CBMaxRequests   uint32        // Max requests in half-open state (default: 1)
@@ -1271,9 +1261,10 @@ func positiveOr(v, fallback int64) int64 {
 // durable storage-identity resolver. Keep it private: the resulting method set
 // includes every backend side effect, so returning it to bootstrap inventory
 // code would make mutation authority available by accident.
-func newHTTPClient(cfg HTTPClientConfig) *HTTPClient {
+func newHTTPClient(policy ConnectionPolicy, cfg HTTPClientOptions) *HTTPClient {
+	connection := policy.state
 	// Apply defaults using cmp.Or (returns first non-zero value)
-	timeout := cmp.Or(cfg.Timeout, 30*time.Second)
+	timeout := cmp.Or(connection.timeout, 30*time.Second)
 	maxIdleConns := cmp.Or(cfg.MaxIdleConns, 100)
 	maxIdleConnsPerHost := cmp.Or(cfg.MaxIdleConnsPerHost, 10) // Higher than default (2)
 
@@ -1287,18 +1278,14 @@ func newHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 		MaxIdleConnsPerHost: maxIdleConnsPerHost,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	if cfg.TLSClientConfig != nil {
-		transport.TLSClientConfig = cfg.TLSClientConfig
-		// The hop stays HTTP/1.1 over TLS when custom TLS configuration is used.
-		// A custom TLSClientConfig disables Go's automatic HTTP/2; we
-		// deliberately do NOT set ForceAttemptHTTP2 — these are low-volume
-		// JSON request/response calls and h2 with a custom TLS config carries
-		// a known footgun (golang/go#20645).
-	}
+	// Each client owns its transport configuration; immutable trust material
+	// remains private to the policy. No nil/default TLS path is exposed.
+	// The backend hop keeps its existing HTTP/1.1 transport behavior.
+	transport.TLSClientConfig = connection.tlsConfig.Clone()
 
 	// Create circuit breaker
 	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
-		Name:        cfg.Name,
+		Name:        connection.name,
 		MaxRequests: cbMaxRequests,
 		Interval:    cfg.CBInterval, // 0 = don't clear counts
 		Timeout:     cbTimeout,
@@ -1368,9 +1355,9 @@ func newHTTPClient(cfg HTTPClientConfig) *HTTPClient {
 	}
 
 	return &HTTPClient{
-		name:    cfg.Name,
-		baseURL: cfg.BaseURL,
-		secret:  cfg.Secret,
+		name:    connection.name,
+		baseURL: connection.baseURL,
+		secret:  connection.secret,
 		httpClient: &http.Client{
 			Timeout:   timeout,
 			Transport: transport,
@@ -1419,8 +1406,11 @@ var _ BootstrapInventoryClient = bootstrapInventoryClient{}
 
 // NewBootstrapInventoryClient constructs the only unbound production client.
 // It can collect identity-bearing inventory but cannot express a mutation.
-func NewBootstrapInventoryClient(cfg HTTPClientConfig) BootstrapInventoryClient {
-	return bootstrapInventoryClient{client: newHTTPClient(cfg)}
+func NewBootstrapInventoryClient(policy ConnectionPolicy, cfg HTTPClientOptions) (BootstrapInventoryClient, error) {
+	if !policy.valid() {
+		return nil, errors.New("backend connection policy is required")
+	}
+	return bootstrapInventoryClient{client: newHTTPClient(policy, cfg)}, nil
 }
 
 func (c bootstrapInventoryClient) Name() string {
@@ -1444,32 +1434,19 @@ func (c bootstrapInventoryClient) ListRetentionsWithIdentity(
 // name to an immutable backend storage identity. Side effects use upgraded-only
 // identity paths, so an old/reverted backend returns 404 before decoding or
 // executing the request rather than merely ignoring a new query parameter. A
-// strong HMAC secret is part of construction, so this mutation-capable client
-// cannot silently degrade to the unsigned compatibility behavior of the
-// read-only bootstrap transport.
+// strong HMAC secret and the shared TLS policy are required at construction.
 func NewIdentityBoundHTTPClient(
-	cfg HTTPClientConfig,
+	policy ConnectionPolicy,
+	cfg HTTPClientOptions,
 	resolver BackendStorageIdentityResolver,
 ) (*HTTPClient, error) {
+	if !policy.valid() {
+		return nil, errors.New("backend connection policy is required")
+	}
 	if util.IsNilInterface(resolver) {
 		return nil, errors.New("backend storage identity resolver is required")
 	}
-	if cfg.Timeout < 0 {
-		return nil, errors.New("identity-bound backend timeout must not be negative")
-	}
-	if len(cfg.Secret) < hmacauth.MinSecretLength {
-		return nil, fmt.Errorf(
-			"identity-bound backend HMAC secret must be at least %d bytes, got %d",
-			hmacauth.MinSecretLength,
-			len(cfg.Secret),
-		)
-	}
-	normalizedOrigin, err := httpurl.NormalizeOrigin(cfg.BaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("identity-bound backend base URL: %w", err)
-	}
-	cfg.BaseURL = normalizedOrigin
-	client := newHTTPClient(cfg)
+	client := newHTTPClient(policy, cfg)
 	client.identity = resolver
 	return client, nil
 }
@@ -1804,8 +1781,8 @@ func (c *HTTPClient) noteMalformedErrorBody(body []byte, operation, why string) 
 }
 
 // signRequest adds an HMAC-SHA256 signature header to the request.
-// If no secret is configured, this is a no-op for the deliberately narrow
-// read-only bootstrap client. NewIdentityBoundHTTPClient rejects that state, so
+// If no secret is configured, this is a no-op for transport test fixtures.
+// Both production factories reject that state, so
 // mutation-capable production clients cannot reach this compatibility branch.
 func (c *HTTPClient) signRequest(req *http.Request, body []byte) {
 	if c.secret == "" {

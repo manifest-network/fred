@@ -80,12 +80,14 @@ func (request MaintenanceApplicationRequest) valid() bool {
 type MaintenanceApplicationResult struct {
 	outcome MaintenanceApplicationOutcome
 	err     error
+	detail  string
 }
 
 func (result MaintenanceApplicationResult) Outcome() MaintenanceApplicationOutcome {
 	return result.outcome
 }
-func (result MaintenanceApplicationResult) Err() error { return result.err }
+func (result MaintenanceApplicationResult) Detail() string { return result.detail }
+func (result MaintenanceApplicationResult) Err() error     { return result.err }
 
 // MaintenanceOrderedEvents preserves the per-lease ordering boundary between
 // the visible starting event and the exact backend call plus durable receipt.
@@ -213,7 +215,7 @@ func (application *MaintenanceApplication) Execute(
 		}
 		if record.Outcome() != MaintenanceOutcomePending {
 			application.releaseTerminal(input.leaseUUID, input.id)
-			return resultForMaintenanceOutcome(record.Outcome())
+			return resultForMaintenanceReceipt(record.Outcome(), record.Detail())
 		}
 	}
 	var prepared MaintenancePreparation
@@ -254,7 +256,7 @@ func (application *MaintenanceApplication) Execute(
 		}
 		if record.Outcome() != MaintenanceOutcomePending {
 			application.release(input.leaseUUID, held)
-			return resultForMaintenanceOutcome(record.Outcome())
+			return resultForMaintenanceReceipt(record.Outcome(), record.Detail())
 		}
 		if !held.journalClaim.Valid() || held.journalClaim.Command().ID() != input.id {
 			if err := application.attach(held, input.leaseUUID, input.id); err != nil {
@@ -286,7 +288,7 @@ func (application *MaintenanceApplication) Execute(
 	}
 	if !admission.Pending() {
 		application.release(input.leaseUUID, held)
-		return resultForMaintenanceOutcome(admission.Outcome())
+		return resultForMaintenanceReceipt(admission.Outcome(), admission.Detail())
 	}
 	held.journalClaim = admission.Claim()
 	return application.reauthorizeAndDispatch(ctx, held)
@@ -338,6 +340,14 @@ func resultForMaintenanceBeginError(err error) MaintenanceApplicationResult {
 	default:
 		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, err)
 	}
+}
+
+func resultForMaintenanceReceipt(outcome MaintenanceCommandOutcome, detail string) MaintenanceApplicationResult {
+	result := resultForMaintenanceOutcome(outcome)
+	if outcome == MaintenanceOutcomeValidationRejected {
+		result.detail = detail
+	}
+	return result
 }
 
 func resultForMaintenanceOutcome(outcome MaintenanceCommandOutcome) MaintenanceApplicationResult {
@@ -446,6 +456,14 @@ func (application *MaintenanceApplication) reauthorizeAndDispatch(
 		application.release(held.journalClaim.Command().LeaseUUID(), held)
 		return resultForMaintenanceOutcome(reauthorization.Outcome())
 	}
+	if reauthorization.payload.valid() {
+		completion := application.coordinator.completeAcceptedUpdate(reauthorization.payload)
+		if completion.Err() != nil {
+			return maintenanceApplicationResult(MaintenanceApplicationInternalFailure, completion.Err())
+		}
+		application.release(held.journalClaim.Command().LeaseUUID(), held)
+		return resultForMaintenanceOutcome(completion.Outcome())
+	}
 	if !reauthorization.Authorized() {
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure,
 			errors.New("maintenance coordinator returned invalid reauthorization"))
@@ -465,10 +483,12 @@ func (application *MaintenanceApplication) dispatch(
 			errors.New("maintenance authorization does not match retained command"))
 	}
 	settled := MaintenanceOutcomePending
+	var detail string
 	call := func() (bool, error) {
 		completion := application.coordinator.executeMaintenance(ctx, authorization)
 		if completion.Settled() {
 			settled = completion.Outcome()
+			detail = completion.Detail()
 		}
 		if completion.Err() != nil {
 			return completion.BackendAccepted(), completion.Err()
@@ -500,7 +520,7 @@ func (application *MaintenanceApplication) dispatch(
 		return maintenanceApplicationResult(MaintenanceApplicationAccepted, nil)
 	}
 	if settled != MaintenanceOutcomePending && settled != MaintenanceOutcomeAccepted {
-		return resultForMaintenanceOutcome(settled)
+		return resultForMaintenanceReceipt(settled, detail)
 	}
 	if accepted {
 		return maintenanceApplicationResult(MaintenanceApplicationInternalFailure, err)

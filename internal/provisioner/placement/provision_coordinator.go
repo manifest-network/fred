@@ -39,6 +39,7 @@ const (
 	ProvisionEventValidationRefused
 	ProvisionEventNoBackend
 	ProvisionEventUncertain
+	ProvisionEventRejected
 )
 
 type provisionEventKind uint8
@@ -89,11 +90,11 @@ func (request ProvisionEventRequest) valid() bool {
 // ProvisionEventResult is an opaque, nil-free result algebra. Lease-derived
 // data is exposed only through behavior-specific accessors.
 type ProvisionEventResult struct {
-	issuer      *provisionCoordinatorMarker
-	disposition ProvisionEventDisposition
-	lease       billingtypes.Lease
-	hasLease    bool
-	err         error
+	disposition     ProvisionEventDisposition
+	lease           billingtypes.Lease
+	hasLease        bool
+	err             error
+	rejectionReason string
 }
 
 func (result ProvisionEventResult) Disposition() ProvisionEventDisposition {
@@ -102,14 +103,13 @@ func (result ProvisionEventResult) Disposition() ProvisionEventDisposition {
 
 func (result ProvisionEventResult) Err() error { return result.err }
 
-func (result ProvisionEventResult) LeaseForRejection() (billingtypes.Lease, bool) {
-	if !result.hasLease ||
-		(result.disposition != ProvisionEventPayloadInvalid &&
-			result.disposition != ProvisionEventValidationRefused) {
-		return billingtypes.Lease{}, false
+// RejectionReason is an observational result, never permission to reject or
+// remove payloads. Both mutations have already completed under the lease claim.
+func (result ProvisionEventResult) RejectionReason() string {
+	if result.disposition != ProvisionEventRejected {
+		return ""
 	}
-	lease := result.lease
-	return lease, true
+	return result.rejectionReason
 }
 
 func (result ProvisionEventResult) LeaseState() (billingtypes.LeaseState, bool) {
@@ -124,35 +124,6 @@ func (result ProvisionEventResult) MetaHashHex() (string, bool) {
 		return "", false
 	}
 	return hex.EncodeToString(result.lease.MetaHash), true
-}
-
-// RejectProvisionResult consumes only a validation result minted by this
-// coordinator, re-observes its exact current tenant/provider identity, and
-// rejects the still-PENDING lease through the construction-bound control plane.
-func (authority *ProvisionCoordinator) RejectProvisionResult(
-	ctx context.Context,
-	result ProvisionEventResult,
-	reason string,
-) (uint64, []string, error) {
-	if !authority.Valid() || ctx == nil || result.issuer != authority.marker ||
-		!result.hasLease ||
-		(result.disposition != ProvisionEventPayloadInvalid &&
-			result.disposition != ProvisionEventValidationRefused) {
-		return 0, nil, errors.New("exact provision validation result is required")
-	}
-	observation := authority.readLease(ctx, result.lease.Uuid, result.lease.Tenant)
-	exact, ok := observation.(observedExactLease)
-	if !ok {
-		return 0, nil, fmt.Errorf("revalidate provision rejection: %w",
-			exactLeaseObservationError(observation))
-	}
-	if exact.lease.State != billingtypes.LEASE_STATE_PENDING {
-		return 0, nil, errors.New("provision rejection target is no longer pending")
-	}
-	if err := authority.coordinator.store.leaseSideEffectError(exact.lease.Uuid); err != nil {
-		return 0, nil, err
-	}
-	return authority.controlPlane.rejectLease(ctx, exact.lease.Uuid, reason)
 }
 
 type provisionCoordinatorMarker struct{ _ byte }
@@ -170,6 +141,7 @@ type ProvisionCoordinator struct {
 	deprovision  *deprovisionCoordinator
 	observe      ProvisionStartObserver
 	marker       *provisionCoordinatorMarker
+	payloads     *payload.Store
 }
 
 // DeprovisionCompletionObserver is the least-authority capability needed by
@@ -203,6 +175,16 @@ func (observer DeprovisionCompletionObserver) ObserveCallbackDeprovisioned(
 func (execution *ExecutionCoordinator) ProvisionCoordinator(
 	observe ProvisionStartObserver,
 ) (*ProvisionCoordinator, error) {
+	return execution.ProvisionCoordinatorWithPayloads(observe, nil)
+}
+
+// ProvisionCoordinatorWithPayloads binds payload cleanup to the same authority
+// that owns the chain decision and the lifecycle claim. A message handler
+// cannot replace the store or manufacture deletion permission.
+func (execution *ExecutionCoordinator) ProvisionCoordinatorWithPayloads(
+	observe ProvisionStartObserver,
+	payloads *payload.Store,
+) (*ProvisionCoordinator, error) {
 	controlPlane, err := execution.providerControlPlane()
 	if err != nil {
 		return nil, errors.New("valid backend execution coordinator and provider control plane are required")
@@ -212,7 +194,7 @@ func (execution *ExecutionCoordinator) ProvisionCoordinator(
 		backends: execution.backends, providerUUID: execution.coordinator.store.providerUUID,
 		controlPlane: controlPlane, callbacks: execution.callbacks,
 		deprovision: execution.deprovision,
-		observe:     observe, marker: &provisionCoordinatorMarker{},
+		observe:     observe, marker: &provisionCoordinatorMarker{}, payloads: payloads,
 	}, nil
 }
 
@@ -278,7 +260,6 @@ func (authority *ProvisionCoordinator) ExecuteCurrentLease(
 			ProvisionEventInvalid, nil, errors.New("invalid event provision authority"),
 		)
 	}
-	defer func() { result.issuer = authority.marker }()
 	claimResult := authority.coordinator.operations.TryClaimLeaseNow(event.leaseUUID)
 	if !claimResult.Acquired() {
 		if authority.coordinator.operations.Contains(event.leaseUUID) {
@@ -307,7 +288,11 @@ func (authority *ProvisionCoordinator) ExecuteCurrentLease(
 			fmt.Errorf("read current lease %s: %w", event.leaseUUID, exactLeaseObservationError(observed)))
 	case observedExactLease:
 		lease := observed.lease
-		return authority.executeObservedCurrentLease(ctx, event, lease, leaseClaim)
+		result = authority.executeObservedCurrentLease(ctx, event, lease, leaseClaim)
+		if result.disposition == ProvisionEventPayloadInvalid || result.disposition == ProvisionEventValidationRefused {
+			return authority.rejectInvalidProvision(ctx, result, leaseClaim)
+		}
+		return result
 	default:
 		return newProvisionEventResult(ProvisionEventUncertain, nil,
 			errors.New("invalid current lease observation"))
@@ -319,9 +304,8 @@ func (authority *ProvisionCoordinator) executeObservedCurrentLease(
 	event ProvisionEventRequest,
 	observed billingtypes.Lease,
 	leaseClaim operation.LeaseClaim,
-) (result ProvisionEventResult) {
+) ProvisionEventResult {
 	lease := &observed
-	defer func() { result.issuer = authority.marker }()
 	switch lease.State {
 	case billingtypes.LEASE_STATE_PENDING:
 	case billingtypes.LEASE_STATE_ACTIVE:
@@ -329,7 +313,7 @@ func (authority *ProvisionCoordinator) executeObservedCurrentLease(
 	case billingtypes.LEASE_STATE_CLOSED,
 		billingtypes.LEASE_STATE_REJECTED,
 		billingtypes.LEASE_STATE_EXPIRED:
-		return newProvisionEventResult(ProvisionEventLeaseTerminal, lease, nil)
+		return authority.finishTerminalProvision(*lease, leaseClaim)
 	default:
 		return newProvisionEventResult(ProvisionEventUncertain, lease,
 			fmt.Errorf("cannot confirm lease %s state %s", event.leaseUUID, lease.State))

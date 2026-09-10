@@ -40,9 +40,11 @@ func causalOutcomeHTTPClient(
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(server.Close)
-	client, err := backend.NewIdentityBoundHTTPClient(backend.HTTPClientConfig{
+	policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
 		Name: "backend-a", BaseURL: server.URL, Secret: causalOutcomeTestSecret,
-	}, causalOutcomeTestIdentity{id: id})
+	})
+	require.NoError(t, err)
+	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, causalOutcomeTestIdentity{id: id})
 	require.NoError(t, err)
 	return client
 }

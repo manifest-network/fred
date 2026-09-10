@@ -6,7 +6,6 @@ package placementprobe
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"slices"
@@ -21,7 +20,6 @@ import (
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/provisioner/lifecycle"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
-	"github.com/manifest-network/fred/internal/tlsconfig"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -138,36 +136,19 @@ func newClients(
 	}
 	clients := make([]Client, 0, len(cfg.Backends))
 	for _, backendConfig := range cfg.Backends {
-		hmacSecret, err := cfg.ResolveBackendHMACSecret(backendConfig.Name)
+		policy, err := cfg.BackendConnectionPolicy(backendConfig.Name)
 		if err != nil {
-			return nil, fmt.Errorf("backend %q: resolve HMAC secret: %w", backendConfig.Name, err)
-		}
-		var tlsClientConfig *tls.Config
-		if backendConfig.TLSCAFile != "" || backendConfig.TLSClientCertFile != "" ||
-			backendConfig.TLSClientKeyFile != "" || backendConfig.TLSSkipVerify {
-			var err error
-			tlsClientConfig, err = tlsconfig.ClientConfig(
-				backendConfig.TLSCAFile,
-				backendConfig.TLSSkipVerify,
-				backendConfig.TLSClientCertFile,
-				backendConfig.TLSClientKeyFile,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("backend %q: build TLS client config: %w", backendConfig.Name, err)
-			}
-		}
-		clientConfig := backend.HTTPClientConfig{
-			Name:            backendConfig.Name,
-			BaseURL:         backendConfig.URL,
-			Timeout:         backendConfig.Timeout,
-			Secret:          string(hmacSecret),
-			TLSClientConfig: tlsClientConfig,
+			return nil, fmt.Errorf("backend %q: compose connection policy: %w", backendConfig.Name, err)
 		}
 		if resolver == nil {
-			clients = append(clients, backend.NewBootstrapInventoryClient(clientConfig))
+			client, err := backend.NewBootstrapInventoryClient(policy, backend.HTTPClientOptions{})
+			if err != nil {
+				return nil, err
+			}
+			clients = append(clients, client)
 			continue
 		}
-		client, err := backend.NewIdentityBoundHTTPClient(clientConfig, resolver)
+		client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, resolver)
 		if err != nil {
 			return nil, fmt.Errorf("backend %q: create identity-bound client: %w", backendConfig.Name, err)
 		}

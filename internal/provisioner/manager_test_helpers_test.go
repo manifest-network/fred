@@ -739,8 +739,8 @@ func composeTestHandlerSet(t testing.TB, deps testHandlerDeps) *HandlerSet {
 			eventTracker = newTestOperationRegistry()
 			eventStore = nil
 		}
-		deps.Orchestrator = newTestProvisionOrchestrator(
-			t, "provider-1", "http://callback", deps.BackendRouter, eventTracker, eventStore,
+		deps.Orchestrator = newTestProvisionOrchestratorWithPayloads(
+			t, "provider-1", "http://callback", deps.BackendRouter, eventTracker, eventStore, deps.PayloadStore,
 			deps.ChainClient,
 		)
 		if deps.Placement == nil {
@@ -1462,6 +1462,18 @@ func newTestProvisionOrchestrator(
 	store any,
 	leaseReaders ...placement.ProvisionLeaseReader,
 ) *ProvisionOrchestrator {
+	return newTestProvisionOrchestratorWithPayloads(t, providerUUID, callbackBaseURL, router, tracker, store, nil, leaseReaders...)
+}
+
+func newTestProvisionOrchestratorWithPayloads(
+	t testing.TB,
+	providerUUID, callbackBaseURL string,
+	router BackendRouter,
+	tracker *testOperationRegistry,
+	store any,
+	payloads *payload.Store,
+	leaseReaders ...placement.ProvisionLeaseReader,
+) *ProvisionOrchestrator {
 	t.Helper()
 	require.NotNil(t, tracker)
 	if len(router.Backends()) == 0 {
@@ -1496,8 +1508,8 @@ func newTestProvisionOrchestrator(
 	}
 	chain := testReconciliationChain{ProvisionLeaseReader: callbackChain}
 	setTestProviderControlPlane(t, execution, chain, nil)
-	provision, err := execution.ProvisionCoordinator(
-		func(leaseUUID, _ string) { startSink.PublishProvisionStarting(leaseUUID) },
+	provision, err := execution.ProvisionCoordinatorWithPayloads(
+		func(leaseUUID, _ string) { startSink.PublishProvisionStarting(leaseUUID) }, payloads,
 	)
 	require.NoError(t, err)
 	reconciliation := bindTestReconciliationCoordinator(

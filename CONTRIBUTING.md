@@ -8,7 +8,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 
 ## Prerequisites
 
-- **Go 1.26.6** (per `go.mod`) — the `go 1.26.6` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` and `testing.B.Loop()` (added in Go 1.25).
+- **Go 1.26.6** (per `go.mod`) — the `go 1.26.6` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` (Go 1.25) and `testing.B.Loop()` (Go 1.24).
 - **Docker Engine 28.1+ (API 1.49+)** with iptables enabled — required for `make test-integration` and the docker-backend's immutable image admission.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **`golangci-lint`**, at the version pinned in `.golangci-lint-version` — required by `make lint`, which now fails rather than skipping when it's absent or mismatched. See [Linting](#linting) for the install command.
@@ -22,21 +22,15 @@ For an overview of what Fred does and how it's structured, start with [README.md
 git clone https://github.com/manifest-network/fred.git
 cd fred
 go mod download
-make all              # builds providerd, mock-backend, docker-backend, k3s-backend into ./build/
+make all              # builds the four daemons and both offline placement tools into ./build/
 make test             # all unit tests (runs the stress suite too; see Stress tests)
 ```
 
-For an end-to-end local environment against a running chain:
-
-```bash
-bash scripts/dev-init.sh    # registers a provider + SKUs, generates configs, writes a callback secret
-./build/docker-backend --config docker-backend.yaml
-./build/providerd --config config.docker.yaml
-```
+For an end-to-end local environment against a running chain, follow [Local Development Setup](README.md#local-development-setup). `scripts/dev-init.sh` registers a provider and SKUs, generates configuration, and prints the complete startup procedure. A fresh deployment must first seal the backend's storage identity and initialize placement authority with `placement-preflight -initialize-fresh` while mutation ingress is fenced and drained. Only then can `providerd` start. Normal startup deliberately does not create placement authority; initialization is a one-time operation, not a restart command.
 
 `scripts/dev-init.sh` is parameterized via environment variables (see the script header). All defaults assume a local chain at `http://localhost:26657` with the `acc0` test key.
 
-To exercise just the provisioner without Docker, run `make run-mock` in one shell and `make run` in another — the mock backend ignores SKUs and simulates provisioning.
+To exercise the provisioner without Docker, follow [Local Fred Development with the Mock Backend](README.md#local-fred-development-with-the-mock-backend). That recipe persists `MOCK_BACKEND_STORAGE_ID`, starts the mock, initializes fresh placement authority, and starts `providerd` with the matching configuration. Reuse the stored identity on mock restarts. The mock ignores SKUs and simulates provisioning.
 
 The experimental K3s backend can be built with `make build-k3s` and run with `make run-k3s` (override its config via `K3S_BACKEND_CONFIG=...`). It is a non-functional scaffold (see *Project layout*) — the provisioner is a stub.
 
@@ -50,6 +44,8 @@ cmd/
 ├── docker-backend/     Production Docker backend
 ├── k3s-backend/        Experimental K3s backend (scaffold, non-functional)
 ├── mock-backend/       Test/dev backend
+├── placement-preflight/ Offline inventory proof and placement initialization/upgrade
+├── placement-repair/   Offline placement-authority repair
 └── loadtest/           Load tester (exercises the API)
 
 internal/
@@ -100,7 +96,7 @@ go test -run TestAuthToken ./...  # specific test by name
 go test -race -short ./...
 ```
 
-**CI does not run `-race`** (it is omitted in `.github/workflows/ci.yml` due to memory pressure on GitHub-hosted runners). Locals are the only place this runs, so make a habit of `go test -race -short ./...` before pushing — especially on PRs that touch concurrency.
+CI runs three race shards on every PR and push to `main`: provisioner packages, backend packages, and all remaining packages. The partition comes from `go list ./...`, so newly extracted helper packages retain coverage. Each uses `-race -short -p 1`, `GOMAXPROCS=2`, and a bounded timeout to limit runner pressure. See [the race matrix](.github/workflows/ci.yml) for the exact commands. Keep running the full command above locally before pushing concurrency changes; large stress fixtures remain outside these CI shards.
 
 ### Multi-backend fleet tests
 
@@ -142,7 +138,7 @@ sudo make test-integration-volume  # filesystem quota tests (root + btrfs-progs)
 
 Volume tests need root because they create loopback filesystems, set filesystem quotas, and manage ZFS pools. The full suite covers btrfs, XFS project quotas, and ZFS; `make test-integration-volume` selects only the btrfs subset.
 
-**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on a privileged `ubuntu-24.04` runner (root + a btrfs loopback + Docker): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore) plus `make test-integration-k3s`. It triggers on PRs/pushes touching the docker backend (`internal/backend/docker/**`, `internal/backend/shared/**`, `cmd/k3s-backend/**`, `Makefile`, `go.mod`/`go.sum`) and runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` still only does `build`, `test` (without `-race`, no `integration` tag), `lint`, and `vulncheck`.
+**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on a privileged `ubuntu-24.04` runner (root + a btrfs loopback + Docker): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore) plus `make test-integration-k3s`. It triggers on PRs/pushes touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
 
 Running the suites locally is still the fastest iteration loop, and required for changes outside the path filter.
 
@@ -235,7 +231,7 @@ Look at `internal/scheduler/doc.go` or `internal/backend/docker/doc.go` for the 
    - only providerd writes it → `internal/metrics/metrics.go`;
    - only one backend writes it → that backend's `metrics.go` (`internal/backend/docker/`, `internal/backend/k3s/`);
    - more than one binary writes it, **or** it belongs to the `fred_background_*` panic family → `internal/metrics/background`, where it **must** carry labels: a `*Vec` registers just as eagerly but exports no series until its first `WithLabelValues`, which is what makes it free for a binary that never writes it. Label-bearing is the membership rule, not "written by everyone" — `GoroutinePanicsTotal` is providerd-only and lives there deliberately, keeping the family whole so the next backend that needs a panic counter does not re-import `internal/metrics`;
-   - shared code that must reference no collector at all → take one by injection, as `backend.RouterConfig.RoutingFallback` and `backend.HTTPClientConfig.RequestsTotal` do, and wire it in `cmd/providerd/main.go`.
+   - shared code that must reference no collector at all → take one by injection, as `backend.RouterConfig.RoutingFallback` and `backend.HTTPClientOptions.RequestsTotal` do, and wire it in `cmd/providerd/main.go`.
 
    A `depguard` rule blocks `internal/metrics` from `internal/backend/**` and the backend `cmd` packages, and each backend `cmd` package has a test asserting its `/metrics` carries only its own prefix. If either fires, the fix is one of the four options above, never an exclusion.
 2. Use the `fred_` namespace and an appropriate subsystem.
@@ -248,7 +244,7 @@ Look at `internal/scheduler/doc.go` or `internal/backend/docker/doc.go` for the 
 
 1. Add a handler in `internal/api/handlers.go` (or a focused file if the handler is long).
 2. Register the route in `internal/api/server.go` using the existing `withAuthRL` wrapper (most authenticated tenant endpoints) or `withPayloadRL` (the `/data` upload). These wrappers apply per-tenant rate limiting plus the appropriate token validator (`tenantRateLimiter.AuthMiddleware()` or `tenantRateLimiter.PayloadAuthMiddleware()`).
-3. Decide whether replay protection applies — it should be **on** for any endpoint that mutates state or returns sensitive details, **off** for idempotent reads. The decision matrix is in [SECURITY.md](SECURITY.md#which-endpoints-check-replay).
+3. Decide whether replay protection applies — it should be **on** for any endpoint that mutates state or returns sensitive details, **off** for idempotent reads. The decision matrix is in [SECURITY.md](SECURITY.md#replay-protection).
 4. Document the endpoint in [README.md § API Endpoints](README.md#api-endpoints) — include path, method, auth, replay flag, request shape, response shape, and all status codes.
 5. Add a handler test in `internal/api/server_handler_test.go` and an integration test if the path is non-trivial.
 

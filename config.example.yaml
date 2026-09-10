@@ -657,6 +657,11 @@ withdraw_limit: 100
 # fred_withdraw_guard_active / fred_withdraw_skipped_by_guard_total).
 credit_check_interval: "0s"
 
+# How long a continuously observed empty tenant balance must persist before
+# credit-based lease closure. A recovered balance resets the grace period.
+# "0s" uses the scheduler default of 5m; negative durations are invalid.
+credit_check_zero_grace_period: "5m"
+
 # Number of consecutive credit check errors before taking action.
 # Prevents premature lease termination due to transient RPC errors.
 credit_check_error_threshold: 3

@@ -329,9 +329,9 @@ func (m *storageMutations) detectVolumeOwner(ctx context.Context, image imageexe
 	return uid, gid, err
 }
 
-func (m *storageMutations) detectWritablePaths(ctx context.Context, image imageexec.Image, uid int, parents []string) (paths []string, err error) {
+func (m *storageMutations) detectWritablePaths(ctx context.Context, detection writablePathDetection) (paths []string, err error) {
 	err = m.runner.Step(ctx, "inspect image writable paths", func(ctx context.Context) error {
-		paths, err = m.ops.docker.DetectWritablePaths(ctx, image, uid, parents)
+		paths, err = m.ops.docker.DetectWritablePaths(ctx, detection.image, detection.uid, candidateWritableParents)
 		return err
 	})
 	return paths, err

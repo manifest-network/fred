@@ -276,7 +276,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerCh
 	if err != nil {
 		return nil, fmt.Errorf("bind backend execution coordinator: %w", err)
 	}
-	provisionCoordinator, err := executionCoordinator.ProvisionCoordinator(
+	provisionCoordinator, err := executionCoordinator.ProvisionCoordinatorWithPayloads(
 		placement.ProvisionStartObserver(func(leaseUUID, _ string) {
 			// Provision start and callback completion use the same synchronous
 			// sink. Sending only the terminal side directly would let a queued
@@ -285,6 +285,7 @@ func NewManager(cfg ManagerConfig, router *backend.Router, chainClient ManagerCh
 				cfg.LeaseEventSink, leaseUUID, backend.ProvisionStatusProvisioning, "",
 			)
 		}),
+		cfg.PayloadStore,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("bind provision execution coordinator: %w", err)

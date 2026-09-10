@@ -66,10 +66,12 @@ func TestLegacyValidationErrorCannotAuthorizeProvisionEventRejection(t *testing.
 
 func TestFreshNoDispatchClearsAttemptWithoutBecomingARefusal(t *testing.T) {
 	fixture := newProvisionDispatchFixture(t, "lease-known-unsent")
-	client, err := backend.NewIdentityBoundHTTPClient(backend.HTTPClientConfig{
+	policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
 		Name: "backend-a", BaseURL: "https://backend.invalid",
 		Secret: causalOutcomeTestSecret,
-	}, causalOutcomeTestIdentity{})
+	})
+	require.NoError(t, err)
+	client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, causalOutcomeTestIdentity{})
 	require.NoError(t, err)
 	execution := bindExecutionForTest(
 		t, fixture.coordinator, newExecutionTestRuntime(client),
@@ -149,10 +151,12 @@ func TestAttemptRecoveryRequiresTransportMintedRefusal(t *testing.T) {
 	})
 
 	t.Run("known no-dispatch preserves redelivery evidence", func(t *testing.T) {
-		client, err := backend.NewIdentityBoundHTTPClient(backend.HTTPClientConfig{
+		policy, err := backend.NewConnectionPolicy(backend.ConnectionConfig{
 			Name: "backend-a", BaseURL: "https://backend.invalid",
 			Secret: causalOutcomeTestSecret,
-		}, causalOutcomeTestIdentity{})
+		})
+		require.NoError(t, err)
+		client, err := backend.NewIdentityBoundHTTPClient(policy, backend.HTTPClientOptions{}, causalOutcomeTestIdentity{})
 		require.NoError(t, err)
 		store, result := recoverProvisionAttemptForTest(
 			t, "lease-recovery-not-dispatched", client,

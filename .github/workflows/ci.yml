@@ -37,9 +37,54 @@ jobs:
         # -short skips the load/stress and benchmark-style tests (guarded by
         # testing.Short()): the 100K-event stress test is timing-flaky in CI and
         # the race-stress tests OOM the runner. They still run locally / on demand.
-        # -race is also omitted here due to runner memory; run
-        # `go test -race -short ./...` locally before pushing concurrency changes.
+        # Race instrumentation runs separately in bounded shards below.
         run: go test -short -v ./...
+
+  race:
+    name: race (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [provisioner, backend, other]
+    env:
+      # Bound compiler/test concurrency and Go's heap target on standard runners.
+      # -short keeps large stress fixtures out of race-instrumented processes.
+      GOMAXPROCS: "2"
+      GOMEMLIMIT: 4GiB
+      RACE_SHARD: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test with the race detector
+        shell: bash
+        run: |
+          # Partition every package structurally. New helpers automatically
+          # retain race coverage when moved outside the two large subtrees.
+          module="$(go list -m)"
+          all_packages="$(go list ./...)"
+          packages=()
+          while IFS= read -r package; do
+            case "$package" in
+              "$module/internal/provisioner"|"$module/internal/provisioner/"*) shard=provisioner ;;
+              "$module/internal/backend"|"$module/internal/backend/"*) shard=backend ;;
+              *) shard=other ;;
+            esac
+            if [ "$shard" = "$RACE_SHARD" ]; then
+              packages+=("$package")
+            fi
+          done <<< "$all_packages"
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::race shard selected no packages"
+            exit 1
+          fi
+          go test -race -short -p 1 -timeout 15m "${packages[@]}"
 
   lint:
     runs-on: ubuntu-latest

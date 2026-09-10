@@ -636,8 +636,8 @@ func newTestHandlerSetWithBackend(
 	if len(publishers) > 0 {
 		publisher = publishers[0]
 	}
-	orch := newTestProvisionOrchestrator(
-		t, "prov-1", "http://localhost:8080", router, tracker, nil, chainClient,
+	orch := newTestProvisionOrchestratorWithPayloads(
+		t, "prov-1", "http://localhost:8080", router, tracker, nil, payloadStore, chainClient,
 	)
 	hs := composeTestHandlerSet(t, testHandlerDeps{
 		ChainClient:  chainClient,
@@ -2827,6 +2827,9 @@ func TestHandlerSet_LeasesAwaitingGauge_PayloadReceivedDecrementsGauge(t *testin
 
 	mb := &mockManagerBackend{name: "test-backend"}
 	mockChain := &chaintest.MockClient{
+		RejectLeasesFunc: func(context.Context, []string, string) (uint64, []string, error) {
+			return 1, nil, nil
+		},
 		GetLeaseFunc: func(ctx context.Context, leaseUUID string) (*billingtypes.Lease, error) {
 			return &billingtypes.Lease{
 				Uuid:     leaseUUID,

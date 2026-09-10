@@ -12,9 +12,11 @@ import (
 	backendclienttest "github.com/manifest-network/fred/internal/testsupport/backendclient"
 )
 
+type backendHTTPClientConfig = backendclienttest.Config
+
 func newBackendHTTPClientForTest(
 	t testing.TB,
-	config backend.HTTPClientConfig,
+	config backendHTTPClientConfig,
 ) *backend.HTTPClient {
 	t.Helper()
 	client, cleanup, err := backendclienttest.New(
@@ -34,7 +36,7 @@ func TestBackendHTTPClientFixturePreservesTypedRestoreRefusal(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newBackendHTTPClientForTest(t, backend.HTTPClientConfig{
+	client := newBackendHTTPClientForTest(t, backendHTTPClientConfig{
 		Name: "typed-restore-refusal", BaseURL: server.URL,
 	})
 	outcome := backend.InvokeRestore(context.Background(), client, backend.RestoreRequest{})

@@ -295,9 +295,9 @@ type Backend struct {
 	// (content-addressable sha256 digest). Zero-value ready; no init needed.
 	volumeOwnerCache sync.Map // image ID → volumeOwnerEntry
 
-	// writablePathCache caches auto-detected writable paths per image ID
-	// for non-root images. Zero-value ready.
-	writablePathCache sync.Map // image ID → []string
+	// writablePathCache retains results for each complete image/UID detection
+	// subject, including root's any-non-root-owner query. Zero-value ready.
+	writablePathCache writablePathCache
 
 	// stopCtx is canceled on shutdown; stopCancel triggers it.
 	stopCtx    context.Context

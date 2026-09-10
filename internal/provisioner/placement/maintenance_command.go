@@ -41,10 +41,16 @@ const (
 	// The API's entire encoded request is capped at 1 MiB. Apply the same hard
 	// bound to direct callers so the placement DB is never an unbounded payload
 	// storage surface.
-	maxMaintenancePayloadBytes        = 1 << 20
-	maxMaintenanceCommandValueBytes   = 2 << 20
-	maxMaintenanceCommandPendingBytes = maxMaintenanceCommandValueBytes - 512
-	maxMaintenanceCommandsPerLease    = 1024
+	maxMaintenancePayloadBytes      = 1 << 20
+	maxMaintenanceCommandValueBytes = 2 << 20
+	// JSON escapes one input byte to at most six output bytes. Reserve the
+	// complete refusal detail and fixed terminal metadata before admission.
+	maxMaintenanceRefusalDetailBytes = 4 << 10
+	// Retain the old pending limit as the baseline for fresh admission. Phase
+	// transitions use the full record limit so legacy rows remain recoverable.
+	maxMaintenanceCommandPendingBytes   = maxMaintenanceCommandValueBytes - 512
+	maxMaintenanceCommandAdmissionBytes = maxMaintenanceCommandPendingBytes - 6*maxMaintenanceRefusalDetailBytes
+	maxMaintenanceCommandsPerLease      = 1024
 )
 
 // MaintenanceCommandKind is the closed set of tenant maintenance effects.
@@ -162,6 +168,7 @@ type MaintenanceCommand struct {
 	lifecycleID       lifecycle.ID
 	callbackURL       string
 	terminal          bool
+	phase             maintenanceJournalPhase
 }
 
 // newMaintenanceCommand validates and detaches every fact needed to safely
@@ -192,7 +199,8 @@ func newMaintenanceCommand(
 		)
 	}
 	command := MaintenanceCommand{
-		id: id, leaseUUID: leaseUUID,
+		phase: maintenanceDeliveryOutstanding,
+		id:    id, leaseUUID: leaseUUID,
 		tenant: principal.tenant, providerUUID: principal.providerUUID,
 		placementRevision: revision.value,
 		kind:              kind, payload: append([]byte(nil), payload...), backendName: backendName,
@@ -235,6 +243,9 @@ func (prepared PreparedMaintenanceCommand) Command() MaintenanceCommand {
 }
 
 func validateMaintenanceCommand(command MaintenanceCommand) error {
+	if !command.phase.validFor(command.kind, command.terminal) {
+		return fmt.Errorf("%w: invalid maintenance journal phase", ErrInvalidMaintenanceCommand)
+	}
 	if !command.id.Valid() {
 		return fmt.Errorf("%w: request ID is required", ErrInvalidMaintenanceCommand)
 	}
@@ -322,7 +333,9 @@ func validateMaintenanceCallbackURL(raw string, legacy bool, want lifecycle.ID) 
 func (command MaintenanceCommand) Valid() bool {
 	return validateMaintenanceCommand(command) == nil
 }
-func (command MaintenanceCommand) Dispatchable() bool           { return command.Valid() && !command.terminal }
+func (command MaintenanceCommand) Dispatchable() bool {
+	return command.Valid() && command.phase == maintenanceDeliveryOutstanding
+}
 func (command MaintenanceCommand) ID() maintenanceid.ID         { return command.id }
 func (command MaintenanceCommand) LeaseUUID() string            { return command.leaseUUID }
 func (command MaintenanceCommand) Tenant() string               { return command.tenant }
@@ -363,7 +376,7 @@ type MaintenanceCommandClaim struct {
 }
 
 func (claim MaintenanceCommandClaim) Valid() bool {
-	return claim.issuer != nil && claim.command.Dispatchable()
+	return claim.issuer != nil && claim.command.Valid() && !claim.command.terminal
 }
 func (claim MaintenanceCommandClaim) Command() MaintenanceCommand {
 	if !claim.Valid() {
@@ -378,6 +391,7 @@ type MaintenanceCommandAdmission struct {
 	claim   MaintenanceCommandClaim
 	command MaintenanceCommand
 	outcome MaintenanceCommandOutcome
+	detail  string
 }
 
 func (result MaintenanceCommandAdmission) Pending() bool {
@@ -390,12 +404,14 @@ func (result MaintenanceCommandAdmission) Claim() MaintenanceCommandClaim {
 	return result.claim
 }
 func (result MaintenanceCommandAdmission) Outcome() MaintenanceCommandOutcome { return result.outcome }
+func (result MaintenanceCommandAdmission) Detail() string                     { return result.detail }
 
 // MaintenanceCommandRecord is a read-only journal observation. It grants no
 // settlement authority; only Begin/Pending can issue a claim.
 type MaintenanceCommandRecord struct {
 	command MaintenanceCommand
 	outcome MaintenanceCommandOutcome
+	detail  string
 }
 
 func (record MaintenanceCommandRecord) Valid() bool { return record.command.Valid() }
@@ -410,6 +426,15 @@ func (record MaintenanceCommandRecord) Outcome() MaintenanceCommandOutcome {
 		return MaintenanceOutcomePending
 	}
 	return record.outcome
+}
+
+func (record MaintenanceCommandRecord) Detail() string { return record.detail }
+
+// maintenanceSettlement couples the closed verdict and its diagnostic at the
+// classifier. Detail is observation only and never authorizes an effect.
+type maintenanceSettlement struct {
+	outcome MaintenanceCommandOutcome
+	detail  string
 }
 
 type persistedMaintenanceCommand struct {
@@ -428,6 +453,8 @@ type persistedMaintenanceCommand struct {
 	LifecycleID       string    `json:"lifecycle_id,omitempty"`
 	CallbackURL       string    `json:"callback_url"`
 	Outcome           string    `json:"outcome"`
+	Phase             string    `json:"phase,omitempty"`
+	Detail            string    `json:"detail,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 	SettledAt         time.Time `json:"settled_at,omitempty"`
 }
@@ -529,14 +556,14 @@ func (s *Store) LookupMaintenanceCommand(
 		if encoded == nil {
 			return nil
 		}
-		command, outcome, _, _, err := decodeMaintenanceCommand(encoded)
+		command, outcome, _, _, detail, err := decodeMaintenanceCommand(encoded)
 		if err != nil {
 			return fmt.Errorf("%w: decode command record: %w", ErrMaintenanceJournalCorrupt, err)
 		}
 		if command.leaseUUID != leaseUUID || command.id != id {
 			return fmt.Errorf("%w: command record key mismatch", ErrMaintenanceJournalCorrupt)
 		}
-		result = MaintenanceCommandRecord{command: command, outcome: outcome}
+		result = MaintenanceCommandRecord{command: command, outcome: outcome, detail: detail}
 		found = true
 		return nil
 	})
@@ -544,11 +571,20 @@ func (s *Store) LookupMaintenanceCommand(
 }
 
 func encodeMaintenanceCommand(command MaintenanceCommand, outcome MaintenanceCommandOutcome, createdAt, settledAt time.Time) ([]byte, error) {
+	encoded, _, err := encodeMaintenanceSettlement(command, maintenanceSettlement{outcome: outcome}, createdAt, settledAt)
+	return encoded, err
+}
+
+func encodeMaintenanceSettlement(command MaintenanceCommand, settlement maintenanceSettlement, createdAt, settledAt time.Time) ([]byte, string, error) {
+	outcome := settlement.outcome
+	if err := validateMaintenanceDetail(settlement.detail, outcome); err != nil {
+		return nil, "", err
+	}
 	if !command.Valid() {
-		return nil, ErrInvalidMaintenanceCommand
+		return nil, "", ErrInvalidMaintenanceCommand
 	}
 	if outcome > MaintenanceOutcomeBackendUnavailable {
-		return nil, ErrInvalidMaintenanceCommand
+		return nil, "", ErrInvalidMaintenanceCommand
 	}
 	persistedPayload := append([]byte(nil), command.payload...)
 	if outcome != MaintenanceOutcomePending {
@@ -568,25 +604,62 @@ func encodeMaintenanceCommand(command MaintenanceCommand, outcome MaintenanceCom
 		}(),
 		CallbackURL: command.callbackURL,
 		Outcome:     outcome.String(), CreatedAt: createdAt.UTC(), SettledAt: settledAt.UTC(),
+		Detail: settlement.detail,
+	}
+	if outcome == MaintenanceOutcomePending {
+		record.Phase = command.phase.String()
 	}
 	if command.lifecycleID.Valid() {
 		record.LifecycleID = command.lifecycleID.String()
 	}
+	// The tighter fresh-admission budget is enforced only by Begin. A legacy
+	// pending row may acquire an explicit phase for the first time on recovery;
+	// that durable transition must retain the full record budget.
+	return encodeBoundedMaintenanceRecord(record, maxMaintenanceCommandValueBytes)
+}
+
+// encodeBoundedMaintenanceRecord preserves diagnostic text within the exact
+// JSON receipt budget. New admission reserves its worst-case size; older
+// pending rows may have less space. Observational detail must never prevent
+// their authoritative settlement. Return the committed prefix so the first
+// response and replay expose exactly the same diagnostic.
+func encodeBoundedMaintenanceRecord(record persistedMaintenanceCommand, limit int) ([]byte, string, error) {
 	encoded, err := json.Marshal(record)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	limit := maxMaintenanceCommandValueBytes
-	if outcome == MaintenanceOutcomePending {
-		limit = maxMaintenanceCommandPendingBytes
+	if len(encoded) <= limit {
+		return encoded, record.Detail, nil
+	}
+	if record.Detail != "" {
+		runes := []rune(record.Detail)
+		low, high := 0, len(runes)
+		for low < high {
+			middle := low + (high-low+1)/2
+			record.Detail = string(runes[:middle])
+			candidate, err := json.Marshal(record)
+			if err != nil {
+				return nil, "", err
+			}
+			if len(candidate) <= limit {
+				low = middle
+			} else {
+				high = middle - 1
+			}
+		}
+		record.Detail = string(runes[:low])
+		encoded, err = json.Marshal(record)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	if len(encoded) > limit {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"%w: encoded command exceeds %d-byte %s budget",
-			ErrInvalidMaintenanceCommand, limit, outcome,
+			ErrInvalidMaintenanceCommand, limit, record.Outcome,
 		)
 	}
-	return encoded, nil
+	return encoded, record.Detail, nil
 }
 
 func decodeMaintenanceCommand(encoded []byte) (
@@ -594,64 +667,73 @@ func decodeMaintenanceCommand(encoded []byte) (
 	MaintenanceCommandOutcome,
 	time.Time,
 	time.Time,
+	string,
 	error,
 ) {
 	if len(encoded) == 0 || len(encoded) > maxMaintenanceCommandValueBytes {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 			errors.New("maintenance command has an invalid encoded size")
 	}
 	var record persistedMaintenanceCommand
 	if err := strictjson.DecodeObject(
 		encoded, maxMaintenanceCommandValueBytes, &record,
 	); err != nil {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, err
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "", err
 	}
 	if record.Schema != maintenanceCommandSchema || record.CreatedAt.IsZero() {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 			errors.New("invalid maintenance command schema or timestamp")
 	}
 	id, err := maintenanceid.Parse(record.ID)
 	if err != nil {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, err
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "", err
 	}
 	storageID, err := backendidentity.Parse(record.BackendStorageID)
 	if err != nil {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, err
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "", err
 	}
 	var lifecycleID lifecycle.ID
 	lifecycleLegacy := false
 	switch record.LifecycleKind {
 	case "legacy":
 		if record.LifecycleID != "" {
-			return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+			return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 				errors.New("legacy maintenance command carries a lifecycle ID")
 		}
 		lifecycleLegacy = true
 	case "typed":
 		lifecycleID, err = lifecycle.ParseID(record.LifecycleID)
 		if err != nil {
-			return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, err
+			return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "", err
 		}
 	default:
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 			errors.New("invalid maintenance lifecycle kind")
 	}
 	outcome, ok := parseMaintenanceCommandOutcome(record.Outcome)
 	if !ok {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 			errors.New("invalid maintenance outcome")
+	}
+	if err := validateMaintenanceDetail(record.Detail, outcome); err != nil {
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "", err
+	}
+	phase, err := decodeMaintenancePhase(record.Phase, outcome)
+	if err != nil {
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "", err
 	}
 	if outcome == MaintenanceOutcomePending && !record.SettledAt.IsZero() ||
 		outcome != MaintenanceOutcomePending && record.SettledAt.IsZero() {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 			errors.New("maintenance settlement timestamp disagrees with outcome")
 	}
 	if !record.SettledAt.IsZero() && record.SettledAt.Before(record.CreatedAt) {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 			errors.New("maintenance settlement predates admission")
 	}
 	command := MaintenanceCommand{
-		id: id, leaseUUID: record.LeaseUUID, tenant: record.Tenant,
+		phase: phase,
+		id:    id, leaseUUID: record.LeaseUUID, tenant: record.Tenant,
 		providerUUID: record.ProviderUUID, placementRevision: record.PlacementRevision,
 		kind: parseMaintenanceCommandKind(record.Kind), payload: append([]byte(nil), record.Payload...),
 		backendName: record.BackendName, backendStorageID: storageID,
@@ -662,17 +744,18 @@ func decodeMaintenanceCommand(encoded []byte) (
 	err = validateMaintenanceCommand(command)
 	if outcome != MaintenanceOutcomePending {
 		if len(record.Payload) != 0 {
-			return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+			return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 				errors.New("terminal maintenance receipt retains payload bytes")
 		}
 		digest, hashErr := hex.DecodeString(record.PayloadHash)
 		if hashErr != nil || len(digest) != sha256.Size ||
 			record.PayloadHash != strings.ToLower(record.PayloadHash) {
-			return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+			return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 				errors.New("terminal maintenance receipt has an invalid payload fingerprint")
 		}
 		command = MaintenanceCommand{
-			id: id, leaseUUID: record.LeaseUUID, tenant: record.Tenant,
+			phase: maintenanceCompleted,
+			id:    id, leaseUUID: record.LeaseUUID, tenant: record.Tenant,
 			providerUUID: record.ProviderUUID, placementRevision: record.PlacementRevision,
 			kind:        parseMaintenanceCommandKind(record.Kind),
 			backendName: record.BackendName, backendStorageID: storageID,
@@ -683,13 +766,23 @@ func decodeMaintenanceCommand(encoded []byte) (
 		err = validateMaintenanceCommand(command)
 	}
 	if err != nil {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, err
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "", err
 	}
 	if record.PayloadHash != command.PayloadHash() {
-		return MaintenanceCommand{}, 0, time.Time{}, time.Time{},
+		return MaintenanceCommand{}, 0, time.Time{}, time.Time{}, "",
 			errors.New("maintenance payload fingerprint mismatch")
 	}
-	return command, outcome, record.CreatedAt, record.SettledAt, nil
+	return command, outcome, record.CreatedAt, record.SettledAt, record.Detail, nil
+}
+
+// A diagnostic is bounded independently of the payload and can only accompany
+// the validation-refusal receipt that admitted it. Older receipts omit it.
+func validateMaintenanceDetail(detail string, outcome MaintenanceCommandOutcome) error {
+	if len(detail) > maxMaintenanceRefusalDetailBytes || !utf8.ValidString(detail) ||
+		(detail != "" && outcome != MaintenanceOutcomeValidationRejected) {
+		return fmt.Errorf("%w: invalid maintenance refusal detail", ErrInvalidMaintenanceCommand)
+	}
+	return nil
 }
 
 // prepareMaintenanceCommand mints one immutable command exclusively from the
@@ -789,6 +882,9 @@ func (s *Store) reauthorizeMaintenanceCommand(claim MaintenanceCommandClaim) err
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := s.requireMaintenancePhaseLocked(claim, maintenanceDeliveryOutstanding); err != nil {
+		return err
+	}
 	current, exists := s.cache[command.leaseUUID]
 	capability, lifecycleExists := s.lifecycleCache[command.leaseUUID]
 	storageID, storageBound := s.backendStorageIDs[command.backendName]
@@ -841,14 +937,14 @@ func (s *Store) beginMaintenanceCommand(
 		}
 		key := maintenanceReceiptKey(command.leaseUUID, command.id)
 		if encoded := records.Get(key); encoded != nil {
-			stored, outcome, _, _, decodeErr := decodeMaintenanceCommand(encoded)
+			stored, outcome, _, _, detail, decodeErr := decodeMaintenanceCommand(encoded)
 			if decodeErr != nil {
 				return fmt.Errorf("%w: decode receipt: %w", ErrMaintenanceJournalCorrupt, decodeErr)
 			}
 			if !stored.equal(command) {
 				return ErrMaintenanceCommandConflict
 			}
-			result = MaintenanceCommandAdmission{command: stored, outcome: outcome}
+			result = MaintenanceCommandAdmission{command: stored, outcome: outcome, detail: detail}
 			if outcome == MaintenanceOutcomePending {
 				head := pending.Get([]byte(command.leaseUUID))
 				if string(head) != command.id.String() {
@@ -876,6 +972,9 @@ func (s *Store) beginMaintenanceCommand(
 		if err != nil {
 			return err
 		}
+		if len(encoded) > maxMaintenanceCommandAdmissionBytes {
+			return fmt.Errorf("%w: command exceeds %d-byte admission budget", ErrInvalidMaintenanceCommand, maxMaintenanceCommandAdmissionBytes)
+		}
 		if err := records.Put(key, encoded); err != nil {
 			return err
 		}
@@ -902,7 +1001,7 @@ func countMaintenanceReceipts(
 	cursor := records.Cursor()
 	retained := 0
 	for key, value := cursor.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, value = cursor.Next() {
-		command, _, _, _, err := decodeMaintenanceCommand(value)
+		command, _, _, _, _, err := decodeMaintenanceCommand(value)
 		if err != nil {
 			return 0, fmt.Errorf("%w: decode receipt for capacity: %w", ErrMaintenanceJournalCorrupt, err)
 		}
@@ -947,13 +1046,34 @@ func validateMaintenanceAdmissionTx(tx *bolt.Tx, command MaintenanceCommand) err
 // classifiers derive the outcome; no exported method accepts a caller-selected
 // persisted enum.
 func (s *Store) settleMaintenanceCommand(claim MaintenanceCommandClaim, outcome MaintenanceCommandOutcome) error {
+	_, err := s.settleMaintenanceDelivery(claim, maintenanceSettlement{outcome: outcome})
+	return err
+}
+
+func (s *Store) settleMaintenanceDelivery(claim MaintenanceCommandClaim, settlement maintenanceSettlement) (MaintenanceCommandRecord, error) {
+	// Update acceptance requires a payload-commit capability. A generic
+	// transport or chain classifier cannot retire its recovery bytes.
+	if settlement.outcome == MaintenanceOutcomeAccepted && claim.command.kind == MaintenanceCommandUpdate {
+		return MaintenanceCommandRecord{}, ErrMaintenanceCommandNotPending
+	}
+	return s.settleMaintenancePhaseReceipt(claim, settlement, maintenanceDeliveryOutstanding)
+}
+
+func (s *Store) settleMaintenancePhase(claim MaintenanceCommandClaim, settlement maintenanceSettlement, phase maintenanceJournalPhase) error {
+	_, err := s.settleMaintenancePhaseReceipt(claim, settlement, phase)
+	return err
+}
+
+func (s *Store) settleMaintenancePhaseReceipt(claim MaintenanceCommandClaim, settlement maintenanceSettlement, phase maintenanceJournalPhase) (MaintenanceCommandRecord, error) {
+	outcome := settlement.outcome
 	if s == nil || !claim.Valid() || claim.issuer != s || outcome == MaintenanceOutcomePending ||
 		outcome > MaintenanceOutcomeBackendUnavailable {
-		return ErrMaintenanceCommandNotPending
+		return MaintenanceCommandRecord{}, ErrMaintenanceCommandNotPending
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
+	var receipt MaintenanceCommandRecord
+	err := s.updateRuntimeAuthority(func(tx *bolt.Tx) error {
 		pending, records, err := maintenanceCommandBuckets(tx)
 		if err != nil {
 			return err
@@ -965,11 +1085,11 @@ func (s *Store) settleMaintenanceCommand(claim MaintenanceCommandClaim, outcome 
 		}
 		key := maintenanceReceiptKey(command.leaseUUID, command.id)
 		encoded := records.Get(key)
-		stored, currentOutcome, createdAt, _, err := decodeMaintenanceCommand(encoded)
+		stored, currentOutcome, createdAt, _, _, err := decodeMaintenanceCommand(encoded)
 		if err != nil {
 			return fmt.Errorf("%w: decode pending receipt: %w", ErrMaintenanceJournalCorrupt, err)
 		}
-		if currentOutcome != MaintenanceOutcomePending || !stored.equal(command) {
+		if currentOutcome != MaintenanceOutcomePending || stored.phase != phase || !stored.equal(command) {
 			return ErrMaintenanceCommandNotPending
 		}
 		settledAt := s.now().UTC()
@@ -979,15 +1099,24 @@ func (s *Store) settleMaintenanceCommand(claim MaintenanceCommandClaim, outcome 
 			// durable lease authority rather than elapsed wall time.
 			settledAt = createdAt
 		}
-		settled, err := encodeMaintenanceCommand(stored, outcome, createdAt, settledAt)
+		settled, detail, err := encodeMaintenanceSettlement(stored, settlement, createdAt, settledAt)
 		if err != nil {
 			return err
 		}
 		if err := records.Put(key, settled); err != nil {
 			return err
 		}
-		return pending.Delete([]byte(command.leaseUUID))
+		if err := pending.Delete([]byte(command.leaseUUID)); err != nil {
+			return err
+		}
+		stored.terminal, stored.phase, stored.payload = true, maintenanceCompleted, nil
+		receipt = MaintenanceCommandRecord{command: stored, outcome: outcome, detail: detail}
+		return nil
 	})
+	if err != nil {
+		return MaintenanceCommandRecord{}, err
+	}
+	return receipt, nil
 }
 
 // reclaimDetachedMaintenanceCommandsForLeaseTx removes one lease's terminal
@@ -1028,7 +1157,7 @@ func reclaimDetachedMaintenanceCommandsForLeaseTx(
 	prefix := []byte(leaseUUID + "\x00")
 	cursor := records.Cursor()
 	for key, value := cursor.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, value = cursor.Next() {
-		command, outcome, _, _, decodeErr := decodeMaintenanceCommand(value)
+		command, outcome, _, _, _, decodeErr := decodeMaintenanceCommand(value)
 		if decodeErr != nil {
 			return fmt.Errorf("%w: decode detached receipt: %w", ErrMaintenanceJournalCorrupt, decodeErr)
 		}
@@ -1069,7 +1198,7 @@ func (s *Store) reclaimDetachedMaintenanceCommands() (int, error) {
 		}
 		cursor := records.Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
-			command, outcome, _, _, decodeErr := decodeMaintenanceCommand(value)
+			command, outcome, _, _, _, decodeErr := decodeMaintenanceCommand(value)
 			if decodeErr != nil {
 				return fmt.Errorf("%w: decode receipt during reclamation: %w", ErrMaintenanceJournalCorrupt, decodeErr)
 			}
@@ -1114,7 +1243,7 @@ func (s *Store) pendingMaintenanceCommands() ([]MaintenanceCommandClaim, error) 
 				return fmt.Errorf("%w: invalid pending ID", ErrMaintenanceJournalCorrupt)
 			}
 			encoded := records.Get(maintenanceReceiptKey(string(leaseKey), id))
-			command, outcome, _, _, err := decodeMaintenanceCommand(encoded)
+			command, outcome, _, _, _, err := decodeMaintenanceCommand(encoded)
 			if err != nil || outcome != MaintenanceOutcomePending || command.leaseUUID != string(leaseKey) {
 				return fmt.Errorf("%w: invalid pending receipt for %q", ErrMaintenanceJournalCorrupt, leaseKey)
 			}
@@ -1146,7 +1275,7 @@ func verifyMaintenanceCommandJournal(tx *bolt.Tx) error {
 			return fmt.Errorf("%w: invalid pending ID", ErrMaintenanceJournalCorrupt)
 		}
 		encoded := records.Get(maintenanceReceiptKey(string(leaseKey), id))
-		command, outcome, _, _, decodeErr := decodeMaintenanceCommand(encoded)
+		command, outcome, _, _, _, decodeErr := decodeMaintenanceCommand(encoded)
 		if decodeErr != nil || outcome != MaintenanceOutcomePending {
 			return fmt.Errorf(
 				"%w: invalid pending command authority for lease %q",
@@ -1188,7 +1317,7 @@ func verifyMaintenanceCommandBuckets(pending, records *bolt.Bucket) error {
 		if value == nil {
 			return fmt.Errorf("%w: nested command record", ErrMaintenanceJournalCorrupt)
 		}
-		command, outcome, _, _, decodeErr := decodeMaintenanceCommand(value)
+		command, outcome, _, _, _, decodeErr := decodeMaintenanceCommand(value)
 		if decodeErr != nil {
 			return fmt.Errorf("%w: decode command record: %w", ErrMaintenanceJournalCorrupt, decodeErr)
 		}

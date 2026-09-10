@@ -16,10 +16,13 @@ import (
 func TestBootstrapInventoryClient_DoesNotExposeMutationAuthority(t *testing.T) {
 	t.Parallel()
 
-	client := NewBootstrapInventoryClient(HTTPClientConfig{
-		Name:    "backend-a",
-		BaseURL: "http://backend.invalid",
+	policy, err := NewConnectionPolicy(ConnectionConfig{
+		Name: "backend-a", BaseURL: "http://backend.invalid",
+		Secret: "bootstrap-test-secret-at-least-32-bytes",
 	})
+	require.NoError(t, err)
+	client, err := NewBootstrapInventoryClient(policy, HTTPClientOptions{})
+	require.NoError(t, err)
 	require.NotNil(t, client)
 	_, isConcreteClient := client.(*HTTPClient)
 	assert.False(t, isConcreteClient,

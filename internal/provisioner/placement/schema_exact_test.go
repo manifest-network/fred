@@ -37,7 +37,7 @@ func TestPlacementAuthorityDecodersRejectCaseAliases(t *testing.T) {
 		{
 			name: "maintenance command",
 			decode: func(value []byte) error {
-				_, _, _, _, err := decodeMaintenanceCommand(value)
+				_, _, _, _, _, err := decodeMaintenanceCommand(value)
 				return err
 			},
 			alias: `{"Schema":1}`,

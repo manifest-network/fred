@@ -51,9 +51,11 @@ const (
 type Result struct {
 	outcome Outcome
 	cause   error
+	detail  string
 }
 
 func (result Result) Outcome() Outcome { return result.outcome }
+func (result Result) Detail() string   { return result.detail }
 func (result Result) Cause() error     { return result.cause }
 
 // NewResult is a test-only constructor for cross-package API service fakes.
@@ -147,7 +149,7 @@ func resultFromApplication(result placement.MaintenanceApplicationResult) Result
 		placement.MaintenanceApplicationInvalid:
 		outcome = OutcomeInternalFailure
 	}
-	return Result{outcome: outcome, cause: result.Err()}
+	return Result{outcome: outcome, cause: result.Err(), detail: result.Detail()}
 }
 
 func (service *Service) RecoverPending(ctx context.Context) error {

@@ -11,7 +11,7 @@ Fred is the Manifest Network **provider daemon**: it watches the chain for lease
 ```bash
 make test                    # NOTE: no -short, so the stress suite runs
 go test -short ./...         # what CI runs
-go test -race -short ./...   # before pushing concurrency changes; CI does NOT run -race,
+go test -race -short ./...   # before pushing concurrency changes; CI runs bounded short race shards,
                              # and -race without -short OOM-kills the runner on the stress suite
 make fmt                     # go fmt only — does NOT cover import grouping
 make lint                    # go vet + golangci-lint

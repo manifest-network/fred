@@ -34,7 +34,7 @@
 // (internal/metrics), and one only a single backend writes (that backend's
 // package-local metrics file). For shared code that must reference no collector
 // at all there is a third option — the injection seam used by
-// backend.RouterConfig and backend.HTTPClientConfig.
+// backend.RouterConfig and backend.HTTPClientOptions.
 package background
 
 import (

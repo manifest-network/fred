@@ -50,7 +50,7 @@ func TestNew_TranslatesIdentityBoundaryWithoutWeakeningFixtureContract(t *testin
 	t.Cleanup(server.Close)
 
 	identity := fixtureIdentity(t)
-	client, cleanup, err := New(backend.HTTPClientConfig{
+	client, cleanup, err := New(Config{
 		Name:    "backend-a",
 		BaseURL: server.URL,
 		Secret:  secret,
@@ -76,14 +76,14 @@ func TestNew_RejectsInvalidInputs(t *testing.T) {
 	t.Parallel()
 
 	identity := fixtureIdentity(t)
-	_, cleanup, err := New(backend.HTTPClientConfig{
+	_, cleanup, err := New(Config{
 		Name:    "backend-a",
 		BaseURL: "backend.invalid",
 	}, identity)
 	assert.Nil(t, cleanup)
 	assert.ErrorContains(t, err, "must be an absolute origin")
 
-	_, cleanup, err = New(backend.HTTPClientConfig{
+	_, cleanup, err = New(Config{
 		Name:    "backend-a",
 		BaseURL: "http://backend.invalid",
 	}, backendidentity.ID{})
