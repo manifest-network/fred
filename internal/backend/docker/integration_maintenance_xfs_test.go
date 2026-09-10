@@ -109,8 +109,7 @@ func TestIntegration_Maintenance_ExactReplaySurvivesBackendRestart_XFS(t *testin
 	waitForProvisionStatus(t, first, leaseUUID, backend.ProvisionStatusReady, 30*time.Second)
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containers, 1)
-	require.Equal(t, "redis:7-alpine", containers[0].Image,
-		"the accepted maintenance command must replace the running image")
+	requireProvisionContainerImage(t, containers[0], "redis:7-alpine")
 	releases, err := first.releaseStore.List(leaseUUID)
 	require.NoError(t, err)
 	assert.Equal(t, 1, countMaintenanceRelease(releases, maintenanceID))
@@ -123,8 +122,7 @@ func TestIntegration_Maintenance_ExactReplaySurvivesBackendRestart_XFS(t *testin
 	waitForProvisionStatus(t, restarted, leaseUUID, backend.ProvisionStatusReady, 30*time.Second)
 	containers = inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containers, 1)
-	require.Equal(t, "redis:7-alpine", containers[0].Image,
-		"backend recovery must retain the replacement image")
+	requireProvisionContainerImage(t, containers[0], "redis:7-alpine")
 
 	authority, err := restarted.maintenanceSettlement.NewMaintenanceRequestAuthority(
 		maintenanceID, shared.MaintenanceIntentUpdate, leaseUUID,

@@ -191,10 +191,11 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := newIntegrationLeaseUUID()
 
-	// Redis declares VOLUME /data
+	// Redis declares VOLUME /data. Disable automatic snapshots so the explicit
+	// synchronous SAVE below cannot race a background save.
 	appManifest := manifest.Manifest{
 		Image:   "redis:7",
-		Command: []string{"redis-server", "--save", "1", "1"},
+		Command: []string{"redis-server", "--save", ""},
 	}
 	payload, err := json.Marshal(appManifest)
 	require.NoError(t, err)
@@ -232,8 +233,10 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 		"container should have bind mount at /data")
 
 	// 5. Write data to redis
-	execInContainer(t, containerID, []string{"redis-cli", "SET", "testkey", "testvalue"})
-	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
+	require.Equal(t, "OK", strings.TrimSpace(execInContainer(t, containerID,
+		[]string{"redis-cli", "-e", "--raw", "SET", "testkey", "testvalue"})))
+	require.Equal(t, "OK", strings.TrimSpace(execInContainer(t, containerID,
+		[]string{"redis-cli", "-e", "--raw", "SAVE"})))
 
 	// 6. Verify data file exists on host volume
 	dataDir := filepath.Join(subvolPath, "data")

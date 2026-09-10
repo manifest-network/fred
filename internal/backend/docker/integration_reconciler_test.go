@@ -1526,7 +1526,7 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.NotEmpty(t, containers)
-	require.Equal(t, originalImage, containers[0].Image, "should start on the as-created image")
+	requireProvisionContainerImage(t, containers[0], originalImage)
 
 	mu.Lock()
 	leaseState = billingtypes.LEASE_STATE_ACTIVE
@@ -1657,7 +1657,7 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 
 	containers = inspectProvisionContainers(t, leaseUUID)
 	require.NotEmpty(t, containers)
-	require.Equal(t, updatedImage, containers[0].Image, "update should have replaced the running image")
+	requireProvisionContainerImage(t, containers[0], updatedImage)
 
 	// --- the reboot: lose the container, let the reconciler bring it back ---
 	killContainer(t, containers[0].ID)
@@ -1695,8 +1695,7 @@ func TestIntegration_Reconciler_UpdatedPayload_ReprovisionsUpdatedImage(t *testi
 	// The assertion this whole ticket exists for.
 	containers = inspectProvisionContainers(t, leaseUUID)
 	require.NotEmpty(t, containers)
-	assert.Equal(t, updatedImage, containers[0].Image,
-		"reprovision must replay the UPDATED manifest — reverting to %s is ENG-619", originalImage)
+	requireProvisionContainerImage(t, containers[0], updatedImage)
 
 	// And the payload must still be there: deleting it as "corrupt" is what
 	// would close the lease on the following sweep.

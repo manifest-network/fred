@@ -749,6 +749,35 @@ func inspectProvisionContainers(t *testing.T, leaseUUID string) []container.Summ
 	return containers
 }
 
+// requireProvisionContainerImage checks both sides of the image contract:
+// Docker executes an immutable ID, while labels and backend inventory preserve
+// the exact manifest reference used for release comparisons and recovery.
+func requireProvisionContainerImage(t *testing.T, summary container.Summary, reference string) {
+	t.Helper()
+	docker, err := NewDockerClient("", "")
+	require.NoError(t, err)
+	defer func() { _ = docker.Close() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	raw, err := docker.client.ContainerInspect(ctx, summary.ID)
+	require.NoError(t, err)
+	require.NotNil(t, raw.ContainerJSONBase)
+	require.NotNil(t, raw.Config)
+	require.Regexp(t, `^sha256:[0-9a-f]{64}$`, raw.Image, "container must execute an immutable image ID")
+	require.Equal(t, raw.Image, raw.Config.Image, "configured image must equal Docker's actual execution ID")
+	require.Equal(t, raw.Image, raw.Config.Labels[LabelImageID], "reference binding must identify the executed image")
+	require.Equal(t, reference, raw.Config.Labels[LabelImageReference], "container must preserve the exact manifest reference")
+	require.Equal(t, raw.Image, summary.ImageID, "list and inspect must agree on the executed image")
+	require.Equal(t, raw.Config.Image, summary.Image, "list must expose the immutable configured image")
+	require.Equal(t, reference, summary.Labels[LabelImageReference])
+	require.Equal(t, raw.Image, summary.Labels[LabelImageID])
+
+	projected, err := docker.InspectContainer(ctx, summary.ID)
+	require.NoError(t, err)
+	require.Equal(t, reference, projected.Image, "backend inventory must retain the original release reference")
+}
+
 // getProvisionInfo returns the ProvisionInfo for a specific lease, or fails.
 func getProvisionInfo(t *testing.T, b *Backend, leaseUUID string) backend.ProvisionInfo {
 	t.Helper()
@@ -1857,7 +1886,7 @@ func TestIntegration_Docker_UpdateLifecycle(t *testing.T) {
 	require.Len(t, containersAfter, 1)
 	assert.NotEqual(t, oldContainerID, containersAfter[0].ID, "update should create a new container")
 	assert.Equal(t, "running", containersAfter[0].State)
-	assert.Contains(t, containersAfter[0].Image, "alpine", "container should be running alpine image")
+	requireProvisionContainerImage(t, containersAfter[0], newManifest.Image)
 
 	// GetInfo still works
 	info, err := b.GetInfo(ctx, leaseUUID)
@@ -2048,7 +2077,7 @@ func TestIntegration_Docker_UpdateFromFailed(t *testing.T) {
 	containersAfter := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containersAfter, 1)
 	assert.Equal(t, "running", containersAfter[0].State)
-	assert.Contains(t, containersAfter[0].Image, "alpine")
+	requireProvisionContainerImage(t, containersAfter[0], newManifest.Image)
 
 	// Status is Ready (recovered from Failed)
 	prov = getProvisionInfo(t, b, leaseUUID)
@@ -2379,7 +2408,7 @@ func TestIntegration_Docker_MultiContainerUpdate(t *testing.T) {
 	for _, c := range containersAfter {
 		assert.False(t, oldIDs[c.ID], "container %s should be new after update", c.ID[:12])
 		assert.Equal(t, "running", c.State)
-		assert.Contains(t, c.Image, "alpine", "container should be running alpine")
+		requireProvisionContainerImage(t, c, newManifest.Image)
 	}
 
 	prov := getProvisionInfo(t, b, leaseUUID)
@@ -2564,7 +2593,7 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containers, 1)
 	assert.Equal(t, "running", containers[0].State)
-	assert.Contains(t, containers[0].Image, "busybox")
+	requireProvisionContainerImage(t, containers[0], appManifest.Image)
 
 	prov := getProvisionInfo(t, b, leaseUUID)
 	assert.Equal(t, backend.ProvisionStatusReady, prov.Status)
@@ -2724,7 +2753,7 @@ func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
 	// Verify the new container is running the updated image
 	containersAfter := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containersAfter, 1)
-	assert.Contains(t, containersAfter[0].Image, "redis:7-alpine", "container should be running redis:7-alpine after update")
+	requireProvisionContainerImage(t, containersAfter[0], newManifest.Image)
 
 	// Read data back from redis — volume should have persisted the data across update
 	result := execInContainer(t, newContainerID, []string{"redis-cli", "GET", "update_key"})
@@ -3232,7 +3261,7 @@ func TestIntegration_Stack_Update(t *testing.T) {
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containers, 2)
 	for _, c := range containers {
-		assert.Contains(t, c.Image, "alpine", "container should be running alpine after update, got %s", c.Image)
+		requireProvisionContainerImage(t, c, "alpine:latest")
 	}
 
 	// Verify status is Ready
@@ -3430,7 +3459,7 @@ func TestIntegration_Stack_FullLifecycle(t *testing.T) {
 	containers := inspectProvisionContainers(t, leaseUUID)
 	require.Len(t, containers, 2)
 	for _, c := range containers {
-		assert.Contains(t, c.Image, "alpine", "expected alpine image after update, got %s", c.Image)
+		requireProvisionContainerImage(t, c, "alpine:latest")
 	}
 
 	// Step 4: Deprovision
