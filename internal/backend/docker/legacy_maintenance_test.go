@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
@@ -170,169 +171,211 @@ func TestV013LegacyReleaseFirstMaintenanceOperations(t *testing.T) {
 }
 
 func TestV013LegacyReleaseSubsequentMaintenanceRollbackPreservesSourceAuthority(t *testing.T) {
-	oldStack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
-		"app": {Image: "docker.io/library/nginx:1.26"},
-	}}
-	items := []backend.LeaseItem{{
-		SKU: "docker-small", ServiceName: "app", Quantity: 1,
-	}}
-	provisions := map[string]*provision{
-		stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{
-			LeaseUUID: stackMaintenanceLeaseUUID,
-			Tenant:    "tenant-a", ProviderUUID: nominalDockerProviderUUID,
-			Status: backend.ProvisionStatusReady, StackManifest: oldStack,
-			Items: slices.Clone(items), ContainerIDs: []string{"old-app"},
-			ServiceContainers: map[string][]string{"app": {"old-app"}},
-		}},
-	}
-
-	type projectAuthority struct {
-		callbackURL          string
-		lifecycleCallbackURL string
-		maintenanceID        shared.MaintenanceID
-	}
-	var (
-		upMu       sync.Mutex
-		upCalls    int
-		projects   []projectAuthority
-		callbackMu sync.Mutex
-		callbacks  []struct {
-			payload backend.CallbackPayload
-			uri     string
+	synctest.Test(t, func(t *testing.T) {
+		oldStack := &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+			"app": {Image: "docker.io/library/nginx:1.26"},
+		}}
+		items := []backend.LeaseItem{{
+			SKU: "docker-small", ServiceName: "app", Quantity: 1,
+		}}
+		provisions := map[string]*provision{
+			stackMaintenanceLeaseUUID: {ProvisionState: leasesm.ProvisionState{
+				LeaseUUID: stackMaintenanceLeaseUUID,
+				Tenant:    "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+				Status: backend.ProvisionStatusReady, StackManifest: oldStack,
+				Items: slices.Clone(items), ContainerIDs: []string{"old-app"},
+				ServiceContainers: map[string][]string{"app": {"old-app"}},
+			}},
 		}
-	)
-	compose := &mockComposeExecutor{
-		UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
-			labels := project.Services["app"].Labels
-			upMu.Lock()
-			upCalls++
-			call := upCalls
-			projects = append(projects, projectAuthority{
-				callbackURL:          labels[LabelCallbackURL],
-				lifecycleCallbackURL: labels[LabelLifecycleCallbackURL],
-				maintenanceID:        mustParseMaintenanceID(t, labels[LabelMaintenanceID]),
-			})
-			upMu.Unlock()
-			if call == 2 {
-				return errors.New("simulated subsequent restart failure")
+
+		type projectAuthority struct {
+			callbackURL          string
+			lifecycleCallbackURL string
+			maintenanceID        shared.MaintenanceID
+		}
+		var (
+			upMu       sync.Mutex
+			upCalls    int
+			projects   []projectAuthority
+			callbackMu sync.Mutex
+			callbacks  []struct {
+				payload backend.CallbackPayload
+				uri     string
 			}
-			return nil
-		},
-		PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
-			return []composeContainerSummary{{
-				ID: "current-app", Service: "app", State: "running",
-			}}, nil
-		},
-	}
-	mock := &mockDockerClient{
-		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
-		InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
-			return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
-		},
-	}
-	installStackStrictCohortInventory(t, mock, compose)
+		)
+		compose := &mockComposeExecutor{
+			UpFn: func(_ context.Context, project *composetypes.Project, _ composeUpOpts) error {
+				labels := project.Services["app"].Labels
+				upMu.Lock()
+				upCalls++
+				call := upCalls
+				projects = append(projects, projectAuthority{
+					callbackURL:          labels[LabelCallbackURL],
+					lifecycleCallbackURL: labels[LabelLifecycleCallbackURL],
+					maintenanceID:        mustParseMaintenanceID(t, labels[LabelMaintenanceID]),
+				})
+				upMu.Unlock()
+				if call == 2 {
+					return errors.New("simulated subsequent restart failure")
+				}
+				return nil
+			},
+			PSFn: func(context.Context, string) ([]composeContainerSummary, error) {
+				return []composeContainerSummary{{
+					ID: "current-app", Service: "app", State: "running",
+				}}, nil
+			},
+		}
+		mock := &mockDockerClient{
+			PullImageFn: func(context.Context, string, time.Duration) error { return nil },
+			InspectContainerFn: func(_ context.Context, containerID string) (*ContainerInfo, error) {
+				return &ContainerInfo{ContainerID: containerID, Status: "running"}, nil
+			},
+		}
+		installStackStrictCohortInventory(t, mock, compose)
 
-	callbackReceived := make(chan struct{}, 2)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload backend.CallbackPayload
-		_ = json.NewDecoder(r.Body).Decode(&payload)
-		callbackMu.Lock()
-		callbacks = append(callbacks, struct {
-			payload backend.CallbackPayload
-			uri     string
-		}{payload: payload, uri: r.URL.RequestURI()})
-		callbackMu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		callbackReceived <- struct{}{}
-	}))
-	defer server.Close()
-	oldCallbackURL := server.URL + "/old/callbacks/provision"
-	newCallbackURL := server.URL + "/new/callbacks/provision"
+		callbackReceived := make(chan struct{}, 2)
+		// Keep callback delivery inside the bubble: real socket I/O is not a
+		// synctest synchronization event and would reintroduce wall-clock scheduling.
+		client := &http.Client{Transport: callbackAckRoundTripper(func(r *http.Request) (*http.Response, error) {
+			var payload backend.CallbackPayload
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				return nil, err
+			}
+			callbackMu.Lock()
+			callbacks = append(callbacks, struct {
+				payload backend.CallbackPayload
+				uri     string
+			}{payload: payload, uri: r.URL.RequestURI()})
+			callbackMu.Unlock()
+			callbackReceived <- struct{}{}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       http.NoBody,
+				Request:    r,
+			}, nil
+		})}
+		const (
+			oldCallbackURL = "https://fred.example/old/callbacks/provision"
+			newCallbackURL = "https://fred.example/new/callbacks/provision"
+		)
 
-	b := newBackendForProvisionTest(t, mock, provisions)
-	b.compose = compose
-	b.cfg.StartupVerifyDuration = time.Millisecond
-	seedLegacyStackMaintenanceAuthority(
-		t, b, stackMaintenanceLeaseUUID, oldStack, items,
-		oldCallbackURL, oldCallbackURL, server.Client(),
-	)
+		b := newBackendForProvisionTest(t, mock, provisions)
+		b.compose = compose
+		b.cfg.StartupVerifyDuration = time.Millisecond
+		seedLegacyStackMaintenanceAuthority(
+			t, b, stackMaintenanceLeaseUUID, oldStack, items,
+			oldCallbackURL, oldCallbackURL, client,
+		)
 
-	// Establish a real prior maintenance generation. The next restart must treat
-	// this active target (including its MaintenanceID) as rollback authority.
-	require.NoError(t, b.Restart(t.Context(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
-		LeaseUUID: stackMaintenanceLeaseUUID, CallbackURL: oldCallbackURL,
-	}))
-	awaitStackMaintenanceCallback(t, b, callbackReceived)
-	source, err := b.releaseStore.LatestActive(stackMaintenanceLeaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, source)
-	require.True(t, source.MaintenanceID.Valid())
-	sourceMaintenanceID := source.MaintenanceID
-	sourceAuthority := mustDockerReleaseRuntimeIdentity(t, *source)
-	require.Equal(t, shared.ReleaseAuthorityLegacy, sourceAuthority.Class())
-	require.Equal(t, oldCallbackURL, sourceAuthority.CallbackURL())
+		awaitCallback := func() {
+			t.Helper()
+			select {
+			case <-callbackReceived:
+			case <-time.After(5 * time.Second):
+				t.Fatal("callback was not delivered within its virtual deadline")
+			}
+			// The transport observation precedes durable acknowledgement. Wait for
+			// the sender and actor to finish before inspecting or admitting work.
+			synctest.Wait()
+			pending, err := b.callbackStore.ListPending()
+			require.NoError(t, err)
+			require.Empty(t, pending, "callback delivery must remove its exact durable row")
+		}
 
-	// The forward replacement publishes the requested new callback base, then
-	// returns an error. Compose Up may have taken effect before returning an
-	// error, so live execution must preserve the Started intent as ambiguous. A
-	// later strict recovery pass observes the exact source generation and is the
-	// only authority allowed to settle the failure.
-	failedMaintenanceID := newTestMaintenanceID(t)
-	require.NoError(t, b.Restart(t.Context(), backend.RestartRequest{MaintenanceID: failedMaintenanceID,
-		LeaseUUID: stackMaintenanceLeaseUUID, CallbackURL: newCallbackURL,
-	}))
-	require.Eventually(t, func() bool {
+		// Establish a real prior maintenance generation. The next restart must treat
+		// this active target (including its MaintenanceID) as rollback authority.
+		require.NoError(t, b.Restart(t.Context(), backend.RestartRequest{MaintenanceID: newTestMaintenanceID(t),
+			LeaseUUID: stackMaintenanceLeaseUUID, CallbackURL: oldCallbackURL,
+		}))
+		awaitCallback()
+		source, err := b.releaseStore.LatestActive(stackMaintenanceLeaseUUID)
+		require.NoError(t, err)
+		require.NotNil(t, source)
+		require.True(t, source.MaintenanceID.Valid())
+		sourceMaintenanceID := source.MaintenanceID
+		sourceAuthority := mustDockerReleaseRuntimeIdentity(t, *source)
+		require.Equal(t, shared.ReleaseAuthorityLegacy, sourceAuthority.Class())
+		require.Equal(t, oldCallbackURL, sourceAuthority.CallbackURL())
+
+		// The forward replacement publishes the requested new callback base, then
+		// returns an error. Compose Up may have taken effect before returning an
+		// error, so live execution must preserve the Started intent as ambiguous. A
+		// later strict recovery pass observes the exact source generation and is the
+		// only authority allowed to settle the failure.
+		failedMaintenanceID := newTestMaintenanceID(t)
+		require.NoError(t, b.Restart(t.Context(), backend.RestartRequest{MaintenanceID: failedMaintenanceID,
+			LeaseUUID: stackMaintenanceLeaseUUID, CallbackURL: newCallbackURL,
+		}))
+		// Clearing the maintenance owner alone does not prove that its terminal
+		// handler and worker have released their activity. Recovery requires both
+		// to finish, otherwise its quiescence gate correctly defers this pass.
+		synctest.Wait()
 		upMu.Lock()
-		defer upMu.Unlock()
-		return upCalls >= 2
-	}, time.Second, time.Millisecond, "ambiguous replacement did not cross Compose Up")
-	require.Eventually(t, func() bool {
-		return !b.actorOwnsMaintenance(stackMaintenanceLeaseUUID, failedMaintenanceID)
-	}, time.Second, time.Millisecond,
-		"actor did not durably hand the ambiguous maintenance generation to recovery")
-	b.cfg.ProvisionTimeout = time.Nanosecond
-	require.NoError(t, b.recoverMaintenanceIntents(t.Context()))
-	awaitStackMaintenanceCallback(t, b, callbackReceived)
+		observedUpCalls := upCalls
+		upMu.Unlock()
+		require.Equal(t, 2, observedUpCalls, "ambiguous replacement did not cross Compose Up")
+		require.False(t, b.actorOwnsMaintenance(stackMaintenanceLeaseUUID, failedMaintenanceID))
+		quiescence := b.tryClaimLeaseActorQuiescence(stackMaintenanceLeaseUUID)
+		require.NotNil(t, quiescence, "ambiguous maintenance must hand its exact generation to recovery")
+		quiescence.Release()
 
-	callbackMu.Lock()
-	require.Len(t, callbacks, 2)
-	firstCallback := callbacks[0]
-	secondCallback := callbacks[1]
-	callbackMu.Unlock()
-	assert.Equal(t, backend.CallbackStatusSuccess, firstCallback.payload.Status)
-	assert.Equal(t, "/old/callbacks/provision", firstCallback.uri)
-	assert.Equal(t, backend.CallbackStatusFailed, secondCallback.payload.Status)
-	assert.Equal(t, "/new/callbacks/provision", secondCallback.uri,
-		"failed maintenance completion belongs to the new target route")
+		intent, found, err := b.maintenanceSettlement.GetMaintenanceIntent(stackMaintenanceLeaseUUID)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, failedMaintenanceID, intent.MaintenanceID())
+		require.Equal(t, shared.MaintenanceExecutionStarted, intent.ExecutionPhase())
+		// Advance to the persisted intent's actual visibility deadline only
+		// after the worker has handed off; changing the configured duration alone
+		// does not advance virtual time.
+		deadline := b.maintenanceRecoveryDeadline(intent.CreatedAt())
+		require.True(t, time.Now().Before(deadline))
+		time.Sleep(time.Until(deadline))
+		synctest.Wait()
+		require.NoError(t, b.recoverMaintenanceIntents(t.Context()))
+		awaitCallback()
 
-	active, err := b.releaseStore.LatestActive(stackMaintenanceLeaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, active)
-	activeAuthority := mustDockerReleaseRuntimeIdentity(t, *active)
-	assert.Equal(t, shared.ReleaseAuthorityLegacy, activeAuthority.Class())
-	assert.Equal(t, sourceMaintenanceID, active.MaintenanceID)
-	assert.Equal(t, oldCallbackURL, activeAuthority.CallbackURL())
-	assert.Equal(t, oldCallbackURL, activeAuthority.LifecycleCallbackURL())
-	assert.True(t, active.OperationID.IsZero())
-	assert.Nil(t, active.RuntimeAuthority)
+		callbackMu.Lock()
+		require.Len(t, callbacks, 2)
+		firstCallback := callbacks[0]
+		secondCallback := callbacks[1]
+		callbackMu.Unlock()
+		assert.Equal(t, backend.CallbackStatusSuccess, firstCallback.payload.Status)
+		assert.Equal(t, "/old/callbacks/provision", firstCallback.uri)
+		assert.Equal(t, backend.CallbackStatusFailed, secondCallback.payload.Status)
+		assert.Equal(t, "/new/callbacks/provision", secondCallback.uri,
+			"failed maintenance completion belongs to the new target route")
 
-	b.provisionsMu.RLock()
-	projectedStatus := b.provisions[stackMaintenanceLeaseUUID].Status
-	projectedCallbackURL := b.provisions[stackMaintenanceLeaseUUID].CallbackURL
-	projectedLifecycleCallbackURL := b.provisions[stackMaintenanceLeaseUUID].LifecycleCallbackURL
-	b.provisionsMu.RUnlock()
-	assert.Equal(t, backend.ProvisionStatusReady, projectedStatus)
-	assert.Equal(t, oldCallbackURL, projectedCallbackURL)
-	assert.Equal(t, oldCallbackURL, projectedLifecycleCallbackURL)
+		active, err := b.releaseStore.LatestActive(stackMaintenanceLeaseUUID)
+		require.NoError(t, err)
+		require.NotNil(t, active)
+		activeAuthority := mustDockerReleaseRuntimeIdentity(t, *active)
+		assert.Equal(t, shared.ReleaseAuthorityLegacy, activeAuthority.Class())
+		assert.Equal(t, sourceMaintenanceID, active.MaintenanceID)
+		assert.Equal(t, oldCallbackURL, activeAuthority.CallbackURL())
+		assert.Equal(t, oldCallbackURL, activeAuthority.LifecycleCallbackURL())
+		assert.True(t, active.OperationID.IsZero())
+		assert.Nil(t, active.RuntimeAuthority)
 
-	upMu.Lock()
-	require.Len(t, projects, 2, "first maintenance and ambiguous target")
-	failedTarget := projects[1]
-	upMu.Unlock()
-	assert.Equal(t, newCallbackURL, failedTarget.callbackURL)
-	assert.Equal(t, newCallbackURL, failedTarget.lifecycleCallbackURL)
-	assert.True(t, failedTarget.maintenanceID.Valid())
-	assert.NotEqual(t, sourceMaintenanceID, failedTarget.maintenanceID)
+		b.provisionsMu.RLock()
+		projectedStatus := b.provisions[stackMaintenanceLeaseUUID].Status
+		projectedCallbackURL := b.provisions[stackMaintenanceLeaseUUID].CallbackURL
+		projectedLifecycleCallbackURL := b.provisions[stackMaintenanceLeaseUUID].LifecycleCallbackURL
+		b.provisionsMu.RUnlock()
+		assert.Equal(t, backend.ProvisionStatusReady, projectedStatus)
+		assert.Equal(t, oldCallbackURL, projectedCallbackURL)
+		assert.Equal(t, oldCallbackURL, projectedLifecycleCallbackURL)
+
+		upMu.Lock()
+		require.Len(t, projects, 2, "first maintenance and ambiguous target")
+		failedTarget := projects[1]
+		upMu.Unlock()
+		assert.Equal(t, newCallbackURL, failedTarget.callbackURL)
+		assert.Equal(t, newCallbackURL, failedTarget.lifecycleCallbackURL)
+		assert.True(t, failedTarget.maintenanceID.Valid())
+		assert.NotEqual(t, sourceMaintenanceID, failedTarget.maintenanceID)
+	})
 }
 
 func TestReleaseRuntimeAuthoritiesForMaintenanceRejectsAuthorityClassChange(t *testing.T) {

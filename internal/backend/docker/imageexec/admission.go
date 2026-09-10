@@ -126,6 +126,9 @@ func (a *Admitter) inspect(ctx context.Context, imageReference string, platform 
 			return inspectedImage{}, fmt.Errorf("image contains reserved label %q", key)
 		}
 	}
+	// Classic stores return a config ID without a descriptor; multi-platform
+	// stores include their target descriptor. Runtime construction rules out
+	// older APIs that hide descriptors and erase this distinction.
 	if response.Descriptor != nil {
 		if response.Descriptor.Digest.String() != response.ID {
 			return inspectedImage{}, fmt.Errorf("image descriptor differs from its immutable ID")

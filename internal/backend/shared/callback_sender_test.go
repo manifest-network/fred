@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -1551,58 +1552,91 @@ func TestCallbackSender_DifferentLeasesDoNotShareDeliveryLock(t *testing.T) {
 }
 
 func TestCallbackSender_ReplayLoopDeliversPublishedCompletionWithoutRestart(t *testing.T) {
-	var available atomic.Bool
-	var attempts atomic.Int32
-	client := &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
-		attempts.Add(1)
-		if !available.Load() {
-			return callbackHTTPResponse(http.StatusServiceUnavailable), nil
-		}
-		return callbackHTTPResponse(http.StatusNoContent), nil
-	})}
-	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb.db")})
-	require.NoError(t, err)
-	defer store.Close()
-	stopCtx, cancel := context.WithCancel(context.Background())
-	s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
-		Store:      store,
-		HTTPClient: client,
-		Secret:     "secret",
-		Logger:     slog.Default(),
+	synctest.Test(t, func(t *testing.T) {
+		var available atomic.Bool
+		var attempts atomic.Int32
+		client := &http.Client{Transport: callbackRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			attempts.Add(1)
+			if !available.Load() {
+				return callbackHTTPResponse(http.StatusServiceUnavailable), nil
+			}
+			return callbackHTTPResponse(http.StatusNoContent), nil
+		})}
+		stores := openOperationHandoffStores(t, "docker")
+		store := stores.callbacks
+		store.StartMaintenance()
+		stopCtx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		s := mustNewDurableCallbackSender(t, CallbackSenderConfig{
+			Store:      store,
+			HTTPClient: client,
+			Secret:     "secret",
+			Logger:     slog.Default(),
 
-		Backoff:        &zeroBackoff,
-		ReplayInterval: 5 * time.Millisecond,
-	}, callbackSenderTestLifetime(stopCtx))
+			Backoff:        &zeroBackoff,
+			ReplayInterval: 5 * time.Millisecond,
+		}, callbackSenderTestLifetime(stopCtx))
+		maintenance, err := NewMaintenanceSettlement(store, stores.releases)
+		require.NoError(t, err)
+		publisher := mustNewCallbackPublisherForTest(t, CallbackPublisherConfig{
+			OperationSettlement:   stores.settlement,
+			MaintenanceSettlement: maintenance,
+			StorageAttestor:       s.attestor,
+			Logger:                s.logger,
+		})
+		// Store maintenance starts with an asynchronous expiry pass. Finish it
+		// while the outbox is empty: cleanup can emit a drain-handoff wake for
+		// the published lease, which could otherwise retry this head
+		// independently of the periodic replay timer being tested.
+		synctest.Wait()
 
-	leaseUUID := testLeaseUUID("lease-1")
-	callbackURL := "https://fred.example/callbacks/provision?operation_id=550e8400-e29b-41d4-a716-446655440000"
-	beginCallbackSenderOperationIntent(t, store, leaseUUID, callbackURL, "docker", s.storageIdentity)
-	s.sendOperationCallbackForTest(
-		leaseUUID, callbackURL, "docker",
-		backend.CallbackStatusFailed, "definitively refused",
-	)
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1, "the exact completion must be durable before replay")
-	assert.Zero(t, attempts.Load(), "durable settlement must not perform HTTP inline")
+		spec := testOperationIntentSpec(t, "periodic-replay")
+		claim := beginHandoffOperation(t, stores.settlement, spec)
+		uncommitted := commitHandoffRefusal(t, stores.settlement, claim)
+		// Use production publication: the legacy sender fixture additionally
+		// queues an operator retry, which can legitimately restart the first
+		// failed delivery chain before the periodic timer fires.
+		require.NoError(t, publisher.PublishOperationFailureContext(
+			stopCtx, uncommitted, "definitively refused",
+		))
+		pending, err := store.ListPending()
+		require.NoError(t, err)
+		require.Len(t, pending, 1, "the exact completion must be durable before replay")
+		assert.Zero(t, attempts.Load(), "durable settlement must not perform HTTP inline")
 
-	available.Store(true)
-	loopDone := make(chan struct{})
-	go func() {
-		defer close(loopDone)
-		s.RunReplayLoop()
-	}()
-	require.Eventually(t, func() bool {
-		pending, listErr := store.ListPending()
-		return listErr == nil && len(pending) == 0
-	}, time.Second, 5*time.Millisecond, "periodic replay must deliver without a backend restart")
-	cancel()
-	select {
-	case <-loopDone:
-	case <-time.After(time.Second):
-		t.Fatal("periodic replay loop did not stop with sender context")
-	}
-	assert.Positive(t, attempts.Load())
+		loopDone := make(chan struct{})
+		go func() {
+			defer close(loopDone)
+			s.RunReplayLoop()
+		}()
+		defer func() {
+			cancel()
+			<-loopDone // Join before closing the store, including after a fatal assertion.
+		}()
+		// Finish initial discovery and its failed delivery chain without racing
+		// worker scheduling or bbolt I/O against a wall-clock timeout.
+		synctest.Wait()
+		require.Equal(t, int32(CallbackMaxAttempts), attempts.Load())
+		pending, err = store.ListPending()
+		require.NoError(t, err)
+		require.Len(t, pending, 1, "exhausted delivery must remain durable")
+
+		// Recovery comes from the periodic timer on the same running loop;
+		// there is no restart or explicit notification to retry the callback.
+		available.Store(true)
+		time.Sleep(s.replayInterval - time.Nanosecond)
+		synctest.Wait()
+		require.Equal(t, int32(CallbackMaxAttempts), attempts.Load(), "a deferred callback must wait for the replay interval")
+		pending, err = store.ListPending()
+		require.NoError(t, err)
+		require.Len(t, pending, 1, "the completion must remain durable until replay is due")
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		pending, err = store.ListPending()
+		require.NoError(t, err)
+		require.Empty(t, pending, "periodic replay must deliver without a backend restart")
+		assert.Equal(t, int32(CallbackMaxAttempts+1), attempts.Load())
+	})
 }
 
 func TestCallbackSender_NotificationWakesTrackedReplayLoop(t *testing.T) {
