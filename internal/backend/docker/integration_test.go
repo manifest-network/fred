@@ -702,14 +702,12 @@ func waitForContainerExited(t *testing.T, containerID string) {
 // The container remains visible to Docker (and recoverState) unlike ContainerRemove.
 func killContainer(t *testing.T, containerID string) {
 	t.Helper()
-	docker, err := NewDockerClient("", "")
-	require.NoError(t, err)
-	defer func() { _ = docker.Close() }()
+	sdk := newImageSecurityFixtureClient(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err = docker.client.ContainerKill(ctx, containerID, "KILL")
+	err := sdk.ContainerKill(ctx, containerID, "KILL")
 	require.NoError(t, err, "failed to kill container %s", containerID)
 }
 

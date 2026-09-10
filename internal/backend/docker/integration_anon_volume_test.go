@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -49,9 +50,9 @@ func newIntegrationDockerClient(t *testing.T, ctx context.Context) *DockerClient
 }
 
 // dockerVolumeSet returns the set of all Docker volume names currently present.
-func dockerVolumeSet(t *testing.T, ctx context.Context, docker *DockerClient) map[string]bool {
+func dockerVolumeSet(t *testing.T, ctx context.Context, sdk *client.Client) map[string]bool {
 	t.Helper()
-	resp, err := docker.client.VolumeList(ctx, volume.ListOptions{})
+	resp, err := sdk.VolumeList(ctx, volume.ListOptions{})
 	require.NoError(t, err)
 	set := make(map[string]bool, len(resp.Volumes))
 	for _, v := range resp.Volumes {
@@ -74,12 +75,15 @@ func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
+	sdk := newImageSecurityFixtureClient(t)
 
 	// fred provisions with PullPolicy=never, so the image must be present before
 	// Up — otherwise Up errors on a clean daemon instead of pulling.
 	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
+	admitted, err := docker.AdmitImage(ctx, "busybox:latest")
+	require.NoError(t, err)
 
-	composeSvc, err := newComposeService("")
+	composeSvc, err := newComposeService("", docker.images)
 	require.NoError(t, err)
 
 	// Build a valid project via the real builder, then force an anonymous
@@ -110,7 +114,9 @@ func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 		_ = composeSvc.Down(cctx, projectName, 5*time.Second)
 	})
 
-	require.NoError(t, composeSvc.Up(ctx, project, composeUpOpts{}))
+	prepared, err := composeSvc.PrepareProject(project, map[string]imageexec.Image{"web": admitted})
+	require.NoError(t, err)
+	require.NoError(t, composeSvc.Up(ctx, prepared, composeUpOpts{}))
 
 	// Discover the anonymous volume Docker attached to the container.
 	inspected, err := docker.client.ContainerInspect(ctx, containerName)
@@ -124,20 +130,20 @@ func TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes(t *testing.T) {
 	require.NotEmpty(t, anonVol, "expected an anonymous volume mounted at /anon-data")
 
 	// Sanity: the volume exists right after Up.
-	_, err = docker.client.VolumeInspect(ctx, anonVol)
+	_, err = sdk.VolumeInspect(ctx, anonVol)
 	require.NoError(t, err, "anonymous volume should exist after Up")
 
 	// Best-effort reap if the assertion below fails (the pre-fix RED run leaks it).
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer ccancel()
-		_ = docker.client.VolumeRemove(cctx, anonVol, true)
+		_ = sdk.VolumeRemove(cctx, anonVol, true)
 	})
 
 	// Tear down the project. This MUST also remove the anonymous volume.
 	require.NoError(t, composeSvc.Down(ctx, projectName, 5*time.Second))
 
-	_, err = docker.client.VolumeInspect(ctx, anonVol)
+	_, err = sdk.VolumeInspect(ctx, anonVol)
 	assert.True(t, client.IsErrNotFound(err),
 		"anonymous volume %s must be removed by Down; got err=%v", anonVol, err)
 }
@@ -151,13 +157,14 @@ func TestIntegration_Docker_RemoveContainer_RemovesAnonymousVolumes(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
+	sdk := newImageSecurityFixtureClient(t)
 
 	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
 
 	// Unique per run so concurrent runs / a crashed prior run can't collide.
 	name := fmt.Sprintf("fred-eng372-rmvol-%d", time.Now().UnixNano())
 
-	created, err := docker.client.ContainerCreate(ctx,
+	created, err := sdk.ContainerCreate(ctx,
 		&container.Config{
 			Image:   "busybox:latest",
 			Cmd:     []string{"sleep", "3600"},
@@ -180,15 +187,15 @@ func TestIntegration_Docker_RemoveContainer_RemovesAnonymousVolumes(t *testing.T
 		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer ccancel()
 		_ = docker.client.ContainerRemove(cctx, created.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
-		_ = docker.client.VolumeRemove(cctx, anonVol, true)
+		_ = sdk.VolumeRemove(cctx, anonVol, true)
 	})
 
-	_, err = docker.client.VolumeInspect(ctx, anonVol)
+	_, err = sdk.VolumeInspect(ctx, anonVol)
 	require.NoError(t, err, "anonymous volume should exist after create")
 
 	require.NoError(t, docker.RemoveContainer(ctx, created.ID))
 
-	_, err = docker.client.VolumeInspect(ctx, anonVol)
+	_, err = sdk.VolumeInspect(ctx, anonVol)
 	assert.True(t, client.IsErrNotFound(err),
 		"anonymous volume %s must be removed by RemoveContainer; got err=%v", anonVol, err)
 }
@@ -205,27 +212,30 @@ func TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes(t *te
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
+	sdk := newImageSecurityFixtureClient(t)
 
 	const img = "redis:7-alpine" // declares VOLUME /data
 	// Pull rather than skip-if-absent: a skip here would silently turn the leak
 	// assertion into a false green on a clean CI daemon.
 	require.NoError(t, docker.PullImage(ctx, img, 120*time.Second))
+	admitted, err := docker.AdmitImage(ctx, img)
+	require.NoError(t, err)
 
-	before := dockerVolumeSet(t, ctx, docker)
+	before := dockerVolumeSet(t, ctx, sdk)
 
 	// Drive the three introspection entrypoints; each creates one temp container
 	// from the image (sites readFileFromImage / DetectVolumeOwner /
 	// DetectWritablePaths). Require success: if a helper failed before creating
 	// its container, the diff would be empty and the leak assertion would
 	// false-green without ever exercising the reap path.
-	_, _, err := docker.ResolveImageUser(ctx, img, "redis") // → readFileFromImage(/etc/passwd)
+	_, _, err = docker.ResolveImageUser(ctx, admitted, "redis") // → readFileFromImage(/etc/passwd)
 	require.NoError(t, err)
-	_, _, err = docker.DetectVolumeOwner(ctx, img, []string{"/data"})
+	_, _, err = docker.DetectVolumeOwner(ctx, admitted, []string{"/data"})
 	require.NoError(t, err)
-	_, err = docker.DetectWritablePaths(ctx, img, 0, []string{"/data"}) // small dir; only the temp-container create/remove path matters here
+	_, err = docker.DetectWritablePaths(ctx, admitted, 0, []string{"/data"}) // small dir; only the temp-container create/remove path matters here
 	require.NoError(t, err)
 
-	after := dockerVolumeSet(t, ctx, docker)
+	after := dockerVolumeSet(t, ctx, sdk)
 
 	// Count only newly-appeared anonymous (64-hex) volumes — the leak shape —
 	// so an unrelated named volume on a shared daemon can't cause a false fail.
@@ -240,7 +250,7 @@ func TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes(t *te
 		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer ccancel()
 		for _, v := range leaked {
-			_ = docker.client.VolumeRemove(cctx, v, true)
+			_ = sdk.VolumeRemove(cctx, v, true)
 		}
 	})
 
@@ -268,10 +278,13 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
+	sdk := newImageSecurityFixtureClient(t)
 
 	require.NoError(t, docker.PullImage(ctx, "busybox:latest", 60*time.Second))
+	admitted, err := docker.AdmitImage(ctx, "busybox:latest")
+	require.NoError(t, err)
 
-	composeSvc, err := newComposeService("")
+	composeSvc, err := newComposeService("", docker.images)
 	require.NoError(t, err)
 
 	// Tenant data lives in a bind mount, exactly as applyVolumeBinds produces.
@@ -307,7 +320,9 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 		_ = composeSvc.Down(cctx, projectName, 5*time.Second)
 	})
 
-	require.NoError(t, composeSvc.Up(ctx, project, composeUpOpts{}))
+	prepared, err := composeSvc.PrepareProject(project, map[string]imageexec.Image{"web": admitted})
+	require.NoError(t, err)
+	require.NoError(t, composeSvc.Up(ctx, prepared, composeUpOpts{}))
 
 	inspected, err := docker.client.ContainerInspect(ctx, containerName)
 	require.NoError(t, err)
@@ -318,13 +333,13 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 		}
 	}
 	require.NotEmpty(t, anonVol, "expected an anonymous volume mounted at /anon-data")
-	_, err = docker.client.VolumeInspect(ctx, anonVol)
+	_, err = sdk.VolumeInspect(ctx, anonVol)
 	require.NoError(t, err, "anonymous volume should exist after Up")
 
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer ccancel()
-		_ = docker.client.VolumeRemove(cctx, anonVol, true)
+		_ = sdk.VolumeRemove(cctx, anonVol, true)
 	})
 
 	// A real daemon behind RemoveContainer/ListManagedContainers, with compose Down
@@ -348,7 +363,7 @@ func TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFail
 	assert.True(t, client.IsErrNotFound(err),
 		"container %s must be removed by the fallback; got err=%v", containerName, err)
 
-	_, err = docker.client.VolumeInspect(ctx, anonVol)
+	_, err = sdk.VolumeInspect(ctx, anonVol)
 	assert.True(t, client.IsErrNotFound(err),
 		"anonymous volume %s must be reaped by the fallback; got err=%v", anonVol, err)
 

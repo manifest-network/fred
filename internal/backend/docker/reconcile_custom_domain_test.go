@@ -627,7 +627,12 @@ func TestReconcileCustomDomain_RecoverStateSwap_RedeploysNewDomain(t *testing.T)
 			substrate.ContainerID = "new-app-c1"
 			substrate.CustomDomain = service.Labels[LabelCustomDomain]
 			substrate.MaintenanceID = mustParseMaintenanceID(t, service.Labels[LabelMaintenanceID])
-			substrate.Image = service.Image
+			imageReference, err := containerImageReference(service.Image, service.Image, service.Labels)
+			if err != nil {
+				mu.Unlock()
+				return err
+			}
+			substrate.Image = imageReference
 			mu.Unlock()
 			return nil
 		},
@@ -793,7 +798,12 @@ func TestReconcileCustomDomain_ConcurrentRecoverState_NoRace(t *testing.T) {
 			substrate.ContainerID = "new-app-c1"
 			substrate.CustomDomain = service.Labels[LabelCustomDomain]
 			substrate.MaintenanceID = mustParseMaintenanceID(t, service.Labels[LabelMaintenanceID])
-			substrate.Image = service.Image
+			imageReference, err := containerImageReference(service.Image, service.Image, service.Labels)
+			if err != nil {
+				substrateMu.Unlock()
+				return err
+			}
+			substrate.Image = imageReference
 			substrateMu.Unlock()
 			return nil
 		},

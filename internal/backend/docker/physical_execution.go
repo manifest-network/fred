@@ -827,7 +827,7 @@ func (b *Backend) doReplacePhysical(
 	volumeSetupStartedAt := time.Now()
 	volBinds, _, err := b.setupVolBinds(
 		mutations, ctx, op.LeaseUUID, op.Items, op.ResourceProfiles,
-		imageSetups, op.Stack.Services, op.Logger,
+		imageSetups, op.Logger,
 	)
 	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseVolumeSetup).
 		Observe(time.Since(volumeSetupStartedAt).Seconds())
@@ -848,7 +848,7 @@ func (b *Backend) doReplacePhysical(
 		NetworkName: networkName, VolBinds: volBinds, Cfg: &b.cfg, Ingress: b.cfg.Ingress,
 	})
 	composeUpStartedAt := time.Now()
-	composeUpErr := mutations.composeUp(ctx, project, composeUpOpts{ForceRecreate: op.Operation == "restart"})
+	composeUpErr := mutations.composeUp(ctx, project, composeProjectImages(project, imageSetups), composeUpOpts{ForceRecreate: op.Operation == "restart"})
 	replacePhaseDurationSeconds.WithLabelValues(op.Operation, phaseComposeUp).
 		Observe(time.Since(composeUpStartedAt).Seconds())
 	if composeUpErr != nil {

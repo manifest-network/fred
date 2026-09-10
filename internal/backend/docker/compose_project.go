@@ -12,6 +12,7 @@ import (
 	composeapi "github.com/docker/compose/v5/pkg/api"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
@@ -399,7 +400,7 @@ func buildComposeServiceConfig(p composeServiceParams) composetypes.ServiceConfi
 		LabelBackendName:          p.BackendName,
 		LabelServiceName:          p.ServiceName,
 	}
-	// Add user labels (already validated to not conflict with fred.*).
+	// Add user labels (already validated against the reserved namespace policy).
 	for k, v := range p.Manifest.Labels {
 		labels[k] = v
 	}
@@ -436,4 +437,16 @@ func applyVolumeBinds(svc *composetypes.ServiceConfig, binds serviceVolBinds) {
 			Target: containerPath,
 		})
 	}
+}
+
+// composeProjectImages maps expanded instance services to the one image admitted
+// for their manifest service. The compiler requires a complete matching set.
+func composeProjectImages(project *composetypes.Project, setups map[string]*imageSetup) map[string]imageexec.Image {
+	images := make(map[string]imageexec.Image, len(project.Services))
+	for name, service := range project.Services {
+		if setup := setups[service.Labels[LabelServiceName]]; setup != nil {
+			images[name] = setup.Image
+		}
+	}
+	return images
 }

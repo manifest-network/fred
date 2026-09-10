@@ -43,6 +43,14 @@ Common topology:
 
 Each docker-backend host typically also runs Traefik (see [Ingress](#ingress-via-traefik)).
 
+For stateful production workloads, run the released `docker-backend` binary
+natively under systemd on each Docker host, with XFS project quotas as described
+below. Tenant applications still run in Docker containers. The locally built
+backend container image is limited to stateless development; it does not ship
+the filesystem tools or host-mount/capability contract needed for managed
+stateful volumes. `providerd` may run natively or in its published container
+image.
+
 ---
 
 ## Host requirements
@@ -62,7 +70,7 @@ Each docker-backend host typically also runs Traefik (see [Ingress](#ingress-via
 | Requirement | Recommendation |
 |---|---|
 | OS | Linux. cgroup v2 strongly recommended — under cgroup v2, tmpfs memory is counted against the container's memory limit; under v1 it is not, which makes the per-container memory budget less precise |
-| Docker | iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
+| Docker | Engine **28.1+ (API 1.49+)** is required for image admission to bind inspected metadata to a single immutable platform image. iptables must be enabled (the default). `--iptables=false` disables cross-tenant network isolation; the docker-backend logs a daemon-warning at startup if it detects this |
 | CPU / RAM | Sized for the SKU pool you advertise; budget 10–20% overhead for the daemon |
 | Disk | Image cache + per-tenant volumes (see [Stateful workloads](#stateful-workloads-disk_mb--0-skus)) |
 | Network | Reachable from `providerd`; outbound reachability to image registries |
@@ -89,6 +97,13 @@ still starts without that bind. `/tmp`, `/run`, image `VOLUME` overrides, and
 tenant-declared tmpfs remain memory-backed.
 
 ### Stateful workloads (`disk_mb > 0` SKUs)
+
+The supported production deployment is the native `docker-backend` systemd
+service with XFS. Install `xfsprogs` on the host and grant the service the quota
+and ownership capabilities documented below. Set `volume_mount_path` to the
+actual containing mountpoint and `volume_data_path` to the managed directory
+beneath it; for example, `/data` and `/data/fred/volumes`. Preserve these paths
+and the matching storage identity across restarts and upgrades.
 
 The docker-backend places each container's data on a quota-enforced host directory. Three filesystems are implemented, but **`xfs` is the only backend validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. **Use `xfs` for production deployments** (see below). The `btrfs` and `zfs` backends have automated coverage but are **not production-validated and not used in any deployment** — treat them as experimental.
 
@@ -448,7 +463,7 @@ WantedBy=multi-user.target
 
 `docker-backend.service` is the same shape with three differences:
 - It needs Docker socket access. Either add `SupplementaryGroups=docker` to the unit (so the service user inherits the `docker` group), add the service user to the `docker` group out of band, or run as root. Note this makes the docker-backend effectively host-root-equivalent regardless of `User=` (access to a rootful Docker socket can launch a privileged container) — so unlike `providerd`, its minimal-capability hardening is partly cosmetic. The real lever for de-privileging it is rootless Docker.
-- **On XFS hosts it needs `CAP_SYS_ADMIN` and `CAP_FOWNER`** to set per-volume project quotas (see the xfs section above): `CAP_SYS_ADMIN` to set the block limit, and `CAP_FOWNER` so the startup backfill can re-tag tenant-owned volume directories with their project ID. Add `AmbientCapabilities=CAP_SYS_ADMIN CAP_FOWNER` and include both in `CapabilityBoundingSet` — ambient capabilities are compatible with `NoNewPrivileges=true`. Scope this to `docker-backend` only; `providerd` does not need it. (btrfs `subvolume`/`qgroup` and zfs `create`/`set` are likewise privileged; zfs alternatively supports `zfs allow` delegation.) Note: a plain `setcap cap_sys_admin,cap_fowner+ep` on the binary is **not** sufficient — the daemon shells out to `xfs_quota`/`btrfs`, and a file-capability grant does not propagate to those child processes (it clears the ambient set). Use `AmbientCapabilities` (or run as root); the daemon refuses to start without `CAP_SYS_ADMIN`.
+- **Native XFS volume management needs `CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER`.** Ownership changes require `CAP_CHOWN`; managing restrictive tenant-owned trees requires `CAP_DAC_OVERRIDE`. XFS quota limits require `CAP_SYS_ADMIN`, and re-tagging tenant-owned files with project IDs requires `CAP_FOWNER`. Set both `AmbientCapabilities=` and `CapabilityBoundingSet=` to these four capabilities, as the manifest-deploy unit does. Ambient capabilities are compatible with `NoNewPrivileges=true` and propagate to the quota subprocesses. A capability grant on the Fred executable alone does not provide this subprocess contract. Scope these capabilities to `docker-backend`; `providerd` does not need them.
 - `ReadWritePaths` should cover the directories holding `callback_db_path`, `diagnostics_db_path`, `releases_db_path`, `retention_db_path`, and `volume_data_path`. The authoritative retention database is required even when `retain_on_close` is false.
 
 `TimeoutStopSec` should comfortably exceed the graceful-drain window so systemd
@@ -789,6 +804,15 @@ forward-fix; never point v0.13 at it or discard it in favor of a fresh file.
 
 ## Upgrades
 
+Image admission requires Docker Engine **28.1+ (API 1.49+)**. Before upgrading,
+check image labels against the reserved namespaces in the
+[manifest guide](docs/manifest-guide.md). Existing containers are not rewritten.
+When first recreating a legacy containerd multi-platform image, the backend may
+need a one-time registry request for its exact selected manifest digest so that
+the manifest becomes independently addressable. Cached layers alone do not
+guarantee this step can run offline. Classic images and already-prepared
+platform manifests remain usable without registry access.
+
 Fred releases are tagged on GitHub with binaries via `goreleaser`. The release process is:
 
 1. Tag a release on GitHub. `goreleaser` publishes `providerd`,
@@ -799,8 +823,9 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
    both placement tools. The image still starts `providerd` by default; invoke
    a tool with `--entrypoint /placement-preflight` or
    `--entrypoint /placement-repair`. There is no published `docker-backend` (or
-   `k3s-backend`) image; run the `docker-backend` binary from its archive, or
-   build its image locally (see [Docker images](#docker-images)).
+   `k3s-backend`) image; stateful production hosts run the `docker-backend`
+   binary from its archive. The locally built backend image is for stateless
+   development (see [Docker images](#docker-images)).
 2. Pull the new binary or image to your hosts.
 3. Roll the backend binaries one at a time when the release's backend protocol
    is backward-compatible, then stop the single `providerd` instance and start
@@ -1907,7 +1932,7 @@ stopped-process backup before upgrading.
 
 ## Docker images
 
-`goreleaser` publishes only the `providerd` image (`ghcr.io/manifest-network/fred`, built from `Dockerfile.goreleaser`). The `docker-backend` and `k3s-backend` images are **not** published — build them locally from the multi-stage `Dockerfile` below, or run `docker-backend` directly from its released binary archive.
+`goreleaser` publishes only the `providerd` image (`ghcr.io/manifest-network/fred`, built from `Dockerfile.goreleaser`). The `docker-backend` and `k3s-backend` images are **not** published. Stateful production hosts use the released native `docker-backend` binary under systemd with XFS. The local `docker-backend` image below supports stateless development only; `k3s-backend` remains an experimental scaffold.
 
 The repo ships a multi-stage `Dockerfile` with three named targets:
 
@@ -1915,7 +1940,7 @@ The repo ships a multi-stage `Dockerfile` with three named targets:
 # providerd
 docker build --target providerd -t fred-providerd .
 
-# docker-backend
+# docker-backend (stateless development only)
 docker build --target docker-backend -t fred-docker-backend .
 
 # k3s-backend (experimental scaffold — see below; not for production)
@@ -1926,7 +1951,24 @@ The `docker-backend` stage is intentionally last in the `Dockerfile`, so a targe
 
 All three run as the `nonroot` user (UID 65532) on a `gcr.io/distroless/static-debian12` base.
 
-**`docker-backend`** — needs the Docker socket and a writable `/data` volume (which holds `callbacks.db`, `diagnostics.db`, `releases.db`, and the always-required `retention.db`; the image declares `WORKDIR /data` and `VOLUME /data`). Use a named Docker volume so permissions are handled automatically; for a host bind mount, the directory must be owned by UID 65532. Use `--group-add` with the host Docker group ID so the nonroot user can talk to the socket:
+**`docker-backend` (stateless development only)** — the image contains no
+`xfs_quota`, `btrfs`, or `zfs` executable. Its `/data` volume persists the
+backend's databases and storage identity; it does not supply managed tenant
+storage. Installing quota tools on the host does not make them available inside
+this image. Containerized stateful backend operation is unsupported.
+
+Before using the commands below, configure every SKU with `disk_mb: 0` and omit
+`volume_data_path`, `volume_mount_path`, and `volume_filesystem`. The supplied
+`docker-backend.example.yaml` includes stateful configuration and must be adapted.
+Keep a positive `total_disk_mb` pool for the diskless scratch allowance described
+in [Stateless workloads](#stateless-workloads-disk_mb-0-skus-only).
+
+The image needs the Docker socket and a writable `/data` volume (which holds
+`callbacks.db`, `diagnostics.db`, `releases.db`, and the always-required
+`retention.db`; the image declares `WORKDIR /data` and `VOLUME /data`). Use a named
+Docker volume so permissions are handled automatically; for a host bind mount,
+the directory must be owned by UID 65532. Use `--group-add` with the host Docker
+group ID so the nonroot user can talk to the socket:
 
 ```bash
 DOCKER_GID=$(getent group docker | cut -d: -f3)

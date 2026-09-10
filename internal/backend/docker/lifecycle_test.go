@@ -204,7 +204,7 @@ func TestResolveImageUserNumeric(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(context.TODO(), "postgres:16", "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "postgres:16"), "")
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 999, gid)
@@ -217,7 +217,7 @@ func TestResolveImageUserNumericWithGroup(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(context.TODO(), "test-image", "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "test-image"), "")
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 100, gid)
@@ -230,7 +230,7 @@ func TestResolveImageUserEmpty(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(context.TODO(), "nginx:latest", "")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "nginx:latest"), "")
 	require.NoError(t, err)
 	assert.Equal(t, 0, uid)
 	assert.Equal(t, 0, gid)
@@ -245,7 +245,7 @@ func TestResolveImageUserManifestOverride(t *testing.T) {
 		},
 	}
 
-	uid, gid, err := mock.ResolveImageUser(context.TODO(), "postgres:16", "postgres")
+	uid, gid, err := mock.ResolveImageUser(context.TODO(), admittedFixtureImage(t, "postgres:16"), "postgres")
 	require.NoError(t, err)
 	assert.Equal(t, 999, uid)
 	assert.Equal(t, 999, gid)
@@ -293,7 +293,7 @@ func TestValidateAdoption(t *testing.T) {
 
 	mkExisting := func(labels map[string]string, img string) container.InspectResponse {
 		return container.InspectResponse{
-			ContainerJSONBase: &container.ContainerJSONBase{ID: "existing-id"},
+			ContainerJSONBase: &container.ContainerJSONBase{ID: "existing-id", Image: testImageID},
 			Config: &container.Config{
 				Image:  img,
 				Labels: labels,
@@ -308,17 +308,17 @@ func TestValidateAdoption(t *testing.T) {
 	}
 
 	t.Run("happy path adopts", func(t *testing.T) {
-		id, err := validateAdoption(mkExisting(goodLabels, image), params, name)
+		id, err := validateAdoption(mkExisting(goodLabels, image), params, name, testImageID)
 		require.NoError(t, err)
 		assert.Equal(t, "existing-id", id)
 	})
 
 	t.Run("nil Config is rejected", func(t *testing.T) {
 		existing := container.InspectResponse{
-			ContainerJSONBase: &container.ContainerJSONBase{ID: "existing-id"},
+			ContainerJSONBase: &container.ContainerJSONBase{ID: "existing-id", Image: testImageID},
 			Config:            nil,
 		}
-		id, err := validateAdoption(existing, params, name)
+		id, err := validateAdoption(existing, params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "inspect returned no config")
@@ -337,7 +337,7 @@ func TestValidateAdoption(t *testing.T) {
 	t.Run("missing fred.managed label is rejected", func(t *testing.T) {
 		badLabels := cloneLabels()
 		delete(badLabels, LabelManaged)
-		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "not managed by Fred")
@@ -346,7 +346,7 @@ func TestValidateAdoption(t *testing.T) {
 	t.Run("backend name mismatch is rejected", func(t *testing.T) {
 		badLabels := cloneLabels()
 		badLabels[LabelBackendName] = "docker-other"
-		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), `from backend "docker-other"`)
@@ -356,7 +356,7 @@ func TestValidateAdoption(t *testing.T) {
 	t.Run("missing backend name label is rejected", func(t *testing.T) {
 		badLabels := cloneLabels()
 		delete(badLabels, LabelBackendName)
-		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "from backend")
@@ -365,7 +365,7 @@ func TestValidateAdoption(t *testing.T) {
 	t.Run("lease UUID mismatch", func(t *testing.T) {
 		badLabels := cloneLabels()
 		badLabels[LabelLeaseUUID] = "some-other-lease"
-		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "not owned by lease")
@@ -374,14 +374,14 @@ func TestValidateAdoption(t *testing.T) {
 	t.Run("missing lease label is rejected", func(t *testing.T) {
 		badLabels := cloneLabels()
 		delete(badLabels, LabelLeaseUUID)
-		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "not owned by lease")
 	})
 
 	t.Run("image mismatch", func(t *testing.T) {
-		id, err := validateAdoption(mkExisting(goodLabels, "nginx:1.24"), params, name)
+		id, err := validateAdoption(mkExisting(goodLabels, "nginx:1.24"), params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), `image "nginx:1.24"`)
@@ -391,7 +391,7 @@ func TestValidateAdoption(t *testing.T) {
 	t.Run("fail count mismatch", func(t *testing.T) {
 		badLabels := cloneLabels()
 		badLabels[LabelFailCount] = "3"
-		id, err := validateAdoption(mkExisting(badLabels, image), params, name)
+		id, err := validateAdoption(mkExisting(badLabels, image), params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "fail_count=3")
@@ -401,7 +401,7 @@ func TestValidateAdoption(t *testing.T) {
 	t.Run("fail count mismatch — caller wants retry", func(t *testing.T) {
 		retryParams := params
 		retryParams.FailCount = 2
-		id, err := validateAdoption(mkExisting(goodLabels, image), retryParams, name)
+		id, err := validateAdoption(mkExisting(goodLabels, image), retryParams, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "fail_count=0")
@@ -413,7 +413,7 @@ func TestValidateAdoption(t *testing.T) {
 		retryParams.FailCount = 1
 		labelsNoFailCount := cloneLabels()
 		delete(labelsNoFailCount, LabelFailCount)
-		id, err := validateAdoption(mkExisting(labelsNoFailCount, image), retryParams, name)
+		id, err := validateAdoption(mkExisting(labelsNoFailCount, image), retryParams, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "fail_count=")
@@ -423,6 +423,7 @@ func TestValidateAdoption(t *testing.T) {
 		existing := container.InspectResponse{
 			ContainerJSONBase: &container.ContainerJSONBase{
 				ID:    "existing-id",
+				Image: testImageID,
 				State: &container.State{Status: container.StateRemoving},
 			},
 			Config: &container.Config{
@@ -430,7 +431,7 @@ func TestValidateAdoption(t *testing.T) {
 				Labels: goodLabels,
 			},
 		}
-		id, err := validateAdoption(existing, params, name)
+		id, err := validateAdoption(existing, params, name, testImageID)
 		require.Error(t, err)
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "being removed")
@@ -440,6 +441,7 @@ func TestValidateAdoption(t *testing.T) {
 		existing := container.InspectResponse{
 			ContainerJSONBase: &container.ContainerJSONBase{
 				ID:    "existing-id",
+				Image: testImageID,
 				State: &container.State{Status: container.StateRunning},
 			},
 			Config: &container.Config{
@@ -447,7 +449,7 @@ func TestValidateAdoption(t *testing.T) {
 				Labels: goodLabels,
 			},
 		}
-		id, err := validateAdoption(existing, params, name)
+		id, err := validateAdoption(existing, params, name, testImageID)
 		require.NoError(t, err)
 		assert.Equal(t, "existing-id", id)
 	})

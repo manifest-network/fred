@@ -103,7 +103,7 @@ func newRestoreQuotaBackend(t *testing.T, mgr *xfsVolumeManager) (*Backend, <-ch
 			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
 		},
 		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
-			return &ImageInfo{ID: "img-1", Volumes: map[string]struct{}{"/data": {}}}, nil
+			return &ImageInfo{ID: fixtureImageID("img-1"), Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)

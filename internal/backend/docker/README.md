@@ -1,6 +1,26 @@
 # Docker Backend
 
-The Docker backend provisions ephemeral containers for tenant workloads. It receives provision requests from Fred, manages the full container lifecycle (pull, create, start, verify, deprovision), enforces SKU-based resource limits, and reports results via HMAC-signed callbacks.
+The Docker backend provisions tenant containers with optional managed persistent volumes. It receives provision requests from Fred, manages the full container lifecycle (pull, create, start, verify, deprovision), enforces SKU-based resource limits, and reports results via HMAC-signed callbacks.
+
+For stateful production workloads, deploy the native `docker-backend` binary
+under systemd on the Docker host with XFS project quotas. Tenant containers use
+managed persistent volumes; the backend manager runs on the host. The locally
+built backend container image supports stateless development only. See the
+[deployment guide](../../../DEPLOYMENT.md#stateful-workloads-disk_mb--0-skus)
+for filesystem, mountpoint, capability, and storage-identity requirements.
+
+Image admission requires Docker Engine **28.1+ (API 1.49+)**. It resolves
+multi-platform indexes to a single immutable manifest before container creation.
+
+The `imageexec` package owns this boundary. Guarded admission produces an opaque
+`imageexec.Image` containing the checked identity and copied metadata. Helpers,
+user resolution, image-content seeding, and workload creation require that type;
+a raw reference or cached ID cannot authorize creation. Compose compilation
+requires one admitted image for every service and produces an opaque
+`imageexec.PreparedProject`. Execution receives that sealed plan, with no mutable
+project accessor. Both executors accept only values from their own admitter.
+The retained SDK views expose neither raw `ContainerCreate` nor generic Compose
+`Up`; the constructors capture those methods inside the typed executors.
 
 ## Configuration Reference
 
@@ -478,7 +498,7 @@ To restore data from a closed lease into a new lease:
 
 Restore-specific re-deploy behavior worth knowing:
 
-- **Image must already be present on the node.** Restore re-uses the replace machinery, which **inspects** the image but does **not** pull it. If the image was garbage-collected from the node since close, restore fails with an image-inspect error — pre-pull the image (or restore before the node's image GC runs).
+- **Image must already be present on the node.** Restore reuses the replace machinery and starts by inspecting the local image. If it was garbage-collected since close, restore fails with an image-inspect error; pre-pull it before restoring. Classic images and independently addressable platform manifests require no registry access. A legacy containerd index whose selected platform lacks an independent image-store record needs a one-time pull by that exact manifest digest, even when its layers are cached. If the registry is unavailable, this preparation fails before creating containers.
 - **Image and configuration are fixed.** Restore deploys strictly from the retained `StackManifest` and items; the request carries no manifest. The new lease's requested service names and quantities must shape-match the retained set exactly (otherwise the restore is rejected with a validation error).
 - **The SKU tier may change (promote/demote).** Only the item *shape* must match (service names + quantities); the SKU's resource (disk) tier **may** differ from the source lease. A **promote** (same-or-larger `disk_mb` tier) is admitted only when its aggregate growth above the retained footprint fits disk capacity, then the larger cap is applied. A **demote** (smaller `disk_mb` tier) is allowed only if the retained volume's **measured** data fits the new tier's `disk_mb` cap — the backend runs `checkDemoteFit` before adopting (restoring durable stateful data into an ephemeral `disk_mb=0` tier is always refused). The conservative exact-name exception above may restore scratch only into another diskless row, after measuring it against that destination's pinned scratch allowance. A refused demote returns HTTP `422` with body `{"code":"demote_exceeds_tier"}` (`backend.ErrDemoteDataExceedsTier`) and is counted by `fred_docker_backend_restore_demote_refused_total{backend,reason}` (`reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`); it is **not** counted by `restore_total`.
 - **Containers are recreated, ownership is not rewritten.** Restore does not force-recreate beyond the normal replace, and the volume chown is non-recursive (it sets ownership on the VOLUME mount point only), so existing files keep their on-disk ownership.
@@ -1464,8 +1484,17 @@ All managed containers and networks carry labels in the `fred.*` namespace.
 | `fred.backend_name` | backend name string | Name of the backend managing the container; set on every managed container |
 | `fred.fqdn` | FQDN string | Assigned ingress FQDN; set on the ingress / custom-domain path |
 | `fred.custom_domain` | domain string | Tenant custom domain; set on the custom-domain path |
+| `fred.image_reference` | image reference string | Original manifest image reference, preserved for release comparisons while execution uses an immutable image ID |
+| `fred.image_id` | `sha256:` image ID | Binds `fred.image_reference` to Docker's actual image ID and the container's configured image; partial or inconsistent bindings fail inventory validation |
 
-User-provided labels in the manifest are also applied, but may not use the `fred.*` or `traefik.*` prefixes (`traefik.*` is reserved to prevent cross-tenant ingress-router hijack, ENG-497).
+Manifest and image labels may not use the `fred.*`, `traefik.*`, or
+`com.docker.compose.*` namespaces, matched case-insensitively. Image metadata is
+checked before creating workloads or inspection helpers, and execution uses
+the inspected immutable image ID. This prevents inherited labels from becoming
+ingress or container-lifecycle instructions. Images built with Compose may carry
+reserved labels automatically; rebuild them without orchestration metadata
+(for example, with `docker build`) before provisioning or replacing workloads.
+Existing containers are not rewritten by this admission check.
 
 ## Bandwidth Limiting
 

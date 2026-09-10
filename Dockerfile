@@ -82,6 +82,11 @@ EXPOSE 9002
 ENTRYPOINT ["/k3s-backend"]
 
 # ---- docker-backend runtime ----
+# Stateless development only: this image has no filesystem quota tools or
+# supported host-mount/capability contract for managed tenant storage. Run the
+# released native binary under systemd with XFS for stateful production.
+# Configure only disk_mb: 0 SKUs and omit volume_data_path, volume_mount_path,
+# and volume_filesystem; /data below persists backend state, not tenant volumes.
 # This stage is kept LAST so `docker build .` without an explicit --target
 # preserves the pre-k3s default of producing the docker-backend image.
 # Callers that want a specific stage should pass --target providerd,

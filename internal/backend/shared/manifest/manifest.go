@@ -504,11 +504,20 @@ func IsBlockedEnvKey(name string) bool {
 // reservedLabelPrefixes are container-label key prefixes that tenants cannot
 // set. Any label key starting with one of these is rejected in validate().
 var reservedLabelPrefixes = []string{
-	"fred.",    // reserved for backend-internal bookkeeping
-	"traefik.", // ingress routing: Traefik's Docker provider merges routers
+	"com.docker.compose.", // Compose owns service discovery and container lifecycle.
+	"fred.",               // reserved for backend-internal bookkeeping
+	"traefik.",            // ingress routing: Traefik's Docker provider merges routers
 	// from every container's labels into one shared table, so a tenant label
 	// here could hijack another tenant's route (ENG-497).
 }
+
+var reservedLabelPrefixRE = func() *regexp.Regexp {
+	patterns := make([]string, len(reservedLabelPrefixes))
+	for i, prefix := range reservedLabelPrefixes {
+		patterns[i] = regexp.QuoteMeta(prefix)
+	}
+	return regexp.MustCompile(`(?i)^(?:` + strings.Join(patterns, "|") + `)`)
+}()
 
 // reservedLabelPrefix returns the reserved prefix a label key uses, if any.
 // It is the single implementation of the reserved-prefix scan: validate() uses
@@ -521,14 +530,15 @@ var reservedLabelPrefixes = []string{
 // in the shared routing table exactly like the lowercase form — reopening the
 // ENG-497 cross-tenant ingress hijack a case-sensitive check would miss.
 //
-// Fold-compare only the prefix-length head of the key with EqualFold (the
-// reservedLabelPrefixes constants are already lowercase) rather than lower-casing
-// the whole key: label keys are tenant-controlled and not length-capped here, so
-// this stays O(len(prefix)) and allocation-free instead of O(len(key)) with an
-// allocation on any mixed-case key.
+// The anchored regexp matches Unicode case-fold equivalents without slicing a
+// UTF-8 key at the ASCII prefix's byte length (for example, Kelvin sign folds to
+// K but occupies more bytes). Its fixed alternatives inspect only the prefix,
+// not a potentially large tenant-controlled suffix. Return the canonical prefix
+// so errors and retention configuration share the same namespace spelling.
 func reservedLabelPrefix(key string) (string, bool) {
+	matched := reservedLabelPrefixRE.FindString(key)
 	for _, prefix := range reservedLabelPrefixes {
-		if len(key) >= len(prefix) && strings.EqualFold(key[:len(prefix)], prefix) {
+		if strings.EqualFold(matched, prefix) {
 			return prefix, true
 		}
 	}
@@ -536,9 +546,9 @@ func reservedLabelPrefix(key string) (string, bool) {
 }
 
 // IsReservedLabelKey reports whether a manifest label key can never appear in a
-// tenant payload (reserved fred./traefik. prefixes, rejected by validate).
+// tenant payload (reserved Fred, Traefik, and Docker Compose namespaces).
 // Exported so retention_partition_source config validation shares the same
-// list and the two checks cannot drift.
+// list, and image metadata admission uses the same policy.
 func IsReservedLabelKey(key string) bool {
 	_, ok := reservedLabelPrefix(key)
 	return ok

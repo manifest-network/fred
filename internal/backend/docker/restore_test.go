@@ -2390,7 +2390,7 @@ func TestRestore_HonorsNewSKU_Promote(t *testing.T) {
 		// A non-empty VOLUME makes setupVolBinds create a stateful volume, so the
 		// new SKU's DiskMB flows into the (capacity-setting) Create call we observe.
 		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
-			return &ImageInfo{ID: "img-1", Volumes: map[string]struct{}{"/data": {}}}, nil
+			return &ImageInfo{ID: fixtureImageID("img-1"), Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
@@ -3768,7 +3768,7 @@ func TestRestore_MultiVolumePromoteThatFits_Admitted(t *testing.T) {
 			return &ContainerInfo{ContainerID: id, Status: "running"}, nil
 		},
 		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
-			return &ImageInfo{ID: "img-1", Volumes: map[string]struct{}{"/data": {}}}, nil
+			return &ImageInfo{ID: fixtureImageID("img-1"), Volumes: map[string]struct{}{"/data": {}}}, nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)

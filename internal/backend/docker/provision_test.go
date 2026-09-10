@@ -3629,7 +3629,7 @@ func TestInspectImageForSetup_AutoDetectVolumeOwner(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:abc123",
+				ID:      fixtureImageID("sha256:abc123"),
 				Volumes: map[string]struct{}{"/data/db": {}, "/data/configdb": {}},
 			}, nil
 		},
@@ -3652,7 +3652,7 @@ func TestInspectImageForSetup_AutoDetectRootOwnership(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:rootowned",
+				ID:      fixtureImageID("sha256:rootowned"),
 				Volumes: map[string]struct{}{"/data": {}},
 			}, nil
 		},
@@ -3677,7 +3677,7 @@ func TestInspectImageForSetup_AutoDetectError(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:errorcase",
+				ID:      fixtureImageID("sha256:errorcase"),
 				Volumes: map[string]struct{}{"/data": {}},
 			}, nil
 		},
@@ -3709,7 +3709,7 @@ func TestInspectImageForSetup_ExplicitUserSkipsAutoDetect(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:explicituser",
+				ID:      fixtureImageID("sha256:explicituser"),
 				Volumes: map[string]struct{}{"/data": {}},
 			}, nil
 		},
@@ -3736,7 +3736,7 @@ func TestInspectImageForSetup_NoVolumesSkipsAutoDetect(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:novolumes",
+				ID:      fixtureImageID("sha256:novolumes"),
 				Volumes: map[string]struct{}{},
 			}, nil
 		},
@@ -3762,7 +3762,7 @@ func TestInspectImageForSetup_DetectsWritablePaths(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:grafana123",
+				ID:      fixtureImageID("sha256:grafana123"),
 				Volumes: map[string]struct{}{},
 				User:    "472",
 			}, nil
@@ -3791,7 +3791,7 @@ func TestInspectImageForSetup_WritablePathsDetectedWithVolumes(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:mysql9",
+				ID:      fixtureImageID("sha256:mysql9"),
 				Volumes: map[string]struct{}{"/var/lib/mysql": {}},
 				User:    "999",
 			}, nil
@@ -3820,7 +3820,7 @@ func TestInspectImageForSetup_WritablePathsDetectedForRoot(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:rootuser",
+				ID:      fixtureImageID("sha256:rootuser"),
 				Volumes: map[string]struct{}{"/data": {}},
 			}, nil
 		},
@@ -3845,7 +3845,7 @@ func TestInspectImageForSetup_WritablePathsErrorNotCached(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:grafana-retry",
+				ID:      fixtureImageID("sha256:grafana-retry"),
 				Volumes: map[string]struct{}{},
 				User:    "472",
 			}, nil
@@ -3902,7 +3902,7 @@ func TestInspectImageForSetup_WritablePathsBinds(t *testing.T) {
 		},
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:grafana-e2e",
+				ID:      fixtureImageID("sha256:grafana-e2e"),
 				Volumes: map[string]struct{}{},
 				User:    "472",
 			}, nil
@@ -4002,7 +4002,7 @@ func TestInspectImageForSetup_FilterSubpaths(t *testing.T) {
 	mock := &mockDockerClient{
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID: "sha256:neo4j-test",
+				ID: fixtureImageID("sha256:neo4j-test"),
 				Volumes: map[string]struct{}{
 					"/data": {},
 				},
@@ -4435,7 +4435,7 @@ func TestDoProvision_WritablePaths_EphemeralCreatesVolume(t *testing.T) {
 		},
 		InspectImageFn: func(ctx context.Context, imageName string) (*ImageInfo, error) {
 			return &ImageInfo{
-				ID:      "sha256:abc",
+				ID:      fixtureImageID("sha256:abc"),
 				Volumes: map[string]struct{}{},
 				User:    "1000",
 			}, nil

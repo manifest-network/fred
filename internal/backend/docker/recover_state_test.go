@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backendidentity"
@@ -152,6 +153,8 @@ func TestPeriodicReconcileContextIsCanceledByBackendShutdown(t *testing.T) {
 }
 
 type mockDockerClient struct {
+	imageOnce                    sync.Once
+	images                       *imageexec.Admitter
 	PingFn                       func(ctx context.Context) error
 	DaemonInfoFn                 func(ctx context.Context) (DaemonSecurityInfo, error)
 	CloseFn                      func() error
@@ -299,9 +302,9 @@ func (m *mockDockerClient) RemoveTenantNetworkIfEmpty(ctx context.Context, tenan
 	panic("unexpected call to RemoveTenantNetworkIfEmpty")
 }
 
-func (m *mockDockerClient) ResolveImageUser(ctx context.Context, imageName string, userOverride string) (int, int, error) {
+func (m *mockDockerClient) ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string) (int, int, error) {
 	if m.ResolveImageUserFn != nil {
-		return m.ResolveImageUserFn(ctx, imageName, userOverride)
+		return m.ResolveImageUserFn(ctx, imageName.ID(), userOverride)
 	}
 	return 0, 0, nil // default: root
 }
@@ -313,23 +316,23 @@ func (m *mockDockerClient) ListManagedNetworks(ctx context.Context) ([]networkty
 	panic("unexpected call to ListManagedNetworks")
 }
 
-func (m *mockDockerClient) DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (int, int, error) {
+func (m *mockDockerClient) DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string) (int, int, error) {
 	if m.DetectVolumeOwnerFn != nil {
-		return m.DetectVolumeOwnerFn(ctx, imageName, volumePaths)
+		return m.DetectVolumeOwnerFn(ctx, imageName.ID(), volumePaths)
 	}
 	return 0, 0, nil // default: root (auto-detect path entered but produces no override)
 }
 
-func (m *mockDockerClient) DetectWritablePaths(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error) {
+func (m *mockDockerClient) DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string) ([]string, error) {
 	if m.DetectWritablePathsFn != nil {
-		return m.DetectWritablePathsFn(ctx, imageName, uid, candidateParents)
+		return m.DetectWritablePathsFn(ctx, imageName.ID(), uid, candidateParents)
 	}
 	return nil, nil // default: no writable paths detected
 }
 
-func (m *mockDockerClient) ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
+func (m *mockDockerClient) ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error {
 	if m.ExtractImageContentFn != nil {
-		return m.ExtractImageContentFn(ctx, imageName, paths, destDir, maxBytes, maxEntries)
+		return m.ExtractImageContentFn(ctx, imageName.ID(), paths, destDir, maxBytes, maxEntries)
 	}
 	return nil // default: extraction succeeds silently
 }

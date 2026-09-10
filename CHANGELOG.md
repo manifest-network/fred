@@ -194,6 +194,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Deployment documentation now identifies native systemd with XFS project quotas
+  as the supported stateful production setup; the local Docker backend image is
+  documented for stateless development only.
+
 - Deployment and backend guidance now records the read-only ENG-632 fleet
   inventory as of 2026-09-02: the serving production tenant fleet uses
   `docker-backend` on XFS. K3s remains a non-functional scaffold, while Btrfs
@@ -1091,6 +1095,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (ENG-632)
 
 ### Security
+
+- Docker image admission rejects reserved `fred.*`, `traefik.*`, and
+  `com.docker.compose.*` labels before any workload or inspection helper is
+  created, preventing inherited labels from hijacking ingress or Compose
+  lifecycle ownership. Guarded admission mints an opaque image capability; helpers
+  and workloads require that capability, and Compose requires a complete prepared
+  project with repulls disabled. Container creation and image setup use the exact inspected
+  immutable image ID and platform, resolving multi-platform indexes to a single
+  runnable manifest on the containerd store. Preparing that manifest may require
+  a registry request for its exact digest. Original manifest references remain
+  intact for recovery and release history. This requires Docker Engine 28.1+
+  (API 1.49+). Manifest validation also reserves Compose labels and matches
+  Unicode case-fold variants of reserved prefixes consistently with the
+  published schema. Images
+  carrying orchestration metadata, including automatic Compose build labels,
+  must be rebuilt without it. Existing containers are not rewritten automatically.
 
 - XFS project IDs and dquots are filesystem-global even when
   `volume_data_path` is a subdirectory. Fred allocates across the nonzero 32-bit

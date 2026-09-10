@@ -23,6 +23,7 @@ import (
 	"github.com/moby/sys/mountinfo"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
@@ -37,7 +38,6 @@ type dockerReadClient interface {
 	Ping(ctx context.Context) error
 	DaemonInfo(ctx context.Context) (DaemonSecurityInfo, error)
 	Close() error
-	InspectImage(ctx context.Context, imageName string) (*ImageInfo, error)
 	InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error)
 	ContainerLogs(ctx context.Context, containerID string, tail int) (string, error)
 	ListManagedContainers(ctx context.Context) ([]ContainerInfo, error)
@@ -50,8 +50,9 @@ type dockerReadClient interface {
 // separate from dockerReadClient makes every unguarded write through b.docker a
 // compile error while retaining one composite construction/test seam.
 type dockerMutationSink interface {
+	AdmitImage(context.Context, string) (imageexec.Image, error)
 	PullImage(ctx context.Context, imageName string, timeout time.Duration) error
-	ResolveImageUser(ctx context.Context, imageName string, userOverride string) (uid, gid int, err error)
+	ResolveImageUser(ctx context.Context, imageName imageexec.Image, userOverride string) (uid, gid int, err error)
 	CreateContainer(ctx context.Context, params CreateContainerParams, timeout time.Duration) (string, error)
 	StartContainer(ctx context.Context, containerID string, timeout time.Duration) error
 	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
@@ -59,9 +60,9 @@ type dockerMutationSink interface {
 	RemoveContainer(ctx context.Context, containerID string) error
 	EnsureTenantNetwork(ctx context.Context, tenant string) (string, error)
 	RemoveTenantNetworkIfEmpty(ctx context.Context, tenant string) error
-	DetectVolumeOwner(ctx context.Context, imageName string, volumePaths []string) (uid, gid int, err error)
-	DetectWritablePaths(ctx context.Context, imageName string, uid int, candidateParents []string) ([]string, error)
-	ExtractImageContent(ctx context.Context, imageName string, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
+	DetectVolumeOwner(ctx context.Context, imageName imageexec.Image, volumePaths []string) (uid, gid int, err error)
+	DetectWritablePaths(ctx context.Context, imageName imageexec.Image, uid int, candidateParents []string) ([]string, error)
+	ExtractImageContent(ctx context.Context, imageName imageexec.Image, paths []string, destDir string, maxBytes, maxEntries int64) map[string]error
 }
 
 // dockerClient is the construction boundary implemented by DockerClient and
@@ -2228,7 +2229,7 @@ func newBackend(
 		return nil, fmt.Errorf("bind close journals: %w", err)
 	}
 
-	composeSvc, err := newComposeService(cfg.DockerHost)
+	composeSvc, err := newComposeService(cfg.DockerHost, docker.images)
 	if err != nil {
 		_ = cbStore.Close()
 		_ = diagStore.Close()

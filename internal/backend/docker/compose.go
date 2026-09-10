@@ -13,6 +13,8 @@ import (
 	"github.com/docker/compose/v5/pkg/compose"
 	mobyclient "github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
+
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 )
 
 // composeReader is the only Compose surface retained by Backend.
@@ -23,10 +25,10 @@ type composeReader interface {
 
 // composeMutationSink is captured only by settlement-bound Guards.
 type composeMutationSink interface {
-	// Up creates and starts services from the project.
-	// Compose diffs current vs desired state: creates missing containers,
-	// recreates changed ones, starts stopped ones.
-	Up(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error
+	// PrepareProject compiles the desired project with its complete admitted images.
+	PrepareProject(*composetypes.Project, map[string]imageexec.Image) (imageexec.PreparedProject, error)
+	// Up creates and starts only services in the prepared project.
+	Up(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) error
 
 	// Down stops and removes all containers for the project.
 	Down(ctx context.Context, projectName string, timeout time.Duration) error
@@ -66,12 +68,15 @@ func composeProjectName(leaseUUID string) string {
 // docker/docker advisories is unmeasured, since buildx still reaches that
 // module via pkg/namesgenerator.
 type composeService struct {
-	backend composeapi.Compose
+	compile  func(*composetypes.Project, map[string]imageexec.Image) (imageexec.PreparedProject, error)
+	executor *imageexec.ComposeExecutor
+	down     func(context.Context, string, composeapi.DownOptions) error
+	ps       func(context.Context, string, composeapi.PsOptions) ([]composeapi.ContainerSummary, error)
 }
 
 // newComposeService creates a composeService that uses the Docker daemon at
 // the given host for Compose operations.
-func newComposeService(dockerHost string) (*composeService, error) {
+func newComposeService(dockerHost string, images *imageexec.Admitter) (*composeService, error) {
 	// Silence the Compose library's logrus logger. Compose emits noisy
 	// warnings (e.g., "No resource found to remove") via its own global
 	// logrus instance. Operational information is already logged by the
@@ -105,28 +110,23 @@ func newComposeService(dockerHost string) (*composeService, error) {
 		return nil, fmt.Errorf("create compose service: %w", err)
 	}
 
-	return &composeService{
-		backend: backend,
-	}, nil
+	executor, err := images.NewComposeExecutor(backend.Up)
+	if err != nil {
+		return nil, err
+	}
+	return &composeService{compile: images.Compile, executor: executor, down: backend.Down, ps: backend.Ps}, nil
 }
 
-func (s *composeService) Up(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
-	recreate := composeapi.RecreateDiverged
-	if opts.ForceRecreate {
-		recreate = composeapi.RecreateForce
-	}
-	return s.backend.Up(ctx, project, composeapi.UpOptions{
-		Create: composeapi.CreateOptions{
-			Recreate:      recreate,
-			QuietPull:     true,
-			RemoveOrphans: true,
-		},
-		Start: composeapi.StartOptions{},
-	})
+func (s *composeService) PrepareProject(project *composetypes.Project, images map[string]imageexec.Image) (imageexec.PreparedProject, error) {
+	return s.compile(project, images)
+}
+
+func (s *composeService) Up(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) error {
+	return s.executor.Up(ctx, project, opts.ForceRecreate)
 }
 
 func (s *composeService) Down(ctx context.Context, projectName string, timeout time.Duration) error {
-	return s.backend.Down(ctx, projectName, composeapi.DownOptions{
+	return s.down(ctx, projectName, composeapi.DownOptions{
 		Timeout:       &timeout,
 		RemoveOrphans: true,
 		// Reap anonymous volumes attached to the project's containers (ENG-372).
@@ -140,7 +140,7 @@ func (s *composeService) Down(ctx context.Context, projectName string, timeout t
 }
 
 func (s *composeService) PS(ctx context.Context, projectName string) ([]composeContainerSummary, error) {
-	containers, err := s.backend.Ps(ctx, projectName, composeapi.PsOptions{
+	containers, err := s.ps(ctx, projectName, composeapi.PsOptions{
 		All: true,
 	})
 	if err != nil {

@@ -355,6 +355,10 @@ host_address: ""
 # =============================================================================
 # VOLUME MANAGEMENT
 # =============================================================================
+# Stateful production uses the native docker-backend systemd service with XFS
+# and host-installed xfsprogs (see DEPLOYMENT.md). The local backend container
+# image is for stateless development only: use disk_mb: 0 for every SKU and
+# omit volume_data_path, volume_mount_path, and volume_filesystem there.
 # When any SKU profile has disk_mb > 0, you must configure a volume data path.
 # Each stateful container gets a quota-enforced subdirectory on the host. On an
 # all-diskless host this path is optional: when configured, auto-detected

@@ -9,7 +9,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 ## Prerequisites
 
 - **Go 1.26.6** (per `go.mod`) — the `go 1.26.6` directive sets the toolchain floor. Fred also uses `sync.WaitGroup.Go()` and `testing.B.Loop()` (added in Go 1.25).
-- **Docker 24+** with iptables enabled — required for `make test-integration` and the docker-backend.
+- **Docker Engine 28.1+ (API 1.49+)** with iptables enabled — required for `make test-integration` and the docker-backend's immutable image admission.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **`golangci-lint`**, at the version pinned in `.golangci-lint-version` — required by `make lint`, which now fails rather than skipping when it's absent or mismatched. See [Linting](#linting) for the install command.
 - **(Optional) `btrfs-progs` + root** — only for `make test-integration-volume`, which exercises filesystem quotas.
@@ -130,7 +130,7 @@ regression, not a test that needs updating.
 
 ### Integration tests
 
-Integration tests require a running Docker daemon and use the `integration` build tag.
+Integration tests require a running Docker Engine 28.1+ daemon and use the `integration` build tag. CI pins Docker Engine 29.7.2 on Ubuntu 24.04 and enables the containerd image store, exercising immutable platform selection and preparation of a platform manifest that is not yet independently addressable. The suite connects to the local system socket (`/var/run/docker.sock`); selecting another Docker CLI context does not redirect those SDK fixtures.
 
 ```bash
 make test-integration              # full Docker integration suite (now also sweeps the slower retain/restore tests; ~15-25 min — override the ceiling with `INTEGRATION_TIMEOUT=30m`)
@@ -140,9 +140,9 @@ make test-integration-k3s          # k3s-backend integration tests (self-builds 
 sudo make test-integration-volume  # filesystem quota tests (root + btrfs-progs)
 ```
 
-Volume tests need root because they create btrfs subvolumes and enable btrfs quotas (the integration suite runs against a btrfs loopback; the xfs project-quota path is a separate, non-integration code path).
+Volume tests need root because they create loopback filesystems, set filesystem quotas, and manage ZFS pools. The full suite covers btrfs, XFS project quotas, and ZFS; `make test-integration-volume` selects only the btrfs subset.
 
-**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on a privileged `ubuntu-latest` runner (root + a btrfs loopback + Docker): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore) plus `make test-integration-k3s`. It triggers on PRs/pushes touching the docker backend (`internal/backend/docker/**`, `internal/backend/shared/**`, `cmd/k3s-backend/**`, `Makefile`, `go.mod`/`go.sum`) and runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` still only does `build`, `test` (without `-race`, no `integration` tag), `lint`, and `vulncheck`.
+**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on a privileged `ubuntu-24.04` runner (root + a btrfs loopback + Docker): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore) plus `make test-integration-k3s`. It triggers on PRs/pushes touching the docker backend (`internal/backend/docker/**`, `internal/backend/shared/**`, `cmd/k3s-backend/**`, `Makefile`, `go.mod`/`go.sum`) and runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` still only does `build`, `test` (without `-race`, no `integration` tag), `lint`, and `vulncheck`.
 
 Running the suites locally is still the fastest iteration loop, and required for changes outside the path filter.
 

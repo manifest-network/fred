@@ -518,7 +518,9 @@ func TestStorageMutationGuard_BackendStopCancelsInFlightMutation(t *testing.T) {
 
 	started := make(chan struct{})
 	stopCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
 	b := &Backend{
+		docker: &mockDockerClient{},
 		compose: &mockComposeExecutor{UpFn: func(ctx context.Context, _ *composetypes.Project, _ composeUpOpts) error {
 			close(started)
 			<-ctx.Done()
@@ -534,7 +536,13 @@ func TestStorageMutationGuard_BackendStopCancelsInFlightMutation(t *testing.T) {
 	go func() {
 		result <- b.mutationAdapter().composeUp(context.Background(), &composetypes.Project{}, composeUpOpts{})
 	}()
-	<-started
+	select {
+	case <-started:
+	case err := <-result:
+		t.Fatalf("mutation returned before entering Compose: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("mutation did not enter Compose")
+	}
 	stop()
 
 	select {

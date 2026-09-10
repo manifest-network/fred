@@ -10,7 +10,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 func TestDockerResourceProfilesPinScratchWithoutRuntimeRepricing(t *testing.T) {
@@ -78,7 +77,7 @@ func TestSetupVolBindsUsesPinnedScratchAfterConfigDrift(t *testing.T) {
 		_, created, err := b.setupVolBinds(
 			mutations, context.Background(), leaseUUID, items, resourceProfiles,
 			map[string]*imageSetup{"app": {WritablePaths: []string{"/var/cache/app"}}},
-			map[string]*manifest.Manifest{"app": {Image: "example.invalid/app:1"}}, b.logger,
+			b.logger,
 		)
 		return bindResult{created: created, err: err}
 	})

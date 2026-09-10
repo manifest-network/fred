@@ -10,6 +10,7 @@ import (
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 )
@@ -112,7 +113,26 @@ func (m *testStorageMutationAdapter) composeUp(
 	opts composeUpOpts,
 ) error {
 	return m.perform(ctx, "test compose up", func(ctx context.Context) error {
-		return m.ops.compose.Up(ctx, project, opts)
+		// Identity tests use an empty project; construct a real prepared fixture
+		// inside the authorized action without weakening the production compiler.
+		if project.Name == "" || len(project.Services) == 0 {
+			project = &composetypes.Project{Name: "fred-test", Services: composetypes.Services{
+				"test": {Name: "test", Image: "fixture:latest"},
+			}}
+		}
+		images := make(map[string]imageexec.Image, len(project.Services))
+		for name, service := range project.Services {
+			admitted, err := m.ops.docker.AdmitImage(ctx, service.Image)
+			if err != nil {
+				return err
+			}
+			images[name] = admitted
+		}
+		prepared, err := m.ops.compose.PrepareProject(project, images)
+		if err != nil {
+			return err
+		}
+		return m.ops.compose.Up(ctx, prepared, opts)
 	})
 }
 
@@ -273,6 +293,14 @@ func (p testDockerMutationProxy) sink() (dockerMutationSink, error) {
 	return sink, nil
 }
 
+func (p testDockerMutationProxy) AdmitImage(ctx context.Context, reference string) (imageexec.Image, error) {
+	sink, err := p.sink()
+	if err != nil {
+		return imageexec.Image{}, err
+	}
+	return sink.AdmitImage(ctx, reference)
+}
+
 func (p testDockerMutationProxy) PullImage(ctx context.Context, image string, timeout time.Duration) error {
 	sink, err := p.sink()
 	if err != nil {
@@ -281,7 +309,7 @@ func (p testDockerMutationProxy) PullImage(ctx context.Context, image string, ti
 	return sink.PullImage(ctx, image, timeout)
 }
 
-func (p testDockerMutationProxy) ResolveImageUser(ctx context.Context, image, user string) (int, int, error) {
+func (p testDockerMutationProxy) ResolveImageUser(ctx context.Context, image imageexec.Image, user string) (int, int, error) {
 	sink, err := p.sink()
 	if err != nil {
 		return 0, 0, err
@@ -345,7 +373,7 @@ func (p testDockerMutationProxy) RemoveTenantNetworkIfEmpty(ctx context.Context,
 	return sink.RemoveTenantNetworkIfEmpty(ctx, tenant)
 }
 
-func (p testDockerMutationProxy) DetectVolumeOwner(ctx context.Context, image string, paths []string) (int, int, error) {
+func (p testDockerMutationProxy) DetectVolumeOwner(ctx context.Context, image imageexec.Image, paths []string) (int, int, error) {
 	sink, err := p.sink()
 	if err != nil {
 		return 0, 0, err
@@ -353,7 +381,7 @@ func (p testDockerMutationProxy) DetectVolumeOwner(ctx context.Context, image st
 	return sink.DetectVolumeOwner(ctx, image, paths)
 }
 
-func (p testDockerMutationProxy) DetectWritablePaths(ctx context.Context, image string, uid int, parents []string) ([]string, error) {
+func (p testDockerMutationProxy) DetectWritablePaths(ctx context.Context, image imageexec.Image, uid int, parents []string) ([]string, error) {
 	sink, err := p.sink()
 	if err != nil {
 		return nil, err
@@ -363,7 +391,7 @@ func (p testDockerMutationProxy) DetectWritablePaths(ctx context.Context, image 
 
 func (p testDockerMutationProxy) ExtractImageContent(
 	ctx context.Context,
-	image string,
+	image imageexec.Image,
 	paths []string,
 	destination string,
 	maxBytes, maxEntries int64,
@@ -385,7 +413,23 @@ func (p testComposeMutationProxy) sink() (composeMutationSink, error) {
 	return sink, nil
 }
 
-func (p testComposeMutationProxy) Up(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+func (p testComposeMutationProxy) PrepareProject(project *composetypes.Project, images map[string]imageexec.Image) (imageexec.PreparedProject, error) {
+	sink, err := p.sink()
+	if err != nil {
+		return imageexec.PreparedProject{}, err
+	}
+	if mock, ok := sink.(*mockComposeExecutor); ok {
+		switch docker := p.backend.docker.(type) {
+		case *mockDockerClient:
+			mock.bindImages(docker.imageAdmitter())
+		case *DockerClient:
+			mock.bindImages(docker.images)
+		}
+	}
+	return sink.PrepareProject(project, images)
+}
+
+func (p testComposeMutationProxy) Up(ctx context.Context, project imageexec.PreparedProject, opts composeUpOpts) error {
 	sink, err := p.sink()
 	if err != nil {
 		return err

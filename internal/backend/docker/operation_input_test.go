@@ -194,7 +194,7 @@ func TestRestore_AsyncWorkerOwnsRequestAfterReturn(t *testing.T) {
 		InspectImageFn: func(_ context.Context, _ string) (*ImageInfo, error) {
 			enterOnce.Do(func() { close(workerEntered) })
 			<-allowWorker
-			return &ImageInfo{ID: "image-1", Volumes: map[string]struct{}{}}, nil
+			return &ImageInfo{ID: fixtureImageID("image-1"), Volumes: map[string]struct{}{}}, nil
 		},
 		InspectContainerFn: func(_ context.Context, id string) (*ContainerInfo, error) {
 			claims, err := b.operationSettlement.ListOperationIntents()

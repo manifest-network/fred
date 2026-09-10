@@ -71,8 +71,14 @@ func installStackStrictCohortInventory(
 			services: make(map[string]serviceSnapshot, len(project.Services)),
 		}
 		for serviceName, service := range project.Services {
+			// Model the Docker read boundary: execute the pinned ID but expose
+			// its checked original reference to durable release comparisons.
+			imageReference, err := containerImageReference(service.Image, service.Image, service.Labels)
+			if err != nil {
+				return fmt.Errorf("project service %q image binding: %w", serviceName, err)
+			}
 			snapshot.services[serviceName] = serviceSnapshot{
-				image:  service.Image,
+				image:  imageReference,
 				labels: maps.Clone(service.Labels),
 			}
 		}

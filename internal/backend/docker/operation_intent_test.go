@@ -2053,7 +2053,7 @@ func TestProvisionTeardownFailureRetainsIntentPoolAndVolumesForRecovery(t *testi
 	mock := &mockDockerClient{
 		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
 		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
-			return &ImageInfo{ID: "image-1", Volumes: map[string]struct{}{`/data`: {}}}, nil
+			return &ImageInfo{ID: fixtureImageID("image-1"), Volumes: map[string]struct{}{`/data`: {}}}, nil
 		},
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			return nil, errors.New(teardownFailure)
@@ -2141,7 +2141,7 @@ func TestProvisionFailurePreservesCreatedVolumesForRecovery(t *testing.T) {
 	mock := &mockDockerClient{
 		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
 		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
-			return &ImageInfo{ID: "image-1", Volumes: map[string]struct{}{`/data`: {}}}, nil
+			return &ImageInfo{ID: fixtureImageID("image-1"), Volumes: map[string]struct{}{`/data`: {}}}, nil
 		},
 	}
 	b := newBackendForProvisionTest(t, mock, nil)
@@ -2436,7 +2436,7 @@ func TestFailedReplacementProvisionRetainsIntentAndAccountingForRecovery(t *test
 	mock := &mockDockerClient{
 		PullImageFn: func(context.Context, string, time.Duration) error { return nil },
 		InspectImageFn: func(context.Context, string) (*ImageInfo, error) {
-			return &ImageInfo{ID: "image-1", Volumes: map[string]struct{}{`/data`: {}}}, nil
+			return &ImageInfo{ID: fixtureImageID("image-1"), Volumes: map[string]struct{}{`/data`: {}}}, nil
 		},
 		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
 			return slices.Clone(inventory), nil

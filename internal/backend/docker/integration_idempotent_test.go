@@ -38,8 +38,12 @@ func newTestDockerClient(t *testing.T) *DockerClient {
 // real Docker daemon. BackendName is taken from the DockerClient so that
 // backend-scoped filters on the client match the containers we create here.
 // Caller typically overrides LeaseUUID/Manifest.Image.
-func baseCreateParams(d *DockerClient, leaseUUID, image string) CreateContainerParams {
+func baseCreateParams(t *testing.T, ctx context.Context, d *DockerClient, leaseUUID, image string) CreateContainerParams {
+	t.Helper()
+	admitted, err := d.AdmitImage(ctx, image)
+	require.NoError(t, err)
 	return CreateContainerParams{
+		Image:         admitted,
 		LeaseUUID:     leaseUUID,
 		Tenant:        "test-tenant",
 		ProviderUUID:  testProviderUUID,
@@ -81,7 +85,7 @@ func TestIntegration_Docker_RemoveContainer_Concurrent(t *testing.T) {
 	// Pull a small image we can create and destroy quickly.
 	require.NoError(t, d.PullImage(ctx, "busybox:latest", 60*time.Second))
 
-	params := baseCreateParams(d, newIntegrationLeaseUUID(), "busybox:latest")
+	params := baseCreateParams(t, ctx, d, newIntegrationLeaseUUID(), "busybox:latest")
 	containerID, err := d.CreateContainer(ctx, params, 30*time.Second)
 	require.NoError(t, err)
 	defer forceRemove(t, d, containerID)
@@ -123,7 +127,7 @@ func TestIntegration_Docker_CreateContainer_AdoptOnReplay(t *testing.T) {
 
 	require.NoError(t, d.PullImage(ctx, "busybox:latest", 60*time.Second))
 
-	params := baseCreateParams(d, newIntegrationLeaseUUID(), "busybox:latest")
+	params := baseCreateParams(t, ctx, d, newIntegrationLeaseUUID(), "busybox:latest")
 
 	before := testutil.ToFloat64(idempotentOpsTotal.WithLabelValues("create", "already_exists"))
 
@@ -151,13 +155,13 @@ func TestIntegration_Docker_CreateContainer_RejectsImageMismatch(t *testing.T) {
 	require.NoError(t, d.PullImage(ctx, "alpine:latest", 60*time.Second))
 
 	leaseUUID := newIntegrationLeaseUUID()
-	firstParams := baseCreateParams(d, leaseUUID, "busybox:latest")
+	firstParams := baseCreateParams(t, ctx, d, leaseUUID, "busybox:latest")
 	firstID, err := d.CreateContainer(ctx, firstParams, 30*time.Second)
 	require.NoError(t, err)
 	defer forceRemove(t, d, firstID)
 
 	// Replay with same lease/instance but a different image — must NOT adopt.
-	mismatchParams := baseCreateParams(d, leaseUUID, "alpine:latest")
+	mismatchParams := baseCreateParams(t, ctx, d, leaseUUID, "alpine:latest")
 	_, err = d.CreateContainer(ctx, mismatchParams, 30*time.Second)
 	require.Error(t, err, "create with mismatched image must not silently adopt")
 	assert.Contains(t, err.Error(), "alpine:latest")

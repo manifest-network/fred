@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
@@ -486,8 +486,8 @@ type volumeOwnerEntry struct {
 // (0, 0) without caching so the next call retries (transient errors
 // self-heal). Successful results are cached permanently since image IDs
 // are immutable content-addressable digests.
-func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx context.Context, imageID, imageName string, volumePaths []string) (uid, gid int) {
-	if v, ok := b.volumeOwnerCache.Load(imageID); ok {
+func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx context.Context, imageName imageexec.Image, volumePaths []string) (uid, gid int) {
+	if v, ok := b.volumeOwnerCache.Load(imageName.ID()); ok {
 		if entry, ok := v.(volumeOwnerEntry); ok {
 			return entry.UID, entry.GID
 		}
@@ -496,11 +496,11 @@ func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx conte
 	detectedUID, detectedGID, err := mutations.detectVolumeOwner(ctx, imageName, volumePaths)
 	if err != nil {
 		b.logger.Warn("failed to detect volume owner, defaulting to root (not cached)",
-			"image", imageName, "error", err)
+			"image", imageName.Reference(), "error", err)
 		return 0, 0
 	}
 
-	b.volumeOwnerCache.Store(imageID, volumeOwnerEntry{UID: detectedUID, GID: detectedGID})
+	b.volumeOwnerCache.Store(imageName.ID(), volumeOwnerEntry{UID: detectedUID, GID: detectedGID})
 	return detectedUID, detectedGID
 }
 
@@ -508,8 +508,8 @@ func (b *Backend) detectVolumeOwnerCached(mutations *storageMutations, ctx conte
 // using the cache keyed by image ID. On error, logs a warning and returns nil
 // without caching so the next call retries. Successful results (including
 // empty slices) are cached permanently since image IDs are immutable.
-func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx context.Context, imageID, imageName string, uid int) []string {
-	if v, ok := b.writablePathCache.Load(imageID); ok {
+func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx context.Context, imageName imageexec.Image, uid int) []string {
+	if v, ok := b.writablePathCache.Load(imageName.ID()); ok {
 		if paths, ok := v.([]string); ok {
 			return paths
 		}
@@ -518,38 +518,37 @@ func (b *Backend) detectWritablePathsCached(mutations *storageMutations, ctx con
 	paths, err := mutations.detectWritablePaths(ctx, imageName, uid, candidateWritableParents)
 	if err != nil {
 		b.logger.Warn("failed to detect writable paths, skipping (not cached)",
-			"image", imageName, "error", err)
+			"image", imageName.Reference(), "error", err)
 		return nil
 	}
 
-	b.writablePathCache.Store(imageID, paths)
+	b.writablePathCache.Store(imageName.ID(), paths)
 	return paths
 }
 
 // imageSetup holds the results of image inspection needed for container creation.
 type imageSetup struct {
-	Volumes       []string // sorted VOLUME paths declared by the image
-	ContainerUser string   // numeric "uid:gid" or "" for root
-	VolumeUID     int      // UID for volume ownership
-	VolumeGID     int      // GID for volume ownership
-	WritablePaths []string // auto-detected writable paths for non-root images
+	Image         imageexec.Image // admitted image shared by helpers and workload execution
+	Volumes       []string        // sorted VOLUME paths declared by the image
+	ContainerUser string          // numeric "uid:gid" or "" for root
+	VolumeUID     int             // UID for volume ownership
+	VolumeGID     int             // GID for volume ownership
+	WritablePaths []string        // auto-detected writable paths for non-root images
 }
 
 // inspectImageForSetup inspects an image and resolves its VOLUME declarations
 // and container user. This combines the image inspect, volume discovery, and
 // user resolution steps that are common to doProvision, doRestart, and doUpdate.
 func (b *Backend) inspectImageForSetup(mutations *storageMutations, ctx context.Context, image string, manifestUser string) (*imageSetup, error) {
-	imageInfo, err := b.docker.InspectImage(ctx, image)
+	admitted, err := mutations.admitImage(ctx, image)
 	if err != nil {
-		return nil, fmt.Errorf("image inspect failed: %w", err)
+		return nil, fmt.Errorf("image admission failed: %w", err)
 	}
+	volumes := admitted.Volumes()
+	result := &imageSetup{Image: admitted, Volumes: volumes}
 
-	volumes := slices.Sorted(maps.Keys(imageInfo.Volumes))
-
-	result := &imageSetup{Volumes: volumes}
-
-	if manifestUser != "" || imageInfo.User != "" {
-		uid, gid, resolveErr := mutations.resolveImageUser(ctx, image, manifestUser)
+	if manifestUser != "" || admitted.User() != "" {
+		uid, gid, resolveErr := mutations.resolveImageUser(ctx, admitted, manifestUser)
 		if resolveErr != nil {
 			return nil, fmt.Errorf("image user resolution failed: %w", resolveErr)
 		}
@@ -564,7 +563,7 @@ func (b *Backend) inspectImageForSetup(mutations *storageMutations, ctx context.
 		// detecting the owner lets us pre-chown host volumes and run as that
 		// user, bypassing the entrypoint's chown+gosu (which requires
 		// CAP_CHOWN that we drop).
-		uid, gid := b.detectVolumeOwnerCached(mutations, ctx, imageInfo.ID, image, volumes)
+		uid, gid := b.detectVolumeOwnerCached(mutations, ctx, admitted, volumes)
 		if uid != 0 || gid != 0 {
 			result.VolumeUID = uid
 			result.VolumeGID = gid
@@ -580,7 +579,7 @@ func (b *Backend) inspectImageForSetup(mutations *storageMutations, ctx context.
 	// Skipped when ReadonlyRootfs is disabled since the detection creates a temp
 	// container and the results are only used for writable path mounting.
 	if b.cfg.IsReadonlyRootfs() {
-		result.WritablePaths = b.detectWritablePathsCached(mutations, ctx, imageInfo.ID, image, result.VolumeUID)
+		result.WritablePaths = b.detectWritablePathsCached(mutations, ctx, admitted, result.VolumeUID)
 		result.WritablePaths = filterSubpaths(result.WritablePaths, result.Volumes)
 	}
 
@@ -719,7 +718,7 @@ const writablePathSubdir = "_wp"
 // a managed volume subdirectory and returns a bind map for container creation.
 // Extraction failures are logged but don't fail the overall operation;
 // paths that fail are simply omitted from the bind map.
-func (b *Backend) setupWritablePathBinds(mutations *storageMutations, ctx context.Context, image string, writablePaths []string, hostVolumePath string, maxBytes, maxEntries int64) map[string]string {
+func (b *Backend) setupWritablePathBinds(mutations *storageMutations, ctx context.Context, image imageexec.Image, writablePaths []string, hostVolumePath string, maxBytes, maxEntries int64) map[string]string {
 	if len(writablePaths) == 0 {
 		return nil
 	}
@@ -750,7 +749,7 @@ func (b *Backend) setupWritablePathBinds(mutations *storageMutations, ctx contex
 		// rather than mount an unvalidated (possibly symlinked) Source. ErrNotExist
 		// is safe — nothing was extracted, so no Source exists to be a symlink.
 		b.logger.Warn("cannot open writable-path root for confinement checks; skipping all writable-path binds",
-			"path", wpDir, "image", image, "error", rootErr)
+			"path", wpDir, "image", image.Reference(), "error", rootErr)
 		return nil
 	}
 	if wpRoot != nil {
@@ -762,13 +761,13 @@ func (b *Backend) setupWritablePathBinds(mutations *storageMutations, ctx contex
 		if failures != nil {
 			if pathErr, ok := failures[wp]; ok {
 				b.logger.Warn("failed to extract writable path content",
-					"path", wp, "image", image, "error", pathErr)
+					"path", wp, "image", image.Reference(), "error", pathErr)
 				continue
 			}
 		}
 		sanitized := sanitizeVolumePath(wp)
 		if sanitized == "" {
-			b.logger.Warn("writable path rejected by sanitization", "path", wp, "image", image)
+			b.logger.Warn("writable path rejected by sanitization", "path", wp, "image", image.Reference())
 			continue
 		}
 		if wpRoot != nil {
@@ -780,11 +779,11 @@ func (b *Backend) setupWritablePathBinds(mutations *storageMutations, ctx contex
 			switch info, lerr := wpRoot.Lstat(sanitized); {
 			case lerr == nil && info.Mode()&fs.ModeSymlink != 0:
 				b.logger.Warn("writable-path bind source is a symlink; skipping to prevent host escape",
-					"path", wp, "image", image)
+					"path", wp, "image", image.Reference())
 				continue
 			case lerr != nil && !errors.Is(lerr, fs.ErrNotExist):
 				b.logger.Warn("writable-path bind source failed confinement check; skipping",
-					"path", wp, "image", image, "error", lerr)
+					"path", wp, "image", image.Reference(), "error", lerr)
 				continue
 			}
 		}
@@ -804,7 +803,6 @@ func (b *Backend) setupVolBinds(
 	items []backend.LeaseItem,
 	resourceProfiles []shared.SKUResourceSnapshot,
 	imageSetups map[string]*imageSetup,
-	services map[string]*manifest.Manifest,
 	logger *slog.Logger,
 ) (map[string]map[int]serviceVolBinds, []string, error) {
 	resourcesBySKU, err := resourceSnapshotMap(items, resourceProfiles)
@@ -850,7 +848,7 @@ func (b *Backend) setupVolBinds(
 					}
 				}
 				if needsWritableVolume {
-					binds.WritableBinds = b.setupWritablePathBinds(mutations, ctx, services[svcName].Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
+					binds.WritableBinds = b.setupWritablePathBinds(mutations, ctx, imgSetup.Image, imgSetup.WritablePaths, hostPath, sizeMB*1024*1024, inodeHardLimit(sizeMB, b.cfg.GetMinAvgFileBytes()))
 				}
 				if volBinds[svcName] == nil {
 					volBinds[svcName] = make(map[int]serviceVolBinds)
@@ -1085,7 +1083,7 @@ func (b *Backend) doProvisionPhysical(
 	b.provisionsMu.RUnlock()
 
 	var volBinds map[string]map[int]serviceVolBinds
-	volBinds, _, err = b.setupVolBinds(mutations, ctx, req.LeaseUUID, req.Items, resourceProfiles, imageSetups, stack.Services, logger)
+	volBinds, _, err = b.setupVolBinds(mutations, ctx, req.LeaseUUID, req.Items, resourceProfiles, imageSetups, logger)
 	if err != nil {
 		callbackErr = "volume creation failed"
 		return
@@ -1116,7 +1114,7 @@ func (b *Backend) doProvisionPhysical(
 	})
 
 	logger.Info("compose up", "project", projectName, "services", len(project.Services))
-	if upErr := mutations.composeUp(ctx, project, composeUpOpts{}); upErr != nil {
+	if upErr := mutations.composeUp(ctx, project, composeProjectImages(project, imageSetups), composeUpOpts{}); upErr != nil {
 		err = fmt.Errorf("compose up failed: %w", upErr)
 		callbackErr = "container creation failed"
 		return

@@ -13,7 +13,6 @@ type dockerReadView struct {
 	ping                 func(context.Context) error
 	daemonInfo           func(context.Context) (DaemonSecurityInfo, error)
 	close                func() error
-	inspectImage         func(context.Context, string) (*ImageInfo, error)
 	inspectContainer     func(context.Context, string) (*ContainerInfo, error)
 	containerLogs        func(context.Context, string, int) (string, error)
 	listContainers       func(context.Context) ([]ContainerInfo, error)
@@ -25,8 +24,8 @@ type dockerReadView struct {
 func projectDockerRead(client dockerReadClient) dockerReadClient {
 	return dockerReadView{
 		ping: client.Ping, daemonInfo: client.DaemonInfo, close: client.Close,
-		inspectImage: client.InspectImage, inspectContainer: client.InspectContainer,
-		containerLogs: client.ContainerLogs, listContainers: client.ListManagedContainers,
+		inspectContainer: client.InspectContainer,
+		containerLogs:    client.ContainerLogs, listContainers: client.ListManagedContainers,
 		listContainersStrict: client.ListManagedContainersStrict,
 		listNetworks:         client.ListManagedNetworks, containerEvents: client.ContainerEvents,
 	}
@@ -37,9 +36,7 @@ func (v dockerReadView) DaemonInfo(ctx context.Context) (DaemonSecurityInfo, err
 	return v.daemonInfo(ctx)
 }
 func (v dockerReadView) Close() error { return v.close() }
-func (v dockerReadView) InspectImage(ctx context.Context, image string) (*ImageInfo, error) {
-	return v.inspectImage(ctx, image)
-}
+
 func (v dockerReadView) InspectContainer(ctx context.Context, id string) (*ContainerInfo, error) {
 	return v.inspectContainer(ctx, id)
 }

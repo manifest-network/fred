@@ -191,7 +191,7 @@ func rawVolumeMutation(selector *ast.SelectorExpr) bool {
 
 func rawSubstrateMethod(name string) bool {
 	switch name {
-	case "PullImage", "ResolveImageUser", "CreateContainer", "StartContainer",
+	case "PullImage", "AdmitImage", "ResolveImageUser", "CreateContainer", "StartContainer",
 		"StopContainer", "RenameContainer", "RemoveContainer", "EnsureTenantNetwork",
 		"RemoveTenantNetworkIfEmpty", "DetectVolumeOwner", "DetectWritablePaths",
 		"ExtractImageContent", "EnsureQuota", "RenameVolume", "Up", "Down":
@@ -201,11 +201,12 @@ func rawSubstrateMethod(name string) bool {
 	}
 }
 
-// PullImage is the only operation allowed to use Runner.Prepare. Image-user,
+// Image pulling and admission may use Runner.Prepare: admission can materialize
+// an immutable image-store manifest, but cannot create containers. Image-user,
 // volume-owner, and writable-path probes create temporary containers and may
 // leave anonymous volumes when Docker returns ambiguously; they are tenant
 // Steps even though their intended result is observational.
-func TestRunnerPrepareAllowlistContainsOnlyPullImage(t *testing.T) {
+func TestRunnerPrepareAllowlistContainsOnlyImagePreparation(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "storage_mutation_guard.go", nil, 0)
 	if err != nil {
@@ -229,7 +230,7 @@ func TestRunnerPrepareAllowlistContainsOnlyPullImage(t *testing.T) {
 			return true
 		})
 	}
-	if !reflect.DeepEqual(prepares, []string{"pullImage"}) {
-		t.Fatalf("Runner.Prepare call sites = %v, want only storageMutations.pullImage", prepares)
+	if !reflect.DeepEqual(prepares, []string{"pullImage", "admitImage"}) {
+		t.Fatalf("Runner.Prepare call sites = %v, want only guarded image preparation", prepares)
 	}
 }

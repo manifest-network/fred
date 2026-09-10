@@ -657,7 +657,7 @@ func TestSetupWritablePathBinds_WipesStaleContentAndReseeds(t *testing.T) {
 	}
 
 	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
-		return b.setupWritablePathBinds(mutations, context.Background(), "grafana/grafana:11.1.0",
+		return b.setupWritablePathBinds(mutations, context.Background(), admittedFixtureImage(t, "grafana/grafana:11.1.0"),
 			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
 	})
 
@@ -705,7 +705,7 @@ func TestSetupWritablePathBinds_RejectsSymlinkBindSource(t *testing.T) {
 	}
 
 	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
-		return b.setupWritablePathBinds(mutations, context.Background(), "img",
+		return b.setupWritablePathBinds(mutations, context.Background(), admittedFixtureImage(t, "img"),
 			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
 	})
 
@@ -737,7 +737,7 @@ func TestSetupWritablePathBinds_FailsClosedWhenRootUnopenable(t *testing.T) {
 	}
 
 	binds := runSubjectStorageMutationForTest(t, b, "550e8400-e29b-41d4-a716-446655440000", func(mutations *storageMutations) map[string]string {
-		return b.setupWritablePathBinds(mutations, context.Background(), "img",
+		return b.setupWritablePathBinds(mutations, context.Background(), admittedFixtureImage(t, "img"),
 			[]string{"/var/lib/grafana"}, hostVol, 64<<20, 1<<30)
 	})
 

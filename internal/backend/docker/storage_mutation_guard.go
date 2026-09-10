@@ -22,6 +22,7 @@ import (
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 
+	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/substratemutation"
 	"github.com/manifest-network/fred/internal/backendidentity"
@@ -302,7 +303,17 @@ func (m *storageMutations) pullImage(ctx context.Context, image string, timeout 
 	})
 }
 
-func (m *storageMutations) resolveImageUser(ctx context.Context, image, user string) (uid, gid int, err error) {
+func (m *storageMutations) admitImage(ctx context.Context, reference string) (admitted imageexec.Image, err error) {
+	err = m.runner.Prepare(ctx, "admit image", func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, m.ops.backend.cfg.ImagePullTimeout)
+		defer cancel()
+		admitted, err = m.ops.docker.AdmitImage(ctx, reference)
+		return err
+	})
+	return admitted, err
+}
+
+func (m *storageMutations) resolveImageUser(ctx context.Context, image imageexec.Image, user string) (uid, gid int, err error) {
 	err = m.runner.Step(ctx, "inspect image user", func(ctx context.Context) error {
 		uid, gid, err = m.ops.docker.ResolveImageUser(ctx, image, user)
 		return err
@@ -310,7 +321,7 @@ func (m *storageMutations) resolveImageUser(ctx context.Context, image, user str
 	return uid, gid, err
 }
 
-func (m *storageMutations) detectVolumeOwner(ctx context.Context, image string, paths []string) (uid, gid int, err error) {
+func (m *storageMutations) detectVolumeOwner(ctx context.Context, image imageexec.Image, paths []string) (uid, gid int, err error) {
 	err = m.runner.Step(ctx, "inspect image volume owner", func(ctx context.Context) error {
 		uid, gid, err = m.ops.docker.DetectVolumeOwner(ctx, image, paths)
 		return err
@@ -318,7 +329,7 @@ func (m *storageMutations) detectVolumeOwner(ctx context.Context, image string, 
 	return uid, gid, err
 }
 
-func (m *storageMutations) detectWritablePaths(ctx context.Context, image string, uid int, parents []string) (paths []string, err error) {
+func (m *storageMutations) detectWritablePaths(ctx context.Context, image imageexec.Image, uid int, parents []string) (paths []string, err error) {
 	err = m.runner.Step(ctx, "inspect image writable paths", func(ctx context.Context) error {
 		paths, err = m.ops.docker.DetectWritablePaths(ctx, image, uid, parents)
 		return err
@@ -330,12 +341,16 @@ func (m *storageMutations) effectEntered() bool {
 	return m != nil && m.runner.EffectEntered()
 }
 
-func (m *storageMutations) composeUp(ctx context.Context, project *composetypes.Project, opts composeUpOpts) error {
+func (m *storageMutations) composeUp(ctx context.Context, project *composetypes.Project, images map[string]imageexec.Image, opts composeUpOpts) error {
 	if project == nil || project.Name != composeProjectName(m.leaseUUID) {
 		return fmt.Errorf("compose up project differs from Started lease %q", m.leaseUUID)
 	}
+	prepared, err := m.ops.compose.PrepareProject(project, images)
+	if err != nil {
+		return err
+	}
 	return m.runner.Step(ctx, "compose up", func(ctx context.Context) error {
-		return m.ops.compose.Up(ctx, project, opts)
+		return m.ops.compose.Up(ctx, prepared, opts)
 	})
 }
 
@@ -457,7 +472,7 @@ func (m *storageMutations) removePath(ctx context.Context, path string) error {
 	})
 }
 
-func (m *storageMutations) extractImageContent(ctx context.Context, image string, paths []string, destination string, maxBytes, maxEntries int64) (failures map[string]error, err error) {
+func (m *storageMutations) extractImageContent(ctx context.Context, image imageexec.Image, paths []string, destination string, maxBytes, maxEntries int64) (failures map[string]error, err error) {
 	volume, scopeErr := writablePathVolumeComponent(m.ops.backend.cfg.VolumeDataPath, destination)
 	if scopeErr != nil || !m.volumeNameInScope(volume) {
 		return nil, fmt.Errorf("image extraction target differs from Started subject: %w", scopeErr)
