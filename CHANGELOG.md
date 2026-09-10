@@ -1096,6 +1096,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- Update gRPC to v1.83.2 to fix receive-buffer memory exhaustion from fragmented
+  HTTP/2 responses, including the transport used by Fred's chain client. Update
+  the containerd client-library dependency to v2.3.5 and its required transitive
+  versions. These dependency updates do not upgrade installed host daemons.
+
 - Docker image admission rejects reserved `fred.*`, `traefik.*`, and
   `com.docker.compose.*` labels before any workload or inspection helper is
   created, preventing inherited labels from hijacking ingress or Compose

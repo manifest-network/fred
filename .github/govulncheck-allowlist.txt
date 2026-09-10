@@ -10,22 +10,21 @@
 # entries as fixes land. Tracking: ENG-415.
 #
 # ── Category A: no upstream fix available (govulncheck "Fixed in: N/A") ──────
-# github.com/docker/docker @ v28.5.2+incompatible has no patched release: the
-# fix ships only as moby/moby/v2 v2.0.0-beta.8, whose 22 published tags are ALL
-# v2.0.0-beta.N. Unlike the daemon-only advisories dropped in ENG-639, these two
-# ARE in the called set — though only via docker/client package init and
-# client.Client.Close, not the plugin code the advisories describe. Keep them:
-# the gate compares against the called set, so removing them would fail CI.
+# The OSV records list no patched github.com/docker/docker version; their fix
+# is tracked under the separate github.com/moby/moby/v2 module. Both advisories
+# remain in the called set through Docker client operations, including image
+# inspection, container creation, and cleanup. Their module-wide matches do not
+# establish that Fred executes the affected daemon plugin code. Keep them while
+# measuring the legacy dependency's removal; deleting them alone fails the gate.
 #
-# Since ENG-642 (docker/compose v5) fred's only *direct* caller of
-# docker/docker/client is internal/backend/docker/lifecycle.go — compose v5 and
-# docker/cli v29 both moved to github.com/moby/moby/client. Porting lifecycle.go
-# across is therefore worth measuring as a follow-up, but it is not a foregone
-# win: buildx still reaches docker/docker via pkg/namesgenerator, and both
+# Fred's direct legacy client calls live in the Docker lifecycle and imageexec
+# boundaries; compose v5 and docker/cli v29 use github.com/moby/moby/client.
+# Consolidating those boundaries onto the newer SDK remains worth measuring:
+# buildx still reaches docker/docker via pkg/namesgenerator, and both
 # advisories are module-granularity (empty ecosystem_specific), so any linkage
 # may keep them called. Measure with govulncheck before assuming.
-GO-2026-4887   docker/docker — no patched release (fix only in moby/moby/v2 betas)
-GO-2026-4883   docker/docker — no patched release (fix only in moby/moby/v2 betas)
+GO-2026-4887   legacy docker/docker module — no patched version in the OSV record
+GO-2026-4883   legacy docker/docker module — no patched version in the OSV record
 #
 # golang.org/x/crypto/openpgp is unmaintained/frozen ("Fixed in: N/A"); its OSV
 # entry has `introduced: 0` with no `fixed` event at all, so no release will
@@ -36,8 +35,7 @@ GO-2026-5932   x/crypto/openpgp unmaintained — reached only via cosmos-sdk key
 #
 # ── Category B is empty. ─────────────────────────────────────────────────────
 # It previously deferred the containerd/buildkit fixes that sat behind the
-# docker/compose v2 toolchain. ENG-642 moved fred to docker/compose v5, which
-# pulls containerd v2.3.3 and buildkit v0.32.1 directly, so every entry it held
-# is fixed in the selected graph and has left the called set. Do not re-add a
-# blanket "compose-coupled" justification: check the requirement graph of the
+# docker/compose v2 toolchain. ENG-642 moved Fred to docker/compose v5, permitting
+# patched containerd/buildkit selections. Those entries left the called set.
+# Do not re-add a blanket "compose-coupled" justification: check the graph of the
 # specific version you need.
